@@ -5,6 +5,13 @@
 
 use serde::{Deserialize, Serialize};
 
+/// The host's cpu count; never 0, and 4 when it cannot be read.
+pub(crate) fn available_cpus() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct WasmRuntimeConfig {
     /// Maximum memory size in pages (64KB per page)
@@ -23,10 +30,7 @@ pub struct WasmRuntimeConfig {
 
 impl Default for WasmRuntimeConfig {
     fn default() -> Self {
-        let default_thread_pool_size = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4)
-            .clamp(1, 4);
+        let default_thread_pool_size = available_cpus().clamp(1, 4);
 
         Self {
             max_memory_pages: 1024,                     // 64MB

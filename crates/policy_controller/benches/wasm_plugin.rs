@@ -35,6 +35,7 @@ use common::{build_view, fleet};
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
 use smg_policy_controller::{
     builtins::{Best, Healthy, LeastRequests},
+    plugins::OpenDecisions,
     wasm::{Plugin, PluginSpec, Runtime, WasmFilter, WasmPicker, WasmScorer},
     Binding, Constraints, Engine, Lease, Lifecycle, Needs, Plan, PoolFacts, Profile, RequestFacts,
     Scratch, Side, Target, Weighted,
@@ -101,6 +102,7 @@ fn engine_of(profile: Profile) -> Engine {
             profile: 0,
             decode_profile: None,
             sessions: None,
+            overload: None,
         }],
         1,
         Needs::default(),
@@ -154,7 +156,7 @@ fn answered(world: &str, plugin: &Plugin) {
 }
 
 fn decide(c: &mut Criterion) {
-    let runtime = Arc::new(Runtime::new().expect("a runtime"));
+    let runtime = Arc::new(Runtime::new(&OpenDecisions::new()).expect("a runtime"));
     let mut group = c.benchmark_group("policy_wasm/decide");
     for (world, component) in worlds() {
         let plugin = plugin(
@@ -192,7 +194,7 @@ fn decide(c: &mut Criterion) {
 /// The kept-instance decision with the affinity column fed: each world's
 /// fill reads a row and the row's entry of the column.
 fn decide_held(c: &mut Criterion) {
-    let runtime = Arc::new(Runtime::new().expect("a runtime"));
+    let runtime = Arc::new(Runtime::new(&OpenDecisions::new()).expect("a runtime"));
     let mut group = c.benchmark_group("policy_wasm/decide_held");
     for (world, component) in worlds() {
         let plugin = plugin(
@@ -256,7 +258,7 @@ fn decide_held(c: &mut Criterion) {
 }
 
 fn decide_fresh(c: &mut Criterion) {
-    let runtime = Arc::new(Runtime::new().expect("a runtime"));
+    let runtime = Arc::new(Runtime::new(&OpenDecisions::new()).expect("a runtime"));
     let mut group = c.benchmark_group("policy_wasm/decide_fresh");
     for (world, component) in worlds() {
         let plugin = plugin(
@@ -296,7 +298,7 @@ fn decide_fresh(c: &mut Criterion) {
 }
 
 fn fuel_exhausted(c: &mut Criterion) {
-    let runtime = Arc::new(Runtime::new().expect("a runtime"));
+    let runtime = Arc::new(Runtime::new(&OpenDecisions::new()).expect("a runtime"));
     let mut group = c.benchmark_group("policy_wasm/fuel_exhausted");
     // A 100 microsecond frame, so the spin ends at 100 microseconds of fuel;
     // a cool-down of zero keeps the breaker from bypassing the guest after
@@ -339,7 +341,7 @@ fn fuel_exhausted(c: &mut Criterion) {
 }
 
 fn observe(c: &mut Criterion) {
-    let runtime = Arc::new(Runtime::new().expect("a runtime"));
+    let runtime = Arc::new(Runtime::new(&OpenDecisions::new()).expect("a runtime"));
     let mut group = c.benchmark_group("policy_wasm/observe");
     for (world, component) in worlds() {
         let plugin = plugin(

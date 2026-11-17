@@ -862,15 +862,6 @@ mod tests {
         async fn get_backend_client(&self) -> WorkerResult<Option<Arc<BackendClient>>> {
             self.0.get_backend_client().await
         }
-        async fn grpc_health_check(&self) -> WorkerResult<bool> {
-            self.0.grpc_health_check().await
-        }
-        async fn zmq_health_check(&self) -> WorkerResult<bool> {
-            self.0.zmq_health_check().await
-        }
-        async fn http_health_check(&self) -> WorkerResult<bool> {
-            self.0.http_health_check().await
-        }
         fn prepare_request(&self, mut req: Value) -> WorkerResult<Value> {
             if let Some(obj) = req.as_object_mut() {
                 obj.insert("custom".to_string(), Value::Bool(true));

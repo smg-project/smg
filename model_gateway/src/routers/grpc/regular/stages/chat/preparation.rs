@@ -6,7 +6,7 @@ use openai_protocol::{
     common::{ToolChoice, ToolChoiceValue},
     profile::ProviderProfile,
 };
-use tracing::error;
+use tracing::{error, warn};
 
 use crate::{
     routers::{
@@ -123,6 +123,7 @@ pub(crate) async fn prepare_chat_like(
             "ChatPreparationStage::execute",
             || multimodal::media_plan_chat(&request.messages),
             true,
+            body_ref.tools.is_some(),
         )
         .await?;
         let media_order = media.media_order;
@@ -145,8 +146,23 @@ pub(crate) async fn prepare_chat_like(
             ) {
                 Ok(msgs) => msgs,
                 Err(e) => {
-                    error!(function = "ChatPreparationStage::execute", error = %e, "Failed to process chat messages");
-                    return Err(error::bad_request("process_messages_failed", e));
+                    // Only a refusal typed as the request's own is the
+                    // client's to fix: one WARN with the cause, the answer
+                    // marked reported. Every other failure (a tokenizer with
+                    // no chat template, a render the template did not refuse
+                    // itself) keeps ERROR and stays unmarked.
+                    let refused = e.is_refusal();
+                    if refused {
+                        warn!(function = "ChatPreparationStage::execute", error = %e, "Failed to process chat messages");
+                    } else {
+                        error!(function = "ChatPreparationStage::execute", error = %e, "Failed to process chat messages");
+                    }
+                    let answer = error::bad_request("process_messages_failed", String::from(e));
+                    return Err(if refused {
+                        utils::reported(answer)
+                    } else {
+                        answer
+                    });
                 }
             };
 
@@ -205,7 +221,7 @@ pub(crate) async fn prepare_chat_like(
             "ChatPreparationStage::execute",
         )?;
         ctx.state.parser_names = Some(parser_names);
-        ctx.state.prompt_thought = prompt_thought;
+        ctx.state.prompt_thought = Some(prompt_thought);
         ctx.state.reading = reading;
 
         let skip_special_tokens = skips_special_tokens(
@@ -384,5 +400,74 @@ mod tests {
         let none = request(json!({"model": "kimi-k3", "messages": [user()]}));
         assert!(!skips(&none, false, true));
         assert!(!skips(&none, true, true));
+    }
+
+    /// Media of a model without a media spec is judged by the template the
+    /// request renders through, the one for requests with tools when the
+    /// request declares tools and the default one otherwise: refused where
+    /// that template takes one string per message, served where it takes
+    /// content parts.
+    #[tokio::test]
+    async fn media_without_a_spec_is_judged_by_the_template_the_request_renders_through() {
+        use std::sync::Arc;
+
+        use llm_tokenizer::{chat_template::ChatTemplateContentFormat, mock::MockTokenizer};
+
+        use crate::routers::grpc::regular::stages::testing::components_forwarding_media_of;
+
+        for (default, with_tools) in [
+            (
+                ChatTemplateContentFormat::String,
+                ChatTemplateContentFormat::OpenAI,
+            ),
+            (
+                ChatTemplateContentFormat::OpenAI,
+                ChatTemplateContentFormat::String,
+            ),
+        ] {
+            let tokenizer = MockTokenizer::new()
+                .with_deferred_chat_ids(vec![1, 2, 3])
+                .with_content_format(default)
+                .with_tool_content_format(with_tools);
+            let (_dir, components) = components_forwarding_media_of("m", Arc::new(tokenizer)).await;
+            for (declares_tools, format) in [(true, with_tools), (false, default)] {
+                let mut body = json!({
+                    "model": "m",
+                    "messages": [{"role": "user", "content": [
+                        {"type": "text", "text": "What is this?"},
+                        {"type": "image_url", "image_url": {"url": "https://a/1.png"}}
+                    ]}]
+                });
+                if declares_tools {
+                    body["tools"] = json!([{"type": "function", "function": {
+                        "name": "lookup", "parameters": {"type": "object", "properties": {}}
+                    }}]);
+                }
+                let mut ctx = RequestContext::for_chat(
+                    Arc::new(request(body)),
+                    None,
+                    "m".into(),
+                    components.clone(),
+                );
+                let refused_with = ChatPreparationStage::new(&[])
+                    .prepare(&mut ctx)
+                    .await
+                    .err()
+                    .map(|response| {
+                        response
+                            .headers()
+                            .get("x-smg-error-code")
+                            .and_then(|code| code.to_str().ok())
+                            .unwrap_or_default()
+                            .to_owned()
+                    });
+                assert_eq!(
+                    refused_with.as_deref(),
+                    (format == ChatTemplateContentFormat::String)
+                        .then_some("multimodal_not_supported"),
+                    "declares tools: {declares_tools}"
+                );
+            }
+        }
     }
 }

@@ -1,6 +1,6 @@
 //! The embedding request and completion wrappers: one variant per wire that
-//! serves embeddings, with the typed accessors the embedding stages and the
-//! clients read. Moved out of `proto_wrapper.rs` as is.
+//! serves embeddings, with the accessors the embedding stages and the clients
+//! read. Moved out of `proto_wrapper.rs`.
 
 use smg_grpc_client::{sglang_proto as sglang, vllm_proto as vllm};
 
@@ -42,40 +42,6 @@ impl ProtoEmbedRequest {
                 .as_ref()
                 .map_or(&[], |input| input.input_ids.as_slice()),
         }
-    }
-
-    /// Get SGLang variant
-    #[expect(
-        clippy::panic,
-        reason = "typed accessor: caller guarantees variant via is_sglang() check"
-    )]
-    pub fn as_sglang(&self) -> &sglang::EmbedRequest {
-        match self {
-            Self::Sglang(req) => req,
-            Self::Vllm(_) => panic!("Expected SGLang embed request"),
-        }
-    }
-
-    /// Get mutable SGLang variant
-    #[expect(
-        clippy::panic,
-        reason = "typed accessor: caller guarantees variant via is_sglang() check"
-    )]
-    pub fn as_sglang_mut(&mut self) -> &mut sglang::EmbedRequest {
-        match self {
-            Self::Sglang(req) => req,
-            Self::Vllm(_) => panic!("Expected SGLang embed request"),
-        }
-    }
-
-    /// Check if this is SGLang
-    pub fn is_sglang(&self) -> bool {
-        matches!(self, Self::Sglang(_))
-    }
-
-    /// Check if this is vLLM
-    pub fn is_vllm(&self) -> bool {
-        matches!(self, Self::Vllm(_))
     }
 
     /// Get request ID

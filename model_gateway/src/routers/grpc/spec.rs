@@ -156,6 +156,17 @@ impl From<&ChatCompletionRequest> for ChatResponseSpec {
 }
 
 impl ChatResponseSpec {
+    /// The spec's `json_mode` of `request`: a `json_object` or `json_schema`
+    /// response format holds the answer to JSON; a structural tag is free text
+    /// around its tags. The one rule the legacy chat path and the Symphony
+    /// path read (its `Asks::json_answer`).
+    pub(crate) fn json_mode_of(request: &ChatCompletionRequest) -> bool {
+        matches!(
+            request.response_format,
+            Some(ResponseFormat::JsonObject | ResponseFormat::JsonSchema { .. })
+        )
+    }
+
     /// The spec of `request` under `provider`, its model's profile as the
     /// request's preparation derived it once; `From` derives the profile for
     /// a request that carries none.
@@ -163,10 +174,7 @@ impl ChatResponseSpec {
         Self {
             wire: Wire::of(provider),
             separate_reasoning: request.separate_reasoning,
-            json_mode: matches!(
-                request.response_format,
-                Some(ResponseFormat::JsonObject | ResponseFormat::JsonSchema { .. })
-            ),
+            json_mode: Self::json_mode_of(request),
             tool_choice: request.tool_choice.clone(),
             // Every tool the model may call, dynamic tools declared on messages
             // included: the request's own list shared, not copied (a new list

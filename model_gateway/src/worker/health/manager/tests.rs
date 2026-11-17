@@ -295,7 +295,10 @@ fn labels_follow_the_engine_for_local_self_hosted_workers_only() {
 /// with no removal queue (the shape of `remove_unhealthy = false`).
 #[tokio::test]
 async fn a_transition_into_ready_submits_a_label_refresh() {
-    use crate::{service_discovery::testing::create_test_app_context, workflow::JobQueueConfig};
+    use crate::{
+        service_discovery::testing::create_test_app_context,
+        workflow::{JobQueue, JobQueueConfig},
+    };
     let app_context = create_test_app_context();
     let registry = Arc::clone(&app_context.worker_registry);
     let job_queue = JobQueue::new(JobQueueConfig::default(), Arc::downgrade(&app_context));
@@ -304,7 +307,7 @@ async fn a_transition_into_ready_submits_a_label_refresh() {
     worker.set_status(WorkerStatus::NotReady);
     let worker_id = registry.register(worker.clone()).unwrap();
     let completion = passing_probe(worker_id, &worker);
-    let applied = apply_probe_completion(&registry, completion, None, Some(&job_queue)).await;
+    let applied = apply_probe_completion(&registry, completion, None, Some(&*job_queue)).await;
     assert!(matches!(
         applied,
         ProbeApplyResult::Applied(Some((WorkerStatus::NotReady, WorkerStatus::Ready)))
@@ -325,7 +328,10 @@ async fn a_transition_into_ready_submits_a_label_refresh() {
 /// transition into service is then what fills them in.
 #[tokio::test]
 async fn a_worker_registered_without_labels_is_refreshed_when_it_comes_into_service() {
-    use crate::{service_discovery::testing::create_test_app_context, workflow::JobQueueConfig};
+    use crate::{
+        service_discovery::testing::create_test_app_context,
+        workflow::{JobQueue, JobQueueConfig},
+    };
     let app_context = create_test_app_context();
     let registry = Arc::clone(&app_context.worker_registry);
     let job_queue = JobQueue::new(JobQueueConfig::default(), Arc::downgrade(&app_context));
@@ -335,7 +341,7 @@ async fn a_worker_registered_without_labels_is_refreshed_when_it_comes_into_serv
     worker.set_status(WorkerStatus::NotReady);
     let worker_id = registry.register(worker.clone()).unwrap();
     let completion = passing_probe(worker_id, &worker);
-    let applied = apply_probe_completion(&registry, completion, None, Some(&job_queue)).await;
+    let applied = apply_probe_completion(&registry, completion, None, Some(&*job_queue)).await;
     assert!(matches!(
         applied,
         ProbeApplyResult::Applied(Some((WorkerStatus::NotReady, WorkerStatus::Ready)))
@@ -343,6 +349,79 @@ async fn a_worker_registered_without_labels_is_refreshed_when_it_comes_into_serv
     assert!(
         job_queue.get_status("http://local:8").is_some(),
         "a worker whose registration discovered nothing is refreshed all the same"
+    );
+}
+
+/// What a recorded removal names: the address, the worker's id and its revision.
+type Removal = (String, String, u64);
+
+/// A `WorkerJobs` that keeps the removals it is asked for.
+#[derive(Default)]
+struct RecordedJobs(parking_lot::Mutex<Vec<Removal>>);
+
+#[async_trait]
+impl WorkerJobs for RecordedJobs {
+    async fn remove_worker(
+        &self,
+        url: String,
+        worker_id: &WorkerId,
+        revision: u64,
+    ) -> Result<(), String> {
+        self.0
+            .lock()
+            .push((url, worker_id.as_str().to_string(), revision));
+        Ok(())
+    }
+
+    async fn refresh_worker_labels(&self, _url: String) -> Result<bool, String> {
+        Ok(true)
+    }
+}
+
+/// A worker that fails under a removal scope is handed over for removal
+/// once: at its address, named by its own id at the revision its probe saw.
+#[tokio::test]
+async fn a_worker_that_fails_under_a_removal_scope_is_handed_over_by_id_and_revision() {
+    let registry = Arc::new(WorkerRegistry::new());
+    let worker = make_worker("http://w:1", 2, 1);
+    let worker_id = registry.register(worker.clone()).unwrap();
+    let revision = worker.revision();
+    let recorded = RecordedJobs::default();
+    let jobs: &dyn WorkerJobs = &recorded;
+    let removal = Some((jobs, UnhealthyRemovalScope::AllLocal));
+    let failed_probe = || ProbeCompletion {
+        worker_id: worker_id.clone(),
+        worker: worker.clone(),
+        expected_revision: revision,
+        launched_status: WorkerStatus::Pending,
+        probe_result: Err(WorkerError::HealthCheckFailed {
+            url: worker.url().to_string(),
+            reason: "refused".to_string(),
+        }),
+    };
+
+    // A failure threshold of one: the tenth failed probe of a pending worker
+    // fails it.
+    for _ in 1..10 {
+        let applied = apply_probe_completion(&registry, failed_probe(), removal, None).await;
+        assert!(matches!(applied, ProbeApplyResult::Applied(None)));
+    }
+    assert!(
+        recorded.0.lock().is_empty(),
+        "a pending worker is not removed"
+    );
+    let applied = apply_probe_completion(&registry, failed_probe(), removal, None).await;
+    assert!(matches!(
+        applied,
+        ProbeApplyResult::Applied(Some((WorkerStatus::Pending, WorkerStatus::Failed)))
+    ));
+    assert_eq!(
+        *recorded.0.lock(),
+        vec![(
+            worker.base_url().to_string(),
+            worker_id.as_str().to_string(),
+            revision,
+        )]
     );
 }
 
@@ -875,15 +954,17 @@ async fn wait_until(deadline: tokio::time::Instant, what: &str, done: impl Fn() 
 
 /// Registers `worker` demoted under the running manager and waits for the
 /// registration's probe to read the health stub (`hits`), which is held:
-/// the worker is still demoted once that read has landed.
+/// the worker is still demoted once that read has landed. Returns the
+/// instant read before the registration: the manager's schedule for the
+/// worker runs from the launch of that probe, not from its answer.
 async fn registered_and_held(
     registry: &WorkerRegistry,
     worker: &Arc<dyn Worker>,
     hits: &AtomicUsize,
-) {
+) -> tokio::time::Instant {
     worker.set_status(WorkerStatus::NotReady);
-    registry.register(worker.clone()).unwrap();
     let registered = tokio::time::Instant::now();
+    registry.register(worker.clone()).unwrap();
     wait_until(
         registered + Duration::from_secs(5),
         "the registration's probe did not read the health in time",
@@ -891,6 +972,7 @@ async fn registered_and_held(
     )
     .await;
     assert_eq!(worker.status(), WorkerStatus::NotReady);
+    registered
 }
 
 /// Through the running loop, against a `/health` that is held: the probe
@@ -976,20 +1058,24 @@ async fn a_demoted_worker_returns_on_consecutive_reads_not_consecutive_intervals
 
     // Registered under the running manager: probed at once, and held.
     let worker = probed_worker_with(&url, ConnectionMode::Http, 2, 3);
-    registered_and_held(&registry, &worker, &hits).await;
+    let registered = registered_and_held(&registry, &worker, &hits).await;
 
-    // The engine is back; the next probe is a whole interval away.
+    // The engine is back; the next probe is an interval after the
+    // registration's, however long the held read took.
     serving.store(true, Ordering::SeqCst);
-    let back = tokio::time::Instant::now();
+    // The return is due 4 s after the registration. The deadline leaves
+    // 1.5 s for the launch lag and the two later round trips, which took
+    // under 0.1 s of it under load, and still ends before the 6 s of two
+    // whole intervals, the return this test rules out.
     wait_until(
-        back + Duration::from_millis(5500),
+        registered + Duration::from_millis(5500),
         "the worker did not return within one interval and a probe timeout",
         || worker.status() == WorkerStatus::Ready,
     )
     .await;
     let returned = tokio::time::Instant::now();
     assert!(
-        returned >= back + Duration::from_millis(3500),
+        returned >= registered + Duration::from_millis(3500),
         "the first passing read was the scheduled one, an interval after the launch, and the \
          promoting read a probe timeout after it"
     );
@@ -1017,19 +1103,18 @@ async fn a_brought_forward_read_never_lands_after_the_scheduled_one() {
     let mut manager = manager_over(&registry);
 
     let worker = probed_worker_with_timeout(&url, ConnectionMode::Http, 2, 2, 5);
-    registered_and_held(&registry, &worker, &hits).await;
+    let registered = registered_and_held(&registry, &worker, &hits).await;
 
     serving.store(true, Ordering::SeqCst);
-    let back = tokio::time::Instant::now();
     wait_until(
-        back + Duration::from_millis(5500),
+        registered + Duration::from_millis(5500),
         "the worker did not return within two intervals: the brought-forward read landed \
          after the scheduled one",
         || worker.status() == WorkerStatus::Ready,
     )
     .await;
     assert!(
-        tokio::time::Instant::now() >= back + Duration::from_millis(3500),
+        tokio::time::Instant::now() >= registered + Duration::from_millis(3500),
         "the scheduled pass an interval after the launch, the promoting read an interval later"
     );
     assert_eq!(
@@ -1039,6 +1124,116 @@ async fn a_brought_forward_read_never_lands_after_the_scheduled_one() {
     );
 
     manager.shutdown().await;
+}
+
+/// A worker whose probe interval is past what the clock can hold does not
+/// stop the loop: its registration probe reads, and a worker registered
+/// after it is probed on its own interval.
+#[tokio::test]
+async fn an_interval_past_the_clock_leaves_the_other_workers_probed() {
+    let serving = Arc::new(AtomicBool::new(true));
+    let far_hits = Arc::new(AtomicUsize::new(0));
+    let near_hits = Arc::new(AtomicUsize::new(0));
+    let far_url = start_health_stub(serving.clone(), far_hits.clone()).await;
+    let near_url = start_health_stub(serving.clone(), near_hits.clone()).await;
+    let registry = Arc::new(WorkerRegistry::new());
+    let mut manager = manager_over(&registry);
+    let start = tokio::time::Instant::now();
+
+    registry
+        .register(probed_worker_with(
+            &far_url,
+            ConnectionMode::Http,
+            1,
+            u64::MAX,
+        ))
+        .unwrap();
+    wait_until(
+        start + Duration::from_secs(5),
+        "the registration probe of the worker with the longest interval did not read",
+        || far_hits.load(Ordering::SeqCst) > 0,
+    )
+    .await;
+    registry
+        .register(probed_worker_with(&near_url, ConnectionMode::Http, 1, 1))
+        .unwrap();
+
+    wait_until(
+        start + Duration::from_secs(10),
+        "the worker registered after it was not probed on its interval",
+        || near_hits.load(Ordering::SeqCst) >= 2,
+    )
+    .await;
+
+    manager.shutdown().await;
+}
+
+/// A demoted worker whose probe timeout is past what the clock can hold does
+/// not stop the loop either: its pass short of the success threshold brings
+/// its next read forward by that timeout, and a worker registered after it
+/// is probed on its own interval.
+#[tokio::test]
+async fn a_timeout_past_the_clock_leaves_the_other_workers_probed() {
+    let serving = Arc::new(AtomicBool::new(true));
+    let far_hits = Arc::new(AtomicUsize::new(0));
+    let near_hits = Arc::new(AtomicUsize::new(0));
+    let far_url = start_health_stub(serving.clone(), far_hits.clone()).await;
+    let near_url = start_health_stub(serving.clone(), near_hits.clone()).await;
+    let registry = Arc::new(WorkerRegistry::new());
+    let mut manager = manager_over(&registry);
+    let start = tokio::time::Instant::now();
+
+    let far = probed_worker_with_timeout(&far_url, ConnectionMode::Http, 2, 1, u64::MAX);
+    far.set_status(WorkerStatus::NotReady);
+    registry.register(far).unwrap();
+    wait_until(
+        start + Duration::from_secs(5),
+        "the first probe of the worker with the longest timeout did not read",
+        || far_hits.load(Ordering::SeqCst) > 0,
+    )
+    .await;
+    registry
+        .register(probed_worker_with(&near_url, ConnectionMode::Http, 1, 1))
+        .unwrap();
+
+    wait_until(
+        start + Duration::from_secs(10),
+        "the worker registered after it was not probed on its interval",
+        || near_hits.load(Ordering::SeqCst) >= 2,
+    )
+    .await;
+
+    manager.shutdown().await;
+}
+
+/// A deadline whose sum the clock cannot hold is put thirty years out: the
+/// worker keeps its slot, and the slot is never due.
+#[test]
+fn a_deadline_past_the_clock_is_put_at_the_schedules_bound() {
+    let registry = WorkerRegistry::new();
+    let worker_id = registry
+        .register(probed_worker_with(
+            "http://w:1",
+            ConnectionMode::Http,
+            1,
+            u64::MAX,
+        ))
+        .unwrap();
+    let now = tokio::time::Instant::now();
+    let mut next_check = HashMap::new();
+
+    schedule_at(
+        &mut next_check,
+        worker_id.clone(),
+        ProbeSlot::Probe(Duration::from_secs(u64::MAX)),
+        now,
+        false,
+    );
+
+    assert_eq!(
+        next_check.get(&worker_id),
+        Some(&(now + Duration::from_secs(946_080_000)))
+    );
 }
 
 #[test]
@@ -1114,7 +1309,10 @@ fn apply_connect_signal_reports_the_promoted_worker() {
 /// the label refresh is submitted for a locally registered worker.
 #[tokio::test]
 async fn a_connect_signal_promotion_submits_a_label_refresh() {
-    use crate::{service_discovery::testing::create_test_app_context, workflow::JobQueueConfig};
+    use crate::{
+        service_discovery::testing::create_test_app_context,
+        workflow::{JobQueue, JobQueueConfig},
+    };
     let app_context = create_test_app_context();
     let registry = Arc::clone(&app_context.worker_registry);
     let job_queue = JobQueue::new(JobQueueConfig::default(), Arc::downgrade(&app_context));
@@ -1138,7 +1336,7 @@ async fn a_connect_signal_promotion_submits_a_label_refresh() {
         },
         &mut next_check,
         &test_config(),
-        Some(&job_queue),
+        Some(&*job_queue),
     )
     .await;
 
@@ -1157,7 +1355,10 @@ async fn a_connect_signal_promotion_submits_a_label_refresh() {
 /// transition to retry on. The registration's status stays its own.
 #[tokio::test]
 async fn a_connect_signal_during_the_registration_job_keeps_the_refresh() {
-    use crate::{service_discovery::testing::create_test_app_context, workflow::JobQueueConfig};
+    use crate::{
+        service_discovery::testing::create_test_app_context,
+        workflow::{JobQueue, JobQueueConfig},
+    };
     let app_context = create_test_app_context();
     let registry = Arc::clone(&app_context.worker_registry);
     let job_queue = JobQueue::new(JobQueueConfig::default(), Arc::downgrade(&app_context));
@@ -1182,7 +1383,7 @@ async fn a_connect_signal_during_the_registration_job_keeps_the_refresh() {
         },
         &mut HashMap::new(),
         &test_config(),
-        Some(&job_queue),
+        Some(&*job_queue),
     )
     .await;
 
@@ -1908,6 +2109,30 @@ fn test_state_machine_pending_to_failed_on_success_when_cap_exceeded() {
         compute_next_status(&worker, worker.runtime_state().as_deref(), true, &cfg(2, 3)),
         Some(WorkerStatus::Failed)
     );
+}
+
+/// A worker that keeps no state has no probe counted on it, so the Pending
+/// cap reads no pending probe for it: the verdict leaves it Pending on a
+/// passing probe and on a failing one, however many it was sent.
+#[test]
+fn the_pending_cap_reads_no_pending_probe_for_a_worker_with_no_state() {
+    let worker = make_worker("http://w:1", 2, 3);
+    assert_eq!(worker.status(), WorkerStatus::Pending);
+    // The worker's own state is past the cap; the verdict is handed none.
+    for _ in 0..30 {
+        worker
+            .runtime_state()
+            .unwrap()
+            .total_pending_probes_increment();
+    }
+    for probe_ok in [true, false] {
+        assert_eq!(
+            compute_next_status(&worker, None, probe_ok, &cfg(2, 3)),
+            None,
+            "probe_ok {probe_ok}"
+        );
+    }
+    assert_eq!(worker.status(), WorkerStatus::Pending);
 }
 
 #[test]

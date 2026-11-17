@@ -52,7 +52,14 @@
 //! `Malformed` where the bare list takes it for content. The engine picks it for a table with a
 //! row into the arguments state.
 //!
-//! The three are the one [`Framing`] the assembler takes at construction, the family's call marker
+//! Under a JSON schema (a required call's list, [`Framing::Forced`]) the output reads as under
+//! [`Framing::ObjectOrList`] with no marker and differs at the end of the stream alone: the
+//! engine held the output to the list, so no byte of an open one is prose. The separators held
+//! after a call, an object cut before its arguments began and what a started call's object held
+//! behind its arguments are refused ([`crate::tagged::refuse`]), where the other framings return
+//! them as `Malformed`.
+//!
+//! The four are the one [`Framing`] the assembler takes at construction, the family's call marker
 //! inside the one that reads it, and the engine's factory maps the table's call syntax to it; the
 //! object reader and the stages around it are the same under every framing. A call written as one
 //! object between a table's markers (`CallSyntax::Json`) is the object reader itself
@@ -86,6 +93,9 @@ pub struct Assembler {
     /// Whether markers frame the list ([`Framing::Framed`]): text in place of it is malformed,
     /// not prose.
     framed: bool,
+    /// Whether a schema holds the output to the list ([`Framing::Forced`]): what the end of the
+    /// stream leaves of an open list is refused, never text.
+    forced: bool,
     /// Whether text followed the lone object or the list's `]`: from there on every byte,
     /// whitespace included, is the model's prose after its calls. Before it, whitespace is held,
     /// the template's wrapping if nothing follows.
@@ -129,20 +139,26 @@ pub enum Framing {
     /// `opener` is the family's call marker the output may open with (Llama 3.1's
     /// `<|python_tag|>`), dropped as the template's wrapping where it does.
     ObjectOrList { opener: Option<&'static str> },
+    /// The JSON a schema holds the output to (a required call's list), read as
+    /// [`Self::ObjectOrList`] reads it with no marker. The engine lets the model write nothing
+    /// else there, so no byte of an open list is prose: what the end of the stream leaves of it
+    /// (the separators after a call, an object cut before its arguments began, a started call's
+    /// object behind its arguments) is refused: counted and never content.
+    Forced,
 }
 
 impl Framing {
     /// Whether a `{` at the first byte is one call alone, and another object after it, behind a
     /// `;` or whitespace, the next.
     fn lone_object(self) -> bool {
-        matches!(self, Self::ObjectOrList { .. })
+        matches!(self, Self::ObjectOrList { .. } | Self::Forced)
     }
 
     /// The family's call marker the output may open with, where the framing names one.
     fn opener(self) -> Option<&'static str> {
         match self {
             Self::ObjectOrList { opener } => opener,
-            Self::Bare | Self::Framed => None,
+            Self::Bare | Self::Framed | Self::Forced => None,
         }
     }
 }
@@ -182,6 +198,7 @@ impl Assembler {
             lone_object: framing.lone_object(),
             listed: false,
             framed: framing == Framing::Framed,
+            forced: framing == Framing::Forced,
             prose_after: false,
             released: false,
             opener: framing.opener(),
@@ -239,12 +256,19 @@ impl Assembler {
     }
 
     /// The end of the stream: an open object is finished as the JSON assembler finishes one, and
-    /// what the list held comes back as `Malformed { UnterminatedRegion }`.
+    /// what the list held comes back as `Malformed { UnterminatedRegion }`. Under a schema
+    /// ([`Framing::Forced`]) an open list is no prose: an object cut before its arguments began,
+    /// what a started call's object held behind its arguments, and the separators held after a
+    /// call, are refused ([`crate::tagged::refuse`]), as a failed call's bytes are.
     pub fn finish(mut self, out: &mut Events) {
         match std::mem::replace(&mut self.stage, Stage::After) {
             Stage::Object(object) => {
                 self.drop_carried(out);
-                object.finish(out);
+                if self.forced {
+                    object.finish_forced(out);
+                } else {
+                    object.finish(out);
+                }
             }
             // The bytes of a marker the output ends inside are text, as a cut marker is anywhere.
             Stage::Deciding | Stage::Opening { .. } | Stage::Content => {
@@ -265,6 +289,15 @@ impl Assembler {
             Stage::After => self.drop_carried(out),
             // Every byte was reported as it arrived.
             Stage::Malformed => {}
+            // The list's own separators after a call the schema held it to: no text of the
+            // model's. The bracket alone, with no object yet, stays what it is below.
+            Stage::Between if self.forced && self.objects > 0 => {
+                crate::tagged::refuse(
+                    std::mem::take(&mut self.carried),
+                    MalformedReason::UnterminatedRegion,
+                    out,
+                );
+            }
             Stage::Between => {
                 if !self.carried.is_empty() {
                     out.push(Event::Malformed {

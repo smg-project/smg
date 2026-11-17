@@ -80,10 +80,10 @@ pub(crate) fn labels_select_nothing(names: &Names) -> bool {
     matches!(selection(names), Selection::Nothing)
 }
 
-/// Why the legacy parsers read a request Symphony was configured for, by the site that decided
-/// it: the precedence among the names and the registry ([`decision`]), or the table's missing
-/// tag ([`assign_for`](super::reader::assign_for)). A request so read is counted once under its
-/// reason ([`telemetry::record_fallback`]); its response's header says `legacy`, as before.
+/// Why the legacy parsers read a request Symphony was configured for: the precedence among the
+/// names and the registry decides it ([`decision`]), and nothing else does. A request so read is
+/// counted once under its reason ([`telemetry::record_fallback`]); its response's header says
+/// `legacy`, as before.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Fallback {
     /// No table reads the model and no name is set for it: the registry does not know the model,
@@ -279,10 +279,11 @@ pub(crate) fn set_aside_by_the_registry(
 /// is absent is not checked (its parsers are unused in that configuration). A name no legacy
 /// parser has that a table answers to (the table's own name, or a launcher's name for a family
 /// whose table has no older parser), and [`TEMPLATE_PARSER`], bind the other name to the same or
-/// to nothing: the legacy parsers read a forced call the table has no tag for by the names they
-/// are given, and have no parser of that name. A legacy parser's name a table answers to is
-/// checked as the legacy name it is, in its own kind. The error says what is wrong with which
-/// name, for the startup or registration failure.
+/// to nothing: the two names are one selection, and where the other name selects the legacy
+/// parsers ([`decision`]) those read by the names they are given and have no parser of that
+/// name. A legacy parser's name a table answers to is checked as the legacy name it is, in its
+/// own kind. The error says what is wrong with which name, for the startup or registration
+/// failure.
 pub(crate) fn check_names(
     parser: ParserChoice,
     names: &Names,
@@ -389,9 +390,10 @@ fn checked_names(
 /// message). The grammar built for the request takes it OR'd with the request's
 /// thinking switch, so the tag and the engine read the prompt the same way: a JSON answer the
 /// switch would place at the first token follows the thought's close instead of streaming as
-/// reasoning. `None` when no table reads the response, leaving the switch's answer as it was;
-/// where a table reads, no legacy parser is built to be asked about the prompt: the table's
-/// replay answers, alone for the family whose legacy rule set the switch aside
+/// reasoning. A prompt that closed the thought itself overrules the switch
+/// ([`PromptThought::or_switch`]). `None` when no table reads the response, leaving the switch's
+/// answer as it was; where a table reads, no legacy parser is built to be asked about the prompt:
+/// the table's replay answers, alone for the family whose legacy rule set the switch aside
 /// ([`PromptThought::alone`]).
 pub(crate) fn reasoning_open(
     parser: ParserChoice,
@@ -431,7 +433,8 @@ pub(crate) struct PromptThought {
     /// The prompt leaves the model inside its thought.
     pub open: bool,
     /// The prompt closed the thought itself and wrote what the template writes after the close
-    /// (thinking switched off), so the tag owes none of it ([`Format::thought_closed`]).
+    /// (thinking switched off), so the tag owes none of it ([`Format::thought_closed`]) and the
+    /// model starts past the thought, whatever the request's thinking switch says.
     pub closed: bool,
     /// The replay decides alone, without the request's thinking switch: Gemma 4 prefills an open
     /// thought channel only after a tool response, so thinking enabled on a new turn says nothing
@@ -448,9 +451,11 @@ pub(crate) type PromptReplay = Option<PromptThought>;
 impl PromptThought {
     /// Whether the prompt leaves the model inside its thought, as request building decides it:
     /// the replay's answer, or the request's thinking `switch` where the replay does not decide
-    /// alone.
+    /// alone. A prompt that closed the thought is past it whatever the switch says: a template
+    /// may close the thought for a request that names no switch while the switch's default says
+    /// thinking.
     pub fn or_switch(self, switch: impl FnOnce() -> bool) -> bool {
-        self.open || (!self.alone && switch())
+        !self.closed && (self.open || (!self.alone && switch()))
     }
 }
 
@@ -1033,6 +1038,11 @@ mod tests {
         assert!(!unopened.open && !unopened.alone);
         assert!(unopened.or_switch(|| true));
         assert!(!unopened.or_switch(|| false));
+        // A prompt that closed the thought itself is past it, whatever the switch says.
+        let closed = read("qwen3", "<|im_start|>assistant\n<think>\n\n</think>\n\n");
+        assert!(closed.closed && !closed.open && !closed.alone);
+        assert!(!closed.or_switch(|| true));
+        assert!(!closed.or_switch(|| false));
         // Gemma 4 prefills an open thought channel only after a tool response: its table's
         // replay decides alone, and thinking enabled on a new turn does not open the thought.
         let channel = read("gemma4", "<|turn>model\n<|channel>thought\n");

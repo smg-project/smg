@@ -11,10 +11,13 @@
 //! selection (`pair_placement`: round robin and cache-aware over an event index, 64 and 512
 //! workers a side, untraced and inside a cache-trace capture). Each placement group also
 //! runs its placement as the gRPC selection stage does, under a request's context demand
-//! (the `cache_aware_context` and `context` cells). The two placement groups
+//! (the `cache_aware_context` and `context` cells). `regular_placement_threads` runs the
+//! round robin placement from 1, 4 and 8 threads at once. The placement groups
 //! are skipped under a process trace switch (`SMG_CACHE_TRACE`, `SMG_CACHE_TRACE_HEADER`),
 //! which captures every placement, the cells labelled untraced too: each says so once on
-//! stderr and the other groups run.
+//! stderr and the other groups run. They start the gateway's own metrics recorder, so a
+//! placement counts its selection as a serving process does. The cells of the first two
+//! drain it between their timed stretches, as that process's upkeep does.
 //!
 //! Run with: cargo bench --bench policy_selection
 #![expect(
@@ -23,13 +26,23 @@
     reason = "benchmark code: panicking on setup failure is expected, a skipped group says so on stderr"
 )]
 
-use std::{collections::HashMap, hint::black_box, sync::Arc};
+use std::{
+    collections::HashMap,
+    hint::black_box,
+    sync::{Arc, Barrier, OnceLock},
+    thread,
+    time::{Duration, Instant},
+};
 
-use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
+use criterion::{
+    criterion_group, criterion_main, BatchSize, Bencher, BenchmarkId, Criterion, Throughput,
+};
 use kv_index::{compute_content_hash, request_prefix_hashes};
+use metrics_exporter_prometheus::PrometheusHandle;
 use openai_protocol::worker::{HealthCheckConfig, WorkerLoadResponse};
 use smg::{
     config::types::{ManualAssignmentMode, PolicyConfig, RoutingKeyOverrideConfig},
+    observability::metrics::{start_prometheus, PrometheusConfig},
     policies::{
         cost::{build, CandidateInputs, RequestInputs, POLICY_NAMES},
         hash_ring::HashRing,
@@ -168,7 +181,7 @@ fn fed_pool(
     Vec<Arc<dyn Worker>>,
     HashMap<String, WorkerLoadResponse>,
 ) {
-    let feed = TestFeed::attached_to(policy);
+    let feed = TestFeed::attached_to(|rx| policy.set_load_receiver(rx));
     let pool: Vec<Arc<dyn Worker>> = (0..workers)
         .map(|i| {
             Arc::new(
@@ -476,6 +489,45 @@ fn skipped_under_a_process_trace(group: &str) -> bool {
     traced
 }
 
+/// The gateway's own metrics recorder, started once for the placement groups, the last
+/// of this file's list: a placement counts its selection on a kept handle, as a serving
+/// process does. With no recorder the count builds its key on every placement, a form no
+/// serving process runs. The handle is the one a serving process's upkeep drains.
+fn count_as_a_serving_process() -> &'static PrometheusHandle {
+    static RECORDER: OnceLock<PrometheusHandle> = OnceLock::new();
+    RECORDER.get_or_init(|| start_prometheus(PrometheusConfig::default()))
+}
+
+/// Placements timed between two drains of the recorder. The recorder holds every
+/// histogram sample until it is drained: 65,536 cache-aware placements hold about 2 MB.
+const PLACEMENTS_A_DRAIN: u64 = 1 << 16;
+
+/// Times `place` as `Bencher::iter` does, in stretches of `PLACEMENTS_A_DRAIN`, and
+/// drains the recorder between them, outside the timed stretches. A serving process's
+/// upkeep drains it every few minutes. Undrained, a cell kept every sample it recorded
+/// and grew for as long as it was timed: 16 MB a second under cache-aware.
+fn time_between_drains<T>(
+    b: &mut Bencher<'_>,
+    recorder: &PrometheusHandle,
+    mut place: impl FnMut() -> T,
+) {
+    b.iter_custom(|placements| {
+        let mut timed = Duration::ZERO;
+        let mut left = placements;
+        while left > 0 {
+            let stretch = left.min(PLACEMENTS_A_DRAIN);
+            let started = Instant::now();
+            for _ in 0..stretch {
+                black_box(place());
+            }
+            timed += started.elapsed();
+            recorder.run_upkeep();
+            left -= stretch;
+        }
+        timed
+    });
+}
+
 /// The stored event of one prompt, as an engine publishes a chain.
 fn stored(tokens: &[u32]) -> KvEventBatch {
     let contents: Vec<_> = tokens
@@ -599,6 +651,7 @@ fn bench_regular_placement(c: &mut Criterion) {
     if skipped_under_a_process_trace("regular_placement") {
         return;
     }
+    let recorder = count_as_a_serving_process();
     let mut group = c.benchmark_group("regular_placement");
     for workers in [128, 1_024] {
         for (policy, cache_aware) in [("round_robin", false), ("cache_aware", true)] {
@@ -606,7 +659,7 @@ fn bench_regular_placement(c: &mut Criterion) {
             group.throughput(Throughput::Elements(1));
             let mut next = 0usize;
             group.bench_with_input(BenchmarkId::new(policy, workers), &workers, |b, _| {
-                b.iter(|| {
+                time_between_drains(b, recorder, || {
                     let tokens = &prompts[next % prompts.len()];
                     next += 1;
                     black_box(path.place(Some(black_box(tokens))).unwrap())
@@ -620,7 +673,7 @@ fn bench_regular_placement(c: &mut Criterion) {
                 BenchmarkId::new("cache_aware_filtered", workers),
                 &workers,
                 |b, _| {
-                    b.iter(|| {
+                    time_between_drains(b, recorder, || {
                         let tokens = &prompts[next % prompts.len()];
                         next += 1;
                         black_box(path.place_filtered(Some(black_box(tokens))).unwrap())
@@ -632,7 +685,7 @@ fn bench_regular_placement(c: &mut Criterion) {
                 BenchmarkId::new("cache_aware_first_attempt", workers),
                 &workers,
                 |b, _| {
-                    b.iter(|| {
+                    time_between_drains(b, recorder, || {
                         let tokens = &prompts[next % prompts.len()];
                         next += 1;
                         black_box(path.place_first_attempt(Some(black_box(tokens))).unwrap())
@@ -644,7 +697,7 @@ fn bench_regular_placement(c: &mut Criterion) {
                 BenchmarkId::new("cache_aware_context", workers),
                 &workers,
                 |b, _| {
-                    b.iter(|| {
+                    time_between_drains(b, recorder, || {
                         let tokens = &prompts[next % prompts.len()];
                         next += 1;
                         black_box(stage.place(Some(black_box(tokens))).unwrap())
@@ -652,6 +705,54 @@ fn bench_regular_placement(c: &mut Criterion) {
                 },
             );
         }
+    }
+    group.finish();
+}
+
+/// One regular placement under round robin over 128 workers while several threads place
+/// through the one path at once, as the routers' request tasks do: a cell's figure is one
+/// thread's time a placement. The cells need a free core a thread: pinned to one core
+/// they time a queue. Round robin records no histogram, so no cell drains the recorder.
+fn bench_regular_placement_from_threads(c: &mut Criterion) {
+    if skipped_under_a_process_trace("regular_placement_threads") {
+        return;
+    }
+    count_as_a_serving_process();
+    let (path, _stage, prompts) = regular_fleet(128, false);
+    let mut group = c.benchmark_group("regular_placement_threads");
+    group.throughput(Throughput::Elements(1));
+    for threads in [1u32, 4, 8] {
+        group.bench_with_input(
+            BenchmarkId::new("round_robin", threads),
+            &threads,
+            |b, &threads| {
+                b.iter_custom(|placements| {
+                    let placements = usize::try_from(placements).unwrap();
+                    let start = Barrier::new(threads as usize);
+                    let timed: Duration = thread::scope(|scope| {
+                        let placing: Vec<_> = (0..threads as usize)
+                            .map(|first| {
+                                let (path, prompts, start) = (&path, &prompts, &start);
+                                scope.spawn(move || {
+                                    start.wait();
+                                    let started = Instant::now();
+                                    for placement in first..first + placements {
+                                        let tokens = &prompts[placement % prompts.len()];
+                                        black_box(path.place(Some(black_box(tokens))).unwrap());
+                                    }
+                                    started.elapsed()
+                                })
+                            })
+                            .collect();
+                        placing
+                            .into_iter()
+                            .map(|placed| placed.join().unwrap())
+                            .sum()
+                    });
+                    timed / threads
+                });
+            },
+        );
     }
     group.finish();
 }
@@ -735,6 +836,7 @@ fn bench_pair_placement(c: &mut Criterion) {
     if skipped_under_a_process_trace("pair_placement") {
         return;
     }
+    let recorder = count_as_a_serving_process();
     let mut group = c.benchmark_group("pair_placement");
     let runtime = tokio::runtime::Builder::new_current_thread()
         .build()
@@ -749,7 +851,7 @@ fn bench_pair_placement(c: &mut Criterion) {
                     BenchmarkId::new(format!("{policy}/{mode}"), side),
                     &side,
                     |b, _| {
-                        b.iter(|| {
+                        time_between_drains(b, recorder, || {
                             let tokens = &prompts[next % prompts.len()];
                             next += 1;
                             let pair =
@@ -765,7 +867,7 @@ fn bench_pair_placement(c: &mut Criterion) {
                 BenchmarkId::new(format!("{policy}/context"), side),
                 &side,
                 |b, _| {
-                    b.iter(|| {
+                    time_between_drains(b, recorder, || {
                         let tokens = &prompts[next % prompts.len()];
                         next += 1;
                         black_box(stage.place_pair(Some(black_box(tokens))).unwrap())
@@ -787,6 +889,7 @@ criterion_group!(
     bench_simple_policy_pick,
     bench_keyed_sticky_hit,
     bench_regular_placement,
+    bench_regular_placement_from_threads,
     bench_pair_placement
 );
 criterion_main!(benches);

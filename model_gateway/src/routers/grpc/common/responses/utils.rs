@@ -5,10 +5,11 @@ use std::sync::Arc;
 use axum::response::Response;
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use openai_protocol::{
-    common::Tool,
+    common::{Tool, Usage},
     responses::{
-        CustomTool, IncompleteDetails, IncompleteReason, NamespaceTool, ResponseStatus,
-        ResponseTool, ResponsesRequest, ResponsesResponse,
+        CustomTool, IncompleteDetails, IncompleteReason, InputTokensDetails, NamespaceTool,
+        OutputTokensDetails, ResponseStatus, ResponseTool, ResponseUsage, ResponsesRequest,
+        ResponsesResponse,
     },
 };
 use serde_json::{json, to_value, Value};
@@ -25,7 +26,7 @@ use crate::{
     observability::metrics::Metrics,
     routers::{
         common::{
-            mcp_utils::{ensure_request_mcp_client, DEFAULT_MAX_ITERATIONS},
+            mcp_utils::{ensure_request_mcp_routing, DEFAULT_MAX_ITERATIONS},
             openai_bridge,
             persistence_utils::{
                 persist_conversation_items, persist_conversation_items_if_open, PersistError,
@@ -110,6 +111,87 @@ pub(crate) fn tool_call_limit(max_tool_calls: Option<usize>) -> usize {
     })
 }
 
+/// The server calls a request may still run once `executed` ran: its cap (see
+/// `tool_call_limit`) less them.
+pub(crate) fn tool_call_allowance(max_tool_calls: Option<usize>, executed: usize) -> usize {
+    tool_call_limit(max_tool_calls).saturating_sub(executed)
+}
+
+/// Whether a Harmony loop generation is past the loop's safety net. The call
+/// limit (see `tool_call_limit`) already bounds the loop, since every turn
+/// that continues it runs at least one server call, so the net allows that
+/// many generations plus the one that answers on the last result; the final
+/// turn after the request's cap is always the last generation and is exempt.
+pub(crate) fn iteration_exceeds_safety_limit(iteration_count: usize, final_turn: bool) -> bool {
+    iteration_count > DEFAULT_MAX_ITERATIONS + 1 && !final_turn
+}
+
+/// Adds one model call's usage to a response's total. Usage is per model
+/// request, so a tool loop reports the sum of its calls; a call that reported
+/// none leaves the total as it is.
+pub(crate) fn add_model_call_usage(total: &mut Option<ResponseUsage>, usage: Option<&Usage>) {
+    let Some(usage) = usage else {
+        return;
+    };
+    let total = total.get_or_insert_with(|| ResponseUsage {
+        input_tokens: 0,
+        output_tokens: 0,
+        total_tokens: 0,
+        input_tokens_details: InputTokensDetails::default(),
+        output_tokens_details: OutputTokensDetails::default(),
+    });
+    total.input_tokens = total.input_tokens.saturating_add(usage.prompt_tokens);
+    total.output_tokens = total.output_tokens.saturating_add(usage.completion_tokens);
+    total.total_tokens = total.total_tokens.saturating_add(usage.total_tokens);
+    if let Some(details) = &usage.prompt_tokens_details {
+        total.input_tokens_details.cached_tokens = total
+            .input_tokens_details
+            .cached_tokens
+            .saturating_add(details.cached_tokens);
+    }
+    if let Some(tokens) = usage
+        .completion_tokens_details
+        .as_ref()
+        .and_then(|details| details.reasoning_tokens)
+    {
+        total.output_tokens_details.reasoning_tokens = total
+            .output_tokens_details
+            .reasoning_tokens
+            .saturating_add(tokens);
+    }
+}
+
+/// Why a generated batch of server calls must stop after its permitted prefix
+/// executes: the request's own `max_tool_calls`, or the loop's internal safety
+/// limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum McpToolCallLimit {
+    User,
+    Safety,
+}
+
+/// The cap a batch of `batch` server calls overflows once `executed` calls
+/// ran: `None` when the batch fits the remaining allowance, else the cap and
+/// the length of the batch's permitted prefix. The cap is the request's own
+/// when it names one at or under the safety limit (a user cap wins when both
+/// are equal), else the safety limit.
+pub(crate) fn tool_call_overflow(
+    max_tool_calls: Option<usize>,
+    executed: usize,
+    batch: usize,
+) -> Option<(McpToolCallLimit, usize)> {
+    let remaining = tool_call_allowance(max_tool_calls, executed);
+    if batch <= remaining {
+        return None;
+    }
+    let limit = if max_tool_calls.is_some_and(|limit| limit <= DEFAULT_MAX_ITERATIONS) {
+        McpToolCallLimit::User
+    } else {
+        McpToolCallLimit::Safety
+    };
+    Some((limit, remaining))
+}
+
 /// Ensure MCP connection succeeds if MCP tools or builtin tools are declared.
 ///
 /// Checks if the request declares MCP tools or builtin tool types
@@ -152,31 +234,16 @@ pub(crate) async fn ensure_mcp_connection(
     if let Some(tools) = tools {
         // TODO: Thread real request headers through the gRPC responses path if/when
         // gRPC MCP flows need the same forwarded-header preservation contract.
-        match ensure_request_mcp_client(mcp_orchestrator, format_registry, tools).await {
-            Some(mcp_servers) => {
-                return Ok((true, mcp_servers));
-            }
-            None => {
-                // No MCP servers available
-                if has_explicit_mcp_tools {
-                    // Explicit MCP tools MUST have working connections
-                    error!(
-                        function = "ensure_mcp_connection",
-                        "Failed to connect to MCP servers"
-                    );
-                    return Err(error::failed_dependency(
-                        "connect_mcp_server_failed",
-                        "Failed to connect to MCP servers. Check server_url and authorization.",
-                    ));
-                }
-                // Builtin tools without MCP routing - pass through to model
-                debug!(
-                    function = "ensure_mcp_connection",
-                    "No MCP routing configured for builtin tools, passing through to model"
-                );
-                return Ok((false, Vec::new()));
-            }
+        if let Some(mcp_servers) =
+            ensure_request_mcp_routing(mcp_orchestrator, format_registry, tools).await?
+        {
+            return Ok((true, mcp_servers));
         }
+        // Builtin tools without MCP routing - pass through to model
+        debug!(
+            function = "ensure_mcp_connection",
+            "No MCP routing configured for builtin tools, passing through to model"
+        );
     }
 
     Ok((false, Vec::new()))
@@ -420,8 +487,7 @@ pub(crate) fn namespace_test_request() -> ResponsesRequest {
 /// tokens, 3 of them cached and 2 reasoning; `assert_responses_api_usage`
 /// reads it back off the wire.
 #[cfg(test)]
-pub(crate) fn responses_api_test_usage() -> openai_protocol::common::Usage {
-    use openai_protocol::common::Usage;
+pub(crate) fn responses_api_test_usage() -> Usage {
     Usage::from_counts(12, 7)
         .with_cached_tokens(3)
         .with_reasoning_tokens(2)
@@ -1372,6 +1438,53 @@ mod tests {
     }
 
     #[test]
+    fn the_safety_net_allows_the_limits_generations_and_the_answer_on_the_last_result() {
+        assert!(!iteration_exceeds_safety_limit(
+            DEFAULT_MAX_ITERATIONS,
+            false
+        ));
+        assert!(!iteration_exceeds_safety_limit(
+            DEFAULT_MAX_ITERATIONS + 1,
+            false
+        ));
+        assert!(iteration_exceeds_safety_limit(
+            DEFAULT_MAX_ITERATIONS + 2,
+            false
+        ));
+        assert!(!iteration_exceeds_safety_limit(
+            DEFAULT_MAX_ITERATIONS + 2,
+            true
+        ));
+    }
+
+    #[test]
+    fn a_responses_usage_is_the_sum_of_its_model_calls() {
+        let counts = |usage: &ResponseUsage| {
+            (
+                usage.input_tokens,
+                usage.output_tokens,
+                usage.total_tokens,
+                usage.input_tokens_details.cached_tokens,
+                usage.output_tokens_details.reasoning_tokens,
+            )
+        };
+        let mut total = None;
+        add_model_call_usage(&mut total, None);
+        assert!(total.is_none());
+        // One call: what a response served by a single call reports.
+        let first = Usage::from_counts(11, 5).with_cached_tokens(4);
+        add_model_call_usage(&mut total, Some(&first));
+        assert_eq!(
+            total.as_ref().map(counts),
+            Some(counts(&ResponseUsage::from(&first)))
+        );
+        let second = Usage::from_counts(23, 7).with_reasoning_tokens(3);
+        add_model_call_usage(&mut total, Some(&second));
+        add_model_call_usage(&mut total, None);
+        assert_eq!(total.as_ref().map(counts), Some((34, 12, 46, 4, 3)));
+    }
+
+    #[test]
     fn the_tool_call_limit_is_the_users_figure_under_the_safety_limit() {
         assert_eq!(tool_call_limit(None), DEFAULT_MAX_ITERATIONS);
         assert_eq!(tool_call_limit(Some(3)), 3);
@@ -1379,6 +1492,35 @@ mod tests {
         assert_eq!(
             tool_call_limit(Some(DEFAULT_MAX_ITERATIONS + 5)),
             DEFAULT_MAX_ITERATIONS
+        );
+        assert_eq!(tool_call_allowance(Some(3), 1), 2);
+        assert_eq!(tool_call_allowance(Some(3), 5), 0);
+        assert_eq!(tool_call_allowance(None, 4), DEFAULT_MAX_ITERATIONS - 4);
+    }
+
+    #[test]
+    fn a_batch_past_the_cap_keeps_its_permitted_prefix_and_names_the_cap() {
+        assert_eq!(tool_call_overflow(Some(3), 1, 2), None);
+        assert_eq!(tool_call_overflow(None, 0, DEFAULT_MAX_ITERATIONS), None);
+        assert_eq!(
+            tool_call_overflow(Some(3), 1, 4),
+            Some((McpToolCallLimit::User, 2))
+        );
+        assert_eq!(
+            tool_call_overflow(Some(1), 1, 1),
+            Some((McpToolCallLimit::User, 0))
+        );
+        assert_eq!(
+            tool_call_overflow(Some(DEFAULT_MAX_ITERATIONS), DEFAULT_MAX_ITERATIONS, 1),
+            Some((McpToolCallLimit::User, 0))
+        );
+        assert_eq!(
+            tool_call_overflow(None, DEFAULT_MAX_ITERATIONS - 1, 2),
+            Some((McpToolCallLimit::Safety, 1))
+        );
+        assert_eq!(
+            tool_call_overflow(Some(DEFAULT_MAX_ITERATIONS + 5), DEFAULT_MAX_ITERATIONS, 1),
+            Some((McpToolCallLimit::Safety, 0))
         );
     }
 }

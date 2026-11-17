@@ -414,6 +414,12 @@ fn assembler(
             json::named::After::Arguments,
         )),
         Some(CallSyntax::ForcedArguments) => Box::new(json::forced::Assembler::new(index, id())),
+        // The required call's list under the schema: the list reader, with an open list no prose.
+        Some(CallSyntax::ForcedList) => Box::new(json::list::Assembler::new(
+            index,
+            ids,
+            json::list::Framing::Forced,
+        )),
         Some(CallSyntax::Gemma(spelling)) => Box::new(gemma::Assembler::new(index, id(), spelling)),
         // A shaped call opens through its terminal's header, which the engine reads before it
         // enters the call's state with that assembler (`Engine::open_shaped`); a table that
@@ -563,18 +569,29 @@ impl Engine {
     /// Whether the table's calls are one JSON value each (the object is the call), so that a
     /// quoted spelling inside their arguments is a string's text under the JSON-answer option;
     /// the tagged, keyed, XML, pythonic, Gemma and shaped syntaxes carry their values otherwise.
+    /// Every syntax is classed by name: a new one does not compile until it is.
     fn json_syntax(&self) -> bool {
-        matches!(
-            self.format.call_syntax(),
-            None | Some(
+        match self.format.call_syntax() {
+            None
+            | Some(
                 CallSyntax::Json
-                    | CallSyntax::NamedJson(_)
-                    | CallSyntax::NamedArguments { .. }
-                    | CallSyntax::JsonList
-                    | CallSyntax::JsonAlone(_)
-                    | CallSyntax::ForcedArguments
-            )
-        )
+                | CallSyntax::NamedJson(_)
+                | CallSyntax::NamedArguments { .. }
+                | CallSyntax::JsonList
+                | CallSyntax::JsonAlone(_)
+                | CallSyntax::ForcedArguments
+                | CallSyntax::ForcedList,
+            ) => true,
+            Some(
+                CallSyntax::Tagged(..)
+                | CallSyntax::Keyed(_)
+                | CallSyntax::Pythonic(_)
+                | CallSyntax::Xml
+                | CallSyntax::Attributed(_)
+                | CallSyntax::Gemma(_)
+                | CallSyntax::Shaped(_),
+            ) => false,
+        }
     }
 
     fn emits(&self) -> Emits {
@@ -1494,7 +1511,7 @@ impl Engine {
     }
 
     /// Where the prompt leaves the engine: the table's replay of it ([`Format::replayed`], which
-    /// [`Format::reasoning_open`] reads too), from the last turn opener the table names or after
+    /// [`Format::reasoning_open`] reads too), from the turn opener the table names or after
     /// its last turn anchor, the turn's first piece deciding its start where the table has a start
     /// row. An arguments state is not entered from the prompt: the engine rests where the turn
     /// started.

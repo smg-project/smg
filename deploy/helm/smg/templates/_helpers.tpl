@@ -992,6 +992,38 @@ ServiceMonitor.
 {{- end }}
 
 {{/*
+Policy controller election -- "true" when policyController.election.enabled
+is set; empty when it is not, and over values that hold no election block.
+*/}}
+{{- define "smg.policyControllerElection" -}}
+{{- if ((.Values.policyController).election).enabled -}}true{{- end -}}
+{{- end }}
+
+{{/*
+Policy controller Lease name -- policyController.election.leaseName, or the
+controller's full name when it is empty: two releases in one namespace never
+share a Lease. No revision is in it: a name that moved at an upgrade would
+elect a second leader beside the first.
+*/}}
+{{- define "smg.policyControllerLeaseName" -}}
+{{- default (include "smg.policyControllerName" .) ((.Values.policyController).election).leaseName -}}
+{{- end }}
+
+{{/*
+Policy controller replicas -- more than one only with the election on. With
+it off every replica is a controller of its own, and two would each lead
+alone: the render refuses them. The count is compared as a number and
+written as the values hold it: a null stays the API's default.
+*/}}
+{{- define "smg.policyControllerReplicas" -}}
+{{- $replicas := .Values.policyController.replicas -}}
+{{- if and (gt (int $replicas) 1) (not (include "smg.policyControllerElection" .)) -}}
+{{- fail (printf "policyController.replicas is %d with policyController.election.enabled off: each replica would lead alone. Turn the election on, or keep one replica" (int $replicas)) -}}
+{{- end -}}
+{{- $replicas -}}
+{{- end }}
+
+{{/*
 Policy controller selector labels -- the release's selector labels with the
 controller's own component, so no router or worker selector takes its pods.
 */}}
@@ -1011,7 +1043,8 @@ stands on the router's tag, so a repository of the operator's own is refused
 without its tag, and so is a router image named by a digest. No release
 older than the first that publishes a controller image has one, so a tag
 that names such a release is refused too. Only the three numbers a release
-tag starts with are compared: any other tag takes the default.
+tag starts with are compared, each of nine digits at most, a number the
+comparer can hold: any other tag takes the default.
 */}}
 {{- define "smg.policyControllerImage" -}}
 {{- $image := .Values.policyController.image -}}
@@ -1039,9 +1072,15 @@ tag starts with are compared: any other tag takes the default.
 Policy controller CLI arguments -- every argument is a flag of
 smg-policy-controller, each from a value. The controller's id is not here:
 the flag reads HOSTNAME, the pod's name. What the controller refuses at
-start is refused at render: two listeners on one port, and a settle window
+start is refused at render: two listeners on one port, a settle window
 over half the grace period (the controller's own default of 5 seconds when
-shutdownSettleSeconds is null).
+shutdownSettleSeconds is null) and a listener named to take identities as
+told that is none of the three: the schema names it first, and the helper
+does where the schema's check is skipped. Those listeners are a set, said
+in the listeners' own order however the value was written: a reorder rolls
+no pod. With the election on the Lease is named,
+and the pod's own address, which the kubelet writes in place of $(POD_IP):
+the holder of the Lease is named by an address the others can dial.
 */}}
 {{- define "smg.policyControllerArgs" -}}
 {{- $controller := .Values.policyController -}}
@@ -1058,6 +1097,22 @@ shutdownSettleSeconds is null).
 {{- if not (kindIs "invalid" $controller.shutdownSettleSeconds) -}}
 {{- $settle = int $controller.shutdownSettleSeconds -}}
 {{- end -}}
+{{- $elected := include "smg.policyControllerElection" . -}}
+{{- $told := list -}}
+{{- $named := $controller.identityAsTold | default list -}}
+{{- if not (kindIs "slice" $named) -}}
+{{- fail (printf "policyController.identityAsTold is %v: a list of listeners' names (gateway, control, replication)" $named) -}}
+{{- end -}}
+{{- range $name := $named -}}
+{{- if not (has $name (list "gateway" "control" "replication")) -}}
+{{- fail (printf "policyController.identityAsTold names %v, none of the chart's listeners (gateway, control, replication)" $name) -}}
+{{- end -}}
+{{- end -}}
+{{- range $listener := list "gateway" "control" "replication" -}}
+{{- if has $listener $named -}}
+{{- $told = append $told $listener -}}
+{{- end -}}
+{{- end -}}
 {{- if gt (mul $settle 2) $grace -}}
 {{- fail (printf "policyController: a settle window of %d s is over half the grace period of %d s (shutdownSettleSeconds, 5 when null, and shutdownGracePeriodSeconds): the controller refuses it" $settle $grace) -}}
 {{- end -}}
@@ -1069,6 +1124,10 @@ shutdownSettleSeconds is null).
 - {{ printf "0.0.0.0:%d" (int $controller.ports.replication) | quote }}
 - "--admin-listen"
 - {{ printf "0.0.0.0:%d" (int $controller.ports.admin) | quote }}
+{{- with $told }}
+- "--identity-as-told"
+- {{ join "," . | quote }}
+{{- end }}
 - "--shutdown-grace-period-secs"
 - {{ $grace | quote }}
 {{- if not (kindIs "invalid" $controller.shutdownSettleSeconds) }}
@@ -1083,6 +1142,12 @@ shutdownSettleSeconds is null).
 - {{ $controller.logging.level | quote }}
 {{- if $controller.logging.json }}
 - "--log-json"
+{{- end }}
+{{- if $elected }}
+- "--lease-name"
+- {{ include "smg.policyControllerLeaseName" . | quote }}
+- "--advertise-address"
+- "$(POD_IP)"
 {{- end }}
 {{- range $controller.extraArgs }}
 - {{ . | quote }}

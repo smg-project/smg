@@ -104,7 +104,9 @@ async fn probe_models_endpoint(
 
     let response = match req.send().await {
         Ok(response) => response,
-        Err(e) => return ModelsProbe::Failed(format!("failed to reach {shown}: {e}")),
+        Err(e) => {
+            return ModelsProbe::Failed(format!("failed to reach {shown}: {}", e.without_url()))
+        }
     };
 
     if !response.status().is_success() {
@@ -113,7 +115,12 @@ async fn probe_models_endpoint(
 
     let models: ModelsResponse = match response.json().await {
         Ok(models) => models,
-        Err(e) => return ModelsProbe::Failed(format!("failed to parse {shown} response: {e}")),
+        Err(e) => {
+            return ModelsProbe::Failed(format!(
+                "failed to parse {shown} response: {}",
+                e.without_url()
+            ))
+        }
     };
 
     let Some(first_model) = models.data.first() else {
@@ -145,8 +152,9 @@ async fn try_vllm_version(
 
     let response = req.send().await.map_err(|e| {
         format!(
-            "Failed to reach {}: {e}",
-            Endpoint::redacted_str(&version_url)
+            "Failed to reach {}: {}",
+            Endpoint::redacted_str(&version_url),
+            e.without_url()
         )
     })?;
 
@@ -173,10 +181,13 @@ async fn try_sglang_server_info(
         req = req.bearer_auth(key);
     }
 
-    let response = req
-        .send()
-        .await
-        .map_err(|e| format!("Failed to reach {}: {e}", Endpoint::redacted_str(&info_url)))?;
+    let response = req.send().await.map_err(|e| {
+        format!(
+            "Failed to reach {}: {}",
+            Endpoint::redacted_str(&info_url),
+            e.without_url()
+        )
+    })?;
 
     if !response.status().is_success() {
         return Err(format!("/server_info returned {}", response.status()));
@@ -389,7 +400,11 @@ impl StepExecutor<WorkerWorkflowData> for DetectBackendStep {
 
 #[cfg(test)]
 mod tests {
-    use axum::{routing::get, Json, Router};
+    use axum::{
+        http::{StatusCode, Uri},
+        routing::get,
+        Json, Router,
+    };
     use serde_json::json;
     use tokio::net::TcpListener;
 
@@ -537,6 +552,46 @@ mod tests {
         assert!(logs_contain(&format!(
             "http://***@127.0.0.1:{port}/v1/models"
         )));
+    }
+
+    /// An address registered with a query, at a port nobody listens on: the
+    /// failure does not repeat the query. The HTTP client's own error text
+    /// ends with the request URL, the query kept.
+    #[tokio::test]
+    async fn http_detection_failures_go_without_the_clients_url() {
+        let refused = RefusedAddress::reserve();
+        let url = format!("{}?token=s3cret", refused.http_url());
+
+        let err = detect_http_backend(&url, 1, &http_client(), None)
+            .await
+            .unwrap_err();
+
+        assert!(!err.contains("s3cret"), "{err}");
+    }
+
+    /// An address registered with a query whose `/v1/models` answers a body
+    /// that is no JSON: the failure does not repeat the query. The HTTP
+    /// client's text of a failed body read ends with the request URL too.
+    #[tokio::test]
+    async fn an_unparsed_models_answer_goes_without_the_clients_url() {
+        // The query takes in the path each probe appends, so the stub tells
+        // the probes apart by the request's tail.
+        let (url, server) = serve_router(Router::new().fallback(|uri: Uri| async move {
+            if uri.to_string().ends_with("/v1/models") {
+                (StatusCode::OK, "not json")
+            } else {
+                (StatusCode::NOT_FOUND, "")
+            }
+        }))
+        .await;
+
+        let result =
+            detect_http_backend(&format!("{url}?token=s3cret"), 1, &http_client(), None).await;
+        server.abort();
+
+        let err = result.unwrap_err();
+        assert!(err.contains("failed to parse"), "{err}");
+        assert!(!err.contains("s3cret"), "{err}");
     }
 
     #[tokio::test]

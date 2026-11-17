@@ -247,7 +247,9 @@ mod tests {
         for w in workers {
             registry.register(w);
         }
-        let cache = Arc::new(WorkerHttpClientCache::new(config));
+        let cache = Arc::new(WorkerHttpClientCache::new(
+            config.worker_http_client_settings(),
+        ));
         RegistryRlView::new(registry, cache)
     }
 

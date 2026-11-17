@@ -124,6 +124,19 @@ jobs:
             cargo bench -p smg-policy-controller --bench "$BENCH" --no-run
           git checkout --quiet "$head"
 
+      # The gate counts an id that fails by time, on both binaries under valgrind's
+      # callgrind, before the verdict (`count` in the row's gate file): the same
+      # instruction count on both sides, with the measured function moved and the
+      # change within twice the threshold, is a placement, reported and not failed.
+      # Without the tool the count is not read and the id fails as the time read
+      # it, so this step never fails the job.
+      - name: Install valgrind
+        if: github.event_name == 'pull_request'
+        timeout-minutes: 5
+        continue-on-error: true
+        run: |
+          bash scripts/ci_apt_install.sh sudo -y --no-install-recommends valgrind
+
       - name: Run the benchmark gate
         if: github.event_name == 'pull_request'
         timeout-minutes: 40

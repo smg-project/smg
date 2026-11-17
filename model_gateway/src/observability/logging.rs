@@ -68,6 +68,13 @@ const WORKSPACE_CRATES: &[&str] = &[
     "wfaas",
 ];
 
+/// The directive of the default filter that turns the audio decoder's probe
+/// target off: the probe reports a clip it cannot read (`probe reached EOF at
+/// N bytes`, `reached probe limit of N bytes`) at ERROR through the library's
+/// own target, for bytes a client sent; the stage that refuses the clip
+/// writes the refusal's line, with the cause.
+const AUDIO_PROBE_OFF: &str = ",symphonia_core::formats::probe=off";
+
 #[derive(Debug, Clone)]
 pub struct LoggingConfig {
     pub level: Level,
@@ -510,18 +517,22 @@ fn build_filter_string(targets: &[String], level_filter: &str) -> String {
 }
 
 /// Build a filter string that sets all workspace crates to the given level
-/// and defaults everything else to WARN.
+/// and defaults everything else to WARN, the audio decoder's probe aside
+/// ([`AUDIO_PROBE_OFF`]).
 ///
-/// Example output: `"warn,smg=info,tool_parser=info,kv_index=info,..."`
+/// Example output: `"warn,symphonia_core::formats::probe=off,smg=info,tool_parser=info,..."`
 #[inline]
 fn build_workspace_filter(level_filter: &str) -> String {
-    // "warn," prefix + each crate entry
-    let capacity = 5 + WORKSPACE_CRATES
-        .iter()
-        .map(|c| c.len() + 1 + level_filter.len() + 1) // "crate=level,"
-        .sum::<usize>();
+    // "warn," prefix + the probe's directive + each crate entry
+    let capacity = 5
+        + AUDIO_PROBE_OFF.len()
+        + WORKSPACE_CRATES
+            .iter()
+            .map(|c| c.len() + 1 + level_filter.len() + 1) // "crate=level,"
+            .sum::<usize>();
     let mut filter = String::with_capacity(capacity);
     filter.push_str("warn");
+    filter.push_str(AUDIO_PROBE_OFF);
     for crate_name in WORKSPACE_CRATES {
         filter.push(',');
         filter.push_str(crate_name);
@@ -813,28 +824,49 @@ pub(crate) mod test_support {
             event: &tracing::Event<'_>,
             _ctx: tracing_subscriber::layer::Context<'_, S>,
         ) {
-            if event.metadata().target() != "smg::response" {
-                return;
+            if event.metadata().target() == "smg::response" {
+                self.0.lock().expect("lines").push(line_of(event));
             }
-            struct Message(String);
-            impl tracing::field::Visit for Message {
-                fn record_debug(
-                    &mut self,
-                    field: &tracing::field::Field,
-                    value: &dyn std::fmt::Debug,
-                ) {
-                    if field.name() == "message" {
-                        self.0 = format!("{value:?}");
-                    }
+        }
+    }
+
+    /// Every event at WARN or ERROR, as (level, message): the lines an
+    /// operator's default level shows, as a test reads them to prove which
+    /// of them an answer writes.
+    #[derive(Clone, Default)]
+    pub(crate) struct LinesAtWarnOrAbove(Arc<Mutex<Vec<(Level, String)>>>);
+
+    impl LinesAtWarnOrAbove {
+        pub(crate) fn lines(&self) -> Vec<(Level, String)> {
+            self.0.lock().expect("lines").clone()
+        }
+    }
+
+    impl<S: tracing::Subscriber> Layer<S> for LinesAtWarnOrAbove {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if matches!(*event.metadata().level(), Level::WARN | Level::ERROR) {
+                self.0.lock().expect("lines").push(line_of(event));
+            }
+        }
+    }
+
+    /// `event` as (level, message).
+    fn line_of(event: &tracing::Event<'_>) -> (Level, String) {
+        struct Message(String);
+        impl tracing::field::Visit for Message {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    self.0 = format!("{value:?}");
                 }
             }
-            let mut message = Message(String::new());
-            event.record(&mut message);
-            self.0
-                .lock()
-                .expect("lines")
-                .push((*event.metadata().level(), message.0));
         }
+        let mut message = Message(String::new());
+        event.record(&mut message);
+        (*event.metadata().level(), message.0)
     }
 
     /// Counts, on this thread's subscriber, the ERROR events and the refusal
@@ -1420,6 +1452,16 @@ mod filter_tests {
             "no per-target directive, let alone an empty one"
         );
         assert!(!trailing.would_enable("hyper", &Level::INFO));
+    }
+
+    /// The default filter drops the audio decoder's probe lines, ERROR
+    /// included; the decoder's other targets keep the dependencies' WARN.
+    #[test]
+    fn the_default_filter_turns_the_audio_probes_target_off() {
+        let targets = targets(&build_workspace_filter("info"));
+        assert!(!targets.would_enable("symphonia_core::formats::probe", &Level::ERROR));
+        assert!(targets.would_enable("symphonia_core::formats", &Level::WARN));
+        assert!(targets.would_enable("smg", &Level::INFO));
     }
 
     #[test]

@@ -100,7 +100,7 @@ impl ProtoGenerateRequest {
     /// Get SGLang variant (panics if not SGLang)
     #[expect(
         clippy::panic,
-        reason = "typed accessor: caller guarantees variant via is_sglang() check"
+        reason = "typed accessor: the caller guarantees the variant"
     )]
     pub fn as_sglang(&self) -> &sglang::GenerateRequest {
         match self {
@@ -109,72 +109,9 @@ impl ProtoGenerateRequest {
         }
     }
 
-    /// Get mutable SGLang variant (panics if not SGLang)
-    #[expect(
-        clippy::panic,
-        reason = "typed accessor: caller guarantees variant via is_sglang() check"
-    )]
-    pub fn as_sglang_mut(&mut self) -> &mut sglang::GenerateRequest {
-        match self {
-            Self::Sglang(req) => req,
-            _ => panic!("Expected SGLang GenerateRequest"),
-        }
-    }
-
-    /// Get vLLM variant (panics if not vLLM)
-    #[expect(
-        clippy::panic,
-        reason = "typed accessor: caller guarantees variant via is_vllm() check"
-    )]
-    pub fn as_vllm(&self) -> &vllm::GenerateRequest {
-        match self {
-            Self::Vllm(req) => req,
-            _ => panic!("Expected vLLM GenerateRequest"),
-        }
-    }
-
-    /// Get TensorRT-LLM variant (panics if not TensorRT-LLM)
-    #[expect(
-        clippy::panic,
-        reason = "typed accessor: caller guarantees variant via is_trtllm() check"
-    )]
-    pub fn as_trtllm(&self) -> &trtllm::GenerateRequest {
-        match self {
-            Self::Trtllm(req) => req,
-            _ => panic!("Expected TensorRT-LLM GenerateRequest"),
-        }
-    }
-
-    /// Get TokenSpeed variant (panics if not TokenSpeed)
-    #[expect(
-        clippy::panic,
-        reason = "typed accessor: caller guarantees variant via is_tokenspeed() check"
-    )]
-    pub fn as_tokenspeed(&self) -> &tokenspeed::GenerateRequest {
-        match self {
-            Self::TokenSpeed(req) => req,
-            _ => panic!("Expected TokenSpeed GenerateRequest"),
-        }
-    }
-
-    /// Check if this is SGLang
-    pub fn is_sglang(&self) -> bool {
-        matches!(self, Self::Sglang(_))
-    }
-
     /// Check if this is vLLM
     pub fn is_vllm(&self) -> bool {
         matches!(self, Self::Vllm(_))
-    }
-
-    /// Check if this is TensorRT-LLM
-    pub fn is_trtllm(&self) -> bool {
-        matches!(self, Self::Trtllm(_))
-    }
-
-    /// Check if this is TokenSpeed
-    pub fn is_tokenspeed(&self) -> bool {
-        matches!(self, Self::TokenSpeed(_))
     }
 
     /// The runtime whose message type this request is.

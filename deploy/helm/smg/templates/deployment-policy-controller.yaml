@@ -1,8 +1,11 @@
 {{- if (.Values.policyController).enabled }}
 {{- /* The standalone policy controller, a Deployment of its own: nothing here
-     points the router at it. The pod mounts no service account token: the
-     controller calls no Kubernetes API yet. */}}
+     points the router at it. With the election on the pod runs under the
+     controller's own service account and mounts its token, for the one
+     Lease; with it off the pod mounts none: the controller then calls no
+     Kubernetes API. */}}
 {{- $controller := .Values.policyController }}
+{{- $elected := include "smg.policyControllerElection" . }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -11,7 +14,17 @@ metadata:
     {{- include "smg.labels" . | nindent 4 }}
     app.kubernetes.io/component: policy-controller
 spec:
-  replicas: {{ $controller.replicas }}
+  replicas: {{ include "smg.policyControllerReplicas" . }}
+  {{- if $elected }}
+  {{- /* With the election on, one pod more at a time and none unavailable:
+       the new pod stands by, and the old leader's stop hands the Lease
+       over. Off, no strategy is named, as before the election. */}}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  {{- end }}
   selector:
     matchLabels:
       {{- include "smg.policyControllerSelectorLabels" . | nindent 6 }}
@@ -31,7 +44,18 @@ spec:
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      {{- if $elected }}
+      {{- /* The account by its field and by the field's deprecated alias.
+           The server fills the alias on the live object and reads the name
+           back from it, and an upgrade deletes only what a manifest named:
+           with both named here, turning the election off, or a rollback
+           past it, removes both. */}}
+      serviceAccountName: {{ include "smg.policyControllerName" . }}
+      serviceAccount: {{ include "smg.policyControllerName" . }}
+      automountServiceAccountToken: true
+      {{- else }}
       automountServiceAccountToken: false
+      {{- end }}
       terminationGracePeriodSeconds: {{ add (int $controller.shutdownGracePeriodSeconds) (int $controller.terminationGraceMarginSeconds) }}
       containers:
         - name: policy-controller
@@ -72,9 +96,17 @@ spec:
           resources:
             {{- toYaml . | nindent 12 }}
           {{- end }}
-          {{- with $controller.extraEnv }}
+          {{- if or $elected $controller.extraEnv }}
           env:
+            {{- if $elected }}
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            {{- end }}
+            {{- with $controller.extraEnv }}
             {{- toYaml . | nindent 12 }}
+            {{- end }}
           {{- end }}
       {{- with $controller.nodeSelector }}
       nodeSelector:

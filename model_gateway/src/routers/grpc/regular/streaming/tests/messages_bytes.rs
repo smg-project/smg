@@ -146,6 +146,7 @@ async fn stream_bytes(scenario: &MessagesScenario) -> Vec<u8> {
             forcing: None,
             opener: None,
             forced_ids: None,
+            json_answer: false,
             span: Span::none(),
             marked: Arc::default(),
         }),

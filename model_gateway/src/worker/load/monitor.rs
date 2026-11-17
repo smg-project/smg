@@ -61,6 +61,7 @@ use openai_protocol::worker::{
 };
 use parking_lot::{Mutex, RwLock};
 use reqwest::StatusCode;
+use rustc_hash::FxHashMap;
 use smg_grpc_client::common_proto::EngineLoad;
 use tokio::{
     sync::{broadcast, Notify},
@@ -70,9 +71,9 @@ use tracing::{debug, info, warn};
 
 use crate::{
     observability::metrics::Metrics,
-    policies::PolicyRegistry,
     worker::{
         health::liveness,
+        identity::endpoint::Endpoint,
         load::state::{LoadReceiver, LoadSnapshot, LoadState},
         registry::event::WorkerEvent,
         ConnectionMode, Worker, WorkerRegistry,
@@ -83,12 +84,34 @@ mod scrape;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// The rank loads by worker as the update line writes them: each address
+/// masked. A worker's address may hold a credential in its userinfo or a
+/// token in its query. The address is read when the line is written, so
+/// nothing is parsed while debug logging is off.
+struct MaskedLoads<'a>(&'a HashMap<String, HashMap<isize, isize>>);
+
+impl Debug for MaskedLoads<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_map()
+            .entries(
+                self.0
+                    .iter()
+                    .map(|(url, ranks)| (Endpoint::redacted_str(url), ranks)),
+            )
+            .finish()
+    }
+}
+
 /// DP rank load cache used by load-aware routing policies.
 ///
 /// Pure in-memory data structure with no I/O. `WorkerMonitor` owns the
 /// shared `Arc<WorkerLoadManager>` and updates it on every successful
 /// poll; routing policies read from it via
 /// `select_and_increment_lowest_dp_load`.
+///
+/// Only a poll feeds it: a worker served by its load stream is not polled,
+/// so its entry is its last poll's, however old, and a reader for a worker
+/// that streams brings its own feed.
 #[derive(Debug, Default)]
 pub struct WorkerLoadManager {
     /// `<worker_url, <dp_rank, load>>`
@@ -104,20 +127,12 @@ impl WorkerLoadManager {
 
     /// Replace cached rank loads for the supplied workers, preserving other workers.
     pub fn update_dp_loads(&self, loads: &HashMap<String, HashMap<isize, isize>>) {
-        debug!("WorkerLoadManager update_dp_loads map:{:?}", loads);
+        debug!(
+            "WorkerLoadManager update_dp_loads map:{:?}",
+            MaskedLoads(loads)
+        );
         let mut cached = self.dp_cached_loads.write();
         cached.extend(loads.iter().map(|(k, v)| (k.clone(), v.clone())));
-    }
-
-    /// One worker's rank loads replace its cached entry: a pushed record's
-    /// update, without the map of maps a poll tick hands over.
-    pub(crate) fn update_worker_dp_loads(&self, url: &str, loads: HashMap<isize, isize>) {
-        let mut cached = self.dp_cached_loads.write();
-        if let Some(entry) = cached.get_mut(url) {
-            *entry = loads;
-        } else {
-            cached.insert(url.to_string(), loads);
-        }
     }
 
     /// Select and increment the least-loaded eligible rank. A virtual worker
@@ -175,10 +190,10 @@ impl WorkerLoadManager {
     }
 }
 
-/// The token counts the DP-rank cache takes from `report`: one per rank
-/// whose row carries token capacity. A row without it is no token count of
-/// its rank, whatever the rows beside it carry: the report on file and a
-/// poll's report under the stream's rows hold rows of more than one origin.
+/// The token counts the DP-rank cache takes from a poll's `report`: one per
+/// rank whose row carries token capacity. A row without it is no token
+/// count of its rank, whatever the rows beside it carry: a poll's report
+/// under the stream's rows holds rows of more than one origin.
 fn dp_rank_token_loads(report: &WorkerLoadResponse) -> HashMap<isize, isize> {
     report
         .loads
@@ -297,10 +312,22 @@ impl NativeLoadsMemo {
     }
 }
 
+/// The routing side as the load monitor sees it: whoever reads the loads the
+/// monitor publishes and books requests on workers. The gateway's policy
+/// registry implements it; the monitor names no policy.
+pub trait LoadConsumer: Send + Sync {
+    /// Whether a reader wants worker loads, so the monitor has to fetch them.
+    fn needs_loads(&self) -> bool;
+
+    /// Trim what the readers booked on `worker` to the requests the router
+    /// still holds there.
+    fn reconcile_in_flight(&self, worker: &dyn Worker);
+}
+
 /// Load monitoring service that subscribes to `WorkerRegistry` events.
 pub struct WorkerMonitor {
     worker_registry: Arc<WorkerRegistry>,
-    policy_registry: Arc<PolicyRegistry>,
+    load_consumer: Arc<dyn LoadConsumer>,
     pub worker_load_manager: Arc<WorkerLoadManager>,
     default_interval: Duration,
     /// When set, force load polling even if no load-aware routing policy is
@@ -331,14 +358,17 @@ pub struct WorkerMonitor {
     /// ([`Self::apply_pushed_load`]), a poll's entry replaces a rank's that
     /// pushed nothing since the poll began ([`Self::apply_polled_load`]).
     /// A record's readers borrow it, and the coalesced publish copies it
-    /// once per window, so a record builds no report of its own.
-    pushed_reports: Mutex<HashMap<String, WorkerLoadResponse>>,
+    /// once per window, so a record builds no report of its own. This map
+    /// and the two below are keyed by the worker's URL, a string of the
+    /// gateway's own, and every record looks its worker up in each: they
+    /// hash with FxHash.
+    pushed_reports: Mutex<FxHashMap<String, WorkerLoadResponse>>,
     /// When each rank of a worker last pushed a load record, by receipt:
     /// the tick's poll decision reads it (see [`PollMode`]).
-    pushed_at: Mutex<HashMap<String, BTreeMap<i32, Instant>>>,
+    pushed_at: Mutex<FxHashMap<String, BTreeMap<i32, Instant>>>,
     /// The workers whose report changed since the last coalesced publish,
     /// each with the incarnation that pushed, for the publish fence.
-    pending_pushed: Mutex<HashMap<String, Arc<dyn Worker>>>,
+    pending_pushed: Mutex<FxHashMap<String, Arc<dyn Worker>>>,
     pushed_notify: Arc<Notify>,
     pushed_flush_task: Mutex<Option<JoinHandle<()>>>,
 }
@@ -444,7 +474,7 @@ impl WorkerMonitor {
     /// is still safe to read; it just stays empty.
     pub fn new(
         worker_registry: Arc<WorkerRegistry>,
-        policy_registry: Arc<PolicyRegistry>,
+        load_consumer: Arc<impl LoadConsumer + 'static>,
         default_interval_secs: u64,
         engine_metrics: bool,
         conditional_polling: bool,
@@ -452,7 +482,7 @@ impl WorkerMonitor {
         let load_state = Arc::new(LoadState::new(Arc::clone(&worker_registry)));
         Self {
             worker_registry,
-            policy_registry,
+            load_consumer,
             worker_load_manager: Arc::new(WorkerLoadManager::new()),
             default_interval: Duration::from_secs(default_interval_secs.max(1)),
             engine_metrics,
@@ -463,9 +493,9 @@ impl WorkerMonitor {
             event_task: Mutex::new(None),
             eviction_flush_task: Mutex::new(None),
             liveness_sweep_task: Mutex::new(None),
-            pushed_reports: Mutex::new(HashMap::new()),
-            pushed_at: Mutex::new(HashMap::new()),
-            pending_pushed: Mutex::new(HashMap::new()),
+            pushed_reports: Mutex::new(FxHashMap::default()),
+            pushed_at: Mutex::new(FxHashMap::default()),
+            pending_pushed: Mutex::new(FxHashMap::default()),
             pushed_notify: Arc::new(Notify::new()),
             pushed_flush_task: Mutex::new(None),
         }
@@ -601,14 +631,11 @@ impl WorkerMonitor {
         // The record feeds its own rank's `smg_engine_*` series through the
         // handles kept for it; a poll's report feeds every rank's.
         Metrics::record_engine_rank_load(url, worker.model_id(), &report.loads[at]);
-        // The DP-rank token cache takes the rows that carry token capacity,
-        // as it takes a poll's: a row a poll wrote to the file without it is
-        // no token count of its rank. A core-only record leaves its
-        // last-known-good entry alone.
-        if report.has_absolute_token_data() && report.ranks_are_dp_ranks() {
-            self.worker_load_manager
-                .update_worker_dp_loads(url, dp_rank_token_loads(report));
-        }
+        // A record feeds the DP-rank token cache nothing. The cache's one
+        // reader is the HTTP pair router's rank pick, and a stream is opened
+        // for a gRPC worker alone: no pick reads a pushing worker's entry. A
+        // poll feeds the cache (`poll_group_once`).
+        //
         // The window's publish takes the report once, under the incarnation
         // that pushed last.
         {
@@ -634,8 +661,7 @@ impl WorkerMonitor {
         if !self.conditional_polling {
             return true;
         }
-        let routing_needs_load = self.policy_registry.needs_backend_loads()
-            || self.policy_registry.get_dp_rank_policy().is_some();
+        let routing_needs_load = self.load_consumer.needs_loads();
         let overload_needs_load = workers.iter().any(|w| w.metadata().overload.is_enabled());
         routing_needs_load || self.engine_metrics || overload_needs_load
     }
@@ -1864,7 +1890,7 @@ async fn poll_group_once(
     // for every worker, polled or served by its stream, whether or not a
     // fetch succeeded; the live count is the router's.
     for worker in &workers {
-        monitor.policy_registry.reconcile_in_flight(worker.as_ref());
+        monitor.load_consumer.reconcile_in_flight(worker.as_ref());
     }
 
     if polled.is_empty() {
@@ -1943,7 +1969,7 @@ mod native_loads_tests {
     use super::*;
     use crate::{
         config::types::PolicyConfig,
-        policies::{LoadBalancingPolicy, SelectWorkerInfo},
+        policies::{LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo},
         worker::{BasicWorkerBuilder, ConnectionMode, WorkerLoadGuard, WorkerType},
     };
 
@@ -2173,11 +2199,17 @@ mod native_loads_tests {
     #[tokio::test]
     async fn load_poll_reconciles_in_flight_with_the_workers_policy() {
         let stub = spawn_engine(StatusCode::OK, NATIVE_BODY).await;
-        let (registry, monitor) = monitor_with(PolicyConfig::RoundRobin, false);
+        let registry = Arc::new(WorkerRegistry::new());
+        let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
+        let monitor = Arc::new(WorkerMonitor::new(
+            registry.clone(),
+            Arc::clone(&policy_registry),
+            1,
+            false,
+            false,
+        ));
         let recorder = Arc::new(ReconcileRecorder::default());
-        monitor
-            .policy_registry
-            .set_decode_policy(Arc::clone(&recorder) as Arc<dyn LoadBalancingPolicy>);
+        policy_registry.set_decode_policy(Arc::clone(&recorder) as Arc<dyn LoadBalancingPolicy>);
         let worker: Arc<dyn Worker> = Arc::new(
             BasicWorkerBuilder::new(stub.url.as_str())
                 .worker_type(WorkerType::Decode)
@@ -2191,7 +2223,7 @@ mod native_loads_tests {
                 .build(),
         );
         worker.set_status(WorkerStatus::Ready);
-        let held = WorkerLoadGuard::new(Arc::clone(&worker), None);
+        let held = WorkerLoadGuard::with_key(Arc::clone(&worker), None);
         registry.register(Arc::clone(&worker)).unwrap();
         monitor.start_event_loop();
 
@@ -3114,8 +3146,8 @@ mod native_loads_tests {
 
     /// A record for a rank on file replaces the rank's entry in place: the
     /// figures are the record's, the telemetry it left out stays what the
-    /// last record that carried it said, the report keeps one entry per
-    /// rank, and the DP-rank token cache takes the report's counts.
+    /// last record that carried it said, and the report keeps one entry per
+    /// rank.
     #[tokio::test]
     async fn a_record_for_a_rank_on_file_replaces_its_entry_in_place() {
         let (registry, monitor) = monitor_with_policy(PolicyConfig::RoundRobin);
@@ -3156,11 +3188,6 @@ mod native_loads_tests {
             })
             .collect();
         assert_eq!(entries, vec![(0, 5, 0.75, 2048, 4096)]);
-        let cached = monitor.worker_load_manager.dp_cached_loads.read();
-        assert_eq!(
-            cached.get(worker.url()).and_then(|ranks| ranks.get(&0)),
-            Some(&2048)
-        );
     }
 
     /// What a fallback poll leaves of a worker whose rank 0 pushed a record
@@ -3218,6 +3245,15 @@ mod native_loads_tests {
             sample,
             ..Default::default()
         };
+        // What an earlier poll left in the rank cache. No record writes
+        // there, so the tick's poll is what replaces this entry or takes it
+        // away.
+        monitor
+            .worker_load_manager
+            .update_dp_loads(&HashMap::from([(
+                stub.url.clone(),
+                HashMap::from([(0, 150), (1, 250)]),
+            )]));
         monitor.apply_pushed_load(&worker, 0, &record(2, 0, 200, 1), t0);
         monitor.apply_pushed_load(&worker, 1, &record(8, 0, 500, 2), t0);
 
@@ -3441,6 +3477,19 @@ mod native_loads_tests {
             sample,
             ..Default::default()
         };
+        // What an earlier poll left in the rank cache: a count of its own
+        // for every rank on file, none of them a record's.
+        let earlier_poll: Vec<(isize, isize)> = [0, 1]
+            .into_iter()
+            .chain(also_quiet.iter().copied())
+            .map(|rank| (rank as isize, 150))
+            .collect();
+        monitor
+            .worker_load_manager
+            .update_dp_loads(&HashMap::from([(
+                stub.url.clone(),
+                earlier_poll.iter().copied().collect(),
+            )]));
         monitor.apply_pushed_load(&worker, 0, &record(10, 8, 900, 1), t0);
         monitor.apply_pushed_load(&worker, 1, &record(8, 0, 500, 2), t0);
         for &rank in also_quiet {
@@ -3462,7 +3511,11 @@ mod native_loads_tests {
                 ranks
             })
         };
-        assert!(cached(&monitor).is_some(), "the records fed the rank cache");
+        assert_eq!(
+            cached(&monitor),
+            Some(earlier_poll),
+            "the records feed the rank cache nothing: it holds the earlier poll's counts"
+        );
 
         let before_poll = Instant::now();
         poll_group_once(&monitor, &key, interval, tick).await;
@@ -3613,8 +3666,8 @@ mod native_loads_tests {
     /// An answer whose entries are annotated with their workers is a
     /// gateway's rollup: it carries token capacity, and its entries are not
     /// this worker's ranks. The rank cache takes none of them: the worker's
-    /// entry, fed by its records, leaves the cache with the poll. The
-    /// answer changes and retracts no rank on file.
+    /// entry, an earlier poll's, leaves the cache with the poll. The answer
+    /// changes and retracts no rank on file.
     #[tokio::test]
     async fn a_fallback_polls_rollup_by_worker_changes_no_rank_on_file() {
         const ROLLUP: &str = r#"{"loads":[
@@ -3639,10 +3692,10 @@ mod native_loads_tests {
     }
 
     /// A poll's row without token capacity is no token count of the rank it
-    /// names. On file for a quiet rank, beside rows that carry capacity, it
-    /// stays out of the rank cache when another rank's next record feeds the
-    /// cache from the file. Read as zero tokens, the quiet rank was the least
-    /// loaded one and was handed out.
+    /// names. The answer feeds the rank cache nothing and takes the earlier
+    /// poll's entry away. On file the row is its rank's, beside rows that
+    /// carry capacity, and the worker's next record feeds the cache nothing
+    /// either.
     #[tokio::test]
     async fn a_fallback_polls_row_without_token_capacity_is_no_token_count_in_the_rank_cache() {
         const RANK_2_NO_CAPACITY: &str = r#"{"loads":[
@@ -3659,16 +3712,16 @@ mod native_loads_tests {
             "the answer retracts no rank, and its row is rank 2's on file"
         );
         assert_eq!(
-            after.cached,
-            Some(vec![(0, 900), (1, 500)]),
-            "rank 1's record feeds the rows that carry capacity: rank 2's is no token count"
+            after.cached, None,
+            "the worker's next record feeds the rank cache nothing"
         );
     }
 
-    /// The poll's own feed reads its report row by row too: beside a row
-    /// that carries token capacity, an answer's row without it is no token
-    /// count, after the poll and after the worker's next record. The row
-    /// with capacity is an idle rank's: its zero is a count, and it is fed.
+    /// The poll's feed reads its report row by row: beside a row that
+    /// carries token capacity, an answer's row without it is no token
+    /// count. The row with capacity is an idle rank's: its zero is a count,
+    /// and it is fed. The worker's next record writes nothing over the
+    /// poll's entry.
     #[tokio::test]
     async fn a_fallback_polls_answer_feeds_the_rank_cache_its_rows_with_token_capacity_alone() {
         const CAPACITY_ON_RANK_1: &str = r#"{"loads":[
@@ -3684,17 +3737,21 @@ mod native_loads_tests {
         );
         assert_eq!(
             after.cached,
-            Some(vec![(1, 500)]),
-            "so does rank 1's next record, from the file"
+            Some(vec![(1, 0)]),
+            "rank 1's next record writes nothing over the poll's entry"
         );
     }
 
-    /// A pushed record on a file that carries token capacity on no row
-    /// feeds the rank cache nothing: the worker's last entry stays.
+    /// A pushed record feeds the rank cache nothing, whatever it carries:
+    /// the worker's last entry, a poll's, stays. A record's token count
+    /// reaches the worker's report, which routing reads, and no cache
+    /// entry: the cache's one reader picks a rank of a worker that has no
+    /// stream.
     #[tokio::test]
-    async fn a_record_on_a_file_without_token_capacity_leaves_the_rank_caches_last_entry() {
+    async fn a_pushed_record_leaves_the_rank_caches_last_entry() {
         let (registry, monitor) = monitor_with_policy(PolicyConfig::RoundRobin);
         let worker = vllm_worker("http://engine:8000");
+        worker.set_status(WorkerStatus::Ready);
         registry.register(Arc::clone(&worker)).unwrap();
         let last_entry = HashMap::from([(0, 900), (1, 500)]);
         monitor
@@ -3704,22 +3761,47 @@ mod native_loads_tests {
                 last_entry.clone(),
             )]));
 
-        // A core-only record: no token count and no capacity.
+        // A core-only record, then one that carries a token count and its
+        // capacity for a rank the entry names.
         let core_only = EngineLoad {
             running_requests: 3,
             sample: 1,
             ..Default::default()
         };
-        monitor.apply_pushed_load(&worker, 0, &core_only, Instant::now());
+        let with_tokens = EngineLoad {
+            running_requests: 4,
+            num_used_tokens: Some(2048),
+            max_total_num_tokens: Some(4096),
+            sample: 2,
+            ..Default::default()
+        };
+        for record in [&core_only, &with_tokens] {
+            monitor.apply_pushed_load(&worker, 0, record, Instant::now());
+            assert_eq!(
+                monitor
+                    .worker_load_manager
+                    .dp_cached_loads
+                    .read()
+                    .get(worker.url())
+                    .cloned(),
+                Some(last_entry.clone()),
+                "no record writes over the last entry"
+            );
+        }
+        monitor.flush_pushed();
+        let snapshot = monitor.load_state.snapshot();
+        let report = snapshot.get(worker.url()).expect("published");
         assert_eq!(
-            monitor
-                .worker_load_manager
-                .dp_cached_loads
-                .read()
-                .get(worker.url())
-                .cloned(),
-            Some(last_entry),
-            "a file with no capacity on any row writes nothing over the last entry"
+            (
+                report.loads[0].num_used_tokens,
+                report.loads[0].max_total_num_tokens
+            ),
+            (2048, 4096),
+            "the report takes the record's token count"
         );
     }
 }
+
+#[cfg(test)]
+#[expect(clippy::print_stdout, reason = "a recorder says where its sheet went")]
+mod classic_overload_rows;

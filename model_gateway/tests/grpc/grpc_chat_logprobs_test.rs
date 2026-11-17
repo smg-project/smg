@@ -97,7 +97,9 @@ async fn chat_logprobs(stream: bool) -> Vec<(String, f64)> {
     }))
     .unwrap();
     let bytes = timeout(Duration::from_secs(30), async {
-        let response = router.route_chat(None, &tenant, request, MODEL).await;
+        let response = router
+            .route_chat(None, &tenant, Arc::new(request), MODEL)
+            .await;
         to_bytes(response.into_body(), 1024 * 1024).await.unwrap()
     })
     .await

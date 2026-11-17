@@ -1,10 +1,16 @@
 //! The standalone controller's run loop (design 2, 6, 8 and 10): the store,
 //! the load driver over it, the election, the gRPC listeners with their
 //! scopes, the service and the health service on each, the admin listener,
-//! readiness and the drain. The service answers `Leader`; the scopes' other
-//! call bodies arrive with the gateway, ingestion and control scope PRs, the
-//! other ingestion drivers with their move out of the gateway. In the
-//! `elected` mode the gateway runs this same loop inside its process.
+//! readiness and the drain. The service answers `Leader`, a gateway's
+//! `Session` and its `Decide` streams, whose decisions run on the
+//! controller's deciding threads, and, on the leader, the control scope's
+//! registration calls, and the run loop sweeps the gateways that are gone;
+//! the scopes' other call bodies arrive with the gateway, ingestion and
+//! control scope PRs, the other ingestion drivers with their move out of
+//! the gateway. In the
+//! `elected` mode the gateway runs this same loop inside its process. A
+//! controller given a spec file runs its document, watches the file and
+//! answers `GetPolicySpec` ([`Controller::spec_file`]).
 //!
 //! A controller is bound first and served second ([`Controller::bind`], then
 //! [`Controller::serve`]): the bind takes every address (port `0` for an
@@ -17,19 +23,35 @@
 //! Every replica runs the same loop, the load driver included: a follower
 //! that waited for a leader's log nobody writes yet would be cold at its
 //! promotion. The standby turns a follower's polls into that log.
+//!
+//! Every socket a listener accepts is set to send at once: a small answer
+//! never waits for the peer's acknowledgement of the write before it.
 
 pub mod admin;
 pub mod config;
+mod decide;
+mod deciders;
 pub mod election;
+mod gateways;
+mod generations;
+mod lifecycle;
+mod membership;
 pub mod metrics;
+mod principal;
 pub mod readiness;
+mod run;
 mod service;
+mod session;
+mod spec_file;
 pub mod tls;
+mod wire;
+mod worker_wire;
 
-use std::{future::Future, io, net::SocketAddr, pin::pin, sync::Arc};
+use std::{future::Future, io, net::SocketAddr, path::PathBuf, pin::pin, sync::Arc};
 
+use axum::serve::{ListenerExt as _, TapIo};
 use tokio::{
-    net::TcpListener,
+    net::{TcpListener, TcpStream},
     sync::watch,
     task::{JoinError, JoinSet},
     time::timeout,
@@ -42,21 +64,26 @@ pub use self::{
     admin::{Version, VERSION},
     config::{Config, ConfigError, Listener, Scope, Tls},
     election::{Election, LeaseError, LeasePlace},
+    generations::SpecRejected,
+    principal::ENTRY as PRINCIPAL_ENTRY,
     readiness::{Readiness, State},
+    run::run,
     tls::TlsError,
 };
 use self::{
     election::Standing,
+    principal::Layer,
     readiness::Phase,
     service::{Service, Shared},
+    spec_file::SpecFile,
 };
 use crate::{
+    catalog::Catalog,
     elector::{Elector, Fence},
     ingest::{
         loads::{LoadDriver, LoadDriverConfig},
         probe::EngineProbe,
     },
-    proto::policy_controller_server::PolicyControllerServer,
     store::{MemoryStore, WorkersStore},
 };
 
@@ -70,14 +97,20 @@ pub const PROTOCOL_VERSION: u32 = 1;
 
 /// The gRPC service every scope is a part of (design 8: one service, four
 /// credentialed scopes), as the health service names it. Every listener
-/// reports it `NOT_SERVING` until a scope's own call is served; `Leader` is
-/// every scope's.
+/// reports it `NOT_SERVING` from its bind on, and no line reports it
+/// `SERVING` yet: `Session` being served moves no listener's word. The
+/// design's rule waits for the steps that serve a scope's work: `SERVING`
+/// while the listener's replica leads and its scope's work can be done
+/// there (on the gateway scope, a decision answered). `Leader` is every
+/// scope's and moves no listener's word.
 pub const SERVICE_NAME: &str = "smg.policy.v1.PolicyController";
 
 /// A controller with its listeners bound and nothing served yet.
 pub struct Controller {
     config: Config,
-    store: Arc<MemoryStore>,
+    /// The stages a policy document may name, fixed at the bind: the stock
+    /// build's, or the host's own.
+    catalog: Arc<Catalog>,
     phase: watch::Sender<Phase>,
     readiness: Readiness,
     metrics: Arc<metrics::Metrics>,
@@ -87,12 +120,30 @@ pub struct Controller {
     elector: Elector,
     /// The election's sight of the lease, written by its thread.
     standing: watch::Sender<Standing>,
-    /// What every listener's instance of the service reads.
+    /// What every listener's instance of the service reads; the store is
+    /// its field, the run loop's drivers read the same one.
     shared: Arc<Shared>,
+    /// The spec's file source, once [`Controller::spec_file`] has read it:
+    /// the serve watches it.
+    spec_file: Option<SpecFile>,
     listeners: Vec<Bound>,
-    admin: TcpListener,
+    admin: AdminSockets,
     admin_addr: SocketAddr,
 }
+
+/// Sets an accepted socket to send at once. An answer is a few small writes
+/// in a row. A socket left with the kernel's default holds each write after
+/// the first until the peer acknowledges the one before, and a peer with
+/// nothing to send delays that acknowledgement by tens of milliseconds: a
+/// call answered in microseconds took about 40 ms on the wire.
+fn send_at_once(socket: &mut TcpStream) {
+    if let Err(error) = socket.set_nodelay(true) {
+        warn!(%error, "an accepted socket keeps the kernel's send delay");
+    }
+}
+
+/// The admin listener as it accepts: each socket set to send at once.
+type AdminSockets = TapIo<TcpListener, fn(&mut TcpStream)>;
 
 /// Why the serve left its wait.
 enum Leave {
@@ -104,14 +155,21 @@ enum Leave {
     Election,
 }
 
-/// A gRPC listener, bound, with its server configured (TLS parsed).
+/// A gRPC listener, bound, with its server configured (TLS parsed). Its
+/// accepted sockets are set to send at once by the transport's own
+/// [`TcpIncoming::with_nodelay`]; [`send_at_once`] says why.
 struct Bound {
     name: String,
     scopes: Vec<Scope>,
     addr: SocketAddr,
-    listener: TcpListener,
+    listener: TcpIncoming,
     server: Server,
     tls: bool,
+    /// Whether it verifies its callers against a client CA, as the bind
+    /// read its TLS material.
+    mutual: bool,
+    /// How the listener's calls come by a principal.
+    layer: Layer,
 }
 
 /// Where a bound controller listens.
@@ -196,6 +254,15 @@ pub enum Error {
     /// The engines' HTTP client could not be built.
     #[error("the engines' probe: {0}")]
     Probe(#[source] reqwest::Error),
+    /// The spec file could not be read, or its document does not run.
+    #[error("the spec file {}: {source}", .path.display())]
+    SpecFile {
+        /// The file.
+        path: PathBuf,
+        /// Why its document was not applied.
+        #[source]
+        source: SpecRejected,
+    },
     /// The lease's place could not be opened, or the elector refused its
     /// identity.
     #[error("the election's lease: {0}")]
@@ -203,10 +270,17 @@ pub enum Error {
     /// The election thread could not be started.
     #[error("the election thread: {0}")]
     ElectionThread(#[source] io::Error),
+    /// A deciding thread could not be started.
+    #[error("the deciding threads: {0}")]
+    Deciders(#[source] io::Error),
     /// The election thread ended before the shutdown: nothing renews the
     /// lease, so the controller stops.
     #[error("the election thread ended before the shutdown")]
     ElectionEnded,
+    /// A deciding thread ended before the shutdown: the models it decided
+    /// have no decider, so the controller stops and gives the lead up.
+    #[error("a deciding thread ended before the shutdown")]
+    DeciderEnded,
     /// A listener returned before the shutdown signal.
     #[error("a listener stopped before the shutdown")]
     Stopped,
@@ -216,19 +290,36 @@ pub enum Error {
 }
 
 impl Controller {
+    /// [`Controller::bind_with`] over the stock build's stages.
+    pub async fn bind(config: Config) -> Result<Self, Error> {
+        Self::bind_with(config, Catalog::builtin()).await
+    }
+
     /// Validates the configuration, installs the process crypto provider,
     /// reads and parses every listener's TLS material, binds every address,
     /// opens the lease's place and builds the store. Nothing is served yet
     /// and no lease is taken, so a refusal arrives before a client can
-    /// connect.
-    pub async fn bind(config: Config) -> Result<Self, Error> {
+    /// connect. A policy document names the stages `catalog` holds: the
+    /// stock build's and the ones the host added.
+    pub async fn bind_with(config: Config, catalog: Catalog) -> Result<Self, Error> {
         config.validate()?;
         tls::install_crypto_provider();
+        // The stages a policy document may name in this build, the host's
+        // own among them.
+        info!(
+            controller_id = %config.controller_id,
+            filters = ?catalog.filters().collect::<Vec<_>>(),
+            scorers = ?catalog.scorers().collect::<Vec<_>>(),
+            pickers = ?catalog.pickers().collect::<Vec<_>>(),
+            "stages held"
+        );
+        let catalog = Arc::new(catalog);
         let mut listeners = Vec::with_capacity(config.listeners.len());
         for listener in &config.listeners {
             let name = listener.name.clone();
             let mut server = Server::builder();
             let mut mode = "off";
+            let mut mutual = false;
             if let Some(tls) = &listener.tls {
                 let material = tls::Material::read(tls)
                     .await
@@ -242,11 +333,8 @@ impl Controller {
                         name: name.clone(),
                         source,
                     })?;
-                mode = if material.mutual() {
-                    "mutual"
-                } else {
-                    "server"
-                };
+                mutual = material.mutual();
+                mode = if mutual { "mutual" } else { "server" };
             }
             let bind = |source| Error::Bind {
                 name: name.clone(),
@@ -267,15 +355,18 @@ impl Controller {
                 name,
                 scopes: listener.scopes.clone(),
                 addr,
-                listener: socket,
+                listener: TcpIncoming::from(socket).with_nodelay(Some(true)),
                 server,
                 tls: listener.tls.is_some(),
+                mutual,
+                layer: Layer::Off,
             });
         }
         let admin = TcpListener::bind(config.admin)
             .await
             .map_err(Error::Admin)?;
         let admin_addr = admin.local_addr().map_err(Error::Admin)?;
+        let admin = admin.tap_io(send_at_once as fn(&mut TcpStream));
         info!(controller_id = %config.controller_id, addr = %admin_addr, "admin listener bound");
         // The holder identity names the gateway listener as bound: a client
         // dials the leader there, with no Service between them.
@@ -299,20 +390,23 @@ impl Controller {
             renew_deadline = ?settings.renew_deadline,
             "election"
         );
-        let fence = elector.fence();
         let (standing, stood) = watch::channel(Standing::default());
-        let (phase, readiness) = readiness::channel(Arc::clone(&fence), stood.clone());
-        let shared = Arc::new(Shared {
-            controller_id: config.controller_id.clone(),
-            address: address.unwrap_or_default(),
-            identity,
-            fence,
-            standing: stood,
-        });
+        let (phase, readiness) = readiness::channel(elector.fence(), stood.clone());
+        let shared = Shared::new(
+            config.controller_id.clone(),
+            address.unwrap_or_default(),
+            &elector,
+            stood,
+            Arc::new(MemoryStore::new()),
+            Arc::clone(&catalog),
+            config.decide_shards,
+        )
+        .map_err(Error::Deciders)?;
+        let shared = Arc::new(shared);
         let probe = Arc::new(EngineProbe::new().map_err(Error::Probe)?);
         Ok(Self {
             config,
-            store: Arc::new(MemoryStore::new()),
+            catalog,
             phase,
             readiness,
             metrics: Arc::new(metrics::Metrics::new()),
@@ -320,6 +414,7 @@ impl Controller {
             elector,
             standing,
             shared,
+            spec_file: None,
             listeners,
             admin,
             admin_addr,
@@ -343,9 +438,90 @@ impl Controller {
         }
     }
 
+    /// Names `listener` one that takes its callers' identities as told
+    /// (the contract's `METHOD_AS_TOLD`): a caller states its name in the
+    /// `x-smg-principal` metadata entry of every call and nothing is
+    /// verified, so whoever reaches the listener acts as any principal of
+    /// its scopes. It is for a listener only one trust domain reaches: a
+    /// loopback, or a mesh that verifies in front of the process. No
+    /// listener is named by default, and one that is not named refuses
+    /// every call that needs a principal.
+    ///
+    /// Called between [`Controller::bind`] and [`Controller::serve`]. This
+    /// method is the setting's one home until the configuration is built
+    /// in one place.
+    ///
+    /// # Errors
+    ///
+    /// No listener has the name, or the listener verifies its callers
+    /// against a client CA: a listener has one credential rule.
+    pub fn identity_as_told(&mut self, listener: &str) -> Result<(), ConfigError> {
+        let bound = self
+            .listeners
+            .iter_mut()
+            .find(|bound| bound.name == listener)
+            .ok_or_else(|| ConfigError::UnknownListener(listener.to_owned()))?;
+        // The bind read whether the listener verifies its callers: that one
+        // reading is asked here, not the configuration again.
+        if bound.mutual {
+            return Err(ConfigError::AsToldBesideClientCa(listener.to_owned()));
+        }
+        bound.layer = Layer::AsTold;
+        warn!(
+            controller_id = %self.config.controller_id,
+            listener = %bound.name,
+            addr = %bound.addr,
+            scopes = ?bound.scopes,
+            "identities are taken as told on this listener: nothing is verified, and whoever reaches it acts as any principal of its scopes"
+        );
+        Ok(())
+    }
+
+    /// The stages a policy document may name in this controller, fixed at
+    /// the bind: a spec file's document is validated against them
+    /// ([`Controller::spec_file`]).
+    pub fn catalog(&self) -> &Catalog {
+        &self.catalog
+    }
+
+    /// Takes the controller's policy spec from the file at `path` (design
+    /// 4.6): the document is read and applied now, as generation 1 or under
+    /// the number its `generation` line writes, and the control scope
+    /// answers `GetPolicySpec` with it. [`Self::serve`] then watches the
+    /// file: a changed one is applied as the next generation, or under the
+    /// number it writes, and one that does not run is rejected whole, with
+    /// the running generation kept.
+    ///
+    /// A file that cannot be read, or a document the validator refuses, is
+    /// refused here, before anything serves. The document names the stages
+    /// the bind was handed ([`Controller::catalog`]), a host's own among
+    /// them. A controller that takes no spec file serves no spec call,
+    /// watches nothing and renders no spec series.
+    pub async fn spec_file(&mut self, path: impl Into<PathBuf>) -> Result<(), Error> {
+        let path = path.into();
+        let generations = Arc::clone(&self.shared.generations);
+        let read = {
+            let path = path.clone();
+            tokio::task::spawn_blocking(move || SpecFile::start(path, generations))
+        };
+        match read.await {
+            Ok(Ok(file)) => self.spec_file = Some(file),
+            Ok(Err(source)) => return Err(Error::SpecFile { path, source }),
+            Err(join) => return Err(Error::Task(join.to_string())),
+        }
+        info!(
+            controller_id = %self.config.controller_id,
+            path = %path.display(),
+            generation = self.shared.generations.generation(),
+            "spec file"
+        );
+        self.metrics.spec(Arc::clone(&self.shared.generations));
+        Ok(())
+    }
+
     /// The store the ingestion drivers and the scopes' calls feed and read.
     pub fn store(&self) -> Arc<MemoryStore> {
-        Arc::clone(&self.store)
+        Arc::clone(&self.shared.store)
     }
 
     /// A read handle on the controller's state, valid across [`Self::serve`].
@@ -372,12 +548,22 @@ impl Controller {
     /// lease before the settle window, so a follower takes it within one
     /// renew period; the listeners keep accepting for the settle window,
     /// stop accepting, and close within the rest of the grace period, their
-    /// streams with them.
+    /// streams with them. An open `Decide` stream ends `UNAVAILABLE` when
+    /// they stop accepting: it does not hold the close to the grace period.
     ///
     /// Every listener's health service reports the overall status (service
-    /// `""`) as the readiness and [`SERVICE_NAME`] as `NOT_SERVING`. A
-    /// listener or an election thread that ends before the shutdown ends
-    /// the serve with its error, the other listeners closed.
+    /// `""`) as the readiness and [`SERVICE_NAME`] as `NOT_SERVING`, but a
+    /// control listener that takes a principal: `SERVING` while this replica
+    /// leads, so a client that checks the service's health by that name
+    /// finds the leader's control listener. That word is told at every move
+    /// of the run loop and after every step of the election, so a fence that
+    /// closes between two steps reads `SERVING` until the next; a
+    /// registration call reads the fence itself and is refused in that
+    /// window.
+    ///
+    /// A listener, an election thread or a deciding thread that ends before
+    /// the shutdown ends the serve with its error, the other listeners
+    /// closed.
     pub async fn serve(self, shutdown: impl Future<Output = ()>) -> Result<(), Error> {
         self.serve_until(shutdown, std::future::pending()).await
     }
@@ -392,7 +578,6 @@ impl Controller {
     ) -> Result<(), Error> {
         let Self {
             config,
-            store,
             phase,
             readiness,
             metrics,
@@ -400,13 +585,20 @@ impl Controller {
             elector,
             standing,
             shared,
+            spec_file,
             listeners,
             admin,
             ..
         } = self;
-        let (stop, _held) = watch::channel(false);
+        let store = Arc::clone(&shared.store);
+        // The listeners' close is one word, and an open decide stream hears
+        // it too: the word is `Shared`'s.
+        let stop = shared.stop.clone();
         let mut tasks: JoinSet<Result<(), Error>> = JoinSet::new();
         let mut reporters = Vec::with_capacity(listeners.len());
+        // The reporters of the listeners whose door a caller can pass: the
+        // control scope's, where a layer places a principal.
+        let mut doors = Vec::new();
         for bound in listeners {
             let (reporter, health) = tonic_health::server::health_reporter();
             reporter
@@ -415,16 +607,18 @@ impl Controller {
             reporter
                 .set_service_status(SERVICE_NAME, ServingStatus::NotServing)
                 .await;
-            let service =
-                PolicyControllerServer::new(Service::new(bound.scopes, Arc::clone(&shared)));
+            if bound.scopes.contains(&Scope::Control) && bound.layer != Layer::Off {
+                doors.push(reporter.clone());
+            }
+            let routes = Service::new(bound.scopes, Arc::clone(&shared)).routes(bound.layer);
             let mut stop = stop.subscribe();
             let name = bound.name;
-            let incoming = TcpIncoming::from(bound.listener);
+            let incoming = bound.listener;
             let mut server = bound.server;
             tasks.spawn(async move {
                 server
+                    .add_routes(routes)
                     .add_service(health)
-                    .add_service(service)
                     .serve_with_incoming_shutdown(incoming, async move {
                         let _ = stop.wait_for(|stop| *stop).await;
                     })
@@ -432,6 +626,37 @@ impl Controller {
                     .map_err(|source| Error::Serve { name, source })
             });
             reporters.push(reporter);
+        }
+        if !doors.is_empty() {
+            // A door's word for the service's name follows the role. This
+            // task is its one writer.
+            let mut role = readiness.clone();
+            let mut stop = stop.subscribe();
+            tasks.spawn(async move {
+                let mut told = None;
+                loop {
+                    let leads = role.state() == State::Leader;
+                    if told != Some(leads) {
+                        let word = if leads {
+                            ServingStatus::Serving
+                        } else {
+                            ServingStatus::NotServing
+                        };
+                        for door in &doors {
+                            door.set_service_status(SERVICE_NAME, word).await;
+                        }
+                        told = Some(leads);
+                    }
+                    tokio::select! {
+                        _ = stop.wait_for(|stop| *stop) => return Ok(()),
+                        moved = role.moved() => {
+                            if moved.is_none() {
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+            });
         }
         let driver = Arc::new(LoadDriver::new(
             Arc::clone(&store),
@@ -447,10 +672,42 @@ impl Controller {
             driver.run(driver_stop).await;
             Ok(())
         });
+        // The presence sweep: what a gateway held is let go once its grace
+        // period ended with no new `Hello`.
+        let gateways = Arc::clone(&shared.gateways);
+        let sweep_stop = stop.subscribe();
+        tasks.spawn(async move {
+            gateways.run(sweep_stop).await;
+            Ok(())
+        });
+        if let Some(file) = spec_file {
+            let file_stop = stop.subscribe();
+            tasks.spawn(async move {
+                file.run(file_stop)
+                    .await
+                    .map_err(|join| Error::Task(join.to_string()))
+            });
+        }
+        // A deciding thread that unwound decides nothing from then on and
+        // nothing starts it again: the serve ends by its error, as it ends
+        // by the election thread's.
+        let mut unwound = shared.deciders.ended();
+        let mut deciders_stop = stop.subscribe();
+        tasks.spawn(async move {
+            let told = async { unwound.wait_for(|unwound| *unwound).await.is_ok() };
+            let stopped = async {
+                let _ = deciders_stop.wait_for(|stop| *stop).await;
+            };
+            tokio::select! {
+                true = told => Err(Error::DeciderEnded),
+                () = stopped => Ok(()),
+            }
+        });
         let app = admin::router(admin::Admin {
             readiness: readiness.clone(),
             metrics: Arc::clone(&metrics),
             loads,
+            decides: Arc::clone(shared.deciders.counts()),
         });
         let mut admin_stop = stop.subscribe();
         tasks.spawn(async move {
@@ -517,7 +774,9 @@ impl Controller {
             Leave::Task(Some(Err(join))) => Some(Error::Task(join.to_string())),
             Leave::Election => Some(Error::ElectionEnded),
         };
-        let deadline = tokio::time::Instant::now() + config.shutdown_grace;
+        // A grace period the clock cannot add to the present bounds nothing:
+        // the wait for the election thread below then has no deadline.
+        let deadline = tokio::time::Instant::now().checked_add(config.shutdown_grace);
         let result = if let Some(error) = error {
             error!(controller_id = %config.controller_id, %error, "the serve ended before the shutdown");
             tasks.abort_all();
@@ -562,14 +821,19 @@ impl Controller {
         // write, tried again a renew period later while it fails. Neither
         // leave ends the process before the release landed or was given
         // up, within the grace period: this one wait serves both.
-        if tokio::time::timeout_at(deadline, election.ended())
-            .await
-            .is_err()
-        {
-            warn!(
-                controller_id = %config.controller_id,
-                "the election thread outlived the grace period; a lease it holds expires by its duration"
-            );
+        match deadline {
+            Some(deadline) => {
+                if tokio::time::timeout_at(deadline, election.ended())
+                    .await
+                    .is_err()
+                {
+                    warn!(
+                        controller_id = %config.controller_id,
+                        "the election thread outlived the grace period; a lease it holds expires by its duration"
+                    );
+                }
+            }
+            None => election.ended().await,
         }
         if result.is_ok() {
             info!(controller_id = %config.controller_id, "stopped");
@@ -581,14 +845,20 @@ impl Controller {
 #[cfg(test)]
 mod tests {
     //! What no case outside the module reaches: a serve whose election
-    //! thread is gone on its own, and a serve that leaves by a listener's
-    //! error.
+    //! thread is gone on its own, one whose deciding thread unwound, and a
+    //! serve that leaves by a listener's error.
 
-    use std::{future::pending, thread, time::Duration};
+    use std::{future::pending, sync::Arc, thread, time::Duration};
 
-    use tokio::{sync::oneshot, time::timeout};
+    use axum::serve::Listener as _;
+    use tokio::{
+        net::{TcpListener, TcpStream},
+        sync::oneshot,
+        time::timeout,
+    };
+    use tonic::codegen::tokio_stream::StreamExt as _;
 
-    use super::{config::tests::valid, Controller, Error};
+    use super::{config::tests::valid, Controller, Error, Phase};
     use crate::elector::{
         ElectError, ElectionSettings, Elector, LeaseBackend, LeaseRecord, MemoryLease, Written,
     };
@@ -620,6 +890,60 @@ mod tests {
         }
     }
 
+    /// Every socket the controller accepts sends at once, read from the
+    /// socket itself: one accepted by each gRPC listener as bound, and one
+    /// by the admin listener. A socket accepted with no option set does not.
+    #[tokio::test]
+    async fn every_accepted_socket_sends_at_once() {
+        let plain = TcpListener::bind("127.0.0.1:0").await.expect("a port");
+        let addr = plain.local_addr().expect("its address");
+        let dialed = TcpStream::connect(addr).await.expect("a connection");
+        let (socket, _) = plain.accept().await.expect("accepted");
+        assert!(
+            !socket.nodelay().expect("the option reads"),
+            "the kernel's default holds small writes"
+        );
+        drop(dialed);
+
+        let mut controller = Controller::bind(valid()).await.expect("the listeners bind");
+        assert!(!controller.listeners.is_empty());
+        for bound in &mut controller.listeners {
+            let dialed = TcpStream::connect(bound.addr).await.expect("a connection");
+            let socket = bound
+                .listener
+                .next()
+                .await
+                .expect("a socket")
+                .expect("accepted");
+            assert!(
+                socket.nodelay().expect("the option reads"),
+                "{}",
+                bound.name
+            );
+            drop(dialed);
+        }
+        let dialed = TcpStream::connect(controller.admin_addr)
+            .await
+            .expect("a connection");
+        let (socket, _) = controller.admin.accept().await;
+        assert!(socket.nodelay().expect("the option reads"), "admin");
+        drop(dialed);
+    }
+
+    /// The deciding threads are the configuration's count: a model's
+    /// requests go to one of that many.
+    #[tokio::test]
+    async fn the_controller_starts_the_deciding_threads_its_configuration_counts() {
+        let mut config = valid();
+        config.decide_shards = 3;
+        let controller = Controller::bind(config).await.expect("the listeners bind");
+        let deciders = &controller.shared.deciders;
+        let highest = (0..64)
+            .map(|index| deciders.of(&format!("model-{index}")))
+            .max();
+        assert_eq!(highest, Some(2));
+    }
+
     /// The thread gone at its take, before the serve read ready, and at its
     /// first renewal, after: the serve ends with the error either way, so
     /// the process exits and its supervisor starts it again.
@@ -647,6 +971,47 @@ mod tests {
             assert!(
                 matches!(served, Err(Error::ElectionEnded)),
                 "a lease that gave way after {writes} writes: {served:?}"
+            );
+        }
+    }
+
+    /// A deciding thread that unwound leaves its models with no decider:
+    /// the serve ends with the error, told before the serve began, before
+    /// it read ready or after, so the process exits and its supervisor
+    /// starts it again. A word told before the serve began is one its
+    /// receiver was made after: the serve reads it by its value.
+    #[tokio::test]
+    async fn a_serve_whose_deciding_thread_unwound_ends_with_an_error() {
+        #[derive(Clone, Copy, Debug, PartialEq)]
+        enum Told {
+            BeforeTheServe,
+            BeforeReady,
+            AfterReady,
+        }
+        for told in [Told::BeforeTheServe, Told::BeforeReady, Told::AfterReady] {
+            let controller = Controller::bind(valid()).await.expect("the listeners bind");
+            let shared = Arc::clone(&controller.shared);
+            let mut phase = controller.phase.subscribe();
+            if told == Told::BeforeTheServe {
+                shared.deciders.tell_unwound();
+            }
+            let unwinds = async move {
+                if told == Told::AfterReady {
+                    let serving = |phase: &Phase| *phase == Phase::Serving;
+                    assert!(phase.wait_for(serving).await.is_ok(), "the serve is ready");
+                }
+                if told != Told::BeforeTheServe {
+                    shared.deciders.tell_unwound();
+                }
+            };
+            let (served, ()) = timeout(Duration::from_secs(20), async {
+                tokio::join!(controller.serve(pending()), unwinds)
+            })
+            .await
+            .expect("the serve ends within twenty seconds");
+            assert!(
+                matches!(served, Err(Error::DeciderEnded)),
+                "told {told:?}: {served:?}"
             );
         }
     }
@@ -728,5 +1093,71 @@ mod tests {
             record.holder.is_empty(),
             "the lease is released when the serve has returned: {record:?}"
         );
+    }
+
+    /// The largest grace period a caller can set is one the clock cannot
+    /// add to the present. A serve under it leaves as under any other, by a
+    /// signal and by a listener's error: it waits for the release, and the
+    /// lease is free when the serve has returned.
+    #[tokio::test]
+    async fn a_serve_under_a_grace_period_the_clock_cannot_hold_leaves_with_its_lease_released() {
+        for by_error in [false, true] {
+            let mut lease = MemoryLease::new();
+            let mut config = valid();
+            config.shutdown_grace = Duration::MAX;
+            let mut controller = Controller::bind(config).await.expect("the listeners bind");
+            controller.elector = Elector::new(
+                Box::new(ReleasesSlowly {
+                    lease: lease.clone(),
+                    slow: Duration::from_millis(500),
+                }),
+                "controller-0@127.0.0.1:1",
+                ElectionSettings {
+                    duration: Duration::from_millis(300),
+                    renew_period: Duration::from_millis(20),
+                    renew_deadline: Duration::from_millis(200),
+                },
+            )
+            .expect("the settings are in order");
+            let fence = controller.elector.fence();
+            let (leave, left) = oneshot::channel::<()>();
+            let serve = async {
+                if by_error {
+                    controller
+                        .serve_until(pending(), async move {
+                            let _ = left.await;
+                            Error::Task("a listener failed".to_owned())
+                        })
+                        .await
+                } else {
+                    controller
+                        .serve(async move {
+                            let _ = left.await;
+                        })
+                        .await
+                }
+            };
+            let told = async {
+                // The take lands, then the serve is told to leave.
+                while fence.term() == 0 {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                leave.send(()).expect("the serve waits for its leave");
+            };
+            let (served, ()) =
+                timeout(Duration::from_secs(60), async { tokio::join!(serve, told) })
+                    .await
+                    .expect("the serve ends");
+            if by_error {
+                assert!(matches!(served, Err(Error::Task(_))), "{served:?}");
+            } else {
+                assert!(served.is_ok(), "{served:?}");
+            }
+            let record = lease.read().expect("a read").expect("a record");
+            assert!(
+                record.holder.is_empty(),
+                "the lease is released when the serve has returned (by an error: {by_error}): {record:?}"
+            );
+        }
     }
 }

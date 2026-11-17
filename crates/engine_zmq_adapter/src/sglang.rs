@@ -476,11 +476,17 @@ pub(crate) fn translate_request_sglang(
         ),
         None => (None, None, None),
     };
-    let routed_dp_rank = match (placement, bootstrap_room) {
-        (RankPlacement::RoomResidue, Some(room)) => {
-            room_residue_rank(room, req.data_parallel_rank, ranks, &req.request_id, yields)
+    let (routed_dp_rank, disagg_prefill_dp_rank) = match (placement, bootstrap_room) {
+        (RankPlacement::RoomResidue, Some(room)) => (
+            room_residue_rank(room, req.data_parallel_rank, ranks, &req.request_id, yields),
+            None,
+        ),
+        (RankPlacement::ReplicaRoomResidue, Some(room)) => {
+            let rank =
+                room_residue_rank(room, req.data_parallel_rank, ranks, &req.request_id, yields);
+            (rank, rank)
         }
-        _ => routed_dp_rank(req.data_parallel_rank, ranks)?,
+        _ => (routed_dp_rank(req.data_parallel_rank, ranks)?, None),
     };
     Ok(TokenizedGenerateReqInput {
         rid: req.request_id,
@@ -508,6 +514,7 @@ pub(crate) fn translate_request_sglang(
         bootstrap_port,
         bootstrap_room,
         routed_dp_rank,
+        disagg_prefill_dp_rank,
         require_reasoning: req.require_reasoning,
         ..TokenizedGenerateReqInput::default()
     })
@@ -678,12 +685,19 @@ fn wire_tensor_sglang(
 /// default (`load_balance_method` `auto` resolves to `follow_bootstrap_room`
 /// there), its KV sender fails a request that runs on another rank than
 /// `bootstrap_room % dp_size`, and the decode side looks for the KV on that
-/// rank. The servicer that launched the engine says which
-/// (`ZmqEngineClient::note_engine_places_by_rendezvous_room`).
+/// rank. Among plain data-parallel replicas the request names that rank as
+/// well (`disagg_prefill_dp_rank`): each replica is attention-DP rank 0, so
+/// the sender fails an unnamed request on every replica but the first. Under
+/// attention DP the request stays unnamed: a named one skips the sender's
+/// registration of its rank, which a decode side that asks for it waits for.
+/// The servicer that launched the engine says which
+/// (`ZmqEngineClient::note_engine_places_by_rendezvous_room`,
+/// `ZmqEngineClient::note_engine_ranks_are_replicas`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RankPlacement {
     Pin,
     RoomResidue,
+    ReplicaRoomResidue,
 }
 
 /// The scheduler rank a disaggregated request goes to on a prefill side that
@@ -1407,6 +1421,32 @@ mod tests {
         );
     }
 
+    /// A chat request's `min_tokens` survives the whole path to the engine:
+    /// the gateway's chat builder writes it to the proto, the translation
+    /// copies it, and the request decoded from the wire's bytes carries it.
+    #[test]
+    fn a_chat_requests_min_tokens_survive_the_wire() {
+        use openai_protocol::chat::ChatCompletionRequest;
+        use smg_grpc_client::sglang_scheduler::SglangSchedulerClient;
+
+        let chat: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}],
+            "min_tokens": 30, "max_tokens": 40
+        }))
+        .expect("a chat request");
+        let proto = SglangSchedulerClient::build_generate_request_from_chat_parts(
+            "r1".to_string(),
+            &chat,
+            "hi".to_string(),
+            vec![1, 2, 3],
+            Default::default(),
+        )
+        .expect("the chat builder");
+        let wire = translate(proto).expect("the translation");
+        let back: WireRequest = decode_msgpack(&encode_msgpack(&wire).unwrap()).unwrap();
+        assert_eq!(back.sampling_params.min_new_tokens, 30);
+    }
+
     /// The rows become the proto's shapes: a tick's rows flattened on the
     /// chunk, one `HiddenStates` per position on the completion, the final
     /// layer, the positions absolute from the anchor the scheduler's counters
@@ -1733,6 +1773,61 @@ mod tests {
             (wire.bootstrap_room, wire.routed_dp_rank),
             (Some(7), Some(1))
         );
+    }
+
+    #[test]
+    fn sglang_translation_names_the_prefill_rank_among_replicas() {
+        use RankPlacement::{Pin, ReplicaRoomResidue, RoomResidue};
+
+        let ranks_of = |placement: RankPlacement, room: Option<i32>, pin: Option<i32>, ranks| {
+            let wire = translate_request_sglang(
+                sglang_proto::GenerateRequest {
+                    request_id: "pd".into(),
+                    tokenized: Some(sglang_proto::TokenizedInput {
+                        original_text: String::new(),
+                        input_ids: vec![1, 2, 3],
+                    }),
+                    data_parallel_rank: pin,
+                    disaggregated_params: room.map(|room| sglang_proto::DisaggregatedParams {
+                        bootstrap_host: "10.0.0.1".into(),
+                        bootstrap_port: 8998,
+                        bootstrap_room: room,
+                    }),
+                    ..Default::default()
+                },
+                default_ready_response().max_model_len,
+                ranks,
+                placement,
+                &PinYieldNote::default(),
+            )
+            .unwrap();
+            (wire.routed_dp_rank, wire.disagg_prefill_dp_rank)
+        };
+        assert_eq!(
+            ranks_of(ReplicaRoomResidue, Some(7), None, 2),
+            (Some(1), Some(1))
+        );
+        assert_eq!(
+            ranks_of(ReplicaRoomResidue, Some(8), Some(1), 2),
+            (Some(0), Some(0)),
+            "the pin yields and the room's rank is the one named"
+        );
+        assert_eq!(
+            ranks_of(ReplicaRoomResidue, Some(7), None, 4),
+            (Some(3), Some(3))
+        );
+        assert_eq!(
+            ranks_of(ReplicaRoomResidue, Some(7), None, 1),
+            (None, None),
+            "a single rank has nothing to name"
+        );
+        assert_eq!(
+            ranks_of(ReplicaRoomResidue, None, Some(1), 2),
+            (Some(1), None),
+            "no room: the pin rule, nothing named"
+        );
+        assert_eq!(ranks_of(RoomResidue, Some(7), None, 2), (Some(1), None));
+        assert_eq!(ranks_of(Pin, Some(7), Some(1), 2), (Some(1), None));
     }
 
     /// A pin's yield to the room goes through the note of the connection it

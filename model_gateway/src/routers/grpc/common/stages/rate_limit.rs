@@ -19,12 +19,10 @@
 
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use axum::response::Response;
 use tracing::warn;
 use uuid::Uuid;
 
-use super::PipelineStage;
 pub(crate) use crate::routers::common::rate_limit_cell::{RateLimitCell, RateLimitOutcome};
 use crate::{
     middleware::TenantRequestMeta,
@@ -57,11 +55,11 @@ impl RateLimitReserveStage {
     pub fn new(manager: Option<Arc<RateLimitManager>>) -> Self {
         Self { manager }
     }
-}
 
-#[async_trait]
-impl PipelineStage for RateLimitReserveStage {
-    async fn execute(&self, ctx: &mut RequestContext) -> Result<(), Response> {
+    /// Called by the pipeline on the stage's own type, as the worker
+    /// selection's `execute` is: a `PipelineStage` impl would box the future
+    /// of every call, an allocation per request.
+    pub(crate) async fn execute(&self, ctx: &mut RequestContext) -> Result<(), Response> {
         let Some(manager) = &self.manager else {
             return Ok(());
         };
@@ -99,10 +97,6 @@ impl PipelineStage for RateLimitReserveStage {
                 .await
             }
         }
-    }
-
-    fn name(&self) -> &'static str {
-        "RateLimitReserve"
     }
 }
 

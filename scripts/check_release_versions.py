@@ -84,6 +84,7 @@ GATEWAY = "smg"
 
 CRATES = (
     crate("openai-protocol", "crates/protocols", "openai-protocol"),
+    crate("smg-worker", "crates/worker", "smg-worker"),
     crate("smg-mm-rdma", "crates/mm_rdma", "smg-mm-rdma"),
     crate("engine-zmq-client", "crates/engine_zmq_client", "engine-zmq-client"),
     crate("reasoning-parser", "crates/reasoning_parser", "reasoning-parser"),
@@ -95,7 +96,7 @@ CRATES = (
     crate("smg-auth", "crates/auth", "smg-auth"),
     crate("smg-mcp", "crates/mcp", "smg-mcp"),
     crate("kv-index", "crates/kv_index", "kv-index"),
-    crate("smg-radix-tree", "crates/radix_tree", "smg-radix-tree"),
+    crate("smg-radix-tree", "crates/radix_tree"),
     crate("data-connector", "crates/data_connector", "smg-data-connector"),
     crate("llm-multimodal", "crates/multimodal", "llm-multimodal"),
     crate("smg-wasm", "crates/wasm", "smg-wasm"),

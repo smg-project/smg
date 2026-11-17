@@ -34,7 +34,7 @@ use smg_grpc_client::{sglang_proto, tokenspeed_proto, trtllm_proto, vllm_proto a
 use tokio::time::Instant;
 
 #[cfg(unix)]
-use crate::sockets::unlink_stale_socket;
+use crate::sockets::{is_leftover_handshake_socket, unlink_stale_socket};
 use crate::{
     abort_status::engine_abort_status,
     eos::EosTokenIds,
@@ -191,6 +191,8 @@ pub(crate) struct ZmqConnectionMeta {
     /// disagrees yielding to it
     /// (see [`ZmqEngineClient::note_engine_places_by_rendezvous_room`]).
     engine_places_by_rendezvous_room: OnceLock<()>,
+    /// See [`ZmqEngineClient::note_engine_ranks_are_replicas`].
+    engine_ranks_are_replicas: OnceLock<()>,
     /// A pin's yield to the room on this connection: the first is logged at
     /// WARN, the rest at DEBUG (`PinYieldNote`).
     pin_yield: PinYieldNote,
@@ -303,6 +305,13 @@ pub async fn connect_with_eos(
     {
         unlink_stale_socket(&input).await?;
         unlink_stale_socket(&output).await?;
+        // The handshake's directory is the caller's choice and is not
+        // verified above, and nothing keeps its address to one process: its
+        // leftover is swept only where the directory and the socket are this
+        // user's own and no listener answers.
+        if is_leftover_handshake_socket(&handshake).await {
+            unlink_stale_socket(&handshake).await?;
+        }
     }
     tracing::info!(
         "Binding ZMQ client for worker {base_url} (handshake={handshake}, engines={engine_count:?})"
@@ -428,6 +437,7 @@ impl ZmqEngineClient {
                 supported_tasks: tokio::sync::OnceCell::new(),
                 engine_truncates_long_prompts: OnceLock::new(),
                 engine_places_by_rendezvous_room: OnceLock::new(),
+                engine_ranks_are_replicas: OnceLock::new(),
                 pin_yield: PinYieldNote::default(),
                 request_timeout: OnceLock::new(),
             }),
@@ -531,6 +541,15 @@ impl ZmqEngineClient {
     /// nothing.
     pub fn note_engine_places_by_rendezvous_room(&self) {
         let _ = self.meta.engine_places_by_rendezvous_room.set(());
+    }
+
+    /// The ranks of an engine that places by the room
+    /// ([`Self::note_engine_places_by_rendezvous_room`]) are plain
+    /// data-parallel replicas, as the launcher that started it knows: from
+    /// now a room-placed request names its rank to the engine, whose KV
+    /// sender fails an unnamed one on every replica but the first.
+    pub fn note_engine_ranks_are_replicas(&self) {
+        let _ = self.meta.engine_ranks_are_replicas.set(());
     }
 
     /// The window the prompt admission applies on this connection: the
@@ -1187,10 +1206,12 @@ impl ZmqEngineClient {
         // pin, or on a prefill side that follows the room by its room's
         // residue ([`Self::note_engine_places_by_rendezvous_room`]).
         let ranks = client.engines().len();
-        let placement = if self.meta.engine_places_by_rendezvous_room.get().is_some() {
-            RankPlacement::RoomResidue
-        } else {
+        let placement = if self.meta.engine_places_by_rendezvous_room.get().is_none() {
             RankPlacement::Pin
+        } else if self.meta.engine_ranks_are_replicas.get().is_some() {
+            RankPlacement::ReplicaRoomResidue
+        } else {
+            RankPlacement::RoomResidue
         };
         let mut streams = Vec::new();
         // Fan-out clones share identical media; cache only within this request.
@@ -1870,8 +1891,10 @@ impl ZmqEngineClient {
                     world_size: ready
                         .map_or(1, |r| i32::try_from(r.world_size).unwrap_or(i32::MAX)),
                     // The handshake does not say which structural-tag
-                    // vocabulary the engine's grammar compiler takes.
+                    // vocabulary the engine's grammar compiler takes, nor
+                    // where the engine starts a grammar.
                     structural_tag_vocabulary: String::new(),
+                    constrained_decoding_start: String::new(),
                 }))
             }
         }
@@ -2198,6 +2221,36 @@ mod tests {
         let client = connected_client(dir.path(), "resolved", resolved.clone()).await;
         client.adopt_tokenizer_eos(Some(&tokenizer));
         assert_eq!(client.effective_eos(), &resolved);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_live_handshake_listener_is_not_swept() {
+        use std::os::unix::net::UnixListener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let base_url = format!("ipc://{}", dir.path().join("w").display());
+        let path = dir.path().join("hs.sock");
+        let handshake = format!("ipc://{}", path.display());
+        let _listener = UnixListener::bind(&path).unwrap();
+
+        let Err(reason) = connect_with_eos(
+            &base_url,
+            "m".to_string(),
+            RuntimeType::Vllm,
+            Handshake::TcpOrIpc(&handshake),
+            1,
+            EosTokenIds::default(),
+            Duration::from_secs(1),
+        )
+        .await
+        else {
+            panic!("a bind over a live listener's socket must fail");
+        };
+        assert!(reason.contains("in use"), "{reason}");
+        crate::sockets::knock_ipc_socket(&path)
+            .await
+            .expect("the listener still answers at its path");
     }
 
     /// The gateway's connect path across a retry: the first handshake greets

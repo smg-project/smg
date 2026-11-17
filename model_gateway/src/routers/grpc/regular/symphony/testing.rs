@@ -280,6 +280,7 @@ pub(super) fn read_with(format: Format) -> Vec<Event<'static>> {
         forcing: None,
         opener: None,
         forced_ids: None,
+        json_answer: false,
         span: tracing::Span::none(),
         marked: Arc::default(),
     };

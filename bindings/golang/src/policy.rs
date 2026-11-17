@@ -177,7 +177,7 @@ impl Worker for GrpcWorker {
 
     fn try_increment_load(&self, max: usize) -> bool {
         self.load
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
                 current.checked_add(1).filter(|next| *next <= max)
             })
             .is_ok()
@@ -242,18 +242,6 @@ impl Worker for GrpcWorker {
     async fn get_backend_client(&self) -> WorkerResult<Option<Arc<BackendClient>>> {
         // Not used by policies — the FFI layer handles the backend directly.
         Ok(None)
-    }
-
-    async fn grpc_health_check(&self) -> WorkerResult<bool> {
-        Ok(self.is_healthy())
-    }
-
-    async fn zmq_health_check(&self) -> WorkerResult<bool> {
-        Ok(self.is_healthy())
-    }
-
-    async fn http_health_check(&self) -> WorkerResult<bool> {
-        Ok(self.is_healthy())
     }
 }
 
