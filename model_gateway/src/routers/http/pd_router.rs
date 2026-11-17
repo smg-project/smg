@@ -54,7 +54,11 @@ use crate::{
     rate_limit::RateLimitManager,
     routers::{
         common::{
-            attach_sized_body, header_utils,
+            attach_sized_body,
+            attempt_ledger::{
+                is_definitive_failure, mark_failed_side, mark_upstream_answer, AttemptLedger,
+            },
+            header_utils,
             kv_transfer::{
                 carries_moriio_peer_markers, connector_mode_for_worker, is_moriio_worker,
                 mooncake_decode_params, mooncake_prefill_params, moriio_decode_params,
@@ -65,7 +69,9 @@ use crate::{
             },
             overload,
             pd_failure::{PdSide, SidePhase},
-            placement::{self, PairFailure, PlacementFailure, PlacementInputs, RefusalSite},
+            placement::{
+                self, CandidateFilter, PairFailure, PlacementFailure, PlacementInputs, RefusalSite,
+            },
             prefill_admission::{
                 acquire_prefill, PrefillAcquireError, PrefillAdmission, PrefillAdmissionRejection,
                 PrefillLoadGuard, PrefillSelectionContext,
@@ -100,6 +106,11 @@ use crate::{
 /// instead of being reworded as a circuit-breaker failure by
 /// [`PDRouter::handle_server_selection_error`].
 type PdPair = (Arc<dyn Worker>, Arc<dyn Worker>);
+
+/// Response extension: the side whose worker answered the attempt's 500
+/// itself (see [`PDRouter::settle_attempt`]).
+#[derive(Clone, Copy, Debug)]
+struct OwnFailure(PdSide);
 
 /// The load one admitted PD request holds. The Prefill guard is released
 /// when the Prefill phase ends; the Decode guard rides on the response body.
@@ -740,13 +751,17 @@ impl PDRouter {
             ReleasePoint::from_retry_config(retry_config),
         );
 
+        // What the request's attempts tell the worker pool: a retry selects
+        // around a worker whose answer was definitive (`attempt_ledger`).
+        let ledger = AttemptLedger::default();
+
         let response = if let Some(denied) = denial {
             denied
         } else if lease.release_point() == ReleasePoint::AfterDispatch {
             // Retries disabled: one dispatch; the lease frees the parsed
             // request as soon as its serialized sides exist.
             let res = self
-                .execute_dual_dispatch_attempt(0, headers, &lease, context)
+                .execute_dual_dispatch_attempt(0, headers, &lease, context, &ledger)
                 .await;
             // Mirror the retry executor's exhaustion accounting for a
             // retryable response that gets no retry.
@@ -758,15 +773,17 @@ impl PDRouter {
         } else {
             // The lease keeps the request alive for replay until the retry
             // window closes (first non-retryable response).
-            let lease = &lease;
+            let (lease, ledger) = (&lease, &ledger);
             RetryExecutor::execute_response_with_retry(
                 retry_config,
                 {
                     move |attempt: u32| {
                         let context = context.clone();
                         async move {
-                            self.execute_dual_dispatch_attempt(attempt, headers, lease, context)
-                                .await
+                            self.execute_dual_dispatch_attempt(
+                                attempt, headers, lease, context, ledger,
+                            )
+                            .await
                         }
                     }
                 },
@@ -835,12 +852,16 @@ impl PDRouter {
 
     /// One PD dispatch attempt: select the pair, lease-serialize the
     /// per-side bodies, dispatch, and record per-attempt worker outcomes.
+    /// A retry selects around the workers the request's `ledger` closed the
+    /// retry window on, and the attempt's answer is settled on that ledger
+    /// ([`Self::settle_attempt`]).
     async fn execute_dual_dispatch_attempt<T: Serialize>(
         &self,
         attempt: u32,
         headers: Option<&HeaderMap>,
         lease: &RequestLease<T>,
         context: PDRequestContext<'_>,
+        ledger: &AttemptLedger,
     ) -> Response {
         // Admission may queue the request, so the selection inputs are copied
         // out of the lease's synchronous view first.
@@ -853,16 +874,26 @@ impl PDRouter {
             )
         });
         let sticky_key = self.policy_registry.sticky_key(headers, rid_key.as_deref());
+        // A retry never goes back to a worker whose answer was definitive
+        // for this request. The selection may wait for admission, so the
+        // filter is built here, as the gRPC selection stage builds its own,
+        // and not through `AttemptLedger::with_candidate_filter`. A first
+        // attempt asks nothing of each candidate.
+        let admits = |worker: &dyn Worker| ledger.admits(worker);
+        let candidate_filter: Option<CandidateFilter<'_>> =
+            if attempt == 0 { None } else { Some(&admits) };
+        // The dispatch takes the context; the settle reads the model after it.
+        let model_id = context.model_id;
         let selected = self
             .select_pd_pair_with_admission(
-                context.model_id,
+                model_id,
                 PlacementInputs {
                     text: text.as_deref(),
                     tokens: tokens.as_deref(),
                     headers: context.headers.as_ref(),
                     rid_key: rid_key.as_deref(),
                     cache_namespace,
-                    candidate_filter: None,
+                    candidate_filter,
                     tried: &[],
                 },
                 sticky_key,
@@ -1033,7 +1064,7 @@ impl PDRouter {
             lease.release_dispatch();
 
             if let (true, Some((prefill_endpoint, _))) = (concurrent_write, &moriio_endpoints) {
-                return self
+                let response = self
                     .execute_moriio_concurrent_write(
                         headers,
                         (prefill_body, decode_body),
@@ -1046,12 +1077,13 @@ impl PDRouter {
                         guards,
                     )
                     .await;
+                return self.settle_attempt(ledger, model_id, [&prefill, &decode], response);
             }
 
             // Outcome accounting happens per-side inside the sequential path:
             // a prefill-only failure must not feed the decode worker's
             // circuit breaker (the decode side was never contacted).
-            return self
+            let response = self
                 .execute_sequential_dispatch_internal(
                     headers,
                     (prefill_body, decode_body),
@@ -1064,6 +1096,7 @@ impl PDRouter {
                     guards,
                 )
                 .await;
+            return self.settle_attempt(ledger, model_id, [&prefill, &decode], response);
         }
 
         let sides =
@@ -1174,7 +1207,7 @@ impl PDRouter {
             prefill_outcome,
             head_success_recorded(&response),
         );
-        response
+        self.settle_attempt(ledger, model_id, [&prefill, &decode], response)
     }
 
     /// Record an attempt's outcome on both sides. On the early-commit path the
@@ -1243,6 +1276,76 @@ impl PDRouter {
         answer
     }
 
+    /// The answer for a decode worker that answered an error status before
+    /// the side's first byte ([`Self::side_refused`]), marked as the
+    /// worker's own answer. Its 500 is definitive for the payload and names
+    /// the decode side for the request's ledger ([`Self::settle_attempt`]).
+    /// Its other statuses name no side and are replayed as before.
+    async fn decode_refused(decode: &dyn Worker, response: reqwest::Response) -> Response {
+        error!(
+            "Decode server returned error status decode_url={} status={}",
+            decode.redacted_url(),
+            response.status()
+        );
+        let mut answer = Self::side_refused(PdSide::Decode, response).await;
+        mark_upstream_answer(&mut answer);
+        if is_definitive_failure(&answer) {
+            answer.extensions_mut().insert(OwnFailure(PdSide::Decode));
+        }
+        answer
+    }
+
+    /// An attempt's definitive answer on the request's ledger, settled as
+    /// the regular HTTP route and the gRPC pipeline settle theirs, over the
+    /// pairs the model's index can still form among its available workers.
+    ///
+    /// The worker that answered takes no further attempt of this request
+    /// while a pair is left without it, and the retry selects another
+    /// worker of its side. A side's status can carry its partner's part of
+    /// the handoff (a decode side that is not streamed answers after the
+    /// transfer), so when the worker that answered is the last of its side
+    /// that can pair, the retry leaves its partner instead and keeps the
+    /// worker. With no pair left either way the answer goes back to the
+    /// client as it is. Any other response passes untouched.
+    fn settle_attempt(
+        &self,
+        ledger: &AttemptLedger,
+        model_id: &str,
+        pair: [&Arc<dyn Worker>; 2],
+        mut response: Response,
+    ) -> Response {
+        let Some(&OwnFailure(side)) = response.extensions().get::<OwnFailure>() else {
+            return response;
+        };
+        let [prefill, decode] = pair;
+        let (answered, partner) = match side {
+            PdSide::Prefill => (prefill, decode),
+            PdSide::Decode => (decode, prefill),
+        };
+        let pairs = self.pd_pairs(model_id);
+        let pairs_without = |gone: &Arc<dyn Worker>| {
+            let free = |worker: &Arc<dyn Worker>| {
+                worker.base_url() != gone.base_url()
+                    && worker.is_available()
+                    && ledger.admits(worker.as_ref())
+            };
+            pairs
+                .prefill
+                .iter()
+                .zip(&pairs.partners)
+                .any(|(candidate, partners)| free(candidate) && partners.iter().any(&free))
+        };
+        let left = [answered, partner]
+            .into_iter()
+            .find(|&worker| pairs_without(worker));
+        mark_failed_side(&mut response, left.unwrap_or(answered).as_ref());
+        // With no pair left the ledger is given no pool to seek an
+        // alternative in, and the answer stands.
+        let pool = left.map(|_| pairs.prefill_pool.iter().chain(pairs.decode_pool.iter()));
+        ledger.settle(&mut response, pair, pool.into_iter().flatten());
+        response
+    }
+
     /// The decode side's response head, once the prefill side is done with:
     /// the side's outcome recorded (a streamed head's success is the relay's
     /// to record, before it spawns its task, see `create_streaming_response`;
@@ -1265,12 +1368,7 @@ impl PDRouter {
             Self::record_sequential_side(decode.as_ref(), metrics_labels::WORKER_DECODE, status);
         }
         if !status.is_success() {
-            error!(
-                "Decode server returned error status decode_url={} status={}",
-                decode.redacted_url(),
-                status
-            );
-            return Self::side_refused(PdSide::Decode, decode_response).await;
+            return Self::decode_refused(decode.as_ref(), decode_response).await;
         }
         Metrics::record_pd_ttft(
             metrics_labels::BACKEND_PD,
@@ -1535,12 +1633,7 @@ impl PDRouter {
             }
             Err(DispatchError::Prefill(response)) => return response,
             Err(DispatchError::Decode(response)) => {
-                error!(
-                    "Decode server returned error status decode_url={} status={}",
-                    decode.redacted_url(),
-                    response.status()
-                );
-                return Self::side_refused(PdSide::Decode, response).await;
+                return Self::decode_refused(decode.as_ref(), response).await;
             }
         };
 
@@ -8212,14 +8305,17 @@ mod tests {
     /// A healthy server for `side` on `shape`: what its partner's failure is
     /// measured next to.
     async fn healthy_stub(shape: Shape, side: PdSide) -> String {
+        spawn_recording_stub(healthy_answer(shape, side)).await.0
+    }
+
+    /// What a healthy server for `side` on `shape` answers.
+    fn healthy_answer(shape: Shape, side: PdSide) -> &'static str {
         match (shape, side) {
-            (Shape::Sequential, PdSide::Prefill) => spawn_recording_stub(
-                r#"{"kv_transfer_params":{"remote_engine_id":"eng0","remote_block_ids":[1,2]}}"#,
-            )
-            .await
-            .0,
-            (Shape::Parallel, PdSide::Prefill) => spawn_recording_stub("{}").await.0,
-            (_, PdSide::Decode) => spawn_recording_stub(r#"{"choices":[]}"#).await.0,
+            (Shape::Sequential, PdSide::Prefill) => {
+                r#"{"kv_transfer_params":{"remote_engine_id":"eng0","remote_block_ids":[1,2]}}"#
+            }
+            (Shape::Parallel, PdSide::Prefill) => "{}",
+            (_, PdSide::Decode) => r#"{"choices":[]}"#,
         }
     }
 
@@ -8431,6 +8527,264 @@ mod tests {
             "{} of {total} rows do not answer the shared vocabulary:\n{}",
             mismatches.len(),
             mismatches.join("\n")
+        );
+    }
+
+    /// A decode policy with a favourite: the worker at that address whenever
+    /// it is among the candidates, as a policy that holds a session or a
+    /// cached prefix picks one worker for one request at every attempt.
+    #[derive(Debug)]
+    struct Favours(String);
+
+    impl crate::policies::LoadBalancingPolicy for Favours {
+        fn select_worker(
+            &self,
+            workers: &[Arc<dyn Worker>],
+            _info: &crate::policies::SelectWorkerInfo,
+        ) -> Option<usize> {
+            workers
+                .iter()
+                .position(|worker| worker.url() == self.0)
+                .or_else(|| (!workers.is_empty()).then_some(0))
+        }
+
+        fn name(&self) -> &'static str {
+            "favours"
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// The default retry allowance with no real back-off between attempts.
+    fn quick_retry_router() -> PDRouter {
+        PDRouter {
+            retry_config: RetryConfig {
+                initial_backoff_ms: 1,
+                max_backoff_ms: 1,
+                ..Default::default()
+            },
+            ..create_test_pd_router()
+        }
+    }
+
+    /// A decode server that answers `status` with an error body before the
+    /// side's first byte, and what arrived at it.
+    async fn refusing_decode_stub(status: StatusCode) -> (String, Arrivals) {
+        spawn_delayed_stub(
+            status,
+            json!({"error": {"message": REFUSAL}}),
+            std::time::Duration::ZERO,
+        )
+        .await
+    }
+
+    /// One prefill worker of `shape` and the decode workers behind it.
+    fn register_fleet(router: &PDRouter, shape: Shape, prefill_url: &str, decode_urls: &[&str]) {
+        for decode_url in decode_urls {
+            let (prefill_url, decode_url) = (prefill_url.to_string(), (*decode_url).to_string());
+            match shape {
+                Shape::Sequential => {
+                    for worker in sequential_pair(prefill_url, decode_url) {
+                        router.worker_registry.register_or_replace(worker);
+                    }
+                }
+                Shape::Parallel => register_pd_pair(router, prefill_url, decode_url),
+            }
+        }
+    }
+
+    /// A decode worker's own 500, answered before the side's first byte, is
+    /// its answer for the payload: a replay on it costs the same work for
+    /// the same answer. With no other decode worker available the request
+    /// makes one attempt and the client reads the worker's 500, as on the
+    /// regular HTTP route and the gRPC prefill-decode route. A status that
+    /// says "not served now" (503) is replayed for every attempt the retry
+    /// config allows. Both dispatch shapes.
+    #[tokio::test]
+    async fn a_lone_decode_workers_own_500_goes_back_after_one_attempt() {
+        let mut mismatches = Vec::new();
+        for shape in [Shape::Sequential, Shape::Parallel] {
+            for (status, replayed) in [
+                (StatusCode::INTERNAL_SERVER_ERROR, false),
+                (StatusCode::SERVICE_UNAVAILABLE, true),
+            ] {
+                let prefill_url = healthy_stub(shape, PdSide::Prefill).await;
+                let (decode_url, arrivals) = refusing_decode_stub(status).await;
+                let router = quick_retry_router();
+                register_fleet(&router, shape, &prefill_url, &[decode_url.as_str()]);
+
+                let response = chat_through(&router, false).await;
+
+                let attempts = arrivals.lock().unwrap().len();
+                let expected = if replayed {
+                    router.retry_config.max_retries as usize
+                } else {
+                    1
+                };
+                if response.status() != status || attempts != expected {
+                    mismatches.push(format!(
+                        "{shape:?}: {} after {attempts} attempts on the refusing decode worker, \
+                         expected {status} after {expected}",
+                        response.status()
+                    ));
+                }
+            }
+        }
+        assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+    }
+
+    /// With another decode worker available the retry leaves the decode
+    /// worker that answered its own 500, even under a policy that picks
+    /// that worker whenever it is a candidate: one attempt on it, then the
+    /// free worker's answer. Placed as a first attempt, a retry would go
+    /// back to the refusing worker every time. Both dispatch shapes.
+    #[tokio::test]
+    async fn the_retry_leaves_a_decode_worker_that_answered_its_own_500() {
+        for shape in [Shape::Sequential, Shape::Parallel] {
+            let prefill_url = healthy_stub(shape, PdSide::Prefill).await;
+            let (refusing_url, refused) =
+                refusing_decode_stub(StatusCode::INTERNAL_SERVER_ERROR).await;
+            let (free_url, served) = spawn_recording_stub(r#"{"choices":[]}"#).await;
+            let router = quick_retry_router();
+            register_fleet(
+                &router,
+                shape,
+                &prefill_url,
+                &[refusing_url.as_str(), free_url.as_str()],
+            );
+            router
+                .policy_registry
+                .set_decode_policy(Arc::new(Favours(refusing_url)));
+
+            let response = chat_through(&router, false).await;
+
+            assert_eq!(
+                (
+                    response.status(),
+                    refused.lock().unwrap().len(),
+                    served.lock().unwrap().len()
+                ),
+                (StatusCode::OK, 1, 1),
+                "{shape:?}: the answer, the attempts on the refusing decode worker, the \
+                 requests the free one served"
+            );
+        }
+    }
+
+    /// A decode side's status can carry its prefill partner's part of the
+    /// handoff, so the last decode worker that can pair is not left on its
+    /// own 500 while another prefill worker can take the request: the retry
+    /// leaves the prefill partner and keeps the decode worker, even under a
+    /// policy that picks that prefill worker whenever it is a candidate.
+    /// One attempt a prefill worker, then the decode worker's 500 goes
+    /// back. Both dispatch shapes.
+    #[tokio::test]
+    async fn the_retry_leaves_the_partner_of_the_last_decode_worker_that_can_pair() {
+        for shape in [Shape::Sequential, Shape::Parallel] {
+            let answer = healthy_answer(shape, PdSide::Prefill);
+            let (first_url, first) = spawn_recording_stub(answer).await;
+            let (second_url, second) = spawn_recording_stub(answer).await;
+            let (decode_url, refused) =
+                refusing_decode_stub(StatusCode::INTERNAL_SERVER_ERROR).await;
+            let router = quick_retry_router();
+            for prefill_url in [&first_url, &second_url] {
+                register_fleet(&router, shape, prefill_url, &[decode_url.as_str()]);
+            }
+            router
+                .policy_registry
+                .set_prefill_policy(Arc::new(Favours(first_url)));
+
+            let response = chat_through(&router, false).await;
+
+            assert_eq!(
+                (response.status(), refused.lock().unwrap().len()),
+                (StatusCode::INTERNAL_SERVER_ERROR, 2),
+                "{shape:?}: the answer, the attempts on the refusing decode worker"
+            );
+            // The sequential shape's prefill side runs first, so its servers
+            // count every attempt that chose them.
+            if matches!(shape, Shape::Sequential) {
+                assert_eq!(
+                    (first.lock().unwrap().len(), second.lock().unwrap().len()),
+                    (1, 1),
+                    "the requests each prefill worker took"
+                );
+            }
+        }
+    }
+
+    /// The alternative to a decode worker that answered its own 500 is a
+    /// decode worker an available prefill worker can hand off to. A decode
+    /// worker whose only compatible prefill worker is down is none: the
+    /// client reads the worker's 500 after one attempt, where a retry would
+    /// find no pair and answer the placement's refusal in its place.
+    #[tokio::test]
+    async fn a_decode_worker_no_prefill_worker_can_hand_off_to_is_no_alternative() {
+        let prefill_url = healthy_stub(Shape::Sequential, PdSide::Prefill).await;
+        let (decode_url, refused) = refusing_decode_stub(StatusCode::INTERNAL_SERVER_ERROR).await;
+        let (unpaired_url, unpaired) = spawn_recording_stub(r#"{"choices":[]}"#).await;
+        let router = quick_retry_router();
+        let register = |url: &str, worker_type: WorkerType, connector: &str, ready: bool| {
+            let worker = BasicWorkerBuilder::new(url)
+                .worker_type(worker_type)
+                .runtime_type(RuntimeType::Vllm)
+                .kv_connector(connector)
+                .build();
+            if ready {
+                worker.set_status(openai_protocol::worker::WorkerStatus::Ready);
+            }
+            router.worker_registry.register_or_replace(Arc::new(worker));
+        };
+        register(&prefill_url, WorkerType::Prefill, "NixlConnector", true);
+        register(&decode_url, WorkerType::Decode, "NixlConnector", true);
+        // A second pair on another transfer protocol, its prefill worker not
+        // ready: its decode worker is available and cannot be paired.
+        register(
+            "http://127.0.0.1:9",
+            WorkerType::Prefill,
+            "MoRIIOConnector",
+            false,
+        );
+        register(&unpaired_url, WorkerType::Decode, "MoRIIOConnector", true);
+
+        let response = chat_through(&router, false).await;
+
+        assert_eq!(
+            (
+                response.status(),
+                refused.lock().unwrap().len(),
+                unpaired.lock().unwrap().len()
+            ),
+            (StatusCode::INTERNAL_SERVER_ERROR, 1, 0),
+            "the answer, the attempts on the decode worker that answered, the requests the \
+             unpaired decode worker took"
+        );
+    }
+
+    /// The concurrent-write dispatch settles a decode worker's own 500 as
+    /// the other two shapes do: a lone pair makes one attempt and the
+    /// client reads the worker's 500.
+    #[tokio::test]
+    async fn a_concurrent_write_pairs_decode_500_goes_back_after_one_attempt() {
+        let computing = std::time::Duration::from_secs(30);
+        let (prefill_url, _) = spawn_delayed_stub(StatusCode::OK, json!({}), computing).await;
+        let (decode_url, refused) = refusing_decode_stub(StatusCode::INTERNAL_SERVER_ERROR).await;
+        let router = quick_retry_router();
+        register_moriio_pair_with(
+            &router,
+            (prefill_url, Some("write")),
+            (decode_url, "write"),
+            &[CONCURRENT_WRITE],
+        );
+
+        let response = moriio_call(&router, "/v1/chat/completions", None, &json!({})).await;
+
+        assert_eq!(
+            (response.status(), refused.lock().unwrap().len()),
+            (StatusCode::INTERNAL_SERVER_ERROR, 1),
+            "the answer, the attempts on the refusing decode worker"
         );
     }
 
