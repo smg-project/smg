@@ -36,7 +36,8 @@ use crate::{
         error,
         grpc::{
             backend_client::{
-                send_tokenspeed_encode_frame, send_tokenspeed_encode_rpc, BackendClient,
+                backend_client_if_initialized, send_tokenspeed_encode_frame,
+                send_tokenspeed_encode_rpc, BackendClient,
             },
             client::GrpcClient,
             context::{ClientSelection, EncodeOutputs, RequestContext, WorkerSelection},
@@ -394,7 +395,7 @@ fn build_plan(
         let bootstrap_room = rand::rng().random_range(0..i64::MAX);
 
         let worker = &assignment.worker;
-        let backend = worker.backend_client_if_initialized();
+        let backend = backend_client_if_initialized(worker.as_ref())?;
         let (bootstrap_host, bootstrap_port) = bootstrap_rendezvous(
             worker.bootstrap_host(),
             worker.bootstrap_port(),
@@ -666,7 +667,7 @@ mod tests {
                     .worker_type(role)
                     .build();
                 worker
-                    .backend_client
+                    .engine_connection
                     .load_full()
                     .set(Arc::new(client.clone()))
                     .ok()

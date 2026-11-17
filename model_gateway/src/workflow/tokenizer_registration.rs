@@ -29,8 +29,11 @@ use super::data::{require_app_context, TokenizerWorkflowData};
 use crate::{
     app_context::AppContext,
     config::{TokenizerCacheConfig, TEMPLATE_PARSER},
-    routers::grpc::multimodal::{
-        load_image_preprocessor_config, load_video_preprocessor_config, MultimodalModelConfig,
+    routers::grpc::{
+        backend_client::get_backend_client,
+        multimodal::{
+            load_image_preprocessor_config, load_video_preprocessor_config, MultimodalModelConfig,
+        },
     },
     worker::{ConnectionMode, Worker, WorkerRegistry},
     workflow::steps::local::ReleaseTokenizerStep,
@@ -585,7 +588,7 @@ async fn fetch_tokenizer_from_worker(
 async fn fetch_bundle(worker: &dyn Worker) -> Result<StreamBundle, String> {
     let runtime = worker.metadata().spec.runtime_type;
 
-    let backend_client = match worker.get_backend_client().await {
+    let backend_client = match get_backend_client(worker).await {
         Ok(Some(client)) => client,
         Ok(None) => {
             return Err(format!(
