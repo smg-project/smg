@@ -64,8 +64,8 @@ impl FormatTime for UtcSeconds {
 
 /// The nineteen characters of a timestamp in one write. Padding six numbers
 /// through the formatting machinery took a third of a line's work, and every
-/// line carries a timestamp. A year of other than four digits keeps the
-/// formatter, whose text this is for every other year.
+/// line carries a timestamp. A year outside 0 to 9999 keeps the formatter,
+/// whose text this writes for every year inside that range.
 fn write_utc_seconds(w: &mut impl fmt::Write, time: DateTime<Utc>) -> fmt::Result {
     let (month, day) = (time.month(), time.day());
     let (hour, minute, second) = (time.hour(), time.minute(), time.second());
