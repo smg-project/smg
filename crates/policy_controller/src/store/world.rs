@@ -148,6 +148,10 @@ pub struct ViewBuffers {
     /// The affinity column: one entry per candidate under a profile that
     /// declared it, empty otherwise.
     pub affinity: Vec<AffinityFacts>,
+    /// The rows a veto of the asking gateway masks, by position, where the
+    /// view is a publication's own rows ([`World::view`]); empty where the
+    /// rows were written for the decision.
+    pub stalled: Vec<u32>,
 }
 
 /// The buffers a host keeps across pair decisions: both sides' views and
@@ -229,6 +233,31 @@ impl Built {
             reach: self.reach,
         }
     }
+}
+
+/// One decision's view of a pool ([`World::view`]): its rows, and beside
+/// them what is the decision's own where no row carries it.
+#[derive(Clone, Copy, Debug)]
+pub struct PoolView<'a> {
+    /// The decision's candidate slice, in the pool's order: a row's index
+    /// is its position. A publication's own rows where the pool was lent,
+    /// the decision's written copy otherwise.
+    pub candidates: &'a [Candidate],
+    /// The rows a veto of the asking gateway masks at the decision's
+    /// instant, by position, in order: what
+    /// [`Constraints::stalled`](crate::Constraints::stalled) takes. Empty
+    /// where the rows carry their stalled bits.
+    pub stalled: &'a [u32],
+    /// One more than the position of the pinned worker's row: what
+    /// [`RequestFacts::pinned_at`](crate::RequestFacts::pinned_at) takes.
+    /// Zero where no pinned worker is in the pool and where the rows carry
+    /// their session bits.
+    pub pinned_at: u32,
+    /// The affinity column: one entry a row under a profile that declared
+    /// it, empty otherwise.
+    pub affinity: &'a [AffinityFacts],
+    /// What the view read beside the rows.
+    pub built: Built,
 }
 
 /// One pool's shape: what a membership write derives of it and no
@@ -696,7 +725,22 @@ impl World {
     fn build_at(&self, index: usize, ask: &Ask, out: &mut ViewBuffers) -> Option<Built> {
         out.candidates.clear();
         out.affinity.clear();
+        out.stalled.clear();
         let (rows, shape) = (self.rows.get(index)?, self.derived.pools.get(index)?);
+        Some(self.written(index, rows, shape, ask, out))
+    }
+
+    /// The pool at `index` copied into `out` and written for the decision:
+    /// [`World::build`] past its lookup, into buffers its caller cleared.
+    #[inline(always)]
+    fn written(
+        &self,
+        index: usize,
+        rows: &[Candidate],
+        shape: &PoolShape,
+        ask: &Ask,
+        out: &mut ViewBuffers,
+    ) -> Built {
         let now_micros = micros(self.origin, ask.now);
         for (from, to) in Segments::of(&shape.locals, ask.gateway, rows.len()) {
             out.candidates.extend_from_slice(&rows[from..to]);
@@ -731,7 +775,7 @@ impl World {
         // asked last, so no loop of the build holds the answer.
         let masked =
             own.is_some_and(|run| mask(run, ask.now, shape.locals.is_empty(), &mut out.candidates));
-        Some(Built {
+        Built {
             pool_size: out.candidates.len() as u32,
             membership_epoch: self.epoch,
             now_micros,
@@ -743,6 +787,96 @@ impl World {
                 0
             } else {
                 ask.gateway.0
+            },
+        }
+    }
+
+    /// One decision's view of the pool serving `model` in `role`; `None`,
+    /// with the buffers cleared, when no member serves it.
+    ///
+    /// Where every gateway reaches the pool whole, the view is the
+    /// publication's own rows, lent: nothing is written into a row, and
+    /// what [`World::build`] writes there stands beside the rows. A row's
+    /// position was published with it. The vetoes of the asking gateway
+    /// that stand at `ask.now` are handed as positions, in order, read from
+    /// its own run alone and by the build's rule: a veto past its end masks
+    /// nothing. The pinned worker's row is handed as one more than its
+    /// position. Under `ask.affinity` the column is filled as the build
+    /// fills it. A row's report age stays what the report carried when it
+    /// was recorded: the age at the decision is the decision's instant less
+    /// the row's sample instant, and no stage of this crate reads it.
+    ///
+    /// The rows are copied and written ([`World::build`]) where they cannot
+    /// be lent: in a pool that holds host-local rows, where the asking
+    /// gateway's positions are its own, and for a decision that asks for
+    /// `written` rows. A profile that shows its rows to a plugin
+    /// ([`Profile::scoped`](crate::Profile::scoped)) asks for them: a
+    /// plugin's view carries each row's bits and ages as the row's fields.
+    /// Both forms come back as one shape, so a caller hands the mask and
+    /// the pin on whichever rows it was given.
+    pub fn view<'a>(
+        &'a self,
+        model: &str,
+        role: Role,
+        ask: &Ask,
+        written: bool,
+        out: &'a mut ViewBuffers,
+    ) -> Option<PoolView<'a>> {
+        out.candidates.clear();
+        out.affinity.clear();
+        out.stalled.clear();
+        let index = self.index(model, role)?;
+        let (rows, shape) = (self.rows.get(index)?, self.derived.pools.get(index)?);
+        if written || !shape.locals.is_empty() {
+            let built = self.written(index, rows, shape, ask, out);
+            return Some(PoolView {
+                candidates: &out.candidates,
+                stalled: &[],
+                pinned_at: 0,
+                affinity: &out.affinity,
+                built,
+            });
+        }
+        let now_micros = micros(self.origin, ask.now);
+        // The asking gateway's run alone, by the build's rule.
+        let own = self
+            .vetoes
+            .get(index)
+            .and_then(|runs| run_of(runs, ask.gateway));
+        if let Some(run) = own {
+            let standing = run.vetoes.iter().filter(|veto| veto.until > ask.now);
+            out.stalled.extend(standing.map(|veto| veto.row));
+        }
+        // The search of the build's own pin, over the same rows.
+        let pinned_at = ask
+            .pinned
+            .and_then(|id| rows.binary_search_by_key(&id, |row| row.id).ok())
+            .map_or(0, |at| at as u32 + 1);
+        if ask.affinity {
+            let admitted = shape.admitted_micros.iter();
+            out.affinity.extend(admitted.map(|&admitted| AffinityFacts {
+                admitted_age_ms: age_ms(now_micros, admitted),
+                ..AffinityFacts::default()
+            }));
+        }
+        // A view a veto masks is the asking gateway's own list, as a copy
+        // a veto masks is.
+        let reach = if out.stalled.is_empty() {
+            0
+        } else {
+            ask.gateway.0
+        };
+        Some(PoolView {
+            candidates: rows,
+            stalled: &out.stalled,
+            pinned_at,
+            affinity: &out.affinity,
+            built: Built {
+                pool_size: rows.len() as u32,
+                membership_epoch: self.epoch,
+                now_micros,
+                generation: self.spec.generation(),
+                reach,
             },
         })
     }
@@ -1144,6 +1278,13 @@ pub(super) struct Writer {
     unlisted: Vec<Arc<[Candidate]>>,
     /// How many times a publication allocated a pool's rows.
     allocations: u64,
+    /// Every replaced world a reader still held when the cell let it go
+    /// ([`Self::replaced`]), until a publication finds no reader holding it
+    /// and lets it go. The cell holds the standing world and the writer
+    /// each of these, so a decision that drops the last reader's hold
+    /// frees nothing: not the world, its list of pools, its vetoes, its
+    /// derived tables nor its generation.
+    worlds: Vec<Arc<World>>,
     /// Every member's rows, sorted by worker id: a worker serving several
     /// models has a row in each model's pool.
     places: Vec<Place>,
@@ -1156,10 +1297,11 @@ pub(super) struct Writer {
     /// The generation every world is published under until the next is
     /// applied: the unbound one at the start.
     spec: Arc<AppliedSpec>,
-    /// The generation before the standing one, kept one apply longer: a
-    /// decider that lets go of the last world published under it frees no
-    /// engine, the next apply does. Its whole engine stays resident that
-    /// long, its session table included, as it stood when it was replaced.
+    /// The generation before the standing one, kept one apply longer: the
+    /// publication that lets go of the last world published under it
+    /// frees no engine, the next apply does. Its whole engine stays
+    /// resident that long, its session table included, as it stood when
+    /// it was replaced.
     retired: Option<Arc<AppliedSpec>>,
     /// The engines of the membership, as the overload verdict reads them.
     engines: Vec<EngineRows>,
@@ -1215,6 +1357,7 @@ impl Writer {
             held: Vec::new(),
             unlisted: Vec::new(),
             allocations: 0,
+            worlds: Vec::new(),
             places: Vec::new(),
             vetoes: Arc::default(),
             pool_vetoes: Arc::default(),
@@ -1247,6 +1390,18 @@ impl Writer {
         })
     }
 
+    /// Take back the world the cell let go as its successor was shown. One
+    /// no reader holds is freed here, by the write, as a world always was;
+    /// one a reader holds is kept among `worlds`, so that reader's hold is
+    /// not the last. The cell's swap pays each reader's borrow of the
+    /// outgoing world into its count before it returns, so the count read
+    /// here is every reader's.
+    pub(super) fn replaced(&mut self, world: Arc<World>) {
+        if let Err(held) = Arc::try_unwrap(world) {
+            self.worlds.push(held);
+        }
+    }
+
     /// Publish every world from here on under `spec`, the first at once:
     /// the standing membership under the new generation. A number at or
     /// under the standing one is refused by naming the standing one, and
@@ -1266,8 +1421,9 @@ impl Writer {
     /// The generation this one replaces is kept until the next apply, and
     /// the one kept until now is handed back for the caller to let go
     /// outside the store's lock: an engine is freed by the thread that
-    /// applies, never by a decider dropping the last world of an old
-    /// generation, unless a decider holds a world across two applies.
+    /// applies, never by a decider. A world a decider holds across two
+    /// applies keeps its generation past the hand-back: the engine then
+    /// goes with that world, at the publication that lets it go.
     pub(super) fn apply<'a>(
         &mut self,
         spec: Arc<AppliedSpec>,
@@ -1754,7 +1910,15 @@ impl Writer {
                 if entries.is_empty() {
                     continue;
                 }
-                let rows: Vec<Candidate> = entries.iter().map(|entry| entry.row).collect();
+                // A row's position is published with it: a pool every
+                // gateway reaches whole is read where it stands.
+                let rows: Vec<Candidate> = (0u32..)
+                    .zip(&entries)
+                    .map(|(position, entry)| Candidate {
+                        position,
+                        ..entry.row
+                    })
+                    .collect();
                 let index = self.working.len() as u32;
                 self.places
                     .extend(entries.iter().enumerate().map(|(row, entry)| Place {
@@ -2191,6 +2355,11 @@ impl Writer {
     /// still holds. A publication asks each held row's count once, and each
     /// pool with no spare to write over reads each unlisted row's length.
     fn publish(&mut self) -> Arc<World> {
+        // A world no reader holds any more is let go here, by a write, and
+        // before the rows are asked: what it alone listed is free for this
+        // publication.
+        self.worlds
+            .retain_mut(|world| Arc::get_mut(world).is_none());
         let unlisted = |rows: &mut Arc<[Candidate]>| Arc::get_mut(rows).is_some();
         self.unlisted.extend(self.held.extract_if(.., unlisted));
         let pools = self.working.iter_mut().zip(&mut self.published);

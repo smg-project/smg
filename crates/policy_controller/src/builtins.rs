@@ -47,9 +47,49 @@ impl Filter for Healthy {
         true
     }
 
+    fn keep(&self, _: &RequestFacts<'_>, c: &Candidate, cx: &Constraints<'_>) -> bool {
+        c.health.routable_ignoring_overload() && !cx.masks(c.position)
+    }
+
+    /// The host's mask is asked about once: a pass under no standing veto
+    /// pays one test for it, and is then the pass over the rows' own bits.
+    fn retain(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        cx: &Constraints<'_>,
+        kept: &mut Vec<u32>,
+    ) {
+        if !cx.stalled.is_empty() {
+            return retain_masked(candidates, cx, kept);
+        }
+        OwnBits.retain(facts, candidates, cx, kept);
+    }
+}
+
+/// The health filter over a row's own bits alone. A filter of its own, so
+/// that the pass under no standing veto is the loop the trait gives a
+/// filter: written out beside the masked pass, the same test compiled to
+/// two instructions a row more past the first refused row.
+#[derive(Debug)]
+struct OwnBits;
+
+impl Filter for OwnBits {
+    fn name(&self) -> &'static str {
+        "healthy"
+    }
+
     fn keep(&self, _: &RequestFacts<'_>, c: &Candidate, _: &Constraints<'_>) -> bool {
         c.health.routable_ignoring_overload()
     }
+}
+
+/// The health filter's pass under a standing veto: a row's own bits, then
+/// the host's mask. Out of line, so the pass under no veto stays the short
+/// one.
+#[inline(never)]
+fn retain_masked(candidates: &[Candidate], cx: &Constraints<'_>, kept: &mut Vec<u32>) {
+    kept.retain(|&i| candidates[i as usize].health.routable_ignoring_overload() && !cx.masks(i));
 }
 
 /// Not over the overload thresholds, unless the host lifted the veto.
@@ -196,7 +236,7 @@ impl Scorer for SessionAffinity {
 
     fn score(
         &self,
-        _: &RequestFacts<'_>,
+        facts: &RequestFacts<'_>,
         candidates: &[Candidate],
         kept: &[u32],
         out: &mut [f32],
@@ -207,6 +247,12 @@ impl Scorer for SessionAffinity {
             } else {
                 0.0
             };
+        }
+        // A pin that stands beside the rows names one row: it is looked for
+        // once, and a decision under no such pin pays one test for it.
+        let pinned = facts.pinned_at.checked_sub(1);
+        if let Some(slot) = pinned.and_then(|at| kept.iter().position(|&i| i == at)) {
+            out[slot] = 1.0;
         }
         TieBand::NORMALIZED
     }
@@ -4174,6 +4220,55 @@ mod tests {
         };
         assert!(!NotTried.keep(&facts, &c, &excluded));
         assert!(NotTried.soft() && HasRoom.soft() && !Healthy.soft() && !HasCapacity.soft());
+    }
+
+    #[test]
+    fn the_healthy_filter_reads_the_hosts_mask_beside_the_rows_own_bits() {
+        let facts = RequestFacts::default();
+        let mut pool: Vec<Candidate> = (0..6).map(|position| candidate(position, 0)).collect();
+        pool[4].health.breaker_open = true;
+        let mask = [1u32, 3];
+        let cx = Constraints {
+            stalled: &mask,
+            ..Constraints::default()
+        };
+        assert!(!cx.masks(0) && cx.masks(1) && cx.masks(3) && !cx.masks(4));
+        // Row by row and over the whole pool, one answer: a row's own bits
+        // refuse it, and so does the mask.
+        let row_by_row: Vec<u32> = pool
+            .iter()
+            .filter(|row| Healthy.keep(&facts, row, &cx))
+            .map(|row| row.position)
+            .collect();
+        let mut whole = kept(6);
+        Healthy.retain(&facts, &pool, &cx, &mut whole);
+        assert_eq!(row_by_row, [0, 2, 5]);
+        assert_eq!(whole, row_by_row);
+        // Under no veto the mask refuses nobody.
+        let mut whole = kept(6);
+        Healthy.retain(&facts, &pool, &Constraints::default(), &mut whole);
+        assert_eq!(whole, [0, 1, 2, 3, 5]);
+    }
+
+    #[test]
+    fn the_session_scorer_reads_the_pin_beside_the_rows_own_bit() {
+        let pool = [candidate(0, 0), candidate(1, 0), candidate(2, 0)];
+        let unpinned = RequestFacts::default();
+        let pinned = RequestFacts {
+            pinned_at: 2,
+            ..unpinned
+        };
+        assert!(pinned.pins(1) && !pinned.pins(0) && !pinned.pins(2));
+        assert!(!unpinned.pins(0) && !unpinned.pins(u32::MAX - 1));
+        let mut scores = [0.0f32; 3];
+        SessionAffinity.score(&unpinned, &pool, &kept(3), &mut scores);
+        assert_eq!(scores, [0.0, 0.0, 0.0]);
+        SessionAffinity.score(&pinned, &pool, &kept(3), &mut scores);
+        assert_eq!(scores, [0.0, 1.0, 0.0]);
+        // The scorer is handed the rows kept: the pin is read by position.
+        let mut scores = [0.0f32; 2];
+        SessionAffinity.score(&pinned, &pool, &[1, 2], &mut scores);
+        assert_eq!(scores, [1.0, 0.0]);
     }
 
     #[test]
