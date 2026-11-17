@@ -16,11 +16,13 @@
 //! the events an index applies and hands it to the sink. Each stand-in leaves
 //! the day a driver feeds its sink.
 //!
-//! What is the store's handle today is the wire tomorrow: a rank's
-//! registration ([`Harness::register`]) becomes the control scope's call when
-//! it is served, and the view a case reads ([`Harness::view`]) gives way to
-//! the decisions the service answers. A case calls the handle alone, so
-//! neither move rewrites a case.
+//! A fleet registers as an operator's does ([`Harness::register`]): an
+//! engine of one rank is an add on the control listener, under the name the
+//! harness states there. The call makes one rank, so a rank of a wider
+//! engine is still the store's membership write. The view a case reads
+//! ([`Harness::view`]) is the store's handle too, and gives way to the
+//! decisions the service answers. A case calls the handle alone, so neither
+//! move rewrites a case.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -51,7 +53,11 @@ use smg_policy_controller::{
     controller::{
         Config, Controller, Election, Error, LeasePlace, Listener, Readiness, Scope, State,
     },
-    proto::{completed::Class, Completed, Dispatched, LeaderInfo, Side, Welcome},
+    proto::{
+        self, completed::Class, policy_controller_client::PolicyControllerClient,
+        register_worker_request::Mode, worker_event::Event, Completed, Dispatched, LeaderInfo,
+        Side, Welcome,
+    },
     store::{
         Ask, BatchFacts, BatchOutcome, GatewayId, HealthPolicy, HealthSink, KvCursor, KvEvent,
         KvEventSink, LaneCounts, MemoryStore, SequenceHash, Signals, StoredBlock, ViewBuffers,
@@ -66,7 +72,9 @@ use tokio::{
     task::JoinSet,
     time::MissedTickBehavior,
 };
-use tonic::codegen::tokio_stream::StreamExt;
+use tonic::{
+    codegen::tokio_stream::StreamExt, metadata::AsciiMetadataValue, transport::Channel, Request,
+};
 
 use crate::{
     engines::{engine_config, eventually},
@@ -86,6 +94,12 @@ pub const POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Room for a loaded host on top of a wait's own timing.
 pub const ROOM: Duration = Duration::from_secs(30);
+
+/// The metadata entry a caller states its name in.
+const PRINCIPAL: &str = "x-smg-principal";
+
+/// The name the harness states on the control listener.
+const OPERATOR: &str = "fleet-operator";
 
 /// The tokens a held request asks for: at the engines' decode step it
 /// outlasts any case.
@@ -262,9 +276,11 @@ struct Probed {
 
 /// A controller in the binary's default shape, served on ephemeral loopback
 /// ports in the case's own process. Its gateway listener takes a gateway's
-/// name as told: the reference client states its own on every call.
+/// name as told: the reference client states its own on every call. Its
+/// control listener takes an operator's the same way.
 pub struct Replica {
     gateway: SocketAddr,
+    control: SocketAddr,
     store: Arc<MemoryStore>,
     readiness: Readiness,
     stop: Option<oneshot::Sender<()>>,
@@ -276,6 +292,7 @@ pub struct Harness {
     replica: Replica,
     store: Arc<MemoryStore>,
     client: Client,
+    operator: PolicyControllerClient<Channel>,
     engines: Vec<Engine>,
     members: HashMap<WorkerId, (usize, u16)>,
     probed: Arc<Mutex<Vec<Probed>>>,
@@ -321,6 +338,16 @@ async fn bounded<T>(
 
 fn millis(duration: Duration) -> u32 {
     u32::try_from(duration.as_millis()).unwrap_or(u32::MAX)
+}
+
+/// `role` as the contract names it.
+fn wire_role(role: Role) -> proto::Role {
+    match role {
+        Role::Single => proto::Role::Single,
+        Role::Prefill => proto::Role::Prefill,
+        Role::Decode => proto::Role::Decode,
+        Role::Encode => proto::Role::Encode,
+    }
 }
 
 /// A fleet engine's parameters: a decode step of 10 ms whatever the batch,
@@ -701,10 +728,17 @@ impl Replica {
         controller
             .identity_as_told("gateway")
             .map_err(|error| error.to_string())?;
-        let gateway = controller
-            .addresses()
+        // The registration calls open to a caller with a principal.
+        controller
+            .identity_as_told("control")
+            .map_err(|error| error.to_string())?;
+        let addresses = controller.addresses();
+        let gateway = addresses
             .of(Scope::Gateway)
             .ok_or("the controller has no gateway listener")?;
+        let control = addresses
+            .of(Scope::Control)
+            .ok_or("the controller has no control listener")?;
         let store = controller.store();
         let readiness = controller.readiness();
         let (stop, stopped) = oneshot::channel::<()>();
@@ -718,6 +752,7 @@ impl Replica {
         });
         Ok(Self {
             gateway,
+            control,
             store,
             readiness,
             stop: Some(stop),
@@ -778,7 +813,8 @@ impl Replica {
 
 impl Harness {
     /// Starts a lone controller, waits until it leads and connects the
-    /// reference client to its gateway listener.
+    /// reference client to its gateway listener and the generated client to
+    /// its control listener, which takes the name its caller states.
     pub async fn start() -> Result<Self, String> {
         let mut replica = Replica::start("fleet-controller", None).await?;
         replica.reaches(State::Leader).await?;
@@ -790,11 +826,19 @@ impl Harness {
         )
         .await?
         .map_err(|error| error.to_string())?;
+        let operator = bounded(
+            "the operator connects to the control listener",
+            ROOM,
+            PolicyControllerClient::connect(format!("http://{}", replica.control)),
+        )
+        .await?
+        .map_err(|error| error.to_string())?;
         let (stop_feeds, _) = watch::channel(false);
         Ok(Self {
             store: Arc::clone(&replica.store),
             replica,
             client,
+            operator,
             engines: Vec::new(),
             members: HashMap::new(),
             probed: Arc::default(),
@@ -845,13 +889,12 @@ impl Harness {
             let running = start_engine(shape.ranks).await?;
             let endpoint = running.endpoint.clone();
             let engine = self.engines.len();
-            let ids: Vec<WorkerId> = (0..shape.ranks)
-                .map(|rank| {
-                    let id = self.member(&endpoint, shape, rank);
-                    self.members.insert(id, (engine, rank));
-                    id
-                })
-                .collect();
+            let mut ids = Vec::with_capacity(usize::from(shape.ranks));
+            for rank in 0..shape.ranks {
+                let id = self.member(&endpoint, shape, rank).await?;
+                self.members.insert(id, (engine, rank));
+                ids.push(id);
+            }
             let probed = Probed {
                 engine,
                 endpoint,
@@ -867,17 +910,22 @@ impl Harness {
         Ok(started)
     }
 
-    /// One rank's registration: the store's membership write today, the
-    /// control scope's call once it is served.
-    fn member(&self, endpoint: &str, shape: &Shape, rank: u16) -> WorkerId {
-        let key = if shape.ranks == 1 {
-            endpoint.to_owned()
-        } else {
-            format!("{endpoint}@{rank}")
-        };
-        self.store
+    /// One rank's registration. An engine of one rank is an operator's add
+    /// on the control listener. The call makes one rank, so a rank of a
+    /// wider engine is the store's membership write.
+    async fn member(
+        &mut self,
+        endpoint: &str,
+        shape: &Shape,
+        rank: u16,
+    ) -> Result<WorkerId, String> {
+        if shape.ranks == 1 {
+            return self.add(endpoint, shape).await;
+        }
+        let id = self
+            .store
             .upsert(WorkerFacts {
-                key,
+                key: format!("{endpoint}@{rank}"),
                 engine: endpoint.to_owned(),
                 incarnation: 1,
                 role: shape.role,
@@ -899,7 +947,59 @@ impl Harness {
                 },
                 ..WorkerFacts::default()
             })
-            .id()
+            .id();
+        Ok(id)
+    }
+
+    /// An operator's add of a one-rank engine. The answer is the row the
+    /// store holds: registered and pending, under the id a sink names it by.
+    async fn add(&mut self, endpoint: &str, shape: &Shape) -> Result<WorkerId, String> {
+        let mut request = Request::new(proto::RegisterWorkerRequest {
+            spec: Some(proto::WorkerSpec {
+                url: endpoint.to_owned(),
+                wire: proto::WireMode::Grpc.into(),
+                role: wire_role(shape.role).into(),
+                runtime: RuntimeType::Vllm.as_str().to_owned(),
+                models: vec![shape.model.to_owned()],
+                health_policy: Some(proto::HealthPolicy {
+                    failure_threshold: 1,
+                    success_threshold: 1,
+                    check_interval_ms: millis(PROBE_INTERVAL),
+                    timeout_ms: millis(DIAL_TIMEOUT),
+                    disabled: false,
+                }),
+                signals: Some(proto::Signals {
+                    events: true,
+                    ..proto::Signals::default()
+                }),
+                ..proto::WorkerSpec::default()
+            }),
+            mode: Mode::Add.into(),
+            wait_ready: false,
+        });
+        request
+            .metadata_mut()
+            .insert(PRINCIPAL, AsciiMetadataValue::from_static(OPERATOR));
+        let answer = bounded(
+            "the registration call answers",
+            ROOM,
+            self.operator.register_worker(request),
+        )
+        .await?
+        .map_err(|status| {
+            format!(
+                "the add of {endpoint} was refused: {:?}: {}",
+                status.code(),
+                status.message()
+            )
+        })?
+        .into_inner();
+        match answer.event {
+            Some(Event::Registered(row)) if row.status() == proto::WorkerStatus::Pending => {
+                Ok(WorkerId(row.id))
+            }
+            other => Err(format!("the add of {endpoint} answered {other:?}")),
+        }
     }
 
     /// Feed: starts the stand-in prober and one stand-in subscriber an
