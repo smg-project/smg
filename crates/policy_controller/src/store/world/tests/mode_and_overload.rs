@@ -4,7 +4,7 @@
 
 use std::time::{Duration, Instant};
 
-use super::{block, member, overloaded, pressure};
+use super::{block, member, overloaded, pressure, rank_of, REPORT_PERIOD};
 use crate::{
     spec::{BindingSpec, OverloadSpec, Pairing},
     store::{LoadSink, LoadSource, MemoryStore},
@@ -63,4 +63,33 @@ fn a_generation_of_another_mode_judges_every_engine_under_its_own_block() {
         0,
         "no write of the load table moved one"
     );
+}
+
+/// A generation of another mode derives the membership again, and the
+/// write that does reads each rank's receipt from its sample on file: a
+/// rank that fell silent long before the generation is not counted under
+/// its block, and is counted again once it is heard.
+#[test]
+fn a_generation_of_another_mode_ages_each_sample_from_its_own_receipt() {
+    let store = MemoryStore::with_publish_window(Duration::ZERO);
+    let t0 = Instant::now();
+    let at = |secs: u64| t0 + Duration::from_secs(secs);
+    let zero = rank_of(&store, "grpc://e:9000", 0);
+    let one = rank_of(&store, "grpc://e:9000", 1);
+    assert!(store.heard_every(REPORT_PERIOD));
+    // No threshold stands yet. One rank falls silent with a queue on file,
+    // and the other is heard long after it.
+    store.record(one, 1, pressure(9, 0), at(0), LoadSource::Stream);
+    store.record(zero, 0, pressure(0, 0), at(0), LoadSource::Stream);
+    member(&store, "http://b:8000");
+    store.record(zero, 0, pressure(0, 0), at(100), LoadSource::Stream);
+    assert_eq!(overloaded(&store, at(100)), []);
+    // The generation's block is met by the silent rank's queue alone, and
+    // that count ended long ago.
+    store
+        .apply(generation_of(1, Pairing::Strict, block(8, 1.0)))
+        .expect("applied");
+    assert_eq!(overloaded(&store, at(100)), []);
+    store.record(one, 1, pressure(9, 0), at(101), LoadSource::Stream);
+    assert_eq!(overloaded(&store, at(101)), [zero, one]);
 }

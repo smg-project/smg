@@ -27,10 +27,10 @@
 //! engines.
 //!
 //! Where it is built the driver tells the store the period every ready
-//! rank is heard in, by its stream or by the poll: the poll interval, or
-//! the poll's deadline plus a tick where that is longer. The store
-//! ends the sample of a rank that lies three such periods behind its
-//! engine's newest ([`LoadSink::heard_every`]).
+//! rank is heard in, by its stream or by the poll: the longer of the poll
+//! interval and the poll's deadline, plus a tick. The store ends the
+//! sample of a rank that lies three such periods behind its engine's
+//! newest ([`LoadSink::heard_every`]).
 //!
 //! The loop also keeps the instant the store names for its publication
 //! ([`LoadSink::publish_due`]): a row that lands inside the store's window
@@ -66,8 +66,8 @@ use crate::{
 pub struct LoadDriverConfig {
     /// How often an engine is polled while its stream is not serving it;
     /// also the freshness bound of the arbitration (a rank whose newest
-    /// record is older than this is polled), and the period every ready
-    /// rank is heard in unless the poll's deadline is longer
+    /// record is older than this is polled), and with a tick the period
+    /// every ready rank is heard in, unless the poll's deadline is longer
     /// ([`Self::report_period`]). The gateway's
     /// `--load-monitor-interval`, 10 s. An interval the clock cannot add to
     /// the present polls an engine once.
@@ -85,16 +85,20 @@ pub struct LoadDriverConfig {
 impl LoadDriverConfig {
     /// The period the driver tells the sink ([`LoadSink::heard_every`]),
     /// true of the slowest read of a sample that can end by its age: the
-    /// poll interval, or the poll's deadline plus a tick where that is
-    /// longer, so a poll that takes its whole deadline still lands inside
-    /// the period it is counted in. The sum saturates at the largest
-    /// deadline a host can set. A sample is aged against its engine's
-    /// newest, and a scrape reads only an engine of one rank, whose sample
-    /// is its engine's newest at any age: the scrape's timeout is not in
-    /// the period.
+    /// longer of the poll interval and the poll's deadline, plus a tick.
+    /// A poll starts on a tick, so two starts of an engine's polls lie at
+    /// most that far apart, and a poll that takes its whole deadline
+    /// lands inside the period it is counted in. A rank that loses one
+    /// report is so heard again within two periods and a deadline, inside
+    /// the three a sample is kept through. The sum saturates at the
+    /// largest interval or deadline a host can set. A sample is aged
+    /// against its engine's newest, and a scrape reads only an engine of
+    /// one rank, whose sample is its engine's newest at any age: the
+    /// scrape's timeout is not in the period.
     pub fn report_period(&self) -> Duration {
         self.poll_interval
-            .max(self.poll_deadline.saturating_add(self.tick))
+            .max(self.poll_deadline)
+            .saturating_add(self.tick)
     }
 }
 

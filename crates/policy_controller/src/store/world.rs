@@ -1057,10 +1057,11 @@ struct EngineRow {
 
 /// How many report periods a rank's sample may lie behind its engine's
 /// newest receipt and still be judged. The period told is no shorter than
-/// the caller's poll and its deadline, so a rank that loses a report is
-/// heard again well inside three periods. A rank that stays silent is
-/// counted through three periods, so through two lost reports, and ends
-/// at the first judged write after them.
+/// the time between two of the caller's polls and than a poll's deadline,
+/// so a rank that loses a report is heard again inside three periods. A
+/// rank that stays silent is counted through three periods, so through
+/// one lost report at the least, and ends at the first judged write
+/// after them.
 const SAMPLE_PERIODS: u64 = 3;
 
 /// The engine's rows, in the writer's list of every engine's.
