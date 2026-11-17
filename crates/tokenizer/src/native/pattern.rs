@@ -64,7 +64,7 @@ pub(super) struct Class {
 /// point. The matcher asks it once per character it tests (every class test
 /// and every first-set test on ASCII text), and a table read is one load
 /// where a bit of a 128-bit word costs a two-word select and a variable shift.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 struct AsciiSet([bool; 128]);
 
 impl Default for AsciiSet {
@@ -571,7 +571,7 @@ pub(super) enum GroupsEnd {
 /// code points, one bit for every character beyond ASCII (set when a class
 /// may hold any of them), and whether the node can match without consuming a
 /// character, in which case any character may follow it.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub(super) struct First {
     ascii: AsciiSet,
     non_ascii: bool,
@@ -1947,34 +1947,7 @@ fn compile(node: &Node, program: &mut Vec<Op>, firsts: &mut Vec<First>) {
             // alternation without them would compile to no ops and match
             // empty. Once per pattern, so the check stays in release builds.
             assert_eq!(sets.len(), alternatives.len());
-            let mut previous_split = None;
-            let mut jumps = Vec::new();
-            for (index, (alternative, first)) in alternatives.iter().zip(sets).enumerate() {
-                let split = program.len();
-                if let Some(previous) = previous_split {
-                    if let Op::Split { first: set, .. } = program[previous] {
-                        program[previous] = Op::Split {
-                            next: split,
-                            first: set,
-                        };
-                    }
-                }
-                program.push(Op::Split {
-                    next: NO_NEXT,
-                    first: firsts.len(),
-                });
-                firsts.push(*first);
-                previous_split = Some(split);
-                compile(alternative, program, firsts);
-                if index + 1 < alternatives.len() {
-                    jumps.push(program.len());
-                    program.push(Op::Jump(NO_NEXT));
-                }
-            }
-            let end = program.len();
-            for jump in jumps {
-                program[jump] = Op::Jump(end);
-            }
+            compile_alternatives(alternatives, sets, program, firsts);
         }
         Node::NotAhead(class) => program.push(Op::NotAhead(*class)),
         Node::End => program.push(Op::End),
@@ -2021,6 +1994,98 @@ fn compile(node: &Node, program: &mut Vec<Op>, firsts: &mut Vec<First>) {
     }
 }
 
+/// Lays out an alternation: each alternative behind a `Split` that names
+/// the next one, and a jump past the alternation at its end. The leading
+/// alternatives that begin with the same characters ([`leading_run`]) are
+/// laid out as one alternative, an alternation of their own: every attempt
+/// arrives at the first `Split`, and a character outside their set passes
+/// them all in one step instead of one step each (the GPT-2 pattern begins
+/// with seven clitics, each behind the apostrophe). They are tried in the
+/// same order and before the alternatives after them, so the matches are
+/// the same.
+fn compile_alternatives(
+    alternatives: &[Node],
+    sets: &[First],
+    program: &mut Vec<Op>,
+    firsts: &mut Vec<First>,
+) {
+    let mut jumps = Vec::new();
+    lay_out_alternatives(alternatives, sets, program, firsts, &mut jumps);
+    let end = program.len();
+    for jump in jumps {
+        program[jump] = Op::Jump(end);
+    }
+}
+
+/// The layout of [`compile_alternatives`] up to its jumps: `jumps` takes
+/// the place of the jump behind every alternative but the last, for the
+/// caller to point past the alternation. The leading run adds its own to
+/// the same list, so a match of one of its alternatives leaves by one
+/// jump, as it would in a flat layout.
+fn lay_out_alternatives(
+    alternatives: &[Node],
+    sets: &[First],
+    program: &mut Vec<Op>,
+    firsts: &mut Vec<First>,
+    jumps: &mut Vec<usize>,
+) {
+    let run = leading_run(sets);
+    let mut previous_split = None;
+    let mut index = 0;
+    while index < alternatives.len() {
+        let split = program.len();
+        if let Some(previous) = previous_split {
+            if let Op::Split { first: set, .. } = program[previous] {
+                program[previous] = Op::Split {
+                    next: split,
+                    first: set,
+                };
+            }
+        }
+        program.push(Op::Split {
+            next: NO_NEXT,
+            first: firsts.len(),
+        });
+        firsts.push(sets[index]);
+        previous_split = Some(split);
+        // The run's alternatives all begin with the set of its first one.
+        let taken = if index == 0 { run } else { 1 };
+        if taken > 1 {
+            lay_out_alternatives(
+                &alternatives[..taken],
+                &sets[..taken],
+                program,
+                firsts,
+                jumps,
+            );
+        } else {
+            compile(&alternatives[index], program, firsts);
+        }
+        index += taken;
+        if index < alternatives.len() {
+            jumps.push(program.len());
+            program.push(Op::Jump(NO_NEXT));
+        }
+    }
+}
+
+/// How many of an alternation's alternatives, counted from its first, stand
+/// behind one `Split` of their own: the leading ones that begin with the
+/// same characters, when there are at least two of them and others after
+/// them; one otherwise. A set that admits the empty match excludes no
+/// character, so its alternatives stay apart.
+fn leading_run(sets: &[First]) -> usize {
+    let run = match sets.first() {
+        Some(lead) if !lead.nullable => sets.iter().take_while(|set| *set == lead).count(),
+        _ => 1,
+    };
+    if run < sets.len() {
+        run
+    } else {
+        1
+    }
+}
+
 /// The most choices a match of `node` can hold at once: every run and every
 /// alternation on a path leaves one until the path is done or backs off.
 fn choices(node: &Node) -> usize {
@@ -2046,7 +2111,18 @@ fn choices(node: &Node) -> usize {
             }
         }
         Node::Concat(nodes) => nodes.iter().map(choices).sum(),
-        Node::Alt { alternatives, .. } => 1 + alternatives.iter().map(choices).max().unwrap_or(0),
+        Node::Alt {
+            alternatives,
+            firsts,
+        } => {
+            let deepest = |nodes: &[Node]| nodes.iter().map(choices).max().unwrap_or(0);
+            // The leading run stands behind a `Split` of its own
+            // ([`leading_run`]): one more choice on the paths through it.
+            match leading_run(firsts) {
+                1 => 1 + deepest(alternatives),
+                run => (2 + deepest(&alternatives[..run])).max(1 + deepest(&alternatives[run..])),
+            }
+        }
     }
 }
 
@@ -3731,6 +3807,86 @@ mod tests {
             .iter()
             .all(|first| first.may_start('\'') && !first.may_start('s')));
         assert!(matches!(parsed.program.last(), Some(Op::Match)));
+    }
+
+    /// The leading alternatives that begin with the same characters stand
+    /// behind one choice: the seven clitics of the GPT-2 pattern, each
+    /// behind the apostrophe, are one alternative of the root's six, and a
+    /// character that is no apostrophe passes them in one step. They are
+    /// tried in the pattern's order all the same, and the matches are the
+    /// engine's. An alternation that is one such run from end to end, one
+    /// whose first two alternatives begin differently, and a run after the
+    /// first alternative are laid out as they are written.
+    #[test]
+    fn leading_alternatives_with_one_first_set_stand_behind_one_choice() {
+        let chain =
+            |pattern: &str, pc: usize| split_chain(&Pattern::parse(pattern).expect("parses"), pc);
+        // The root: the clitics as one, the letter and digit runs and the
+        // punctuation with their optional space, the two whitespace runs.
+        let root = chain(GPT2, 0);
+        assert_eq!(root.len(), 6);
+        assert!(root[0].may_start('\'') && !root[0].may_start('s') && !root[0].may_start(' '));
+        // The clitics in the pattern's order, right after the root's split.
+        let clitics = chain(GPT2, 1);
+        assert_eq!(clitics.len(), 7);
+        assert!(clitics.iter().all(|first| *first == root[0]));
+        // A run of two before a third alternative is one of the root's two.
+        assert_eq!(chain("ab|ac|[0-9]+", 0).len(), 2);
+        assert_eq!(chain("ab|ac|[0-9]+", 1).len(), 2);
+        // As written: one run from end to end, first alternatives that begin
+        // differently, and a run after the first alternative.
+        assert_eq!(chain(END_LETTERS, 0).len(), 2);
+        assert_eq!(chain("ab|[0-9]+|ac|\u{E9}+", 0).len(), 4);
+        assert_eq!(chain("[0-9]+|ab|ac|x", 0).len(), 4);
+        // A match of one of the run's alternatives leaves by one jump, past
+        // the whole alternation: no jump of the program lands on a jump.
+        let parsed = Pattern::parse("ab|ac|[0-9]+").expect("parses");
+        for op in &parsed.program {
+            if let Op::Jump(target) = op {
+                assert!(!matches!(parsed.program[*target], Op::Jump(_)));
+            }
+        }
+        // The run's own choice counts toward the bound: with the run's paths
+        // at the limit the pattern parses and matches, and with one more
+        // optional character it is declined.
+        let at_limit = |optionals: usize| {
+            let run = "a?".repeat(optionals);
+            format!("a{run}b|a{run}c|d")
+        };
+        let parsed = Pattern::parse(&at_limit(MAX_CHOICES - 2)).expect("parses");
+        let text = "a".repeat(MAX_CHOICES - 1) + "b";
+        assert_eq!(
+            parsed.find_iter(&text).collect::<Vec<_>>(),
+            vec![(0, text.len())]
+        );
+        assert!(Pattern::parse(&at_limit(MAX_CHOICES - 1)).is_none());
+
+        // The engine's matches where the run's alternatives nest prefixes,
+        // fail late, and give way to the alternatives after them.
+        const ALPHABET: [char; 12] = [
+            'a', 'b', 'c', 'd', 's', 't', '\'', ' ', '7', '!', '\n', '\u{E9}',
+        ];
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        for pattern in [
+            GPT2,
+            "ab|ac|[0-9]+",
+            "a+b|a+c|[a-d]+|'",
+            "'s|'t|'[a-d]+|[a-z ]+|'",
+            "ab|ab?c|a|[b-d]+",
+            "ab|[0-9]+|ac|\u{E9}+",
+        ] {
+            let parsed = Pattern::parse(pattern).expect("parses").program_only();
+            for round in 0..400 {
+                let text: String = (0..1 + round % 24)
+                    .map(|_| ALPHABET[(pseudo_random(&mut state) % ALPHABET.len() as u64) as usize])
+                    .collect();
+                assert_eq!(
+                    parsed.find_iter(&text).collect::<Vec<_>>(),
+                    oracle_matches(pattern, &text),
+                    "pattern {pattern:?} text {text:?}"
+                );
+            }
+        }
     }
 
     /// The `\z` that ends a digit-grouping lookahead counts as an anchor, as
