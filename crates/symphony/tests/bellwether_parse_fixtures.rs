@@ -573,9 +573,6 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     // recorded for them is content alone, and the plain table reads it as it stands.
     ("academic-ds-9b", GenerationPrompt::Plain),
     ("afm-4.5b", GenerationPrompt::Plain),
-    ("agentcpm-report", GenerationPrompt::Plain),
-    ("apertus-70b-instruct-2509", GenerationPrompt::Plain),
-    ("apertus-8b-instruct-2509", GenerationPrompt::Plain),
     ("apertus-v1.1-4b-instruct", GenerationPrompt::Plain),
     ("audio-flamingo-3-hf", GenerationPrompt::Plain),
     ("bar-2x7b-base", GenerationPrompt::Plain),
@@ -591,14 +588,6 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     ),
     ("dogr", GenerationPrompt::Plain),
     ("dots.mocr", GenerationPrompt::Plain),
-    (
-        "falcon-h1-tiny-multilingual-100m-instruct",
-        GenerationPrompt::Plain,
-    ),
-    ("granite-speech-3.2-8b", GenerationPrompt::Plain),
-    ("granite-vision-3.1-2b-preview", GenerationPrompt::Plain),
-    ("granite-vision-3.2-2b", GenerationPrompt::Plain),
-    ("granite-vision-3.3-2b", GenerationPrompt::Plain),
     // Python calls: Olmo 3 has no thought; LFM2.5's template adds nothing to the turn opener in
     // either thinking setting (its render set), and the model writes `<think>` itself or not.
     ("olmo-3-7b-instruct", GenerationPrompt::Plain),
