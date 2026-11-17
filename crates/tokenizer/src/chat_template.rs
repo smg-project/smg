@@ -1801,16 +1801,6 @@ fn dict_function(
     Ok(Value::from_iter(pairs))
 }
 
-/// The function a template compiled by
-/// [`ChatTemplateState::mark_built_controls`] calls on each control spelling
-/// it binds to a name.
-const CONTROL_CONSTANT: &str = "control_constant";
-
-/// Stands before each value the load writes behind a template's own output
-/// to read it (see [`ChatTemplateState::control_constants`]): the unit
-/// separator, an ASCII control character no template writes.
-const VALUE_SEPARATOR: u8 = 0x1f;
-
 /// A root `set` statement of a chat template: one that binds a name at the
 /// top level, or in a block that shares the top level's names (a top-level
 /// `if`, `filter`, `autoescape` or `block`), where a template binds the
@@ -1916,68 +1906,91 @@ fn unread_bindings<'a>(target: &Expr<'a>, conditional: bool, sets: &mut Vec<Root
     }
 }
 
-/// `source`, a chat template, with the expression of every root `set`
-/// statement ([`root_sets`]) that binds one of `names` wrapped in
-/// [`CONTROL_CONSTANT`]. `None` when the template binds none of them there.
-fn wrap_control_constants(source: &str, names: &HashSet<&str>) -> Option<String> {
-    let mut spans: Vec<(usize, usize)> = root_sets(source)
-        .into_iter()
-        .filter(|set| names.contains(set.name))
-        .filter_map(|set| set.expression)
-        .collect();
-    if spans.is_empty() {
-        return None;
-    }
-    spans.sort_unstable();
-    let mut wrapped =
-        String::with_capacity(source.len() + spans.len() * (CONTROL_CONSTANT.len() + 2));
-    let mut cursor = 0;
-    for (start, end) in spans {
-        wrapped.push_str(&source[cursor..start]);
-        wrapped.push_str(CONTROL_CONSTANT);
-        wrapped.push('(');
-        wrapped.push_str(&source[start..end]);
-        wrapped.push(')');
-        cursor = end;
-    }
-    wrapped.push_str(&source[cursor..]);
-    Some(wrapped)
+/// Stands before each value the load reads back from a render of a
+/// template's own statements (see [`ChatTemplateState::control_bindings`]):
+/// the unit separator, an ASCII control character no template writes.
+const VALUE_SEPARATOR: u8 = 0x1f;
+
+/// A root `set` statement that binds one control spelling for every render:
+/// the byte span of its expression, and the spelling.
+struct ControlBinding {
+    span: (usize, usize),
+    spelling: String,
 }
 
-/// The names among `sets`, the root `set` statements of `source`
-/// ([`root_sets`]), that no request reaches: every statement that binds one
-/// reads only literals and names that such statements bound at the top level
-/// before it, and none binds it in a way nothing reads. A control constant
-/// is one of them: the function that marks its value cannot tell a spelling
-/// the template built from one a request argument carried
-/// (`{% set close = custom if custom is defined else '</s>' %}`).
-fn request_free_names<'a>(source: &'a str, sets: &[RootSet<'a>]) -> HashSet<&'a str> {
+/// For each of `sets`, the root `set` statements of `source`
+/// ([`root_sets`]), whether its value is the same at every render; and the
+/// names that some statement binds to no one value. A statement's value is
+/// the same at every render when its expression reads nothing of a request:
+/// literals, and names that such statements bound at the top level before
+/// it (a name bound under an `if`, or in a way nothing reads, has no one
+/// value from there on). A value that a request argument may carry is never
+/// one of them (`{% set close = custom if custom is defined else '</s>' %}`),
+/// and its name is the request's to set, whatever else binds it
+/// (`{% if custom is defined %}{% set close = custom %}{% endif %}` after
+/// `{% set close = '</s>' %}`).
+fn fixed_statements<'a>(source: &str, sets: &[RootSet<'a>]) -> (Vec<bool>, Vec<&'a str>) {
     let env = Environment::new();
-    // `bound`: free and sure to be bound from here on, so a read of the
-    // name finds the template's value and never a request argument's.
-    let (mut free, mut bound, mut reached) = (HashSet::new(), HashSet::new(), HashSet::new());
+    // The names whose value every render sees from here on.
+    let mut fixed: HashSet<&str> = HashSet::new();
+    let mut unsettled = Vec::new();
+    let mut is_fixed = Vec::with_capacity(sets.len());
     for set in sets {
-        let reads_free = set.expression.is_some_and(|(start, end)| {
+        let reads_fixed = set.expression.is_some_and(|(start, end)| {
             let expression = format!("{{{{ {} }}}}", &source[start..end]);
             env.template_from_str(&expression).is_ok_and(|template| {
                 template
                     .undeclared_variables(false)
                     .iter()
-                    .all(|read| bound.contains(read.as_str()))
+                    .all(|read| fixed.contains(read.as_str()))
             })
         });
-        if reads_free && !reached.contains(set.name) {
-            free.insert(set.name);
-            if !set.conditional {
-                bound.insert(set.name);
-            }
+        if reads_fixed && !set.conditional {
+            fixed.insert(set.name);
         } else {
-            free.remove(set.name);
-            bound.remove(set.name);
-            reached.insert(set.name);
+            fixed.remove(set.name);
         }
+        if !reads_fixed {
+            unsettled.push(set.name);
+        }
+        is_fixed.push(reads_fixed);
     }
-    free
+    (is_fixed, unsettled)
+}
+
+/// `spelling` between the marks of `encoders::marks`, as a string literal of
+/// a template's source. `None` for a spelling a plain literal does not hold
+/// (a backslash, a control character, both kinds of quote).
+fn marked_literal(spelling: &str) -> Option<String> {
+    let holds = |quote: u8| {
+        !spelling
+            .bytes()
+            .any(|byte| byte == quote || byte == b'\\' || byte < b' ')
+    };
+    if holds(b'\'') {
+        Some(format!("'{}'", marks::mark(spelling)))
+    } else if holds(b'"') {
+        Some(format!("\"{}\"", marks::mark(spelling)))
+    } else {
+        None
+    }
+}
+
+/// `source`, a chat template, with the expression of each of `bindings`
+/// ([`ChatTemplateState::control_bindings`], in the template's order) replaced by its
+/// spelling between marks ([`marked_literal`]). `None` when a spelling has
+/// no literal.
+fn with_marked_literals(source: &str, bindings: &[ControlBinding]) -> Option<String> {
+    let mut marked = String::with_capacity(source.len());
+    let mut cursor = 0;
+    for binding in bindings {
+        let (start, end) = binding.span;
+        marked.push_str(&source[cursor..start]);
+        marked.push_str(&marked_literal(&binding.spelling)?);
+        cursor = end;
+    }
+    marked.push_str(&source[cursor..]);
+    Some(marked)
 }
 
 /// Whether a call of the string method `method` with `args` searches a text
@@ -3792,14 +3805,15 @@ impl ChatTemplateState {
     /// spell a control token whole: it binds each to a name once, out of a
     /// constant of its own (`'<open{}>'.format(suffix)`), and writes the
     /// names. [`Self::mark_controls`] finds no spelling in such a source, so
-    /// the template engine resolves the names instead
-    /// ([`Self::control_constants`]): a root name whose value is one added
-    /// token (`is_control`) is a control constant, and the expression of each
-    /// root `set` statement that binds one is wrapped in a function that puts
-    /// such a value between the marks of `encoders::marks`. Compiled so, the
-    /// template writes control tokens where it writes the names, alone or
-    /// inside a longer value, and the same spellings in request text stay
-    /// text, as under [`Self::mark_controls`].
+    /// the load reads the bindings instead ([`Self::control_bindings`]): a
+    /// root `set` statement whose value is the same at every render and is
+    /// one added token (`is_control`) binds a control spelling, and a copy
+    /// of the source takes that spelling, between the marks of
+    /// `encoders::marks`, as a literal in the statement's place. Compiled
+    /// so, the template writes control tokens where it writes the names,
+    /// alone or inside a longer value, and the same spellings in request
+    /// text stay text, as under [`Self::mark_controls`]; a render builds no
+    /// spelling again.
     ///
     /// The templates (this one, the `tool_use` one, the processor's) are
     /// marked together or not at all, and only when the marks are complete
@@ -3809,37 +3823,30 @@ impl ChatTemplateState {
     /// is, its prompts encoded from their text as before. Every reading is
     /// made through copies of the templates ([`Self::twin`]), so the render
     /// of a request carries nothing for it. `controls`, the matcher over the
-    /// added tokens, is asked for only once a template has a control
-    /// constant its source does not spell, so a checkpoint without one never
+    /// added tokens, is asked for only once a template binds a control
+    /// spelling its source does not hold, so a checkpoint without one never
     /// builds it.
     /// Returns whether the templates are now marked.
     pub(crate) fn mark_built_controls<'a>(
         &mut self,
-        is_control: impl Fn(&str) -> bool + Clone + Send + Sync + 'static,
+        is_control: &dyn Fn(&str) -> bool,
         controls: impl FnOnce() -> Option<&'a AddedTokens>,
         special_tokens: &SpecialTokens,
     ) -> bool {
-        let constants = self.control_constants(&is_control, special_tokens);
-        if constants.is_empty() {
+        let bindings = self.control_bindings(is_control, special_tokens);
+        if bindings.is_empty() {
             return false;
         }
         let Some(controls) = controls() else {
             return false;
         };
-        let Some(own) =
-            self.built_controls_marked(&constants, is_control.clone(), controls, special_tokens)
-        else {
+        let Some(own) = self.built_controls_marked(&bindings, controls, special_tokens) else {
             return false;
         };
         let mut nested = Vec::new();
         for state in [&self.tool_use, &self.processor].into_iter().flatten() {
-            let constants = state.control_constants(&is_control, special_tokens);
-            let Some(env) = state.built_controls_marked(
-                &constants,
-                is_control.clone(),
-                controls,
-                special_tokens,
-            ) else {
+            let bindings = state.control_bindings(is_control, special_tokens);
+            let Some(env) = state.built_controls_marked(&bindings, controls, special_tokens) else {
                 return false;
             };
             nested.push(env);
@@ -3885,20 +3892,21 @@ impl ChatTemplateState {
         }
     }
 
-    /// The root names of this template whose value, after a bare turn, is one
-    /// control spelling (`is_control`), each with its spelling, however the
-    /// template builds the value. The template engine says them: a copy of
-    /// the source that writes every root name behind the template's own
-    /// output ([`VALUE_SEPARATOR`]) renders the turn. None when the source
-    /// spells one of them whole, or when a statement that binds one may read
-    /// a request argument ([`request_free_names`]): that template is of the
-    /// other kind, and it says so here, before the matcher over the added
-    /// tokens is asked for.
-    fn control_constants(
+    /// The root `set` statements of this template that bind a control
+    /// spelling for every render: those whose value is the same at every
+    /// render ([`fixed_statements`]) and is one control spelling
+    /// (`is_control`), under a name no statement binds another way. The
+    /// template engine says the values: those statements alone, each
+    /// followed by its value behind a separator ([`VALUE_SEPARATOR`]), are
+    /// rendered once, the way a request's template is. None when the source
+    /// spells one of the spellings whole: that template is of the other
+    /// kind, and it says so here, before the matcher over the added tokens
+    /// is asked for.
+    fn control_bindings(
         &self,
         is_control: &dyn Fn(&str) -> bool,
         special_tokens: &SpecialTokens,
-    ) -> Vec<(String, String)> {
+    ) -> Vec<ControlBinding> {
         let Some(template) = self
             .env
             .as_ref()
@@ -3908,27 +3916,35 @@ impl ChatTemplateState {
         };
         let source = template.source();
         let sets = root_sets(source);
-        let mut names: Vec<&str> = sets.iter().map(|set| set.name).collect();
-        names.sort_unstable();
-        names.dedup();
-        // A template that binds no root name builds no constant: nothing is
+        let (is_fixed, unsettled) = fixed_statements(source, &sets);
+        let fixed: Vec<(&str, (usize, usize))> = sets
+            .iter()
+            .zip(is_fixed)
+            .filter(|(_, is_fixed)| *is_fixed)
+            .filter_map(|(set, _)| Some((set.name, set.expression?)))
+            .collect();
+        // A template with no such statement builds no constant: nothing is
         // compiled for it.
-        if names.is_empty() {
+        if fixed.is_empty() {
             return Vec::new();
         }
-        let mut with_values = String::with_capacity(source.len() + names.len() * 48);
-        with_values.push_str(source);
-        for name in &names {
+        let mut statements = String::new();
+        for (name, (start, end)) in &fixed {
+            statements.push_str("{% set ");
+            statements.push_str(name);
+            statements.push_str(" = ");
+            statements.push_str(&source[*start..*end]);
+            statements.push_str(" %}");
             // A spelling is a string; a value of any other type is written
             // empty.
-            with_values.push(char::from(VALUE_SEPARATOR));
-            with_values.push_str("{{ ");
-            with_values.push_str(name);
-            with_values.push_str(" if ");
-            with_values.push_str(name);
-            with_values.push_str(" is string else '' }}");
+            statements.push(char::from(VALUE_SEPARATOR));
+            statements.push_str("{{ ");
+            statements.push_str(name);
+            statements.push_str(" if ");
+            statements.push_str(name);
+            statements.push_str(" is string else '' }}");
         }
-        let Ok(env) = build_environment(with_values) else {
+        let Ok(env) = build_environment(statements) else {
             return Vec::new();
         };
         let messages = [serde_json::json!({"role": "user", "content": "probe"})];
@@ -3941,42 +3957,40 @@ impl ChatTemplateState {
         let Ok((rendered, _)) = self.twin(env).apply_with_continuation(&messages, params) else {
             return Vec::new();
         };
-        // The values stand last, one behind each separator, in the names'
-        // order: read from the end, whatever the template itself wrote. A
-        // cut at an ASCII byte leaves each piece the text it was.
-        let constants: Vec<(String, String)> = names
-            .iter()
-            .rev()
-            .zip(rendered.as_bytes().rsplit(|byte| *byte == VALUE_SEPARATOR))
-            .filter_map(|(name, value)| Some((*name, str::from_utf8(value).ok()?)))
-            .filter(|(_, value)| is_control(value))
-            .map(|(name, value)| (name.to_owned(), value.to_owned()))
+        // One value behind each separator, in the statements' order; before
+        // the first the statements write nothing. A cut at an ASCII byte
+        // leaves each piece the text it was.
+        let values: Vec<&str> = rendered
+            .split(char::from(VALUE_SEPARATOR))
+            .skip(1)
             .collect();
-        if constants
+        if values.len() != fixed.len() {
+            return Vec::new();
+        }
+        let bindings: Vec<ControlBinding> = fixed
             .iter()
-            .any(|(_, spelling)| source.contains(spelling.as_str()))
+            .zip(values)
+            .filter(|((name, _), value)| is_control(value) && !unsettled.contains(name))
+            .map(|((_, span), value)| ControlBinding {
+                span: *span,
+                spelling: value.to_owned(),
+            })
+            .collect();
+        if bindings
+            .iter()
+            .any(|binding| source.contains(binding.spelling.as_str()))
         {
             return Vec::new();
         }
-        if !constants.is_empty() {
-            let free = request_free_names(source, &sets);
-            if constants
-                .iter()
-                .any(|(name, _)| !free.contains(name.as_str()))
-            {
-                return Vec::new();
-            }
-        }
-        constants
+        bindings
     }
 
-    /// This template compiled with the control spellings `constants` bind
-    /// between marks, when the template is of the kind that builds them and
-    /// the marks are complete (see [`Self::mark_built_controls`]).
+    /// This template compiled with the control spellings of `bindings`
+    /// between marks, when the marks are complete (see
+    /// [`Self::mark_built_controls`]).
     fn built_controls_marked(
         &self,
-        constants: &[(String, String)],
-        is_control: impl Fn(&str) -> bool + Send + Sync + 'static,
+        bindings: &[ControlBinding],
         controls: &AddedTokens,
         special_tokens: &SpecialTokens,
     ) -> Option<Environment<'static>> {
@@ -3985,36 +3999,11 @@ impl ChatTemplateState {
         let source = template.source();
         // A source that spells a control whole is of the other kind: its
         // spellings would want the scan of `mark_controls`, which is not
-        // made here. A source that uses the wrapper's name would shadow it.
-        if constants.is_empty()
-            || controls.ranges(source).next().is_some()
-            || source.contains(CONTROL_CONSTANT)
-        {
+        // made here.
+        if bindings.is_empty() || controls.ranges(source).next().is_some() {
             return None;
         }
-        let names: HashSet<&str> = constants.iter().map(|(name, _)| name.as_str()).collect();
-        let mut marked = build_environment(wrap_control_constants(source, &names)?).ok()?;
-        // The spellings the bare turn showed stand ready between marks. A
-        // name may be bound to another control under request arguments the
-        // load never passed: that one is marked as it comes. Either is built
-        // from the template's own text (`request_free_names`).
-        let ready: HashMap<String, Value> = constants
-            .iter()
-            .map(|(_, spelling)| (spelling.clone(), Value::from(marks::mark(spelling))))
-            .collect();
-        marked.add_function(CONTROL_CONSTANT, move |value: Value| -> Value {
-            let Some(text) = value.as_str() else {
-                return value;
-            };
-            if let Some(control) = ready.get(text) {
-                return control.clone();
-            }
-            if is_control(text) {
-                Value::from(marks::mark(text))
-            } else {
-                value
-            }
-        });
+        let mut marked = build_environment(with_marked_literals(source, bindings)?).ok()?;
         // While the check runs the string methods say when one searches a
         // text for a marked value, whatever the probes hold.
         let searches = Arc::new(AtomicUsize::new(0));
@@ -4030,7 +4019,7 @@ impl ChatTemplateState {
         let marked = self.twin(marked);
         let complete = self.twin(plain.clone()).marks_every_control(
             &marked,
-            constants,
+            bindings,
             controls,
             special_tokens,
         );
@@ -4044,7 +4033,7 @@ impl ChatTemplateState {
     }
 
     /// Whether `marked`, this template compiled with the control spellings
-    /// `constants` bind between marks, may stand for this one; both are
+    /// of `bindings` between marks, may stand for this one; both are
     /// templates alone ([`Self::twin`]).
     ///
     /// On the probe conversations, with the generation prompt and without,
@@ -4067,7 +4056,7 @@ impl ChatTemplateState {
     fn marks_every_control(
         &self,
         marked: &Self,
-        constants: &[(String, String)],
+        bindings: &[ControlBinding],
         controls: &AddedTokens,
         special_tokens: &SpecialTokens,
     ) -> bool {
@@ -4079,9 +4068,9 @@ impl ChatTemplateState {
         } else {
             &[None]
         };
-        let spellings: String = constants
+        let spellings: String = bindings
             .iter()
-            .map(|(_, spelling)| spelling.as_str())
+            .map(|binding| binding.spelling.as_str())
             .chain(special_spellings(special_tokens))
             .collect();
         let typed_probes = probes(

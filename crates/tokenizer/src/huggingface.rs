@@ -381,13 +381,6 @@ impl EncoderCore {
             .contains_key(text)
     }
 
-    /// [`Self::is_added`] of `core` as a lookup a template keeps (see
-    /// `ChatTemplateState::mark_built_controls`).
-    fn added_lookup(core: &Arc<Self>) -> impl Fn(&str) -> bool + Clone + Send + Sync + 'static {
-        let core = Arc::clone(core);
-        move |text| core.is_added(text)
-    }
-
     /// The matcher over the added vocabulary, built on first use.
     fn added(&self) -> Option<&AddedTokens> {
         self.added
@@ -966,7 +959,7 @@ impl HuggingFaceTokenizer {
             // (see `ChatTemplateState::mark_built_controls`).
             chat_template
                 .mark_built_controls(
-                    EncoderCore::added_lookup(&core),
+                    &|text: &str| core.is_added(text),
                     || core.added(),
                     &special_tokens,
                 )
@@ -2664,7 +2657,7 @@ impl TokenizerTrait for HuggingFaceTokenizer {
         let core = &self.core;
         if !self.structural_controls
             && self.chat_template.mark_built_controls(
-                EncoderCore::added_lookup(core),
+                &|text: &str| core.is_added(text),
                 || core.added(),
                 &self.special_tokens,
             )

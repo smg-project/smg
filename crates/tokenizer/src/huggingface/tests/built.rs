@@ -438,12 +438,13 @@ fn a_constant_that_holds_another_control_under_a_request_argument_is_marked() {
 
 #[test]
 fn a_constant_bound_from_a_request_argument_leaves_the_template_as_it_was() {
-    // The function that marks a constant cannot tell a spelling the template
-    // built from one a request supplied, so a name that may take a request
-    // argument is no constant: read in the binding itself, through another
-    // name, through a name that is bound only when the request left it out,
-    // or through a name a block, a `set` of several names or a `set` inside
-    // a `filter` block binds again.
+    // A spelling a request supplies must not become a control token through
+    // the marks, and the template that takes one keeps writing it as it did:
+    // a name that may take a request argument is no constant. The argument
+    // may be read in the binding itself, through another name, through a
+    // name that is bound only when the request left it out, through a name a
+    // block, a `set` of several names or a `set` inside a `filter` block
+    // binds again, or by a second binding of the constant's own name.
     let direct = "{% set suffix = ':x' %}{% set open = '[INST{}]'.format(suffix) %}\
         {% set close = custom if custom is defined else '[/INST{}]'.format(suffix) %}";
     let through = "{% set suffix = custom if custom is defined else ':x' %}\
@@ -458,7 +459,12 @@ fn a_constant_bound_from_a_request_argument_leaves_the_template_as_it_was() {
     let filtered = "{% set suffix = ':x' %}{% filter trim %}{% if custom is defined %}\
         {% set suffix = custom %}{% endif %}{% endfilter %}\
         {% set open = '[INST{}]'.format(suffix) %}{% set close = '[/INST{}]'.format(suffix) %}";
-    for constants in [direct, through, defaulted, block, several, filtered] {
+    let rebound = "{% set suffix = ':x' %}{% set open = '[INST{}]'.format(suffix) %}\
+        {% set close = '[/INST{}]'.format(suffix) %}\
+        {% if custom is defined %}{% set close = custom %}{% endif %}";
+    for constants in [
+        direct, through, defaulted, block, several, filtered, rebound,
+    ] {
         let temp = TempDir::new().unwrap();
         let takes = template(constants, "{{ open }}", "{{ close }}", "{{ close }}");
         let tok = checkpoint(temp.path(), &takes);
