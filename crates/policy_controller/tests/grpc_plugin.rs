@@ -50,7 +50,7 @@ use smg_policy_controller::{
 };
 use support::{
     grpc_plugin::{eventually, Behaviour, ServerTls, TestPlugin, ALL, FILTER, PICK, SCORE},
-    said::{lines, openings, said},
+    said::{lines, openings, panic_once_at, said, trap_spent},
 };
 
 /// The decision budget of the answered cases, and the connect frame of
@@ -3084,11 +3084,14 @@ fn events_past_the_queue_are_dropped_and_counted() {
     );
 }
 
-/// A refused event leaves its mark on the numbers. An event's number counts
-/// what the stream owed: the events sent before it and the events the queue
-/// refused. The number after a loss skips by what was lost, so a plugin that
-/// keeps a ledger of leases reads the gap. Three events go first and arrive;
+/// A refused event leaves its mark on the numbers, where the loss fell. An
+/// event's number counts the events sent before it and the events the queue
+/// had refused when it entered the queue. Three events go first and arrive;
 /// then the I/O thread is held off the queue while it fills and refuses.
+/// The events the queue took were raised before the loss: they arrive
+/// gapless. The next event raised skips by what was lost, so a plugin that
+/// keeps a ledger of leases reads the gap behind everything raised before
+/// it.
 #[test]
 fn a_refused_event_leaves_a_gap_in_the_numbers() {
     let served = TestPlugin::serve();
@@ -3109,22 +3112,21 @@ fn a_refused_event_leaves_a_gap_in_the_numbers() {
     assert!(refused > 0, "the queue refused some: {stats:?}");
     assert!(eventually(|| served.seen().events.len() as u64 == sent));
     let seqs: Vec<u64> = served.seen().events.iter().map(|e| e.seq).collect();
-    assert_eq!(seqs[..3], [1, 2, 3], "nothing was lost before the hold");
     assert!(
-        seqs.windows(2).all(|pair| pair[0] < pair[1]),
-        "the numbers only grow"
-    );
-    let skipped: u64 = seqs.windows(2).map(|pair| pair[1] - pair[0] - 1).sum();
-    assert_eq!(
-        skipped,
-        refused,
-        "the numbers skip by what the queue refused: the last is {:?} of {sent} sent",
-        seqs.last()
+        seqs.windows(2).all(|pair| pair[0] + 1 == pair[1]),
+        "an event raised before the loss arrived behind a gap"
     );
     assert_eq!(
         seqs.last().copied(),
-        Some(sent + refused),
-        "the last number counts every event raised, sent or refused"
+        Some(sent),
+        "the events raised before the loss read gapless"
+    );
+    dispatch();
+    assert!(eventually(|| served.seen().events.len() as u64 == sent + 1));
+    assert_eq!(
+        served.seen().events.last().map(|e| e.seq),
+        Some(sent + 1 + refused),
+        "the next event raised skips by what the queue refused"
     );
 }
 
@@ -3161,6 +3163,62 @@ fn the_numbers_go_on_across_two_observe_streams() {
     assert!(
         numbers.first().copied() > last,
         "the numbers went down across two streams: {numbers:?}"
+    );
+    assert!(
+        numbers.windows(2).all(|pair| pair[1] > pair[0]),
+        "{numbers:?}"
+    );
+}
+
+/// The numbers are kept across a turn of the `Observe` task that panicked.
+/// The first server goes, and the host's line of that end panics where it
+/// is said, once. The task is started again a pause later, and what the
+/// second server is sent is numbered above everything the first was.
+#[test]
+fn the_numbers_go_on_across_a_turn_that_panicked() {
+    let mut first = TestPlugin::serve();
+    let runtime = runtime();
+    let mut row = spec(&first, "numbers-over-a-panic");
+    row.connect_micros = 1_000_000;
+    let plugin = Plugin::load(&runtime, row).expect("the plugin loads");
+    let engine = single_engine(profile(&plugin, ALL));
+    for _ in 0..40 {
+        engine.on_dispatched(&Lease::default(), &Target::default(), Side::Single, 3);
+    }
+    assert!(eventually(|| first.seen().events.len() == 40));
+    let last = first.seen().events.last().map(|event| event.seq);
+    assert_eq!(last, Some(40));
+    let path = first.socket.clone();
+    panic_once_at("numbers-over-a-panic", "observe stream failed");
+    first.stop();
+    // No event is raised while the first server goes: the call's own end is
+    // then all the task sees, and its line panics where it is said. With an
+    // event queued at that instant the send can see the end first, and that
+    // end has no line.
+    assert!(
+        eventually(trap_spent),
+        "the line of the first stream's end did not panic"
+    );
+    let second = TestPlugin::serve();
+    std::fs::rename(&second.socket, &path).expect("the second server takes the first's path");
+    let mut raised = 0_u32;
+    while second.seen().events.len() < 20 {
+        raised += 1;
+        assert!(raised <= 15_000, "no event reached the second server");
+        engine.on_dispatched(&Lease::default(), &Target::default(), Side::Single, 3);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(
+        said().lock().expect("the kept lines").iter().any(|line| {
+            line.contains("observe task panicked") && line.contains("numbers-over-a-panic")
+        }),
+        "the host said nothing of the task that panicked"
+    );
+    let seen = second.seen();
+    let numbers: Vec<u64> = seen.events.iter().map(|event| event.seq).collect();
+    assert!(
+        numbers.first().copied() > last,
+        "the numbers started again with the turn: {numbers:?}"
     );
     assert!(
         numbers.windows(2).all(|pair| pair[1] > pair[0]),

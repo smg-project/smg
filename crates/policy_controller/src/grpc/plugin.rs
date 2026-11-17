@@ -159,8 +159,7 @@ struct Tally {
     failed_streams: AtomicU64,
     late_answers: AtomicU64,
     observed: AtomicU64,
-    /// Shared with the `Observe` stream's task, which numbers an event by it.
-    observe_dropped: Arc<AtomicU64>,
+    observe_dropped: AtomicU64,
 }
 
 fn bump(counter: &AtomicU64) {
@@ -218,11 +217,13 @@ impl Inner {
         // The number is the stream's: the I/O thread writes it where the
         // event enters the stream, so threads that raise events at once
         // cannot send a later number first. A refused event is counted
-        // here, and the number of every later event counts it too.
+        // here, and an event carries that count as it enters the queue: the
+        // stream's task adds the highest it has seen, so a gap sits behind
+        // the last event raised before the loss.
         let request = proto::ObserveRequest {
             request: Some(proto::observe_request::Request::Event(
                 proto::LifecycleEvent {
-                    seq: 0,
+                    seq: self.tally.observe_dropped.load(Ordering::Relaxed),
                     event: Some(event),
                 },
             )),
@@ -238,12 +239,7 @@ impl LaneEvents for Inner {
     fn connected(&self) {
         bump(&self.tally.connects);
         if let Some(queue) = self.observe_rx.lock().take() {
-            let lane = ObserveLane::new(
-                Arc::clone(&self.peer),
-                self.events(),
-                queue,
-                Arc::clone(&self.tally.observe_dropped),
-            );
+            let lane = ObserveLane::new(Arc::clone(&self.peer), self.events(), queue);
             self.runtime.send(Command::Observe(Arc::new(lane)));
         }
     }

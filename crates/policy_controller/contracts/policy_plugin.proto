@@ -604,9 +604,9 @@ message LifecycleEvent {
   // events it refused at a full queue. A gap is events the plugin never
   // received (refused at a full queue, or in flight on a stream that
   // ended), and a plugin that keeps a ledger of leases treats it as a loss.
-  // A gap's size is exact and its place is not: events raised before the
-  // loss can arrive behind it. A loss after the last event sent shows at
-  // the next event.
+  // A gap sits where the loss fell: every event raised before it arrives
+  // ahead of the gap. A loss after the last event raised shows at the next
+  // event.
   uint64 seq = 1;
   oneof event {
     Issued issued = 2;

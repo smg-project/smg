@@ -594,6 +594,19 @@ impl Lane {
         at
     }
 
+    /// Fails the lane and tells its plugin, the state first: the telling
+    /// reads the host's clock, and whatever that does, the lane reads as
+    /// failed and is asked for again. The telling carries the instant the
+    /// failure was dated by, the one the lane's pause runs from, so the count
+    /// on the breaker reads no instant a held I/O thread moved.
+    fn fail_and_tell(&self, why: Fault) {
+        let said = why.to_string();
+        let at = self.fail(why);
+        if let Some(events) = self.events() {
+            events.stream_failed(&said, at);
+        }
+    }
+
     fn deliver(&self, decision: proto::PluginDecision) {
         // The I/O thread ran: an answer is stamped before it is handed on,
         // so a gap it arrives across is on the witness when it is read.
@@ -634,8 +647,6 @@ pub(crate) struct ObserveLane {
     peer: Arc<Peer>,
     events: Weak<dyn LaneEvents>,
     queue: Mutex<Option<mpsc::Receiver<proto::ObserveRequest>>>,
-    /// The events the plugin's queue refused: an event's number counts them.
-    refused: Arc<AtomicU64>,
 }
 
 impl ObserveLane {
@@ -643,13 +654,11 @@ impl ObserveLane {
         peer: Arc<Peer>,
         events: Weak<dyn LaneEvents>,
         queue: mpsc::Receiver<proto::ObserveRequest>,
-        refused: Arc<AtomicU64>,
     ) -> Self {
         Self {
             peer,
             events,
             queue: Mutex::new(Some(queue)),
-            refused,
         }
     }
 
@@ -987,14 +996,7 @@ async fn run_lane(lane: Arc<Lane>) {
     let (tx, mut inbound, stages) = match open_decide(&lane.peer).await {
         Ok(opened) => opened,
         Err(why) => {
-            // The lane's state moves before the plugin is told: the telling
-            // reads the host's clock, and whatever that does, the lane
-            // reads as failed and is asked for again.
-            let said = why.to_string();
-            let at = lane.fail(why);
-            if let Some(events) = lane.events() {
-                events.stream_failed(&said, at);
-            }
+            lane.fail_and_tell(why);
             return;
         }
     };
@@ -1015,12 +1017,8 @@ async fn run_lane(lane: Arc<Lane>) {
             },
         }
     };
-    // A status's text is the plugin's: cut. The state first, as above.
-    let why = bounded(why);
-    let at = lane.fail(Fault::Stream(why.clone()));
-    if let Some(events) = lane.events() {
-        events.stream_failed(&why, at);
-    }
+    // A status's text is the plugin's: cut.
+    lane.fail_and_tell(Fault::Stream(bounded(why)));
 }
 
 async fn run_observe(lane: Arc<ObserveLane>) {
@@ -1032,12 +1030,17 @@ async fn run_observe(lane: Arc<ObserveLane>) {
     // number never goes down, on one stream or across two, and a gap is
     // what the plugin lost.
     let mut sent = 0_u64;
+    // The refusals the events carried, the highest so far.
+    let mut lost = 0_u64;
     // A turn that panicked did so in the host's own code (the plugin's
-    // telling of a failure). The queue and the count are held here, outside
+    // telling of a failure). The queue and the counts are held here, outside
     // the turn: the events raised meanwhile wait in the queue, the numbers
     // go on, and the stream is asked for again a pause later. No decision
     // asks for this stream, as one does for a `Decide` stream.
-    while let Err(panicked) = Caught(Box::pin(observe_streams(&lane, &mut queue, &mut sent))).await
+    while let Err(panicked) = Caught(Box::pin(observe_streams(
+        &lane, &mut queue, &mut sent, &mut lost,
+    )))
+    .await
     {
         tracing::error!(
             error = panic_text(&*panicked),
@@ -1049,10 +1052,22 @@ async fn run_observe(lane: Arc<ObserveLane>) {
 
 /// The `Observe` calls of one plugin, each opened when the one before it
 /// ended, until the plugin is dropped.
+/// The number of the next event sent: the events sent, this one with them,
+/// plus the events lost ahead of it. An event comes with the refusals its
+/// thread had seen as it entered the queue, and the highest carried so far
+/// is what was lost ahead. A count carried late, by a thread that read it
+/// before another's refusal, moves no number back.
+fn number(sent: &mut u64, lost: &mut u64, carried: u64) -> u64 {
+    *lost = (*lost).max(carried);
+    *sent += 1;
+    *sent + *lost
+}
+
 async fn observe_streams(
     lane: &ObserveLane,
     queue: &mut mpsc::Receiver<proto::ObserveRequest>,
     sent: &mut u64,
+    lost: &mut u64,
 ) {
     let peer = &lane.peer;
     // One line per outage: the first failure after a call that carried an
@@ -1100,13 +1115,11 @@ async fn observe_streams(
                 match queue.recv().await {
                     Some(mut event) => {
                         // Numbered here, where it enters the stream: one
-                        // task numbers every event, in the order it sends,
-                        // by what the stream owed until now.
+                        // task numbers every event, in the order it sends.
                         if let Some(proto::observe_request::Request::Event(numbered)) =
                             event.request.as_mut()
                         {
-                            *sent += 1;
-                            numbered.seq = *sent + lane.refused.load(Ordering::Relaxed);
+                            numbered.seq = number(sent, lost, numbered.seq);
                         }
                         if tx.send(event).await.is_err() {
                             return true;
@@ -1158,8 +1171,8 @@ mod tests {
     use tokio::{sync::mpsc, task::JoinSet};
 
     use super::{
-        run_commands, Command, Lane, LaneEvents, ObserveLane, Peer, Runtime, SendError, Wait,
-        Witness, PROMISE_MICROS, WINDOW,
+        number, run_commands, Command, Lane, LaneEvents, LaneState, ObserveLane, Peer, Runtime,
+        SendError, Wait, Witness, PROMISE_MICROS, RECONNECT_PAUSE, WINDOW,
     };
     use crate::{grpc::config::Transport, plugins::OpenDecisions, proto};
 
@@ -1547,6 +1560,56 @@ mod tests {
         assert_eq!(streams.len(), 1, "the witness's ticker alone is left");
     }
 
+    /// What a lane tells its plugin, with the instant of each failed stream
+    /// kept.
+    #[derive(Default)]
+    struct Dated {
+        failed: parking_lot::Mutex<Vec<Instant>>,
+    }
+
+    impl LaneEvents for Dated {
+        fn connected(&self) {}
+        fn stream_failed(&self, _why: &str, at: Instant) {
+            self.failed.lock().push(at);
+        }
+        fn late_answer(&self) {}
+        fn observe_failed(&self, _why: &str) {}
+    }
+
+    /// A failed stream's telling carries the instant its lane dated the
+    /// failure by, the one its pause runs from: the count on the breaker
+    /// reads that instant and not the telling's own, which a held I/O thread
+    /// moves. Here the connect finds no socket.
+    #[tokio::test]
+    async fn a_failed_streams_telling_carries_the_instant_its_lane_was_dated_by() {
+        let (commands, taken) = mpsc::unbounded_channel();
+        let mut looping = JoinSet::new();
+        looping.spawn(run_commands(taken, Arc::new(Witness::new())));
+        let events = Arc::new(Dated::default());
+        let listener: Arc<dyn LaneEvents> = Arc::clone(&events) as _;
+        let lane = Arc::new(Lane::new(
+            nowhere(),
+            Arc::downgrade(&listener),
+            Arc::new(Witness::new()),
+        ));
+        assert!(commands.send(Command::Connect(Arc::clone(&lane))).is_ok());
+        let mut waits = 0;
+        while events.failed.lock().is_empty() {
+            waits += 1;
+            assert!(waits < 10_000, "the connect to no socket was never told");
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let dated = match &*lane.state.lock() {
+            LaneState::Failed(_, at) => Some(*at),
+            _ => None,
+        };
+        assert_eq!(
+            events.failed.lock().first().copied(),
+            dated,
+            "the telling carries the lane's own instant"
+        );
+    }
+
     /// What an `Observe` lane tells its plugin, with a first telling that
     /// panics.
     #[derive(Default)]
@@ -1564,6 +1627,21 @@ mod tests {
         }
     }
 
+    /// A count carried late moves no number back. Two threads raise at a
+    /// full queue, and the one that read the count first enters the queue
+    /// last: the counts handed here are the ones the events carried.
+    #[test]
+    fn a_count_carried_late_moves_no_number_back() {
+        let (mut sent, mut lost) = (0_u64, 0_u64);
+        assert_eq!(number(&mut sent, &mut lost, 0), 1);
+        // Two refusals fell before the second event was raised.
+        assert_eq!(number(&mut sent, &mut lost, 2), 4);
+        // The third was raised before them and queued after the second.
+        assert_eq!(number(&mut sent, &mut lost, 0), 5);
+        // One more refusal: a gap of one, behind the third.
+        assert_eq!(number(&mut sent, &mut lost, 3), 7);
+    }
+
     /// An `Observe` task that panics is not the end of the plugin's events.
     /// Here the connect finds no socket and the plugin's own telling of that
     /// panics, once. The queue keeps its receiver across the panic, so an
@@ -1577,12 +1655,7 @@ mod tests {
         let events = Arc::new(PanicsOnce::default());
         let listener: Arc<dyn LaneEvents> = Arc::clone(&events) as _;
         let (queue, raised) = mpsc::channel(4);
-        let lane = ObserveLane::new(
-            nowhere(),
-            Arc::downgrade(&listener),
-            raised,
-            Arc::new(AtomicU64::new(0)),
-        );
+        let lane = ObserveLane::new(nowhere(), Arc::downgrade(&listener), raised);
         assert!(commands.send(Command::Observe(Arc::new(lane))).is_ok());
         for telling in 1..=2 {
             let mut waits = 0;
@@ -1595,6 +1668,55 @@ mod tests {
             assert!(
                 queue.try_send(proto::ObserveRequest::default()).is_ok(),
                 "the queue lost its receiver with the task that panicked"
+            );
+        }
+    }
+
+    /// What an `Observe` lane tells its plugin, with tellings that panic
+    /// until the `last`, and the loop's clock read at each.
+    struct PanicsUntil {
+        last: usize,
+        told: parking_lot::Mutex<Vec<tokio::time::Instant>>,
+    }
+
+    impl LaneEvents for PanicsUntil {
+        fn connected(&self) {}
+        fn stream_failed(&self, _why: &str, _at: Instant) {}
+        fn late_answer(&self) {}
+        fn observe_failed(&self, _why: &str) {
+            let tellings = {
+                let mut told = self.told.lock();
+                told.push(tokio::time::Instant::now());
+                told.len()
+            };
+            assert!(tellings >= self.last, "a telling before the last panics");
+        }
+    }
+
+    /// A turn that panicked is started again a pause later, never at once:
+    /// under a telling that panics every time the I/O thread, which carries
+    /// every stream, would spin. The loop's clock is paused here and moves
+    /// by its sleeps alone, and each telling reads it.
+    #[tokio::test(start_paused = true)]
+    async fn a_panicked_turn_is_started_again_a_pause_later() {
+        let (commands, taken) = mpsc::unbounded_channel();
+        let mut looping = JoinSet::new();
+        looping.spawn(run_commands(taken, Arc::new(Witness::new())));
+        let events = Arc::new(PanicsUntil {
+            last: 4,
+            told: parking_lot::Mutex::new(Vec::new()),
+        });
+        let listener: Arc<dyn LaneEvents> = Arc::clone(&events) as _;
+        let (_queue, raised) = mpsc::channel(4);
+        let lane = ObserveLane::new(nowhere(), Arc::downgrade(&listener), raised);
+        assert!(commands.send(Command::Observe(Arc::new(lane))).is_ok());
+        tokio::time::sleep(RECONNECT_PAUSE * 8).await;
+        let told = events.told.lock().clone();
+        assert!(told.len() >= 4, "{} tellings in eight pauses", told.len());
+        for pair in told.windows(2).take(3) {
+            assert!(
+                pair[1].duration_since(pair[0]) >= RECONNECT_PAUSE,
+                "a panicked turn was started again at once"
             );
         }
     }

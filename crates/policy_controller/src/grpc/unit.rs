@@ -85,8 +85,10 @@ impl Unit {
     /// one failure a pause, which is all one lane can raise. So the streams
     /// that end together at a restart are one failure, one deciding thread
     /// and sixteen count the same at any phases, and a plugin that stays away
-    /// counts once a pause. A lane's next failure is dated a whole pause
-    /// after its last, so it is at or past the window by arithmetic.
+    /// counts once a pause. A decision asks for a failed stream a whole pause
+    /// after its failure, so that open's failure is at or past the window by
+    /// arithmetic. The apply asks without waiting the pause: a failed open
+    /// it asked for inside the pause counts nothing.
     pub(crate) fn stream_failed(&self, at: Instant, now: impl FnOnce() -> u64) {
         let mut counted = self.outage.lock();
         if counted.is_some_and(|last| at.saturating_duration_since(last) < RECONNECT_PAUSE) {
