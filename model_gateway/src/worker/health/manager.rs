@@ -30,34 +30,33 @@ use openai_protocol::worker::{
     EngineAggregateMetricsSnapshot, FlushCacheResult, HealthCheckConfig, ProfileOptions,
     ProfileResult, SchedulerLoadSnapshot, WorkerLoadResponse, WorkerStatus,
 };
-use smg_worker::{labels::DISCOVERY_PROVIDER_LABEL, settings::UnhealthyRemovalScope};
+use smg_worker::{
+    labels::DISCOVERY_PROVIDER_LABEL, metrics_labels, settings::UnhealthyRemovalScope,
+};
 use tokio::{
     sync::{broadcast, mpsc, Notify},
     task::JoinHandle,
 };
 use tracing::{debug, error, info, warn};
 
-use crate::{
-    observability::metrics::{metrics_labels, Metrics},
-    worker::{
-        connection::engine::NO_ENGINE_CONNECTOR,
-        health::liveness,
-        identity::{
-            basic::WorkerTypeExt,
-            endpoint::{grpc_base_url, Endpoint},
-        },
-        load::{
-            metrics_aggregator::{self, MetricPack},
-            state::LoadSnapshot,
-        },
-        registry::{
-            event::{WorkerConnected, WorkerEvent},
-            WorkerId,
-        },
-        runtime::WorkerRuntime,
-        ConnectionMode, RuntimeType, Worker, WorkerOrigin, WorkerRegistry, WorkerResult,
-        WorkerType,
+use crate::worker::{
+    connection::engine::NO_ENGINE_CONNECTOR,
+    health::liveness,
+    identity::{
+        basic::WorkerTypeExt,
+        endpoint::{grpc_base_url, Endpoint},
     },
+    load::{
+        metrics_aggregator::{self, MetricPack},
+        state::LoadSnapshot,
+    },
+    metrics::Metrics,
+    registry::{
+        event::{WorkerConnected, WorkerEvent},
+        WorkerId,
+    },
+    runtime::WorkerRuntime,
+    ConnectionMode, RuntimeType, Worker, WorkerOrigin, WorkerRegistry, WorkerResult, WorkerType,
 };
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);

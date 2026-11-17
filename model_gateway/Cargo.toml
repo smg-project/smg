@@ -88,7 +88,7 @@ uuid = { workspace = true, features = ["serde", "fast-rng"] }
 
 # Workspace crates
 openai-protocol = { workspace = true, features = ["axum"] }
-smg-worker = { workspace = true, features = ["runtime"] }
+smg-worker = { workspace = true, features = ["metrics", "runtime"] }
 reasoning-parser.workspace = true
 tool-parser.workspace = true
 smg-symphony.workspace = true

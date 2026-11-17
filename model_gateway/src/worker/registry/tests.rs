@@ -4,13 +4,11 @@ use metrics_exporter_prometheus::PrometheusBuilder;
 use openai_protocol::model_card::ModelCard;
 
 use super::*;
-use crate::{
-    observability::worker_metrics::{self, WorkerSeriesRecorder},
-    worker::{
-        health::circuit_breaker::{CircuitBreakerConfig, CircuitState},
-        test_support::no_health_check,
-        BasicWorker, BasicWorkerBuilder, WorkerLoadGuard,
-    },
+use crate::worker::{
+    health::circuit_breaker::{CircuitBreakerConfig, CircuitState},
+    metrics::series::{self as worker_series, WorkerSeriesRecorder},
+    test_support::no_health_check,
+    BasicWorker, BasicWorkerBuilder, WorkerLoadGuard,
 };
 
 /// A worker whose breaker opens on one failed request and would stay
@@ -4050,7 +4048,7 @@ fn clear_all_overload_flags_resets_every_model() {
 /// registry hands the store the removed worker's own witness.
 #[test]
 fn a_removed_workers_address_is_retired_until_its_last_handle_is_gone() {
-    let series = worker_metrics::installed_or_default();
+    let series = worker_series::installed_or_default();
     let registry = WorkerRegistry::new();
     let url = "http://retired-seam:8080";
     let worker: Arc<dyn Worker> = Arc::new(
@@ -4086,7 +4084,7 @@ fn a_removed_workers_address_is_retired_until_its_last_handle_is_gone() {
 /// gone too, and the guard's release lands nowhere.
 #[test]
 fn a_replaced_workers_guard_keeps_the_removed_address_retired_until_it_drops() {
-    let series = worker_metrics::installed_or_default();
+    let series = worker_series::installed_or_default();
     let recorder = WorkerSeriesRecorder::new(
         PrometheusBuilder::new().build_recorder(),
         Arc::clone(series),

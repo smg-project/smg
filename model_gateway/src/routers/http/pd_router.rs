@@ -95,8 +95,8 @@ use crate::{
         PD_PREFILL_QUEUE_TIMEOUT,
     },
     worker::{
-        identity::endpoint::Endpoint, PdPairIndex, PdWire, RoutingPool, RuntimeType, Worker,
-        WorkerLoadGuard, WorkerRegistry, UNKNOWN_MODEL_ID,
+        identity::endpoint::Endpoint, metrics::Metrics as WorkerMetrics, PdPairIndex, PdWire,
+        RoutingPool, RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry, UNKNOWN_MODEL_ID,
     },
 };
 
@@ -2579,7 +2579,7 @@ impl PDRouter {
     ) -> reqwest::RequestBuilder {
         let endpoint_url = worker.endpoint_url(route);
         // Every side built here is sent; counted per side, on its worker.
-        Metrics::record_worker_request(worker.url(), worker.model_id());
+        WorkerMetrics::record_worker_request(worker.url(), worker.model_id());
         let request = attach_sized_body(
             worker
                 .http_client()
@@ -3080,7 +3080,7 @@ impl RouterTrait for PDRouter {
             headers,
             worker.api_key(),
         );
-        Metrics::record_worker_request(worker.url(), worker.model_id());
+        WorkerMetrics::record_worker_request(worker.url(), worker.model_id());
         let res = match send_with_stale_conn_retry(request).await {
             Ok(res) => res,
             Err(e) if is_request_timeout(&e) => {

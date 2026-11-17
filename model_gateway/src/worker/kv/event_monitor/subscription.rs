@@ -17,16 +17,14 @@ use super::{
     apply::{WorkerIndexCounters, WorkerIndexState},
     KvBlockSize, KvEventMonitor, SubscriptionKind,
 };
-use crate::{
-    observability::metrics::Metrics,
-    worker::{
-        connection::engine::EngineConnection,
-        health::liveness,
-        identity::endpoint::Endpoint,
-        kv::{event_monitor::recovery::ResyncReason, index_backend::KvIndex},
-        load::monitor::WorkerMonitor,
-        Worker,
-    },
+use crate::worker::{
+    connection::engine::EngineConnection,
+    health::liveness,
+    identity::endpoint::Endpoint,
+    kv::{event_monitor::recovery::ResyncReason, index_backend::KvIndex},
+    load::monitor::WorkerMonitor,
+    metrics::Metrics,
+    Worker,
 };
 
 /// Initial reconnection delay after stream failure.

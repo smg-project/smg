@@ -30,30 +30,28 @@ use openai_protocol::{
     worker::{TagVocabulary, WorkerStatus},
 };
 use rustc_hash::FxBuildHasher;
-use smg_worker::settings::RetryConfig;
+use smg_worker::{metrics_labels, settings::RetryConfig};
 use symphony::grammar::GrammarStart;
 use tokio::sync::{broadcast, mpsc};
 use uuid::Uuid;
 
-use crate::{
-    observability::metrics::{metrics_labels, Metrics},
-    worker::{
-        connection::engine::EngineConnector,
-        health::circuit_breaker::CircuitState,
-        identity::{
-            basic::{RuntimeType, WorkerType},
-            endpoint::Endpoint,
-        },
-        pd::{
-            pair_index::{PdPairIndex, PdWire},
-            pairing::PdPairingMode,
-        },
-        registry::{
-            event::{WorkerConnected, WorkerEvent},
-            hash_ring::HashRing,
-        },
-        ConnectionMode, Worker, DEFAULT_SAMPLING_PARAMS_LABEL, UNKNOWN_MODEL_ID,
+use crate::worker::{
+    connection::engine::EngineConnector,
+    health::circuit_breaker::CircuitState,
+    identity::{
+        basic::{RuntimeType, WorkerType},
+        endpoint::Endpoint,
     },
+    metrics::Metrics,
+    pd::{
+        pair_index::{PdPairIndex, PdWire},
+        pairing::PdPairingMode,
+    },
+    registry::{
+        event::{WorkerConnected, WorkerEvent},
+        hash_ring::HashRing,
+    },
+    ConnectionMode, Worker, DEFAULT_SAMPLING_PARAMS_LABEL, UNKNOWN_MODEL_ID,
 };
 
 pub mod event;
@@ -2420,7 +2418,7 @@ impl WorkerRegistry {
         }
 
         // The worker's series are kept for the time its address is
-        // registered (see `observability::worker_metrics`). The builder's
+        // registered (see `worker::metrics::series`). The builder's
         // writes for health, HTTP/2 and breaker state preceded this
         // registration and were dropped if the address was retired by an
         // earlier removal, so they are repeated here.

@@ -16,22 +16,20 @@ use super::{
     endpoint::Endpoint,
     metadata::DecodingLabels,
 };
-use crate::{
-    observability::metrics::Metrics,
-    worker::{
-        connection::{
-            engine::{ConnectorDefault, EngineConnection, EngineConnector, NoConnector},
-            http_client::LazyHttpClient,
-        },
-        health::{
-            circuit_breaker::{CircuitBreaker, CircuitBreakerConfig},
-            overload::OverloadThresholds,
-            resilience::ResolvedResilience,
-        },
-        pd::pairing::PdPairing,
-        registry::event::WorkerConnected,
-        Worker,
+use crate::worker::{
+    connection::{
+        engine::{ConnectorDefault, EngineConnection, EngineConnector, NoConnector},
+        http_client::LazyHttpClient,
     },
+    health::{
+        circuit_breaker::{CircuitBreaker, CircuitBreakerConfig},
+        overload::OverloadThresholds,
+        resilience::ResolvedResilience,
+    },
+    metrics::Metrics,
+    pd::pairing::PdPairing,
+    registry::event::WorkerConnected,
+    Worker,
 };
 
 /// Builder for creating BasicWorker instances with fluent API.
