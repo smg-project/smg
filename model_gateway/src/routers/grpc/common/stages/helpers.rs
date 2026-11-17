@@ -166,8 +166,9 @@ pub(crate) enum IdStamp {
     /// Bare client `rid` outside PD: stable across attempts.
     Exact,
     /// `{base}-{uuid}` minted fresh per attempt (rid under PD,
-    /// middleware-derived ids).
-    Suffixed { base: String },
+    /// middleware-derived ids). The base is the first `base_len` bytes of
+    /// the id each attempt leaves on the plan, so the stamp keeps no copy.
+    Suffixed { base_len: usize },
     /// `{prefix}{uuid}` minted fresh per attempt.
     Minted { prefix: &'static str },
     /// Batched completion fan-out: shared id plus per-sub engine ids.
@@ -198,7 +199,7 @@ pub(crate) fn resolve_request_id_stamp(
     if let Some(rid) = request_type.rid() {
         return if disaggregated {
             let stamp = IdStamp::Suffixed {
-                base: rid.to_string(),
+                base_len: rid.len(),
             };
             (suffixed_id(rid, request_stamp_uuid(tenant_meta)), stamp)
         } else {
@@ -209,7 +210,7 @@ pub(crate) fn resolve_request_id_stamp(
         Some(request_id) => (
             suffixed_id(request_id, request_stamp_uuid(tenant_meta)),
             IdStamp::Suffixed {
-                base: request_id.to_string(),
+                base_len: request_id.len(),
             },
         ),
         None => (
@@ -229,6 +230,17 @@ fn suffixed_id(base: &str, uuid: uuid::Uuid) -> String {
     id.push('-');
     push_hyphenated(&mut id, uuid);
     id
+}
+
+/// The base of a `{base}-{uuid}` id whose base is `base_len` bytes long, or
+/// `None` for any other text (see [`IdStamp::Suffixed`]).
+fn suffixed_base(id: &str, base_len: usize) -> Option<&str> {
+    let (base, suffix) = id.split_at_checked(base_len)?;
+    let is_uuid_suffix = suffix.len() == 1 + uuid::fmt::Hyphenated::LENGTH
+        && suffix
+            .strip_prefix('-')
+            .is_some_and(|uuid| uuid::Uuid::try_parse(uuid).is_ok());
+    is_uuid_suffix.then_some(base)
 }
 
 /// `{prefix}{uuid}`, written into one `String` of its exact size (see
@@ -297,6 +309,16 @@ pub(crate) fn wire_prompt_text(rendered_prompt: String, carries_media: bool) -> 
     }
 }
 
+/// The error of a stamp over a plan it was not built for: a build-stage
+/// wiring bug, named in the log.
+fn plan_mismatch(what: &'static str) -> Response {
+    error!(function = "IdStamp::restamp", "{what}");
+    error::internal_error(
+        "id_stamp_plan_mismatch",
+        "Id stamp does not match the plan shape",
+    )
+}
+
 impl IdStamp {
     /// Re-mint the retained plan's engine id(s) for a retry attempt. A plan
     /// shape that doesn't match the stamp is a build-stage wiring bug: fail
@@ -304,7 +326,15 @@ impl IdStamp {
     pub(crate) fn restamp(&self, plan: &mut ExecutionPlan) -> Result<(), Response> {
         match self {
             Self::Exact => Ok(()),
-            Self::Suffixed { base } => plan.set_request_id(suffixed_id(base, uuid::Uuid::now_v7())),
+            Self::Suffixed { base_len } => match suffixed_base(plan.request_id(), *base_len) {
+                Some(base) => {
+                    let id = suffixed_id(base, uuid::Uuid::now_v7());
+                    plan.set_request_id(id)
+                }
+                None => Err(plan_mismatch(
+                    "Suffixed id stamp on a plan whose id is not its base and a uuid",
+                )),
+            },
             Self::Minted { prefix } => plan.set_request_id(minted_id(prefix, uuid::Uuid::now_v7())),
             Self::Batch(batch) => {
                 let shared = batch
@@ -336,14 +366,7 @@ impl IdStamp {
                     ExecutionPlan::Single(_)
                     | ExecutionPlan::PrefillDecode(_)
                     | ExecutionPlan::EncodePrefillDecode { .. } => {
-                        error!(
-                            function = "IdStamp::restamp",
-                            "Batch id stamp on a non-batch plan"
-                        );
-                        Err(error::internal_error(
-                            "id_stamp_plan_mismatch",
-                            "Id stamp does not match the plan shape",
-                        ))
+                        Err(plan_mismatch("Batch id stamp on a non-batch plan"))
                     }
                 }
             }
