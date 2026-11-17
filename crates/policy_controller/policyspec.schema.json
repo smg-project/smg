@@ -655,7 +655,7 @@
           "exclusiveMinimum": 0
         },
         "prefix_tokens": {
-          "description": "The depth in tokens at which a request with no routing key is keyed\nby its prefix: the last whole block at or under the depth, so at\nleast one block of the view's block size and at most the blocks a\nrequest carries. Absent, such a request has no key.",
+          "description": "The depth in tokens at which a request with no routing key is keyed\nby its prefix: the last whole block at or under the depth, so at\nleast one block of the view's block size and at most the blocks a\nrequest carries. Under the view's `boundaries` a request that reaches\none is keyed there instead, at the deepest it reaches. The depth is\nchecked in the view's token blocks and read in the blocks a request\nwas hashed by. A text request's windows are `block_size` characters,\na quarter of a token block, so it carries a quarter of the checked\ndepth and a deeper depth keys at its last window. Under a block size\nan engine published above the depth a request has no key. Absent, a\nrequest with no routing key has none.",
           "type": [
             "integer",
             "null"
@@ -678,7 +678,7 @@
       "additionalProperties": false
     },
     "BoundedLoadParams": {
-      "description": "The bounded-load rule of the consistent-hash scorer: a ring owner whose\nrequests in flight are past both parts of the rule over the candidates'\nmean, the request being placed counted in the mean, is passed over, and\nthe profile's next stage places the request.",
+      "description": "The bounded-load rule of the consistent-hash scorer: a ring owner whose\nrequests in flight are past both parts of the rule over the candidates'\nmean, the request being placed counted in the mean, is passed over. A\nprefix keyed at a boundary is then tried at the next boundary down. A\nrequest no owner keeps is scored as one with no key: the profile's next\nstage places it, and in a profile with no stage after the ring the picker\ndraws among every candidate, the passed owner among them.",
       "type": "object",
       "properties": {
         "factor": {
