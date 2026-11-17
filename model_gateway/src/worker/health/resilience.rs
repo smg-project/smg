@@ -6,8 +6,9 @@
 use std::{collections::HashSet, time::Duration};
 
 use openai_protocol::worker::ResilienceUpdate;
+use smg_worker::settings::RetryConfig;
 
-use crate::{config::types::RetryConfig, worker::health::circuit_breaker::CircuitBreakerConfig};
+use crate::worker::health::circuit_breaker::CircuitBreakerConfig;
 
 /// Default retryable HTTP status codes.
 pub const DEFAULT_RETRYABLE_STATUS_CODES: &[u16] = &[408, 429, 500, 502, 503, 504];
