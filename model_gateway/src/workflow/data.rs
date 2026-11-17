@@ -44,6 +44,14 @@ use crate::{
     worker::{registry::WorkerId, ConnectionMode, Worker},
 };
 
+/// The application context a workflow's data was given, or the workflow's
+/// error for a run that was started without one.
+pub(crate) fn require_app_context(
+    app_context: Option<&Arc<AppContext>>,
+) -> WorkflowResult<&Arc<AppContext>> {
+    app_context.ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))
+}
+
 // ============================================================================
 // Shared trait for worker registration workflows
 // ============================================================================
@@ -184,10 +192,7 @@ impl WorkerWorkflowData {
         if let Some(client) = &self.http_client_handle {
             return Ok(Arc::clone(client));
         }
-        let app_context = self
-            .app_context
-            .as_ref()
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
+        let app_context = require_app_context(self.app_context.as_ref())?;
         app_context
             .worker_client_cache
             .get(&self.config.http_pool, self.http2.unwrap_or(false))
