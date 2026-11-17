@@ -379,6 +379,29 @@ fn a_token_that_begins_inside_a_normalized_control_leaves_the_template_as_it_was
 }
 
 #[test]
+fn a_control_that_begins_with_another_added_token_is_marked() {
+    // Of two added tokens that begin at one place the flat encode takes the
+    // longer, so a token that is the beginning of a control the template
+    // writes never takes its place. The template is marked, and the control
+    // reads as itself from the text of a request that types no spelling and
+    // between the marks of one that does, on every load of the same files.
+    for content in ["[/INST:", "</s:"] {
+        let temp = TempDir::new().unwrap();
+        let conversion = with_added_token(content);
+        for load in 0..32 {
+            let tok = checkpoint_of(temp.path(), &conversion, &builds());
+            assert!(tok.chat_template.marked(), "{content}, load {load}");
+            let (_, ids, from_text) = render(&tok, json!("ab"));
+            assert!(from_text, "{content}, load {load}");
+            assert_eq!(ids, [2, 13, 14, 3, 13, 14, 1], "{content}, load {load}");
+            let (_, ids, from_text) = render(&tok, json!("a[/INST:x]b"));
+            assert!(!from_text, "{content}, load {load}");
+            assert_eq!(ids, TYPED_AS_TEXT, "{content}, load {load}");
+        }
+    }
+}
+
+#[test]
 fn a_replaced_template_is_judged_anew() {
     let temp = TempDir::new().unwrap();
     let mut tok = checkpoint(temp.path(), &spells());

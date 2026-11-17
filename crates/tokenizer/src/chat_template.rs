@@ -2424,20 +2424,24 @@ fn with_marked_literals(source: &str, bindings: &[ControlBinding]) -> Option<Str
 
 /// Whether the flat encode may read one of `spellings`, where a text holds
 /// it, otherwise than alone and as it stands. `added` is every added token
-/// of the vocabulary, each with whether its entry carries a flag: it takes
+/// of the vocabulary, each with a flag: whether the caller's flat encode
+/// reads that token otherwise by itself. Its entry says so (the token takes
 /// the whitespace beside it, it matches only as a whole word, or it is
-/// matched after normalization.
+/// matched after normalization), or the caller's encoder does not take the
+/// longer of two added tokens that begin at one place and the token begins
+/// with another one.
 ///
 /// Between marks a spelling is read as its own token. The flat encode takes
-/// the added tokens leftmost and longest, each under its flags: first the
-/// ones matched as they stand, then, in what is left between them, the
-/// ones matched after normalization. So a flagged spelling is more than
-/// its characters there, or none of them, or it is read only in the second
-/// pass, behind every token of the first and wherever the text normalizes
-/// to it; and a token that holds a spelling, or that ends inside one, takes
-/// the spelling's place where the text beside it completes that token. A
-/// token that stands inside a spelling without a flag, or that begins
-/// inside one, never does: the spelling starts first, or is the longer.
+/// the added tokens leftmost, each under its flags: first the ones matched
+/// as they stand, then, in what is left between them, the ones matched
+/// after normalization. So a flagged spelling is more than its characters
+/// there, or none of them, or it is read only in the second pass, behind
+/// every token of the first and wherever the text normalizes to it, or it
+/// is read as the token it begins with; and a token that holds a spelling,
+/// or that ends inside one, takes the spelling's place where the text
+/// beside it completes that token. A token that stands inside a spelling
+/// without a flag, or that begins inside one, never does: the spelling
+/// starts first, or is the longer and is taken.
 fn contested<'a>(spellings: &[&str], mut added: impl Iterator<Item = (&'a str, bool)>) -> bool {
     // The bytes a spelling begins with: a token meets a spelling only there.
     let mut begins = [false; 256];

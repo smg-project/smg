@@ -649,16 +649,28 @@ impl TiktokenTokenizer {
             return;
         }
         let (vocab, added_texts) = (&self.vocab, &self.added_texts);
+        let is_added = |text: &str| {
+            vocab
+                .get(text)
+                .is_some_and(|id| added_texts.get(id).is_some_and(|added| added == text))
+        };
         let matcher = OnceCell::new();
         let marked = self.chat_template.mark_built_controls(
-            &|text: &str| {
-                vocab
-                    .get(text)
-                    .is_some_and(|id| added_texts.get(id).is_some_and(|added| added == text))
-            },
+            &is_added,
             // This file's reader takes an added token as it stands: no flag
-            // of an entry counts.
-            || added_texts.values().map(|text| (text.as_str(), false)),
+            // of an entry counts. But of two added tokens that begin at one
+            // place its own encoder takes the first in its own order, not
+            // the longer, so it may read a token that begins with another
+            // one as that one and the rest. Such a token counts as flagged.
+            || {
+                added_texts.values().map(|text| {
+                    let begins_with_another = text
+                        .char_indices()
+                        .skip(1)
+                        .any(|(end, _)| is_added(&text[..end]));
+                    (text.as_str(), begins_with_another)
+                })
+            },
             || {
                 matcher
                     .get_or_init(|| {
@@ -2758,6 +2770,24 @@ mod tests {
             let tokenizer = TiktokenTokenizer::from_dir(dir.path()).unwrap();
             assert_eq!(tokenizer.controls.is_some(), marked, "{longer}");
             assert_eq!(typed_turn_ids(&tokenizer).1, !marked, "{longer}");
+        }
+    }
+
+    /// Of two added tokens that begin at one place this file's own encoder
+    /// takes the first in its own order, not the longer. Where a control the
+    /// template builds begins with another added token, the flat encode may
+    /// read that one and the rest, and between marks the control would be
+    /// read: the template is left as it was. The rule reads the vocabulary
+    /// alone, so every load of the same files answers the same.
+    #[test]
+    fn a_tiktoken_file_s_control_that_begins_with_an_added_token_leaves_the_template_as_it_was() {
+        for shorter in ["</s:", "[/INST:"] {
+            let dir = suffixed_controls_dir_with(&builds_its_controls(), None, Some(shorter));
+            for load in 0..32 {
+                let tokenizer = TiktokenTokenizer::from_dir(dir.path()).unwrap();
+                assert!(tokenizer.controls.is_none(), "{shorter}, load {load}");
+                assert!(typed_turn_ids(&tokenizer).1, "{shorter}, load {load}");
+            }
         }
     }
 
