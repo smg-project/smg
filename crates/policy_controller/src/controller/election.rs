@@ -69,7 +69,7 @@ pub enum LeasePlace {
 
 impl LeasePlace {
     /// Whether another replica can see the lease.
-    fn is_shared(&self) -> bool {
+    pub(super) fn is_shared(&self) -> bool {
         !matches!(self, Self::Process)
     }
 }
@@ -608,7 +608,8 @@ enum Streak {
 }
 
 /// One line a change of role, a gone streak or a waiting one; a take's term
-/// to the store.
+/// to the store, and one warning where that take started no term in the
+/// store's log.
 fn report(
     elector: &Elector,
     tick: &Tick,
@@ -627,6 +628,15 @@ fn report(
         Tick::Acquired { term } => {
             following.clear();
             store.set_term(*term);
+            // The take started no term in the store's log.
+            if let Some(followed) = store.followed() {
+                warn!(
+                    identity = elector.identity(),
+                    term,
+                    followed,
+                    "the take started no term in the log: the log followed a term at or above it, so its writes stand under no term and no standby follows them until a later take"
+                );
+            }
         }
         Tick::Lost { term, holder } => {
             warn!(
@@ -797,12 +807,12 @@ mod tests {
         Running, Standing, Word,
     };
     use crate::{
-        controller::config::ConfigError,
+        controller::{config::ConfigError, replication::journaled},
         elector::{
             ElectError, ElectionSettings, Elector, LeaseBackend, LeaseRecord, MemoryLease, Written,
             TERM_CEILING,
         },
-        store::{LeasesStore, MemoryStore},
+        store::{LeasesStore, MemoryStore, Position},
     };
 
     #[test]
@@ -1441,6 +1451,57 @@ mod tests {
             .filter(|line| line.contains("the lease's term is under the highest this replica saw"))
             .count();
         assert_eq!(fell, 2, "{text}");
+    }
+
+    #[test]
+    fn a_take_that_starts_no_term_in_the_log_is_one_warning_at_the_take() {
+        let lines = Logged(Arc::new(Mutex::new(Vec::new())));
+        // A second subscriber stays registered beside each loop's own, as in
+        // the cases above.
+        let _beside = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+        // Two candidates, each over a lease and a store of its own: the
+        // second's log followed term 5 before its take of term 1.
+        for (name, followed) in [("a@127.0.0.1:1", false), ("b@127.0.0.1:2", true)] {
+            let settings = ElectionSettings {
+                duration: Duration::from_millis(600),
+                renew_period: Duration::from_millis(20),
+                renew_deadline: Duration::from_millis(400),
+            };
+            let (store, log) = journaled(&LeasePlace::Process);
+            if followed {
+                log.restart(Position { seq: 9, term: 5 });
+            }
+            let candidate = Elector::new(Box::new(MemoryLease::new()), name, settings)
+                .expect("the settings are in order");
+            let (standing, stood) = watch::channel(Standing::default());
+            let writer = lines.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish();
+            let (stop, stopped) = mpsc::channel();
+            let taking = Arc::clone(&store);
+            let looping = thread::spawn(move || {
+                tracing::subscriber::with_default(subscriber, || {
+                    run(candidate, &taking, &standing, &stopped);
+                });
+            });
+            until("the take", || stood.borrow().holder == name);
+            stop.send(Word::Stop).expect("the loop runs");
+            until("the loop's end after its stop", || looping.is_finished());
+            looping.join().expect("the loop ends");
+            assert_eq!(store.term(), 1);
+            assert_eq!(store.followed(), followed.then_some(5), "{name}");
+        }
+        let text = String::from_utf8(lines.0.lock().clone()).expect("the lines are text");
+        let count = |name: &str, what: &str| {
+            text.lines()
+                .filter(|line| line.contains(name) && line.contains(what))
+                .count()
+        };
+        assert_eq!(count("a@127.0.0.1:1", "started no term"), 0, "{text}");
+        assert_eq!(count("b@127.0.0.1:2", "started no term"), 1, "{text}");
+        assert_eq!(count("b@127.0.0.1:2", "followed=5"), 1, "{text}");
     }
 
     /// A lease whose every write takes `takes` to store while `slow` is set,

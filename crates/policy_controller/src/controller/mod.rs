@@ -39,6 +39,7 @@ mod membership;
 pub mod metrics;
 mod principal;
 pub mod readiness;
+mod replication;
 mod run;
 mod service;
 mod session;
@@ -392,12 +393,13 @@ impl Controller {
         );
         let (standing, stood) = watch::channel(Standing::default());
         let (phase, readiness) = readiness::channel(elector.fence(), stood.clone());
+        let journal = replication::journaled(&config.election.lease);
         let shared = Shared::new(
             config.controller_id.clone(),
             address.unwrap_or_default(),
             &elector,
             stood,
-            Arc::new(MemoryStore::new()),
+            journal,
             Arc::clone(&catalog),
             config.decide_shards,
         )

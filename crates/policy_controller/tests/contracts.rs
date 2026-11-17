@@ -1087,6 +1087,7 @@ const ONEOFS: &[(&str, &str, &str, &[&str])] = &[
             "generation",
             "ids",
             "lease_end",
+            "term_start",
         ],
     ),
     (
