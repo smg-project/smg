@@ -7,12 +7,13 @@
 
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
+    ops::{Deref, DerefMut},
     sync::Arc,
     time::{Duration, Instant},
 };
 
 use arc_swap::ArcSwap;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, MutexGuard};
 use rustc_hash::FxHashMap;
 
 use crate::{
@@ -46,6 +47,9 @@ const CHANGE_LOG: usize = 1_024;
 
 /// The store. `Default` is empty with term `0`.
 pub struct MemoryStore {
+    /// The rows, behind the membership lock. A write that records a change
+    /// holds it as a [`Writing`], which tells the journal when the write's
+    /// locks are let go.
     workers: Mutex<Workers>,
     health: Mutex<HealthTables>,
     /// The load rows, one entry per member: an entry is created with its
@@ -72,8 +76,9 @@ pub struct MemoryStore {
     world: ArcSwap<World>,
     /// Where the rows' clock starts.
     origin: Instant,
-    /// Where the term is told; `None` for a store nobody follows. The
-    /// membership writes tell through their table's own handle.
+    /// Where the term is told, and that a write's locks are let go; `None`
+    /// for a store nobody follows. The membership writes tell through
+    /// their table's own handle.
     journal: Option<Arc<dyn Journal>>,
     /// The same journal where it carries load rows: where the load writes
     /// are told.
@@ -427,6 +432,15 @@ impl MemoryStore {
         self.loads.lock().writer.whole_derivations(model)
     }
 
+    /// Whether no lock a journaled write takes is held at this instant:
+    /// the membership lock, the lease lock and the load lock, each tried.
+    #[cfg(test)]
+    pub(crate) fn unlocked(&self) -> bool {
+        self.workers.try_lock().is_some()
+            && self.leases.try_lock().is_some()
+            && self.loads.try_lock().is_some()
+    }
+
     /// The KV tables, for the index's cases.
     #[cfg(test)]
     pub(super) fn kv(&self) -> &KvTables {
@@ -553,38 +567,80 @@ struct Probes {
 }
 
 impl Workers {
-    fn record(&mut self, change: MembershipChange) -> MembershipChange {
-        self.record_over(change, None)
-    }
-
-    /// [`Workers::record`] for a write that took a row out of the table (a
-    /// removal, a replacement): `left` is that row, for the journal.
-    fn record_over(
-        &mut self,
-        change: MembershipChange,
-        left: Option<&WorkerRow>,
-    ) -> MembershipChange {
-        self.epoch += 1;
-        if self.log.len() == CHANGE_LOG {
-            self.log.pop_front();
-        }
-        self.log.push_back((self.epoch, change));
-        if let Some(journal) = &self.journal {
-            let row = self.rows.get(&change.id()).map(|row| &row.row);
-            journal.member(self.epoch, change, row, left);
-        }
-        change
-    }
-
     /// The row under `id` when `revision` is still its revision.
     fn guarded(&mut self, id: WorkerId, revision: u64) -> Option<&mut Row> {
         self.rows
             .get_mut(&id)
             .filter(|row| row.row.revision == revision)
     }
+}
+
+/// Tells the journal, at its drop, that a write's locks are let go
+/// ([`Journal::released`]). A write takes it before its first lock: what a
+/// scope takes first it drops last.
+struct Released<'a>(Option<&'a dyn Journal>);
+
+impl Drop for Released<'_> {
+    fn drop(&mut self) {
+        if let Some(journal) = self.0 {
+            journal.released();
+        }
+    }
+}
+
+/// The membership lock as a journaled write holds it. The fields drop in
+/// their order: the lock, then the word to the journal that the write's
+/// locks are let go. What the journal wakes for a write, it wakes behind
+/// no writer and no reader of the rows.
+struct Writing<'a> {
+    workers: MutexGuard<'a, Workers>,
+    _released: Released<'a>,
+}
+
+impl Deref for Writing<'_> {
+    type Target = Workers;
+
+    fn deref(&self) -> &Workers {
+        &self.workers
+    }
+}
+
+impl DerefMut for Writing<'_> {
+    fn deref_mut(&mut self) -> &mut Workers {
+        &mut self.workers
+    }
+}
+
+/// A change is recorded through the write's guard alone: a path that takes
+/// the membership lock bare has no way to journal a write, so none is
+/// journaled whose release the journal does not hear.
+impl Writing<'_> {
+    fn record(&mut self, change: MembershipChange) -> MembershipChange {
+        self.record_over(change, None)
+    }
+
+    /// [`Writing::record`] for a write that took a row out of the table (a
+    /// removal, a replacement): `left` is that row, for the journal.
+    fn record_over(
+        &mut self,
+        change: MembershipChange,
+        left: Option<&WorkerRow>,
+    ) -> MembershipChange {
+        let workers = &mut *self.workers;
+        workers.epoch += 1;
+        if workers.log.len() == CHANGE_LOG {
+            workers.log.pop_front();
+        }
+        workers.log.push_back((workers.epoch, change));
+        if let Some(journal) = &workers.journal {
+            let row = workers.rows.get(&change.id()).map(|row| &row.row);
+            journal.member(workers.epoch, change, row, left);
+        }
+        change
+    }
 
     fn set_status(&mut self, id: WorkerId, status: WorkerStatus) -> Option<MembershipChange> {
-        let row = self.rows.get_mut(&id)?;
+        let row = self.workers.rows.get_mut(&id)?;
         let from = row.row.status;
         if from == status {
             return None;
@@ -601,6 +657,24 @@ impl Workers {
     }
 }
 
+impl MemoryStore {
+    /// The word to the journal, at its drop, that a write's locks are let
+    /// go.
+    fn released(&self) -> Released<'_> {
+        Released(self.journal.as_deref())
+    }
+
+    /// The membership lock for a write the journal is told: every path
+    /// that records a change takes the lock here.
+    fn writing(&self) -> Writing<'_> {
+        let released = self.released();
+        Writing {
+            workers: self.workers.lock(),
+            _released: released,
+        }
+    }
+}
+
 impl WorkersStore for MemoryStore {
     fn upsert(&self, mut facts: WorkerFacts) -> MembershipChange {
         // A blank value of a descriptor is no report: the row of record holds
@@ -608,7 +682,7 @@ impl WorkersStore for MemoryStore {
         if let Some(descriptor) = facts.pairing.as_deref_mut() {
             descriptor.normalize();
         }
-        let mut workers = self.workers.lock();
+        let mut workers = self.writing();
         let now = Instant::now();
         if let Some(old_id) = workers.by_key.get(&facts.key).copied() {
             let same_incarnation = workers
@@ -728,7 +802,7 @@ impl WorkersStore for MemoryStore {
     }
 
     fn patch(&self, id: WorkerId, patch: WorkerPatch, revision: u64) -> Option<MembershipChange> {
-        let mut workers = self.workers.lock();
+        let mut workers = self.writing();
         let row = workers.guarded(id, revision)?;
         // Every field is named: one more stops the build here until the
         // carry below is asked of it.
@@ -754,7 +828,7 @@ impl WorkersStore for MemoryStore {
     }
 
     fn remove(&self, id: WorkerId, revision: u64) -> Option<MembershipChange> {
-        let mut workers = self.workers.lock();
+        let mut workers = self.writing();
         workers.guarded(id, revision)?;
         let row = workers.rows.remove(&id)?;
         workers.by_key.remove(&row.row.facts.key);
@@ -780,7 +854,7 @@ impl WorkersStore for MemoryStore {
         status: WorkerStatus,
         revision: u64,
     ) -> Option<MembershipChange> {
-        let mut workers = self.workers.lock();
+        let mut workers = self.writing();
         workers.guarded(id, revision)?;
         let change = workers.set_status(id, status)?;
         self.show_status(id, status);
@@ -914,7 +988,7 @@ impl HealthSink for MemoryStore {
         ok: bool,
         revision: u64,
     ) -> Option<(WorkerStatus, WorkerStatus)> {
-        let mut workers = self.workers.lock();
+        let mut workers = self.writing();
         let row = workers.guarded(id, revision)?;
         let from = row.row.status;
         let to = next_status(row, ok)?;
@@ -924,7 +998,7 @@ impl HealthSink for MemoryStore {
     }
 
     fn connected(&self, id: WorkerId, revision: u64) -> Option<(WorkerStatus, WorkerStatus)> {
-        let mut workers = self.workers.lock();
+        let mut workers = self.writing();
         let row = workers.guarded(id, revision)?;
         let from = row.row.status;
         if matches!(from, WorkerStatus::Draining | WorkerStatus::Ready) {
@@ -1445,6 +1519,9 @@ impl LeasesStore for MemoryStore {
     }
 
     fn set_term(&self, term: u64) {
+        // Taken before the lock, so dropped after it: a rise is told to the
+        // journal under the lease lock, and released once that is let go.
+        let _released = self.released();
         let mut leases = self.leases.lock();
         if term > leases.term {
             leases.term = term;

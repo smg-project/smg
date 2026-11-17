@@ -29,9 +29,9 @@
 //! start). The log keeps the watched kinds apart from the load rows, in
 //! a ring of their own in the one order of positions, so the load rows'
 //! churn lets no membership event go, and it tells one listener when the
-//! watched kinds grew ([`Log::on_watched`]). A log may carry the
-//! watched kinds alone: where no standby is served, a load write tells
-//! nothing.
+//! watched kinds grew, once the store that wrote has let its locks go
+//! ([`Log::on_watched`]). A log may carry the watched kinds alone: where
+//! no standby is served, a load write tells nothing.
 //!
 //! What is here: the bounded log ([`Log`]) and the reads made of it
 //! ([`Log::holds`] for the place a reader brings from another connection or

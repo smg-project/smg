@@ -6,7 +6,7 @@ use std::{
     collections::BTreeMap,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc,
+        Arc, OnceLock, Weak,
     },
     thread,
     time::{Duration, Instant},
@@ -310,6 +310,74 @@ fn a_write_the_store_refused_and_an_entry_off_the_journal_tell_nothing() {
         Position { seq: 1, term: 0 },
         "the registration alone"
     );
+}
+
+/// The listener of the watched kinds is told once the store has let its
+/// locks go, by every path a journaled write takes: what the listener
+/// wakes stands in no writer's way, and in no reservation's. A write the
+/// store refused, a term that did not rise and a load row tell it nothing.
+#[test]
+fn a_watched_write_is_told_once_the_store_let_its_locks_go() {
+    const KEY: &str = "http://a:8000";
+    // Whether the store's locks were free, at each telling.
+    let told = Arc::new(Mutex::new(Vec::new()));
+    let written: Arc<OnceLock<Weak<MemoryStore>>> = Arc::default();
+    let log = {
+        let (told, written) = (Arc::clone(&told), Arc::clone(&written));
+        Log::new(64, 64).on_watched(move |_| {
+            let store = written.get().and_then(Weak::upgrade);
+            told.lock()
+                .push(store.expect("the store that wrote").unlocked());
+        })
+    };
+    let store = Arc::new(MemoryStore::journaled(Arc::new(log)));
+    assert!(written.set(Arc::downgrade(&store)).is_ok());
+    // The paths told while a lock was held: every one is named, not the
+    // first alone.
+    let (mut seen, mut held) = (0, Vec::new());
+    let mut tells = |path: &'static str, want: usize| {
+        let told = told.lock();
+        assert_eq!(told.len() - seen, want, "{path}: its tellings");
+        if !told[seen..].iter().all(|free| *free) {
+            held.push(path);
+        }
+        seen = told.len();
+    };
+    store.set_term(1);
+    tells("a term's start", 1);
+    let a = store.upsert(facts(KEY, 1)).id();
+    tells("a registration", 1);
+    store.upsert(WorkerFacts {
+        dp_size: 2,
+        ..facts(KEY, 1)
+    });
+    tells("a registration told again", 1);
+    let patch = WorkerPatch {
+        priority: Some(7),
+        ..WorkerPatch::default()
+    };
+    store.patch(a, patch, revision(&store, a));
+    tells("a patch", 1);
+    store.set_status(a, WorkerStatus::Ready, revision(&store, a));
+    tells("a status", 1);
+    let b = store.upsert(facts(KEY, 2)).id();
+    tells("a replacement", 1);
+    // Three failed probes take a ready worker out: the first two move no
+    // status.
+    for _ in 0..3 {
+        store.probe_outcome(b, false, revision(&store, b));
+    }
+    tells("a probe's outcome", 1);
+    store.connected(b, revision(&store, b));
+    tells("a connection", 1);
+    let stale = revision(&store, b) + 1;
+    assert_eq!(store.remove(b, stale), None);
+    store.set_term(1);
+    store.record(b, 0, running(1), Instant::now(), LoadSource::Stream);
+    tells("a refused write, a term that did not rise, a load row", 0);
+    store.remove(b, revision(&store, b));
+    tells("a removal", 1);
+    assert!(held.is_empty(), "told under a lock of the store: {held:?}");
 }
 
 #[test]
