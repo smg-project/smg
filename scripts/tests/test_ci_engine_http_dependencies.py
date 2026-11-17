@@ -749,7 +749,8 @@ def _nightly_sglang_benchmark_job(job_id):
     import yaml
 
     workflow = yaml.safe_load((ROOT / ".github/workflows/nightly-benchmark-amd.yml").read_text())
-    return workflow["jobs"][job_id]
+    current_job_id = {"single-worker": "single-sglang", "multi-worker": "multi-sglang"}[job_id]
+    return workflow["jobs"][current_job_id]
 
 
 @pytest.mark.parametrize("job_id", ["single-worker", "multi-worker"])
