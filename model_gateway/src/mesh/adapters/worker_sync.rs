@@ -81,7 +81,7 @@ use crate::{
         endpoint_key,
         identity::endpoint::Endpoint,
         registry::{event::WorkerEvent, WorkerId},
-        ConnectionMode, EndpointKey, Worker, WorkerOrigin, WorkerRegistry,
+        ConnectionMode, EndpointKey, RemoteWorkerState, Worker, WorkerOrigin, WorkerRegistry,
     },
 };
 
@@ -420,7 +420,7 @@ impl WorkerSyncAdapter {
             else {
                 continue;
             };
-            self.apply_state(worker_id, &state);
+            self.apply_state(worker_id, state);
             if self.worker_registry.get_by_url(url).is_some() {
                 return;
             }
@@ -612,7 +612,7 @@ impl WorkerSyncAdapter {
 
     fn apply_incoming(&self, worker_id: &str, bytes: &[u8]) {
         match decode_worker_state(bytes) {
-            Ok(state) => self.apply_state(worker_id, &state),
+            Ok(state) => self.apply_state(worker_id, state),
             Err(err) => warn!(worker_id, %err, "failed to decode WorkerState"),
         }
     }
@@ -622,8 +622,8 @@ impl WorkerSyncAdapter {
     /// is published over, a dead owner's import dropped, a gone owner's left
     /// alone inside the grace, a live owner's imported or refreshed unless
     /// this node retired the endpoint.
-    fn apply_state(&self, worker_id: &str, state: &WorkerState) {
-        if self.is_own_orphan(worker_id, state) {
+    fn apply_state(&self, worker_id: &str, state: WorkerState) {
+        if self.is_own_orphan(worker_id, &state) {
             info!(
                 worker_id,
                 url = %Endpoint::redacted_str(&state.url),
@@ -633,11 +633,11 @@ impl WorkerSyncAdapter {
             self.on_worker_removed(worker_id);
             return;
         }
-        if self.republish_above_own_key(worker_id, state) {
+        if self.republish_above_own_key(worker_id, &state) {
             return;
         }
         match self.owner_liveness(&state.owner) {
-            OwnerLiveness::Dead => self.drop_dead_owner_import(state),
+            OwnerLiveness::Dead => self.drop_dead_owner_import(&state),
             // Inside the grace a gone owner's key creates no import and
             // refreshes none: a router that starts after an owner died never
             // imports its keys, while an owner that blips keeps its imports
@@ -648,10 +648,11 @@ impl WorkerSyncAdapter {
                 "leaving worker state alone: its owner node is gone, inside the grace"
             ),
             OwnerLiveness::Live => {
-                if self.holds_back(state) {
-                    self.drop_held_back_import(state);
+                if self.holds_back(&state) {
+                    self.drop_held_back_import(&state);
                 } else {
-                    self.worker_registry.on_remote_worker_state(state);
+                    self.worker_registry
+                        .on_remote_worker_state(&remote_worker_state(state));
                 }
             }
         }
@@ -857,6 +858,20 @@ impl WorkerSyncAdapter {
     /// Publish a tombstone for a worker, removing it from the CRDT.
     pub fn on_worker_removed(&self, worker_id: &str) {
         self.workers.delete(&format!("{PREFIX}{worker_id}"));
+    }
+}
+
+/// A mesh record as the registry takes it: the six fields the registry
+/// reads, moved out of the record. The published load and the owner stay
+/// behind; the registry reads neither.
+fn remote_worker_state(state: WorkerState) -> RemoteWorkerState {
+    RemoteWorkerState {
+        worker_id: state.worker_id,
+        model_id: state.model_id,
+        url: state.url,
+        health: state.health,
+        version: state.version,
+        spec: state.spec,
     }
 }
 
@@ -1669,7 +1684,10 @@ mod tests {
         let local_id = registry
             .register(local_worker("http://local:8080"))
             .unwrap();
-        registry.on_remote_worker_state(&sample_state("peer-w1", "http://remote:8080"));
+        registry.on_remote_worker_state(&remote_worker_state(sample_state(
+            "peer-w1",
+            "http://remote:8080",
+        )));
         let phantom = WorkerId::from_string("gone-w9".to_string());
         ns.put(
             "worker:gone-w9",
@@ -2449,7 +2467,7 @@ mod tests {
         assert_eq!(version_of(&ns, &key), Some(revision));
 
         worker.set_status(WorkerStatus::NotReady);
-        adapter.apply_state(id.as_str(), &published);
+        adapter.apply_state(id.as_str(), published.clone());
         assert_eq!(
             worker.revision(),
             revision,
@@ -2461,7 +2479,7 @@ mod tests {
             model_id: "other-model".to_string(),
             ..published
         };
-        adapter.apply_state(id.as_str(), &foreign);
+        adapter.apply_state(id.as_str(), foreign);
         assert_eq!(
             worker.revision(),
             revision + 1,

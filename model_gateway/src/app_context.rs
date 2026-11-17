@@ -1425,15 +1425,13 @@ policy:
             .expect("the registry");
         let mut spec = WorkerSpec::new(format!("grpc://{}", refused.addr()));
         spec.connection_mode = ConnectionMode::Grpc;
-        registry.on_remote_worker_state(&smg_mesh::WorkerState {
+        registry.on_remote_worker_state(&crate::worker::RemoteWorkerState {
             worker_id: "peer-w1".to_string(),
             model_id: "m".to_string(),
             url: spec.url.clone(),
             health: true,
-            load: 0.0,
             version: 1,
             spec: serde_json::to_vec(&spec).expect("a spec encodes"),
-            owner: "peer".to_string(),
         });
         let import = registry.get_all().pop().expect("the import");
         assert_eq!(*import.connection_mode(), ConnectionMode::Grpc);

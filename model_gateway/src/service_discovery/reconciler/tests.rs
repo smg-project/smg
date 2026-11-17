@@ -364,15 +364,13 @@ fn owned_workers_exclude_mesh_imported_workers() {
         DISCOVERY_PROVIDER_LABEL.to_string(),
         "kubernetes".to_string(),
     );
-    let state = smg_mesh::WorkerState {
+    let state = crate::worker::RemoteWorkerState {
         worker_id: "peer-w1".to_string(),
         model_id: "m".to_string(),
         url: "http://10.0.0.3:8080".to_string(),
         health: true,
-        load: 0.0,
         version: 0,
         spec: serde_json::to_vec(&spec).unwrap(),
-        owner: "peer".to_string(),
     };
     app_context.worker_registry.on_remote_worker_state(&state);
     assert!(app_context

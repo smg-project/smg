@@ -407,15 +407,13 @@ fn labels_follow_the_engine_for_local_self_hosted_workers_only() {
     let zmq_id = registry.register(zmq.clone()).unwrap();
     assert!(labels_follow_the_engine(&registry, &zmq_id, &zmq));
 
-    registry.on_remote_worker_state(&smg_mesh::WorkerState {
+    registry.on_remote_worker_state(&crate::worker::RemoteWorkerState {
         worker_id: "peer-w1".to_string(),
         model_id: "m".to_string(),
         url: "http://remote:1".to_string(),
         health: true,
-        load: 0.0,
         version: 1,
         spec: vec![],
-        owner: "peer".to_string(),
     });
     let mesh_id = registry.get_id_by_url("http://remote:1").unwrap();
     let mesh = registry.get(&mesh_id).unwrap();
@@ -902,15 +900,13 @@ fn the_probe_slot_follows_the_status_and_the_health_settings() {
 #[tokio::test]
 async fn a_failed_mesh_import_under_removal_keeps_its_probe_slot() {
     let registry = Arc::new(WorkerRegistry::new());
-    registry.on_remote_worker_state(&smg_mesh::WorkerState {
+    registry.on_remote_worker_state(&crate::worker::RemoteWorkerState {
         worker_id: "peer-w1".to_string(),
         model_id: "m".to_string(),
         url: "http://remote:1".to_string(),
         health: true,
-        load: 0.0,
         version: 1,
         spec: vec![],
-        owner: "peer".to_string(),
     });
     let worker_id = registry.get_id_by_url("http://remote:1").unwrap();
     let worker = registry.get(&worker_id).unwrap();
@@ -2102,15 +2098,13 @@ fn a_failed_workers_removal_follows_the_scope() {
             .build(),
     );
     let discovered_id = registry.register(discovered).unwrap();
-    registry.on_remote_worker_state(&smg_mesh::WorkerState {
+    registry.on_remote_worker_state(&crate::worker::RemoteWorkerState {
         worker_id: "peer-w1".to_string(),
         model_id: "m".to_string(),
         url: "http://remote:1".to_string(),
         health: true,
-        load: 0.0,
         version: 1,
         spec: vec![],
-        owner: "peer".to_string(),
     });
     let mesh_id = registry.get_id_by_url("http://remote:1").unwrap();
 

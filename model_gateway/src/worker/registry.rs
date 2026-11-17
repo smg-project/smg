@@ -2955,6 +2955,32 @@ enum PublishedSpec {
     Spec(Box<openai_protocol::worker::WorkerSpec>),
 }
 
+/// A worker as another node published it: what the registry reads of a
+/// remote record. The host's record of a peer's worker may carry more (a
+/// published load, the publishing node); the registry reads neither, and
+/// the host hands these fields over at its call of
+/// [`WorkerRegistry::on_remote_worker_state`].
+#[derive(Debug, Clone)]
+pub struct RemoteWorkerState {
+    /// The publisher's id for the worker, which an import adopts; empty
+    /// when the publisher sent none.
+    pub worker_id: String,
+    /// The model the worker serves: the model of an import built without
+    /// a usable spec.
+    pub model_id: String,
+    /// The worker's address: a record for an address the registry holds
+    /// refreshes that worker, one for a new address imports it.
+    pub url: String,
+    /// Whether the publisher holds the worker healthy.
+    pub health: bool,
+    /// The publication's version: a higher one under an import's own id
+    /// is its owner's replacement of the worker.
+    pub version: u64,
+    /// The JSON bytes of the worker's `WorkerSpec`; empty when the
+    /// publisher sent none.
+    pub spec: Vec<u8>,
+}
+
 impl WorkerRegistry {
     /// Sink for inbound mesh worker-state updates. The v2
     /// `WorkerSyncAdapter` calls this for each entry it pulls from
@@ -2966,7 +2992,7 @@ impl WorkerRegistry {
     /// a URL this registry does not hold registers a new worker from the
     /// spec (falling back to a minimal builder if the spec is absent or
     /// invalid).
-    pub fn on_remote_worker_state(&self, state: &smg_mesh::WorkerState) {
+    pub fn on_remote_worker_state(&self, state: &RemoteWorkerState) {
         // ZMQ is a same-host transport: its `ipc://` endpoint names a socket
         // on the publisher's machine, so importing it here would advertise a
         // route that can never reach the engine. Publishers filter these out;
@@ -3163,7 +3189,7 @@ impl WorkerRegistry {
     fn is_newer_publication_of_import(
         &self,
         import_id: &WorkerId,
-        state: &smg_mesh::WorkerState,
+        state: &RemoteWorkerState,
     ) -> bool {
         state.worker_id == import_id.as_str()
             && self
@@ -3175,7 +3201,7 @@ impl WorkerRegistry {
     /// Rebuild a mesh import from its owner's publication without a usable
     /// spec: the minimal worker, through the replacement path
     /// (`import_rebuild_wanted` keeps an import built from a spec instead).
-    fn rebuild_minimal_import(&self, import_id: &WorkerId, state: &smg_mesh::WorkerState) {
+    fn rebuild_minimal_import(&self, import_id: &WorkerId, state: &RemoteWorkerState) {
         let replacement: Arc<dyn Worker> = Arc::new(self.import_from(state, None));
         let record = ImportRecord {
             version: state.version,
@@ -3273,7 +3299,7 @@ impl WorkerRegistry {
     /// transport gate it declares. The caller says what it does without one:
     /// the import path builds the minimal worker, the rebuild keeps an
     /// import built from a spec as built and rebuilds a minimal one.
-    fn importable_spec(state: &smg_mesh::WorkerState) -> PublishedSpec {
+    fn importable_spec(state: &RemoteWorkerState) -> PublishedSpec {
         if state.spec.is_empty() {
             return PublishedSpec::Absent;
         }
@@ -3302,7 +3328,7 @@ impl WorkerRegistry {
     /// promotion. It connects through the registry's connector.
     fn import_from(
         &self,
-        state: &smg_mesh::WorkerState,
+        state: &RemoteWorkerState,
         spec: Option<openai_protocol::worker::WorkerSpec>,
     ) -> super::identity::basic::BasicWorker {
         use openai_protocol::model_card::ModelCard;

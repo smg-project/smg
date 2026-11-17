@@ -370,15 +370,13 @@ fn origin_tracks_local_and_mesh_registrations() {
     let local_id = registry.register(local).unwrap();
     assert_eq!(registry.origin_of(&local_id), Some(WorkerOrigin::Local));
 
-    registry.on_remote_worker_state(&smg_mesh::WorkerState {
+    registry.on_remote_worker_state(&RemoteWorkerState {
         worker_id: "peer-w1".to_string(),
         model_id: "llama-3".to_string(),
         url: "http://remote:8080".to_string(),
         health: true,
-        load: 0.0,
         version: 1,
         spec: vec![],
-        owner: "peer".to_string(),
     });
     let mesh_id = registry.get_id_by_url("http://remote:8080").unwrap();
     assert_eq!(registry.origin_of(&mesh_id), Some(WorkerOrigin::Mesh));
@@ -833,16 +831,14 @@ fn record(version: u64) -> ImportRecord {
     }
 }
 
-fn remote_state(worker_id: &str, url: &str, health: bool, spec: Vec<u8>) -> smg_mesh::WorkerState {
-    smg_mesh::WorkerState {
+fn remote_state(worker_id: &str, url: &str, health: bool, spec: Vec<u8>) -> RemoteWorkerState {
+    RemoteWorkerState {
         worker_id: worker_id.to_string(),
         model_id: "llama-3".to_string(),
         url: url.to_string(),
         health,
-        load: 0.0,
         version: 1,
         spec,
-        owner: "peer".to_string(),
     }
 }
 
@@ -882,7 +878,7 @@ fn a_mesh_imports_lines_name_the_address_masked() {
     let url = ADDRESS_WITH_A_PASSWORD;
     let spec = |model: &str| spec_bytes(url, model, WorkerType::Regular);
     let undecodable = || b"not a worker spec".to_vec();
-    let state = |version: u64, health: bool, spec: Vec<u8>| smg_mesh::WorkerState {
+    let state = |version: u64, health: bool, spec: Vec<u8>| RemoteWorkerState {
         version,
         ..remote_state("peer-w1", url, health, spec)
     };
