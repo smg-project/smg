@@ -18,7 +18,7 @@ use openai_protocol::{
         ResponsesResponse, ResponsesUsage,
     },
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use smg_external_router::retry::REQUEST_TIMEOUT_CODE;
 use smg_mcp::{self as mcp};
@@ -652,7 +652,7 @@ impl ResponseStreamEventEmitter {
 
     // INVARIANT: this method is terminal — it drains internal state via `take()`
     // and must only be called once per emitter lifetime.
-    pub fn emit_completed(&mut self, usage: Option<&serde_json::Value>) -> serde_json::Value {
+    pub fn emit_completed(&mut self, usage: Option<serde_json::Value>) -> serde_json::Value {
         // Build output array from tracked items
         let output: Vec<serde_json::Value> = self
             .output_items
@@ -697,7 +697,7 @@ impl ResponseStreamEventEmitter {
 
         // Add usage if provided
         if let Some(usage_val) = usage {
-            response_obj["usage"] = usage_val.clone();
+            response_obj["usage"] = usage_val;
         }
 
         // Add all original request fields if available
@@ -758,7 +758,7 @@ impl ResponseStreamEventEmitter {
     /// built on. The paths that emit their terminal themselves use it.
     pub fn emit_failed(
         &mut self,
-        usage: Option<&serde_json::Value>,
+        usage: Option<serde_json::Value>,
         error: &serde_json::Value,
     ) -> serde_json::Value {
         self.finish_reason = Some("failed".into());
@@ -788,7 +788,7 @@ impl ResponseStreamEventEmitter {
     /// and emit exactly one terminal event.
     pub async fn emit_terminal(
         &mut self,
-        usage: Option<&serde_json::Value>,
+        usage: Option<serde_json::Value>,
         error: Option<&serde_json::Value>,
         tx: &SseSender,
     ) -> Result<(), String> {
@@ -825,8 +825,8 @@ impl ResponseStreamEventEmitter {
     ) {
         let usage_json = usage.map(|usage| json!(usage));
         let event = match not_stored {
-            Some(error) => self.emit_failed(usage_json.as_ref(), error),
-            None => self.emit_completed(usage_json.as_ref()),
+            Some(error) => self.emit_failed(usage_json, error),
+            None => self.emit_completed(usage_json),
         };
         let delivered = self.send_event_best_effort(&event, tx).await;
         if delivered && not_stored.is_some() {
@@ -1213,13 +1213,13 @@ impl ResponseStreamEventEmitter {
     /// for persistence. Should be called after streaming is complete.
     /// Reads non-destructively so `emit_completed()` can still drain state afterwards.
     pub fn finalize(&self, usage: Option<Usage>) -> ResponsesResponse {
-        // Build output array from tracked items (clone — emit_completed drains later)
+        // Build output array from tracked items, read in place (emit_completed drains later)
         let output: Vec<ResponseOutputItem> = self
             .output_items
             .iter()
             .filter_map(|item| {
                 let data = item.item_data.as_ref()?;
-                match serde_json::from_value::<ResponseOutputItem>(data.clone()) {
+                match ResponseOutputItem::deserialize(data) {
                     Ok(typed) => Some(typed),
                     Err(error) => {
                         // The terminal event carries the raw item; the stored object carries
@@ -2539,7 +2539,7 @@ mod tests {
         emitter.complete_output_item(index);
         let usage = json!({"input_tokens": 3, "output_tokens": 2, "total_tokens": 5});
 
-        let event = emitter.emit_completed(Some(&usage));
+        let event = emitter.emit_completed(Some(usage.clone()));
 
         let keys = |value: &serde_json::Value| -> Vec<String> {
             value.as_object().unwrap().keys().cloned().collect()

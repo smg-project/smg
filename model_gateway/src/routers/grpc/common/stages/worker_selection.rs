@@ -6,7 +6,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use async_trait::async_trait;
 use axum::{
     http::{header::RETRY_AFTER, HeaderMap, HeaderValue},
     response::Response,
@@ -19,7 +18,7 @@ use super::{
     context_length::pair_context_length,
     helpers,
     pd_protocol::{EncodeHandoff, PdProtocol},
-    ContextRequirements, PipelineStage,
+    ContextRequirements,
 };
 #[cfg(test)]
 use crate::observability::log_throttle::KeyedLogThrottle;
@@ -311,9 +310,12 @@ fn disaggregated((prefill, decode, runtime_type): PdWorkerPair) -> WorkerSelecti
     }
 }
 
-#[async_trait]
-impl PipelineStage for WorkerSelectionStage {
-    async fn execute(&self, ctx: &mut RequestContext) -> Result<(), Response> {
+impl WorkerSelectionStage {
+    /// Called by the pipeline on the stage's own type. It is no
+    /// `PipelineStage` impl: that trait boxes the future of every call, an
+    /// allocation per request, and the pipeline never needs this stage as a
+    /// trait object.
+    pub(crate) async fn execute(&self, ctx: &mut RequestContext) -> Result<(), Response> {
         self.select(ctx).await.map_err(|refusal| {
             let request_id = helpers::middleware_request_id(ctx.input.tenant_request_meta.as_ref());
             self.report_refusal(
@@ -323,10 +325,6 @@ impl PipelineStage for WorkerSelectionStage {
                 refusal,
             )
         })
-    }
-
-    fn name(&self) -> &'static str {
-        "WorkerSelection"
     }
 }
 
@@ -503,7 +501,7 @@ impl<'a> SelectionInputs<'a> {
 }
 
 impl WorkerSelectionStage {
-    /// The selection behind [`PipelineStage::execute`]; a refusal it returns
+    /// The selection behind [`Self::execute`]; a refusal it returns
     /// is reported there by [`Self::report_refusal`]. The request's inputs are
     /// gathered first and kept for the retries in the routing snapshot, the
     /// mode's pick runs on them ([`Self::pick`]), and the selection is checked
@@ -7276,7 +7274,7 @@ mod tests {
         let ctx = prepared_ctx(Arc::clone(&registry), None);
         let accepted = Some(Instant::now() - Duration::from_millis(100));
         let guard = PrefillLoadGuard::Unbounded {
-            _guard: WorkerLoadGuard::new(Arc::clone(&prefill), None),
+            _guard: WorkerLoadGuard::with_key(Arc::clone(&prefill), None),
         };
         assert_eq!(prefill.load(), 1, "the admission holds its claim");
 
@@ -7582,15 +7580,15 @@ mod tests {
         );
     }
 
-    /// The stage's `execute` future is boxed once per request (`async_trait`)
-    /// and fits the allocator's 2,048-byte class on 64-bit targets: 1,744
-    /// bytes. It read 4,112 when the admission budget's two async wrappers
-    /// each kept the admission they had moved on (three copies of a 1.1 KB
-    /// future, and a 16-byte field took the box from the 4,096 class to
-    /// 5,120); returned as futures they hold it once. A field that grows the
-    /// future past the class needs its own read.
+    /// The stage's `execute` future lives unboxed inside the pipeline's
+    /// ingress future and is held to 2,048 bytes on 64-bit targets (1,744
+    /// when the bound was set). It read 4,112 when the admission budget's
+    /// two async wrappers each kept the admission they had moved on (three
+    /// copies of a 1.1 KB future); returned as futures they hold it once. A
+    /// field that grows the future past the bound needs its own read. A
+    /// boxed future would read 16 bytes here, the size of its pointer.
     #[test]
-    fn the_selection_stage_future_fits_its_class() {
+    fn the_selection_stage_future_is_unboxed_and_bounded() {
         let registry = Arc::new(WorkerRegistry::new());
         let stage = WorkerSelectionStage::new(
             Arc::clone(&registry),
@@ -7599,22 +7597,22 @@ mod tests {
             None,
         );
         let mut ctx = prepared_ctx(registry, None);
-        let future = size_of_val(&*stage.execute(&mut ctx));
+        let future = size_of_val(&stage.execute(&mut ctx));
         assert!(
-            future <= 2048,
+            (17..=2048).contains(&future),
             "the stage's execute future is {future} bytes"
         );
     }
 
-    /// One attempt's dispatch future (`execute_plan`'s) stays in the
-    /// 2,048-byte class the selection stage's future is held to: 1,152 bytes
+    /// One attempt's dispatch future (`execute_plan`'s) stays within the
+    /// 2,048-byte bound the selection stage's future is held to: 1,152 bytes
     /// on 64-bit targets. The pipeline awaits it by value, so it sizes every
     /// attempt's future: that one read 7,280 bytes while the two
     /// disaggregated dispatches were awaited by value, and reads 1,528 with
     /// both boxed at their call. A dispatch that grows the future past the
-    /// class is boxed at its call or needs its own read.
+    /// bound is boxed at its call or needs its own read.
     #[test]
-    fn the_dispatch_future_fits_its_class() {
+    fn the_dispatch_future_fits_its_bound() {
         let mut ctx = dispatch_ctx("test-model", grpc_wire(RuntimeType::Vllm));
         let future = size_of_val(&execute_plan(
             &mut ctx,
@@ -7626,3 +7624,7 @@ mod tests {
         assert!(future <= 2048, "the dispatch future is {future} bytes");
     }
 }
+
+#[cfg(test)]
+#[expect(clippy::print_stdout, reason = "a recorder says where its sheet went")]
+mod classic_encode_pair_rows;

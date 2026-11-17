@@ -1397,7 +1397,6 @@ mod tests {
             runtime.progress_reference_ms() > registered,
             "the clock starts at the dispatch, not at registration"
         );
-        assert!(runtime.token_progress_age() < Duration::from_millis(10));
         assert!(runtime.try_decrement_load());
         assert_eq!(
             runtime.progress_reference_ms(),

@@ -183,6 +183,10 @@ async fn responses_result_with_finishes(
         assert_eq!(error["error"]["code"], "worker_stream_failed");
         return (error, vec![]);
     }
+    if expected_status == "failed_dependency" {
+        assert_eq!(status, StatusCode::FAILED_DEPENDENCY);
+        return (serde_json::from_slice(&bytes).unwrap(), vec![]);
+    }
     assert_eq!(
         status,
         StatusCode::OK,
@@ -303,6 +307,30 @@ async fn responses_events(tools: Value) -> Vec<Value> {
 #[tokio::test]
 async fn regular_responses_stream_ends_with_json_terminal_event() {
     responses_events(json!([])).await;
+}
+
+/// An `mcp` tool that binds no server is refused before the model is asked,
+/// in both response modes, by the rule the HTTP router applies: here a label
+/// without a `server_url` that names no configured server, the case the
+/// sentence's last clause is for.
+#[tokio::test]
+async fn an_mcp_tool_that_binds_no_server_is_refused_in_the_shared_words() {
+    for stream in [false, true] {
+        let (error, _) = responses_result_with_output(
+            json!([{"type": "mcp", "server_label": "typo"}]),
+            None,
+            None,
+            "failed_dependency",
+            stream,
+        )
+        .await;
+        assert_eq!(error["error"]["code"], "connect_mcp_server_failed");
+        assert_eq!(
+            error["error"]["message"],
+            "Failed to connect to MCP servers. Check server_url and authorization, or that a \
+             server_label without server_url names a configured server."
+        );
+    }
 }
 
 #[tokio::test]

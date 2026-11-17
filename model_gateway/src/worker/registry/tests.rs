@@ -575,6 +575,76 @@ fn a_refresh_that_changes_a_card_is_read_by_the_next_kept_answer() {
     assert!(model.harmony(a_worker_names(4_096)));
 }
 
+/// A reader of what a list's workers say together for qwen: the reasoning
+/// parser the first card names, with nothing else said, counted in
+/// `readings`. The stage's own rules are its to hold; the case below holds
+/// what the snapshot keeps of a reading.
+fn the_reasoning_parser_named(
+    readings: &AtomicUsize,
+) -> impl Fn(&[Arc<dyn Worker>]) -> ModelLabels + '_ {
+    move |workers| {
+        readings.fetch_add(1, Ordering::Relaxed);
+        ModelLabels {
+            tool_parser: None,
+            reasoning_parser: workers.iter().find_map(|worker| {
+                let card = worker.models().into_iter().find(|card| card.id == "qwen")?;
+                card.reasoning_parser
+            }),
+            grammar_start: GrammarStart::Unknown,
+            vocabulary: TagVocabulary::Current,
+        }
+    }
+}
+
+#[test]
+fn what_the_workers_say_together_is_read_once_for_a_membership() {
+    let registry = WorkerRegistry::new();
+    let worker: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new("grpc://127.0.0.1:8401")
+            .connection_mode(ConnectionMode::Grpc)
+            .health_config(no_health_check())
+            .models(vec![ModelCard::new("qwen").with_reasoning_parser("qwen3")])
+            .build(),
+    );
+    registry.register(Arc::clone(&worker)).unwrap();
+    let readings = AtomicUsize::new(0);
+    let read = the_reasoning_parser_named(&readings);
+    let parser = |snapshot: &ModelWorkerSnapshot, model_id: &str| {
+        snapshot
+            .labels(model_id, &read)
+            .map(|labels| labels.reasoning_parser.clone())
+    };
+    let model = registry.model_routing_snapshot("qwen").unwrap();
+    for _request in 0..3 {
+        assert_eq!(parser(&model, "qwen"), Some(Some("qwen3".to_string())));
+    }
+    assert_eq!(readings.load(Ordering::Relaxed), 1);
+    // Another spelling than the kept one is the caller's to read, and so is
+    // the snapshot every unknown model shares: neither reads nor keeps.
+    assert_eq!(parser(&model, "Qwen"), None);
+    assert_eq!(
+        parser(&registry.get_routing_snapshot("nobody"), "nobody"),
+        None
+    );
+    assert_eq!(readings.load(Ordering::Relaxed), 1);
+
+    assert!(registry.refresh_models(
+        &worker,
+        vec![ModelCard::new("qwen").with_reasoning_parser("deepseek_r1")],
+    ));
+    // The snapshot drawn before the refresh keeps what it answered; the one
+    // a request draws now reads the cards again, once.
+    assert_eq!(parser(&model, "qwen"), Some(Some("qwen3".to_string())));
+    let model = registry.model_routing_snapshot("qwen").unwrap();
+    for _request in 0..3 {
+        assert_eq!(
+            parser(&model, "qwen"),
+            Some(Some("deepseek_r1".to_string()))
+        );
+    }
+    assert_eq!(readings.load(Ordering::Relaxed), 2);
+}
+
 #[test]
 fn a_refresh_publishes_the_snapshot_of_every_model_that_holds_the_worker() {
     let registry = WorkerRegistry::new();
@@ -3061,8 +3131,6 @@ fn test_builder_status_override_on_replace() {
 #[test]
 fn test_replace_preserves_runtime_state_and_circuit_breaker() {
     let registry = WorkerRegistry::new();
-    let mut headers = http::HeaderMap::new();
-    headers.insert("x-smg-routing-key", "sticky-key".parse().unwrap());
 
     let first: Arc<dyn Worker> = Arc::new(
         BasicWorkerBuilder::new("http://worker:8080")
@@ -3075,7 +3143,7 @@ fn test_replace_preserves_runtime_state_and_circuit_breaker() {
 
     first.set_status(WorkerStatus::NotReady);
     first.increment_processed();
-    let load_guard = WorkerLoadGuard::new(first.clone(), Some(&headers));
+    let load_guard = WorkerLoadGuard::with_key(first.clone(), Some("sticky-key"));
 
     for _ in 0..5 {
         first.record_outcome(503);
@@ -4044,7 +4112,7 @@ fn a_replaced_workers_guard_keeps_the_removed_address_retired_until_it_drops() {
         let registry = WorkerRegistry::new();
         let first = worker();
         let id = registry.register(Arc::clone(&first)).unwrap();
-        let guard = WorkerLoadGuard::new(first, None);
+        let guard = WorkerLoadGuard::with_key(first, None);
         assert!(
             listed(),
             "the guard's load is a series of the registered address"

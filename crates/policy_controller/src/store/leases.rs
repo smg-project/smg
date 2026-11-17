@@ -42,6 +42,16 @@ pub struct LeaseRecord {
     pub state: LeaseState,
 }
 
+/// What a gateway's `Dispatched` report says beside its lease.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Dispatch {
+    /// Which target of the pick the gateway dispatched to.
+    pub target_index: u8,
+    pub side: Side,
+    /// Decision to dispatch on the gateway's clock, in microseconds.
+    pub since_decision_micros: u32,
+}
+
 /// Why a lease was not recorded.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LeaseRefused {
@@ -70,16 +80,29 @@ pub trait LeasesStore: Send + Sync {
 
     fn issue(&self, record: LeaseRecord) -> Result<(), LeaseRefused>;
 
-    /// The gateway dispatched `side` of the lease at `at`; `false` when the
-    /// lease is unknown.
-    fn dispatched(&self, gateway: GatewayId, lease: LeaseId, side: Side, at: Instant) -> bool;
+    /// The gateway dispatched the lease as `dispatch` says, at `at`;
+    /// `false` when the lease is unknown.
+    fn dispatched(
+        &self,
+        gateway: GatewayId,
+        lease: LeaseId,
+        dispatch: Dispatch,
+        at: Instant,
+    ) -> bool;
 
     /// A side completed; `false` when the lease is unknown.
     fn completed(&self, gateway: GatewayId, lease: LeaseId, outcome: &Outcome) -> bool;
 
-    /// The gateway gave the lease up; `false` when the lease is unknown. A
-    /// second release of one lease changes nothing.
-    fn released(&self, gateway: GatewayId, lease: LeaseId, reason: ReleaseReason) -> bool;
+    /// The gateway gave the lease up, on `side` or, with `None`, on every
+    /// side (a pair's leases share an id); `false` when the lease is
+    /// unknown. A second release of one lease changes nothing.
+    fn released(
+        &self,
+        gateway: GatewayId,
+        lease: LeaseId,
+        side: Option<Side>,
+        reason: ReleaseReason,
+    ) -> bool;
 
     fn get(&self, gateway: GatewayId, lease: LeaseId) -> Option<LeaseRecord>;
 
@@ -93,7 +116,9 @@ pub trait LeasesStore: Send + Sync {
     fn restore(&self, gateway: GatewayId, records: &[LeaseRecord]) -> usize;
 
     /// The gateway is gone past its grace: every lease of it released as
-    /// client gone. Returns how many.
+    /// client gone. Returns how many. It is the store's one door for a
+    /// gone gateway: whatever else the store keeps under the gateway's key
+    /// leaves here too.
     fn drop_gateway(&self, gateway: GatewayId) -> usize;
 
     /// The leases of a gateway that are issued or dispatched.

@@ -1269,6 +1269,12 @@ subscription from zero while it is complete, and a state snapshot
 replay is conservatively reset because it cannot distinguish an idle publisher
 from a restarted one.
 
+The load record on the stream differs the same way while the publisher is
+quiet: the Python servicers repeat one record, that of the rank whose batch
+went out last, and the Rust servicer's relay repeats every rank's record on
+the rank's own clock. An engine with several data-parallel ranks behind one
+address wants the Rust servicer.
+
 #### Rust request path (`--servicer-impl rust`)
 
 `sglang serve --grpc-mode` (`python -m sglang.launch_server --grpc-mode`)
@@ -1579,6 +1585,17 @@ them) under `guided_decoding_backend: xgrammar`, read off the distribution's
 metadata at start-up; absent otherwise. A router spells such a worker's
 structural tags without `optional`, `plus` and `star` (a `token` node stays as
 derived). The engine's own servicer does not report the field.
+
+The Rust servicer also says where the engine starts a request's grammar on a
+prompt that ends inside the model's thinking block
+(`GetServerInfo.constrained_decoding_start`, the `constrained_decoding_start`
+label): `first_token` under `guided_decoding_backend: xgrammar` or
+`llguidance`, since the engine's guided decoder builds a request's matcher
+before the first generated token and no reasoning parser gates it; absent
+under `none` (the engine refuses a guided request) and when the launcher could
+not name the backend. A router shapes a forced tool call's grammar by it: the
+thought and then the calls, so the call is not forced into the thought. The
+engine's own servicer does not report the field.
 
 ## Architecture
 

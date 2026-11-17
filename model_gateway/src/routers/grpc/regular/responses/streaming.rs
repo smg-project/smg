@@ -675,15 +675,13 @@ async fn process_and_transform_sse_stream(
         // can be neither retrieved nor continued.
         let not_stored = persist.await.err().map(|e| e.error_object());
         let error = terminal_error.as_ref().or(not_stored.as_ref());
-        event_emitter
-            .emit_terminal(usage_json.as_ref(), error, &tx)
-            .await?;
+        event_emitter.emit_terminal(usage_json, error, &tx).await?;
     } else {
         // A background response's terminal write is retried behind the event
         // (its client polls the record); an unstored response stores
         // nothing. Neither fails the stream.
         event_emitter
-            .emit_terminal(usage_json.as_ref(), terminal_error.as_ref(), &tx)
+            .emit_terminal(usage_json, terminal_error.as_ref(), &tx)
             .await?;
         if let Err(e) = persist.await {
             debug!(response_id = %final_response.id, error = %e.message, "Response not stored");
@@ -1259,12 +1257,10 @@ async fn execute_tool_loop_streaming_internal(
         // written ends the stream with response.failed.
         let not_stored = persist.await.err().map(|e| e.error_object());
         let error = terminal_error.as_ref().or(not_stored.as_ref());
-        emitter
-            .emit_terminal(terminal_usage.as_ref(), error, &tx)
-            .await?;
+        emitter.emit_terminal(terminal_usage, error, &tx).await?;
     } else {
         emitter
-            .emit_terminal(terminal_usage.as_ref(), terminal_error.as_ref(), &tx)
+            .emit_terminal(terminal_usage, terminal_error.as_ref(), &tx)
             .await?;
         if let Err(e) = persist.await {
             debug!(response_id = %final_response.id, error = %e.message, "Response not stored");

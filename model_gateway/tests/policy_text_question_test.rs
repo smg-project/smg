@@ -145,7 +145,7 @@ fn a_request_asks_whether_text_is_wanted_without_allocating() {
 #[test]
 fn a_least_load_decision_allocates_its_eligible_list_and_nothing_else() {
     let policy = LeastLoadPolicy::new();
-    let feed = TestFeed::attached_to(&policy);
+    let feed = TestFeed::attached_to(|rx| policy.set_load_receiver(rx));
     let workers: Vec<Arc<dyn Worker>> = (0..8)
         .map(|i| {
             Arc::new(
@@ -356,7 +356,7 @@ fn a_power_of_two_random_or_passthrough_pick_allocates_nothing() {
     };
     let mut over_budget = Vec::new();
     for (name, policy) in &policies {
-        let feed = TestFeed::attached_to(policy.as_ref());
+        let feed = TestFeed::attached_to(|rx| policy.as_ref().set_load_receiver(rx));
         let workers: Vec<Arc<dyn Worker>> = (0..8)
             .map(|i| {
                 Arc::new(

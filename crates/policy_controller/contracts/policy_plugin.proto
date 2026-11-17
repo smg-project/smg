@@ -30,6 +30,7 @@ enum Role {
 }
 
 enum Phase {
+  // Reads as PHASE_SINGLE.
   PHASE_UNSPECIFIED = 0;
   PHASE_SINGLE = 1;
   PHASE_PREFILL = 2;
@@ -46,6 +47,7 @@ enum Side {
 }
 
 enum HashKind {
+  // Reads as HASH_KIND_TOKEN.
   HASH_KIND_UNSPECIFIED = 0;
   // Token blocks of the model's block size of record.
   HASH_KIND_TOKEN = 1;
@@ -274,7 +276,8 @@ message RequestFacts {
   bool streaming = 5;
   uint32 max_output_tokens = 6;
   uint32 prompt_tokens = 7;  // the host's count or estimate
-  // Prefix block hashes, capped by `view.max_block_hashes`.
+  // Prefix block hashes, capped by `view.max_block_hashes`: a controller
+  // reads the first that many of a longer list and refuses none.
   repeated fixed64 block_hashes = 8 [packed = true];
   HashKind hash_kind = 9;
   // The routing key as the host derives it; its `hash` form is the
@@ -285,15 +288,20 @@ message RequestFacts {
   repeated fixed64 tried = 13 [packed = true];
   // Time left for the whole decision, relative to the frame's receipt (on a
   // PluginDecide, rebased to that frame's receipt when the controller
-  // forwards it).
+  // forwards it). A request that states no budget has none: 0 is none left.
   uint32 budget_micros = 14;
   repeated Header headers = 15;  // allow-listed only
   MediaCounts media = 16;
   // The per-decision seed; the only randomness a stage or plugin gets.
   fixed64 seed = 17;
   // Wire-only, foreign hosts only (a front with text and no tokenizer): the
-  // controller hashes it into `block_hashes` before any stage sees the view;
-  // bounded by `view.max_prompt_text_bytes`, refused over it.
+  // controller hashes it into `block_hashes` before any stage sees the view,
+  // bounded by `view.max_prompt_text_bytes`, a field of the spec still to
+  // come with the step that hashes text: a text over the cap is read to the
+  // cap and its tail is not read, and a cap of 0 takes no text. A
+  // controller that does not hash it yet keeps none of it: it answers the
+  // request `Busy` with no reason and never decides it as a request with no
+  // prefix.
   bytes prompt_text = 18;
   // The size in tokens of one of the request's blocks as the host counted
   // them: an index's learned block size on an event-fed request, the
@@ -308,7 +316,10 @@ message RequestFacts {
 message Constraints {
   // Ids this gateway just failed to connect to.
   repeated fixed64 excluded = 1 [packed = true];
-  uint32 wire_modes = 2;  // WireMode bits the gateway speaks
+  // WireMode bits the gateway speaks; 0 states none and narrows nothing.
+  // Read before any stage runs: a worker that shares no bit with a gateway
+  // that states some is no candidate, one that states no wire included.
+  uint32 wire_modes = 2;
   // The overload veto does not apply to this decision.
   bool overload_lifted = 3;
   // At most this many candidates; absent for no hint, a present 0 a decision
@@ -359,7 +370,9 @@ message Pick {
 
 message Shed {
   ShedReason reason = 1;
-  // The filter, the picker or the pair plan's pre-pass that left nothing.
+  // The filter, the picker or the pair plan's pre-pass that left nothing; or
+  // the deciding gateway's own constraint that left none of a pool that has
+  // rows, `wires` or `subset-hint`.
   string emptied_by = 2;
   uint32 retry_after_secs = 3;  // u16
   // The binding's scale-from-zero budget lets the host hold the request.
@@ -404,13 +417,15 @@ message Lease {
 
 // Serves the routing trace header and Explain; positions into the generation's
 // spec. The record carries the first five fields (its `top` at most three
-// entries, each only `worker_id` and `score`); the observability contract
-// fills the rest, unset until then.
+// entries, each only `worker_id` and `score`) and reads `drew_first` from
+// its count, which a decision that drew first does not hold; the
+// observability contract fills the rest, unset until then.
 message Trace {
   // Zero-based position in the spec's profile names in ascending UTF-8 order.
   uint32 profile = 1;  // u16
-  // Candidates left after the filters.
-  uint32 survivors = 2;
+  // Candidates left after the filters, where the decision counted them:
+  // unset, never a zero, when it drew first (`drew_first`).
+  optional uint32 survivors = 2;
   // Best first; at most 3 (the record's TRACE_TOP).
   repeated Scored top = 3;
   fixed64 seed = 4;
@@ -430,6 +445,11 @@ message Trace {
   // The gateway's fallback profile decided.
   bool fallback = 10;
   AffinitySource affinity_source = 11;
+  // The decision drew first: its picker drew the rows it hands out and the
+  // filters were asked about each of them alone. No pass over the pool ran:
+  // `survivors` is unset and `drops` is empty, neither one a count, and
+  // `top` is of the rows drawn.
+  bool drew_first = 12;
 }
 
 message FilterDrop {
@@ -447,9 +467,9 @@ message Scored {
   uint32 dp_rank = 4;
 }
 
-// The controller will not reach this decide in budget: the gateway decides
-// locally at once. Never a decision: no lease, no trace; never seen in the
-// embedded mode.
+// The controller will not reach this decide in budget, or has no decision
+// for it: the gateway decides locally at once. Never a decision: no lease,
+// no trace; never seen in the embedded mode.
 message Busy {
   enum Reason {
     REASON_UNSPECIFIED = 0;
@@ -581,7 +601,14 @@ message Signal {
 // the controller's (bit 63 clear): a gateway-minted fallback id is re-minted
 // when the controller first learns the lease, its origin kept LOCAL.
 message LifecycleEvent {
-  // Monotonic per Observe stream.
+  // Monotonic for the plugin's life, across every Observe stream the host
+  // opens to it. The host numbers what it owed: the events it sent and the
+  // events it refused at a full queue. A gap is events the plugin never
+  // received (refused at a full queue, or in flight on a stream that
+  // ended), and a plugin that keeps a ledger of leases treats it as a loss.
+  // A gap sits where the loss fell: every event raised before it arrives
+  // ahead of the gap. A loss after the last event raised shows at the next
+  // event.
   uint64 seq = 1;
   oneof event {
     Issued issued = 2;
@@ -693,7 +720,9 @@ message Decline {
 // for and left unanswered is declined. A frame that declines a stage in
 // `decline.stage` and fills that stage's answer field is invalid: refused
 // as malformed like any other invalid frame (the decision falls back, the
-// breaker counts it), never read one way or the other.
+// breaker counts it), never read one way or the other. `counters` holds no
+// more increments than the hello declared counters; a longer list is
+// invalid the same way.
 message PluginDecision {
   fixed64 decision_id = 1;
   Survivors survivors = 2;
