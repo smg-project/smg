@@ -587,6 +587,9 @@ mod tests {
     #[derive(Clone, Default)]
     struct LocalServer {
         tools: Option<&'static [&'static str]>,
+        /// While set, a listing leaves out the first of `tools` and
+        /// describes the others anew.
+        relisted: Option<Arc<AtomicBool>>,
         refused_bearer: Option<&'static str>,
         refusing: Option<Arc<AtomicBool>>,
         list_delay: Duration,
@@ -654,12 +657,17 @@ mod tests {
                     if !server.list_delay.is_zero() {
                         tokio::time::sleep(server.list_delay).await;
                     }
+                    let relisted = server
+                        .relisted
+                        .as_ref()
+                        .is_some_and(|flag| flag.load(Ordering::SeqCst));
+                    let note = if relisted { ", relisted" } else { "" };
                     match server.tools {
                         Some(names) if !refused => Json(json!({
                             "jsonrpc": "2.0", "id": id,
-                            "result": {"tools": names.iter().map(|name| json!({
+                            "result": {"tools": names.iter().skip(usize::from(relisted)).map(|name| json!({
                                 "name": name,
-                                "description": format!("the {name} tool"),
+                                "description": format!("the {name} tool{note}"),
                                 "inputSchema": {"type": "object", "properties": {}}
                             })).collect::<Vec<_>>()}
                         }))
@@ -1175,6 +1183,159 @@ mod tests {
             reader.await.expect("the reader ends"),
             Some(names.len()),
             "what a reader finds once the listing error is gone (None: no refresh in ten seconds)"
+        );
+    }
+
+    /// A refresh drops what the server no longer lists and keeps the rest.
+    /// The server lists two tools, each with a configured alias, and the
+    /// kept one has an alias registered through the orchestrator too. The
+    /// second listing leaves the first tool out and describes the other
+    /// anew. The dropped tool and its alias are gone; the kept tool and its
+    /// aliases stay, each with the new description.
+    #[tokio::test]
+    async fn a_refresh_drops_the_tool_the_server_no_longer_lists() {
+        let relisted = Arc::new(AtomicBool::new(false));
+        let changed = Arc::new(Notify::new());
+        let arrived = Arc::new(Notify::new());
+        let url = serve_local_mcp_server(LocalServer {
+            tools: Some(&["gone", "kept"]),
+            relisted: Some(Arc::clone(&relisted)),
+            changed: Some(Arc::clone(&changed)),
+            arrived: Some(Arc::clone(&arrived)),
+            ..Default::default()
+        })
+        .await;
+        let alias = |name: &str| ToolConfig {
+            alias: Some(name.to_string()),
+            ..Default::default()
+        };
+        let orchestrator = Arc::new(McpOrchestrator::new(McpConfig::default()).await.unwrap());
+        orchestrator
+            .connect_static_server(&McpServerConfig {
+                name: "conf".to_string(),
+                transport: McpTransport::Streamable {
+                    url,
+                    token: None,
+                    headers: HashMap::new(),
+                },
+                proxy: None,
+                required: false,
+                tools: Some(HashMap::from([
+                    ("gone".to_string(), alias("gone_alias")),
+                    ("kept".to_string(), alias("kept_alias")),
+                ])),
+                builtin_type: None,
+                builtin_tool_name: None,
+                internal: false,
+            })
+            .await
+            .expect("the server connects");
+        // The first load's listing.
+        arrived.notified().await;
+        orchestrator
+            .register_alias("kept_too", "conf", "kept", None)
+            .expect("the kept tool is listed");
+        let inventory = orchestrator.tool_inventory();
+        let described = |name: &str| {
+            inventory
+                .get_tool_or_alias(name)
+                .and_then(|(_, tool)| tool.description.map(|text| text.into_owned()))
+        };
+        assert_eq!(described("gone_alias").as_deref(), Some("the gone tool"));
+        assert_eq!(described("kept_too").as_deref(), Some("the kept tool"));
+
+        relisted.store(true, Ordering::SeqCst);
+        // The second refresh's listing reaches the server only after the
+        // first's write-back.
+        for _ in 0..2 {
+            changed.notify_one();
+            tokio::time::timeout(Duration::from_secs(10), arrived.notified())
+                .await
+                .expect("a refresh's listing reaches the server");
+        }
+
+        assert!(inventory.get_entry("conf", "gone").is_none());
+        assert!(inventory.resolve_alias("gone_alias").is_none());
+        assert_eq!(described("gone_alias"), None);
+        for name in ["kept", "kept_alias", "kept_too"] {
+            assert_eq!(
+                described(name).as_deref(),
+                Some("the kept tool, relisted"),
+                "the description under {name} after the refresh"
+            );
+        }
+    }
+
+    /// A refresh never shows a server with fewer tools than both listings
+    /// hold: the refreshed listing goes in before what is gone goes out. A
+    /// reader on its own thread lists in a loop through one whole refresh of
+    /// two thousand tools. The second refresh's listing reaches the server
+    /// only after the first's write-back, and ends the read.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refresh_keeps_the_tools_both_listings_hold() {
+        let names: &'static [&'static str] = (0..2000)
+            .map(|n| &*format!("tool-{n}").leak())
+            .collect::<Vec<_>>()
+            .leak();
+        let changed = Arc::new(Notify::new());
+        let arrived = Arc::new(Notify::new());
+        let url = serve_local_mcp_server(LocalServer {
+            tools: Some(names),
+            changed: Some(Arc::clone(&changed)),
+            arrived: Some(Arc::clone(&arrived)),
+            ..Default::default()
+        })
+        .await;
+        let orchestrator = Arc::new(McpOrchestrator::new(McpConfig::default()).await.unwrap());
+        orchestrator
+            .connect_static_server(&McpServerConfig {
+                name: "conf".to_string(),
+                transport: McpTransport::Streamable {
+                    url,
+                    token: None,
+                    headers: HashMap::new(),
+                },
+                proxy: None,
+                required: false,
+                tools: None,
+                builtin_type: None,
+                builtin_tool_name: None,
+                internal: false,
+            })
+            .await
+            .expect("the server connects");
+        // The first load's listing.
+        arrived.notified().await;
+
+        let (spinning, spins) = oneshot::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let reader = tokio::task::spawn_blocking({
+            let (orchestrator, stop) = (Arc::clone(&orchestrator), Arc::clone(&stop));
+            move || {
+                let conf = ["conf".to_string()];
+                let mut fewest = orchestrator.list_tools_for_servers(&conf).len();
+                let _ = spinning.send(());
+                // Its own end: were a wait below to time out, a reader still
+                // looping would hold the runtime open and hang the test.
+                let end = std::time::Instant::now() + Duration::from_secs(30);
+                while !stop.load(Ordering::SeqCst) && std::time::Instant::now() < end {
+                    fewest = fewest.min(orchestrator.list_tools_for_servers(&conf).len());
+                }
+                fewest
+            }
+        });
+        spins.await.expect("the reader runs");
+        for _ in 0..2 {
+            changed.notify_one();
+            tokio::time::timeout(Duration::from_secs(10), arrived.notified())
+                .await
+                .expect("a refresh's listing reaches the server");
+        }
+        stop.store(true, Ordering::SeqCst);
+        assert_eq!(
+            reader.await.expect("the reader ends"),
+            names.len(),
+            "the fewest tools a reader found through a refresh"
         );
     }
 
