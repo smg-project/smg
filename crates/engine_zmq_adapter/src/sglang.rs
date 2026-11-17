@@ -29,6 +29,7 @@ use crate::{
     fanout::fan_out_n,
     pin_yield::PinYieldNote,
     sglang_encode::EncodeMediaRefs,
+    sglang_v41_items::{deepseek_v41_items, is_v41_batch},
     stream::{
         finish, map_slim_output, matched_stop_of, poll_mapped, FinishParts, MappedGenerateStream,
         StreamState,
@@ -575,6 +576,8 @@ pub(crate) fn translate_sglang_multimodal(
 }
 
 /// Translate one modality with its own tensor storage and absolute prompt offsets.
+/// A DeepSeek-V4.1 image batch becomes one item per image, the shape SGLang's
+/// own processor builds ([`deepseek_v41_items`]).
 fn translate_sglang_batch(
     mm: sglang_proto::MultimodalInputs,
     prompt_len: usize,
@@ -647,6 +650,14 @@ fn translate_sglang_batch(
     } else {
         Some(offsets)
     };
+    if modality == SglangWireModality::Image && is_v41_batch(&model_specific_data) {
+        let offsets = offsets.as_deref().unwrap_or_default();
+        return Ok(SglangWireMmInputs {
+            mm_items: deepseek_v41_items(feature, &model_specific_data, offsets)?,
+            im_token_id: mm.im_token_id,
+            video_token_id: None,
+        });
+    }
     Ok(SglangWireMmInputs {
         mm_items: vec![SglangWireMmItem {
             modality,
