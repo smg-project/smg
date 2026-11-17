@@ -276,8 +276,6 @@ async fn run_tool_loop(
     Ok(())
 }
 
-/// Send a streaming request to the pre-selected worker; `start_time` is the
-/// iteration's start, the duration a failed send is counted with.
 /// A round's server tool counts added to the loop's total, as its tokens
 /// are. The total stays `None` until a round reports its counts, so a loop
 /// whose upstream ran no server tool writes no `server_tool_use`, as the
@@ -295,6 +293,8 @@ fn add_server_tool_use(total: &mut Option<ServerToolUsage>, round: Option<&Serve
         .saturating_add(round.web_fetch_requests);
 }
 
+/// Send a streaming request to the pre-selected worker; `start_time` is the
+/// iteration's start, the duration a failed send is counted with.
 async fn send_streaming_request(
     router: &RouterContext,
     req_ctx: &RequestContext,
