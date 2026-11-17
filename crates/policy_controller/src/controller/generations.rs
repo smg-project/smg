@@ -642,11 +642,16 @@ pub(crate) struct DryRun {
 
 /// How many dry runs may wait their turn: a call past them is refused. What
 /// waits is bounded by count here, and by bytes before it waits: a document
-/// over the size bound takes no turn. 32 passes of the heaviest file the
+/// over the size bound takes no turn, and a guard longer than a digest's
+/// text ([`DIGEST_TEXT_LEN`]) takes none. 32 passes of the heaviest file the
 /// search finds, each under 40 ms at the median by run, are under a second
-/// and a half, and 32 documents of the size bound are 4 MiB. A waiting call
-/// that ends leaves the wait and frees its place.
+/// and a half, and 32 documents of the size bound with their guards are
+/// 4 MiB. A waiting call that ends leaves the wait and frees its place.
 pub(crate) const DRY_RUNS_WAITING: usize = 32;
+
+/// The length of a digest's text: `sha256:` and 64 hex digits. No digest is
+/// written longer, so a longer guard names none.
+const DIGEST_TEXT_LEN: usize = "sha256:".len() + 64;
 
 /// Why a dry run gave no verdict.
 #[derive(Debug)]
@@ -919,14 +924,16 @@ impl Generations {
     /// than its pass ends. The guard is read behind the wait, with the
     /// pass: a call that waited through an apply is judged against what
     /// stands after it. A document over the bound takes no turn: it is
-    /// refused by its size, unread, and waits on no pass.
+    /// refused by its size, unread, and waits on no pass. A guard longer
+    /// than a digest's text takes none either: it names no digest, the
+    /// guard refuses it at once, and no wait holds it.
     pub(crate) async fn dry_run_in_turn(
         self: &Arc<Self>,
         expected: String,
         document: Vec<u8>,
         format: Format,
     ) -> Result<DryRun, Unanswered> {
-        if over_bound(&document).is_some() {
+        if over_bound(&document).is_some() || expected.len() > DIGEST_TEXT_LEN {
             return self.dry_run(&expected, &document, format);
         }
         let Ok(place) = Arc::clone(&self.dry_runs).try_acquire_owned() else {
@@ -1756,6 +1763,36 @@ pub(crate) mod tests {
         assert_eq!(refused.would_run, Err(SpecRejected::TooLarge(over)));
     }
 
+    /// A guard longer than a digest's text takes no turn: it names no
+    /// digest, and the guard refuses it while another's pass stands in the
+    /// validator.
+    #[tokio::test]
+    async fn a_guard_longer_than_a_digest_waits_on_no_pass() {
+        gate!(Here);
+        let (gate, generations) = (Here::gate(), gated::<Here>());
+        assert_eq!(yaml(&generations, LEAST_LOAD), Ok(Applied::Generation(1)));
+        let (_, standing) = generations.standing();
+        let standing = standing.expect("a digest stands").to_string();
+        assert_eq!(standing.len(), DIGEST_TEXT_LEN);
+        let longer = format!("{standing}0");
+        gate.arm();
+        let beside = async {
+            gate.entered_a_pace_on().await;
+            let call = generations.dry_run_in_turn(longer, RANDOM.into(), Format::Yaml);
+            let refused = tokio::time::timeout(Duration::from_secs(5), call).await;
+            gate.release();
+            refused
+        };
+        let first = generations.dry_run_in_turn(String::new(), RANDOM.into(), Format::Yaml);
+        let (first, refused) = tokio::join!(first, beside);
+        first.expect("a verdict");
+        let refused = refused.expect("the refusal waits on no pass");
+        assert!(
+            matches!(refused, Err(Unanswered::Guarded(1, Some(_)))),
+            "{refused:?}"
+        );
+    }
+
     /// No more dry runs wait than [`DRY_RUNS_WAITING`]: the call past them
     /// is refused at once, a waiting call that ends frees its place, and
     /// the ones let in all answer.
@@ -1807,6 +1844,11 @@ pub(crate) mod tests {
             }
         }
         assert_eq!((answered, left), (DRY_RUNS_WAITING + 1, 1));
+        // A call that ran gave its place back, as one that left did.
+        assert_eq!(
+            generations.dry_runs.available_permits(),
+            DRY_RUNS_WAITING + 1
+        );
     }
 
     /// The validator's word comes before the digest's. A `kind` line is in
