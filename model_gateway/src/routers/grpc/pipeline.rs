@@ -329,8 +329,8 @@ enum RunOutcome {
     Final(Box<DispatchContext>, Instant),
 }
 
-/// One full pipeline run: the one box of a run, allocated where the request
-/// context moves in (see [`RequestPipeline::run`]).
+/// One full pipeline run, boxed once in [`RequestPipeline::run`]; the request
+/// context reaches it in a box of its own.
 type RunFuture<'a> = Pin<Box<dyn Future<Output = Result<RunOutcome, Response>> + Send + 'a>>;
 
 impl RequestPipeline {
@@ -683,7 +683,7 @@ impl RequestPipeline {
     /// `retry_config` enables the dispatch-phase retry loop.
     ///
     /// The run is boxed once, here: it holds ingress + per-attempt state
-    /// across awaits. The 2.6 KiB context comes in a box of its own, so every
+    /// across awaits. The 2.5 KiB context comes in a box of its own, so every
     /// hop from the entry point into this future moves a pointer; by value,
     /// each hop copied the context whole.
     fn run<'a>(
