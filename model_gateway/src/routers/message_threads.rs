@@ -702,7 +702,8 @@ struct Place {
 
 /// The answer under construction: the `message_start` message, its content
 /// blocks by index, each tool call's input JSON as it streams, and the bytes
-/// of text, thinking, signature and input retained so far.
+/// retained so far: each block's start event, and the text, thinking,
+/// signature and input its deltas add.
 struct Assembled {
     message: Message,
     blocks: Vec<ContentBlock>,
@@ -846,7 +847,7 @@ impl StreamedTurn {
             let parsed = parse_event(&self.carry[..end]);
             self.carry.drain(..end);
             match parsed {
-                Ok(Some(event)) => self.apply(event),
+                Ok(Some(event)) => self.apply(event, end),
                 Ok(None) => {}
                 Err(Unreadable) => self.decline("data this gateway cannot read"),
             }
@@ -863,7 +864,8 @@ impl StreamedTurn {
         }
     }
 
-    fn apply(&mut self, event: MessageStreamEvent) {
+    /// `event` folded into the answer; `size` is the bytes it arrived in.
+    fn apply(&mut self, event: MessageStreamEvent, size: usize) {
         let Some(answer) = &mut self.answer else {
             return;
         };
@@ -871,7 +873,7 @@ impl StreamedTurn {
             MessageStreamEvent::ContentBlockStart {
                 index,
                 content_block,
-            } => answer.start_block(index, content_block),
+            } => answer.start_block(index, content_block, size),
             MessageStreamEvent::ContentBlockDelta { index, delta } => answer.delta(index, delta),
             MessageStreamEvent::ContentBlockStop { index } => {
                 if answer.stop_block(index).is_err() {
@@ -1013,10 +1015,15 @@ impl HttpBody for StreamedTurn {
 }
 
 impl Assembled {
-    fn start_block(&mut self, index: u32, block: ContentBlock) {
+    /// The block at `index`, as its start event of `size` bytes gave it. A
+    /// block may arrive whole in that event (a server tool's result, a block
+    /// this gateway does not read), so the event counts toward the bytes
+    /// retained, as a delta does; one that replaces a block counts too.
+    fn start_block(&mut self, index: u32, block: ContentBlock, size: usize) {
         let Some(index) = slot(index) else {
             return;
         };
+        self.retained += size;
         while self.blocks.len() < index {
             self.blocks.push(ContentBlock::Text {
                 text: String::new(),
@@ -2247,6 +2254,42 @@ mod tests {
             StatusCode::NOT_FOUND,
             "the request does not read the block"
         );
+    }
+
+    /// A block that arrives whole in its start event counts toward the limit
+    /// as deltas do: an answer whose blocks pass the bound with no delta at
+    /// all is not stored, and the same answer under a wider bound is.
+    #[tokio::test]
+    async fn a_block_started_whole_counts_toward_the_limit() {
+        let block = json!({"type": "a_block_kind_of_no_api", "detail": "x".repeat(2048)});
+        let mut events = text_events("msg_whole", "known");
+        events.splice(
+            4..4,
+            [
+                (
+                    "content_block_start",
+                    json!({"type": "content_block_start", "index": 1, "content_block": block}),
+                ),
+                (
+                    "content_block_stop",
+                    json!({"type": "content_block_stop", "index": 1}),
+                ),
+            ],
+        );
+        let bytes = sse(&events);
+        for (limit, kept) in [(1 << 20, true), (1024, false)] {
+            let threads = MessageThreads::new().limited(limit);
+            let (_, turn) = accepted(threads.resolve(create("hi", true), None).await);
+            let answered = threads
+                .stored(turn.expect("a turn"), streamed(&bytes, &[]))
+                .await;
+            let read = to_bytes(answered.into_body(), usize::MAX)
+                .await
+                .expect("the stream");
+            assert_eq!(read.as_ref(), bytes.as_slice());
+            let stored = threads.turns("msg_whole", None).await.is_ok();
+            assert_eq!(stored, kept, "a limit of {limit} bytes");
+        }
     }
 
     /// A stream with data this gateway cannot read (a tool call whose input
