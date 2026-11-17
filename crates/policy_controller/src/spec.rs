@@ -2221,6 +2221,23 @@ fn check_profile(
             None
         }
     };
+    // A host that makes no lifecycle call holds no stage that needs them:
+    // it would decide on state nothing keeps. Every entry of a complete
+    // profile is built, so a scorer stands at its entry's place.
+    if complete && !catalog.makes_lifecycle_calls() {
+        let mut entries = p.score.iter().zip(&scorers).enumerate();
+        let scorer = entries.find_map(|(i, (entry, built))| {
+            let needs = built.scorer.needs_lifecycle();
+            needs.then(|| format!("{}.score[{i}].{}", at.0, entry.name()))
+        });
+        let needs = picker
+            .as_ref()
+            .is_some_and(|picker| picker.needs_lifecycle());
+        if let Some(path) = scorer.or_else(|| needs.then(|| at.field("pick"))) {
+            complete = false;
+            deferred.note(path, "the lifecycle this stage needs");
+        }
+    }
     if p.score.is_empty() && SAMPLING_PICKERS.contains(&p.pick.name()) {
         return Err(SpecError::PickerNeedsScorer {
             profile: name.to_string(),
@@ -2878,7 +2895,10 @@ impl PolicySpec {
     ///
     /// Every field is checked in shape first; a field this build cannot
     /// honour (a stage, a plan, a matcher or a binding rule of a later step)
-    /// is then refused by name as [`SpecError::NotInBuild`].
+    /// is then refused by name as [`SpecError::NotInBuild`], and so is a
+    /// stage that needs the lifecycle's calls
+    /// ([`crate::Lifecycle::needs_lifecycle`]) under the standalone
+    /// controller, which makes none of them yet.
     pub fn validate_in(
         &self,
         catalog: &Catalog,

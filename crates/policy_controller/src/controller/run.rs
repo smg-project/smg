@@ -1037,6 +1037,73 @@ mod tests {
         }
     }
 
+    /// Scores every worker alike, and says whether the lifecycle's calls
+    /// keep its state: a stage of a host's own.
+    #[derive(Debug)]
+    struct Level(bool);
+
+    impl crate::Lifecycle for Level {
+        fn needs_lifecycle(&self) -> bool {
+            self.0
+        }
+    }
+
+    impl crate::Scorer for Level {
+        fn name(&self) -> &'static str {
+            "level"
+        }
+
+        fn score(
+            &self,
+            _: &RequestFacts<'_>,
+            _: &[Candidate],
+            _: &[u32],
+            out: &mut [f32],
+        ) -> crate::TieBand {
+            out.fill(1.0);
+            crate::TieBand::NORMALIZED
+        }
+    }
+
+    /// The controller makes no lifecycle call yet: a spec file that names
+    /// a stage in need of them refuses the start by the stage's field, and
+    /// the same stage with no such need starts.
+    #[tokio::test]
+    async fn a_spec_file_that_names_a_stage_in_need_of_the_lifecycle_refuses_the_start() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let path = dir.path().join("policy.yaml");
+        let document =
+            "apiVersion: smg.policy/v1\nprofiles:\n  default:\n    score: [level]\n    pick: best\n";
+        std::fs::write(&path, document).expect("the file");
+        let start = |needs: bool| {
+            let config = parse(&EPHEMERAL).config().expect("the flags are in order");
+            let mut stages = Catalog::builtin();
+            stages
+                .scorer("level", move || Box::new(Level(needs)))
+                .expect("a free name");
+            bind(config, stages, &[], Some(path.clone()))
+        };
+
+        let controller = start(false).await.expect("no need of the calls starts");
+        assert_eq!(controller.store().world().spec().generation(), 1);
+        drop(controller);
+
+        match start(true).await {
+            Err(Error::SpecFile {
+                source: SpecRejected::Invalid(SpecError::NotInBuild { path: field, what }),
+                ..
+            }) => assert_eq!(
+                (field.as_str(), what),
+                (
+                    "profiles.default.score[0].level",
+                    "the lifecycle this stage needs"
+                )
+            ),
+            Err(other) => panic!("the start was refused as {other}"),
+            Ok(_) => panic!("no served line makes the calls the stage needs"),
+        }
+    }
+
     /// The flag's names reach the bound controller: a name the flags mount
     /// no listener under refuses the start, by that name.
     #[tokio::test]
