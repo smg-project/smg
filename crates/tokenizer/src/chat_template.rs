@@ -20,7 +20,10 @@ use chrono::{
 };
 use minijinja::{
     machinery::{
-        ast::{BinOpKind, Call, CallArg, Expr, ForLoop, IfCond, Macro, Set, Stmt, UnaryOpKind},
+        ast::{
+            BinOpKind, Call, CallArg, CallType, Expr, ForLoop, IfCond, Macro, Set, Stmt,
+            UnaryOpKind,
+        },
         parse, tokenize, Token, WhitespaceConfig,
     },
     syntax::SyntaxConfig,
@@ -1802,17 +1805,28 @@ fn dict_function(
 }
 
 /// A root `set` statement of a chat template: one that binds a name at the
-/// top level, or in a block that shares the top level's names (a top-level
-/// `if`, `filter`, `autoescape` or `block`), where a template binds the
-/// names its whole render reads.
+/// top level, or in a statement that shares the top level's names (a
+/// top-level `if`, `filter`, `autoescape` or block `set`, the `else` of a
+/// top-level `for`), where a template binds the names its whole render
+/// reads.
 struct RootSet<'a> {
     name: &'a str,
-    /// The byte span of the expression. `None` when the statement binds the
-    /// name another way (a block's output, one of several names at once):
-    /// nothing says what that value reads.
-    expression: Option<(usize, usize)>,
-    /// Whether the statement stands under a top-level `if`: it may not run.
+    /// The expression the name is bound to. `None` when nothing says what
+    /// the value reads: the statement binds the name another way (a block's
+    /// output, one of several names at once, a macro, an import), or its
+    /// expression computes more than the syntax itself does
+    /// ([`names_read`]).
+    expression: Option<Expression<'a>>,
+    /// Whether the statement stands under a top-level `if` or in the `else`
+    /// of a top-level `for`: it may not run.
     conditional: bool,
+}
+
+/// The expression of a root `set` statement: its byte span in the source,
+/// and the names it reads.
+struct Expression<'a> {
+    span: (usize, usize),
+    names: Vec<&'a str>,
 }
 
 /// The root `set` statements of `source`, a chat template, in the template's
@@ -1849,15 +1863,24 @@ fn root_set_statement<'a>(
         Stmt::Template(template) => {
             root_sets_under(&template.children, source, conditional, sets);
         }
+        // The walk follows the engine's scopes. It enters every list of
+        // statements that runs among the names it stands in, where a `set`
+        // binds a top-level name: the bodies of an `if`, a `filter`, an
+        // `autoescape` and a block `set`, and the `else` of a `for`, which
+        // runs once the loop's own names are gone. It enters none that runs
+        // among names of its own, which end with it: the body of a `for`, a
+        // `with`, a macro, a `call`, a `block`.
         Stmt::IfCond(cond) => {
             root_sets_under(&cond.true_body, source, true, sets);
             root_sets_under(&cond.false_body, source, true, sets);
         }
-        // None of these opens a scope of its own: a `set` inside binds the
-        // name for the rest of the template.
+        Stmt::ForLoop(for_loop) => root_sets_under(&for_loop.else_body, source, true, sets),
         Stmt::FilterBlock(block) => root_sets_under(&block.body, source, conditional, sets),
         Stmt::AutoEscape(block) => root_sets_under(&block.body, source, conditional, sets),
-        Stmt::Block(block) => root_sets_under(&block.body, source, conditional, sets),
+        Stmt::SetBlock(block) => {
+            root_sets_under(&block.body, source, conditional, sets);
+            unread_bindings(&block.target, conditional, sets);
+        }
         Stmt::Set(set) => {
             let Expr::Var(target) = &set.target else {
                 unread_bindings(&set.target, conditional, sets);
@@ -1869,7 +1892,7 @@ fn root_set_statement<'a>(
                 target.span().end_offset as usize,
                 set.span().end_offset as usize,
             );
-            let expression = source.get(name_end..end).and_then(|rest| {
+            let span = source.get(name_end..end).and_then(|rest| {
                 // Found by its byte: a search by a `char` pattern here makes
                 // the optimiser build the mark scans of `encoders::marks`
                 // differently (33 instructions more on each natively marked
@@ -1877,14 +1900,88 @@ fn root_set_statement<'a>(
                 let assign = rest.bytes().position(|byte| byte == b'=')?;
                 Some((end - rest[assign + 1..].trim_start().len(), end))
             });
+            let mut names = Vec::new();
+            let expression = span
+                .filter(|_| names_read(&set.expr, &mut names))
+                .map(|span| Expression { span, names });
             sets.push(RootSet {
                 name: target.id,
                 expression,
                 conditional,
             });
         }
-        Stmt::SetBlock(block) => unread_bindings(&block.target, conditional, sets),
+        Stmt::Macro(declared) => sets.push(RootSet {
+            name: declared.name,
+            expression: None,
+            conditional,
+        }),
+        Stmt::Import(import) => unread_bindings(&import.name, conditional, sets),
+        Stmt::FromImport(import) => {
+            for (name, alias) in &import.names {
+                unread_bindings(alias.as_ref().unwrap_or(name), conditional, sets);
+            }
+        }
         _ => {}
+    }
+}
+
+/// Whether `expr` computes its value from literals and names alone, by what
+/// the syntax itself does: operators, subscripts, and the methods of such
+/// values (`'<{}>'.format(suffix)`). The names it reads go to `names`. A
+/// filter, a test and any other call run code that no name stands for:
+/// `random` draws anew at each render, and a function, a macro or a block
+/// reads what it likes.
+fn names_read<'a>(expr: &Expr<'a>, names: &mut Vec<&'a str>) -> bool {
+    match expr {
+        Expr::Var(var) => {
+            names.push(var.id);
+            true
+        }
+        Expr::Const(_) => true,
+        Expr::UnaryOp(op) => names_read(&op.expr, names),
+        Expr::BinOp(op) => names_read(&op.left, names) && names_read(&op.right, names),
+        Expr::Compare(compare) => {
+            names_read(&compare.expr, names)
+                && compare.ops.iter().all(|op| names_read(&op.expr, names))
+        }
+        Expr::IfExpr(cond) => {
+            names_read(&cond.test_expr, names)
+                && names_read(&cond.true_expr, names)
+                && cond
+                    .false_expr
+                    .as_ref()
+                    .is_none_or(|expr| names_read(expr, names))
+        }
+        Expr::GetAttr(attr) => names_read(&attr.expr, names),
+        Expr::GetItem(item) => {
+            names_read(&item.expr, names) && names_read(&item.subscript_expr, names)
+        }
+        Expr::Slice(slice) => {
+            names_read(&slice.expr, names)
+                && [&slice.start, &slice.stop, &slice.step]
+                    .into_iter()
+                    .flatten()
+                    .all(|bound| names_read(bound, names))
+        }
+        Expr::List(list) => list.items.iter().all(|item| names_read(item, names)),
+        Expr::Map(map) => map
+            .keys
+            .iter()
+            .chain(&map.values)
+            .all(|expr| names_read(expr, names)),
+        // A method of a value, as the engine itself reads the call: a call
+        // through `self` runs a block of the template.
+        Expr::Call(call) => {
+            matches!(call.identify_call(), CallType::Method(..))
+                && names_read(&call.expr, names)
+                && call.args.iter().all(|arg| match arg {
+                    CallArg::Pos(expr)
+                    | CallArg::Kwarg(_, expr)
+                    | CallArg::PosSplat(expr)
+                    | CallArg::KwargSplat(expr) => names_read(expr, names),
+                })
+        }
+        Expr::Filter(_) | Expr::Test(_) => false,
     }
 }
 
@@ -1918,33 +2015,28 @@ struct ControlBinding {
     spelling: String,
 }
 
-/// For each of `sets`, the root `set` statements of `source`
+/// For each of `sets`, the root `set` statements of a template
 /// ([`root_sets`]), whether its value is the same at every render; and the
 /// names that some statement binds to no one value. A statement's value is
-/// the same at every render when its expression reads nothing of a request:
-/// literals, and names that such statements bound at the top level before
-/// it (a name bound under an `if`, or in a way nothing reads, has no one
-/// value from there on). A value that a request argument may carry is never
-/// one of them (`{% set close = custom if custom is defined else '</s>' %}`),
-/// and its name is the request's to set, whatever else binds it
+/// the same at every render when its expression reads nothing of a request
+/// and draws nothing ([`names_read`]): literals, and names that such
+/// statements bound at the top level before it (a name bound under an `if`,
+/// or in a way nothing reads, has no one value from there on). A value that
+/// a request argument may carry is never one of them
+/// (`{% set close = custom if custom is defined else '</s>' %}`), and its
+/// name is the request's to set, whatever else binds it
 /// (`{% if custom is defined %}{% set close = custom %}{% endif %}` after
 /// `{% set close = '</s>' %}`).
-fn fixed_statements<'a>(source: &str, sets: &[RootSet<'a>]) -> (Vec<bool>, Vec<&'a str>) {
-    let env = Environment::new();
+fn fixed_statements<'a>(sets: &[RootSet<'a>]) -> (Vec<bool>, Vec<&'a str>) {
     // The names whose value every render sees from here on.
     let mut fixed: HashSet<&str> = HashSet::new();
     let mut unsettled = Vec::new();
     let mut is_fixed = Vec::with_capacity(sets.len());
     for set in sets {
-        let reads_fixed = set.expression.is_some_and(|(start, end)| {
-            let expression = format!("{{{{ {} }}}}", &source[start..end]);
-            env.template_from_str(&expression).is_ok_and(|template| {
-                template
-                    .undeclared_variables(false)
-                    .iter()
-                    .all(|read| fixed.contains(read.as_str()))
-            })
-        });
+        let reads_fixed = set
+            .expression
+            .as_ref()
+            .is_some_and(|expression| expression.names.iter().all(|name| fixed.contains(name)));
         if reads_fixed && !set.conditional {
             fixed.insert(set.name);
         } else {
@@ -3916,12 +4008,12 @@ impl ChatTemplateState {
         };
         let source = template.source();
         let sets = root_sets(source);
-        let (is_fixed, unsettled) = fixed_statements(source, &sets);
+        let (is_fixed, unsettled) = fixed_statements(&sets);
         let fixed: Vec<(&str, (usize, usize))> = sets
             .iter()
             .zip(is_fixed)
             .filter(|(_, is_fixed)| *is_fixed)
-            .filter_map(|(set, _)| Some((set.name, set.expression?)))
+            .filter_map(|(set, _)| Some((set.name, set.expression.as_ref()?.span)))
             .collect();
         // A template with no such statement builds no constant: nothing is
         // compiled for it.
@@ -3997,13 +4089,28 @@ impl ChatTemplateState {
         let plain = self.env.as_ref()?;
         let template = plain.get_template("chat").ok()?;
         let source = template.source();
+        if bindings.is_empty() {
+            return None;
+        }
+        let declined = |guard: &str| -> Option<Environment<'static>> {
+            tracing::debug!(
+                guard,
+                "the chat template binds control spellings and stays unmarked"
+            );
+            None
+        };
         // A source that spells a control whole is of the other kind: its
         // spellings would want the scan of `mark_controls`, which is not
         // made here.
-        if bindings.is_empty() || controls.ranges(source).next().is_some() {
-            return None;
+        if controls.ranges(source).next().is_some() {
+            return declined("its source spells an added token whole");
         }
-        let mut marked = build_environment(with_marked_literals(source, bindings)?).ok()?;
+        let Some(literals) = with_marked_literals(source, bindings) else {
+            return declined("no string literal holds one of the spellings");
+        };
+        let Ok(mut marked) = build_environment(literals) else {
+            return declined("the template does not compile with the spellings as literals");
+        };
         // While the check runs the string methods say when one searches a
         // text for a marked value, whatever the probes hold.
         let searches = Arc::new(AtomicUsize::new(0));
@@ -4024,8 +4131,13 @@ impl ChatTemplateState {
             special_tokens,
         );
         let mut marked = marked.env?;
-        if !complete || searches.load(Ordering::Relaxed) > 0 {
-            return None;
+        if !complete {
+            return declined(
+                "the marked template does not stand for it on the probe conversations",
+            );
+        }
+        if searches.load(Ordering::Relaxed) > 0 {
+            return declined("it searches a text for one of the spellings");
         }
         // A request renders through the methods as every template has them.
         marked.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
@@ -4041,18 +4153,22 @@ impl ChatTemplateState {
     /// `marked` must write the text this template writes, every added token
     /// in it between marks: then no control the template writes on them
     /// would be encoded as text, and a request that types no spelling is
-    /// encoded as it was. A render this template refuses is not judged; the
-    /// bare turn must render, and a control must be written.
+    /// encoded as it was. The bare turn must render, and a control must be
+    /// written.
     ///
     /// On the same conversations in the same modes, with every spelling the
     /// template may hold between marks (its constants', the special tokens')
     /// typed into every string, `marked` must again write this template's
     /// text: a template that looks for one of them in request text would no
     /// longer find the spelling a request sends, and would keep text it
-    /// drops today. A typed conversation this template refuses where it
-    /// renders the untyped one fails as well: the refusal reads request
-    /// text. The string methods say the same of a search no typed string
-    /// triggers ([`searches_for_a_mark`], read by the caller).
+    /// drops today. The string methods say the same of a search no typed
+    /// string triggers ([`searches_for_a_mark`], read by the caller).
+    ///
+    /// A refusal is judged like a text. This template must refuse the typed
+    /// conversation exactly where it refuses the untyped one: a refusal that
+    /// a typed spelling brings or lifts reads request text. And where it
+    /// refuses, `marked` must refuse both as well: a constant that holds
+    /// marks may answer a test of the template's own another way.
     fn marks_every_control(
         &self,
         marked: &Self,
@@ -4090,7 +4206,19 @@ impl ChatTemplateState {
                         &probe.messages,
                         probe.params(special_tokens, now, mode),
                     ) else {
-                        if index == 0 && mode == with_prompt {
+                        let refused = |template: &Self, asked: &Probe, tokens: &SpecialTokens| {
+                            template
+                                .apply_with_continuation(
+                                    &asked.messages,
+                                    asked.params(tokens, now, mode),
+                                )
+                                .is_err()
+                        };
+                        if (index == 0 && mode == with_prompt)
+                            || !refused(self, typed, special_tokens)
+                            || !refused(marked, probe, &marked_tokens)
+                            || !refused(marked, typed, &marked_tokens)
+                        {
                             return false;
                         }
                         continue;

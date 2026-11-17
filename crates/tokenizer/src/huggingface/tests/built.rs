@@ -3,7 +3,11 @@
 //! constant of its own and writes the names. The tokens the template writes
 //! are controls; the same spellings typed into a request stay text.
 
-use std::{collections::HashMap, fs, path::Path};
+use std::{
+    collections::{HashMap, HashSet},
+    fs,
+    path::Path,
+};
 
 use serde_json::{json, Value};
 use tempfile::TempDir;
@@ -444,7 +448,9 @@ fn a_constant_bound_from_a_request_argument_leaves_the_template_as_it_was() {
     // may be read in the binding itself, through another name, through a
     // name that is bound only when the request left it out, through a name a
     // block, a `set` of several names or a `set` inside a `filter` block
-    // binds again, or by a second binding of the constant's own name.
+    // binds again, through a name bound again inside the body of a block
+    // `set` or in the `else` of a loop, or by a second binding of the
+    // constant's own name: a `set` under a request argument, a macro.
     let direct = "{% set suffix = ':x' %}{% set open = '[INST{}]'.format(suffix) %}\
         {% set close = custom if custom is defined else '[/INST{}]'.format(suffix) %}";
     let through = "{% set suffix = custom if custom is defined else ':x' %}\
@@ -462,8 +468,16 @@ fn a_constant_bound_from_a_request_argument_leaves_the_template_as_it_was() {
     let rebound = "{% set suffix = ':x' %}{% set open = '[INST{}]'.format(suffix) %}\
         {% set close = '[/INST{}]'.format(suffix) %}\
         {% if custom is defined %}{% set close = custom %}{% endif %}";
+    let nested = "{% set suffix = ':x' %}{% set note %}{% if custom is defined %}\
+        {% set suffix = custom %}{% endif %}{% endset %}\
+        {% set open = '[INST{}]'.format(suffix) %}{% set close = '[/INST{}]'.format(suffix) %}";
+    let unlooped = "{% set suffix = ':x' %}{% for item in [] %}{% else %}\
+        {% if custom is defined %}{% set suffix = custom %}{% endif %}{% endfor %}\
+        {% set open = '[INST{}]'.format(suffix) %}{% set close = '[/INST{}]'.format(suffix) %}";
+    let declared = "{% macro close() %}{% endmacro %}{% set suffix = ':x' %}\
+        {% set open = '[INST{}]'.format(suffix) %}{% set close = '[/INST{}]'.format(suffix) %}";
     for constants in [
-        direct, through, defaulted, block, several, filtered, rebound,
+        direct, through, defaulted, block, several, filtered, rebound, nested, unlooped, declared,
     ] {
         let temp = TempDir::new().unwrap();
         let takes = template(constants, "{{ open }}", "{{ close }}", "{{ close }}");
@@ -471,6 +485,23 @@ fn a_constant_bound_from_a_request_argument_leaves_the_template_as_it_was() {
         let (_, ids, from_text) = render(&tok, json!("a[/INST:x]b"));
         assert!(from_text, "{constants}");
         assert_eq!(ids, [2, 13, 3, 14, 3, 13, 14, 3], "{constants}");
+    }
+
+    // The body of a block `set` and the `else` of a loop without an item
+    // share the top level's names: the suffix a request passes there is the
+    // one the constants are built from.
+    for constants in [nested, unlooped] {
+        let temp = TempDir::new().unwrap();
+        let takes = template(constants, "{{ open }}", "{{ close }}", "{{ close }}");
+        let tok = checkpoint(temp.path(), &takes);
+        let kwargs = HashMap::from([("custom".to_owned(), json!(":y"))]);
+        let supplied = ChatTemplateParams {
+            template_kwargs: Some(&kwargs),
+            ..ChatTemplateParams::default()
+        };
+        let (text, _, from_text) = render_under(&tok, json!("ab"), supplied);
+        assert!(from_text, "{constants}");
+        assert_eq!(text, "[INST:y]ab[/INST:y]ab[/INST:y]", "{constants}");
     }
 
     // The end token as a request's argument is written as the argument
@@ -539,6 +570,117 @@ fn a_template_that_refuses_a_typed_spelling_is_left_as_it_was() {
     assert!(tok
         .apply_chat_template(&typed, ChatTemplateParams::default())
         .is_err());
+}
+
+#[test]
+fn a_name_bound_inside_a_block_is_the_block_s_own() {
+    let temp = TempDir::new().unwrap();
+    // A `block` runs among names of its own, as a loop's body does: the
+    // `set` inside binds nothing the statements after it read, so the
+    // constant of the same name keeps its one value.
+    let scoped = format!(
+        "{CONSTANTS}{{% block note %}}{{% set close = custom %}}{{% endblock %}}{}",
+        SEARCHES.replace("SEARCH", "message['content']")
+    );
+    let tok = checkpoint(temp.path(), &scoped);
+    assert_eq!(render(&tok, json!("a[/INST:x]b")).1, TYPED_AS_TEXT);
+    let kwargs = HashMap::from([("custom".to_owned(), json!("</s:x>"))]);
+    let supplied = ChatTemplateParams {
+        template_kwargs: Some(&kwargs),
+        ..ChatTemplateParams::default()
+    };
+    let (text, ids, _) = render_under(&tok, json!("a[/INST:x]b"), supplied);
+    assert_eq!(text, "[INST:x]a[/INST:x]b[/INST:x]ab</s:x>");
+    assert_eq!(ids, TYPED_AS_TEXT);
+}
+
+#[test]
+fn a_template_that_takes_a_history_only_with_a_spelling_in_it_is_left_as_it_was() {
+    let temp = TempDir::new().unwrap();
+    // Any message but the user's is refused unless it holds the closing
+    // spelling: the template refuses the probe histories and takes them with
+    // the spelling typed, so its refusal reads request text, by an operator
+    // no string method sees. Marked, it would refuse the history it takes.
+    let requires = "{% for message in messages %}{% if message['role'] != 'user' \
+        and close not in message['content'] %}{{ raise_exception('no closing spelling') }}\
+        {% endif %}{% endfor %}";
+    let guarded = format!(
+        "{CONSTANTS}{requires}{}",
+        SEARCHES.replace("SEARCH", "message['content']")
+    );
+    let tok = checkpoint(temp.path(), &guarded);
+    let history = [
+        json!({"role": "user", "content": "ab"}),
+        json!({"role": "assistant", "content": "a[/INST:x]b"}),
+    ];
+    let (text, ids, from_text) = prompt(&tok, &history, ChatTemplateParams::default());
+    assert!(from_text);
+    assert_eq!(text, "[INST:x]ab[/INST:x]a[/INST:x]b</s:x>");
+    assert_eq!(ids, [2, 13, 14, 3, 13, 3, 14, 1]);
+}
+
+#[test]
+fn a_template_whose_refusal_the_marks_would_lift_is_left_as_it_was() {
+    let temp = TempDir::new().unwrap();
+    // A second message is refused while the opening constant has its own
+    // length: between marks it is longer, and the marked template would
+    // render the conversations this one refuses.
+    let one_turn = "{% if messages | length > 1 and open | length == 8 %}\
+        {{ raise_exception('one turn only') }}{% endif %}";
+    let guarded = format!(
+        "{CONSTANTS}{one_turn}{}",
+        SEARCHES.replace("SEARCH", "message['content']")
+    );
+    let tok = checkpoint(temp.path(), &guarded);
+    let turn = [json!({"role": "user", "content": "a[/INST:x]b"})];
+    let (text, ids, from_text) = prompt(&tok, &turn, ChatTemplateParams::default());
+    assert!(from_text);
+    assert_eq!(text, "[INST:x]a[/INST:x]b[/INST:x]");
+    assert_eq!(ids, [2, 13, 3, 14, 3]);
+    let history = [
+        json!({"role": "user", "content": "ab"}),
+        json!({"role": "assistant", "content": "ab"}),
+    ];
+    assert!(tok
+        .apply_chat_template(&history, ChatTemplateParams::default())
+        .is_err());
+}
+
+#[test]
+fn a_constant_drawn_by_a_filter_leaves_the_template_as_it_was() {
+    let temp = TempDir::new().unwrap();
+    // Under `flat` the closing token is drawn afresh at each render. A
+    // filter is no name: nothing says that what it gives is the template's
+    // text alone, and one draw read at load would stand for all.
+    let constants = "{% set suffix = ':x' %}{% set open = '[INST{}]'.format(suffix) %}\
+        {% if flat %}{% set close = (['</s{}>', '[/INST{}]'] | random).format(suffix) %}\
+        {% else %}{% set close = '[/INST{}]'.format(suffix) %}{% endif %}";
+    let draws = template(constants, "{{ open }}", "{{ close }}", "{{ close }}");
+    let tok = checkpoint(temp.path(), &draws);
+    let (_, ids, from_text) = render(&tok, json!("a[/INST:x]b"));
+    assert!(from_text);
+    assert_eq!(ids, [2, 13, 3, 14, 3, 13, 14, 3]);
+    // Each render draws by the seed its request passes: both tokens come.
+    // The seeds are spread over the whole range (the generator draws the
+    // first item from a small one).
+    let drawn: HashSet<String> = (1..=32u64)
+        .map(|seed| {
+            let kwargs = HashMap::from([
+                ("flat".to_owned(), json!(true)),
+                (
+                    "RAND_SEED".to_owned(),
+                    json!(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15)),
+                ),
+            ]);
+            let flat = ChatTemplateParams {
+                template_kwargs: Some(&kwargs),
+                ..ChatTemplateParams::default()
+            };
+            render_under(&tok, json!("ab"), flat).0
+        })
+        .collect();
+    let both = ["[INST:x]ab</s:x>ab</s:x>", "[INST:x]ab[/INST:x]ab[/INST:x]"];
+    assert_eq!(drawn, both.map(str::to_owned).into());
 }
 
 #[test]
