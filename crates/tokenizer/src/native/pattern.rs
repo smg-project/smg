@@ -140,18 +140,28 @@ impl PlaneSet {
 
     /// Inserts every code point of `ranges` that is in the plane.
     fn insert_ranges(&mut self, ranges: &[(u32, u32)]) {
-        for &(start, end) in ranges {
-            for code in start..=end.min(0xFFFF) {
-                self.0[(code >> 6) as usize] |= 1 << (code & 63);
-            }
-        }
+        Self::words_of(ranges, |word, mask| self.0[word] |= mask);
     }
 
     /// Removes every code point of `ranges` that is in the plane.
     fn remove_ranges(&mut self, ranges: &[(u32, u32)]) {
+        Self::words_of(ranges, |word, mask| self.0[word] &= !mask);
+    }
+
+    /// Calls `f` with each word of the bitmap that `ranges` reach in the
+    /// plane and the bits of it they cover: a range is its first and last
+    /// words in part and the words between them whole.
+    fn words_of(ranges: &[(u32, u32)], mut f: impl FnMut(usize, u64)) {
         for &(start, end) in ranges {
-            for code in start..=end.min(0xFFFF) {
-                self.0[(code >> 6) as usize] &= !(1 << (code & 63));
+            let end = end.min(0xFFFF);
+            if start > end {
+                continue;
+            }
+            let (first, last) = ((start >> 6) as usize, (end >> 6) as usize);
+            for word in first..=last {
+                let from = if word == first { start & 63 } else { 0 };
+                let to = if word == last { end & 63 } else { 63 };
+                f(word, (u64::MAX >> (63 - to)) & (u64::MAX << from));
             }
         }
     }
@@ -366,6 +376,45 @@ impl Class {
                 bounds(table);
             }
         }
+    }
+
+    /// Membership of each of `points`, ascending code points above the
+    /// plane, into `members`: the sets of [`Class::contains_slow`] (the
+    /// class's ranges and the tables of its categories, less the tables of
+    /// its exclusions, the complement for a negated class) by one walk
+    /// along each table.
+    pub(super) fn members_among(&self, points: &[u32], members: &mut Vec<bool>) {
+        let mark = |ranges: &[(u32, u32)], marks: &mut [bool]| {
+            let mut ranges = ranges.iter().peekable();
+            for (&point, mark) in points.iter().zip(marks) {
+                while ranges.next_if(|&&(_, end)| end < point).is_some() {}
+                *mark |= ranges.peek().is_some_and(|&&(start, _)| start <= point);
+            }
+        };
+        let mut hit = vec![false; points.len()];
+        let mut out = vec![false; points.len()];
+        mark(&self.ranges, &mut hit);
+        for &(bit, table) in &CATEGORY_TABLES {
+            if self.categories & bit != 0 {
+                mark(table, &mut hit);
+            }
+            if self.without & bit != 0 {
+                mark(table, &mut out);
+            }
+        }
+        members.clear();
+        members.extend(
+            hit.iter()
+                .zip(&out)
+                .map(|(&hit, &out)| (hit && !out) != self.negated),
+        );
+    }
+
+    /// The class's members among the 64 code points of the plane's block
+    /// `block` (the code points from `64 * block` on), a bit each: one word
+    /// of the bitmap [`Self::contains`] reads beyond ASCII.
+    pub(super) fn plane_block(&self, block: usize) -> u64 {
+        self.plane.0[block]
     }
 
     /// Whether the class may hold a character beyond ASCII.
