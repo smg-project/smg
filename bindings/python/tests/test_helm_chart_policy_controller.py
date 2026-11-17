@@ -59,10 +59,10 @@ ON = ("policyController.enabled=true",)
 ELECTED = (*ON, "policyController.election.enabled=true")
 # The spellings of an election that is off.
 OFF = ((), ("policyController.election.enabled=false",), ("policyController.election=null",))
-# The strategy of a controller with the election off: the old pod ends
-# before the new one starts. The null takes the rolling update's fields off
-# a live object, where the API refuses them beside Recreate.
-LONE_STRATEGY = {"type": "Recreate", "rollingUpdate": None}
+# The strategy of a controller with the election off: no pod more at a
+# time, so the old pod is told to stop before the new one is made. The type
+# is the rolling update's, as with the election on.
+LONE_STRATEGY = {"type": "RollingUpdate", "rollingUpdate": {"maxSurge": 0, "maxUnavailable": 1}}
 # The variable the elected controller's address is read from: the kubelet
 # writes the pod's address in place of $(POD_IP).
 POD_IP = {"name": "POD_IP", "valueFrom": {"fieldRef": {"fieldPath": "status.podIP"}}}
@@ -917,14 +917,15 @@ def test_the_rollout_follows_the_election():
 
 
 @needs_helm
-def test_with_the_election_off_an_upgrade_ends_the_old_pod_first():
-    """Off, every pod leads alone, and a rolling update starts the new pod
-    beside the old one: two leaders for the overlap. The lone controller's
-    Deployment is recreated in its place. A live Deployment holds
-    rolling-update fields, the server's own where the manifest named no
-    strategy and the chart's where the election was on, and the API refuses
-    them beside Recreate: the manifest names them null, which an upgrade's
-    patch takes off the live object."""
+def test_with_the_election_off_an_upgrade_tells_the_old_pod_to_stop_first():
+    """Off, every pod leads alone, and the server's own strategy starts the
+    new pod beside the old one: two leaders until the new one is ready. The
+    lone controller rolls with no pod more at a time. Its strategy keeps the
+    rolling update's type and names both of its fields, as the elected one
+    does. The API refuses those fields beside Recreate, and a server-side
+    apply takes off a live object only what it put there: the server's own,
+    on a Deployment that named no strategy, would stay. So no upgrade
+    between the three strategies has a field to take off."""
     for off in OFF:
         assert one(render(*ON, *off), "Deployment")["spec"]["strategy"] == LONE_STRATEGY, off
     served = {
@@ -933,12 +934,25 @@ def test_with_the_election_off_an_upgrade_ends_the_old_pod_first():
     }
     elected = one(render(*ELECTED), "Deployment")["spec"]["strategy"]
     lone = one(render(*ON), "Deployment")["spec"]["strategy"]
-    for live in (served, elected):
-        # The rendered strategy over the live one: a null takes its field off.
-        patched = {**live, **lone}
-        assert {field: value for field, value in patched.items() if value is not None} == {
-            "type": "Recreate"
-        }, live
+    for rendered in (lone, elected):
+        for live in (served, lone, elected):
+            # An apply that takes nothing off: a live field the manifest
+            # does not name stays beside the ones it names.
+            fields = {**live["rollingUpdate"], **rendered["rollingUpdate"]}
+            applied = {**live, **rendered, "rollingUpdate": fields}
+            assert applied == rendered, (rendered, live)
+            assert applied["type"] == "RollingUpdate", (rendered, live)
+
+
+@needs_helm
+def test_no_hook_delays_the_stop_signal():
+    """The lone controller's order rests on the stop signal reaching the old
+    pod at its delete: the old pod decides nothing from that signal on. A
+    preStop hook runs before the signal, and the old pod would lead beside
+    the new one for the hook's length: the container names no hook, with
+    the election on or off."""
+    for values in (ON, ELECTED):
+        assert "lifecycle" not in container(render(*values)), values
 
 
 @needs_helm

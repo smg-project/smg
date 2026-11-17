@@ -428,8 +428,8 @@ policyController:
 
   # -- Replicas. With the election off every replica is a controller of its
   #    own and two would each lead alone: the chart refuses more than one,
-  #    and an upgrade ends the old pod before it starts the new one. With it
-  #    on, run two or more: one leads and the others stand by.
+  #    and an upgrade tells the old pod to stop before it makes the new one.
+  #    With it on, run two or more: one leads and the others stand by.
   replicas: 1
 
   # -- Leader election among the replicas, over one coordination.k8s.io Lease
