@@ -273,6 +273,15 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 - A Responses `tool_choice` of type `computer` or `computer_use`, as the public API lists them
   (`ToolChoiceTypes`), parses. The crate refused the request whole, as matching no variant of
   `ResponsesToolChoice`. Breaking: `BuiltInToolChoiceType` gains `Computer` and `ComputerUse`.
+- A Messages web search result is written with its `type` (`web_search_result`) and its null
+  `page_age`, and the web search error `request_too_large` and a tool search's error result
+  (`tool_search_tool_result_error`) read, as the public API writes them. A result had been written
+  without the `type` that the public API requires of a replayed one, and each of the two errors
+  failed a whole answer or request that held it. A tool reference in a replayed tool search result
+  keeps its `cache_control`, which was dropped. Breaking: `WebSearchResultBlock` gains
+  `block_type`, `WebSearchToolResultErrorCode` gains `RequestTooLarge`, a tool search result's
+  `content` is the new `ToolSearchToolResultContent`, and `ToolReferenceBlock` gains
+  `cache_control`.
 - A completion request with `"echo": null` is served, as the public API allows. The crate refused
   it as a 400 `invalid_type`. The engine flags `no_stop_trim`, `ignore_eos`, `skip_special_tokens`
   and `return_hidden_states` read a `null` as their default too, as the chat request's flags do.
