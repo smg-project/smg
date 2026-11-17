@@ -472,9 +472,7 @@ impl VisionPreProcessor for Step3VLProcessor {
         &self,
         images: &[&DynamicImage],
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
-        if images.is_empty() {
-            return Err(TransformError::EmptyBatch);
-        }
+        TransformError::if_empty(images)?;
         let side = IMAGE_SIZE as usize;
         let view_len = 3 * side * side;
         let patch = PATCH_SIZE as usize;

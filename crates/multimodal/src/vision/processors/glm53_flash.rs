@@ -429,9 +429,7 @@ fn encode<F: RgbSource>(
             .iter()
             .map(|frame| prepare(frame, geometry, filter, do_resize))
             .collect::<Result<Vec<_>, _>>()?;
-        if prepared.is_empty() {
-            return Err(TransformError::EmptyBatch);
-        }
+        TransformError::if_empty(&prepared)?;
         for patch_row in 0..grid_h / params.merge {
             for patch_col in 0..grid_w / params.merge {
                 let (y0, x0) = (patch_row * merged_patch, patch_col * merged_patch);
@@ -670,9 +668,7 @@ impl VisionPreProcessor for Glm53FlashProcessor {
         &self,
         images: &[&DynamicImage],
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
-        if images.is_empty() {
-            return Err(TransformError::EmptyBatch);
-        }
+        TransformError::if_empty(images)?;
         let params = self.params_for(Modality::Image)?;
         let norm = self.pixels.norm;
         // Plan the complete batch once instead of reallocating and copying

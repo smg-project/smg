@@ -364,9 +364,7 @@ impl VisionPreProcessor for Phi3VisionProcessor {
         &self,
         images: &[&DynamicImage],
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
-        if images.is_empty() {
-            return Err(TransformError::EmptyBatch);
-        }
+        TransformError::if_empty(images)?;
 
         for image in images {
             let (width, height) = image.dimensions();
