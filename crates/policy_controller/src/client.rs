@@ -157,6 +157,9 @@ struct Session {
     answers: Streaming<ControllerFrame>,
     /// The number of the last frame queued: the hello's is 1.
     seq: u64,
+    /// The status the stream ended with, once read. The stream tells it
+    /// once; the session tells it at each ask.
+    ended: Option<Status>,
     welcome: Welcome,
 }
 
@@ -196,6 +199,7 @@ impl Session {
                     frames,
                     answers,
                     seq: 1,
+                    ended: None,
                     welcome,
                 },
                 term,
@@ -228,10 +232,14 @@ impl Session {
     }
 
     /// The stream's end, awaited within `wait`: the status the controller
-    /// ended it with, an `Ok` one when it closed the stream with none. A
-    /// frame that comes first takes the floor's check ([`read_under`]),
-    /// raises `floor` by its term and is read no further.
+    /// ended it with, an `Ok` one for a clean end. A frame that comes first
+    /// takes the floor's check ([`read_under`]), raises `floor` by its term
+    /// and is read no further. The status is kept once read: the stream
+    /// tells it once, and each later ask reads it again.
     async fn end(&mut self, floor: &mut u64, wait: Duration) -> Result<Status, Error> {
+        if let Some(status) = &self.ended {
+            return Ok(status.clone());
+        }
         let ended = async {
             loop {
                 match self.answers.message().await {
@@ -244,7 +252,9 @@ impl Session {
                 }
             }
         };
-        answered("the session's end", wait, ended).await?
+        let status = answered("the session's end", wait, ended).await??;
+        self.ended = Some(status.clone());
+        Ok(status)
     }
 }
 
@@ -393,7 +403,8 @@ impl Client {
     /// its caller's. The frame is queued within the client's bound and
     /// leaves when the connection sends it: a queue with no room in time
     /// is [`Error::NoAnswer`]. A session the controller ended tells the
-    /// status it ended with here ([`Error::Status`]).
+    /// status it ended with here ([`Error::Status`]), the same at each
+    /// report: an `Ok` one after a clean end.
     pub async fn dispatched(&mut self, report: Dispatched) -> Result<(), Error> {
         self.report(gateway_frame::Frame::Dispatched(report)).await
     }
@@ -415,9 +426,10 @@ impl Client {
     }
 
     /// The session's end, awaited within the client's bound: the status the
-    /// controller ended the stream with. A frame that comes first raises the
-    /// floor by its term and is read no further; one under a term below the
-    /// floor is [`Error::BelowFloor`]. A session still open at the bound is
+    /// controller ended the stream with, the same at each ask once it is
+    /// read. A frame that comes first raises the floor by its term and is
+    /// read no further; one under a term below the floor is
+    /// [`Error::BelowFloor`]. A session still open at the bound is
     /// [`Error::NoAnswer`].
     pub async fn session_end(&mut self) -> Result<Status, Error> {
         self.session.end(&mut self.floor, self.wait).await
@@ -452,13 +464,14 @@ pub mod blocking {
     /// [`super::Client`] driven to each call's end on a runtime of its own.
     /// It holds no protocol: every call is the async client's. The runtime
     /// keeps one thread, which drives the connection between calls: a
-    /// report leaves when it is made. The runtime is this client's alone,
-    /// so a call, and the drop, must come from a thread that runs no
-    /// runtime. The drop waits for nothing the runtime still runs.
+    /// report leaves without waiting for the next call. The runtime is this
+    /// client's alone, so a call must come from a thread that runs no
+    /// runtime. The drop waits for nothing the runtime still runs: a report
+    /// made just before it may never leave.
     #[derive(Debug)]
     pub struct Client {
         // Declared before the runtime: its drop comes first, on a runtime
-        // that still runs.
+        // that still runs. No case holds the order.
         inner: super::Client,
         runtime: Background,
     }
@@ -572,7 +585,9 @@ pub mod blocking {
 mod tests {
     use std::{
         convert::Infallible,
+        future::{ready, Ready},
         net::{Ipv4Addr, SocketAddr},
+        pin::Pin,
         sync::mpsc,
         time::Duration,
     };
@@ -583,20 +598,26 @@ mod tests {
         Router,
     };
     use prost::Message as _;
-    use tokio::{net::TcpListener, task::JoinSet, time::timeout};
+    use tokio::{
+        net::TcpListener,
+        sync::mpsc::{unbounded_channel, UnboundedReceiver},
+        task::JoinSet,
+        time::timeout,
+    };
     use tonic::{
-        codegen::tokio_stream::{iter, once, pending, StreamExt},
+        codegen::tokio_stream::{iter, once, pending, Stream, StreamExt},
+        server::{Grpc, StreamingService},
         service::{Interceptor, Routes},
         transport::{server::TcpIncoming, Endpoint, Server},
-        Request,
+        Code, Request, Status, Streaming,
     };
 
     use super::{
         blocking, controller_frame, gateway_frame, hello, numbered, Client, ControllerFrame, Error,
-        PolicyControllerClient, Principal, Session, Stub, Welcome, ANSWER_WAIT, PRINCIPAL_ENTRY,
-        PROTOCOL_VERSION,
+        GatewayFrame, PolicyControllerClient, Principal, Session, Stub, Welcome, ANSWER_WAIT,
+        PRINCIPAL_ENTRY, PROTOCOL_VERSION,
     };
-    use crate::proto::{Completed, Dispatched, NotLeader};
+    use crate::proto::{Completed, Dispatched, NotLeader, Released};
 
     /// The bound a case gives a wait it wants ended.
     const SHORT: Duration = Duration::from_millis(300);
@@ -1055,6 +1076,179 @@ mod tests {
         .await
         .expect("a peer that reads nothing leaves a report waiting for room");
         assert!(ran_out(&waited, "the session's queue", SHORT), "{waited:?}");
+    }
+
+    /// The session call of a peer that answers a welcome and then ends the
+    /// stream as `end` says: clean, or with the status.
+    struct Ends(fn() -> Result<(), Status>);
+
+    impl StreamingService<GatewayFrame> for Ends {
+        type Response = ControllerFrame;
+        type ResponseStream = Pin<Box<dyn Stream<Item = Result<ControllerFrame, Status>> + Send>>;
+        type Future = Ready<Result<tonic::Response<Self::ResponseStream>, Status>>;
+
+        fn call(&mut self, _request: Request<Streaming<GatewayFrame>>) -> Self::Future {
+            let end = (self.0)().err().map(Err);
+            let answers = iter([Ok(under(0, Some(welcome())))]).chain(iter(end));
+            ready(Ok(tonic::Response::new(Box::pin(answers))))
+        }
+    }
+
+    /// A peer that answers each call with a welcome and then ends the
+    /// stream as a controller does, its status in the trailers, for as long
+    /// as the case holds its task.
+    async fn ending(
+        end: fn() -> Result<(), Status>,
+    ) -> (SocketAddr, JoinSet<Result<(), tonic::transport::Error>>) {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("a listener");
+        let address = listener.local_addr().expect("its address");
+        let answer = Router::new().fallback(move |request: axum::extract::Request| async move {
+            Grpc::new(tonic_prost::ProstCodec::<ControllerFrame, GatewayFrame>::default())
+                .streaming(Ends(end), request)
+                .await
+                .map(Body::new)
+        });
+        let mut serving = JoinSet::new();
+        serving.spawn(
+            Server::builder()
+                .add_routes(Routes::from(answer))
+                .serve_with_incoming(TcpIncoming::from(listener)),
+        );
+        (address, serving)
+    }
+
+    /// A peer that answers each call with a welcome and keeps the frames
+    /// the call sends, for as long as the case holds its task.
+    async fn keeping() -> (
+        SocketAddr,
+        JoinSet<Result<(), tonic::transport::Error>>,
+        UnboundedReceiver<GatewayFrame>,
+    ) {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("a listener");
+        let address = listener.local_addr().expect("its address");
+        let (keep, kept) = unbounded_channel();
+        let (call, mut calls) = unbounded_channel::<Body>();
+        let answer = Router::new().fallback(move |request: axum::extract::Request| {
+            // The call's frames are read by the peer's own task.
+            let _ = call.send(request.into_body());
+            async {
+                Response::builder()
+                    .header("content-type", "application/grpc")
+                    .body(welcome_under(0))
+                    .expect("a response")
+            }
+        });
+        let mut serving = JoinSet::new();
+        serving.spawn(
+            Server::builder()
+                .add_routes(Routes::from(answer))
+                .serve_with_incoming(TcpIncoming::from(listener)),
+        );
+        serving.spawn(async move {
+            while let Some(sent) = calls.recv().await {
+                let mut sent = sent.into_data_stream();
+                let mut bytes = Vec::new();
+                while let Some(Ok(chunk)) = sent.next().await {
+                    bytes.extend(chunk);
+                    // A message on the wire: its flag, its length, its bytes.
+                    while let Some(length) = bytes.get(1..5) {
+                        let length = u32::from_be_bytes(length.try_into().expect("four bytes"));
+                        let end = 5 + usize::try_from(length).expect("a short frame");
+                        let Some(message) = bytes.get(5..end) else {
+                            break;
+                        };
+                        let frame = GatewayFrame::decode(message).expect("a gateway's frame");
+                        let _ = keep.send(frame);
+                        bytes.drain(..end);
+                    }
+                }
+            }
+            Ok(())
+        });
+        (address, serving, kept)
+    }
+
+    #[tokio::test]
+    async fn an_ended_sessions_status_is_told_again_at_each_ask() {
+        let (address, _serving) =
+            ending(|| Err(Status::invalid_argument("the frame reads wrong"))).await;
+        let mut stub = stub(address).await;
+        let (mut session, _) = Session::open(&mut stub, "gateway-1", 0, ROOM)
+            .await
+            .expect("the welcome opens the session");
+        let mut floor = 0;
+        for ask in ["the first ask", "a second ask"] {
+            let ended = session
+                .end(&mut floor, ROOM)
+                .await
+                .expect("the stream's end is read");
+            assert_eq!(
+                ended.code(),
+                Code::InvalidArgument,
+                "{ask} reads the status the stream ended with: {ended:?}"
+            );
+        }
+        // The connection drops the ended call's request, which closes the
+        // session's queue: a report made after that tells the same status.
+        timeout(ROOM, session.frames.closed())
+            .await
+            .expect("the ended call's queue closes");
+        let report = gateway_frame::Frame::Released(Released::default());
+        let reported = session.send(&mut floor, report, ROOM).await;
+        assert!(
+            matches!(&reported, Err(Error::Status(status)) if status.code() == Code::InvalidArgument),
+            "a report into the ended session tells the status it ended with: {reported:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_clean_end_is_told_as_an_ok_status_at_each_ask() {
+        let (address, _serving) = ending(|| Ok(())).await;
+        let mut stub = stub(address).await;
+        let (mut session, _) = Session::open(&mut stub, "gateway-1", 0, ROOM)
+            .await
+            .expect("the welcome opens the session");
+        let mut floor = 0;
+        for ask in ["the first ask", "a second ask"] {
+            let ended = session
+                .end(&mut floor, ROOM)
+                .await
+                .expect("the stream's end is read");
+            assert_eq!(ended.code(), Code::Ok, "{ask} reads a clean end: {ended:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn each_report_is_numbered_after_the_last_and_states_the_floor_of_its_minute() {
+        let (address, _serving, mut kept) = keeping().await;
+        let mut stub = stub(address).await;
+        let (mut session, _) = Session::open(&mut stub, "gateway-1", 0, ROOM)
+            .await
+            .expect("the welcome opens the session");
+        for mut floor in [0, 0, 9] {
+            let report = gateway_frame::Frame::Dispatched(Dispatched::default());
+            session
+                .send(&mut floor, report, ROOM)
+                .await
+                .expect("the report is queued");
+        }
+        let mut read = Vec::new();
+        while read.len() < 4 {
+            let frame = timeout(ROOM, kept.recv())
+                .await
+                .expect("the peer reads the session's frames")
+                .expect("the peer keeps each frame");
+            read.push((frame.seq, frame.term_floor));
+        }
+        assert_eq!(
+            read,
+            [(1, 0), (2, 0), (3, 0), (4, 9)],
+            "the hello, then each report numbered after the last and stating the floor of its minute"
+        );
     }
 
     #[test]

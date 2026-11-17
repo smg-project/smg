@@ -424,9 +424,11 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
         )
         .await
         .expect("the second completion is read");
-        // One session's frames are applied in their order: the dead and the
-        // hung engine's completions are on file by now, and neither is one
-        // of class ok.
+        // One session's frames are applied in their order, so the dead and
+        // the hung engine's reports were read by now: neither wrote a
+        // completion of class ok for this gateway. A completion of another
+        // class writes nothing, so these hold the class each frame carries
+        // and nothing more.
         assert!(
             !harness.completed_ok(GATEWAY, dead, asked),
             "a dead engine's row holds no completion of class ok"
@@ -460,6 +462,28 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             ended.message().contains("Released.what"),
             "the refusal names the field: {ended:?}"
         );
+        // The session tells the status it ended with at each ask, and to a
+        // report once the connection has dropped the ended call's request.
+        let again = other.session_end().await.expect("the end is told again");
+        assert_eq!(
+            again.code(),
+            Code::InvalidArgument,
+            "a second ask reads the status the session ended with: {again:?}"
+        );
+        let told = tokio::time::timeout(ROOM, async {
+            loop {
+                match other.released(Released::default()).await {
+                    Ok(()) => tokio::time::sleep(POLL_INTERVAL / 10).await,
+                    Err(error) => break error,
+                }
+            }
+        })
+        .await
+        .expect("a report into the ended session is refused");
+        assert!(
+            matches!(&told, client::Error::Status(status) if status.code() == Code::InvalidArgument),
+            "a report into the ended session tells the status it ended with: {told:?}"
+        );
         // The first gateway's session stands: its next reports are applied.
         let last = Instant::now();
         let class = harness.send(live).await.expect("a live engine is sent");
@@ -472,9 +496,10 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
         .await
         .expect("the third completion is read");
 
-        // The blocking form's report leaves when it is made: its runtime
-        // drives the connection between calls. The client is held, and
-        // asked nothing more, until the store has read its completion.
+        // The blocking form's report leaves with no call after it: its
+        // runtime drives the connection between calls. The client is held,
+        // and asked nothing more, until the store has read its completion:
+        // its drop would not wait for a report still queued.
         let served = harness.worker(live).expect("the live engine's row").0;
         let address = format!("http://{}", harness.gateway());
         let reported = Instant::now();
@@ -509,7 +534,7 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             .expect("the client's thread sends its answer")
             .expect("the blocking client's report");
         within(
-            "the blocking form's report leaves when it is made",
+            "the blocking form's report leaves with no call after it",
             PROBE_INTERVAL + ROOM,
             || harness.completed_ok("blocking-gateway", live, reported),
         )
