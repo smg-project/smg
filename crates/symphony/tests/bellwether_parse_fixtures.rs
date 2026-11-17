@@ -571,14 +571,8 @@ const MODELS: &[(&str, GenerationPrompt)] = &[
     ("midashenglm-spatial", GenerationPrompt::Plain),
     // Checkpoints whose template writes neither a call nor a thought: every reference bellwether
     // recorded for them is content alone, and the plain table reads it as it stands.
-    ("academic-ds-9b", GenerationPrompt::Plain),
-    ("afm-4.5b", GenerationPrompt::Plain),
-    ("apertus-v1.1-4b-instruct", GenerationPrompt::Plain),
     ("audio-flamingo-3-hf", GenerationPrompt::Plain),
     ("bar-2x7b-base", GenerationPrompt::Plain),
-    ("bar-2x7b-code", GenerationPrompt::Plain),
-    ("bar-2x7b-math", GenerationPrompt::Plain),
-    ("bar-7b", GenerationPrompt::Plain),
     ("bitcpm-cann-3b-unquantized", GenerationPrompt::Plain),
     ("caprl-internvl3.5-8b", GenerationPrompt::Plain),
     ("cogalign-llava-ov-0-5b", GenerationPrompt::Plain),
