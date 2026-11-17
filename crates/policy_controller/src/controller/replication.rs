@@ -233,9 +233,11 @@ impl Replication {
 
     /// The complete snapshot, admitted under `term`: the rows, the load
     /// rows and the log's place, read as one, which a standby is restored
-    /// from and rejoins at. One message; a fleet whose snapshot passes the
-    /// transport's bound is refused `RESOURCE_EXHAUSTED`. A row's admission
-    /// crosses as its age at `now`, as a load row's sample does.
+    /// from and rejoins at. The place is `term`'s own: where the term moved
+    /// between the admission and the read, the call is `UNAVAILABLE`. One
+    /// message; a fleet whose snapshot passes the transport's bound is
+    /// refused `RESOURCE_EXHAUSTED`. A row's admission crosses as its age
+    /// at `now`, as a load row's sample does.
     pub(crate) fn snapshot(
         &self,
         term: u64,
@@ -244,6 +246,14 @@ impl Replication {
     ) -> Result<proto::Snapshot, Status> {
         self.serves(term)?;
         let cut = self.store.cut(Kinds::All);
+        // A take, or another leader's event, can land between the admission
+        // and the cut, whose place is then that write's.
+        if cut.at.term != term {
+            return Err(Status::unavailable(format!(
+                "the snapshot's place is under term {}, not term {term}: this replica's term moved inside the read",
+                cut.at.term
+            )));
+        }
         let snapshot = proto::Snapshot {
             term,
             controller_id: controller_id.to_owned(),
@@ -597,13 +607,17 @@ impl Stream for Batches {
 
 #[cfg(test)]
 mod tests {
+    use parking_lot::Mutex;
     use tonic::Code;
 
     use super::*;
     use crate::{
         elector::{ElectionSettings, Elector, Tick},
         proto::replication_event::Event as Sent,
-        store::{LoadSink, LoadSource, WorkerFacts, WorkersStore},
+        store::{
+            LoadSample, LoadSink, LoadSource, MembershipChange, WorkerFacts, WorkerRow,
+            WorkersStore,
+        },
         view::{LoadRow, WorkerId},
     };
 
@@ -920,6 +934,15 @@ mod tests {
         let short = later + BEAT - Duration::from_millis(1);
         assert!(matches!(feed.look(short), Step::Idle));
         assert_eq!(resync(feed.look(later + BEAT)), Code::ResourceExhausted);
+
+        // One event acknowledged is room for one.
+        let mut feed = leader.feed(START, 300);
+        assert_eq!(batch(feed.look(leader.at)).events.len(), 256);
+        assert_eq!(batch(feed.look(leader.at)).events.len(), 44);
+        feed.ack(1);
+        let one = batch(feed.look(leader.at));
+        assert_eq!((one.first_seq, one.events.len()), (301, 1));
+        assert!(matches!(feed.look(leader.at), Step::Idle));
 
         // An ack never runs past what was sent.
         let mut feed = leader.feed(START, 300);
@@ -1248,6 +1271,85 @@ mod tests {
         assert!((5_000..65_000).contains(&age), "{age} ms");
     }
 
+    /// The leader's log as its store's journal, and one write that lands
+    /// as a cut reads its place: where a write of another thread can.
+    struct AtTheCut {
+        log: Arc<Log>,
+        lands: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    }
+
+    impl Journal for AtTheCut {
+        fn member(
+            &self,
+            epoch: u64,
+            change: MembershipChange,
+            row: Option<&WorkerRow>,
+            left: Option<&WorkerRow>,
+        ) {
+            self.log.member(epoch, change, row, left);
+        }
+
+        fn load(&self, id: WorkerId, rank: u16, sample: &LoadSample) {
+            self.log.load(id, rank, sample);
+        }
+
+        fn term_rose(&self, term: u64) {
+            self.log.term_rose(term);
+        }
+
+        fn carries_loads(&self) -> bool {
+            self.log.carries_loads()
+        }
+
+        fn head(&self, kinds: Kinds) -> Position {
+            // Taken out before it runs: the write reads no head itself.
+            let lands = self.lands.lock().take();
+            if let Some(lands) = lands {
+                lands();
+            }
+            self.log.head(kinds)
+        }
+
+        fn followed(&self) -> Option<u64> {
+            self.log.followed()
+        }
+    }
+
+    #[test]
+    fn a_snapshot_a_take_landed_inside_is_refused() {
+        let leader = Leader::elected();
+        let log = Arc::new(Log::new(WATCHED_EVENTS, LOAD_EVENTS));
+        let journal = Arc::new(AtTheCut {
+            log: Arc::clone(&log),
+            lands: Mutex::default(),
+        });
+        let store = Arc::new(MemoryStore::journaled(Arc::clone(&journal) as _));
+        store.set_term(leader.term);
+        let replication = Replication::new(Arc::clone(&store), log, leader.elector.fence());
+        let served = replication
+            .snapshot(leader.term, "controller-0", leader.at)
+            .expect("a snapshot");
+        assert_eq!(served.replication_term, leader.term);
+
+        // The store takes the next term after the call's admission, as the
+        // cut reads its place: the place is that take's.
+        let later = leader.term + 1;
+        *journal.lands.lock() = Some(Box::new({
+            let store = Arc::clone(&store);
+            move || store.set_term(later)
+        }));
+        let refused = replication
+            .snapshot(leader.term, "controller-0", leader.at)
+            .expect_err("a term beside a later term's place");
+        assert_eq!(refused.code(), Code::Unavailable);
+        assert_eq!(store.term(), later, "the take landed inside the call");
+        // The later term's call is served at that place.
+        let served = replication
+            .snapshot(later, "controller-0", leader.at)
+            .expect("the later term's snapshot");
+        assert_eq!((served.term, served.replication_term), (later, later));
+    }
+
     #[test]
     fn a_silent_second_is_answered_with_the_heartbeat_at_the_head() {
         let leader = Leader::leading();
@@ -1339,6 +1441,32 @@ mod tests {
             said.contains("took term 1") && said.contains("followed term 7"),
             "{said}"
         );
+    }
+
+    #[test]
+    fn a_store_under_a_later_term_than_the_calls_serves_no_call() {
+        // The store took term 7 after the take of term 1 and its log
+        // followed neither: a call admitted under term 1 is told so.
+        let leader = Leader::leading();
+        leader.writes(1);
+        leader.store.set_term(7);
+        let replication = leader.replication();
+        let refused = replication.serves(leader.term).expect_err("a later take");
+        assert_eq!(refused.code(), Code::Unavailable);
+        let said = refused.message();
+        assert!(
+            said.contains("under term 7") && said.contains("a later take than term 1"),
+            "{said}"
+        );
+        let refused = replication
+            .snapshot(leader.term, "controller-0", leader.at)
+            .expect_err("a later take");
+        assert_eq!(refused.code(), Code::Unavailable);
+        // The later term's own call is served, at that take's place.
+        let served = replication
+            .snapshot(7, "controller-0", leader.at)
+            .expect("the later term's snapshot");
+        assert_eq!((served.term, served.replication_term), (7, 7));
     }
 
     #[test]

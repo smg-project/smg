@@ -1182,8 +1182,10 @@ async fn a_leader_that_loses_its_lease_ends_its_stream_and_joins_no_other() {
         let mut open = replicate(leader.replication, held.clone())
             .await
             .expect("a stream");
-        // A second call says no hello yet. The snapshot behind it on the
-        // same connection is answered once the leader admitted both.
+        // A second call says no hello yet, from a task of its own. Nothing
+        // orders it ahead of the snapshot asked here: it has that round
+        // trip, and the leader's wait for its next look at the lease, to
+        // be admitted while the leader leads.
         let mut waits = client(leader.replication).await;
         let (late, sent) = mpsc::channel(1);
         let mut waiting = JoinSet::new();
