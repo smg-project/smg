@@ -1128,7 +1128,7 @@ fn contracts_dir() -> PathBuf {
 /// The engine wire's protos (`smg.grpc.common`): the controller protocol
 /// imports the load record and the event batch a relay forwards unchanged.
 fn engine_wire_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../grpc_client/proto")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../worker/proto")
 }
 
 fn compile_protocol() -> io::Result<FileDescriptorSet> {

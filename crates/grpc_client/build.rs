@@ -1,6 +1,13 @@
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // The shared messages' file is the worker crate's. Its build script names
+    // the directory, and cargo hands the name to this one.
+    let wire = std::env::var("DEP_SMG_WORKER_PROTO_DIR").map_err(|e| {
+        format!("DEP_SMG_WORKER_PROTO_DIR, the worker crate's proto directory: {e}")
+    })?;
+    let common = format!("{wire}/common.proto");
+
     // Rebuild triggers
-    println!("cargo:rerun-if-changed=proto/common.proto");
+    println!("cargo:rerun-if-changed={common}");
     println!("cargo:rerun-if-changed=proto/sglang_scheduler.proto");
     println!("cargo:rerun-if-changed=proto/tokenspeed_scheduler.proto");
     println!("cargo:rerun-if-changed=proto/tokenspeed_encoder.proto");
@@ -13,7 +20,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build_server(false)
         .build_client(false)
         .protoc_arg("--experimental_allow_proto3_optional")
-        .compile_protos(&["proto/common.proto"], &["proto"])?;
+        .compile_protos(&[common.as_str()], &[wire.as_str()])?;
 
     // Pass 2: the EPD encoder proto reuses tokenspeed scheduler message types
     // (MultimodalInputs/TensorData). Compile it with the scheduler package
@@ -32,7 +39,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // scheduler's Generate: the same sized codec (see `crate::codec`).
         .codec_path("crate::codec::SizedProstCodec")
         .protoc_arg("--experimental_allow_proto3_optional")
-        .compile_protos(&["proto/tokenspeed_encoder.proto"], &["proto"])?;
+        .compile_protos(
+            &["proto/tokenspeed_encoder.proto"],
+            &["proto", wire.as_str()],
+        )?;
 
     // Pass 3: compile engine protos, referencing common types via extern_path
     tonic_prost_build::configure()
@@ -86,7 +96,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "proto/mlx_engine.proto",
                 "proto/tokenspeed_scheduler.proto",
             ],
-            &["proto"],
+            &["proto", wire.as_str()],
         )?;
 
     Ok(())

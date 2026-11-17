@@ -10,6 +10,10 @@ categories = ["data-structures"]
 # The default-layer case walks the workspace's manifests, which a published
 # package does not carry.
 exclude = ["tests/default_layer.rs"]
+# A dependent's build script finds the crate's proto directory through this
+# key: cargo hands it `DEP_SMG_WORKER_PROTO_DIR`, in the workspace and from
+# the registry alike.
+links = "smg_worker_proto"
 
 [lib]
 name = "smg_worker"

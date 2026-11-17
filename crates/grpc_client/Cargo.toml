@@ -18,6 +18,9 @@ name = "smg_grpc_client"
 [dependencies]
 # Workspace dependencies
 openai-protocol.workspace = true
+# The shared messages' proto file is the worker crate's: the build script
+# reads its directory from `DEP_SMG_WORKER_PROTO_DIR`.
+smg-worker.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt", "sync", "time"] }

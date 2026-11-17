@@ -418,7 +418,7 @@ class ShardTableTests(unittest.TestCase):
                 self.assertEqual(read.stdout.strip(), expected, args)
             for name in (
                 "crates/policy_controller/Cargo.toml",
-                "crates/grpc_client/proto/common.proto",
+                "crates/worker/proto/common.proto",
             ):
                 self.assertTrue((source / name).is_file(), name)
         # A directory inside the checkout is refused and never made: the
