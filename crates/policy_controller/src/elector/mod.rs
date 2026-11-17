@@ -82,7 +82,7 @@
 //!   An elector alone over a store it made itself ([`Elector::alone`]) has
 //!   no other holder to wait for: its take leads at once.
 //!
-//! The elector keeps four private instants, each with one meaning. Before
+//! The elector keeps five private instants, each with one meaning. Before
 //! the first it writes no record that names it: it takes nothing, and a
 //! holder told to leave whose release has not landed tries that release
 //! again in place of a renewal. A step-down sets it one lease duration
@@ -92,7 +92,9 @@
 //! release before it hands on the wait left to it. The third is the end it
 //! stamped its fence with last: a renewal no later than it keeps the opening.
 //! The fourth is the latest instant a step or a word was handed: a call
-//! handed no instant reads the later of it and the clock.
+//! handed no instant reads the later of it and the clock. The fifth is
+//! this run's first sight of a record that is gone after one was seen
+//! held: the wait for that record counts from it.
 //!
 //! The settings ([`ElectionSettings`]): duration 3 s, renew period 1 s, renew
 //! deadline 2 s by default; a deployment that prefers fewer leadership
@@ -571,6 +573,12 @@ impl Elector {
         self.observed.as_ref().map(|o| &o.record)
     }
 
+    /// The highest term this run saw in a record or was told: its next take
+    /// is above it, and the standing names no holder under a lower one.
+    pub fn highest_term(&self) -> u64 {
+        self.highest_term
+    }
+
     /// One step of the election at `now`: a holder renews, a candidate takes
     /// a free lease or keeps following. Call it every renew period. An error
     /// changes nothing: a holder keeps its record and its fence closes by
@@ -665,6 +673,8 @@ impl Elector {
                 // The record is kept until the re-read settles what moved:
                 // a read error leaves a second call its retry.
                 let stored = self.backend.read()?;
+                // A sight as any other: the run counts its term.
+                self.observe(stored.as_ref(), self.latest());
                 self.held = None;
                 match (stored, self.attempted.take()) {
                     // This process's own renewal that landed and reported an
@@ -842,6 +852,9 @@ impl Elector {
             }
             Written::Moved => {
                 let current = self.backend.read()?;
+                // The record read again is a sight as any other: the run
+                // counts its term and the standing reads it.
+                self.observe(current.as_ref(), self.latest());
                 match (current, self.attempted.take()) {
                     // This process's own earlier attempt landed between this
                     // tick's read and its write: the record is its own,
@@ -1968,10 +1981,11 @@ mod tests {
     }
 
     /// A backend that lets another candidate write between this candidate's
-    /// read and its write: the race a compare-and-swap exists for.
+    /// read and its write: the race a compare-and-swap exists for. A case
+    /// may set the rival after the candidate's take.
     struct Interposed {
         lease: MemoryLease,
-        rival: Option<LeaseRecord>,
+        rival: Arc<Mutex<Option<LeaseRecord>>>,
     }
 
     impl LeaseBackend for Interposed {
@@ -1984,7 +1998,7 @@ mod tests {
             expected: Option<&LeaseRecord>,
             record: &LeaseRecord,
         ) -> Result<Written, ElectError> {
-            if let Some(rival) = self.rival.take() {
+            if let Some(rival) = self.rival.lock().take() {
                 assert_eq!(
                     self.lease
                         .write(expected, &rival)
@@ -2012,7 +2026,7 @@ mod tests {
         };
         let backend = Interposed {
             lease: lease.clone(),
-            rival: Some(rival.clone()),
+            rival: Arc::new(Mutex::new(Some(rival.clone()))),
         };
         let mut a = Elector::new(Box::new(backend), "a@host:1", settings()).expect("settings");
         let t0 = Instant::now() + AHEAD;
@@ -2028,6 +2042,63 @@ mod tests {
             }
         );
         assert_eq!(lease.clone().read().expect("read"), Some(rival));
+    }
+
+    /// A holder over a store where another replica's release under term
+    /// nine lands between its next read and its next write.
+    fn led_before_a_rivals_release(t0: Instant) -> Elector {
+        let lease = MemoryLease::new();
+        let rival = Arc::new(Mutex::new(None));
+        let backend = Interposed {
+            lease: lease.clone(),
+            rival: Arc::clone(&rival),
+        };
+        let mut a = Elector::new(Box::new(backend), "a@host:1", settings()).expect("settings");
+        a.lead_at(t0);
+        let mine = lease.clone().read().expect("read").expect("the record");
+        *rival.lock() = Some(LeaseRecord {
+            holder: String::new(),
+            term: 9,
+            duration_ms: 0,
+            renewed_at_micros: mine.renewed_at_micros + 1,
+            ..mine
+        });
+        a
+    }
+
+    #[test]
+    fn a_release_that_lands_under_a_renewals_write_is_observed_at_the_read_after_it() {
+        // The renewal's write comes back moved and the lease is read again.
+        // That record is a sight as any other: the run counts its term, so
+        // the standing reads it and the next take is above it.
+        let t0 = Instant::now() + 3 * S;
+        let mut a = led_before_a_rivals_release(t0);
+        assert_eq!(
+            a.tick(t0 + S).expect("the look that loses the lease"),
+            Tick::Lost {
+                term: 1,
+                holder: String::new()
+            }
+        );
+        assert_eq!(a.observed().map(|record| record.term), Some(9));
+        assert_eq!(a.highest_term(), 9);
+        assert_eq!(
+            a.tick(t0 + 2 * S).expect("take"),
+            Tick::Acquired { term: 10 }
+        );
+    }
+
+    #[test]
+    fn a_release_that_lands_under_a_stops_write_is_observed_at_the_read_after_it() {
+        // The same race at a stop: the release's write comes back moved, the
+        // lease read again is released under a term above this run's, and
+        // the run counts that term.
+        let t0 = Instant::now() + 3 * S;
+        let mut a = led_before_a_rivals_release(t0);
+        assert!(a.release().expect("the release"));
+        assert!(!a.is_holder());
+        assert_eq!(a.observed().map(|record| record.term), Some(9));
+        assert_eq!(a.highest_term(), 9);
     }
 
     /// A backend whose writes fail while `fails` is above zero, as a stalled
