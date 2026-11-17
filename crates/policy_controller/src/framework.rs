@@ -14,7 +14,10 @@ use crate::{
     lease::{Lease, Lifecycle, Membership, Outcome, ReleaseReason, Side, Signal},
     sessions::{Assignment, Claim, SessionRule, SessionTable, SessionVerdict},
     spec::Needs,
-    view::{AffinityFacts, Candidate, Constraints, Phase, PoolFacts, RequestFacts, WorkerId},
+    view::{
+        mean_in_flight, AffinityFacts, Candidate, Constraints, NamedAffinity, Phase, PoolFacts,
+        RequestFacts, WorkerId,
+    },
     Draw,
 };
 
@@ -33,8 +36,11 @@ pub trait Filter: Send + Sync + Debug {
     /// Whether a decision that draws first ([`Picker::draw_first`]) may ask
     /// this filter about the rows it drew alone, with no pass over the
     /// rest: [`Filter::keep`] of one row is the filter's whole word on it.
-    /// The default is no, and a profile that holds such a filter runs its
-    /// whole pass: a plugin's filter is shown the whole view.
+    /// A row-wise filter reads each row alone and is promised no order of
+    /// the rows it is asked about: they come ascending where the pool is
+    /// read whole, and in the draw's order behind a draw. The default is
+    /// no, and a profile that holds such a filter runs its whole pass: a
+    /// plugin's filter is shown the whole view.
     fn row_wise(&self) -> bool {
         false
     }
@@ -110,8 +116,11 @@ pub trait Scorer: Lifecycle + Debug {
 
     /// Whether the scorer may be handed the rows a picker drew first
     /// ([`Picker::draw_first`]), where no pass over the pool ran before it.
-    /// The default is no, and a profile that holds such a scorer runs its
-    /// whole pass: a plugin's scorer is shown the whole view.
+    /// A row-wise scorer reads each row alone and is promised no order of
+    /// the rows it is handed: they stand ascending where the pool is read
+    /// whole, and in the draw's order behind a draw. The default is no,
+    /// and a profile that holds such a scorer runs its whole pass: a
+    /// plugin's scorer is shown the whole view.
     fn row_wise(&self) -> bool {
         false
     }
@@ -186,8 +195,10 @@ pub trait Picker: Lifecycle + Debug {
     /// that set to the front of `kept` and says how many survivors behind it
     /// follow the pick as alternates. It permutes `kept` and writes no other
     /// value. A survivor the picker passed over is handed to no scorer, so
-    /// it moves no input of a built-in's estimate. The default compares
-    /// every survivor.
+    /// it moves no input of a built-in's estimate. The affinity stages
+    /// read the rows a host named fastest where the compared set stands
+    /// ascending: a row asked behind the one before it costs a search.
+    /// The default compares every survivor.
     fn narrow(
         &self,
         _facts: &RequestFacts<'_>,
@@ -260,6 +271,18 @@ pub trait Picker: Lifecycle + Debug {
         out: &mut Targets,
     ) {
         self.pick(facts, candidates, kept, scores, band, out);
+    }
+
+    /// Whether the rows a host named in the affinity column's place
+    /// ([`NamedAffinity`]) join the rows this picker draws first: the
+    /// engine keeps, behind the rows drawn, each named row every filter
+    /// keeps, and hands the stages the drawn rows' mean in flight, so a
+    /// named row does not move the mean it is judged against. The engine
+    /// asks such a picker to draw for a request that names rows in the
+    /// column's place, and for no other. The default is no: what the picker
+    /// drew is all it compares.
+    fn joined_by_named(&self) -> bool {
+        false
     }
 
     /// What the host must feed for this picker to mean anything. A picker
@@ -949,15 +972,74 @@ fn draws_first(profile: &Profile) -> bool {
         && profile.scorers.iter().all(|w| w.scorer.row_wise())
 }
 
+/// The rows a host named join the rows a picker drew
+/// ([`Picker::joined_by_named`]): each named row every filter keeps is
+/// pushed behind the draw, none twice, the holders before the warming rows.
+/// Returns the mean in flight of the rows drawn, which the spill gate reads
+/// in place of the mean of the rows handed. A named row past the pool fails
+/// here, as an index past the candidates does.
+fn join_named(
+    named: &NamedAffinity<'_>,
+    candidates: &[Candidate],
+    keep: &mut dyn FnMut(&Candidate) -> bool,
+    kept: &mut Vec<u32>,
+) -> f32 {
+    let mean = mean_in_flight(candidates, kept);
+    let holders = named.holders.iter().map(|holder| holder.row);
+    for row in holders.chain(named.warming.iter().copied()) {
+        if !kept.contains(&row) && keep(&candidates[row as usize]) {
+            kept.push(row);
+        }
+    }
+    mean
+}
+
+/// The picker's order of a draw the rows a host named join
+/// ([`Picker::joined_by_named`]): the named rows join the rows drawn
+/// ([`join_named`]) and the stages are handed the drawn rows' mean in
+/// flight. Out of line: a draw nothing joins keeps the code it had.
+#[inline(never)]
+fn order_joined(
+    profile: &Profile,
+    after: &RequestFacts<'_>,
+    named: NamedAffinity<'_>,
+    candidates: &[Candidate],
+    keep: &mut dyn FnMut(&Candidate) -> bool,
+    buf: &mut Buffers,
+    out: &mut Targets,
+) {
+    let mean = join_named(&named, candidates, keep, &mut buf.kept);
+    let joined = RequestFacts {
+        named: Some(NamedAffinity {
+            mean_in_flight: Some(mean),
+            ..named
+        }),
+        ..*after
+    };
+    let band = combine(
+        profile,
+        &joined,
+        candidates,
+        &buf.kept,
+        &mut buf.scores,
+        &mut buf.stage,
+    );
+    profile
+        .picker
+        .order_drawn(&joined, candidates, &buf.kept, &buf.scores, band, out);
+}
+
 /// A single-plan decision by a picker that draws first
 /// ([`Picker::draw_first`]), in front of the plan's opening. The picker
 /// draws rows and every filter of the profile is asked about each through
 /// the filter's own `keep`, hard and soft alike. A row every filter keeps is
 /// a row the whole pass keeps, so every target handed out is one the pass
 /// could have handed out; the scorers are handed the rows drawn and the
-/// picker orders them. A draw that keeps nobody says nothing of the pool:
-/// the decision widens to the whole pass ([`run_single`]), which alone sheds
-/// and names a stage.
+/// picker orders them. Where the picker takes them
+/// ([`Picker::joined_by_named`]), the rows a host named join the rows drawn
+/// before the scorers run ([`order_joined`]). A draw that keeps nobody says
+/// nothing of the pool: the decision widens to the whole pass
+/// ([`run_single`]), which alone sheds and names a stage.
 ///
 /// Whatever follows the draw reads the seed's stream past the values the
 /// draw read. The stream is continued, never restarted: a pass behind
@@ -981,13 +1063,19 @@ fn run_drawn(
     buf.reserve(candidates.len());
     buf.kept.clear();
     let mut draw = Draw::new(facts.seed);
-    let drew = profile.picker.draw_first(
-        facts,
-        pool,
-        candidates,
-        &mut |c| profile.filters.iter().all(|f| f.keep(facts, c, cx)),
-        &mut buf.kept,
-        &mut draw,
+    let mut keep = |c: &Candidate| profile.filters.iter().all(|f| f.keep(facts, c, cx));
+    let drew =
+        profile
+            .picker
+            .draw_first(facts, pool, candidates, &mut keep, &mut buf.kept, &mut draw);
+    // The host caps both lists at the picker's sample: past it a decision
+    // reads dearer, never wrong, so a debug build alone asserts it.
+    debug_assert!(
+        facts.named.is_none_or(|named| {
+            let cap = profile.picker.needs().sample as usize;
+            cap == 0 || named.holders.len().max(named.warming.len()) <= cap
+        }),
+        "each list of rows named stands at or under the sample of the picker that draws"
     );
     // A picker that read no value of the stream left the seed as it was.
     let resumed;
@@ -1001,23 +1089,41 @@ fn run_drawn(
         &resumed
     };
     if drew {
-        let band = combine(
-            profile,
-            after,
-            candidates,
-            &buf.kept,
-            &mut buf.scores,
-            &mut buf.stage,
-        );
         let mut targets = Targets::new();
-        profile.picker.order_drawn(
-            after,
-            candidates,
-            &buf.kept,
-            &buf.scores,
-            band,
-            &mut targets,
-        );
+        match after.named {
+            // The rows the host named join the rows drawn where the picker
+            // takes them: out of line, so a draw nothing joins keeps the
+            // code it had.
+            Some(named) if profile.picker.joined_by_named() => {
+                order_joined(
+                    profile,
+                    after,
+                    named,
+                    candidates,
+                    &mut keep,
+                    buf,
+                    &mut targets,
+                );
+            }
+            _ => {
+                let band = combine(
+                    profile,
+                    after,
+                    candidates,
+                    &buf.kept,
+                    &mut buf.scores,
+                    &mut buf.stage,
+                );
+                profile.picker.order_drawn(
+                    after,
+                    candidates,
+                    &buf.kept,
+                    &buf.scores,
+                    band,
+                    &mut targets,
+                );
+            }
+        }
         if !targets.is_empty() {
             let trace = Trace {
                 survivors: Survivors::NOT_COUNTED,
@@ -1162,6 +1268,11 @@ impl Marks {
     /// ([`draws_first`]): a pool of [`DRAW_FROM`] rows or more is decided by
     /// the rows drawn. It asks nothing before the profile's run.
     const DRAWS_FIRST: u8 = 1 << 2;
+    /// The rows a host named join the rows the picker draws
+    /// ([`Picker::joined_by_named`]): such a profile draws for a request
+    /// that names rows in the column's place, and for no other. Set only
+    /// beside [`Self::DRAWS_FIRST`].
+    const JOINED: u8 = 1 << 3;
 
     fn of(profile: &Profile) -> Self {
         let scoped = if profile.scoped() { Self::SCOPED } else { 0 };
@@ -1175,7 +1286,12 @@ impl Marks {
         } else {
             0
         };
-        Self(scoped | by_assignment | draws_first)
+        let joined = if draws_first != 0 && profile.picker.joined_by_named() {
+            Self::JOINED
+        } else {
+            0
+        };
+        Self(scoped | by_assignment | draws_first | joined)
     }
 
     /// Whether no stage asks anything before the profile's run: no scope
@@ -1184,8 +1300,13 @@ impl Marks {
         self.0 & (Self::SCOPED | Self::BY_ASSIGNMENT) == 0
     }
 
-    const fn draws_first(self) -> bool {
-        self.0 & Self::DRAWS_FIRST != 0
+    /// How the profile draws, its two marks in one masked read: zero where
+    /// it never draws first, [`Self::DRAWS_FIRST`] alone where it draws for
+    /// every request, both marks where it draws for a request that names
+    /// rows. A decision asks once, so a profile that never draws pays the
+    /// one compare it paid before the second mark.
+    const fn draw(self) -> u8 {
+        self.0 & (Self::DRAWS_FIRST | Self::JOINED)
     }
 
     const fn scoped(self) -> bool {
@@ -1814,11 +1935,12 @@ impl Engine {
     /// to that rule is placed by its assignment. Every other request of a
     /// profile whose picker draws first ([`Picker::draw_first`]) is decided
     /// by the rows it draws where the pool is large enough, and by the whole
-    /// pass under that size or when the draw keeps nobody. The request's affinity
+    /// pass under that size or when the draw keeps nobody. A picker the rows
+    /// named join ([`Picker::joined_by_named`]) draws for a request that
+    /// names rows and for no other. The request's affinity
     /// column is empty or holds one entry a candidate; any other is
     /// refused, as a decline under the stage name `affinity-column`. Rows
-    /// named in the column's place
-    /// ([`NamedAffinity`](crate::NamedAffinity)) are read as the host
+    /// named in the column's place ([`NamedAffinity`]) are read as the host
     /// derived them: a debug build asserts that they stand for the pool.
     pub fn decide(
         &self,
@@ -1880,7 +2002,13 @@ impl Engine {
         };
         let buf = &mut scratch.single;
         // An encode item's rules are the whole pass's own: it never draws.
-        if marks.draws_first() && !encode && candidates.len() >= DRAW_FROM {
+        // A picker the rows named join draws for a request that names rows.
+        let draw = marks.draw();
+        if draw != 0
+            && !encode
+            && candidates.len() >= DRAW_FROM
+            && (draw == Marks::DRAWS_FIRST || facts.named.is_some())
+        {
             return run_drawn(profile, index, facts, pool, set, cx, buf);
         }
         run_single(profile, index, facts, pool, set, cx, buf)
@@ -2887,6 +3015,7 @@ mod tests {
                         holders: &holders,
                         warming,
                         thin: false,
+                        mean_in_flight: None,
                     }),
                     ..RequestFacts::default()
                 };
@@ -3023,7 +3152,7 @@ mod tests {
         let (prefills, decodes) = (paired(2), paired(2));
         let facts = RequestFacts {
             model: "m",
-            named: Some(crate::NamedAffinity::default()),
+            named: Some(NamedAffinity::default()),
             ..RequestFacts::default()
         };
         let decision = engine.decide_pair(
@@ -3053,9 +3182,9 @@ mod tests {
         }];
         let facts = RequestFacts {
             model: "m",
-            named: Some(crate::NamedAffinity {
+            named: Some(NamedAffinity {
                 holders: &holders,
-                ..crate::NamedAffinity::default()
+                ..NamedAffinity::default()
             }),
             ..RequestFacts::default()
         };
@@ -7196,5 +7325,160 @@ mod tests {
             1,
             "a chain one past the depth ends there, with one payload forgotten"
         );
+    }
+
+    // ---- a draw the rows a host named join
+
+    fn holding(row: u32, overlap_blocks: u32) -> crate::NamedHolder {
+        crate::NamedHolder {
+            row,
+            overlap_blocks,
+            predicted_blocks: 0,
+        }
+    }
+
+    /// A request of sixteen blocks whose host names `holders`.
+    fn naming(seed: u64, holders: &[crate::NamedHolder]) -> RequestFacts<'_> {
+        static HASHES: [u64; 16] = [0; 16];
+        RequestFacts {
+            block_hashes: &HASHES,
+            prompt_tokens: 256,
+            named: Some(NamedAffinity {
+                holders,
+                ..NamedAffinity::default()
+            }),
+            ..request(seed)
+        }
+    }
+
+    /// Behind the draw of a `best` that takes a sample, the rows a host
+    /// named join the rows drawn: the deepest named holder leads whether the
+    /// draw reached it or not, one a filter refuses leaves the lead to the
+    /// next, and a named row the draw reached too is handed out once.
+    #[test]
+    fn the_rows_a_host_named_join_the_rows_a_sampled_best_drew() {
+        let engine = preset("cache_aware");
+        assert_eq!(engine.needs().sample, 16);
+        let holders = [holding(20, 8), holding(40, 12)];
+        crate::view::LOOKS_BEHIND.with(|looks| looks.set(0));
+        for (down, lead) in [(64u32, 40u32), (40, 20)] {
+            let pool = pool_of(64, |i| i == down);
+            for seed in 0..200u64 {
+                let got = drawn(&engine, &naming(seed, &holders), &pool);
+                assert!(got.trace().drew_first(), "seed {seed}: the decision drew");
+                let rows = positions(&got);
+                assert_eq!(rows.first(), Some(&lead), "seed {seed}, row {down} down");
+                let mut once = rows.clone();
+                once.sort_unstable();
+                once.dedup();
+                assert_eq!(once.len(), rows.len(), "seed {seed}: {rows:?}, a row twice");
+            }
+        }
+        // Behind the draw the stages search the rows named: no walk looked
+        // behind its cursor in any of the decisions.
+        assert_eq!(crate::view::LOOKS_BEHIND.with(std::cell::Cell::get), 0);
+    }
+
+    /// A host caps each list of rows it names at the picker's sample. Past
+    /// it a decision reads dearer and is never wrong, so a debug build
+    /// alone stops, by the assertion's own words.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "at or under the sample of the picker that draws")]
+    fn rows_named_past_the_sample_stop_a_debug_build_where_the_picker_draws() {
+        let engine = preset("cache_aware");
+        let holders: Vec<crate::NamedHolder> = (0..17).map(|row| holding(row, 12)).collect();
+        let decision = drawn(&engine, &naming(1, &holders), &pool_of(64, |_| false));
+        panic!("seventeen rows named answered {decision:?}");
+    }
+
+    /// A pool of at most twice the sample is read whole, rows named or not,
+    /// and so is a larger pool whose host names none: the draw is for the
+    /// pools a host names rows in.
+    #[test]
+    fn a_sampled_best_reads_a_small_pool_and_a_pool_with_no_rows_named_whole() {
+        let (engine, twin) = (preset("cache_aware"), preset("cache_aware"));
+        let holders = [holding(3, 12)];
+        for seed in 0..40u64 {
+            // Twice the sample, rows named: the whole pass, row for row.
+            let pool = pool_of(32, |i| i % 17 == 5);
+            let facts = naming(seed, &holders);
+            let got = drawn(&engine, &facts, &pool);
+            assert!(!got.trace().drew_first(), "seed {seed}");
+            assert_eq!(got, whole_pass(&twin, &facts, &pool), "seed {seed}");
+            // One row more: the decision draws.
+            let pool = pool_of(33, |i| i % 17 == 5);
+            let got = drawn(&engine, &facts, &pool);
+            assert!(got.trace().drew_first(), "seed {seed}");
+            // No rows named: the whole pass, whatever the pool's size.
+            let pool = pool_of(257, |i| i % 17 == 5);
+            let facts = request(seed);
+            let got = drawn(&engine, &facts, &pool);
+            assert!(!got.trace().drew_first(), "seed {seed}");
+            assert_eq!(got, whole_pass(&twin, &facts, &pool), "seed {seed}");
+        }
+    }
+
+    /// The joined mark stands only beside the draw's: under a filter that is
+    /// not row-wise a `best` that takes a sample reads its pool whole,
+    /// whatever rows the host names.
+    #[test]
+    fn a_joined_picker_under_a_stage_that_is_not_row_wise_never_draws() {
+        /// Keeps every row, and its word on one row is not its whole word.
+        #[derive(Debug)]
+        struct Whole;
+        impl Filter for Whole {
+            fn name(&self) -> &'static str {
+                "whole"
+            }
+
+            fn keep(&self, _: &RequestFacts<'_>, _: &Candidate, _: &Constraints<'_>) -> bool {
+                true
+            }
+        }
+        let engine = Engine::new(
+            vec![Profile {
+                name: "whole".into(),
+                filters: vec![Box::new(Healthy), Box::new(Whole)],
+                scorers: Vec::new(),
+                picker: Box::new(crate::builtins::SampledBest::new(16)),
+            }],
+            vec![single_binding()],
+            1,
+            Needs::default(),
+        );
+        let holders = [holding(3, 12)];
+        let pool = pool_of(64, |_| false);
+        for seed in 0..20u64 {
+            let got = drawn(&engine, &naming(seed, &holders), &pool);
+            assert!(!got.trace().drew_first(), "seed {seed}");
+            assert_eq!(got.trace().survivors.get(), Some(64), "seed {seed}");
+        }
+    }
+
+    /// The mean the spill gate reads behind a draw is the drawn rows': four
+    /// named holders with seven in flight spill against rows drawn at two,
+    /// where the mean of the rows handed, the holders among them, would
+    /// keep each of them in the lead.
+    #[test]
+    fn the_rows_named_do_not_move_the_mean_they_are_judged_against() {
+        let engine = preset("cache_aware");
+        let holders = [
+            holding(8, 12),
+            holding(24, 12),
+            holding(40, 12),
+            holding(56, 12),
+        ];
+        let pool: Vec<Candidate> = (0..64u32)
+            .map(|i| candidate(i, if i % 16 == 8 { 7 } else { 2 }))
+            .collect();
+        let mut led = 0u32;
+        for seed in 0..200u64 {
+            let got = drawn(&engine, &naming(seed, &holders), &pool);
+            assert!(got.trace().drew_first(), "seed {seed}");
+            led += u32::from(positions(&got).first().is_some_and(|row| row % 16 == 8));
+        }
+        // A draw that takes all four holders reads a mean they pass: rare.
+        assert!(led < 20, "{led} of 200 decisions were led by a busy holder");
     }
 }

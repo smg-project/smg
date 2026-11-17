@@ -32,7 +32,7 @@ use sha2::{Digest as _, Sha256};
 use crate::{
     affinity::{Gates, KvPressure, PrefixAffinity, WarmupSlice},
     builtins::{
-        FewestSessions, LeastLoad, LeastRequests, ResidentWork, SessionAffinity,
+        FewestSessions, LeastLoad, LeastRequests, ResidentWork, SampledBest, SessionAffinity,
         DEFAULT_MEAN_PREFILL_TOKENS,
     },
     catalog::{Catalog, Found},
@@ -87,7 +87,8 @@ pub const SCORERS: [&str; 10] = [
 /// The pickers of v1; `count-first` and `power-of-two-count-first` compare
 /// the requests in flight before the score; `manual` leaves the placement
 /// to the binding's sessions rule, by its assignment; `best-with-temperature`
-/// takes its temperature and is written in the parameter form.
+/// takes its temperature and is written in the parameter form, as `best` is
+/// when it takes a sample.
 pub const PICKERS: [&str; 9] = [
     "best",
     "round-robin",
@@ -107,6 +108,10 @@ static STOCK: LazyLock<Catalog> = LazyLock::new(Catalog::builtin);
 /// A sampling picker compares its draws by the profile's scorers, so it
 /// needs at least one.
 const SAMPLING_PICKERS: [&str; 2] = ["power-of-two", "power-of-two-count-first"];
+
+/// The most rows the `best` picker's sample may hold: a row joins the
+/// sample after a search of the rows already in it.
+const MAX_SAMPLE: u32 = 64;
 
 /// The side names a binding's `profiles` map may use.
 const SIDES: [&str; 4] = ["single", "prefill", "decode", "encode"];
@@ -151,6 +156,16 @@ pub struct Needs {
     /// candidate and nothing is refused. What holds a host to the need is
     /// the builder of its view, by a case of its own.
     pub affinity: bool,
+    /// The sample of a picker that decides a large pool by a draw of this
+    /// many rows and the rows the host names; `0` for none. A host that can
+    /// name the request's holders and the pool's warming rows
+    /// ([`NamedAffinity`](crate::NamedAffinity)) hands those in the
+    /// column's place, each list capped at this many rows: the holders by
+    /// depth, whole depth groups from the deepest while they fit and the
+    /// group at the cap's edge by a uniform draw from the decision's seed;
+    /// the warming rows by that draw over their whole list. A host that
+    /// cannot fills the column, and the pool is read whole.
+    pub sample: u32,
 }
 
 impl Needs {
@@ -169,6 +184,7 @@ impl Needs {
             active_sessions: self.active_sessions || other.active_sessions,
             session_in_flight: self.session_in_flight || other.session_in_flight,
             affinity: self.affinity || other.affinity,
+            sample: self.sample.max(other.sample),
         }
     }
 }
@@ -600,6 +616,18 @@ pub struct ResidentWorkParams {
     pub request_tokens: u32,
 }
 
+/// The `best` picker's parameters.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BestParams {
+    /// How many rows the picker draws where the host names the request's
+    /// holders and the pool's warming rows: a pool of more than twice this
+    /// many rows is decided by that sample and the named rows, any other by
+    /// the whole pool. From 1 to 64.
+    #[schemars(range(min = 1, max = 64))]
+    pub sample: u32,
+}
+
 /// The `best-with-temperature` picker's parameters.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -943,6 +971,7 @@ impl JsonSchema for ScoreSpec {
 #[derive(Clone, Debug, PartialEq, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum PickStage {
+    Best(BestParams),
     BestWithTemperature(BestWithTemperatureParams),
 }
 
@@ -950,6 +979,7 @@ impl PickStage {
     /// The picker's name, as the document spells it.
     pub fn name(&self) -> &'static str {
         match self {
+            Self::Best(_) => "best",
             Self::BestWithTemperature(_) => "best-with-temperature",
         }
     }
@@ -995,6 +1025,11 @@ impl Serialize for PickSpec {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         match self {
             Self::Name(name) => serializer.serialize_str(name),
+            Self::Params(PickStage::Best(p)) => {
+                let mut map = serializer.serialize_map(Some(1))?;
+                map.serialize_entry("best", p)?;
+                map.end()
+            }
             Self::Params(PickStage::BestWithTemperature(p)) => {
                 let mut map = serializer.serialize_map(Some(1))?;
                 map.serialize_entry("best-with-temperature", p)?;
@@ -1006,11 +1041,12 @@ impl Serialize for PickSpec {
 
 /// The one picker of a pick entry's map, read by its key.
 fn picker_entry<'de, A: MapAccess<'de>>(mut map: A) -> Result<PickStage, A::Error> {
-    const WITH_PARAMETERS: [&str; 1] = ["best-with-temperature"];
+    const WITH_PARAMETERS: [&str; 2] = ["best", "best-with-temperature"];
     let Some(key) = map.next_key::<String>()? else {
         return Err(de::Error::custom("a pick entry names one picker"));
     };
     let stage = match key.as_str() {
+        "best" => PickStage::Best(map.next_value()?),
         "best-with-temperature" => PickStage::BestWithTemperature(map.next_value()?),
         other => return Err(de::Error::unknown_variant(other, &WITH_PARAMETERS)),
     };
@@ -1971,6 +2007,16 @@ fn picker_of(
                 })
             }
         },
+        PickSpec::Params(PickStage::Best(p)) => {
+            if !(1..=MAX_SAMPLE).contains(&p.sample) {
+                return Err(at.sub("pick").sub("best").bad(
+                    "sample",
+                    p.sample,
+                    "a whole number from 1 to 64",
+                ));
+            }
+            Resolved::Built(Box::new(SampledBest::new(p.sample)))
+        }
         PickSpec::Params(PickStage::BestWithTemperature(p)) => {
             if !at_or_above_zero(p.temperature) {
                 return Err(at.sub("pick").sub("best-with-temperature").bad(
@@ -2667,7 +2713,9 @@ impl PolicySpec {
                     "kv-pressure".into(),
                     "least-load".into(),
                 ],
-                pick: "best".into(),
+                // A large pool is decided by a draw of sixteen rows and the
+                // rows the host names: its holders and its warming rows.
+                pick: PickStage::Best(BestParams { sample: 16 }).into(),
             },
             other => return Err(SpecError::UnknownPreset(other.to_string())),
         };
@@ -5209,5 +5257,37 @@ mod tests {
         assert_eq!(handed.pairing(), Pairing::Strict);
         let own = AppliedSpec::validate(&document).expect("a preset validates");
         assert_eq!(own.pairing(), Pairing::Strict);
+    }
+
+    /// `best` takes a sample in the parameter form and stays the unit by its
+    /// name: the sample is a whole number from 1 to 64 and the profile's
+    /// need, and the cache-aware preset states sixteen.
+    #[test]
+    fn the_best_picker_takes_a_sample_in_the_parameter_form() {
+        let sampled = spec_with_pick(r#"{"best":{"sample":16}}"#);
+        let engine = sampled.validate().expect("validates");
+        assert_eq!(engine.needs().sample, 16);
+        let written = serde_json::to_string(&sampled).expect("serializes");
+        assert!(
+            written.contains(r#""pick":{"best":{"sample":16}}"#),
+            "{written}"
+        );
+        assert_eq!(doc(&written), sampled);
+        // By its name it is the unit: the whole pool, and no sample needed.
+        let unit = spec_with_pick(r#""best""#);
+        assert_eq!(unit.validate().expect("validates").needs().sample, 0);
+        for sample in [0, 65] {
+            let pick = format!(r#"{{"best":{{"sample":{sample}}}}}"#);
+            assert_eq!(
+                bad_field(&spec_with_pick(&pick)),
+                "profiles.p.pick.best.sample"
+            );
+        }
+        let err = parse_error(
+            r#"{"apiVersion":"smg.policy/v1","profiles":{"p":{"pick":{"best":{"draws":4}}}}}"#,
+        );
+        assert!(err.contains("unknown field `draws`"), "{err}");
+        let preset = PolicySpec::preset("cache_aware").expect("a preset");
+        assert_eq!(preset.validate().expect("validates").needs().sample, 16);
     }
 }

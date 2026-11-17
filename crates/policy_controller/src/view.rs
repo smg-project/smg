@@ -341,7 +341,7 @@ pub struct AffinityFacts {
 /// lists are the host's to keep ascending by row and under the candidates'
 /// count: a debug build asserts it where a decision takes its inputs, and a
 /// release build reads them as they stand. In-process only.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct NamedAffinity<'a> {
     /// The rows that hold a leading part of the request, ascending by row,
     /// each with what it holds. A row not named reads as holding nothing.
@@ -352,6 +352,12 @@ pub struct NamedAffinity<'a> {
     pub warming: &'a [u32],
     /// The warming rows are the thin.
     pub thin: bool,
+    /// The mean in-flight count the spill gate reads behind a draw: the
+    /// mean of the rows the picker drew, so a row the host named does not
+    /// move the mean it is judged against. The engine sets it; a host
+    /// leaves `None`, which reads as the mean of the rows a stage is
+    /// handed.
+    pub mean_in_flight: Option<f32>,
 }
 
 /// One row a host names as a holder: what the row's entry of a column says
@@ -386,6 +392,17 @@ impl<'a> NamedAffinity<'a> {
     pub(crate) fn walk(self) -> NamedWalk<'a> {
         NamedWalk(Walk::new(self.holders))
     }
+
+    /// Whether the engine drew the rows a stage is handed: it set their
+    /// mean ([`NamedAffinity::mean_in_flight`]). They stand in the draw's
+    /// order, so a pass reads each row by a search and keeps no cursor; a
+    /// walk is the read of a pool read whole, whose rows stand ascending.
+    /// The sign chooses a cost and never an answer: both reads answer
+    /// alike in whatever order the rows are asked.
+    #[inline]
+    pub(crate) fn drawn(&self) -> bool {
+        self.mean_in_flight.is_some()
+    }
 }
 
 impl NamedHolder {
@@ -399,6 +416,13 @@ impl NamedHolder {
             ..AffinityFacts::default()
         }
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many times a walk on this thread looked behind its cursor: a
+    /// case reads it to tell a walk from a search.
+    pub(crate) static LOOKS_BEHIND: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 /// A forward cursor over a list its host keeps ascending by row, for one
@@ -446,6 +470,8 @@ impl<'a, T: Copy> Walk<'a, T> {
     #[cold]
     #[inline(never)]
     fn behind(&self, index: u32, row: &impl Fn(&T) -> u32) -> usize {
+        #[cfg(test)]
+        LOOKS_BEHIND.with(|looks| looks.set(looks.get() + 1));
         self.list.partition_point(|entry| row(entry) < index)
     }
 }
@@ -482,6 +508,16 @@ impl Feed<'_> {
         }
     }
 
+    /// The mean in flight the engine set behind a draw
+    /// ([`NamedAffinity::mean_in_flight`]): the rows named carry it, a
+    /// column carries none.
+    pub(crate) fn drawn_mean(self) -> Option<f32> {
+        match self {
+            Self::Column(_) => None,
+            Self::Named(named) => named.mean_in_flight,
+        }
+    }
+
     /// Row `index`'s entry: a column's own, where an index past the end
     /// fails, or a named row's ([`NamedAffinity::entry`]).
     #[inline]
@@ -489,6 +525,23 @@ impl Feed<'_> {
         match self {
             Self::Column(column) => column[index as usize],
             Self::Named(named) => named.entry(index),
+        }
+    }
+
+    /// Row `index`'s entry as one pass reads it: by the pass's own `reads`
+    /// where the pool is read whole, and by a search behind a draw
+    /// (`DRAWN`), where the rows stand in the draw's order and a pass
+    /// keeps no cursor. The choice is a constant of the body that reads.
+    #[inline(always)]
+    pub(crate) fn read<const DRAWN: bool>(
+        self,
+        reads: &mut Reads<'_>,
+        index: u32,
+    ) -> AffinityFacts {
+        if DRAWN {
+            self.entry(index)
+        } else {
+            reads.entry(index)
         }
     }
 }
@@ -637,6 +690,19 @@ pub struct MediaCounts {
 pub struct Header<'a> {
     pub name: u8,
     pub value: &'a str,
+}
+
+/// The mean of the in-flight counts of `rows` of `candidates`; zero over no
+/// row.
+pub(crate) fn mean_in_flight(candidates: &[Candidate], rows: &[u32]) -> f32 {
+    if rows.is_empty() {
+        return 0.0;
+    }
+    let sum: u64 = rows
+        .iter()
+        .map(|&i| u64::from(candidates[i as usize].in_flight))
+        .sum();
+    sum as f32 / rows.len() as f32
 }
 
 /// One request as a decision sees it. Borrowed from the host for the
@@ -1037,6 +1103,54 @@ mod tests {
         let mut walk = NamedAffinity::default().walk();
         assert_eq!(walk.entry(0), AffinityFacts::default());
         assert_eq!(walk.entry(3), AffinityFacts::default());
+    }
+
+    /// Behind a draw a pass reads the rows named by a search: each row reads
+    /// as the walk of a whole read reads it, and no read looks behind a
+    /// cursor, where the walk asked in that order does.
+    #[test]
+    fn a_read_behind_a_draw_searches_the_rows_named_and_keeps_no_cursor() {
+        let holders = [(1, 4), (4, 9), (9, 3)].map(|(row, overlap_blocks)| NamedHolder {
+            row,
+            overlap_blocks,
+            predicted_blocks: 0,
+        });
+        let whole = NamedAffinity {
+            holders: &holders,
+            ..NamedAffinity::default()
+        };
+        let drawn = NamedAffinity {
+            mean_in_flight: Some(1.0),
+            ..whole
+        };
+        assert!(drawn.drawn() && !whole.drawn());
+        let feed = Feed::Named(drawn);
+        let order = [9, 0, 4, 4, 1, 10, 9];
+        LOOKS_BEHIND.with(|looks| looks.set(0));
+        let mut reads = feed.reads();
+        for row in order {
+            assert_eq!(
+                feed.read::<true>(&mut reads, row),
+                whole.entry(row),
+                "row {row}"
+            );
+        }
+        assert_eq!(
+            LOOKS_BEHIND.with(std::cell::Cell::get),
+            0,
+            "a search looked behind"
+        );
+        for row in order {
+            assert_eq!(
+                feed.read::<false>(&mut reads, row),
+                whole.entry(row),
+                "row {row}"
+            );
+        }
+        assert!(
+            LOOKS_BEHIND.with(std::cell::Cell::get) > 0,
+            "the walk never looked behind"
+        );
     }
 
     /// Rows named in the column's place read through the same accessor: a
