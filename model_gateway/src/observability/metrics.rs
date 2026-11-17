@@ -1154,7 +1154,7 @@ pub fn start_prometheus(config: PrometheusConfig) -> PrometheusHandle {
 
 /// The exporter's default summary quantiles, for the summaries of the
 /// per-worker store (`PrometheusBuilder` keeps its own copy private).
-pub(crate) const DEFAULT_SUMMARY_QUANTILES: &[f64] = &[0.0, 0.5, 0.9, 0.95, 0.99, 0.999, 1.0];
+const DEFAULT_SUMMARY_QUANTILES: &[f64] = &[0.0, 0.5, 0.9, 0.95, 0.99, 0.999, 1.0];
 
 /// Histogram buckets by metric name. The exporter renders a histogram with
 /// these buckets for a matching name and a summary for any other name.
