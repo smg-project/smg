@@ -607,7 +607,9 @@ fn run(
     }
     give_up(&mut elector);
     seen.holder.clear();
-    seen.term = seen.term.max(elector.fence().term());
+    // The stop's release may read the lease again, and the elector counts
+    // that record's term as at any step: the last standing reads it here.
+    seen.term = seen.term.max(elector.highest_term());
     standing.send_replace(seen);
 }
 
@@ -1960,6 +1962,39 @@ mod tests {
         assert!(text.contains("the lease is released"), "{text}");
     }
 
+    /// A stop whose release comes back moved reads the lease again, and the
+    /// elector counts that record's term as at any step. The last standing
+    /// a stopping replica leaves counts it too: another replica's release
+    /// under term nine, stored after the holder's last step, is read by
+    /// the stop alone.
+    #[test]
+    fn a_release_read_again_at_a_stop_is_counted_by_the_last_standing() {
+        let store = Losable::default();
+        let holder = Elector::new(Box::new(store.clone()), "a@127.0.0.1:1", unhurried())
+            .expect("the settings are in order");
+        let (standing, stood) = watch::channel(Standing::default());
+        let leading = looping(holder, standing);
+        until("the take", || stood.borrow().holder == "a@127.0.0.1:1");
+        assert_eq!(stood.borrow().term, 1);
+        // The release under term nine is stored before the stop's own
+        // write, which comes back moved; the read after it finds it.
+        store.ahead([Ahead::Write(LeaseRecord {
+            term: 9,
+            ..LeaseRecord::default()
+        })]);
+        let (released, text) = leading.stopped_with("the lease is released");
+        assert_eq!(released, 1, "{text}");
+        assert_eq!(
+            *stood.borrow(),
+            Standing {
+                holder: String::new(),
+                term: 9,
+                looked: true,
+            },
+            "{text}"
+        );
+    }
+
     #[test]
     fn a_late_renewal_logs_one_line_a_streak_and_one_more_when_renewals_turn_late_again() {
         unheld(
@@ -2508,6 +2543,60 @@ mod tests {
         assert_eq!(failed, 1, "{text}");
     }
 
+    /// A step that reads the lease twice. A holder told to leave whose
+    /// release is still owed reads another holder under term nine; its
+    /// release's write comes back moved over a holder restored under term
+    /// seven, which the read after it finds. The term is read before
+    /// anybody is named: that step names nobody, under term nine.
+    #[test]
+    fn a_step_that_reads_a_term_and_then_a_holder_restored_under_it_names_nobody() {
+        const FALLEN: &str = "the lease's term is under the highest";
+        let held = |holder: &str, term: u64| LeaseRecord {
+            holder: holder.to_owned(),
+            term,
+            duration_ms: 60_000,
+            ..LeaseRecord::default()
+        };
+        let store = Losable::default();
+        let holder = Elector::new(Box::new(store.clone()), "a@127.0.0.1:1", brisk())
+            .expect("the settings are in order");
+        let fence = holder.fence();
+        let (standing, stood) = watch::channel(Standing::default());
+        let looping = looping(holder, standing);
+        until("the first lead", || {
+            fence.leader_term(Instant::now()) == Some(1)
+        });
+        // The word's release fails and stays owed: every step tries it
+        // again in place of a renewal.
+        store.fail_writes(true);
+        looping
+            .stop
+            .send(Word::StepDown(None))
+            .expect("the loop runs");
+        until("the failed release", || {
+            looping.said("the release failed and is tried again")
+        });
+        // The next step's read finds the holder under term nine, and its
+        // release's write the holder restored under term seven.
+        store.ahead([
+            Ahead::Read(Some(held("z@127.0.0.1:9", 9))),
+            Ahead::Write(held("y@127.0.0.1:7", 7)),
+        ]);
+        store.fail_writes(false);
+        until("the step that read both", || stood.borrow().term == 9);
+        assert_eq!(
+            *stood.borrow(),
+            Standing {
+                holder: String::new(),
+                term: 9,
+                looked: true,
+            }
+        );
+        until("the line of the fallen term", || looping.said(FALLEN));
+        let (fallen, text) = looping.stopped_with(FALLEN);
+        assert_eq!(fallen, 1, "{text}");
+    }
+
     /// A record lost under a live holder, by no release. The holder's fence
     /// is open until its own next step reads the lease; a replica that saw
     /// the record held waits that record's duration from its first sight of
@@ -2867,6 +2956,17 @@ mod tests {
             duration: Duration::from_millis(600),
             renew_period: Duration::from_millis(20),
             renew_deadline: Duration::from_millis(400),
+        }
+    }
+
+    /// A renew period of a minute, past the bound of every wait of a case:
+    /// after its first step nothing reads the lease but the case's own
+    /// word or stop.
+    fn unhurried() -> ElectionSettings {
+        ElectionSettings {
+            duration: Duration::from_secs(180),
+            renew_period: Duration::from_secs(60),
+            renew_deadline: Duration::from_secs(120),
         }
     }
 
@@ -3310,6 +3410,75 @@ mod tests {
         assert_eq!(under, 1, "{text}");
         assert!(!text.contains("stepped down"), "{text}");
         assert!(!text.contains("waits its turn"), "{text}");
+    }
+
+    /// A term said reaches the standing at the word, before the next step
+    /// could read it: a follower told term nine names the holder it
+    /// followed under term three no longer, a renew period ahead of its
+    /// next look.
+    #[test]
+    fn a_term_said_to_a_follower_stands_before_its_next_step() {
+        let held = LeaseRecord {
+            holder: "x@127.0.0.1:8".to_owned(),
+            term: 3,
+            duration_ms: 60_000,
+            ..LeaseRecord::default()
+        };
+        let mut lease = MemoryLease::new();
+        assert_eq!(lease.write(None, &held).expect("a write"), Written::Done);
+        let follower = Elector::new(Box::new(lease), "b@127.0.0.1:2", unhurried())
+            .expect("the settings are in order");
+        let (standing, stood) = watch::channel(Standing::default());
+        let looping = looping(follower, standing);
+        until("the first look", || stood.borrow().holder == held.holder);
+        looping
+            .stop
+            .send(Word::StepDown(Some(9)))
+            .expect("the loop runs");
+        until("the term said", || stood.borrow().term == 9);
+        assert_eq!(
+            *stood.borrow(),
+            Standing {
+                holder: String::new(),
+                term: 9,
+                looked: true,
+            }
+        );
+        let (stepped, text) = looping.stopped_with("stepped down");
+        assert_eq!(stepped, 0, "{text}");
+    }
+
+    /// A word's release that comes back moved reads the lease again, and
+    /// the standing counts that record's term at the word. A holder told to
+    /// leave under no term finds another replica's release under term
+    /// nine: nobody is named under term nine, before the next step.
+    #[test]
+    fn a_release_read_again_at_a_word_is_counted_before_the_next_step() {
+        let store = Losable::default();
+        let holder = Elector::new(Box::new(store.clone()), "a@127.0.0.1:1", unhurried())
+            .expect("the settings are in order");
+        let (standing, stood) = watch::channel(Standing::default());
+        let looping = looping(holder, standing);
+        until("the take", || stood.borrow().holder == "a@127.0.0.1:1");
+        store.ahead([Ahead::Write(LeaseRecord {
+            term: 9,
+            ..LeaseRecord::default()
+        })]);
+        looping
+            .stop
+            .send(Word::StepDown(None))
+            .expect("the loop runs");
+        until("the word taken", || stood.borrow().holder.is_empty());
+        assert_eq!(
+            *stood.borrow(),
+            Standing {
+                holder: String::new(),
+                term: 9,
+                looked: true,
+            }
+        );
+        let (stepped, text) = looping.stopped_with("stepped down; the lease is released");
+        assert_eq!(stepped, 1, "{text}");
     }
 
     #[test]
