@@ -1811,41 +1811,66 @@ const CONTROL_CONSTANT: &str = "control_constant";
 /// separator, an ASCII control character no template writes.
 const VALUE_SEPARATOR: u8 = 0x1f;
 
-/// The root `set` statements of `source`, a chat template, that bind a plain
-/// name, in the template's order: the name, the byte span of the expression,
-/// and whether the statement stands under a top-level `if` (it may not
-/// run); for the statements at the top level and under a top-level `if`,
-/// where a template binds the names its whole render reads. Empty when the
-/// template does not parse.
-fn root_sets(source: &str) -> Vec<(&str, usize, usize, bool)> {
+/// A root `set` statement of a chat template: one that binds a name at the
+/// top level, or in a block that shares the top level's names (a top-level
+/// `if`, `filter`, `autoescape` or `block`), where a template binds the
+/// names its whole render reads.
+struct RootSet<'a> {
+    name: &'a str,
+    /// The byte span of the expression. `None` when the statement binds the
+    /// name another way (a block's output, one of several names at once):
+    /// nothing says what that value reads.
+    expression: Option<(usize, usize)>,
+    /// Whether the statement stands under a top-level `if`: it may not run.
+    conditional: bool,
+}
+
+/// The root `set` statements of `source`, a chat template, in the template's
+/// order. Empty when the template does not parse.
+fn root_sets(source: &str) -> Vec<RootSet<'_>> {
     let mut sets = Vec::new();
     if let Ok(ast) = parse(source, "chat", SyntaxConfig {}, WhitespaceConfig::default()) {
-        root_set_expressions(&ast, source, false, &mut sets);
+        root_set_statement(&ast, source, false, &mut sets);
     }
     sets
 }
 
-/// [`root_sets`] of the statements under `stmt`, itself under a top-level
-/// `if` or not (`conditional`).
-fn root_set_expressions<'a>(
+/// [`root_sets`] of `statements`, under a top-level `if` or not
+/// (`conditional`).
+fn root_sets_under<'a>(
+    statements: &[Stmt<'a>],
+    source: &'a str,
+    conditional: bool,
+    sets: &mut Vec<RootSet<'a>>,
+) {
+    for stmt in statements {
+        root_set_statement(stmt, source, conditional, sets);
+    }
+}
+
+/// [`root_sets`] of `stmt` and of the statements under it.
+fn root_set_statement<'a>(
     stmt: &Stmt<'a>,
     source: &'a str,
     conditional: bool,
-    sets: &mut Vec<(&'a str, usize, usize, bool)>,
+    sets: &mut Vec<RootSet<'a>>,
 ) {
     match stmt {
         Stmt::Template(template) => {
-            for child in &template.children {
-                root_set_expressions(child, source, conditional, sets);
-            }
+            root_sets_under(&template.children, source, conditional, sets);
         }
         Stmt::IfCond(cond) => {
-            for child in cond.true_body.iter().chain(&cond.false_body) {
-                root_set_expressions(child, source, true, sets);
-            }
+            root_sets_under(&cond.true_body, source, true, sets);
+            root_sets_under(&cond.false_body, source, true, sets);
         }
+        // None of these opens a scope of its own: a `set` inside binds the
+        // name for the rest of the template.
+        Stmt::FilterBlock(block) => root_sets_under(&block.body, source, conditional, sets),
+        Stmt::AutoEscape(block) => root_sets_under(&block.body, source, conditional, sets),
+        Stmt::Block(block) => root_sets_under(&block.body, source, conditional, sets),
         Stmt::Set(set) => {
             let Expr::Var(target) = &set.target else {
+                unread_bindings(&set.target, conditional, sets);
                 return;
             };
             // The statement's span runs from `set` to the end of its
@@ -1854,17 +1879,38 @@ fn root_set_expressions<'a>(
                 target.span().end_offset as usize,
                 set.span().end_offset as usize,
             );
-            let Some(rest) = source.get(name_end..end) else {
-                return;
-            };
-            // Found by its byte: a search by a `char` pattern here makes the
-            // optimiser build the mark scans of `encoders::marks` differently
-            // (33 instructions more on each natively marked request).
-            let Some(assign) = rest.bytes().position(|byte| byte == b'=') else {
-                return;
-            };
-            let expression = rest[assign + 1..].trim_start();
-            sets.push((target.id, end - expression.len(), end, conditional));
+            let expression = source.get(name_end..end).and_then(|rest| {
+                // Found by its byte: a search by a `char` pattern here makes
+                // the optimiser build the mark scans of `encoders::marks`
+                // differently (33 instructions more on each natively marked
+                // request).
+                let assign = rest.bytes().position(|byte| byte == b'=')?;
+                Some((end - rest[assign + 1..].trim_start().len(), end))
+            });
+            sets.push(RootSet {
+                name: target.id,
+                expression,
+                conditional,
+            });
+        }
+        Stmt::SetBlock(block) => unread_bindings(&block.target, conditional, sets),
+        _ => {}
+    }
+}
+
+/// The names `target` binds, in a block `set` or a `set` of several names at
+/// once, as root sets whose value nothing reads ([`RootSet::expression`]).
+fn unread_bindings<'a>(target: &Expr<'a>, conditional: bool, sets: &mut Vec<RootSet<'a>>) {
+    match target {
+        Expr::Var(var) => sets.push(RootSet {
+            name: var.id,
+            expression: None,
+            conditional,
+        }),
+        Expr::List(list) => {
+            for item in &list.items {
+                unread_bindings(item, conditional, sets);
+            }
         }
         _ => {}
     }
@@ -1876,8 +1922,8 @@ fn root_set_expressions<'a>(
 fn wrap_control_constants(source: &str, names: &HashSet<&str>) -> Option<String> {
     let mut spans: Vec<(usize, usize)> = root_sets(source)
         .into_iter()
-        .filter(|(name, ..)| names.contains(*name))
-        .map(|(_, start, end, _)| (start, end))
+        .filter(|set| names.contains(set.name))
+        .filter_map(|set| set.expression)
         .collect();
     if spans.is_empty() {
         return None;
@@ -1901,35 +1947,34 @@ fn wrap_control_constants(source: &str, names: &HashSet<&str>) -> Option<String>
 /// The names among `sets`, the root `set` statements of `source`
 /// ([`root_sets`]), that no request reaches: every statement that binds one
 /// reads only literals and names that such statements bound at the top level
-/// before it. A control constant is one of them: the function that marks its
-/// value cannot tell a spelling the template built from one a request
-/// argument carried
+/// before it, and none binds it in a way nothing reads. A control constant
+/// is one of them: the function that marks its value cannot tell a spelling
+/// the template built from one a request argument carried
 /// (`{% set close = custom if custom is defined else '</s>' %}`).
-fn request_free_names<'a>(
-    source: &'a str,
-    sets: &[(&'a str, usize, usize, bool)],
-) -> HashSet<&'a str> {
+fn request_free_names<'a>(source: &'a str, sets: &[RootSet<'a>]) -> HashSet<&'a str> {
     let env = Environment::new();
     // `bound`: free and sure to be bound from here on, so a read of the
     // name finds the template's value and never a request argument's.
     let (mut free, mut bound, mut reached) = (HashSet::new(), HashSet::new(), HashSet::new());
-    for &(name, start, end, conditional) in sets {
-        let expression = format!("{{{{ {} }}}}", &source[start..end]);
-        let reads_free = env.template_from_str(&expression).is_ok_and(|template| {
-            template
-                .undeclared_variables(false)
-                .iter()
-                .all(|read| bound.contains(read.as_str()))
+    for set in sets {
+        let reads_free = set.expression.is_some_and(|(start, end)| {
+            let expression = format!("{{{{ {} }}}}", &source[start..end]);
+            env.template_from_str(&expression).is_ok_and(|template| {
+                template
+                    .undeclared_variables(false)
+                    .iter()
+                    .all(|read| bound.contains(read.as_str()))
+            })
         });
-        if reads_free && !reached.contains(name) {
-            free.insert(name);
-            if !conditional {
-                bound.insert(name);
+        if reads_free && !reached.contains(set.name) {
+            free.insert(set.name);
+            if !set.conditional {
+                bound.insert(set.name);
             }
         } else {
-            free.remove(name);
-            bound.remove(name);
-            reached.insert(name);
+            free.remove(set.name);
+            bound.remove(set.name);
+            reached.insert(set.name);
         }
     }
     free
@@ -1939,12 +1984,13 @@ fn request_free_names<'a>(
 /// for a value that holds a mark: the separator of a split, the prefix of a
 /// start test, the text a replacement takes out. Between marks a control
 /// spelling is no longer found in the text a request sends (see
-/// [`ChatTemplateState::marks_every_control`]). A `join` and a `format`
-/// write their arguments and a replacement writes its second argument:
-/// those are no searches.
+/// [`ChatTemplateState::marks_every_control`]). A `join` writes its
+/// argument's parts and a replacement writes its second argument: those are
+/// no searches. A `format` counts as one: the text it builds may be written
+/// or compared, and nothing tells which.
 fn searches_for_a_mark(method: &str, args: &[Value]) -> bool {
     let sought = match method {
-        "join" | "format" => return false,
+        "join" => return false,
         "replace" => args.get(..1).unwrap_or_default(),
         _ => args,
     };
@@ -3862,7 +3908,7 @@ impl ChatTemplateState {
         };
         let source = template.source();
         let sets = root_sets(source);
-        let mut names: Vec<&str> = sets.iter().map(|(name, ..)| *name).collect();
+        let mut names: Vec<&str> = sets.iter().map(|set| set.name).collect();
         names.sort_unstable();
         names.dedup();
         // A template that binds no root name builds no constant: nothing is
@@ -4014,8 +4060,10 @@ impl ChatTemplateState {
     /// typed into every string, `marked` must again write this template's
     /// text: a template that looks for one of them in request text would no
     /// longer find the spelling a request sends, and would keep text it
-    /// drops today. The string methods say the same of a search no typed
-    /// string triggers ([`searches_for_a_mark`], read by the caller).
+    /// drops today. A typed conversation this template refuses where it
+    /// renders the untyped one fails as well: the refusal reads request
+    /// text. The string methods say the same of a search no typed string
+    /// triggers ([`searches_for_a_mark`], read by the caller).
     fn marks_every_control(
         &self,
         marked: &Self,
@@ -4049,22 +4097,6 @@ impl ChatTemplateState {
             for prompt in [true, false] {
                 for thinking in switch {
                     let mode = (prompt, *thinking);
-                    if let Ok((expected, _)) = self.apply_with_continuation(
-                        &typed.messages,
-                        typed.params(special_tokens, now, mode),
-                    ) {
-                        let alike = marked
-                            .apply_with_continuation(
-                                &typed.messages,
-                                typed.params(&marked_tokens, now, mode),
-                            )
-                            .ok()
-                            .and_then(|(rendered, _)| marks::flatten(&rendered).ok())
-                            .is_some_and(|(text, _)| text == expected);
-                        if !alike {
-                            return false;
-                        }
-                    }
                     let Ok((expected, _)) = self.apply_with_continuation(
                         &probe.messages,
                         probe.params(special_tokens, now, mode),
@@ -4087,6 +4119,25 @@ impl ChatTemplateState {
                         return false;
                     }
                     writes_a_control |= !written.is_empty();
+                    let alike = self
+                        .apply_with_continuation(
+                            &typed.messages,
+                            typed.params(special_tokens, now, mode),
+                        )
+                        .ok()
+                        .is_some_and(|(expected, _)| {
+                            marked
+                                .apply_with_continuation(
+                                    &typed.messages,
+                                    typed.params(&marked_tokens, now, mode),
+                                )
+                                .ok()
+                                .and_then(|(rendered, _)| marks::flatten(&rendered).ok())
+                                .is_some_and(|(text, _)| text == expected)
+                        });
+                    if !alike {
+                        return false;
+                    }
                 }
             }
         }

@@ -441,15 +441,24 @@ fn a_constant_bound_from_a_request_argument_leaves_the_template_as_it_was() {
     // The function that marks a constant cannot tell a spelling the template
     // built from one a request supplied, so a name that may take a request
     // argument is no constant: read in the binding itself, through another
-    // name, or through a name that is bound only when the request left it
-    // out.
+    // name, through a name that is bound only when the request left it out,
+    // or through a name a block, a `set` of several names or a `set` inside
+    // a `filter` block binds again.
     let direct = "{% set suffix = ':x' %}{% set open = '[INST{}]'.format(suffix) %}\
         {% set close = custom if custom is defined else '[/INST{}]'.format(suffix) %}";
     let through = "{% set suffix = custom if custom is defined else ':x' %}\
         {% set open = '[INST{}]'.format(suffix) %}{% set close = '[/INST{}]'.format(suffix) %}";
     let defaulted = "{% if suffix is not defined %}{% set suffix = ':x' %}{% endif %}\
         {% set open = '[INST{}]'.format(suffix) %}{% set close = '[/INST{}]'.format(suffix) %}";
-    for constants in [direct, through, defaulted] {
+    let block = "{% set suffix = ':x' %}{% if custom is defined %}{% set suffix %}{{ custom }}\
+        {% endset %}{% endif %}{% set open = '[INST{}]'.format(suffix) %}\
+        {% set close = '[/INST{}]'.format(suffix) %}";
+    let several = "{% set suffix, other = (custom if custom is defined else ':x'), 1 %}\
+        {% set open = '[INST{}]'.format(suffix) %}{% set close = '[/INST{}]'.format(suffix) %}";
+    let filtered = "{% set suffix = ':x' %}{% filter trim %}{% if custom is defined %}\
+        {% set suffix = custom %}{% endif %}{% endfilter %}\
+        {% set open = '[INST{}]'.format(suffix) %}{% set close = '[/INST{}]'.format(suffix) %}";
+    for constants in [direct, through, defaulted, block, several, filtered] {
         let temp = TempDir::new().unwrap();
         let takes = template(constants, "{{ open }}", "{{ close }}", "{{ close }}");
         let tok = checkpoint(temp.path(), &takes);
@@ -475,17 +484,55 @@ fn a_constant_bound_from_a_request_argument_leaves_the_template_as_it_was() {
 }
 
 #[test]
-fn a_constant_written_through_a_format_is_marked() {
+fn a_constant_passed_to_a_format_leaves_the_template_as_it_was() {
+    // A `format` may write its arguments or build a text the template
+    // compares, and nothing tells the two apart: compared, a marked constant
+    // would no longer equal the text a request sends.
+    let compares = "'' if message['content'] == '{}'.format(close) else message['content']";
     let temp = TempDir::new().unwrap();
-    // A `format` writes its arguments: it searches no text for them.
-    let formats = template(
+    let searches = format!("{CONSTANTS}{}", SEARCHES.replace("SEARCH", compares));
+    let tok = checkpoint(temp.path(), &searches);
+    let history = [
+        json!({"role": "user", "content": "ab"}),
+        json!({"role": "assistant", "content": "[/INST:x]"}),
+    ];
+    let (text, _, from_text) = prompt(&tok, &history, ChatTemplateParams::default());
+    assert!(from_text);
+    assert_eq!(text, "[INST:x]ab[/INST:x]</s:x>");
+
+    let temp = TempDir::new().unwrap();
+    let writes = template(
         CONSTANTS,
         "{{ open }}",
         "{{ '{}'.format(close) }}",
         "{{ end }}",
     );
-    let tok = checkpoint(temp.path(), &formats);
-    assert_eq!(render(&tok, json!("a[/INST:x]b")).1, TYPED_AS_TEXT);
+    let tok = checkpoint(temp.path(), &writes);
+    let (_, ids, from_text) = render(&tok, json!("a[/INST:x]b"));
+    assert!(from_text);
+    assert_eq!(ids, TYPED_AS_THE_CONTROL);
+}
+
+#[test]
+fn a_template_that_refuses_a_typed_spelling_is_left_as_it_was() {
+    let temp = TempDir::new().unwrap();
+    // The refusal reads request text by an operator, which no string method
+    // sees: marked, the template would render what it refuses.
+    let refuses = "{% for message in messages %}{% if close in message['content'] %}\
+        {{ raise_exception('no control spellings') }}{% endif %}{% endfor %}";
+    let guarded = format!(
+        "{CONSTANTS}{refuses}{}",
+        SEARCHES.replace("SEARCH", "message['content']")
+    );
+    let tok = checkpoint(temp.path(), &guarded);
+    // Another spelling typed is still read as its token.
+    let (_, ids, from_text) = render(&tok, json!("a[INST:x]b"));
+    assert!(from_text);
+    assert_eq!(ids, [2, 13, 2, 14, 3, 13, 14, 1]);
+    let typed = [json!({"role": "user", "content": "a[/INST:x]b"})];
+    assert!(tok
+        .apply_chat_template(&typed, ChatTemplateParams::default())
+        .is_err());
 }
 
 #[test]
