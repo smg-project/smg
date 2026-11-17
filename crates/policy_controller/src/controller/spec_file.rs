@@ -5,9 +5,10 @@
 //! mounted ConfigMap's file is a link), and applies its document as the
 //! source's first ([`Generations`]). A file that cannot be read, a file over
 //! the bound (refused by its size, unread) and a document that does not run
-//! each refuse the start. So does a pipe, a device or a directory, unread:
-//! the file is opened without waiting, where an open of a pipe waits for a
-//! writer, and only what the opened file says is a regular file is read.
+//! each refuse the start. So does a pipe, a device or a directory: the look
+//! refuses it by its kind, unopened. A name may turn between a look and its
+//! read, so the read opens without waiting and never as a controlling
+//! terminal, and reads only what the opened file says is a regular file.
 //!
 //! The watch is a poll. A second after each look ended the path is resolved
 //! and the file's identity read: where the path leads once every link is
@@ -57,7 +58,7 @@ const START_READS: usize = 3;
 /// a file that does not stand still.
 const RESTLESS_LOOKS: u32 = 5;
 
-/// What a read says of an opened file that is no regular file.
+/// What a look or a read says of a path that leads to no regular file.
 const NOT_A_FILE: &str = "the path leads to no regular file";
 
 /// What one look at the path found.
@@ -99,6 +100,11 @@ fn look(path: &Path) -> Seen {
 fn identity(path: &Path) -> io::Result<Identity> {
     let resolved = fs::canonicalize(path)?;
     let metadata = fs::metadata(&resolved)?;
+    // A pipe, a device or a directory is refused here, unopened. The read
+    // asks the opened file again: the name may turn between the two.
+    if !metadata.is_file() {
+        return Err(io::Error::other(NOT_A_FILE));
+    }
     Ok(Identity {
         len: metadata.len(),
         modified: metadata.modified().ok(),
@@ -115,12 +121,14 @@ fn identity(path: &Path) -> io::Result<Identity> {
     })
 }
 
-/// Opens the file without waiting. An open of a pipe waits for a writer
-/// otherwise, a start's without end.
+/// Opens the file without waiting, and never as the process's controlling
+/// terminal. An open of a pipe waits for a writer otherwise, a start's
+/// without end, and a session leader that has no terminal takes the first
+/// terminal's device it opens: the kind is read after the open.
 fn open(path: &Path) -> io::Result<fs::File> {
     use rustix::fs::{Mode, OFlags};
 
-    let flags = OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC;
+    let flags = OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC;
     let opened = rustix::io::retry_on_intr(|| rustix::fs::open(path, flags, Mode::empty()))?;
     Ok(opened.into())
 }
@@ -513,6 +521,11 @@ mod tests {
     /// that waits on `other` fails the case where it would hang it.
     #[cfg(unix)]
     fn refused_as_no_file(bed: Bed, other: PathBuf) {
+        assert_eq!(
+            look(&other),
+            Seen::Unreadable(NOT_A_FILE.to_owned()),
+            "the look refuses it, unopened"
+        );
         let (answer, answered) = mpsc::channel();
         thread::spawn(move || {
             let started = bed.start_on(&other);
@@ -536,20 +549,50 @@ mod tests {
         assert_eq!(counts, (1, 1));
     }
 
-    /// A pipe is refused by its kind, at the start and under the watch: it
-    /// is opened without waiting and never read. This one has no writer,
-    /// and an open that waits for one fails the case.
+    /// A pipe at `path`, with no writer. The program makes it: the linked
+    /// system-call crate has no call for one on every system the crate
+    /// builds on.
+    #[cfg(unix)]
+    fn pipe_at(path: &Path) {
+        let made = Command::new("mkfifo")
+            .arg(path)
+            .status()
+            .expect("mkfifo runs");
+        assert!(made.success(), "mkfifo: {made}");
+    }
+
+    /// A pipe is refused by its kind, at the start and under the watch,
+    /// unopened: this one has no writer, and an open would wait for one.
     #[cfg(unix)]
     #[test]
     fn a_pipe_is_refused_by_its_kind_unread() {
         let bed = bed(LEAST_LOAD.as_bytes());
         let pipe = bed.dir.path().join("pipe.yaml");
-        let made = Command::new("mkfifo")
-            .arg(&pipe)
-            .status()
-            .expect("mkfifo runs");
-        assert!(made.success(), "mkfifo: {made}");
+        pipe_at(&pipe);
         refused_as_no_file(bed, pipe);
+    }
+
+    /// A name that turns to a pipe between a look and its read is refused by
+    /// the opened file's kind: the read opens without waiting and reads no
+    /// byte of what is no regular file. The read runs on a thread of its
+    /// own, waited five seconds, so an open that waits fails the case.
+    #[cfg(unix)]
+    #[test]
+    fn a_name_turned_to_a_pipe_under_a_read_is_refused_unread() {
+        let bed = bed(LEAST_LOAD.as_bytes());
+        let looked = identity(&bed.path).expect("the file");
+        let pipe = bed.dir.path().join("pipe.yaml");
+        pipe_at(&pipe);
+        fs::rename(&pipe, &bed.path).expect("the rename");
+
+        let (answer, answered) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = answer.send(read(&looked));
+        });
+        let read = answered
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the read answers: its open does not wait");
+        assert_eq!(read, Err(SpecRejected::Unreadable(NOT_A_FILE.to_owned())));
     }
 
     /// A device is refused as a pipe is, behind a link: a terminal's own
