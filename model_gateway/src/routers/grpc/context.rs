@@ -479,6 +479,8 @@ pub(crate) struct DispatchContext {
     /// text-only request, or a plan with nothing to encode.
     pub encode_watch: Option<EncodeWatch>,
     pub multimodal_inflight: Option<InflightPermit>,
+    /// Set for each attempt before it dispatches. Response processing is
+    /// its last reader and takes it.
     pub dispatch: Option<DispatchMetadata>,
     pub load_guards: Option<LoadGuards>,
     /// Prefill admission slot for the next PD/EPD dispatch; a retry's
