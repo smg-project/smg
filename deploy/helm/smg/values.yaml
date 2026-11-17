@@ -427,7 +427,8 @@ policyController:
     tag: ""
 
   # -- Replicas. With the election off every replica is a controller of its
-  #    own and two would each lead alone: the chart refuses more than one.
+  #    own and two would each lead alone: the chart refuses more than one,
+  #    and an upgrade tells the old pod to stop before it makes the new one.
   #    With it on, run two or more: one leads and the others stand by.
   replicas: 1
 
