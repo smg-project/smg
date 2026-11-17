@@ -2158,7 +2158,16 @@ mod tests {
         );
         assert_eq!(a.highest_term(), 2);
         // The rival's record stood still for its duration since that read:
+        // a look a microsecond under the wait's end still follows it, and
         // the take at its end is above the term counted.
+        assert_eq!(
+            a.tick(t0 + 4 * S - Duration::from_micros(1))
+                .expect("a look inside the wait"),
+            Tick::Following {
+                holder: "b@host:2".to_owned(),
+                term: 2
+            }
+        );
         assert_eq!(
             a.tick(t0 + 4 * S).expect("the take after the wait"),
             Tick::Acquired { term: 3 }
