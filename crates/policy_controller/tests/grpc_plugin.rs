@@ -3540,6 +3540,49 @@ fn the_exposure_withholds_what_the_row_does_not_reveal() {
     );
 }
 
+/// A frame carries the request's block hashes to a plugin whose row
+/// declares them, in either form, and none to one whose row declares
+/// neither: a prompt's length sizes no frame of a plugin that reads none.
+#[test]
+fn a_frame_carries_block_hashes_to_a_row_that_declares_them_alone() {
+    let runtime = runtime();
+    let hashes: Vec<u64> = (1..=300).collect();
+    let request = RequestFacts {
+        block_hashes: &hashes,
+        ..facts(1)
+    };
+    let candidates = pool(4);
+    let sent = |name: &str, needs: Needs| {
+        let served = TestPlugin::serve();
+        let mut spec = spec(&served, name);
+        spec.needs = needs;
+        let plugin = Plugin::load(&runtime, spec).expect("the plugin loads");
+        let engine = single_engine(profile(&plugin, ALL));
+        assert_eq!(
+            lead(&decide_with(&engine, &request, &candidates)),
+            Some(103),
+            "{name}: the plugin answers"
+        );
+        let seen = served.seen();
+        let sent = seen.frames[0].request.as_ref().expect("the request");
+        sent.block_hashes.clone()
+    };
+    assert!(
+        sent("reads-none", Needs::default()).is_empty(),
+        "a row that declares no hashes is sent none"
+    );
+    let tokens = Needs {
+        token_hashes: true,
+        ..Needs::default()
+    };
+    assert_eq!(sent("reads-tokens", tokens), hashes);
+    let text = Needs {
+        text_hashes: true,
+        ..Needs::default()
+    };
+    assert_eq!(sent("reads-text", text), hashes);
+}
+
 /// A lease on the lifecycle carries the session's value, and a request
 /// shows the same value in the hash form, so a plugin matches the two: a
 /// row that withholds the session key withholds both.

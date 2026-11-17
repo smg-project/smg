@@ -693,7 +693,11 @@ message PluginHelloAck {
 
 // `scores_in` carries the native scorers' combined scores when the plugin is
 // asked for the pick alone; a row the filters dropped scores below zero. The
-// candidate list is bounded by `plugins[].max_candidates`.
+// candidate list is bounded by `plugins[].max_candidates`. The request's
+// `block_hashes` are filled only for a plugin whose row declares a request's
+// hashes (token hashes or text hashes among its needs), with the first 8,190
+// of a longer list; a plugin that declares neither receives none, whatever
+// the other stages of its generation read.
 message PluginDecide {
   fixed64 decision_id = 1;
   RequestFacts request = 2;

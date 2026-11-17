@@ -69,7 +69,11 @@ pub struct GrpcPluginSpec {
     pub connect_micros: u32,
     pub view: Exposure,
     /// What the host must feed for the plugin's stages to mean anything;
-    /// the plugin declares it, the host cannot read it off a server.
+    /// the plugin declares it, the host cannot read it off a server. A frame
+    /// carries the request's block hashes where these declare them, in the
+    /// token form or the text form: eight bytes a hash, the first 8,190 of a
+    /// longer list. Where they declare neither it carries none, whatever
+    /// the other stages of the profile read.
     pub needs: Needs,
     /// The counters the plugin may add to, by id; a name per id.
     pub metrics: Vec<String>,
@@ -83,7 +87,8 @@ pub struct GrpcPluginSpec {
 
 impl GrpcPluginSpec {
     /// The default candidate bound: a frame is 1.5 KB on the wire at 64
-    /// candidates and 12.6 KB at 512.
+    /// candidates and 12.6 KB at 512, before the block hashes of a row that
+    /// declares them.
     pub const DEFAULT_MAX_CANDIDATES: u32 = 128;
 
     /// The default connect frame: the WebAssembly host's `init` frame.
