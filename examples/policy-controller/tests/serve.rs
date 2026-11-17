@@ -144,7 +144,8 @@ fn the_built_binary_holds_the_stages_of_this_build() {
 /// The example runs on the allocator the stock controller's binary
 /// registers, with its settings. The allocator is asked for its statistics
 /// at the process's end, an ask the system allocator does not hear, and the
-/// statistics name the settings it runs on.
+/// statistics name the settings it runs on, and on Linux aarch64 the page
+/// size it was built for.
 #[cfg(all(
     not(target_env = "msvc"),
     not(target_env = "musl"),
@@ -169,6 +170,11 @@ fn the_built_binary_runs_on_the_stock_binarys_allocator() {
         "opt.muzzy_decay_ms: 0 (",
         "opt.narenas: 16\n",
         "opt.oversize_threshold: 33554432\n",
+        // The cargo configuration builds the allocator of an aarch64 binary
+        // for 64 KiB pages: the workspace's here, and the line
+        // `own-repository.sh` writes in a repository of your own.
+        #[cfg(all(target_arch = "aarch64", target_env = "gnu"))]
+        "Page size: 65536\n",
     ] {
         assert!(
             written.contains(setting),
