@@ -13,7 +13,7 @@ use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, Wo
 
 use super::discover_dp::DpInfo;
 use crate::{
-    config::ParserChoice,
+    config::{validation::part_behind_the_path, ParserChoice},
     routers::grpc::{
         multimodal::{
             mm_settings, pool_processes_media_refs, registration_lacks_media_processing,
@@ -222,6 +222,7 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
 
         // Normalize URL
         let url = normalize_url(&config.url, *connection_mode);
+        warn_of_a_part_not_sent(&url, *connection_mode);
 
         validate_zmq_handshake_address(
             &app_context.worker_registry,
@@ -949,6 +950,27 @@ fn resolve_zmq_health_config(
     }
 }
 
+/// Says once, at a gRPC worker's registration, that the query or the fragment
+/// in its address is not sent: a gRPC call names its method and nothing
+/// behind the address's path, so the worker is served without the part. The
+/// address is named masked and cut at its path.
+fn warn_of_a_part_not_sent(url: &str, connection_mode: ConnectionMode) {
+    if connection_mode != ConnectionMode::Grpc {
+        return;
+    }
+    let Some(part) = ::url::Url::parse(url)
+        .ok()
+        .as_ref()
+        .and_then(part_behind_the_path)
+    else {
+        return;
+    };
+    warn!(
+        "gRPC worker {} has a {part} in its address: a gRPC call does not send it",
+        Endpoint::redacted_str(url)
+    );
+}
+
 fn normalize_url(url: &str, connection_mode: ConnectionMode) -> String {
     if url.starts_with("http://")
         || url.starts_with("https://")
@@ -1290,6 +1312,91 @@ mod tests {
             }),
             "{scrape}"
         );
+    }
+
+    /// A gRPC worker registered with a query or a fragment in its address is
+    /// created as before, and its registration says once that the part is not
+    /// sent: a gRPC call names its method and nothing behind the address's
+    /// path. The line names the address masked and cut at its path, so it
+    /// shows neither a credential nor the part. An address with neither part
+    /// says nothing, and neither does an HTTP worker's: the worker URL door
+    /// refuses a part under HTTP, and the sentence is a gRPC call's.
+    #[traced_test]
+    #[tokio::test]
+    async fn a_grpc_workers_query_is_said_once_at_its_registration() {
+        for (url, mode) in [
+            ("grpc://127.0.0.1:18011", ConnectionMode::Grpc),
+            ("http://127.0.0.1:18014?key=q7hidden", ConnectionMode::Http),
+        ] {
+            assert_eq!(create_worker_at(url, mode).await, StepResult::Success);
+        }
+        assert!(!logs_contain("does not send it"));
+
+        for url in [
+            "grpc://user:s3cret@127.0.0.1:18012?key=q7hidden",
+            "grpc://127.0.0.1:18013/#f7hidden",
+        ] {
+            assert_eq!(
+                create_worker_at(url, ConnectionMode::Grpc).await,
+                StepResult::Success
+            );
+        }
+        logs_assert(|lines: &[&str]| {
+            let said: Vec<&str> = lines
+                .iter()
+                .copied()
+                .filter(|line| line.contains("does not send it"))
+                .collect();
+            let [query, fragment] = said.as_slice() else {
+                return Err(format!(
+                    "{} lines, wanted one a worker: {said:?}",
+                    said.len()
+                ));
+            };
+            for (line, address, part) in [
+                (
+                    query,
+                    "grpc://***@127.0.0.1:18012",
+                    "a query in its address",
+                ),
+                (
+                    fragment,
+                    "grpc://127.0.0.1:18013",
+                    "a fragment in its address",
+                ),
+            ] {
+                if !(line.contains(" WARN ") && line.contains(address) && line.contains(part)) {
+                    return Err(format!(
+                        "wanted a warning of `{address}` with `{part}`: {line}"
+                    ));
+                }
+                if ["s3cret", "q7hidden", "f7hidden", "key="]
+                    .iter()
+                    .any(|hidden| line.contains(hidden))
+                {
+                    return Err(format!("the line shows what the address hides: {line}"));
+                }
+            }
+            Ok(())
+        });
+    }
+
+    /// Runs the creation step for a worker of one model registered at `url`,
+    /// its connection mode already detected as `mode`.
+    async fn create_worker_at(url: &str, mode: ConnectionMode) -> StepResult {
+        use openai_protocol::worker::WorkerModels;
+        use wfaas::WorkflowInstanceId;
+
+        use crate::workflow::steps::create_worker_workflow_data;
+
+        let mut spec = WorkerSpec::new(url);
+        spec.models = WorkerModels::Single(Box::new(ModelCard::new("m")));
+        let mut data =
+            create_worker_workflow_data(spec, WorkerRegistrationMode::Upsert, make_app_context());
+        data.worker_kind = Some(WorkerKind::Local);
+        data.connection_mode = Some(mode);
+        let mut ctx = WorkflowContext::new(WorkflowInstanceId::new(), data);
+        CreateLocalWorkerStep.execute(&mut ctx).await.unwrap()
     }
 
     /// A registration context for a gRPC worker of `model` at a loopback URL

@@ -403,8 +403,8 @@ mod tests {
     }
 
     /// A scheme is read at the start of an address alone. An address with
-    /// none may hold a `://` further in, in a path or a query: both probes
-    /// dial it as they dial any address with no scheme. Read as a scheme,
+    /// none may hold a `://` further in, in its path: both probes dial it
+    /// as they dial any address with no scheme. Read as a scheme,
     /// what stood before that `://` was refused by name, a userinfo in it,
     /// in the detection step's failure message, which a log line carries.
     /// A word of scheme characters is a scheme, known or not, and one the
@@ -415,7 +415,6 @@ mod tests {
             "user:secret@10.0.0.11:8000/a://b",
             "10.0.0.11:8000/a://b",
             "10.0.0.11:8000/proxy/http://backend:9000",
-            "decode.internal:8000/v1?next=http://x",
         ] {
             assert_eq!(
                 http_health_url(url).as_deref(),

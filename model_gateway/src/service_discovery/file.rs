@@ -892,19 +892,19 @@ mod tests {
 
     /// A scheme is a known one at the start of an address, as the address
     /// type reads it and the registration keeps it. An address with none
-    /// may hold a `://` further in, in a path, in a query or behind a
-    /// userinfo: it is listed and kept as written. Read as the end of a
-    /// scheme, that `://` had the door refuse the address, and the manifest
-    /// whole. A scheme the gateway does not know is no scheme: the address
-    /// is read as one with none, and refused in the door's words, which
-    /// name no part of it.
+    /// may hold a `://` further in, in a path or behind a userinfo: it is
+    /// listed and kept as written. Read as the end of a scheme, that `://`
+    /// had the door refuse the address, and the manifest whole. One in a
+    /// query is refused with its query, which the door takes under no HTTP
+    /// address. A scheme the gateway does not know is no scheme: the
+    /// address is read as one with none, and refused in the door's words,
+    /// which name no part of it.
     #[test]
     fn a_scheme_is_read_at_the_start_of_a_listed_address_alone() {
         let entry = |url: &str| manifest(&format!(r#"{{"url": "{url}"}}"#));
         for url in [
             "10.0.0.11:8000/a://b",
             "10.0.0.11:8000/proxy/http://backend:9000",
-            "decode.internal:8000/v1?next=http://x",
             "adm1n:s3cret@10.0.0.11:8000/a://b",
             "http://10.0.0.11:8000/a://b",
         ] {
@@ -924,6 +924,10 @@ mod tests {
             (
                 "adm1n:s3cr://et@10.0.0.11:8000",
                 "Invalid URL format: invalid port number",
+            ),
+            (
+                "decode.internal:8000/v1?next=http://x",
+                "a worker URL takes no query",
             ),
         ] {
             let refusal = parse_err(&entry(url), Roles::Regular);
