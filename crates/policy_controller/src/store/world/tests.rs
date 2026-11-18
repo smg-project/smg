@@ -4593,6 +4593,20 @@ fn a_worker_of_two_models_reads_the_lists_in_each_of_its_rows() {
     let world = store.world();
     assert_eq!(read(&world, MODEL), (1, 1, 0b1));
     assert_eq!(read(&world, "second"), (1, 1, 0b1));
+    assert_eq!(store.outside_lists(), OutsideLists::default());
+    // An apply whose lists name neither of its fields counts the member once
+    // a list, not once a row.
+    store
+        .apply(generation_listing(3, &["tier=gold"], &["east"], &["alpha"]))
+        .expect("applied");
+    let world = store.world();
+    assert_eq!(read(&world, MODEL), (0, 0, 0b1));
+    assert_eq!(read(&world, "second"), (0, 0, 0b1));
+    let outside = OutsideLists {
+        engines: 1,
+        zones: 1,
+    };
+    assert_eq!(store.outside_lists(), outside);
 }
 
 #[test]

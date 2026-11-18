@@ -92,7 +92,7 @@ pub use kv_events::{
 };
 pub use leases::{Dispatch, LeaseRecord, LeaseRefused, LeaseState, LeasesStore};
 pub use loads::{LoadSample, LoadSink, LoadSource, PollMode};
-pub use memory::{Cut, MemoryStore};
+pub use memory::{Cut, MemoryStore, StoreCounts};
 pub use pairing::{PairClasses, PairingDescriptor};
 pub use reservations::{ReservationKind, ReservationStore};
 pub use sessions::{Pin, SessionsStore};

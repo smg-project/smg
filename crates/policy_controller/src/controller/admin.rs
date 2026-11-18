@@ -19,12 +19,7 @@ use axum::{
 use serde::Serialize;
 use serde_json::json;
 
-use super::{
-    deciders::Counts,
-    metrics::{Metrics, StoreCounts},
-    readiness::Readiness,
-    PROTOCOL_PACKAGE,
-};
+use super::{deciders::Counts, metrics::Metrics, readiness::Readiness, PROTOCOL_PACKAGE};
 use crate::{ingest::loads::Stats, store::MemoryStore};
 
 /// What `/version` answers.
@@ -106,7 +101,7 @@ async fn metrics(AxumState(admin): AxumState<Admin>) -> Response {
             || admin.readiness.state(),
             &admin.loads,
             &admin.decides,
-            || StoreCounts::of(&admin.store),
+            || admin.store.counts(),
         ),
     )
         .into_response()
@@ -129,8 +124,9 @@ mod tests {
             readiness::{tests::fenced, Phase},
         },
         ingest::loads::Stats,
-        store::{MemoryStore, WorkerFacts, WorkersStore},
-        view::Role,
+        spec::{BindingSpec, OverloadSpec},
+        store::{LoadSink, LoadSource, MemoryStore, WorkerFacts, WorkersStore},
+        view::{LoadRow, Role},
         AppliedSpec, PolicySpec,
     };
 
@@ -250,6 +246,20 @@ mod tests {
         document.generation = 1;
         document.view.engines = vec!["alpha".to_owned()];
         document.view.zones = vec!["east".to_owned()];
+        let profile = document
+            .profiles
+            .keys()
+            .next()
+            .expect("the preset's profile");
+        document.bindings = vec![BindingSpec {
+            profile: Some(profile.clone()),
+            overload: Some(OverloadSpec {
+                waiting_requests: Some(8),
+                token_usage: Some(1.0),
+                ..OverloadSpec::default()
+            }),
+            ..BindingSpec::default()
+        }];
         let lists = AppliedSpec::validate(&document).expect("the document validates");
         store.apply(lists).expect("applied");
         let member = |key: &str, engine: &str, zone: &str| WorkerFacts {
@@ -264,7 +274,7 @@ mod tests {
             ..WorkerFacts::default()
         };
 
-        store.upsert(member("listed", "alpha", "east"));
+        let listed = store.upsert(member("listed", "alpha", "east")).id();
         let (_, _, body) = get(app.clone(), "/metrics").await;
         assert!(body.contains("smg_policy_controller_members_outside_list{list=\"engines\"} 0"));
         assert!(body.contains("smg_policy_controller_members_outside_list{list=\"zones\"} 0"));
@@ -273,8 +283,22 @@ mod tests {
         // A member the lists do not name is counted at the next scrape.
         store.upsert(member("stray", "beta", "west"));
         store.upsert(member("far", "alpha", "north"));
-        let (_, _, body) = get(app, "/metrics").await;
+        let (_, _, body) = get(app.clone(), "/metrics").await;
         assert!(body.contains("smg_policy_controller_members_outside_list{list=\"engines\"} 1"));
         assert!(body.contains("smg_policy_controller_members_outside_list{list=\"zones\"} 2"));
+        assert!(body.contains("smg_policy_controller_overload_flips_total 0"));
+
+        // A load write that moves a verdict is counted at the scrape after it.
+        let queue = LoadRow {
+            queued: 9,
+            ..LoadRow::default()
+        };
+        store.report(
+            &[(listed, 0, Some(queue))],
+            Instant::now(),
+            LoadSource::Poll,
+        );
+        let (_, _, body) = get(app, "/metrics").await;
+        assert!(body.contains("smg_policy_controller_overload_flips_total 1"));
     }
 }
