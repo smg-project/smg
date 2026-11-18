@@ -74,8 +74,8 @@ use crate::worker::{
     identity::endpoint::Endpoint,
     load::state::{LoadReceiver, LoadSnapshot, LoadState},
     metrics::Metrics,
-    registry::event::WorkerEvent,
-    ConnectionMode, Worker, WorkerRegistry,
+    registry::{event::WorkerEvent, worker_model_ids, Generation, WorkerRegistry},
+    ConnectionMode, Worker,
 };
 
 mod scrape;
@@ -323,8 +323,8 @@ pub trait LoadConsumer: Send + Sync {
 }
 
 /// Load monitoring service that subscribes to `WorkerRegistry` events.
-pub struct WorkerMonitor {
-    worker_registry: Arc<WorkerRegistry>,
+pub struct WorkerMonitor<G> {
+    worker_registry: Arc<WorkerRegistry<G>>,
     load_consumer: Arc<dyn LoadConsumer>,
     pub worker_load_manager: Arc<WorkerLoadManager>,
     default_interval: Duration,
@@ -338,7 +338,7 @@ pub struct WorkerMonitor {
     conditional_polling: bool,
     /// Shared immutable load snapshots: group ticks and the eviction flusher
     /// publish here; routing readers grab `Arc` snapshots.
-    load_state: Arc<LoadState>,
+    load_state: Arc<LoadState<G>>,
     /// What each worker's probes established about its native load routes,
     /// so discovery is not repeated every tick. A worker whose routes are
     /// all absent is served from `/metrics`. Cleared by
@@ -456,7 +456,7 @@ const PUSHED_PUBLISH_WINDOW: Duration = Duration::from_millis(20);
 /// staying far below the polling cadence that refreshes live entries.
 const EVICTION_DEBOUNCE: Duration = Duration::from_millis(20);
 
-impl Debug for WorkerMonitor {
+impl<G> Debug for WorkerMonitor<G> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WorkerMonitor")
             .field("default_interval", &self.default_interval)
@@ -464,14 +464,14 @@ impl Debug for WorkerMonitor {
     }
 }
 
-impl WorkerMonitor {
+impl<G: Generation> WorkerMonitor<G> {
     /// Construct a `WorkerMonitor` without spawning any background work.
     ///
     /// The caller must invoke [`Self::start_event_loop`] once initial
     /// workers have been registered. Until then, `worker_load_manager`
     /// is still safe to read; it just stays empty.
     pub fn new(
-        worker_registry: Arc<WorkerRegistry>,
+        worker_registry: Arc<WorkerRegistry<G>>,
         load_consumer: Arc<impl LoadConsumer + 'static>,
         default_interval_secs: u64,
         engine_metrics: bool,
@@ -1145,7 +1145,7 @@ impl WorkerMonitor {
             // A worker can serve multiple models (one load group per model),
             // so sentinel every model's series — not just the primary.
             let dp_size = worker.dp_size().unwrap_or(1);
-            for model_id in WorkerRegistry::worker_model_ids(&worker) {
+            for model_id in worker_model_ids(&worker) {
                 Metrics::remove_engine_load_metrics(worker.url(), &model_id, dp_size);
             }
         }
@@ -1471,7 +1471,34 @@ impl WorkerMonitor {
     }
 }
 
-impl Drop for WorkerMonitor {
+/// Where a load record pushed on a worker's event stream goes: the load
+/// monitor, as the KV event monitor's streams hold it. Held by this name,
+/// the sink brings nothing of the registry the monitor is built over.
+pub(crate) trait PushedLoadSink: Send + Sync {
+    /// Take the record of `dp_rank` received at `received_at`
+    /// ([`WorkerMonitor::apply_pushed_load`]).
+    fn push_load(
+        self: Arc<Self>,
+        worker: &Arc<dyn Worker>,
+        dp_rank: i32,
+        record: &EngineLoad,
+        received_at: Instant,
+    );
+}
+
+impl<G: Generation> PushedLoadSink for WorkerMonitor<G> {
+    fn push_load(
+        self: Arc<Self>,
+        worker: &Arc<dyn Worker>,
+        dp_rank: i32,
+        record: &EngineLoad,
+        received_at: Instant,
+    ) {
+        self.apply_pushed_load(worker, dp_rank, record, received_at);
+    }
+}
+
+impl<G> Drop for WorkerMonitor<G> {
     fn drop(&mut self) {
         if let Some(handle) = self.event_task.get_mut().take() {
             handle.abort();
@@ -1495,7 +1522,10 @@ impl Drop for WorkerMonitor {
 /// Holds the monitor weakly (same cycle-breaking rationale as the other
 /// loops); holding the `LoadState` strongly is fine — it owns no task
 /// handles back into the monitor.
-async fn eviction_flush_loop(load_state: Arc<LoadState>, monitor: Weak<WorkerMonitor>) {
+async fn eviction_flush_loop<G: Generation>(
+    load_state: Arc<LoadState<G>>,
+    monitor: Weak<WorkerMonitor<G>>,
+) {
     loop {
         load_state.eviction_wakeup().await;
         tokio::time::sleep(EVICTION_DEBOUNCE).await;
@@ -1540,7 +1570,7 @@ fn polled_engines(polled: &[Arc<dyn Worker>]) -> Vec<Vec<Arc<dyn Worker>>> {
 /// can belong to multiple groups simultaneously. Each `(model, type,
 /// connection)` triple is one group.
 fn group_keys_for_worker(worker: &Arc<dyn Worker>) -> Vec<WorkerGroupKey> {
-    WorkerRegistry::worker_model_ids(worker)
+    worker_model_ids(worker)
         .into_iter()
         .map(|model_id| WorkerGroupKey {
             model_id,
@@ -1576,8 +1606,8 @@ fn group_interval(workers: &[Arc<dyn Worker>], default_interval: Duration) -> Du
 /// `Weak` only for the duration of the work and drops the temporary
 /// `Arc` before the next `recv().await`, so the monitor's `Drop` can
 /// fire as soon as the owning `AppContext` goes away.
-async fn run_event_loop(
-    monitor: Weak<WorkerMonitor>,
+async fn run_event_loop<G: Generation>(
+    monitor: Weak<WorkerMonitor<G>>,
     mut events_rx: broadcast::Receiver<WorkerEvent>,
 ) {
     loop {
@@ -1671,7 +1701,7 @@ const LOAD_POLL_DEADLINE: Duration = Duration::from_secs(3);
 /// worker (the map has four shards per CPU the process sees, rounded up to a
 /// power of two: 1,024 on a 192-CPU host, 4,096 small allocations a second
 /// with the gateway idle).
-async fn liveness_sweep_loop(monitor: Weak<WorkerMonitor>) {
+async fn liveness_sweep_loop<G: Generation>(monitor: Weak<WorkerMonitor<G>>) {
     let mut ticker = tokio::time::interval(liveness::SWEEP_INTERVAL);
     loop {
         ticker.tick().await;
@@ -1684,8 +1714,8 @@ async fn liveness_sweep_loop(monitor: Weak<WorkerMonitor>) {
     }
 }
 
-async fn group_monitor_loop(
-    monitor: Weak<WorkerMonitor>,
+async fn group_monitor_loop<G: Generation>(
+    monitor: Weak<WorkerMonitor<G>>,
     group_key: WorkerGroupKey,
     interval: Duration,
 ) {
@@ -1707,8 +1737,8 @@ async fn group_monitor_loop(
 
 /// One tick of a group at `now`: the poll decision per worker, the polls of
 /// those not served by their stream, and the publish of what they returned.
-async fn poll_group_once(
-    monitor: &Arc<WorkerMonitor>,
+async fn poll_group_once<G: Generation>(
+    monitor: &Arc<WorkerMonitor<G>>,
     group_key: &WorkerGroupKey,
     interval: Duration,
     now: Instant,
@@ -1767,8 +1797,12 @@ async fn poll_group_once(
                 let native_loads_memo = Arc::clone(&monitor.native_loads_memo);
                 let connection_mode = group_key.connection_mode;
                 async move {
-                    WorkerMonitor::fetch_engine_loads(members, connection_mode, &native_loads_memo)
-                        .await
+                    WorkerMonitor::<G>::fetch_engine_loads(
+                        members,
+                        connection_mode,
+                        &native_loads_memo,
+                    )
+                    .await
                 }
             })
             .collect();
@@ -1967,7 +2001,8 @@ mod native_loads_tests {
 
     use super::*;
     use crate::worker::{
-        test_support::LoadReaders, BasicWorkerBuilder, ConnectionMode, WorkerLoadGuard, WorkerType,
+        test_support::LoadReaders, BasicWorkerBuilder, ConnectionMode, WorkerLoadGuard,
+        WorkerMonitor, WorkerRegistry, WorkerType,
     };
 
     const VLLM_METRICS: &str = "vllm:num_requests_running{m=\"a\"} 7.0\n\

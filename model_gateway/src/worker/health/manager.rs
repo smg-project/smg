@@ -53,10 +53,10 @@ use crate::worker::{
     metrics::Metrics,
     registry::{
         event::{WorkerConnected, WorkerEvent},
-        WorkerId,
+        Generation, WorkerId, WorkerRegistry,
     },
     runtime::WorkerRuntime,
-    ConnectionMode, RuntimeType, Worker, WorkerOrigin, WorkerRegistry, WorkerResult, WorkerType,
+    ConnectionMode, RuntimeType, Worker, WorkerOrigin, WorkerResult, WorkerType,
 };
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
@@ -229,8 +229,8 @@ impl WorkerManager {
     /// instant a ZMQ worker's handshake lands. Health polling continues to
     /// honor each worker's own disable flag, so starting the loop with global
     /// health checks off does not resurrect polling for other transports.
-    pub fn maybe_start(
-        registry: Arc<WorkerRegistry>,
+    pub fn maybe_start<G: Generation>(
+        registry: Arc<WorkerRegistry<G>>,
         config: WorkerManagerConfig,
         job_queue: Option<Arc<dyn WorkerJobs>>,
         health_checks_enabled: bool,
@@ -261,8 +261,8 @@ impl WorkerManager {
     ///   - Applies the state machine to probe outcomes and calls
     ///     `WorkerRegistry::transition_status()` to publish StatusChanged.
     ///   - Asks for the removal of Failed workers when removal is enabled.
-    pub fn start(
-        registry: Arc<WorkerRegistry>,
+    pub fn start<G: Generation>(
+        registry: Arc<WorkerRegistry<G>>,
         config: WorkerManagerConfig,
         job_queue: Option<Arc<dyn WorkerJobs>>,
     ) -> Self {
@@ -412,8 +412,8 @@ impl ProbeSlot {
 
     /// The slot of a registered worker at `status`: the status the caller
     /// read at a probe's launch, or the one a transition just installed.
-    fn of_worker(
-        registry: &Arc<WorkerRegistry>,
+    fn of_worker<G: Generation>(
+        registry: &Arc<WorkerRegistry<G>>,
         worker_id: &WorkerId,
         worker: &dyn Worker,
         status: WorkerStatus,
@@ -474,8 +474,8 @@ fn deadline_after(now: tokio::time::Instant, delay: Duration) -> tokio::time::In
 /// thread has already captured a consistent registry snapshot. The only
 /// in-loop reconcile is the lag-recovery rebuild triggered by
 /// `RecvError::Lagged`.
-async fn run_health_loop(
-    registry: Arc<WorkerRegistry>,
+async fn run_health_loop<G: Generation>(
+    registry: Arc<WorkerRegistry<G>>,
     mut events_rx: broadcast::Receiver<WorkerEvent>,
     mut connect_rx: Option<mpsc::UnboundedReceiver<WorkerConnected>>,
     mut next_check: HashMap<WorkerId, tokio::time::Instant>,
@@ -639,9 +639,9 @@ async fn run_health_loop(
 /// worker is probed at once, a removed one leaves the schedule, and a lagged
 /// subscription rebuilds it from a fresh snapshot. `Break` when the registry
 /// is gone and the loop has nothing left to serve.
-fn apply_registry_event(
+fn apply_registry_event<G: Generation>(
     event: Result<WorkerEvent, broadcast::error::RecvError>,
-    registry: &Arc<WorkerRegistry>,
+    registry: &Arc<WorkerRegistry<G>>,
     next_check: &mut HashMap<WorkerId, tokio::time::Instant>,
     config: &WorkerManagerConfig,
 ) -> ControlFlow<()> {
@@ -698,8 +698,8 @@ fn apply_registry_event(
 /// `RecvError::Lagged`) shares this seed: a worker still Pending after a lag
 /// is read at once too, one read toward its pending cap, as the `Registered`
 /// events the lag lost would have been.
-fn reconcile_from_registry(
-    registry: &Arc<WorkerRegistry>,
+fn reconcile_from_registry<G: Generation>(
+    registry: &Arc<WorkerRegistry<G>>,
     next_check: &mut HashMap<WorkerId, tokio::time::Instant>,
     config: &WorkerManagerConfig,
 ) {
@@ -717,8 +717,8 @@ fn reconcile_from_registry(
     }
 }
 
-fn queue_due_probes(
-    registry: &Arc<WorkerRegistry>,
+fn queue_due_probes<G: Generation>(
+    registry: &Arc<WorkerRegistry<G>>,
     config: &WorkerManagerConfig,
     next_check: &mut HashMap<WorkerId, tokio::time::Instant>,
     in_flight: &mut HashSet<WorkerId>,
@@ -794,8 +794,8 @@ fn queue_due_probes(
 
 /// `removal` is where a worker that just failed goes, and which ones go:
 /// `None` when nothing is removed.
-async fn apply_probe_completion(
-    registry: &Arc<WorkerRegistry>,
+async fn apply_probe_completion<G: Generation>(
+    registry: &Arc<WorkerRegistry<G>>,
     completion: ProbeCompletion,
     removal: Option<(&dyn WorkerJobs, UnhealthyRemovalScope)>,
     refresh_queue: Option<&dyn WorkerJobs>,
@@ -903,8 +903,8 @@ async fn recv_connect_signal(
 /// A connect signal is a transition into service like a probe's: the
 /// promoted worker's labels follow its engine under the same rule
 /// (`labels_follow_the_engine`, a job queue to run the refresh on).
-async fn apply_connect_signal_and_refresh(
-    registry: &Arc<WorkerRegistry>,
+async fn apply_connect_signal_and_refresh<G: Generation>(
+    registry: &Arc<WorkerRegistry<G>>,
     connected: WorkerConnected,
     next_check: &mut HashMap<WorkerId, tokio::time::Instant>,
     config: &WorkerManagerConfig,
@@ -939,8 +939,8 @@ async fn apply_connect_signal_and_refresh(
 /// the handshake is what its probe reads), or a worker whose checks are off
 /// (nothing to read). Returns the worker the signal moved into service, for
 /// what follows a transition (the label refresh); `None` when nothing moved.
-fn apply_connect_signal(
-    registry: &Arc<WorkerRegistry>,
+fn apply_connect_signal<G: Generation>(
+    registry: &Arc<WorkerRegistry<G>>,
     connected: WorkerConnected,
     next_check: &mut HashMap<WorkerId, tokio::time::Instant>,
     config: &WorkerManagerConfig,
@@ -1130,8 +1130,8 @@ async fn refresh_kv_engine_id_after_recovery(worker: &Arc<dyn Worker>, timeout: 
 /// first transition into service is what fills them in; an engine that
 /// offers no metadata answers a refresh with no labels, which the refresh
 /// step skips.
-fn labels_follow_the_engine(
-    registry: &WorkerRegistry,
+fn labels_follow_the_engine<G: Generation>(
+    registry: &WorkerRegistry<G>,
     worker_id: &WorkerId,
     worker: &Arc<dyn Worker>,
 ) -> bool {
@@ -1284,8 +1284,8 @@ fn compute_next_status(
 /// provider registered it (it carries the provider label): the provider
 /// registers it again once its engine returns, while nothing would re-add a
 /// static or API-added one.
-fn should_remove_failed(
-    registry: &Arc<WorkerRegistry>,
+fn should_remove_failed<G: Generation>(
+    registry: &Arc<WorkerRegistry<G>>,
     worker_id: &WorkerId,
     scope: UnhealthyRemovalScope,
 ) -> bool {
@@ -1305,8 +1305,8 @@ fn should_remove_failed(
     }
 }
 
-async fn submit_removal_job(
-    registry: &Arc<WorkerRegistry>,
+async fn submit_removal_job<G: Generation>(
+    registry: &Arc<WorkerRegistry<G>>,
     worker_id: &WorkerId,
     worker_url: &str,
     expected_revision: u64,
@@ -1342,7 +1342,7 @@ async fn submit_removal_job(
 }
 
 impl WorkerManager {
-    pub fn get_worker_urls(registry: &Arc<WorkerRegistry>) -> Vec<String> {
+    pub fn get_worker_urls<G: Generation>(registry: &Arc<WorkerRegistry<G>>) -> Vec<String> {
         registry
             .get_all()
             .iter()
@@ -1390,8 +1390,8 @@ impl WorkerManager {
 
     /// Workers targeted by an admin op: all registered workers, or only
     /// the worker(s) whose URL matches the filter.
-    fn admin_target_workers(
-        worker_registry: &WorkerRegistry,
+    fn admin_target_workers<G: Generation>(
+        worker_registry: &WorkerRegistry<G>,
         url_filter: Option<&str>,
     ) -> Vec<Arc<dyn Worker>> {
         let workers = worker_registry.get_all();
@@ -1401,7 +1401,9 @@ impl WorkerManager {
         }
     }
 
-    pub async fn flush_cache_all(worker_registry: &WorkerRegistry) -> FlushCacheResult {
+    pub async fn flush_cache_all<G: Generation>(
+        worker_registry: &WorkerRegistry<G>,
+    ) -> FlushCacheResult {
         let all_workers = worker_registry.get_all();
         let total_workers = all_workers.len();
         let http_workers = all_workers
@@ -1492,8 +1494,8 @@ impl WorkerManager {
 
     /// Start a profiling run on all workers, or on the single worker
     /// matching `worker_url`.
-    pub async fn start_profile_all(
-        worker_registry: &WorkerRegistry,
+    pub async fn start_profile_all<G: Generation>(
+        worker_registry: &WorkerRegistry<G>,
         options: &ProfileOptions,
         worker_url: Option<&str>,
     ) -> ProfileResult {
@@ -1507,8 +1509,8 @@ impl WorkerManager {
 
     /// Stop the in-flight profiling run on all workers, or on the single
     /// worker matching `worker_url`.
-    pub async fn stop_profile_all(
-        worker_registry: &WorkerRegistry,
+    pub async fn stop_profile_all<G: Generation>(
+        worker_registry: &WorkerRegistry<G>,
         worker_url: Option<&str>,
     ) -> ProfileResult {
         Self::admin_profile(worker_registry, worker_url, &PROFILE_STOP, |w| async move {
@@ -1521,8 +1523,8 @@ impl WorkerManager {
     /// `worker_url`: an empty fleet is answered with why, the call fans out
     /// ([`Self::admin_fan_out`]), and the summary says all succeeded or how
     /// many did not; `verb` spells the call in the log and the summary.
-    async fn admin_profile<F, Fut>(
-        worker_registry: &WorkerRegistry,
+    async fn admin_profile<G: Generation, F, Fut>(
+        worker_registry: &WorkerRegistry<G>,
         worker_url: Option<&str>,
         verb: &ProfileVerb,
         op: F,
@@ -1591,8 +1593,8 @@ impl WorkerManager {
     ///
     /// A rank names its worker by the masked address: the route is public,
     /// and a registered address may carry a password or a token.
-    pub(crate) fn fleet_loads(
-        worker_registry: &WorkerRegistry,
+    pub(crate) fn fleet_loads<G: Generation>(
+        worker_registry: &WorkerRegistry<G>,
         snapshot: &LoadSnapshot,
         model_id: Option<&str>,
     ) -> WorkerLoadResponse {
@@ -1644,7 +1646,9 @@ impl WorkerManager {
     /// failed scrape is a warn line; a comment line names the registration
     /// that answered, the one that closed the address, or an address none
     /// answered for.
-    pub async fn get_engine_metrics(worker_registry: &WorkerRegistry) -> EngineMetricsResult {
+    pub async fn get_engine_metrics<G: Generation>(
+        worker_registry: &WorkerRegistry<G>,
+    ) -> EngineMetricsResult {
         let workers = worker_registry.get_all();
 
         if workers.is_empty() {

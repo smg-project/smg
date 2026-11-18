@@ -4,6 +4,8 @@ use metrics_exporter_prometheus::PrometheusBuilder;
 use openai_protocol::model_card::ModelCard;
 
 use super::*;
+// The cases run over the gateway's registry.
+use crate::worker::WorkerRegistry;
 use crate::worker::{
     health::circuit_breaker::{CircuitBreakerConfig, CircuitState},
     metrics::series::{self as worker_series, WorkerSeriesRecorder},
@@ -548,7 +550,7 @@ fn a_refresh_that_changes_a_card_is_read_by_the_next_kept_answer() {
         )
     };
     let model = registry.model_routing_snapshot("qwen").unwrap();
-    let global = registry.current_global_routing_snapshot();
+    let global = registry.global_generation();
     assert_eq!(floor(&model), Some(a_regular_floor_of(8_192)));
     assert_eq!(floor(&global), Some(a_regular_floor_of(8_192)));
     assert!(!model.harmony(a_worker_names(4_096)));
@@ -565,7 +567,7 @@ fn a_refresh_that_changes_a_card_is_read_by_the_next_kept_answer() {
     let model = registry.model_routing_snapshot("qwen").unwrap();
     assert_eq!(floor(&model), Some(a_regular_floor_of(4_096)));
     assert_eq!(
-        floor(&registry.current_global_routing_snapshot()),
+        floor(&registry.global_generation()),
         Some(a_regular_floor_of(4_096))
     );
     assert!(model.harmony(a_worker_names(4_096)));
@@ -743,13 +745,13 @@ fn a_refresh_that_repeats_the_cards_publishes_nothing() {
     let worker = worker_with_a_window("grpc://127.0.0.1:8401", "qwen", 8_192);
     registry.register(Arc::clone(&worker)).unwrap();
     let model = registry.model_routing_snapshot("qwen").unwrap();
-    let global = registry.current_global_routing_snapshot();
+    let global = registry.global_generation();
 
     // The cards of its registration, then the cards of an earlier refresh.
     for window in [8_192, 4_096, 4_096] {
         let changed = worker.context_length("qwen") != Some(window);
         let model = registry.model_routing_snapshot("qwen").unwrap();
-        let global = registry.current_global_routing_snapshot();
+        let global = registry.global_generation();
         assert_eq!(
             registry.refresh_models(
                 &worker,
@@ -762,7 +764,7 @@ fn a_refresh_that_repeats_the_cards_publishes_nothing() {
             !changed
         );
         assert_eq!(
-            Arc::ptr_eq(&global, &registry.current_global_routing_snapshot()),
+            Arc::ptr_eq(&global, &registry.global_generation()),
             !changed
         );
     }
@@ -770,10 +772,7 @@ fn a_refresh_that_repeats_the_cards_publishes_nothing() {
         &model,
         &registry.model_routing_snapshot("qwen").unwrap()
     ));
-    assert!(!Arc::ptr_eq(
-        &global,
-        &registry.current_global_routing_snapshot()
-    ));
+    assert!(!Arc::ptr_eq(&global, &registry.global_generation()));
 }
 
 #[test]

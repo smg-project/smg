@@ -22,7 +22,7 @@ use crate::worker::{
     health::liveness,
     identity::endpoint::Endpoint,
     kv::{event_monitor::recovery::ResyncReason, index_backend::KvIndex},
-    load::monitor::WorkerMonitor,
+    load::monitor::PushedLoadSink,
     metrics::Metrics,
     Worker,
 };
@@ -211,7 +211,7 @@ struct WorkerSubscription<'a> {
     worker_url: &'a str,
     role: Role<'a>,
     model_id: &'a str,
-    load_sink: Option<&'a Weak<WorkerMonitor>>,
+    load_sink: Option<&'a Weak<dyn PushedLoadSink>>,
     wake: Option<&'a Arc<tokio::sync::Notify>>,
 }
 
@@ -388,7 +388,7 @@ impl KvEventMonitor {
         block_sizes: Arc<DashMap<String, KvBlockSize>>,
         model_id: String,
         mut shutdown_rx: oneshot::Receiver<()>,
-        load_sink: Option<Weak<WorkerMonitor>>,
+        load_sink: Option<Weak<dyn PushedLoadSink>>,
     ) {
         let index = match &indexer {
             Some(indexer) => match indexer.intern_worker(&worker_url) {
@@ -680,8 +680,8 @@ impl KvEventMonitor {
             return;
         }
         liveness::on_contact(sub.worker);
-        if let Some(monitor) = sub.load_sink.and_then(Weak::upgrade) {
-            monitor.apply_pushed_load(sub.worker, dp_rank, load, Instant::now());
+        if let Some(sink) = sub.load_sink.and_then(Weak::upgrade) {
+            sink.push_load(sub.worker, dp_rank, load, Instant::now());
         }
     }
 
@@ -827,7 +827,8 @@ mod tests {
         policies::PolicyRegistry,
         routers::grpc::test_engine::serve_on_loopback,
         worker::{
-            identity::basic::StallReason, BasicWorkerBuilder, WorkerRegistry, UNKNOWN_MODEL_ID,
+            identity::basic::StallReason, BasicWorkerBuilder, WorkerMonitor, WorkerRegistry,
+            UNKNOWN_MODEL_ID,
         },
     };
 
@@ -1342,6 +1343,7 @@ mod tests {
             false,
         ));
         let sink = Arc::downgrade(&monitor);
+        let sink: Weak<dyn PushedLoadSink> = sink;
         let wake = worker.runtime_state().map(|state| state.contact_wake());
         let sub = WorkerSubscription {
             worker: &worker,

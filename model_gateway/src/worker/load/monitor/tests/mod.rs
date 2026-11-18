@@ -13,7 +13,7 @@ use crate::worker::{
     health::overload::OverloadThresholds,
     runtime::StallReason,
     test_support::{ready_worker, render_with_recorder, LoadReaders},
-    BasicWorkerBuilder, ConnectionMode, WorkerType,
+    BasicWorkerBuilder, ConnectionMode, WorkerMonitor, WorkerRegistry, WorkerType,
 };
 
 /// Build an isolated monitor and registry beside a routing side that reads
