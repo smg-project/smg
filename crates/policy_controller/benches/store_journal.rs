@@ -19,7 +19,8 @@
 //!   of the log, the longest the log's lock is held;
 //! - `policy_store_journal/read/watched_at_head`: a watch's read of the
 //!   watched kinds at their head, beside the load rows: nothing to copy,
-//!   the lock and the look at the log alone;
+//!   the lock and the look at the log alone. The log of the three read
+//!   cells holds a full ring of the watched kinds;
 //! - `policy_store_journal/cut/<watched|every>/<n>`: one cut of the tables
 //!   of the watched kinds or of every kind: the copy a writer of those
 //!   tables waits for, and the sort after it;
@@ -190,9 +191,9 @@ fn status_write(c: &mut Criterion) {
             pool_on(n, Some(Log::new(WATCHED, LOADS).on_watched(|| {})))
         }),
     ];
-    for (kind, pool_of) in pools {
+    for (kind, build) in pools {
         for n in SIZES {
-            let pool = pool_of(n);
+            let pool = build(n);
             let id = pool.ids[n / 2];
             let mut ready = true;
             group.bench_with_input(BenchmarkId::new(kind, n), &n, |b, _| {
@@ -262,6 +263,22 @@ fn read(c: &mut Criterion) {
     let mut group = c.benchmark_group("policy_store_journal/read");
     let pool = pool_of(64, Some(LOADS));
     let log = pool.log.as_ref().expect("the journaled pool's log");
+    // The watched ring full and written half over again, as a controller
+    // that ran a while holds it: the ring's buffer is wrapped at its
+    // middle, and a reader's search of it is the search of a full ring.
+    for turn in 0..WATCHED + WATCHED / 2 {
+        let status = if turn % 2 == 0 {
+            WorkerStatus::NotReady
+        } else {
+            WorkerStatus::Ready
+        };
+        let revision = WorkersStore::get(&pool.store, pool.ids[0])
+            .expect("the row")
+            .revision;
+        pool.store
+            .set_status(pool.ids[0], status, revision)
+            .expect("a flip");
+    }
     let at = pool.opened + Duration::from_millis(1);
     for turn in 0..4_096u64 {
         let index = (turn as usize).wrapping_mul(67) % 64;

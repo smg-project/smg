@@ -104,17 +104,52 @@ impl Kept {
     fn has(&self, at: Position) -> bool {
         at == self.floor
             || self
-                .events
-                .binary_search_by_key(&at.seq, |entry| entry.at.seq)
-                .ok()
-                .and_then(|index| self.events.get(index))
-                .is_some_and(|entry| entry.at.term == at.term)
+                .until(at.seq)
+                .checked_sub(1)
+                .and_then(|last| self.events.get(last))
+                .is_some_and(|entry| entry.at == at)
     }
 
     /// The retained events after position `seq`, oldest first.
     fn after(&self, seq: u64) -> vec_deque::Iter<'_, Entry> {
-        let from = self.events.partition_point(|entry| entry.at.seq <= seq);
-        self.events.range(from..)
+        self.events.range(self.until(seq)..)
+    }
+
+    /// How many retained events stand at or before position `seq`: the
+    /// index of the first one after it. Searched from the head, by offsets
+    /// that double, then by halves between the last two looks: a reader
+    /// stands near the head, and its search takes steps by its distance
+    /// from there, not by the ring's size. A reader far behind takes at
+    /// most twice the steps of a search of the whole ring.
+    fn until(&self, seq: u64) -> usize {
+        let before = |index: usize| {
+            self.events
+                .get(index)
+                .is_some_and(|entry| entry.at.seq <= seq)
+        };
+        let len = self.events.len();
+        // Every event before `lo` stands at or before `seq`, and every
+        // event from `hi` on stands after it.
+        let (mut lo, mut hi) = (0, len);
+        let mut back = 1;
+        while lo < hi {
+            let look = len.saturating_sub(back);
+            if before(look) {
+                lo = look + 1;
+                break;
+            }
+            hi = look;
+            back *= 2;
+        }
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if before(mid) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
     }
 
     /// None of the ring's events: what a reader of the other ring's kinds
@@ -608,9 +643,11 @@ impl Log {
     /// A telling is owed while the count of moves is past the highest
     /// count told. The count is loaded before the kept one is raised to
     /// it, so a move is told after its count moved, and the reader that
-    /// telling wakes finds the log past its [`Stamp`]. Of the releases
-    /// that race, each that raises the kept count tells: no move goes
-    /// untold, and a release that raises nothing tells nothing.
+    /// telling wakes finds the log past its [`Stamp`], unless an earlier
+    /// telling woke it past that move already: its stamp stands then, and
+    /// it reads nothing. Of the releases that race, each that raises the
+    /// kept count tells: no move goes untold, and a release that raises
+    /// nothing tells nothing.
     fn tell(&self) {
         let Some(told) = &self.told else {
             return;
@@ -1466,6 +1503,47 @@ mod tests {
         assert_eq!(reader.reads(&log, 8), Ok(vec![TERM, MEMBER + 6]));
         // The log's end: the stamp is set.
         assert_eq!(reader.reads_beside_the_lock(&log), Some(Ok(vec![])));
+    }
+
+    /// A search from the head answers, for every place of rings of every
+    /// small size, full or not, as a count over the whole ring does: the
+    /// events at or before the place, and with them the events after it and
+    /// whether the ring has the place under its term.
+    #[test]
+    fn a_search_from_the_head_answers_as_a_count_of_the_whole_ring() {
+        for capacity in [1, 2, 3, 5, 16, 64] {
+            for pushed in 0..=capacity + 20 {
+                // Places three apart from 10: the events of one ring stand
+                // beside the places of the other's.
+                let mut kept = Kept::of(capacity);
+                let mut next = 10;
+                for _ in 0..pushed {
+                    let entry = Entry {
+                        at: at(next, 1),
+                        event: Event::Term,
+                    };
+                    kept.push(capacity, entry);
+                    next += 3;
+                }
+                for seq in 0..next + 2 {
+                    let before = kept
+                        .events
+                        .iter()
+                        .filter(|entry| entry.at.seq <= seq)
+                        .count();
+                    let of = format!("place {seq} of {pushed} pushed to {capacity}");
+                    assert_eq!(kept.until(seq), before, "{of}");
+                    assert_eq!(kept.after(seq).len(), kept.events.len() - before, "{of}");
+                    let held = kept.events.iter().any(|entry| entry.at.seq == seq);
+                    assert_eq!(
+                        kept.has(at(seq, 1)),
+                        held || at(seq, 1) == kept.floor,
+                        "{of}"
+                    );
+                    assert!(!kept.has(at(seq, 2)), "{of}, under another term");
+                }
+            }
+        }
     }
 
     #[test]
