@@ -886,6 +886,46 @@ impl LeastLoad {
         (queued + running + credit_work) / drain + self.kv_pressure_weight * k / (1.0 - k)
     }
 
+    /// Costs the rows the first pass left pending, those with no report:
+    /// each from the reporting peers' baseline among the rows handed
+    /// ([`Self::unreported_cost`]). Out of line: a pool whose every row
+    /// reports pays for no second pass.
+    #[cold]
+    #[inline(never)]
+    fn cost_pending(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &[u32],
+        out: &mut [f32],
+        nominal: f32,
+        fleet_has_loads: bool,
+    ) {
+        let mut peer_baseline = 0.0;
+        if fleet_has_loads {
+            peer_baseline = out
+                .iter()
+                .copied()
+                .filter(|cost| *cost != PENDING)
+                .fold(f32::INFINITY, f32::min);
+            if !peer_baseline.is_finite() {
+                peer_baseline = 0.0;
+            }
+        }
+        with_counts!(facts, |counts| {
+            for (slot, &i) in out.iter_mut().zip(kept) {
+                if *slot == PENDING {
+                    *slot = self.unreported_cost(
+                        counts(&candidates[i as usize]),
+                        nominal,
+                        fleet_has_loads,
+                        peer_baseline,
+                    );
+                }
+            }
+        });
+    }
+
     /// The cost of a candidate without a report: the reporting peers' baseline
     /// plus its in-flight work, or the in-flight count alone when no peer
     /// reports.
@@ -961,30 +1001,9 @@ impl LeastLoad {
                 *slot = self.reported_cost(r, *slot, nominal);
             }
         }
-        let fleet_has_loads = reporting > 0;
-        let mut peer_baseline = 0.0;
-        if reporting < rows.len() && fleet_has_loads {
-            peer_baseline = out
-                .iter()
-                .copied()
-                .filter(|cost| *cost != PENDING)
-                .fold(f32::INFINITY, f32::min);
-            if !peer_baseline.is_finite() {
-                peer_baseline = 0.0;
-            }
+        if reporting < rows.len() {
+            self.cost_pending(facts, candidates, rows, out, nominal, reporting > 0);
         }
-        with_counts!(facts, |counts| {
-            for (slot, &i) in out.iter_mut().zip(rows) {
-                if *slot == PENDING {
-                    *slot = self.unreported_cost(
-                        counts(&candidates[i as usize]),
-                        nominal,
-                        fleet_has_loads,
-                        peer_baseline,
-                    );
-                }
-            }
-        });
         // The band of a microsecond of expected wait on the normalized scale:
         // exact for one scorer, additive under several.
         let span = normalize_costs(out);
@@ -1165,6 +1184,46 @@ impl ResidentWork {
     }
 }
 
+impl ResidentWork {
+    /// Costs the rows the first pass left pending, those with no report
+    /// that counts resident tokens: the best reporting peer among the rows
+    /// handed plus the row's requests in flight, or the requests alone
+    /// where no row reports. Out of line: a pool whose every row reports
+    /// pays for no second pass.
+    #[cold]
+    #[inline(never)]
+    fn cost_pending(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &[u32],
+        out: &mut [f32],
+        fleet_reports: bool,
+    ) {
+        let peer_baseline = if fleet_reports {
+            out.iter()
+                .copied()
+                .filter(|cost| *cost != PENDING)
+                .fold(f32::INFINITY, f32::min)
+        } else {
+            0.0
+        };
+        let in_flight_work = self.mean_prefill_tokens as f32 + self.request_tokens as f32;
+        with_counts!(facts, |counts| {
+            for (slot, &i) in out.iter_mut().zip(kept) {
+                if *slot == PENDING {
+                    let in_flight = counts(&candidates[i as usize]) as f32;
+                    *slot = if fleet_reports {
+                        peer_baseline + in_flight * in_flight_work
+                    } else {
+                        in_flight
+                    };
+                }
+            }
+        });
+    }
+}
+
 impl Lifecycle for ResidentWork {
     fn on_dispatched(
         &self,
@@ -1234,28 +1293,9 @@ impl Scorer for ResidentWork {
                 }
             });
         }
-        let fleet_reports = reporting > 0;
-        let peer_baseline = if fleet_reports && reporting < kept.len() {
-            out.iter()
-                .copied()
-                .filter(|cost| *cost != PENDING)
-                .fold(f32::INFINITY, f32::min)
-        } else {
-            0.0
-        };
-        let in_flight_work = self.mean_prefill_tokens as f32 + self.request_tokens as f32;
-        with_counts!(facts, |counts| {
-            for (slot, &i) in out.iter_mut().zip(kept) {
-                if *slot == PENDING {
-                    let in_flight = counts(&candidates[i as usize]) as f32;
-                    *slot = if fleet_reports {
-                        peer_baseline + in_flight * in_flight_work
-                    } else {
-                        in_flight
-                    };
-                }
-            }
-        });
+        if reporting < kept.len() {
+            self.cost_pending(facts, candidates, kept, out, reporting > 0);
+        }
         // The least-load scorer's band, on a score in tokens: equal work is
         // a tie, drawn by the picker.
         let span = normalize_costs(out);
