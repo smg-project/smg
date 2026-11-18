@@ -45,6 +45,15 @@ use crate::{
 /// again (the registry's broadcast is sized the same today).
 const CHANGE_LOG: usize = 1_024;
 
+/// The store's counts one scrape reports, both of one state of the store.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StoreCounts {
+    /// The members outside the standing generation's lists.
+    pub outside: OutsideLists,
+    /// The load writes that moved an overload verdict.
+    pub overload_flips: u64,
+}
+
 /// The store. `Default` is empty with term `0`.
 pub struct MemoryStore {
     /// The rows, behind the membership lock. A write that records a change
@@ -445,12 +454,22 @@ impl MemoryStore {
         health.vetoes.len() + completions.sum::<usize>()
     }
 
+    /// The counts one scrape reports, read under one hold of the load lock:
+    /// the two are of one state of the store.
+    pub fn counts(&self) -> StoreCounts {
+        let loads = self.loads.lock();
+        StoreCounts {
+            outside: loads.writer.outside(),
+            overload_flips: loads.writer.flips(),
+        }
+    }
+
     /// How many writes to the load table moved an overload verdict: a
     /// record, a report, the word that no report came, an eviction. A
     /// membership write and an applied generation judge again and count
     /// nothing.
     pub fn overload_flips(&self) -> u64 {
-        self.loads.lock().writer.flips()
+        self.counts().overload_flips
     }
 
     /// How many members of the standing membership name an engine family
@@ -458,7 +477,7 @@ impl MemoryStore {
     /// list. Such a worker is admitted and reads position 0 in that field;
     /// a generation that declares no list counts none.
     pub fn outside_lists(&self) -> OutsideLists {
-        self.loads.lock().writer.outside()
+        self.counts().outside
     }
 
     /// How many workers the load table holds an entry for.

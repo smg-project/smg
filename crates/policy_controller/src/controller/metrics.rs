@@ -24,7 +24,7 @@ use parking_lot::Mutex;
 use super::{deciders::Counts, generations::Generations, readiness::State};
 use crate::{
     ingest::loads::{Failures, Stats},
-    store::{MemoryStore, OutsideLists},
+    store::StoreCounts,
 };
 
 /// `1` for the controller's state (`starting`, `leader`, `follower`,
@@ -138,25 +138,6 @@ struct DecideCounters {
     dropped: [Counter; 2],
     undialed: Counter,
     outlasted: Counter,
-}
-
-/// The store's counts one scrape reports.
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct StoreCounts {
-    /// The members outside the standing generation's lists.
-    pub(crate) outside: OutsideLists,
-    /// The load writes that moved an overload verdict.
-    pub(crate) overload_flips: u64,
-}
-
-impl StoreCounts {
-    /// What `store` counts now.
-    pub(crate) fn of(store: &MemoryStore) -> Self {
-        Self {
-            outside: store.outside_lists(),
-            overload_flips: store.overload_flips(),
-        }
-    }
 }
 
 impl Metrics {
