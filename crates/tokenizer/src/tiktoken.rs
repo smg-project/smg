@@ -3151,6 +3151,7 @@ mod tests {
             "{{ '<' }}{{ 'b>' }}",
             "{{ '<' ~ 'b>' }}",
             "<{# no text #}b>",
+            "<{# no text #}\nb>",
             "<b>",
         ] {
             let template = format!(

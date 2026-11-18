@@ -382,6 +382,38 @@ fn a_whole_word_token_in_one_of_two_joined_pieces_leaves_the_template_as_it_was(
     assert!(!marked("{{ ('x' ~ 'TAG')[1:] }}"));
 }
 
+/// Every piece a template writes and every run of pieces side by side is
+/// asked by itself. An added token that matches only as a whole word ends
+/// a piece: the template is left as it is, whether that piece is the last,
+/// a run of two pieces stands before it, or a piece follows it.
+#[test]
+fn a_whole_word_token_at_the_end_of_a_piece_leaves_the_template_as_it_was() {
+    let conversion = with_added_token("<a>")
+        .replace(
+            r#""special": false}],"#,
+            r#""special": false},
+        {"id": 20, "content": "tag", "single_word": true, "lstrip": false, "rstrip": false, "normalized": true, "special": true}],"#,
+        )
+        .replace(r#""<a>": 19}"#, r#""<a>": 19, "tag": 20}"#)
+        .replace(
+            r#""normalizer": null"#,
+            r#""normalizer": {"type": "BertNormalizer", "clean_text": true, "handle_chinese_chars": false, "strip_accents": null, "lowercase": true}"#,
+        );
+    assert!(conversion.contains(r#""id": 20"#) && conversion.contains("BertNormalizer"));
+    let marked = |before: &str, after: &str| {
+        let template = [before, &builds(), after].concat();
+        let temp = TempDir::new().unwrap();
+        checkpoint_of(temp.path(), &conversion, &template)
+            .chat_template
+            .marked()
+    };
+    let last = "{% if tagged %}{{ ' TAG' }}{% endif %}";
+    assert!(marked("{{ 'x' ~ 'y' }}", ""));
+    assert!(!marked("", last));
+    assert!(!marked("{{ 'x' ~ 'y' }}", last));
+    assert!(!marked("", &[last, "{{ 'x' }}"].concat()));
+}
+
 /// A replaced template makes the kept tokens anew: a token that kept its id
 /// is read by its characters once the template writes it as a control.
 #[test]

@@ -2524,27 +2524,34 @@ fn contested<'a>(spellings: &[&str], mut added: impl Iterator<Item = (&'a str, b
 }
 
 /// What `source`, a chat template, writes by itself: its raw text and its
-/// string literals, each behind a separator ([`VALUE_SEPARATOR`]), and then
-/// each run of two or more pieces that stand side by side, joined, behind a
-/// separator of its own. Between two pieces of a run nothing lies but a
-/// comment, the marks of an expression or a join, so a render that writes
-/// one writes the next right after it, and a token the pieces spell
-/// together is written whole. Every piece stands in it by itself too: a
-/// token that matches only as a whole word, or after normalization, may
-/// stand in a piece and not in its run. A comment is not in it, and neither
-/// is a literal that `built` names by its byte offset: one inside an
-/// expression the template builds a value from, the pattern of that value,
-/// which it writes only as the value. A template the lexer refuses is read
-/// whole.
-fn written_text(source: &str, built: impl Fn(usize) -> bool) -> String {
-    let mut written = String::new();
-    // The runs of pieces that stand side by side, each behind a separator:
-    // where the open run begins, and how many pieces it holds so far.
-    let mut runs = String::new();
-    let (mut start, mut pieces) = (0, 0_usize);
-    for item in tokenize(source, false, SyntaxConfig, WhitespaceConfig::default()) {
+/// string literals, each piece a text of its own, and then each run of two
+/// or more pieces that stand side by side, joined. Between two pieces of a
+/// run nothing lies but a comment, the marks of an expression or a join, so
+/// a render that writes one writes the next right after it, and a token the
+/// pieces spell together is written whole. Each text is asked by itself: a
+/// token that matches only as a whole word, or after normalization, is
+/// found in the piece that holds it. The lexer reads under the whitespace
+/// rules of the render ([`build_environment`]).
+/// A comment is not in the texts, and neither is a literal that `built`
+/// names by its byte offset: one inside an expression the template builds a
+/// value from, the pattern of that value, which it writes only as the
+/// value. A template the lexer refuses is read whole.
+fn written_text(source: &str, built: impl Fn(usize) -> bool) -> Vec<String> {
+    let mut written = Vec::new();
+    // The runs of pieces that stand side by side, and how many pieces the
+    // open run holds so far.
+    let mut runs: Vec<String> = Vec::new();
+    let mut pieces = 0_usize;
+    // A newline after a block or a comment that ends a line is not written,
+    // nor the blanks before a block that begins one.
+    let whitespace = WhitespaceConfig {
+        trim_blocks: true,
+        lstrip_blocks: true,
+        ..WhitespaceConfig::default()
+    };
+    for item in tokenize(source, false, SyntaxConfig, whitespace) {
         let Ok((token, span)) = item else {
-            return source.to_owned();
+            return vec![source.to_owned()];
         };
         let text = match &token {
             Token::TemplateData(text) | Token::Str(text) => Some(*text),
@@ -2555,24 +2562,25 @@ fn written_text(source: &str, built: impl Fn(usize) -> bool) -> String {
         let Some(text) = text.filter(|_| !built(span.start_offset as usize)) else {
             // The run ends here; one piece alone is no run.
             if pieces == 1 {
-                runs.truncate(start);
+                runs.pop();
             }
             pieces = 0;
             continue;
         };
-        written.push(char::from(VALUE_SEPARATOR));
-        written.push_str(text);
+        written.push(text.to_owned());
         if pieces == 0 {
-            start = runs.len();
-            runs.push(char::from(VALUE_SEPARATOR));
+            runs.push(String::new());
         }
-        runs.push_str(text);
+        if let Some(run) = runs.last_mut() {
+            run.push_str(text);
+        }
         pieces += 1;
     }
     if pieces == 1 {
-        runs.truncate(start);
+        runs.pop();
     }
-    written + &runs
+    written.extend(runs);
+    written
 }
 
 /// The names a render gives the four special tokens a template reads
@@ -4668,7 +4676,8 @@ impl ChatTemplateState {
                 if source.contains(spelling)
                     && written
                         .get_or_insert_with(written_by_itself)
-                        .contains(spelling)
+                        .iter()
+                        .any(|text| text.contains(spelling))
                 {
                     return Vec::new();
                 }
@@ -4737,9 +4746,10 @@ impl ChatTemplateState {
                 .any(|binding| (binding.span.0..binding.span.1).contains(&at))
         };
         let written = written_text(source, bound);
-        if controls.ranges(&written).next().is_some()
-            || cut_out.is_some_and(|cut_out| !cut_out(&written).is_empty())
-        {
+        if written.iter().any(|text| {
+            controls.ranges(text).next().is_some()
+                || cut_out.is_some_and(|cut_out| !cut_out(text).is_empty())
+        }) {
             return declined("it writes an added token whole by itself");
         }
         let Some(literals) = with_marked_literals(source, bindings) else {
