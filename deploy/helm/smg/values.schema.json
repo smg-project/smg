@@ -28,7 +28,8 @@
             "least_load",
             "manual",
             "consistent_hashing",
-            "prefix_hash"
+            "prefix_hash",
+            "prefill_cost"
           ]
         },
         "parser": { "type": "string", "enum": ["", "legacy", "symphony"] },

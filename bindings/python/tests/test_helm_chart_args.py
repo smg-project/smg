@@ -871,13 +871,13 @@ def test_the_schema_admits_the_policies_the_launcher_takes():
     render a pod whose launcher exits at argparse)."""
     schema = json.loads(SCHEMA.read_text())
     policy = schema["properties"]["router"]["properties"]["policy"]
-    assert policy["enum"] == router_args.COMMON_POLICY_CHOICES, (
+    assert policy["enum"] == router_args.REGULAR_POLICY_CHOICES, (
         "values.schema.json's router.policy enum differs from the launcher's --policy choices"
     )
 
 
 @needs_helm
-@pytest.mark.parametrize("policy", router_args.COMMON_POLICY_CHOICES)
+@pytest.mark.parametrize("policy", router_args.REGULAR_POLICY_CHOICES)
 def test_every_launcher_policy_renders_and_reaches_the_launcher(policy):
     _, documents = render(f"router.policy={policy}")
     args = router_container(documents)["args"]
