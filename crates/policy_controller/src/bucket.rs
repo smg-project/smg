@@ -1934,6 +1934,24 @@ mod tests {
         assert!(fenced, "no fence on the leaver while the walk waited");
     }
 
+    /// A worker a decision was listing when the snapshot's word came is in
+    /// no index yet: the walk fences it before its partition forgets it.
+    #[test]
+    fn a_snapshot_fences_a_leaver_its_partition_lists_and_the_index_does_not() {
+        let scorer = scorer(NEVER, 1.5, 5);
+        let pool = pool(3);
+        led(&scorer, &pool[..2], 0, SECOND);
+        // The third row joins under the partition's guard, as at a
+        // decision that has not written the index yet.
+        of(&scorer, "m").lock().list(&pool, |_| false);
+        let gone = pool[2].id;
+        assert!(!scorer.listed.load().contains_key(&gone));
+        scorer.on_membership(&Membership::Snapshot(&[pool[0].id, pool[1].id]));
+        assert!(scorer.fence.lock().holds(gone), "the walk fenced nobody");
+        led(&scorer, &pool, 0, 2 * SECOND);
+        assert_eq!(loads(&scorer).0.len(), 2, "an older view lists it nowhere");
+    }
+
     /// A decision reads the fence for every row of its view: a fenced row
     /// the filters dropped joins nowhere when another row of the view joins.
     #[test]
