@@ -75,6 +75,19 @@ impl Object {
         self.done && !self.fragments.refused() && self.fragments.whole()
     }
 
+    /// Give back the text of an object that closed: nothing reads it after the closing brace, so
+    /// a reader kept to the call's end ([`Self::cut`]) holds none of the call's bytes meanwhile.
+    pub(crate) fn give_back(&mut self) {
+        debug_assert!(self.done, "only a closed object gives its text back");
+        self.text = String::new();
+    }
+
+    /// How many bytes the reader holds for the object's text.
+    #[cfg(test)]
+    pub(crate) fn held(&self) -> usize {
+        self.text.capacity()
+    }
+
     /// [`Self::feed`] without the call's end: the fragments the bytes complete, and at the
     /// object's close the word that says it is no whole value where it is none; how many of the
     /// bytes the object took, up to its closing brace.

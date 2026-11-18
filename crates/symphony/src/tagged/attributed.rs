@@ -964,6 +964,7 @@ impl Assembler {
         let taken = object.read(text, out);
         if object.closed() {
             let whole = object.whole();
+            object.give_back();
             self.close_held = whole && take_back_the_brace(out);
             debug_assert!(
                 !whole || self.close_held,
@@ -3010,18 +3011,37 @@ mod tests {
         }
     }
 
-    /// What stands before a JSON object and inside it changes nothing else of the syntax. The
-    /// whitespace before the object is the template's whatever it is (spaces, a tab, a carriage
-    /// return and a newline, a no-break space), dropped, and the object is read whole. An object
-    /// that holds a parameter tag where a member should stand is read as the model wrote it, the
-    /// tag its text, under the one `Malformed { InvalidArguments }` event of no bytes that says
-    /// the arguments are no JSON: nothing is refused and no byte is lost, however the bytes are
-    /// cut.
+    /// The reader stays to the call's end, the mark of a call written as one object; the text it
+    /// read does not: after the closing brace nothing reads it.
+    #[test]
+    fn a_closed_object_gives_its_text_back_at_the_brace() {
+        for tags in [Tags::DSML, Tags::DSML_V4] {
+            let mut assembler = Assembler::new(0, "call_0", tags);
+            let mut out = Events::new();
+            let declared = declared();
+            assembler.feed(
+                "f\">\n{\"city\": \"Paris\", \"days\": 3",
+                &declared,
+                &mut out,
+            );
+            let open = assembler.json.as_ref().map(|object| object.held());
+            assert!(open.is_some_and(|held| held > 0), "{open:?}");
+            assembler.feed("}", &declared, &mut out);
+            let closed = assembler.json.as_ref().map(|object| object.held());
+            assert_eq!(closed, Some(0), "the closed object's text is given back");
+            assembler.close(tags.invoke_close, &mut out);
+            assert_eq!(
+                arguments(&out.drain()),
+                "{\"city\": \"Paris\", \"days\": 3}"
+            );
+        }
+    }
+
+    /// The reader says the first byte that is no JSON where it stands, with an event of no bytes.
+    /// The call's end, whichever it is, adds no second report of the same object and makes up no
+    /// brace: the arguments stay as the model wrote them.
     #[test]
     fn an_object_the_reader_refused_is_reported_once_at_every_end() {
-        // The reader says the first byte that is no JSON where it stands, with an event of no
-        // bytes. The call's end, whichever it is, adds no second report of the same object and
-        // makes up no brace: the arguments stay as the model wrote them.
         for tags in [Tags::DSML, Tags::DSML_V4] {
             let call = "f\">\n{\"n\": ?";
             for (end, events) in [
@@ -3040,6 +3060,13 @@ mod tests {
         }
     }
 
+    /// What stands before a JSON object and inside it changes nothing else of the syntax. The
+    /// whitespace before the object is the template's whatever it is (spaces, a tab, a carriage
+    /// return and a newline, a no-break space), dropped, and the object is read whole. An object
+    /// that holds a parameter tag where a member should stand is read as the model wrote it, the
+    /// tag its text, under the one `Malformed { InvalidArguments }` event of no bytes that says
+    /// the arguments are no JSON: nothing is refused and no byte is lost, however the bytes are
+    /// cut.
     #[test]
     fn whitespace_before_a_json_object_is_dropped_and_a_tag_inside_it_is_its_text() {
         for tags in [Tags::DSML, Tags::DSML_V4] {
