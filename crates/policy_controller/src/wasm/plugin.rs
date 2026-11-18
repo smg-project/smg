@@ -1096,15 +1096,18 @@ impl Plugin {
     }
 
     /// Whether the decider the calling thread acts as (the thread itself
-    /// where it names none) holds a kept instance, or would take the apply's
-    /// own: its next decision makes none.
+    /// where it names none) holds a kept instance: its next decision makes
+    /// none. The thread that loaded is warm under no name by the apply's own
+    /// instance too, which it alone takes there. Under a name that instance
+    /// counts for no decider: the first to warm or decide takes it, so a
+    /// warm-up that asks here first still warms every decider.
     pub fn is_warm(&self) -> bool {
         let _lent = self.lent_here();
         let kept = self
             .instances
             .get()
             .is_some_and(|slot| slot.borrow().is_some());
-        kept || self.spare_is_mine()
+        kept || (Decider::acting().is_none() && self.spare_is_mine())
     }
 
     /// Forgets the kept instance of the decider the calling thread acts as

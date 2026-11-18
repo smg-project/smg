@@ -8583,3 +8583,30 @@ fn the_thread_that_loaded_hears_what_it_tells_after_it_forgot_its_instance() {
         "an instance made at the telling, and told: {told:?}"
     );
 }
+
+/// Under a name the load's instance warms no decider by waiting: it is the
+/// first asker's. A warm-up that asks before it warms makes an instance for
+/// every decider, the first by taking the load's.
+#[test]
+fn a_warm_up_that_asks_first_warms_every_named_decider() {
+    let runtime = runtime();
+    let plugin = load(
+        &runtime,
+        "asks-first",
+        guest::record_guest(),
+        mode::LEAST_IN_FLIGHT,
+    );
+    assert!(plugin.is_warm(), "the thread that loaded, by the load's");
+    for name in 0..3 {
+        let _turn = Decider::new(name).enter();
+        assert!(!plugin.is_warm(), "decider {name} holds none yet");
+        plugin.warm().expect("it warms");
+        assert!(plugin.is_warm(), "decider {name} holds its own");
+    }
+    let stats = plugin.stats();
+    assert_eq!(
+        stats.instantiations, 3,
+        "one a decider, the load's among them: {stats:?}"
+    );
+    assert!(!plugin.is_warm(), "the load's instance went to a decider");
+}
