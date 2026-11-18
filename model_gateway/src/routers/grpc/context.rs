@@ -1959,6 +1959,8 @@ pub(crate) enum FinalResponse {
 
 #[cfg(test)]
 mod tests {
+    use std::slice;
+
     use smg_grpc_client::VllmEngineClient;
 
     use super::*;
@@ -2599,7 +2601,9 @@ mod tests {
                 kv_penalty_seconds: 0.0,
             };
             let (_, _, mut lease) = ledger
-                .select_and_reserve_with_local_counts(&[candidate.clone()], |_| worker.load())
+                .select_and_reserve_with_local_counts(slice::from_ref(&candidate), |_| {
+                    worker.load()
+                })
                 .unwrap();
             let remaining_work = || {
                 let (_, cost, probe) = ledger
