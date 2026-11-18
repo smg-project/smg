@@ -311,7 +311,8 @@ fn trace_record() -> &'static [&'static str] {
             top,
             top_len,
             seed,
-            generation
+            generation,
+            lifted
         }
     )
 }
@@ -781,6 +782,7 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
                 ("fallback", Type::Bool),
                 ("affinity_source", Type::Enum),
                 ("drew_first", Type::Bool),
+                ("lifted", Type::Enum),
             ],
             repeated: &["top", "drops"],
             optional: &["survivors"],

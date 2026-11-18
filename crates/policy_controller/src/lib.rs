@@ -120,8 +120,8 @@ pub mod wit;
 
 pub use catalog::{Catalog, CatalogError, StageKind};
 pub use decision::{
-    Decision, Pair, Pick, Queue, Shed, ShedReason, Survivors, Target, Targets, Trace, MAX_TARGETS,
-    TRACE_TOP,
+    Decision, Lifted, Pair, Pick, Queue, Shed, ShedReason, Survivors, Target, Targets, Trace,
+    MAX_TARGETS, TRACE_TOP,
 };
 pub use framework::{
     Binding, DecisionScope, Engine, Filter, Narrowed, PairPools, PairTable, PairTableError, Picker,

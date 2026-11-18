@@ -1191,7 +1191,9 @@ impl JsonSchema for PickSpec {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ProfileSpec {
-    /// The hard filters, in order.
+    /// The hard filters, in order. Which workers the hard filters keep does
+    /// not turn on their order; a shed's reason does: a shed names the
+    /// first filter, in this order, that left nobody.
     #[serde(default)]
     pub filter: Vec<String>,
     /// The scorers, each a name or a name with its weight and parameters.
@@ -3271,6 +3273,9 @@ impl PolicySpec {
             positions.insert(name.as_str(), position);
         }
         let mut bindings = Vec::with_capacity(self.bindings.len());
+        // The built bindings whose document sheds a pool the overload veto
+        // empties, by their place in `bindings`.
+        let mut sheds = Vec::new();
         for (index, binding) in self.bindings.iter().enumerate() {
             let cx = BindingContext {
                 index,
@@ -3280,6 +3285,13 @@ impl PolicySpec {
                 by_assignment: &by_assignment,
             };
             if let Some(built) = check_binding(binding, &cx, &mut needs, &mut deferred)? {
+                if binding
+                    .overload
+                    .as_ref()
+                    .is_some_and(|overload| overload.shed_when_all_vetoed)
+                {
+                    sheds.push(bindings.len());
+                }
                 bindings.push(built);
             }
         }
@@ -3304,7 +3316,10 @@ impl PolicySpec {
             });
         }
         needs.headers |= !self.view.headers.is_empty();
-        let engine = Engine::new(profiles, bindings, self.generation, needs);
+        let mut engine = Engine::new(profiles, bindings, self.generation, needs);
+        for at in sheds {
+            engine.shed_when_all_vetoed(at);
+        }
         Ok((engine, depth))
     }
 
