@@ -3124,10 +3124,9 @@ fn a_decider_issues_into_its_own_file_and_a_leases_id_names_it() {
         lease.expect("minted under the store's term").id
     };
     let (second, third) = (issue(1), issue(2));
-    assert_ne!(
-        second.0 >> 24,
-        third.0 >> 24,
-        "a file mints in blocks of its own"
+    assert!(
+        third.0.abs_diff(second.0) > 1,
+        "a file mints in a block of its own: {second:?} {third:?}"
     );
     let (reached, parked) = mpsc::sync_channel(1);
     let (go, word) = mpsc::sync_channel::<()>(1);
@@ -3522,4 +3521,27 @@ fn a_door_files_no_id_whose_file_a_claim_would_name_anew() {
     LeasesStore::set_term(&one, 3);
     assert_eq!(LeasesStore::issue(&one, by_hand(3, 9)), Ok(()));
     assert_eq!(LeasesStore::restore(&one, gateway, &[by_hand(4, 9)]), 1);
+}
+
+/// The most deciders a host names each issue a first lease: every id is
+/// far below its term's mark, three quarters of the counter, so no count
+/// of deciders hands a term over at its first leases.
+#[test]
+fn the_first_leases_of_the_most_deciders_are_far_below_the_terms_mark() {
+    let store = MemoryStore::new().with_deciders(256);
+    let a = ready(&store, "http://a:1");
+    LeasesStore::set_term(&store, 1);
+    let (gateway, now) = (GatewayId(1), Instant::now());
+    let first = |decider: u8| {
+        let _acting = Decider::new(decider).enter();
+        let record = booking(gateway, 0, a, now);
+        let lease = store.issue_decided(record, store.world().booked_of(a), |_| ());
+        lease.expect("minted under the store's term").id.0 & 0xffff_ffff
+    };
+    let counters: Vec<u64> = (0..=u8::MAX).map(first).collect();
+    let mark = 3_u64 << 30;
+    let highest = counters.iter().max().copied().unwrap_or(mark);
+    assert!(highest * 12 <= mark, "{highest} beside the mark {mark}");
+    assert_eq!(LeasesStore::live(&store, gateway), 256);
+    assert_eq!(in_flight(&store), [(a, 256)]);
 }

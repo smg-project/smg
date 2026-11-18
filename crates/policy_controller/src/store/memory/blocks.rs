@@ -2,19 +2,21 @@
 //! split of the counter.
 //!
 //! An id is its term over a counter of 32 bits (`Leases::mint`). A file
-//! claims the counter a block at a time, [`BLOCKS`] blocks a term of 2^24
+//! claims the counter a block at a time, [`BLOCKS`] blocks a term of 2^20
 //! ids each, and mints from the block it holds under its own turn. One
 //! table of a byte a block names each block's file, so a frame finds its
 //! lease's file by one byte. A file's bits in every id would spend a
 //! term's ids as many times sooner as there are files, on a fleet of one
-//! model as well.
+//! model as well. A block is small beside the counter: each file holds
+//! one, so the most files a host names, 256, take a sixteenth of the
+//! counter at their first ids and leave the term its span.
 //!
 //! A claim is one atomic step of the term's block count, made under the
 //! claiming file's turn, and the block's byte is written before the
 //! block's first id leaves that turn. The blocks are claimed in their
 //! order: one file mints the counter from 1 on, as it did before the
 //! blocks, and three quarters of the counter, the term's mark, is the
-//! claim of block 192. The claim past the last block fails: the term is
+//! claim of block 3,072. The claim past the last block fails: the term is
 //! spent.
 //!
 //! An id's file never changes while its lease can be on file. A rise of
@@ -46,8 +48,9 @@ use arc_swap::ArcSwap;
 
 use crate::lease::LeaseId;
 
-/// The bits of an id's counter that count inside a block.
-const BLOCK_BITS: u32 = 24;
+/// The bits of an id's counter that count inside a block: 2^20 ids a
+/// block, 4,096 blocks a term.
+const BLOCK_BITS: u32 = 20;
 
 /// The ids of one block.
 #[cfg(any(test, feature = "controller"))]
@@ -109,13 +112,13 @@ impl Blocks {
     }
 
     /// The block of `lease`'s counter.
-    fn block_of(lease: LeaseId) -> u8 {
-        (lease.0 >> BLOCK_BITS) as u8
+    fn block_of(lease: LeaseId) -> u16 {
+        (lease.0 as u32 >> BLOCK_BITS) as u16
     }
 
-    /// `named` among `files` files: a byte past them wraps, and no count
-    /// of files stops a read.
-    fn among(named: u8, files: usize) -> usize {
+    /// `named` among `files` files, a block's byte or a block's number: one
+    /// past them wraps, and no count of files stops a read.
+    fn among(named: u16, files: usize) -> usize {
         usize::from(named).checked_rem(files).unwrap_or(0)
     }
 
@@ -124,7 +127,7 @@ impl Blocks {
     /// `term` does not lead the blocks or its last block is claimed: the
     /// file mints no further id under it.
     #[cfg(any(test, feature = "controller"))]
-    pub(super) fn claim(&self, term: u64, file: u8) -> Option<u8> {
+    pub(super) fn claim(&self, term: u64, file: u8) -> Option<u16> {
         let leading = Self::word(term);
         let next = |word: u64| {
             let claimed = (word & !KEPT).checked_sub(leading)?;
@@ -133,7 +136,7 @@ impl Blocks {
         let claimed = &self.claimed;
         let word = claimed.try_update(Ordering::Relaxed, Ordering::Relaxed, next);
         // The blocks claimed before this one are its number.
-        let block = u8::try_from((word.ok()? & !KEPT) - leading).ok()?;
+        let block = u16::try_from((word.ok()? & !KEPT) - leading).ok()?;
         let named = self.files.get(usize::from(block))?;
         named.store(file, Ordering::Release);
         Some(block)
@@ -162,8 +165,10 @@ impl Blocks {
         let held = |of: u64| terms.iter().any(|&(term, held)| held && term == of);
         let mut kept = Vec::new();
         if held(leaving) {
-            let files = self.files.each_ref();
-            let files = files.map(|named| named.load(Ordering::Acquire));
+            let mut files = [0; BLOCKS as usize];
+            for (kept, named) in files.iter_mut().zip(&self.files) {
+                *kept = named.load(Ordering::Acquire);
+            }
             kept.push(Kept {
                 term: leaving,
                 files,
@@ -198,7 +203,7 @@ impl Blocks {
             let named = named.map_or(0, |named| named.load(Ordering::Acquire));
             word = self.claimed.load(Ordering::Acquire);
             if word >> u32::BITS == term {
-                return Self::among(named, files);
+                return Self::among(u16::from(named), files);
             }
         }
         if word & KEPT == 0 {
@@ -213,11 +218,11 @@ impl Blocks {
     /// thing [`Self::file_of`] does: the read of the kept tables saves
     /// registers, and an id of the leading term would pay for them.
     #[inline(never)]
-    fn kept_file(&self, term: u64, block: u8, files: usize) -> usize {
+    fn kept_file(&self, term: u64, block: u16, files: usize) -> usize {
         let kept = self.kept.load();
         let table = kept.iter().find(|table| table.term == term);
         let named = table.and_then(|table| table.files.get(usize::from(block)));
-        Self::among(named.copied().unwrap_or(block), files)
+        Self::among(named.map_or(block, |named| u16::from(*named)), files)
     }
 
     /// Whether the file `lease` names among `files` of them is settled:
@@ -393,7 +398,7 @@ mod tests {
     /// The claim past the last block fails as a spent term does: the last
     /// id of the counter is minted, and no file mints another under the
     /// term. The term's mark, three quarters of the counter, is the first
-    /// id of block 192, claimed as any block is.
+    /// id of block 3,072, claimed as any block is.
     #[test]
     fn the_claim_past_the_last_block_fails_as_a_spent_term() {
         let blocks = Blocks::default();
@@ -404,16 +409,36 @@ mod tests {
         let nothing_left = blocks.spend(0, 0, 0).mint(&blocks, 0, 0);
         assert_eq!(nothing_left, None, "spent whole");
 
-        let (blocks, mark) = (Blocks::default(), 3_u32 << 30);
-        assert_eq!(mark, 192 << BLOCK_BITS);
+        let (blocks, mark, at) = (Blocks::default(), 3_u32 << 30, 3 * BLOCKS / 4);
+        assert_eq!((at, mark), (3_072, at << BLOCK_BITS));
         let mut file = blocks.spend(0, u32::MAX - (mark - 2), 0);
         let at_the_mark = [(); 2].map(|()| file.mint(&blocks, 0, 0));
         assert_eq!(at_the_mark, [Some(mark - 1), Some(mark)]);
-        // Block 192 is claimed: another file's first id is block 193's.
+        // The mark's block is claimed: another file's first id is the
+        // next block's.
         assert_eq!(
             Minted::default().mint(&blocks, 0, 1),
-            Some(193 << BLOCK_BITS)
+            Some((at + 1) << BLOCK_BITS)
         );
+    }
+
+    /// The most files a host names, each at its first id, take a sixteenth
+    /// of the counter between them: no first id is near the term's mark,
+    /// and the term keeps its span whatever the count of files.
+    #[test]
+    fn the_first_ids_of_the_most_files_leave_the_term_its_span() {
+        let blocks = Blocks::default();
+        blocks.rise(1, std::iter::empty());
+        let first = |file: u8| Minted::default().mint(&blocks, 1, file);
+        let firsts: Vec<_> = (0..=u8::MAX).map(first).collect();
+        let highest = firsts.iter().max().copied().flatten();
+        assert!(firsts.iter().all(Option::is_some), "a block a file");
+        assert_eq!(highest, Some(u32::from(u8::MAX) << BLOCK_BITS));
+        assert!(highest < Some(1 << 28), "under a sixteenth of the counter");
+        for (file, counter) in (0..=u8::MAX).zip(&firsts) {
+            let lease = id(1, counter.expect("a block a file"));
+            assert_eq!(blocks.file_of(lease, 256), usize::from(file));
+        }
     }
 
     /// A rise starts the blocks again: the term that led claims nothing
