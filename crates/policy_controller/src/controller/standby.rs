@@ -821,7 +821,16 @@ impl Standby {
             } else {
                 match self.follower.apply(&batch, now) {
                     Ok(()) => {}
-                    Err(Halt::Lost(at)) => return self.lost(leader, at, landed),
+                    Err(Halt::Lost(at)) => {
+                        // The events of the batch ahead of that one landed
+                        // and stand, as a whole batch's would: an event
+                        // followed the last restore.
+                        let partly = at.seq > batch.first_seq;
+                        if partly {
+                            self.fresh.store(false, Ordering::Relaxed);
+                        }
+                        return self.lost(leader, at, landed || partly);
+                    }
                     Err(Halt::Unread(refused)) => return Ended::waits(landed, unread(refused)),
                 }
                 if !landed {
@@ -2294,6 +2303,33 @@ mod tests {
         assert_eq!(standby.follower.place(), lands.at);
         assert_eq!(standby.shared.lag.asks(), 3);
         assert_eq!(*bed.names.lock(), ["standby-0"; 4]);
+        // A restore, then one batch whose first event lands and whose
+        // second does not: an event landed since the restore all the same.
+        let parts = snapshot(&leader, now);
+        let restored = leader.1.head(Kinds::All);
+        leader.0.upsert(facts("http://halved:8000", 1));
+        let lands = entries(&leader.1, restored).remove(0);
+        let halved = proto::ReplicationBatch {
+            events: vec![worker_wire::replication(&lands, now); 2],
+            ..batch(&lands, now)
+        };
+        let applied = AtomicBool::new(false);
+        let script = async {
+            let mut opened = bed.opened().await;
+            assert!(matches!(opened.frame().await, Some(Frame::Hello(_))));
+            opened.says(resync()).await;
+            for part in &parts {
+                opened.says(part.clone()).await;
+            }
+            opened.says(halved).await;
+            opened
+        };
+        let (ended, _opened) = tokio::join!(standby.stream(&named, &applied), script);
+        assert_eq!((ended.next, ended.applied), (Next::Join, true));
+        assert!(ended.why.is_none(), "{:?}", ended.why);
+        assert_eq!(standby.follower.place(), lands.at);
+        assert_eq!(standby.shared.lag.asks(), 4);
+        assert_eq!(*bed.names.lock(), ["standby-0"; 5]);
     }
 
     #[tokio::test]
