@@ -11,14 +11,51 @@ use smg_grpc_client::common_proto::{kv_cache_event, EngineLoad, KvEventBatch, Kv
 use tokio::sync::{oneshot, Semaphore};
 use tracing::{error, info, warn};
 
-use super::{
-    port::{BatchFacts, BatchOutcome, KvEventSink, ResyncReason, SnapshotChunk},
-    KvEventMonitor, PushedLoadSink, SubscriptionKind,
-};
+use super::port::{BatchFacts, BatchOutcome, KvEventSink, ResyncReason, SnapshotChunk};
 use crate::worker::{
     connection::engine::EngineConnection, health::liveness, identity::endpoint::Endpoint,
-    metrics::Metrics, Worker,
+    load::monitor::WorkerMonitor, metrics::Metrics, registry::Generation, Worker,
 };
+
+/// What a worker's stream is for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SubscriptionKind {
+    /// The worker's KV events to the sink, with the load records that ride
+    /// them: a worker whose cache the host indexes.
+    Events,
+    /// The worker's load records alone (`SubscribeKvEventsRequest.
+    /// loads_only`): a worker whose load the host reads and whose cache it
+    /// does not index. A servicer that predates the field streams its
+    /// events too; they are dropped.
+    Loads,
+}
+
+/// Where a load record pushed on a worker's event stream goes: the load
+/// monitor, as the collector's streams hold it. Held by this name,
+/// the sink brings nothing of the registry the load monitor is built over.
+pub(crate) trait PushedLoadSink: Send + Sync {
+    /// Take the record of `dp_rank` received at `received_at`
+    /// ([`WorkerMonitor::apply_pushed_load`]).
+    fn push_load(
+        self: Arc<Self>,
+        worker: &Arc<dyn Worker>,
+        dp_rank: i32,
+        record: &EngineLoad,
+        received_at: Instant,
+    );
+}
+
+impl<G: Generation> PushedLoadSink for WorkerMonitor<G> {
+    fn push_load(
+        self: Arc<Self>,
+        worker: &Arc<dyn Worker>,
+        dp_rank: i32,
+        record: &EngineLoad,
+        received_at: Instant,
+    ) {
+        self.apply_pushed_load(worker, dp_rank, record, received_at);
+    }
+}
 
 /// Initial reconnection delay after stream failure.
 const INITIAL_RECONNECT_DELAY_MS: u64 = 100;
@@ -281,7 +318,12 @@ async fn subscribe_with_deadline(
     }
 }
 
-impl KvEventMonitor {
+/// The collector of one worker's pushed stream: the subscription loop and
+/// its rounds. It keeps nothing: a subscription's state is its task's, and
+/// what a stream brought is the sink's.
+pub(super) struct KvEventCollector;
+
+impl KvEventCollector {
     /// Tell the sink the worker left, when its subscription ends: on the
     /// blocking pool and under a fleet-wide bound, since the worker's blocks
     /// leave the sink's index inside the call.
@@ -649,7 +691,7 @@ impl KvEventMonitor {
         mut on_batch: impl FnMut(&KvEventBatch),
         mut on_load: impl FnMut(&KvEventBatch, &EngineLoad),
     ) -> StreamResult {
-        use tokio_stream::StreamExt;
+        use futures::StreamExt;
 
         while let Some(result) = stream.next().await {
             let batch = match result {
@@ -684,7 +726,7 @@ impl KvEventMonitor {
         mut on_batch: impl FnMut(),
         mut on_load: impl FnMut(&KvEventBatch, &EngineLoad),
     ) -> StreamResult {
-        use tokio_stream::StreamExt;
+        use futures::StreamExt;
 
         while let Some(result) = stream.next().await {
             let batch = match result {
@@ -783,7 +825,7 @@ mod tests {
         super::{
             index_sink::{IndexSink, OpenRow},
             port::KvCursor,
-            KvBlockSize,
+            KvBlockSize, KvEventMonitor,
         },
         *,
     };
@@ -1297,7 +1339,7 @@ mod tests {
             }
             let drained = tokio::time::timeout(
                 Duration::from_secs(5),
-                KvEventMonitor::drain_stream(&sub, stream, &mut snapshot, &mut shutdown_rx),
+                KvEventCollector::drain_stream(&sub, stream, &mut snapshot, &mut shutdown_rx),
             )
             .await
             .unwrap_or_else(|_| panic!("case {which}: the drain ends"));
@@ -1410,7 +1452,7 @@ mod tests {
         };
         let drained = tokio::time::timeout(
             Duration::from_secs(5),
-            KvEventMonitor::drain_stream(&sub, stream, &mut snapshot, &mut shutdown_rx),
+            KvEventCollector::drain_stream(&sub, stream, &mut snapshot, &mut shutdown_rx),
         )
         .await
         .expect("the drain ends");
@@ -1549,7 +1591,7 @@ mod tests {
             let mut snapshot = None;
             let drained = tokio::time::timeout(
                 Duration::from_secs(5),
-                KvEventMonitor::drain_stream(&sub, stream, &mut snapshot, &mut shutdown_rx),
+                KvEventCollector::drain_stream(&sub, stream, &mut snapshot, &mut shutdown_rx),
             )
             .await
             .expect("the finite stream ends");
@@ -1630,7 +1672,7 @@ mod tests {
             let mut snapshot = None;
             let drained = tokio::time::timeout(
                 Duration::from_secs(5),
-                KvEventMonitor::drain_stream(&sub, stream, &mut snapshot, &mut shutdown_rx),
+                KvEventCollector::drain_stream(&sub, stream, &mut snapshot, &mut shutdown_rx),
             )
             .await
             .expect("the finite stream ends");
@@ -2059,7 +2101,7 @@ mod tests {
         );
         assert_ne!(indexer.current_size(), 0, "the stored block is indexed");
 
-        KvEventMonitor::remove_from_sink(sink, id, "grpc://w1:9000").await;
+        KvEventCollector::remove_from_sink(sink, id, "grpc://w1:9000").await;
 
         assert_eq!(indexer.current_size(), 0);
     }
@@ -2111,7 +2153,7 @@ mod tests {
             request
         };
         let (round, request) = tokio::join!(
-            KvEventMonitor::subscription_round(&sub, &mut backoff, &mut shutdown_rx),
+            KvEventCollector::subscription_round(&sub, &mut backoff, &mut shutdown_rx),
             request,
         );
         assert!(matches!(round, Round::Shutdown | Round::Backoff));
@@ -2167,7 +2209,7 @@ mod tests {
             let sub = said_subscription(&worker, &sink);
             let (_keep, mut shutdown_rx) = oneshot::channel::<()>();
             let round =
-                KvEventMonitor::subscription_round(&sub, &mut Backoff::new(), &mut shutdown_rx)
+                KvEventCollector::subscription_round(&sub, &mut Backoff::new(), &mut shutdown_rx)
                     .await;
             if again {
                 assert!(matches!(round, Round::Again), "{expected:?}");
@@ -2187,7 +2229,7 @@ mod tests {
         }
 
         let sink = Arc::new(Said::default());
-        KvEventMonitor::remove_from_sink(Arc::clone(&sink), 7, "grpc://w1:9000").await;
+        KvEventCollector::remove_from_sink(Arc::clone(&sink), 7, "grpc://w1:9000").await;
         assert_eq!(sink.calls(), ["removed 7"]);
     }
 
@@ -2216,7 +2258,7 @@ mod tests {
         let sub = said_subscription(&worker, &sink);
         let (_keep, mut shutdown_rx) = oneshot::channel::<()>();
         let round =
-            KvEventMonitor::subscription_round(&sub, &mut Backoff::new(), &mut shutdown_rx).await;
+            KvEventCollector::subscription_round(&sub, &mut Backoff::new(), &mut shutdown_rx).await;
         assert!(matches!(round, Round::Backoff));
         let said: Vec<String> = sink
             .calls()

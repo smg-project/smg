@@ -522,7 +522,10 @@ mod tests {
     };
 
     use super::{
-        super::{apply::convert_kv_block, subscription::batch_facts},
+        super::{
+            apply::convert_kv_block,
+            subscription::{batch_facts, KvEventCollector},
+        },
         *,
     };
     use crate::worker::{
@@ -1886,14 +1889,14 @@ mod tests {
         };
         let mut only = batch(7, None, vec![]);
         only.load = Some(record.clone());
-        assert!(KvEventMonitor::is_load_only(&only));
+        assert!(KvEventCollector::is_load_only(&only));
         let mut carrying = batch(8, None, vec![stored(None, &[1])]);
         carrying.load = Some(EngineLoad {
             load_only: false,
             ..record
         });
-        assert!(!KvEventMonitor::is_load_only(&carrying));
-        assert!(!KvEventMonitor::is_load_only(&batch(9, None, vec![])));
+        assert!(!KvEventCollector::is_load_only(&carrying));
+        assert!(!KvEventCollector::is_load_only(&batch(9, None, vec![])));
     }
 
     /// A snapshot whose relay joined the publisher late and could not replay

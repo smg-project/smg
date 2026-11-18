@@ -31,12 +31,10 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc, OnceLock, Weak,
     },
-    time::Instant,
 };
 
 use dashmap::{mapref::entry::Entry, DashMap};
 use futures::FutureExt as _;
-use smg_grpc_client::common_proto::EngineLoad;
 use tokio::{
     sync::{oneshot, watch, Mutex},
     task::JoinHandle,
@@ -64,6 +62,8 @@ mod subscription;
 pub(crate) use apply::WorkerIndexState;
 use index_sink::{IndexSink, OpenRow};
 use port::KvEventSink;
+pub use subscription::SubscriptionKind;
+use subscription::{KvEventCollector, PushedLoadSink};
 
 /// Interval between publications of each model's index size and, for the chain
 /// index, its shape and memory (`smg_kv_index_*` gauges by model).
@@ -85,19 +85,6 @@ const STATS_INTERVAL_SECS: u64 = 30;
 pub(crate) struct KvBlockSize {
     pub(crate) tokens: usize,
     pub(crate) from_events: bool,
-}
-
-/// What a worker's stream is for.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SubscriptionKind {
-    /// The worker's KV events into its model's index, with the load records
-    /// that ride them: a worker under a cache-aware policy.
-    Events,
-    /// The worker's load records alone (`SubscribeKvEventsRequest.
-    /// loads_only`): a worker priced by its load with no KV index. A
-    /// servicer that predates the field streams its events too; they are
-    /// dropped.
-    Loads,
 }
 
 pub struct KvEventMonitor {
@@ -132,33 +119,6 @@ pub struct KvEventMonitor {
     /// sink, a peer in the app context. Unset in a monitor built alone (the
     /// tests), which holds every object.
     worker_registry: OnceLock<Weak<dyn WorkerLookup>>,
-}
-
-/// Where a load record pushed on a worker's event stream goes: the load
-/// monitor, as this monitor's streams hold it. Held by this name,
-/// the sink brings nothing of the registry the load monitor is built over.
-pub(crate) trait PushedLoadSink: Send + Sync {
-    /// Take the record of `dp_rank` received at `received_at`
-    /// ([`WorkerMonitor::apply_pushed_load`]).
-    fn push_load(
-        self: Arc<Self>,
-        worker: &Arc<dyn Worker>,
-        dp_rank: i32,
-        record: &EngineLoad,
-        received_at: Instant,
-    );
-}
-
-impl<G: Generation> PushedLoadSink for WorkerMonitor<G> {
-    fn push_load(
-        self: Arc<Self>,
-        worker: &Arc<dyn Worker>,
-        dp_rank: i32,
-        record: &EngineLoad,
-        received_at: Instant,
-    ) {
-        self.apply_pushed_load(worker, dp_rank, record, received_at);
-    }
 }
 
 /// The registry as this monitor holds it: it asks one thing of it, the
@@ -541,7 +501,7 @@ impl KvEventMonitor {
                     }
                     None => None,
                 };
-                Self::subscription_loop(
+                KvEventCollector::subscription_loop(
                     worker,
                     worker_url,
                     row.map(OpenRow::into_feed),
