@@ -32,6 +32,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
+    io::ErrorKind,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::Path,
     sync::{
@@ -85,6 +86,7 @@ use tonic::{
 use crate::{
     engines::{engine_config, eventually},
     net::loopback,
+    pair,
 };
 
 /// The leader's address and the standby's of a pair: one host, two
@@ -821,33 +823,38 @@ impl Replica {
         catalog: Catalog,
         spec: Option<&Path>,
     ) -> Result<Self, String> {
-        Self::serve(id, lease, loopback().ip(), 0, false, (catalog, spec)).await
+        Self::serve(id, lease, loopback().ip(), 0, false, (Some(catalog), spec)).await
     }
 
     /// As [`Replica::start`], with every listener on `ip` and the
-    /// replication listener at `port` (`0` takes one). Replicas of one
-    /// lease listen on one replication port, each at an address of its
-    /// own, as replicas configured alike do: the one that follows finds
-    /// its leader's stream there, and the leader takes its name as told.
+    /// replication listener at `port`. Replicas of one lease listen on one
+    /// replication port, each at an address of its own, as replicas
+    /// configured alike do: the one that follows finds its leader's stream
+    /// there, and the leader takes its name as told. `0` takes a number of
+    /// the pairs' own ([`pair::ports`]), the next one free on `ip` and, at
+    /// the leader's address, on the standby's too ([`pair::free`]): a bind
+    /// of port `0` is handed none of them, so the number stays free on the
+    /// address a standby binds it at.
     pub async fn start_at(
         id: &str,
         lease: Option<&Path>,
         ip: IpAddr,
         port: u16,
     ) -> Result<Self, String> {
-        Self::serve(id, lease, ip, port, true, (Catalog::builtin(), None)).await
+        Self::serve(id, lease, ip, port, true, (None, None)).await
     }
 
-    /// Binds and serves the controller over the stages `catalog` holds and
-    /// on the `spec` file where one is given; with `standbys` its
-    /// replication listener takes a standby's name as told.
+    /// Binds and serves the controller over the stages `catalog` holds,
+    /// the stock build's where it names none, and on the `spec` file where
+    /// one is given; with `standbys` its replication listener takes a
+    /// standby's name as told.
     async fn serve(
         id: &str,
         lease: Option<&Path>,
         ip: IpAddr,
         port: u16,
         standbys: bool,
-        (catalog, spec): (Catalog, Option<&Path>),
+        (catalog, spec): (Option<Catalog>, Option<&Path>),
     ) -> Result<Self, String> {
         let listener = |name: &str, scopes: &[Scope], port: u16| Listener {
             name: name.to_owned(),
@@ -855,7 +862,7 @@ impl Replica {
             scopes: scopes.to_vec(),
             tls: None,
         };
-        let config = Config {
+        let config = |port: u16| Config {
             controller_id: id.to_owned(),
             listeners: vec![
                 listener("gateway", &[Scope::Gateway, Scope::Ingestion], 0),
@@ -874,13 +881,42 @@ impl Replica {
                 ..Election::default()
             },
         };
-        let mut controller = bounded(
-            "the controller binds its listeners",
-            ROOM,
-            Controller::bind_with(config, catalog),
-        )
-        .await?
-        .map_err(|error| error.to_string())?;
+        // A pair's first replica draws its replication port from the pairs'
+        // own numbers and takes the next one free on its address. A bind
+        // takes its catalog: the stock build's is made again for each
+        // number, and a host's own is bound once, at the port its start
+        // names.
+        let drawn = standbys && port == 0 && catalog.is_none();
+        let mut numbers = pair::ports(ip);
+        let mut host = catalog;
+        let mut controller = loop {
+            let port = if drawn {
+                numbers
+                    .next()
+                    .ok_or("no port among the pairs' own is free")?
+            } else {
+                port
+            };
+            let catalog = host.take().unwrap_or_else(Catalog::builtin);
+            let bound = bounded(
+                "the controller binds its listeners",
+                ROOM,
+                Controller::bind_with(config(port), catalog),
+            )
+            .await?;
+            match bound {
+                // In use on this address: the next number.
+                Err(Error::Bind { source, .. })
+                    if drawn && source.kind() == ErrorKind::AddrInUse => {}
+                // Held on the standby's address by a standby that outlived
+                // its leader: the next number, and this bind is let go.
+                Ok(_)
+                    if drawn
+                        && ip == LEADER
+                        && !pair::free(STANDBY, port).map_err(|error| error.to_string())? => {}
+                bound => break bound.map_err(|error| error.to_string())?,
+            }
+        };
         controller
             .identity_as_told("gateway")
             .map_err(|error| error.to_string())?;
