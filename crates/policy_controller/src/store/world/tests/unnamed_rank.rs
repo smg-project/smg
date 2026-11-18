@@ -14,6 +14,7 @@ use crate::{
 };
 
 const ENGINE: &str = "grpc://e:9000";
+const OTHER: &str = "grpc://f:9000";
 
 /// A store with no threshold and the two ranks of one engine, each with a
 /// record on file from one answer.
@@ -115,6 +116,75 @@ fn a_rank_that_pushed_since_the_poll_began_takes_no_mark_beside_one_the_answer_l
     let t2 = t1 + Duration::from_secs(1);
     store.record(one, 1, load(2, 0), t2, LoadSource::Stream);
     assert_eq!(overloaded(&store, t2), [two]);
+}
+
+#[test]
+fn a_rank_left_out_beside_a_named_rank_that_pushed_since_the_poll_began_is_avoided() {
+    let (store, t0, zero, one) = two_ranks();
+    // Rank one pushes as a poll begins. The poll's answer brings a row for
+    // it and none for rank zero: the record stands over the answer's row,
+    // and the answer named the rank all the same.
+    store.record(one, 1, load(5, 0), t0, LoadSource::Stream);
+    names_one_alone(&store, zero, one, t0);
+    assert_eq!(store.unnamed_ranks(), 1, "the answer named its peer");
+    // No row was written: the mark is judged and shown with the answer.
+    assert_eq!(overloaded(&store, t0), [zero]);
+    assert_eq!(store.overload_flips(), 1);
+    let rows = view(&store, &ask(t0)).0;
+    let row = rows.iter().find(|row| row.id == one).expect("its row");
+    assert_eq!(row.load.map(|load| load.running), Some(5), "the record");
+    // The same answer again moves nothing.
+    names_one_alone(&store, zero, one, t0);
+    assert_eq!(overloaded(&store, t0), [zero]);
+    assert_eq!((store.overload_flips(), store.unnamed_ranks()), (1, 1));
+}
+
+#[test]
+fn a_row_passed_over_for_a_record_ends_no_word_that_no_report_came() {
+    let (store, t0, zero, one) = two_ranks();
+    let mut both = [zero, one];
+    both.sort_unstable();
+    store
+        .apply(generation_with(1, block(8, 0.8)))
+        .expect("applied");
+    // Rank one pushes at the count: the engine's verdict holds both.
+    let t1 = t0 + Duration::from_secs(1);
+    store.record(one, 1, pressure(9, 0), t1, LoadSource::Stream);
+    assert_eq!(overloaded(&store, t1), both);
+    // A later poll brings no report, and the verdict reads clear.
+    let t2 = t1 + Duration::from_secs(1);
+    store.report(&[(zero, 0, None), (one, 1, None)], t2, LoadSource::Poll);
+    assert_eq!(overloaded(&store, t2), []);
+    // The answer of a poll that began before the record lands late. Its row
+    // for rank one is passed over: it marks the rank left out and ends no
+    // word, so the engine's own verdict still reads clear.
+    names_one_alone(&store, zero, one, t0);
+    store.publish(t2);
+    assert_eq!(overloaded(&store, t2), [zero]);
+}
+
+#[test]
+fn a_mixed_answer_marks_the_rank_left_out_of_each_engine_it_names() {
+    // Two engines in one answer: a written row names the first, and a row
+    // passed over for a record names the second.
+    let (store, t0, zero, one) = two_ranks();
+    let [far_zero, far_one] = [0, 1].map(|rank| rank_of(&store, OTHER, rank));
+    names_both(&store, far_zero, far_one, t0);
+    store.record(far_one, 1, load(2, 0), t0, LoadSource::Stream);
+    store.report(
+        &[
+            (zero, 0, None),
+            (one, 1, Some(load(2, 0))),
+            (far_zero, 0, None),
+            (far_one, 1, Some(load(2, 0))),
+        ],
+        t0,
+        LoadSource::Poll,
+    );
+    let mut left_out = [zero, far_zero];
+    left_out.sort_unstable();
+    assert_eq!(overloaded(&store, t0), left_out);
+    assert_eq!(store.unnamed_ranks(), 2);
 }
 
 #[test]

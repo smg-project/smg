@@ -116,6 +116,9 @@ pub trait LoadSink: Send + Sync {
     /// for a poll that left out no such rank. The crate's store pays the
     /// build a rank the answer names still waits for before it writes the
     /// answer, so an answer is read over the rows of every rank it names.
+    /// A row the answer brings for a rank that pushed since the poll began
+    /// is passed over, and names its engine all the same: a rank left out
+    /// beside it is avoided.
     fn report(
         &self,
         answer: &[(WorkerId, u16, Option<LoadRow>)],

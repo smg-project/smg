@@ -1677,6 +1677,18 @@ impl Ranks {
     }
 }
 
+/// What a poll's answer says of one engine, the least first.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Said {
+    /// No row for a rank of it.
+    Nothing,
+    /// A row for a rank that pushed since the poll began: the row is passed
+    /// over, and the engine is named.
+    Named,
+    /// A row that was written.
+    Heard,
+}
+
 /// The load table and the world's write side, behind one lock.
 struct Loads {
     ranks: FxHashMap<WorkerId, Ranks>,
@@ -1767,8 +1779,8 @@ impl LoadSink for MemoryStore {
         // the one judgment and the one publication, so its ranks are read
         // as one answer left them. A caller's mix of engines judges each,
         // and each engine is heard by its own ranks' rows.
-        let mut first: Option<(u32, bool)> = None;
-        let mut others: Vec<(u32, bool)> = Vec::new();
+        let mut first: Option<(u32, Said)> = None;
+        let mut others: Vec<(u32, Said)> = Vec::new();
         let mut omits = false;
         for &(id, rank, row) in answer {
             // A report that lands after its worker left (the poll was out
@@ -1778,10 +1790,14 @@ impl LoadSink for MemoryStore {
             };
             // A rank that pushed since the poll began keeps its record,
             // and its stream is heard: no word of the poll stands over it.
-            if ranks.pushed_since(rank, polled_at) {
+            // A row the answer brings for it is passed over, and names its
+            // engine all the same.
+            let pushed = ranks.pushed_since(rank, polled_at);
+            if pushed && row.is_none() {
                 continue;
             }
-            let (engine, heard) = match row {
+            let (engine, said) = match row {
+                Some(_) if pushed => (writer.engine_of(id), Said::Named),
                 Some(row) => {
                     let age = Duration::from_millis(u64::from(row.report_age_ms));
                     let sample = LoadSample {
@@ -1800,23 +1816,23 @@ impl LoadSink for MemoryStore {
                         writer.hear(place, polled_at);
                         Some(engine)
                     });
-                    (engine, true)
+                    (engine, Said::Heard)
                 }
                 // A rank the answer omits keeps what is on file.
                 None => {
                     omits = true;
-                    (writer.engine_of(id), false)
+                    (writer.engine_of(id), Said::Nothing)
                 }
             };
             let Some(engine) = engine else {
                 continue;
             };
             match &mut first {
-                None => first = Some((engine, heard)),
-                Some(seen) if seen.0 == engine => seen.1 |= heard,
+                None => first = Some((engine, said)),
+                Some(seen) if seen.0 == engine => seen.1 = seen.1.max(said),
                 Some(_) => match others.iter_mut().find(|seen| seen.0 == engine) {
-                    Some(seen) => seen.1 |= heard,
-                    None => others.push((engine, heard)),
+                    Some(seen) => seen.1 = seen.1.max(said),
+                    None => others.push((engine, said)),
                 },
             }
         }
@@ -1828,7 +1844,9 @@ impl LoadSink for MemoryStore {
         // answer's engines are known and before any is judged. An answer
         // with no row for an engine is the word that none came, which
         // moves no mark, and a rank that pushed since the poll began
-        // named itself.
+        // named itself. A row passed over for such a rank names its engine
+        // as a written row does: the naming is the answer's, whichever
+        // sample stands.
         if omits || writer.any_unnamed() {
             for &(id, rank, row) in answer {
                 let pushed = table
@@ -1840,38 +1858,46 @@ impl LoadSink for MemoryStore {
                 let Some(engine) = writer.engine_of(id) else {
                     continue;
                 };
-                let heard = if first.0 == engine {
-                    first.1
+                let named = if first.0 == engine {
+                    first.1 != Said::Nothing
                 } else {
-                    others.iter().any(|seen| seen.0 == engine && seen.1)
+                    others
+                        .iter()
+                        .any(|seen| seen.0 == engine && seen.1 != Said::Nothing)
                 };
-                if heard {
+                if named {
                     writer.name(id, rank, row.is_none());
                 }
             }
         }
         let mut changed = false;
-        for (engine, heard) in std::iter::once(first).chain(others) {
-            changed |= if heard {
+        for (engine, said) in std::iter::once(first).chain(others) {
+            changed |= match said {
                 // A row was written: the engine is judged once, and the
                 // write is shown whether or not a verdict moved.
-                writer.judged(engine, true);
-                true
-            } else {
+                Said::Heard => {
+                    writer.judged(engine, true);
+                    true
+                }
+                // No row was written, and the answer named a rank that
+                // pushed since the poll began: no word that none came. A
+                // mark the answer moved is judged and shown with it.
+                Said::Named => writer.judged(engine, false),
                 // No row came for the engine: the word that none came,
-                // unless a rank of it pushed since the poll began, whether
-                // the answer names that rank or not. The word is shown
-                // where it moves a verdict. A rank the answer does not name
-                // may stand inside the window of its registration, or of a
-                // refresh that moved it, with no row at its rank here: the
-                // build reads what it reported against the word and the
-                // instant this poll began.
-                let pushed = writer.ranks_of(engine).any(|(id, rank)| {
-                    table
-                        .get(&id)
-                        .is_some_and(|ranks| ranks.pushed_since(rank, polled_at))
-                });
-                !pushed && writer.silence(engine, polled_at)
+                // unless a rank of it pushed since the poll began. The
+                // word is shown where it moves a verdict. A rank the answer
+                // does not name may stand inside the window of its
+                // registration, or of a refresh that moved it, with no row
+                // at its rank here: the build reads what it reported
+                // against the word and the instant this poll began.
+                Said::Nothing => {
+                    let pushed = writer.ranks_of(engine).any(|(id, rank)| {
+                        table
+                            .get(&id)
+                            .is_some_and(|ranks| ranks.pushed_since(rank, polled_at))
+                    });
+                    !pushed && writer.silence(engine, polled_at)
+                }
             };
         }
         if changed {
