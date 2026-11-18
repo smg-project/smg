@@ -17,9 +17,10 @@ pub struct Pin {
     /// takes none. It stands on the decision clock, in microseconds since
     /// the store's origin, as the engine's table holds the instant it
     /// forgets the key: a dispatch writes it as read, or as its lease's
-    /// own rule counts it from the lease's issue, and converts no clock.
-    /// `None` for a key its rule keeps with no TTL: such a pin stays until
-    /// its worker's row goes.
+    /// own rule counts it from the lease's issue, never earlier than the
+    /// end that stood, and converts no clock. `None` for a key its rule
+    /// keeps with no TTL: such a pin stays until a dispatch under a table
+    /// moves it and its end, or its worker's row goes.
     pub ends: Option<u64>,
 }
 
@@ -32,6 +33,13 @@ pub trait SessionsStore: Send + Sync {
     /// Pin `key` to `worker` at `at`, to end at `ends` on the decision
     /// clock (`None`: at no instant); a re-pin moves it and its end.
     fn pin(&self, key: u64, worker: WorkerId, at: Instant, ends: Option<u64>);
+
+    /// Pin `key` as [`pin`](Self::pin) does, for a writer that knows the
+    /// key's rule by its lease alone: the end that stands stays where it is
+    /// the later one, and no end is later than any instant. A lease
+    /// dispatched behind a newer one of its key, or behind a dispatch whose
+    /// table ended the pin later, then never ends the pin earlier.
+    fn pin_no_earlier(&self, key: u64, worker: WorkerId, at: Instant, ends: Option<u64>);
 
     fn lookup(&self, key: u64) -> Option<Pin>;
 

@@ -77,9 +77,9 @@ pub struct LeaseRecord {
     /// The decode side of a pair.
     pub decode: Option<WorkerId>,
     /// The TTL of the sessions rule the lease's decision was made under,
-    /// copied from its pick (`None`: a rule with no TTL, or no rule): a
-    /// commit whose engine's table holds no such key ends the key's pin of
-    /// record by it.
+    /// copied from its decision's scratch (`None`: a rule with no TTL, or
+    /// no rule): a commit whose engine's table holds no such key ends the
+    /// key's pin of record by it, no earlier than that pin's end stood.
     pub session_ttl_micros: Option<u64>,
     /// The term of the leader that issued the lease.
     pub term: u64,

@@ -1316,6 +1316,45 @@ fn a_removed_workers_pins_of_record_leave_with_its_row() {
     assert!(sessions.is_empty(), "the old incarnation's pin");
 }
 
+/// The door of a writer that knows a key's rule by its lease alone: the
+/// worker and the last use move as at the plain door, and the end that
+/// stood stays where it is the later one. No end is later than any
+/// instant.
+#[test]
+fn a_pin_by_a_leases_own_rule_never_ends_earlier_than_the_pin_that_stood() {
+    let store = MemoryStore::new();
+    let sessions: &dyn SessionsStore = &store;
+    let now = Instant::now();
+    let later = now + Duration::from_secs(1);
+    let ends = |seconds: u64| Some(store.micros(now + Duration::from_secs(seconds)));
+    let pin = |worker, last_used, ends| {
+        Some(Pin {
+            worker: WorkerId(worker),
+            last_used,
+            ends,
+        })
+    };
+    sessions.pin_no_earlier(0, WorkerId(1), now, ends(5));
+    assert!(sessions.is_empty(), "the absent key is never pinned");
+    // No pin stood: the end is the writer's own.
+    sessions.pin_no_earlier(11, WorkerId(1), now, ends(5));
+    assert_eq!(sessions.lookup(11), pin(1, now, ends(5)));
+    // An earlier end leaves the later one, and the pin moves.
+    sessions.pin_no_earlier(11, WorkerId(2), later, ends(3));
+    assert_eq!(sessions.lookup(11), pin(2, later, ends(5)));
+    // A later end is taken.
+    sessions.pin_no_earlier(11, WorkerId(3), now, ends(7));
+    assert_eq!(sessions.lookup(11), pin(3, now, ends(7)));
+    // No end is the latest: it is taken, and then it stays.
+    sessions.pin_no_earlier(11, WorkerId(4), now, None);
+    assert_eq!(sessions.lookup(11), pin(4, now, None));
+    sessions.pin_no_earlier(11, WorkerId(5), now, ends(9));
+    assert_eq!(sessions.lookup(11), pin(5, now, None));
+    // The plain door moves a pin's end either way.
+    sessions.pin(11, WorkerId(6), now, ends(1));
+    assert_eq!(sessions.lookup(11), pin(6, now, ends(1)));
+}
+
 #[test]
 fn a_pin_is_written_at_the_commit_and_leaves_with_its_worker_or_at_its_end() {
     let store = MemoryStore::new();

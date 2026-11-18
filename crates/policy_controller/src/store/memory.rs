@@ -1947,6 +1947,22 @@ impl SessionsStore for MemoryStore {
         );
     }
 
+    fn pin_no_earlier(&self, key: u64, worker: WorkerId, at: Instant, ends: Option<u64>) {
+        if key == 0 {
+            return;
+        }
+        let pin = Pin {
+            worker,
+            last_used: at,
+            ends,
+        };
+        let mut pins = self.pins_of(key).lock();
+        let stood = pins.entry(key).or_insert(pin);
+        // The later end stays, and no end is later than any instant.
+        let later = stood.ends.zip(ends).map(|(stood, asked)| stood.max(asked));
+        *stood = Pin { ends: later, ..pin };
+    }
+
     fn lookup(&self, key: u64) -> Option<Pin> {
         self.pins_of(key).lock().get(&key).copied()
     }

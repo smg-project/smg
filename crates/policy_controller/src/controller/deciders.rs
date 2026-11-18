@@ -877,10 +877,11 @@ impl PinSource for StorePins<'_> {
         let pin = SessionsStore::lookup(self.store, key.get())?;
         // A pin at or past its own end is no pin, whether or not the sweep
         // has run: its end is the instant the engine's table forgot the
-        // key. A TTL counted from the dispatch ends later than that, and
-        // so may the TTL of a rule applied since. The end stands on the
-        // decision clock: the ask's instant is turned into it here, at a
-        // miss that finds a pin with an end and nowhere else.
+        // key, or the latest a lease's own rule counted where no table
+        // held it. A TTL counted from the dispatch ends later than that,
+        // and so may the TTL of a rule applied since. The end stands on
+        // the decision clock: the ask's instant is turned into it here, at
+        // a miss that finds a pin with an end and nowhere else.
         let ended = |ends: u64| ends <= self.store.micros(self.now);
         if pin.ends.is_some_and(ended) {
             return None;
@@ -4841,6 +4842,13 @@ pub(crate) mod tests {
         let record = LeasesStore::get(&*bed.store, GATEWAY, LeaseId(lease_of(&answer).id))
             .expect("the lease is on file");
         assert_eq!(record.session_ttl_micros, Some(kept));
+        // An unkeyed decision behind it, on the scratch the keyed one left
+        // its TTL on: no rule governed its pick, and its record carries
+        // none.
+        let answer = bed.ask(frame(2, 1_002)).await;
+        let unkeyed = LeasesStore::get(&*bed.store, GATEWAY, LeaseId(lease_of(&answer).id))
+            .expect("the lease is on file");
+        assert_eq!(unkeyed.session_ttl_micros, None);
         bed.store.apply(later).expect("a later generation");
         let lease = record.lease;
         let hand = lifecycle::open(&bed.store, GATEWAY);
