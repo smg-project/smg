@@ -30,7 +30,8 @@
 //! at the link in the system's own words, and nothing of it stays on file.
 //! A write refused after its link removes its name and syncs the directory
 //! again, and says so where that fails: alone the name would run at a
-//! start, and beside the other form's name the two refuse it.
+//! start, and beside the other form's name the two refuse it until that
+//! name leaves.
 //!
 //! A start reads the directory: the highest number is the generation to
 //! run, and a file a write left under its temporary name is removed. Any
@@ -169,11 +170,12 @@ fn backs_out(generation: u64) -> io::Error {
 
 /// What a write says where its refused generation did not come off file
 /// again: the write's own failure, then the removal's, then what a start
-/// meets. A name left alone runs; `beside` the other form's name, the two
-/// refuse the start.
+/// meets. A name left alone runs. `beside` the other form's name the two
+/// refuse the start while that name stands, and this one runs once it is
+/// gone: the other writer may back out next.
 fn stays(generation: u64, failed: &io::Error, left: &io::Error, beside: bool) -> io::Error {
     let start = if beside {
-        "beside the other form's name a start is refused by the two"
+        "while the other form's name stands a start is refused by the two, and a start runs it once that name is gone"
     } else {
         "a start may run it"
     };
@@ -652,8 +654,9 @@ pub(crate) mod tests {
     }
 
     /// A back-out whose removal does not reach the disk says what a start
-    /// meets: beside the other form's name the two refuse it, where a name
-    /// left alone would run.
+    /// meets: while the other form's name stands the two refuse it, and
+    /// once that name is gone, as where its writer backs out next, this
+    /// one runs.
     #[cfg(unix)]
     #[test]
     fn a_back_out_that_stays_on_file_is_told_beside_the_other_name() {
@@ -671,7 +674,8 @@ pub(crate) mod tests {
         assert!(failed.ends_with(": this write backs out"), "{told}");
         assert_eq!(
             left,
-            "the directory did not sync): beside the other form's name a start is refused by the two"
+            "the directory did not sync): while the other form's name stands a start is refused by the two, \
+             and a start runs it once that name is gone"
         );
         assert_eq!(store.kept(), []);
     }
