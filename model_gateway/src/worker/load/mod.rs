@@ -1,4 +1,6 @@
 pub mod capacity;
+#[cfg(test)]
+mod gateway_tests;
 pub mod monitor;
 pub mod state;
 

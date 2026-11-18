@@ -121,6 +121,15 @@ fn effective_bootstrap_port(worker: &dyn Worker) -> Option<(u16, BootstrapPortSo
     default_applies.then_some((DEFAULT_BOOTSTRAP_PORT, BootstrapPortSource::Default))
 }
 
+/// `effective_bootstrap_port` for a host's tests: the decision beside the
+/// connector mode the host's request path mints.
+#[cfg(test)]
+pub(crate) fn effective_bootstrap_port_for_test(
+    worker: &dyn Worker,
+) -> Option<(u16, BootstrapPortSource)> {
+    effective_bootstrap_port(worker)
+}
+
 /// The address the probes check for `worker`: the host the side was
 /// registered under and the port of [`effective_bootstrap_port`] (the one it
 /// was registered with, or the default its partners are handed), with where
@@ -264,10 +273,7 @@ mod tests {
     use metrics_exporter_prometheus::PrometheusBuilder;
 
     use super::*;
-    use crate::{
-        routers::common::kv_transfer::{kv_connector_mode, KvConnectorMode},
-        worker::{test_support::RefusedAddress, BasicWorkerBuilder},
-    };
+    use crate::worker::{test_support::RefusedAddress, BasicWorkerBuilder};
 
     /// A worker of one type and runtime, with the connector and the
     /// bootstrap port it was registered with.
@@ -413,32 +419,6 @@ mod tests {
             effective_bootstrap_port(&rendezvous),
             Some((8998, BootstrapPortSource::Registered))
         );
-    }
-
-    /// For a prefill worker of the runtime that names a KV
-    /// connector the probe's decision is the request path's: the
-    /// default is probed exactly when the connector mode minted for the worker
-    /// hands the decode worker a bootstrap address on that port.
-    #[test]
-    fn the_default_port_decision_follows_the_connector_mode_the_request_path_mints() {
-        for connector in [
-            None,
-            Some(MOONCAKE_CONNECTOR),
-            Some("NixlConnector"),
-            Some("MoRIIOConnector"),
-            Some("LMCacheConnector"),
-        ] {
-            let worker = worker_of(WorkerType::Prefill, RuntimeType::Vllm, connector, None);
-            let minted = matches!(
-                kv_connector_mode(connector, worker.bootstrap_host(), None, None),
-                KvConnectorMode::Mooncake { port, .. } if port == u32::from(DEFAULT_BOOTSTRAP_PORT)
-            );
-            assert_eq!(
-                effective_bootstrap_port(&worker).is_some(),
-                minted,
-                "{connector:?}"
-            );
-        }
     }
 
     #[tokio::test]

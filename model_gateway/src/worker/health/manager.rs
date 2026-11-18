@@ -1051,6 +1051,15 @@ async fn read_kv_engine_id(worker: &dyn Worker) -> Result<Option<String>, String
         .map_err(|e| format!("Failed to fetch gRPC server info: {e}"))
 }
 
+/// `read_kv_engine_id` for a host's tests: the read through the host's own
+/// connector, over an engine on the wire.
+#[cfg(test)]
+pub(crate) async fn read_kv_engine_id_for_test(
+    worker: &dyn Worker,
+) -> Result<Option<String>, String> {
+    read_kv_engine_id(worker).await
+}
+
 /// A PD worker that answers its probe again may be a new engine process on
 /// the same address, with a new KV transfer engine id (#2491); a worker
 /// registered while its engine was still coming up may have none at all.

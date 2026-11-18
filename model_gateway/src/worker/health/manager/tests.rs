@@ -173,49 +173,6 @@ async fn the_engine_id_read_dials_the_base_address_of_a_rank_row() {
     );
 }
 
-/// The read end to end, through the gateway's own connector, over a mock
-/// engine that reports an id: a plain row, a rank row and a worker registered
-/// under an HTTP scheme each read the reported id, and an id reported empty
-/// reads as none.
-#[tokio::test]
-async fn the_engine_id_read_answers_the_id_an_engine_reports() {
-    let (url, engine) = mock_engine_on_wire("m", mock_worker::config::SchedulerWire::Vllm).await;
-    let port: u16 = url
-        .rsplit(':')
-        .next()
-        .and_then(|port| port.parse().ok())
-        .expect("the mock engine's port");
-    let report = |id: &str| {
-        let mut patch = serde_json::Map::new();
-        patch.insert("kv_engine_id".to_string(), id.into());
-        mock_worker::overrides::for_port(port).patch_info(&patch);
-    };
-    let row = |address: &str, rank: Option<(usize, usize)>| {
-        let mut builder = BasicWorkerBuilder::new(address)
-            .worker_type(WorkerType::Prefill)
-            .connection_mode(ConnectionMode::Grpc)
-            .runtime_type(RuntimeType::Vllm);
-        if let Some((rank, size)) = rank {
-            builder = builder.dp_config(rank, size);
-        }
-        builder.build()
-    };
-    let grpc = url.replacen("http://", "grpc://", 1);
-    let reported = || Ok::<_, String>(Some("eng".to_string()));
-
-    report("eng");
-    assert_eq!(read_kv_engine_id(&row(&grpc, None)).await, reported());
-    assert_eq!(
-        read_kv_engine_id(&row(&grpc, Some((1, 2)))).await,
-        reported()
-    );
-    assert_eq!(read_kv_engine_id(&row(&url, None)).await, reported());
-
-    report("");
-    assert_eq!(read_kv_engine_id(&row(&grpc, None)).await, Ok(None));
-    engine.abort();
-}
-
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use http::{header::AUTHORIZATION, HeaderMap};
 use openai_protocol::{
@@ -224,16 +181,13 @@ use openai_protocol::{
 };
 
 use super::*;
-use crate::{
-    routers::grpc::test_engine::mock_engine_on_wire,
-    worker::{
-        connection::engine::{EngineConnection, EngineConnector, ZmqLink},
-        health::circuit_breaker::CircuitState,
-        identity::builder,
-        test_support::{CountingConnector, RefusedAddress},
-        BasicWorkerBuilder, ConnectionMode, RuntimeType, Worker, WorkerError, WorkerRegistry,
-        WorkerType,
-    },
+use crate::worker::{
+    connection::engine::{EngineConnection, EngineConnector, ZmqLink},
+    health::circuit_breaker::CircuitState,
+    identity::builder,
+    test_support::{CountingConnector, RefusedAddress},
+    BasicWorkerBuilder, ConnectionMode, RuntimeType, Worker, WorkerError, WorkerRegistry,
+    WorkerType,
 };
 
 fn make_worker(url: &str, success_threshold: u32, failure_threshold: u32) -> Arc<dyn Worker> {
