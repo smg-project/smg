@@ -1034,7 +1034,7 @@ class RouterArgs:
             f"--{prefix}prefill-cost-kv-pressure-weight",
             type=float,
             default=RouterArgs.prefill_cost_kv_pressure_weight,
-            help="KV-pressure time weight for prefill_cost (regular gRPC only)",
+            help="KV-pressure time weight for prefill_cost",
         )
         routing_group.add_argument(
             f"--{prefix}prefill-cost-default-throughput",

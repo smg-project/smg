@@ -88,13 +88,13 @@ impl RouterFactory {
                         ctx,
                     ),
                     RoutingMode::OpenAI { .. } => {
-                        return Err("OpenAI mode requires HTTP connection_mode".to_string())
+                        return Err("OpenAI mode requires HTTP connection_mode".to_string());
                     }
                     RoutingMode::Anthropic { .. } => {
-                        return Err("Anthropic mode requires HTTP connection_mode".to_string())
+                        return Err("Anthropic mode requires HTTP connection_mode".to_string());
                     }
                     RoutingMode::Gemini { .. } => {
-                        return Err("Gemini mode requires HTTP connection_mode".to_string())
+                        return Err("Gemini mode requires HTTP connection_mode".to_string());
                     }
                 }
                 let mode = grpc_mode(&ctx.router_config).ok_or_else(|| {
@@ -188,10 +188,12 @@ impl RouterFactory {
         main_policy_config: &PolicyConfig,
         ctx: &Arc<AppContext>,
     ) {
-        let prefill_policy =
-            PolicyFactory::create_from_config(prefill_policy_config.unwrap_or(main_policy_config));
-        let decode_policy =
-            PolicyFactory::create_from_config(decode_policy_config.unwrap_or(main_policy_config));
+        let prefill_policy = PolicyFactory::create_without_reservations(
+            prefill_policy_config.unwrap_or(main_policy_config),
+        );
+        let decode_policy = PolicyFactory::create_without_reservations(
+            decode_policy_config.unwrap_or(main_policy_config),
+        );
 
         ctx.policy_registry.set_prefill_policy(prefill_policy);
         ctx.policy_registry.set_decode_policy(decode_policy);
@@ -307,6 +309,46 @@ impl RouterFactory {
 mod grpc_router_type_tests {
     use super::*;
     use crate::routers::grpc::testing::grpc_ctx;
+
+    #[test]
+    fn prefill_cost_default_does_not_become_a_pd_role_policy() {
+        use crate::{
+            app_context::testing::app_context_for_tests, config::RouterConfig,
+            policies::as_cache_aware, worker::WorkerRegistry,
+        };
+
+        let policy = PolicyConfig::PrefillCost {
+            block_size: 64,
+            kv_pressure_weight: 0.15,
+            mean_prefill_tokens: 1024,
+            default_throughput: 2000.0,
+        };
+        let config = RouterConfig::builder()
+            .policy(policy.clone())
+            .build_unchecked();
+        let ctx = app_context_for_tests(config, Arc::new(WorkerRegistry::new()), None);
+        RouterFactory::set_epd_policies(None, None, Some(&PolicyConfig::RoundRobin), &policy, &ctx);
+        assert_eq!(
+            ctx.policy_registry.get_prefill_policy().name(),
+            "cache_aware"
+        );
+        assert_eq!(
+            ctx.policy_registry.get_decode_policy().name(),
+            "round_robin"
+        );
+        assert_eq!(
+            ctx.policy_registry.get_encode_policy().name(),
+            "consistent_hashing"
+        );
+        let prefill = ctx.policy_registry.get_prefill_policy();
+        assert_eq!(
+            as_cache_aware(prefill.as_ref())
+                .unwrap()
+                .config_for_test()
+                .block_size,
+            64
+        );
+    }
 
     #[tokio::test]
     async fn grpc_router_type_reflects_disaggregation_mode() {

@@ -34,8 +34,8 @@ use crate::{
         extract_routing_key_hint_named, parse_routing_tokens_hint, ROUTING_KEY_HINT_MAX_BYTES,
     },
     worker::{
-        identity::endpoint::Endpoint, load::state::LoadReceiver, KvEventMonitor, LoadConsumer,
-        RequestCompletionSink, Worker, WorkerType,
+        identity::endpoint::Endpoint, load::state::LoadReceiver, ConnectionMode, KvEventMonitor,
+        LoadConsumer, RequestCompletionSink, Worker, WorkerType,
     },
 };
 
@@ -145,6 +145,9 @@ pub struct PolicyRegistry {
     /// Default policy instance (cached, immutable after creation)
     default_policy: Arc<dyn LoadBalancingPolicy>,
 
+    /// Cache-aware routing for HTTP and ZMQ pools under a prefill-cost default.
+    fallback_policy: Option<Arc<dyn LoadBalancingPolicy>>,
+
     /// Operator config the default policy was built from; hinted per-model
     /// policies of the same type are built from it so they inherit the
     /// operator's tunables.
@@ -251,7 +254,12 @@ impl PolicyRegistry {
                 }
             })
             .collect();
-        let text_needs = TextNeeds::of(default_policy.as_ref());
+        let fallback_policy = matches!(default_policy_config, PolicyConfig::PrefillCost { .. })
+            .then(|| PolicyFactory::create_without_reservations(&default_policy_config));
+        let mut text_needs = TextNeeds::of(default_policy.as_ref());
+        if let Some(fallback) = &fallback_policy {
+            text_needs = text_needs.join(TextNeeds::of(fallback.as_ref()));
+        }
         Self {
             reservation_ledger: Arc::new(
                 super::prefill_cost::reservation::ReservationLedger::default(),
@@ -260,6 +268,7 @@ impl PolicyRegistry {
             text_needs: Arc::new(AtomicU8::new(text_needs.0)),
             text_needs_refresh: Arc::new(Mutex::new(())),
             default_policy,
+            fallback_policy,
             default_policy_config,
             prefill_policy: Arc::new(OnceLock::new()),
             decode_policy: Arc::new(OnceLock::new()),
@@ -557,6 +566,9 @@ impl PolicyRegistry {
         // This covers the default_policy (created before the monitor was available)
         // and any model/PD policies that were already set up.
         Self::maybe_inject_monitor(&self.default_policy, monitor.as_ref());
+        if let Some(fallback) = &self.fallback_policy {
+            Self::maybe_inject_monitor(fallback, monitor.as_ref());
+        }
         if let Some(p) = self.prefill_policy.get() {
             Self::maybe_inject_monitor(p, monitor.as_ref());
         }
@@ -610,6 +622,9 @@ impl PolicyRegistry {
             }
         };
         once(&self.default_policy);
+        if let Some(fallback) = &self.fallback_policy {
+            once(fallback);
+        }
         for role in [
             &self.prefill_policy,
             &self.decode_policy,
@@ -636,6 +651,9 @@ impl PolicyRegistry {
             guard.clone_from(&adapter);
         }
         Self::maybe_inject_mesh_tree_sync(&self.default_policy, adapter.as_ref());
+        if let Some(fallback) = &self.fallback_policy {
+            Self::maybe_inject_mesh_tree_sync(fallback, adapter.as_ref());
+        }
         if let Some(p) = self.prefill_policy.get() {
             Self::maybe_inject_mesh_tree_sync(p, adapter.as_ref());
         }
@@ -680,7 +698,14 @@ impl PolicyRegistry {
             WorkerType::Prefill => self.get_prefill_policy(),
             WorkerType::Decode => self.get_decode_policy(),
             WorkerType::Encode => self.get_encode_policy(),
-            WorkerType::Regular => self.get_policy_or_default(worker.model_id()),
+            WorkerType::Regular => {
+                let policy = self.get_policy_or_default(worker.model_id());
+                if policy.needs_reservation() && *worker.connection_mode() != ConnectionMode::Grpc {
+                    self.get_fallback_policy()
+                } else {
+                    policy
+                }
+            }
         }
     }
 
@@ -776,6 +801,32 @@ impl PolicyRegistry {
         Arc::clone(&self.default_policy)
     }
 
+    /// Default for routes that cannot carry prefill-cost reservations.
+    fn get_fallback_policy(&self) -> Arc<dyn LoadBalancingPolicy> {
+        self.fallback_policy
+            .as_ref()
+            .map_or_else(|| self.get_default_policy(), Arc::clone)
+    }
+
+    /// Resolve regular routing from the candidates' transport, not from the
+    /// presence of a request lease. Native gRPC still requires that lease.
+    pub(crate) fn policy_for_regular_workers(
+        &self,
+        model_id: &str,
+        workers: &[Arc<dyn Worker>],
+    ) -> Arc<dyn LoadBalancingPolicy> {
+        let policy = self.get_policy_or_default(model_id);
+        if policy.needs_reservation()
+            && workers
+                .iter()
+                .any(|worker| *worker.connection_mode() != ConnectionMode::Grpc)
+        {
+            self.get_fallback_policy()
+        } else {
+            policy
+        }
+    }
+
     /// Get policy for a model, or default if not found
     pub fn get_policy_or_default(&self, model_id: &str) -> Arc<dyn LoadBalancingPolicy> {
         self.get_policy(model_id)
@@ -808,6 +859,9 @@ impl PolicyRegistry {
             push(policy);
         }
         push(Arc::clone(&self.default_policy));
+        if let Some(fallback) = &self.fallback_policy {
+            push(Arc::clone(fallback));
+        }
         if let Some(p) = self.prefill_policy.get() {
             push(Arc::clone(p));
         }
@@ -937,7 +991,7 @@ impl PolicyRegistry {
         self.prefill_policy
             .get()
             .map(Arc::clone)
-            .unwrap_or_else(|| self.get_default_policy())
+            .unwrap_or_else(|| self.get_fallback_policy())
     }
 
     /// Get the decode policy for PD mode, or default if not set (lock-free)
@@ -945,7 +999,7 @@ impl PolicyRegistry {
         self.decode_policy
             .get()
             .map(Arc::clone)
-            .unwrap_or_else(|| self.get_default_policy())
+            .unwrap_or_else(|| self.get_fallback_policy())
     }
 
     /// Get the encode policy for EPD mode. Falls back to consistent_hashing so
@@ -1000,6 +1054,9 @@ impl PolicyRegistry {
     fn refresh_text_needs(&self) {
         let _one_at_a_time = self.text_needs_refresh.lock();
         let mut needs = TextNeeds::of(self.default_policy.as_ref());
+        if let Some(fallback) = &self.fallback_policy {
+            needs = needs.join(TextNeeds::of(fallback.as_ref()));
+        }
         for entry in self.model_policies.iter() {
             let policy = entry.value().as_ref();
             needs = needs.join(TextNeeds::of(policy));
@@ -1030,27 +1087,18 @@ impl PolicyRegistry {
         self.policy_for_worker(worker).needs_kv_events()
     }
 
-    /// Initialize cache-aware policy with workers if applicable
-    /// This should be called after workers are registered for a model
+    /// Give the pool its roots in the cache-aware policy that routes it.
     pub fn init_cache_aware_policy(&self, model_id: &str, workers: &[Arc<dyn Worker>]) {
-        // Get the policy for this model
-        if let Some(policy) = self.get_policy(model_id) {
-            if let Some(cache_aware) = as_cache_aware(policy.as_ref()) {
-                debug!(
-                    "Initializing cache-aware policy with {} workers for model {}",
-                    workers.len(),
-                    model_id
-                );
-                cache_aware.init_workers(workers);
-            }
+        let policy = self.policy_for_regular_workers(model_id, workers);
+        if let Some(cache_aware) = as_cache_aware(policy.as_ref()) {
+            cache_aware.init_workers(workers);
         }
     }
 
     /// Remove a worker from cache-aware policy if applicable
     /// This should be called when a worker is being removed
     pub fn remove_worker_from_cache_aware(&self, model_id: &str, worker_url: &str) {
-        // Get the policy for this model
-        if let Some(policy) = self.get_policy(model_id) {
+        for policy in self.policies_for_model(model_id) {
             if let Some(cache_aware) = as_cache_aware(policy.as_ref()) {
                 cache_aware.remove_worker_by_url(worker_url);
                 debug!(
@@ -1217,6 +1265,163 @@ mod tests {
         assert!(registry.needs_backend_loads());
         assert!(registry.worker_needs_kv_events(regular.as_ref()));
         assert!(registry.pair_needs_request_text());
+    }
+
+    #[test]
+    fn prefill_cost_keeps_http_routing_beside_native_grpc() {
+        use crate::{
+            routers::common::placement::{select_from, PlacementInputs},
+            worker::{
+                test_support::{grpc_worker, registry_with},
+                RuntimeType,
+            },
+        };
+
+        let policies = PolicyRegistry::new(PolicyConfig::PrefillCost {
+            block_size: 16,
+            kv_pressure_weight: 0.15,
+            mean_prefill_tokens: 1024,
+            default_throughput: 2000.0,
+        });
+        let grpc = grpc_worker("grpc://qwen:8080", "qwen", RuntimeType::Sglang, &[]);
+        let http = ready_worker("http://yagpt:8080", "yagpt");
+        let workers = registry_with(vec![Arc::clone(&grpc), Arc::clone(&http)]);
+        for worker in [&grpc, &http] {
+            policies.on_worker_added(worker.model_id(), None);
+        }
+        let http_pool = [Arc::clone(&http)];
+        let fallback = policies.policy_for_regular_workers("yagpt", &http_pool);
+        assert_eq!(fallback.name(), "cache_aware");
+        assert!(Arc::ptr_eq(
+            &fallback,
+            &policies.policy_for_worker(http.as_ref())
+        ));
+        assert!(select_from(
+            &workers,
+            &policies,
+            "yagpt",
+            &http_pool,
+            PlacementInputs::default()
+        )
+        .is_some());
+
+        let grpc_pool = [Arc::clone(&grpc)];
+        assert_eq!(
+            policies
+                .policy_for_regular_workers("qwen", &grpc_pool)
+                .name(),
+            "prefill_cost"
+        );
+        assert!(select_from(
+            &workers,
+            &policies,
+            "qwen",
+            &grpc_pool,
+            PlacementInputs::default()
+        )
+        .is_none());
+        let tokens = [1, 2, 3];
+        let slot = policies.reservation_slot();
+        let selected = select_from(
+            &workers,
+            &policies,
+            "qwen",
+            &grpc_pool,
+            PlacementInputs {
+                tokens: Some(&tokens),
+                reservation: Some(&slot),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(slot.take_for(selected.url()).is_some());
+
+        let (_tx, rx) = watch::channel(LoadSnapshot::from_loads_for_test(Vec::new()));
+        policies.set_load_receiver(Some(rx));
+        policies.set_kv_event_monitor(Some(Arc::new(KvEventMonitor::new())));
+        let cache = as_cache_aware(fallback.as_ref()).unwrap();
+        assert!(cache.has_load_receiver_for_test());
+        assert!(cache.kv_event_monitor_is_set_for_test());
+        assert!(policies.any_policy_needs_request_text(None));
+        policies.init_cache_aware_policy("yagpt", &http_pool);
+        assert_eq!(cache.tree_tenants_for_test("yagpt"), [http.url()]);
+        policies.remove_workers_from_cache_aware("yagpt", &HashSet::from([http.url().to_string()]));
+        policies.on_model_unserved("yagpt");
+        assert!(cache.tree_tenants_for_test("yagpt").is_empty());
+        assert!(policies.get_policy("yagpt").is_none());
+        assert!(policies.any_policy_needs_request_text(None));
+        assert!(Arc::ptr_eq(
+            &fallback,
+            &policies.policy_for_regular_workers("yagpt", &http_pool)
+        ));
+    }
+
+    #[test]
+    fn zmq_placement_uses_cache_routing_without_booking_native_prefill_work() {
+        use crate::{
+            routers::common::placement::{select_from, PlacementInputs},
+            worker::{
+                test_support::{grpc_worker, no_health_check, registry_with},
+                BasicWorkerBuilder, RuntimeType,
+            },
+        };
+
+        let policies = PolicyRegistry::new(PolicyConfig::PrefillCost {
+            block_size: 16,
+            kv_pressure_weight: 0.15,
+            mean_prefill_tokens: 1024,
+            default_throughput: 2000.0,
+        });
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("tcp://zmq:8000")
+                .connection_mode(ConnectionMode::Zmq)
+                .health_config(no_health_check())
+                .build(),
+        );
+        let pool = [Arc::clone(&worker)];
+        let workers = registry_with(vec![Arc::clone(&worker)]);
+        let slot = policies.reservation_slot();
+        let selected = select_from(
+            &workers,
+            &policies,
+            worker.model_id(),
+            &pool,
+            PlacementInputs {
+                reservation: Some(&slot),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            policies.policy_for_worker(selected.as_ref()).name(),
+            "cache_aware"
+        );
+        assert!(slot.take_for(selected.url()).is_none());
+
+        let native = grpc_worker(
+            "grpc://native:8080",
+            worker.model_id(),
+            RuntimeType::Sglang,
+            &[],
+        );
+        workers.register(Arc::clone(&native)).unwrap();
+        worker.increment_load();
+        let mixed = [Arc::clone(&native), worker];
+        assert_eq!(
+            policies
+                .policy_for_regular_workers(native.model_id(), &mixed)
+                .name(),
+            "cache_aware"
+        );
+        let selected = select_from(
+            &workers,
+            &policies,
+            native.model_id(),
+            &mixed,
+            PlacementInputs::default(),
+        )
+        .unwrap();
+        assert_eq!(selected.url(), native.url());
     }
 
     /// An encode worker's KV-event question is the encode policy's own

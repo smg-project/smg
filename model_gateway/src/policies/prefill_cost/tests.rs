@@ -571,10 +571,16 @@ fn actual_placement_all_vetoed_fallback_still_hands_off_a_full_batch_lease() {
         config::PolicyConfig,
         policies::PolicyRegistry,
         routers::common::placement::{select_from, PlacementInputs},
-        worker::test_support::registry_with,
+        worker::{
+            test_support::{grpc_worker, registry_with},
+            RuntimeType,
+        },
     };
 
-    let workers = make_workers(&[COLD, HOLDER]);
+    let workers: Vec<_> = ["grpc://cold:8000", "grpc://holder:8000"]
+        .iter()
+        .map(|url| grpc_worker(url, "llama-3", RuntimeType::Sglang, &[]))
+        .collect();
     let registry = registry_with(workers.clone());
     for worker in &workers {
         registry.set_worker_overloaded(worker, true);

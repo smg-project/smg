@@ -34,8 +34,21 @@ Select the policy in the router configuration. A worker's
 default is also `prefill_cost`. With another default, the label follows the
 unknown-policy fallback and leaves that default in place.
 
-Use a regular worker pool with IGW disabled. HTTP and ZMQ workers and PD/EPD
-pools are unsupported.
+IGW can serve native gRPC and HTTP models side by side:
+
+```sh
+smg --enable-igw --policy prefill_cost
+```
+
+Register workers through discovery or the workers API. Regular native gRPC
+pools use `prefill_cost`. A regular pool containing HTTP or ZMQ workers uses
+`cache_aware`; PD/EPD roles also use `cache_aware` unless another role policy
+is configured. The fallback keeps the standard `cache_aware` settings and
+inherits `block_size`. Engine-reported KV block sizes still take precedence
+for each model.
+
+Outside IGW, start `prefill_cost` with regular native gRPC workers. It is not
+a PD/EPD role policy.
 
 ## Choosing a worker
 

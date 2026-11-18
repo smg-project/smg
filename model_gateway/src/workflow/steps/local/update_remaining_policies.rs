@@ -4,8 +4,9 @@ use async_trait::async_trait;
 use tracing::{debug, info};
 use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
+#[cfg(test)]
+use crate::policies::as_cache_aware;
 use crate::{
-    policies::as_cache_aware,
     worker::identity::endpoint::Endpoint,
     workflow::data::{require_app_context, WorkerRemovalWorkflowData},
 };
@@ -34,18 +35,16 @@ impl StepExecutor<WorkerRemovalWorkflowData> for UpdateRemainingPoliciesStep {
         for model_id in affected_models {
             let remaining_workers = app_context.worker_registry.get_by_model(model_id);
 
-            if let Some(policy) = app_context.policy_registry.get_policy(model_id) {
-                if as_cache_aware(policy.as_ref()).is_some() && !remaining_workers.is_empty() {
-                    app_context
-                        .policy_registry
-                        .init_cache_aware_policy(model_id, &remaining_workers);
+            if !remaining_workers.is_empty() {
+                app_context
+                    .policy_registry
+                    .init_cache_aware_policy(model_id, &remaining_workers);
 
-                    debug!(
-                        "Updated cache-aware policy for model {} ({} remaining workers)",
-                        model_id,
-                        remaining_workers.len()
-                    );
-                }
+                debug!(
+                    "Updated cache-aware policy for model {} ({} remaining workers)",
+                    model_id,
+                    remaining_workers.len()
+                );
             }
         }
 

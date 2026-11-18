@@ -13,6 +13,25 @@ use crate::config::PolicyConfig;
 pub struct PolicyFactory;
 
 impl PolicyFactory {
+    /// Use cache-aware routing on paths that cannot carry prefill-cost leases.
+    pub(crate) fn create_without_reservations(
+        config: &PolicyConfig,
+    ) -> Arc<dyn LoadBalancingPolicy> {
+        match config {
+            PolicyConfig::PrefillCost { block_size, .. } => {
+                Arc::new(CacheAwarePolicy::with_config(CacheAwareConfig {
+                    block_size: *block_size,
+                    // A mixed pool can finish on either transport; keep the
+                    // fallback free of policy-owned completion bookkeeping.
+                    selection_policy: None,
+                    selection_accounting_ttl_ms: 0,
+                    ..Default::default()
+                }))
+            }
+            _ => Self::create_from_config(config),
+        }
+    }
+
     /// Create a policy from configuration
     pub fn create_from_config(config: &PolicyConfig) -> Arc<dyn LoadBalancingPolicy> {
         match config {

@@ -461,7 +461,7 @@ fn select_pass(
     whole: Option<&Arc<[Arc<dyn Worker>]>>,
     inputs: PlacementInputs<'_>,
 ) -> Result<Arc<dyn Worker>, Miss> {
-    let policy = policies.get_policy_or_default(model_id);
+    let policy = policies.policy_for_regular_workers(model_id, candidates);
 
     // The per-request predicate applies to every entry point, so a caller
     // that sets it can never dispatch to a worker it rejects. Each candidate

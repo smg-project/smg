@@ -6,12 +6,11 @@ use async_trait::async_trait;
 use tracing::debug;
 use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
-use crate::{
-    policies::as_cache_aware,
-    workflow::{
-        data::{require_app_context, WorkerUpdateWorkflowData},
-        steps::shared::start_kv_stream,
-    },
+#[cfg(test)]
+use crate::policies::as_cache_aware;
+use crate::workflow::{
+    data::{require_app_context, WorkerUpdateWorkflowData},
+    steps::shared::start_kv_stream,
 };
 
 /// Step to update policies for updated workers.
@@ -46,19 +45,17 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdatePoliciesForWorkerStep {
         for model_id in &affected_models {
             let workers = app_context.worker_registry.get_by_model(model_id);
 
-            if let Some(policy) = app_context.policy_registry.get_policy(model_id) {
-                if as_cache_aware(policy.as_ref()).is_some() && !workers.is_empty() {
-                    // Re-initialize cache-aware policy with updated workers
-                    app_context
-                        .policy_registry
-                        .init_cache_aware_policy(model_id, &workers);
+            if !workers.is_empty() {
+                // Re-initialize cache-aware policy with updated workers
+                app_context
+                    .policy_registry
+                    .init_cache_aware_policy(model_id, &workers);
 
-                    debug!(
-                        "Updated cache-aware policy for model {} ({} workers)",
-                        model_id,
-                        workers.len()
-                    );
-                }
+                debug!(
+                    "Updated cache-aware policy for model {} ({} workers)",
+                    model_id,
+                    workers.len()
+                );
             }
 
             // Only a registration builds a model's policy: an update that

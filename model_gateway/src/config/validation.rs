@@ -828,19 +828,22 @@ impl ConfigValidator {
         }
         let supported = match &config.mode {
             RoutingMode::Regular { worker_urls } => {
-                !config.enable_igw
-                    && config.connection_mode == ConnectionMode::Grpc
-                    && worker_urls
-                        .iter()
-                        .all(|url| url.starts_with("grpc://") || url.starts_with("grpcs://"))
+                config.enable_igw
+                    || (config.connection_mode == ConnectionMode::Grpc
+                        && worker_urls
+                            .iter()
+                            .all(|url| url.starts_with("grpc://") || url.starts_with("grpcs://")))
             }
             _ => false,
         };
         if supported {
             Ok(())
         } else {
-            Err(ConfigError::invalid_value("policy", "prefill_cost",
-                "prefill_cost requires regular native gRPC workers; IGW, HTTP, ZMQ and PD/EPD are not supported"))
+            Err(ConfigError::invalid_value(
+                "policy",
+                "prefill_cost",
+                "prefill_cost requires regular native gRPC routing or IGW; PD/EPD role policies are not supported",
+            ))
         }
     }
 
@@ -6180,14 +6183,21 @@ mod tests {
             let mut config = config();
             ConfigValidator::validate_prefill_cost_mode(&config).unwrap();
             config.enable_igw = true;
-            assert!(ConfigValidator::validate_prefill_cost_mode(&config).is_err());
-            // IGW can discover HTTP workers and derive role policies later even with
-            // an empty regular native-gRPC startup list.
+            ConfigValidator::validate_prefill_cost_mode(&config).unwrap();
+            config.connection_mode = ConnectionMode::Http;
             config.mode = RoutingMode::Regular {
                 worker_urls: vec![],
             };
-            assert!(ConfigValidator::validate_prefill_cost_mode(&config).is_err());
+            ConfigValidator::validate_prefill_cost_mode(&config).unwrap();
+            config.mode = RoutingMode::Regular {
+                worker_urls: vec!["grpc://qwen:8080".into(), "http://yagpt:8080".into()],
+            };
+            ConfigValidator::validate_prefill_cost_mode(&config).unwrap();
             config.enable_igw = false;
+            config.connection_mode = ConnectionMode::Grpc;
+            config.mode = RoutingMode::Regular {
+                worker_urls: vec![],
+            };
             ConfigValidator::validate_prefill_cost_mode(&config).unwrap();
             config.connection_mode = ConnectionMode::Http;
             assert!(ConfigValidator::validate_prefill_cost_mode(&config)
