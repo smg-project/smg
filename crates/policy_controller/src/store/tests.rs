@@ -1169,36 +1169,42 @@ fn manual_ruled(generation: u64, ttl_s: u32, sweep_s: u32) -> crate::spec::Appli
 
 #[cfg(feature = "controller")]
 #[test]
-fn the_pins_sweep_drops_the_pins_past_the_rules_ttl_once_an_interval() {
+fn the_pins_sweep_drops_each_pin_past_its_own_end_once_an_interval() {
     let store = MemoryStore::new();
     let now = Instant::now();
     let t = |seconds: u64| now + Duration::from_secs(seconds);
     let sessions: &dyn SessionsStore = &store;
-    // No sessions rule stands: no pass runs, whatever the age of a pin.
-    sessions.pin(1, WorkerId(1), now);
+    // No sessions rule ever stood: no pass runs, whatever the end of a
+    // pin.
+    sessions.pin(1, WorkerId(1), now, Some(t(60)));
     assert_eq!(store.sweep_pins(t(1_000_000)), 0);
     store
         .apply(manual_ruled(1, 60, 30))
         .expect("a first generation");
     for key in 2..=1_001 {
-        sessions.pin(key, WorkerId(1), t(10));
+        sessions.pin(key, WorkerId(1), t(10), Some(t(70)));
     }
-    assert_eq!(sessions.len(), 1_001);
-    // The first pass: the pin of second 0 is past the TTL at second 61.
+    // One key its rule keeps with no TTL.
+    sessions.pin(1_002, WorkerId(1), t(10), None);
+    assert_eq!(sessions.len(), 1_002);
+    // The first pass: the pin that ends at second 60 is past it at 61.
     assert_eq!(store.sweep_pins(t(61)), 1);
-    // A tick inside the interval walks nothing, though every pin is old.
+    // A tick inside the interval walks nothing, though a thousand pins
+    // ended.
     assert_eq!(store.sweep_pins(t(80)), 0);
-    assert_eq!(sessions.len(), 1_000);
-    // The next pass due: the thousand pins of second 10 leave together,
-    // so the table holds the keys of one TTL and one interval at most.
+    assert_eq!(sessions.len(), 1_001);
+    // The next pass due: the thousand pins that ended at second 70 leave
+    // together, and the pin with no end stays.
     assert_eq!(store.sweep_pins(t(91)), 1_000);
-    assert!(sessions.is_empty());
-    // A rule that keeps its keys for ever: no pass runs.
+    assert_eq!(sessions.len(), 1);
+    // A later generation whose one rule keeps its keys for ever sweeps
+    // nothing of its own: the earlier interval stands, and a pin an
+    // earlier rule ended still leaves.
     store
         .apply(manual_ruled(2, u32::MAX, u32::MAX))
         .expect("a later generation");
-    sessions.pin(1, WorkerId(1), now);
-    assert_eq!(store.sweep_pins(t(1_000_000)), 0);
+    sessions.pin(1, WorkerId(1), t(100), Some(t(110)));
+    assert_eq!(store.sweep_pins(t(121)), 1);
     assert_eq!(sessions.len(), 1);
 }
 
@@ -1215,8 +1221,8 @@ fn a_shorter_sweep_applied_waits_out_no_earlier_interval() {
     store
         .apply(manual_ruled(1, 7_200, 3_600))
         .expect("a first generation");
-    sessions.pin(1, WorkerId(1), now);
-    // The first pass runs at once and finds no pin past the TTL.
+    sessions.pin(1, WorkerId(1), now, Some(t(60)));
+    // The first pass runs at once and finds no pin past its end.
     assert_eq!(store.sweep_pins(t(1)), 0);
     // A generation that sweeps every thirty seconds: its pass is due
     // thirty seconds after the last one, not an hour after it.
@@ -1228,16 +1234,68 @@ fn a_shorter_sweep_applied_waits_out_no_earlier_interval() {
     assert!(sessions.is_empty());
 }
 
+/// A generation that sweeps, replaced before the sweep ticked once: its
+/// interval was learned at its apply, so the pins it ended still leave
+/// under a generation that sweeps nothing.
+#[cfg(feature = "controller")]
 #[test]
-fn a_pin_is_written_at_the_commit_and_leaves_with_its_worker_or_its_age() {
+fn a_generation_replaced_before_any_pass_still_leaves_its_interval() {
+    let store = MemoryStore::new();
+    let now = Instant::now();
+    let t = |seconds: u64| now + Duration::from_secs(seconds);
+    let sessions: &dyn SessionsStore = &store;
+    store
+        .apply(manual_ruled(1, 60, 30))
+        .expect("a first generation");
+    sessions.pin(1, WorkerId(1), now, Some(t(60)));
+    store
+        .apply(manual_ruled(2, u32::MAX, u32::MAX))
+        .expect("a later generation");
+    assert_eq!(store.sweep_pins(t(61)), 1);
+    assert!(sessions.is_empty());
+}
+
+/// Two standing rules, one that keeps its keys for ever and one that ends
+/// them: the sweep runs at the interval of the rule that sweeps, each pin
+/// leaves at its own end, and a pin with none stays.
+#[cfg(feature = "controller")]
+#[test]
+fn a_pin_past_its_own_end_leaves_where_another_rule_keeps_its_keys_for_ever() {
+    use crate::spec::{AppliedSpec, PolicySpec};
+
+    let store = MemoryStore::new();
+    let now = Instant::now();
+    let t = |seconds: u64| now + Duration::from_secs(seconds);
+    let sessions: &dyn SessionsStore = &store;
+    let mut document = PolicySpec::preset("manual").expect("a preset of this build");
+    let mut for_ever = document.bindings[0].clone();
+    for_ever.matcher.model = "kept-for-ever".into();
+    let rule = for_ever.sessions.as_mut().expect("the preset's rule");
+    (rule.ttl_s, rule.sweep_s) = (u32::MAX, u32::MAX);
+    let rule = document.bindings[0].sessions.as_mut();
+    let rule = rule.expect("the preset's rule");
+    (rule.ttl_s, rule.sweep_s) = (60, 30);
+    document.bindings.insert(0, for_ever);
+    let spec = AppliedSpec::validate(&document).expect("the document validates");
+    store.apply(spec).expect("a first generation");
+    sessions.pin(1, WorkerId(1), now, Some(t(60)));
+    sessions.pin(2, WorkerId(1), now, None);
+    assert_eq!(store.sweep_pins(t(61)), 1);
+    assert_eq!(sessions.lookup(1), None);
+    assert!(sessions.lookup(2).is_some());
+}
+
+#[test]
+fn a_pin_is_written_at_the_commit_and_leaves_with_its_worker_or_at_its_end() {
     let store = MemoryStore::new();
     let sessions: &dyn SessionsStore = &store;
     let now = Instant::now();
-    sessions.pin(0, WorkerId(1), now);
+    let ends = |seconds: u64| Some(now + Duration::from_secs(seconds));
+    sessions.pin(0, WorkerId(1), now, ends(1));
     assert!(sessions.is_empty(), "the absent key is never pinned");
-    sessions.pin(11, WorkerId(1), now);
-    sessions.pin(12, WorkerId(2), now + Duration::from_secs(5));
-    sessions.pin(11, WorkerId(3), now + Duration::from_secs(1));
+    sessions.pin(11, WorkerId(1), now, ends(1));
+    sessions.pin(12, WorkerId(2), now + Duration::from_secs(5), ends(6));
+    sessions.pin(11, WorkerId(3), now + Duration::from_secs(1), ends(2));
     assert_eq!(
         sessions.lookup(11).map(|pin| pin.worker),
         Some(WorkerId(3)),
@@ -1248,6 +1306,7 @@ fn a_pin_is_written_at_the_commit_and_leaves_with_its_worker_or_its_age() {
         Pin {
             worker: WorkerId(9),
             last_used: now,
+            ends: None,
         },
     );
     assert_eq!(
@@ -1260,6 +1319,7 @@ fn a_pin_is_written_at_the_commit_and_leaves_with_its_worker_or_its_age() {
         Pin {
             worker: WorkerId(9),
             last_used: now,
+            ends: None,
         },
     );
     assert_eq!(sessions.len(), 3);
@@ -2090,9 +2150,9 @@ fn a_removal_and_a_sweep_reach_the_pins_of_every_shard() {
     let first = |i: usize| (i / shards).is_multiple_of(2);
     for (i, key) in (1_u64..).take(keys).enumerate() {
         if first(i) {
-            sessions.pin(key, WorkerId(1), now);
+            sessions.pin(key, WorkerId(1), now, Some(now));
         } else {
-            sessions.pin(key, WorkerId(2), later);
+            sessions.pin(key, WorkerId(2), later, Some(later));
         }
     }
     assert_eq!(sessions.len(), keys);

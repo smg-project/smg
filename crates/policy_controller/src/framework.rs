@@ -2826,26 +2826,30 @@ impl Engine {
         &self.sessions
     }
 
-    /// What ends the pins a host keeps of this generation's sessions rules:
-    /// the longest TTL among the rules and the shortest interval one of
-    /// them sweeps at, both in microseconds. `None` where no rule pins a
-    /// key, and where a rule keeps its keys with no TTL: no instant ends
-    /// such a pin.
-    pub fn pins_horizon(&self) -> Option<(u64, u64)> {
-        let rules = || {
-            self.bindings
-                .iter()
-                .filter_map(|entry| entry.binding.sessions.as_ref())
-        };
-        let mut ttl = 0;
-        for rule in rules() {
-            ttl = ttl.max(rule.ttl_micros?);
-        }
-        let every = rules()
+    /// This generation's sessions rules.
+    fn session_rules(&self) -> impl Iterator<Item = &SessionRule> {
+        self.bindings
+            .iter()
+            .filter_map(|entry| entry.binding.sessions.as_ref())
+    }
+
+    /// How often a host sweeps the pins it keeps of this generation's
+    /// sessions rules: the shortest interval one of them sweeps at, in
+    /// microseconds. `None` where no rule sweeps.
+    pub fn pins_shortest_sweep(&self) -> Option<u64> {
+        self.session_rules()
             .map(|rule| rule.sweep_micros)
             .filter(|every| *every > 0)
-            .min()?;
-        Some((ttl, every))
+            .min()
+    }
+
+    /// The longest TTL among this generation's sessions rules, in
+    /// microseconds: what ends a pin whose own rule its host cannot name.
+    /// `None` where no rule has one.
+    pub fn pins_longest_ttl(&self) -> Option<u64> {
+        self.session_rules()
+            .filter_map(|rule| rule.ttl_micros)
+            .max()
     }
 
     /// What the host must feed before any request exists: every profile's
@@ -7439,7 +7443,7 @@ mod tests {
     }
 
     #[test]
-    fn the_pins_horizon_is_the_longest_ttl_and_the_shortest_sweep_of_the_rules() {
+    fn a_host_reads_the_rules_shortest_sweep_and_their_longest_ttl() {
         let rule = |ttl_micros, sweep_micros| SessionRule {
             assignment: Assignment::Random,
             inflight_cap: 0,
@@ -7464,14 +7468,18 @@ mod tests {
                 Needs::default(),
             )
         };
-        assert_eq!(manual_engine(None).pins_horizon(), None, "no rule");
+        let read = |engine: &Engine| (engine.pins_shortest_sweep(), engine.pins_longest_ttl());
+        assert_eq!(read(&manual_engine(None)), (None, None), "no rule");
         let one = manual_engine(Some(rule(Some(1_000), 100)));
-        assert_eq!(one.pins_horizon(), Some((1_000, 100)));
+        assert_eq!(read(&one), (Some(100), Some(1_000)));
         let both = two(rule(Some(1_000), 100), rule(Some(5_000), 40));
-        assert_eq!(both.pins_horizon(), Some((5_000, 40)));
-        // A rule that keeps its keys with no TTL: no instant ends a pin.
-        let for_ever = two(rule(Some(1_000), 100), rule(None, 0));
-        assert_eq!(for_ever.pins_horizon(), None);
+        assert_eq!(read(&both), (Some(40), Some(5_000)));
+        // A rule that keeps its keys with no TTL sweeps nothing and ends
+        // nothing: the other rule's interval and TTL stand.
+        let mixed = two(rule(Some(1_000), 100), rule(None, 0));
+        assert_eq!(read(&mixed), (Some(100), Some(1_000)));
+        let for_ever = manual_engine(Some(rule(None, 0)));
+        assert_eq!(read(&for_ever), (None, None));
     }
 
     /// One decision for `key` (`0`: no key) drawn by `seed`: the worker and

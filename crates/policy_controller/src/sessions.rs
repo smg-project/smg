@@ -315,6 +315,17 @@ impl SessionTable {
         self.shard(key).lock().get(&key).map(|e| e.pins)
     }
 
+    /// What a host keeps of `key` beside its own pin of record: the pins,
+    /// and the instant the table forgets the key on the decision clock,
+    /// `None` under a rule without a TTL.
+    pub fn held(&self, key: Session) -> Option<(Pins, Option<u64>)> {
+        let key = key.get();
+        self.shard(key).lock().get(&key).map(|entry| {
+            let forgotten = entry.expires_at_micros;
+            (entry.pins, (forgotten != u64::MAX).then_some(forgotten))
+        })
+    }
+
     /// Keys the table holds.
     pub fn len(&self) -> usize {
         self.shards.iter().map(|s| s.lock().len()).sum()
@@ -432,6 +443,28 @@ mod tests {
         // hourly key stays.
         assert_eq!(table.lookup(s(2), 2_000, &RULE), [WorkerId(0); 2]);
         assert_eq!(table.pins(s(1)), Some([WorkerId(1), WorkerId(0)]));
+    }
+
+    /// A host reads a key's pins with the instant its rule forgets it, and
+    /// no instant under a rule without a TTL.
+    #[test]
+    fn a_key_is_held_with_the_instant_its_rule_forgets_it() {
+        let table = SessionTable::new(RULE.sweep_micros);
+        assert_eq!(table.held(s(1)), None);
+        table.lookup(s(1), 50, &RULE);
+        table.dispatched(s(1), SessionVerdict::Pinned, WorkerId(1));
+        assert_eq!(
+            table.held(s(1)),
+            Some(([WorkerId(1), WorkerId(0)], Some(1_050)))
+        );
+        let for_ever = SessionRule {
+            ttl_micros: None,
+            sweep_micros: 0,
+            ..RULE
+        };
+        table.lookup(s(2), 50, &for_ever);
+        table.dispatched(s(2), SessionVerdict::Pinned, WorkerId(2));
+        assert_eq!(table.held(s(2)), Some(([WorkerId(2), WorkerId(0)], None)));
     }
 
     /// A key whose TTL passed is forgotten at its next lookup even when no

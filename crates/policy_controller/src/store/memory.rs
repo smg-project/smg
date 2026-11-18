@@ -84,10 +84,10 @@ pub struct MemoryStore {
     /// hold one shard, and a sweep or a worker's removal walks them one
     /// hold after another.
     sessions: Vec<Mutex<FxHashMap<u64, Pin>>>,
-    /// The instant of the pins' last sweep ([`Self::sweep_pins`]); `None`
-    /// before the first.
+    /// When the pins were last swept and how often a pass runs
+    /// ([`Self::sweep_pins`]).
     #[cfg(feature = "controller")]
-    pins_swept: Mutex<Option<Instant>>,
+    pins_swept: Mutex<PinsSwept>,
     leases: Mutex<Leases>,
     /// What a decision reads, through one load: swapped whole at each
     /// publication.
@@ -501,6 +501,15 @@ impl MemoryStore {
             before
         };
         drop(before);
+        // The pins' sweep learns a generation's interval here, not at its
+        // first pass: a generation replaced between two ticks of the sweep
+        // still leaves its interval for the pins it ended.
+        #[cfg(feature = "controller")]
+        {
+            if let Some(every) = spec.engine().pins_shortest_sweep() {
+                self.pins_swept.lock().every = Some(every);
+            }
+        }
         Ok(())
     }
 
@@ -1835,7 +1844,7 @@ impl MemoryStore {
 }
 
 impl SessionsStore for MemoryStore {
-    fn pin(&self, key: u64, worker: WorkerId, at: Instant) {
+    fn pin(&self, key: u64, worker: WorkerId, at: Instant, ends: Option<Instant>) {
         if key == 0 {
             return;
         }
@@ -1844,6 +1853,7 @@ impl SessionsStore for MemoryStore {
             Pin {
                 worker,
                 last_used: at,
+                ends,
             },
         );
     }
@@ -1868,13 +1878,13 @@ impl SessionsStore for MemoryStore {
             .sum()
     }
 
-    fn expire(&self, before: Instant) -> usize {
+    fn expire(&self, now: Instant) -> usize {
         self.sessions
             .iter()
             .map(|shard| {
                 let mut pins = shard.lock();
                 let count = pins.len();
-                pins.retain(|_, pin| pin.last_used >= before);
+                pins.retain(|_, pin| pin.ends.is_none_or(|ends| ends > now));
                 count - pins.len()
             })
             .sum()
@@ -1896,32 +1906,47 @@ impl SessionsStore for MemoryStore {
     }
 }
 
+/// When the pins were last swept, and at what interval.
+#[cfg(feature = "controller")]
+#[derive(Default)]
+struct PinsSwept {
+    /// The instant of the last pass; `None` before the first.
+    last: Option<Instant>,
+    /// The interval of the last generation one of whose rules swept, in
+    /// microseconds, learned at its apply; `None` before one was applied.
+    every: Option<u64>,
+}
+
 #[cfg(feature = "controller")]
 impl MemoryStore {
-    /// One pass of the pins' sweep at `now`, where one is due: the pins of
-    /// record last used longer ago than the longest TTL among the standing
-    /// generation's sessions rules leave the table. A pass is due once the
-    /// interval of the standing rule that sweeps most often has passed
-    /// since the last one, so a clock that ticks faster walks nothing
-    /// between two passes. The interval is the standing generation's at
-    /// each tick: the pins outlive generations, and an apply that shortens
-    /// it waits out no earlier one. Where a rule keeps its keys with no
-    /// TTL no pass runs. Returns how many pins left.
+    /// One pass of the pins' sweep at `now`, where one is due: each pin of
+    /// record past its own end leaves the table, whatever the other rules
+    /// keep. A pass is due once the interval of the standing rule that
+    /// sweeps most often has passed since the last one, so a clock that
+    /// ticks faster walks nothing between two passes. The interval is the
+    /// standing generation's at each tick: the pins outlive generations,
+    /// and an apply that shortens it waits out no earlier one. Where no
+    /// standing rule sweeps, the interval of the last generation one of
+    /// whose rules swept stands, as its apply left it, so the pins it
+    /// ended still leave; before any such generation no pass runs. Returns
+    /// how many pins left.
     pub(crate) fn sweep_pins(&self, now: Instant) -> usize {
-        let horizon = self.with_world(|world| world.spec().engine().pins_horizon());
-        let Some((ttl, every)) = horizon else {
-            return 0;
-        };
+        let standing = self.with_world(|world| world.spec().engine().pins_shortest_sweep());
         {
             let mut swept = self.pins_swept.lock();
+            let Some(every) = standing.or(swept.every) else {
+                return 0;
+            };
             let interval = Duration::from_micros(every);
-            if swept.is_some_and(|last| now.saturating_duration_since(last) < interval) {
+            if swept
+                .last
+                .is_some_and(|last| now.saturating_duration_since(last) < interval)
+            {
                 return 0;
             }
-            *swept = Some(now);
+            swept.last = Some(now);
         }
-        now.checked_sub(Duration::from_micros(ttl))
-            .map_or(0, |before| SessionsStore::expire(self, before))
+        SessionsStore::expire(self, now)
     }
 }
 
