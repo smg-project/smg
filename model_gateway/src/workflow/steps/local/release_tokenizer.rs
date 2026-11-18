@@ -125,6 +125,14 @@ impl ReleaseTokenizerStep {
     /// cut, and a step cut with the removed entry in hand would lose it.
     /// Whether the entry left.
     fn release(app_context: &Arc<AppContext>, model_id: &str, entry_id: &str) -> bool {
+        let preparations = app_context.tokenizer_preparations.lock();
+        if preparations
+            .values()
+            .any(|models| models.contains(model_id))
+            || app_context.worker_registry.contains_model(model_id)
+        {
+            return false;
+        }
         let Some(entry) = app_context
             .tokenizer_registry
             .remove_if_id(model_id, entry_id)

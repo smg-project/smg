@@ -1268,6 +1268,7 @@ impl CliArgs {
                 l1_max_memory: self.model.tokenizer_cache_l1_max_memory,
             })
             .disable_tokenizer_autoload(self.model.disable_tokenizer_autoload)
+            .wait_for_tokenizer(self.model.wait_for_tokenizer)
             .parser(ParserChoice::parse(&self.model.parser).unwrap_or_default())
             .history_backend(history_backend)
             .memory_config(MemoryConfig {

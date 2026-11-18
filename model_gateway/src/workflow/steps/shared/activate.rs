@@ -27,7 +27,11 @@ fn activation_status(worker: &Arc<dyn Worker>) -> Option<WorkerStatus> {
     if *worker.connection_mode() == ConnectionMode::Zmq {
         return None;
     }
-    (worker.status() != WorkerStatus::Ready).then_some(WorkerStatus::Ready)
+    (!matches!(
+        worker.status(),
+        WorkerStatus::Ready | WorkerStatus::Draining
+    ))
+    .then_some(WorkerStatus::Ready)
 }
 
 #[async_trait]
@@ -45,25 +49,22 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for ActivateWorke
         // capacity on it (a worker flipped Ready directly was counted only
         // if the tracker's recompute for the `Registered` event happened to
         // run after the flip, so a second worker's slots were often never
-        // added), and so does every other subscriber. A worker the registry
-        // no longer holds is flipped directly, as before.
+        // added), and so does every other subscriber.
         let registry = &app_context.worker_registry;
         let mut activated = 0;
         for worker in workers {
-            if let Some(status) = activation_status(worker) {
-                // Only the worker this workflow registered: an upsert of the
-                // same URL that raced it (discovery beside an API call) must
-                // not have its own worker flipped from here.
-                match registry
-                    .get_id_by_url(worker.url())
-                    .filter(|id| registry.get(id).is_some_and(|w| Arc::ptr_eq(&w, worker)))
-                {
-                    Some(worker_id) => {
-                        registry.transition_status(&worker_id, status);
-                    }
-                    None => worker.set_status(status),
-                }
-                activated += 1;
+            if let Some(worker_id) = registry.get_id_by_url(worker.url()) {
+                // Check the object inside the mutation lock: a retired worker
+                // can share runtime state (and revision) with its replacement.
+                let changed =
+                    registry.apply_if_revision(&worker_id, worker.revision(), |current| {
+                        let status = Arc::ptr_eq(current, worker)
+                            .then(|| activation_status(current))
+                            .flatten();
+                        ((), status)
+                    });
+                activated +=
+                    usize::from(changed.is_some_and(|(_, transition)| transition.is_some()));
             }
         }
 

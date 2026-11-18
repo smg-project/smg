@@ -125,6 +125,7 @@ const PLAIN: &[&str] = &[
     "chat_template",
     "model_aliases",
     "disable_tokenizer_autoload",
+    "wait_for_tokenizer",
     "parser",
     "history_backend",
     "memory",

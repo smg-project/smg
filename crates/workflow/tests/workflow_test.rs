@@ -1413,7 +1413,7 @@ async fn test_sweep_reclaims_state_after_waiter_timeout() {
 }
 
 #[tokio::test]
-async fn test_waiter_timeout_reclaims_already_terminal_state() {
+async fn test_waiter_returns_a_settled_terminal_state_at_its_deadline() {
     let engine: WorkflowEngine<TestWorkflowData> = WorkflowEngine::new();
     let notify = Arc::new(Notify::new());
 
@@ -1421,8 +1421,9 @@ async fn test_waiter_timeout_reclaims_already_terminal_state() {
     let instance_id = started(&engine, workflow).await.unwrap();
 
     // The waiter sees Running at t=0 and sleeps 100ms, past its 50ms timeout;
-    // the workflow terminates mid-sleep (notify at t=20ms), so the timeout
-    // branch runs against an already-terminal state and must reclaim it.
+    // the workflow terminates mid-sleep (notify at t=20ms). Return its
+    // settled result before applying the deadline, rather than discard the
+    // state a caller needs for generation-bound cleanup.
     let (result, ()) = tokio::join!(
         engine.wait_for_completion(instance_id, "test", Duration::from_millis(50)),
         async {
@@ -1430,11 +1431,7 @@ async fn test_waiter_timeout_reclaims_already_terminal_state() {
             notify.notify_one();
         }
     );
-    let err = result.unwrap_err();
-    assert!(
-        err.contains("timeout"),
-        "expected timeout error, got: {err}"
-    );
+    result.expect("the completed workflow wins over the waiter deadline");
     assert!(matches!(
         engine.get_status(instance_id).await,
         Err(WorkflowError::NotFound(_))

@@ -324,10 +324,13 @@ pub async fn list_tokenizers(registry: &Arc<TokenizerRegistry>) -> Response {
 /// Handle DELETE /v1/tokenizers/{tokenizer_id}
 pub async fn remove_tokenizer(context: &Arc<AppContext>, tokenizer_id: &str) -> Response {
     // Try to remove by ID first, then by name for backward compatibility
-    let removed = context
-        .tokenizer_registry
-        .remove_by_id(tokenizer_id)
-        .or_else(|| context.tokenizer_registry.remove(tokenizer_id));
+    let removed = {
+        let _preparations = context.tokenizer_preparations.lock();
+        context
+            .tokenizer_registry
+            .remove_by_id(tokenizer_id)
+            .or_else(|| context.tokenizer_registry.remove(tokenizer_id))
+    };
 
     if let Some(entry) = removed {
         context.multimodal_config_registry.remove(&entry.id);

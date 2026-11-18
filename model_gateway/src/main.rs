@@ -1484,6 +1484,10 @@ struct ModelArgs {
     #[arg(long, default_value_t = false, help_heading = "Tokenizer")]
     disable_tokenizer_autoload: bool,
 
+    /// Prepare gateway-local tokenizers before admitting gRPC/ZMQ workers and mesh imports
+    #[arg(long, default_value_t = false, help_heading = "Tokenizer")]
+    wait_for_tokenizer: bool,
+
     /// Enable L0 (exact match) tokenizer cache
     #[arg(long, default_value_t = false, help_heading = "Tokenizer")]
     tokenizer_cache_enable_l0: bool,

@@ -978,7 +978,12 @@ impl JobQueue {
             match state.status {
                 WorkflowStatus::Pending | WorkflowStatus::Running => {
                     match engine.cancel_workflow(state.instance_id).await {
-                        Ok(()) => cancelled += 1,
+                        Ok(()) => {
+                            if let Some(scope) = &state.context.data.tokenizer_preparation {
+                                scope.close();
+                            }
+                            cancelled += 1;
+                        }
                         // Ended between the listing and the cancel: its job's
                         // end path runs as for any registration that ended.
                         Err(WorkflowError::NotFound(_)) => {}
@@ -1207,6 +1212,9 @@ impl JobQueue {
                     registration_mode.clone(),
                     Arc::clone(context),
                 );
+                // Terminal workflow state can outlive the owning job.
+                let preparation = workflow_data.tokenizer_preparation.clone();
+                let _preparation_guard = preparation.as_ref().map(|scope| scope.guard());
                 let instance_id = engines
                     .worker_registration
                     .start_workflow(WorkflowId::new("worker_registration"), workflow_data)
@@ -1223,6 +1231,9 @@ impl JobQueue {
                         .map_err(|e| {
                             format!("Failed to cancel worker registration workflow: {e:?}")
                         })?;
+                    if let Some(scope) = &preparation {
+                        scope.close();
+                    }
                 }
 
                 debug!(
@@ -1232,11 +1243,35 @@ impl JobQueue {
                 );
 
                 let label = Job::workflow_label(&config.url);
-                let state = engines
+                let wait = engines
                     .worker_registration
                     .wait_for_terminal_state(instance_id, &label, timeout_duration)
-                    .await?;
-                let outcome = wfaas::completion_outcome(&state, &label);
+                    .await;
+                let (state, wait_error) = match wait {
+                    Ok(state) => (state, None),
+                    Err(error) if preparation.is_some() => {
+                        let _ = engines
+                            .worker_registration
+                            .cancel_workflow(instance_id)
+                            .await;
+                        if let Some(scope) = &preparation {
+                            scope.close();
+                        }
+                        // A registry commit may have won the deadline race;
+                        // settle cancellation before the identity-bound cleanup.
+                        let state = engines
+                            .worker_registration
+                            .wait_for_terminal_state(instance_id, &label, Duration::from_secs(10))
+                            .await
+                            .map_err(|settle| {
+                                format!("{error}; cancellation did not settle: {settle}")
+                            })?;
+                        (state, Some(error))
+                    }
+                    Err(error) => return Err(error),
+                };
+                let outcome =
+                    wait_error.map_or_else(|| wfaas::completion_outcome(&state, &label), Err);
                 // A POST's registration that put its worker in the registry
                 // and did not finish (a DELETE's cancel landing after the
                 // registry step, a later step's failure) leaves no worker
@@ -1601,6 +1636,7 @@ impl JobQueue {
             }
             Job::RemoveTokenizer { request } => {
                 // Tokenizer removal is synchronous and fast
+                let _preparations = context.tokenizer_preparations.lock();
                 if let Some(entry) = context.tokenizer_registry.remove_by_id(&request.id) {
                     context.multimodal_config_registry.remove(&entry.id);
                     context.worker_loaded_tokenizers.remove(&entry.id);

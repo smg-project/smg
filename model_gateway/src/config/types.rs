@@ -576,6 +576,10 @@ pub struct RouterConfig {
     /// Disable automatic tokenizer loading at startup and worker registration
     #[serde(default)]
     pub disable_tokenizer_autoload: bool,
+    /// Prepare each token-inference worker's tokenizer before publishing it locally,
+    /// including mesh imports. Opt-in: the default keeps asynchronous autoload.
+    #[serde(default)]
+    pub wait_for_tokenizer: bool,
     /// Which parser reads a chat completion's reasoning and tool calls: Symphony
     /// (`symphony`, the default) for the models its registry knows, or the per-model
     /// parsers (`legacy`). A request's `X-SMG-Parser` header overrides it for that request.
@@ -2278,6 +2282,7 @@ impl Default for RouterConfig {
             tokenizer_path: None,
             chat_template: None,
             disable_tokenizer_autoload: false,
+            wait_for_tokenizer: false,
             parser: ParserChoice::default(),
             model_aliases: HashMap::new(),
             history_backend: default_history_backend(),

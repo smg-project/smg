@@ -1405,17 +1405,6 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
         let max_poll_interval = Duration::from_millis(2000);
         let poll_backoff = Duration::from_millis(200);
         loop {
-            if start.elapsed() > timeout_duration {
-                // Only removes already-terminal state; a still-running
-                // workflow stays readable and is reclaimed by the periodic
-                // cleanup task once it terminates.
-                self.state_store.cleanup_if_terminal(instance_id).await;
-                return Err(format!(
-                    "Workflow timeout after {}s for {}",
-                    timeout_duration.as_secs(),
-                    label
-                ));
-            }
             let state = self
                 .get_status(instance_id)
                 .await
@@ -1424,20 +1413,25 @@ impl<D: WorkflowData, S: StateStore<D> + 'static> WorkflowEngine<D, S> {
                 .step_states
                 .values()
                 .any(|step| matches!(step.status, StepStatus::Running | StepStatus::Retrying));
-            match state.status {
-                WorkflowStatus::Cancelled if step_on_its_task => {
-                    tokio::time::sleep(poll_interval).await;
-                    poll_interval = (poll_interval + poll_backoff).min(max_poll_interval);
-                }
-                WorkflowStatus::Completed | WorkflowStatus::Failed | WorkflowStatus::Cancelled => {
-                    self.state_store.cleanup_if_terminal(instance_id).await;
-                    return Ok(state);
-                }
-                WorkflowStatus::Pending | WorkflowStatus::Paused | WorkflowStatus::Running => {
-                    tokio::time::sleep(poll_interval).await;
-                    poll_interval = (poll_interval + poll_backoff).min(max_poll_interval);
-                }
+            if matches!(
+                state.status,
+                WorkflowStatus::Completed | WorkflowStatus::Failed
+            ) || (state.status == WorkflowStatus::Cancelled && !step_on_its_task)
+            {
+                self.state_store.cleanup_if_terminal(instance_id).await;
+                return Ok(state);
             }
+            if start.elapsed() > timeout_duration {
+                // A caller cancelling on its deadline must still be able to
+                // inspect the final generation for identity-bound cleanup.
+                return Err(format!(
+                    "Workflow timeout after {}s for {}",
+                    timeout_duration.as_secs(),
+                    label
+                ));
+            }
+            tokio::time::sleep(poll_interval).await;
+            poll_interval = (poll_interval + poll_backoff).min(max_poll_interval);
         }
     }
 

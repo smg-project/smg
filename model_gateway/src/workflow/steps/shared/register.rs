@@ -236,35 +236,41 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for RegisterWorke
             }
         }
 
-        let mut worker_ids = Vec::with_capacity(workers.len());
         let registration_mode = context.data.registration_mode();
+        let commit = || {
+            let mut worker_ids = Vec::with_capacity(workers.len());
+            check_batch(&app_context.worker_registry, workers, &registration_mode)?;
 
-        check_batch(&app_context.worker_registry, workers, &registration_mode)?;
+            // Taken before the registry is written: a replacement that changes a
+            // worker's group must refresh the group it leaves as well as the one
+            // it joins, and only the registry as it is now knows the former.
+            let touched_groups = pool_groups_touched(&app_context.worker_registry, workers);
+            let left_models = models_left(&app_context.worker_registry, workers);
 
-        // Taken before the registry is written: a replacement that changes a
-        // worker's group must refresh the group it leaves as well as the one
-        // it joins, and only the registry as it is now knows the former.
-        let touched_groups = pool_groups_touched(&app_context.worker_registry, workers);
-        let left_models = models_left(&app_context.worker_registry, workers);
-
-        for worker in workers {
-            let worker_id = register_worker(
-                &app_context.worker_registry,
-                Arc::clone(worker),
-                &registration_mode,
-            )?;
-            debug!(
-                "Registered worker {} (model: {}) with ID {:?}",
-                worker.redacted_url(),
-                worker.model_id(),
-                worker_id
-            );
-            // A decode worker's running window is the PD admission bound; one
-            // that reports none leaves the gate off for it, which is said here
-            // rather than inferred later from absent series.
-            pd_admission::announce_decode_window(worker.as_ref());
-            worker_ids.push(worker_id);
-        }
+            for worker in workers {
+                let worker_id = register_worker(
+                    &app_context.worker_registry,
+                    Arc::clone(worker),
+                    &registration_mode,
+                )?;
+                debug!(
+                    "Registered worker {} (model: {}) with ID {:?}",
+                    worker.redacted_url(),
+                    worker.model_id(),
+                    worker_id
+                );
+                // A decode worker's running window is the PD admission bound; one
+                // that reports none leaves the gate off for it, which is said here
+                // rather than inferred later from absent series.
+                pd_admission::announce_decode_window(worker.as_ref());
+                worker_ids.push(worker_id);
+            }
+            Ok((worker_ids, touched_groups, left_models))
+        };
+        let (worker_ids, touched_groups, left_models) = match context.data.tokenizer_preparation() {
+            Some(preparation) => preparation.commit(commit)?,
+            None => commit()?,
+        };
 
         // Under Symphony the failure classes of the table that reads these
         // workers' model exist at zero from here, once every worker of the
@@ -319,6 +325,12 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for RegisterWorke
         for model_id in &left_models {
             if !app_context.worker_registry.serves_model_locally(model_id) {
                 app_context.policy_registry.on_model_unserved(model_id);
+            }
+            if app_context.router_config.wait_for_tokenizer {
+                crate::workflow::steps::local::ReleaseTokenizerStep::release_if_unserved(
+                    &app_context,
+                    model_id,
+                );
             }
         }
 
