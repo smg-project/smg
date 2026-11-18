@@ -68,7 +68,7 @@ use tracing::{info, warn};
 
 use crate::{
     elector::Fence,
-    store::{GatewayId, HealthSink, LeasesStore, MemoryStore, VetoWrite},
+    store::{GatewayId, HealthSink, LeasesStore, MemoryStore, VetoWrite, WorkersStore},
     view::WorkerId,
 };
 
@@ -182,6 +182,10 @@ struct Row {
     vetoes: FxHashMap<WorkerId, Ends>,
     /// How many ends the note holds, over every worker.
     held: usize,
+    /// The membership epoch at the note's last walk for rows that left
+    /// ([`Row::left`]), `None` before the first: a row leaves by a
+    /// membership write alone, so one walk an epoch finds every one.
+    left_at: Option<u64>,
     /// Held for as long as this presence lasts: a [`Presence`] waits for
     /// its drop.
     ended: watch::Sender<()>,
@@ -218,7 +222,7 @@ impl Row {
     /// The ends of workers whose rows left since they were noted go: the
     /// store shows no veto of `gateway` on them. One question a noted
     /// worker, asked where a gateway's ceiling stands in the way of a frame
-    /// and nowhere else.
+    /// and nowhere else, once a membership epoch.
     fn left(&mut self, store: &MemoryStore, gateway: GatewayId, now: Instant) {
         self.vetoes
             .retain(|worker, _| store.vetoed(gateway, *worker, now));
@@ -404,6 +408,7 @@ impl Gateways {
             replaced: Vec::new(),
             vetoes: FxHashMap::default(),
             held: 0,
+            left_at: None,
             ended: watch::channel(()).0,
         });
         if row.session > 0 && row.gone.is_none() {
@@ -527,7 +532,16 @@ impl Gateways {
                     // vetoes the store shows.
                     row.prune(now);
                     if row.held + ends.len() >= VETOES_MAX {
-                        row.left(&self.store, gateway, now);
+                        // A row leaves by a membership write alone and
+                        // each moves the epoch, read here before the walk:
+                        // the store is asked once an epoch, and a frame
+                        // refused again under it asks nothing. The prune
+                        // above still walks the note at each such frame.
+                        let epoch = WorkersStore::epoch(&*self.store);
+                        if row.left_at != Some(epoch) {
+                            row.left(&self.store, gateway, now);
+                            row.left_at = Some(epoch);
+                        }
                     }
                     if row.held + ends.len() >= VETOES_MAX {
                         break Vetoed::Over;
@@ -1708,6 +1722,52 @@ pub(crate) mod tests {
         );
         assert!(store.vetoed(A, one_more, t0 + S));
         assert_eq!(gateways.kept(A), KINDS_MAX + 1);
+        drop(seat);
+    }
+
+    /// A refusal at a true ceiling asks the store of the note's rows once
+    /// a membership epoch. The table alone writes a gateway's vetoes and
+    /// a row leaves by a membership write alone: a veto the store lost by
+    /// another hand is not found under the same epoch, and the next
+    /// membership write has the store asked again.
+    #[test]
+    fn a_refusal_at_a_true_ceiling_asks_the_store_once_a_membership_epoch() {
+        let (_elector, store, gateways, t0) = leading(GRACE);
+        let seat = welcomed(&gateways, A, "gateway-a", TERM, t0);
+        let kinds = i32::try_from(KINDS_MAX).expect("a small number");
+        let workers: Vec<WorkerId> = (0..VETOES_MAX / KINDS_MAX)
+            .map(|n| worker(&store, &format!("http://w{n}:8000")))
+            .collect();
+        let list: Vec<(WorkerId, i32, Instant)> = workers
+            .iter()
+            .flat_map(|&w| (1..=kinds).map(move |kind| (w, kind, t0 + 60 * S)))
+            .collect();
+        assert_eq!(seat.restore(&list, t0), VETOES_MAX);
+        let one_more = worker(&store, "http://one-more:8000");
+        // Every row stands: the frame is refused, and the store was asked.
+        assert_eq!(
+            seat.veto(one_more, BREAKER, Some(t0 + 60 * S), t0 + S),
+            Vetoed::Over
+        );
+        // The store loses one worker's veto behind the note, by no
+        // membership write: under the same epoch the store is not asked
+        // again, and the frame is refused as before.
+        HealthSink::gateway_veto(&*store, A, workers[1], None);
+        assert!(!store.vetoed(A, workers[1], t0 + S));
+        assert_eq!(
+            seat.veto(one_more, BREAKER, Some(t0 + 60 * S), t0 + S),
+            Vetoed::Over,
+            "the store was asked twice under one membership epoch"
+        );
+        // A membership write moves the epoch: the next frame asks the
+        // store, that worker's ends go and the veto is shown.
+        let _late = worker(&store, "http://late:8000");
+        assert_eq!(
+            seat.veto(one_more, BREAKER, Some(t0 + 60 * S), t0 + S),
+            Vetoed::Shown
+        );
+        assert!(store.vetoed(A, one_more, t0 + S));
+        assert_eq!(gateways.kept(A), VETOES_MAX - KINDS_MAX + 1);
         drop(seat);
     }
 
