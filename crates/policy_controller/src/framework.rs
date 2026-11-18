@@ -3352,6 +3352,9 @@ impl Engine {
     /// pins again follows that pin under the rule's in-flight cap
     /// ([`Self::respill`]): nothing is claimed, and a key handed on reads
     /// the veto as it stands before the lifted pass's survivors.
+    /// A pin of record whose worker the standing pass left out is written
+    /// back where the lifted pass kept that worker, and is one of the
+    /// key's pins from there on.
     #[expect(
         clippy::too_many_arguments,
         reason = "the profile run's inputs, as run_profile takes them"
@@ -3384,7 +3387,7 @@ impl Engine {
             return answer;
         }
         let key = facts.session();
-        let pins = self.sessions.lookup(key, facts.now_micros, rule);
+        let mut pins = self.sessions.lookup(key, facts.now_micros, rule);
         // The first pin the filters kept, by the pins' order.
         let owner = pins
             .iter()
@@ -3399,14 +3402,22 @@ impl Engine {
         // one record and agree with no claim between them. A table that
         // held a pin, every one down or filtered, asks nothing: the rule's
         // recovery places that key.
+        // A pin of record whose worker that pass left out: the kept form
+        // asks for it again, after its lifted pass.
+        let mut left_out = None;
         let owner = owner.or_else(|| {
             if pins[0] != WorkerId(0) {
                 return None;
             }
             let stored = cx.pins?.pinned(key, rule.ttl_micros)?;
-            buf.kept
+            if !buf
+                .kept
                 .iter()
-                .find(|&&i| candidates[i as usize].id == stored)?;
+                .any(|&i| candidates[i as usize].id == stored)
+            {
+                left_out = Some(stored);
+                return None;
+            }
             let pins = self.sessions.restore(key, facts.now_micros, rule, stored);
             pins.iter()
                 .filter(|p| **p != WorkerId(0))
@@ -3452,6 +3463,30 @@ impl Engine {
             // survivors.
             if let Some(shed) = vetoed::lifted(profile, index, facts, pool, set, cx, buf) {
                 return shed;
+            }
+            // The pin of record the standing pass left out is written
+            // back where the lifted pass kept its worker: a pin a
+            // dispatch made, which the placement below reads as one
+            // the table held.
+            if let Some(stored) = left_out {
+                if buf
+                    .kept
+                    .iter()
+                    .any(|&i| candidates[i as usize].id == stored)
+                {
+                    // The door writes nothing where another request took
+                    // the key since this decision's read. Where the
+                    // recorded worker leads the pins that stand, this
+                    // decision's sight is that worker alone: a pin behind
+                    // it is another request's claim, and the claim below
+                    // sees it and follows it. Where another worker leads,
+                    // the first read stands, and the claim follows that
+                    // worker.
+                    let written = self.sessions.restore(key, facts.now_micros, rule, stored);
+                    if written[0] == stored {
+                        pins = [stored, WorkerId(0)];
+                    }
+                }
             }
         }
         let mut decision = self.place(profile, index, placing, facts, pool, candidates, buf);
@@ -7398,14 +7433,14 @@ mod tests {
     /// The pins of record a case lends: one key's stored worker, and the
     /// TTL each question was asked under.
     #[derive(Debug)]
-    struct Stored {
+    pub(super) struct Stored {
         key: Session,
         worker: WorkerId,
         asked: Mutex<Vec<Option<u64>>>,
     }
 
     impl Stored {
-        fn of(key: u64, worker: WorkerId) -> Self {
+        pub(super) fn of(key: u64, worker: WorkerId) -> Self {
             Self {
                 key: session(key),
                 worker,
