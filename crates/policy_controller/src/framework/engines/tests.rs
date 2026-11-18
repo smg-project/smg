@@ -7,8 +7,8 @@ use std::cell::RefCell;
 use super::super::{Binding, Engine, Filter, Picker, Plan, Profile, Scorer, TieBand, Weighted};
 use crate::{
     affinity::Gates,
-    builtins::{Best, PowerOfTwo, Random, SampledBest},
-    decision::{Decision, Targets, MAX_TARGETS},
+    builtins::{Best, NotOverloaded, PowerOfTwo, Random, SampledBest},
+    decision::{Decision, Lifted, Targets, MAX_TARGETS},
     lease::{Lifecycle, Membership},
     ring::ConsistentHash,
     spec::{BoundedLoadParams, Needs},
@@ -613,8 +613,7 @@ fn keyed(
     keyed_by(engine, key, rows, engines, epoch).0
 }
 
-/// [`keyed`], with whether the walk alone decided: its trace counts no
-/// survivors, and a whole pass counts them.
+/// [`keyed`], with whether the walk alone decided.
 fn keyed_by(
     engine: &Engine,
     key: &str,
@@ -622,6 +621,22 @@ fn keyed_by(
     engines: Engines<'_>,
     epoch: u64,
 ) -> (Vec<u32>, bool) {
+    placed(engine, key, rows, engines, epoch)
+        .map(|(rows, _, by_walk)| (rows, by_walk))
+        .unwrap_or_default()
+}
+
+/// What a request with the routing key `key` is handed: its rows by
+/// position, the veto its trace says was lifted, and whether the walk
+/// alone decided, whose trace counts no survivors where a whole pass
+/// counts them. `None` for a request that is shed.
+fn placed(
+    engine: &Engine,
+    key: &str,
+    rows: &[Candidate],
+    engines: Engines<'_>,
+    epoch: u64,
+) -> Option<(Vec<u32>, Lifted, bool)> {
     let facts = RequestFacts {
         model: "m",
         session_key: Identity::plain(key),
@@ -637,14 +652,12 @@ fn keyed_by(
     };
     let cx = Constraints::default();
     let decision = engine.decide(&facts, &pool, rows, &cx, &mut Scratch::new());
-    let pick = decision.pick();
-    pick.map(|pick| {
-        (
-            positions(&pick.targets),
-            pick.trace.survivors.get().is_none(),
-        )
-    })
-    .unwrap_or_default()
+    let pick = decision.pick()?;
+    Some((
+        positions(&pick.targets),
+        pick.trace.lifted,
+        pick.trace.survivors.get().is_none(),
+    ))
 }
 
 /// How many of 64 keys a ring decided by its walk alone over `rows` and
@@ -1087,4 +1100,77 @@ fn a_pick_the_whole_pass_makes_behind_the_unit_reads_the_stream_on() {
         widened >= 20 && apart > 0,
         "{widened} widened, {apart} apart"
     );
+}
+
+/// The plain ring under `best`, behind the filter of this file and the
+/// overload veto, marked as the validator marks a profile the ring alone
+/// places: a keyed request keeps its key's worker over the veto.
+fn kept_ring() -> Engine {
+    let scorer = Weighted {
+        scorer: Box::new(ConsistentHash::new(None)),
+        weight: 1.0,
+    };
+    let mut engine = engine_of(vec![Box::new(Asked), Box::new(NotOverloaded)], vec![scorer]);
+    engine.places_by_key(0);
+    engine
+}
+
+/// A key kept over the veto is placed by the ring's walk where its pool
+/// lists its engines: the rows handed and the mark of the lifted veto are
+/// the whole pass's, with half the rows over their thresholds, with every
+/// row but one over, and with every row over. The lift reaches the walk:
+/// its rows are the ones it hands where no row is over.
+#[test]
+fn a_key_kept_over_the_veto_is_placed_by_the_walk_as_the_whole_pass_places_it() {
+    let (ring, whole) = (kept_ring(), kept_ring());
+    for (shape, under) in [(1, 2), (2, 64), (3, u32::MAX)] {
+        let (mut rows, listed, ends) = fleet(&[8; 8], shape);
+        rows[1].health.healthy = true;
+        let engines = Engines::new(0, &listed, &ends);
+        let keys: Vec<String> = (0..64).map(|i| format!("conv-{i}")).collect();
+        let calm = keys.iter().map(|key| placed(&ring, key, &rows, engines, 1));
+        let calm: Vec<_> = calm.collect();
+        for row in &mut rows {
+            // One row in `under` stands under its thresholds, or none.
+            row.health.overloaded = under == u32::MAX || row.position % under != 1;
+        }
+        let mut walked = 0;
+        for (key, calm) in keys.iter().zip(calm) {
+            let by_pass = placed(&whole, key, &rows, Engines::default(), 1);
+            let (passed, mark, by_walk) = by_pass.expect("a kept key is placed");
+            assert!(!by_walk, "{key}: a pool with no list is read whole");
+            let (targets, lifted, by_walk) =
+                placed(&ring, key, &rows, engines, 1).expect("a kept key is placed");
+            assert_eq!((&targets, lifted), (&passed, mark), "{key}, one in {under}");
+            assert_eq!(Some(targets), calm.map(|calm| calm.0), "{key}: the lift");
+            // The one row under its thresholds stands without the lift,
+            // whether the walk met it or not.
+            let stood = if under == u32::MAX {
+                Lifted::Overload
+            } else {
+                Lifted::None
+            };
+            assert_eq!(lifted, stood, "{key}, one in {under}");
+            walked += u32::from(by_walk);
+        }
+        assert!(walked >= 48, "{walked} of 64 keys by the walk alone");
+    }
+}
+
+/// Under a binding that sheds the veto stands for a key, and the walk
+/// passes a row over its thresholds as it passes any row refused: the rows
+/// handed are the whole pass's.
+#[test]
+fn a_key_under_a_binding_that_sheds_is_walked_with_the_veto_standing() {
+    let shedding = || {
+        let mut ring = kept_ring();
+        ring.shed_when_all_vetoed(0);
+        ring
+    };
+    let (mut rows, listed, ends) = fleet(&[8; 8], 1);
+    for row in &mut rows {
+        row.health.overloaded = row.position % 5 == 0;
+    }
+    let walked = walked(&shedding(), &shedding(), &rows, &listed, &ends);
+    assert!(walked >= 48, "{walked} of 64 keys by the walk alone");
 }
