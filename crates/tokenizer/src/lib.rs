@@ -20,6 +20,7 @@ pub mod stop;
 pub mod stream;
 mod token_text;
 pub mod traits;
+mod unigram;
 #[cfg(feature = "tokenizers-v1")]
 mod v1;
 mod word_cache;
