@@ -27,7 +27,8 @@ use std::{
 pub enum EncodePath {
     /// The opt-in `tokenizers` v1 pipeline.
     V1,
-    /// The crate's direct byte-level encoder.
+    /// One of the crate's direct encoders: the byte-level one or the
+    /// WordPiece one.
     Native,
     /// `tokenizers` 0.23, the reference implementation.
     Tokenizers,
