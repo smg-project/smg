@@ -385,8 +385,9 @@ impl Tables {
     /// the same row back on its id included, so the ask is right at any
     /// instant behind the lookup's fence. Where no id kept was taken since,
     /// the read stands. Else a block may be another row's: the lookup is
-    /// made again within the ids not taken since, and its rows are asked
-    /// again. Past [`Self::ROUNDS`] lookups no read of the naming stands,
+    /// made again within the ids not taken since, by a draw of that round's
+    /// own ([`Index::deepest_again`]), and its rows are asked again. Past
+    /// [`Self::ROUNDS`] lookups no read of the naming stands,
     /// and it names no holder. Off a decision's usual path: it runs for the
     /// decisions that hold tables from before a take.
     #[cold]
@@ -411,7 +412,7 @@ impl Tables {
             }
             rounds += 1;
             let own = index.own(&within[..words], whole_at);
-            index.deepest_again(naming, &own[..words], cap, kept);
+            index.deepest_again(naming, &own[..words], cap, rounds, kept);
             // As in the naming: the read before the fence, the asks after.
             fence(Ordering::Acquire);
         }
@@ -758,20 +759,28 @@ impl Index {
         self.taken.load(Ordering::Acquire)
     }
 
-    /// The naming's lookup made again ([`Tables::look_again`]): the
-    /// request's deepest holders within `within` under `cap`, into `kept`
-    /// by index id, the depth the cap cuts by a draw from the decision's
-    /// seed on the holders' stream. A lookup of its own beside the
-    /// naming's: with one instantiation for both, every decision would pay
-    /// a call for the lookup it makes once.
+    /// The naming's lookup made again, for the `round`th time
+    /// ([`Tables::look_again`]): the request's deepest holders within
+    /// `within` under `cap`, into `kept` by index id, the depth the cap
+    /// cuts by a draw of the round's own. A round runs only where the
+    /// lookup before it kept an id taken since, so the stream that lookup
+    /// cut by would cut by the same values again, and favour the rows it
+    /// reaches first. Each round's stream is seeded by the first value of
+    /// the one before it, the first round's by the holders' stream. A
+    /// lookup of its own beside the naming's: with one instantiation for
+    /// both, every decision would pay a call for the lookup it makes once.
     fn deepest_again(
         &self,
         naming: &Naming<'_>,
         within: &[u64],
         cap: usize,
+        round: usize,
         kept: &mut Vec<(u32, u32)>,
     ) {
         let mut draw = Draw::new(naming.seed ^ HOLDERS_STREAM);
+        for _ in 0..round {
+            draw = Draw::new(draw.next_u64());
+        }
         self.chain.deepest_into(
             naming.block_hashes,
             |hash| *hash,

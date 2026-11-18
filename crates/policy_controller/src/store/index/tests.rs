@@ -1283,12 +1283,12 @@ mod named {
     }
 
     /// What a decision that holds the world of before is named for
-    /// `request` under `cap` once `then` has run under it: the holders by
-    /// their workers, and the workers of that world's rows.
+    /// `request` under a cap and a seed once `then` has run under it: the
+    /// holders by their workers, and the workers of that world's rows.
     fn named_under_a_kept_world(
         store: &MemoryStore,
         request: &[u64],
-        cap: u32,
+        (cap, seed): (u32, u64),
         then: impl FnOnce(),
     ) -> (Vec<(WorkerId, u32)>, Vec<WorkerId>) {
         let mut view = ViewBuffers::default();
@@ -1307,7 +1307,7 @@ mod named {
             let naming = Naming {
                 gateway: GatewayId::LOCAL,
                 block_hashes: request,
-                seed: 7,
+                seed,
                 cap,
                 wires: None,
                 now_micros: built.now_micros,
@@ -1330,7 +1330,7 @@ mod named {
         store: &MemoryStore,
         left: WorkerId,
         request: &[u64],
-        cap: u32,
+        (cap, seed): (u32, u64),
         then: impl FnOnce(WorkerId),
     ) -> (Vec<(WorkerId, u32)>, WorkerId) {
         // A row's id in the model's index, as the world of now holds it.
@@ -1343,7 +1343,7 @@ mod named {
             })
         };
         let mut taker = None;
-        let (holders, before) = named_under_a_kept_world(store, request, cap, || {
+        let (holders, before) = named_under_a_kept_world(store, request, (cap, seed), || {
             let freed = index_id(left);
             let revision = WorkersStore::get(store, left).expect("the row").revision;
             store.remove(left, revision).expect("removed");
@@ -1369,10 +1369,11 @@ mod named {
         let request = [1, 2, 3];
         // The taker holds the request whole, and the row that stands comes
         // to hold two of its blocks.
-        let (holders, taker) = named_past_an_id_taken_again(&store, left, &request, 16, |taker| {
-            holds(&store, taker, &request);
-            holds(&store, stays, &[1, 2]);
-        });
+        let (holders, taker) =
+            named_past_an_id_taken_again(&store, left, &request, (16, 7), |taker| {
+                holds(&store, taker, &request);
+                holds(&store, stays, &[1, 2]);
+            });
         assert_eq!(holders, [(stays, 2)]);
         // The world of now names both by what they hold.
         let now = handed(&store, GatewayId::LOCAL, None, &request, (16, 7));
@@ -1392,7 +1393,7 @@ mod named {
         let left = admitted(&store, "left");
         let deep = admitted(&store, "deep");
         let request = [1, 2, 3];
-        let (holders, _) = named_past_an_id_taken_again(&store, left, &request, 16, |taker| {
+        let (holders, _) = named_past_an_id_taken_again(&store, left, &request, (16, 7), |taker| {
             holds(&store, shallow, &[1]);
             holds(&store, taker, &[1, 2]);
             holds(&store, deep, &request);
@@ -1412,13 +1413,44 @@ mod named {
         let left = admitted(&store, "left");
         let (shallow, deep) = (admitted(&store, "shallow"), admitted(&store, "deep"));
         let request = [1, 2, 3];
-        let (holders, _) = named_past_an_id_taken_again(&store, left, &request, 2, |taker| {
+        let (holders, _) = named_past_an_id_taken_again(&store, left, &request, (2, 7), |taker| {
             holds(&store, taker, &request);
             holds(&store, deep, &[1, 2]);
             holds(&store, shallow, &[1]);
         });
         assert_eq!(holders.len(), 2, "{holders:?}");
         assert!(holders.contains(&(deep, 2)) && holders.contains(&(shallow, 1)));
+    }
+
+    /// The lookup made again cuts by a draw of its own. Three rows hold one
+    /// block under a cap of one, and one of them is on an id taken again:
+    /// where the first lookup drew that id, the second draws between the two
+    /// that stand, and across seeds each is named as often as the other. By
+    /// the first lookup's stream again the lower id would be named two
+    /// times of three.
+    #[test]
+    fn the_rows_that_stand_beside_an_id_taken_again_are_drawn_evenly() {
+        let request = [1];
+        let mut lower = 0u32;
+        for seed in 0..600 {
+            let store = MemoryStore::new();
+            store.apply(sampled(1)).expect("above the unbound start");
+            let left = admitted(&store, "left");
+            let (first, second) = (admitted(&store, "first"), admitted(&store, "second"));
+            let (holders, _) =
+                named_past_an_id_taken_again(&store, left, &request, (1, seed), |taker| {
+                    holds(&store, taker, &request);
+                    holds(&store, first, &request);
+                    holds(&store, second, &request);
+                });
+            assert!(
+                holders == [(first, 1)] || holders == [(second, 1)],
+                "seed {seed}: {holders:?}"
+            );
+            lower += u32::from(holders == [(first, 1)]);
+        }
+        // 600 draws of one in two: about 300 a row.
+        assert!((240..=360).contains(&lower), "{lower} of 600");
     }
 
     /// A row that joins takes an id of its own, and the index counts that
@@ -1433,7 +1465,7 @@ mod named {
         let request = [1, 2, 3];
         holds(&store, near, &request);
         holds(&store, far, &[1]);
-        let (holders, before) = named_under_a_kept_world(&store, &request, 16, || {
+        let (holders, before) = named_under_a_kept_world(&store, &request, (16, 7), || {
             let joined = admitted(&store, "joined");
             holds(&store, joined, &request);
         });
