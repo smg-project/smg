@@ -599,6 +599,8 @@ impl Stream for Batches {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use parking_lot::Mutex;
     use tonic::Code;
 
@@ -1385,13 +1387,26 @@ mod tests {
     #[test]
     fn a_snapshot_a_take_landed_inside_is_refused() {
         let leader = Leader::elected();
-        let log = Arc::new(Log::new(WATCHED_EVENTS, LOAD_EVENTS));
+        let told = Arc::new(AtomicUsize::new(0));
+        let log = {
+            let told = Arc::clone(&told);
+            Arc::new(Log::new(WATCHED_EVENTS, LOAD_EVENTS).on_watched(move || {
+                told.fetch_add(1, Ordering::Relaxed);
+            }))
+        };
         let journal = Arc::new(AtTheCut {
             log: Arc::clone(&log),
             lands: Mutex::default(),
         });
         let store = Arc::new(MemoryStore::journaled(Arc::clone(&journal) as _));
         store.set_term(leader.term);
+        // The journal hands the store's release on to its log, or the
+        // log's listener hears of no write: the term's start is told.
+        assert_eq!(
+            told.load(Ordering::Relaxed),
+            1,
+            "the release was not handed on"
+        );
         let replication = Replication::new(Arc::clone(&store), log, leader.elector.fence());
         let served = replication
             .snapshot(leader.term, "controller-0", leader.at)
