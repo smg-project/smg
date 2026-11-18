@@ -126,7 +126,11 @@ pub(crate) fn tells(store: &MemoryStore) {
 /// frame that names no target of the pick tells nothing.
 ///
 /// Its caller is whoever applies the frame, under the turn of the leases'
-/// file: what it calls is bounded and takes no door of the leases.
+/// file: what it calls is bounded and takes no door of the leases. It
+/// enters as the decider that issued the lease on whichever thread applies.
+/// While the deciders share one file that thread does not hold that
+/// decider's turn: a stage that keeps state a decider is served these
+/// calls no earlier than a file a decider.
 fn told(store: &MemoryStore, record: &LeaseRecord, said: Said, by: Option<Decider>) {
     // The lease's own decider acts while its event is told, whichever
     // thread applies the frame.
