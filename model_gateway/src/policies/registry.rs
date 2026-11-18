@@ -20,6 +20,8 @@ use tracing::{debug, info, warn};
 /// When the last worker of a model is removed, the policy mapping is cleaned up.
 use super::{
     as_bucket, as_cache_aware, get_healthy_worker_indices,
+    hash_ring::HashRing,
+    kept_rings::KeptRings,
     manual::{ExecutionBranch, PinState},
     normalize_model_key, DPRankLoadPolicy, LoadBalancingPolicy, ManualConfig, ManualPolicy,
     PolicyFactory, SelectWorkerInfo, WorkerRole,
@@ -35,7 +37,8 @@ use crate::{
     },
     worker::{
         identity::endpoint::Endpoint, load::state::LoadReceiver, KvEventMonitor, LoadConsumer,
-        RequestCompletionSink, Worker, WorkerType,
+        ModelWorkerSnapshot, RequestCompletionSink, Worker, WorkerRegistry, WorkerRegistryExt,
+        WorkerType,
     },
 };
 
@@ -186,6 +189,8 @@ pub struct PolicyRegistry {
     routing_key_headers: Arc<Vec<HeaderName>>,
     /// How strictly PD placement pairs prefill and decode descriptors.
     pd_pairing_mode: PdPairingMode,
+    /// The hash rings kept between membership generations ([`KeptRings`]).
+    rings: Arc<KeptRings>,
 }
 
 /// A sticky key with this many of its own requests already in flight on its
@@ -266,7 +271,43 @@ impl PolicyRegistry {
             routing_key_sticky,
             routing_key_headers: Arc::new(routing_key_headers),
             pd_pairing_mode: PdPairingMode::default(),
+            rings: Arc::new(KeptRings::default()),
         }
+    }
+
+    /// The consistent-hash ring `model_id`'s requests are placed on: the
+    /// ring of the generation the registry holds for the model, `None` for a
+    /// model nobody serves. The model-less id reads the ring over every
+    /// worker, the candidates of a request that names no model. A caller
+    /// holding a client's name for the model resolves it at request entry,
+    /// as for the registry's other reads by model.
+    pub(crate) fn hash_ring(
+        &self,
+        registry: &WorkerRegistry,
+        model_id: &str,
+    ) -> Option<Arc<HashRing>> {
+        self.rings
+            .of(model_id, &registry.get_routing_snapshot(model_id))
+    }
+
+    /// [`Self::hash_ring`] of a generation the caller holds, so the ring and
+    /// what else it reads of the generation are of one membership.
+    pub(crate) fn hash_ring_of(
+        &self,
+        model_id: &str,
+        generation: &ModelWorkerSnapshot,
+    ) -> Option<Arc<HashRing>> {
+        self.rings.of(model_id, generation)
+    }
+
+    /// Starts the task that fills the hash rings off the request path
+    /// ([`KeptRings::keep_warm`]).
+    pub(crate) fn keep_rings_warm(
+        &self,
+        registry: &Arc<WorkerRegistry>,
+        runtime: &tokio::runtime::Handle,
+    ) {
+        self.rings.keep_warm(registry, runtime);
     }
 
     /// Set how strictly PD placement pairs prefill and decode descriptors.

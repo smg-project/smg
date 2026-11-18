@@ -496,7 +496,7 @@ fn select_pass(
         // it: no other placement pays the registry's keyed read and the
         // ring's shared count.
         hash_ring: policy_reads_hash_ring(policy.as_ref())
-            .then(|| registry.get_hash_ring(model_id))
+            .then(|| policies.hash_ring(registry, model_id))
             .flatten(),
         role: WorkerRole::Single,
         overload_lifted: false,
@@ -1352,7 +1352,13 @@ pub(crate) fn select_pair(
     // told the list, so what it keeps for the pool does not move with the
     // workers that are open for this request.
     let prefill = Narrowed::at(&pairs.prefill, open);
-    let hash_ring = registry.get_hash_ring(model_id);
+    // As for a single placement: the ring is read for the policies that walk
+    // it alone. No other pair pays the registry's keyed read and the ring's
+    // shared count, or fills the ring of a generation it never reads.
+    let hash_ring = (policy_reads_hash_ring(prefill_policy.as_ref())
+        || policy_reads_hash_ring(decode_policy.as_ref()))
+    .then(|| policies.hash_ring(registry, model_id))
+    .flatten();
     let mut info = SelectWorkerInfo {
         request_text: inputs.text,
         tokens: inputs.tokens,
@@ -1983,6 +1989,42 @@ mod tests {
             .expect("the targeted pair is open");
             assert_eq!(pair.decode.url(), expected, "target {index}");
         }
+    }
+
+    /// A pair's ring read is the single placement's: for the policies that
+    /// walk the ring alone. A pair of other policies reads none, and so
+    /// fills the ring of no generation.
+    #[test]
+    fn a_pair_reads_the_hash_ring_for_a_policy_that_walks_it_alone() {
+        // A pair is placed under `decode` beside a prefill policy that walks
+        // no ring: whether the generation's ring was filled for it.
+        let fills_the_ring = |decode: Arc<dyn LoadBalancingPolicy>| {
+            let registry = gated_pd_registry(2);
+            let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+            policies.set_prefill_policy(Arc::new(RoundRobinPolicy::new()));
+            policies.set_decode_policy(decode);
+            let pairs = pairs_of(&registry, &policies);
+            select_pair(
+                &registry,
+                &policies,
+                MODEL,
+                &pairs,
+                None,
+                None,
+                PlacementInputs::default(),
+            )
+            .expect("a pair is open");
+            registry.get_routing_snapshot(MODEL).hash_ring_is_filled()
+        };
+
+        assert!(
+            !fills_the_ring(Arc::new(RoundRobinPolicy::new())),
+            "no policy of the pair walks the ring"
+        );
+        assert!(
+            fills_the_ring(Arc::new(ConsistentHashingPolicy::new())),
+            "the decode policy walks the ring"
+        );
     }
 
     /// The load-scoring decode policies price a side by its report and
@@ -3302,7 +3344,9 @@ mod tests {
         let urls: Vec<String> = (1..=8).map(|n| format!("http://h:{n}")).collect();
         let urls: Vec<&str> = urls.iter().map(String::as_str).collect();
         let registry = http_registry(&urls);
-        let ring = registry.get_hash_ring(MODEL).expect("the model's ring");
+        let ring = PolicyRegistry::new(PolicyConfig::ConsistentHashing)
+            .hash_ring(&registry, MODEL)
+            .expect("the model's ring");
         let pool = candidates(&registry, MODEL, RoutingPool::HttpRegular, None);
         let pool = pool.as_slice();
         let prefix_hash = PolicyConfig::PrefixHash {

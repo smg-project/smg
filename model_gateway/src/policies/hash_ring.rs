@@ -1,11 +1,11 @@
 //! Consistent hash ring for O(log n) worker selection.
 //!
 //! The ring maps a routing key to a worker URL using consistent hashing over
-//! virtual nodes. The registry reconciles one ring per model when workers are
-//! added or removed via [`HashRing::updated`], which rehashes only the URLs
-//! that changed — individual lookups only pay an `O(log n)` binary search plus
-//! a visited mark per worker (on the stack up to 512 workers, one vector of
-//! words beyond) to skip virtual-node duplicates. See
+//! virtual nodes. Each membership generation has one ring, reconciled from
+//! the ring kept for its model via [`HashRing::updated`], which rehashes only
+//! the URLs that changed — individual lookups only pay an `O(log n)` binary
+//! search plus a visited mark per worker (on the stack up to 512 workers, one
+//! vector of words beyond) to skip virtual-node duplicates. See
 //! [`HashRing::find_healthy_url`] for details.
 //!
 //! The type intentionally has no dependency on the `Worker` trait — it is
@@ -198,13 +198,30 @@ impl HashRing {
         }
     }
 
+    /// Whether `urls` are this ring's URLs in this ring's order: the ring is
+    /// then the ring over them, and nothing is hashed or allocated to learn
+    /// it. A ring keeps each URL where its first list put it and new ones
+    /// behind, so a list given again answers true unless a list moved a URL
+    /// the ring kept. False decides nothing: the same URLs in another order
+    /// make the same ring, and [`Self::updated`] finds it.
+    pub(crate) fn is_over<I>(&self, urls: I) -> bool
+    where
+        I: IntoIterator,
+        I::Item: AsRef<str>,
+    {
+        let mut own = self.urls.iter();
+        urls.into_iter()
+            .all(|url| own.next().is_some_and(|own| &**own == url.as_ref()))
+            && own.next().is_none()
+    }
+
     /// Hash a string to a ring position using blake3 (stable across versions).
     #[inline]
     #[expect(
         clippy::expect_used,
         reason = "blake3 always produces 32 bytes — converting a fixed 8-byte slice to [u8; 8] is infallible"
     )]
-    pub fn hash_position(s: &str) -> u64 {
+    pub(crate) fn hash_position(s: &str) -> u64 {
         let hash = blake3::hash(s.as_bytes());
         u64::from_le_bytes(
             hash.as_bytes()[..8]
@@ -420,6 +437,30 @@ mod tests {
         let cleared = base.updated(std::iter::empty::<&str>());
         assert!(cleared.is_empty());
         assert_eq!(cleared.worker_count(), 0);
+    }
+
+    #[test]
+    fn a_ring_is_over_its_own_urls_in_its_own_order() {
+        let ring = HashRing::new(["http://a", "http://b", "http://c"]);
+        assert!(ring.is_over(["http://a", "http://b", "http://c"]));
+        assert!(!ring.is_over(["http://a", "http://b"]), "one short");
+        assert!(
+            !ring.is_over(["http://a", "http://b", "http://c", "http://d"]),
+            "one more"
+        );
+        assert!(
+            !ring.is_over(["http://b", "http://a", "http://c"]),
+            "another order"
+        );
+        assert!(
+            !ring.is_over(["http://a", "http://a", "http://b", "http://c"]),
+            "a repeat"
+        );
+
+        // Retained URLs keep their place and a new one goes behind them, as
+        // a membership list does when a worker leaves and another joins.
+        let moved = ring.updated(["http://a", "http://c", "http://d"]);
+        assert!(moved.is_over(["http://a", "http://c", "http://d"]));
     }
 
     #[test]

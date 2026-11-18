@@ -735,60 +735,6 @@ fn routing_pool_alias_reuses_canonical_snapshot() {
     assert!(Arc::ptr_eq(&canonical, &alias));
 }
 
-#[test]
-fn concurrent_hash_ring_registration_keeps_encode_selectable() {
-    use crate::policies::{ConsistentHashingPolicy, LoadBalancingPolicy, SelectWorkerInfo};
-
-    let registry = Arc::new(WorkerRegistry::new());
-    let prefill: Arc<dyn Worker> = Arc::new(
-        BasicWorkerBuilder::new("http://prefill:8080")
-            .model(ModelCard::new("epd-model"))
-            .worker_type(WorkerType::Prefill)
-            .connection_mode(ConnectionMode::Grpc)
-            .health_config(no_health_check())
-            .build(),
-    );
-    let encode: Arc<dyn Worker> = Arc::new(
-        BasicWorkerBuilder::new("http://encode:8080")
-            .model(ModelCard::new("epd-model"))
-            .worker_type(WorkerType::Encode)
-            .connection_mode(ConnectionMode::Grpc)
-            .health_config(no_health_check())
-            .build(),
-    );
-    let second_encode = Arc::clone(&encode);
-    let blocked = registry.overlapping_hash_ring_updates(
-        move |registry| {
-            registry.register(prefill).expect("register prefill");
-        },
-        move |registry| {
-            registry.register(second_encode).expect("register encode");
-        },
-    );
-
-    assert_eq!(registry.get_by_model("epd-model").len(), 2);
-    assert!(encode.is_healthy_and_eligible());
-    let info = SelectWorkerInfo {
-        routing_key: Some("image-hash"),
-        hash_ring: registry.get_hash_ring("epd-model"),
-        ..Default::default()
-    };
-    assert_eq!(
-        ConsistentHashingPolicy::new().select_worker(&[encode], &info),
-        Some(0),
-        "a registered, healthy encode worker must remain selectable"
-    );
-    assert_eq!(info.hash_ring.expect("model ring").worker_count(), 2);
-    assert_eq!(
-        registry
-            .get_hash_ring(UNKNOWN_MODEL_ID)
-            .expect("wildcard ring")
-            .worker_count(),
-        2
-    );
-    assert!(blocked, "ring publications must be serialized");
-}
-
 /// A ZMQ worker whose handshake driver is in flight, holding the socket
 /// binds derived from `dir`. The handshake takes an OS-assigned loopback
 /// port: the port derived from a temporary ipc path is a hash into a band

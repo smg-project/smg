@@ -1,8 +1,8 @@
 //! The gateway's value of a membership generation ([`Generation`]): the
 //! members, and the cells that keep what the routers derive from them (the
 //! routing pools, the prefill and decode pairs, the window floors, the
-//! labels the workers say together). The registry builds one at every
-//! publish; the routing readers hand it to a request.
+//! labels the workers say together, the hash ring). The registry builds
+//! one at every publish; the routing readers hand it to a request.
 
 use std::{
     ops::Deref,
@@ -12,14 +12,17 @@ use std::{
 use openai_protocol::worker::TagVocabulary;
 use symphony::grammar::GrammarStart;
 
-use crate::worker::{
-    identity::basic::{RuntimeType, WorkerType},
-    pd::{
-        pair_index::{PdPairIndex, PdWire},
-        pairing::PdPairingMode,
+use crate::{
+    policies::hash_ring::HashRing,
+    worker::{
+        identity::basic::{RuntimeType, WorkerType},
+        pd::{
+            pair_index::{PdPairIndex, PdWire},
+            pairing::PdPairingMode,
+        },
+        registry::{Generation, WorkerRegistry},
+        ConnectionMode, Worker, UNKNOWN_MODEL_ID,
     },
-    registry::{Generation, WorkerRegistry},
-    ConnectionMode, Worker, UNKNOWN_MODEL_ID,
 };
 
 /// Static routing pool inside a model snapshot.
@@ -173,6 +176,9 @@ pub struct ModelWorkerSnapshot {
     /// What the workers of this generation say together, kept with the
     /// model id it was read for (see [`Self::labels`]).
     labels: OnceLock<(Box<str>, ModelLabels)>,
+    /// The consistent-hash ring over the URLs of this generation's members
+    /// (see [`Self::hash_ring`]).
+    hash_ring: OnceLock<Arc<HashRing>>,
 }
 
 impl ModelWorkerSnapshot {
@@ -184,6 +190,7 @@ impl ModelWorkerSnapshot {
             harmony: OnceLock::new(),
             window_floors: std::array::from_fn(|_| OnceLock::new()),
             labels: OnceLock::new(),
+            hash_ring: OnceLock::new(),
         }
     }
 
@@ -256,6 +263,33 @@ impl ModelWorkerSnapshot {
             .labels
             .get_or_init(|| (model_id.into(), read(&self.all)));
         (**spelling == *model_id).then_some(labels)
+    }
+
+    /// The consistent-hash ring over the URLs of this generation's members.
+    /// The first read after the membership change fills it: `kept` hands the
+    /// ring the gateway kept for the model, and the fill reconciles that
+    /// ring to these members, hashing only the URLs it does not hold; with
+    /// none kept it builds the ring whole. A kept ring over these very
+    /// members, as after a generation is published again over the same
+    /// list, is taken as it is. Every read after it reads the filled ring,
+    /// and a read that arrives during the fill waits for it.
+    /// Whatever ring `kept` hands, the cell holds the ring of these
+    /// members: a kept ring saves hashing and decides no placement.
+    pub(crate) fn hash_ring(&self, kept: impl FnOnce() -> Option<Arc<HashRing>>) -> &Arc<HashRing> {
+        self.hash_ring.get_or_init(|| {
+            let urls = || self.all.iter().map(|worker| worker.url());
+            match kept() {
+                Some(kept) if kept.is_over(urls()) => kept,
+                Some(kept) => Arc::new(kept.updated(urls())),
+                None => Arc::new(HashRing::new(urls())),
+            }
+        })
+    }
+
+    /// Whether the ring cell is filled, for the cases that say who filled it.
+    #[cfg(test)]
+    pub(crate) fn hash_ring_is_filled(&self) -> bool {
+        self.hash_ring.get().is_some()
     }
 
     /// The compatible prefill/decode pairs of `wire` under `mode`: descriptor
