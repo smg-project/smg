@@ -258,7 +258,8 @@ mod held {
     /// A generation is first told every member once, by id, then each
     /// membership write in the writes' order, each when the store takes
     /// it: the world shown at a call is the last build's, and the build a
-    /// write owes follows. A status change is no membership event.
+    /// write owes follows. A leave is told after its own build. A status
+    /// change is no membership event.
     /// The generation after it is told the members that stand then, and
     /// the one it replaced hears no more.
     #[test]
@@ -282,10 +283,6 @@ mod held {
         store
             .patch(a, priority, revision(&store, a))
             .expect("patched");
-        store.upsert(WorkerFacts {
-            dp_size: 2,
-            ..facts("http://w1:8000", Role::Single, &[MODEL])
-        });
         let d = store
             .upsert(WorkerFacts {
                 incarnation: 2,
@@ -293,21 +290,27 @@ mod held {
             })
             .id();
         store.remove(a, revision(&store, a)).expect("removed");
+        store.upsert(WorkerFacts {
+            dp_size: 2,
+            ..facts("http://w1:8000", Role::Single, &[MODEL])
+        });
         first.sort_unstable();
-        // Each call saw the world of the last build, the one the first
-        // join's ask paid: a build a write owes follows its call.
+        // A join, a patch and a refresh saw the world of the last build: the
+        // build such a write owes follows its call. A leave saw the world of
+        // its own build, at the store's epoch of its write: the fourth and
+        // the fifth write since the generation was applied.
         assert_eq!(
             *told.lock(),
             [
                 (at, format!("{:?}", Membership::Snapshot(&first))),
                 (at, format!("{:?}", Membership::Added(c))),
                 (at + 1, format!("{:?}", Membership::Relabelled(a))),
-                (at + 1, format!("{:?}", Membership::Resized(b))),
                 (
-                    at + 1,
+                    at + 4,
                     format!("{:?}", Membership::Replaced { old: c, new: d })
                 ),
-                (at + 1, format!("{:?}", Membership::Removed(a))),
+                (at + 5, format!("{:?}", Membership::Removed(a))),
+                (at + 5, format!("{:?}", Membership::Resized(b))),
             ]
         );
         let (next_ring, next_told) = (Arc::new(ConsistentHash::new(None)), Told::default());
@@ -323,12 +326,14 @@ mod held {
             .collect();
         second.sort_unstable();
         // The apply paid no owed build: the world it shows is still the one
-        // of the last build, and its snapshot names the rows on file.
+        // of the last build, and its snapshot names the rows on file. The
+        // removal after it is told at its own build, which took the refresh
+        // in.
         assert_eq!(
             *next_told.lock(),
             [
-                (at + 1, format!("{:?}", Membership::Snapshot(&second))),
-                (at + 1, format!("{:?}", Membership::Removed(b))),
+                (at + 5, format!("{:?}", Membership::Snapshot(&second))),
+                (at + 7, format!("{:?}", Membership::Removed(b))),
             ]
         );
         assert_eq!(told.lock().len(), 6, "a generation that left was told");
@@ -371,6 +376,25 @@ mod held {
         standby.follow(3, MembershipChange::Registered { id: joined }, Some(row));
         let added = format!("{:?}", Membership::Added(joined));
         assert_eq!(told.lock().last(), Some(&(2, added)));
+        // A followed leave is told as the leader's own is: after the build
+        // that takes its rows out of their pools, under the world of its
+        // own epoch. A removal, then a new life.
+        let leaves = leader
+            .remove(joined, revision(&leader, joined))
+            .expect("removed");
+        standby.follow(4, leaves, None);
+        let removed = format!("{:?}", Membership::Removed(joined));
+        assert_eq!(told.lock().last(), Some(&(4, removed)));
+        let old = leader.by_key("http://a:8000").expect("the row").id;
+        let replaces = leader.upsert(WorkerFacts {
+            incarnation: 2,
+            ..facts("http://a:8000", Role::Single, &[MODEL])
+        });
+        let new = replaces.id();
+        let row = WorkersStore::get(&leader, new);
+        standby.follow(5, replaces, row);
+        let replaced = format!("{:?}", Membership::Replaced { old, new });
+        assert_eq!(told.lock().last(), Some(&(5, replaced)));
     }
 
     /// A join is told when the store takes it, one window before a view

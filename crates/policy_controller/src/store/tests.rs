@@ -1835,6 +1835,34 @@ fn a_member_keeps_its_slot_and_a_leavers_slot_is_given_to_no_one() {
     }
 }
 
+/// A member back under its key and incarnation is one that joined: it is
+/// given the table's next slot, and the leases on file for the one that
+/// left end on the count they booked.
+#[test]
+fn a_member_back_under_its_id_is_given_the_next_slot() {
+    let store = MemoryStore::new();
+    let (stays, leaves) = (ready(&store, "http://a:1"), ready(&store, "http://b:1"));
+    let leases: &dyn LeasesStore = &store;
+    let (gateway, now) = (GatewayId(1), Instant::now());
+    leases.set_term(1);
+    for id in 1..=2 {
+        assert_eq!(leases.issue(booking(gateway, id, leaves, now)), Ok(()));
+    }
+    let row = WorkersStore::get(&store, leaves).expect("the row");
+    assert!(store.remove(leaves, row.revision).is_some());
+    // The same key and incarnation after the leave: the same id, and the
+    // two leases of the registration that left still on file.
+    let back = ready(&store, "http://b:1");
+    assert_eq!(back, leaves);
+    let mut stand = [(stays, 0), (back, 0)];
+    stand.sort_unstable();
+    assert_eq!(in_flight(&store), stand);
+    for id in 1..=2 {
+        assert!(leases.released(gateway, LeaseId(id), None, ReleaseReason::WorkerRemoved));
+    }
+    assert_eq!(in_flight(&store), stand);
+}
+
 /// A record filed over one on file under its key gives the first's count
 /// back: a restore whose page names one lease twice keeps one lease and
 /// one count.

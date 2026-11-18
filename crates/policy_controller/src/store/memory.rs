@@ -362,9 +362,9 @@ impl MemoryStore {
     /// record that name it, which the leader's own write alone drops, and
     /// a row that stays keeps its admission instant.
     ///
-    /// The pools follow as at the leader's own write: each write leaves its
-    /// build owed, which the replica's loop pays at the window's end, and a
-    /// leave's rows leave rotation at once.
+    /// The pools follow as at the leader's own write: a join, a refresh and
+    /// a patch leave their build owed, which the replica's loop pays at the
+    /// window's end, and a leave pays its own before it is told.
     ///
     /// The change is applied only where it fits the tables: the epoch is
     /// the next one, a new row's id is free and a registration's key too,
@@ -450,9 +450,9 @@ impl MemoryStore {
             _ => return,
         };
         workers.record_over(change, left.as_ref());
-        // The build each write leaves owed, as the leader's own does: the
-        // replica's loop pays it at the window's end. A leave's rows leave
-        // rotation at once.
+        // The build each write leaves, as the leader's own: a join, a
+        // refresh and a patch owe it, and a leave pays its own before it is
+        // told. What is owed, the replica's loop pays at the window's end.
         let now = Instant::now();
         match change {
             MembershipChange::Registered { id } => {
@@ -468,21 +468,13 @@ impl MemoryStore {
                 self.tell(change);
             }
             MembershipChange::Replaced { old, new } => {
-                // The old incarnation's rows leave rotation in the hold
-                // that makes the new one's load entry, as at the leader.
-                let first = {
-                    let mut loads = self.loads.lock();
-                    loads.ranks.insert(new, Ranks::default());
-                    let world = loads.writer.fold_gone(old);
-                    self.show(&mut loads.writer, world);
-                    let classes = Classes::Written {
-                        left: Some(old),
-                        joined: Some(new),
-                    };
-                    loads.writer.owe(classes, now)
-                };
-                self.wake_host(first);
+                self.loads.lock().ranks.insert(new, Ranks::default());
                 self.index_member(&workers, new);
+                let classes = Classes::Written {
+                    left: Some(old),
+                    joined: Some(new),
+                };
+                self.pay_leave(&workers, classes, now);
                 self.tell(change);
             }
             MembershipChange::Relabelled { id } | MembershipChange::Resized { id } => {
@@ -500,17 +492,11 @@ impl MemoryStore {
             }
             MembershipChange::StatusChanged { id, to, .. } => self.show_status(id, to),
             MembershipChange::Removed { id } => {
-                let first = {
-                    let mut loads = self.loads.lock();
-                    let world = loads.writer.fold_gone(id);
-                    self.show(&mut loads.writer, world);
-                    let classes = Classes::Written {
-                        left: Some(id),
-                        joined: None,
-                    };
-                    loads.writer.owe(classes, now)
+                let classes = Classes::Written {
+                    left: Some(id),
+                    joined: None,
                 };
-                self.wake_host(first);
+                self.pay_leave(&workers, classes, now);
                 self.tell(change);
             }
         }
@@ -708,10 +694,11 @@ impl MemoryStore {
     /// Tell the standing generation's engine what `change` is to it
     /// ([`MembershipChange::as_lifecycle`]). Called by every membership
     /// write under the workers lock, after the write left its build owed or
-    /// showed its leave, and with the load lock let go: the engine hears the
+    /// paid its leave's, and with the load lock let go: the engine hears the
     /// writes in their order, a load write waits for no stage, and an apply,
     /// which takes the workers lock, moves no generation in between. A leave
-    /// is told after the swap that takes its rows out of rotation. A join is
+    /// is told after the build that takes its rows out of their pools: the
+    /// worker is in no pool when its write returns, whoever wrote. A join is
     /// told when the store takes it, and the world that lists its row
     /// follows within one publication window. A decision takes neither lock
     /// and meets the call at a stage's own lock alone. One that built its
@@ -767,6 +754,19 @@ impl MemoryStore {
             ),
         };
         self.show(writer, world);
+    }
+
+    /// A leave pays its own build. A removal and a replaced incarnation owe
+    /// the build as every membership write does and pay it in the same
+    /// write, as the ask pays it, with every write the window held. Called
+    /// under the workers lock, before the leave is told: the worker is in no
+    /// pool when its write returns, under every profile and stage and
+    /// whoever wrote, a served call or a followed change. A storm of
+    /// removals so builds once a removal. The window stands as it was, and
+    /// the host is not woken: nothing is left owed.
+    fn pay_leave(&self, workers: &Workers, classes: Classes, at: Instant) {
+        self.loads.lock().writer.owe(classes, at);
+        self.pay(workers, None);
     }
 
     /// Build what the membership writes left owed, now, whatever the
@@ -931,8 +931,8 @@ impl MemoryStore {
     /// the store's tables that live exactly as long as the row leave with
     /// it, here and nowhere else: the health tables, the load rows and the
     /// worker's KV lane with its blocks in the index. The vetoes a world
-    /// carries are not among them: they leave with the row at the build
-    /// the membership write that calls this leaves owed. Nor are the
+    /// carries are not among them: they leave with the row in the
+    /// publication of the membership write that calls this. Nor are the
     /// sessions' pins of record that name the worker: the leader's own
     /// removal or replacement drops them once it let its lock go
     /// ([`Self::forget_pins`]), and a row that leaves by a followed change
@@ -1263,22 +1263,13 @@ impl WorkersStore for MemoryStore {
             // The new incarnation starts with an empty load entry, made
             // after the telling: nothing the old one reported is the new
             // one's, and no load of it stands before the replacement.
-            // In the same hold the old incarnation's rows leave rotation, at
-            // once: no decision made after this answer is handed the old id.
-            // The new one's rows come with the build this write leaves owed.
-            let first = {
-                let mut loads = self.loads.lock();
-                loads.ranks.insert(new_id, Ranks::default());
-                let world = loads.writer.fold_gone(old_id);
-                self.show(&mut loads.writer, world);
-                let classes = Classes::Written {
-                    left: Some(old_id),
-                    joined: Some(new_id),
-                };
-                loads.writer.owe(classes, now)
-            };
-            self.wake_host(first);
+            self.loads.lock().ranks.insert(new_id, Ranks::default());
             self.index_member(&workers, new_id);
+            let classes = Classes::Written {
+                left: Some(old_id),
+                joined: Some(new_id),
+            };
+            self.pay_leave(&workers, classes, now);
             self.tell(change);
             drop(workers);
             self.forget_pins(old_id);
@@ -1359,20 +1350,11 @@ impl WorkersStore for MemoryStore {
         // later finds no load entry and writes nothing.
         self.forget_worker(id);
         let change = workers.record_over(MembershipChange::Removed { id }, Some(&row.row));
-        // The worker's rows leave rotation at once: no decision made after
-        // this answer is handed it. They leave their pools at the build this
-        // write leaves owed.
-        let first = {
-            let mut loads = self.loads.lock();
-            let world = loads.writer.fold_gone(id);
-            self.show(&mut loads.writer, world);
-            let classes = Classes::Written {
-                left: Some(id),
-                joined: None,
-            };
-            loads.writer.owe(classes, Instant::now())
+        let classes = Classes::Written {
+            left: Some(id),
+            joined: None,
         };
-        self.wake_host(first);
+        self.pay_leave(&workers, classes, Instant::now());
         self.tell(change);
         drop(workers);
         self.forget_pins(id);

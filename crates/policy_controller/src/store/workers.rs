@@ -291,9 +291,10 @@ pub enum MembershipTail {
 /// took: a registration, its refresh and a patch are in force for decisions
 /// within one window of their answer, and a caller that needs its own write
 /// in force at once asks for the build
-/// ([`crate::store::MemoryStore::publish_now`]). A removal, the old id of a
-/// replaced incarnation and a status change are in force at their answer:
-/// no decision made after it is handed the worker.
+/// ([`crate::store::MemoryStore::publish_now`]). A removal and a replaced
+/// incarnation pay the build before they answer, and a status change is
+/// published with its answer: no decision made after it is handed the
+/// worker.
 pub trait WorkersStore: Send + Sync {
     /// A registration or its refresh. A new key is `Registered`; the same key
     /// with another incarnation is `Replaced` (the old id leaves with its

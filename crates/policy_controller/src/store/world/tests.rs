@@ -4963,6 +4963,41 @@ fn a_membership_write_reads_the_member_it_writes_and_carries_every_others_fields
 }
 
 #[test]
+fn a_member_back_under_its_id_is_read_under_the_lists_again() {
+    let store = MemoryStore::new();
+    store
+        .apply(generation_listing(1, &[], &["east", "west"], &["alpha"]))
+        .expect("applied");
+    let stays = listed_member(&store, "e", "alpha", Some("east"), &[]);
+    let leaves = listed_member(&store, "w", "alpha", Some("west"), &[]);
+    assert_eq!(listed(&store.world(), leaves), (1, 2, 0));
+    let row = WorkersStore::get(&store, leaves).expect("the row");
+    store.remove(leaves, row.revision).expect("removed");
+    // The same key and incarnation, stating a zone the list does not name,
+    // registered after the leave: the same id, and its row stands at the
+    // revision the one that left was read at.
+    let north = WorkerFacts {
+        engine_kind: "alpha".to_string(),
+        zone: Some("north".to_string()),
+        ..facts("w", Role::Single, &[MODEL])
+    };
+    let back = store.upsert(north).id();
+    let again = WorkersStore::get(&store, back).expect("the row");
+    assert_eq!((back, again.revision), (leaves, row.revision));
+    store.publish_now();
+    // The build reads the registration that stands: no field of the one
+    // that left is carried, and the count outside the list follows.
+    let world = store.world();
+    assert_eq!(listed(&world, back), (1, 0, 0));
+    assert_eq!(listed(&world, stays), (1, 1, 0));
+    let outside = OutsideLists {
+        engines: 0,
+        zones: 1,
+    };
+    assert_eq!(store.outside_lists(), outside);
+}
+
+#[test]
 fn a_member_whose_rows_revision_stands_is_carried_and_one_whose_revision_moved_is_read() {
     let origin = Instant::now();
     let row = |id: u64, zone: &str, revision: u64| WorkerRow {

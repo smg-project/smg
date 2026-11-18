@@ -15,9 +15,9 @@
 //! host pays it at the window's end for every write since the last, so a
 //! storm of registrations builds once a window, and an asker pays it at
 //! once ([`MemoryStore::publish_now`](crate::store::MemoryStore::publish_now)).
-//! A removal and the old id of a replaced incarnation leave rotation at
-//! their answer: their rows are folded as gone and published at once, and
-//! leave their pools at the build.
+//! A removal and a replaced incarnation pay the build before they answer:
+//! the worker that left is in no pool from there on, and a storm of
+//! removals builds once a removal.
 //!
 //! What a membership build derives (where each pool stands, each pool's
 //! shape) is built once and shared by every world until the next membership
@@ -1860,11 +1860,10 @@ pub(super) struct Writer {
     /// store's life, which the leases' file writes and a world lends.
     counts: Arc<Counts>,
     /// Each member's slot in the counts, by worker id, as the last
-    /// membership build left it, less the members that left since: a
-    /// member keeps its slot across builds, a member that joins is given
-    /// the table's next one, and the slot of a worker that left is given
-    /// to no one, so the leases still on file for it end on the count
-    /// they booked.
+    /// membership build left it: a member keeps its slot across builds, a
+    /// member that joins is given the table's next one, and the slot of a
+    /// worker that left is given to no one, so the leases still on file
+    /// for it end on the count they booked.
     booked: Vec<(WorkerId, Slot)>,
     /// The list the next membership build fills, kept for its room.
     booked_spare: Vec<(WorkerId, Slot)>,
@@ -3200,26 +3199,10 @@ impl Writer {
     /// statuses a row reads alike: nothing a decision reads moved.
     #[must_use]
     pub(super) fn fold_status(&mut self, id: WorkerId, status: WorkerStatus) -> Option<Arc<World>> {
-        let health = health_of(status);
-        self.fold_health(id, health.healthy, health.draining)
-    }
-
-    /// A worker left the membership: its rows read not ready and draining
-    /// from here on, which no stock pass hands out, and leave their pools at
-    /// the build its removal left owed. Published at once, as a status
-    /// change is: no decision made after the removal's answer is handed the
-    /// worker. `None` for a worker with no row in a pool yet.
-    #[must_use]
-    pub(super) fn fold_gone(&mut self, id: WorkerId) -> Option<Arc<World>> {
-        self.fold_health(id, false, true)
-    }
-
-    /// Write the two status bits on each of the member's rows and publish at
-    /// once; `None` where no row's bits moved.
-    fn fold_health(&mut self, id: WorkerId, healthy: bool, draining: bool) -> Option<Arc<World>> {
         let Self {
             places, working, ..
         } = self;
+        let health = health_of(status);
         let mut folded = false;
         for place in places_of(places, id) {
             let Some(pool) = working.get_mut(place.pool as usize) else {
@@ -3228,11 +3211,11 @@ impl Writer {
             let Some(row) = pool.rows.get_mut(place.row as usize) else {
                 continue;
             };
-            if (row.health.healthy, row.health.draining) == (healthy, draining) {
+            if (row.health.healthy, row.health.draining) == (health.healthy, health.draining) {
                 continue;
             }
-            row.health.healthy = healthy;
-            row.health.draining = draining;
+            row.health.healthy = health.healthy;
+            row.health.draining = health.draining;
             pool.dirty = true;
             folded = true;
         }

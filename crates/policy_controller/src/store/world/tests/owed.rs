@@ -9,12 +9,13 @@ use std::{
 };
 
 use super::{
-    ask, facts, load, member, running_of, stalled, status, view, Classes, ViewBuffers, ASKER,
-    MODEL, PUBLISH_WINDOW,
+    ask, block, facts, generation_with, load, member, overloaded, pressure, running_of, stalled,
+    status, view, Classes, ViewBuffers, ASKER, MODEL, PUBLISH_WINDOW,
 };
 use crate::{
     store::{
-        HealthSink, LoadSink, LoadSource, MemoryStore, WorkerFacts, WorkerStatus, WorkersStore,
+        HealthSink, Kinds, LoadSink, LoadSource, MemoryStore, WorkerFacts, WorkerStatus,
+        WorkersStore,
     },
     view::{Role, WorkerId},
 };
@@ -148,7 +149,7 @@ fn a_veto_past_its_end_leaves_at_the_build_a_windows_end_pays() {
 }
 
 #[test]
-fn a_leave_is_in_force_at_its_answer_and_its_row_leaves_at_the_build() {
+fn a_removal_pays_its_build_before_it_answers() {
     let store = MemoryStore::new();
     let t0 = Instant::now();
     let stays = member(&store, "http://a:8000");
@@ -157,23 +158,27 @@ fn a_leave_is_in_force_at_its_answer_and_its_row_leaves_at_the_build() {
         status(&store, id, WorkerStatus::Ready);
     }
     assert_eq!(handed(&store, t0).len(), 2);
+    let builds = store.membership_builds();
     store
         .remove(leaves, revision(&store, leaves))
         .expect("removed");
-    // No build was paid. The pool still lists the row and no decision is
-    // handed it: a leave does not wait for the window.
-    assert_eq!(view(&store, &ask(t0)).0.len(), 2);
-    assert_eq!(handed(&store, t0), [stays]);
-    store.publish_now();
-    assert_eq!(view(&store, &ask(t0)).0.len(), 1);
+    // The removal built before it answered. The pool lists the row no more,
+    // whatever a pass reads of a row's health, and nothing is left owed.
+    let (rows, _, _) = view(&store, &ask(t0));
+    assert_eq!(rows.iter().map(|row| row.id).collect::<Vec<_>>(), [stays]);
+    assert_eq!(
+        (store.membership_builds(), store.publish_due()),
+        (builds + 1, None)
+    );
 }
 
 #[test]
-fn a_replaced_incarnation_leaves_at_the_answer_and_the_new_one_joins_at_the_build() {
+fn a_replaced_incarnation_pays_its_build_before_it_answers() {
     let store = MemoryStore::new();
     let t0 = Instant::now();
     let old = member(&store, "http://a:8000");
     status(&store, old, WorkerStatus::Ready);
+    let builds = store.membership_builds();
     let new = store
         .upsert(WorkerFacts {
             incarnation: 2,
@@ -181,13 +186,189 @@ fn a_replaced_incarnation_leaves_at_the_answer_and_the_new_one_joins_at_the_buil
         })
         .id();
     assert_ne!(new, old);
-    // The old life is handed to no decision, and the new one is not built.
-    let (rows, _, _) = view(&store, &ask(t0));
-    assert_eq!(rows.iter().map(|row| row.id).collect::<Vec<_>>(), [old]);
-    assert!(handed(&store, t0).is_empty());
+    // The write built before it answered: the old life's row is in no pool,
+    // the new life stands in its place with the status it inherits, and
+    // nothing is left owed.
+    assert_eq!(handed(&store, t0), [new]);
+    assert_eq!(
+        (store.membership_builds(), store.publish_due()),
+        (builds + 1, None)
+    );
+}
+
+/// A standby's follow door owes and pays as its leader's writes do: a
+/// followed registration and a followed refresh leave their build owed,
+/// the registration's row in no view before it, and a followed removal and
+/// a followed new life pay their own build before the door returns.
+#[test]
+fn a_followed_join_owes_its_build_and_a_followed_leave_pays_its_own() {
+    let leader = MemoryStore::new();
+    let a = member(&leader, "http://a:8000");
+    let b = member(&leader, "http://b:8000");
+    let standby = MemoryStore::new();
+    assert!(standby.restore_from(leader.cut(Kinds::All)));
+    let now = Instant::now();
+    let listed = |store: &MemoryStore| -> Vec<WorkerId> {
+        let (rows, _, _) = view(store, &ask(now));
+        rows.iter().map(|row| row.id).collect()
+    };
+    // A followed registration: on file, owed, in no view until the build.
+    let joins = leader.upsert(worker(2));
+    let row = WorkersStore::get(&leader, joins.id());
+    standby.follow(WorkersStore::epoch(&leader), joins, row);
+    assert_eq!(listed(&standby).len(), 2);
+    assert!(standby.publish_due().is_some());
+    standby.publish_now();
+    assert_eq!(listed(&standby).len(), 3);
+    // A followed refresh keeps the window as the registration does, and
+    // the leave after it pays what it left owed.
+    let refresh = leader.upsert(WorkerFacts {
+        zone: Some("z".to_owned()),
+        ..worker(2)
+    });
+    let row = WorkersStore::get(&leader, refresh.id());
+    standby.follow(WorkersStore::epoch(&leader), refresh, row);
+    assert!(standby.publish_due().is_some());
+    // A followed removal: the row is in no view when the door returns.
+    let leaves = leader.remove(a, revision(&leader, a)).expect("removed");
+    standby.follow(WorkersStore::epoch(&leader), leaves, None);
+    assert!(!listed(&standby).contains(&a));
+    assert_eq!(standby.publish_due(), None);
+    // A followed new life: it stands in the old one's place at once.
+    let life = WorkerFacts {
+        incarnation: 2,
+        ..facts("http://b:8000", Role::Single, &[MODEL])
+    };
+    let replaces = leader.upsert(life);
+    let new = replaces.id();
+    let row = WorkersStore::get(&leader, new);
+    standby.follow(WorkersStore::epoch(&leader), replaces, row);
+    let rows = listed(&standby);
+    assert!(rows.contains(&new) && !rows.contains(&b));
+    assert_eq!(standby.publish_due(), None);
+}
+
+/// A restore builds at once, whatever the window: the cut's rows are in a
+/// view when it returns, over a build the replica's own write left owed,
+/// and nothing is left owed.
+#[test]
+fn a_restore_builds_its_world_at_once_and_leaves_nothing_owed() {
+    let leader = MemoryStore::new();
+    let mut cut = [
+        member(&leader, "http://a:8000"),
+        member(&leader, "http://b:8000"),
+    ];
+    cut.sort_unstable();
+    let standby = MemoryStore::new();
+    // A row of the replica's own, its build still owed.
+    standby.upsert(worker(9));
+    assert!(standby.publish_due().is_some());
+    assert!(standby.restore_from(leader.cut(Kinds::All)));
+    let (rows, _, _) = view(&standby, &ask(Instant::now()));
+    let mut listed: Vec<WorkerId> = rows.iter().map(|row| row.id).collect();
+    listed.sort_unstable();
+    assert_eq!(listed, cut);
+    assert_eq!(standby.publish_due(), None);
+}
+
+#[test]
+fn a_worker_that_returns_under_its_id_inside_the_window_stays_out_of_the_pools_it_left() {
+    let store = MemoryStore::new();
+    let t0 = Instant::now();
+    let stays = member(&store, "http://a:8000");
+    let leaves = member(&store, "http://b:8000");
+    for id in [stays, leaves] {
+        status(&store, id, WorkerStatus::Ready);
+    }
+    store
+        .remove(leaves, revision(&store, leaves))
+        .expect("removed");
+    // The same key and incarnation, registered for another model: the same
+    // id, told ready before the build its return owes.
+    let back = store
+        .upsert(facts("http://b:8000", Role::Single, &["other"]))
+        .id();
+    assert_eq!(back, leaves);
+    status(&store, back, WorkerStatus::Ready);
+    // The status is the new registration's. The pool it left lists no row
+    // of it since the leave's own build, and the next build reads the
+    // status with the registration.
+    assert_eq!(handed(&store, t0), [stays]);
     store.publish_now();
-    let (rows, _, _) = view(&store, &ask(t0));
-    assert_eq!(rows.iter().map(|row| row.id).collect::<Vec<_>>(), [new]);
+    assert_eq!(handed(&store, t0), [stays]);
+    let mut out = ViewBuffers::default();
+    store
+        .build_view("other", Role::Single, &ask(t0), &mut out)
+        .expect("the pool it registered for");
+    let ready = out.candidates.iter().filter(|row| row.health.routable());
+    assert_eq!(ready.map(|row| row.id).collect::<Vec<_>>(), [back]);
+}
+
+#[test]
+fn no_veto_on_a_worker_that_left_stands_over_the_one_that_returns_under_its_id() {
+    let store = MemoryStore::new();
+    let t0 = Instant::now();
+    let id = member(&store, "http://a:8000");
+    status(&store, id, WorkerStatus::Ready);
+    store.gateway_veto(ASKER, id, Some(t0 + Duration::from_secs(1)));
+    assert_eq!(stalled(&store, ASKER, t0), [id]);
+    store.remove(id, revision(&store, id)).expect("removed");
+    let back = store
+        .upsert(facts("http://a:8000", Role::Single, &[MODEL]))
+        .id();
+    assert_eq!(back, id);
+    status(&store, back, WorkerStatus::Ready);
+    store.publish_now();
+    // The veto left with the worker it was on, at the leave's answer: the
+    // build finds none to put on the one that returned.
+    assert_eq!(stalled(&store, ASKER, t0), []);
+    assert_eq!(handed(&store, t0), [back]);
+}
+
+#[test]
+fn the_word_that_no_report_came_leaves_with_the_worker_it_was_said_of() {
+    let store = MemoryStore::with_publish_window(Duration::ZERO);
+    let t0 = Instant::now();
+    let id = member(&store, "http://a:8000");
+    store
+        .apply(generation_with(1, block(8, 1.0)))
+        .expect("applied");
+    store.report(&[(id, 0, Some(pressure(9, 0)))], t0, LoadSource::Poll);
+    store.report(&[(id, 0, None)], t0, LoadSource::Poll);
+    assert_eq!(overloaded(&store, t0), []);
+    store.remove(id, revision(&store, id)).expect("removed");
+    let back = store
+        .upsert(facts("http://a:8000", Role::Single, &[MODEL]))
+        .id();
+    // The one that returned reports a queue past the threshold before its
+    // build. The build judges it from that record: the word said of the one
+    // that left is not carried to it.
+    store.record(back, 0, pressure(9, 0), t0, LoadSource::Stream);
+    store.publish_now();
+    assert_eq!(overloaded(&store, t0), [back]);
+}
+
+#[test]
+fn a_poll_with_no_report_for_a_worker_that_returned_moves_no_verdict_before_its_build() {
+    let store = MemoryStore::with_publish_window(Duration::ZERO);
+    let t0 = Instant::now();
+    let id = member(&store, "http://a:8000");
+    store
+        .apply(generation_with(1, block(8, 1.0)))
+        .expect("applied");
+    store.report(&[(id, 0, Some(pressure(9, 0)))], t0, LoadSource::Poll);
+    assert_eq!(
+        (overloaded(&store, t0), store.overload_flips()),
+        (vec![id], 1)
+    );
+    store.remove(id, revision(&store, id)).expect("removed");
+    let back = store
+        .upsert(facts("http://a:8000", Role::Single, &[MODEL]))
+        .id();
+    // The poll's word is the new registration's, whose engine is not built
+    // yet: it does not reach the engine of the one that left.
+    store.report(&[(back, 0, None)], t0, LoadSource::Poll);
+    assert_eq!(store.overload_flips(), 1);
 }
 
 #[test]
@@ -249,9 +430,11 @@ fn no_decision_is_handed_a_worker_after_its_leaves_answer_under_a_storm() {
                     store
                         .build_view(MODEL, Role::Single, &ask(Instant::now()), &mut out)
                         .expect("the pool");
-                    for row in out.candidates.iter().filter(|row| row.health.routable()) {
+                    // Every row of the view, whatever its health: a profile
+                    // with no health filter picks among them all.
+                    for row in &out.candidates {
                         if let Some(&index) = index_of.get(&row.id) {
-                            assert!(!left[index], "worker {index}: handed after its leave");
+                            assert!(!left[index], "worker {index}: listed after its leave");
                         }
                     }
                 }

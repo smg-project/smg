@@ -367,14 +367,13 @@ fn a_decision_that_straddles_a_write_frees_nothing() {
             assert_eq!(store.publish_due(), Some(end), "the record waits");
             store.publish(end);
         }
-        // A leave: its rows are folded as gone at its answer.
+        // A leave: it pays its build at its answer.
         5 => {
             let id = ids[40 + turn as usize];
             let revision = WorkersStore::get(&store, id).expect("the row").revision;
             store.remove(id, revision).expect("removed");
         }
-        // A new incarnation: the old one's rows are folded as gone at its
-        // answer.
+        // A new incarnation: the write pays its build at its answer.
         _ => {
             let key = format!("http://w{:04}:8000", 20 + turn);
             store.upsert(WorkerFacts {
