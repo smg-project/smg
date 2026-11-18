@@ -300,6 +300,47 @@ fn a_typed_added_token_is_text_under_a_renderer_with_its_own_encoder() {
     }
 }
 
+/// A pipeline that matches an added token after normalization reads as
+/// that token a text its normalizer turns into the spelling. Under it a
+/// prompt is encoded by segments: such a text is read by its characters,
+/// alone and beside a typed token that keeps its id. With no normalizer,
+/// or an empty sequence of them, the entry matches as it is spelled, and a
+/// prompt is encoded from its text.
+#[test]
+fn a_text_the_normalizer_turns_into_an_added_token_stays_text() {
+    let conversion = with_added_token("<a>")
+        .replace(
+            r#""special": false}],"#,
+            r#""special": false},
+        {"id": 20, "content": "<b>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": true, "special": true}],"#,
+        )
+        .replace(r#""<a>": 19}"#, r#""<a>": 19, "<b>": 20}"#);
+    assert!(conversion.contains(r#""id": 20"#) && conversion.contains(r#"": 20}"#));
+    let under = |normalizer: &str| {
+        let conversion = conversion.replace(
+            r#""normalizer": null"#,
+            &format!(r#""normalizer": {normalizer}"#),
+        );
+        let temp = TempDir::new().unwrap();
+        let tok = checkpoint_of(temp.path(), &conversion, &builds());
+        assert!(tok.chat_template.marked(), "{normalizer}");
+        (temp, tok)
+    };
+    let (_temp, tok) = under(r#"{"type": "Lowercase"}"#);
+    let (_, ids, from_text) = render(&tok, json!("<B>"));
+    assert!(!from_text);
+    assert_eq!(ids, [2, 16, 14, 18, 3, 13, 14, 1]);
+    let (_, ids, from_text) = render(&tok, json!("<a><B>"));
+    assert!(!from_text);
+    assert_eq!(ids, [2, 19, 16, 14, 18, 3, 13, 14, 1]);
+    for normalizer in ["null", r#"{"type": "Sequence", "normalizers": []}"#] {
+        let (_temp, tok) = under(normalizer);
+        let (_, ids, from_text) = render(&tok, json!("a<a>b"));
+        assert!(from_text, "{normalizer}");
+        assert_eq!(ids, [2, 13, 19, 14, 3, 13, 14, 1], "{normalizer}");
+    }
+}
+
 #[test]
 fn a_mark_typed_into_a_message_is_no_mark() {
     let temp = TempDir::new().unwrap();

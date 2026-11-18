@@ -366,6 +366,9 @@ struct EncoderCore {
     /// of the text only: the same pipeline with the scheme `never`, built on
     /// first use (see [`Self::plain_tokenizer`]).
     plain_after_control: OnceLock<HfTokenizer>,
+    /// Whether the pipeline matches an added token after normalization,
+    /// read on first use (see [`Self::matches_after_normalization`]).
+    matches_after_normalization: OnceLock<bool>,
 }
 
 impl EncoderCore {
@@ -376,6 +379,7 @@ impl EncoderCore {
             added: OnceLock::new(),
             plain: OnceLock::new(),
             plain_after_control: OnceLock::new(),
+            matches_after_normalization: OnceLock::new(),
         }
     }
 
@@ -449,12 +453,37 @@ impl EncoderCore {
             .as_ref()
     }
 
+    /// Whether the pipeline matches an added token after normalization: an
+    /// entry says so, and the normalizer is more than an empty sequence.
+    /// The flat encode then reads as that token a text the normalizer turns
+    /// into its spelling, which the matcher of [`Self::added`], a reader of
+    /// the raw text, passes. A prompt rendered by segments is encoded by
+    /// segments under such a pipeline: there the text is its characters.
+    fn matches_after_normalization(&self) -> bool {
+        *self.matches_after_normalization.get_or_init(|| {
+            let normalizes = match self.tokenizer.get_normalizer() {
+                None => false,
+                Some(NormalizerWrapper::Sequence(steps)) => !steps.as_ref().is_empty(),
+                Some(_) => true,
+            };
+            normalizes
+                && self
+                    .tokenizer
+                    .get_added_vocabulary()
+                    .get_added_tokens_decoder()
+                    .values()
+                    .any(|token| token.normalized)
+        })
+    }
+
     /// Whether the flat encode of `text` cuts out exactly the added tokens at
     /// `controls` (the renderer's control tokens, in order): then it is the
     /// segment encode and the text can be encoded as text, through every
     /// path and cache a flat encode takes. False when another added-token
     /// spelling occurs in the text (one a client typed), or a control is no
-    /// added token of this vocabulary.
+    /// added token of this vocabulary. The matcher reads the raw text: the
+    /// answer holds for a pipeline that matches no added token after
+    /// normalization ([`Self::matches_after_normalization`]).
     fn flat_encode_is_segment_encode(&self, text: &str, controls: &[Range<usize>]) -> bool {
         match self.added() {
             Some(added) => added.ranges(text).eq(controls.iter().cloned()),
@@ -2441,13 +2470,16 @@ impl HuggingFaceTokenizer {
             .kept
             .as_deref()
             .filter(|_| matches!(self.renderer, Renderer::Jinja));
-        let flat_encode_is_segment_encode = match kept {
-            Some(kept) => self
-                .core
-                .added()
-                .is_some_and(|added| marks::flat_encode_keeps(added, kept, &text, &controls)),
-            None => self.core.flat_encode_is_segment_encode(&text, &controls),
-        };
+        // The matchers read the raw text: under a pipeline that matches an
+        // added token after normalization the prompt is encoded by segments.
+        let flat_encode_is_segment_encode = !self.core.matches_after_normalization()
+            && match kept {
+                Some(kept) => self
+                    .core
+                    .added()
+                    .is_some_and(|added| marks::flat_encode_keeps(added, kept, &text, &controls)),
+                None => self.core.flat_encode_is_segment_encode(&text, &controls),
+            };
         let encoding = if flat_encode_is_segment_encode {
             PromptEncoding::FromText
         } else {
