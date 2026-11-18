@@ -79,11 +79,15 @@ pub struct MemoryStore {
     /// tables and reads each pool's standing in them.
     kv: Arc<KvTables>,
     reservations: Mutex<Reservations>,
-    sessions: Mutex<FxHashMap<u64, Pin>>,
-    /// The instant the pins' next sweep is due ([`Self::sweep_pins`]);
-    /// `None` before the first.
+    /// The pins of record, in the shards of the engine's own table
+    /// ([`crate::sessions::shard_of`]): a dispatch's write and a lookup
+    /// hold one shard, and a sweep or a worker's removal walks them one
+    /// hold after another.
+    sessions: Vec<Mutex<FxHashMap<u64, Pin>>>,
+    /// When the pins were last swept and how often a pass runs
+    /// ([`Self::sweep_pins`]).
     #[cfg(feature = "controller")]
-    pins_due: Mutex<Option<Instant>>,
+    pins_swept: Mutex<PinsSwept>,
     leases: Mutex<Leases>,
     /// What a decision reads, through one load: swapped whole at each
     /// publication.
@@ -172,9 +176,11 @@ impl MemoryStore {
             }),
             kv,
             reservations: Mutex::default(),
-            sessions: Mutex::default(),
+            sessions: (0..crate::sessions::SHARDS)
+                .map(|_| Mutex::default())
+                .collect(),
             #[cfg(feature = "controller")]
-            pins_due: Mutex::default(),
+            pins_swept: Mutex::default(),
             leases: Mutex::new(leases),
             world,
             origin,
@@ -340,8 +346,9 @@ impl MemoryStore {
     /// a resize is told as a relabel and recorded as the leader recorded
     /// it, by the widths. Nothing is minted and no revision is guarded: the
     /// leader's log is the order. A row that leaves takes its tables with
-    /// it as the leader's own write does, and a row that stays keeps its
-    /// admission instant.
+    /// it as the leader's own write does, but for the sessions' pins of
+    /// record that name it, which the leader's own write alone drops, and
+    /// a row that stays keeps its admission instant.
     ///
     /// The change is applied only where it fits the tables: the epoch is
     /// the next one, a new row's id is free and a registration's key too,
@@ -495,6 +502,15 @@ impl MemoryStore {
             before
         };
         drop(before);
+        // The pins' sweep learns a generation's interval here, not at its
+        // first pass: a generation replaced between two ticks of the sweep
+        // still leaves its interval for the pins it ended.
+        #[cfg(feature = "controller")]
+        {
+            if let Some(every) = spec.engine().pins_shortest_sweep() {
+                self.pins_swept.lock().every = Some(every);
+            }
+        }
         Ok(())
     }
 
@@ -799,8 +815,15 @@ impl MemoryStore {
     /// it, here and nowhere else: the health tables, the load rows and the
     /// worker's KV lane with its blocks in the index. The vetoes a world
     /// carries are not among them: they leave with the row in the
-    /// publication of the membership write that calls this. Called under
-    /// the workers lock:
+    /// publication of the membership write that calls this. Nor are the
+    /// sessions' pins of record that name the worker: the leader's own
+    /// removal or replacement drops them once it let its lock go
+    /// ([`Self::forget_pins`]), and a row that leaves by a followed change
+    /// or a restore keeps them. A standby is sent no pin, so those are of
+    /// a term this store led itself: no decision takes one while its
+    /// worker is gone, and a worker that returns under the same key and
+    /// incarnation is pinned by them again. Called under the workers
+    /// lock:
     /// the health writers take it first and a load write goes into its
     /// worker's entry or nowhere, so a write racing the removal finds the
     /// row gone or lands before the tables are cleared.
@@ -810,6 +833,20 @@ impl MemoryStore {
         health.forget(id);
         let mut loads = self.loads.lock();
         loads.ranks.remove(&id);
+    }
+
+    /// The sessions' pins of record that name a worker whose row is gone
+    /// leave here, once the membership write let the workers lock go: the
+    /// walk is as long as the pins of record, and no writer of the
+    /// membership or of a worker's health waits on it. A pin a dispatch
+    /// writes past the walk names a row that is gone and is taken by no
+    /// decision; where its rule has a TTL, the pins' sweep ends it. A
+    /// worker's id is its key and incarnation: where the same incarnation
+    /// registers again before the walk ends, a pin a dispatch writes for
+    /// it in a shard the walk has not reached leaves though its row
+    /// stands, until the key's next dispatch writes it again.
+    fn forget_pins(&self, id: WorkerId) {
+        SessionsStore::drop_worker(self, id);
     }
 
     /// How many times a publication allocated a pool's rows since the store
@@ -1102,6 +1139,8 @@ impl WorkersStore for MemoryStore {
                 joined: Some(new_id),
             };
             self.rebuild_world(&workers, classes, change);
+            drop(workers);
+            self.forget_pins(old_id);
             return change;
         }
         let id = identity(&facts.key, facts.incarnation);
@@ -1178,6 +1217,8 @@ impl WorkersStore for MemoryStore {
             joined: None,
         };
         self.rebuild_world(&workers, classes, change);
+        drop(workers);
+        self.forget_pins(id);
         Some(change)
     }
 
@@ -1873,80 +1914,119 @@ impl ReservationStore for MemoryStore {
 
 // --------------------------------------------------------------- sessions
 
+impl MemoryStore {
+    /// The shard that holds `key`'s pin of record.
+    fn pins_of(&self, key: u64) -> &Mutex<FxHashMap<u64, Pin>> {
+        &self.sessions[crate::sessions::shard_of(key)]
+    }
+}
+
 impl SessionsStore for MemoryStore {
-    fn pin(&self, key: u64, worker: WorkerId, at: Instant) {
+    fn pin(&self, key: u64, worker: WorkerId, at: Instant, ends: Option<u64>) {
         if key == 0 {
             return;
         }
-        self.sessions.lock().insert(
+        self.pins_of(key).lock().insert(
             key,
             Pin {
                 worker,
                 last_used: at,
+                ends,
             },
         );
     }
 
     fn lookup(&self, key: u64) -> Option<Pin> {
-        self.sessions.lock().get(&key).copied()
+        self.pins_of(key).lock().get(&key).copied()
     }
 
     fn unpin(&self, key: u64) {
-        self.sessions.lock().remove(&key);
+        self.pins_of(key).lock().remove(&key);
     }
 
     fn drop_worker(&self, worker: WorkerId) -> usize {
-        let mut sessions = self.sessions.lock();
-        let before = sessions.len();
-        sessions.retain(|_, pin| pin.worker != worker);
-        before - sessions.len()
+        self.sessions
+            .iter()
+            .map(|shard| {
+                let mut pins = shard.lock();
+                let before = pins.len();
+                pins.retain(|_, pin| pin.worker != worker);
+                before - pins.len()
+            })
+            .sum()
     }
 
-    fn expire(&self, before: Instant) -> usize {
-        let mut sessions = self.sessions.lock();
-        let count = sessions.len();
-        sessions.retain(|_, pin| pin.last_used >= before);
-        count - sessions.len()
+    fn expire(&self, now: u64) -> usize {
+        self.sessions
+            .iter()
+            .map(|shard| {
+                let mut pins = shard.lock();
+                let count = pins.len();
+                pins.retain(|_, pin| pin.ends.is_none_or(|ends| ends > now));
+                count - pins.len()
+            })
+            .sum()
     }
 
     fn merge(&self, key: u64, pin: Pin) {
         if key == 0 {
             return;
         }
-        let mut sessions = self.sessions.lock();
-        let entry = sessions.entry(key).or_insert(pin);
+        let mut pins = self.pins_of(key).lock();
+        let entry = pins.entry(key).or_insert(pin);
         if pin.last_used > entry.last_used {
             *entry = pin;
         }
     }
 
     fn len(&self) -> usize {
-        self.sessions.lock().len()
+        self.sessions.iter().map(|shard| shard.lock().len()).sum()
     }
+}
+
+/// When the pins were last swept, and at what interval.
+#[cfg(feature = "controller")]
+#[derive(Default)]
+struct PinsSwept {
+    /// The instant of the last pass; `None` before the first.
+    last: Option<Instant>,
+    /// The interval of the last generation one of whose rules swept, in
+    /// microseconds, learned at its apply; `None` before one was applied.
+    every: Option<u64>,
 }
 
 #[cfg(feature = "controller")]
 impl MemoryStore {
-    /// One pass of the pins' sweep at `now`, where one is due: the pins of
-    /// record last used longer ago than the longest TTL among the standing
-    /// generation's sessions rules leave the table. A pass is due once an
-    /// interval of the rule that sweeps most often, so a clock that ticks
-    /// faster walks nothing between two passes. Where a rule keeps its
-    /// keys with no TTL no pass runs. Returns how many pins left.
+    /// One pass of the pins' sweep at `now`, where one is due: each pin of
+    /// record past its own end leaves the table, whatever the other rules
+    /// keep. A pass is due once the interval of the standing rule that
+    /// sweeps most often has passed since the last one, so a clock that
+    /// ticks faster walks nothing between two passes. The interval is the
+    /// standing generation's at each tick: the pins outlive generations,
+    /// and an apply that shortens it waits out no earlier one. Where no
+    /// standing rule sweeps, the interval of the last generation one of
+    /// whose rules swept stands, as its apply left it, so the pins it
+    /// ended still leave; before any such generation no pass runs. Returns
+    /// how many pins left.
     pub(crate) fn sweep_pins(&self, now: Instant) -> usize {
-        let horizon = self.with_world(|world| world.spec().engine().pins_horizon());
-        let Some((ttl, every)) = horizon else {
-            return 0;
-        };
+        let standing = self.with_world(|world| world.spec().engine().pins_shortest_sweep());
         {
-            let mut due = self.pins_due.lock();
-            if due.is_some_and(|due| now < due) {
+            let mut swept = self.pins_swept.lock();
+            let Some(every) = standing.or(swept.every) else {
+                return 0;
+            };
+            let interval = Duration::from_micros(every);
+            if swept
+                .last
+                .is_some_and(|last| now.saturating_duration_since(last) < interval)
+            {
                 return 0;
             }
-            *due = Some(now + Duration::from_micros(every));
+            swept.last = Some(now);
         }
-        now.checked_sub(Duration::from_micros(ttl))
-            .map_or(0, |before| SessionsStore::expire(self, before))
+        // The pins' ends stand on the decision clock: the pass's instant
+        // is turned into it once.
+        SessionsStore::expire(self, self.micros(now))
     }
 }
 
@@ -2228,10 +2308,14 @@ impl LeasesStore for MemoryStore {
             return true;
         }
         held.record.state = LeaseState::Dispatched { at };
-        // A dispatch on another target of the pick: the lease books that
-        // worker from here on, and the count of the first one is free.
-        let named = held.record.target_at(dispatch.target_index);
-        if let Some((target, _)) = named.filter(|(target, _)| *target != held.record.target) {
+        // A dispatch on another target of the pick: the record names that
+        // target's index from here on. Where the target is another worker
+        // the lease books it and the count of the first one is free;
+        // another rank of the lease's own worker moves no count.
+        let Some((target, _)) = held.record.target_at(dispatch.target_index) else {
+            return true;
+        };
+        if target != held.record.target {
             if let Some(booked) = held.booked {
                 leases.counts.free(booked);
             }
@@ -2240,8 +2324,8 @@ impl LeasesStore for MemoryStore {
                 leases.counts.book(booked);
             }
             held.record.target = target;
-            held.record.lease.target_index = dispatch.target_index;
         }
+        held.record.lease.target_index = dispatch.target_index;
         true
     }
 

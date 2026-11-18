@@ -60,7 +60,8 @@ use crate::{
     spec::{AppliedSpec, MAX_HEADERS},
     view::{
         fingerprint, key_of_session, AffinityFacts, Constraints, HashKind, Header, Identity,
-        MediaCounts, ModelFingerprint, NamedAffinity, Phase, RequestFacts, WireModes, WorkerId,
+        MediaCounts, ModelFingerprint, NamedAffinity, Phase, PinSource, RequestFacts, WireModes,
+        WorkerId,
     },
 };
 
@@ -324,6 +325,7 @@ impl Checked {
                 // The asking gateway's standing vetoes beside lent rows,
                 // and nothing where each row carries its own bit.
                 stalled: view.stalled,
+                pins: view.pins,
             },
         );
         lists.headers = emptied(headers);
@@ -355,6 +357,9 @@ pub(crate) struct Viewed<'a> {
     /// The rows the deciding host named in the column's place, where the
     /// request's profile takes them.
     pub(crate) named: Option<NamedAffinity<'a>>,
+    /// The pins of record the host lends the decision ([`PinSource`]);
+    /// `None` where it keeps none.
+    pub(crate) pins: Option<&'a dyn PinSource>,
 }
 
 /// The lists of one request in the engine's form, on buffers their decider
@@ -711,6 +716,7 @@ mod tests {
             in_flight: None,
             max_block_hashes: 256,
             named: None,
+            pins: None,
         };
         checked.read(lists, view, check)
     }
@@ -1034,6 +1040,7 @@ mod tests {
                 in_flight: None,
                 max_block_hashes,
                 named: None,
+                pins: None,
             };
             checked.read(&mut Lists::default(), view, |facts, _| {
                 facts.block_hashes.to_vec()

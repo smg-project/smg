@@ -756,9 +756,10 @@ pub(crate) mod tests {
         },
         elector::{ElectionSettings, Elector, Tick},
         lease::{Lease, LeaseId},
+        spec::{AppliedSpec, PolicySpec},
         store::{
             GatewayId, HealthSink, LeaseRecord, LeaseState, LeasesStore, MemoryStore, Picked,
-            WorkersStore,
+            SessionsStore, WorkersStore,
         },
         view::WorkerId,
     };
@@ -1378,6 +1379,39 @@ pub(crate) mod tests {
             ended.elapsed()
         );
 
+        stop.send_replace(true);
+        timeout(Duration::from_secs(20), task.join_next())
+            .await
+            .expect("the task ends within 20 s of its stop")
+            .expect("one task")
+            .expect("it ended by itself");
+    }
+
+    /// The pins of record ride the sweeps' task: a pin past its end leaves
+    /// by the task's own tick, which no other caller of the pins' sweep
+    /// stands in for.
+    #[tokio::test]
+    async fn the_sweeps_task_drops_a_pin_of_record_past_its_end() {
+        let (_elector, store, gateways, t0) = leading(Duration::from_millis(60));
+        // A standing sessions rule: without one no pass of the pins runs.
+        let mut document = PolicySpec::preset("manual").expect("a preset of this build");
+        document.generation = 1;
+        let spec = AppliedSpec::validate(&document).expect("the document validates");
+        store.apply(spec).expect("a first generation");
+        SessionsStore::pin(&*store, 7, WorkerId(1), t0, Some(store.micros(t0)));
+        assert_eq!(SessionsStore::len(&*store), 1);
+        let (stop, stopped) = watch::channel(false);
+        let mut task = JoinSet::new();
+        let sweeper = Arc::clone(&gateways);
+        task.spawn(async move { sweeper.run(stopped).await });
+        let started = Instant::now();
+        while SessionsStore::len(&*store) > 0 {
+            assert!(
+                started.elapsed() < Duration::from_secs(20),
+                "the task swept no pin in 20 s"
+            );
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
         stop.send_replace(true);
         timeout(Duration::from_secs(20), task.join_next())
             .await

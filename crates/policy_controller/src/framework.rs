@@ -2847,26 +2847,34 @@ impl Engine {
         &self.sessions
     }
 
-    /// What ends the pins a host keeps of this generation's sessions rules:
-    /// the longest TTL among the rules and the shortest interval one of
-    /// them sweeps at, both in microseconds. `None` where no rule pins a
-    /// key, and where a rule keeps its keys with no TTL: no instant ends
-    /// such a pin.
-    pub fn pins_horizon(&self) -> Option<(u64, u64)> {
-        let rules = || {
-            self.bindings
-                .iter()
-                .filter_map(|entry| entry.binding.sessions.as_ref())
-        };
-        let mut ttl = 0;
-        for rule in rules() {
-            ttl = ttl.max(rule.ttl_micros?);
-        }
-        let every = rules()
+    /// This generation's sessions rules.
+    fn session_rules(&self) -> impl Iterator<Item = &SessionRule> {
+        self.bindings
+            .iter()
+            .filter_map(|entry| entry.binding.sessions.as_ref())
+    }
+
+    /// How often a host sweeps the pins it keeps of this generation's
+    /// sessions rules: the shortest interval one of them sweeps at, in
+    /// microseconds. `None` where no rule sweeps.
+    pub fn pins_shortest_sweep(&self) -> Option<u64> {
+        self.session_rules()
             .map(|rule| rule.sweep_micros)
             .filter(|every| *every > 0)
-            .min()?;
-        Some((ttl, every))
+            .min()
+    }
+
+    /// The longest TTL among this generation's sessions rules, in
+    /// microseconds: what ends a pin whose own rule its host cannot name,
+    /// so the pin outlasts whichever rule placed its key. `None`, no end,
+    /// where one of the rules keeps its keys with no TTL: the key may be
+    /// that rule's. `None` as well where no rule stands.
+    pub fn pins_longest_ttl(&self) -> Option<u64> {
+        let mut longest = None;
+        for rule in self.session_rules() {
+            longest = longest.max(Some(rule.ttl_micros?));
+        }
+        longest
     }
 
     /// What the host must feed before any request exists: every profile's
@@ -3232,7 +3240,10 @@ impl Engine {
     /// routable pin is placed by the stages. The stages are the profile's own
     /// under `delegate`, else the assignment's, and `placing` names which:
     /// the binding's placing assignment, not the rule's declared one. The
-    /// pin is written by the dispatch (`on_dispatched`), never here.
+    /// pin is written by the dispatch (`on_dispatched`), never here, but
+    /// for one read: a key the table holds no pin of asks the pins of
+    /// record the host lent ([`Constraints::pins`]), and a stored worker
+    /// among the kept candidates is written back and decides as a pin.
     #[expect(
         clippy::too_many_arguments,
         reason = "the profile run's inputs, as run_profile takes them"
@@ -3262,6 +3273,28 @@ impl Engine {
             .filter(|p| **p != WorkerId(0))
             .find_map(|p| buf.kept.iter().find(|&&i| candidates[i as usize].id == *p))
             .copied();
+        // The read at a miss. The table held no pin of the key: a key it
+        // never saw, or one whose pins went with an earlier generation's
+        // table. The host's pins of record are asked once, with no lock of
+        // the table's held, and a stored worker the filters kept is written
+        // back as the key's pin: two first requests of one such key read
+        // one record and agree with no claim between them. A table that
+        // held a pin, every one down or filtered, asks nothing: the rule's
+        // recovery places that key.
+        let owner = owner.or_else(|| {
+            if pins[0] != WorkerId(0) {
+                return None;
+            }
+            let stored = cx.pins?.pinned(key, rule.ttl_micros)?;
+            buf.kept
+                .iter()
+                .find(|&&i| candidates[i as usize].id == stored)?;
+            let pins = self.sessions.restore(key, facts.now_micros, rule, stored);
+            pins.iter()
+                .filter(|p| **p != WorkerId(0))
+                .find_map(|p| buf.kept.iter().find(|&&i| candidates[i as usize].id == *p))
+                .copied()
+        });
         if let Some(i) = owner {
             let c = &candidates[i as usize];
             let under_cap = rule.inflight_cap == 0 || c.session_in_flight < rule.inflight_cap;
@@ -7160,6 +7193,193 @@ mod tests {
         target
     }
 
+    /// The pins of record a case lends: one key's stored worker, and the
+    /// TTL each question was asked under.
+    #[derive(Debug)]
+    struct Stored {
+        key: Session,
+        worker: WorkerId,
+        asked: Mutex<Vec<Option<u64>>>,
+    }
+
+    impl Stored {
+        fn of(key: u64, worker: WorkerId) -> Self {
+            Self {
+                key: session(key),
+                worker,
+                asked: Mutex::default(),
+            }
+        }
+
+        fn asked(&self) -> Vec<Option<u64>> {
+            self.asked.lock().expect("the case's lock").clone()
+        }
+    }
+
+    impl crate::PinSource for Stored {
+        fn pinned(&self, key: Session, ttl_micros: Option<u64>) -> Option<WorkerId> {
+            self.asked.lock().expect("the case's lock").push(ttl_micros);
+            (key == self.key).then_some(self.worker)
+        }
+    }
+
+    /// Decide for `key` at `now` with `stored` lent, without committing.
+    fn decide_lent(
+        engine: &Engine,
+        pool: &[Candidate],
+        key: u64,
+        now: u64,
+        stored: &Stored,
+    ) -> Decision {
+        let facts = RequestFacts {
+            model: "m",
+            session_key: Identity::hashed(key),
+            now_micros: now,
+            ..RequestFacts::default()
+        };
+        let mut scratch = Scratch::new();
+        engine.decide(
+            &facts,
+            &PoolFacts::default(),
+            pool,
+            &Constraints {
+                pins: Some(stored),
+                ..Constraints::default()
+            },
+            &mut scratch,
+        )
+    }
+
+    /// A key the table holds no pin of takes the host's pin of record: the
+    /// stored worker decides as a pin where the filters kept it, the table
+    /// holds it from then on, and the record is asked once, under the
+    /// rule's TTL. A second request of the key before any commit reads the
+    /// table's pin: two first requests agree with no claim between them.
+    #[test]
+    fn a_key_with_no_pin_in_the_table_takes_the_hosts_pin_of_record() {
+        let engine = session_engine(SessionRule {
+            ttl_micros: Some(60_000_000),
+            sweep_micros: 30_000_000,
+            ..SESSIONS
+        });
+        // Least requests would place the key on the first worker.
+        let pool = vec![candidate(0, 0), candidate(1, 5), candidate(2, 9)];
+        let stored = Stored::of(7, pool[2].id);
+        for now in [10, 11] {
+            let decision = decide_lent(&engine, &pool, 7, now, &stored);
+            let pick = decision.pick().expect("a pick");
+            assert_eq!(pick.targets.first().map(|t| t.position), Some(2));
+            assert_eq!(pick.session_verdict, SessionVerdict::Pinned);
+        }
+        assert_eq!(
+            stored.asked(),
+            [Some(60_000_000)],
+            "asked once, at the miss"
+        );
+        assert_eq!(
+            engine.sessions().pins(session(7)),
+            Some([pool[2].id, WorkerId(0)])
+        );
+        // Another key has no pin of record and is claimed as a fresh one.
+        let fresh = decide_lent(&engine, &pool, 8, 12, &stored);
+        let pick = fresh.pick().expect("a pick");
+        assert_eq!(pick.session_verdict, SessionVerdict::Claimed(pool[0].id));
+        assert_eq!(stored.asked().len(), 2);
+    }
+
+    /// A pin of record on a worker the filters dropped is passed over and
+    /// the key is placed as a fresh one. A table that holds a pin of the
+    /// key, down as it is, asks no pin of record: the rule's recovery
+    /// places that key.
+    #[test]
+    fn a_pin_of_record_decides_among_the_kept_candidates_and_for_an_empty_key_alone() {
+        let engine = session_engine(SESSIONS);
+        let mut pool = vec![candidate(0, 0), candidate(1, 5), candidate(2, 9)];
+        pool[2].health.healthy = false;
+        let stored = Stored::of(7, pool[2].id);
+        let decision = decide_lent(&engine, &pool, 7, 10, &stored);
+        let pick = decision.pick().expect("a pick");
+        assert_eq!(pick.targets.first().map(|t| t.position), Some(0));
+        assert_eq!(pick.session_verdict, SessionVerdict::Claimed(pool[0].id));
+        assert_eq!(stored.asked().len(), 1);
+        // The claim stands in the table. Its worker goes down and the
+        // stored one comes back: the table's pin is the key's, and the
+        // record is not asked again.
+        pool[0].health.healthy = false;
+        pool[2].health.healthy = true;
+        let decision = decide_lent(&engine, &pool, 7, 11, &stored);
+        let pick = decision.pick().expect("a pick");
+        assert_eq!(stored.asked().len(), 1, "a key with a pin asked the record");
+        assert_eq!(
+            pick.targets.first().map(|t| t.position),
+            Some(1),
+            "placed by the profile among the kept"
+        );
+    }
+
+    /// Pins of record whose ask lets another first request of the key write
+    /// its pin into the table, as a decision on another thread does between
+    /// this decision's read of the table and its write back.
+    #[derive(Debug)]
+    struct Racing<'a> {
+        engine: &'a Engine,
+        rule: SessionRule,
+        stored: WorkerId,
+        other: WorkerId,
+    }
+
+    impl crate::PinSource for Racing<'_> {
+        fn pinned(&self, key: Session, _: Option<u64>) -> Option<WorkerId> {
+            let _ = self
+                .engine
+                .sessions()
+                .restore(key, 10, &self.rule, self.other);
+            Some(self.stored)
+        }
+    }
+
+    /// A pin another first request wrote into the table while this decision
+    /// asked the record is the key's: the write back hands the pins that
+    /// stand, and the decision follows them, not the stored worker.
+    #[test]
+    fn a_pin_written_during_the_ask_is_the_keys_whatever_the_record_names() {
+        let rule = SessionRule {
+            ttl_micros: Some(60_000_000),
+            sweep_micros: 30_000_000,
+            ..SESSIONS
+        };
+        let engine = session_engine(rule);
+        let pool = vec![candidate(0, 0), candidate(1, 5), candidate(2, 9)];
+        let racing = Racing {
+            engine: &engine,
+            rule,
+            stored: pool[2].id,
+            other: pool[1].id,
+        };
+        let facts = RequestFacts {
+            model: "m",
+            session_key: Identity::hashed(7),
+            now_micros: 10,
+            ..RequestFacts::default()
+        };
+        let decision = engine.decide(
+            &facts,
+            &PoolFacts::default(),
+            &pool,
+            &Constraints {
+                pins: Some(&racing),
+                ..Constraints::default()
+            },
+            &mut Scratch::new(),
+        );
+        let pick = decision.pick().expect("a pick");
+        assert_eq!(pick.targets.first().map(|t| t.position), Some(1));
+        assert_eq!(
+            engine.sessions().pins(session(7)),
+            Some([pool[1].id, WorkerId(0)])
+        );
+    }
+
     /// A key is placed by the profile once, then stays on its pin past the
     /// load; an unroutable pin hands the key to a failover; once both are
     /// routable the rule's recovery says which leads.
@@ -7643,7 +7863,7 @@ mod tests {
     }
 
     #[test]
-    fn the_pins_horizon_is_the_longest_ttl_and_the_shortest_sweep_of_the_rules() {
+    fn a_host_reads_the_rules_shortest_sweep_and_their_longest_ttl() {
         let rule = |ttl_micros, sweep_micros| SessionRule {
             assignment: Assignment::Random,
             inflight_cap: 0,
@@ -7668,14 +7888,21 @@ mod tests {
                 Needs::default(),
             )
         };
-        assert_eq!(manual_engine(None).pins_horizon(), None, "no rule");
+        let read = |engine: &Engine| (engine.pins_shortest_sweep(), engine.pins_longest_ttl());
+        assert_eq!(read(&manual_engine(None)), (None, None), "no rule");
         let one = manual_engine(Some(rule(Some(1_000), 100)));
-        assert_eq!(one.pins_horizon(), Some((1_000, 100)));
+        assert_eq!(read(&one), (Some(100), Some(1_000)));
         let both = two(rule(Some(1_000), 100), rule(Some(5_000), 40));
-        assert_eq!(both.pins_horizon(), Some((5_000, 40)));
-        // A rule that keeps its keys with no TTL: no instant ends a pin.
-        let for_ever = two(rule(Some(1_000), 100), rule(None, 0));
-        assert_eq!(for_ever.pins_horizon(), None);
+        assert_eq!(read(&both), (Some(40), Some(5_000)));
+        // A rule that keeps its keys with no TTL sweeps nothing: the other
+        // rule's interval stands. Its keys never end, so no TTL is the
+        // longest, wherever the rule sits among the bindings.
+        let mixed = two(rule(Some(1_000), 100), rule(None, 0));
+        assert_eq!(read(&mixed), (Some(100), None));
+        let mixed = two(rule(None, 0), rule(Some(1_000), 100));
+        assert_eq!(read(&mixed), (Some(100), None));
+        let for_ever = manual_engine(Some(rule(None, 0)));
+        assert_eq!(read(&for_ever), (None, None));
     }
 
     /// One decision for `key` (`0`: no key) drawn by `seed`: the worker and

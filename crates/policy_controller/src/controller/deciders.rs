@@ -141,11 +141,11 @@ use crate::{
     sessions::SessionVerdict,
     store::{
         leases::DISPATCH_TTL, Ask, Built, GatewayId, LeaseRecord, LeaseRefused, LeaseState,
-        MemoryStore, Named, Naming, Picked, ViewBuffers, World,
+        MemoryStore, Named, Naming, Picked, SessionsStore, ViewBuffers, World,
     },
     view::{
-        fingerprint, AffinityFacts, Candidate, Constraints, Phase, PoolFacts, RequestFacts, Role,
-        Session, WireModes, WorkerId,
+        fingerprint, AffinityFacts, Candidate, Constraints, Phase, PinSource, PoolFacts,
+        RequestFacts, Role, Session, WireModes, WorkerId,
     },
 };
 
@@ -639,8 +639,13 @@ impl Decider {
             counts.texts.fetch_add(1, Ordering::Relaxed);
             return Err(Reason::Unspecified);
         }
-        let taken =
-            Taken::at(request, gateway, received, now).ok_or(Reason::BudgetGoneOnArrival)?;
+        // The store's pins, lent to the decision: its engine asks them for
+        // a key its own table holds no pin of, as after an apply of a new
+        // generation.
+        let pins = StorePins { store, now };
+        let taken = Taken::at(request, gateway, received, now)
+            .ok_or(Reason::BudgetGoneOnArrival)?
+            .lent(&pins);
         let (buffers, own) = (&mut self.buffers, counts.part(self.index));
         // One load of the world for the decision and for its lease: the
         // lease books the count that load laid beside its target's row,
@@ -723,6 +728,9 @@ struct Taken<'a> {
     now: Instant,
     /// What is left of the request's budget at that instant.
     left: Duration,
+    /// The pins of record lent to the decision, where its host keeps them:
+    /// its engine asks them for a key its own table holds no pin of.
+    pins: Option<&'a dyn PinSource>,
 }
 
 impl<'a> Taken<'a> {
@@ -745,7 +753,16 @@ impl<'a> Taken<'a> {
             gateway,
             now,
             left,
+            pins: None,
         })
+    }
+
+    /// The request with the pins of record lent to its decision.
+    fn lent(self, pins: &'a dyn PinSource) -> Self {
+        Self {
+            pins: Some(pins),
+            ..self
+        }
     }
 
     /// The time since the request was taken at `later`, a read of the
@@ -766,6 +783,44 @@ impl<'a> Taken<'a> {
     /// left then, less that time, under the same rule.
     fn outlasted(&self, since: Duration) -> bool {
         self.left.saturating_sub(since) < Duration::from_micros(1)
+    }
+}
+
+/// The store's pins of record as a decision's engine reads them
+/// ([`PinSource`]): asked for a key the engine's table holds no pin of,
+/// under no lock but the pins' own.
+struct StorePins<'a> {
+    store: &'a MemoryStore,
+    /// The decision's instant: a pin's end and its age are read against
+    /// it.
+    now: Instant,
+}
+
+impl std::fmt::Debug for StorePins<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StorePins").finish_non_exhaustive()
+    }
+}
+
+impl PinSource for StorePins<'_> {
+    fn pinned(&self, key: Session, ttl_micros: Option<u64>) -> Option<WorkerId> {
+        let pin = SessionsStore::lookup(self.store, key.get())?;
+        // A pin at or past its own end is no pin, whether or not the sweep
+        // has run: its end is the instant the engine's table forgot the
+        // key. A TTL counted from the dispatch ends later than that, and
+        // so may the TTL of a rule applied since. The end stands on the
+        // decision clock: the ask's instant is turned into it here, at a
+        // miss that finds a pin with an end and nowhere else.
+        let ended = |ends: u64| ends <= self.store.micros(self.now);
+        if pin.ends.is_some_and(ended) {
+            return None;
+        }
+        // The asking rule's TTL holds as well, against the pin's last use:
+        // a pin as old as that TTL is no pin, to the microsecond.
+        let age = self.now.saturating_duration_since(pin.last_used);
+        ttl_micros
+            .is_none_or(|ttl| age < Duration::from_micros(ttl))
+            .then_some(pin.worker)
     }
 }
 
@@ -1024,6 +1079,7 @@ fn hand<R>(
         gateway,
         now,
         left,
+        pins,
     } = *taken;
     let spec = world.spec();
     let (model, phase) = (request.model(), request.phase());
@@ -1142,6 +1198,7 @@ fn hand<R>(
         in_flight: counts,
         max_block_hashes: request.hashes_read(spec),
         named: names.then(|| named.affinity()),
+        pins,
     };
     let answer = request.read(lists, viewed, |facts, constraints| {
         decide(facts, &pool, candidates, constraints, scratch)
@@ -4299,5 +4356,134 @@ pub(crate) mod tests {
         let mut view = built(true);
         assert_eq!(narrow(&mut view, Some(WireModes::GRPC), Some(0)), 0);
         assert_eq!(read(&view), (vec![], vec![]));
+    }
+
+    /// The bed's frame under a session key.
+    fn keyed(key: u64, seed: u64) -> proto::DecideRequest {
+        let mut frame = frame(u8::try_from(seed % 251).expect("under 251"), seed);
+        frame
+            .facts
+            .as_mut()
+            .expect("the case's frame has facts")
+            .session_key = Some(proto::Identity {
+            form: Some(proto::identity::Form::Hash(key)),
+        });
+        frame
+    }
+
+    /// A keyed session keeps its worker across an apply of a new
+    /// generation. The new engine's table of sessions starts empty: a
+    /// decision that finds no pin there reads the store's, which the
+    /// session's `Dispatched` frame wrote, and is made on it. Inside a
+    /// generation a decision of a dispatched key is made on its pin too.
+    #[tokio::test]
+    async fn a_keyed_session_keeps_its_worker_across_an_apply() {
+        use crate::{
+            controller::lifecycle::{self, tests::a_dispatched},
+            sessions::SessionVerdict,
+        };
+        const KEYS: u64 = 24;
+        let mut bed = bed(Some(preset("manual", 1)), true, (1, 8), []);
+        let at = bed.script.taken;
+        let verdict = |bed: &Bed, answer: &proto::DecideAnswer| {
+            LeasesStore::get(&*bed.store, GATEWAY, LeaseId(lease_of(answer).id))
+                .expect("the lease is on file")
+                .lease
+                .session_verdict
+        };
+        // The key's value as its decision made it, read off the lease.
+        let session = |bed: &Bed, answer: &proto::DecideAnswer| {
+            LeasesStore::get(&*bed.store, GATEWAY, LeaseId(lease_of(answer).id))
+                .expect("the lease is on file")
+                .lease
+                .session
+        };
+        let pins = |bed: &Bed, session: crate::view::Session| {
+            bed.store
+                .deciding(|world| world.spec().engine().sessions().pins(session))
+        };
+        // Each key's first decision claims a worker, and its gateway's
+        // Dispatched frame commits it: the engine's pin and the store's.
+        let mut first = Vec::new();
+        for key in 1..=KEYS {
+            let answer = bed.ask(keyed(key, 1_000 + key)).await;
+            let worker = picked(&answer);
+            assert_eq!(verdict(&bed, &answer), SessionVerdict::Claimed(worker));
+            lifecycle::dispatched(&bed.store, GATEWAY, &a_dispatched(lease_of(&answer).id), at)
+                .expect("the frame reads");
+            first.push((key, worker, session(&bed, &answer)));
+        }
+        // The keys stand on more than one worker: a bed that kept every
+        // key on one would hold nothing.
+        let stood = bed
+            .workers
+            .iter()
+            .filter(|member| first.iter().any(|&(_, worker, _)| worker == **member))
+            .count();
+        assert!(stood > 1, "the keys stand on {stood} worker");
+        for &(key, worker, _) in &first {
+            let answer = bed.ask(keyed(key, 2_000 + key)).await;
+            assert_eq!(picked(&answer), worker);
+            assert_eq!(verdict(&bed, &answer), SessionVerdict::Pinned);
+        }
+        // A new generation: its engine's table holds no pin of any key.
+        assert!(pins(&bed, first[0].2).is_some());
+        bed.store
+            .apply(preset("manual", 2))
+            .expect("a later generation");
+        assert_eq!(pins(&bed, first[0].2), None);
+        for &(key, worker, session) in &first {
+            let answer = bed.ask(keyed(key, 3_000 + key)).await;
+            assert_eq!(
+                picked(&answer),
+                worker,
+                "key {key} left its worker at the apply"
+            );
+            assert_eq!(verdict(&bed, &answer), SessionVerdict::Pinned);
+            assert_eq!(pins(&bed, session), Some([worker, WorkerId(0)]));
+        }
+    }
+
+    /// The store's pin is the key's worker before its own end and for less
+    /// than the rule's TTL since its last use: the engine's table forgets
+    /// a key at its TTL to the microsecond, and the pin of record is no
+    /// older a pin.
+    #[test]
+    fn a_stored_pin_as_old_as_the_rules_ttl_is_no_pin() {
+        use super::StorePins;
+        use crate::{
+            store::SessionsStore,
+            view::{PinSource, Session},
+        };
+        let store = MemoryStore::new();
+        let t0 = Instant::now();
+        let key = Session::from_raw(41);
+        SessionsStore::pin(&store, key.get(), WorkerId(7), t0, None);
+        let at = |micros: u64| StorePins {
+            store: &store,
+            now: t0 + Duration::from_micros(micros),
+        };
+        assert_eq!(at(999).pinned(key, Some(1_000)), Some(WorkerId(7)));
+        assert_eq!(at(1_000).pinned(key, Some(1_000)), None);
+        assert_eq!(
+            at(1_000_000).pinned(key, None),
+            Some(WorkerId(7)),
+            "a rule with no TTL"
+        );
+        assert_eq!(at(0).pinned(Session::from_raw(42), None), None);
+        // A pin at its own end is no pin, whatever TTL the asking rule
+        // has: the engine's table forgot the key at that instant.
+        let ended = Session::from_raw(43);
+        let end = store.micros(t0) + 500;
+        SessionsStore::pin(&store, ended.get(), WorkerId(8), t0, Some(end));
+        assert_eq!(at(499).pinned(ended, Some(1_000)), Some(WorkerId(8)));
+        assert_eq!(at(500).pinned(ended, Some(1_000)), None);
+        assert_eq!(at(500).pinned(ended, None), None, "a rule with no TTL");
+        // A decision's clock behind the pin's last use reads no age.
+        let behind = StorePins {
+            store: &store,
+            now: t0.checked_sub(Duration::from_micros(5)).unwrap_or(t0),
+        };
+        assert_eq!(behind.pinned(key, Some(1)), Some(WorkerId(7)));
     }
 }
