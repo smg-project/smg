@@ -684,7 +684,18 @@ impl WorkerSyncAdapter {
         }
     }
 
-    fn apply_state_inner(self: &Arc<Self>, worker_id: &str, state: WorkerState) {
+    fn apply_state_inner(self: &Arc<Self>, worker_id: &str, mut state: WorkerState) {
+        // Resolve legacy empty payload IDs at the inbound boundary, before
+        // owner liveness and endpoint retirement can cancel a preparation.
+        // Default imports retain their existing identity behavior.
+        if state.worker_id.is_empty()
+            && self.app_context.upgrade().is_some_and(|app| {
+                app.router_config.wait_for_tokenizer
+                    && !app.router_config.disable_tokenizer_autoload
+            })
+        {
+            worker_id.clone_into(&mut state.worker_id);
+        }
         if self.is_own_orphan(worker_id, &state) {
             info!(
                 worker_id,
@@ -1202,8 +1213,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_slotless_replacement_holds_its_endpoint_until_its_actual_key_is_tombstoned() {
-        for empty_payload_id in [false, true] {
+    async fn a_slotless_replacement_releases_its_claim_when_its_key_stops_being_importable() {
+        for (empty_payload_id, cleanup) in [false, true].into_iter().flat_map(|empty| {
+            ["tombstone", "owner-down", "retired"].map(|cleanup| (empty, cleanup))
+        }) {
             let mesh = MeshKV::new("node-a".into());
             let ns = worker_namespace(&mesh);
             let registry = Arc::new(WorkerRegistry::new());
@@ -1215,11 +1228,13 @@ mod tests {
                 Arc::clone(&registry),
                 None,
             );
+            let cluster =
+                cluster_with(&[("node-b", NodeStatus::Alive), ("node-c", NodeStatus::Alive)]);
             let adapter = WorkerSyncAdapter::new_with_context(
                 Arc::clone(&ns),
                 Arc::clone(&registry),
                 "node-a".into(),
-                empty_cluster(),
+                Arc::clone(&cluster),
                 Arc::downgrade(&app),
             );
             let _slots = Arc::clone(&adapter.preparation_slots)
@@ -1254,16 +1269,29 @@ mod tests {
             // all preparation permits are busy with other endpoints.
             ns.put(
                 "worker:w2",
-                bincode::serialize(&sample_state("w2", url)).unwrap(),
+                bincode::serialize(&owned_state("w2", url, "node-c")).unwrap(),
             );
             adapter.sync_key_from_store("worker:w2", "w2");
             assert!(registry.get_by_url(url).is_none());
 
-            // Reconciliation must recover a dropped tombstone notification
-            // using the key suffix, including legacy values with an empty ID.
-            ns.delete("worker:w1");
-            adapter.reconcile();
-            assert!(!adapter.preparing.lock().contains_key(url));
+            // Every cleanup path uses the authoritative key, including
+            // legacy values with no publisher ID in the payload.
+            match cleanup {
+                "tombstone" => ns.delete("worker:w1"),
+                "owner-down" => set_status(&cluster, "node-b", NodeStatus::Down),
+                _ => adapter.retire(url, None),
+            }
+            adapter.reconcile_once();
+            assert!(
+                !adapter.preparing.lock().contains_key(url),
+                "{cleanup}, empty ID: {empty_payload_id}"
+            );
+            if cleanup == "retired" {
+                assert!(registry.get_by_url(url).is_none());
+                adapter.readmit(url);
+                ns.delete("worker:w1");
+                adapter.reconcile_once();
+            }
             assert_eq!(registry.get_id_by_url(url).unwrap().as_str(), "w2");
         }
     }
