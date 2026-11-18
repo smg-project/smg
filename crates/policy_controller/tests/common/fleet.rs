@@ -69,7 +69,7 @@ use smg_policy_controller::{
         ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore,
     },
     view::{fingerprint, LoadRow, Role, WireModes, WorkerId},
-    AppliedSpec, LeaseId, PolicySpec,
+    AppliedSpec, Catalog, LeaseId, PolicySpec,
 };
 use tokio::{
     io::{copy, sink},
@@ -796,6 +796,20 @@ impl Replica {
     /// Binds and serves a controller named `id`. Replicas given one `lease`
     /// file elect over it; with none the controller leads itself.
     pub async fn start(id: &str, lease: Option<&Path>) -> Result<Self, String> {
+        Self::start_over(id, lease, Catalog::builtin(), None).await
+    }
+
+    /// As [`Replica::start`], over the stages `catalog` holds, a host's own
+    /// among them. With `spec` the controller takes its policy document
+    /// from that file and applies it itself, as a host's own build does: a
+    /// document names a host's stage where the controller bound over that
+    /// catalog validates it, and nowhere else.
+    pub async fn start_over(
+        id: &str,
+        lease: Option<&Path>,
+        catalog: Catalog,
+        spec: Option<&Path>,
+    ) -> Result<Self, String> {
         let listener = |name: &str, scopes: &[Scope]| Listener {
             name: name.to_owned(),
             addr: loopback(),
@@ -824,7 +838,7 @@ impl Replica {
         let mut controller = bounded(
             "the controller binds its listeners",
             ROOM,
-            Controller::bind(config),
+            Controller::bind_with(config, catalog),
         )
         .await?
         .map_err(|error| error.to_string())?;
@@ -835,6 +849,15 @@ impl Replica {
         controller
             .identity_as_told("control")
             .map_err(|error| error.to_string())?;
+        if let Some(spec) = spec {
+            bounded(
+                "the controller takes its spec file",
+                ROOM,
+                controller.spec_file(spec),
+            )
+            .await?
+            .map_err(|error| error.to_string())?;
+        }
         let addresses = controller.addresses();
         let gateway = addresses
             .of(Scope::Gateway)
@@ -919,7 +942,23 @@ impl Harness {
     /// reference client to its gateway listener and the generated client to
     /// its control listener, which takes the name its caller states.
     pub async fn start() -> Result<Self, String> {
-        let mut replica = Replica::start("fleet-controller", None).await?;
+        let replica = Replica::start("fleet-controller", None).await?;
+        Self::around(replica).await
+    }
+
+    /// Starts a lone controller of a host's own build: over the stages
+    /// `catalog` holds and on the policy document at `spec`, which the
+    /// controller reads and applies itself. The case applies no generation
+    /// in its own process beside it.
+    pub async fn start_hosting(catalog: Catalog, spec: &Path) -> Result<Self, String> {
+        let replica = Replica::start_over("fleet-controller", None, catalog, Some(spec)).await?;
+        Self::around(replica).await
+    }
+
+    /// The harness around a controller once it leads: the reference client
+    /// at its gateway listener and the generated client at its control
+    /// listener.
+    async fn around(mut replica: Replica) -> Result<Self, String> {
         replica.reaches(State::Leader).await?;
         let gateway = replica.gateway();
         let client = bounded(

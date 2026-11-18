@@ -56,6 +56,11 @@
 //! split the sizes among them, requests of like size meet on one engine,
 //! and under the bucket preset's own balance rule an engine a decision
 //! booked gives way to one that booked nothing.
+//! A host's own stages decide as the stock ones do: a controller bound over
+//! a catalog that holds a scorer in code, a WebAssembly guest's and a
+//! served plugin's beside the stock stages, on a spec file that names the
+//! three, answers each cache namespace of a request on a row of its own,
+//! and under either plugin passes over the row that holds a lease.
 //!
 //! No stub server: the engines are the mock worker's, the controller is the
 //! one the binary runs and the client is the generated one. Every wait is
@@ -69,9 +74,31 @@
 mod engines;
 #[path = "common/fleet.rs"]
 mod fleet;
+#[cfg(feature = "wasm")]
+#[expect(
+    dead_code,
+    reason = "this binary serves the plugin in its honest behaviour and reads nothing it was sent"
+)]
+#[expect(
+    clippy::expect_used,
+    reason = "the served plugin runs inside the case; a failure there is the case's failure"
+)]
+#[path = "support/grpc_plugin.rs"]
+mod grpc_plugin;
 #[expect(dead_code, reason = "this binary reads no admin page")]
 #[path = "common/net.rs"]
 mod net;
+#[cfg(feature = "wasm")]
+#[expect(
+    dead_code,
+    reason = "this binary loads the record guest in its honest mode and nothing else of the module"
+)]
+#[expect(
+    clippy::expect_used,
+    reason = "the guest's assembly runs inside the case; a failure there is the case's failure"
+)]
+#[path = "support/wasm_guest.rs"]
+mod wasm_guest;
 
 use std::{
     collections::{HashMap, HashSet},
@@ -2102,4 +2129,283 @@ async fn the_client_at_a_replica_that_does_not_lead_is_told_the_leader() {
     tokio::time::timeout(CASE, case)
         .await
         .expect("the case ends inside its outer bound");
+}
+
+/// A controller of a host's own build over the fleet: its catalog holds a
+/// scorer in code, a WebAssembly guest's and a served plugin's beside the
+/// stock stages, and the document of its spec file names the three.
+#[cfg(feature = "wasm")]
+mod hosted {
+    use std::{collections::HashSet, sync::Arc};
+
+    use smg_policy_controller::{
+        grpc::{self, GrpcPluginSpec, GrpcScorer, Transport},
+        plugins::OpenDecisions,
+        wasm::{self, PluginSpec, WasmScorer},
+        Candidate, Catalog, Lifecycle, Scorer, TieBand,
+    };
+
+    use super::{
+        for_model, given_up, grpc_plugin::TestPlugin, kept, nth, picked, wasm_guest, within,
+        Harness, Role, Shape, ASKS, CASE, COUNTED, FLEET, MODEL, POLL_INTERVAL, PROBE_INTERVAL,
+        ROOM,
+    };
+
+    /// The model the served plugin scores: a pool of its own.
+    const SERVED: &str = "fleet-served-model";
+
+    /// The guest's stage, by the name the host's document writes.
+    const GUEST: &str = "fewest-in-flight";
+
+    /// The served plugin's stage, by its name.
+    const REMOTE: &str = "fewest-in-flight-served";
+
+    /// The scorer in code, by its name.
+    const NAMESPACED: &str = "of-namespace";
+
+    /// How many times a load, or a round of asks, is made. The host ends a
+    /// guest's `init` at a frame of the wall clock and a plugin's stage
+    /// that misses its frame steps aside: a runner that holds a thread for
+    /// that long ends a call that did nothing wrong, and the load or the
+    /// round is made again.
+    const TRIES: u64 = 10;
+
+    /// A host's scorer in code: of the rows it is handed, in their order,
+    /// the one the request's cache namespace counts to scores one and every
+    /// other row nothing. No stock stage reads the namespace: it reaches a
+    /// stock decision as the block hashes a gateway folds it into.
+    #[derive(Debug)]
+    struct OfNamespace;
+
+    impl Lifecycle for OfNamespace {}
+
+    impl Scorer for OfNamespace {
+        fn name(&self) -> &'static str {
+            NAMESPACED
+        }
+
+        fn score(
+            &self,
+            facts: &smg_policy_controller::RequestFacts<'_>,
+            _: &[Candidate],
+            _: &[u32],
+            out: &mut [f32],
+        ) -> TieBand {
+            let rows = out.len().max(1);
+            let turn = usize::try_from(facts.namespace_seed).map_or(0, |seed| seed % rows);
+            for (place, score) in out.iter_mut().enumerate() {
+                *score = if place == turn { 1.0 } else { 0.0 };
+            }
+            TieBand::NORMALIZED
+        }
+    }
+
+    /// The host's document: the counted model's requests under the guest's
+    /// scorer, the served model's under the served plugin's, every other
+    /// model's under the scorer in code.
+    fn document() -> String {
+        format!(
+            r#"{{ "apiVersion": "smg.policy/v1",
+  "profiles": {{
+    "namespaced": {{ "filter": ["healthy"], "score": ["{NAMESPACED}"], "pick": "best" }},
+    "guest": {{ "filter": ["healthy"], "score": ["{GUEST}"], "pick": "best" }},
+    "served": {{ "filter": ["healthy"], "score": ["{REMOTE}"], "pick": "best" }}
+  }},
+  "bindings": [
+    {{ "match": {{ "model": "{COUNTED}" }}, "profile": "guest" }},
+    {{ "match": {{ "model": "{SERVED}" }}, "profile": "served" }},
+    {{ "profile": "namespaced" }}
+  ] }}"#
+        )
+    }
+
+    /// The rows of `model`'s pool among `shapes`: every rank of its engines.
+    fn ranks(shapes: &[Shape], model: &str) -> usize {
+        shapes
+            .iter()
+            .filter(|shape| shape.model == model)
+            .map(|shape| usize::from(shape.ranks))
+            .sum()
+    }
+
+    /// One row of `model`'s pool keeps a lease, and [`ASKS`] asks follow:
+    /// under a stage that scores by the requests in flight, none of them
+    /// names that row. `answered` counts the calls the plugin itself
+    /// answered, as many a decision as its kind takes: the round's first
+    /// ask says how many. A round whose asks did not each take that many
+    /// was reached by a hold of the runner, or met a plugin whose thread
+    /// was cold: its stage stepped aside and scored every row alike. Such a
+    /// round claims nothing and is made again, [`TRIES`] rounds at most;
+    /// the last one is read whatever it says.
+    async fn passes_over_a_held_row(
+        harness: &mut Harness,
+        model: &str,
+        answered: impl Fn() -> u64,
+    ) -> Result<(), String> {
+        let (held, lease) = kept(harness, for_model(nth(model, 0), model)).await?;
+        let mut round = 0;
+        let (each, calls, named) = loop {
+            round += 1;
+            let before = answered();
+            let mut each = 0;
+            let mut named = false;
+            for n in 0..ASKS {
+                let ask = for_model(nth(model, round * ASKS + n), model);
+                named |= picked(harness, ask).await? == held;
+                if n == 0 {
+                    each = answered() - before;
+                }
+            }
+            let calls = answered() - before;
+            if (each != 0 && calls == each * ASKS) || round == TRIES {
+                break (each, calls, named);
+            }
+        };
+        given_up(harness, &[lease], 0).await?;
+        if each == 0 || calls != each * ASKS {
+            return Err(format!(
+                "the plugin answered {calls} calls over the {ASKS} asks of its last round of {TRIES}, {each} at the first"
+            ));
+        }
+        if named {
+            return Err("an ask named the row that holds a lease".to_owned());
+        }
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_hosts_own_stages_decide_over_the_fleet() {
+        let case = async {
+            // The host loads its two plugins and hands the controller its
+            // catalog whole, ahead of the bind. One count of open decisions
+            // stands behind both runtimes, as in a host's own build.
+            let open = OpenDecisions::new();
+            let runtime = Arc::new(wasm::Runtime::new(&open).expect("a runtime"));
+            let mut spec = PluginSpec::new(GUEST, wasm_guest::record_guest());
+            spec.config = vec![wasm_guest::mode::LEAST_IN_FLIGHT];
+            // The guest adds to its counters by id: each id has a name.
+            spec.metrics = (0..=wasm_guest::counter::PICK_RANDOM)
+                .map(|id| format!("counter-{id}"))
+                .collect();
+            let mut load = wasm::Plugin::load(&runtime, spec.clone());
+            for _ in 1..TRIES {
+                if load.is_ok() {
+                    break;
+                }
+                load = wasm::Plugin::load(&runtime, spec.clone());
+            }
+            let guest = load.expect("the guest loads");
+
+            let plugin = TestPlugin::serve();
+            let runtime = grpc::Runtime::new(&open).expect("a runtime");
+            let socket = Transport::Unix {
+                path: plugin.socket.clone(),
+                peer_uid: None,
+            };
+            let mut spec = GrpcPluginSpec::new(REMOTE, socket);
+            // The load's connect and hello, far past a loaded host's round
+            // trip.
+            spec.connect_micros = 5_000_000;
+            let served = grpc::Plugin::load(&runtime, spec).expect("the served plugin loads");
+
+            let mut catalog = Catalog::builtin();
+            catalog
+                .scorer(NAMESPACED, || Box::new(OfNamespace))
+                .expect("a free name");
+            let bound = Arc::clone(&guest);
+            catalog
+                .scorer(guest.name(), move || {
+                    Box::new(WasmScorer::new(bound.bind(), None))
+                })
+                .expect("a free name");
+            let bound = Arc::clone(&served);
+            catalog
+                .scorer(served.name(), move || {
+                    Box::new(GrpcScorer::new(bound.bind(), None))
+                })
+                .expect("a free name");
+            let dir = tempfile::tempdir().expect("a temp dir");
+            let file = dir.path().join("policy.json");
+            std::fs::write(&file, document()).expect("the document's file");
+            let mut harness = Harness::start_hosting(catalog, &file)
+                .await
+                .expect("a controller of a host's own build starts on its document");
+
+            // The fleet registers with a third pool, the served plugin's, and
+            // turns ready as under a stock build.
+            let mut shapes = FLEET.to_vec();
+            shapes.extend(
+                [Shape {
+                    model: SERVED,
+                    ..FLEET[0]
+                }; 2],
+            );
+            harness
+                .register(&shapes)
+                .await
+                .expect("the fleet registers");
+            harness.feed();
+            within(
+                "every rank of the three pools is healthy",
+                PROBE_INTERVAL + POLL_INTERVAL + ROOM,
+                || {
+                    [MODEL, COUNTED, SERVED].into_iter().all(|model| {
+                        harness.view(model, Role::Single).is_ok_and(|pool| {
+                            pool.len() == ranks(&shapes, model)
+                                && pool.iter().all(|row| row.healthy)
+                        })
+                    })
+                },
+            )
+            .await
+            .expect("the fleet turns ready");
+
+            // A request's cache namespace reaches the stage that decides it:
+            // requests of one namespace meet on one row whatever their
+            // draws, and as many namespaces as the pool has rows name each
+            // row.
+            let rows = ranks(&shapes, MODEL);
+            let mut homes = HashSet::new();
+            for namespace in (0u64..).take(rows) {
+                let mut met = HashSet::new();
+                for draw in 0..4 {
+                    let mut ask = nth("namespace", 4 * namespace + draw);
+                    if let Some(facts) = &mut ask.facts {
+                        facts.namespace_seed = namespace;
+                    }
+                    let row = picked(&mut harness, ask)
+                        .await
+                        .expect("a pick answers an ask over a ready fleet");
+                    met.insert(row);
+                }
+                assert_eq!(
+                    met.len(),
+                    1,
+                    "requests of one cache namespace meet on one row: {met:?}"
+                );
+                homes.extend(met);
+            }
+            assert_eq!(
+                homes.len(),
+                rows,
+                "each cache namespace has a row of its own under the host's scorer: {homes:?}"
+            );
+
+            // A plugin's stage decides its model, in both forms: the guest
+            // in the controller's process and the plugin served outside it
+            // score a row by the requests in flight on it, which are the
+            // leases the decisions before left there.
+            passes_over_a_held_row(&mut harness, COUNTED, || guest.stats().answered)
+                .await
+                .expect("the guest passes over the row that holds a lease");
+            passes_over_a_held_row(&mut harness, SERVED, || served.stats().answered)
+                .await
+                .expect("the served plugin passes over the row that holds a lease");
+
+            harness.stop().await.expect("a clean stop");
+        };
+        tokio::time::timeout(CASE, Box::pin(case))
+            .await
+            .expect("the case ends inside its outer bound");
+    }
 }
