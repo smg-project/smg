@@ -961,6 +961,39 @@ fn an_encode_profile_that_shows_its_rows_declines_a_request_with_items() {
     assert_eq!(asked.load(Ordering::Relaxed), 0, "no stage is asked");
 }
 
+/// The pair entry declines a mask beside the rows a side shows a plugin
+/// (`written-rows`), and it reads the mask as this entry hands it: numbered
+/// with the rows a cut leaves. A mask on a row the cut left out masks none
+/// of them and declines nothing.
+#[test]
+fn a_mask_on_a_row_cut_out_declines_nothing_for_a_side_that_shows_its_rows() {
+    let mut engine = engine();
+    let binding = engine.binding("m", Phase::Prefill).expect("the binding");
+    let prefill = usize::from(binding.profile);
+    let shows = ShowsItsRows(Arc::new(AtomicU32::new(0)));
+    engine.profiles[prefill].filters.push(Box::new(shows));
+    engine.marks[prefill] =
+        crate::framework::Marks::of(&engine.profiles[prefill], engine.orders[prefill]);
+    // The first prefill's class holds no encoder: the pair is decided over
+    // the second alone.
+    let mut bed = Bed::new();
+    bed.prefills = vec![row(0, Role::Prefill, 1, 0), row(1, Role::Prefill, 1, 0)];
+    bed.prefill_classes = vec![2, 1];
+    let (facts, _) = bed.asked();
+    let cx = Constraints::default();
+    let decide = |mask: &[u32]| {
+        let masked = masking(mask);
+        decide_under(&bed, &engine, &facts, bed.pools(), [&masked, &cx, &cx]).0
+    };
+    // The mask names the row the cut left out.
+    assert_eq!(pair_of(&decide(&[0])), (1, 0));
+    // It names the row admitted: a mask beside the rows shown.
+    assert_eq!(
+        shed_of(&decide(&[1])),
+        (ShedReason::PolicyDeclined, "written-rows")
+    );
+}
+
 /// A pin is a position in another pool, and the encode side's stages are
 /// handed none.
 #[test]
