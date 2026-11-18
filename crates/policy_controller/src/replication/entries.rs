@@ -120,7 +120,11 @@ pub const ENTRIES: &[(&str, &str, Fate)] = &[
         "restore_from",
         Fate::Rebuilt("the journal starts again: a reader re-syncs from this store's own snapshot"),
     ),
+    // The three doors for a followed write, one a kind of the leader's
+    // events: each is the standby's side of a journaled write.
     ("MemoryStore", "follow", Fate::Journaled),
+    ("MemoryStore", "follow_load", Fate::Journaled),
+    ("MemoryStore", "follow_term", Fate::Journaled),
     ("MemoryStore", "apply", Fate::NotYet(GENERATION)),
     ("MemoryStore", "world", Fate::Read),
     ("MemoryStore", "build_view", Fate::Read),

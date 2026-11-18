@@ -1748,20 +1748,25 @@ mod tests {
     impl Journal for AtTheCut {
         fn member(
             &self,
+            at: Option<Position>,
             epoch: u64,
             change: MembershipChange,
             row: Option<&WorkerRow>,
             left: Option<&WorkerRow>,
         ) {
-            self.log.member(epoch, change, row, left);
+            self.log.member(at, epoch, change, row, left);
         }
 
-        fn load(&self, id: WorkerId, rank: u16, sample: &LoadSample) {
-            self.log.load(id, rank, sample);
+        fn load(&self, at: Option<Position>, id: WorkerId, rank: u16, sample: &LoadSample) {
+            self.log.load(at, id, rank, sample);
         }
 
         fn term_rose(&self, term: u64) {
             self.log.term_rose(term);
+        }
+
+        fn term_followed(&self, at: Position) {
+            self.log.term_followed(at);
         }
 
         fn carries_loads(&self) -> bool {

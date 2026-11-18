@@ -1195,9 +1195,9 @@ pub(crate) mod tests {
             let text = String::from_utf8(lines.0.lock().clone()).expect("the lines as text");
             text.matches("has no wire form").count()
         };
-        journal.member(2, MembershipChange::Removed { id }, None, None);
+        journal.member(None, 2, MembershipChange::Removed { id }, None, None);
         let replaced = MembershipChange::Replaced { old: id, new: id };
-        journal.member(3, replaced, Some(&row), None);
+        journal.member(None, 3, replaced, Some(&row), None);
         journal.released();
         let unwired = leader.head();
         leader.register(1, 1, "model-a");
@@ -1218,7 +1218,7 @@ pub(crate) mod tests {
         leader.store.set_term(3);
         let mut later = leader.watch(Start::Snapshot, &[]);
         next(&mut later).await;
-        journal.member(4, MembershipChange::Removed { id }, None, None);
+        journal.member(None, 4, MembershipChange::Removed { id }, None, None);
         journal.released();
         let again = leader.head();
         assert!(again.seq < unwired.seq && again.term == 3, "{again:?}");

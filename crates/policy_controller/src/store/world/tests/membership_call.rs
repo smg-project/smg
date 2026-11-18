@@ -64,8 +64,8 @@ mod held {
         lease::{Lifecycle, Membership},
         spec::{BindingSpec, Needs},
         store::{
-            world::ViewBuffers, Kinds, LoadSink, MembershipChange, MemoryStore, WorkerFacts,
-            WorkerPatch, WorkerStatus, WorkersStore,
+            world::ViewBuffers, Kinds, LoadSink, MembershipChange, MemoryStore, Position,
+            WorkerFacts, WorkerPatch, WorkerStatus, WorkersStore,
         },
         view::{Candidate, Constraints, Identity, RequestFacts, Role, WorkerId},
         AppliedSpec, Catalog, ConsistentHash, PolicySpec, Scratch,
@@ -373,7 +373,13 @@ mod held {
         // lists its row.
         let joined = member(&leader, "http://c:8000");
         let row = WorkersStore::get(&leader, joined).expect("the row");
-        standby.follow(3, MembershipChange::Registered { id: joined }, Some(row));
+        let unjournaled = Position::default();
+        standby.follow(
+            unjournaled,
+            3,
+            MembershipChange::Registered { id: joined },
+            Some(row),
+        );
         let added = format!("{:?}", Membership::Added(joined));
         assert_eq!(told.lock().last(), Some(&(2, added)));
         // A followed leave is told as the leader's own is: after the build
@@ -382,7 +388,7 @@ mod held {
         let leaves = leader
             .remove(joined, revision(&leader, joined))
             .expect("removed");
-        standby.follow(4, leaves, None);
+        standby.follow(unjournaled, 4, leaves, None);
         let removed = format!("{:?}", Membership::Removed(joined));
         assert_eq!(told.lock().last(), Some(&(4, removed)));
         let old = leader.by_key("http://a:8000").expect("the row").id;
@@ -392,7 +398,7 @@ mod held {
         });
         let new = replaces.id();
         let row = WorkersStore::get(&leader, new);
-        standby.follow(5, replaces, row);
+        standby.follow(unjournaled, 5, replaces, row);
         let replaced = format!("{:?}", Membership::Replaced { old, new });
         assert_eq!(told.lock().last(), Some(&(5, replaced)));
     }

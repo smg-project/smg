@@ -42,7 +42,7 @@ use crate::{
         replication_event::Event as Sent,
     },
     replication::{Log, Lost},
-    store::{Cut, Kinds, LeasesStore, LoadSample, LoadSink, MemoryStore, Position, WorkerRow},
+    store::{Cut, Kinds, LeasesStore, LoadSample, MemoryStore, Position, WorkerRow},
     view::{fingerprint, WorkerId},
 };
 
@@ -103,7 +103,9 @@ impl Follower {
     }
 
     /// One batch applied at `now`: each event at its position under the
-    /// batch's term, by the store's one write for its kind. A load row
+    /// batch's term, by the store's door for a followed write of its kind,
+    /// which alone lands there: a write of the store's own that comes
+    /// between takes no part in it, and the event does not land. A load row
     /// stands with the instant of its apply. The first event that does not
     /// land stops the batch; the events before it stand, each at its place.
     /// A standby that applied nothing takes its leader's first position, a
@@ -134,7 +136,7 @@ impl Follower {
                 // at, it would start a lead of the store's own.
                 Err(Lost) if matches!(event.event, Some(Sent::TermStart(_))) => {
                     self.log.join(at).map_err(|Lost| Halt::Lost(at))?;
-                    self.store.set_term(at.term);
+                    self.store.follow_term(at);
                     continue;
                 }
                 Err(Lost) => return Err(Halt::Lost(at)),
@@ -143,14 +145,14 @@ impl Follower {
                 Some(Sent::Membership(told)) => {
                     let (epoch, change, row) =
                         worker_wire::told_change(told, now).map_err(Halt::Unread)?;
-                    self.store.follow(epoch, change, row);
+                    self.store.follow(at, epoch, change, row);
                 }
                 Some(Sent::Load(told)) => {
                     let (id, rank, row, source) =
                         worker_wire::told_load(told).map_err(Halt::Unread)?;
-                    self.store.record(id, rank, row, now, source);
+                    self.store.follow_load(at, id, rank, row, now, source);
                 }
-                Some(Sent::TermStart(_)) => self.store.set_term(at.term),
+                Some(Sent::TermStart(_)) => self.store.follow_term(at),
                 // A kind this build does not apply, and one it does not know.
                 Some(_) | None => {
                     return Err(Halt::Unread(Refused {
@@ -891,7 +893,7 @@ mod tests {
         elector::{ElectionSettings, Elector, Tick},
         proto::policy_controller_server::{PolicyController, PolicyControllerServer},
         replication::{Entry, Event},
-        store::{LoadSource, WorkerFacts, WorkerStatus, WorkersStore},
+        store::{LoadSink, LoadSource, WorkerFacts, WorkerStatus, WorkersStore},
         view::{LoadRow, WireModes},
     };
 

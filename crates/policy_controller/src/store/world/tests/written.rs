@@ -10,8 +10,8 @@ use crate::{
     spec::Pairing,
     store::{
         world::{Classes, Writer, PUBLISH_WINDOW},
-        Kinds, MembershipChange, MemoryStore, WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus,
-        WorkersStore,
+        Kinds, MembershipChange, MemoryStore, Position, WorkerFacts, WorkerPatch, WorkerRow,
+        WorkerStatus, WorkersStore,
     },
     view::{Role, WireModes, WorkerId},
 };
@@ -296,7 +296,12 @@ fn a_followed_refresh_asks_the_pair_classes_what_the_leaders_refresh_asks() {
     assert_eq!(wholes(), (Some(1), Some(1)));
     let follow = |change: MembershipChange| {
         let row = WorkersStore::get(&leader, change.id());
-        standby.follow(WorkersStore::epoch(&leader), change, row);
+        standby.follow(
+            Position::default(),
+            WorkersStore::epoch(&leader),
+            change,
+            row,
+        );
     };
     // No offer moved, and another worker joins inside the window.
     follow(leader.upsert(WorkerFacts {

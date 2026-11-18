@@ -374,7 +374,10 @@ impl MemoryStore {
     /// leader's log is the order. A row that leaves takes its tables with
     /// it as the leader's own write does, but for the sessions' pins of
     /// record that name it, which the leader's own write alone drops, and
-    /// a row that stays keeps its admission instant.
+    /// a row that stays keeps its admission instant. `at` is the event's
+    /// place in that log, which the applier holds ([`Journal::member`]):
+    /// the journal takes the write there, and no write of the store's own
+    /// does.
     ///
     /// The pools follow as at the leader's own write: a join, a refresh and
     /// a patch leave their build owed, which the replica's loop pays at the
@@ -391,8 +394,14 @@ impl MemoryStore {
     /// The world's engine is told the change as at the leader's own write
     /// ([`MembershipChange::as_lifecycle`]): a standby's stages hold what
     /// its leader's hold, with no step at a take.
-    pub fn follow(&self, epoch: u64, change: MembershipChange, row: Option<WorkerRow>) {
-        let mut workers = self.writing();
+    pub fn follow(
+        &self,
+        at: Position,
+        epoch: u64,
+        change: MembershipChange,
+        row: Option<WorkerRow>,
+    ) {
+        let mut workers = self.writing_at(Some(at));
         if epoch != workers.epoch + 1 {
             return;
         }
@@ -514,6 +523,37 @@ impl MemoryStore {
                 self.tell_membership(change);
             }
         }
+    }
+
+    /// One of the leader's load rows, applied as the replication stream
+    /// tells it: [`LoadSink::record`] on a standby, journaled at `at`, the
+    /// event's place, which the applier holds ([`Journal::load`]).
+    pub fn follow_load(
+        &self,
+        at: Position,
+        id: WorkerId,
+        rank: u16,
+        row: LoadRow,
+        received_at: Instant,
+        source: LoadSource,
+    ) {
+        self.record_at(Some(at), id, rank, row, received_at, source);
+    }
+
+    /// The start of a leader's term, applied as the replication stream
+    /// tells it: it writes no row. The journal keeps the event's place,
+    /// `at`, where the applier holds it ([`Journal::term_followed`]), and
+    /// the store's term rises to the term's. The store took nothing: it
+    /// leads no term by it, as it does by a take
+    /// ([`LeasesStore::set_term`]).
+    pub fn follow_term(&self, at: Position) {
+        // Taken before the turn, so dropped after it, as at a take.
+        let _released = self.released();
+        let mut leases = self.turn();
+        if let Some(journal) = &self.journal {
+            journal.term_followed(at);
+        }
+        leases.term = leases.term.max(at.term);
     }
 
     /// Apply a generation: every world from here on is published under
@@ -1103,6 +1143,9 @@ impl Drop for Released<'_> {
 /// no writer and no reader of the rows.
 struct Writing<'a> {
     workers: MutexGuard<'a, Workers>,
+    /// The place of the leader's event the write applies, for the journal:
+    /// none for a write of the store's own.
+    at: Option<Position>,
     _released: Released<'a>,
 }
 
@@ -1143,7 +1186,7 @@ impl Writing<'_> {
         workers.log.push_back((workers.epoch, change));
         if let Some(journal) = &workers.journal {
             let row = workers.rows.get(&change.id()).map(|row| &row.row);
-            journal.member(workers.epoch, change, row, left);
+            journal.member(self.at, workers.epoch, change, row, left);
         }
         change
     }
@@ -1176,9 +1219,16 @@ impl MemoryStore {
     /// The membership lock for a write the journal is told: every path
     /// that records a change takes the lock here.
     fn writing(&self) -> Writing<'_> {
+        self.writing_at(None)
+    }
+
+    /// [`MemoryStore::writing`] for a write the journal is told with `at`:
+    /// the place of the leader's event a standby's applier applies by it.
+    fn writing_at(&self, at: Option<Position>) -> Writing<'_> {
         let released = self.released();
         Writing {
             workers: self.workers.lock(),
+            at,
             _released: released,
         }
     }
@@ -1695,9 +1745,13 @@ impl Loads {
     }
 }
 
-impl LoadSink for MemoryStore {
-    fn record(
+impl MemoryStore {
+    /// [`LoadSink::record`], told to the journal with `at`: the place of
+    /// the leader's event the row applies, none for a row of the store's
+    /// own.
+    fn record_at(
         &self,
+        at: Option<Position>,
         id: WorkerId,
         rank: u16,
         row: LoadRow,
@@ -1726,13 +1780,26 @@ impl LoadSink for MemoryStore {
         }
         ranks.samples.insert(rank, sample);
         if let Some(journal) = &self.load_journal {
-            journal.load(id, rank, &sample);
+            journal.load(at, id, rank, &sample);
         }
         if let Some(place) = writer.fold_load(id, rank, Some(&sample)) {
             writer.recorded(place, id, rank, received_at);
             let world = writer.folded_at(received_at);
             self.show(writer, world);
         }
+    }
+}
+
+impl LoadSink for MemoryStore {
+    fn record(
+        &self,
+        id: WorkerId,
+        rank: u16,
+        row: LoadRow,
+        received_at: Instant,
+        source: LoadSource,
+    ) {
+        self.record_at(None, id, rank, row, received_at, source);
     }
 
     fn report(
@@ -1792,7 +1859,7 @@ impl LoadSink for MemoryStore {
                     };
                     ranks.samples.insert(rank, sample);
                     if let Some(journal) = &self.load_journal {
-                        journal.load(id, rank, &sample);
+                        journal.load(None, id, rank, &sample);
                     }
                     let place = writer.fold_load(id, rank, Some(&sample));
                     let engine = place.and_then(|place| {
