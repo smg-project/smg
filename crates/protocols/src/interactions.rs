@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
 use serde_with::skip_serializing_none;
 use validator::{Validate, ValidationError};
@@ -1145,25 +1145,36 @@ pub struct InteractionsUsage {
 /// reads its uppercase name, which the SDK's own examples send
 /// (`response_modalities=["IMAGE"]`), and is written in lowercase. The SDK
 /// keeps the set open, so a modality this build does not name is kept as
-/// written (`Other`).
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+/// written (`Other`). A modality is read from a string alone: a derived
+/// reading also takes an object keyed by a name (`{"image": null}`) as that
+/// modality, which no API sends.
+#[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum ResponseModality {
-    #[serde(alias = "TEXT")]
     Text,
-    #[serde(alias = "IMAGE")]
     Image,
-    #[serde(alias = "AUDIO")]
     Audio,
-    #[serde(alias = "VIDEO")]
     Video,
-    #[serde(alias = "DOCUMENT")]
     Document,
     /// A modality this build does not name, kept as the client or upstream
     /// wrote it
     #[serde(untagged)]
     Other(String),
+}
+
+impl<'de> Deserialize<'de> for ResponseModality {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let name = String::deserialize(deserializer)?;
+        Ok(match name.as_str() {
+            "text" | "TEXT" => Self::Text,
+            "image" | "IMAGE" => Self::Image,
+            "audio" | "AUDIO" => Self::Audio,
+            "video" | "VIDEO" => Self::Video,
+            "document" | "DOCUMENT" => Self::Document,
+            _ => Self::Other(name),
+        })
+    }
 }
 
 fn is_option_blank(v: Option<&String>) -> bool {
@@ -1346,6 +1357,16 @@ mod tests {
             "response_modalities": ["IMAGE", "text", "VIDEO", "document", "AUDIO"]
         }))
         .unwrap();
+        assert_eq!(
+            request.response_modalities,
+            Some(vec![
+                ResponseModality::Image,
+                ResponseModality::Text,
+                ResponseModality::Video,
+                ResponseModality::Document,
+                ResponseModality::Audio
+            ])
+        );
         let written = crate::common::to_value_exact(&request).unwrap();
         assert_eq!(
             written["response_modalities"],
@@ -1381,6 +1402,23 @@ mod tests {
             written["response_modalities"],
             serde_json::json!(["a_modality_of_no_api"])
         );
+
+        // A modality is a name: an object keyed by one, which a derived
+        // reading takes as that modality, is refused in either case.
+        for object in [
+            serde_json::json!({"IMAGE": null}),
+            serde_json::json!({"image": null}),
+        ] {
+            let refused = serde_json::from_value::<InteractionsRequest>(serde_json::json!({
+                "model": "m",
+                "input": "Hello",
+                "store": false,
+                "response_modalities": [object]
+            }))
+            .expect_err("an object in place of a modality's name")
+            .to_string();
+            assert!(refused.contains("expected a string"), "{object}: {refused}");
+        }
     }
 
     /// The tools the public API declares beside the ones the gateway knew
