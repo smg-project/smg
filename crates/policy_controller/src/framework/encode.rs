@@ -476,8 +476,10 @@ impl Engine {
         let encode_facts = RequestFacts {
             phase: Phase::Encode,
             affinity: encode.affinity,
-            // A pin is a position in another pool: the encode side takes none.
+            // A pin and lent counts are positions in another pool: the
+            // encode side takes neither.
             pinned_at: 0,
+            lent_in_flight: None,
             ..*facts
         };
         let takes = |row: &Candidate, of: &EncoderFacts| takes_media(&items, images, row, of);
