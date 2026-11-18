@@ -37,7 +37,11 @@ complete), `GetLoads`, `Abort`, and (realistic mode only) `SubscribeKvEvents`, a
 the admin fan-out's `FlushCache` (every rank's cache cleared at once,
 `success: true`), `StartProfile` and `StopProfile` (a run in progress refused
 with `success: false`, the trace file written at the stop), the same on each
-wire; the other RPCs (`GetTokenizer`, embeddings, LoRA) return `unimplemented`. The canned
+wire; the other RPCs (`GetTokenizer`, embeddings, LoRA) return `unimplemented`.
+`GetLoads` and the pushed load record count a rank's resident tokens
+(`num_resident_tokens`, the context tokens of the requests it runs) on the
+TokenSpeed wire, whose load report has the figure; the other two wires send
+none. The canned
 and scripted answers, the realistic engine, the data-parallel ranks and the
 prefill/decode roles are the same behind each wire; each shapes its own
 messages (a role is `disaggregation_mode` in the server args on the TokenSpeed
