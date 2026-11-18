@@ -1973,6 +1973,63 @@ mod tests {
         });
     }
 
+    /// A worker whose connection is not the gateway's client carries no
+    /// event stream: its subscription is refused as unimplemented, the
+    /// worker's gauge rises, and no second connect is asked for.
+    #[test]
+    fn a_connection_that_is_not_the_gateways_client_carries_no_event_stream() {
+        use metrics_exporter_prometheus::PrometheusBuilder;
+
+        use crate::worker::{connection::engine::EngineConnector, test_support::CountingConnector};
+
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        // The subscription task publishes from the runtime's thread, which
+        // must be the one holding the local recorder.
+        metrics::with_local_recorder(&recorder, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let connector = Arc::new(CountingConnector::default());
+                let worker: Arc<dyn Worker> = Arc::new(
+                    BasicWorkerBuilder::new("grpc://no-engine:9000")
+                        .worker_type(WorkerType::Regular)
+                        .connection_mode(ConnectionMode::Grpc)
+                        .model(ModelCard::new("m"))
+                        .health_config(HealthCheckConfig {
+                            disable_health_check: true,
+                            ..Default::default()
+                        })
+                        .engine_connector(Arc::clone(&connector) as Arc<dyn EngineConnector>)
+                        .build(),
+                );
+                let prefix = format!("smg_kv_events_unavailable{{worker=\"{}\"}}", worker.url());
+                let gauge = || {
+                    handle
+                        .render()
+                        .lines()
+                        .find(|line| line.starts_with(&prefix))
+                        .and_then(|line| line.rsplit(' ').next()?.parse::<f64>().ok())
+                };
+                let monitor = KvEventMonitor::new();
+                monitor
+                    .on_worker_added(&worker, SubscriptionKind::Events)
+                    .await;
+                for _ in 0..500 {
+                    if gauge() == Some(1.0) {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                assert_eq!(gauge(), Some(1.0), "the refusal raises the gauge");
+                assert_eq!(connector.connects(), 1, "no second connect");
+                monitor.on_worker_removed(worker.url()).await;
+            });
+        });
+    }
+
     #[tokio::test]
     async fn a_removed_workers_blocks_leave_the_index_off_the_runtime() {
         let indexer = Arc::new(KvIndex::chain());
