@@ -37,6 +37,7 @@ use tokenizers::{
     decoders::DecoderWrapper,
     models::{
         bpe::{Vocab, BPE},
+        unigram::Unigram,
         wordpiece::WordPiece,
         ModelWrapper, TrainerWrapper,
     },
@@ -64,8 +65,9 @@ pub(crate) type LoadingTokenizer = TokenizerOf<LateBoundModel>;
 pub(crate) trait ModelView {
     fn wrapper(&self) -> &ModelWrapper;
 
-    /// What the one-pass read of the file saw of a BPE or WordPiece
-    /// section, while the model is loading; nothing once it is built.
+    /// What the one-pass read of the file saw of a BPE, WordPiece or
+    /// Unigram section, while the model is loading; nothing once it is
+    /// built.
     fn read(&self) -> Option<&ReadBpe> {
         None
     }
@@ -87,9 +89,9 @@ pub(crate) struct LateBoundModel {
     /// Words the BPE model caches per thread once built: the general bound
     /// until the load decides otherwise.
     words: AtomicUsize,
-    /// What the one-pass read of a BPE or WordPiece section saw, for the
-    /// loader's own tables; `None` for a model built in memory or read by
-    /// the crate.
+    /// What the one-pass read of a BPE, WordPiece or Unigram section saw,
+    /// for the loader's own tables; `None` for a model built in memory or
+    /// read by the crate.
     read: Option<ReadBpe>,
 }
 
@@ -99,7 +101,8 @@ pub(crate) struct LateBoundModel {
 /// merge names tokens of the vocabulary, the vocabulary's largest id, and
 /// whether its ids are exactly the range `0..n` of its `n` entries. A
 /// WordPiece section leaves the same read without merges (`pairs` is
-/// `None`).
+/// `None`), and so does a Unigram section, where the id of a piece is its
+/// place in the section's list.
 /// Dropped with the loading model when it moves into the built tokenizer.
 pub(crate) struct ReadBpe {
     pub(crate) pairs: Option<Box<[[u32; 3]]>>,
@@ -185,6 +188,23 @@ impl ReadBpe {
         }
     }
 
+    /// The read of a Unigram section: the id of a piece is its place in
+    /// the section's list, so the ids are dense however the section is
+    /// written, and the largest is the count of pieces less one. The
+    /// pieces are not listed a second time: the tables read each from
+    /// the model by its id, and a copy of them stays resident after the
+    /// load.
+    fn of_pieces(unigram: &Unigram) -> Self {
+        Self {
+            pairs: None,
+            max_id: u32::try_from(unigram.get_vocab_size())
+                .ok()
+                .and_then(|pieces| pieces.checked_sub(1)),
+            dense: true,
+            tokens: None,
+        }
+    }
+
     fn of(vocab: &Vocab, merges: &[(String, String)]) -> Self {
         let mut read = Self::without_merges(vocab);
         let mut token = String::new();
@@ -257,6 +277,22 @@ pub(crate) fn entries_of<'a>(
 }
 
 impl LateBoundModel {
+    /// The model [`unigram_scores::section`] read, with the read of its
+    /// pieces ([`ReadBpe::of_pieces`]): the loader's tables take the
+    /// largest id from it, as they do after a BPE or WordPiece section,
+    /// and clone no vocabulary to find it.
+    fn of_unigram(model: ModelWrapper) -> Self {
+        let read = match &model {
+            ModelWrapper::Unigram(unigram) => Some(ReadBpe::of_pieces(unigram)),
+            // That reader builds no other kind.
+            _ => None,
+        };
+        Self {
+            read,
+            ..Self::from(model)
+        }
+    }
+
     /// Sets the words the BPE model caches per thread once built (other
     /// model kinds have no such cache).
     pub(crate) fn bound(&self, words: usize) {
@@ -327,7 +363,8 @@ impl<'de> Deserialize<'de> for LateBoundModel {
 /// order of its keys (`type`, `unk_id`, `vocab`, `byte_fallback`): the
 /// entries are read until one tells the kind, which is the value of `type`,
 /// the key `unk_id` (no other kind has it) or a vocabulary that is a list
-/// of pieces with their scores. A WordPiece section streams as well, with
+/// of pieces with their scores; it leaves the read of its pieces
+/// ([`ReadBpe::of_pieces`]). A WordPiece section streams as well, with
 /// `type` or, as the older files are, without it ([`wordpiece_section`]).
 /// Any other section (another model kind, a BPE section with `type` later,
 /// a section that shows a key no Unigram section has before any of those)
@@ -356,7 +393,7 @@ impl<'de> Visitor<'de> for ModelSection {
                     }
                     if kind == "Unigram" {
                         return unigram_scores::section(None, Replay::new(read, None, map))
-                            .map(LateBoundModel::from);
+                            .map(LateBoundModel::of_unigram);
                     }
                     let word_piece = kind == "WordPiece" && read.is_empty();
                     read.push((key, Value::String(kind)));
@@ -369,13 +406,13 @@ impl<'de> Visitor<'de> for ModelSection {
                 "unk_id" => {
                     read.push((key, map.next_value()?));
                     return unigram_scores::section(None, Replay::new(read, None, map))
-                        .map(LateBoundModel::from);
+                        .map(LateBoundModel::of_unigram);
                 }
                 // A list of pieces with their scores is a Unigram section's.
                 "vocab" => match map.next_value_seed(unigram_scores::VocabShape)? {
                     unigram_scores::Vocab::Scored(vocab) => {
                         return unigram_scores::section(Some(vocab), Replay::new(read, None, map))
-                            .map(LateBoundModel::from);
+                            .map(LateBoundModel::of_unigram);
                     }
                     unigram_scores::Vocab::Other(vocab) => {
                         read.push((key, vocab));
@@ -1400,5 +1437,85 @@ mod tests {
         let read = late.read().expect("a WordPiece section leaves a read");
         assert_eq!((read.max_id, read.dense), (Some(7), false));
         assert!(read.tokens.is_none());
+    }
+
+    /// A Unigram section as the entries the crate writes: `type`, the
+    /// unknown piece, the pieces with their scores (one piece twice), the
+    /// byte fallback.
+    fn unigram_entries() -> Vec<String> {
+        let pieces = [("<unk>", 0.0), ("a", -1.0), ("ab", -2.5), ("a", -3.0)];
+        let model = Unigram::from(
+            pieces
+                .into_iter()
+                .map(|(piece, score)| (piece.to_string(), score))
+                .collect(),
+            Some(0),
+            false,
+        )
+        .expect("a Unigram model");
+        let json = serde_json::to_string(&ModelWrapper::Unigram(model)).expect("serializes");
+        let section: Map<String, Value> =
+            serde_json::from_str(&json).expect("the section is a map");
+        section
+            .iter()
+            .map(|(key, value)| format!("{}:{value}", Value::from(key.as_str())))
+            .collect()
+    }
+
+    #[test]
+    fn a_unigram_section_reports_its_largest_id_in_any_order_of_its_keys() {
+        let entries = unigram_entries();
+        assert_eq!(entries.len(), 4, "type, unk_id, vocab, byte_fallback");
+        // With `type` and without it: `unk_id` or a vocabulary of scored
+        // pieces tells the kind as well.
+        for entries in [&entries[..], &entries[1..]] {
+            for order in orders(entries) {
+                let text = section_of(&order);
+                let late: LateBoundModel = serde_json::from_str(&text).expect("a Unigram section");
+                let read = late.read().unwrap_or_else(|| panic!("no read of {text}"));
+                // The report is the range of the ids: four pieces, the
+                // two equal ones each on an id of its own, so 0 to 3.
+                assert_eq!((read.max_id, read.dense), (Some(3), true), "{text}");
+                // It carries the ids alone. The pieces stay with the
+                // model, which the tables ask by id.
+                assert!(read.pairs.is_none() && read.tokens.is_none(), "{text}");
+                let pieces: Vec<_> = (0..5).filter_map(|id| late.id_to_token(id)).collect();
+                assert_eq!(pieces, ["<unk>", "a", "ab", "a"], "{text}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_unigram_section_without_pieces_reports_an_empty_range_of_ids() {
+        // Without an unknown piece: the crate's builder refuses an empty
+        // list that names one.
+        let late: LateBoundModel =
+            serde_json::from_str(r#"{"type":"Unigram","unk_id":null,"vocab":[]}"#)
+                .expect("a Unigram section without pieces");
+        let read = late.read().expect("a Unigram section leaves a read");
+        // The empty range: dense, and no id is its largest.
+        assert_eq!((read.max_id, read.dense), (None, true));
+    }
+
+    #[test]
+    fn a_unigram_section_with_a_key_of_no_kind_first_takes_the_crate_reader() {
+        let entries = unigram_entries();
+        let json = section_of(&entries);
+        // A key no section has. In front, the section goes to the crate's
+        // reader and the model is the crate's, with no report. After the
+        // entry that tells the kind, this reader skips the key as the
+        // crate's does, and reports.
+        for at in 0..=entries.len() {
+            let mut with = entries.clone();
+            with.insert(at, r#""future":{"x":[1,2]}"#.to_string());
+            let text = section_of(&with);
+            assert_eq!(outcome::<ModelWrapper>(&text).as_ref(), Ok(&json), "{text}");
+            assert_eq!(
+                outcome::<LateBoundModel>(&text).as_ref(),
+                Ok(&json),
+                "{text}"
+            );
+            assert_eq!(in_one_pass(&text), at > 0, "{text}");
+        }
     }
 }
