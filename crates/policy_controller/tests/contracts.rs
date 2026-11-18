@@ -165,6 +165,7 @@ fn request_record() -> &'static [&'static str] {
             block_size,
             now_micros,
             pinned_at,
+            lent_in_flight,
             affinity,
             named,
             model_fingerprint,
@@ -636,6 +637,7 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
             host_only: &[
                 "now_micros",
                 "pinned_at",
+                "lent_in_flight",
                 "affinity",
                 "named",
                 "model_fingerprint",
@@ -872,6 +874,7 @@ fn wit_mirrors() -> Vec<WitMirror> {
             host_only: &[
                 "now_micros",
                 "pinned_at",
+                "lent_in_flight",
                 "affinity",
                 "named",
                 "model_fingerprint",

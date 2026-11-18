@@ -869,10 +869,7 @@ mod tests {
             let class = buffer_pool::allocation_capacity(expected.as_raw().len());
             for round in 0..2 {
                 let canvas = processor.padding_336(rows.clone());
-                assert!(
-                    canvas.as_raw() == expected.as_raw(),
-                    "round {round}: pixels differ"
-                );
+                assert!(canvas == expected, "round {round}: pixels differ");
                 assert_eq!(
                     POOL.held(),
                     0,

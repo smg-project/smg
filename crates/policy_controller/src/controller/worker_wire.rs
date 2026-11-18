@@ -21,7 +21,7 @@ use crate::{
     proto::{self, worker_event::Event},
     replication::{Entry, Event as Written},
     store::{
-        Cut, GatewayId, HealthPolicy, LoadSample, LoadSource, MembershipChange, Overload, Position,
+        GatewayId, HealthPolicy, LoadSample, LoadSource, MembershipChange, Overload, Position,
         Reachability, Signals, WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus,
     },
     view::{LoadRow, Role, SignalSource, WireModes, WorkerId},
@@ -684,17 +684,22 @@ pub(crate) fn told_load(
     Ok((WorkerId(told.worker_id), rank, stored, ingress))
 }
 
-/// A complete snapshot as the cut a standby's store is restored from
-/// ([`crate::store::MemoryStore::restore_from`]): the rows and the load
-/// rows at the snapshot's place and epoch. Every instant is `now` less the
-/// age its row crossed with, the one `now` for the whole cut, so no row
-/// ages against another by the restore.
-pub(crate) fn told_cut(told: &proto::Snapshot, now: Instant) -> Result<Cut, Refused> {
-    let mut rows = Vec::with_capacity(told.workers.len());
+/// One part of a leader's snapshot, read at `now`, into the rows and the
+/// load rows a standby stages for its restore
+/// ([`crate::store::MemoryStore::restore_from`]). Every instant is `now`
+/// less the age its row crossed with: the leader told each age at the
+/// part's send, so a part is read at its arrival.
+pub(crate) fn told_part(
+    told: &proto::ReplicationSnapshot,
+    now: Instant,
+    rows: &mut Vec<WorkerRow>,
+    loads: &mut Vec<(WorkerId, u16, LoadSample)>,
+) -> Result<(), Refused> {
+    rows.reserve(told.workers.len());
     for row in &told.workers {
         rows.push(told_row(row, now)?);
     }
-    let mut loads = Vec::with_capacity(told.loads.len());
+    loads.reserve(told.loads.len());
     for load in &told.loads {
         let (id, rank, row, source) = told_load(load)?;
         let age = Duration::from_millis(u64::from(row.report_age_ms));
@@ -706,15 +711,7 @@ pub(crate) fn told_cut(told: &proto::Snapshot, now: Instant) -> Result<Cut, Refu
         };
         loads.push((id, rank, sample));
     }
-    Ok(Cut {
-        at: Position {
-            seq: told.replication_seq,
-            term: told.replication_term,
-        },
-        epoch: told.membership_epoch,
-        rows,
-        loads,
-    })
+    Ok(())
 }
 
 /// `value`, or `default` where the wire's zero says unset.
@@ -1095,7 +1092,7 @@ mod tests {
 
     use super::{
         event, load, member, page, patch, refused, registration, removed, replaced, replication,
-        row, start_again, status, status_changed, told_change, told_cut, told_load, told_row,
+        row, start_again, status, status_changed, told_change, told_load, told_part, told_row,
         Refused, KEY_BYTES, LABELS, MODELS, NAME_BYTES, ROW_BYTES, URL_BYTES, VALUE_BYTES,
     };
     use crate::{
@@ -2710,17 +2707,18 @@ mod tests {
             sampled_at: at,
             source: LoadSource::Poll,
         };
-        // Sent in a snapshot 700 ms after its receipt, restored later.
+        // Sent in a snapshot's part 700 ms after its receipt, read later.
         let sent = load(WorkerId(7), 2, &sample, at + Duration::from_millis(700));
-        let snapshot = proto::Snapshot {
+        let part = proto::ReplicationSnapshot {
             loads: vec![sent],
-            replication_seq: 9,
-            replication_term: 2,
-            ..proto::Snapshot::default()
+            last: true,
+            ..proto::ReplicationSnapshot::default()
         };
         let now = at + Duration::from_secs(5);
-        let cut = told_cut(&snapshot, now).expect("a cut this build holds");
-        let (id, rank, restored) = cut.loads.first().expect("the load row");
+        let (mut rows, mut loads) = (Vec::new(), Vec::new());
+        told_part(&part, now, &mut rows, &mut loads).expect("a part this build holds");
+        assert!(rows.is_empty());
+        let (id, rank, restored) = loads.first().expect("the load row");
         assert_eq!((*id, *rank), (WorkerId(7), 2));
         // The restore is its receipt, and its age is the age it crossed
         // with: a restored row is no fresher than its leader's.

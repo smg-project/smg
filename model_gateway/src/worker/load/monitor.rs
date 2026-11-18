@@ -567,8 +567,13 @@ impl<G: Generation> WorkerMonitor<G> {
         {
             return;
         }
-        let age = record.age() + PUSHED_ONE_WAY_MARGIN;
-        let sampled_at = received_at.checked_sub(age).unwrap_or(received_at);
+        // An age the margin overflows, or one older than the clock, reads as
+        // sampled at the receipt.
+        let sampled_at = record
+            .age()
+            .checked_add(PUSHED_ONE_WAY_MARGIN)
+            .and_then(|age| received_at.checked_sub(age))
+            .unwrap_or(received_at);
         let url = worker.url();
         // The stream pushes: silence from this worker is judged by the
         // stream's cadence from now on (`liveness`, the stale rule).
@@ -1680,7 +1685,7 @@ async fn liveness_sweep_loop<G: Generation>(monitor: Weak<WorkerMonitor<G>>) {
         let Some(monitor) = monitor.upgrade() else {
             return;
         };
-        for worker in monitor.worker_registry.get_routing_workers().iter() {
+        for worker in monitor.worker_registry.global_generation().members().iter() {
             liveness::sweep(worker);
         }
     }

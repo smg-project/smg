@@ -141,9 +141,17 @@ pub struct HuggingFaceTokenizer {
     /// for such a checkpoint (see `apply_chat_template_with_encoding`).
     structural_controls: bool,
     /// The special tokens between the marks, for the marked template's
-    /// context (`Some` with `structural_controls`, read while the template
-    /// is marked).
+    /// context (`Some` with `structural_controls` or once a template that
+    /// builds its control spellings was marked, read while the template is
+    /// marked).
     special_tokens_marked: Option<SpecialTokens>,
+    /// The ids, in order, of the added tokens that keep their id where a
+    /// request types them, under templates marked for the control spellings
+    /// they build (see [`EncoderCore::kept`]); `None` when there is none,
+    /// and for any other template. They count where the template renders
+    /// the prompt: a renderer with an encoder of its own writes controls
+    /// no template holds.
+    kept: Option<Box<[u32]>>,
 }
 
 /// Logs, once per load, which path a tokenizer's full decode takes: the
@@ -368,8 +376,9 @@ struct EncoderCore {
     wordpiece: Option<WordPieceEncoder>,
     /// Every added token, special or not, as one leftmost-longest matcher
     /// over the raw text, built on first use (only a renderer with an
-    /// encoder of its own asks; a vocabulary can carry tens of thousands of
-    /// added tokens, which a Jinja-rendered model never pays for); `None`
+    /// encoder of its own asks, and the load of a template that builds its
+    /// control spellings; a vocabulary can carry tens of thousands of added
+    /// tokens, which any other Jinja-rendered model never pays for); `None`
     /// for a vocabulary without added tokens. It tells whether the flat
     /// encode of a prompt rendered by segments would cut out exactly the
     /// renderer's control tokens.
@@ -383,6 +392,9 @@ struct EncoderCore {
     /// of the text only: the same pipeline with the scheme `never`, built on
     /// first use (see [`Self::plain_tokenizer`]).
     plain_after_control: OnceLock<HfTokenizer>,
+    /// Whether the pipeline matches an added token after normalization,
+    /// read on first use (see [`Self::matches_after_normalization`]).
+    matches_after_normalization: OnceLock<bool>,
 }
 
 impl EncoderCore {
@@ -398,7 +410,69 @@ impl EncoderCore {
             added: OnceLock::new(),
             plain: OnceLock::new(),
             plain_after_control: OnceLock::new(),
+            matches_after_normalization: OnceLock::new(),
         }
+    }
+
+    /// Whether `text` is one added token of the vocabulary, special or not:
+    /// a lookup, where [`Self::added`] would build its matcher.
+    fn is_added(&self, text: &str) -> bool {
+        self.tokenizer
+            .get_added_vocabulary()
+            .get_vocab()
+            .contains_key(text)
+    }
+
+    /// The added tokens of the vocabulary, special or not: each spelling,
+    /// and whether its entry carries a flag under which the flat encode
+    /// reads more than the spelling or none of it (the token takes the
+    /// whitespace beside it, or matches only as a whole word), or reads it
+    /// in a later pass (the token is matched after normalization).
+    fn added_entries(&self) -> impl Iterator<Item = (&str, bool)> {
+        self.tokenizer
+            .get_added_vocabulary()
+            .get_added_tokens_decoder()
+            .values()
+            .map(|token| {
+                let flagged = token.lstrip || token.rstrip || token.single_word || token.normalized;
+                (token.content.as_str(), flagged)
+            })
+    }
+
+    /// The ids, in order, of the added tokens that keep their id where a
+    /// request types them under templates that hold `written` between
+    /// marks: the ones the vocabulary does not flag special, that the
+    /// templates write nowhere as a control, and that the flat encode reads
+    /// alone and as they stand (no flag on the entry, as in
+    /// [`Self::added_entries`]). `None` when there is none.
+    ///
+    /// A checkpoint with its own vocabulary file keeps none: that file's
+    /// reader encodes every request string as plain text, so the reference
+    /// reads no added token a request types. A template that builds its
+    /// spellings has no such reader beside it. Its reference is the flat
+    /// encode, which reads every added token a request types as its token,
+    /// and a request types some on purpose (the place holder of an image).
+    /// So there only what the templates write and what the vocabulary flags
+    /// special is taken as a control; any other added token reads as the
+    /// flat encode reads it.
+    fn kept(&self, written: &[String]) -> Option<Box<[u32]>> {
+        let mut kept: Vec<u32> = self
+            .tokenizer
+            .get_added_vocabulary()
+            .get_added_tokens_decoder()
+            .iter()
+            .filter(|(_, token)| {
+                let flagged = token.special
+                    || token.lstrip
+                    || token.rstrip
+                    || token.single_word
+                    || token.normalized;
+                !flagged && !written.contains(&token.content)
+            })
+            .map(|(&id, _)| id)
+            .collect();
+        kept.sort_unstable();
+        (!kept.is_empty()).then(|| kept.into_boxed_slice())
     }
 
     /// The matcher over the added vocabulary, built on first use.
@@ -420,12 +494,37 @@ impl EncoderCore {
             .as_ref()
     }
 
+    /// Whether the pipeline matches an added token after normalization: an
+    /// entry says so, and the normalizer is more than an empty sequence.
+    /// The flat encode then reads as that token a text the normalizer turns
+    /// into its spelling, which the matcher of [`Self::added`], a reader of
+    /// the raw text, passes. A prompt rendered by segments is encoded by
+    /// segments under such a pipeline: there the text is its characters.
+    fn matches_after_normalization(&self) -> bool {
+        *self.matches_after_normalization.get_or_init(|| {
+            let normalizes = match self.tokenizer.get_normalizer() {
+                None => false,
+                Some(NormalizerWrapper::Sequence(steps)) => !steps.as_ref().is_empty(),
+                Some(_) => true,
+            };
+            normalizes
+                && self
+                    .tokenizer
+                    .get_added_vocabulary()
+                    .get_added_tokens_decoder()
+                    .values()
+                    .any(|token| token.normalized)
+        })
+    }
+
     /// Whether the flat encode of `text` cuts out exactly the added tokens at
     /// `controls` (the renderer's control tokens, in order): then it is the
     /// segment encode and the text can be encoded as text, through every
     /// path and cache a flat encode takes. False when another added-token
     /// spelling occurs in the text (one a client typed), or a control is no
-    /// added token of this vocabulary.
+    /// added token of this vocabulary. The matcher reads the raw text: the
+    /// answer holds for a pipeline that matches no added token after
+    /// normalization ([`Self::matches_after_normalization`]).
     fn flat_encode_is_segment_encode(&self, text: &str, controls: &[Range<usize>]) -> bool {
         match self.added() {
             Some(added) => added.ranges(text).eq(controls.iter().cloned()),
@@ -973,13 +1072,26 @@ impl HuggingFaceTokenizer {
         let structural_controls = tokenizer_path
             .parent()
             .is_some_and(|dir| dir.join("tekken.json").is_file());
+        let mut kept = None;
         let special_tokens_marked = if structural_controls {
             if let Some(controls) = core.added() {
                 chat_template.mark_controls(controls)?;
             }
             Some(marks::marked_special_tokens(&special_tokens))
         } else {
-            None
+            // A template that builds its control spellings says so itself
+            // (see `ChatTemplateState::mark_built_controls`).
+            chat_template
+                .mark_built_controls(
+                    &|text: &str| core.is_added(text),
+                    || core.added_entries(),
+                    || core.added(),
+                    &special_tokens,
+                )
+                .map(|written| {
+                    kept = core.kept(&written);
+                    marks::marked_special_tokens(&special_tokens)
+                })
         };
         Ok(HuggingFaceTokenizer {
             byte_level,
@@ -1002,6 +1114,7 @@ impl HuggingFaceTokenizer {
             byte_fallback_values,
             structural_controls,
             special_tokens_marked,
+            kept,
         })
     }
 
@@ -1323,6 +1436,7 @@ impl HuggingFaceTokenizer {
             byte_fallback_values,
             structural_controls: false,
             special_tokens_marked: None,
+            kept: None,
         }
     }
 
@@ -2411,10 +2525,31 @@ impl HuggingFaceTokenizer {
             marked.push_str(&marks::strip(prefix));
         }
         let (text, controls) = marks::flatten(&marked)?;
-        let encoding = if self.core.flat_encode_is_segment_encode(&text, &controls) {
+        // Under templates marked for the spellings they build, a typed added
+        // token of `kept` is cut out by the flat encode and by the segment
+        // encode alike. The kept tokens are the templates' own: they count
+        // where the template renders the prompt.
+        let kept = self
+            .kept
+            .as_deref()
+            .filter(|_| matches!(self.renderer, Renderer::Jinja));
+        // The matchers read the raw text: under a pipeline that matches an
+        // added token after normalization the prompt is encoded by segments.
+        let flat_encode_is_segment_encode = !self.core.matches_after_normalization()
+            && match kept {
+                Some(kept) => self
+                    .core
+                    .added()
+                    .is_some_and(|added| marks::flat_encode_keeps(added, kept, &text, &controls)),
+                None => self.core.flat_encode_is_segment_encode(&text, &controls),
+            };
+        let encoding = if flat_encode_is_segment_encode {
             PromptEncoding::FromText
         } else {
-            let segments = marks::segments(&marked)?;
+            let mut segments = marks::segments(&marked)?;
+            if let (Some(kept), Some(added)) = (kept, self.core.added()) {
+                segments = marks::with_kept(segments, added, kept);
+            }
             let core = Arc::clone(&self.core);
             PromptEncoding::Deferred(EncodeJob::new(move || {
                 core.encode_segments(&segments).map(Encoding::Plain)
@@ -2685,6 +2820,23 @@ impl TokenizerTrait for HuggingFaceTokenizer {
             .then(|| self.core.added())
             .flatten();
         self.chat_template.replace_marked(template, controls)?;
+        // Without the vocabulary file the new template is judged as the
+        // checkpoint's own was at load: one that builds its control spellings
+        // is marked, any other renders plain.
+        let core = &self.core;
+        if !self.structural_controls {
+            let written = self.chat_template.mark_built_controls(
+                &|text: &str| core.is_added(text),
+                || core.added_entries(),
+                || core.added(),
+                &self.special_tokens,
+            );
+            self.kept = written.as_deref().and_then(|written| core.kept(written));
+            if written.is_some() && self.special_tokens_marked.is_none() {
+                self.special_tokens_marked =
+                    Some(marks::marked_special_tokens(&self.special_tokens));
+            }
+        }
         if self.glm.is_some() {
             self.renderer = glm_renderer.map_or(Renderer::Jinja, Renderer::Glm53);
             self.profile = self.renderer.profile();

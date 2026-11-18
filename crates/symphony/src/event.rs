@@ -487,6 +487,12 @@ impl<'d> Events<'d> {
         self.push(Event::Reasoning(text));
     }
 
+    /// Take back the last event, for a parser that pushed it in this step and holds its bytes
+    /// for a later one; nothing when the list is empty.
+    pub(crate) fn pop(&mut self) -> Option<Event<'d>> {
+        self.items.pop()
+    }
+
     /// The events so far.
     pub fn as_slice(&self) -> &[Event<'d>] {
         &self.items

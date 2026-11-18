@@ -310,6 +310,8 @@ impl Checked {
                 model_fingerprint: ModelFingerprint::NONE,
                 // No decider asks its view for a pinned worker's row.
                 pinned_at: 0,
+                // What the leases book, beside rows a view lent.
+                lent_in_flight: view.in_flight.as_ref(),
             },
             &Constraints {
                 excluded: &lists.excluded,
@@ -340,6 +342,10 @@ pub(crate) struct Viewed<'a> {
     /// candidates are a publication's own rows; empty where they were
     /// written for the decision and carry their own stalled bits.
     pub(crate) stalled: &'a [u32],
+    /// What the leases on file book on each row, by position, where the
+    /// candidates are a publication's own rows; `None` where they were
+    /// written for the decision and carry their counts.
+    pub(crate) in_flight: Option<crate::LentCounts<'a>>,
     /// How many of the request's block hashes the deciding generation
     /// reads.
     pub(crate) max_block_hashes: usize,
@@ -645,6 +651,7 @@ mod tests {
             budget_micros: 1_500,
             affinity: &affinity,
             stalled: &[],
+            in_flight: None,
             max_block_hashes: 256,
             named: None,
         };
@@ -967,6 +974,7 @@ mod tests {
                 budget_micros: 1,
                 affinity: &[],
                 stalled: &[],
+                in_flight: None,
                 max_block_hashes,
                 named: None,
             };

@@ -252,6 +252,10 @@ impl From<&common::EngineLoad> for SchedulerLoadSnapshot {
 }
 
 /// The record as the worker's load report and its liveness read it.
+///
+/// The readers are named apart from the record's fields: a generated
+/// accessor of a field's name would shadow the trait's method on this type
+/// and answer the field's default where the trait says absent.
 impl LoadRecord for common::EngineLoad {
     #[inline]
     fn age(&self) -> Duration {

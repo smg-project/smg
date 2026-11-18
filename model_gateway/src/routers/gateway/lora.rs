@@ -8,7 +8,9 @@ use std::sync::Arc;
 use axum::response::Response;
 
 use super::{route_error, router_ids, Gateway, RouterTrait};
-use crate::worker::{ConnectionMode, RoutingPool, RuntimeType, Worker, WorkerRegistry};
+use crate::worker::{
+    ConnectionMode, RoutingPool, RuntimeType, Worker, WorkerRegistry, WorkerRegistryExt,
+};
 
 fn sglang_grpc(worker: &dyn Worker) -> bool {
     worker.metadata().spec.runtime_type == RuntimeType::Sglang

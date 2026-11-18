@@ -102,54 +102,36 @@ impl Kept {
     /// Whether the ring has `at` under its term: a retained event, or the
     /// place before the oldest.
     fn has(&self, at: Position) -> bool {
+        self.has_at(at, self.until(at.seq))
+    }
+
+    /// [`Kept::has`] for a caller that searched already: `until` is how
+    /// many retained events stand at or before the position of `at`
+    /// ([`Kept::until`]), and where the ring retains the place it is the
+    /// last of them.
+    fn has_at(&self, at: Position, until: usize) -> bool {
         at == self.floor
-            || self
-                .until(at.seq)
+            || until
                 .checked_sub(1)
                 .and_then(|last| self.events.get(last))
                 .is_some_and(|entry| entry.at == at)
     }
 
-    /// The retained events after position `seq`, oldest first.
-    fn after(&self, seq: u64) -> vec_deque::Iter<'_, Entry> {
-        self.events.range(self.until(seq)..)
+    /// The retained events from the one at index `from` on, oldest first.
+    fn from(&self, from: usize) -> vec_deque::Iter<'_, Entry> {
+        self.events.range(from..)
     }
 
     /// How many retained events stand at or before position `seq`: the
-    /// index of the first one after it. Searched from the head, by offsets
-    /// that double, then by halves between the last two looks: a reader
-    /// stands near the head, and its search takes steps by its distance
-    /// from there, not by the ring's size. A reader far behind takes at
-    /// most twice the steps of a search of the whole ring.
+    /// index of the first one after it, searched from the head
+    /// ([`first_after`]). A reader stands near the head, and its search
+    /// takes steps by its distance from there, not by the ring's size.
     fn until(&self, seq: u64) -> usize {
-        let before = |index: usize| {
+        first_after(self.events.len(), |index| {
             self.events
                 .get(index)
                 .is_some_and(|entry| entry.at.seq <= seq)
-        };
-        let len = self.events.len();
-        // Every event before `lo` stands at or before `seq`, and every
-        // event from `hi` on stands after it.
-        let (mut lo, mut hi) = (0, len);
-        let mut back = 1;
-        while lo < hi {
-            let look = len.saturating_sub(back);
-            if before(look) {
-                lo = look + 1;
-                break;
-            }
-            hi = look;
-            back *= 2;
-        }
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            if before(mid) {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
-        }
-        lo
+        })
     }
 
     /// None of the ring's events: what a reader of the other ring's kinds
@@ -178,6 +160,36 @@ impl Kept {
         self.events.clear();
         self.floor = at;
     }
+}
+
+/// The first of `len` places in a row that does not stand `before`, where
+/// every place that does comes ahead of every one that does not; `len`
+/// where all do. Searched from the end, by offsets that double, then by
+/// halves between the last two looks: one look where every place stands
+/// before, two where all but the last do, and at most twice the steps of
+/// a search of the whole row.
+fn first_after(len: usize, mut before: impl FnMut(usize) -> bool) -> usize {
+    // Every place before `lo` stands before, and none from `hi` on does.
+    let (mut lo, mut hi) = (0, len);
+    let mut back = 1;
+    while lo < hi {
+        let look = len.saturating_sub(back);
+        if before(look) {
+            lo = look + 1;
+            break;
+        }
+        hi = look;
+        back *= 2;
+    }
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if before(mid) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
 }
 
 struct Ring {
@@ -212,13 +224,35 @@ struct Ring {
 }
 
 impl Ring {
-    /// Whether a reader of `kinds` continues from `at`: the log has that
-    /// place under that term (a place is a write of any kind, so either
-    /// ring may have it), and every event of `kinds` after it is retained.
+    /// Whether a reader of `kinds` continues from `at` ([`Ring::after`]).
     fn continues(&self, kinds: Kinds, at: Position) -> bool {
-        (self.watched.has(at) || self.loads.has(at))
-            && at.seq >= self.watched.floor.seq
-            && (kinds == Kinds::Watched || at.seq >= self.loads.floor.seq)
+        self.after(kinds, at).is_some()
+    }
+
+    /// What a reader of `kinds` at `at` has before it: the retained events
+    /// after that place, the watched ring's and the load ring's, each
+    /// oldest first. `None` unless the log has that place under that term
+    /// (a place is a write of any kind, so either ring may have it) and
+    /// every event of `kinds` after it is retained. A ring is searched
+    /// once: the search that says whether it has the place finds what
+    /// follows the place there. A reader of the watched kinds is handed no
+    /// load row, and that ring is looked at for it only where the watched
+    /// ring has not its place.
+    fn after(&self, kinds: Kinds, at: Position) -> Option<[vec_deque::Iter<'_, Entry>; 2]> {
+        if at.seq < self.watched.floor.seq || (kinds == Kinds::All && at.seq < self.loads.floor.seq)
+        {
+            return None;
+        }
+        let watched = self.watched.until(at.seq);
+        let held = self.watched.has_at(at, watched);
+        let loads = match kinds {
+            Kinds::All => {
+                let loads = self.loads.until(at.seq);
+                (held || self.loads.has_at(at, loads)).then(|| self.loads.from(loads))
+            }
+            Kinds::Watched => (held || self.loads.has(at)).then(|| self.loads.none()),
+        }?;
+        Some([self.watched.from(watched), loads])
     }
 
     /// The number of a place under no term that would stand at `seq`:
@@ -537,17 +571,12 @@ impl Log {
             return Err(Lost);
         }
         let ring = self.ring.lock();
-        if !ring.continues(kinds, after) {
+        // A reader of the watched kinds reads no load row: that ring is
+        // written at the load rows' pace.
+        let Some([watched, loads]) = ring.after(kinds, after) else {
             return Err(Lost);
-        }
-        let mut watched = ring.watched.after(after.seq).peekable();
-        // A reader of the watched kinds reads no load row, and its read
-        // looks at none: that ring is written at the load rows' pace.
-        let mut loads = match kinds {
-            Kinds::All => ring.loads.after(after.seq),
-            Kinds::Watched => ring.loads.none(),
-        }
-        .peekable();
+        };
+        let (mut watched, mut loads) = (watched.peekable(), loads.peekable());
         let mut batch_term = None;
         let mut ended = false;
         while out.len() < at_most {
@@ -643,11 +672,11 @@ impl Log {
     /// A telling is owed while the count of moves is past the highest
     /// count told. The count is loaded before the kept one is raised to
     /// it, so a move is told after its count moved, and the reader that
-    /// telling wakes finds the log past its [`Stamp`], unless an earlier
-    /// telling woke it past that move already: its stamp stands then, and
-    /// it reads nothing. Of the releases that race, each that raises the
-    /// kept count tells: no move goes untold, and a release that raises
-    /// nothing tells nothing.
+    /// telling wakes finds the log past its [`Stamp`], unless it read
+    /// past that move already, whatever brought it to read: its stamp
+    /// stands then, and it reads nothing. Of the releases that race, each
+    /// that raises the kept count tells: no move goes untold, and a
+    /// release that raises nothing tells nothing.
     fn tell(&self) {
         let Some(told) = &self.told else {
             return;
@@ -1507,8 +1536,8 @@ mod tests {
 
     /// A search from the head answers, for every place of rings of every
     /// small size, full or not, as a count over the whole ring does: the
-    /// events at or before the place, and with them the events after it and
-    /// whether the ring has the place under its term.
+    /// events at or before the place, and with them whether the ring has the
+    /// place under its term.
     #[test]
     fn a_search_from_the_head_answers_as_a_count_of_the_whole_ring() {
         for capacity in [1, 2, 3, 5, 16, 64] {
@@ -1533,7 +1562,6 @@ mod tests {
                         .count();
                     let of = format!("place {seq} of {pushed} pushed to {capacity}");
                     assert_eq!(kept.until(seq), before, "{of}");
-                    assert_eq!(kept.after(seq).len(), kept.events.len() - before, "{of}");
                     let held = kept.events.iter().any(|entry| entry.at.seq == seq);
                     assert_eq!(
                         kept.has(at(seq, 1)),
@@ -1541,6 +1569,94 @@ mod tests {
                         "{of}"
                     );
                     assert!(!kept.has(at(seq, 2)), "{of}, under another term");
+                }
+            }
+        }
+    }
+
+    /// The search takes its looks by a place's distance from the end, not
+    /// by the row's length: one look where nothing follows the place, two
+    /// where one event does, and at most twice the bits its distance is
+    /// written in. The bench holds the time of it, this case its shape.
+    #[test]
+    fn a_search_from_the_head_takes_its_looks_by_the_distance_from_it() {
+        for len in [1usize, 2, 3, 7, 100, 4_096, 65_536] {
+            let near = (0..=len).take(130);
+            let far = (7..=16).flat_map(|bit| [(1usize << bit) - 1, 1 << bit, (1 << bit) + 1]);
+            for behind in near.chain(far.filter(|&behind| behind <= len)) {
+                let first = len - behind;
+                let mut looks = 0u32;
+                let found = first_after(len, |index| {
+                    looks += 1;
+                    index < first
+                });
+                let of = format!("{behind} behind the end of {len}");
+                assert_eq!(found, first, "{of}");
+                let bits = usize::BITS - behind.leading_zeros();
+                assert!(looks <= (2 * bits).max(1), "{looks} looks at {of}");
+                match behind {
+                    0 => assert_eq!(looks, 1, "{of}"),
+                    1 if len > 1 => assert_eq!(looks, 2, "{of}"),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// A reader's place is searched once a ring, and what the search hands
+    /// it is what a count of both rings finds: for every place of a log of
+    /// both kinds, full or not, under its term and under two others, a
+    /// reader of each kind is handed nothing unless a ring has the place
+    /// and every event of its kinds after it is retained, then each ring's
+    /// events after the place, and no load row where it reads the watched
+    /// kinds.
+    #[test]
+    fn a_reader_is_handed_what_a_count_of_both_rings_finds_after_its_place() {
+        let has = |kept: &Kept, place: Position| {
+            place == kept.floor || kept.events.iter().any(|entry| entry.at == place)
+        };
+        let after = |kept: &Kept, seq: u64| {
+            kept.events
+                .iter()
+                .filter(|entry| entry.at.seq > seq)
+                .count()
+        };
+        for (watched, loads) in [(1, 1), (2, 5), (5, 2), (4, 16), (16, 4)] {
+            for writes in 0..=2 * (watched + loads) + 3 {
+                let log = Log::new(watched, loads);
+                log.term_rose(1);
+                for turn in 0..writes {
+                    let mark = u32::try_from(turn).expect("a test's turn");
+                    if turn % 3 == 0 {
+                        member(&log, mark);
+                    } else {
+                        load(&log, mark);
+                    }
+                }
+                let ring = log.ring.lock();
+                for seq in 0..ring.head.seq + 2 {
+                    for term in 0..3 {
+                        let place = at(seq, term);
+                        let had = has(&ring.watched, place) || has(&ring.loads, place);
+                        for kinds in [Watched, All] {
+                            let retained = seq >= ring.watched.floor.seq
+                                && (kinds == Watched || seq >= ring.loads.floor.seq);
+                            let counted = (had && retained).then(|| {
+                                let loads = match kinds {
+                                    All => after(&ring.loads, seq),
+                                    Watched => 0,
+                                };
+                                [after(&ring.watched, seq), loads]
+                            });
+                            let handed = ring
+                                .after(kinds, place)
+                                .map(|rings| rings.map(|events| events.len()));
+                            assert_eq!(
+                                handed, counted,
+                                "{kinds:?} at {place:?} after {writes} writes to {watched} and {loads}"
+                            );
+                        }
+                    }
                 }
             }
         }

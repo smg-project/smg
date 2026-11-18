@@ -110,8 +110,8 @@ use crate::{
     wasm::module::{MiddlewareAttachPoint, WasmModuleAttachPoint},
     worker::{
         identity::endpoint::Endpoint, metrics::Metrics as WorkerMetrics, ConnectionMode,
-        RoutingPool, RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry, WorkerType,
-        UNKNOWN_MODEL_ID,
+        RoutingPool, RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry, WorkerRegistryExt,
+        WorkerType, UNKNOWN_MODEL_ID,
     },
 };
 

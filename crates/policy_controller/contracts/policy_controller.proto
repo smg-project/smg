@@ -19,7 +19,7 @@
 // PushLoad and PushKvEvents; the relay's subject is the RELAY origin.
 // Control: `user` reads (GetSnapshot, Explain, GetPolicySpec, Leader,
 // WatchRegime), `admin` writes the rest; every call writes an audit event.
-// Replication: Replicate, and GetSnapshot as the re-sync base;
+// Replication: Replicate, whose stream carries a re-sync's snapshot in parts;
 // ReplicaHello.replica_id must equal the subject. Leader is served to every
 // scope; a standby serves Leader, WatchWorkers, GetSnapshot and GetPolicySpec
 // and answers Session and Decide with NotLeader / Busy { NOT_LEADER }.
@@ -69,10 +69,9 @@
 // protocol version in common, a floor above the term, a revision or
 // digest guard, a Decide stream of a gateway that is not present where the
 // controller leads (at its open, at its first request under a term, and an
-// open one when the presence ends), a rejoin position not held under its
-// term (a resync_required batch precedes it; the rejoin opens a new
-// Replicate stream), or a replication call on a controller whose lease
-// lives in its own process (it has no standby); INVALID_ARGUMENT a spec,
+// open one when the presence ends), or a replication call on a controller
+// whose lease lives in its own process (it has no standby); INVALID_ARGUMENT
+// a spec,
 // registration or patch rejected (the field path in ApplyResult.issues, and
 // at the head of a refused registration's or patch's status message), a
 // Dispatched, Completed or Released whose side, class, reason or number
@@ -81,10 +80,9 @@
 // same), a veto of no kind, a Hello whose veto_count is not its list's
 // length, or a DecideRequest field out of its range in this protocol version
 // (the status message names the field, and the stream closes);
-// RESOURCE_EXHAUSTED a relay over its per-subscriber budget or a standby
-// over its backlog (a resync_required batch precedes it), a complete
-// snapshot above one message, a WatchWorkers past its principal's ceiling of
-// 4 open watches or past the replica's ceiling of watching principals, a
+// RESOURCE_EXHAUSTED a relay over its per-subscriber budget, a WatchWorkers
+// past its principal's ceiling of 4 open watches or past the replica's
+// ceiling of watching principals, a
 // Decide stream past its gateway's Welcome.max_decide_streams, a Session
 // frame over the transport's limit of 4 MiB a message, a Decide frame over
 // 64 KiB as encoded, or a ceiling of the controller's: a Hello past 4,096
@@ -487,8 +485,8 @@ message WorkerEvent {
   // batch carries it and a standby adopts it, so every replica numbers the
   // event alike. Every page of one snapshot carries the position the snapshot
   // is consistent with, filtered by `models` or not: the last position of the
-  // kinds a watcher can ask for when the rows were read (GetSnapshot's
-  // replication_seq names the log's head, at or after it; the rows are the
+  // kinds a watcher can ask for when the rows were read (a standby's
+  // snapshot stands at the log's head, at or after it; the rows are the
   // same at both); the tail starts after it. A registration call's answer
   // carries the position of the call's write, and where the call wrote
   // nothing the last position of those kinds: a watcher that has passed it
@@ -863,8 +861,8 @@ message DeregisterWorkerRequest {
 // --- Control scope: the store -----------------------------------------------
 
 // Redacted by default: URLs lose credentials, session keys and header values
-// are fingerprinted, plugin state dumps hash identifiers. The replication
-// scope's call is served complete and unredacted: a standby's re-sync base.
+// are fingerprinted, plugin state dumps hash identifiers. A standby is
+// restored on its Replicate stream (ReplicationSnapshot), never by this call.
 message SnapshotRequest {
   enum Slice {
     SLICE_UNSPECIFIED = 0;
@@ -905,10 +903,8 @@ message Snapshot {
   KvIndexSummary kv_index = 12;
   repeated GatewayRow gateways = 13;
   bool truncated = 14;
-  // The log position the snapshot is consistent with (a standby rejoins with
-  // `last_applied_seq` here and `last_applied_term` = `replication_term`);
-  // non-zero only on a complete, unredacted snapshot of the replication scope,
-  // zero on a partial or redacted one.
+  // The log position the snapshot is consistent with; non-zero only on a
+  // complete, unredacted snapshot, zero on a partial or redacted one.
   uint64 replication_seq = 15;
   // The interned-id table at that position.
   IdAssignment ids = 16;
@@ -920,9 +916,7 @@ message Snapshot {
   // The term the event at `replication_seq` was written under; present with
   // it, zero with it.
   uint64 replication_term = 18;
-  // The membership epoch at `replication_seq`; present with it. A standby
-  // restored from the snapshot numbers its next membership change after it,
-  // as the leader does.
+  // The membership epoch at `replication_seq`; present with it.
   uint64 membership_epoch = 19;
 }
 
@@ -1223,9 +1217,11 @@ message ReplicaHello {
   // `last_applied_term`; on another term, a position past its head, or one
   // older than it retains, it answers a resync_required batch, never a
   // continuation: two replicas that agree on a position and its term share
-  // the prefix before it. A standby seeds both from a snapshot's
-  // `replication_seq` and `replication_term`; a non-zero `last_applied_seq`
-  // with a zero term is answered resync_required as well. A standby that
+  // the prefix before it. A standby restored from a snapshot stands at the
+  // snapshot's place under its term. A non-zero `last_applied_seq` with a
+  // zero term is answered resync_required as well: a standby on which its
+  // leader's event did not land states its head's number under no term, and
+  // is restored whole. A standby that
   // applied nothing states zero for both: it is continued from the leader's
   // first write, at the position after the place the leader's run drew,
   // while the leader's log retains every write since.
@@ -1242,16 +1238,46 @@ message ReplicationBatch {
   // current term: a catch-up batch splits at a term boundary, so a standby
   // records each position under its write term.
   uint64 term = 2;
-  // No events: the leader's heartbeat, one a second on an idle stream.
-  // `first_seq` is then the position after the leader's head and `term` the
-  // head's: a standby that applied `first_seq - 1` stands at the head.
+  // No events and no part of a snapshot: the leader's heartbeat, one a
+  // second on an idle stream. `first_seq` is then the position after the
+  // leader's head and `term` the head's: a standby that applied
+  // `first_seq - 1` stands at the head.
   repeated ReplicationEvent events = 3;
   // The standby's backlog was cut, or its `last_applied_seq` is not held
-  // under `last_applied_term`: re-sync from GetSnapshot (its `replication_seq`
-  // and `replication_term` seed the next hello), then rejoin on a new
-  // Replicate stream. A standby that re-syncs ends its open WatchWorkers
-  // tails with SnapshotRequired: their positions came from the log it dropped.
+  // under `last_applied_term`: the leader's snapshot follows on this stream
+  // in parts (`snapshot`), then the log from the snapshot's place. A standby
+  // that re-syncs ends its open WatchWorkers tails with SnapshotRequired:
+  // their positions came from the log it dropped.
   bool resync_required = 4;
+  // One part of the leader's snapshot; the batch carries no event.
+  // `first_seq` is then the position after the snapshot's place and `term`
+  // the place's, the same on every part: a standby restored from the
+  // snapshot stands at `first_seq - 1`, and the next batch of events starts
+  // at `first_seq`.
+  ReplicationSnapshot snapshot = 5;
+}
+
+// One part of a snapshot a standby is restored from: the leader's rows and
+// load rows as one write of its log left them, cut once and sent in parts on
+// the stream that then carries the log from that place, so no gap stands
+// between a snapshot and what follows it. Rows are paged as a watch's
+// snapshot is (WorkerSnapshot: 128 rows or 2 MiB of rows, a first row
+// whatever it weighs), the load rows within the same bytes, the rows' parts
+// first. A standby stages the parts and restores at the last one, whole or
+// not at all: a stream that ends inside a snapshot leaves its store as it
+// was. An empty store is one empty part.
+message ReplicationSnapshot {
+  // The part's number in its snapshot: zero, then one more each part.
+  uint32 part = 1;
+  // The snapshot's last part.
+  bool last = 2;
+  // The membership epoch at the snapshot's place, on every part. A standby
+  // restored from the snapshot numbers its next membership change after it,
+  // as the leader does.
+  uint64 membership_epoch = 3;
+  // Each row's `admitted_age_ms` is its age at the part's send.
+  repeated WorkerRow workers = 4;
+  repeated LoadSample loads = 5;
 }
 
 message ReplicationEvent {

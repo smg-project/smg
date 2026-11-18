@@ -1,6 +1,6 @@
 //! Harmony model detection
 
-use crate::worker::{Worker, WorkerRegistry};
+use crate::worker::{Worker, WorkerRegistry, WorkerRegistryExt};
 
 /// Harmony model detector
 ///

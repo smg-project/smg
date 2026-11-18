@@ -19,7 +19,7 @@ use super::{
     KvBlockSize, KvEventMonitor, PushedLoadSink, SubscriptionKind,
 };
 use crate::{
-    routers::grpc::backend_client::BackendClient,
+    routers::grpc::backend_client::typed,
     worker::{
         health::liveness,
         identity::endpoint::Endpoint,
@@ -515,10 +515,11 @@ impl KvEventMonitor {
 
         let start_seq = state.resume_sequence();
         // The streams are the gateway's client's: the loop reads it back from
-        // the handle, as the request path does. A connection of another type
-        // carries no stream, and reads as an engine that serves none.
-        let subscribed = match backend_client.downcast_arc::<BackendClient>() {
-            Some(streams) => {
+        // the handle through the request path's reader. A connection of another
+        // type carries no stream: said once, in that reader's words, and read
+        // as an engine that serves none.
+        let subscribed = match typed(sub.worker.as_ref(), backend_client) {
+            Ok(streams) => {
                 subscribe_with_deadline(
                     streams.as_ref(),
                     start_seq,
@@ -529,9 +530,12 @@ impl KvEventMonitor {
                 )
                 .await
             }
-            None => Subscribed::Refused(tonic::Status::unimplemented(
-                "the worker's connection carries no event stream",
-            )),
+            Err(error) => {
+                error!(%error, "The worker's connection carries no event stream");
+                Subscribed::Refused(tonic::Status::unimplemented(
+                    "the worker's connection carries no event stream",
+                ))
+            }
         };
         let stream = match subscribed {
             Subscribed::Stream(stream) => {
@@ -854,7 +858,7 @@ mod tests {
     use crate::{
         config::types::PolicyConfig,
         policies::PolicyRegistry,
-        routers::grpc::test_engine::serve_on_loopback,
+        routers::grpc::{backend_client::BackendClient, test_engine::serve_on_loopback},
         worker::{
             identity::basic::StallReason, BasicWorkerBuilder, WorkerMonitor, WorkerRegistry,
             UNKNOWN_MODEL_ID,
@@ -1980,7 +1984,10 @@ mod tests {
     fn a_connection_that_is_not_the_gateways_client_carries_no_event_stream() {
         use metrics_exporter_prometheus::PrometheusBuilder;
 
-        use crate::worker::{connection::engine::EngineConnector, test_support::CountingConnector};
+        use crate::worker::{
+            connection::engine::EngineConnector, kv::event_monitor::Slot,
+            test_support::CountingConnector,
+        };
 
         let recorder = PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();
@@ -2025,6 +2032,21 @@ mod tests {
                 }
                 assert_eq!(gauge(), Some(1.0), "the refusal raises the gauge");
                 assert_eq!(connector.connects(), 1, "no second connect");
+                // The connect count cannot tell a second subscription over the
+                // kept handle from an end: the loop's own task says it ended.
+                let mut ended = false;
+                for _ in 0..500 {
+                    ended = match monitor.worker_handles.lock().await.get(worker.url()) {
+                        Some(Slot::Active(sub)) => sub.handle.is_finished(),
+                        Some(Slot::Removing(_)) => false,
+                        None => true,
+                    };
+                    if ended {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                assert!(ended, "the refusal ends the loop");
                 monitor.on_worker_removed(worker.url()).await;
             });
         });
