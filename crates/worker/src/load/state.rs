@@ -520,6 +520,25 @@ mod tests {
         assert_eq!(waiting_of(&state.snapshot(), "http://w1:8080"), Some(2));
     }
 
+    /// A group publish checks the incarnation by identity, not by URL: a
+    /// late poll of a worker that was replaced under its own URL publishes
+    /// nothing, and the replacement's poll publishes its own.
+    #[test]
+    fn a_late_poll_of_a_replaced_worker_is_fenced_by_its_identity() {
+        let (registry, state) = setup();
+        let old = ready_worker("http://w1:8080", "m");
+        let old_id = registry.register(Arc::clone(&old)).unwrap();
+        registry.remove(&old_id);
+        let new = ready_worker("http://w1:8080", "m");
+        registry.register(Arc::clone(&new)).unwrap();
+
+        state.publish_group(&[], vec![(Arc::clone(&old), load(1))]);
+        assert!(state.snapshot().is_empty(), "the old worker's poll is late");
+
+        state.publish_group(&[], vec![(Arc::clone(&new), load(2))]);
+        assert_eq!(waiting_of(&state.snapshot(), "http://w1:8080"), Some(2));
+    }
+
     #[test]
     fn a_large_removal_batch_causes_one_rebuild() {
         let (registry, state) = setup();
