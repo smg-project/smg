@@ -8112,3 +8112,71 @@ fn a_warm_up_whose_telling_faults_leaves_the_next_decision_the_plugins_own() {
     );
     assert!(decided.answered > warmed.answered, "{decided:?}");
 }
+
+/// A thread under no name that came by its first instance at a close's
+/// rebuild (its first `init` ended by the decision's clamp) is a decider of
+/// its own from there: a lease's event it tells is heard, not dropped.
+#[test]
+fn a_thread_whose_first_instance_the_close_rebuilt_hears_what_it_tells() {
+    tried(a_thread_whose_first_instance_the_close_rebuilt_hears_what_it_tells_in_a_try);
+}
+
+/// One try of the case above, told its number: whether it stood.
+fn a_thread_whose_first_instance_the_close_rebuilt_hears_what_it_tells_in_a_try(made: u32) -> bool {
+    const CASE: &str = "a first instance the close rebuilt";
+    // The host's warnings are kept from here on: a rebuild that fails says why.
+    said();
+    let began = TRY_BEGAN.get();
+    let runtime = runtime();
+    let heavy = load(
+        &runtime,
+        "rebuilt-first",
+        guest::record_guest(),
+        mode::BURN_IN_INIT,
+    );
+    let engine = plugin_engine(&heavy);
+    // A thread that did not load and was not warmed: the load's instance is
+    // not its to take, and its first `init` runs under a decision's clamp.
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                TRY_BEGAN.set(began);
+                let (wall, cpu) = (std::time::Instant::now(), bound_clock());
+                let _ = engine.decide(
+                    &RequestFacts {
+                        budget_micros: 200,
+                        ..facts(1)
+                    },
+                    &four(),
+                    &pool(4),
+                    &Constraints::default(),
+                    &mut Scratch::new(),
+                );
+                let held = off_cpu_since(wall, cpu);
+                if !the_close_rebuilt(CASE, &heavy, held, made) {
+                    return false;
+                }
+                let rebuilt = heavy.stats();
+                assert_eq!(rebuilt.budget_spent, 1, "the clamp ended it: {rebuilt:?}");
+                // Three tellings: after the rebuild, after a second decision
+                // on that instance, and after a warm-up there.
+                let tell = || {
+                    engine.on_dispatched(&Lease::default(), &Target::default(), Side::Single, 3);
+                };
+                tell();
+                let _ = decide(&engine, &pool(4), 2);
+                tell();
+                heavy.warm().expect("the thread is warm already");
+                tell();
+                let told = heavy.stats();
+                assert_eq!(
+                    (told.observed - rebuilt.observed, told.events_dropped),
+                    (3, 0),
+                    "the thread is a decider of its own: {told:?}"
+                );
+                true
+            })
+            .join()
+            .expect("the thread that did not load")
+    })
+}

@@ -2497,6 +2497,10 @@ impl Bound {
                         Ok(instance) => {
                             bump(&plugin.tally.lazy_instantiations);
                             *guard = Some(instance);
+                            // An instance came to stand here as at every
+                            // other place that makes one: under no name the
+                            // thread is a decider of its own from this close.
+                            plugin.stand();
                         }
                         Err(error) => {
                             tracing::warn!(plugin = plugin.name, %error, "the rebuild of a dropped instance failed");
