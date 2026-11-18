@@ -930,10 +930,11 @@ impl PinSource for StorePins<'_> {
         let pin = SessionsStore::lookup(self.store, key.get())?;
         // A pin at or past its own end is no pin, whether or not the sweep
         // has run: its end is the instant the engine's table forgot the
-        // key. A TTL counted from the dispatch ends later than that, and
-        // so may the TTL of a rule applied since. The end stands on the
-        // decision clock: the ask's instant is turned into it here, at a
-        // miss that finds a pin with an end and nowhere else.
+        // key, or the latest a lease's own rule counted where no table
+        // held it. A TTL counted from the dispatch ends later than that,
+        // and so may the TTL of a rule applied since. The end stands on
+        // the decision clock: the ask's instant is turned into it here, at
+        // a miss that finds a pin with an end and nowhere else.
         let ended = |ends: u64| ends <= self.store.micros(self.now);
         if pin.ends.is_some_and(ended) {
             return None;
@@ -1017,6 +1018,14 @@ fn decide_in(
                     target: pick.targets.first()?.id,
                     picked: Picked::of(&pick.targets),
                     verdict: pick.session_verdict,
+                    // The scratch holds this decision's rule's TTL where
+                    // a rule governed the pick, and an earlier decision's
+                    // where none did.
+                    ttl_micros: if pick.session_verdict == SessionVerdict::None {
+                        None
+                    } else {
+                        scratch.session_ttl_micros()
+                    },
                     generation: pick.trace.generation,
                     session: facts.session(),
                     tokens: facts.prompt_tokens,
@@ -1043,6 +1052,8 @@ struct Booking {
     picked: Picked,
     /// What the decision did with the request's session key.
     verdict: SessionVerdict,
+    /// The TTL of the rule behind that verdict; none without one.
+    ttl_micros: Option<u64>,
     /// The generation that decided.
     generation: u64,
     /// The request's session; none for a request with no key.
@@ -1098,6 +1109,7 @@ fn issue(
         issued_at: taken.now,
         dispatch_deadline: taken.due(),
         state: LeaseState::Issued,
+        session_ttl_micros: booking.ttl_micros,
     };
     let built = booking.built;
     let booked = built.and_then(|built| world.booked(&built, booking.target));
@@ -3400,6 +3412,7 @@ pub(crate) mod tests {
                 issued_at: now,
                 dispatch_deadline: now + DISPATCH_TTL,
                 state: LeaseState::Issued,
+                session_ttl_micros: None,
             });
             assert_eq!(filed, Ok(()));
             let frame = frame_for(SPOKEN, 1, 1);
@@ -3448,6 +3461,7 @@ pub(crate) mod tests {
             issued_at: now,
             dispatch_deadline: now + DISPATCH_TTL,
             state: LeaseState::Issued,
+            session_ttl_micros: None,
         });
         assert_eq!(filed, Ok(()));
     }
@@ -5027,6 +5041,46 @@ pub(crate) mod tests {
             assert_eq!(verdict(&bed, &answer), SessionVerdict::Pinned);
             assert_eq!(pins(&bed, session), Some([worker, WorkerId(0)]));
         }
+    }
+
+    /// A keyed lease in flight at an apply tells no engine of its dispatch.
+    /// Its record on file carries the TTL of the rule its decision was made
+    /// under, and its pin of record ends by it, counted from the issue:
+    /// the generation that stands keeps a key an hour and ends no such pin.
+    #[tokio::test]
+    async fn a_lease_in_flight_at_an_apply_ends_its_pin_by_its_own_rule() {
+        use crate::{
+            controller::lifecycle::{self, tests::a_dispatched},
+            store::SessionsStore,
+        };
+        let mut document = PolicySpec::preset("manual").expect("a preset of this build");
+        let rule = document.bindings[0].sessions.as_mut();
+        let rule = rule.expect("the preset's rule");
+        let kept = u64::from(rule.ttl_s) * 1_000_000;
+        // The generation that stands at the dispatch keeps a key an hour.
+        rule.ttl_s = 3_600;
+        document.generation = 2;
+        let later = applied(&document);
+        let mut bed = bed(Some(preset("manual", 1)), true, (1, 8), []);
+        let at = bed.script.taken;
+        let answer = bed.ask(keyed(1, 1_001)).await;
+        let record = LeasesStore::get(&*bed.store, GATEWAY, LeaseId(lease_of(&answer).id))
+            .expect("the lease is on file");
+        assert_eq!(record.session_ttl_micros, Some(kept));
+        // An unkeyed decision behind it, on the scratch the keyed one left
+        // its TTL on: no rule governed its pick, and its record carries
+        // none.
+        let answer = bed.ask(frame(2, 1_002)).await;
+        let unkeyed = LeasesStore::get(&*bed.store, GATEWAY, LeaseId(lease_of(&answer).id))
+            .expect("the lease is on file");
+        assert_eq!(unkeyed.session_ttl_micros, None);
+        bed.store.apply(later).expect("a later generation");
+        let lease = record.lease;
+        let hand = lifecycle::open(&bed.store, GATEWAY);
+        lifecycle::dispatched(&bed.store, &hand, &a_dispatched(lease.id.0), at)
+            .expect("the frame reads");
+        let pin = SessionsStore::lookup(&*bed.store, lease.session.get()).expect("a pin");
+        assert_eq!(pin.ends, Some(lease.issued_micros + kept));
     }
 
     /// The store's pin is the key's worker before its own end and for less

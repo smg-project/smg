@@ -560,19 +560,19 @@ impl MemoryStore {
             )?;
             writer.replaced(self.world.swap(world));
             drop(loads);
+            // The pins' sweep learns a generation's interval here, not at
+            // its first pass: a generation replaced between two ticks of
+            // the sweep still leaves its interval for the pins it ended.
+            // It is saved under the workers lock, so two applies save
+            // theirs in the order of their publications.
+            #[cfg(feature = "controller")]
+            if let Some(every) = spec.engine().pins_shortest_sweep() {
+                self.pins_swept.lock().every = Some(every);
+            }
             self.tell_members(&workers);
             before
         };
         drop(before);
-        // The pins' sweep learns a generation's interval here, not at its
-        // first pass: a generation replaced between two ticks of the sweep
-        // still leaves its interval for the pins it ended.
-        #[cfg(feature = "controller")]
-        {
-            if let Some(every) = spec.engine().pins_shortest_sweep() {
-                self.pins_swept.lock().every = Some(every);
-            }
-        }
         Ok(())
     }
 
@@ -2136,6 +2136,22 @@ impl SessionsStore for MemoryStore {
                 ends,
             },
         );
+    }
+
+    fn pin_no_earlier(&self, key: u64, worker: WorkerId, at: Instant, ends: Option<u64>) {
+        if key == 0 {
+            return;
+        }
+        let pin = Pin {
+            worker,
+            last_used: at,
+            ends,
+        };
+        let mut pins = self.pins_of(key).lock();
+        let stood = pins.entry(key).or_insert(pin);
+        // The later end stays, and no end is later than any instant.
+        let later = stood.ends.zip(ends).map(|(stood, asked)| stood.max(asked));
+        *stood = Pin { ends: later, ..pin };
     }
 
     fn lookup(&self, key: u64) -> Option<Pin> {

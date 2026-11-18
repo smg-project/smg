@@ -43,7 +43,7 @@ use crate::{
         completed::Class,
         released::{Reason, What},
     },
-    sessions::SessionVerdict,
+    sessions::{Forgets, SessionVerdict},
     store::{Dispatch, GatewayId, Hand, HealthSink, LeaseRecord, MemoryStore, Said, SessionsStore},
     view::{Session, WorkerId},
 };
@@ -166,7 +166,7 @@ fn told(store: &MemoryStore, record: &LeaseRecord, said: Said, by: Option<Decide
                         dispatch.since_decision_micros,
                     );
                 }
-                pinned(store, record, engine, spec.engine(), id, at);
+                pinned(store, record, engine, id, at);
             }
             (Said::Completed(outcome), Some(engine)) => {
                 engine.on_completed(&record.lease, &outcome);
@@ -184,20 +184,22 @@ fn told(store: &MemoryStore, record: &LeaseRecord, said: Said, by: Option<Decide
 /// pinned. Where no engine was told it names the dispatched worker. A
 /// lease no sessions rule governed pins nothing.
 ///
-/// The pin ends where the engine's table forgets the key, and at no
-/// instant under a rule without a TTL. Where the table holds no such key,
-/// or no engine was told, the key's rule is not known: the longest TTL
-/// among the `standing` generation's rules ends the pin, and the pin has
-/// no end where one of them has no TTL, since the key may be that
-/// rule's. The end stands on the decision clock, as the table holds it:
-/// a dispatch converts no clock but where the rule is not known. The
-/// table's lock is let go before the store's pin is written: no lock is
-/// held across the two.
+/// The pin ends where the engine's table forgets the key, and never under
+/// a rule without a TTL. Where the table holds no such key, or no engine
+/// was told, the lease's own rule ends it: the TTL its decision was made
+/// under, as its record on file carries it, counted from the lease's
+/// issue as the table counted it then. So it does where the dispatch
+/// itself made the table's entry anew and no decision has read it: that
+/// entry holds no instant yet. An end the lease's rule counts never moves
+/// the pin's end earlier: a lease dispatched behind a newer one of its
+/// key, or behind a dispatch whose table ended the pin later, leaves the
+/// later end standing. Either end stands on the decision clock: a
+/// dispatch converts no clock. The table's lock is let go before the
+/// store's pin is written: no lock is held across the two.
 fn pinned(
     store: &MemoryStore,
     record: &LeaseRecord,
     engine: Option<&Engine>,
-    standing: &Engine,
     dispatched: WorkerId,
     at: Instant,
 ) {
@@ -209,19 +211,23 @@ fn pinned(
     let preferred = held
         .map(|(pins, _)| pins[0])
         .filter(|pin| *pin != WorkerId(0));
-    let ends = match held {
-        Some((_, forgotten)) => forgotten,
-        None => standing
-            .pins_longest_ttl()
-            .map(|ttl| store.micros(at).saturating_add(ttl)),
-    };
-    SessionsStore::pin(
-        store,
-        lease.session.get(),
-        preferred.unwrap_or(dispatched),
-        at,
-        ends,
-    );
+    let (key, worker) = (lease.session.get(), preferred.unwrap_or(dispatched));
+    match held {
+        // The table's word is the key's rule as it stands: it moves the
+        // pin's end either way.
+        Some((_, Forgets::At(forgotten))) => {
+            SessionsStore::pin(store, key, worker, at, Some(forgotten));
+        }
+        Some((_, Forgets::Never)) => SessionsStore::pin(store, key, worker, at, None),
+        // The lease's own rule is the word of a decision that may be older
+        // than the pin's last writer: it never moves the end earlier.
+        Some((_, Forgets::Unread)) | None => {
+            let ends = record
+                .session_ttl_micros
+                .map(|ttl| lease.issued_micros.saturating_add(ttl));
+            SessionsStore::pin_no_earlier(store, key, worker, at, ends);
+        }
+    }
 }
 
 /// What a `Dispatched` frame says, read whole.
@@ -708,6 +714,22 @@ pub(crate) mod tests {
         assert_eq!((table, pin_of_record(&store)), (0, Some(WorkerId(7))));
     }
 
+    /// A decision's read of [`KEY`] at `now` under a rule of `ttl_micros`,
+    /// in the table of the engine that stands.
+    fn read_under(store: &MemoryStore, ttl_micros: Option<u64>, now: Instant) {
+        let rule = SessionRule {
+            assignment: Assignment::Random,
+            inflight_cap: 0,
+            ttl_micros,
+            sweep_micros: 0,
+            recovery: Recovery::Original,
+        };
+        store.with_world(|world| {
+            let table = world.spec().engine().sessions();
+            table.lookup(KEY, store.micros(now), &rule);
+        });
+    }
+
     /// The pin of record ends where the engine's table forgets its key: the
     /// instant the key's rule set at its last decision, and no instant
     /// under a rule without a TTL.
@@ -716,21 +738,7 @@ pub(crate) mod tests {
         let store = MemoryStore::new();
         let t0 = Instant::now();
         let _heard = hearing(&store, 1);
-        let rule = |ttl_micros| SessionRule {
-            assignment: Assignment::Random,
-            inflight_cap: 0,
-            ttl_micros,
-            sweep_micros: 0,
-            recovery: Recovery::Original,
-        };
-        // A decision's read of the key under a rule, at `t0`.
-        let read = |rule: &SessionRule| {
-            store.with_world(|world| {
-                let table = world.spec().engine().sessions();
-                table.lookup(KEY, store.micros(t0), rule);
-            });
-        };
-        read(&rule(Some(60_000_000)));
+        read_under(&store, Some(60_000_000), t0);
         keyed(&store, 1, 7, SessionVerdict::Claimed(WorkerId(7)), t0);
         let at = t0 + Duration::from_millis(3);
         dispatched(&store, &open(&store, A), &a_dispatched(1), at).expect("the frame reads");
@@ -739,48 +747,62 @@ pub(crate) mod tests {
         assert_eq!((pin.worker, pin.ends), (WorkerId(7), Some(forgotten)));
         // The key read again under a rule without a TTL: its next dispatch
         // moves the pin's end with it.
-        read(&rule(None));
+        read_under(&store, None, t0);
         keyed(&store, 2, 7, SessionVerdict::Pinned, t0);
         dispatched(&store, &open(&store, A), &a_dispatched(2), at).expect("the frame reads");
         let pin = SessionsStore::lookup(&store, KEY.get()).expect("a pin");
         assert_eq!((pin.worker, pin.ends), (WorkerId(7), None));
+        // And read once more under a rule of half a minute: the table's
+        // word moves the pin's end earlier as well.
+        read_under(&store, Some(30_000_000), t0);
+        keyed(&store, 3, 7, SessionVerdict::Pinned, t0);
+        dispatched(&store, &open(&store, A), &a_dispatched(3), at).expect("the frame reads");
+        let pin = SessionsStore::lookup(&store, KEY.get()).expect("a pin");
+        let sooner = forgotten - 30_000_000;
+        assert_eq!((pin.worker, pin.ends), (WorkerId(7), Some(sooner)));
     }
 
-    /// A lease whose generation left tells no engine, and its key's rule is
-    /// not known: the dispatched worker is pinned to end by the longest TTL
-    /// among the standing rules.
+    /// Files the keyed lease `id` of [`A`] on worker 7, as generation 1
+    /// issued it at `now` under a rule of `ttl_micros`.
+    fn keyed_under(store: &MemoryStore, id: u64, ttl_micros: Option<u64>, now: Instant) {
+        let mut record = lease(A, id, now);
+        record.lease.generation = 1;
+        record.lease.session = KEY;
+        record.lease.session_verdict = SessionVerdict::Claimed(WorkerId(7));
+        record.session_ttl_micros = ttl_micros;
+        record.lease.issued_micros = store.micros(now);
+        record.target = WorkerId(7);
+        store.issue(record).expect("a lease");
+    }
+
+    /// A dispatch whose key left the table since its decision makes the
+    /// entry anew, and no decision has read it: the pin of record ends by
+    /// the lease's own rule, not at the unread entry's instant.
     #[test]
-    fn a_pin_no_engine_was_told_of_ends_by_the_standing_rules_longest_ttl() {
+    fn a_dispatch_that_makes_its_keys_entry_anew_ends_the_pin_by_its_leases_rule() {
         let store = MemoryStore::new();
         let t0 = Instant::now();
-        let _first = hearing(&store, 1);
-        keyed(&store, 1, 7, SessionVerdict::Claimed(WorkerId(7)), t0);
-        // The manual preset stands as generation 2: its rule keeps a key
-        // an hour.
-        let mut document = PolicySpec::preset("manual").expect("a preset of this build");
-        document.generation = 2;
-        let rule = document.bindings[0].sessions.as_mut();
-        rule.expect("the preset's rule").ttl_s = 3_600;
-        let spec = AppliedSpec::validate(&document).expect("the document validates");
-        store.apply(spec).expect("a later generation");
+        let _heard = hearing(&store, 1);
+        keyed_under(&store, 1, Some(60_000_000), t0);
         let at = t0 + Duration::from_millis(3);
         dispatched(&store, &open(&store, A), &a_dispatched(1), at).expect("the frame reads");
+        // The engine was told: its table holds the key again.
+        let table = store.with_world(|world| world.spec().engine().sessions().len());
         let pin = SessionsStore::lookup(&store, KEY.get()).expect("a pin");
-        let ends = store.micros(at) + 3_600_000_000;
-        assert_eq!((pin.worker, pin.ends), (WorkerId(7), Some(ends)));
+        let ends = store.micros(t0) + 60_000_000;
+        assert_eq!((table, pin.worker, pin.ends), (1, WorkerId(7), Some(ends)));
     }
 
-    /// Beside a standing rule that keeps its keys with no TTL, a pin whose
-    /// rule is not known has no end: the key may be that rule's, and the
-    /// other rule's TTL would end its pin of record early.
+    /// A lease whose generation left tells no engine: its pin ends by the
+    /// TTL its own decision was made under, counted from its issue,
+    /// whatever the standing rules keep. Here one of them keeps its keys
+    /// for ever and the other an hour, and the lease's rule kept a minute.
     #[test]
-    fn a_pin_no_engine_was_told_of_has_no_end_beside_a_rule_with_no_ttl() {
+    fn a_pin_no_engine_was_told_of_ends_by_its_leases_own_rule() {
         let store = MemoryStore::new();
         let t0 = Instant::now();
         let _first = hearing(&store, 1);
-        keyed(&store, 1, 7, SessionVerdict::Claimed(WorkerId(7)), t0);
-        // Generation 2: one rule keeps its keys for ever, the other an
-        // hour.
+        keyed_under(&store, 1, Some(60_000_000), t0);
         let mut document = PolicySpec::preset("manual").expect("a preset of this build");
         document.generation = 2;
         let mut for_ever = document.bindings[0].clone();
@@ -795,7 +817,84 @@ pub(crate) mod tests {
         let at = t0 + Duration::from_millis(3);
         dispatched(&store, &open(&store, A), &a_dispatched(1), at).expect("the frame reads");
         let pin = SessionsStore::lookup(&store, KEY.get()).expect("a pin");
+        let ends = store.micros(t0) + 60_000_000;
+        assert_eq!((pin.worker, pin.ends), (WorkerId(7), Some(ends)));
+    }
+
+    /// A lease of a rule with no TTL pins with no end, though every
+    /// standing rule has one: the key was that rule's, and a standing
+    /// rule's TTL would end its pin of record early.
+    #[test]
+    fn a_pin_no_engine_was_told_of_has_no_end_under_a_lease_of_a_rule_with_no_ttl() {
+        let store = MemoryStore::new();
+        let t0 = Instant::now();
+        let _first = hearing(&store, 1);
+        keyed_under(&store, 1, None, t0);
+        // The manual preset stands as generation 2: its rule keeps a key
+        // an hour.
+        let mut document = PolicySpec::preset("manual").expect("a preset of this build");
+        document.generation = 2;
+        let rule = document.bindings[0].sessions.as_mut();
+        rule.expect("the preset's rule").ttl_s = 3_600;
+        let spec = AppliedSpec::validate(&document).expect("the document validates");
+        store.apply(spec).expect("a later generation");
+        let at = t0 + Duration::from_millis(3);
+        dispatched(&store, &open(&store, A), &a_dispatched(1), at).expect("the frame reads");
+        let pin = SessionsStore::lookup(&store, KEY.get()).expect("a pin");
         assert_eq!((pin.worker, pin.ends), (WorkerId(7), None));
+    }
+
+    /// Two leases of one key under a rule of a second, in flight at an
+    /// apply, are dispatched in the reverse of their issues. The older
+    /// one, dispatched last, leaves the pin's end where the newer one's
+    /// rule counted it: its own count ended a tenth of a second before
+    /// its dispatch.
+    #[test]
+    fn an_older_lease_dispatched_last_never_ends_the_pin_earlier() {
+        let store = MemoryStore::new();
+        let t0 = Instant::now();
+        let ms = Duration::from_millis;
+        let _first = hearing(&store, 1);
+        keyed_under(&store, 1, Some(1_000_000), t0);
+        keyed_under(&store, 2, Some(1_000_000), t0 + ms(800));
+        let _second = hearing(&store, 2);
+        let hand = open(&store, A);
+        dispatched(&store, &hand, &a_dispatched(2), t0 + ms(1_000)).expect("the frame reads");
+        let ends = Some(store.micros(t0) + 1_800_000);
+        let pin = SessionsStore::lookup(&store, KEY.get()).expect("a pin");
+        assert_eq!(pin.ends, ends);
+        dispatched(&store, &hand, &a_dispatched(1), t0 + ms(1_100)).expect("the frame reads");
+        let pin = SessionsStore::lookup(&store, KEY.get()).expect("a pin");
+        assert_eq!((pin.last_used, pin.ends), (t0 + ms(1_100), ends));
+    }
+
+    /// A lease no engine is told of, dispatched behind a newer lease of
+    /// its key that the engine in place was told of: the end the table
+    /// gave the pin stands, though the older lease's own rule, the shorter
+    /// one, counts an earlier end.
+    #[test]
+    fn an_end_the_table_gave_stands_behind_an_older_lease_of_a_shorter_rule() {
+        let store = MemoryStore::new();
+        let t0 = Instant::now();
+        let ms = Duration::from_millis;
+        let _first = hearing(&store, 1);
+        keyed_under(&store, 1, Some(1_000_000), t0);
+        let _second = hearing(&store, 2);
+        // The generation in place reads the key under a rule of a minute,
+        // and its lease is dispatched first.
+        read_under(&store, Some(60_000_000), t0 + ms(1));
+        let mut newer = lease(A, 2, t0 + ms(1));
+        newer.lease.generation = 2;
+        newer.lease.session = KEY;
+        newer.lease.session_verdict = SessionVerdict::Claimed(WorkerId(7));
+        newer.target = WorkerId(7);
+        store.issue(newer).expect("a lease");
+        let hand = open(&store, A);
+        dispatched(&store, &hand, &a_dispatched(2), t0 + ms(2)).expect("the frame reads");
+        dispatched(&store, &hand, &a_dispatched(1), t0 + ms(3)).expect("the frame reads");
+        let pin = SessionsStore::lookup(&store, KEY.get()).expect("a pin");
+        let forgotten = store.micros(t0 + ms(1)) + 60_000_000;
+        assert_eq!((pin.last_used, pin.ends), (t0 + ms(3), Some(forgotten)));
     }
 
     #[test]

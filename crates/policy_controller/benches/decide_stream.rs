@@ -1178,6 +1178,7 @@ fn in_process(store: &MemoryStore, decisions: u64, commit: bool) -> u64 {
                 issued_at: ask.now,
                 dispatch_deadline: ask.now + DISPATCH,
                 state: LeaseState::Issued,
+                session_ttl_micros: None,
             });
             assert_eq!(filed, Ok(()), "the store files the lease");
             let ended = store.released(gateway, lease, None, ReleaseReason::ClientGone);
