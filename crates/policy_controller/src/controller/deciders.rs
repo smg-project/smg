@@ -130,7 +130,7 @@ use crate::{
     sessions::SessionVerdict,
     store::{
         leases::DISPATCH_TTL, Ask, Built, GatewayId, LeaseRecord, LeaseRefused, LeaseState,
-        MemoryStore, ViewBuffers, World,
+        MemoryStore, Named, Naming, ViewBuffers, World,
     },
     view::{
         fingerprint, AffinityFacts, Candidate, Constraints, Phase, PoolFacts, RequestFacts, Role,
@@ -453,6 +453,7 @@ struct Buffers {
     view: ViewBuffers,
     scratch: Scratch,
     lists: Lists,
+    named: Named,
 }
 
 /// Starts decider `index`'s thread. The thread holds the guard that tells
@@ -913,6 +914,11 @@ type Read<'a> = (
 /// hashes are cut at what that generation reads of them. `decide`'s answer
 /// comes back with the build its rows were read by, `None` where no member
 /// serves the model.
+///
+/// A request whose profile reads the affinity column and takes a sample is
+/// handed no column: the rows the store names for it stand in the column's
+/// place ([`World::name`]), at most that sample of each list
+/// ([`Engine::named_for`](crate::framework::Engine::named_for)).
 fn hand<R>(
     world: &World,
     taken: &Taken<'_>,
@@ -934,14 +940,26 @@ fn hand<R>(
     } = *taken;
     let spec = world.spec();
     let (model, phase) = (request.model(), request.phase());
+    let engine = spec.engine();
     // What the decision's profile reads, and whether it shows its rows to
     // a plugin.
-    let (needs, shown) = spec.engine().reads_for(model, phase);
+    let (needs, shown) = engine.reads_for(model, phase);
+    // A profile whose picker takes a sample is handed the rows the store
+    // names in the column's place, capped by that sample, and no column.
+    // The deciding profile answers for itself: the needs are merged over
+    // a pair's two phases and a sessions rule, so they say only where to
+    // ask, and no other decision pays the second walk.
+    let cap = if needs.affinity && needs.sample > 0 {
+        engine.named_for(model, phase)
+    } else {
+        0
+    };
+    let names = cap > 0;
     let ask = Ask {
         gateway,
         now,
         pinned: None,
-        affinity: needs.affinity,
+        affinity: needs.affinity && !names,
     };
     let role = match phase {
         Phase::Single => Role::Single,
@@ -953,6 +971,7 @@ fn hand<R>(
         view,
         scratch,
         lists,
+        named,
     } = buffers;
     let wires = request.wires();
     // No member serves the model in the role: the engine answers over no
@@ -1013,12 +1032,29 @@ fn hand<R>(
             built,
         )
     };
+    if names {
+        // A row is named by its place among the rows the decision is made
+        // over: the lent rows, or the built ones after their narrowing.
+        let hashes = request.block_hashes();
+        let naming = Naming {
+            gateway,
+            // The first hashes, as many as the generation reads of them:
+            // the engine's request takes the same count.
+            block_hashes: hashes.get(..request.hashes_read(spec)).unwrap_or(hashes),
+            seed: request.seed(),
+            cap,
+            wires,
+            now_micros,
+        };
+        world.name(model, role, &naming, candidates, named);
+    }
     let viewed = Viewed {
         now_micros,
         budget_micros: u32::try_from(left.as_micros()).unwrap_or(u32::MAX),
         affinity,
         stalled,
         max_block_hashes: request.hashes_read(spec),
+        named: names.then(|| named.affinity()),
     };
     let answer = request.read(lists, viewed, |facts, constraints| {
         decide(facts, &pool, candidates, constraints, scratch)
@@ -2434,6 +2470,9 @@ pub(crate) mod tests {
         budget_micros: u32,
         /// The affinity column's length.
         column: usize,
+        /// The rows named in the column's place: how many holders and how
+        /// many warming rows, where the request carries any list.
+        named: Option<(usize, usize)>,
         candidates: Vec<WorkerId>,
         stalled: Vec<WorkerId>,
         /// The pool's size and its generation.
@@ -2464,6 +2503,9 @@ pub(crate) mod tests {
                     now_micros: facts.now_micros,
                     budget_micros: facts.budget_micros,
                     column: facts.affinity.len(),
+                    named: facts
+                        .named
+                        .map(|named| (named.holders.len(), named.warming.len())),
                     candidates: rows.iter().map(|row| row.id).collect(),
                     // By the row's own bit where the rows were written, and
                     // by the mask beside them where they were lent.
@@ -2495,6 +2537,7 @@ pub(crate) mod tests {
             now_micros: store.micros(now),
             budget_micros: 1_234,
             column: 0,
+            named: None,
             candidates: singles.clone(),
             stalled: Vec::new(),
             pool: (3, 1),
@@ -2539,13 +2582,367 @@ pub(crate) mod tests {
         let frame_nobody = frame_for("model-nobody-serves", 1, 1);
         assert_eq!(handed(&store, frame_nobody, GATEWAY, now), nobody);
 
-        // A profile that declares the affinity column is handed one entry
-        // a candidate, and no other profile is.
+        // A profile whose picker takes a sample is handed the rows the
+        // store names in the column's place, and no column. Here no row
+        // holds a block and the three, admitted together, are all young:
+        // nobody is named.
         store
             .apply(preset("cache_aware", 2))
             .expect("above the standing one");
+        let named = handed(&store, frame(1, 1), OTHER, now);
+        assert_eq!(
+            (named.column, named.named, named.pool),
+            (0, Some((0, 0)), (3, 2))
+        );
+        // A profile that declares the column and takes no sample is handed
+        // one entry a candidate, and no other profile is.
+        let mut document = PolicySpec::preset("cache_aware").expect("a preset of this build");
+        document.generation = 3;
+        for profile in document.profiles.values_mut() {
+            profile.pick = "best".into();
+        }
+        store
+            .apply(applied(&document))
+            .expect("above the standing one");
         let column = handed(&store, frame(1, 1), OTHER, now);
-        assert_eq!((column.column, column.pool), (3, (3, 2)));
+        assert_eq!(
+            (column.column, column.named, column.pool),
+            (3, None, (3, 3))
+        );
+    }
+
+    /// A member of `role` whose signals ask for events, holding the chain
+    /// of `contents`.
+    fn holding(store: &MemoryStore, name: &str, role: Role, wires: WireModes, contents: &[u64]) {
+        let facts = WorkerFacts {
+            role,
+            wire_modes: wires,
+            ..WorkerFacts::default()
+        };
+        held_by(store, name, facts, contents);
+    }
+
+    /// A member of the role, the wires and the reach of `facts` whose
+    /// signals ask for events, holding the chain of `contents`: its id.
+    fn held_by(store: &MemoryStore, name: &str, facts: WorkerFacts, contents: &[u64]) -> WorkerId {
+        use kv_index::chain_prefix_hash;
+
+        use crate::store::{
+            BatchFacts, BatchOutcome, ContentHash, KvEvent, KvEventSink, SequenceHash, Signals,
+            StoredBlock,
+        };
+
+        let facts = WorkerFacts {
+            key: name.to_owned(),
+            engine: name.to_owned(),
+            incarnation: 1,
+            models: vec![MODEL.to_owned()],
+            dp_size: 1,
+            signals: Signals {
+                events: true,
+                ..Signals::default()
+            },
+            ..facts
+        };
+        let id = store.upsert(facts).id();
+        let mut blocks: Vec<StoredBlock> = Vec::with_capacity(contents.len());
+        for &content in contents {
+            let seq_hash = match blocks.last() {
+                Some(parent) => chain_prefix_hash(parent.seq_hash, ContentHash(content)),
+                None => SequenceHash(content),
+            };
+            blocks.push(StoredBlock {
+                seq_hash,
+                content_hash: ContentHash(content),
+            });
+        }
+        let batch = BatchFacts {
+            sequence: 1,
+            ..BatchFacts::default()
+        };
+        let events = [KvEvent::Stored {
+            parent: None,
+            blocks,
+        }];
+        assert_eq!(store.admit(id, 0, batch, &events), BatchOutcome::Applied);
+        id
+    }
+
+    /// The hand names for the gateway its request came from: a holder
+    /// behind the asking gateway's own socket is named, and one behind
+    /// another gateway's is no row of its view.
+    #[test]
+    fn the_hand_names_for_the_gateway_its_request_came_from() {
+        use crate::store::Reachability;
+
+        let store = MemoryStore::new();
+        store
+            .apply(preset("cache_aware", 1))
+            .expect("above the unbound start");
+        let member = |name: &str, reach: Reachability, contents: &[u64]| {
+            let facts = WorkerFacts {
+                reachable_from: reach,
+                ..WorkerFacts::default()
+            };
+            held_by(&store, name, facts, contents)
+        };
+        // Three members hold the request's block: one every gateway dials
+        // and one behind each of two gateways' sockets. A fourth holds
+        // another block, so the head is not the whole pool's.
+        let any = member("any", Reachability::Any, &[1]);
+        let mine = member("mine", Reachability::Gateway(GATEWAY), &[1]);
+        let theirs = member("theirs", Reachability::Gateway(OTHER), &[1]);
+        member("cold", Reachability::Any, &[9]);
+        let holders = |gateway: GatewayId| {
+            let mut frame = frame(1, 7);
+            let facts = frame.facts.as_mut().expect("the case's frame has facts");
+            facts.block_hashes = vec![1];
+            facts.hash_kind = proto::HashKind::Text.into();
+            let request = checked(frame);
+            let now = Instant::now() + Duration::from_secs(3);
+            let taken = Taken::at(&request, gateway, now, now).expect("budget is left");
+            let mut buffers = Buffers::default();
+            store.deciding(|world| {
+                let none = AtomicU64::new(0);
+                hand(
+                    world,
+                    &taken,
+                    &mut buffers,
+                    &none,
+                    |facts, _, rows, _, _| {
+                        let named = facts.named.expect("a sampling profile names its rows");
+                        let holders = named.holders.iter();
+                        let mut ids: Vec<WorkerId> =
+                            holders.map(|holder| rows[holder.row as usize].id).collect();
+                        ids.sort_unstable();
+                        ids
+                    },
+                )
+                .0
+            })
+        };
+        let sorted = |mut ids: Vec<WorkerId>| {
+            ids.sort_unstable();
+            ids
+        };
+        assert_eq!(holders(GATEWAY), sorted(vec![any, mine]));
+        assert_eq!(holders(OTHER), sorted(vec![any, theirs]));
+    }
+
+    /// The rows a decider's hand names are the store's own naming of the
+    /// request: by the frame's first hashes up to the generation's cap, its
+    /// seed, the sample of its profile's picker as the cap, its gateway's
+    /// wires, and the instant its view was built at. Each is read off a
+    /// fleet where it moves the rows named.
+    #[test]
+    fn the_hand_names_a_requests_rows_by_the_frames_own_facts() {
+        use std::collections::BTreeSet;
+
+        use crate::{
+            store::{Named, Naming},
+            view::NamedAffinity,
+        };
+
+        /// The lists by worker: the holders with their depths, the warming
+        /// rows, the bit.
+        fn lists(
+            named: &NamedAffinity<'_>,
+            rows: &[Candidate],
+        ) -> (Vec<(WorkerId, u32)>, Vec<WorkerId>, bool) {
+            let id = |row: u32| rows[row as usize].id;
+            let holders = named.holders.iter();
+            (
+                holders
+                    .map(|holder| (id(holder.row), holder.overlap_blocks))
+                    .collect(),
+                named.warming.iter().map(|&row| id(row)).collect(),
+                named.thin,
+            )
+        }
+
+        let store = MemoryStore::new();
+        // The sampling preset, its view cut at two block hashes.
+        let mut document = PolicySpec::preset("cache_aware").expect("a preset of this build");
+        document.generation = 1;
+        document.view.max_block_hashes = 2;
+        store
+            .apply(applied(&document))
+            .expect("above the unbound start");
+        let member = |name: &str, wires: WireModes, contents: &[u64]| {
+            holding(&store, name, Role::Single, wires, contents);
+        };
+        // One member past its first blocks, so the fleet is not all young;
+        // seventeen more that speak gRPC and two that speak HTTP alone, each
+        // holding the request's three blocks and young.
+        let both = WireModes::HTTP.union(WireModes::GRPC);
+        let filled: Vec<u64> = (1..=1_100).collect();
+        member("big", both, &filled);
+        for n in 0..17 {
+            member(&format!("g{n:02}"), both, &[1, 2, 3]);
+        }
+        for n in 0..2 {
+            member(&format!("h{n}"), WireModes::HTTP, &[1, 2, 3]);
+        }
+        // What the decider's hand gives the engine for a frame of three
+        // block hashes from a gateway that speaks gRPC alone.
+        let by_hand = |seed: u64, at: Instant| {
+            let mut frame = frame(1, seed);
+            let facts = frame.facts.as_mut().expect("the case's frame has facts");
+            facts.block_hashes = vec![1, 2, 3];
+            facts.hash_kind = proto::HashKind::Text.into();
+            let frame = constrained(frame, u32::from(WireModes::GRPC.bits()), None);
+            let request = checked(frame);
+            let taken = Taken::at(&request, GATEWAY, at, at).expect("budget is left");
+            let mut buffers = Buffers::default();
+            store.deciding(|world| {
+                let none = AtomicU64::new(0);
+                hand(
+                    world,
+                    &taken,
+                    &mut buffers,
+                    &none,
+                    |facts, _, rows, _, _| facts.named.map(|named| lists(&named, rows)),
+                )
+                .0
+            })
+        };
+        // What the store names for that request by its own door: the view
+        // built and narrowed as the decider narrows it, then named.
+        let by_store = |seed: u64, at: Instant| {
+            let mut view = ViewBuffers::default();
+            let mut named = Named::default();
+            store.deciding(|world| {
+                let ask = Ask {
+                    gateway: GATEWAY,
+                    now: at,
+                    pinned: None,
+                    affinity: false,
+                };
+                let built = world
+                    .build(MODEL, Role::Single, &ask, &mut view)
+                    .expect("the pool");
+                view.candidates
+                    .retain(|row| row.wire_modes.intersects(WireModes::GRPC));
+                let naming = Naming {
+                    gateway: GATEWAY,
+                    block_hashes: &[1, 2],
+                    seed,
+                    cap: 16,
+                    wires: Some(WireModes::GRPC),
+                    now_micros: built.now_micros,
+                };
+                world.name(MODEL, Role::Single, &naming, &view.candidates, &mut named);
+            });
+            lists(&named.affinity(), &view.candidates)
+        };
+        let taken = Instant::now();
+        let now = taken + Duration::from_secs(3);
+        // Eighteen holders the gateway dials under a cap of sixteen: the
+        // draw is the seed's, and the depth the generation's cap of hashes.
+        let mut drawn = BTreeSet::new();
+        for seed in 1..=8 {
+            let named = by_hand(seed, now).expect("a sampling profile names its rows");
+            assert_eq!(named, by_store(seed, now), "seed {seed}");
+            assert_eq!(named.0.len(), 16, "seed {seed}");
+            assert!(named.0.iter().all(|holder| holder.1 == 2), "seed {seed}");
+            assert!(!named.1.is_empty(), "the young rows warm: seed {seed}");
+            drawn.insert(named.0);
+        }
+        assert!(drawn.len() > 1, "each seed draws its own sixteen");
+        // Sixty-one seconds on, with no window published between, the young
+        // rows' namings are over.
+        let later = taken + Duration::from_secs(61);
+        let named = by_hand(1, later).expect("a sampling profile names its rows");
+        assert_eq!(named, by_store(1, later));
+        assert!(named.1.is_empty());
+    }
+
+    /// A decode decision of a model that also pairs is decided by its own
+    /// profile, and the hand reads that profile's sample: it caps the rows
+    /// it names by it, and a profile that takes none keeps its column. So
+    /// does one whose own stages read no column, and one whose warm-up
+    /// stages rule by different numbers. The needs of its workers' stream
+    /// carry the pair's decode side, which reads the column and samples
+    /// sixteen here.
+    #[test]
+    fn the_hand_caps_the_rows_it_names_by_the_profile_that_decides() {
+        use crate::Phase;
+
+        // What the hand gives a decode request asked alone under `pick`:
+        // the holders named with the rows handed, and the column's length.
+        let handed = |score: &str, pick: &str, (own, named, ruled): (u32, u32, bool)| {
+            let document: PolicySpec = serde_json::from_str(&format!(
+                r#"{{
+                  "apiVersion": "smg.policy/v1",
+                  "generation": 1,
+                  "profiles": {{
+                    "alone": {{ "score": [{score}], "pick": {pick} }},
+                    "wide": {{ "score": ["prefix-affinity"], "pick": {{ "best": {{ "sample": 16 }} }} }}
+                  }},
+                  "bindings": [
+                    {{ "match": {{ "phase": ["decode"] }}, "profile": "alone" }},
+                    {{ "plan": "pd-pair", "profiles": {{ "prefill": "wide", "decode": "wide" }} }}
+                  ]
+                }}"#
+            ))
+            .expect("a document of this build");
+            let store = MemoryStore::new();
+            store
+                .apply(applied(&document))
+                .expect("above the unbound start");
+            store.deciding(|world| {
+                let engine = world.spec().engine();
+                assert_eq!(engine.needs_for(MODEL, Phase::Decode).sample, 16);
+                assert_eq!(engine.sample_for(MODEL, Phase::Decode), own);
+                assert_eq!(engine.named_for(MODEL, Phase::Decode), named);
+                let rule = engine.warm_rule_for(MODEL, Phase::Decode);
+                assert_eq!(rule.is_some(), ruled);
+            });
+            // Twenty decode members hold the request's one block.
+            for n in 0..20 {
+                let name = format!("d{n:02}");
+                holding(&store, &name, Role::Decode, WireModes::NONE, &[1]);
+            }
+            let mut frame = phased(frame(1, 7), proto::Phase::Decode);
+            let facts = frame.facts.as_mut().expect("the case's frame has facts");
+            facts.block_hashes = vec![1];
+            facts.hash_kind = proto::HashKind::Text.into();
+            let request = checked(frame);
+            let now = Instant::now() + Duration::from_secs(3);
+            let taken = Taken::at(&request, GATEWAY, now, now).expect("budget is left");
+            let mut buffers = Buffers::default();
+            store.deciding(|world| {
+                let none = AtomicU64::new(0);
+                hand(
+                    world,
+                    &taken,
+                    &mut buffers,
+                    &none,
+                    |facts, _, rows, _, _| {
+                        let named = facts.named.map(|named| (named.holders.len(), rows.len()));
+                        (named, facts.affinity.len())
+                    },
+                )
+                .0
+            })
+        };
+        // A sample of four names four of the twenty holders, and no column.
+        let affinity = r#""prefix-affinity""#;
+        let four = r#"{ "best": { "sample": 4 } }"#;
+        assert_eq!(handed(affinity, four, (4, 4, false)), (Some((4, 20)), 0));
+        // No sample: the column, an entry a row, and no row named. Lists
+        // capped at the pair's sample would hide holders from its pass.
+        assert_eq!(handed(affinity, r#""best""#, (0, 0, false)), (None, 20));
+        // A sample and no stage of its own that reads the column: the
+        // pair's needs alone ask for it, and the profile is named no row.
+        assert_eq!(handed(r#""least-load""#, four, (4, 0, false)), (None, 20));
+        // One warm-up ruling names. Two that rule by different numbers do
+        // not: a pool's warming rows are named by one ruling, which is none
+        // for such a profile, and over the column each stage rules for itself.
+        let one = r#"{ "warmup-slice": { "secs": 30 } }, "prefix-affinity""#;
+        assert_eq!(handed(one, four, (4, 4, true)), (Some((4, 20)), 0));
+        let two = r#"{ "warmup-slice": { "secs": 30 } }, { "warmup-slice": { "secs": 90 } }"#;
+        assert_eq!(handed(two, four, (4, 0, false)), (None, 20));
     }
 
     #[tokio::test]

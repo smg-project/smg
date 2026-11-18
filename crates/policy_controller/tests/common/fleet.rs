@@ -273,6 +273,10 @@ struct Stream {
     /// the sink reads a restarted publisher there and empties the rank,
     /// and this set keeps what it had. No engine of the fleet opens one.
     held: HashSet<SequenceHash>,
+    /// The first chain the stream stored, in the chain's order: the blocks of
+    /// the first store under no parent, then of each store whose parent is
+    /// the chain's last block. A prompt's head as the engine holds it.
+    head: Vec<StoredBlock>,
 }
 
 /// An engine as the stand-in prober dials it: its address and the rows its
@@ -703,7 +707,10 @@ fn admit(store: &MemoryStore, engine: &Probed, events: &Events, batch: &KvEventB
             row.applied += 1;
             for event in decoded {
                 match event {
-                    KvEvent::Stored { blocks, .. } => {
+                    KvEvent::Stored { parent, blocks } => {
+                        if parent == row.head.last().map(|block| block.seq_hash) {
+                            row.head.extend(&blocks);
+                        }
                         row.held.extend(blocks.iter().map(|block| block.seq_hash));
                     }
                     KvEvent::Removed(hashes) => {
@@ -1137,6 +1144,25 @@ impl Harness {
             Arc::clone(&self.events),
             self.stop_feeds.subscribe(),
         ));
+    }
+
+    /// The first chain the first rank of the engine at `engine` stored, in
+    /// the chain's order, each block by the hash of its tokens: what a
+    /// request that brings the same prompt states of its head.
+    pub fn head(&self, engine: usize) -> Vec<u64> {
+        let streams = self.events.rows.lock();
+        self.members
+            .iter()
+            .find(|(_, (of, rank))| *of == engine && *rank == 0)
+            .and_then(|(id, _)| streams.get(id))
+            .map(|stream| {
+                stream
+                    .head
+                    .iter()
+                    .map(|block| block.content_hash.0)
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// The KV events of the engine at `engine`, a rank a row: what each

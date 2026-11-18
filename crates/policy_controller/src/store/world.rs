@@ -93,10 +93,12 @@ use std::{
 use rustc_hash::FxHashMap;
 
 use crate::{
+    affinity::WarmRule,
     framework::{OverloadThresholds, PairPools, PairTable},
     spec::{AppliedSpec, Listed, Pairing},
     store::{
         encoding::{EncodeClasses, EncodeMember},
+        index::{KvTables, Named, PoolIndex, Reading},
         leases::{Counts, Slot},
         loads::LoadSample,
         pairing::{known, Derivation, Member, PairClasses, Pool},
@@ -105,7 +107,7 @@ use crate::{
     },
     view::{
         fingerprint, AffinityFacts, Candidate, Health, OverloadRegime, Phase, PoolFacts, Role,
-        WorkerId,
+        WireModes, WorkerId,
     },
 };
 
@@ -145,6 +147,30 @@ pub struct Ask {
     /// ([`Needs::affinity`](crate::Needs::affinity)): the build fills it
     /// then, and leaves it empty otherwise.
     pub affinity: bool,
+}
+
+/// What a decision brings to the naming of its rows ([`World::name`]).
+#[derive(Clone, Copy, Debug)]
+pub struct Naming<'a> {
+    /// The gateway the decision is for: the view was built for it.
+    pub gateway: GatewayId,
+    /// The request's block hashes, in order from its first block
+    /// ([`RequestFacts::block_hashes`](crate::RequestFacts::block_hashes)).
+    pub block_hashes: &'a [u64],
+    /// The decision's seed: where a list is cut, the rows kept are drawn
+    /// from it, on streams of the naming's own.
+    pub seed: u64,
+    /// The most rows either list may hold: the sample of the profile's
+    /// picker ([`Needs::sample`](crate::Needs::sample)); `0` holds every
+    /// row.
+    pub cap: u32,
+    /// The wires the view was narrowed by since its build, where the
+    /// decision's gateway states them.
+    pub wires: Option<WireModes>,
+    /// The decision's instant on the store's clock, in microseconds, as
+    /// its build read it ([`Built::now_micros`]): a warming row is named
+    /// until its own end.
+    pub now_micros: u64,
 }
 
 /// The buffers a host keeps across decisions: a build clears and fills
@@ -655,6 +681,8 @@ pub struct World {
     /// The generation this publication was made under: its engine and its
     /// number, read with the rows in one load.
     spec: Arc<AppliedSpec>,
+    /// Each pool's standing in its model's index, at the pool's index.
+    indexes: Arc<[Option<Arc<PoolIndex>>]>,
 }
 
 impl std::fmt::Debug for World {
@@ -1031,6 +1059,86 @@ impl World {
         }
         built
     }
+
+    /// Name the rows the affinity stages read in the column's place
+    /// ([`NamedAffinity`](crate::NamedAffinity)) for `view`, the rows a
+    /// decision of `model` in `role` is made over: the pool's as
+    /// [`World::view`] lends them, or as [`World::build`] wrote them, which
+    /// its caller may have narrowed by its gateway's wires since. `named`
+    /// takes the request's deepest holders, by one lookup of the pool's
+    /// index under the cap of the profile's sample, and the pool's warming
+    /// rows as this publication read them, less those whose naming ended by
+    /// the decision's instant. Under a cap the holders' lookup lists
+    /// nothing of the pool's length, and the warming rows are read where
+    /// the publication holds them: they are copied only for a view that is
+    /// not the pool whole, and past the first row's end. No row is named,
+    /// and no index is read, where the view holds no row or no member
+    /// serves `model` in `role`.
+    ///
+    /// The lookup is of this instant: an index is written between two
+    /// publications, so a holder may be named a window before its row's
+    /// load shows the request that made it one.
+    pub fn name(
+        &self,
+        model: &str,
+        role: Role,
+        naming: &Naming<'_>,
+        view: &[Candidate],
+        named: &mut Named,
+    ) {
+        named.clear();
+        // A view with no row (a subset hint of 0, wires no member shares)
+        // names nobody and reads no index.
+        if view.is_empty() {
+            return;
+        }
+        let Some(index) = self.index(model, role) else {
+            return;
+        };
+        let (Some(rows), Some(shape), Some(Some(held))) = (
+            self.rows.get(index),
+            self.derived.pools.get(index),
+            self.indexes.get(index),
+        ) else {
+            return;
+        };
+        held.name(naming, rows, &shape.locals, view, named);
+    }
+
+    /// The pool's standing in its model's index, for the cases: a
+    /// membership write that kept it publishes the same one.
+    #[cfg(test)]
+    pub(super) fn standing(&self, model: &str, role: Role) -> Option<Arc<PoolIndex>> {
+        self.indexes.get(self.index(model, role)?)?.clone()
+    }
+
+    /// Every pool's standing, for the cases: a membership write that moved
+    /// none publishes the same list.
+    #[cfg(test)]
+    pub(super) fn standings(&self) -> Arc<[Option<Arc<PoolIndex>>]> {
+        Arc::clone(&self.indexes)
+    }
+
+    /// The workers of the pool a naming's read is kept within, by id: for
+    /// the cases.
+    #[cfg(test)]
+    pub(crate) fn reached(&self, model: &str, role: Role, naming: &Naming<'_>) -> Vec<WorkerId> {
+        let Some(index) = self.index(model, role) else {
+            return Vec::new();
+        };
+        let (Some(rows), Some(shape), Some(Some(held))) = (
+            self.rows.get(index),
+            self.derived.pools.get(index),
+            self.indexes.get(index),
+        ) else {
+            return Vec::new();
+        };
+        let reached = held.reached(naming, &shape.locals);
+        reached
+            .iter()
+            .filter_map(|&row| rows.get(row as usize).map(|row| row.id))
+            .collect()
+    }
 }
 
 /// Write the stalled bit on each row of `rows` a veto of `run` masks at
@@ -1234,7 +1342,10 @@ pub(super) enum Classes {
     },
     /// No member joined or left and no member's offer moved
     /// ([`same_offer`]): the classes are the last write's, carried, and no
-    /// member's facts are read for them.
+    /// member's facts are read for them. Every pool holds the rows it
+    /// held, each admitted when it was and stating the wires it stated: a
+    /// pool's standing in its model's index is carried on the same word
+    /// ([`Writer::index_pools`]).
     Carry,
 }
 
@@ -1499,6 +1610,19 @@ pub(super) struct Writer {
     /// The generation every world is published under until the next is
     /// applied: the unbound one at the start.
     spec: Arc<AppliedSpec>,
+    /// Each pool's standing in its model's index: made by a membership
+    /// write, its warming rows read again by a window's publication.
+    indexes: Arc<[Option<Arc<PoolIndex>>]>,
+    /// The buffers a pool's reading is made in.
+    reading: Reading,
+    /// The lane table's count of moves as the last membership write read
+    /// it ([`KvTables::moves`]): while it stands, no pool's place in an
+    /// index moved.
+    lanes: u64,
+    /// The store's index tables, where a membership write reads each
+    /// pool's standing ([`Self::over`]). A writer made alone holds tables
+    /// of its own with no lane.
+    kv: Arc<KvTables>,
     /// The generation before the standing one, kept one apply longer: the
     /// publication that lets go of the last world published under it
     /// frees no engine, the next apply does. Its whole engine stays
@@ -1578,6 +1702,10 @@ impl Writer {
             vetoes: Arc::default(),
             pool_vetoes: Arc::default(),
             spec: Arc::new(AppliedSpec::unbound()),
+            indexes: Arc::default(),
+            reading: Reading::default(),
+            lanes: 0,
+            kv: Arc::default(),
             retired: None,
             engines: Vec::new(),
             engine_rows: Vec::new(),
@@ -1602,6 +1730,14 @@ impl Writer {
         Arc::clone(&self.counts)
     }
 
+    /// The writer over the store's index tables: every membership write
+    /// reads its pools' standings in `kv`. The store hands them once, at
+    /// its making, and writes its lanes into the same tables.
+    pub(super) fn over(mut self, kv: Arc<KvTables>) -> Self {
+        self.kv = kv;
+        self
+    }
+
     /// A world of everything published so far: one small object, a pointer
     /// per pool. Nothing derived is built here.
     pub(super) fn world(&self) -> Arc<World> {
@@ -1612,6 +1748,7 @@ impl Writer {
             rows: self.published.clone().into_boxed_slice(),
             vetoes: Arc::clone(&self.pool_vetoes),
             spec: Arc::clone(&self.spec),
+            indexes: Arc::clone(&self.indexes),
         })
     }
 
@@ -1646,7 +1783,10 @@ impl Writer {
     /// the membership's and the generation the document's, and what is
     /// derived from both is published under both. That door reads every
     /// member where the generation's lists differ from the standing one's
-    /// and carries each member's fields where they are the same.
+    /// and carries each member's fields where they are the same. Either
+    /// way each pool's warming rows are ruled by the new generation: the
+    /// membership write's door reads the index tables under it, and a
+    /// generation of the standing mode rules each pool's standing again.
     ///
     /// The generation this one replaces is kept until the next apply, and
     /// the one kept until now is handed back for the caller to let go
@@ -1686,6 +1826,9 @@ impl Writer {
             // stand.
             self.hear_again(sample_of);
             self.judge_every();
+            // A generation may rule a pool's warming rows by other numbers,
+            // or rule none.
+            self.rule_indexes();
             self.publish()
         };
         Ok((world, before))
@@ -2076,7 +2219,8 @@ impl Writer {
     /// caller says (`classes`). A member's engine family, zone and labels
     /// under the standing generation's lists are read where its row's
     /// revision moved since they were last read, and carried where it
-    /// stands.
+    /// stands. Each pool takes its standing in its model's index as the
+    /// write leaves the store's tables ([`Self::over`]).
     pub(super) fn rebuild<'a>(
         &mut self,
         epoch: u64,
@@ -2455,11 +2599,14 @@ impl Writer {
         self.engines = engines;
         self.silenced = silenced;
         self.epoch = epoch;
-        self.derived = Arc::new(Derived {
-            by_model,
-            pools: pools.into_boxed_slice(),
-            counts: Arc::clone(&self.counts),
-        });
+        let before = mem::replace(
+            &mut self.derived,
+            Arc::new(Derived {
+                by_model,
+                pools: pools.into_boxed_slice(),
+                counts: Arc::clone(&self.counts),
+            }),
+        );
         // A worker's vetoes leave with its row, in this write's own hold:
         // no publication shows the row without them. The ids stand in
         // order as the walk above pushed them.
@@ -2485,6 +2632,7 @@ impl Writer {
             pool.dirty = false;
             self.published.push(Arc::from(pool.rows.as_slice()));
         }
+        self.index_pools(&before, classes);
         self.publish()
     }
 
@@ -2802,6 +2950,166 @@ impl Writer {
         self.derivations.get(model).map(Derivation::wholes)
     }
 
+    /// Each pool's standing in its model's index as this membership write
+    /// leaves it. A pool the write did not move keeps its standing: its
+    /// tables, and its warming rows as a write or a window last read them.
+    /// A write that moved no pool looks none up and allocates nothing
+    /// here. A pool moved where its rows are not as many, a row was
+    /// admitted at another instant, a lane's row states other wires
+    /// ([`PoolIndex::holds`]), or a lane of the pool was made or retired
+    /// ([`KvTables::stands`]); its standing is made ([`KvTables::pool`])
+    /// with its warming rows under the standing generation's ruling for
+    /// the pool's model and phase, read at the last window's instant or an
+    /// admission after it. A pool is found at its place, or among
+    /// `before`, the pools as they stood, where the write moved its place.
+    /// A write that moved no member and no offer ([`Classes::Carry`]) moved
+    /// no row, no admission and no wire a row states: where no lane moved
+    /// either, every pool stands as it did and none is walked. Under
+    /// [`Classes::Derive`] the pools may stand under a generation of another
+    /// pairing mode, one the standings were not ruled by: every kept pool's
+    /// warming rows are ruled and read again.
+    fn index_pools(&mut self, before: &Derived, classes: Classes) {
+        let Self {
+            derived,
+            working,
+            spec,
+            reading,
+            indexes: held,
+            origin,
+            last_window,
+            lanes,
+            kv,
+            ..
+        } = self;
+        let window = last_window.map_or(0, |at| micros(*origin, at));
+        // No lane was made or retired since the last write stood its
+        // pools: no pool's place in an index moved, and none is looked up.
+        let moves = kv.moves();
+        let still = mem::replace(lanes, moves) == moves;
+        if still && classes == Classes::Carry {
+            return;
+        }
+        let ruled = classes != Classes::Derive;
+        // The list is copied at the first pool whose standing is new:
+        // where the pools are as many, every other stands in it already.
+        let same = held.len() == working.len();
+        let mut next = (!same).then(|| vec![None; working.len()]);
+        for (model, sides) in &derived.by_model {
+            // The model's pools as they stood, looked up at the first of
+            // its pools that does not stand at its place.
+            let mut stood = None;
+            for (side, pool) in sides.iter().enumerate() {
+                let Some(at) = pool.map(|pool| pool as usize) else {
+                    continue;
+                };
+                let (Some(rows), Some(shape)) = (working.get(at), derived.pools.get(at)) else {
+                    continue;
+                };
+                let (rows, admitted) = (&*rows.rows, &*shape.admitted_micros);
+                let here = held.get(at).and_then(Option::as_ref);
+                let here = here.filter(|standing| standing.is_of(model, rows));
+                let was = here.map(|standing| (at, standing)).or_else(|| {
+                    let sides = *stood.get_or_insert_with(|| before.by_model.get(model));
+                    let old = sides?.get(side).copied().flatten()? as usize;
+                    Some((old, held.get(old)?.as_ref()?))
+                });
+                let kept = was.filter(|(_, standing)| {
+                    standing.holds(rows, admitted) && (still || kv.stands(model, rows, standing))
+                });
+                let now = || admitted.iter().copied().fold(window, u64::max);
+                let read = match kept {
+                    Some((old, standing)) => {
+                        let read = if ruled {
+                            None
+                        } else {
+                            standing.again(ruling_of(spec, model, rows), now(), reading)
+                        };
+                        match read {
+                            Some(read) => Arc::new(read),
+                            None if same && old == at => continue,
+                            None => Arc::clone(standing),
+                        }
+                    }
+                    None => {
+                        let rule = ruling_of(spec, model, rows);
+                        Arc::new(kv.pool(model, rows, admitted, rule, now(), reading))
+                    }
+                };
+                let next = next.get_or_insert_with(|| held.to_vec());
+                if let Some(slot) = next.get_mut(at) {
+                    *slot = Some(read);
+                }
+            }
+        }
+        if let Some(next) = next {
+            *held = next.into();
+        }
+    }
+
+    /// Rule every pool's warming rows again under the standing generation,
+    /// at the last window's instant: it may rule a pool by other numbers,
+    /// or rule none.
+    fn rule_indexes(&mut self) {
+        let Self {
+            derived,
+            working,
+            spec,
+            reading,
+            indexes,
+            origin,
+            last_window,
+            ..
+        } = self;
+        let now = last_window.map_or(0, |at| micros(*origin, at));
+        let mut next = None;
+        for (model, sides) in &derived.by_model {
+            for &pool in sides.iter().flatten() {
+                let at = pool as usize;
+                let (Some(Some(held)), Some(rows)) = (indexes.get(at), working.get(at)) else {
+                    continue;
+                };
+                let rule = ruling_of(spec, model, &rows.rows);
+                if let Some(read) = held.again(rule, now, reading) {
+                    put_read(&mut next, indexes, at, read);
+                }
+            }
+        }
+        if let Some(next) = next {
+            *indexes = next.into();
+        }
+    }
+
+    /// Read each ruled pool's warming rows again at the last window's
+    /// instant, under the ruling it was read by. A pool no ruling names
+    /// warms nobody, so a window reads nothing of it. The list is new only
+    /// when a pool's rows moved: a publication that moved none allocates
+    /// nothing.
+    fn read_indexes(&mut self) {
+        let Self {
+            reading,
+            indexes,
+            origin,
+            last_window,
+            ..
+        } = self;
+        let mut next = None;
+        for (at, held) in indexes.iter().enumerate() {
+            let Some(held) = held else {
+                continue;
+            };
+            let Some(rule) = held.rule() else {
+                continue;
+            };
+            let now = last_window.map_or(0, |at| micros(*origin, at));
+            if let Some(read) = held.again(Some(rule), now, reading) {
+                put_read(&mut next, indexes, at, read);
+            }
+        }
+        if let Some(next) = next {
+            *indexes = next.into();
+        }
+    }
+
     fn publish_window(&mut self, at: Instant) -> Arc<World> {
         self.last_window = Some(at);
         // A veto that ended at or before this window's instant leaves the
@@ -2811,8 +3119,37 @@ impl Writer {
             self.vetoes = Arc::new(vetoes);
             self.derive_vetoes();
         }
+        self.read_indexes();
         self.publish()
     }
+}
+
+/// Sets pool `at`'s standing to `read` in `next`, the list a writer
+/// publishes in `standing`'s place: a copy of it, made at the first pool
+/// whose rows moved.
+fn put_read(
+    next: &mut Option<Vec<Option<Arc<PoolIndex>>>>,
+    standing: &[Option<Arc<PoolIndex>>],
+    at: usize,
+    read: PoolIndex,
+) {
+    let next = next.get_or_insert_with(|| standing.to_vec());
+    if let Some(slot) = next.get_mut(at) {
+        *slot = Some(Arc::new(read));
+    }
+}
+
+/// The warm-up ruling of the profile a pool's decisions resolve to under
+/// `spec`, by the pool's model and its role's phase: as a request of that
+/// phase asked alone resolves its profile, not by the pair binding a decode
+/// pool's thresholds take
+/// ([`Engine::pool_binding`](crate::framework::Engine::pool_binding)). The
+/// hand names rows for such a request alone; a pair's sides read their
+/// columns. `None` where the profile's warm-up stages rule by different
+/// numbers: it is named no rows.
+fn ruling_of(spec: &AppliedSpec, model: &str, rows: &[Candidate]) -> Option<WarmRule> {
+    let role = rows.first()?.role;
+    spec.engine().warm_rule_for(model, phase_of(role))
 }
 
 /// Writes `rows` over `over` when `over` is of `rows`' length and the
