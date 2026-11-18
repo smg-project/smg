@@ -4666,8 +4666,9 @@ pub(crate) mod tests {
         assert_eq!(behind.pinned(key, Some(1)), Some(WorkerId(7)));
     }
 
-    /// The count pass is skipped where the request's own narrowing clears
-    /// every row, and nowhere else: a subset of none, a mask of no wire.
+    /// The count pass is skipped for the two requests whose own words keep
+    /// no row, a subset of none and a mask of no wire, and nowhere else: a
+    /// mask that no row of the pool speaks is still counted.
     #[test]
     fn a_request_is_counted_nothing_only_where_its_narrowing_keeps_no_row() {
         let narrowed = |wires: Option<WireModes>, subset: Option<u32>| {

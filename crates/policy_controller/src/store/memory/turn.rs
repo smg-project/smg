@@ -13,17 +13,16 @@
 //! grows.
 //!
 //! Who applies. A decider with a job at hand is at work at the file
-//! ([`MemoryStore::at_work`]): it tries the turn once before each
-//! decision reads its rows' counts, takes it at each issue, and takes it
-//! once more before it waits for its next job. A turn it finds held is
-//! its holder's to apply under: a decider never waits for the turn ahead
-//! of a decision. While any is at work a session leaves what it handed
-//! to them, so the file's lines stay with the threads that read them: a
-//! handed frame waits for the next take of a thread at work, a
-//! decision's try or its issue. With none at work the session takes the
-//! turn and applies. So no handed frame waits on a lull, but behind a
-//! thread that left its work by an unwind: what it left is the next
-//! take's.
+//! ([`MemoryStore::at_work`]): it tries the turn once before each decision
+//! reads its rows' counts, takes it at each issue, and takes it once more
+//! before it waits for its next job. A turn it finds held it leaves to its
+//! holder and reads on: a decider never waits for the turn ahead of a
+//! decision. While any is at work a session leaves what it handed to them,
+//! so the file's lines stay with the threads that read them: a handed
+//! frame waits for the next take of a thread at work, a decision's try or
+//! its issue. With none at work the session takes the turn and applies. So
+//! no handed frame waits on a lull, but behind a thread that left its work
+//! by an unwind: what it left is the next take's.
 //!
 //! The lock order, written here once: the turn is taken first or not at
 //! all. Under it come the world's load (no lock), a stage's own lock, the
@@ -114,8 +113,8 @@ impl File {
         }
     }
 
-    /// Takes the turn and applies nothing: for the term's read and a
-    /// count's, which no handed frame changes.
+    /// Takes the turn and applies nothing: for the term's read, which no
+    /// handed frame changes.
     pub(super) fn take(&self) -> Turn<'_> {
         #[cfg(debug_assertions)]
         assert_ne!(
@@ -139,9 +138,9 @@ impl File {
         self.turn.try_lock().is_some()
     }
 
-    /// Whether a frame waits in the ring or is about to be written.
-    /// The turn where it is free. `None` where a thread holds it: that
-    /// thread's take applied what was handed before it.
+    /// The turn where it is free, with nothing applied. `None` where a
+    /// thread holds it: what is handed behind that holder's take waits
+    /// for the next take that applies.
     pub(super) fn try_take(&self) -> Option<Turn<'_>> {
         let behind = self.turn.try_lock()?;
         #[cfg(debug_assertions)]
@@ -199,9 +198,9 @@ pub struct AtWork(Arc<MemoryStore>);
 
 impl AtWork {
     /// Applies what is handed, before a decision reads its rows' counts,
-    /// where the turn is free. A turn that is held was taken by a thread
-    /// that applied what was handed before it: the decision reads on and
-    /// its issue takes the turn.
+    /// where the turn is free. Where it is held the decision reads on:
+    /// what is handed behind the holder's take waits for the next take
+    /// that applies, and the decision's issue is one.
     pub fn apply(&self) {
         if let Some(mut turn) = self.0.file.try_take() {
             self.0.apply_handed(&mut turn.behind);

@@ -2537,6 +2537,14 @@ fn a_frame_handed_as_a_thread_leaves_its_work_is_applied_by_one_of_the_two() {
         HEARD.fetch_add(1, SeqCst);
     }
     const ROUNDS: usize = 100_000;
+    const BOUND: Duration = Duration::from_secs(60);
+    /// Tells the case's two threads to end, where the case unwinds too.
+    struct Ends<'a>(&'a AtomicUsize);
+    impl Drop for Ends<'_> {
+        fn drop(&mut self) {
+            self.0.store(usize::MAX, SeqCst);
+        }
+    }
     let store = Arc::new(MemoryStore::new());
     let a = ready(&store, "http://a:1");
     LeasesStore::set_term(&*store, 1);
@@ -2556,7 +2564,8 @@ fn a_frame_handed_as_a_thread_leaves_its_work_is_applied_by_one_of_the_two() {
         };
         let start = move |asked: usize, spins: usize| {
             set.fetch_add(1, SeqCst);
-            while go.load(SeqCst) != asked {
+            // The case's end is a word to go, too.
+            while go.load(SeqCst) != asked && round.load(SeqCst) != usize::MAX {
                 std::hint::spin_loop();
             }
             for _ in 0..spins {
@@ -2584,6 +2593,15 @@ fn a_frame_handed_as_a_thread_leaves_its_work_is_applied_by_one_of_the_two() {
                 asked = next(asked);
             }
         });
+        // A round's waits are bounded and the two threads end where this
+        // one unwinds: a failure ends the case.
+        let _ends = Ends(round);
+        let wait = |count: &AtomicUsize, asked: usize| {
+            while count.load(SeqCst) != 2 * asked {
+                assert!(now.elapsed() < BOUND, "a thread of the case stopped");
+                std::hint::spin_loop();
+            }
+        };
         for asked in 1..=ROUNDS {
             if now.elapsed() > Duration::from_secs(20) {
                 break;
@@ -2593,20 +2611,76 @@ fn a_frame_handed_as_a_thread_leaves_its_work_is_applied_by_one_of_the_two() {
             lease.store(issued.expect("minted under the store's term").id.0, SeqCst);
             let before = HEARD.load(SeqCst);
             round.store(asked, SeqCst);
-            while set.load(SeqCst) != 2 * asked {
-                std::hint::spin_loop();
-            }
+            wait(set, asked);
             go.store(asked, SeqCst);
-            while done.load(SeqCst) != 2 * asked {
-                std::hint::spin_loop();
-            }
+            wait(done, asked);
             short += usize::from(HEARD.load(SeqCst) == before);
             ran = asked;
         }
-        round.store(usize::MAX, SeqCst);
     });
     assert!(ran > 0, "no round ran");
     assert_eq!(short, 0, "of {ran} rounds, a handed frame waited on a lull");
+}
+
+/// A frame handed while another thread holds the turn is left to the
+/// thread at work, and that thread waits for the turn as it leaves: the
+/// frame is told once the holder lets go, with no door of the leases
+/// asked behind it.
+#[test]
+fn a_thread_that_leaves_its_work_waits_for_a_held_turn() {
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    static HEARD: AtomicUsize = AtomicUsize::new(0);
+    fn counted(_: &MemoryStore, _: &LeaseRecord, _: Said, _: Option<Decider>) {
+        HEARD.fetch_add(1, SeqCst);
+    }
+    let store = Arc::new(MemoryStore::new());
+    let a = ready(&store, "http://a:1");
+    LeasesStore::set_term(&*store, 1);
+    store.tell_through(counted);
+    let (gateway, now) = (GatewayId(1), Instant::now());
+    let first = store
+        .issue_decided(
+            booking(gateway, 0, a, now),
+            store.world().booked_of(a),
+            |_| (),
+        )
+        .expect("minted under the store's term");
+    let (reached, parked) = mpsc::sync_channel(1);
+    let (go, word) = mpsc::sync_channel::<()>(1);
+    let (left, gone) = mpsc::sync_channel(1);
+    let (early, before) = std::thread::scope(|scope| {
+        let store = &store;
+        // An issuer is parked in its issue's hook, under the turn.
+        scope.spawn(move || {
+            let record = booking(gateway, 0, a, now);
+            let issued = store.issue_decided(record, store.world().booked_of(a), |_| {
+                reached.send(()).expect("the case hears the issue");
+                word.recv().expect("the case lets the issuer go");
+            });
+            issued.expect("minted under the store's term");
+        });
+        parked.recv().expect("the issue tells");
+        // One thread is at work: a frame handed now is left to it.
+        let at_work = store.at_work();
+        let hand = store.handover(gateway);
+        let before = HEARD.load(SeqCst);
+        store.hand(&hand, first.id, GONE);
+        // It leaves its work on a thread of its own, and is not through
+        // while the turn is held.
+        scope.spawn(move || {
+            drop(at_work);
+            left.send(()).expect("the case waits for the leaver");
+        });
+        let early = gone.recv_timeout(Duration::from_millis(250)).is_ok();
+        go.send(()).expect("the issuer holds the other end");
+        (early, before)
+    });
+    assert!(!early, "the leaver was through under a held turn");
+    let told = HEARD.load(SeqCst) - before;
+    assert_eq!(
+        told, 1,
+        "the leaver applies what was handed under the held turn"
+    );
 }
 
 /// A line that prints the store from under the turn, a tell's or a panic's,
