@@ -29,6 +29,27 @@ The final image runs as UID 65532 and contains no compiler or Rust toolchain.
 This Dockerfile builds the standalone router. Run the inference engine in a
 separate container. It does not include the Ubuntu image's optional Slurm clients.
 
+### Published images
+
+The [Release Docker Image workflow](../.github/workflows/release-docker.yml)
+publishes the Linux amd64 OL9 router alongside the other release images when a
+maintainer dispatches it against a release tag. Push-triggered runs validate the
+build. It uses the existing Docker Hub and GHCR credentials.
+
+| Registry | Release tag | Stable alias |
+| --- | --- | --- |
+| Docker Hub | `lightseekorg/smg:<version>-ol9` | `lightseekorg/smg:latest-ol9` |
+| GHCR | `ghcr.io/smg-project/smg:<version>-ol9` | `ghcr.io/smg-project/smg:latest-ol9` |
+
+Only final releases move `latest-ol9`; candidates keep their versioned tags.
+The workflow's mirror mode also copies an existing `-ol9` image from Docker Hub
+to GHCR, and reports a missing OL9 variant for older releases.
+
+The [Nightly Docker Build workflow](../.github/workflows/nightly-docker.yml)
+publishes `ghcr.io/smg-project/smg:nightly-ol9` and
+`ghcr.io/smg-project/smg:nightly-YYYYMMDD-<sha>-ol9`. An express run publishes
+only the dated tag. OL9 images currently target `linux/amd64`.
+
 ### Test against a gRPC worker
 
 For example, with a vLLM gRPC worker named `worker` listening on port 8080 on a
