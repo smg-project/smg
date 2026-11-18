@@ -76,8 +76,13 @@
 //! rule and the cool-down. Without a fallback stage, `failure: open` steps
 //! aside and `failure: closed` sheds, as for every kind.
 //!
-//! The lifecycle: one `Observe` stream per plugin, opened once a `Decide`
-//! stream has settled, carries the events the engine forwards (issued,
+//! The lifecycle: a plugin hears the kinds of event its row lists
+//! ([`GrpcPluginSpec::observes`]), none by default. A row that lists none is
+//! told nothing and has no `Observe` stream. A row that lists any has its
+//! plugin's scorer and picker say they need the lifecycle's calls
+//! ([`crate::Lifecycle::needs_lifecycle`]), so a host that makes none
+//! refuses them. One `Observe` stream per such plugin, opened once a
+//! `Decide` stream has settled, carries the events it hears (among issued,
 //! dispatched, completed, released, membership, signals) in order, each
 //! numbered by the I/O thread where it enters the stream, so the numbers
 //! never go down whichever threads raise the events; an event the queue
@@ -138,7 +143,8 @@ mod unit;
 mod view;
 
 pub use config::{
-    BreakerSpec, Exposure, Failure, GrpcPluginSpec, HeaderSet, Reveal, Tls, Transport,
+    BreakerSpec, EventKind, EventSet, Exposure, Failure, GrpcPluginSpec, HeaderSet, Reveal, Tls,
+    Transport,
 };
 pub use plugin::{Binder, Bound, LoadError, Plugin, Stats};
 pub use runtime::Runtime;

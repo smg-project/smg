@@ -17,7 +17,8 @@ use std::sync::Arc;
 use smg_policy_controller::{
     plugins::OpenDecisions,
     wasm::{
-        Failure, LoadError, Plugin, PluginSpec, Runtime, WasmFilter, WasmPicker, WasmScorer, World,
+        EventKind, EventSet, Failure, LoadError, Plugin, PluginSpec, Runtime, WasmFilter,
+        WasmPicker, WasmScorer, World,
     },
     Binding, Candidate, Constraints, Decision, Engine, Health, Lease, Lifecycle, Needs, Outcome,
     Plan, PoolFacts, Profile, ReleaseReason, RequestFacts, Scratch, ShedReason, Side,
@@ -58,12 +59,14 @@ fn example_or_skip(test: &str) -> Option<Vec<u8>> {
 }
 
 /// The example's spec with `config` as its configuration: empty for the
-/// example's default, else one byte, the session bonus in percent.
+/// example's default, else one byte, the session bonus in percent. Its row
+/// lists the one kind of event the example counts.
 fn spec_with(component: Vec<u8>, config: &[u8]) -> PluginSpec {
     let mut spec = PluginSpec::new("example", component);
     spec.config = config.to_vec();
     spec.budget_micros = 10_000;
     spec.metrics = vec!["completed".to_string()];
+    spec.observes = EventSet::of([EventKind::Completed]);
     spec
 }
 
@@ -299,10 +302,10 @@ fn the_example_sheds_an_unusable_pool_and_counts_completions() {
             .map(|(_, value)| value)
             .expect("the declared counter")
     };
-    // A lifecycle event of another kind reaches `observe` and is not
-    // counted: the counter is of completions.
+    // The row lists completions alone: an event of another kind is not
+    // told, and the counter is of completions.
     engine.on_released(&Lease::default(), ReleaseReason::ClientGone);
-    assert_eq!(plugin.stats().observed, 1, "the release was observed");
+    assert_eq!(plugin.stats().observed, 0, "a release is not told");
     assert_eq!(completed(), 0);
     engine.on_completed(
         &Lease::default(),
@@ -318,4 +321,5 @@ fn the_example_sheds_an_unusable_pool_and_counts_completions() {
         },
     );
     assert_eq!(completed(), 1);
+    assert_eq!(plugin.stats().observed, 1, "the completion was told");
 }

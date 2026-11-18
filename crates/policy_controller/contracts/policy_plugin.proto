@@ -807,7 +807,9 @@ service PolicyPlugin {
   // One bidirectional stream per controller shard, pipelined, ordered per
   // decision id: view and stage set in; mask, scores and pick out.
   rpc Decide(stream PluginRequest) returns (stream PluginResponse);
-  // A client stream answered once: the LifecycleEvent states, opened for a
-  // plugin once one of its Decide streams settled and for no other.
+  // A client stream answered once: the LifecycleEvent states of the kinds
+  // the plugin's row lists (`plugins[].observes`, none by default), opened
+  // once one of the plugin's Decide streams settled, for a plugin whose row
+  // lists a kind and for no other.
   rpc Observe(stream ObserveRequest) returns (Ack);
 }

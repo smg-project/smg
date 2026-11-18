@@ -114,6 +114,8 @@ interface types {
   /// into the spec's `view.headers` list with the value (unlike the one-based
   /// `zone`, `engine-kind` and `connector`); `budget-micros` is relative to
   /// the host's receipt; `seed` is the only randomness (see `host`).
+  /// `block-hashes` is empty unless the plugin's row declares `token_hashes` or
+  /// `text_hashes` among its needs.
   record request {
     model: string,
     namespace-seed: u64,
@@ -264,6 +266,9 @@ interface plugin {
     pick: func(scores: list<f32>) -> result<option<u32>, decline>;
   }
 
+  /// Called with the kinds of event the plugin's row lists
+  /// (`plugins[].observes`), none by default: a module whose row lists none
+  /// is never called.
   observe: func(event: lifecycle-event);
 }
 
@@ -318,10 +323,9 @@ interface plugin {
 ///   256; the view holds the first N hashes in every form, record and packed
 ///   alike, and none for a plugin whose row declares neither token hashes
 ///   nor text hashes among its needs), header-count by the allow-list (at
-///   most 256 names), tried-count
-///   by the attempt counter (u8) times the four targets of a decision; a spec
-///   whose cap exceeds 65,535 is refused at apply when a packed plugin is
-///   configured, never a truncated block. The string lengths are u16 as
+///   most 256 names), tried-count by the attempt counter (u8) times the four
+///   targets of a decision. A hash cap above 8,190 is refused at apply, and a
+///   longer list is cut to its first 8,190. The string lengths are u16 as
 ///   well: a request whose model name, header value or plain identity
 ///   exceeds 65,535 bytes is not packed; the host skips the packed plugin
 ///   for that decision (its stages take their fallbacks, as for a
@@ -351,6 +355,9 @@ interface plugin-packed {
     pick: func(scores: list<f32>) -> result<option<u32>, decline>;
   }
 
+  /// Called with the kinds of event the plugin's row lists
+  /// (`plugins[].observes`), none by default: a module whose row lists none
+  /// is never called.
   observe: func(event: lifecycle-event);
 }
 
