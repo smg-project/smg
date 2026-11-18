@@ -1746,6 +1746,37 @@ impl Ranks {
     }
 }
 
+/// What a poll's answer brought of one engine, the least first.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Brought {
+    /// No row for a rank of it.
+    Nothing,
+    /// A row for a rank that pushed since the poll began: the row is passed
+    /// over, and the engine is named.
+    Named,
+    /// A row that was written.
+    Heard,
+}
+
+/// Note what an answer brought of `engine`: the most it brought stands.
+/// Inlined: the pass over an answer's rows runs it a row.
+#[inline]
+fn note(
+    first: &mut Option<(u32, Brought)>,
+    others: &mut Vec<(u32, Brought)>,
+    engine: u32,
+    brought: Brought,
+) {
+    match first {
+        None => *first = Some((engine, brought)),
+        Some(seen) if seen.0 == engine => seen.1 = seen.1.max(brought),
+        Some(_) => match others.iter_mut().find(|seen| seen.0 == engine) {
+            Some(seen) => seen.1 = seen.1.max(brought),
+            None => others.push((engine, brought)),
+        },
+    }
+}
+
 /// The load table and the world's write side, behind one lock.
 struct Loads {
     ranks: FxHashMap<WorkerId, Ranks>,
@@ -1850,12 +1881,13 @@ impl LoadSink for MemoryStore {
             writer,
         } = &mut *loads;
         // The answer is one engine's: its rows are written whole before
-        // the one judgment and the one publication, so its ranks are read
+        // its judgment and the one publication, so its ranks are read
         // as one answer left them. A caller's mix of engines judges each,
         // and each engine is heard by its own ranks' rows.
-        let mut first: Option<(u32, bool)> = None;
-        let mut others: Vec<(u32, bool)> = Vec::new();
+        let mut first: Option<(u32, Brought)> = None;
+        let mut others: Vec<(u32, Brought)> = Vec::new();
         let mut omits = false;
+        let mut passed = false;
         for &(id, rank, row) in answer {
             // A report that lands after its worker left (the poll was out
             // when the row went) finds no entry and is dropped.
@@ -1864,10 +1896,13 @@ impl LoadSink for MemoryStore {
             };
             // A rank that pushed since the poll began keeps its record,
             // and its stream is heard: no word of the poll stands over it.
+            // A row the answer brings for it is passed over. It names its
+            // engine all the same, which is read below where it matters.
             if ranks.pushed_since(rank, polled_at) {
+                passed |= row.is_some();
                 continue;
             }
-            let (engine, heard) = match row {
+            let (engine, brought) = match row {
                 Some(row) => {
                     let age = Duration::from_millis(u64::from(row.report_age_ms));
                     let sample = LoadSample {
@@ -1886,24 +1921,33 @@ impl LoadSink for MemoryStore {
                         writer.hear(place, polled_at);
                         Some(engine)
                     });
-                    (engine, true)
+                    (engine, Brought::Heard)
                 }
                 // A rank the answer omits keeps what is on file.
                 None => {
                     omits = true;
-                    (writer.engine_of(id), false)
+                    (writer.engine_of(id), Brought::Nothing)
                 }
             };
-            let Some(engine) = engine else {
-                continue;
-            };
-            match &mut first {
-                None => first = Some((engine, heard)),
-                Some(seen) if seen.0 == engine => seen.1 |= heard,
-                Some(_) => match others.iter_mut().find(|seen| seen.0 == engine) {
-                    Some(seen) => seen.1 |= heard,
-                    None => others.push((engine, heard)),
-                },
+            if let Some(engine) = engine {
+                note(&mut first, &mut others, engine, brought);
+            }
+        }
+        // A row passed over names its engine as a written row does: the
+        // naming is the answer's, whichever sample stands. It moves a mark
+        // only beside a rank the answer left out, so the passed-over rows
+        // are read for their engines there and nowhere else.
+        if omits && passed {
+            for &(id, rank, row) in answer {
+                let pushed = table
+                    .get(&id)
+                    .is_some_and(|ranks| ranks.pushed_since(rank, polled_at));
+                if !pushed || row.is_none() {
+                    continue;
+                }
+                if let Some(engine) = writer.engine_of(id) {
+                    note(&mut first, &mut others, engine, Brought::Named);
+                }
             }
         }
         let Some(first) = first else {
@@ -1926,38 +1970,47 @@ impl LoadSink for MemoryStore {
                 let Some(engine) = writer.engine_of(id) else {
                     continue;
                 };
-                let heard = if first.0 == engine {
-                    first.1
+                let named = if first.0 == engine {
+                    first.1 != Brought::Nothing
                 } else {
-                    others.iter().any(|seen| seen.0 == engine && seen.1)
+                    others
+                        .iter()
+                        .any(|seen| seen.0 == engine && seen.1 != Brought::Nothing)
                 };
-                if heard {
+                if named {
                     writer.name(id, rank, row.is_none());
                 }
             }
         }
         let mut changed = false;
-        for (engine, heard) in std::iter::once(first).chain(others) {
-            changed |= if heard {
+        for (engine, brought) in std::iter::once(first).chain(others) {
+            changed |= match brought {
                 // A row was written: the engine is judged once, and the
                 // write is shown whether or not a verdict moved.
-                writer.judged(engine, true);
-                true
-            } else {
+                Brought::Heard => {
+                    writer.judged(engine, true);
+                    true
+                }
+                // No row was written, and the answer named a rank that
+                // pushed since the poll began beside a rank it left out:
+                // no word that none came. The mark the answer moved is
+                // judged and shown with it.
+                Brought::Named => writer.judged(engine, false),
                 // No row came for the engine: the word that none came,
-                // unless a rank of it pushed since the poll began, whether
-                // the answer names that rank or not. The word is shown
-                // where it moves a verdict. A rank the answer does not name
-                // may stand inside the window of its registration, or of a
-                // refresh that moved it, with no row at its rank here: the
-                // build reads what it reported against the word and the
-                // instant this poll began.
-                let pushed = writer.ranks_of(engine).any(|(id, rank)| {
-                    table
-                        .get(&id)
-                        .is_some_and(|ranks| ranks.pushed_since(rank, polled_at))
-                });
-                !pushed && writer.silence(engine, polled_at)
+                // unless a rank of it pushed since the poll began. The
+                // word is shown where it moves a verdict. A rank the answer
+                // does not name may stand inside the window of its
+                // registration, or of a refresh that moved it, with no row
+                // at its rank here: the build reads what it reported
+                // against the word and the instant this poll began.
+                Brought::Nothing => {
+                    let pushed = writer.ranks_of(engine).any(|(id, rank)| {
+                        table
+                            .get(&id)
+                            .is_some_and(|ranks| ranks.pushed_since(rank, polled_at))
+                    });
+                    !pushed && writer.silence(engine, polled_at)
+                }
             };
         }
         if changed {

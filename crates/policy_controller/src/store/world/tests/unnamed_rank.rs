@@ -6,14 +6,16 @@
 use std::time::{Duration, Instant};
 
 use super::{
-    ask, block, generation_with, load, member, overloaded, pressure, rank_among, rank_of, view,
+    ask, block, facts, generation_with, load, member, overloaded, pressure, rank_among, rank_of,
+    view, MODEL,
 };
 use crate::{
-    store::{LoadSink, LoadSource, MemoryStore, WorkersStore},
-    view::WorkerId,
+    store::{LoadSink, LoadSource, MemoryStore, WorkerFacts, WorkersStore},
+    view::{Role, WorkerId},
 };
 
 const ENGINE: &str = "grpc://e:9000";
+const OTHER: &str = "grpc://f:9000";
 
 /// A store with no threshold and the two ranks of one engine, each with a
 /// record on file from one answer.
@@ -81,6 +83,36 @@ fn an_answer_or_a_record_that_names_the_rank_ends_its_mark() {
 }
 
 #[test]
+fn the_write_that_ends_the_last_mark_is_counted_as_a_verdict_moved() {
+    let (store, t0, zero, one) = two_ranks();
+    names_one_alone(&store, zero, one, t0);
+    assert_eq!(store.overload_flips(), 1, "the mark");
+    // An answer that names the rank again clears its bit.
+    names_both(&store, zero, one, t0);
+    assert_eq!(
+        (overloaded(&store, t0), store.overload_flips()),
+        (vec![], 2)
+    );
+    // So does a record.
+    names_one_alone(&store, zero, one, t0);
+    let t1 = t0 + Duration::from_secs(1);
+    store.record(zero, 0, load(1, 0), t1, LoadSource::Stream);
+    assert_eq!(
+        (overloaded(&store, t1), store.overload_flips()),
+        (vec![], 4)
+    );
+    // And so does the eviction of the marked member.
+    let t2 = t1 + Duration::from_secs(1);
+    names_one_alone(&store, zero, one, t2);
+    store.evict(zero);
+    store.publish(t2);
+    assert_eq!(
+        (overloaded(&store, t2), store.overload_flips()),
+        (vec![], 6)
+    );
+}
+
+#[test]
 fn a_rank_that_pushed_since_the_poll_began_takes_no_mark_beside_one_the_answer_leaves_out() {
     // Three ranks of one engine, each with a record on file from one answer.
     let store = MemoryStore::with_publish_window(Duration::ZERO);
@@ -115,6 +147,95 @@ fn a_rank_that_pushed_since_the_poll_began_takes_no_mark_beside_one_the_answer_l
     let t2 = t1 + Duration::from_secs(1);
     store.record(one, 1, load(2, 0), t2, LoadSource::Stream);
     assert_eq!(overloaded(&store, t2), [two]);
+}
+
+#[test]
+fn a_rank_left_out_beside_a_named_rank_that_pushed_since_the_poll_began_is_avoided() {
+    let (store, t0, zero, one) = two_ranks();
+    // Rank one pushes as a poll begins. The poll's answer brings a row for
+    // it and none for rank zero: the record stands over the answer's row,
+    // and the answer named the rank all the same.
+    store.record(one, 1, load(5, 0), t0, LoadSource::Stream);
+    names_one_alone(&store, zero, one, t0);
+    assert_eq!(store.unnamed_ranks(), 1, "the answer named its peer");
+    // No row was written: the mark is judged and shown with the answer.
+    assert_eq!(overloaded(&store, t0), [zero]);
+    assert_eq!(store.overload_flips(), 1);
+    let rows = view(&store, &ask(t0)).0;
+    let row = rows.iter().find(|row| row.id == one).expect("its row");
+    assert_eq!(row.load.map(|load| load.running), Some(5), "the record");
+    // The same answer again moves nothing.
+    names_one_alone(&store, zero, one, t0);
+    assert_eq!(overloaded(&store, t0), [zero]);
+    assert_eq!((store.overload_flips(), store.unnamed_ranks()), (1, 1));
+}
+
+#[test]
+fn a_row_passed_over_for_a_record_ends_no_word_that_no_report_came() {
+    let (store, t0, zero, one) = two_ranks();
+    let mut both = [zero, one];
+    both.sort_unstable();
+    store
+        .apply(generation_with(1, block(8, 0.8)))
+        .expect("applied");
+    // Rank one pushes at the count: the engine's verdict holds both.
+    let t1 = t0 + Duration::from_secs(1);
+    store.record(one, 1, pressure(9, 0), t1, LoadSource::Stream);
+    assert_eq!(overloaded(&store, t1), both);
+    // A later poll brings no report, and the verdict reads clear.
+    let t2 = t1 + Duration::from_secs(1);
+    store.report(&[(zero, 0, None), (one, 1, None)], t2, LoadSource::Poll);
+    assert_eq!(overloaded(&store, t2), []);
+    // The answer of a poll that began before the record lands late. Its row
+    // for rank one is passed over: it marks the rank left out and ends no
+    // word, so the engine's own verdict still reads clear.
+    names_one_alone(&store, zero, one, t0);
+    store.publish(t2);
+    assert_eq!(overloaded(&store, t2), [zero]);
+}
+
+#[test]
+fn an_answer_that_only_names_an_engine_is_no_word_that_no_report_came() {
+    let (store, t0, zero, one) = two_ranks();
+    let mut both = [zero, one];
+    both.sort_unstable();
+    store
+        .apply(generation_with(1, block(8, 0.8)))
+        .expect("applied");
+    // Rank one pushes at the count: the engine's verdict holds both.
+    let t1 = t0 + Duration::from_secs(1);
+    store.record(one, 1, pressure(9, 0), t1, LoadSource::Stream);
+    assert_eq!(overloaded(&store, t1), both);
+    // The answer of a poll that began before the record brings rank one's
+    // row and leaves rank zero out. The row is passed over, and the engine
+    // was heard by its record: the verdict stands.
+    names_one_alone(&store, zero, one, t0);
+    store.publish(t1);
+    assert_eq!(overloaded(&store, t1), both);
+}
+
+#[test]
+fn a_mixed_answer_marks_the_rank_left_out_of_each_engine_it_names() {
+    // Two engines in one answer: a written row names the first, and a row
+    // passed over for a record names the second.
+    let (store, t0, zero, one) = two_ranks();
+    let [far_zero, far_one] = [0, 1].map(|rank| rank_of(&store, OTHER, rank));
+    names_both(&store, far_zero, far_one, t0);
+    store.record(far_one, 1, load(2, 0), t0, LoadSource::Stream);
+    store.report(
+        &[
+            (zero, 0, None),
+            (one, 1, Some(load(2, 0))),
+            (far_zero, 0, None),
+            (far_one, 1, Some(load(2, 0))),
+        ],
+        t0,
+        LoadSource::Poll,
+    );
+    let mut left_out = [zero, far_zero];
+    left_out.sort_unstable();
+    assert_eq!(overloaded(&store, t0), left_out);
+    assert_eq!(store.unnamed_ranks(), 2);
 }
 
 #[test]
@@ -178,6 +299,28 @@ fn a_membership_write_keeps_the_mark_and_a_member_that_leaves_takes_its_own() {
     let revision = WorkersStore::get(&store, zero).expect("the row").revision;
     store.remove(zero, revision).expect("removed");
     assert_eq!(store.unnamed_ranks(), 0);
+}
+
+#[test]
+fn a_refresh_that_moves_a_member_s_rank_number_takes_the_mark_on_the_old_one() {
+    let (store, t0, zero, one) = two_ranks();
+    names_one_alone(&store, zero, one, t0);
+    assert_eq!((store.unnamed_ranks(), store.judges_writes()), (1, true));
+    // The member registers again under its key and incarnation as another
+    // rank of the engine: no answer or record names the old number again.
+    let refreshed = store
+        .upsert(WorkerFacts {
+            engine: ENGINE.to_string(),
+            dp_rank: 2,
+            dp_size: 3,
+            ..facts(&format!("{ENGINE}#0"), Role::Single, &[MODEL])
+        })
+        .id();
+    assert_eq!(refreshed, zero, "one id");
+    // The write leaves a build owed, and the mark goes with that build.
+    store.publish_now();
+    assert_eq!((store.unnamed_ranks(), store.judges_writes()), (0, false));
+    assert_eq!(overloaded(&store, t0), []);
 }
 
 #[test]

@@ -1930,12 +1930,13 @@ pub(super) struct Writer {
     silenced: u32,
     /// The ranks an engine's last answer left unnamed beside a rank it
     /// named, each by its member and its rank's number, sorted. A rank
-    /// stands here until an answer or a record names it again, or its
-    /// member's rows go. While a rank the answer named has a record on
-    /// file, an unnamed rank's rows carry the overload bit
-    /// ([`Self::judge`]): no decision takes a rank its engine stopped
-    /// naming while another answers. Empty until an answer names part of
-    /// an engine.
+    /// stands here until an answer or a record names it again, its
+    /// member's rows go, or the build that follows its member's
+    /// registration under another rank number. While a rank the answer
+    /// named has a record on file, an unnamed rank's rows carry the
+    /// overload bit ([`Self::judge`]): a decision that drops overloaded
+    /// rows takes no rank its engine stopped naming while another
+    /// answers. Empty until an answer names part of an engine.
     unnamed: Vec<(WorkerId, u16)>,
     /// How many writes to the load table moved an overload verdict.
     flips: u64,
@@ -2222,8 +2223,10 @@ impl Writer {
     /// rows start with no bit, and an applied generation may hand any pool
     /// another pair or none: an engine that had a threshold is judged once
     /// more under what it has now, so a bit no threshold holds is cleared.
-    fn judge_every(&mut self) {
+    /// Whether a verdict moved.
+    fn judge_every(&mut self) -> bool {
         self.judging = false;
+        let mut moved = false;
         for index in 0..self.engines.len() {
             // A rank stands unnamed only while the writer judges: a record
             // reads a mark behind that one test.
@@ -2234,12 +2237,22 @@ impl Writer {
             };
             let had = mem::replace(&mut engine.judged, true);
             if had || has {
-                self.judge(index as u32);
+                moved |= self.judge(index as u32);
             }
             if let Some(engine) = self.engines.get_mut(index) {
                 engine.judged = has;
             }
         }
+        moved
+    }
+
+    /// The last mark went: every engine is judged once more, and one with
+    /// no threshold is judged at no write after it. The write that ended
+    /// the mark is counted here where that judgment moves a verdict: its
+    /// door's own judgment comes after and finds the bit cleared.
+    fn judge_unmarked(&mut self) {
+        let moved = self.judge_every();
+        self.flips += u64::from(moved);
     }
 
     /// Judge one engine over what is on file for its ranks and write the
@@ -2546,10 +2559,8 @@ impl Writer {
             }
             (Ok(at), false) => {
                 self.unnamed.remove(at);
-                // The last mark went: every engine is judged once more, and
-                // one with no threshold is judged at no write after it.
                 if self.unnamed.is_empty() {
-                    self.judge_every();
+                    self.judge_unmarked();
                 }
                 true
             }
@@ -2571,17 +2582,30 @@ impl Writer {
         self.unnamed.retain(|&(member, _)| member != id);
         let went = self.unnamed.len() != before;
         if went && self.unnamed.is_empty() {
-            self.judge_every();
+            self.judge_unmarked();
         }
         went
     }
 
-    /// The marks of the members a membership write removed go with them.
+    /// The marks of the members a membership write removed go with them,
+    /// and so does a mark on a rank number its member no longer holds: a
+    /// refresh may move the number under one id, and no answer or record
+    /// names the old one again.
     fn forget_gone(&mut self) {
         let Self {
-            unnamed, places, ..
+            unnamed,
+            places,
+            working,
+            ..
         } = self;
-        unnamed.retain(|&(id, _)| places_of(places, id).next().is_some());
+        unnamed.retain(|&(id, rank)| {
+            places_of(places, id).any(|place| {
+                working
+                    .get(place.pool as usize)
+                    .and_then(|pool| pool.rows.get(place.row as usize))
+                    .is_some_and(|row| row.dp_rank == rank)
+            })
+        });
     }
 
     /// Whether an answer left a rank of the engine unnamed.
