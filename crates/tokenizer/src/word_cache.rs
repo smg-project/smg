@@ -1563,8 +1563,8 @@ mod tests {
     fn a_unigram_section_reports_its_largest_id_in_any_order_of_its_keys() {
         let entries = unigram_entries();
         assert_eq!(entries.len(), 4, "type, unk_id, vocab, byte_fallback");
-        // With `type` and without it: `unk_id` or a vocabulary of scored
-        // pieces tells the kind as well.
+        // With `type` and without it: without `type`, the list of scored
+        // pieces tells the kind, and `unk_id` is held until then.
         for entries in [&entries[..], &entries[1..]] {
             for order in orders(entries) {
                 let text = section_of(&order);
