@@ -654,8 +654,9 @@ pub struct LoadSnapshot {
     /// committed output of each as its sequence holds them right now: a
     /// request still waiting holds none, and a prefix two requests share
     /// counts for both. A servicer sends it where its wire's load report
-    /// has the figure.
-    pub num_resident_tokens: i64,
+    /// has the figure. `None` on the row of a worker that runs no engine:
+    /// it holds requests and counts none of them.
+    pub num_resident_tokens: Option<i64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -2249,7 +2250,7 @@ impl SchedulerState {
             num_cached_blocks: self.pool.cached().min(i32::MAX as usize) as i32,
             num_preemptions: self.preemptions.min(i64::MAX as u64) as i64,
             num_kv_batches: self.kv_seq.min(i64::MAX as u64) as i64,
-            num_resident_tokens: self.running.iter().map(|r| i64::from(r.seq_len())).sum(),
+            num_resident_tokens: Some(self.running.iter().map(|r| i64::from(r.seq_len())).sum()),
         }
     }
 
@@ -3004,7 +3005,7 @@ impl LoadSnapshot {
             num_cached_blocks: 0,
             num_preemptions: 0,
             num_kv_batches: 0,
-            num_resident_tokens: 0,
+            num_resident_tokens: Some(0),
         }
     }
 }
@@ -4525,7 +4526,7 @@ mod tests {
     fn resident_tokens_count_each_running_sequence() {
         let p = EngineParams::default();
         let mut st = SchedulerState::new();
-        assert_eq!(st.snapshot(&p).num_resident_tokens, 0, "an idle rank");
+        assert_eq!(st.snapshot(&p).num_resident_tokens, Some(0), "an idle rank");
         let (first, mut first_rx) = req("resident-1", vec![7; 48], 6);
         let (second, mut second_rx) = req("resident-2", vec![7; 48], 6);
         st.enqueue(first, &p);
@@ -4553,7 +4554,7 @@ mod tests {
             if done == [false; 2] && tokens.iter().all(|sent| *sent > 0) {
                 assert_eq!(
                     st.snapshot(&p).num_resident_tokens,
-                    2 * 48 + tokens[0] + tokens[1],
+                    Some(2 * 48 + tokens[0] + tokens[1]),
                     "tokens so far: {tokens:?}"
                 );
                 counted = true;
@@ -4561,7 +4562,7 @@ mod tests {
         }
         assert!(counted, "both requests ran together past their prefill");
         assert_eq!(done, [true; 2], "both requests finished");
-        assert_eq!(st.snapshot(&p).num_resident_tokens, 0, "nothing runs");
+        assert_eq!(st.snapshot(&p).num_resident_tokens, Some(0), "nothing runs");
     }
 
     #[test]
@@ -4580,7 +4581,7 @@ mod tests {
             num_cached_blocks: 42_000,
             num_preemptions: 0,
             num_kv_batches: 10,
-            num_resident_tokens: 90_000,
+            num_resident_tokens: Some(90_000),
         };
         assert_eq!(full.as_reported_by(LoadsLike::Mock), full);
         let v = full.as_reported_by(LoadsLike::Vllm);

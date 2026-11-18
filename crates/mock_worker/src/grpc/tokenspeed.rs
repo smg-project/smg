@@ -185,7 +185,7 @@ impl TokenSpeedScheduler for MockScheduler {
                 utilization: s.token_usage,
                 memory: None,
                 queues: None,
-                num_resident_tokens: Some(s.num_resident_tokens),
+                num_resident_tokens: s.num_resident_tokens,
             })
             .collect();
         Ok(Response::new(ts::GetLoadsResponse {

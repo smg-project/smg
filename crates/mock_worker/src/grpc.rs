@@ -1056,7 +1056,8 @@ impl MockScheduler {
     /// alone, as the servicers answer; each wire shapes the rows into its
     /// `SchedulerLoad`. A canned worker is one rank whose running count is
     /// the canned and scripted answers with a stream still open on this
-    /// worker (not the process's other workers); nothing waits there.
+    /// worker (not the process's other workers); nothing waits there, and
+    /// with no engine to count them its row carries no resident tokens.
     pub(crate) fn load_rows(&self, wanted: Option<i32>) -> Vec<(i32, engine::LoadSnapshot)> {
         self.overrides.note_loads_poll();
         let mut rows: Vec<(i32, engine::LoadSnapshot)> = if self.ranks.is_empty() {
@@ -1077,7 +1078,7 @@ impl MockScheduler {
                     num_cached_blocks: 0,
                     num_preemptions: 0,
                     num_kv_batches: 0,
-                    num_resident_tokens: 0,
+                    num_resident_tokens: None,
                 },
             )]
         } else {
@@ -1808,9 +1809,10 @@ impl RankLoadSource {
     fn record(&self, like: LoadsLike, step_reports: bool, sample: u64) -> common::EngineLoad {
         let snapshot = self.engine.load().as_reported_by(like);
         let mut record = load_record(&snapshot, like, sample);
-        record.num_resident_tokens = self
-            .counts_resident
-            .then(|| u64::try_from(snapshot.num_resident_tokens).unwrap_or(0));
+        record.num_resident_tokens = snapshot
+            .num_resident_tokens
+            .filter(|_| self.counts_resident)
+            .map(|held| u64::try_from(held).unwrap_or(0));
         record.engine_silence_ms = silence_ms(&self.engine);
         record.engine_reports_steps = Some(step_reports);
         record.prefill_pending_tokens = Some(pending_u32(&self.prefill_pending));
@@ -2912,6 +2914,29 @@ mod tests {
                 .collect();
             assert_eq!(pools, vec![tokens, tokens], "{}", service.name);
         }
+    }
+
+    /// A canned worker runs no engine: its one polled row holds requests
+    /// and counts none of them, so it carries no resident figure where a
+    /// rank that runs nothing carries zero.
+    #[tokio::test]
+    async fn a_canned_workers_polled_row_carries_no_resident_tokens() {
+        let (service, _stop) = MockScheduler::for_tests(Config::default(), 65_131);
+        let loads = service
+            .get_loads(Request::new(ts::GetLoadsRequest::default()))
+            .await
+            .expect("loads")
+            .into_inner();
+        let counted: Vec<Option<i64>> = loads
+            .loads
+            .iter()
+            .map(|load| load.num_resident_tokens)
+            .collect();
+        assert_eq!(
+            counted,
+            vec![None],
+            "one row, and no count of what it holds"
+        );
     }
 
     /// `GetLoads` lists one entry per rank, the request's `dp_rank` keeping

@@ -41,7 +41,7 @@ wire; the other RPCs (`GetTokenizer`, embeddings, LoRA) return `unimplemented`.
 `GetLoads` and the pushed load record count a rank's resident tokens
 (`num_resident_tokens`, the context tokens of the requests it runs) on the
 TokenSpeed wire, whose load report has the figure; the other two wires send
-none. The canned
+none, and so does a canned worker, which runs no engine. The canned
 and scripted answers, the realistic engine, the data-parallel ranks and the
 prefill/decode roles are the same behind each wire; each shapes its own
 messages (a role is `disaggregation_mode` in the server args on the TokenSpeed
