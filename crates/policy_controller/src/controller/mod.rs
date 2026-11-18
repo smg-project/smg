@@ -11,7 +11,9 @@
 //! `elected` mode the gateway runs this same loop inside its process. A
 //! controller given a spec file runs its document, watches the file and
 //! answers `GetPolicySpec` and a dry run of `ApplyPolicySpec`
-//! ([`Controller::spec_file`]).
+//! ([`Controller::spec_file`]). A controller given a spec store runs the
+//! newest generation on file, takes its document through the apply call and
+//! rolls back to a generation on file ([`Controller::spec_store`]).
 //!
 //! A controller is bound first and served second ([`Controller::bind`], then
 //! [`Controller::serve`]): the bind takes every address (port `0` for an
@@ -46,6 +48,7 @@ mod run;
 mod service;
 mod session;
 mod spec_file;
+mod spec_store;
 pub mod tls;
 mod watch_workers;
 mod wire;
@@ -76,6 +79,7 @@ pub use self::{
     principal::ENTRY as PRINCIPAL_ENTRY,
     readiness::{Readiness, State},
     run::run,
+    spec_store::StoreRefused,
     tls::TlsError,
 };
 use self::{
@@ -84,6 +88,7 @@ use self::{
     readiness::Phase,
     service::{Service, Shared},
     spec_file::SpecFile,
+    spec_store::SpecStore,
 };
 use crate::{
     catalog::Catalog,
@@ -270,6 +275,16 @@ pub enum Error {
         /// Why its document was not applied.
         #[source]
         source: SpecRejected,
+    },
+    /// The spec store could not be read, its newest generation does not
+    /// run, or this controller cannot take one.
+    #[error("the spec store {}: {source}", .path.display())]
+    SpecStore {
+        /// The directory.
+        path: PathBuf,
+        /// Why it did not become the spec's source.
+        #[source]
+        source: StoreRefused,
     },
     /// The lease's place could not be opened, or the elector refused its
     /// identity.
@@ -510,8 +525,9 @@ impl Controller {
     /// A file that cannot be read, or a document the validator refuses, is
     /// refused here, before anything serves. The document names the stages
     /// the bind was handed ([`Controller::catalog`]), a host's own among
-    /// them. A controller that takes no spec file serves no spec call,
-    /// watches nothing and renders no spec series.
+    /// them. A controller that takes no spec source serves no spec call,
+    /// watches nothing and renders no spec series, and one that took a spec
+    /// store takes no file ([`SpecRejected::SecondSource`]).
     pub async fn spec_file(&mut self, path: impl Into<PathBuf>) -> Result<(), Error> {
         let path = path.into();
         let generations = Arc::clone(&self.shared.generations);
@@ -529,6 +545,51 @@ impl Controller {
             path = %path.display(),
             generation = self.shared.generations.generation(),
             "spec file"
+        );
+        self.metrics.spec(Arc::clone(&self.shared.generations));
+        Ok(())
+    }
+
+    /// Takes the controller's policy spec through the apply call, persisted
+    /// in the directory at `dir` (design 4.6): the newest generation on
+    /// file is applied now, under the number its name states, and the
+    /// control scope then takes `ApplyPolicySpec` in enforce mode where
+    /// this replica leads. A document is persisted in the directory, then
+    /// applied as the next generation; a rollback runs a generation on file
+    /// again as the next one, and the read call answers a generation on
+    /// file by its number. A directory with no generation on file starts
+    /// the controller with no document, until the first apply.
+    ///
+    /// Refused here, before anything serves ([`StoreRefused`]): a path that
+    /// leads to no directory, a directory that is not read, two files under
+    /// one number, a newest generation that does not run, a spec source
+    /// taken before this one, and a lease another replica can take
+    /// ([`LeasePlace`]). A standby does not follow an applied generation in
+    /// this build, so a promoted one would run without it.
+    pub async fn spec_store(&mut self, dir: impl Into<PathBuf>) -> Result<(), Error> {
+        let path = dir.into();
+        let refused = |source| Error::SpecStore {
+            path: path.clone(),
+            source,
+        };
+        if self.config.election.lease.is_shared() {
+            return Err(refused(StoreRefused::BesideASharedLease));
+        }
+        let generations = Arc::clone(&self.shared.generations);
+        let bound = {
+            let path = path.clone();
+            tokio::task::spawn_blocking(move || generations.bind_store(SpecStore::open(path)?))
+        };
+        match bound.await {
+            Ok(Ok(())) => {}
+            Ok(Err(source)) => return Err(refused(source)),
+            Err(join) => return Err(Error::Task(join.to_string())),
+        }
+        info!(
+            controller_id = %self.config.controller_id,
+            path = %path.display(),
+            generation = self.shared.generations.generation(),
+            "spec store"
         );
         self.metrics.spec(Arc::clone(&self.shared.generations));
         Ok(())

@@ -235,6 +235,10 @@ required-features = ["controller"]
 name = "spec_file"
 required-features = ["controller"]
 
+[[test]]
+name = "spec_store"
+required-features = ["controller"]
+
 # Replays recorded rows through the row builder of `ingest`: a bare test run builds no part of it.
 [[test]]
 name = "classic_rows"
