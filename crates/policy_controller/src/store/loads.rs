@@ -78,9 +78,10 @@ pub struct LoadSample {
 /// brings a row for one rank of an engine and none for another, the rank it
 /// left out carries the overload bit on its rows while a rank the answer
 /// named has a record on file, whether or not a threshold stands. The mark
-/// ends when an answer or a record names the rank again, and goes with the
-/// member's rows. A rank alone is never avoided: with no named rank on file
-/// it reads as its engine does.
+/// ends when an answer or a record names the rank again. It goes with the
+/// member's rows, and with the build that follows the member's
+/// registration under another rank number. A rank alone is never avoided:
+/// with no named rank on file it reads as its engine does.
 ///
 /// A worker's rows live exactly as long as its membership row: the write
 /// that removes or replaces the worker deletes them, and a record or a

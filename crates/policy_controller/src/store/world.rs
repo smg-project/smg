@@ -1930,12 +1930,13 @@ pub(super) struct Writer {
     silenced: u32,
     /// The ranks an engine's last answer left unnamed beside a rank it
     /// named, each by its member and its rank's number, sorted. A rank
-    /// stands here until an answer or a record names it again, or its
-    /// member's rows go. While a rank the answer named has a record on
-    /// file, an unnamed rank's rows carry the overload bit
-    /// ([`Self::judge`]): a decision that drops overloaded rows takes no
-    /// rank its engine stopped naming while another answers. Empty until
-    /// an answer names part of an engine.
+    /// stands here until an answer or a record names it again, its
+    /// member's rows go, or the build that follows its member's
+    /// registration under another rank number. While a rank the answer
+    /// named has a record on file, an unnamed rank's rows carry the
+    /// overload bit ([`Self::judge`]): a decision that drops overloaded
+    /// rows takes no rank its engine stopped naming while another
+    /// answers. Empty until an answer names part of an engine.
     unnamed: Vec<(WorkerId, u16)>,
     /// How many writes to the load table moved an overload verdict.
     flips: u64,

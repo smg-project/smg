@@ -1677,9 +1677,9 @@ impl Ranks {
     }
 }
 
-/// What a poll's answer says of one engine, the least first.
+/// What a poll's answer brought of one engine, the least first.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum Said {
+enum Brought {
     /// No row for a rank of it.
     Nothing,
     /// A row for a rank that pushed since the poll began: the row is passed
@@ -1689,16 +1689,21 @@ enum Said {
     Heard,
 }
 
-/// Note what an answer says of `engine`: the most it says stands. Inlined:
-/// the pass over an answer's rows runs it a row.
+/// Note what an answer brought of `engine`: the most it brought stands.
+/// Inlined: the pass over an answer's rows runs it a row.
 #[inline]
-fn say(first: &mut Option<(u32, Said)>, others: &mut Vec<(u32, Said)>, engine: u32, said: Said) {
+fn note(
+    first: &mut Option<(u32, Brought)>,
+    others: &mut Vec<(u32, Brought)>,
+    engine: u32,
+    brought: Brought,
+) {
     match first {
-        None => *first = Some((engine, said)),
-        Some(seen) if seen.0 == engine => seen.1 = seen.1.max(said),
+        None => *first = Some((engine, brought)),
+        Some(seen) if seen.0 == engine => seen.1 = seen.1.max(brought),
         Some(_) => match others.iter_mut().find(|seen| seen.0 == engine) {
-            Some(seen) => seen.1 = seen.1.max(said),
-            None => others.push((engine, said)),
+            Some(seen) => seen.1 = seen.1.max(brought),
+            None => others.push((engine, brought)),
         },
     }
 }
@@ -1793,8 +1798,8 @@ impl LoadSink for MemoryStore {
         // its judgment and the one publication, so its ranks are read
         // as one answer left them. A caller's mix of engines judges each,
         // and each engine is heard by its own ranks' rows.
-        let mut first: Option<(u32, Said)> = None;
-        let mut others: Vec<(u32, Said)> = Vec::new();
+        let mut first: Option<(u32, Brought)> = None;
+        let mut others: Vec<(u32, Brought)> = Vec::new();
         let mut omits = false;
         let mut passed = false;
         for &(id, rank, row) in answer {
@@ -1811,7 +1816,7 @@ impl LoadSink for MemoryStore {
                 passed |= row.is_some();
                 continue;
             }
-            let (engine, said) = match row {
+            let (engine, brought) = match row {
                 Some(row) => {
                     let age = Duration::from_millis(u64::from(row.report_age_ms));
                     let sample = LoadSample {
@@ -1830,16 +1835,16 @@ impl LoadSink for MemoryStore {
                         writer.hear(place, polled_at);
                         Some(engine)
                     });
-                    (engine, Said::Heard)
+                    (engine, Brought::Heard)
                 }
                 // A rank the answer omits keeps what is on file.
                 None => {
                     omits = true;
-                    (writer.engine_of(id), Said::Nothing)
+                    (writer.engine_of(id), Brought::Nothing)
                 }
             };
             if let Some(engine) = engine {
-                say(&mut first, &mut others, engine, said);
+                note(&mut first, &mut others, engine, brought);
             }
         }
         // A row passed over names its engine as a written row does: the
@@ -1855,7 +1860,7 @@ impl LoadSink for MemoryStore {
                     continue;
                 }
                 if let Some(engine) = writer.engine_of(id) {
-                    say(&mut first, &mut others, engine, Said::Named);
+                    note(&mut first, &mut others, engine, Brought::Named);
                 }
             }
         }
@@ -1880,11 +1885,11 @@ impl LoadSink for MemoryStore {
                     continue;
                 };
                 let named = if first.0 == engine {
-                    first.1 != Said::Nothing
+                    first.1 != Brought::Nothing
                 } else {
                     others
                         .iter()
-                        .any(|seen| seen.0 == engine && seen.1 != Said::Nothing)
+                        .any(|seen| seen.0 == engine && seen.1 != Brought::Nothing)
                 };
                 if named {
                     writer.name(id, rank, row.is_none());
@@ -1892,11 +1897,11 @@ impl LoadSink for MemoryStore {
             }
         }
         let mut changed = false;
-        for (engine, said) in std::iter::once(first).chain(others) {
-            changed |= match said {
+        for (engine, brought) in std::iter::once(first).chain(others) {
+            changed |= match brought {
                 // A row was written: the engine is judged once, and the
                 // write is shown whether or not a verdict moved.
-                Said::Heard => {
+                Brought::Heard => {
                     writer.judged(engine, true);
                     true
                 }
@@ -1904,7 +1909,7 @@ impl LoadSink for MemoryStore {
                 // pushed since the poll began beside a rank it left out:
                 // no word that none came. The mark the answer moved is
                 // judged and shown with it.
-                Said::Named => writer.judged(engine, false),
+                Brought::Named => writer.judged(engine, false),
                 // No row came for the engine: the word that none came,
                 // unless a rank of it pushed since the poll began. The
                 // word is shown where it moves a verdict. A rank the answer
@@ -1912,7 +1917,7 @@ impl LoadSink for MemoryStore {
                 // registration, or of a refresh that moved it, with no row
                 // at its rank here: the build reads what it reported
                 // against the word and the instant this poll began.
-                Said::Nothing => {
+                Brought::Nothing => {
                     let pushed = writer.ranks_of(engine).any(|(id, rank)| {
                         table
                             .get(&id)

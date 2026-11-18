@@ -195,6 +195,26 @@ fn a_row_passed_over_for_a_record_ends_no_word_that_no_report_came() {
 }
 
 #[test]
+fn an_answer_that_only_names_an_engine_is_no_word_that_no_report_came() {
+    let (store, t0, zero, one) = two_ranks();
+    let mut both = [zero, one];
+    both.sort_unstable();
+    store
+        .apply(generation_with(1, block(8, 0.8)))
+        .expect("applied");
+    // Rank one pushes at the count: the engine's verdict holds both.
+    let t1 = t0 + Duration::from_secs(1);
+    store.record(one, 1, pressure(9, 0), t1, LoadSource::Stream);
+    assert_eq!(overloaded(&store, t1), both);
+    // The answer of a poll that began before the record brings rank one's
+    // row and leaves rank zero out. The row is passed over, and the engine
+    // was heard by its record: the verdict stands.
+    names_one_alone(&store, zero, one, t0);
+    store.publish(t1);
+    assert_eq!(overloaded(&store, t1), both);
+}
+
+#[test]
 fn a_mixed_answer_marks_the_rank_left_out_of_each_engine_it_names() {
     // Two engines in one answer: a written row names the first, and a row
     // passed over for a record names the second.
