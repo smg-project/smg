@@ -1,8 +1,8 @@
 //! A worker's engine connection as the worker runtime sees it.
 //!
 //! [`EngineConnection`] holds the calls the runtime makes on a connected
-//! engine: liveness, the health and load reads, the admin calls and the KV
-//! subscriptions. [`EngineConnector`] makes a connection. The host
+//! engine: liveness, the health and load reads and the admin calls, each in
+//! the worker's own types. [`EngineConnector`] makes a connection. The host
 //! implements both over its own client type and hands the connector to the
 //! worker builder; the request path reads its own client type back from the
 //! handle with `downcast_arc`.
@@ -11,8 +11,7 @@ use std::{any::Any, fmt, sync::Arc, time::Duration};
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
-use openai_protocol::worker::{RuntimeType, WorkerLoadResponse, WorkerType};
-use smg_grpc_client::common_proto;
+use openai_protocol::worker::{ProfileOptions, RuntimeType, WorkerLoadResponse, WorkerType};
 use tokio::sync::OnceCell;
 
 type ConnectionCell = OnceCell<Arc<dyn EngineConnection>>;
@@ -55,6 +54,15 @@ impl EngineConnectionCache {
 pub const NO_ENGINE_CONNECTOR: &str = "the worker was built without an engine connector: \
     hand one to its builder, or build it through the host's name for the builder";
 
+/// An engine's answer to an admin call, in the worker's own words.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdminAnswer {
+    /// Whether the engine did what it was asked.
+    pub success: bool,
+    /// What the engine said about it; an engine may say nothing.
+    pub message: String,
+}
+
 /// The calls the worker runtime makes on a worker's connection to its
 /// engine, over gRPC or ZMQ. The worker holds the host's client behind this
 /// trait and shares it with the request path.
@@ -76,30 +84,13 @@ pub trait EngineConnection: Any + Send + Sync {
 
     /// Flush the engine's KV cache; `timeout_s` is the wait the engine is
     /// asked to honor.
-    async fn flush_cache(
-        &self,
-        timeout_s: f32,
-    ) -> Result<common_proto::FlushCacheResponse, tonic::Status>;
+    async fn flush_cache(&self, timeout_s: f32) -> Result<AdminAnswer, tonic::Status>;
 
-    /// Start a profiling run on the engine.
-    async fn start_profile(
-        &self,
-        req: common_proto::StartProfileRequest,
-    ) -> Result<common_proto::ProfileResponse, tonic::Status>;
+    /// Start a profiling run on the engine with the worker's `options`.
+    async fn start_profile(&self, options: &ProfileOptions) -> Result<AdminAnswer, tonic::Status>;
 
     /// Stop the profiling run in flight on the engine.
-    async fn stop_profile(&self) -> Result<common_proto::ProfileResponse, tonic::Status>;
-
-    /// Subscribe to the engine's KV cache events from `start_seq` on.
-    async fn subscribe_kv_events(
-        &self,
-        start_seq: u64,
-    ) -> Result<tonic::Streaming<common_proto::KvEventBatch>, tonic::Status>;
-
-    /// Subscribe to the engine's load records alone, no events.
-    async fn subscribe_load_records(
-        &self,
-    ) -> Result<tonic::Streaming<common_proto::KvEventBatch>, tonic::Status>;
+    async fn stop_profile(&self) -> Result<AdminAnswer, tonic::Status>;
 
     /// The KV transfer engine id the engine's server info reports; `None`
     /// when it reports none.

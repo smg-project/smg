@@ -13,8 +13,11 @@ use std::sync::{Arc, LazyLock};
 use async_trait::async_trait;
 use engine_zmq_adapter::admin::{flush_reply_wait, PROFILE_WAIT};
 use openai_protocol::{
-    chat::ChatCompletionRequest, completion::CompletionRequest, generate::GenerateRequest,
-    messages::CreateMessageRequest, worker::WorkerLoadResponse,
+    chat::ChatCompletionRequest,
+    completion::CompletionRequest,
+    generate::GenerateRequest,
+    messages::CreateMessageRequest,
+    worker::{ProfileOptions, WorkerLoadResponse},
 };
 use smg_grpc_client::{
     common_proto, sglang_proto,
@@ -42,8 +45,11 @@ use crate::{
         MultimodalData,
     },
     worker::{
-        connection::engine::{ConnectorDefault, EngineConnection, EngineConnector, ZmqLink},
+        connection::engine::{
+            AdminAnswer, ConnectorDefault, EngineConnection, EngineConnector, ZmqLink,
+        },
         identity::endpoint::Endpoint,
+        kv::event_monitor::EngineStreams,
         RuntimeType, Worker, WorkerError, WorkerResult,
     },
 };
@@ -399,47 +405,67 @@ impl EngineConnection for BackendClient {
         }
     }
 
-    async fn flush_cache(
-        &self,
-        timeout_s: f32,
-    ) -> Result<common_proto::FlushCacheResponse, tonic::Status> {
-        match self {
-            Self::Grpc(client) => client.flush_cache(timeout_s).await,
+    async fn flush_cache(&self, timeout_s: f32) -> Result<AdminAnswer, tonic::Status> {
+        let (success, message) = match self {
+            Self::Grpc(client) => {
+                let answer = client.flush_cache(timeout_s).await?;
+                (answer.success, answer.message)
+            }
             // The reply wait is the servicers' rule, read from the adapter.
             Self::Zmq(client) => {
-                let (success, message) = client
+                client
                     .flush_cache_control(timeout_s, flush_reply_wait(timeout_s))
-                    .await?;
-                Ok(common_proto::FlushCacheResponse { success, message })
+                    .await?
             }
-        }
+        };
+        Ok(AdminAnswer { success, message })
     }
 
-    async fn start_profile(
-        &self,
-        req: common_proto::StartProfileRequest,
-    ) -> Result<common_proto::ProfileResponse, tonic::Status> {
-        match self {
-            Self::Grpc(client) => client.start_profile(req).await,
+    async fn start_profile(&self, options: &ProfileOptions) -> Result<AdminAnswer, tonic::Status> {
+        let req = common_proto::StartProfileRequest {
+            output_dir: options.output_dir.clone(),
+            start_step: options.start_step,
+            num_steps: options.num_steps,
+            activities: options.activities.clone().unwrap_or_default(),
+            with_stack: options.with_stack,
+            record_shapes: options.record_shapes,
+            profile_by_stage: options.profile_by_stage,
+        };
+        let (success, message) = match self {
+            Self::Grpc(client) => {
+                let answer = client.start_profile(req).await?;
+                (answer.success, answer.message)
+            }
             Self::Zmq(client) => {
-                let (success, message) = client
+                client
                     .profile_control(Some(SglangProfileStart::from_request(req)), PROFILE_WAIT)
-                    .await?;
-                Ok(common_proto::ProfileResponse { success, message })
+                    .await?
             }
-        }
+        };
+        Ok(AdminAnswer { success, message })
     }
 
-    async fn stop_profile(&self) -> Result<common_proto::ProfileResponse, tonic::Status> {
-        match self {
-            Self::Grpc(client) => client.stop_profile().await,
-            Self::Zmq(client) => {
-                let (success, message) = client.profile_control(None, PROFILE_WAIT).await?;
-                Ok(common_proto::ProfileResponse { success, message })
+    async fn stop_profile(&self) -> Result<AdminAnswer, tonic::Status> {
+        let (success, message) = match self {
+            Self::Grpc(client) => {
+                let answer = client.stop_profile().await?;
+                (answer.success, answer.message)
             }
-        }
+            Self::Zmq(client) => client.profile_control(None, PROFILE_WAIT).await?,
+        };
+        Ok(AdminAnswer { success, message })
     }
 
+    async fn kv_engine_id(&self) -> Result<Option<String>, tonic::Status> {
+        let mut labels = BackendClient::get_server_info(self).await?.to_labels();
+        Ok(labels.remove("kv_engine_id").filter(|id| !id.is_empty()))
+    }
+}
+
+/// The engine's two pushed streams, for their one caller: the subscription
+/// loop of the KV event monitor.
+#[async_trait]
+impl EngineStreams for BackendClient {
     async fn subscribe_kv_events(
         &self,
         start_seq: u64,
@@ -463,11 +489,6 @@ impl EngineConnection for BackendClient {
                 "SubscribeKvEvents not supported over ZMQ",
             )),
         }
-    }
-
-    async fn kv_engine_id(&self) -> Result<Option<String>, tonic::Status> {
-        let mut labels = BackendClient::get_server_info(self).await?.to_labels();
-        Ok(labels.remove("kv_engine_id").filter(|id| !id.is_empty()))
     }
 }
 
