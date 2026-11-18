@@ -146,6 +146,13 @@ pub enum LeaseRefused {
     /// counter of 1 to 2^32 - 1). Equal terms say the term itself mints no
     /// more.
     Unminted { lease: u64, store: u64 },
+    /// The record's id names no file of leases for good: it is of the
+    /// store's term from a block of the counter that no file claimed, or
+    /// of a term the store can still take. No decider minted it, and the
+    /// block's claim would name its file anew with the lease on file. A
+    /// store of one file refuses none by it: there every id names that
+    /// file.
+    Unclaimed,
 }
 
 /// Where leases are recorded.
@@ -196,12 +203,17 @@ pub trait LeasesStore: Send + Sync {
     fn get(&self, gateway: GatewayId, lease: LeaseId) -> Option<LeaseRecord>;
 
     /// Release the issued leases whose dispatch deadline passed at `now` as
-    /// abandoned; returns them.
+    /// abandoned; returns them. A store that keeps a file of leases a
+    /// decider ends them where its caller may act: it passes a file whose
+    /// decider is at work, which ends its own at its issues, so what is
+    /// returned can be a part of the leases that are due. Such a store
+    /// tells its engine of each end itself: a caller tells none again.
     fn expire(&self, now: Instant) -> Vec<LeaseRecord>;
 
     /// Restore what a gateway's `Hello` pages list, releasing what they
-    /// omit; a record above the store's term is skipped. Returns how many
-    /// stand after it.
+    /// omit; a record above the store's term is skipped, and so is one
+    /// whose id names no file for good ([`LeaseRefused::Unclaimed`]).
+    /// Returns how many stand after it.
     fn restore(&self, gateway: GatewayId, records: &[LeaseRecord]) -> usize;
 
     /// The gateways are gone past their grace: every lease of each released

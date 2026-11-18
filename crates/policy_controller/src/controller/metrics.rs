@@ -77,11 +77,7 @@ pub const SPEC_APPLY_TOTAL: &str = "smg_policy_spec_apply_total";
 pub const DECIDE_BUSY_TOTAL: &str = "smg_policy_controller_decide_busy_total";
 /// Decide requests this build had no decision for, by `cause` (`fault`,
 /// `pair_side`, `prompt_text`, `decider_gone`, `lease_ids_spent`): the
-/// `Busy` answers with no reason, each under what took its decision. A
-/// lease's lifecycle call that panics as its decider leaves its work is a
-/// `fault` too, and answered no request. So is one that panics as a decider
-/// gives up an answer its stream refused: that request was decided, and
-/// its answer is counted with the answers no stream took as well.
+/// `Busy` answers with no reason, each under what took its decision.
 pub const DECIDE_NO_DECISION_TOTAL: &str = "smg_policy_controller_decide_no_decision_total";
 /// Decide requests that carried more block hashes than their generation
 /// reads of them: decided over the first ones, the rest hashed for nothing.
@@ -107,6 +103,12 @@ pub const DECIDE_BUDGET_OUTLASTED_TOTAL: &str =
 pub const MEMBERS_OUTSIDE_LIST: &str = "smg_policy_controller_members_outside_list";
 /// Writes to the load table that moved an overload verdict.
 pub const OVERLOAD_FLIPS_TOTAL: &str = "smg_policy_controller_overload_flips_total";
+/// Lifecycle calls that panicked as a lease's event was applied (a
+/// dispatch, a completion, a release a frame brings, a dispatch
+/// deadline's end): each is held there, so it ends no thread. A call that
+/// panics inside a decision (the issue's, the release of a lease the
+/// decision gives up) counts with the requests that got no decision.
+pub const LIFECYCLE_FAULTS_TOTAL: &str = "smg_policy_controller_lifecycle_faults_total";
 
 /// The controller's series and the handle that renders them.
 pub(crate) struct Metrics {
@@ -123,6 +125,7 @@ pub(crate) struct Metrics {
     /// The members outside a list: `engines`, then `zones`.
     outside: [Gauge; 2],
     overload_flips: Counter,
+    lifecycle_faults: Counter,
     /// Held from a scrape's sample of the state to the end of its render:
     /// the gauges are written from one sample and read back whole.
     scrape: Mutex<()>,
@@ -259,6 +262,11 @@ impl Metrics {
             "Decisions cut at their last read with under a microsecond of budget or under a millisecond of the lease's dispatch span left, of the Busy answers under budget_gone_on_arrival"
                 .into(),
         );
+        recorder.describe_counter(
+            KeyName::from_const_str(LIFECYCLE_FAULTS_TOTAL),
+            None,
+            "Lifecycle calls that panicked as a lease's event was applied, each held there".into(),
+        );
         recorder.describe_gauge(
             KeyName::from_const_str(MEMBERS_OUTSIDE_LIST),
             None,
@@ -323,6 +331,8 @@ impl Metrics {
         });
         let overload_flips =
             recorder.register_counter(&Key::from_name(OVERLOAD_FLIPS_TOTAL), &metadata);
+        let lifecycle_faults =
+            recorder.register_counter(&Key::from_name(LIFECYCLE_FAULTS_TOTAL), &metadata);
         start.set(
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -339,6 +349,7 @@ impl Metrics {
             decides,
             outside,
             overload_flips,
+            lifecycle_faults,
             scrape: Mutex::new(()),
             recorder,
             spec: OnceLock::new(),
@@ -448,6 +459,7 @@ impl Metrics {
         engines.set(f64::from(counts.outside.engines));
         zones.set(f64::from(counts.outside.zones));
         self.overload_flips.absolute(counts.overload_flips);
+        self.lifecycle_faults.absolute(counts.lifecycle_faults);
     }
 
     /// Sets the load counters from the driver's atomics.
@@ -788,6 +800,7 @@ mod tests {
             Some("smg_policy_controller_members_outside_list{list=\"engines\"} 0")
         );
         assert!(rendered.contains("smg_policy_controller_overload_flips_total 0"));
+        assert!(rendered.contains("smg_policy_controller_lifecycle_faults_total 0"));
         assert!(rendered.contains("# HELP smg_policy_controller_members_outside_list "));
 
         let counts = StoreCounts {
@@ -796,6 +809,7 @@ mod tests {
                 zones: 5,
             },
             overload_flips: 9,
+            lifecycle_faults: 4,
         };
         let rendered = metrics.render(
             || State::Leader,
@@ -812,6 +826,7 @@ mod tests {
             Some("smg_policy_controller_members_outside_list{list=\"zones\"} 5")
         );
         assert!(rendered.contains("smg_policy_controller_overload_flips_total 9"));
+        assert!(rendered.contains("smg_policy_controller_lifecycle_faults_total 4"));
 
         // The count outside a list falls once a generation names the member.
         let rendered = metrics.render(

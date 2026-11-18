@@ -90,22 +90,40 @@ impl Counts {
         })
     }
 
-    /// One lease more books the worker of `slot`. The turn of the leases'
-    /// file orders the writers, so a write is a load and a store: no reader
-    /// waits on the line and no writer locks it.
+    /// One lease more books the worker of `slot`, in one atomic step. The
+    /// turn of a leases' file orders that file's writers alone, and two
+    /// files book one worker where it serves two models: neither write is
+    /// lost under the other. No reader waits on the line.
     pub(crate) fn book(&self, slot: Slot) {
         if let Some(cell) = self.cell(slot) {
-            let held = cell.load(Ordering::Relaxed);
-            cell.store(held.saturating_add(1), Ordering::Relaxed);
+            let one_more = |held: u32| held.saturating_add(1);
+            cell.update(Ordering::Relaxed, Ordering::Relaxed, one_more);
         }
     }
 
-    /// One lease that booked the worker of `slot` left the file, under the
-    /// same lock.
+    /// One lease that booked the worker of `slot` left the file, in one
+    /// atomic step as well: a count at zero stays there.
     pub(crate) fn free(&self, slot: Slot) {
         if let Some(cell) = self.cell(slot) {
-            let held = cell.load(Ordering::Relaxed);
-            cell.store(held.saturating_sub(1), Ordering::Relaxed);
+            let one_less = |held: u32| held.saturating_sub(1);
+            cell.update(Ordering::Relaxed, Ordering::Relaxed, one_less);
+        }
+    }
+
+    /// A lease's booking moves from the worker of `from` to the worker of
+    /// `to`: added before it is taken. Where a thread's writes are seen in
+    /// the order it made them (x86-64), a reader that reads the worker
+    /// the booking leaves and then the worker it goes to counts the
+    /// request on one of the two or on both. A reader that meets the two
+    /// in the other order may count it on neither, as before the order.
+    /// The writes and the reads are relaxed: a machine that orders them
+    /// more loosely may show any reader the taking first.
+    pub(crate) fn moved(&self, from: Option<Slot>, to: Option<Slot>) {
+        if let Some(to) = to {
+            self.book(to);
+        }
+        if let Some(from) = from {
+            self.free(from);
         }
     }
 
@@ -326,7 +344,14 @@ impl std::fmt::Debug for LentCounts<'_> {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use std::cell::OnceCell;
+    use std::{
+        cell::OnceCell,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Barrier,
+        },
+        thread,
+    };
 
     use super::{Counts, KeptCounts, LentCounts, Slot};
     use crate::view::{Candidate, RequestFacts};
@@ -501,5 +526,71 @@ pub(crate) mod tests {
         let lent = counts.lend(&rows, &mut kept);
         let read: Vec<u32> = (0..6).map(|position| lent.at(position)).collect();
         assert_eq!(read, [4, 1, 0, 2, 3, 0]);
+    }
+
+    /// Two files book one worker where it serves two models: a write is one
+    /// atomic step, so no booking of either writer is lost under the
+    /// other's, and nothing they give back.
+    #[test]
+    fn two_writers_of_one_cell_lose_no_count() {
+        const EACH: u32 = 400_000;
+        let counts = Counts::default();
+        let slot = counts.claim();
+        let start = Barrier::new(2);
+        let both = |write: fn(&Counts, Slot)| {
+            thread::scope(|scope| {
+                for _ in 0..2 {
+                    scope.spawn(|| {
+                        start.wait();
+                        for _ in 0..EACH {
+                            write(&counts, slot);
+                        }
+                    });
+                }
+            });
+            counts.in_flight(slot)
+        };
+        assert_eq!(both(Counts::book), 2 * EACH, "every booking of both");
+        assert_eq!(both(Counts::free), 0, "and each one given back");
+    }
+
+    /// A booking that moves is added before it is taken: a reader beside the
+    /// mover that reads the worker it leaves and then the worker it goes to
+    /// counts the request on one of the two or on both, never on neither.
+    /// Read where another thread sees a thread's writes in their order: a
+    /// machine that orders them more loosely may show the taking first. On
+    /// one core a reader seldom lands between the two steps, and the case
+    /// never fails a right order.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn a_moved_booking_is_never_read_on_neither_worker() {
+        const MOVES: usize = 50_000;
+        let counts = Counts::default();
+        // A pair of workers a move, the booking on the first of them.
+        let pairs: Vec<[Slot; 2]> = (0..MOVES)
+            .map(|_| [counts.claim(), counts.claim()])
+            .collect();
+        for [from, _] in &pairs {
+            counts.book(*from);
+        }
+        let read = |[from, to]: &[Slot; 2]| (counts.in_flight(*from), counts.in_flight(*to));
+        let at = AtomicUsize::new(0);
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                for (pair, [from, to]) in pairs.iter().enumerate() {
+                    at.store(pair, Ordering::Relaxed);
+                    counts.moved(Some(*from), Some(*to));
+                }
+                at.store(MOVES, Ordering::Relaxed);
+            });
+            while let Some(pair) = pairs.get(at.load(Ordering::Relaxed)) {
+                let (left, came) = read(pair);
+                assert!(left + came >= 1, "a moved booking read on neither worker");
+            }
+        });
+        assert!(
+            pairs.iter().all(|pair| read(pair) == (0, 1)),
+            "each moved once"
+        );
     }
 }

@@ -1376,7 +1376,7 @@ impl Plugin {
                     plugin = self.name,
                     "a lifecycle event was told on a thread that names no decider and holds no \
                      instance of the plugin: it is dropped and counted, as each such event is; a \
-                     host tells a lease's events as the decider that issued the lease"
+                     host tells a lease's events as the decider whose file holds the lease"
                 );
             }
             return None;

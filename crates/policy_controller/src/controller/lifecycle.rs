@@ -29,14 +29,18 @@
 //! completion or its release. A generation that no longer stands is told
 //! nothing: the stages of a later one never saw the issue.
 
-use std::time::Instant;
+use std::{
+    panic::{catch_unwind, AssertUnwindSafe},
+    time::Instant,
+};
 
 use tonic::Status;
+use tracing::error;
 
 use crate::{
     decider::Decider,
     decision::Target,
-    framework::Engine,
+    framework::{release as release_payload, Engine},
     lease::{Lease, LeaseId, Lifecycle, Outcome, ReleaseReason, Side, TransportClass},
     proto::{
         self,
@@ -104,13 +108,13 @@ pub(crate) fn released(
     Ok(())
 }
 
-/// Opens a hand at the leases' file, a session's or a `Decide` stream's:
+/// Opens a hand at the leases' files, a session's or a `Decide` stream's:
 /// what it says of `gateway`'s leases is handed through it, and the store
 /// is given the word to the engine that whoever applies it tells with
 /// ([`tells`]).
 pub(crate) fn open(store: &MemoryStore, gateway: GatewayId) -> Hand {
     tells(store);
-    store.handover(gateway)
+    Hand::new(gateway)
 }
 
 /// Gives the store the word to the engine of a frame applied to a lease.
@@ -130,14 +134,36 @@ pub(crate) fn tells(store: &MemoryStore) {
 ///
 /// Its caller is whoever applies the frame, under the turn of the leases'
 /// file: what it calls is bounded and takes no door of the leases. It
-/// enters as the decider that issued the lease on whichever thread applies.
-/// While the deciders share one file its turn is no decider's own: a
-/// stage that keeps state a decider is served these calls no earlier
-/// than a file a decider.
+/// enters as the decider whose file the lease is on, on whichever thread
+/// applies.
+///
+/// A stage's call that panics is held here, whoever applies: a decider
+/// inside a decision or as it takes up or leaves its work, a session, the
+/// gateways' sweep. The lease's event stands on file as applied, the
+/// fault is counted on the store ([`MemoryStore::lifecycle_faults`]) and
+/// a streak of faults writes one line. It costs no request its decision
+/// and ends no thread.
 fn told(store: &MemoryStore, record: &LeaseRecord, said: Said, by: Option<Decider>) {
     // The lease's own decider acts while its event is told, whichever
     // thread applies the frame.
     let _acting = by.map(Decider::enter);
+    let Err(payload) = catch_unwind(AssertUnwindSafe(|| tell(store, record, said))) else {
+        store.call_returned();
+        return;
+    };
+    // A payload's own drop can panic: the engine's helper frees it under a
+    // catch of its own.
+    release_payload(payload);
+    if store.call_faulted() {
+        error!(
+            lease = record.lease.id.0,
+            "a lease's lifecycle call panicked: held, and the lease's event stands as applied"
+        );
+    }
+}
+
+/// What [`told`] tells, under its catch.
+fn tell(store: &MemoryStore, record: &LeaseRecord, said: Said) {
     store.with_world(|world| {
         let spec = world.spec();
         let engine = (spec.generation() == record.lease.generation).then(|| spec.engine());
@@ -377,6 +403,8 @@ pub(crate) mod tests {
     const B: GatewayId = GatewayId(12);
     /// The session of the keyed leases.
     const KEY: Session = Session::from_raw(41);
+    /// The lease whose release the hearing stage panics at.
+    const BURSTS: u64 = 99;
 
     /// A worker the store holds a row for.
     pub(crate) fn worker(store: &MemoryStore, key: &str) -> WorkerId {
@@ -455,6 +483,7 @@ pub(crate) mod tests {
 
         fn on_released(&self, lease: &Lease, _: ReleaseReason) {
             self.0.lock().push(("released", lease.id.0, WorkerId(0)));
+            assert_ne!(lease.id.0, BURSTS, "the stage's call panics");
         }
     }
 
@@ -530,6 +559,30 @@ pub(crate) mod tests {
             heard.lock()[1..],
             [("completed", 1, served), ("released", 2, WorkerId(0))]
         );
+    }
+
+    /// A stage's call that panics is held where the engine is told,
+    /// whoever applies the frame: here the thread that hands it, as a
+    /// session does with no decider at work. The lease left the file
+    /// ahead of the call, the fault is counted, and the next frame is
+    /// told.
+    #[test]
+    fn a_stages_call_that_panics_is_held_and_the_next_frame_is_told() {
+        let store = MemoryStore::new();
+        let t0 = Instant::now();
+        let heard = hearing(&store, 1);
+        for id in [BURSTS, 2] {
+            issued(&store, id, 1, t0);
+        }
+        let hand = open(&store, A);
+        released(&store, &hand, &a_released(BURSTS)).expect("the frame reads");
+        assert_eq!(state(&store, A, BURSTS), None);
+        assert_eq!(store.lifecycle_faults(), 1);
+        released(&store, &hand, &a_released(2)).expect("the frame reads");
+        let told = [BURSTS, 2].map(|lease| ("released", lease, WorkerId(0)));
+        assert_eq!(*heard.lock(), told);
+        assert_eq!(store.lifecycle_faults(), 1);
+        assert_eq!(store.live(A), 0);
     }
 
     #[test]

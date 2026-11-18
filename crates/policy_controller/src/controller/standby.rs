@@ -922,7 +922,7 @@ mod tests {
     /// A replica's store and the log it journals to under a shared lease:
     /// the log's places start where this replica's run drew.
     fn replica() -> Replica {
-        let (store, feed) = journaled(&LeasePlace::File("shared".into()));
+        let (store, feed) = journaled(&LeasePlace::File("shared".into()), 1);
         (store, feed.log)
     }
 
@@ -1790,7 +1790,7 @@ mod tests {
         let elector = Elector::alone(OWN, ElectionSettings::default())
             .expect("the default settings are in order");
         let (standing, stood) = watch::channel(Standing::default());
-        let journal = journaled(&LeasePlace::File("shared".into()));
+        let journal = journaled(&LeasePlace::File("shared".into()), 1);
         let (id, address) = ("standby-0".to_owned(), "127.0.0.1:1".to_owned());
         let catalog = Arc::new(crate::Catalog::builtin());
         let shared = Shared::new(id, address, &elector, stood, journal, catalog, 1)

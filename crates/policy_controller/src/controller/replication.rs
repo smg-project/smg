@@ -86,21 +86,38 @@ const MESSAGE_BYTES: usize = 4 * 1024 * 1024;
 /// reader is told to start again. A standby that applied nothing names no
 /// place of any run: the standby's feed joins it at the drawn start
 /// ([`Feed::join`]).
-pub(crate) fn journaled(place: &LeasePlace) -> (Arc<MemoryStore>, watch_workers::Feed) {
-    journaled_from(place, RandomState::new().hash_one(0u8) % FIRST_PLACES)
+pub(crate) fn journaled(
+    place: &LeasePlace,
+    deciders: usize,
+) -> (Arc<MemoryStore>, watch_workers::Feed) {
+    let first = RandomState::new().hash_one(0u8) % FIRST_PLACES;
+    journaled_for(place, first, deciders)
 }
 
-/// The same with the log's places starting after `first`: zero in the
-/// cases, whose tables read a log's places from one.
+/// The same over one file of leases with the log's places starting after
+/// `first`: zero in the cases, whose tables read a log's places from one.
+#[cfg(test)]
 pub(crate) fn journaled_from(
     place: &LeasePlace,
     first: u64,
+) -> (Arc<MemoryStore>, watch_workers::Feed) {
+    journaled_for(place, first, 1)
+}
+
+/// The store and its feed with the log's places starting after `first`,
+/// the store with a file of leases a decider, `deciders` of them
+/// ([`MemoryStore::with_deciders`]).
+pub(crate) fn journaled_for(
+    place: &LeasePlace,
+    first: u64,
+    deciders: usize,
 ) -> (Arc<MemoryStore>, watch_workers::Feed) {
     let loads = if place.is_shared() { LOAD_EVENTS } else { 0 };
     let log = Log::new(WATCHED_EVENTS, loads).starting_after(first);
     let feed = watch_workers::Feed::of(log);
     let journal: Arc<dyn Journal> = Arc::<Log>::clone(&feed.log);
-    (Arc::new(MemoryStore::journaled(journal)), feed)
+    let store = MemoryStore::journaled(journal).with_deciders(deciders);
+    (Arc::new(store), feed)
 }
 
 /// The places a run's log may start after: below 2^48, drawn once a run.
@@ -1335,7 +1352,7 @@ mod tests {
     #[test]
     fn a_place_of_the_run_before_under_an_equal_term_is_told_to_start_again() {
         let run = || {
-            let leader = Leader::over(journaled(&LeasePlace::File("shared".into())));
+            let leader = Leader::over(journaled(&LeasePlace::File("shared".into()), 1));
             leader.store.set_term(leader.term);
             leader.writes(3);
             leader

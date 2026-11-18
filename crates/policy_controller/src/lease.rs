@@ -242,9 +242,14 @@ impl fmt::Debug for EventSet {
 /// no-op, so a stateless stage implements nothing.
 ///
 /// A served controller tells a lease's issue, its dispatch, its completion
-/// and its release while it holds the turn of its leases' file, and the
+/// and its release while it holds the turn of the lease's file, and the
 /// release of a lease its decision gives up right after that turn: those
-/// hooks are bounded, and call no door of the leases' store.
+/// hooks are bounded, and call no door of the leases' store. A hook that
+/// panics at a dispatch, a completion or a release that a frame brings,
+/// or at a dispatch deadline's end, is held there: the lease's
+/// event stands as applied. One that panics at the issue, or at the
+/// release of a lease its decision gives up, costs that request its
+/// decision.
 pub trait Lifecycle: Send + Sync {
     /// The engine issued `decision` under `lease`. In the embedded mode the
     /// commit follows at once and the accounting happens at dispatch; a
