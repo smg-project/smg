@@ -92,6 +92,33 @@ async fn a_zmq_worker_built_without_a_connector_refuses_its_connect() {
     assert!(worker.engine_connection_if_initialized().is_none());
 }
 
+/// A ZMQ worker built without a connector answers its health check with the
+/// acquisition's refusal: the health log names the cause, where a probe
+/// that only read not ready named none.
+#[tokio::test]
+async fn a_zmq_worker_built_without_a_connector_names_it_at_its_health_check() {
+    let worker = <BasicWorkerBuilder>::new("ipc://engine.ipc")
+        .connection_mode(ConnectionMode::Zmq)
+        .build();
+
+    let refusal = worker
+        .check_health_async()
+        .await
+        .expect_err("no connector, no health");
+    assert!(
+        matches!(
+            &refusal,
+            WorkerError::ConnectionFailed { url, reason }
+                if url == "ipc://engine.ipc" && reason == NO_ENGINE_CONNECTOR
+        ),
+        "{refusal}"
+    );
+    assert!(
+        worker.zmq_connect_abort.load_full().is_none(),
+        "the check starts no driver either"
+    );
+}
+
 /// A rebuild over a live worker keeps the connector the worker was built
 /// with: the replacement connects the way the worker it replaces does.
 #[tokio::test]

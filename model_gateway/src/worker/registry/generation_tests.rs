@@ -1,8 +1,9 @@
 //! What a host's value of a generation can count on, proved with a value
 //! that counts itself: every publish builds one, a generation has one value,
 //! a value answers the members it was built from, a replaced value falls
-//! once its write let the index go, and the model-less generation carries a
-//! value like any other.
+//! once its write let the index go, the model-less generation carries a
+//! value like any other, and a superseded one of those falls at the next
+//! membership change.
 
 use std::{
     cell::{Cell, RefCell},
@@ -82,11 +83,13 @@ fn every_publish_builds_one_value() {
 
     assert!(registry.refresh_models(&first, a_changed_card()));
     assert_eq!(built(), 5, "a refresh that changes a card");
+    assert!(registry.replace(&first_id, ready_worker("http://a:8000", "m")));
+    assert_eq!(built(), 6, "a property rebuild");
 
     registry.remove(&second_id).unwrap();
-    assert_eq!(built(), 6, "a member leaves");
+    assert_eq!(built(), 7, "a member leaves");
     registry.remove(&first_id).unwrap();
-    assert_eq!(built(), 7, "the last member leaves");
+    assert_eq!(built(), 8, "the last member leaves");
 }
 
 #[test]
@@ -182,4 +185,34 @@ fn the_model_less_generation_carries_a_value_like_any_other() {
         "a change ends it like any other"
     );
     assert_eq!(next.members().len(), 3);
+}
+
+#[test]
+fn a_superseded_model_less_value_falls_at_the_next_membership_change() {
+    let standing = STANDING.get();
+    let registry = WorkerRegistry::<Counted>::new();
+    registry
+        .register(ready_worker("http://a:8000", "m"))
+        .unwrap();
+    assert_eq!(
+        STANDING.get() - standing,
+        2,
+        "the empty one and the model's"
+    );
+
+    drop(registry.global_generation());
+    assert_eq!(
+        STANDING.get() - standing,
+        3,
+        "the model-less one stands once it is read"
+    );
+
+    registry
+        .register(ready_worker("http://b:8000", "m"))
+        .unwrap();
+    assert_eq!(
+        STANDING.get() - standing,
+        2,
+        "and falls at the change, with no read of it to come"
+    );
 }

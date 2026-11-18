@@ -1085,7 +1085,8 @@ impl BasicWorker {
     /// report unavailable until the driver lands.
     ///
     /// A worker built without a connector has no handshake to drive, and
-    /// none starts: its acquisition refuses and its probe reads not ready.
+    /// none starts: its acquisition refuses, and its health check answers
+    /// the same refusal.
     fn spawn_zmq_connect_driver(&self, cell: &Arc<OnceCell<Arc<dyn EngineConnection>>>) {
         if self.superseded.load(Ordering::Acquire) {
             return;
@@ -1489,7 +1490,17 @@ impl Worker for BasicWorker {
         let probe_ok = match &self.metadata.spec.connection_mode {
             ConnectionMode::Http => self.http_health_check().await?,
             ConnectionMode::Grpc => self.grpc_health_check().await?,
-            ConnectionMode::Zmq => self.zmq_health_check(),
+            ConnectionMode::Zmq => {
+                // No handshake will ever complete: the check says why, as the
+                // acquisition does, where a bare not-ready names no cause.
+                if self.engine_connector.is_none() {
+                    return Err(WorkerError::ConnectionFailed {
+                        url: self.metadata.spec.url.clone(),
+                        reason: NO_ENGINE_CONNECTOR.to_string(),
+                    });
+                }
+                self.zmq_health_check()
+            }
         };
 
         if probe_ok {

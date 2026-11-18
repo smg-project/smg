@@ -460,10 +460,17 @@ impl WorkerRegistry<ModelWorkerSnapshot> {
 /// generation gets that value. What a host derives from one generation
 /// lives in its value and falls with it, and a selection of several roles
 /// reads every role from the one value it took.
+///
+/// A value falls when its generation ends: a model's once the write that
+/// replaced it let the index go, the model-less one inside the next
+/// membership change, under the membership order. Its drop keeps the
+/// build's rule: it takes no lock of the registry and calls nothing of it.
 pub trait Generation: std::fmt::Debug + Send + Sync + 'static {
     /// The value of the generation with `members`.
     ///
-    /// Runs at every publish, under the model index's guard: it makes empty
+    /// Runs at every publish, under a registry guard: a model's shard of the
+    /// index, or for the model-less generation the membership-order write
+    /// guard that every registration and removal waits on. It makes empty
     /// cells and returns. It takes no lock, calls nothing of the registry
     /// and reads no member.
     fn of(members: Arc<[Arc<dyn Worker>]>) -> Self;

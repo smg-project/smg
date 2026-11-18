@@ -74,4 +74,5 @@ pub type BasicWorkerBuilder = identity::builder::BasicWorkerBuilder<BackendConne
 /// The load monitor holds that registry. The two lines are the gateway's,
 /// and stay with it when the registry moves into the worker crate.
 pub type WorkerRegistry = registry::WorkerRegistry<ModelWorkerSnapshot>;
+/// The load monitor over that registry.
 pub type WorkerMonitor = load::monitor::WorkerMonitor<ModelWorkerSnapshot>;

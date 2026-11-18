@@ -66,6 +66,11 @@ pub struct AdminAnswer {
 /// The calls the worker runtime makes on a worker's connection to its
 /// engine, over gRPC or ZMQ. The worker holds the host's client behind this
 /// trait and shares it with the request path.
+///
+/// The engine's two event subscriptions are no call of this trait: they
+/// answer the wire's own messages, so the host's event monitor reads them
+/// from the host's client, read back through this handle. A connection of
+/// another type feeds that monitor no KV events and no load records.
 #[async_trait]
 pub trait EngineConnection: Any + Send + Sync {
     /// Whether the engine's wire carries the admin calls: the cache flush
@@ -136,6 +141,10 @@ pub struct ZmqLink {
 /// client. A worker gets it from its builder, handed in or as the builder's
 /// default ([`ConnectorDefault`]); a worker with neither refuses a gRPC or
 /// ZMQ connect.
+///
+/// The host's event monitor subscribes through the host's own client alone:
+/// a connector that hands out another connection leaves its workers without
+/// KV events, and their load polled.
 #[async_trait]
 pub trait EngineConnector: fmt::Debug + Send + Sync {
     /// Connect to the gRPC server of an engine of `runtime` at `base_url`.

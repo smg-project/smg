@@ -1581,8 +1581,9 @@ pub struct SchedulerLoadSnapshot {
 
 bitflags! {
     /// The telemetry a pushed load record can carry beside its core: one
-    /// flag for each part of [`SchedulerLoadSnapshot`] a record may leave
-    /// out.
+    /// flag for each part of [`SchedulerLoadSnapshot`] whose figure a report
+    /// keeps from the last record that carried it. An optional figure
+    /// outside these six is published as the record sends it.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct LoadTelemetry: u8 {
         /// `cache_hit_rate`.
@@ -1608,8 +1609,9 @@ pub trait LoadRecord {
     /// The sample's age when the record was sent.
     fn age(&self) -> Duration;
 
-    /// The telemetry the record carries. What it leaves out keeps, in the
-    /// report, the figure of the last record that carried it.
+    /// The telemetry the record carries. A flagged part it leaves out
+    /// keeps, in the report, the figure of the last record that carried it;
+    /// nothing else is kept.
     fn telemetry(&self) -> LoadTelemetry;
 
     /// The rank's entry a poll would have produced from the record, with

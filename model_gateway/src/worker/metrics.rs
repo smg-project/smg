@@ -1428,8 +1428,8 @@ impl Metrics {
     /// A worker registered at `worker_url`: its series record again if the
     /// address was retired by an earlier removal.
     pub fn worker_registered(worker_url: &str) {
-        if let Some(series) = series::installed() {
-            series.activate(worker_url);
+        if let Some(store) = series::installed() {
+            store.activate(worker_url);
         }
         handles::worker_set_changed();
     }
@@ -1439,8 +1439,8 @@ impl Metrics {
     /// taken before the replacement): the store keeps its witness, so a
     /// later removal of the address drops those writes until it is gone too.
     pub fn worker_replaced(worker_url: &str, worker: Weak<dyn Worker>) {
-        if let Some(series) = series::installed() {
-            series.replaced(worker_url, worker);
+        if let Some(store) = series::installed() {
+            store.replaced(worker_url, worker);
         }
     }
 
@@ -1452,8 +1452,8 @@ impl Metrics {
     /// handle that could still write for it. The interned label goes with
     /// them.
     pub fn remove_worker_metrics(worker_url: &str, worker: Weak<dyn Worker>) {
-        if let Some(series) = series::installed() {
-            series.retire(worker_url, worker);
+        if let Some(store) = series::installed() {
+            store.retire(worker_url, worker);
         }
         handles::worker_set_changed();
         STRING_INTERNER.remove(worker_url);

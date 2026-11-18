@@ -150,9 +150,9 @@ impl<G: Generation> PushedLoadSink for WorkerMonitor<G> {
     }
 }
 
-/// The registry as a peer that asks one thing of it holds it: the worker
-/// registered under a URL. Such a holder reads no generation, so it names
-/// no value of the registry's host.
+/// The registry as this monitor holds it: it asks one thing of it, the
+/// worker registered under a URL. Such a holder reads no generation, so it
+/// names no value of the registry's host.
 pub(crate) trait WorkerLookup: Send + Sync {
     /// The worker registered under `url`, as [`WorkerRegistry::get_by_url`]
     /// reads it.

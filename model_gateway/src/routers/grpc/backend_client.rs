@@ -549,7 +549,7 @@ impl EngineConnector for BackendConnector {
 /// The gateway's client behind a worker's engine connection: the same
 /// allocation. A connection another host made is an error that says so,
 /// never `None`: `None` is what a worker without a connection answers.
-fn typed(
+pub(crate) fn typed(
     worker: &dyn Worker,
     connection: Arc<dyn EngineConnection>,
 ) -> WorkerResult<Arc<BackendClient>> {
