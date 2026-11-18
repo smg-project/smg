@@ -327,7 +327,10 @@ pub async fn ensure_mcp_servers(
                 tool = %tool_name,
                 "Adding static server for built-in tool routing"
             );
-            if !mcp_servers.iter().any(|b| b.server_key == server_name) {
+            if !mcp_servers
+                .iter()
+                .any(|b| b.pool_key.is_none() && b.server_key == server_name)
+            {
                 let list_error = orchestrator.list_error_for_server(&server_name);
                 mcp_servers.push(McpServerBinding {
                     label: server_name.clone(),
@@ -2501,6 +2504,81 @@ mod tests {
                 "each call reaches the server of the binding that lists its tool"
             );
         }
+    }
+
+    /// A request that carries a built-in tool and binds the name of the
+    /// configured server that tool is routed to as a URL gets both
+    /// bindings: the built-in tool's call runs on the configured server and
+    /// the URL's tool on the request's own connection.
+    #[tokio::test]
+    async fn a_built_in_tools_server_and_a_url_of_one_name_both_bind() {
+        let named_calls: Arc<Mutex<Vec<String>>> = Arc::default();
+        let url_calls: Arc<Mutex<Vec<String>>> = Arc::default();
+        let named_at = serve_local_mcp_server(LocalServer {
+            tools: Some(&["search"]),
+            calls: Some(Arc::clone(&named_calls)),
+            ..Default::default()
+        })
+        .await;
+        let url = serve_local_mcp_server(LocalServer {
+            tools: Some(&["other"]),
+            calls: Some(Arc::clone(&url_calls)),
+            ..Default::default()
+        })
+        .await;
+        let mut config = config_holding(&url, named_at);
+        config.servers[0].builtin_type = Some(BuiltinToolType::WebSearchPreview);
+        config.servers[0].builtin_tool_name = Some("search".to_string());
+        let orchestrator = Arc::new(McpOrchestrator::new(config).await.unwrap());
+        let by_url = McpServerInput {
+            label: "by-url".to_string(),
+            url: Some(url.clone()),
+            authorization: Some("one-token".to_string()),
+            headers: HashMap::new(),
+            allowed_tools: None,
+        };
+        let bindings = ensure_mcp_servers(
+            &orchestrator,
+            &FormatRegistry::new(),
+            &[by_url],
+            &[BuiltinToolType::WebSearchPreview],
+        )
+        .await
+        .expect("the request binds its servers");
+        let bound: Vec<(&str, bool)> = bindings
+            .iter()
+            .map(|binding| (binding.label.as_str(), binding.pool_key.is_some()))
+            .collect();
+        assert_eq!(
+            bound,
+            [("by-url", true), (url.as_str(), false)],
+            "the URL binds a pooled connection and the built-in tool its configured server"
+        );
+        let session = McpToolSession::new(&orchestrator, bindings, "test-request");
+        assert!(
+            session.is_builtin_tool("search"),
+            "the configured server's tool is offered as the built-in one"
+        );
+        let mut reached = Vec::new();
+        for tool in ["search", "other"] {
+            let output = session
+                .execute_tool(ToolExecutionInput {
+                    call_id: "call-1".to_string(),
+                    tool_name: tool.to_string(),
+                    arguments: json!({}),
+                })
+                .await;
+            assert_eq!(output.error_message, None, "the call of `{tool}` runs");
+            reached.push((
+                named_calls.lock().expect("the calls lock").len(),
+                url_calls.lock().expect("the calls lock").len(),
+            ));
+        }
+        assert_eq!(
+            reached,
+            [(1, 0), (1, 1)],
+            "each call reaches the server of the binding that lists its tool"
+        );
     }
 
     /// A configured server named by a URL keeps its tools when a request's
