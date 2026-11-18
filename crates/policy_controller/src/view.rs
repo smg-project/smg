@@ -1006,6 +1006,17 @@ pub struct PoolFacts<'a> {
     /// rotation does, keys it by this too. In-process only: a plugin reads
     /// the rows it is handed.
     pub reach: u64,
+    /// Whether every row of the pool holds a rate: a report whose
+    /// `live_rate` is above zero. A host says so where it knows it of the
+    /// rows it wrote, and a decision reads it once: a profile decided by
+    /// rank ([`Scorer::spread`](crate::Scorer::spread)) is asked by rank
+    /// only where it is on, since the load stage reads every row to cost a
+    /// row without a rate. Off by default: a host that does not say it gets
+    /// the whole pass. A host that says it of a pool that holds such a row
+    /// costs the decision its ranks' reading and changes no answer: the
+    /// stage says so itself of the rows it is handed
+    /// ([`Front::Whole`](crate::Front::Whole)). In-process only.
+    pub rated: bool,
 }
 
 #[cfg(test)]

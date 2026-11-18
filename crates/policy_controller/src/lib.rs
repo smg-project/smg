@@ -124,8 +124,9 @@ pub use decision::{
     MAX_TARGETS, TRACE_TOP,
 };
 pub use framework::{
-    Binding, DecisionScope, Engine, Filter, Narrowed, PairPools, PairTable, PairTableError, Picker,
-    Plan, Profile, Scorer, Scratch, TieBand, Weighted, DRAW_BOUND, DRAW_FROM,
+    Binding, DecisionScope, Engine, Filter, Front, Narrowed, PairPools, PairTable, PairTableError,
+    Picker, Plan, Profile, Scorer, Scratch, Spread, TieBand, Weighted, DRAW_BOUND, DRAW_FROM,
+    RANK_FROM,
 };
 pub use lease::{
     EventKind, EventSet, Lease, LeaseId, LeaseKind, Lifecycle, Membership, Outcome, ReleaseReason,
