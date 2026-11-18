@@ -22,9 +22,9 @@ use smg_policy_controller::{
         Ask, GatewayId, HealthSink, LoadSink, LoadSource, MemoryStore, PairBuffers,
         PairingDescriptor, ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore, PUBLISH_WINDOW,
     },
-    Candidate, Constraints, Engine, Health, Lease, Lifecycle, LoadRow, PairPools, PolicySpec,
-    PoolFacts, RequestFacts, Role, Scratch, Side, SignalSource, Target, WireModes, WorkerId,
-    PRESETS,
+    AffinityFacts, Candidate, Constraints, Engine, Health, Lease, Lifecycle, LoadRow,
+    NamedAffinity, NamedHolder, PairPools, PolicySpec, PoolFacts, RequestFacts, Role, Scratch,
+    Side, SignalSource, Target, WireModes, WorkerId, PRESETS,
 };
 
 #[global_allocator]
@@ -105,6 +105,78 @@ fn a_decision_after_the_first_allocates_nothing_for_any_preset() {
                 allocations_during(|| engine.decide(&facts(2), &pool(n), &view, &cx, &mut scratch));
             assert!(decision.pick().is_some(), "{preset} at {n} routes");
             assert_eq!(allocations, 0, "{preset} at {n}: a decision allocated");
+        }
+    }
+}
+
+/// A decision asked by rank allocates nothing after the thread's first: the
+/// sums of the rows a rank puts in front stand behind the rows' own, in room
+/// the first decision took. The first decision puts no row in front, by
+/// rank where no row holds the request's prefix and then by a draw for a
+/// request that names rows, and the second puts the holders there: one row
+/// in eight, each with nothing in flight.
+#[test]
+fn a_decision_by_rank_after_the_first_allocates_nothing() {
+    let engine = engine_of("cache_aware");
+    for n in [64u32, 512] {
+        let mut view = fleet(n);
+        for row in view.iter_mut().step_by(8) {
+            row.in_flight = 0;
+        }
+        let column = |blocks: u32| -> Vec<AffinityFacts> {
+            (0..n)
+                .map(|i| AffinityFacts {
+                    overlap_blocks: if i % 8 == 0 { blocks } else { 0 },
+                    ..AffinityFacts::default()
+                })
+                .collect()
+        };
+        let (cold, held) = (column(0), column(4));
+        let names = [NamedHolder {
+            row: 0,
+            overlap_blocks: 4,
+            predicted_blocks: 0,
+        }];
+        let firsts = [
+            RequestFacts {
+                affinity: &cold,
+                ..facts(1)
+            },
+            RequestFacts {
+                named: Some(NamedAffinity {
+                    holders: &names,
+                    ..NamedAffinity::default()
+                }),
+                ..facts(1)
+            },
+        ];
+        let said = PoolFacts {
+            rated: true,
+            ..pool(n)
+        };
+        let cx = Constraints::default();
+        for (order, first) in firsts.iter().enumerate() {
+            let mut scratch = Scratch::new();
+            engine
+                .decide(first, &said, &view, &cx, &mut scratch)
+                .pick()
+                .expect("the fleet routes");
+            let second = RequestFacts {
+                affinity: &held,
+                ..facts(2)
+            };
+            let (decision, allocations) =
+                allocations_during(|| engine.decide(&second, &said, &view, &cx, &mut scratch));
+            let pick = decision.pick().expect("the fleet routes");
+            assert!(
+                pick.targets.iter().all(|target| target.position % 8 == 0),
+                "at {n}, order {order}, the targets are holders: {:?}",
+                pick.targets
+            );
+            assert_eq!(
+                allocations, 0,
+                "at {n}, order {order}: a decision by rank allocated"
+            );
         }
     }
 }
