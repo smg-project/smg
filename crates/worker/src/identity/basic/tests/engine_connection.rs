@@ -117,6 +117,27 @@ async fn a_zmq_worker_built_without_a_connector_names_it_at_its_health_check() {
     );
 }
 
+/// A ZMQ worker the builder was handed a connection for needs no connector
+/// at its health check: the check serves the connection in the slot, as the
+/// acquisition does, and starts no driver.
+#[tokio::test]
+async fn a_zmq_worker_handed_its_connection_is_healthy_without_a_connector() {
+    let worker = <BasicWorkerBuilder>::new("ipc://engine.ipc")
+        .connection_mode(ConnectionMode::Zmq)
+        .engine_connection(NoEngine)
+        .build();
+
+    worker
+        .check_health_async()
+        .await
+        .expect("the handed connection is alive");
+    assert!(worker.engine_connection().await.is_ok());
+    assert!(
+        worker.zmq_connect_abort.load_full().is_none(),
+        "the check starts no driver"
+    );
+}
+
 /// A rebuild over a live worker keeps the connector the worker was built
 /// with: the replacement connects the way the worker it replaces does.
 #[tokio::test]
