@@ -303,11 +303,14 @@ impl Standby {
 
     /// The next batch that carries events or the word to re-sync: a
     /// heartbeat is passed over, five of them at most (a case waits for a
-    /// batch that is on its way, never through five silent seconds).
+    /// batch that is on its way, never through five silent seconds). A
+    /// part of a snapshot fails the case here: a leader sends parts behind
+    /// the word alone, and [`Standby::snapshot`] reads them.
     async fn batch(&mut self) -> proto::ReplicationBatch {
         let mut found = None;
         for _ in 0..5 {
             let batch = self.frame().await;
+            assert!(batch.snapshot.is_none(), "a part no word announced");
             if batch.resync_required || !batch.events.is_empty() {
                 found = Some(batch);
                 break;
@@ -316,13 +319,14 @@ impl Standby {
         found.expect("a batch within five heartbeats")
     }
 
-    /// The next heartbeat, past at most 64 batches.
+    /// The next heartbeat, past at most 64 batches. A part of a snapshot
+    /// fails the case here, as in [`Standby::batch`].
     async fn beat(&mut self) -> proto::ReplicationBatch {
         let mut found = None;
         for _ in 0..64 {
             let batch = self.frame().await;
-            let part = batch.snapshot.is_some();
-            if !batch.resync_required && batch.events.is_empty() && !part {
+            assert!(batch.snapshot.is_none(), "a part no word announced");
+            if !batch.resync_required && batch.events.is_empty() {
                 found = Some(batch);
                 break;
             }
@@ -1356,10 +1360,12 @@ async fn removed_again(lease: &Path) -> Infallible {
 }
 
 /// The fence at the wire. A leader whose lease is gone ends an open stream
-/// `ABORTED` at its next look of the lease. A hello it still waited for is
-/// refused the same way, though it names a place the log does not hold: a
-/// replica that lost the lead tells no standby to re-sync. Both calls are
-/// refused after it.
+/// `ABORTED` at its next look of the lease. A call that still waited for
+/// its hello is refused too, though the hello names a place the log does
+/// not hold: a replica that lost the lead tells no standby to re-sync.
+/// That call ends `ABORTED` where it was admitted under the lead, as the
+/// feed's own case holds by construction, and at the door otherwise. Both
+/// calls are refused after it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_leader_that_loses_its_lease_ends_its_stream_and_joins_no_other() {
     let dir = tempfile::tempdir().expect("a temp dir");
@@ -1371,14 +1377,15 @@ async fn a_leader_that_loses_its_lease_ends_its_stream_and_joins_no_other() {
         let mut open = replicate(leader.replication, held.clone())
             .await
             .expect("a stream");
-        // A second call says no hello yet, from a task of its own. Nothing
-        // orders it ahead of the call made here: it has that round
-        // trip, and the leader's wait for its next look at the lease, to
-        // be admitted while the leader leads.
+        // A second call says no hello yet. The case polls it once before
+        // it asks the leader's word below, so its request stands on the
+        // connection ahead of that call's: the leader's transport holds
+        // the stream before the word is answered. The call's own first
+        // step, at the door, is a task of the leader's runtime, and
+        // nothing on the wire shows it done.
         let mut waits = client(leader.replication).await;
         let (late, sent) = mpsc::channel(1);
-        let mut waiting = JoinSet::new();
-        waiting.spawn({
+        let mut call = Box::pin({
             let mut waits = waits.clone();
             async move {
                 waits
@@ -1387,6 +1394,13 @@ async fn a_leader_that_loses_its_lease_ends_its_stream_and_joins_no_other() {
                     .map(|_| ())
             }
         });
+        tokio::select! {
+            biased;
+            early = &mut call => panic!("the call waits for its hello, not {early:?}"),
+            () = std::future::ready(()) => {}
+        }
+        let mut waiting = JoinSet::new();
+        waiting.spawn(call);
         waits
             .leader(proto::LeaderRequest::default())
             .await
@@ -1412,7 +1426,13 @@ async fn a_leader_that_loses_its_lease_ends_its_stream_and_joins_no_other() {
             .expect("the one call")
             .expect("the call's task")
             .expect_err("a replica that lost the lead joins no feed");
-        assert_eq!(refused.code(), Code::Aborted);
+        // Admitted under the lead, the call read the fence again at its
+        // hello. Where its first step came after the loss, the door
+        // refused it, as it refuses the two calls below.
+        assert!(
+            matches!(refused.code(), Code::Aborted | Code::FailedPrecondition),
+            "{refused:?}"
+        );
         for after in [
             replicate(leader.replication, held).await.map(|_| ()),
             snapshot(leader.replication).await.map(|_| ()),
