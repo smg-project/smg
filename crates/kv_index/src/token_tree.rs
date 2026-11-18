@@ -1573,6 +1573,11 @@ impl TokenTree {
             };
 
             let node = &leaf_data[idx];
+            // A concurrent insert may have attached the tenant to a
+            // descendant since the walk or the promotion.
+            if !self.is_tenant_leaf(node, tenant) {
+                continue;
+            }
             let (node_tokens, parent_became_leaf) = self.remove_tenant_and_cleanup(node, tenant);
             if node_tokens > 0 {
                 evicted += node_tokens;
@@ -1674,26 +1679,41 @@ impl TokenTree {
         (node_tokens, parent_leaf_info)
     }
 
-    /// Remove empty nodes walking up via parent pointers.
-    /// Returns Some((parent_node, ts)) if a parent became a tenant-leaf.
+    /// Whether a child of `node` holds `tenant_id`.
+    fn any_child_holds(node: &Node, tenant_id: &TenantId) -> bool {
+        node.children.iter().any(|child| {
+            child
+                .value()
+                .tenant_last_access_time
+                .contains_key(tenant_id.as_ref())
+        })
+    }
+
+    /// Remove empty nodes walking up via parent pointers, from `node`, which
+    /// `tenant_id` has just left, and return the node that became the
+    /// tenant's leaf by it, with its timestamp.
+    ///
+    /// When `node` is not empty (another tenant holds it), nothing is
+    /// detached and the candidate is `node`'s parent, unless a child of
+    /// `node` holds the tenant again. Otherwise the walk detaches empty nodes
+    /// upward, moving each time to the parent it read before the detach,
+    /// whether the detach took or failed (a concurrent insert gave the node
+    /// a child or a tenant, or the node was already detached or replaced
+    /// under its key), and the candidate is the first of those parents that
+    /// is not empty. An empty node whose parent is gone, or that has no page
+    /// key, ends the walk where it stands. If that node is `node` itself, the
+    /// candidate is its parent, and the result is None when that parent is
+    /// gone; otherwise the candidate is the empty node, returned only if a
+    /// concurrent insert has given it the tenant. The candidate is returned
+    /// if it holds the tenant and no child of it does, and never if it is the
+    /// root, which eviction never offers.
     fn cleanup_empty_ancestors_with_parent(
         &self,
         node: &NodeRef,
         tenant_id: &TenantId,
     ) -> Option<(NodeRef, u64)> {
         let mut current = Arc::clone(node);
-        let mut parent_leaf_info: Option<(NodeRef, u64)> = None;
-
-        loop {
-            if !current.is_empty() {
-                if parent_leaf_info.is_none() && self.is_tenant_leaf(&current, tenant_id) {
-                    if let Some(ts) = current.tenant_last_access_time.get(tenant_id.as_ref()) {
-                        parent_leaf_info = Some((Arc::clone(&current), *ts));
-                    }
-                }
-                break;
-            }
-
+        while current.is_empty() {
             let parent_weak = current.parent.read();
             let Some(parent) = parent_weak.upgrade() else {
                 break;
@@ -1727,17 +1747,32 @@ impl TokenTree {
                 // The node left the tree: its path hash's entry goes with it.
                 self.forget_hash(&current);
             }
-
-            if parent_leaf_info.is_none() && self.is_tenant_leaf(&parent, tenant_id) {
-                if let Some(ts) = parent.tenant_last_access_time.get(tenant_id.as_ref()) {
-                    parent_leaf_info = Some((Arc::clone(&parent), *ts));
-                }
-            }
-
+            // A failed detach (a concurrent insert gave the node a child or a
+            // tenant, or the node was already detached or replaced under its
+            // key) moves on to the parent read above as well. The race: an
+            // insert re-attaches the tenant under the node, and the parent is
+            // offered past it. Both evictions re-check `is_tenant_leaf` when
+            // they pop the parent and reject it once the attach has landed;
+            // an attach still in flight at the pop is a race main has too.
             current = parent;
         }
 
-        parent_leaf_info
+        let candidate = if Arc::ptr_eq(&current, node) {
+            // Concurrency: a child of `node` holding the tenant again (a
+            // concurrent re-attach) keeps `node`'s parent from being the
+            // tenant's leaf.
+            if Self::any_child_holds(node, tenant_id) {
+                return None;
+            }
+            node.parent.read().upgrade()?
+        } else {
+            current
+        };
+        if Arc::ptr_eq(&candidate, &self.root) || !self.is_tenant_leaf(&candidate, tenant_id) {
+            return None;
+        }
+        let ts = *candidate.tenant_last_access_time.get(tenant_id.as_ref())?;
+        Some((candidate, ts))
     }
 
     /// Get the token count for a specific tenant.
