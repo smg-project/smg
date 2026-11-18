@@ -320,12 +320,13 @@ impl<'de> Deserialize<'de> for LateBoundModel {
 /// one the crate builds from the same file. A Unigram section is read by
 /// [`unigram_scores::section`], for the scores the reference reads, in any
 /// order of its keys (`type`, `unk_id`, `vocab`, `byte_fallback`): the
-/// entries are read until one tells the kind, which is the value of `type`,
-/// the key `unk_id` (no other kind has it) or a vocabulary that is a list
-/// of pieces with their scores. Any other section (another model kind, a
-/// BPE section with `type` later, a section that shows a key no Unigram
-/// section has before any of those) goes to the crate's own reader, which
-/// streams it as before with the entries already read put back in front.
+/// entries are read until one tells the kind, which is the value of `type`
+/// or a vocabulary that is a list of pieces with their scores. Every other
+/// entry is held until then, a key no section has among them, so the place
+/// of a key does not decide which reader takes the section. Any other
+/// section (another model kind, a BPE section with `type` later) goes to
+/// the crate's own reader, which streams it as before with the entries
+/// already read put back in front.
 struct ModelSection;
 
 impl<'de> Visitor<'de> for ModelSection {
@@ -336,10 +337,8 @@ impl<'de> Visitor<'de> for ModelSection {
     }
 
     fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<LateBoundModel, A::Error> {
-        // The entries read before one tells the kind, and the key that
-        // ended the reading with its value still in the section.
+        // The entries read before one tells the kind.
         let mut read = Vec::new();
-        let mut pending = None;
         while let Some(key) = map.next_key::<String>()? {
             match key.as_str() {
                 "type" => {
@@ -354,12 +353,6 @@ impl<'de> Visitor<'de> for ModelSection {
                     read.push((key, Value::String(kind)));
                     break;
                 }
-                // Only a Unigram section has this key.
-                "unk_id" => {
-                    read.push((key, map.next_value()?));
-                    return unigram_scores::section(None, Replay::new(read, None, map))
-                        .map(LateBoundModel::from);
-                }
                 // A list of pieces with their scores is a Unigram section's.
                 "vocab" => match map.next_value_seed(unigram_scores::VocabShape)? {
                     unigram_scores::Vocab::Scored(vocab) => {
@@ -371,17 +364,16 @@ impl<'de> Visitor<'de> for ModelSection {
                         break;
                     }
                 },
-                // A Unigram section has this key, and so has a BPE section.
-                "byte_fallback" => read.push((key, map.next_value()?)),
-                // No Unigram section has this key.
-                _ => {
-                    pending = Some(key);
-                    break;
-                }
+                // No other entry tells the kind: `unk_id`, which a section
+                // of another kind may carry (the crate's reader skips it
+                // there), `byte_fallback`, which a BPE section has too, or a
+                // key no section has. Each is held, so where it stands does
+                // not decide which reader takes the section.
+                _ => read.push((key, map.next_value()?)),
             }
         }
         ModelWrapper::deserialize(de::value::MapAccessDeserializer::new(Replay::new(
-            read, pending, map,
+            read, None, map,
         )))
         .map(LateBoundModel::from)
     }
@@ -838,6 +830,14 @@ mod tests {
                 "{merges} read as a merge list"
             );
         }
+    }
+
+    #[test]
+    fn a_section_of_another_kind_that_carries_unk_id_takes_the_crate_reader() {
+        // Only a Unigram section has `unk_id`, but the crate's reader skips
+        // a key it does not know: the key does not claim the section.
+        let json = r#"{"unk_id":0,"type":"BPE","vocab":{"a":0},"merges":[]}"#;
+        assert_eq!(loading_reading(json), crate_reading(json));
     }
 
     #[test]
