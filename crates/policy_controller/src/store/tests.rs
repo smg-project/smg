@@ -1897,12 +1897,50 @@ fn a_dispatch_on_another_target_of_the_pick_moves_the_leases_count() {
     // The lease ends on the count it books now.
     assert!(leases.released(gateway, LeaseId(1), None, ReleaseReason::ClientGone));
     assert_eq!(in_flight(&store), of(0, 0));
-    // An index the pick holds no target at moves the state and no count.
+    // An index the pick holds no target at moves the state, and neither a
+    // count nor the record's index.
     leases.issue(picked(2)).expect("filed");
     assert!(leases.dispatched(gateway, LeaseId(2), on(2), now));
     assert_eq!(in_flight(&store), of(1, 0));
-    let state = leases.get(gateway, LeaseId(2)).map(|record| record.state);
-    assert_eq!(state, Some(LeaseState::Dispatched { at: now }));
+    let filed = leases.get(gateway, LeaseId(2)).expect("on file");
+    assert_eq!(
+        (filed.state, filed.lease.target_index),
+        (LeaseState::Dispatched { at: now }, 0)
+    );
+}
+
+/// One worker at two ranks of a pick: a dispatch on the second names the
+/// lease's own worker, so no count moves, and the record's index follows
+/// the dispatch all the same.
+#[test]
+fn a_dispatch_on_another_rank_of_the_leases_worker_moves_the_index_alone() {
+    let store = MemoryStore::new();
+    let a = ready(&store, "http://a:1");
+    let (gateway, now) = (GatewayId(1), Instant::now());
+    store.set_term(1);
+    let mut targets = Targets::new();
+    for dp_rank in [0, 3] {
+        targets.push(Target {
+            id: a,
+            dp_rank,
+            ..Target::default()
+        });
+    }
+    let record = LeaseRecord {
+        picked: Picked::of(&targets),
+        ..booking(gateway, 1, a, now)
+    };
+    let leases: &dyn LeasesStore = &store;
+    leases.issue(record).expect("filed");
+    let on = Dispatch {
+        target_index: 1,
+        ..Dispatch::default()
+    };
+    assert!(leases.dispatched(gateway, LeaseId(1), on, now));
+    assert_eq!(in_flight(&store), [(a, 1)], "the worker's count stands");
+    let filed = leases.get(gateway, LeaseId(1)).expect("on file");
+    assert_eq!((filed.target, filed.lease.target_index), (a, 1));
+    assert_eq!(filed.target_at(1), Some((a, 3)), "the rank dispatched to");
 }
 
 #[test]

@@ -2244,10 +2244,14 @@ impl LeasesStore for MemoryStore {
             return true;
         }
         held.record.state = LeaseState::Dispatched { at };
-        // A dispatch on another target of the pick: the lease books that
-        // worker from here on, and the count of the first one is free.
-        let named = held.record.target_at(dispatch.target_index);
-        if let Some((target, _)) = named.filter(|(target, _)| *target != held.record.target) {
+        // A dispatch on another target of the pick: the record names that
+        // target's index from here on. Where the target is another worker
+        // the lease books it and the count of the first one is free;
+        // another rank of the lease's own worker moves no count.
+        let Some((target, _)) = held.record.target_at(dispatch.target_index) else {
+            return true;
+        };
+        if target != held.record.target {
             if let Some(booked) = held.booked {
                 leases.counts.free(booked);
             }
@@ -2256,8 +2260,8 @@ impl LeasesStore for MemoryStore {
                 leases.counts.book(booked);
             }
             held.record.target = target;
-            held.record.lease.target_index = dispatch.target_index;
         }
+        held.record.lease.target_index = dispatch.target_index;
         true
     }
 
