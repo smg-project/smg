@@ -1,7 +1,7 @@
 // Gemini Interactions API types
 // https://ai.google.dev/gemini-api/docs/interactions
 
-use std::{borrow::Cow, collections::HashMap};
+use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -128,45 +128,56 @@ impl GenerationRequest for InteractionsRequest {
     }
 
     fn extract_text_for_routing(&self) -> String {
-        /// A text content's text, borrowed; a user-input or model-output
-        /// step's own contents' texts joined, left out when they hold none.
-        fn text_of(content: &Content) -> Option<Cow<'_, str>> {
-            match content {
-                Content::Text { text, .. } => text.as_deref().map(Cow::Borrowed),
-                Content::UserInput {
-                    content: Some(contents),
-                }
-                | Content::ModelOutput {
-                    content: Some(contents),
-                    ..
-                } => {
-                    let mut text = String::new();
-                    push_joined(&mut text, contents.iter().filter_map(text_of));
-                    (!text.is_empty()).then_some(Cow::Owned(text))
-                }
-                _ => None,
-            }
-        }
-
-        /// `texts` into `buffer`, a space between each: the shape `join(" ")`
-        /// gives, empty pieces included.
-        fn push_joined<T: AsRef<str>>(buffer: &mut String, texts: impl Iterator<Item = T>) {
-            for (index, text) in texts.enumerate() {
-                if index > 0 {
+        /// `contents`' texts into `buffer`, a space between each: the shape
+        /// `join(" ")` gives, empty pieces included. A user-input or
+        /// model-output step is one piece, its own contents' texts joined
+        /// the same way where they land, and is left out when they join to
+        /// nothing. Each text is copied once.
+        fn push_texts(buffer: &mut String, contents: &[Content]) {
+            let mut first = true;
+            for content in contents {
+                let mark = buffer.len();
+                if !first {
                     buffer.push(' ');
                 }
-                buffer.push_str(text.as_ref());
+                let is_piece = match content {
+                    Content::Text {
+                        text: Some(text), ..
+                    } => {
+                        buffer.push_str(text);
+                        true
+                    }
+                    Content::UserInput {
+                        content: Some(contents),
+                    }
+                    | Content::ModelOutput {
+                        content: Some(contents),
+                        ..
+                    } => {
+                        let start = buffer.len();
+                        push_texts(buffer, contents);
+                        buffer.len() > start
+                    }
+                    _ => false,
+                };
+                if is_piece {
+                    first = false;
+                } else {
+                    buffer.truncate(mark);
+                }
             }
         }
 
         match &self.input {
             InteractionsInput::Text(text) => text.clone(),
             InteractionsInput::Content(content) => {
-                text_of(content).map(Cow::into_owned).unwrap_or_default()
+                let mut buffer = String::new();
+                push_texts(&mut buffer, std::slice::from_ref(content));
+                buffer
             }
             InteractionsInput::Contents(contents) => {
                 let mut buffer = String::new();
-                push_joined(&mut buffer, contents.iter().filter_map(text_of));
+                push_texts(&mut buffer, contents);
                 buffer
             }
             InteractionsInput::Turns(turns) => {
@@ -178,7 +189,7 @@ impl GenerationRequest for InteractionsRequest {
                     match &turn.content {
                         Some(TurnContent::Text(text)) => buffer.push_str(text),
                         Some(TurnContent::Contents(contents)) => {
-                            push_joined(&mut buffer, contents.iter().filter_map(text_of));
+                            push_texts(&mut buffer, contents);
                         }
                         None => {}
                     }
@@ -1413,6 +1424,31 @@ mod tests {
             "{errors}"
         );
 
+        // The same blank text item in both steps: it makes a user input
+        // step empty, and a model output step, the model's own, it does not.
+        let blank = serde_json::json!([{"type": "text", "text": ""}]);
+        let blank_user_input: InteractionsRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "input": [{"type": "user_input", "content": blank}], "store": false
+        }))
+        .unwrap();
+        let errors = blank_user_input
+            .validate()
+            .expect_err("a blank item in a user input step")
+            .to_string();
+        assert!(
+            errors.contains("Input content array contains empty content items"),
+            "{errors}"
+        );
+        let blank_model_output: InteractionsRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "input": [{"type": "model_output", "content": blank}], "store": false
+        }))
+        .unwrap();
+        assert!(
+            blank_model_output.validate().is_ok(),
+            "{:?}",
+            blank_model_output.validate()
+        );
+
         let nested_file_search: InteractionsRequest = serde_json::from_value(serde_json::json!({
             "model": "m",
             "input": [{"type": "user_input", "content": [{"type": "file_search_call", "id": "fs_1"}]}],
@@ -1764,6 +1800,37 @@ mod tests {
                     {"role": "user", "content": [{"type": "text", "text": "x"}, {"type": "text", "text": "y"}]}
                 ]),
                 "first   x y",
+            ),
+            (
+                serde_json::json!({"type": "user_input", "content": [
+                    {"type": "text", "text": "one"},
+                    {"type": "text", "text": "two"}
+                ]}),
+                "one two",
+            ),
+            (
+                serde_json::json!([
+                    {"type": "user_input", "content": [{"type": "text", "text": "a"}]},
+                    {"type": "model_output"},
+                    {"type": "user_input", "content": [{"type": "image", "uri": "u"}]},
+                    {"type": "model_output", "content": [{"type": "text", "text": ""}]},
+                    {"type": "text", "text": ""},
+                    {"type": "model_output", "content": [
+                        {"type": "text", "text": "b"},
+                        {"type": "text", "text": ""}
+                    ]}
+                ]),
+                "a  b ",
+            ),
+            (
+                serde_json::json!([
+                    {"role": "user", "content": "first"},
+                    {"role": "user", "content": [
+                        {"type": "user_input", "content": [{"type": "image", "uri": "u"}]},
+                        {"type": "user_input", "content": [{"type": "text", "text": "x"}]}
+                    ]}
+                ]),
+                "first x",
             ),
         ];
         for (input, expected) in cases {
