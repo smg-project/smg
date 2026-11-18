@@ -147,7 +147,9 @@ pub struct HuggingFaceTokenizer {
     /// The ids, in order, of the added tokens that keep their id where a
     /// request types them, under templates marked for the control spellings
     /// they build (see [`EncoderCore::kept`]); `None` when there is none,
-    /// and for any other template.
+    /// and for any other template. They count where the template renders
+    /// the prompt: a renderer with an encoder of its own writes controls
+    /// no template holds.
     kept: Option<Box<[u32]>>,
 }
 
@@ -2433,8 +2435,13 @@ impl HuggingFaceTokenizer {
         let (text, controls) = marks::flatten(&marked)?;
         // Under templates marked for the spellings they build, a typed added
         // token of `kept` is cut out by the flat encode and by the segment
-        // encode alike.
-        let flat_encode_is_segment_encode = match &self.kept {
+        // encode alike. The kept tokens are the templates' own: they count
+        // where the template renders the prompt.
+        let kept = self
+            .kept
+            .as_deref()
+            .filter(|_| matches!(self.renderer, Renderer::Jinja));
+        let flat_encode_is_segment_encode = match kept {
             Some(kept) => self
                 .core
                 .added()
@@ -2445,7 +2452,7 @@ impl HuggingFaceTokenizer {
             PromptEncoding::FromText
         } else {
             let mut segments = marks::segments(&marked)?;
-            if let (Some(kept), Some(added)) = (&self.kept, self.core.added()) {
+            if let (Some(kept), Some(added)) = (kept, self.core.added()) {
                 segments = marks::with_kept(segments, added, kept);
             }
             let core = Arc::clone(&self.core);

@@ -273,6 +273,33 @@ fn a_typed_added_token_that_is_special_flagged_or_written_stays_text() {
     assert_eq!(ids, TYPED_AS_TEXT);
 }
 
+/// The tokens that keep their id are the template's: under a renderer with
+/// an encoder of its own, which writes its controls itself, a typed added
+/// token is read by its characters, also once the template is replaced.
+#[test]
+fn a_typed_added_token_is_text_under_a_renderer_with_its_own_encoder() {
+    let temp = TempDir::new().unwrap();
+    fs::write(
+        temp.path().join("config.json"),
+        json!({"architectures": ["DeepseekV32ForCausalLM"]}).to_string(),
+    )
+    .unwrap();
+    let mut tok = checkpoint_of(temp.path(), &with_added_token("<a>"), &builds());
+    assert!(tok.chat_template.marked());
+    for replaced in [false, true] {
+        if replaced {
+            tok.set_chat_template(builds()).unwrap();
+        }
+        let (_, ids, from_text) = render(&tok, json!("a<a>b"));
+        assert!(!from_text, "replaced: {replaced}");
+        assert!(
+            ids.windows(5).any(|typed| typed == [13, 16, 13, 18, 14]),
+            "replaced: {replaced}"
+        );
+        assert!(!ids.contains(&19), "replaced: {replaced}");
+    }
+}
+
 #[test]
 fn a_mark_typed_into_a_message_is_no_mark() {
     let temp = TempDir::new().unwrap();
