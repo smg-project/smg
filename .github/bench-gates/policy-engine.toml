@@ -10,7 +10,8 @@
 # manual preset on its pin and off it at 8 workers (`policy_engine/decide/manual_keyed_hit/8`,
 # `policy_engine/decide/manual_keyed_miss/8`) and the spec's parse-and-validate time
 # (`policy_engine/spec/parse_validate`): 39 single-threaded rows, deterministic by construction (a fresh
-# seed per iteration), about five minutes a run, so three interleaved runs a side fit the job's budget.
+# seed per iteration), about six minutes a run: three interleaved runs a side take about 37 of the gate
+# step's 60 minutes, and the count of an id that fails by the clock has the room behind them.
 #
 # From sixteen workers on, a decision under `passthrough`, `random`, `round_robin` or `power_of_two` is made by
 # the rows its picker draws and no pass over the pool: those presets' rows at 64 and 512 workers hold the draw
@@ -135,9 +136,9 @@
 
 repeats = 3
 count = true
-# The count ends 2,280 s into the run: the gate step's bound is 40 minutes, and the report is written
+# The count ends 3,480 s into the run: the gate step's bound is 60 minutes, and the report is written
 # in the two minutes behind the count. No count starts in the budget's last 30 s.
-run_budget = 2280
+run_budget = 3480
 filter = "^policy_engine/"
 
 # The files that feed this binary beyond the measured crate: the base side is built with them as the

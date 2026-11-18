@@ -144,9 +144,14 @@ jobs:
         run: |
           bash scripts/ci_apt_install.sh sudo -y --no-install-recommends valgrind
 
+      # The bound is the `decision` row's need. Its 39 ids take about 37 minutes of
+      # rounds, three a side, and the count of an id that fails by the clock runs
+      # behind them. Under 40 minutes that count had no room, and a runner a few
+      # per cent slow would run past the bound. Each row's gate file ends its
+      # count below this bound (`run_budget`).
       - name: Run the benchmark gate
         if: github.event_name == 'pull_request'
-        timeout-minutes: 40
+        timeout-minutes: 60
         run: |
           set -o pipefail
           python3 scripts/bench_gate.py run --gates ".github/bench-gates/$GATES" \
