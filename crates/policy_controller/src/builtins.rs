@@ -1452,9 +1452,7 @@ fn draw_ranked<const DRAWN: bool>(
 
 /// Push the kept positions in descending score order, ties by draw
 /// ([`draw_ranked`]). The rows drawn live in a fixed array: nothing is
-/// allocated. Out of line: one body serves both pickers, and a pick's own
-/// entry stays short enough to be laid into its caller.
-#[inline(never)]
+/// allocated.
 fn push_ranked<const DRAWN: bool>(
     mut draw: Draw,
     candidates: &[Candidate],
