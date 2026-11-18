@@ -2249,7 +2249,8 @@ impl Marks {
     const RANKED: u8 = 1 << 4;
     /// The plain ring alone places a keyed request by its session key:
     /// under a binding that steers, such a request keeps its key's worker
-    /// over the overload veto ([`Engine::keep`]). The validator sets it for
+    /// over the overload veto ([`Engine::keep`]), where the kept key's test
+    /// passes it ([`vetoed::keeps_its_key`]). The validator sets it for
     /// that one shape of profile, no stage does ([`Self::with_key`]).
     const KEYED: u8 = 1 << 5;
     /// The scope of a profile under the key's mark: its [`Self::SCOPED`]
@@ -3190,14 +3191,16 @@ impl Engine {
     /// where no row of the pool is over its thresholds, or where the pool
     /// stays empty with the veto lifted. Where the binding steers, a
     /// keyed request of a profile that places by the session key is decided
-    /// with the overload veto lifted, so the key keeps its worker. The
-    /// request's affinity column is empty or holds one entry a candidate;
-    /// any other is refused, as a decline under the stage name
-    /// `affinity-column`. Rows named in the column's place
-    /// ([`NamedAffinity`]) are read as the host derived them: a debug build
-    /// asserts that they stand for the pool. A profile that shows its rows
-    /// to a plugin is declined over rows that carry a mask or a pin beside
-    /// them, under the stage name `written-rows` ([`Self::reads_for`]).
+    /// with the overload veto lifted, so the key keeps its worker; under a
+    /// sessions rule with an in-flight cap, only where the host wrote the
+    /// key's counts ([`RequestFacts::session_counted`]). The request's
+    /// affinity column is empty or holds one entry a candidate; any other is
+    /// refused, as a decline under the stage name `affinity-column`. Rows
+    /// named in the column's place ([`NamedAffinity`]) are read as the host
+    /// derived them: a debug build asserts that they stand for the pool. A
+    /// profile that shows its rows to a plugin is declined over rows that
+    /// carry a mask or a pin beside them, under the stage name
+    /// `written-rows` ([`Self::reads_for`]).
     pub fn decide(
         &self,
         facts: &RequestFacts<'_>,
@@ -3351,7 +3354,8 @@ impl Engine {
     /// ([`Lifted::Overload`]). A placement that lands on one of the key's
     /// pins again follows that pin under the rule's in-flight cap
     /// ([`Self::respill`]): nothing is claimed, and a key handed on reads
-    /// the veto as it stands before the lifted pass's survivors.
+    /// the veto as it stands before the lifted pass's survivors. Handed on
+    /// to a survivor of the lifted pass alone, it says the lifted veto too.
     /// A pin of record whose worker the standing pass left out is written
     /// back where the lifted pass kept that worker, and is one of the
     /// key's pins from there on.

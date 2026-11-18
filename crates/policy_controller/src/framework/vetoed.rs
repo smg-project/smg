@@ -10,12 +10,14 @@
 //! A profile that places a request by its session key reads the same word
 //! ahead of its pass ([`keeps_its_key`]): where the binding steers, a keyed
 //! request is decided with the veto lifted ([`Engine::keep`]), so the key
-//! keeps its worker while that worker is over its thresholds. Under a
-//! sessions rule the key's pin is asked first, with the veto as it stands,
-//! and the lifted pass places a key no pin takes. Where the veto as it
-//! stands leaves the key's pool nobody, the kept pick says the lifted veto in
-//! its trace as the rule's own pick does ([`Lifted::Overload`]): a host
-//! counts both from the one mark.
+//! keeps its worker while that worker is over its thresholds. A sessions
+//! rule with an in-flight cap keeps the key only where the host wrote the
+//! cap's count ([`RequestFacts::session_counted`]). Under a sessions rule
+//! the key's pin is asked first, with the veto as it stands, and the lifted
+//! pass places a key no pin takes. Where the veto as it stands leaves the
+//! key's pool nobody, the kept pick says the lifted veto in its trace as the
+//! rule's own pick does ([`Lifted::Overload`]): a host counts both from the
+//! one mark.
 
 use super::{
     filter, run_single, single_emptied, trace_of, Assignment, Binding, Buffers, Engine, Filter,

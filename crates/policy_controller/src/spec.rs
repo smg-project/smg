@@ -168,7 +168,8 @@ pub struct Needs {
     /// `min_group` assignment and the `fewest-sessions` scorer).
     pub active_sessions: bool,
     /// The request's own key's in-flight count per worker (a sessions rule
-    /// with an in-flight cap).
+    /// with an in-flight cap). A host that writes it says so on the request
+    /// ([`RequestFacts::session_counted`](crate::RequestFacts::session_counted)).
     pub session_in_flight: bool,
     /// The affinity column
     /// ([`RequestFacts::affinity`](crate::RequestFacts::affinity)): one
@@ -1305,9 +1306,12 @@ pub struct OverloadSpec {
     /// alone places the request: under the single plan, in a profile whose
     /// only scorer is `consistent-hash` with no `prefix_tokens` and no
     /// `bounded_load`, picked by `best` with no parameters, under no
-    /// sessions rule or one that delegates. Set, the key moves to the
-    /// ring's next worker; unset, the key stays on its worker over the
-    /// veto. Everywhere else a keyed request keeps the veto.
+    /// sessions rule or one that delegates. A rule with an in-flight cap
+    /// keeps the key only under a host that counts the key's requests,
+    /// which the controller's own service does not yet. A rule with
+    /// `inflight_cap: 65535` has no cap. Set, the key moves to the ring's
+    /// next worker; unset, the key stays on its worker over the veto.
+    /// Everywhere else a keyed request keeps the veto.
     pub shed_when_all_vetoed: bool,
 }
 
