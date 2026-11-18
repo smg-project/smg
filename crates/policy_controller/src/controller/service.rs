@@ -46,6 +46,7 @@ use super::{
     decide::{self, Streams},
     deciders::{self, Deciders, Reads},
     election::{split_identity, Standing},
+    floor::Floors,
     gateways::Gateways,
     generations::{DryRun, Format, Generations, Unanswered, DRY_RUNS_WAITING},
     membership::Door,
@@ -170,6 +171,9 @@ pub(crate) struct Shared {
     pub(crate) role: watch::Sender<bool>,
     /// Who watches this replica: the bounds of a watch's open.
     pub(crate) watchers: Arc<Watchers>,
+    /// A gateway's term floor above this replica's term, on its way to the
+    /// election.
+    pub(crate) floors: Floors,
 }
 
 /// Who leads, as this replica knows it at one read of its fence.
@@ -245,6 +249,7 @@ impl Shared {
             feed,
             role: watch::channel(false).0,
             watchers: Arc::new(Watchers::new(session::PRESENT_MAX)),
+            floors: Floors::default(),
         })
     }
 
