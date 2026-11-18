@@ -1912,7 +1912,9 @@ def first_ready(process: subprocess.Popen, url: str) -> dict | None:
     exits meanwhile fails the case with its output."""
     deadline = time.monotonic() + 20
     while time.monotonic() < deadline:
-        assert process.poll() is None, f"the controller exited: {process.stdout.read()}"
+        if process.poll() is not None:
+            output = process.stdout.read() if process.stdout else ""
+            raise AssertionError(f"the controller exited: {output}")
         try:
             with DIRECT.open(url, timeout=2) as response:
                 assert response.status == 200
