@@ -6,7 +6,7 @@
 
 pub mod reservation;
 
-use std::{any::Any, sync::Arc};
+use std::{any::Any, collections::HashSet, sync::Arc};
 
 use kv_index::{compute_request_content_hashes, salt::request_content_hashes_with_seed};
 use openai_protocol::worker::WorkerLoadResponse;
@@ -25,6 +25,7 @@ use crate::worker::{
     KvEventMonitor, Worker,
 };
 
+/// Prefill placement using native KV overlap and outstanding input work.
 #[derive(Debug)]
 pub struct PrefillCostPolicy {
     block_size: usize,
@@ -47,10 +48,12 @@ impl Default for PrefillCostPolicy {
 }
 
 impl PrefillCostPolicy {
+    /// Use the default block size, work allowance and input-rate fallback.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Configure input-work scoring; throughput is measured in input tokens/s.
     pub fn with_params(
         block_size: usize,
         kv_pressure_weight: f64,
@@ -75,6 +78,7 @@ impl PrefillCostPolicy {
         }
     }
 
+    /// Read prefix reuse from this monitor, or count the full prompt without one.
     pub fn set_kv_event_monitor(&self, monitor: Option<Arc<KvEventMonitor>>) {
         *self.kv_monitor.write() = monitor;
     }
@@ -84,8 +88,35 @@ impl PrefillCostPolicy {
     }
 
     /// Partial DP reports and invalid input rates use nominal peer capacity.
-    fn input_rate(load: &WorkerLoadResponse) -> Option<f64> {
-        if load.loads.is_empty() || load.loads.len() < load.dp_rank_count.max(0) as usize {
+    fn input_rate(worker: &dyn Worker, load: &WorkerLoadResponse) -> Option<f64> {
+        if let Some(rank) = worker.dp_rank() {
+            if load.loads.len() != 1 || load.loads[0].dp_rank != i32::try_from(rank).ok()? {
+                return None;
+            }
+        } else {
+            let labels = &worker.metadata().spec.labels;
+            let dimension = |name: &str| -> Option<usize> {
+                labels
+                    .get(name)
+                    .map_or(Some(1), |value| value.parse().ok())
+                    .filter(|value| *value > 0)
+            };
+            let expected = dimension("dp_size")?
+                .checked_mul(dimension("attn_dp_size")?)?
+                .max(worker.dp_size().unwrap_or(1))
+                .max(load.dp_rank_count.max(1) as usize);
+            if load.loads.len() != expected {
+                return None;
+            }
+            let mut ranks = HashSet::with_capacity(load.loads.len());
+            for row in &load.loads {
+                let rank = usize::try_from(row.dp_rank).ok()?;
+                if rank >= expected || !ranks.insert(rank) {
+                    return None;
+                }
+            }
+        }
+        if load.loads.is_empty() {
             return None;
         }
         let rate = load.loads.iter().try_fold(0.0, |sum, rank| {
@@ -182,7 +213,7 @@ impl LoadBalancingPolicy for PrefillCostPolicy {
             if let Some(rate) = snapshot
                 .as_ref()
                 .and_then(|loads| loads.get(workers[idx].url()))
-                .and_then(Self::input_rate)
+                .and_then(|load| Self::input_rate(workers[idx].as_ref(), load))
             {
                 rate_sum += rate;
                 rate_count += 1;
@@ -198,23 +229,26 @@ impl LoadBalancingPolicy for PrefillCostPolicy {
             .iter()
             .map(|&idx| {
                 let worker = &workers[idx];
-                let (backend_work_tokens, sampled_at, rate, pressure) = match snapshot
-                    .as_ref()
-                    .and_then(|loads| loads.report(worker.url()))
-                {
-                    Some((load, sampled_at)) => (
-                        self.backend_work(load),
-                        Some(sampled_at),
-                        Self::input_rate(load).unwrap_or(nominal),
-                        load.effective_kv_pressure(),
-                    ),
-                    None => (
-                        (worker.load() as u64).saturating_mul(self.mean_prefill_tokens as u64),
-                        None,
-                        nominal,
-                        0.0,
-                    ),
-                };
+                let (backend_work_tokens, sampled_at, rate, pressure, local_count_mean) =
+                    match snapshot
+                        .as_ref()
+                        .and_then(|loads| loads.report(worker.url()))
+                    {
+                        Some((load, sampled_at)) => (
+                            self.backend_work(load),
+                            Some(sampled_at),
+                            Self::input_rate(worker.as_ref(), load).unwrap_or(nominal),
+                            load.effective_kv_pressure(),
+                            None,
+                        ),
+                        None => (
+                            0,
+                            None,
+                            nominal,
+                            0.0,
+                            Some(u64::from(self.mean_prefill_tokens)),
+                        ),
+                    };
                 let pressure = if pressure.is_nan() { 0.0 } else { pressure };
                 PrefillCandidate {
                     idx,
@@ -223,6 +257,7 @@ impl LoadBalancingPolicy for PrefillCostPolicy {
                     // prompts are conservatively charged in full.
                     uncached_tokens: total_prompt.saturating_sub(cached[idx]),
                     active_request_tokens,
+                    local_count_mean,
                     backend_work_tokens,
                     sampled_at,
                     tokens_per_second: rate,
@@ -236,7 +271,9 @@ impl LoadBalancingPolicy for PrefillCostPolicy {
                 }
             })
             .collect();
-        let (idx, _, lease) = slot.ledger.select_and_reserve(&candidates)?;
+        let (idx, _, lease) = slot
+            .ledger
+            .select_and_reserve_with_local_counts(&candidates, |idx| workers[idx].load())?;
         slot.store(lease);
         workers[idx].increment_processed();
         Some(idx)

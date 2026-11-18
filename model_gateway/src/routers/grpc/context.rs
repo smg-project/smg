@@ -57,7 +57,10 @@ use crate::{
     config::ParserChoice,
     middleware::TenantRequestMeta,
     observability::{cache_trace, metrics::Metrics},
-    policies::{prefill_cost::reservation::Reservation, CacheNamespace},
+    policies::{
+        prefill_cost::reservation::{CountedLoad, Reservation},
+        CacheNamespace,
+    },
     routers::{
         common::{
             attempt_ledger::AttemptLedger, pd_admission::PdAdmissionGuard,
@@ -1091,6 +1094,11 @@ pub(crate) enum LoadGuards {
     /// policies see the real backend concurrency.
     Batch {
         _guards: Vec<LoadGuards>,
+    },
+    /// The local worker counters this cost lease already prices. The wrapper
+    /// keeps counter changes and coverage changes atomic to cost selection.
+    CostCounted {
+        _guards: Box<CountedLoad<LoadGuards>>,
     },
     /// A disaggregated dispatch whose bootstrap rooms the PD admission gate
     /// claimed before it was allowed to send. The claim rides with the guards
@@ -2566,6 +2574,118 @@ mod tests {
             3,
         ));
         assert_eq!(spy.0.lock().unwrap().len(), before + 3);
+    }
+
+    #[test]
+    fn cost_counted_load_follows_the_guards_without_extending_the_lease() {
+        use crate::{
+            policies::prefill_cost::reservation::{PrefillCandidate, ReservationLedger},
+            worker::BasicWorkerBuilder,
+        };
+
+        for count in [1, 3] {
+            let worker: Arc<dyn Worker> =
+                Arc::new(BasicWorkerBuilder::new("grpc://counted-cost").build());
+            let ledger = Arc::new(ReservationLedger::default());
+            let candidate = PrefillCandidate {
+                idx: 0,
+                worker: worker.url(),
+                uncached_tokens: 30,
+                active_request_tokens: count as u64 * 10,
+                local_count_mean: Some(10),
+                backend_work_tokens: 0,
+                sampled_at: None,
+                tokens_per_second: 1.0,
+                kv_penalty_seconds: 0.0,
+            };
+            let (_, _, mut lease) = ledger
+                .select_and_reserve_with_local_counts(&[candidate.clone()], |_| worker.load())
+                .unwrap();
+            let remaining_work = || {
+                let (_, cost, probe) = ledger
+                    .select_and_reserve_with_local_counts(
+                        &[PrefillCandidate {
+                            uncached_tokens: 0,
+                            active_request_tokens: 0,
+                            ..candidate.clone()
+                        }],
+                        |_| worker.load(),
+                    )
+                    .unwrap();
+                drop(probe);
+                cost
+            };
+            let selection = WorkerSelection::Single {
+                worker: Arc::clone(&worker),
+            };
+            let guards = LoadGuards::CostCounted {
+                _guards: Box::new(
+                    lease.counted_load(count, || LoadGuards::scaled(&selection, None, count)),
+                ),
+            };
+            assert_eq!(worker.load(), count);
+            assert_eq!(remaining_work(), (30 + count * 10) as f64);
+            lease.dispatched();
+            assert_eq!(remaining_work(), (30 + count * 10) as f64);
+
+            let unrelated = WorkerLoadGuard::with_key(Arc::clone(&worker), None);
+            assert_eq!(remaining_work(), (40 + count * 10) as f64);
+            lease.prefill_complete();
+            assert_eq!(remaining_work(), ((count + 1) * 10) as f64);
+
+            // Raw RPC ownership can end before the response body's load guards.
+            drop(lease);
+            assert_eq!(ledger.active(worker.url()), 0);
+            assert_eq!(worker.load(), count + 1);
+            assert_eq!(remaining_work(), ((count + 1) * 10) as f64);
+            drop(guards);
+            assert_eq!(worker.load(), 1);
+            assert_eq!(remaining_work(), 10.0);
+            drop(unrelated);
+            assert_eq!(remaining_work(), 0.0);
+        }
+    }
+
+    #[test]
+    fn ending_counted_guards_does_not_end_an_owned_cost_reservation() {
+        use crate::{
+            policies::prefill_cost::reservation::{PrefillCandidate, ReservationLedger},
+            worker::BasicWorkerBuilder,
+        };
+
+        let worker: Arc<dyn Worker> =
+            Arc::new(BasicWorkerBuilder::new("grpc://counted-cost").build());
+        let ledger = Arc::new(ReservationLedger::default());
+        let (_, _, lease) = ledger
+            .select_and_reserve(&[PrefillCandidate {
+                idx: 0,
+                worker: worker.url(),
+                uncached_tokens: 30,
+                active_request_tokens: 10,
+                local_count_mean: Some(10),
+                backend_work_tokens: 0,
+                sampled_at: None,
+                tokens_per_second: 1.0,
+                kv_penalty_seconds: 0.0,
+            }])
+            .unwrap();
+        let guards = LoadGuards::CostCounted {
+            _guards: Box::new(lease.counted_load(1, || {
+                LoadGuards::new(
+                    &WorkerSelection::Single {
+                        worker: Arc::clone(&worker),
+                    },
+                    None,
+                )
+            })),
+        };
+        assert_eq!(worker.load(), 1);
+        drop(guards);
+        assert_eq!(worker.load(), 0);
+        assert_eq!(ledger.active(worker.url()), 1);
+        assert_eq!(ledger.pending(worker.url()), 30);
+        drop(lease);
+        assert_eq!(ledger.active(worker.url()), 0);
     }
 
     /// The client-shape mismatch answers an executor takes from the

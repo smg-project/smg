@@ -363,9 +363,9 @@ pub struct WorkerMonitor<G> {
     /// gateway's own, and every record looks its worker up in each: they
     /// hash with FxHash.
     pushed_reports: Mutex<FxHashMap<String, WorkerLoadResponse>>,
-    /// When each rank of a worker last pushed a load record, by receipt:
-    /// the tick's poll decision reads it (see [`PollMode`]).
-    pushed_at: Mutex<FxHashMap<String, BTreeMap<i32, Instant>>>,
+    /// Each rank's last stream receipt and the sample behind its current row.
+    /// Receipt decides polling; the oldest retained sample fences accounting.
+    pushed_at: Mutex<FxHashMap<String, BTreeMap<i32, RankLoadTime>>>,
     /// The workers whose report changed since the last coalesced publish,
     /// each with the incarnation that pushed, for the publish fence.
     pending_pushed: Mutex<FxHashMap<String, Arc<dyn Worker>>>,
@@ -376,6 +376,12 @@ pub struct WorkerMonitor<G> {
 /// A worker's published copy of its pushed report, with the worker it came
 /// from for the publish fence.
 type PushedReport = (Arc<dyn Worker>, Arc<WorkerLoadResponse>);
+
+#[derive(Clone, Copy)]
+struct RankLoadTime {
+    received_at: Instant,
+    sampled_at: Instant,
+}
 
 /// Where a worker's load comes from at a tick. An engine that reports its
 /// load on its KV-event stream is not asked for it again: in gRPC mode the
@@ -550,9 +556,10 @@ impl<G: Generation> WorkerMonitor<G> {
     /// kept for that rank, and into the shared snapshot, which routing
     /// reads, in the next coalesced publish, which copies the report once
     /// per window: a record allocates no report, key, label or timestamp of
-    /// its own. The report's `sampled_at` is the receipt less the record's
-    /// age and the one-way margin, what a policy releases its dispatch credit
-    /// against. Negative ranks and records for another virtual worker's rank
+    /// its own. A rank's sample is the receipt less the record's age and the
+    /// one-way margin; the report's `sampled_at` is the oldest retained sample,
+    /// what a policy releases its dispatch credit against. Negative ranks and
+    /// records for another virtual worker's rank
     /// are ignored before updating freshness, liveness, metrics or routing
     /// state, and before any reader of the record is called.
     pub fn apply_pushed_load<R: LoadRecord>(
@@ -587,14 +594,20 @@ impl<G: Generation> WorkerMonitor<G> {
         // A worker's entries are made on its first record; the lookups that
         // find them copy no key.
         let mut reports = self.pushed_reports.lock();
-        {
+        let report_sampled_at = {
             let mut receipts = self.pushed_at.lock();
+            let time = RankLoadTime {
+                received_at,
+                sampled_at,
+            };
             if let Some(ranks) = receipts.get_mut(url) {
-                ranks.insert(dp_rank, received_at);
+                ranks.insert(dp_rank, time);
+                ranks.values().map(|time| time.sampled_at).min()
             } else {
-                receipts.insert(url.to_string(), BTreeMap::from([(dp_rank, received_at)]));
+                receipts.insert(url.to_string(), BTreeMap::from([(dp_rank, time)]));
+                Some(sampled_at)
             }
-        }
+        };
         if !reports.contains_key(url) {
             reports.insert(url.to_string(), WorkerLoadResponse::default());
         }
@@ -622,7 +635,7 @@ impl<G: Generation> WorkerMonitor<G> {
                 at
             }
         };
-        report.sampled_at = Some(sampled_at);
+        report.sampled_at = report_sampled_at;
         // What a poll does with a fresh report, read off the worker's own.
         self.apply_overload_verdict(worker, Some(&*report), "pushed record");
         liveness::on_load_report(
@@ -680,7 +693,7 @@ impl<G: Generation> WorkerMonitor<G> {
             Some(ranks) if !ranks.is_empty() => {
                 let fresh = ranks
                     .values()
-                    .all(|&at| now.saturating_duration_since(at) < interval);
+                    .all(|time| now.saturating_duration_since(time.received_at) < interval);
                 if fresh {
                     PollMode::Suppressed
                 } else {
@@ -731,8 +744,8 @@ impl<G: Generation> WorkerMonitor<G> {
     /// that rank, so an answer with rows never omits it. Returns the rows
     /// on file of the ranks that pushed since the poll began (the stream's,
     /// the newer), named by the poll's answer or not, and, when there are
-    /// any, the report on file's sample instant, for a publish that carries
-    /// them over the poll's under their own sample boundary.
+    /// any, their oldest sample instant, for a publish that carries them
+    /// over the poll's under their own sample boundary.
     pub(crate) fn apply_polled_load(
         &self,
         url: &str,
@@ -767,8 +780,10 @@ impl<G: Generation> WorkerMonitor<G> {
         // against the list.
         let lists_ranks = load.has_absolute_token_data()
             && load.loads.len() >= usize::try_from(load.dp_rank_count).unwrap_or(0);
+        let polled_sampled_at = load.sampled_at.unwrap_or_else(Instant::now);
         let on_file = report.loads.len();
         let mut newer = Vec::new();
+        let mut newer_sampled_at: Option<Instant> = None;
         // Every rank on file: one that pushed since the poll began keeps its
         // row and hands it to the publish, whether the poll's answer names
         // the rank or not; any other takes the answer's entry for it, and
@@ -776,16 +791,26 @@ impl<G: Generation> WorkerMonitor<G> {
         // empty answer: what a poll retracts it retracts from the file, so
         // no later record of another rank publishes the old row again.
         report.loads.retain_mut(|row| {
-            let pushed_since = receipts
+            let time = receipts
                 .as_deref()
                 .and_then(|ranks| ranks.get(&row.dp_rank))
-                .is_some_and(|&at| at >= polled_at);
-            if pushed_since {
+                .copied();
+            if let Some(time) = time.filter(|time| time.received_at >= polled_at) {
                 newer.push(row.clone());
+                newer_sampled_at =
+                    Some(newer_sampled_at.map_or(time.sampled_at, |at| at.min(time.sampled_at)));
                 return true;
             }
             if let Some(entry) = load.loads.iter().find(|entry| entry.dp_rank == row.dp_rank) {
                 row.clone_from(entry);
+                if let Some(time) = receipts
+                    .as_deref_mut()
+                    .and_then(|ranks| ranks.get_mut(&row.dp_rank))
+                {
+                    // The row is now the poll's, but polling is not a stream
+                    // receipt: a quiet rank must keep triggering fallback.
+                    time.sampled_at = polled_sampled_at;
+                }
                 return true;
             }
             if !lists_ranks {
@@ -799,12 +824,10 @@ impl<G: Generation> WorkerMonitor<G> {
         if report.loads.len() < on_file {
             report.dp_rank_count = i32::try_from(report.loads.len()).unwrap_or(i32::MAX);
         }
-        let sampled_at = if newer.is_empty() {
-            None
-        } else {
-            report.sampled_at
-        };
-        (newer, sampled_at)
+        report.sampled_at = receipts
+            .as_deref()
+            .and_then(|ranks| ranks.values().map(|time| time.sampled_at).min());
+        (newer, newer_sampled_at)
     }
 
     /// Retract pre-poll pushed ranks after an authoritative empty response.
@@ -817,13 +840,15 @@ impl<G: Generation> WorkerMonitor<G> {
             return;
         };
         times.retain(|&dp_rank, at| {
-            rank.is_some_and(|rank| usize::try_from(dp_rank) != Ok(rank)) || *at >= polled_at
+            rank.is_some_and(|rank| usize::try_from(dp_rank) != Ok(rank))
+                || at.received_at >= polled_at
         });
         if let Some(report) = reports.get_mut(url) {
             report
                 .loads
                 .retain(|load| times.contains_key(&load.dp_rank));
             report.dp_rank_count = i32::try_from(report.loads.len()).unwrap_or(i32::MAX);
+            report.sampled_at = times.values().map(|time| time.sampled_at).min();
         }
     }
 
@@ -1140,8 +1165,12 @@ impl<G: Generation> WorkerMonitor<G> {
         self.native_loads_memo.remove(url);
         // The pushed-record state goes with the worker: a replacement is
         // polled until its own stream pushes.
-        self.pushed_reports.lock().remove(url);
-        self.pushed_at.lock().remove(url);
+        {
+            let mut reports = self.pushed_reports.lock();
+            let mut times = self.pushed_at.lock();
+            reports.remove(url);
+            times.remove(url);
+        }
         self.load_state.enqueue_eviction(Arc::clone(worker));
     }
 
@@ -1820,15 +1849,13 @@ async fn poll_group_once<G: Generation>(
         // whether the poll's answer names the rank or not: every step
         // below reads the report so reconciled.
         if let Some(load) = response.as_mut().filter(|load| !load.loads.is_empty()) {
-            let read_at = Instant::now();
+            let polled_sampled_at = *load.sampled_at.get_or_insert_with(Instant::now);
             let (newer, stream_sampled_at) = monitor.apply_polled_load(&url, load, now);
-            // One sample instant per report, the earlier of the two: the
-            // carried rows keep their stream's, so the scorer releases
-            // no dispatch they never saw; the poll's own rows cost their
-            // in-flight dispatches once more until the next report, the
-            // safe side.
-            load.sampled_at = Some(stream_sampled_at.map_or(read_at, |at| at.min(read_at)));
+            // Carried rows keep their stream's boundary. The poll's sample
+            // contributes only while a row from its answer remains, so no
+            // replaced row holds back a fully newer report.
             let polled_rows = load.loads.len();
+            let mut replaced = 0;
             for row in newer {
                 if let Some(entry) = load
                     .loads
@@ -1836,6 +1863,7 @@ async fn poll_group_once<G: Generation>(
                     .find(|entry| entry.dp_rank == row.dp_rank)
                 {
                     *entry = row;
+                    replaced += 1;
                 } else {
                     // A rank the answer does not name: the row goes in
                     // before the first entry of a greater rank, its
@@ -1848,6 +1876,11 @@ async fn poll_group_once<G: Generation>(
                     load.loads.insert(at, row);
                 }
             }
+            load.sampled_at = match stream_sampled_at {
+                Some(at) if replaced == polled_rows => Some(at),
+                Some(at) => Some(at.min(polled_sampled_at)),
+                None => Some(polled_sampled_at),
+            };
             // The rank count is never below the rows the report carries; a
             // larger count of the poll's own stands, so a partial report
             // stays partial for the readers that ask.
@@ -3002,7 +3035,7 @@ mod native_loads_tests {
 
     /// The records of one window publish one report per worker, in the
     /// poll's shape: every rank on file in rank order, the `pushed` version,
-    /// an RFC 3339 timestamp, the rank count and the last record's sample
+    /// an RFC 3339 timestamp, the rank count and the oldest retained sample
     /// instant, built at the publish and not per record; a window with no
     /// record publishes nothing.
     #[tokio::test]
@@ -3033,7 +3066,7 @@ mod native_loads_tests {
             .map(|rank| (rank.dp_rank, rank.num_running_reqs))
             .collect();
         assert_eq!(ranks, vec![(0, 2), (1, 8)]);
-        assert_eq!(sampled_at, last - PUSHED_ONE_WAY_MARGIN);
+        assert_eq!(sampled_at, t0 - PUSHED_ONE_WAY_MARGIN);
         assert_eq!(monitor.pending_pushed_len(), 0);
         monitor.flush_pushed();
         assert!(

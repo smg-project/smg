@@ -307,10 +307,18 @@ pub(crate) async fn execute_plan(
     // request retried on it.
     let ledger = &ctx.ledger;
 
-    ctx.load_guards = Some(LoadGuards::admitted(
-        admission,
-        LoadGuards::scaled(workers, ctx.sticky_key.as_deref(), sub_requests),
-    ));
+    let make_guards = || {
+        LoadGuards::admitted(
+            admission,
+            LoadGuards::scaled(workers, ctx.sticky_key.as_deref(), sub_requests),
+        )
+    };
+    ctx.load_guards = Some(match ctx.cost_reservation.as_ref() {
+        Some(lease) => LoadGuards::CostCounted {
+            _guards: Box::new(lease.counted_load(sub_requests, make_guards)),
+        },
+        None => make_guards(),
+    });
     // A sticky request to a grouped data-parallel worker goes to its key's
     // engine.
     pin_grouped_dp_rank(
@@ -392,11 +400,11 @@ pub(crate) async fn execute_plan(
                     .await
                 }
                 ProtoRequest::Embed(req) => {
-                    execute_embed(vec![req], clients, workers, ledger).await
+                    execute_embed(vec![req], clients, workers, ledger, cost_reservation).await
                 }
             },
             ExecutionPlan::EmbedBatch { requests, .. } => {
-                execute_embed(requests, clients, workers, ledger).await
+                execute_embed(requests, clients, workers, ledger, cost_reservation).await
             }
             // The two disaggregated arms are boxed: their futures are over ten
             // times the single arm's, and by value they would size every
@@ -963,10 +971,7 @@ async fn execute_batch_dispatch(
     ledger: &AttemptLedger,
     dispatched_at: Instant,
 ) -> Result<ExecutionResult, Response> {
-    let reservations: Vec<_> = match cost_reservation {
-        Some(lease) => lease.split(requests.len()).into_iter().map(Some).collect(),
-        None => requests.iter().map(|_| None).collect(),
-    };
+    let mut reservations = cost_reservation.map(|lease| lease.split(requests.len()).into_iter());
     // One Prefill handle per PD sub-request, all on the one admission slot.
     let prefill_guards: Vec<Option<PrefillLoadGuard>> = match kind {
         ExecutionPlanKind::Single => requests.iter().map(|_| None).collect(),
@@ -981,8 +986,8 @@ async fn execute_batch_dispatch(
     let dispatches = requests
         .into_iter()
         .zip(prefill_guards)
-        .zip(reservations)
-        .map(|((request, prefill_guard), reservation)| {
+        .map(|(request, prefill_guard)| {
+            let reservation = reservations.as_mut().and_then(Iterator::next);
             let mut clients = clients.clone();
             async move {
                 match kind {
@@ -1356,6 +1361,20 @@ where
     answers.into_iter().map(|(_, answer)| answer).collect()
 }
 
+/// Stamp a booked unary call only when its window slot starts. Constructing
+/// the call here keeps queued siblings undispatched and avoids storing an
+/// already-created RPC future in this wrapper's initial state.
+async fn dispatch_embed_booked<M, C>(make_call: M, mut reservation: Reservation) -> C::Output
+where
+    M: FnOnce() -> C,
+    C: Future,
+{
+    reservation.dispatched();
+    let answer = make_call().await;
+    drop(reservation);
+    answer
+}
+
 /// The embed calls of a request, one per input, at most
 /// [`MAX_IN_FLIGHT_EMBED_CALLS`] of them in flight together on the one worker
 /// and answered in the inputs' order (the wire takes one input per call). The
@@ -1371,6 +1390,7 @@ async fn execute_embed(
     clients: &mut ClientSelection,
     workers: &WorkerSelection,
     ledger: &AttemptLedger,
+    cost_reservation: Option<Reservation>,
 ) -> Result<ExecutionResult, Response> {
     // The file's own `join_all` import goes with the last other call that
     // uses it; this one names the function here, so the call stands whether
@@ -1380,19 +1400,43 @@ async fn execute_embed(
     let client = &*clients.single_or_mismatch("execute_embed")?;
 
     let worker = workers.single();
-    let calls = requests.into_iter().map(|request| {
-        if let Some(worker) = worker {
-            WorkerMetrics::record_worker_request(worker.url(), worker.model_id());
-        }
-        client.embed(request)
-    });
-    // A batch within the window is one plain join, as a single input is. The
-    // window's queue is a future of its own, boxed: only the batch that
-    // needs the window pays for it, in its calls and in this future's size.
-    let answers = if calls.len() <= MAX_IN_FLIGHT_EMBED_CALLS {
-        join_all(calls).await
+    let answers = if let Some(reservation) = cost_reservation {
+        // The optional cost path owns its larger future separately. The
+        // ordinary path below retains its existing call and future shapes.
+        Box::pin(async move {
+            let leases = reservation.split(requests.len());
+            let calls = requests.into_iter().zip(leases).map(|(request, lease)| {
+                dispatch_embed_booked(
+                    move || {
+                        if let Some(worker) = worker {
+                            WorkerMetrics::record_worker_request(worker.url(), worker.model_id());
+                        }
+                        client.embed(request)
+                    },
+                    lease,
+                )
+            });
+            if calls.len() <= MAX_IN_FLIGHT_EMBED_CALLS {
+                join_all(calls).await
+            } else {
+                embed_in_window(calls).await
+            }
+        })
+        .await
     } else {
-        Box::pin(embed_in_window(calls)).await
+        let calls = requests.into_iter().map(|request| {
+            if let Some(worker) = worker {
+                WorkerMetrics::record_worker_request(worker.url(), worker.model_id());
+            }
+            client.embed(request)
+        });
+        // A batch within the window is one plain join, as a single input is.
+        // Only a batch needing the window pays for its separate future.
+        if calls.len() <= MAX_IN_FLIGHT_EMBED_CALLS {
+            join_all(calls).await
+        } else {
+            Box::pin(embed_in_window(calls)).await
+        }
     };
     // One breaker sample for the request, read from every answer: a worker
     // failure on any input counts whatever its place in the batch.
@@ -6022,7 +6066,10 @@ pub(crate) mod tests {
     mod cost {
         use std::{
             future,
-            sync::Arc,
+            sync::{
+                atomic::{AtomicUsize, Ordering},
+                Arc,
+            },
             time::{Duration, Instant},
         };
 
@@ -6050,6 +6097,7 @@ pub(crate) mod tests {
                     worker: worker.url(),
                     uncached_tokens: 100,
                     active_request_tokens: 1024,
+                    local_count_mean: None,
                     backend_work_tokens: 0,
                     sampled_at: None,
                     tokens_per_second: 2000.0,
@@ -6057,6 +6105,145 @@ pub(crate) mod tests {
                 }])
                 .unwrap();
             (worker, ledger, lease)
+        }
+
+        fn work_with_a_new_report(ledger: &Arc<ReservationLedger>, worker: &dyn Worker) -> f64 {
+            let (_, cost, probe) = ledger
+                .select_and_reserve(&[PrefillCandidate {
+                    idx: 0,
+                    worker: worker.url(),
+                    uncached_tokens: 0,
+                    active_request_tokens: 0,
+                    local_count_mean: None,
+                    backend_work_tokens: 2000,
+                    sampled_at: Some(Instant::now()),
+                    tokens_per_second: 1.0,
+                    kv_penalty_seconds: 0.0,
+                }])
+                .unwrap();
+            drop(probe);
+            cost
+        }
+
+        async fn drive_embedding_starts<F: Future>(
+            mut call: Pin<&mut F>,
+            started: &AtomicUsize,
+            expected: usize,
+        ) {
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while started.load(Ordering::SeqCst) < expected {
+                    assert!(futures::poll!(call.as_mut()).is_pending());
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("embedding calls should enter their window");
+        }
+
+        #[tokio::test]
+        async fn embedding_stamps_at_start_and_releases_on_success_or_error() {
+            for fails in [false, true] {
+                let (worker, ledger, lease) = reservation();
+                let started = AtomicUsize::new(0);
+                let (gate_tx, gate_rx) = oneshot::channel();
+                let mut call = Box::pin(dispatch_embed_booked(
+                    || {
+                        started.fetch_add(1, Ordering::SeqCst);
+                        async { gate_rx.await.unwrap() }
+                    },
+                    lease,
+                ));
+                assert_eq!(started.load(Ordering::SeqCst), 0);
+                assert_eq!(work_with_a_new_report(&ledger, worker.as_ref()), 3124.0);
+                drive_embedding_starts(call.as_mut(), &started, 1).await;
+                assert_eq!(work_with_a_new_report(&ledger, worker.as_ref()), 2000.0);
+                assert_eq!(ledger.active(worker.url()), 1);
+                let answer = if fails {
+                    Err(tonic::Status::unavailable("local embedding failure"))
+                } else {
+                    Ok(())
+                };
+                gate_tx.send(answer).unwrap();
+                assert_eq!(call.await.is_err(), fails);
+                assert_eq!(ledger.pending(worker.url()), 0);
+                assert_eq!(ledger.active(worker.url()), 0);
+            }
+        }
+
+        #[tokio::test]
+        async fn embedding_siblings_release_out_of_order_and_keep_input_order() {
+            let (worker, ledger, lease) = reservation();
+            let started = AtomicUsize::new(0);
+            let (senders, receivers): (Vec<_>, Vec<_>) = (0..3).map(|_| oneshot::channel()).unzip();
+            let calls = receivers
+                .into_iter()
+                .zip(lease.split(3))
+                .map(|(gate, lease)| {
+                    let started = &started;
+                    dispatch_embed_booked(
+                        move || {
+                            started.fetch_add(1, Ordering::SeqCst);
+                            async move { gate.await.unwrap() }
+                        },
+                        lease,
+                    )
+                });
+            let mut call = Box::pin(futures::future::join_all(calls));
+            drive_embedding_starts(call.as_mut(), &started, 3).await;
+            assert_eq!(work_with_a_new_report(&ledger, worker.as_ref()), 2000.0);
+            let mut senders: Vec<_> = senders.into_iter().map(Some).collect();
+            for index in [2, 0] {
+                senders[index].take().unwrap().send(index).unwrap();
+                assert!(futures::poll!(call.as_mut()).is_pending());
+                assert_eq!(ledger.pending(worker.url()), 100);
+                assert_eq!(ledger.active(worker.url()), 1);
+            }
+            senders[1].take().unwrap().send(1).unwrap();
+            assert_eq!(call.await, vec![0, 1, 2]);
+            assert_eq!(ledger.active(worker.url()), 0);
+        }
+
+        #[tokio::test]
+        async fn embedding_window_does_not_stamp_queued_siblings_and_cancels_them() {
+            for open_last_slot in [false, true] {
+                let (worker, ledger, lease) = reservation();
+                let started = AtomicUsize::new(0);
+                let count = MAX_IN_FLIGHT_EMBED_CALLS + 1;
+                let (senders, receivers): (Vec<_>, Vec<_>) =
+                    (0..count).map(|_| oneshot::channel()).unzip();
+                let calls = receivers
+                    .into_iter()
+                    .zip(lease.split(count))
+                    .map(|(gate, lease)| {
+                        let started = &started;
+                        dispatch_embed_booked(
+                            move || {
+                                started.fetch_add(1, Ordering::SeqCst);
+                                async move { gate.await.unwrap() }
+                            },
+                            lease,
+                        )
+                    });
+                let mut call = Box::pin(embed_in_window(calls));
+                drive_embedding_starts(call.as_mut(), &started, MAX_IN_FLIGHT_EMBED_CALLS).await;
+                assert_eq!(started.load(Ordering::SeqCst), MAX_IN_FLIGHT_EMBED_CALLS);
+                assert_eq!(work_with_a_new_report(&ledger, worker.as_ref()), 3124.0);
+                assert_eq!(ledger.pending(worker.url()), 100);
+                if open_last_slot {
+                    let mut senders = senders.into_iter();
+                    senders.next().unwrap().send(()).unwrap();
+                    drive_embedding_starts(call.as_mut(), &started, count).await;
+                    assert_eq!(work_with_a_new_report(&ledger, worker.as_ref()), 2000.0);
+                    // Keep the other gates alive until after cancellation.
+                    drop(call);
+                    drop(senders);
+                } else {
+                    drop(call);
+                    drop(senders);
+                }
+                assert_eq!(ledger.pending(worker.url()), 0);
+                assert_eq!(ledger.active(worker.url()), 0);
+            }
         }
 
         #[tokio::test]

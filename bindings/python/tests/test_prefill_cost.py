@@ -18,7 +18,7 @@ def test_prefill_cost_python_cli_roundtrips_to_the_native_constructor(prefixed):
         [
             prefix + "policy",
             "prefill_cost",
-            prefix + "worker-urls",
+            "--worker-urls",
             "grpc://worker:8080",
             prefix + "prefill-cost-default-throughput",
             "8000",
@@ -29,6 +29,7 @@ def test_prefill_cost_python_cli_roundtrips_to_the_native_constructor(prefixed):
         ]
     )
     args = RouterArgs.from_cli_args(parsed, use_router_prefix=prefixed)
+    assert args.worker_urls == ["grpc://worker:8080"]
     assert args.policy == "prefill_cost"
     assert args.prefill_cost_default_throughput == 8000.0
     assert args.prefill_cost_kv_pressure_weight == 0.25

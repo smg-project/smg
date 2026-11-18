@@ -58,7 +58,8 @@ without token counts uses `waiting_requests * mean_prefill_tokens`. Running
 requests use the same allowance, including requests already decoding; the
 engine does not report their remaining prefill work.
 
-The rate comes from valid prefill-throughput reports. A missing or invalid
+The rate comes from complete prefill-throughput reports for the worker's DP
+ranks. A rank-pinned worker needs only its own row. A missing or invalid
 rate uses the mean reported input rate of the eligible workers, or
 `default_throughput` when none has one. All these rates are input tokens per
 second. KV usage contributes `kv_pressure_weight * k / (1 - k)` seconds,
@@ -79,17 +80,21 @@ old attempt before selecting again.
 A batch counts every prompt, with cache credit only for the first. Its
 prefill estimate stays until every input produces a token or ends, and its
 running allowance stays until the last input ends. Partly finished batches
-can therefore count more work than remains. An embedding batch continues to
-count in full even after an engine load report includes it, until the batch
-completes.
+can therefore count more work than remains. An embedding batch keeps its
+input estimate until all its RPCs finish, including calls waiting for a
+dispatch slot.
 
 Sticky assignments keep their worker. When a sticky assignment or overload
 fallback bypasses normal selection, the final worker is charged the full
 prompt and any provisional assignment is released.
 
+Without an engine report, the local worker load counter adds only requests
+that the reservation counters do not already cover.
+
 Backend load reports can include requests SMG has already counted. The score
 takes the larger of the reported work and older dispatched work, then adds
-work not yet dispatched and work sent after the report. A report can arrive
+work not yet dispatched and work sent after the report. A report assembled
+from several DP updates uses the oldest sample it still contains. A report can arrive
 before a dispatched request reaches the engine, so this can undercount work
 in transit. Stale reports retain their queue estimate until a new one arrives.
 The counters belong to one gateway process; other gateway replicas see its

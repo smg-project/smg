@@ -15,7 +15,7 @@ use crate::{
     policies::{
         prefill_cost::reservation::{Reservation, ReservationLedger, ReservationSlot},
         test_support::make_workers,
-        CacheAwareConfig, CacheAwarePolicy, CacheNamespace,
+        BucketConfig, BucketPolicy, CacheAwareConfig, CacheAwarePolicy, CacheNamespace,
     },
     worker::{
         load::state::{one_rank_load, TestFeed},
@@ -239,6 +239,34 @@ fn paired_native_tiny_suffix_preserves_the_expensive_warm_prefix() {
     }
 }
 
+#[tokio::test]
+async fn paired_bucket_spill_does_not_price_cached_prefixes() {
+    for cached in [4_096, PROMPT - 64] {
+        let host = Host::new(cached);
+        host.reports(0, [Some(2_000.0); 2], [100.0; 2]);
+        let bucket = BucketPolicy::with_config(BucketConfig {
+            balance_abs_threshold: 64,
+            balance_rel_threshold: 1.5,
+            bucket_adjust_interval_secs: 3_600,
+        });
+        bucket.init_prefill_worker_urls(&host.workers);
+        let arrivals = [host.prompt(1_000_000), host.prompt(2_000_000)];
+        let bucket_ledger = Arc::new(ReservationLedger::default());
+        let bucket_picks: Vec<_> = arrivals
+            .iter()
+            .map(|tokens| host.select_using(&bucket, tokens, tokens.len(), None, &bucket_ledger))
+            .collect();
+        let ledger = Arc::new(ReservationLedger::default());
+        let revised: Vec<_> = arrivals
+            .iter()
+            .map(|tokens| host.select(tokens, &ledger))
+            .collect();
+        assert_eq!((bucket_picks[0].0, bucket_picks[1].0), (1, 0));
+        let expected = if cached == 4_096 { (1, 0) } else { (1, 1) };
+        assert_eq!((revised[0].0, revised[1].0), expected);
+    }
+}
+
 #[test]
 fn fully_cached_requests_still_spread_while_the_first_is_decoding() {
     let host = Host::new(PROMPT);
@@ -316,6 +344,65 @@ fn measured_input_capacity_can_outweigh_a_larger_queue() {
         "input capacity, not inverse output rate, prices prefill"
     );
     assert_eq!(ledger.pending(HOLDER), 12_288);
+}
+
+#[test]
+fn grouped_input_rates_require_the_workers_full_rank_count() {
+    use crate::worker::BasicWorkerBuilder;
+
+    let worker = BasicWorkerBuilder::new("grpc://grouped:8080")
+        .label("dp_size", "2")
+        .label("attn_dp_size", "3")
+        .build();
+    let mut load = one_rank_load(0, 0.0, 100.0);
+    load.loads[0].prefill_throughput = Some(2_000.0);
+    load.dp_rank_count = 1;
+    assert_eq!(PrefillCostPolicy::input_rate(&worker, &load), None);
+    let row = load.loads[0].clone();
+    load.loads = (0..6)
+        .map(|rank| {
+            let mut row = row.clone();
+            row.dp_rank = rank;
+            row
+        })
+        .collect();
+    assert_eq!(
+        PrefillCostPolicy::input_rate(&worker, &load),
+        Some(12_000.0)
+    );
+    load.loads[5].dp_rank = 4;
+    assert_eq!(PrefillCostPolicy::input_rate(&worker, &load), None);
+}
+
+#[test]
+fn a_rank_pinned_worker_uses_its_own_single_row() {
+    use crate::worker::BasicWorkerBuilder;
+
+    let worker = BasicWorkerBuilder::new("grpc://ranked:8080")
+        .dp_config(2, 4)
+        .build();
+    let mut load = one_rank_load(0, 0.0, 100.0);
+    load.loads[0].prefill_throughput = Some(7_000.0);
+    load.loads[0].dp_rank = 2;
+    assert_eq!(PrefillCostPolicy::input_rate(&worker, &load), Some(7_000.0));
+    load.loads[0].dp_rank = 0;
+    assert_eq!(PrefillCostPolicy::input_rate(&worker, &load), None);
+}
+
+#[test]
+fn partial_input_rates_cannot_inflate_nominal_peer_capacity() {
+    use crate::worker::{test_support::no_health_check, BasicWorkerBuilder};
+
+    let mut host = Host::new(4_096);
+    host.workers[1] = Arc::new(
+        BasicWorkerBuilder::new(HOLDER)
+            .label("dp_size", "4")
+            .health_config(no_health_check())
+            .build(),
+    );
+    host.reports(100_000, [Some(2_000.0), Some(100_000_000.0)], [100.0; 2]);
+    let ledger = Arc::new(ReservationLedger::default());
+    assert_eq!(host.select(&host.prompt(1_000_000), &ledger).0, 0);
 }
 
 #[test]
@@ -525,4 +612,46 @@ fn actual_placement_all_vetoed_fallback_still_hands_off_a_full_batch_lease() {
     assert_eq!(slot.ledger.pending(selected.url()), (PROMPT * 2) as u64);
     drop(lease);
     assert_eq!(slot.ledger.active(selected.url()), 0);
+}
+
+#[test]
+fn sticky_and_policy_placements_use_the_same_configured_unknown_prompt_size() {
+    use crate::{
+        config::{PolicyConfig, RoutingKeyOverrideConfig},
+        policies::PolicyRegistry,
+    };
+
+    let workers = make_workers(&[HOLDER]);
+    let policies = PolicyRegistry::with_override(
+        PolicyConfig::PrefillCost {
+            block_size: BLOCK,
+            kv_pressure_weight: 0.15,
+            mean_prefill_tokens: 4_096,
+            default_throughput: 2_000.0,
+        },
+        RoutingKeyOverrideConfig {
+            enabled: true,
+            ..Default::default()
+        },
+    );
+    let policy = policies.get_default_policy();
+    // First establish the pin, then compare a normal placement with its sticky hit.
+    for routing_key in [Some("conversation"), None, Some("conversation")] {
+        let slot = policies.reservation_slot();
+        let selected = policies
+            .select_worker_for_model(
+                &policy,
+                workers[0].model_id(),
+                &workers,
+                &SelectWorkerInfo {
+                    routing_key,
+                    reservation: Some(&slot),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let lease = slot.take_for(workers[selected].url()).unwrap();
+        assert_eq!(slot.ledger.pending(HOLDER), 4_096);
+        drop(lease);
+    }
 }

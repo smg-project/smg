@@ -402,11 +402,11 @@ impl PolicyRegistry {
         cache_trace::begin_selection(workers);
         if policy.needs_reservation() {
             if let Some(slot) = info.reservation {
-                slot.set_active_tokens(policy.reservation_active_tokens().unwrap_or(0));
-                slot.require(info.tokens.map_or(
-                    super::least_load::DEFAULT_MEAN_PREFILL_TOKENS as u64,
-                    |tokens| tokens.len() as u64,
-                ));
+                let mean = policy
+                    .reservation_active_tokens()
+                    .unwrap_or(super::least_load::DEFAULT_MEAN_PREFILL_TOKENS as u64);
+                slot.set_active_tokens(mean);
+                slot.require(info.tokens.map_or(mean, |tokens| tokens.len() as u64));
             }
         }
         if let Some((sticky, key, source)) = self.sticky_for(policy.as_ref(), info) {

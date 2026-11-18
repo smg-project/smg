@@ -1,4 +1,5 @@
 mod prom_scrape;
+mod rank_samples;
 mod worker_load_manager;
 
 use std::collections::HashMap;

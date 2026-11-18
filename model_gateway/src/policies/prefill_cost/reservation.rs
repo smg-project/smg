@@ -17,6 +17,8 @@ pub struct PrefillCandidate<'a> {
     pub uncached_tokens: u64,
     /// Running-request work estimate that remains after the first output token.
     pub active_request_tokens: u64,
+    /// A router-local count has no backend sample to reconcile with reservations.
+    pub local_count_mean: Option<u64>,
     pub backend_work_tokens: u64,
     pub sampled_at: Option<Instant>,
     pub tokens_per_second: f64,
@@ -28,6 +30,7 @@ struct Entry {
     dispatched_at: Option<Instant>,
     pending_tokens: u64,
     active_tokens: u64,
+    counted_requests: u64,
 }
 
 #[derive(Debug, Default)]
@@ -54,15 +57,25 @@ impl ReservationLedger {
         self: &Arc<Self>,
         candidates: &[PrefillCandidate<'_>],
     ) -> Option<(usize, f64, Reservation)> {
+        self.select_and_reserve_with_local_counts(candidates, |_| 0)
+    }
+
+    /// Read local worker counters under the lock used to attach their load guards.
+    pub(crate) fn select_and_reserve_with_local_counts(
+        self: &Arc<Self>,
+        candidates: &[PrefillCandidate<'_>],
+        local_running: impl Fn(usize) -> usize,
+    ) -> Option<(usize, f64, Reservation)> {
         let mut book = self.lock();
         let mut best: Option<(usize, f64)> = None;
         for (position, candidate) in candidates.iter().enumerate() {
             if !candidate.tokens_per_second.is_finite() || candidate.tokens_per_second <= 0.0 {
                 continue;
             }
-            let (mut reflected, mut newer) = (0u64, 0u64);
+            let (mut reflected, mut newer, mut counted_requests) = (0u64, 0u64, 0u64);
             if let Some(entries) = book.workers.get(candidate.worker) {
                 for entry in entries.values() {
+                    counted_requests = counted_requests.saturating_add(entry.counted_requests);
                     let local_work = entry.pending_tokens.saturating_add(entry.active_tokens);
                     if entry.dispatched_at.is_none()
                         || candidate
@@ -78,10 +91,19 @@ impl ReservationLedger {
             // Undispatched reservations and dispatches newer than the sample cannot
             // be reflected. Older sent requests may overlap the report: max is an
             // estimate, not proof that the engine has received those requests.
-            let work = candidate
-                .backend_work_tokens
-                .max(reflected)
-                .saturating_add(newer)
+            let existing_work = if let Some(mean) = candidate.local_count_mean {
+                let uncovered =
+                    (local_running(candidate.idx) as u64).saturating_sub(counted_requests);
+                reflected
+                    .saturating_add(newer)
+                    .saturating_add(uncovered.saturating_mul(mean))
+            } else {
+                candidate
+                    .backend_work_tokens
+                    .max(reflected)
+                    .saturating_add(newer)
+            };
+            let work = existing_work
                 .saturating_add(candidate.uncached_tokens)
                 .saturating_add(candidate.active_request_tokens);
             let cost = work as f64 / candidate.tokens_per_second + candidate.kv_penalty_seconds;
@@ -102,6 +124,7 @@ impl ReservationLedger {
                     dispatched_at: None,
                     pending_tokens: candidate.uncached_tokens,
                     active_tokens: candidate.active_request_tokens,
+                    counted_requests: 0,
                 },
             );
         drop(book);
@@ -192,11 +215,56 @@ pub struct Reservation {
     dispatch_pending: bool,
 }
 
+/// A worker's local load count and its coverage in the reservation ledger.
+#[derive(Debug)]
+pub(crate) struct CountedLoad<T> {
+    guard: Option<T>,
+    ledger: Arc<ReservationLedger>,
+    worker: String,
+    id: u64,
+}
+
+impl<T> Drop for CountedLoad<T> {
+    fn drop(&mut self) {
+        let mut book = self.ledger.lock();
+        drop(self.guard.take());
+        if let Some(entry) = book
+            .workers
+            .get_mut(&self.worker)
+            .and_then(|entries| entries.get_mut(&self.id))
+        {
+            entry.counted_requests = 0;
+        }
+    }
+}
+
 impl Reservation {
+    /// The worker this attempt's work is charged to.
     pub fn worker(&self) -> &str {
         &self.owner.worker
     }
 
+    /// Attach synchronous worker load guards without exposing an unpaired count.
+    pub(crate) fn counted_load<T>(&self, count: usize, make: impl FnOnce() -> T) -> CountedLoad<T> {
+        let mut book = self.owner.ledger.lock();
+        let guard = make();
+        if let Some(entry) = book
+            .workers
+            .get_mut(&self.owner.worker)
+            .and_then(|entries| entries.get_mut(&self.owner.id))
+        {
+            entry.counted_requests = count as u64;
+        }
+        drop(book);
+        CountedLoad {
+            guard: Some(guard),
+            ledger: Arc::clone(&self.owner.ledger),
+            worker: self.owner.worker.clone(),
+            id: self.owner.id,
+        }
+    }
+
+    /// Mark this branch sent once all its sibling dispatches have started or ended.
     pub fn dispatched(&mut self) {
         if self.dispatch_pending {
             self.dispatch_pending = false;
@@ -208,6 +276,7 @@ impl Reservation {
         }
     }
 
+    /// Clear pending input work once every branch has produced output or ended.
     pub fn prefill_complete(&mut self) {
         if self.pending {
             self.pending = false;
@@ -220,6 +289,7 @@ impl Reservation {
     }
 
     /// A batched logical request keeps its work until every sibling starts or ends.
+    /// Share one attempt across independently owned batch branches.
     pub fn split(mut self, parts: usize) -> Vec<Self> {
         let parts = parts.max(1);
         let pending = self.pending;
@@ -268,6 +338,7 @@ struct SlotState {
 }
 
 impl ReservationSlot {
+    /// Create an attempt-local handoff over a shared worker ledger.
     pub fn new(ledger: Arc<ReservationLedger>) -> Self {
         Self {
             ledger,
@@ -284,6 +355,7 @@ impl ReservationSlot {
         self
     }
 
+    /// Price the running allowance for every input in a batch.
     pub fn with_request_count(mut self, requests: usize) -> Self {
         self.inner
             .get_mut()
@@ -292,6 +364,7 @@ impl ReservationSlot {
         self
     }
 
+    /// Number of backend inputs represented by this attempt.
     pub fn request_count(&self) -> usize {
         self.inner
             .lock()
@@ -300,6 +373,7 @@ impl ReservationSlot {
             .max(1)
     }
 
+    /// Set the per-input allowance retained while the attempt is alive.
     pub fn set_active_tokens(&self, per_request_tokens: u64) {
         let mut state = self
             .inner
@@ -308,6 +382,7 @@ impl ReservationSlot {
         state.active_tokens = per_request_tokens.saturating_mul(state.request_count.max(1) as u64);
     }
 
+    /// Use the full batch size when known, at least as large as its first prompt.
     pub fn total_tokens_or(&self, first_prompt_tokens: usize) -> u64 {
         self.inner
             .lock()
@@ -317,6 +392,7 @@ impl ReservationSlot {
             .max(first_prompt_tokens as u64)
     }
 
+    /// Keep enough work to book a target that bypasses normal policy selection.
     pub fn require(&self, prompt_tokens: u64) {
         let mut state = self
             .inner
@@ -325,6 +401,7 @@ impl ReservationSlot {
         state.required_tokens = Some(prompt_tokens.max(state.total_tokens.unwrap_or(0)));
     }
 
+    /// Replace the provisional choice, releasing the previous attempt's work.
     pub fn store(&self, lease: Reservation) {
         let old = self
             .inner
@@ -361,6 +438,7 @@ impl ReservationSlot {
                 worker,
                 uncached_tokens: tokens,
                 active_request_tokens: active_tokens,
+                local_count_mean: None,
                 backend_work_tokens: 0,
                 sampled_at: None,
                 tokens_per_second: 1.0,
@@ -383,6 +461,7 @@ mod tests {
                 worker: "holder",
                 uncached_tokens: 12288,
                 active_request_tokens: 0,
+                local_count_mean: None,
                 backend_work_tokens: 0,
                 sampled_at: None,
                 tokens_per_second: 2000.0,
@@ -393,6 +472,7 @@ mod tests {
                 worker: "cold",
                 uncached_tokens: 16384,
                 active_request_tokens: 0,
+                local_count_mean: None,
                 backend_work_tokens: 0,
                 sampled_at: None,
                 tokens_per_second: 2000.0,
@@ -488,13 +568,53 @@ mod tests {
     fn a_report_cannot_hide_dispatches_newer_than_its_sample() {
         let ledger = Arc::new(ReservationLedger::default());
         let sample = Instant::now() - Duration::from_secs(1);
-        let (_, _, first) = ledger.select_and_reserve(&candidates()[..1]).unwrap();
+        let (_, _, mut first) = ledger.select_and_reserve(&candidates()[..1]).unwrap();
+        first.dispatched();
         let mut rows = candidates();
         rows[0].sampled_at = Some(sample);
         rows[0].backend_work_tokens = 5000;
         let (_, cost, second) = ledger.select_and_reserve(&rows[..1]).unwrap();
         assert_eq!(cost, (5000.0 + 24576.0) / 2000.0);
         drop((first, second));
+    }
+
+    #[test]
+    fn a_local_count_only_adds_requests_not_covered_by_the_ledger() {
+        struct Guard<'a>(&'a AtomicUsize);
+        impl Drop for Guard<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+        for (untracked, counted, dispatched) in
+            [(0, true, false), (2, true, true), (2, false, false)]
+        {
+            let ledger = Arc::new(ReservationLedger::default());
+            let live = AtomicUsize::new(untracked);
+            let mut row = candidates()[0].clone();
+            row.active_request_tokens = 1_024;
+            row.local_count_mean = Some(1_024);
+            let (_, _, mut first) = ledger
+                .select_and_reserve_with_local_counts(&[row.clone()], |_| {
+                    live.load(Ordering::Acquire)
+                })
+                .unwrap();
+            let guard = counted.then(|| {
+                first.counted_load(1, || {
+                    live.fetch_add(1, Ordering::AcqRel);
+                    Guard(&live)
+                })
+            });
+            if dispatched {
+                first.dispatched();
+            }
+            row.uncached_tokens = 0;
+            let (_, cost, second) = ledger
+                .select_and_reserve_with_local_counts(&[row], |_| live.load(Ordering::Acquire))
+                .unwrap();
+            assert_eq!(cost, (14_336 + untracked * 1_024) as f64 / 2_000.0);
+            drop((second, guard, first));
+        }
     }
 
     #[test]
