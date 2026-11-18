@@ -352,8 +352,8 @@ pub(crate) trait RankLoads: Send + Sync {
 
 /// One rank's load record from a wire's `GetLoads` entry: the shared
 /// conversion, which leaves `waiting_uncached_tokens` unset (it is the
-/// servicer's to set), plus `queued`, the queued token-work this servicer
-/// estimates for the rank (each wire's `info::rank_load` puts it on the
+/// servicer's to set), plus `queued`, the queued token-work reported or
+/// estimated for the rank (each wire's `info::rank_load` puts it on the
 /// entry's `num_waiting_uncached_tokens`). The four wires' [`RankLoads`]
 /// impls read their entry and hand it here.
 pub(crate) fn record_with_queue<L>(load: &L, queued: i32) -> common::EngineLoad

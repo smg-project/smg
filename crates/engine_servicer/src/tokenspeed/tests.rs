@@ -4402,10 +4402,10 @@ async fn the_relays_rank_record_is_the_get_loads_entry_of_the_rank() {
 }
 
 #[tokio::test]
-async fn resident_tokens_reach_direct_loads_and_grpc_reports() {
+async fn engine_token_work_reaches_direct_loads_and_grpc_reports() {
     use engine_zmq_client::protocol::tokenspeed::output::{
         BASE_COLUMN_NAMES, BATCH_TOKEN_ID_OUT_SLIM_TAG, FINISHED_MESSAGES, FINISHED_STATUS_CODES,
-        NUM_RESIDENT_TOKENS,
+        NUM_RESIDENT_TOKENS, NUM_WAITING_UNCACHED_TOKENS,
     };
 
     let mut ready = default_ready_response();
@@ -4417,6 +4417,7 @@ async fn resident_tokens_reach_direct_loads_and_grpc_reports() {
                 FINISHED_STATUS_CODES,
                 FINISHED_MESSAGES,
                 NUM_RESIDENT_TOKENS,
+                NUM_WAITING_UNCACHED_TOKENS,
             ])
             .map(str::to_string)
             .collect(),
@@ -4429,17 +4430,33 @@ async fn resident_tokens_reach_direct_loads_and_grpc_reports() {
         .unwrap()
         .into_inner();
     recv_add(&mut h.engine_in).await;
+    let mut waiting = h
+        .client
+        .generate(generate_request("waiting", true, Vec::new()))
+        .await
+        .unwrap()
+        .into_inner();
+    recv_add(&mut h.engine_in).await;
     let adapter = h.server.state.shared.engine().unwrap();
 
-    for (completion, resident) in [Some(5_000_000_000), Some(0), None].into_iter().enumerate() {
+    for (completion, (resident, pending, expected)) in [
+        (Some(5_000_000_000), Some(1), 1),
+        (Some(0), Some(0), 0),
+        (None, None, 3),
+        (None, Some(2), 2),
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let mut step = batch(
             "running",
             vec![10],
             completion as u32 + 1,
             None,
-            Some((1, 0, 10, 100)),
+            Some((1, 1, 10, 100)),
         );
         step.num_resident_tokens = resident;
+        step.num_waiting_uncached_tokens = pending;
         send(&mut h.engine_out, &step).await;
         running.message().bounded().await.unwrap().unwrap();
 
@@ -4447,6 +4464,10 @@ async fn resident_tokens_reach_direct_loads_and_grpc_reports() {
         assert_eq!(
             direct.loads[0].num_resident_tokens,
             resident.map(|tokens| tokens as i64)
+        );
+        assert_eq!(
+            direct.loads[0].num_waiting_uncached_tokens,
+            pending.unwrap_or(0) as i32
         );
         let polled = h
             .client
@@ -4458,20 +4479,21 @@ async fn resident_tokens_reach_direct_loads_and_grpc_reports() {
             polled.loads[0].num_resident_tokens,
             resident.map(|tokens| tokens as i64)
         );
+        // The waiting request has three prompt tokens. Only absence uses that estimate.
+        assert_eq!(polled.loads[0].num_waiting_uncached_tokens, expected);
         let pushed = h.server.state.rank_load(Some(0)).unwrap();
         assert_eq!(pushed.num_resident_tokens, resident);
+        assert_eq!(pushed.waiting_uncached_tokens, Some(expected as u32));
     }
-    let mut done = batch(
-        "running",
-        Vec::new(),
-        3,
-        Some("length"),
-        Some((1, 0, 10, 100)),
-    );
-    done.num_resident_tokens = Some(5_000_000_000);
-    send(&mut h.engine_out, &done).await;
-    while running.message().bounded().await.unwrap().is_some() {}
+    for (id, stream) in [("running", &mut running), ("waiting", &mut waiting)] {
+        let mut done = batch(id, Vec::new(), 3, Some("length"), Some((1, 1, 10, 100)));
+        done.num_resident_tokens = Some(5_000_000_000);
+        done.num_waiting_uncached_tokens = Some(3);
+        send(&mut h.engine_out, &done).await;
+        while stream.message().bounded().await.unwrap().is_some() {}
+    }
     let idle = adapter.get_loads();
     assert_eq!(idle.loads[0].num_resident_tokens, Some(0));
+    assert_eq!(idle.loads[0].num_waiting_uncached_tokens, 0);
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }

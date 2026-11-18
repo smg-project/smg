@@ -210,6 +210,7 @@ impl EngineProtocol for TokenSpeedProtocol {
             num_waiting: batch.num_waiting,
             kv_cache_usage: batch.kv_active_pages as f64 / batch.kv_total_pages as f64,
             num_resident_tokens: batch.num_resident_tokens,
+            num_waiting_uncached_tokens: batch.num_waiting_uncached_tokens,
         });
         let outputs = batch.into_outputs()?;
         // TokenSpeed has no out-of-band finish channel: every finish is carried

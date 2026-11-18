@@ -1745,6 +1745,9 @@ impl ZmqEngineClient {
                 num_resident_tokens: load
                     .num_resident_tokens
                     .map(|tokens| i64::try_from(tokens).unwrap_or(i64::MAX)),
+                num_waiting_uncached_tokens: load
+                    .num_waiting_uncached_tokens
+                    .map_or(0, |tokens| i32::try_from(tokens).unwrap_or(i32::MAX)),
                 ..Default::default()
             })
     }

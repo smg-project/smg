@@ -40,6 +40,8 @@ pub const FINISH_REASON_DETAILS: &str = "finish_reason_details";
 
 /// Optional per-rank context-token count, independent of allocator occupancy.
 pub const NUM_RESIDENT_TOKENS: &str = "num_resident_tokens";
+/// Optional per-rank prompt work remaining after prefix matching.
+pub const NUM_WAITING_UNCACHED_TOKENS: &str = "num_waiting_uncached_tokens";
 
 /// The prompt-logprob and ranked-candidate columns a TokenSpeed engine
 /// appends, by its names: per request, the prompt positions' logprobs
@@ -87,6 +89,8 @@ pub const BASE_COLUMN_NAMES: [&str; 13] = [
 pub struct SlimOutputLayout {
     /// The field index of [`NUM_RESIDENT_TOKENS`].
     pub num_resident_tokens: Option<usize>,
+    /// The field index of [`NUM_WAITING_UNCACHED_TOKENS`].
+    pub num_waiting_uncached_tokens: Option<usize>,
     /// The field index of [`FINISHED_STATUS_CODES`].
     pub finish_status: Option<usize>,
     /// The field index of [`FINISHED_MESSAGES`].
@@ -121,6 +125,7 @@ impl SlimOutputLayout {
         };
         Self {
             num_resident_tokens: position(NUM_RESIDENT_TOKENS),
+            num_waiting_uncached_tokens: position(NUM_WAITING_UNCACHED_TOKENS),
             finish_status: position(FINISHED_STATUS_CODES),
             finish_message: position(FINISHED_MESSAGES),
             finish_details: position(FINISH_REASON_DETAILS),
@@ -214,6 +219,8 @@ pub struct BatchTokenIDOutSlim {
     pub kv_total_pages: u64,
     /// Prompt plus committed output tokens held by this rank; absent on older engines.
     pub num_resident_tokens: Option<u64>,
+    /// Remaining uncached prompt tokens; absence differs from a reported zero.
+    pub num_waiting_uncached_tokens: Option<u64>,
     /// The HTTP-style status of each request's finish reason, parallel to
     /// `finished_reasons`: an abort at admission carries its 400; a finish
     /// without one is `None`. Empty from an engine that does not declare the
@@ -245,11 +252,12 @@ impl Serialize for BatchTokenIDOutSlim {
     fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
         // Keep the finish-detail slots before token counts so their positions
         // stay fixed even on batches without a finish reason.
-        let has_resident_tokens = self.num_resident_tokens.is_some();
-        let detailed = has_resident_tokens
+        let token_work =
+            self.num_resident_tokens.is_some() || self.num_waiting_uncached_tokens.is_some();
+        let detailed = token_work
             || !self.finished_status_codes.is_empty()
             || !self.finished_messages.is_empty();
-        let fields = 14 + usize::from(detailed) * 2 + usize::from(has_resident_tokens);
+        let fields = 14 + usize::from(detailed) * 2 + usize::from(token_work) * 2;
         let mut tuple = serializer.serialize_tuple(fields)?;
         tuple.serialize_element(BATCH_TOKEN_ID_OUT_SLIM_TAG)?;
         tuple.serialize_element(&self.rids)?;
@@ -269,8 +277,9 @@ impl Serialize for BatchTokenIDOutSlim {
             tuple.serialize_element(&self.finished_status_codes)?;
             tuple.serialize_element(&self.finished_messages)?;
         }
-        if has_resident_tokens {
+        if token_work {
             tuple.serialize_element(&self.num_resident_tokens)?;
+            tuple.serialize_element(&self.num_waiting_uncached_tokens)?;
         }
         tuple.end()
     }
@@ -340,6 +349,7 @@ fn read_token_batch_after_tag<'de, A: SeqAccess<'de>>(
         kv_active_pages: seq.next_element::<u64>()?.unwrap_or(0),
         kv_total_pages: seq.next_element::<u64>()?.unwrap_or(0),
         num_resident_tokens: None,
+        num_waiting_uncached_tokens: None,
         finished_status_codes: Vec::new(),
         finished_messages: Vec::new(),
         input_logprobs_val: Vec::new(),
@@ -362,6 +372,8 @@ fn read_token_batch_after_tag<'de, A: SeqAccess<'de>>(
     loop {
         if Some(index) == layout.num_resident_tokens {
             column!(batch.num_resident_tokens);
+        } else if Some(index) == layout.num_waiting_uncached_tokens {
+            column!(batch.num_waiting_uncached_tokens);
         } else if Some(index) == layout.finish_details {
             let Some(details) = seq.next_element::<Vec<Option<FinishDetails>>>()? else {
                 break;
@@ -603,6 +615,7 @@ impl BatchTokenIDOutSlim {
             kv_active_pages: _,
             kv_total_pages: _,
             num_resident_tokens: _,
+            num_waiting_uncached_tokens: _,
         } = self;
 
         // Absent columns (an engine that declares none) read as `None` for
@@ -918,21 +931,31 @@ mod tests {
     }
 
     #[test]
-    fn resident_tokens_follow_the_declared_layout() {
+    fn token_work_columns_follow_the_declared_layout() {
         let mut names = BASE_COLUMN_NAMES.to_vec();
-        names.extend(["unknown_column", NUM_RESIDENT_TOKENS]);
+        names.extend([
+            NUM_WAITING_UNCACHED_TOKENS,
+            "unknown_column",
+            NUM_RESIDENT_TOKENS,
+        ]);
         let layout = layout_of(&names);
-        for resident in [Some(5_000_000_000u64), Some(0), None] {
+        for (resident, pending) in [
+            (Some(5_000_000_000u64), Some(17u64)),
+            (Some(0), Some(0)),
+            (None, None),
+        ] {
             let Value::Array(mut fields) = decode_value(&python_output_bytes()).unwrap() else {
                 panic!("expected an array");
             };
             fields.extend([
+                pending.map_or(Value::Nil, Value::from),
                 Value::from("ignored"),
                 resident.map_or(Value::Nil, Value::from),
             ]);
             let bytes = encode_msgpack(&Value::Array(fields)).unwrap();
             let decoded = decode_slim_batch(&bytes, &layout).unwrap();
             assert_eq!(decoded.num_resident_tokens, resident);
+            assert_eq!(decoded.num_waiting_uncached_tokens, pending);
             assert_eq!(decoded.output_ids, vector_batch().output_ids);
             // An undeclared extension must not be interpreted as a load count.
             assert_eq!(
