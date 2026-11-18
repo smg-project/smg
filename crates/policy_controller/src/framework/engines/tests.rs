@@ -7,7 +7,7 @@ use std::cell::RefCell;
 use super::super::{Binding, Engine, Filter, Picker, Plan, Profile, Scorer, TieBand, Weighted};
 use crate::{
     affinity::Gates,
-    builtins::{Best, NotOverloaded, PowerOfTwo, Random, SampledBest},
+    builtins::{Best, CountFirst, NotOverloaded, PowerOfTwo, Random, SampledBest},
     decision::{Decision, Lifted, Targets, MAX_TARGETS},
     lease::{Lifecycle, Membership},
     ring::ConsistentHash,
@@ -573,11 +573,20 @@ fn ring_engine_of(ring: ConsistentHash) -> Engine {
 
 /// One profile of `filters` and `scorers` under `best`.
 fn engine_of(filters: Vec<Box<dyn Filter>>, scorers: Vec<Weighted>) -> Engine {
+    engine_under(filters, scorers, Box::new(Best))
+}
+
+/// One profile of `filters` and `scorers` under `picker`.
+fn engine_under(
+    filters: Vec<Box<dyn Filter>>,
+    scorers: Vec<Weighted>,
+    picker: Box<dyn Picker>,
+) -> Engine {
     let profile = Profile {
         name: "ring".into(),
         filters,
         scorers,
-        picker: Box::new(Best),
+        picker,
     };
     let binding = Binding {
         model: "*".into(),
@@ -1246,4 +1255,46 @@ fn a_key_under_a_binding_that_sheds_is_walked_with_the_veto_standing() {
     }
     let walked = walked(&shedding(), &shedding(), &rows, &listed, &ends);
     assert!(walked >= 48, "{walked} of 64 keys by the walk alone");
+}
+
+/// The ring under a picker that narrows is its profile's run. Count-first
+/// compares the rows that hold the fewest requests alone, so a key's owner
+/// yields to a row that holds fewer: no walk hands the owner out, and the
+/// rows are the ones a pool that lists nothing is handed. The picker that
+/// samples follows no ring either.
+#[test]
+fn a_ring_under_a_picker_that_narrows_is_its_profiles_run() {
+    let ring_under = |picker: Box<dyn Picker>| {
+        let scorer = Weighted {
+            scorer: Box::new(ConsistentHash::new(None)),
+            weight: 1.0,
+        };
+        engine_under(vec![Box::new(Asked)], vec![scorer], picker)
+    };
+    let (mut rows, listed, ends) = fleet(&[8; 8], 1);
+    for row in &mut rows {
+        row.health.healthy = true;
+    }
+    let engines = Engines::new(0, &listed, &ends);
+    let (narrowing, whole) = (
+        ring_under(Box::new(CountFirst)),
+        ring_under(Box::new(CountFirst)),
+    );
+    let sampling = ring_under(Box::new(SampledBest::new(2)));
+    let mut yielded = 0;
+    for i in 0..64 {
+        let key = format!("conv-{i}");
+        let (targets, by_walk) = keyed_by(&narrowing, &key, &rows, engines, 1);
+        assert!(!by_walk, "{key}: count-first narrows");
+        let by_pass = keyed(&whole, &key, &rows, Engines::default(), 1);
+        assert_eq!(targets, by_pass, "{key}");
+        let owner = keyed(&ring_engine(), &key, &rows, Engines::default(), 1)[0];
+        yielded += u32::from(targets[0] != owner);
+        let (_, by_walk) = keyed_by(&sampling, &key, &rows, engines, 1);
+        assert!(!by_walk, "{key}: a sample follows no ring");
+    }
+    assert!(
+        yielded >= 16,
+        "{yielded} of 64 owners yield to a row with fewer"
+    );
 }

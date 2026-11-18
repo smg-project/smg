@@ -1711,6 +1711,12 @@ impl Picker for Best {
         true
     }
 
+    /// Every row handed is compared and the best scores are taken in
+    /// their order: a scorer that places a request by itself is followed.
+    fn takes_best(&self) -> bool {
+        true
+    }
+
     fn pick(
         &self,
         facts: &RequestFacts<'_>,

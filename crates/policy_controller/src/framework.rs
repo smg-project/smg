@@ -519,6 +519,17 @@ pub trait Picker: Lifecycle + Debug {
         false
     }
 
+    /// Whether the picker compares every row it is handed and takes its
+    /// targets from the best scores among them, in their order: it narrows
+    /// to no set of its own and draws between equal scores alone. A
+    /// profile whose one scorer places a request by itself
+    /// ([`Scorer::own`]) may then hand out that scorer's rows, the ones
+    /// this picker would take. The default is no: a picker that narrows,
+    /// samples or draws does not follow a scorer's order.
+    fn takes_best(&self) -> bool {
+        false
+    }
+
     /// What the host must feed for this picker to mean anything. A picker
     /// that reads the affinity column ([`RequestFacts::affinity`]) declares
     /// [`Needs::affinity`]; one that does not may be handed an empty
@@ -2364,7 +2375,9 @@ impl Marks {
     const ENGINES: u16 = 1 << 7;
     /// The profile's one scorer places a request by itself
     /// ([`Scorer::own`]), every filter answers row by row and the picker
-    /// takes its targets from the best scores: a request that carries a
+    /// takes the best scores of every row ([`Picker::takes_best`]): a
+    /// picker that narrows first does not follow the scorer's order, and
+    /// its profile runs. Under the mark a request that carries a
     /// session key, over a pool whose host lists its engines, is the
     /// scorer's to place ([`run_owned`]).
     const OWNS: u16 = 1 << 8;
@@ -2407,7 +2420,8 @@ impl Marks {
             _ => false,
         };
         let row_wise = profile.filters.iter().all(|f| f.row_wise());
-        let owns = if (scoped | by_assignment) == 0 && alone && row_wise && front {
+        let takes_best = profile.picker.takes_best();
+        let owns = if (scoped | by_assignment) == 0 && alone && row_wise && takes_best {
             Self::OWNS
         } else {
             0
