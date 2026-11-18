@@ -1876,10 +1876,11 @@ mod tests {
     }
 
     #[test]
-    fn glm_derives_the_tag_the_gateway_hand_writes_today() {
+    fn glm_derives_the_gateways_tag_with_the_call_markers_out_of_its_values() {
         // The old crate's `Glm4MoeParser::build_structural_tag`, which mirrors xgrammar's built-in
         // `glm_4_7` tag: one trigger, a `glm_xml`-styled schema per named tool as written (a
-        // no-argument tool's `{}` included), `at_least_one` as asked.
+        // no-argument tool's `{}` included), `at_least_one` as asked. Its values exclude the two
+        // markers the table ends a call on inside a value too, which the old tag left writable.
         let schema = value!({"type": "object", "properties": {"city": {"type": "string"}}});
         let grammar = formats::glm()
             .grammar(&weather_tools(), true, false)
@@ -1888,7 +1889,12 @@ mod tests {
             value!({
                 "type": "tag",
                 "begin": format!("<tool_call>{name}"),
-                "content": {"type": "json_schema", "json_schema": schema, "style": "glm_xml"},
+                "content": {
+                    "type": "json_schema",
+                    "json_schema": schema,
+                    "style": "glm_xml",
+                    "excludes": ["</tool_call>", "<tool_call>"],
+                },
                 "end": "</tool_call>",
             })
         };
