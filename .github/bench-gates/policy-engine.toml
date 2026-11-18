@@ -147,8 +147,9 @@ filter = "^policy_engine/"
 # pull request has them (bench_gate.py build --sources-from), so a row added here cannot move the
 # gated rows through the binary's inlining (symphony.toml records the case). A row joins this binary, in
 # the pull request whose change it measures, only when it calls nothing the base branch's crate lacks. A
-# row that times an answer only the change gives is listed only where the engine gives it (the
-# `all_vetoed` rows), so the base side lists none. Any other row goes to a bench target of its own.
+# row that times an answer only the change gives is listed only where the engine gives it, so in the
+# pull request that brings the answer the base side lists none. The `all_vetoed` rows came so; on a
+# later base both sides list them. Any other row goes to a bench target of its own.
 sources = [
     "crates/policy_controller/benches/decision.rs",
     "crates/policy_controller/benches/common/mod.rs",

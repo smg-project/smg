@@ -816,11 +816,14 @@ pub struct RequestFacts<'a> {
     /// In-process only.
     pub lent_in_flight: Option<&'a crate::counts::LentCounts<'a>>,
     /// The host wrote each row's count of this request's session key
-    /// ([`Candidate::session_in_flight`]). A sessions rule's in-flight cap
-    /// reads the count either way. A key kept on its worker over the
-    /// overload veto is kept under a capped rule only where this is set:
-    /// with the count unwritten the cap could not hand the key on, so the
-    /// veto stands for it as for any request. In-process only.
+    /// ([`Candidate::session_in_flight`]), the count a capped sessions rule
+    /// asks for
+    /// ([`Needs::session_in_flight`](crate::Needs::session_in_flight)). A
+    /// sessions rule's in-flight cap reads the count either way. A key kept
+    /// on its worker over the overload veto is kept under a capped rule only
+    /// where this is set: with the count unwritten the cap could not hand
+    /// the key on, so the veto stands for it as for any request. In-process
+    /// only.
     pub session_counted: bool,
     /// The candidates' affinity facts, by index in the candidate slice the
     /// decision is made over: the one column the affinity stages read, in
@@ -1020,8 +1023,10 @@ pub struct Constraints<'a> {
     /// override, for a pool whose policy balances load against affinity
     /// itself. An engine built from a document lifts the veto itself for a
     /// keyed request of a profile that places by the session key, where the
-    /// binding steers. An engine built by hand does not: its host says so
-    /// here.
+    /// binding steers; under a sessions rule with an in-flight cap, only
+    /// where the host wrote the key's counts
+    /// ([`RequestFacts::session_counted`]). An engine built by hand does
+    /// not: its host says so here.
     pub overload_lifted: bool,
     /// A subset hint: decide over at most this many candidates.
     pub subset_hint: Option<u32>,
