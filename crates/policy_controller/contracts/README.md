@@ -67,7 +67,9 @@ clock, a lease's issue instant), and each file's comments name them.
   offsets are in the WIT comments, the model name is padded so the u64
   sections stay 8-byte aligned for any name length, and the guest's
   `cabi_realloc` returns 8-aligned memory for the blocks (or it reads with
-  unaligned loads).
+  unaligned loads). Either world's view carries the request's block hashes
+  only where the plugin's row declares them among its needs, 8,190 at most,
+  as a gRPC plugin's frame does.
 - The validity rules a plugin must keep are in the files: surviving positions
   unique and in range, one finite score per candidate clamped to `0..1`, a
   pick inside the surviving set; a violation is a trap (the instance is

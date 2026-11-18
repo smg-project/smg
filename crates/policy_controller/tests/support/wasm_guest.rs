@@ -117,6 +117,9 @@ pub mod counter {
     pub const OBSERVE_SESSION: u32 = 4;
     /// `random-u64` as drawn in `pick` under `DRAW_IN_PICK`.
     pub const PICK_RANDOM: u32 = 5;
+    /// The block hashes each request handed a guest of
+    /// [`hash_counting_guests`](super::hash_counting_guests), summed.
+    pub const HASHES: u32 = 6;
 }
 
 /// The canonical ABI layout the record guest reads: the constructor's
@@ -126,6 +129,9 @@ pub mod canonical {
     pub const ARGS_CANDIDATES_PTR: usize = 136;
     /// Offset of the candidate list's length in the arguments.
     pub const ARGS_CANDIDATES_LEN: usize = 140;
+    /// Offset of the length of the request's `block-hashes` list in the
+    /// arguments: the request is their first field.
+    pub const ARGS_HASHES_LEN: usize = 52;
     /// Size of one `candidate` record in guest memory.
     pub const CANDIDATE_SIZE: usize = 120;
     /// Offset of `in-flight` within a `candidate`.
@@ -183,6 +189,14 @@ pub fn check_canonical_layout() {
     let list_at = request_size.size_wasm32().next_multiple_of(4);
     assert_eq!(list_at, canonical::ARGS_CANDIDATES_PTR);
     assert_eq!(list_at + 4, canonical::ARGS_CANDIDATES_LEN);
+    let request = record_offsets("request");
+    let hashes = request
+        .iter()
+        .find(|(n, _)| n == "block-hashes")
+        .map(|(_, o)| *o)
+        .expect("request has block-hashes");
+    // A list is a pointer, then its length.
+    assert_eq!(hashes + 4, canonical::ARGS_HASHES_LEN, "{request:?}");
 }
 
 /// Assembles `wat_text` and wraps it as a component of `world`.
@@ -210,6 +224,43 @@ pub fn record_guest() -> Vec<u8> {
 /// A guest of the packed world.
 pub fn packed_guest() -> Vec<u8> {
     component("policy-packed", &guest_wat(Guest::Packed))
+}
+
+/// Both guests with a constructor that first tells the host, through the
+/// counter [`counter::HASHES`], how many block hashes the request handed
+/// it: the record guest reads the list's length in its arguments, the
+/// packed guest its request block's hash-count. Each by its world's name.
+pub fn hash_counting_guests() -> [(&'static str, Vec<u8>); 2] {
+    let counting = |guest: Guest, read: &str| {
+        let constructed = "    (call $on_construct)\n";
+        let counted = format!(
+            "    (call $counter (i32.const {}) (i64.extend_i32_u {read}))\n{constructed}",
+            counter::HASHES
+        );
+        let text = guest_wat(guest);
+        assert_eq!(
+            text.matches(constructed).count(),
+            1,
+            "the constructor tells the host once"
+        );
+        text.replacen(constructed, &counted, 1)
+    };
+    let record = format!(
+        "(i32.load offset={} (local.get $args))",
+        canonical::ARGS_HASHES_LEN
+    );
+    // The packed request block holds its hash-count at 48, a u16.
+    let packed = "(i32.load16_u offset=48 (local.get $rptr))";
+    [
+        (
+            "record",
+            component("policy", &counting(Guest::Record, &record)),
+        ),
+        (
+            "packed",
+            component("policy-packed", &counting(Guest::Packed, packed)),
+        ),
+    ]
 }
 
 /// A guest that imports a WASI interface: refused at load.

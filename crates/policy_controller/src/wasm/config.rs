@@ -91,7 +91,11 @@ pub struct PluginSpec {
     /// What the host must feed for the plugin's stages to mean anything
     /// (hashes, loads, headers, media, the affinity column behind a
     /// candidate's five affinity facts); the plugin declares it, the host
-    /// cannot read it off a module.
+    /// cannot read it off a module. The view carries the request's block
+    /// hashes where these declare them, in the token form or the text form:
+    /// the first [`MAX_BLOCK_HASHES`](crate::spec::MAX_BLOCK_HASHES) of
+    /// a longer list. Where they declare neither it carries none, whatever
+    /// the other stages of the profile read.
     pub needs: Needs,
     /// The counters the plugin may add to, by id; a name per id.
     pub metrics: Vec<String>,

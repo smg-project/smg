@@ -1,7 +1,8 @@
 //! The view and the lifecycle as a guest sees them: the record form through
 //! the generated types, the packed form as the little-endian blocks the
 //! WIT's layout table names, and the lifecycle as the versioned variant. The
-//! exposure decides what of the identities and headers crosses.
+//! exposure decides what of the identities and headers crosses, and the
+//! plugin's declared needs whether the request's block hashes do.
 
 use super::{
     bindings::wit,
@@ -10,6 +11,8 @@ use super::{
 use crate::{
     decision::{Decision, Target, MAX_TARGETS},
     lease::{Lease, LeaseKind, Membership, Outcome, ReleaseReason, Side, Signal, TransportClass},
+    plugins::shown_hashes,
+    spec::Needs,
     view::{
         AffinityFacts, Candidate, Feed, HashKind, Health, Identity, LoadRow, OverloadRegime, Phase,
         PoolFacts, RequestFacts, Role, SignalSource, WireModes, ZoneCapacity,
@@ -226,9 +229,11 @@ pub(crate) fn headers<'a>(facts: &RequestFacts<'a>, exposure: &Exposure) -> Vec<
         .collect()
 }
 
+/// The request under the plugin's exposure and its declared needs.
 pub(crate) fn request<'a>(
     facts: &RequestFacts<'a>,
     exposure: &Exposure,
+    needs: Needs,
     tried: &'a [u64],
     headers: &'a [(u8, &'a str)],
 ) -> wit::Request<'a> {
@@ -240,7 +245,7 @@ pub(crate) fn request<'a>(
         streaming: facts.streaming,
         max_output_tokens: facts.max_output_tokens,
         prompt_tokens: facts.prompt_tokens,
-        block_hashes: facts.block_hashes,
+        block_hashes: shown_hashes(facts, needs),
         hash_kind: hash_kind(facts.hash_kind),
         session_key: session_identity(facts, exposure.session_key),
         phase: phase(facts.phase),
@@ -659,8 +664,9 @@ impl Packed {
         candidates: &[Candidate],
         pool: &PoolFacts<'_>,
         exposure: &Exposure,
+        needs: Needs,
     ) -> Result<(), TooLong> {
-        self.fill_request(facts, exposure)?;
+        self.fill_request(facts, exposure, needs)?;
         self.fill_candidates(facts, candidates);
         self.fill_pool(pool);
         Ok(())
@@ -670,6 +676,7 @@ impl Packed {
         &mut self,
         facts: &RequestFacts<'_>,
         exposure: &Exposure,
+        needs: Needs,
     ) -> Result<(), TooLong> {
         use layout::*;
         let buf = &mut self.request;
@@ -685,7 +692,8 @@ impl Packed {
             .iter()
             .filter(|h| exposure.headers.contains(h.name));
         let header_count = u16::try_from(exposed.clone().count()).map_err(|_| TooLong)?;
-        let hash_count = u16::try_from(facts.block_hashes.len()).map_err(|_| TooLong)?;
+        let hashes = shown_hashes(facts, needs);
+        let hash_count = u16::try_from(hashes.len()).map_err(|_| TooLong)?;
         let tried_count = u16::try_from(facts.tried.len()).map_err(|_| TooLong)?;
         put(buf, REQ_NAMESPACE_SEED, &facts.namespace_seed.to_le_bytes());
         put(buf, REQ_SEED, &facts.seed.to_le_bytes());
@@ -714,7 +722,7 @@ impl Packed {
         put(buf, REQ_BLOCK_SIZE, &facts.block_size.to_le_bytes());
         buf.extend_from_slice(facts.model.as_bytes());
         buf.resize(buf.len().next_multiple_of(8), 0);
-        for h in facts.block_hashes {
+        for h in hashes {
             buf.extend_from_slice(&h.to_le_bytes());
         }
         for t in facts.tried {
@@ -995,6 +1003,7 @@ pub(crate) fn signal(s: &Signal, now_micros: u64) -> wit::Signal {
 mod tests {
     use super::{layout::*, *};
     use crate::{
+        spec::MAX_BLOCK_HASHES,
         view::{Header, MediaCounts, NamedAffinity, NamedHolder, WorkerId},
         wasm::config::HeaderSet,
     };
@@ -1274,6 +1283,63 @@ mod tests {
         Packed::default().fill_candidates(&facts, &[Candidate::default(), candidate_row()]);
     }
 
+    /// Both forms carry the request's block hashes for a row that declares
+    /// them, in the token form or the text form, the first
+    /// [`MAX_BLOCK_HASHES`] of a longer list, and none for a row that
+    /// declares neither, whatever else it declares.
+    #[test]
+    fn a_view_carries_the_block_hashes_its_row_declares() {
+        let most = usize::try_from(MAX_BLOCK_HASHES).expect("the range fits a length");
+        let longer: Vec<u64> = (0..=u64::from(MAX_BLOCK_HASHES)).collect();
+        let facts = RequestFacts {
+            block_hashes: &longer,
+            ..RequestFacts::default()
+        };
+        let token = Needs {
+            token_hashes: true,
+            ..Needs::default()
+        };
+        let text = Needs {
+            text_hashes: true,
+            ..Needs::default()
+        };
+        let neither = Needs {
+            text: true,
+            loads: true,
+            events: true,
+            affinity: true,
+            ..Needs::default()
+        };
+        for (needs, carried) in [
+            (Needs::default(), 0),
+            (neither, 0),
+            (token, most),
+            (text, most),
+        ] {
+            let record = request(&facts, &Exposure::default(), needs, &[], &[]);
+            assert_eq!(record.block_hashes, &longer[..carried], "{needs:?}");
+            let mut packed = Packed::default();
+            packed
+                .fill_request(&facts, &Exposure::default(), needs)
+                .expect("the request packs");
+            let b = &packed.request;
+            assert_eq!(usize::from(le_u16(b, REQ_HASH_COUNT)), carried, "{needs:?}");
+            // No name, no tried id, no header: the hashes are the block's tail.
+            assert_eq!(b.len(), HEADER + 8 * carried, "{needs:?}");
+            if carried > 0 {
+                assert_eq!(le_u64(b, HEADER), 0);
+                assert_eq!(le_u64(b, b.len() - 8), longer[carried - 1], "{needs:?}");
+            }
+        }
+        // A list inside the range is carried whole.
+        let short = RequestFacts {
+            block_hashes: &longer[..3],
+            ..RequestFacts::default()
+        };
+        let record = request(&short, &Exposure::default(), token, &[], &[]);
+        assert_eq!(record.block_hashes, &longer[..3]);
+    }
+
     #[test]
     fn a_twelve_byte_model_name_puts_the_hashes_at_ninety_six() {
         // The WIT's own example of the alignment rule.
@@ -1326,9 +1392,14 @@ mod tests {
             session_key: Reveal::Hash,
             headers: HeaderSet::of([2]),
         };
+        // The row declares the hashes this request carries.
+        let text_hashes = Needs {
+            text_hashes: true,
+            ..Needs::default()
+        };
         let mut packed = Packed::default();
         packed
-            .fill_request(&facts, &exposure)
+            .fill_request(&facts, &exposure, text_hashes)
             .expect("the request packs");
         let b = &packed.request;
         assert_eq!(le_u16(b, REQ_MODEL_LEN), 12);
@@ -1372,7 +1443,7 @@ mod tests {
             block_size: 16,
             ..RequestFacts::default()
         };
-        let record = request(&facts, &Exposure::default(), &[], &[]);
+        let record = request(&facts, &Exposure::default(), Needs::default(), &[], &[]);
         assert_eq!((record.seed, record.block_size), (9, 16));
     }
 
@@ -1391,7 +1462,7 @@ mod tests {
         };
         let mut packed = Packed::default();
         packed
-            .fill_request(&facts, &exposure)
+            .fill_request(&facts, &exposure, Needs::default())
             .expect("the request packs");
         assert_eq!(le_u64(&packed.request, REQ_TENANT), 0);
         assert_eq!(
@@ -1432,18 +1503,18 @@ mod tests {
             session_key: Reveal::None,
             ..Exposure::default()
         };
-        let record = request(&facts, &withheld, &[], &[]);
+        let record = request(&facts, &withheld, Needs::default(), &[], &[]);
         assert_eq!(record.session_key, wit::Identity::None);
         let mut packed = Packed::default();
         packed
-            .fill_request(&facts, &withheld)
+            .fill_request(&facts, &withheld, Needs::default())
             .expect("the request packs");
         assert_eq!(le_u64(&packed.request, REQ_SESSION_KEY), 0);
         let plain = Exposure {
             session_key: Reveal::Plain,
             ..Exposure::default()
         };
-        let record = request(&facts, &plain, &[], &[]);
+        let record = request(&facts, &plain, Needs::default(), &[], &[]);
         assert_eq!(record.session_key, wit::Identity::Plain("conversation-7"));
     }
 
@@ -1464,7 +1535,7 @@ mod tests {
         };
         let mut packed = Packed::default();
         packed
-            .fill_request(&facts, &exposure)
+            .fill_request(&facts, &exposure, Needs::default())
             .expect("the request packs");
         let b = &packed.request;
         let session = facts.session().get();
@@ -1485,7 +1556,7 @@ mod tests {
         };
         let mut packed = Packed::default();
         assert_eq!(
-            packed.fill_request(&facts, &Exposure::default()),
+            packed.fill_request(&facts, &Exposure::default(), Needs::default()),
             Err(TooLong)
         );
     }

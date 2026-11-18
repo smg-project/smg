@@ -133,7 +133,8 @@ pub struct Needs {
     /// handed the hashes as deep as the stages that declare them read
     /// ([`AppliedSpec::block_hashes_read`]), so a stage that reads the list
     /// declares one of the two kinds: under a generation where no stage
-    /// does, it is handed none.
+    /// does, it is handed none. A plugin is shown the list where its own
+    /// row declares one of the two, and none of it otherwise.
     pub token_hashes: bool,
     /// The request's prefix block hashes over windows of its text, which a
     /// host without a tokenizer feeds in their place. A stage that reads a

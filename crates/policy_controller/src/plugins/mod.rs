@@ -2,7 +2,8 @@
 //! which each kind's runtime is built over (a decision's number, its budget
 //! and whose bound a call ran out under), the breaker with its latency ring,
 //! the counters a plugin declares, the parts of its row that are not about
-//! its kind, the names its stages carry, and the three adapters that bind a
+//! its kind, the block hashes of a request its view carries, the names its
+//! stages carry, and the three adapters that bind a
 //! plugin's decision to a profile as the framework's filter, scorer and
 //! picker, each with the fallback stage its row names.
 //!
@@ -32,6 +33,11 @@ pub(crate) use stages::Stage;
 pub(crate) use stages::{BoundPlugin, Fallback};
 pub use stages::{PluginFilter, PluginPicker, PluginScorer};
 
+use crate::{
+    spec::{Needs, MAX_BLOCK_HASHES},
+    view::RequestFacts,
+};
+
 /// A stage's name lives as long as the process: the trace and the shed
 /// carry `&'static str` names, and a spec that reloads a plugin under the
 /// same name reuses the one allocation.
@@ -47,6 +53,21 @@ pub(crate) fn intern(name: &str) -> &'static str {
     let leaked: &'static str = Box::leak(name.to_owned().into_boxed_str());
     guard.insert(leaked);
     leaked
+}
+
+/// The block hashes of a request a plugin's view carries, whatever its
+/// kind: the request's where the plugin's row declares a request's hashes
+/// ([`Needs::request_hashes`]), the first [`MAX_BLOCK_HASHES`] of a longer
+/// list (the contracts' range), and none where the row declares neither
+/// form, whatever the other stages of the generation read. So the row and
+/// the contract bound what a plugin is handed, and a prompt's length sizes
+/// no view of a plugin that reads none of it.
+pub(crate) fn shown_hashes<'a>(facts: &RequestFacts<'a>, needs: Needs) -> &'a [u64] {
+    if !needs.request_hashes() {
+        return &[];
+    }
+    let most = usize::try_from(MAX_BLOCK_HASHES).unwrap_or(usize::MAX);
+    facts.block_hashes.get(..most).unwrap_or(facts.block_hashes)
 }
 
 #[cfg(test)]

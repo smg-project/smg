@@ -8,9 +8,12 @@
 use crate::{
     decision::{Decision, Target, Trace},
     lease::{Lease, LeaseKind, Membership, Outcome, ReleaseReason, Side, Signal, TransportClass},
-    plugins::config::{Exposure, Reveal},
+    plugins::{
+        config::{Exposure, Reveal},
+        shown_hashes,
+    },
     proto,
-    spec::{Needs, MAX_BLOCK_HASHES},
+    spec::Needs,
     view::{
         AffinityFacts, Candidate, HashKind, Health, Identity, LoadRow, OverloadRegime, Phase,
         PoolFacts, RequestFacts, Role, SignalSource, WireModes, ZoneCapacity,
@@ -207,20 +210,6 @@ pub(crate) fn exposure(e: &Exposure) -> proto::Exposure {
     }
 }
 
-/// The block hashes a frame carries: the request's where the plugin's row
-/// declares a request's hashes, the first [`MAX_BLOCK_HASHES`] of a longer
-/// list (the contract's range), and none where the row declares neither
-/// form, whatever the other stages of the generation read. So the row and
-/// the contract bound a frame, and a prompt's length sizes no frame of a
-/// plugin that reads none of it.
-fn block_hashes<'a>(facts: &RequestFacts<'a>, needs: Needs) -> &'a [u64] {
-    if !needs.request_hashes() {
-        return &[];
-    }
-    let most = usize::try_from(MAX_BLOCK_HASHES).unwrap_or(usize::MAX);
-    facts.block_hashes.get(..most).unwrap_or(facts.block_hashes)
-}
-
 /// The request under the plugin's exposure and its declared needs. The
 /// budget is written when the frame is sent: what the decision has left at
 /// that instant.
@@ -233,7 +222,7 @@ fn request(facts: &RequestFacts<'_>, exposure: &Exposure, needs: Needs) -> proto
         streaming: facts.streaming,
         max_output_tokens: facts.max_output_tokens,
         prompt_tokens: facts.prompt_tokens,
-        block_hashes: block_hashes(facts, needs).to_vec(),
+        block_hashes: shown_hashes(facts, needs).to_vec(),
         hash_kind: hash_kind(facts.hash_kind),
         session_key: session_identity(facts, exposure.session_key),
         phase: phase(facts.phase),
