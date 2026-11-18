@@ -16,8 +16,6 @@ use arc_swap::ArcSwap;
 use parking_lot::{Mutex, MutexGuard};
 use rustc_hash::FxHashMap;
 
-#[cfg(any(test, feature = "controller"))]
-use crate::store::leases::Said;
 use crate::{
     decider::Decider,
     lease::{LeaseId, Lifecycle, Membership, Outcome, ReleaseReason, Side, TransportClass},
@@ -27,7 +25,9 @@ use crate::{
         index::{indexed_under, KvEvent, KvTables, LaneCounts},
         journal::{Journal, Kinds, Position},
         kv_events::{BatchFacts, BatchOutcome, KvCursor, KvEventSink, ResyncReason},
-        leases::{Counts, Dispatch, LeaseRecord, LeaseRefused, LeaseState, LeasesStore, Slot},
+        leases::{
+            Counts, Dispatch, LeaseRecord, LeaseRefused, LeaseState, LeasesStore, Said, Slot,
+        },
         loads::{LoadSample, LoadSink, LoadSource, PollMode, Wake},
         reservations::{ReservationKind, ReservationStore},
         sessions::{Pin, SessionsStore},
@@ -295,6 +295,17 @@ impl MemoryStore {
     /// The pools are built from the cut's rows at once, whatever the
     /// publication window, and no build is left owed: a decision after the
     /// restore reads its rows.
+    ///
+    /// A replica that restores holds no lease. What stands on file was
+    /// filed while this replica led and is another history's by now: its
+    /// end was told to another leader, and no frame of the stream ends it
+    /// here. Behind the restore's locks, under the file's turn, each lease
+    /// leaves the file on the count it booked and its end is told as a
+    /// frame's release is, a removed worker's
+    /// ([`ReleaseReason::WorkerRemoved`]): the engine of the lease's own
+    /// generation hears it once, where that generation stands. A gateway's
+    /// `Hello` files what it lists again once this replica leads
+    /// ([`LeasesStore::restore`]).
     pub fn restore_from(&self, cut: Cut) -> bool {
         // Taken before the first lock, so dropped after the last: the journal
         // restarts inside the locks, and its listener is told behind them.
@@ -360,8 +371,16 @@ impl MemoryStore {
         // id, as an apply tells a generation's.
         self.tell_members(&workers);
         drop(workers);
+        // The turn is taken with the restore's locks let go. Under it each
+        // lease leaves the file and its end is told as a frame's release
+        // is: a later generation's stages never saw the issue and hear
+        // nothing of it.
         let mut leases = self.turn();
         leases.term = leases.term.max(cut.at.term);
+        for (record, by) in leases.empty() {
+            let said = Said::Released(None, ReleaseReason::WorkerRemoved);
+            self.tell(&record, said, by);
+        }
         true
     }
 
@@ -2472,6 +2491,19 @@ impl Leases {
         }
         self.end(key);
         true
+    }
+
+    /// Takes every lease off the file, each by the file's one end, and
+    /// every place of the deadline queue with them: what a restore
+    /// leaves of the leases this replica filed. Each comes as its tell
+    /// takes it ([`Held::told`]).
+    fn empty(&mut self) -> Vec<(LeaseRecord, Option<Decider>)> {
+        let keys: Vec<Key> = self.records.keys().copied().collect();
+        self.due.clear();
+        keys.iter()
+            .filter_map(|key| self.ended(key))
+            .map(|held| held.told())
+            .collect()
     }
 
     /// Queues `deadline` in its order. The deadlines come in rising order
