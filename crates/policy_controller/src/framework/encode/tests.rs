@@ -317,6 +317,104 @@ fn a_gap_no_retry_closes_is_named_by_membership() {
     assert_eq!(bed.stage(), "decode-vision");
 }
 
+/// A hard filter that refuses one row, by its id.
+#[derive(Debug)]
+struct RefusesOne(WorkerId);
+
+impl crate::framework::Filter for RefusesOne {
+    fn name(&self) -> &'static str {
+        "refuses-one"
+    }
+
+    fn keep(&self, _: &RequestFacts<'_>, row: &Candidate, _: &Constraints<'_>) -> bool {
+        row.id != self.0
+    }
+}
+
+/// A row over its thresholds.
+fn overloaded(row: Candidate) -> Candidate {
+    Candidate {
+        health: Health {
+            overloaded: true,
+            ..row.health
+        },
+        ..row
+    }
+}
+
+/// Encoders the overload veto left none of are a saturated fleet: the shed
+/// names the veto's stage and its reason is saturation, as a pair's side
+/// sheds its own rows. A stage ahead of the veto that leaves none is a
+/// missing endpoint as before, and so is one behind it that refuses an
+/// encoder the veto kept. An encoder that does not take the request is not
+/// counted, and under a veto its host lifted the encoders serve.
+#[test]
+fn encoders_the_veto_left_none_of_shed_as_saturation() {
+    let stock = engine();
+    let saturated = (ShedReason::Saturated, "not-overloaded");
+    let missing = (ShedReason::NoEndpoints, "encoders");
+    // Every encoder that takes the request is over its thresholds.
+    let mut bed = Bed::new();
+    bed.encoders = vec![
+        overloaded(row(0, Role::Encode, 0, 0)),
+        overloaded(row(1, Role::Encode, 0, 0)),
+    ];
+    bed.facts = vec![pushing(1), pushing(1)];
+    assert_eq!(shed_of(&bed.decide().0), saturated);
+    // A pair's side says the same of its own rows.
+    let mut side = Bed::new();
+    side.decodes = vec![overloaded(row(0, Role::Decode, 1, 0))];
+    assert_eq!(shed_of(&side.pair(&stock)), saturated);
+    // The host lifted the veto on the encode side: the item is placed.
+    let (facts, _) = bed.asked();
+    let cx = Constraints::default();
+    let lifted = Constraints {
+        overload_lifted: true,
+        ..Constraints::default()
+    };
+    let sides = [&cx, &cx, &lifted];
+    let (decision, placed) = decide_under(&bed, &stock, &facts, bed.pools(), sides);
+    assert!(matches!(decision, Decision::Pick(_)), "{decision:?}");
+    assert_eq!(placed.encoders().len(), 1);
+
+    // An unready encoder beside one over its thresholds was refused ahead
+    // of the veto: the veto still left none.
+    bed.encoders[1] = unready(row(1, Role::Encode, 0, 0));
+    assert_eq!(shed_of(&bed.decide().0), saturated);
+    // No encoder reached the veto: a missing endpoint.
+    bed.encoders[0] = unready(row(0, Role::Encode, 0, 0));
+    assert_eq!(shed_of(&bed.decide().0), missing);
+
+    // An encoder the veto kept, refused by a hard filter listed behind it:
+    // a missing endpoint, as a pair's side names rows so filtered.
+    bed.encoders = vec![
+        overloaded(row(0, Role::Encode, 0, 0)),
+        row(1, Role::Encode, 0, 0),
+    ];
+    let mut behind = engine();
+    for profile in &mut behind.profiles {
+        profile
+            .filters
+            .push(Box::new(RefusesOne(bed.encoders[1].id)));
+    }
+    assert_eq!(shed_of(&bed.decide_with(&behind).0), missing);
+
+    // An encoder over its thresholds that takes no image is not counted:
+    // the one that takes it was refused ahead of the veto.
+    bed.encoders = vec![
+        unready(row(0, Role::Encode, 0, 0)),
+        Candidate {
+            vision: false,
+            ..overloaded(row(1, Role::Encode, 0, 0))
+        },
+    ];
+    assert_eq!(shed_of(&bed.decide().0), missing);
+    // Nor is one over its thresholds that states no end.
+    bed.encoders[1] = overloaded(row(1, Role::Encode, 0, 0));
+    bed.facts[1] = pushing(0);
+    assert_eq!(shed_of(&bed.decide().0), missing);
+}
+
 #[test]
 fn a_shed_of_the_pair_is_returned_as_the_pair_gave_it() {
     let mut bed = Bed::new();
@@ -372,14 +470,7 @@ fn the_pairs_own_answers_read_the_same_through_both_entries() {
     let mut shed = Bed::new();
     shed.prefills = vec![unready(row(0, Role::Prefill, 1, 0))];
     let mut vetoed = Bed::new();
-    vetoed.decodes = vec![Candidate {
-        health: Health {
-            healthy: true,
-            overloaded: true,
-            ..Health::default()
-        },
-        ..row(0, Role::Decode, 1, 0)
-    }];
+    vetoed.decodes = vec![overloaded(row(0, Role::Decode, 1, 0))];
     // The beds are what they are named for.
     assert!(
         matches!(alternates.pair(&engine), Decision::Pick(pick) if pick.targets.len() == 2),
