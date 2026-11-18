@@ -3,6 +3,7 @@
 //! allocates per decision.
 
 use std::{
+    any::Any,
     cell::Cell,
     collections::VecDeque,
     hash::Hasher,
@@ -17,8 +18,11 @@ use parking_lot::{Mutex, MutexGuard};
 use rustc_hash::{FxHashMap, FxHasher};
 
 use crate::{
+    counts::with_counts,
     decision::{Target, Targets, MAX_TARGETS},
-    framework::{Filter, Narrowed, Picker, Scorer, TieBand, DRAW_BOUND},
+    framework::{
+        top_drawn, top_pass, Filter, Front, Narrowed, Picker, Scorer, TieBand, DRAW_BOUND,
+    },
     lease::{Lease, Lifecycle, Membership, Side},
     spec::Needs,
     view::{Candidate, Constraints, LoadRow, ModelFingerprint, PoolFacts, RequestFacts, WorkerId},
@@ -47,9 +51,49 @@ impl Filter for Healthy {
         true
     }
 
+    fn keep(&self, _: &RequestFacts<'_>, c: &Candidate, cx: &Constraints<'_>) -> bool {
+        c.health.routable_ignoring_overload() && !cx.masks(c.position)
+    }
+
+    /// The host's mask is asked about once: a pass under no standing veto
+    /// pays one test for it, and is then the pass over the rows' own bits.
+    fn retain(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        cx: &Constraints<'_>,
+        kept: &mut Vec<u32>,
+    ) {
+        if !cx.stalled.is_empty() {
+            return retain_masked(candidates, cx, kept);
+        }
+        OwnBits.retain(facts, candidates, cx, kept);
+    }
+}
+
+/// The health filter over a row's own bits alone. A filter of its own, so
+/// that the pass under no standing veto is the loop the trait gives a
+/// filter: written out beside the masked pass, the same test compiled to
+/// two instructions a row more past the first refused row.
+#[derive(Debug)]
+struct OwnBits;
+
+impl Filter for OwnBits {
+    fn name(&self) -> &'static str {
+        "healthy"
+    }
+
     fn keep(&self, _: &RequestFacts<'_>, c: &Candidate, _: &Constraints<'_>) -> bool {
         c.health.routable_ignoring_overload()
     }
+}
+
+/// The health filter's pass under a standing veto: a row's own bits, then
+/// the host's mask. Out of line, so the pass under no veto stays the short
+/// one.
+#[inline(never)]
+fn retain_masked(candidates: &[Candidate], cx: &Constraints<'_>, kept: &mut Vec<u32>) {
+    kept.retain(|&i| candidates[i as usize].health.routable_ignoring_overload() && !cx.masks(i));
 }
 
 /// Not over the overload thresholds, unless the host lifted the veto.
@@ -135,6 +179,73 @@ impl Filter for NotTried {
     }
 }
 
+/// The filters of this file as one test of a row: the set of them a
+/// profile holds. The engine folds a profile made of these filters alone
+/// into one at its build ([`RowTests::of`]), and a decision that draws first
+/// asks it about each row drawn: one call a row, where the filters' own
+/// `keep`s are a call a filter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RowTests(u8);
+
+impl RowTests {
+    const HEALTHY: u8 = 1;
+    const NOT_OVERLOADED: u8 = 1 << 1;
+    const HAS_CAPACITY: u8 = 1 << 2;
+    const HAS_ROOM: u8 = 1 << 3;
+    const NOT_TRIED: u8 = 1 << 4;
+
+    /// `filters` as one set, where each is a filter of this file, known by
+    /// its type. A host's own filter is no test the engine holds, one that
+    /// wraps a filter of this file too: a profile with one folds into
+    /// nothing, and is asked through each filter's `keep`.
+    pub(crate) fn of(filters: &[Box<dyn Filter>]) -> Option<Self> {
+        let mut tests = 0;
+        for filter in filters {
+            let filter: &dyn Any = filter.as_ref();
+            tests |= if filter.is::<Healthy>() {
+                Self::HEALTHY
+            } else if filter.is::<NotOverloaded>() {
+                Self::NOT_OVERLOADED
+            } else if filter.is::<HasCapacity>() {
+                Self::HAS_CAPACITY
+            } else if filter.is::<HasRoom>() {
+                Self::HAS_ROOM
+            } else if filter.is::<NotTried>() {
+                Self::NOT_TRIED
+            } else {
+                return None;
+            };
+        }
+        Some(Self(tests))
+    }
+
+    /// Whether a decision under `cx` asks the host's mask about a row
+    /// beside [`RowTests::keeps`]: the health filter is in the set and a
+    /// veto stands.
+    pub(crate) fn masked(self, cx: &Constraints<'_>) -> bool {
+        self.0 & Self::HEALTHY != 0 && !cx.stalled.is_empty()
+    }
+
+    /// Whether every filter of the set keeps the row, each by its own
+    /// `keep`. The health filter answers here for the row's own bits: the
+    /// host's mask, its other half, is the caller's to ask where
+    /// [`RowTests::masked`] says a veto stands.
+    #[inline(always)]
+    pub(crate) fn keeps(
+        self,
+        facts: &RequestFacts<'_>,
+        c: &Candidate,
+        cx: &Constraints<'_>,
+    ) -> bool {
+        let holds = |test: u8| self.0 & test != 0;
+        (!holds(Self::HEALTHY) || OwnBits.keep(facts, c, cx))
+            && (!holds(Self::NOT_OVERLOADED) || NotOverloaded.keep(facts, c, cx))
+            && (!holds(Self::HAS_CAPACITY) || HasCapacity.keep(facts, c, cx))
+            && (!holds(Self::HAS_ROOM) || HasRoom.keep(facts, c, cx))
+            && (!holds(Self::NOT_TRIED) || NotTried.keep(facts, c, cx))
+    }
+}
+
 // ---------------------------------------------------------------- scorers
 
 /// Lower raw costs become higher normalized scores; equal costs score `1.0`.
@@ -170,14 +281,16 @@ impl Scorer for LeastRequests {
 
     fn score(
         &self,
-        _: &RequestFacts<'_>,
+        facts: &RequestFacts<'_>,
         candidates: &[Candidate],
         kept: &[u32],
         out: &mut [f32],
     ) -> TieBand {
-        for (slot, &i) in out.iter_mut().zip(kept) {
-            *slot = candidates[i as usize].in_flight as f32;
-        }
+        with_counts!(facts, |counts| {
+            for (slot, &i) in out.iter_mut().zip(kept) {
+                *slot = counts(&candidates[i as usize]) as f32;
+            }
+        });
         normalize_costs(out);
         TieBand::NORMALIZED
     }
@@ -196,7 +309,7 @@ impl Scorer for SessionAffinity {
 
     fn score(
         &self,
-        _: &RequestFacts<'_>,
+        facts: &RequestFacts<'_>,
         candidates: &[Candidate],
         kept: &[u32],
         out: &mut [f32],
@@ -207,6 +320,12 @@ impl Scorer for SessionAffinity {
             } else {
                 0.0
             };
+        }
+        // A pin that stands beside the rows names one row: it is looked for
+        // once, and a decision under no such pin pays one test for it.
+        let pinned = facts.pinned_at.checked_sub(1);
+        if let Some(slot) = pinned.and_then(|at| kept.iter().position(|&i| i == at)) {
+            out[slot] = 1.0;
         }
         TieBand::NORMALIZED
     }
@@ -715,11 +834,17 @@ impl LeastLoad {
     /// A reporting candidate's dispatch credit as token-work: the since-report
     /// tokens plus the host's in-flight requests no report or credit accounts
     /// for, at the mean prefill. Read under one tally load; no division here.
-    fn credit_work(&self, c: &Candidate, credit_tokens: u64, credit_requests: u64) -> f32 {
+    fn credit_work(
+        &self,
+        c: &Candidate,
+        in_flight: u32,
+        credit_tokens: u64,
+        credit_requests: u64,
+    ) -> f32 {
         let reported = c
             .load
             .map_or(0, |r| u64::from(r.running) + u64::from(r.queued));
-        let unaccounted = u64::from(c.in_flight).saturating_sub(reported + credit_requests);
+        let unaccounted = u64::from(in_flight).saturating_sub(reported + credit_requests);
         unaccounted as f32 * self.mean_prefill_tokens as f32 + credit_tokens as f32
     }
 
@@ -752,15 +877,15 @@ impl LeastLoad {
     /// reports.
     fn unreported_cost(
         &self,
-        c: &Candidate,
+        in_flight: u32,
         nominal: f32,
         fleet_has_loads: bool,
         peer_baseline: f32,
     ) -> f32 {
         if fleet_has_loads {
-            peer_baseline + c.in_flight as f32 * self.mean_prefill_tokens as f32 / nominal
+            peer_baseline + in_flight as f32 * self.mean_prefill_tokens as f32 / nominal
         } else {
-            c.in_flight as f32
+            in_flight as f32
         }
     }
 }
@@ -795,9 +920,16 @@ impl Scorer for LeastLoad {
         true
     }
 
+    /// The rows a rank put in front are costed alone where each reports a
+    /// rate, and the stage says where one does not
+    /// ([`Self::score_front`]).
+    fn front_wise(&self) -> bool {
+        true
+    }
+
     fn score(
         &self,
-        _: &RequestFacts<'_>,
+        facts: &RequestFacts<'_>,
         candidates: &[Candidate],
         kept: &[u32],
         out: &mut [f32],
@@ -820,20 +952,22 @@ impl Scorer for LeastLoad {
         let mut reporting = 0usize;
         {
             let tally = self.credits.tally.load();
-            for (slot, &i) in out.iter_mut().zip(kept) {
-                let c = &candidates[i as usize];
-                *slot = match c.load {
-                    Some(_) => {
-                        let (tokens, requests) =
-                            tally.get(&(c.id, c.dp_rank)).map_or((0, 0), |since| {
-                                since.credit_through(c.load_sampled_at_micros)
-                            });
-                        reporting += 1;
-                        self.credit_work(c, tokens, requests)
-                    }
-                    None => PENDING,
-                };
-            }
+            with_counts!(facts, |counts| {
+                for (slot, &i) in out.iter_mut().zip(kept) {
+                    let c = &candidates[i as usize];
+                    *slot = match c.load {
+                        Some(_) => {
+                            let (tokens, requests) =
+                                tally.get(&(c.id, c.dp_rank)).map_or((0, 0), |since| {
+                                    since.credit_through(c.load_sampled_at_micros)
+                                });
+                            reporting += 1;
+                            self.credit_work(c, counts(c), tokens, requests)
+                        }
+                        None => PENDING,
+                    };
+                }
+            });
         }
         for (slot, &i) in out.iter_mut().zip(kept) {
             if let Some(r) = candidates[i as usize].load {
@@ -852,16 +986,18 @@ impl Scorer for LeastLoad {
                 peer_baseline = 0.0;
             }
         }
-        for (slot, &i) in out.iter_mut().zip(kept) {
-            if *slot == PENDING {
-                *slot = self.unreported_cost(
-                    &candidates[i as usize],
-                    nominal,
-                    fleet_has_loads,
-                    peer_baseline,
-                );
+        with_counts!(facts, |counts| {
+            for (slot, &i) in out.iter_mut().zip(kept) {
+                if *slot == PENDING {
+                    *slot = self.unreported_cost(
+                        counts(&candidates[i as usize]),
+                        nominal,
+                        fleet_has_loads,
+                        peer_baseline,
+                    );
+                }
             }
-        }
+        });
         // The band of a microsecond of expected wait on the normalized scale:
         // exact for one scorer, additive under several.
         let span = normalize_costs(out);
@@ -870,6 +1006,36 @@ impl Scorer for LeastLoad {
         } else {
             TieBand::NORMALIZED
         }
+    }
+
+    /// As [`Self::score`], with one word more. A row without a report is
+    /// costed from its reporting peers' baseline, and a report without a
+    /// rate drains at the rows' mean rate: either reads rows the stage may
+    /// not have been handed. So where one stands among the rows handed, the
+    /// stage says it must be asked whole ([`Front::Whole`]) before it costs
+    /// any: the rows a rank put in front are costed alone only where each
+    /// reports a rate, and then as they are among every row. Their costs
+    /// are spread over their own span and not the pool's, so two of them
+    /// further apart than the tie's microsecond are told apart whatever the
+    /// rows behind them cost. Among every row, a difference that is a small
+    /// enough share of the pool's span falls under the last bit of a
+    /// profile's sum, and the rows are drawn among.
+    fn score_front(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &[u32],
+        out: &mut [f32],
+    ) -> (TieBand, Front) {
+        let alone = kept.iter().all(|&i| {
+            candidates[i as usize]
+                .load
+                .is_some_and(|report| report.live_rate > 0)
+        });
+        if !alone {
+            return (TieBand::NORMALIZED, Front::Whole);
+        }
+        (self.score(facts, candidates, kept, out), Front::Unsaid)
     }
 
     fn needs(&self) -> Needs {
@@ -916,13 +1082,13 @@ impl ResidentWork {
     /// with its since-report credit.
     fn reported_cost(
         &self,
-        c: &Candidate,
+        in_flight: u32,
         r: LoadRow,
         credit_tokens: u64,
         credit_requests: u64,
     ) -> f32 {
         let reported = u64::from(r.running) + u64::from(r.queued);
-        let unaccounted = u64::from(c.in_flight).saturating_sub(reported + credit_requests);
+        let unaccounted = u64::from(in_flight).saturating_sub(reported + credit_requests);
         let resident = r.resident_tokens as f32;
         let mean_context = if reported > 0 {
             resident / reported as f32
@@ -961,7 +1127,7 @@ impl Scorer for ResidentWork {
 
     fn score(
         &self,
-        _: &RequestFacts<'_>,
+        facts: &RequestFacts<'_>,
         candidates: &[Candidate],
         kept: &[u32],
         out: &mut [f32],
@@ -972,25 +1138,27 @@ impl Scorer for ResidentWork {
         let mut reporting = 0usize;
         {
             let tally = self.credits.tally.load();
-            for (slot, &i) in out.iter_mut().zip(kept) {
-                let c = &candidates[i as usize];
-                // A report releases the dispatches it reflects whatever the
-                // score reads of them: a rank whose report counts no
-                // resident tokens would hold its credit at the bound.
-                let reported = c.load.map(|r| {
-                    let credit = tally.get(&(c.id, c.dp_rank)).map_or((0, 0), |since| {
-                        since.credit_through(c.load_sampled_at_micros)
+            with_counts!(facts, |counts| {
+                for (slot, &i) in out.iter_mut().zip(kept) {
+                    let c = &candidates[i as usize];
+                    // A report releases the dispatches it reflects whatever the
+                    // score reads of them: a rank whose report counts no
+                    // resident tokens would hold its credit at the bound.
+                    let reported = c.load.map(|r| {
+                        let credit = tally.get(&(c.id, c.dp_rank)).map_or((0, 0), |since| {
+                            since.credit_through(c.load_sampled_at_micros)
+                        });
+                        (r, credit)
                     });
-                    (r, credit)
-                });
-                *slot = match reported {
-                    Some((r, (tokens, requests))) if r.resident_counted => {
-                        reporting += 1;
-                        self.reported_cost(c, r, tokens, requests)
-                    }
-                    _ => PENDING,
-                };
-            }
+                    *slot = match reported {
+                        Some((r, (tokens, requests))) if r.resident_counted => {
+                            reporting += 1;
+                            self.reported_cost(counts(c), r, tokens, requests)
+                        }
+                        _ => PENDING,
+                    };
+                }
+            });
         }
         let fleet_reports = reporting > 0;
         let peer_baseline = if fleet_reports && reporting < kept.len() {
@@ -1002,16 +1170,18 @@ impl Scorer for ResidentWork {
             0.0
         };
         let in_flight_work = self.mean_prefill_tokens as f32 + self.request_tokens as f32;
-        for (slot, &i) in out.iter_mut().zip(kept) {
-            if *slot == PENDING {
-                let in_flight = candidates[i as usize].in_flight as f32;
-                *slot = if fleet_reports {
-                    peer_baseline + in_flight * in_flight_work
-                } else {
-                    in_flight
-                };
+        with_counts!(facts, |counts| {
+            for (slot, &i) in out.iter_mut().zip(kept) {
+                if *slot == PENDING {
+                    let in_flight = counts(&candidates[i as usize]) as f32;
+                    *slot = if fleet_reports {
+                        peer_baseline + in_flight * in_flight_work
+                    } else {
+                        in_flight
+                    };
+                }
             }
-        }
+        });
         // The least-load scorer's band, on a score in tokens: equal work is
         // a tie, drawn by the picker.
         let span = normalize_costs(out);
@@ -1085,6 +1255,10 @@ fn draw_in_band(
 /// finds the rows drawn. Returns how many of `picks` it filled, in slot
 /// order: none where the band is not flat, and the slots it leaves are drawn
 /// one by one.
+///
+/// Inlined into the ranked push's two bodies, a pass's and a draw's, as it
+/// was into the one body before a draw had its own.
+#[inline(always)]
 fn draw_flat(
     draw: &mut Draw,
     scores: &[f32],
@@ -1140,17 +1314,147 @@ fn draw_flat(
     fills
 }
 
-/// Push the kept positions in descending score order, ties by draw: per slot
-/// the rows within the band of the best remaining score are one tie, drawn
-/// from uniformly with the values of `draw`. One pass keeps the five best
-/// scores (equal scores in scan order); while the next best is below the
-/// band of the best remaining, that row stands alone in its band and is the
-/// slot's pick with no draw spent. From the first band that holds several
-/// rows on, a slot costs the passes of [`draw_in_band`] and one value of the
-/// draw; where that band's rows score alike, its slots are drawn by rank in
-/// one count ([`draw_flat`]). The taken slots
-/// live in a fixed array: nothing is allocated.
-fn push_ranked(
+/// Whether the entry at `at` of the five best stands alone in its band: no
+/// entry stands behind it, or the next one lies below its band.
+fn alone(
+    best_five: &[(usize, f32); MAX_TARGETS + 1],
+    len: usize,
+    at: usize,
+    band: TieBand,
+) -> bool {
+    at + 1 >= len || below_band(best_five[at + 1].1, best_five[at].1, band)
+}
+
+/// The rows of a ranked pick, by their places in `scores`, handed to `pick`
+/// in slot order: `slots` of them at most, and `slots` no more than a
+/// target list holds. Per slot the rows within the band of the best
+/// remaining score are one tie, drawn from uniformly with the values of
+/// `draw`: one value a slot while two rows of its band are left, none for a
+/// row alone, the pick counted from the band's last row in scan order
+/// ([`draw_in_band`]).
+///
+/// One pass keeps the five best scores (equal scores in scan order), and a
+/// band that ends among them is read off them: an entry below the band
+/// stands behind its rows, or the five are every row. A row alone in its
+/// band is its slot's pick. A band of several rows that score alike is
+/// drawn slot by slot among its rows left, and once it is spent the entry
+/// behind it is the best score left. So a pool whose bands end among the
+/// five costs that pass and, at its first band of several rows, the read
+/// below: no slot costs a pass of its own.
+///
+/// The five stand for the pool only where no score is a NaN (one ties in
+/// every band, and the pass may have dropped it) and the band is a width of
+/// zero or more (under a band below zero a row lies below its own band): one
+/// read of the scores, made at the first band of several rows. Where that
+/// fails, where a band reaches the fifth entry (rows behind the five may
+/// stand in it) and where a band's rows differ within it, the slots left
+/// are read over the pool: a flat band is counted once and drawn by rank
+/// ([`draw_flat`]), and each slot it leaves costs the passes of
+/// [`draw_in_band`].
+///
+/// `DRAWN` is the order of a draw: the five best are read with no branch on
+/// a score ([`top_drawn`]). Inlined into the ranked push's two bodies, where
+/// `pick` pushes a row's target: the rows drawn live in a fixed array and
+/// nothing is allocated.
+#[inline(always)]
+fn draw_ranked<const DRAWN: bool>(
+    draw: &mut Draw,
+    scores: &[f32],
+    band: TieBand,
+    slots: usize,
+    mut pick: impl FnMut(usize),
+) {
+    let mut best_five = [(usize::MAX, f32::NEG_INFINITY); MAX_TARGETS + 1];
+    let len = if DRAWN {
+        top_drawn(scores, &mut best_five)
+    } else {
+        top_pass(scores, &mut best_five)
+    };
+    let mut taken = [usize::MAX; MAX_TARGETS];
+    let mut filled = 0usize;
+    while filled < slots && alone(&best_five, len, filled, band) {
+        let (row, _) = best_five[filled];
+        taken[filled] = row;
+        pick(row);
+        filled += 1;
+    }
+    // Whether the five stand for the pool: unread until a band asks.
+    let mut sound = false;
+    // Several rows share the band of the best score left, the next entry
+    // among them.
+    while filled < slots {
+        let top = best_five[filled].1;
+        // Rows behind the five may stand in a band that reaches the fifth
+        // entry.
+        if len > MAX_TARGETS && !below_band(best_five[MAX_TARGETS].1, top, band) {
+            break;
+        }
+        let mut end = filled + 2;
+        while end < len && !below_band(best_five[end].1, top, band) {
+            end += 1;
+        }
+        // A row that differs within the band moves the band as it is taken.
+        if best_five[filled + 1..end]
+            .iter()
+            .any(|&(_, score)| score != top)
+        {
+            break;
+        }
+        if !sound {
+            sound = band.0 >= 0.0 && !scores.iter().fold(false, |nan, s| nan | s.is_nan());
+            if !sound {
+                break;
+            }
+        }
+        // The band's rows left, in scan order: a slot's draw counts from
+        // the last of them.
+        let mut rows = [usize::MAX; MAX_TARGETS];
+        for (row, &(i, _)) in rows.iter_mut().zip(&best_five[filled..end]) {
+            *row = i;
+        }
+        let mut left = end - filled;
+        while left > 0 && filled < slots {
+            let back = if left > 1 { draw.below(left) } else { 0 };
+            let at = left - 1 - back;
+            taken[filled] = rows[at];
+            pick(rows[at]);
+            // The rows behind it close the gap.
+            for gap in at..MAX_TARGETS - 1 {
+                rows[gap] = rows[gap + 1];
+            }
+            filled += 1;
+            left -= 1;
+        }
+        // The rows alone behind the band.
+        while filled < slots && alone(&best_five, len, filled, band) {
+            let (row, _) = best_five[filled];
+            taken[filled] = row;
+            pick(row);
+            filled += 1;
+        }
+    }
+    if filled < slots {
+        let top = best_five[filled].1;
+        let fills = draw_flat(draw, scores, top, band, &mut taken[filled..slots]);
+        for &row in &taken[filled..filled + fills] {
+            pick(row);
+        }
+        filled += fills;
+    }
+    for slot in filled..slots {
+        let open = |i: usize| !taken[..slot].contains(&i);
+        let Some(row) = draw_in_band(scores, band, draw, open) else {
+            break;
+        };
+        taken[slot] = row;
+        pick(row);
+    }
+}
+
+/// Push the kept positions in descending score order, ties by draw
+/// ([`draw_ranked`]). The rows drawn live in a fixed array: nothing is
+/// allocated.
+fn push_ranked<const DRAWN: bool>(
     mut draw: Draw,
     candidates: &[Candidate],
     kept: &[u32],
@@ -1159,53 +1463,9 @@ fn push_ranked(
     out: &mut Targets,
 ) {
     let slots = MAX_TARGETS.min(kept.len());
-    let mut best_five: [(usize, f32); MAX_TARGETS + 1] =
-        [(usize::MAX, f32::NEG_INFINITY); MAX_TARGETS + 1];
-    let mut len = 0usize;
-    for (i, &s) in scores.iter().enumerate() {
-        if len == best_five.len() && s <= best_five[len - 1].1 {
-            continue;
-        }
-        let mut at = if len < best_five.len() {
-            len += 1;
-            len - 1
-        } else {
-            best_five.len() - 1
-        };
-        while at > 0 && s > best_five[at - 1].1 {
-            best_five[at] = best_five[at - 1];
-            at -= 1;
-        }
-        best_five[at] = (i, s);
-    }
-    let mut taken = [usize::MAX; MAX_TARGETS];
-    let mut filled = 0usize;
-    while filled < slots
-        && (filled + 1 >= len || below_band(best_five[filled + 1].1, best_five[filled].1, band))
-    {
-        let (i, _) = best_five[filled];
-        taken[filled] = i;
-        out.push(target_of(&candidates[kept[i] as usize]));
-        filled += 1;
-    }
-    if filled < slots {
-        let mut picks = [usize::MAX; MAX_TARGETS];
-        let top = best_five[filled].1;
-        let fills = draw_flat(&mut draw, scores, top, band, &mut picks[..slots - filled]);
-        for &i in &picks[..fills] {
-            taken[filled] = i;
-            out.push(target_of(&candidates[kept[i] as usize]));
-            filled += 1;
-        }
-    }
-    for slot in filled..slots {
-        let left = |i: usize| !taken[..slot].contains(&i);
-        let Some(b) = draw_in_band(scores, band, &mut draw, left) else {
-            break;
-        };
-        taken[slot] = b;
-        out.push(target_of(&candidates[kept[b] as usize]));
-    }
+    draw_ranked::<DRAWN>(&mut draw, scores, band, slots, |row| {
+        out.push(target_of(&candidates[kept[row] as usize]));
+    });
 }
 
 /// The target that names `c`, on no pair.
@@ -1280,6 +1540,12 @@ impl Picker for Best {
         "best"
     }
 
+    /// The targets are the best of the rows handed: a rank may put rows in
+    /// front of this picker.
+    fn front_wise(&self) -> bool {
+        true
+    }
+
     fn pick(
         &self,
         facts: &RequestFacts<'_>,
@@ -1289,7 +1555,118 @@ impl Picker for Best {
         band: TieBand,
         out: &mut Targets,
     ) {
-        push_ranked(Draw::new(facts.seed), candidates, kept, scores, band, out);
+        push_ranked::<false>(Draw::new(facts.seed), candidates, kept, scores, band, out);
+    }
+}
+
+/// The best of a sample: `best` over the rows it draws first. Where the
+/// host named the request's holders and the pool's warming rows
+/// ([`NamedAffinity`](crate::NamedAffinity)) and the pool holds more than
+/// twice the sample, and at least the sixteen rows the engine asks a draw
+/// from, it draws `sample` rows the filters keep, uniformly and with
+/// replacement (a repeat or a refused row costs one of its `2 * sample`
+/// draws), the named rows join them, and the highest combined score among
+/// those wins. Any other pool is read whole, as `best` reads it, and so is
+/// a pool whose sample holds no row.
+#[derive(Debug)]
+pub struct SampledBest {
+    sample: u32,
+}
+
+impl SampledBest {
+    /// The picker over a sample of `sample` rows, at least one.
+    pub fn new(sample: u32) -> Self {
+        Self {
+            sample: sample.max(1),
+        }
+    }
+}
+
+impl Lifecycle for SampledBest {}
+
+impl Picker for SampledBest {
+    fn name(&self) -> &'static str {
+        "best"
+    }
+
+    /// The targets are the best of the rows handed: a rank may put rows in
+    /// front of this picker.
+    fn front_wise(&self) -> bool {
+        true
+    }
+
+    fn pick(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &[u32],
+        scores: &[f32],
+        band: TieBand,
+        out: &mut Targets,
+    ) {
+        push_ranked::<false>(Draw::new(facts.seed), candidates, kept, scores, band, out);
+    }
+
+    /// The pick over the rows drawn and joined, which stand in the draw's
+    /// order: their five best are read as a draw's.
+    fn order_drawn(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &[u32],
+        scores: &[f32],
+        band: TieBand,
+        out: &mut Targets,
+    ) {
+        push_ranked::<true>(Draw::new(facts.seed), candidates, kept, scores, band, out);
+    }
+
+    fn draws_first(&self) -> bool {
+        true
+    }
+
+    fn joined_by_named(&self) -> bool {
+        true
+    }
+
+    /// At most `2 * sample` uniform draws until `sample` rows are kept; a
+    /// repeat and a row the filters refuse are dropped, each at the cost
+    /// of its draw. The draws are the picker's own bound: it counts no
+    /// refused rows against [`DRAW_BOUND`], which is sized for a draw of
+    /// one or two. A pool of at most twice the sample, and a sample that
+    /// holds no row, leave the decision to the whole pass. Whether the
+    /// host named rows is the engine's to ask
+    /// ([`Picker::joined_by_named`]).
+    fn draw_first(
+        &self,
+        _: &RequestFacts<'_>,
+        _: &PoolFacts<'_>,
+        candidates: &[Candidate],
+        keep: &mut dyn FnMut(&Candidate) -> bool,
+        kept: &mut Vec<u32>,
+        draw: &mut Draw,
+    ) -> bool {
+        let sample = self.sample as usize;
+        if candidates.len() <= 2 * sample {
+            return false;
+        }
+        for _ in 0..2 * sample {
+            if kept.len() == sample {
+                break;
+            }
+            let row = draw.below(candidates.len()) as u32;
+            if !kept.contains(&row) && keep(&candidates[row as usize]) {
+                kept.push(row);
+            }
+        }
+        !kept.is_empty()
+    }
+
+    fn needs(&self) -> Needs {
+        Needs {
+            sample: self.sample,
+            ..Needs::default()
+        }
     }
 }
 
@@ -1667,56 +2044,64 @@ impl Picker for CountFirst {
         "count-first"
     }
 
+    /// The targets are the best of the rows handed: a rank may put rows in
+    /// front of this picker.
+    fn front_wise(&self) -> bool {
+        true
+    }
+
     fn narrow(
         &self,
         facts: &RequestFacts<'_>,
         candidates: &[Candidate],
         kept: &mut [u32],
     ) -> Narrowed {
-        let count = |row: u32| candidates[row as usize].in_flight;
-        let Some(fewest) = kept.iter().map(|&row| count(row)).min() else {
-            return Narrowed::all(0);
-        };
-        let mut compared = 0usize;
-        for i in 0..kept.len() {
-            if count(kept[i]) == fewest {
-                kept.swap(compared, i);
-                compared += 1;
-            }
-        }
-        // The alternates the target list still has room for once the
-        // compared set is ordered: the next by count, equal counts drawn.
-        let alternates = MAX_TARGETS
-            .saturating_sub(compared)
-            .min(kept.len() - compared);
-        // The order of equal counts is drawn from a stream of its own, so it
-        // says nothing of the tie among the fewest (the seed's stream, which
-        // `pick` reads) nor of the draws a pair plan's decode side makes.
-        let mut draw = Draw::new(facts.seed ^ ALTERNATES_STREAM);
-        for slot in compared..compared + alternates {
-            let mut next = slot;
-            let mut tied = 1usize;
-            for i in slot + 1..kept.len() {
-                match count(kept[i]).cmp(&count(kept[next])) {
-                    std::cmp::Ordering::Less => {
-                        next = i;
-                        tied = 1;
-                    }
-                    std::cmp::Ordering::Equal => {
-                        tied += 1;
-                        if draw.below(tied) == 0 {
-                            next = i;
-                        }
-                    }
-                    std::cmp::Ordering::Greater => {}
+        with_counts!(facts, |counts| {
+            let count = |row: u32| counts(&candidates[row as usize]);
+            let Some(fewest) = kept.iter().map(|&row| count(row)).min() else {
+                return Narrowed::all(0);
+            };
+            let mut compared = 0usize;
+            for i in 0..kept.len() {
+                if count(kept[i]) == fewest {
+                    kept.swap(compared, i);
+                    compared += 1;
                 }
             }
-            kept.swap(slot, next);
-        }
-        Narrowed {
-            compared,
-            alternates,
-        }
+            // The alternates the target list still has room for once the
+            // compared set is ordered: the next by count, equal counts drawn.
+            let alternates = MAX_TARGETS
+                .saturating_sub(compared)
+                .min(kept.len() - compared);
+            // The order of equal counts is drawn from a stream of its own, so it
+            // says nothing of the tie among the fewest (the seed's stream, which
+            // `pick` reads) nor of the draws a pair plan's decode side makes.
+            let mut draw = Draw::new(facts.seed ^ ALTERNATES_STREAM);
+            for slot in compared..compared + alternates {
+                let mut next = slot;
+                let mut tied = 1usize;
+                for i in slot + 1..kept.len() {
+                    match count(kept[i]).cmp(&count(kept[next])) {
+                        std::cmp::Ordering::Less => {
+                            next = i;
+                            tied = 1;
+                        }
+                        std::cmp::Ordering::Equal => {
+                            tied += 1;
+                            if draw.below(tied) == 0 {
+                                next = i;
+                            }
+                        }
+                        std::cmp::Ordering::Greater => {}
+                    }
+                }
+                kept.swap(slot, next);
+            }
+            Narrowed {
+                compared,
+                alternates,
+            }
+        })
     }
 
     fn pick(
@@ -1728,34 +2113,36 @@ impl Picker for CountFirst {
         band: TieBand,
         out: &mut Targets,
     ) {
-        let count = |row: u32| candidates[row as usize].in_flight;
-        // The ties are drawn from the seed's own stream, as the best picker
-        // draws them: the alternates' order has a stream of its own.
-        let mut draw = Draw::new(facts.seed);
-        // The narrowing leaves one count, and among equal counts the pick is
-        // the best picker's.
-        if kept.windows(2).all(|pair| count(pair[0]) == count(pair[1])) {
-            return push_ranked(draw, candidates, kept, scores, band, out);
-        }
-        // Rows that were never narrowed: the same rule a slot, among the
-        // fewest in flight of the rows left. Every row here came with a
-        // score, so equal counts past the fewest go by score too, where the
-        // narrowing draws them unscored.
-        let mut taken = [usize::MAX; MAX_TARGETS];
-        for slot in 0..MAX_TARGETS.min(kept.len()) {
-            let left = |i: usize| !taken[..slot].contains(&i);
-            let rows = kept.iter().enumerate();
-            let fewest = rows
-                .filter(|&(i, _)| left(i))
-                .map(|(_, &row)| count(row))
-                .min();
-            let open = |i: usize| left(i) && Some(count(kept[i])) == fewest;
-            let Some(b) = draw_in_band(scores, band, &mut draw, open) else {
-                break;
-            };
-            taken[slot] = b;
-            out.push(target_of(&candidates[kept[b] as usize]));
-        }
+        with_counts!(facts, |counts| {
+            let count = |row: u32| counts(&candidates[row as usize]);
+            // The ties are drawn from the seed's own stream, as the best picker
+            // draws them: the alternates' order has a stream of its own.
+            let mut draw = Draw::new(facts.seed);
+            // The narrowing leaves one count, and among equal counts the pick is
+            // the best picker's.
+            if kept.windows(2).all(|pair| count(pair[0]) == count(pair[1])) {
+                return push_ranked::<false>(draw, candidates, kept, scores, band, out);
+            }
+            // Rows that were never narrowed: the same rule a slot, among the
+            // fewest in flight of the rows left. Every row here came with a
+            // score, so equal counts past the fewest go by score too, where the
+            // narrowing draws them unscored.
+            let mut taken = [usize::MAX; MAX_TARGETS];
+            for slot in 0..MAX_TARGETS.min(kept.len()) {
+                let left = |i: usize| !taken[..slot].contains(&i);
+                let rows = kept.iter().enumerate();
+                let fewest = rows
+                    .filter(|&(i, _)| left(i))
+                    .map(|(_, &row)| count(row))
+                    .min();
+                let open = |i: usize| left(i) && Some(count(kept[i])) == fewest;
+                let Some(b) = draw_in_band(scores, band, &mut draw, open) else {
+                    break;
+                };
+                taken[slot] = b;
+                out.push(target_of(&candidates[kept[b] as usize]));
+            }
+        });
     }
 }
 
@@ -1806,7 +2193,7 @@ impl Picker for PowerOfTwoCountFirst {
         band: TieBand,
         out: &mut Targets,
     ) {
-        let count = |i: usize| candidates[kept[i] as usize].in_flight;
+        let count = |i: usize| facts.in_flight(&candidates[kept[i] as usize]);
         let by_count = |a: usize, b: usize| {
             count(a)
                 .cmp(&count(b))
@@ -2074,6 +2461,23 @@ impl Picker for RoundRobin {
     }
 }
 
+/// The five filters of this file a set names, by bit: what the cases of the
+/// folded test walk, here and in the engine's.
+#[cfg(test)]
+pub(crate) fn filters_of(set: u8) -> Vec<Box<dyn Filter>> {
+    let all: [fn() -> Box<dyn Filter>; 5] = [
+        || Box::new(Healthy),
+        || Box::new(NotOverloaded),
+        || Box::new(HasCapacity),
+        || Box::new(HasRoom),
+        || Box::new(NotTried),
+    ];
+    (0..all.len())
+        .filter(|bit| set & (1 << bit) != 0)
+        .map(|bit| all[bit]())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     /// The dispatches that waited for a retirement in progress; the retire
@@ -2082,6 +2486,7 @@ mod tests {
 
     use super::*;
     use crate::{
+        counts::tests::Lent,
         decision::Pair,
         view::{Health, LoadRow},
     };
@@ -2554,6 +2959,43 @@ mod tests {
         assert!(scores[0] > scores[1], "{scores:?}");
     }
 
+    /// What the load stage says of the rows it is handed
+    /// ([`Scorer::score_front`]): its scores and no word where each reports
+    /// a rate, and that it must be asked whole where one has no rate or no
+    /// report, before it costs any.
+    #[test]
+    fn least_load_must_be_asked_whole_of_a_row_without_a_rate_or_a_report() {
+        let ll = LeastLoad::new(0.15, 1024, 2000.0);
+        let mut pool = [candidate(0, 0), candidate(1, 0), candidate(2, 0)];
+        for (row, running) in pool.iter_mut().zip([1, 3, 2]) {
+            row.load = Some(report(running, 0));
+        }
+        let facts = RequestFacts::default();
+        let (mut said, mut plain) = ([0.0f32; 3], [0.0f32; 3]);
+        let band = ll.score(&facts, &pool, &kept(3), &mut plain);
+        assert_eq!(
+            ll.score_front(&facts, &pool, &kept(3), &mut said),
+            (band, Front::Unsaid)
+        );
+        assert_eq!(said, plain);
+        // A report without a rate drains at the rows' mean rate.
+        pool[1].load = Some(LoadRow {
+            live_rate: 0,
+            ..report(3, 0)
+        });
+        let mut untouched = [-1.0f32; 3];
+        let word = ll.score_front(&facts, &pool, &kept(3), &mut untouched).1;
+        assert_eq!(word, Front::Whole);
+        assert_eq!(untouched, [-1.0; 3], "nothing is costed");
+        // A row without a report is costed from its reporting peers.
+        pool[1].load = None;
+        let word = ll.score_front(&facts, &pool, &kept(3), &mut untouched).1;
+        assert_eq!(word, Front::Whole);
+        // Handed the rows that report a rate alone, it answers for them.
+        let word = ll.score_front(&facts, &pool, &[0, 2], &mut said[..2]).1;
+        assert_eq!(word, Front::Unsaid);
+    }
+
     #[test]
     fn least_load_ties_within_a_microsecond_of_wait_on_a_spread_pool() {
         // Two workers a quarter of a microsecond apart in expected wait, and a
@@ -2676,11 +3118,11 @@ mod tests {
         pool[1].load = Some(resident(1, 9_000));
         let cheap = ResidentWork::new(1_000);
         assert_eq!(
-            cheap.reported_cost(&pool[0], resident(2, 6_000), 0, 0),
+            cheap.reported_cost(pool[0].in_flight, resident(2, 6_000), 0, 0),
             8_000.0
         );
         assert_eq!(
-            cheap.reported_cost(&pool[1], resident(1, 9_000), 0, 0),
+            cheap.reported_cost(pool[1].in_flight, resident(1, 9_000), 0, 0),
             10_000.0
         );
         assert_eq!(resident_scores(&cheap, &pool), [1.0, 0.0]);
@@ -2695,7 +3137,10 @@ mod tests {
             queued: 1,
             ..resident(1, 6_000)
         };
-        assert_eq!(cheap.reported_cost(&pool[0], queued, 0, 0), 8_000.0);
+        assert_eq!(
+            cheap.reported_cost(pool[0].in_flight, queued, 0, 0),
+            8_000.0
+        );
     }
 
     /// A dispatch the report does not reflect yet adds its prompt and one
@@ -2810,7 +3255,7 @@ mod tests {
             ..resident(2, 8_000)
         };
         assert_eq!(
-            rw.reported_cost(&busy, row, 0, 0),
+            rw.reported_cost(busy.in_flight, row, 0, 0),
             8_000.0 + 2_000.0 + 5.0 * 1_000.0
         );
     }
@@ -2850,17 +3295,17 @@ mod tests {
         // Two reported requests hold 8,000 tokens, a mean context of 4,000;
         // three more are in transit.
         assert_eq!(
-            rw.reported_cost(&busy, resident(2, 8_000), 0, 0),
+            rw.reported_cost(busy.in_flight, resident(2, 8_000), 0, 0),
             8_000.0 + 3.0 * 4_000.0 + 5.0 * 1_000.0
         );
         // One of the three is a credited dispatch of 1,500 tokens.
         assert_eq!(
-            rw.reported_cost(&busy, resident(2, 8_000), 1_500, 1),
+            rw.reported_cost(busy.in_flight, resident(2, 8_000), 1_500, 1),
             8_000.0 + 1_500.0 + 2.0 * 4_000.0 + 5.0 * 1_000.0
         );
         let idle = candidate(1, 2);
         assert_eq!(
-            rw.reported_cost(&idle, resident(0, 0), 0, 0),
+            rw.reported_cost(idle.in_flight, resident(0, 0), 0, 0),
             2.0 * DEFAULT_MEAN_PREFILL_TOKENS as f32 + 2.0 * 1_000.0
         );
     }
@@ -3287,6 +3732,123 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// A band that ends among the five best is read off them, and the rows
+    /// and the draws are the ones the passes over the pool give. The pick
+    /// kept in this case reads by passes: single bands off the five, one
+    /// flat band by its count, then each slot left by passes of its own.
+    /// The pools tie whole, differ row by row or tie in bands of every
+    /// length around the five, some with rows that differ inside a band and
+    /// some with values no score should be; the bands are narrow, none,
+    /// wide, below zero and no number; the slots are the list's room or
+    /// fewer; the five are read by a pass and behind a draw.
+    #[test]
+    fn a_band_that_ends_among_the_five_best_is_drawn_as_the_passes_over_the_pool_draw_it() {
+        fn by_passes<const DRAWN: bool>(
+            draw: &mut Draw,
+            scores: &[f32],
+            band: TieBand,
+            slots: usize,
+        ) -> Vec<usize> {
+            let mut picked = Vec::new();
+            let mut best_five = [(usize::MAX, f32::NEG_INFINITY); MAX_TARGETS + 1];
+            let len = if DRAWN {
+                top_drawn(scores, &mut best_five)
+            } else {
+                top_pass(scores, &mut best_five)
+            };
+            let mut taken = [usize::MAX; MAX_TARGETS];
+            let mut filled = 0usize;
+            while filled < slots
+                && (filled + 1 >= len
+                    || below_band(best_five[filled + 1].1, best_five[filled].1, band))
+            {
+                let (i, _) = best_five[filled];
+                taken[filled] = i;
+                picked.push(i);
+                filled += 1;
+            }
+            if filled < slots {
+                let mut picks = [usize::MAX; MAX_TARGETS];
+                let top = best_five[filled].1;
+                let fills = draw_flat(draw, scores, top, band, &mut picks[..slots - filled]);
+                for &i in &picks[..fills] {
+                    taken[filled] = i;
+                    picked.push(i);
+                    filled += 1;
+                }
+            }
+            for slot in filled..slots {
+                let left = |i: usize| !taken[..slot].contains(&i);
+                let Some(b) = draw_in_band(scores, band, draw, left) else {
+                    break;
+                };
+                taken[slot] = b;
+                picked.push(b);
+            }
+            picked
+        }
+        // Both readings from one seed: the rows, and where the stream
+        // stands behind them.
+        fn held<const DRAWN: bool>(
+            case: u32,
+            scores: &[f32],
+            band: TieBand,
+            slots: usize,
+            seed: u64,
+        ) {
+            let (mut read, mut passed) = (Draw::new(seed), Draw::new(seed));
+            let mut rows = Vec::new();
+            draw_ranked::<DRAWN>(&mut read, scores, band, slots, |row| rows.push(row));
+            let by = by_passes::<DRAWN>(&mut passed, scores, band, slots);
+            assert_eq!(
+                (rows, read.state()),
+                (by, passed.state()),
+                "case {case}: {slots} of {scores:?} under {band:?}, seed {seed}, drawn {DRAWN}"
+            );
+        }
+        // Under the last of the two bands below zero a score of one lies in
+        // its own band and a lower score lies under its own.
+        let bands = [1e-6, 0.0, 0.2, -0.2, -3e-8, f32::NAN, f32::INFINITY];
+        let odd = [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -0.0];
+        let mut pools = Draw::new(0x5eed);
+        for case in 0..60_000u32 {
+            let rows = pools.below(40);
+            // The levels the rows fall on: one ties the pool whole, and
+            // sixty-four leave few rows a level.
+            let levels = 1usize << pools.below(7);
+            let apart = pools.below(8) == 0;
+            let (near, wild) = (pools.below(4) == 0, pools.below(4) == 0);
+            let scores: Vec<f32> = (0..rows)
+                .map(|row| {
+                    let level = if apart {
+                        (row * 37 + case as usize) % 64
+                    } else {
+                        pools.below(levels) * (64 / levels)
+                    };
+                    let score = 1.0 - level as f32 / 64.0;
+                    if wild && pools.below(8) == 0 {
+                        odd[pools.below(odd.len())]
+                    } else if near && pools.below(4) == 0 {
+                        score - 4e-7
+                    } else {
+                        score
+                    }
+                })
+                .collect();
+            let band = TieBand(bands[pools.below(bands.len())]);
+            // The list's room, and now and then less of it.
+            let room = MAX_TARGETS.min(rows);
+            let slots = if pools.below(4) == 0 {
+                pools.below(room + 1)
+            } else {
+                room
+            };
+            let seed = pools.next_u64();
+            held::<false>(case, &scores, band, slots, seed);
+            held::<true>(case, &scores, band, slots, seed);
         }
     }
 
@@ -4082,6 +4644,153 @@ mod tests {
     }
 
     #[test]
+    fn a_profiles_filters_as_one_row_test_answer_as_each_filter_asked() {
+        // One row every filter keeps, then a row each refusal takes alone:
+        // the four health bits, the overload bit, the capacity bit, the
+        // room bit, a row the request tried, one the host excluded and one
+        // the host's mask names.
+        let mut pool: Vec<Candidate> = (0..11)
+            .map(|position| Candidate {
+                has_capacity: true,
+                has_room: true,
+                ..candidate(position, 0)
+            })
+            .collect();
+        pool[1].health.healthy = false;
+        pool[2].health.breaker_open = true;
+        pool[3].health.stalled = true;
+        pool[4].health.draining = true;
+        pool[5].health.overloaded = true;
+        pool[6].has_capacity = false;
+        pool[7].has_room = false;
+        let (tried, excluded, mask) = ([pool[8].id], [pool[9].id], [10u32]);
+        let facts = RequestFacts {
+            tried: &tried,
+            ..RequestFacts::default()
+        };
+        let plain = Constraints {
+            excluded: &excluded,
+            ..Constraints::default()
+        };
+        let lifted = Constraints {
+            overload_lifted: true,
+            ..plain
+        };
+        let scopes = [
+            plain,
+            lifted,
+            Constraints {
+                stalled: &mask,
+                ..plain
+            },
+            Constraints {
+                stalled: &mask,
+                ..lifted
+            },
+        ];
+        let mut refused = [0u32; 11];
+        for set in 0..32u8 {
+            let filters = filters_of(set);
+            let tests = RowTests::of(&filters).expect("the filters of this file fold");
+            for cx in &scopes {
+                let masked = tests.masked(cx);
+                assert_eq!(
+                    masked,
+                    set & 1 != 0 && !cx.stalled.is_empty(),
+                    "set {set:#07b}"
+                );
+                for c in &pool {
+                    let each = filters.iter().all(|f| f.keep(&facts, c, cx));
+                    let folded = tests.keeps(&facts, c, cx) && !(masked && cx.masks(c.position));
+                    assert_eq!(folded, each, "set {set:#07b}, row {}, {cx:?}", c.position);
+                    refused[c.position as usize] += u32::from(!each);
+                }
+            }
+        }
+        // The ready row is kept under every set and scope, and each other
+        // row is refused under some.
+        assert_eq!(refused[0], 0);
+        assert!(refused[1..].iter().all(|&times| times > 0), "{refused:?}");
+    }
+
+    #[test]
+    fn a_filter_of_a_hosts_folds_its_profile_into_no_row_test() {
+        /// A host's filter around the health filter: the same word on every
+        /// row, and a type the engine does not hold.
+        #[derive(Debug)]
+        struct Hosted(Healthy);
+        impl Filter for Hosted {
+            fn name(&self) -> &'static str {
+                self.0.name()
+            }
+
+            fn row_wise(&self) -> bool {
+                true
+            }
+
+            fn keep(&self, facts: &RequestFacts<'_>, c: &Candidate, cx: &Constraints<'_>) -> bool {
+                self.0.keep(facts, c, cx)
+            }
+        }
+        assert!(RowTests::of(&[]).is_some(), "no filter keeps every row");
+        let mut filters = filters_of(0b10011);
+        assert!(RowTests::of(&filters).is_some());
+        filters.insert(1, Box::new(Hosted(Healthy)));
+        assert_eq!(RowTests::of(&filters), None);
+    }
+
+    #[test]
+    fn the_healthy_filter_reads_the_hosts_mask_beside_the_rows_own_bits() {
+        let facts = RequestFacts::default();
+        let mut pool: Vec<Candidate> = (0..6).map(|position| candidate(position, 0)).collect();
+        pool[4].health.breaker_open = true;
+        let mask = [1u32, 3];
+        let cx = Constraints {
+            stalled: &mask,
+            ..Constraints::default()
+        };
+        assert!(!cx.masks(0) && cx.masks(1) && cx.masks(3) && !cx.masks(4));
+        // Row by row and over the whole pool, one answer: a row's own bits
+        // refuse it, and so does the mask.
+        let row_by_row: Vec<u32> = pool
+            .iter()
+            .filter(|row| Healthy.keep(&facts, row, &cx))
+            .map(|row| row.position)
+            .collect();
+        let mut whole = kept(6);
+        Healthy.retain(&facts, &pool, &cx, &mut whole);
+        assert_eq!(row_by_row, [0, 2, 5]);
+        assert_eq!(whole, row_by_row);
+        // Under no veto the mask refuses nobody.
+        let mut whole = kept(6);
+        Healthy.retain(&facts, &pool, &Constraints::default(), &mut whole);
+        assert_eq!(whole, [0, 1, 2, 3, 5]);
+    }
+
+    #[test]
+    fn the_session_scorer_reads_the_pin_beside_the_rows_own_bit() {
+        let pool = [candidate(0, 0), candidate(1, 0), candidate(2, 0)];
+        let unpinned = RequestFacts::default();
+        let pinned = RequestFacts {
+            pinned_at: 2,
+            ..unpinned
+        };
+        assert!(pinned.pins(1) && !pinned.pins(0) && !pinned.pins(2));
+        assert!(!unpinned.pins(0) && !unpinned.pins(u32::MAX - 1));
+        // No position reads as pinned under no pin, the last one neither.
+        assert!(!unpinned.pins(u32::MAX));
+        let mut scores = [0.0f32; 3];
+        SessionAffinity.score(&unpinned, &pool, &kept(3), &mut scores);
+        assert_eq!(scores, [0.0, 0.0, 0.0]);
+        SessionAffinity.score(&pinned, &pool, &kept(3), &mut scores);
+        assert_eq!(scores, [0.0, 1.0, 0.0]);
+        // The scorer is handed the rows kept: the pin is read by position.
+        let mut scores = [0.0f32; 2];
+        SessionAffinity.score(&pinned, &pool, &[1, 2], &mut scores);
+        assert_eq!(scores, [1.0, 0.0]);
+    }
+
+    #[test]
     fn the_affinity_scorers_read_the_rows_facts() {
         let hashes = [1u64, 2, 3, 4];
         let facts = RequestFacts {
@@ -4095,5 +4804,196 @@ mod tests {
         assert_eq!(scores, [0.0, 1.0]);
         assert!(SessionAffinity.needs().headers);
         assert!(LeastLoad::new(0.15, 1024, 2000.0).needs().loads);
+    }
+
+    /// A sampled `best` draws over a pool of more than twice its sample and
+    /// over no smaller one: it keeps `sample` rows the filters keep, none
+    /// twice, and counts no refused rows: its draws are its bound, and a
+    /// sample that holds no row hands the decision to the whole pass.
+    /// Whether the host named rows is the engine's to ask.
+    #[test]
+    fn a_sampled_best_draws_its_sample_from_a_pool_over_twice_it() {
+        let picker = SampledBest::new(8);
+        assert_eq!(picker.needs().sample, 8);
+        assert_eq!(SampledBest::new(0).needs().sample, 1);
+        let pool: Vec<Candidate> = (0..64).map(|i| candidate(i, 0)).collect();
+        let request = RequestFacts {
+            seed: 9,
+            ..RequestFacts::default()
+        };
+        // What a draw answers: it drew, the rows it kept, and whether it
+        // read a value of the stream.
+        let draws =
+            |facts: &RequestFacts<'_>, rows: usize, keep: &mut dyn FnMut(&Candidate) -> bool| {
+                let (mut kept, mut draw) = (Vec::new(), Draw::new(facts.seed));
+                let drew = picker.draw_first(
+                    facts,
+                    &PoolFacts::default(),
+                    &pool[..rows],
+                    keep,
+                    &mut kept,
+                    &mut draw,
+                );
+                (drew, kept, draw.state() != facts.seed)
+            };
+        let (drew, kept, read) = draws(&request, 64, &mut |_| true);
+        assert!(drew && read);
+        let mut once = kept.clone();
+        once.sort_unstable();
+        once.dedup();
+        assert_eq!((kept.len(), once.len()), (8, 8), "{kept:?}");
+        // A pool of at most twice the sample: no draw, and no value of the
+        // stream read. One row more is drawn from.
+        assert_eq!(
+            draws(&request, 16, &mut |_| true),
+            (false, Vec::new(), false)
+        );
+        assert!(draws(&request, 17, &mut |_| true).0);
+        // Every row refused: each of the sixteen draws asks, and the sample
+        // that holds no row hands the decision to the whole pass.
+        let mut asked = 0u32;
+        let (drew, ..) = draws(&request, 64, &mut |_| {
+            asked += 1;
+            false
+        });
+        assert!(!drew);
+        assert_eq!(asked, 16);
+    }
+
+    /// Under a filter that refuses a third and a half of the pool, the rows
+    /// a sampled `best` keeps hold even shares: each row the filter keeps
+    /// is kept as often as any other, within six deviations of a count that
+    /// size, and no refused row is kept.
+    #[test]
+    fn a_sampled_best_keeps_even_shares_under_a_filter_that_refuses() {
+        let picker = SampledBest::new(8);
+        let pool: Vec<Candidate> = (0..64).map(|i| candidate(i, 0)).collect();
+        for one_in in [3u32, 2] {
+            let mut counts = [0u32; 64];
+            for seed in 0..4_000u64 {
+                let facts = RequestFacts {
+                    seed,
+                    ..RequestFacts::default()
+                };
+                let (mut kept, mut draw) = (Vec::new(), Draw::new(seed));
+                picker.draw_first(
+                    &facts,
+                    &PoolFacts::default(),
+                    &pool,
+                    &mut |row| row.position % one_in != 0,
+                    &mut kept,
+                    &mut draw,
+                );
+                for row in kept {
+                    counts[row as usize] += 1;
+                }
+            }
+            let open = 64 - 64u32.div_ceil(one_in);
+            let even = f64::from(counts.iter().sum::<u32>()) / f64::from(open);
+            for (row, &count) in (0u32..).zip(&counts) {
+                if row % one_in == 0 {
+                    assert_eq!(count, 0, "one in {one_in} refused: row {row} was kept");
+                    continue;
+                }
+                let off = (f64::from(count) - even).abs();
+                assert!(
+                    off < 6.0 * even.sqrt(),
+                    "one in {one_in} refused: row {row} is {off:.0} off an even {even:.0}"
+                );
+            }
+        }
+    }
+
+    /// A sampled `best` reads at most twice its sample of the stream's
+    /// values. Where repeats use them up it hands out the rows it kept,
+    /// fewer than the sample, and reads no value more.
+    #[test]
+    fn a_sampled_best_reads_at_most_twice_its_sample_of_the_stream() {
+        let picker = SampledBest::new(2);
+        // One row past twice the sample: one seed in about a hundred draws
+        // one row four times.
+        let pool: Vec<Candidate> = (0..5).map(|i| candidate(i, 0)).collect();
+        let mut short = 0u32;
+        for seed in 0..2_000u64 {
+            let facts = RequestFacts {
+                seed,
+                ..RequestFacts::default()
+            };
+            let (mut kept, mut draw) = (Vec::new(), Draw::new(seed));
+            let pool_facts = PoolFacts::default();
+            assert!(picker.draw_first(
+                &facts,
+                &pool_facts,
+                &pool,
+                &mut |_| true,
+                &mut kept,
+                &mut draw
+            ));
+            // The values read: the stream's steps from the seed to its state.
+            let (mut twin, mut read) = (Draw::new(seed), 0usize);
+            while twin.state() != draw.state() {
+                twin.next_u64();
+                read += 1;
+                assert!(read <= 4, "seed {seed}: more than twice the sample read");
+            }
+            assert!(
+                read >= kept.len(),
+                "seed {seed}: {kept:?} from {read} values"
+            );
+            if kept.len() < 2 {
+                assert_eq!(read, 4, "seed {seed}: {kept:?}");
+                short += 1;
+            }
+        }
+        assert!(short > 0, "no seed spent its draws on one row");
+    }
+
+    /// Every built-in that reads a row's requests in flight reads them
+    /// through the request's facts: over rows whose counts stand in a lent
+    /// table, the rows themselves reading zero, each scores and picks as it
+    /// does over rows that carry the counts.
+    #[test]
+    fn a_built_in_reads_a_lent_count_as_it_reads_a_rows_own() {
+        // Counts that part the rows, and reports on four of them: both
+        // load scorers take their reporting and their unreporting terms,
+        // and two rows that count resident tokens part by their costs.
+        let counts = [5, 1, 3, 0, 4, 2, 6, 1];
+        let mut pool: Vec<Candidate> = (0..)
+            .zip(counts)
+            .map(|(at, held)| candidate(at, held))
+            .collect();
+        pool[0].load = Some(resident(2, 9_000));
+        pool[1].load = Some(report(2, 4_000));
+        pool[4].load = Some(resident(1, 6_000));
+        pool[6].load = Some(report(0, 0));
+        let mut bare = pool.clone();
+        let lent = Lent::take(&mut bare);
+        assert!(bare.iter().all(|row| row.in_flight == 0));
+        let rows = kept(pool.len() as u32);
+        let flat = |rows: &[u32]| vec![0.0; rows.len()];
+        for seed in 0..16 {
+            let own = RequestFacts {
+                seed,
+                ..RequestFacts::default()
+            };
+            let beside = lent.beside(&own);
+            let scorers: [&dyn Scorer; 3] = [
+                &LeastRequests,
+                &LeastLoad::new(0.15, 1024, 2000.0),
+                &ResidentWork::new(512),
+            ];
+            for scorer in scorers {
+                let (mut written, mut read) = (vec![0.0; pool.len()], vec![0.0; pool.len()]);
+                scorer.score(&own, &pool, &rows, &mut written);
+                scorer.score(&beside, &bare, &rows, &mut read);
+                assert_eq!(written, read, "{} at seed {seed}", scorer.name());
+            }
+            let pickers: [&dyn Picker; 2] = [&CountFirst, &PowerOfTwoCountFirst];
+            for picker in pickers {
+                let written = picked(picker, &own, &pool, &flat);
+                let read = picked(picker, &beside, &bare, &flat);
+                assert_eq!(written, read, "{} at seed {seed}", picker.name());
+            }
+        }
     }
 }

@@ -17,7 +17,6 @@ use openai_protocol::{
     model_card::ModelCard,
     worker::{ProviderType, WorkerInfo, WorkerModels, WorkerStatus},
 };
-use smg_grpc_client::common_proto;
 use tokio::{
     sync::{mpsc, Notify, OnceCell},
     task::AbortHandle,
@@ -26,81 +25,60 @@ use tokio::{
 
 pub use super::metadata::WorkerMetadata;
 pub(crate) use crate::worker::runtime::COLD_PREFILL_TOKENS_PER_SEC;
+use crate::worker::{
+    connection::{
+        engine::{
+            EngineConnection, EngineConnectionCache, EngineConnector, ZmqLink, NO_ENGINE_CONNECTOR,
+        },
+        engine_admin::{
+            admin_backend_client, admin_grpc_result, admin_http_post, failed, FLUSH_HTTP_TIMEOUT,
+            PROFILE_HTTP_TIMEOUT,
+        },
+        http_client::LazyHttpClient,
+    },
+    health::circuit_breaker::{CircuitBreakerConfig, CircuitState},
+    metrics::Metrics,
+    pd::pairing::PdPairing,
+    registry::event::WorkerConnected,
+    runtime::{
+        routing_state_series, AVAILABLE_CODE, CIRCUIT_OPEN_CODE, ROUTING_STATE_SERIES, STALE_BIT,
+    },
+    CircuitBreaker, ResolvedResilience, WorkerError, WorkerResult,
+};
 pub use crate::worker::{
     load::inflight::{WorkerLoadGuard, WorkerRoutingKeyLoad},
     runtime::{RoutingState, StallReason, WorkerRuntime},
 };
-use crate::{
-    observability::metrics::{metrics_labels, Metrics},
-    routers::grpc::{backend_client::BackendClient, client::GrpcClient, zmq_client},
-    worker::{
-        connection::{
-            engine_admin::{
-                admin_backend_client, admin_grpc_result, admin_http_post, failed,
-                FLUSH_HTTP_TIMEOUT, PROFILE_HTTP_TIMEOUT,
-            },
-            http_client::LazyHttpClient,
-        },
-        health::circuit_breaker::{CircuitBreakerConfig, CircuitState},
-        pd::pairing::PdPairing,
-        registry::event::WorkerConnected,
-        runtime::{
-            routing_state_series, AVAILABLE_CODE, CIRCUIT_OPEN_CODE, ROUTING_STATE_SERIES,
-            STALE_BIT,
-        },
-        CircuitBreaker, ResolvedResilience, WorkerError, WorkerResult,
-    },
-};
 
-/// Connect the ZMQ backend for this worker URL. All connect mechanics —
-/// address derivation, socket-dir prep, EOS resolution, handshake — live in
-/// the client layer ([`zmq_client::connect_for_worker`]); the worker layer
-/// wraps the client into its slot and error type, after checking the role
-/// each engine declared at the handshake against `worker_type`.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the worker's connection inputs, captured by the detached connect driver"
-)]
+/// Connect the ZMQ backend for this worker. All connect mechanics — address
+/// derivation, socket-dir prep, EOS resolution, handshake, and the check of
+/// the role each engine declared against the worker's — live behind the
+/// host's connector ([`EngineConnector::connect_zmq`]); the worker layer
+/// keeps the connection in its slot and maps the error.
 async fn connect_zmq_backend(
-    base_url: String,
-    model_id: String,
-    runtime: RuntimeType,
-    worker_type: WorkerType,
-    handshake_override: Option<String>,
-    engine_count: zmq_client::EngineCount,
-    startup: Duration,
-    request_timeout: Option<Duration>,
-) -> WorkerResult<Arc<BackendClient>> {
-    zmq_client::connect_for_worker(
-        &base_url,
-        model_id,
-        runtime,
-        handshake_override.as_deref(),
-        engine_count,
-        startup,
-        request_timeout,
-    )
-    .await
-    .and_then(|client| {
-        client.check_declared_role(worker_type)?;
-        Ok(Arc::new(BackendClient::Zmq(client)))
-    })
-    .map_err(|reason| WorkerError::ConnectionFailed {
-        url: base_url,
-        reason,
-    })
+    connector: Arc<dyn EngineConnector>,
+    link: ZmqLink,
+) -> WorkerResult<Arc<dyn EngineConnection>> {
+    let base_url = link.base_url.clone();
+    connector
+        .connect_zmq(link)
+        .await
+        .map_err(|reason| WorkerError::ConnectionFailed {
+            url: base_url,
+            reason,
+        })
 }
 
-/// Default bootstrap port for PD disaggregation (used by SGLang and vLLM Mooncake)
+/// Default bootstrap port for PD disaggregation (a bootstrap server's, and the Mooncake connector's)
 pub const DEFAULT_BOOTSTRAP_PORT: u16 = 8998;
 
-/// vLLM Mooncake KV connector name
+/// The Mooncake KV connector's name
 pub const MOONCAKE_CONNECTOR: &str = "MooncakeConnector";
 
-/// vLLM NIXL KV connector name
+/// The NIXL KV connector's name
 pub const NIXL_CONNECTOR: &str = "NixlConnector";
 
-/// vLLM MoRI-IO KV connector name
+/// The MoRI-IO KV connector's name
 pub const MORIIO_CONNECTOR: &str = "MoRIIOConnector";
 
 /// Worker label naming a MoRI-IO engine's transfer mode, `read` or `write`.
@@ -402,13 +380,13 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// worker hasn't reported a value or reports zero (zero is meaningless
     /// for capacity accounting).
     ///
-    /// Engines spell the same window two ways — TokenSpeed and vLLM
-    /// advertise `max_num_seqs`, SGLang advertises `max_running_requests` —
-    /// and both are the count of requests the scheduler will run at once, so
-    /// both are read here rather than leaving TokenSpeed workers looking like
-    /// non-reporters. `max_num_seqs` wins when a worker reports both: it is
-    /// the authoritative name for the engines that use it, and it is the
-    /// order `smg_grpc_servicer.tokenspeed.loads::running_window` reports in,
+    /// Engines spell the same window two ways, `max_num_seqs` and
+    /// `max_running_requests`, and both are the count of requests the
+    /// scheduler will run at once, so both are read here rather than
+    /// leaving the workers of one spelling looking like
+    /// non-reporters. `max_num_seqs` wins when a worker reports both:
+    /// it is the authoritative name for the engines that use it, and
+    /// it is the order the servicer's load report reads them in,
     /// so the label and the `GetLoads` report cannot disagree.
     ///
     /// `WorkerCapacity` uses this to derive total fleet capacity when
@@ -655,10 +633,17 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// entry alive.
     fn http_client_handle_if_initialized(&self) -> Option<Arc<reqwest::Client>>;
 
-    /// Strong handle to the worker's backend client (gRPC or ZMQ), if its
+    /// Strong handle to the worker's engine connection (gRPC or ZMQ), if its
     /// lazy connect landed. Never drives the connect: a worker still
     /// connecting, or an HTTP worker, has none.
-    fn backend_client_if_initialized(&self) -> Option<Arc<BackendClient>> {
+    fn engine_connection_if_initialized(&self) -> Option<Arc<dyn EngineConnection>> {
+        None
+    }
+
+    /// What makes this worker's engine connection: the connector it was
+    /// built with, when it holds one. A caller that needs a connection of
+    /// its own to the worker's engine connects through it.
+    fn engine_connector(&self) -> Option<Arc<dyn EngineConnector>> {
         None
     }
 
@@ -834,9 +819,9 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
         // Default: no-op. BasicWorker overrides this.
     }
 
-    /// Get or create a gRPC client for this worker
-    /// Returns None for HTTP workers, Some(client) for gRPC workers
-    async fn get_backend_client(&self) -> WorkerResult<Option<Arc<BackendClient>>>;
+    /// Get or create this worker's engine connection
+    /// Returns None for HTTP workers, Some(connection) for gRPC and ZMQ workers
+    async fn engine_connection(&self) -> WorkerResult<Option<Arc<dyn EngineConnection>>>;
 
     /// Release background work owned by this worker instance.
     ///
@@ -875,14 +860,10 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
                 let client = admin_backend_client(
                     self.url(),
                     "flush_cache",
-                    self.get_backend_client().await?,
+                    self.engine_connection().await?,
                 )?;
                 let result = client.flush_cache(0.0).await;
-                admin_grpc_result(
-                    self.url(),
-                    "flush_cache",
-                    result.map(|r| (r.success, r.message)),
-                )
+                admin_grpc_result(self.url(), "flush_cache", result)
             }
         }
     }
@@ -912,23 +893,10 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
                 let client = admin_backend_client(
                     self.url(),
                     "start_profile",
-                    self.get_backend_client().await?,
+                    self.engine_connection().await?,
                 )?;
-                let req = common_proto::StartProfileRequest {
-                    output_dir: options.output_dir.clone(),
-                    start_step: options.start_step,
-                    num_steps: options.num_steps,
-                    activities: options.activities.clone().unwrap_or_default(),
-                    with_stack: options.with_stack,
-                    record_shapes: options.record_shapes,
-                    profile_by_stage: options.profile_by_stage,
-                };
-                let result = client.start_profile(req).await;
-                admin_grpc_result(
-                    self.url(),
-                    "start_profile",
-                    result.map(|r| (r.success, r.message)),
-                )
+                let result = client.start_profile(options).await;
+                admin_grpc_result(self.url(), "start_profile", result)
             }
         }
     }
@@ -952,14 +920,10 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
                 let client = admin_backend_client(
                     self.url(),
                     "stop_profile",
-                    self.get_backend_client().await?,
+                    self.engine_connection().await?,
                 )?;
                 let result = client.stop_profile().await;
-                admin_grpc_result(
-                    self.url(),
-                    "stop_profile",
-                    result.map(|r| (r.success, r.message)),
-                )
+                admin_grpc_result(self.url(), "stop_profile", result)
             }
         }
     }
@@ -972,11 +936,7 @@ pub(crate) trait ConnectionModeExt {
 
 impl ConnectionModeExt for ConnectionMode {
     fn as_metric_label(&self) -> &'static str {
-        match self {
-            ConnectionMode::Http => metrics_labels::CONNECTION_HTTP,
-            ConnectionMode::Grpc => metrics_labels::CONNECTION_GRPC,
-            ConnectionMode::Zmq => metrics_labels::CONNECTION_ZMQ,
-        }
+        self.as_str()
     }
 }
 
@@ -987,12 +947,7 @@ pub(crate) trait WorkerTypeExt {
 
 impl WorkerTypeExt for WorkerType {
     fn as_metric_label(&self) -> &'static str {
-        match self {
-            WorkerType::Regular => metrics_labels::WORKER_REGULAR,
-            WorkerType::Prefill => metrics_labels::WORKER_PREFILL,
-            WorkerType::Decode => metrics_labels::WORKER_DECODE,
-            WorkerType::Encode => metrics_labels::WORKER_ENCODE,
-        }
+        self.as_str()
     }
 }
 
@@ -1011,14 +966,16 @@ pub struct BasicWorker {
     pub metadata: WorkerMetadata,
     pub runtime: ArcSwap<WorkerRuntime>,
     pub circuit_breaker: ArcSwap<CircuitBreaker>,
-    /// Lazily initialized backend client (gRPC or ZMQ) for local workers.
-    /// The inner `OnceCell` keeps reads lock-free after initialization and
-    /// dedupes concurrent connects; the outer `ArcSwap` lets the ZMQ health
-    /// probe evict a dead client by swapping in a fresh cell (gRPC never
-    /// swaps — a failed gRPC worker is removed and re-added instead).
-    pub backend_client: Arc<ArcSwap<OnceCell<Arc<BackendClient>>>>,
+    /// Lazily initialized engine connection (gRPC or ZMQ) for local workers.
+    /// Compatible replacements share the slot in [`EngineConnectionCache`].
+    /// Its current cell deduplicates handshakes; a ZMQ probe on either
+    /// worker can evict that cell when the connection dies.
+    pub engine_connection: Arc<EngineConnectionCache>,
+    /// What makes the engine connection: the host's connector, as the
+    /// builder resolved it. Without one a gRPC or ZMQ connect is refused.
+    pub engine_connector: Option<Arc<dyn EngineConnector>>,
     /// Guards the one-shot background ZMQ handshake driver so the health probe
-    /// never cancels a long (model-load) handshake. Self-clears on failure to
+    /// never cancels a long (model-load) handshake. Clears at completion to
     /// allow a retry. Unused for HTTP/gRPC.
     pub zmq_connect_started: Arc<AtomicBool>,
     /// Abort handle for that driver, so removing or replacing the worker
@@ -1067,7 +1024,8 @@ impl Clone for BasicWorker {
             completion_sink: Arc::clone(&self.completion_sink),
             runtime: ArcSwap::from(self.runtime.load_full()),
             circuit_breaker: ArcSwap::from(self.circuit_breaker.load_full()),
-            backend_client: Arc::clone(&self.backend_client),
+            engine_connection: Arc::clone(&self.engine_connection),
+            engine_connector: self.engine_connector.clone(),
             zmq_connect_started: Arc::clone(&self.zmq_connect_started),
             zmq_connect_abort: Arc::clone(&self.zmq_connect_abort),
             connect_signal_tx: self.connect_signal_tx.clone(),
@@ -1125,24 +1083,32 @@ impl BasicWorker {
     /// load, so any caller awaiting it (request pipeline, load monitor, health
     /// probe) would block far past its own deadline. Callers peek the cell and
     /// report unavailable until the driver lands.
-    fn spawn_zmq_connect_driver(&self, cell: &Arc<OnceCell<Arc<BackendClient>>>) {
+    ///
+    /// A worker built without a connector has no handshake to drive, and
+    /// none starts: its acquisition refuses and its probe reads not ready.
+    fn spawn_zmq_connect_driver(&self, cell: &Arc<OnceCell<Arc<dyn EngineConnection>>>) {
+        if self.superseded.load(Ordering::Acquire) {
+            return;
+        }
+        let Some(connector) = self.engine_connector.clone() else {
+            return;
+        };
         if self.zmq_connect_started.swap(true, Ordering::SeqCst) {
             return;
         }
         let cell = Arc::clone(cell);
         let started = Arc::clone(&self.zmq_connect_started);
-        let base_url = self.metadata.base_url().to_string();
-        let model_id = self.metadata.model_id().to_string();
+        let link = ZmqLink {
+            base_url: self.metadata.base_url().to_string(),
+            model_id: self.metadata.model_id().to_string(),
+            runtime: self.metadata.spec.runtime_type,
+            worker_type: self.metadata.spec.worker_type,
+            handshake_address: self.metadata.spec.zmq_handshake_address.clone(),
+            engine_count: self.metadata.zmq_engine_count(),
+            startup: self.metadata.zmq_startup_timeout,
+            request_timeout: self.metadata.zmq_request_timeout,
+        };
         let url = self.metadata.spec.url.clone();
-        let runtime = self.metadata.spec.runtime_type;
-        let worker_type = self.metadata.spec.worker_type;
-        let handshake_override = self.metadata.spec.zmq_handshake_address.clone();
-        let engine_count = self.metadata.zmq_engine_count().map_or(
-            zmq_client::EngineCount::Declared,
-            zmq_client::EngineCount::Exactly,
-        );
-        let startup = self.metadata.zmq_startup_timeout;
-        let request_timeout = self.metadata.zmq_request_timeout;
         // Capture the readiness signal and the revision at hand-off. The
         // manager only promotes if this revision still matches, so a
         // same-URL replacement racing the handshake is discarded.
@@ -1150,27 +1116,19 @@ impl BasicWorker {
         let revision = self.revision();
         #[expect(
             clippy::disallowed_methods,
-            reason = "detached one-shot handshake driver; the OnceCell dedupes with the request path and the guard self-clears on failure to allow a retry"
+            reason = "detached one-shot handshake driver; the OnceCell dedupes with the request path and the guard clears when the handshake completes"
         )]
         // Detached: only the AbortHandle is kept, so the task keeps running
         // until it completes or the worker leaves the registry.
         let handle = tokio::spawn(async move {
             match cell
-                .get_or_try_init(|| {
-                    connect_zmq_backend(
-                        base_url,
-                        model_id,
-                        runtime,
-                        worker_type,
-                        handshake_override,
-                        engine_count,
-                        startup,
-                        request_timeout,
-                    )
-                })
+                .get_or_try_init(|| connect_zmq_backend(connector, link))
                 .await
             {
                 Ok(_) => {
+                    // Only an in-flight handshake needs this guard. A probe
+                    // holding another worker can evict the shared connection.
+                    started.store(false, Ordering::SeqCst);
                     // Handshake landed: wake the manager to promote now
                     // rather than on the next poll. A dropped signal (no
                     // manager, or receiver gone) is harmless — polling
@@ -1188,8 +1146,14 @@ impl BasicWorker {
                 }
             }
         });
-        self.zmq_connect_abort
-            .store(Some(Arc::new(handle.abort_handle())));
+        let published = Some(Arc::new(handle.abort_handle()));
+        self.zmq_connect_abort.store(published.clone());
+        // Retirement can take the previous handle between the entry check
+        // and publication. Cancel this task even if retirement missed it.
+        if self.superseded.load(Ordering::Acquire) {
+            handle.abort();
+            self.zmq_connect_abort.compare_and_swap(&published, None);
+        }
     }
 
     /// Whether the breaker permits execution. A breaker that moves from open
@@ -1283,11 +1247,11 @@ impl BasicWorker {
         // replacement that arrived with its own client keeps it.
         if self.metadata.spec.connection_mode != other.metadata.spec.connection_mode
             || self.metadata.spec.runtime_type != other.metadata.spec.runtime_type
-            || self.backend_client.load().get().is_some()
+            || self.engine_connection.load_full().get().is_some()
         {
             return;
         }
-        self.backend_client.store(other.backend_client.load_full());
+        self.engine_connection.adopt(&other.engine_connection);
     }
 }
 
@@ -1316,7 +1280,7 @@ impl BasicWorker {
 
     async fn grpc_health_check(&self) -> WorkerResult<bool> {
         let timeout = Duration::from_secs(self.metadata.health_config.timeout_secs);
-        let maybe = self.get_backend_client().await?;
+        let maybe = self.engine_connection().await?;
         let Some(backend_client) = maybe else {
             tracing::error!(
                 "Worker {} is not a gRPC worker but connection mode is gRPC",
@@ -1326,13 +1290,13 @@ impl BasicWorker {
         };
 
         match time::timeout(timeout, backend_client.health_check()).await {
-            Ok(Ok(resp)) => {
+            Ok(Ok(healthy)) => {
                 tracing::debug!(
                     "gRPC health OK for {}: healthy={}",
                     self.metadata.redacted_url,
-                    resp.healthy
+                    healthy
                 );
-                Ok(resp.healthy)
+                Ok(healthy)
             }
             Ok(Err(err)) => {
                 tracing::warn!(
@@ -1364,7 +1328,7 @@ impl BasicWorker {
         // liveness is local (the connector marks the client closed on
         // ENGINE_CORE_DEAD or a transport failure); there is no health RPC on
         // the raw ZMQ wire.
-        let cell = self.backend_client.load_full();
+        let cell = self.engine_connection.load_full();
         if let Some(backend_client) = cell.get() {
             if backend_client.is_alive() {
                 return true;
@@ -1381,8 +1345,7 @@ impl BasicWorker {
                 "ZMQ engine for {} is no longer alive; evicting the dead client and rebinding on a later probe",
                 self.metadata.redacted_url
             );
-            self.backend_client
-                .compare_and_swap(&cell, Arc::new(OnceCell::new()));
+            self.engine_connection.evict(&cell);
             self.zmq_connect_started.store(false, Ordering::SeqCst);
             return false;
         }
@@ -1828,8 +1791,12 @@ impl Worker for BasicWorker {
         self.http_client.handle_if_initialized()
     }
 
-    fn backend_client_if_initialized(&self) -> Option<Arc<BackendClient>> {
-        self.backend_client.load_full().get().cloned()
+    fn engine_connection_if_initialized(&self) -> Option<Arc<dyn EngineConnection>> {
+        self.engine_connection.load_full().get().cloned()
+    }
+
+    fn engine_connector(&self) -> Option<Arc<dyn EngineConnector>> {
+        self.engine_connector.clone()
     }
 
     fn supports_model(&self, model_id: &str) -> bool {
@@ -1867,7 +1834,7 @@ impl Worker for BasicWorker {
             .store(Arc::new(WorkerModels::from(models)));
     }
 
-    async fn get_backend_client(&self) -> WorkerResult<Option<Arc<BackendClient>>> {
+    async fn engine_connection(&self) -> WorkerResult<Option<Arc<dyn EngineConnection>>> {
         match self.metadata.spec.connection_mode {
             ConnectionMode::Http => Ok(None),
             ConnectionMode::Grpc => {
@@ -1879,7 +1846,7 @@ impl Worker for BasicWorker {
                 // only the first call per worker runs it. The cold path pays
                 // its allocation once; every later call's future holds a
                 // pointer where it held kilobytes.
-                let cell = self.backend_client.load_full();
+                let cell = self.engine_connection.load_full();
                 let client = cell
                     .get_or_try_init(|| {
                         Box::pin(async {
@@ -1890,15 +1857,25 @@ impl Worker for BasicWorker {
                                 self.metadata.redacted_url
                             );
                             // DP-expanded workers carry a `{base}@{rank}` URL; connect to the base
-                            match GrpcClient::connect(self.metadata.base_url(), &runtime_str).await
-                            {
+                            let connected = match &self.engine_connector {
+                                Some(connector) => {
+                                    connector
+                                        .connect_grpc(
+                                            self.metadata.base_url(),
+                                            self.metadata.spec.runtime_type,
+                                        )
+                                        .await
+                                }
+                                None => Err(NO_ENGINE_CONNECTOR.to_string()),
+                            };
+                            match connected {
                                 Ok(client) => {
                                     tracing::info!(
                                         "Successfully connected gRPC client ({}) for worker: {}",
                                         runtime_str,
                                         self.metadata.redacted_url
                                     );
-                                    Ok(Arc::new(BackendClient::Grpc(client)))
+                                    Ok(client)
                                 }
                                 Err(e) => {
                                     tracing::error!(
@@ -1925,9 +1902,17 @@ impl Worker for BasicWorker {
                 // fast instead of blocking a request or a load poll behind it.
                 // Kicking the driver off here also covers workers whose health
                 // checks are disabled, where no probe ever runs.
-                let cell = self.backend_client.load_full();
+                let cell = self.engine_connection.load_full();
                 if let Some(client) = cell.get() {
                     return Ok(Some(Arc::clone(client)));
+                }
+                if self.engine_connector.is_none() {
+                    // No handshake will complete: refuse now, as the gRPC
+                    // arm does.
+                    return Err(WorkerError::ConnectionFailed {
+                        url: self.metadata.spec.url.clone(),
+                        reason: NO_ENGINE_CONNECTOR.to_string(),
+                    });
                 }
                 self.spawn_zmq_connect_driver(&cell);
                 Err(WorkerError::ConnectionFailed {

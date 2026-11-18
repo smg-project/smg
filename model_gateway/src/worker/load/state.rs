@@ -44,7 +44,10 @@ use tokio::sync::{watch, Notify};
 
 #[cfg(any(test, feature = "test-util"))]
 use crate::worker::BasicWorker;
-use crate::worker::{registry::WorkerRegistry, Worker};
+use crate::worker::{
+    registry::{Generation, WorkerRegistry},
+    Worker,
+};
 
 /// Subscription handle to the published load snapshots. `borrow().clone()`
 /// yields an `Arc<LoadSnapshot>`; the watch guard must not be held across a
@@ -191,8 +194,8 @@ pub(crate) fn one_rank_load_reqs_only(
 }
 
 /// Publication side of the shared load view. Owned by `WorkerMonitor`.
-pub(crate) struct LoadState {
-    registry: Arc<WorkerRegistry>,
+pub(crate) struct LoadState<G> {
+    registry: Arc<WorkerRegistry<G>>,
     tx: watch::Sender<Arc<LoadSnapshot>>,
     pending_evictions: Mutex<Vec<Arc<dyn Worker>>>,
     /// Wakes the monitor's debounced eviction flusher.
@@ -202,8 +205,8 @@ pub(crate) struct LoadState {
     publishes: AtomicU64,
 }
 
-impl LoadState {
-    pub(crate) fn new(registry: Arc<WorkerRegistry>) -> Self {
+impl<G: Generation> LoadState<G> {
+    pub(crate) fn new(registry: Arc<WorkerRegistry<G>>) -> Self {
         let (tx, _rx) = watch::channel(Arc::new(LoadSnapshot::default()));
         Self {
             registry,
@@ -362,7 +365,10 @@ mod tests {
     use openai_protocol::worker::SchedulerLoadSnapshot;
 
     use super::*;
-    use crate::worker::test_support::ready_worker;
+    use crate::worker::{test_support::ready_worker, ModelWorkerSnapshot, WorkerRegistry};
+
+    /// The load state over the gateway's registry.
+    type LoadState = super::LoadState<ModelWorkerSnapshot>;
 
     /// A load report distinguishable by its waiting-token count.
     fn load(waiting: i32) -> Arc<WorkerLoadResponse> {

@@ -88,6 +88,7 @@ uuid = { workspace = true, features = ["serde", "fast-rng"] }
 
 # Workspace crates
 openai-protocol = { workspace = true, features = ["axum"] }
+smg-worker = { workspace = true, features = ["metrics", "runtime"] }
 reasoning-parser.workspace = true
 tool-parser.workspace = true
 smg-symphony.workspace = true
@@ -145,7 +146,6 @@ rustc-hash = "2"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 openssl = "0.10.81"
 openai-harmony = "0.0.8"
-openmetrics-parser = "0.4.4"
 arc-swap = "1.9.1"
 once_cell = "1.21.4"
 sha2 = "0.11"
@@ -164,6 +164,9 @@ toml = "1.1"
 # the provider routers) would leak into every test target whatever features the
 # build selected, so a `--no-default-features` test run would not be one.
 smg = { path = ".", default-features = false, features = ["test-util"] }
+# The worker runtime's test support: the root-store child runs and the lazy
+# client's observation.
+smg-worker = { workspace = true, features = ["test-util"] }
 # The gateway's test harness (the mock workers, app builders and launch helpers the
 # integration tests share): a workspace member for tests only, compiled once.
 smg-test-harness = { path = "test_harness" }

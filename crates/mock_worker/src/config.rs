@@ -245,6 +245,14 @@ pub enum SchedulerWire {
 }
 
 impl SchedulerWire {
+    /// Whether this wire's load report counts the context tokens a rank's
+    /// requests hold (`num_resident_tokens`). On such a wire the polled
+    /// answer and the pushed record both carry the figure; on a wire whose
+    /// engine reports none, neither does.
+    pub fn counts_resident_tokens(self) -> bool {
+        matches!(self, Self::TokenSpeed)
+    }
+
     /// The field of this wire's generate request that carries a disaggregated
     /// request's KV rendezvous (the prefill side's bootstrap server and the
     /// room both sides meet under, or the vLLM connector's parameters).

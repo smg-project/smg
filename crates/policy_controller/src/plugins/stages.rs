@@ -3,7 +3,10 @@
 //! one profile share the bound plugin's decision (their [`DecisionScope`]);
 //! the first scorer or picker made in an engine build, whichever of the
 //! build's profiles binds the plugin, forwards the lifecycle, so an event
-//! reaches the plugin once per engine. A fallback is a built-in stage: the
+//! reaches the plugin once per engine. It forwards the kinds of event the
+//! plugin's row lists and no other: a row lists none by default, and a
+//! plugin whose row lists any has its scorer and picker say they need the
+//! lifecycle's calls, forwarding or not. A fallback is a built-in stage: the
 //! engine opens the scopes of a profile's own stages, not a fallback's. Each
 //! adapter declares the plugin's needs and its fallback's, so the profile's
 //! needs hold them whichever stage the plugin is bound as. The adapters are
@@ -17,7 +20,9 @@ use crate::{
     builtins::Best,
     decision::{Decision, Target, Targets},
     framework::{DecisionScope, Filter, Picker, Scorer, TieBand},
-    lease::{Lease, Lifecycle, Membership, Outcome, ReleaseReason, Side, Signal},
+    lease::{
+        EventKind, EventSet, Lease, Lifecycle, Membership, Outcome, ReleaseReason, Side, Signal,
+    },
     spec::Needs,
     view::{Candidate, Constraints, RequestFacts},
 };
@@ -37,7 +42,8 @@ pub struct Fallback;
 /// A plugin bound to one profile, as its three stage adapters read it: the
 /// decision the engine opens through [`DecisionScope`] answers the filter,
 /// the scorer and the picker, and one adapter of an engine build forwards
-/// the lifecycle, one `observe_` call per event. This crate's plugin kinds
+/// the lifecycle, one `observe_` call per event of a kind the plugin's row
+/// lists and no call for an event of another. This crate's plugin kinds
 /// implement it and these adapters alone call it. It is public for the
 /// adapters' bounds and no public path names it: a host builds the adapters
 /// from what a kind bound and never writes this name.
@@ -49,6 +55,9 @@ pub trait BoundPlugin: DecisionScope + 'static {
     fn failure(&self) -> Failure;
     /// What the host must feed for the plugin's stages to mean anything.
     fn needs(&self) -> Needs;
+    /// The kinds of lifecycle event the plugin's row lists: the adapter
+    /// that forwards the lifecycle hands those and no other.
+    fn observes(&self) -> EventSet;
     /// Claims the lifecycle for the adapter that asks: `true` for the first
     /// of an engine build, so an event reaches the plugin once per build.
     fn take_observer(&self) -> bool;
@@ -96,11 +105,22 @@ fn stage_needs<B: BoundPlugin>(bound: &B, fallback: Option<Needs>) -> Needs {
     fallback.map_or(own, |fallback| own.or(fallback))
 }
 
+/// What one scorer or picker forwards of the lifecycle: the kinds the
+/// plugin's row lists where the adapter is its build's observer, none where
+/// another adapter is.
+fn forwarded<B: BoundPlugin>(bound: &B) -> EventSet {
+    if bound.take_observer() {
+        bound.observes()
+    } else {
+        EventSet::NONE
+    }
+}
+
 /// The plugin's `filter` stage. Without a fallback, a failure keeps every
 /// row under `failure: open` and empties the pool under `closed`. A filter
 /// is not a lifecycle stage of the framework (the engine forwards the
 /// lifecycle to scorers and pickers), so a filter-only binding observes
-/// nothing.
+/// nothing, whatever its row lists.
 #[derive(Debug)]
 pub struct PluginFilter<B> {
     bound: Arc<B>,
@@ -179,13 +199,14 @@ impl<B: BoundPlugin> Filter for PluginFilter<B> {
 pub struct PluginScorer<B> {
     bound: Arc<B>,
     fallback: Option<Box<dyn Scorer>>,
-    observes: bool,
+    /// The kinds of event this adapter forwards.
+    observes: EventSet,
 }
 
 impl<B: BoundPlugin> PluginScorer<B> {
     pub fn new(bound: Arc<B>, fallback: Option<Box<dyn Scorer>>) -> Self {
         bound.bound_to(Stage::Score);
-        let observes = bound.take_observer();
+        let observes = forwarded(&*bound);
         Self {
             bound,
             fallback,
@@ -235,13 +256,14 @@ impl<B: BoundPlugin> Scorer for PluginScorer<B> {
 pub struct PluginPicker<B> {
     bound: Arc<B>,
     fallback: Option<Box<dyn Picker>>,
-    observes: bool,
+    /// The kinds of event this adapter forwards.
+    observes: EventSet,
 }
 
 impl<B: BoundPlugin> PluginPicker<B> {
     pub fn new(bound: Arc<B>, fallback: Option<Box<dyn Picker>>) -> Self {
         bound.bound_to(Stage::Pick);
-        let observes = bound.take_observer();
+        let observes = forwarded(&*bound);
         Self {
             bound,
             fallback,
@@ -305,7 +327,7 @@ macro_rules! forward_lifecycle {
     ($ty:ident) => {
         impl<B: BoundPlugin> Lifecycle for $ty<B> {
             fn on_decision_issued(&self, lease: &Lease, decision: &Decision) {
-                if self.observes {
+                if self.observes.contains(EventKind::Issued) {
                     self.bound.observe_issued(lease, decision);
                 }
                 if let Some(fallback) = &self.fallback {
@@ -320,7 +342,7 @@ macro_rules! forward_lifecycle {
                 side: Side,
                 since_decision_micros: u32,
             ) {
-                if self.observes {
+                if self.observes.contains(EventKind::Dispatched) {
                     self.bound
                         .observe_dispatched(lease, target, side, since_decision_micros);
                 }
@@ -330,7 +352,7 @@ macro_rules! forward_lifecycle {
             }
 
             fn on_completed(&self, lease: &Lease, outcome: &Outcome) {
-                if self.observes {
+                if self.observes.contains(EventKind::Completed) {
                     self.bound.observe_completed(lease, outcome);
                 }
                 if let Some(fallback) = &self.fallback {
@@ -339,7 +361,7 @@ macro_rules! forward_lifecycle {
             }
 
             fn on_released(&self, lease: &Lease, reason: ReleaseReason) {
-                if self.observes {
+                if self.observes.contains(EventKind::Released) {
                     self.bound.observe_released(lease, reason);
                 }
                 if let Some(fallback) = &self.fallback {
@@ -348,7 +370,7 @@ macro_rules! forward_lifecycle {
             }
 
             fn on_membership(&self, change: &Membership<'_>) {
-                if self.observes {
+                if self.observes.contains(EventKind::Membership) {
                     self.bound.observe_membership(change);
                 }
                 if let Some(fallback) = &self.fallback {
@@ -357,12 +379,23 @@ macro_rules! forward_lifecycle {
             }
 
             fn on_signal(&self, signal: &Signal) {
-                if self.observes {
+                if self.observes.contains(EventKind::Signal) {
                     self.bound.observe_signal(signal);
                 }
                 if let Some(fallback) = &self.fallback {
                     fallback.on_signal(signal);
                 }
+            }
+
+            // A plugin that hears any event keeps state by it, whichever
+            // adapter of the build forwards. One that hears none declares
+            // no such need: its fallback's word stands.
+            fn needs_lifecycle(&self) -> bool {
+                !self.bound.observes().is_empty()
+                    || self
+                        .fallback
+                        .as_ref()
+                        .is_some_and(|fallback| fallback.needs_lifecycle())
             }
         }
     };
@@ -370,3 +403,418 @@ macro_rules! forward_lifecycle {
 
 forward_lifecycle!(PluginScorer);
 forward_lifecycle!(PluginPicker);
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{
+        atomic::{AtomicBool, AtomicU32, Ordering},
+        Arc,
+    };
+
+    use super::{BoundPlugin, Fallback, PluginFilter, PluginPicker, PluginScorer};
+    use crate::{
+        catalog::Catalog,
+        decision::{Decision, Pick, Target},
+        framework::{DecisionScope, Scorer, TieBand},
+        lease::{
+            EventKind, EventSet, Lease, Lifecycle, Membership, Outcome, ReleaseReason, Side,
+            Signal, TransportClass,
+        },
+        plugins::config::Failure,
+        spec::{Needs, PolicySpec, SpecError},
+        view::{Candidate, Health, Phase, PoolFacts, RequestFacts, WorkerId},
+    };
+
+    /// A plugin that declares nothing and answers no call.
+    #[derive(Debug)]
+    struct Quiet;
+
+    impl DecisionScope for Quiet {
+        fn open(&self, _: &RequestFacts<'_>, _: &[Candidate], _: &PoolFacts<'_>) {}
+
+        fn close(&self) {}
+    }
+
+    impl BoundPlugin for Quiet {
+        fn name(&self) -> &'static str {
+            "quiet"
+        }
+
+        fn failure(&self) -> Failure {
+            Failure::Open
+        }
+
+        fn needs(&self) -> Needs {
+            Needs::default()
+        }
+
+        fn observes(&self) -> EventSet {
+            EventSet::NONE
+        }
+
+        fn take_observer(&self) -> bool {
+            false
+        }
+
+        fn retain(&self, _: &RequestFacts<'_>, _: &mut Vec<u32>) -> Result<(), Fallback> {
+            Err(Fallback)
+        }
+
+        fn keep(&self, _: &RequestFacts<'_>, _: u32) -> Result<bool, Fallback> {
+            Err(Fallback)
+        }
+
+        fn score(&self, _: &RequestFacts<'_>, _: &[u32], _: &mut [f32]) -> Result<(), Fallback> {
+            Err(Fallback)
+        }
+
+        fn pick(&self, _: &RequestFacts<'_>, _: &[u32], _: &[f32]) -> Result<u32, Fallback> {
+            Err(Fallback)
+        }
+
+        fn observe_issued(&self, _: &Lease, _: &Decision) {}
+
+        fn observe_dispatched(&self, _: &Lease, _: &Target, _: Side, _: u32) {}
+
+        fn observe_completed(&self, _: &Lease, _: &Outcome) {}
+
+        fn observe_released(&self, _: &Lease, _: ReleaseReason) {}
+
+        fn observe_membership(&self, _: &Membership<'_>) {}
+
+        fn observe_signal(&self, _: &Signal) {}
+    }
+
+    /// A bound plugin that answers no stage and counts the events it is
+    /// told, by kind.
+    #[derive(Debug, Default)]
+    struct Told {
+        observes: EventSet,
+        observer_taken: AtomicBool,
+        told: [AtomicU32; 6],
+    }
+
+    impl Told {
+        fn listing(observes: EventSet) -> Arc<Self> {
+            Arc::new(Self {
+                observes,
+                ..Self::default()
+            })
+        }
+
+        fn note(&self, kind: EventKind) {
+            let at = EventKind::ALL
+                .iter()
+                .position(|known| *known == kind)
+                .expect("a kind of the six");
+            self.told[at].fetch_add(1, Ordering::Relaxed);
+        }
+
+        /// How often each kind was told, in the order of [`EventKind::ALL`].
+        fn told(&self) -> [u32; 6] {
+            std::array::from_fn(|at| self.told[at].load(Ordering::Relaxed))
+        }
+    }
+
+    impl DecisionScope for Told {
+        fn open(&self, _: &RequestFacts<'_>, _: &[Candidate], _: &PoolFacts<'_>) {}
+
+        fn close(&self) {}
+    }
+
+    impl BoundPlugin for Told {
+        fn name(&self) -> &'static str {
+            "told"
+        }
+
+        fn failure(&self) -> Failure {
+            Failure::Open
+        }
+
+        fn needs(&self) -> Needs {
+            Needs::default()
+        }
+
+        fn observes(&self) -> EventSet {
+            self.observes
+        }
+
+        fn take_observer(&self) -> bool {
+            !self.observer_taken.swap(true, Ordering::Relaxed)
+        }
+
+        fn retain(&self, _: &RequestFacts<'_>, _: &mut Vec<u32>) -> Result<(), Fallback> {
+            Err(Fallback)
+        }
+
+        fn keep(&self, _: &RequestFacts<'_>, _: u32) -> Result<bool, Fallback> {
+            Err(Fallback)
+        }
+
+        fn score(&self, _: &RequestFacts<'_>, _: &[u32], _: &mut [f32]) -> Result<(), Fallback> {
+            Err(Fallback)
+        }
+
+        fn pick(&self, _: &RequestFacts<'_>, _: &[u32], _: &[f32]) -> Result<u32, Fallback> {
+            Err(Fallback)
+        }
+
+        fn observe_issued(&self, _: &Lease, _: &Decision) {
+            self.note(EventKind::Issued);
+        }
+
+        fn observe_dispatched(&self, _: &Lease, _: &Target, _: Side, _: u32) {
+            self.note(EventKind::Dispatched);
+        }
+
+        fn observe_completed(&self, _: &Lease, _: &Outcome) {
+            self.note(EventKind::Completed);
+        }
+
+        fn observe_released(&self, _: &Lease, _: ReleaseReason) {
+            self.note(EventKind::Released);
+        }
+
+        fn observe_membership(&self, _: &Membership<'_>) {
+            self.note(EventKind::Membership);
+        }
+
+        fn observe_signal(&self, _: &Signal) {
+            self.note(EventKind::Signal);
+        }
+    }
+
+    /// A fallback scorer whose state the lifecycle's calls keep: it counts
+    /// them.
+    #[derive(Debug)]
+    struct Kept(Arc<AtomicU32>);
+
+    impl Kept {
+        fn count(&self) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    impl Lifecycle for Kept {
+        fn on_decision_issued(&self, _: &Lease, _: &Decision) {
+            self.count();
+        }
+
+        fn on_dispatched(&self, _: &Lease, _: &Target, _: Side, _: u32) {
+            self.count();
+        }
+
+        fn on_completed(&self, _: &Lease, _: &Outcome) {
+            self.count();
+        }
+
+        fn on_released(&self, _: &Lease, _: ReleaseReason) {
+            self.count();
+        }
+
+        fn on_membership(&self, _: &Membership<'_>) {
+            self.count();
+        }
+
+        fn on_signal(&self, _: &Signal) {
+            self.count();
+        }
+
+        fn needs_lifecycle(&self) -> bool {
+            true
+        }
+    }
+
+    impl Scorer for Kept {
+        fn name(&self) -> &'static str {
+            "kept"
+        }
+
+        fn score(
+            &self,
+            _: &RequestFacts<'_>,
+            _: &[Candidate],
+            _: &[u32],
+            out: &mut [f32],
+        ) -> TieBand {
+            out.fill(0.0);
+            TieBand::NORMALIZED
+        }
+    }
+
+    /// Every lifecycle call once, in the order of [`EventKind::ALL`].
+    fn tell(stage: &dyn Lifecycle) {
+        let lease = Lease::default();
+        stage.on_decision_issued(&lease, &Decision::Pick(Pick::default()));
+        stage.on_dispatched(&lease, &Target::default(), Side::Single, 0);
+        stage.on_completed(
+            &lease,
+            &Outcome {
+                side: Side::Single,
+                served: WorkerId(1),
+                status: 200,
+                class: TransportClass::Ok,
+                ttft_micros: 0,
+                tokens_in: 0,
+                tokens_out: 0,
+                duration_micros: 0,
+            },
+        );
+        stage.on_released(&lease, ReleaseReason::ClientGone);
+        stage.on_membership(&Membership::Added(WorkerId(1)));
+        stage.on_signal(&Signal::Health {
+            worker: WorkerId(1),
+            health: Health::default(),
+        });
+    }
+
+    /// A host names a decision's rows in the affinity column's place only
+    /// for a profile whose every stage answers row by row, and a plugin's
+    /// stage does not. A profile that holds one, as a filter or as a scorer
+    /// beside the affinity stage, takes no sample and is named no rows: its
+    /// plugin reads the column whole.
+    #[test]
+    fn a_profile_that_holds_a_plugins_stage_is_named_no_rows() {
+        // The sample of the profile that decides, and the cap a host names
+        // its rows under.
+        let named = |catalog: &Catalog, stages: &str| {
+            let document: PolicySpec = serde_json::from_str(&format!(
+                r#"{{"apiVersion":"smg.policy/v1","profiles":{{"p":{{{stages},"pick":{{"best":{{"sample":16}}}}}}}}}}"#
+            ))
+            .expect("a well-formed document");
+            let engine = document
+                .validate_in(catalog, &[])
+                .expect("a document of this build");
+            (
+                engine.sample_for("m", Phase::Single),
+                engine.named_for("m", Phase::Single),
+            )
+        };
+        let stock = Catalog::builtin();
+        assert_eq!(named(&stock, r#""score":["prefix-affinity"]"#), (16, 16));
+        // A catalog holds a name once, whatever the stage's kind: one a
+        // shape.
+        let mut filtering = Catalog::builtin();
+        filtering
+            .filter("quiet", || {
+                Box::new(PluginFilter::new(Arc::new(Quiet), None))
+            })
+            .expect("a free name, the stage's own");
+        let filtered = r#""filter":["quiet"],"score":["prefix-affinity"]"#;
+        assert_eq!(named(&filtering, filtered), (0, 0));
+        let mut scoring = Catalog::builtin();
+        scoring
+            .scorer("quiet", || {
+                Box::new(PluginScorer::new(Arc::new(Quiet), None))
+            })
+            .expect("a free name, the stage's own");
+        let scored = r#""score":["prefix-affinity","quiet"]"#;
+        assert_eq!(named(&scoring, scored), (0, 0));
+    }
+
+    /// The forwarding adapter hands the plugin the kinds its row lists and
+    /// no other, each once: none for a row that lists nothing, every kind
+    /// for one that lists them all, and each kind alone its own call.
+    #[test]
+    fn an_adapter_hands_the_kinds_the_row_lists_and_no_other() {
+        let alone = EventKind::ALL.map(|kind| EventSet::of([kind]));
+        let two = EventSet::of([EventKind::Completed, EventKind::Signal]);
+        for listed in [EventSet::NONE, EventSet::ALL, two]
+            .into_iter()
+            .chain(alone)
+        {
+            let wanted = EventKind::ALL.map(|kind| u32::from(listed.contains(kind)));
+            let scored = Told::listing(listed);
+            tell(&PluginScorer::new(Arc::clone(&scored), None));
+            assert_eq!(scored.told(), wanted, "the scorer, {listed:?}");
+            let picked = Told::listing(listed);
+            tell(&PluginPicker::new(Arc::clone(&picked), None));
+            assert_eq!(picked.told(), wanted, "the picker, {listed:?}");
+        }
+    }
+
+    /// One adapter of a build forwards, the first made, and every scorer and
+    /// picker of a plugin that hears says it needs the lifecycle's calls,
+    /// the forwarding one or not: a host that makes none refuses each. A
+    /// plugin that hears nothing leaves that word to its fallback.
+    #[test]
+    fn a_plugin_that_hears_needs_the_lifecycle_whichever_adapter_forwards() {
+        let hearing = Told::listing(EventSet::of([EventKind::Released]));
+        let first = PluginScorer::new(Arc::clone(&hearing), None);
+        let second = PluginPicker::new(Arc::clone(&hearing), None);
+        tell(&second);
+        assert_eq!(
+            hearing.told(),
+            [0; 6],
+            "the second adapter forwards nothing"
+        );
+        tell(&first);
+        assert_eq!(hearing.told(), [0, 0, 0, 1, 0, 0]);
+        assert!(first.needs_lifecycle() && second.needs_lifecycle());
+
+        let unlisted = Told::listing(EventSet::NONE);
+        assert!(!PluginScorer::new(Arc::clone(&unlisted), None).needs_lifecycle());
+        assert!(!PluginPicker::new(Arc::clone(&unlisted), None).needs_lifecycle());
+        let kept: Box<dyn Scorer> = Box::new(Kept(Arc::default()));
+        assert!(PluginScorer::new(unlisted, Some(kept)).needs_lifecycle());
+    }
+
+    /// A fallback is told every event, whatever the plugin's row lists.
+    #[test]
+    fn a_fallback_is_told_every_event_whatever_the_row_lists() {
+        for listed in [
+            EventSet::NONE,
+            EventSet::of([EventKind::Issued]),
+            EventSet::ALL,
+        ] {
+            let calls = Arc::new(AtomicU32::new(0));
+            let fallback: Box<dyn Scorer> = Box::new(Kept(Arc::clone(&calls)));
+            tell(&PluginScorer::new(Told::listing(listed), Some(fallback)));
+            assert_eq!(calls.load(Ordering::Relaxed), 6, "{listed:?}");
+        }
+    }
+
+    /// A document that names a hearing plugin's scorer is refused by a host
+    /// that makes no lifecycle call, by the stage's field. One that hears
+    /// nothing is built there, and a host that makes the calls builds the
+    /// hearing one.
+    #[test]
+    fn a_document_naming_a_plugin_that_hears_is_refused_where_the_host_makes_no_call() {
+        let catalog_of = |listed: EventSet| {
+            let plugin = Told::listing(listed);
+            let mut catalog = Catalog::builtin();
+            catalog
+                .scorer("told", move || {
+                    Box::new(PluginScorer::new(Arc::clone(&plugin), None))
+                })
+                .expect("a free name, the stage's own");
+            catalog
+        };
+        let document = || -> PolicySpec {
+            serde_json::from_str(
+                r#"{"apiVersion":"smg.policy/v1","profiles":{"p":{"score":["told"],"pick":"best"}}}"#,
+            )
+            .expect("a well-formed document")
+        };
+        let hearing = EventSet::of([EventKind::Signal]);
+
+        let refused = document()
+            .validate_in(&catalog_of(hearing).without_lifecycle(), &[])
+            .err();
+        assert_eq!(
+            refused,
+            Some(SpecError::NotInBuild {
+                path: "profiles.p.score[0].told".to_string(),
+                what: "the lifecycle this stage needs",
+            })
+        );
+        let unheard = document()
+            .validate_in(&catalog_of(EventSet::NONE).without_lifecycle(), &[])
+            .expect("a plugin that hears nothing needs no call");
+        assert!(!unheard.needs_lifecycle());
+        let served = document()
+            .validate_in(&catalog_of(hearing), &[])
+            .expect("the host makes the calls");
+        assert!(served.needs_lifecycle());
+    }
+}

@@ -22,8 +22,10 @@ profiles:
     filter: [healthy, not-overloaded, not-tried]
     score:
       - consistent-hash:
+          weight: 8
           prefix_tokens: 512
           bounded_load: { factor: 1.5, abs_margin: 4 }
+      - least-requests
     pick: best
 bindings:
   - match: { model: "*" }

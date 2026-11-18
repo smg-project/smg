@@ -1742,6 +1742,12 @@ impl ZmqEngineClient {
                 num_running_reqs: i32::try_from(load.num_running).unwrap_or(i32::MAX),
                 num_waiting_reqs: i32::try_from(load.num_waiting).unwrap_or(i32::MAX),
                 token_usage: load.kv_cache_usage,
+                num_resident_tokens: load
+                    .num_resident_tokens
+                    .map(|tokens| i64::try_from(tokens).unwrap_or(i64::MAX)),
+                num_waiting_uncached_tokens: load
+                    .num_waiting_uncached_tokens
+                    .map_or(0, |tokens| i32::try_from(tokens).unwrap_or(i32::MAX)),
                 ..Default::default()
             })
     }
@@ -2019,7 +2025,7 @@ mod tests {
             connect_to_frontend, default_ready_response, hello, EngineInbound, MockEngine,
         },
         protocol::vllm::request::UtilityCall,
-        EngineId,
+        EngineId, EngineLiveness,
     };
     use llm_tokenizer::{mock::MockTokenizer, traits::Tokenizer};
     use openai_protocol::worker::RuntimeType;
@@ -2265,7 +2271,24 @@ mod tests {
         let base_url = format!("ipc://{}", dir.path().join("w").display());
         let handshake = format!("ipc://{}", dir.path().join("hs.sock").display());
 
-        let (gave_up, engine) = tokio::join!(
+        // The first connect gives up after one second of silence. Until its
+        // HELLO is answered the engine counts as alive, with a sign of life on
+        // every poll and the engine polled first, so a starved host cannot
+        // spend that second on the greeting: it runs out in the READY wait.
+        let alive = EngineLiveness::new();
+        let first_startup = StartupBudget {
+            silence: Duration::from_secs(1),
+            ceiling: None,
+            liveness: Some(alive.clone()),
+        };
+        let greeted = hello(&handshake, EngineId::from_engine_index(0));
+        tokio::pin!(greeted);
+        let (engine, gave_up) = tokio::join!(
+            biased;
+            std::future::poll_fn(|cx| {
+                alive.touch();
+                std::future::Future::poll(greeted.as_mut(), cx)
+            }),
             connect_with_eos(
                 &base_url,
                 "m".to_string(),
@@ -2273,9 +2296,8 @@ mod tests {
                 Handshake::TcpOrIpc(&handshake),
                 1,
                 EosTokenIds::default(),
-                Duration::from_secs(1),
+                first_startup,
             ),
-            hello(&handshake, EngineId::from_engine_index(0)),
         );
         let Err(reason) = gave_up else {
             panic!("the first connect must give up its READY wait");
@@ -2283,8 +2305,20 @@ mod tests {
         assert!(reason.contains("waiting for READY"), "{reason}");
         let engine = engine.expect("HELLO/INIT with the first connect");
         // The dropped listeners' socket files go on their own tasks; the
-        // gateway retries a health probe later.
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // gateway retries a health probe later, the test once they are gone.
+        let (greeting, input, output) =
+            zmq_socket_addresses(&base_url, Handshake::TcpOrIpc(&handshake)).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while [&greeting, &input, &output].into_iter().any(|endpoint| {
+                endpoint
+                    .strip_prefix("ipc://")
+                    .is_some_and(|path| Path::new(path).exists())
+            }) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the dropped listeners' socket files go");
 
         let (client, engine) = tokio::join!(
             connect_with_eos(

@@ -8,9 +8,12 @@ const BIN: &str = env!("CARGO_BIN_EXE_smg-policy-controller");
 
 /// A start the controller refuses: the settle window is over half the grace
 /// period. It writes one line through the logger, binds nothing and exits 1.
-const REFUSED_START: [&str; 8] = [
+/// It names a spec source, as every start does, and opens none.
+const REFUSED_START: [&str; 10] = [
     "--controller-id",
     "controller-0",
+    "--spec-store",
+    "spec",
     "--runtime-worker-threads",
     "1",
     "--shutdown-settle-secs",
@@ -123,6 +126,44 @@ fn the_binarys_settings_are_the_gateways_constant() {
         settings_after(gateway, "pub const SERVER_MALLOC_CONF").expect("the gateway's constant");
     let ours = settings_after(binary, "const SETTINGS").expect("the binary's copy");
     assert_eq!(ours, theirs, "the binary's settings are not the gateway's");
+}
+
+/// The example controller's settings are a copy of this binary's, in a file
+/// a user copies out of the tree: no case of the copy can read this one.
+/// The example's source is read by path: its copy moves with the binary's,
+/// or this case fails.
+#[test]
+fn the_examples_settings_are_the_binarys() {
+    let binary = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/bin/smg-policy-controller.rs"
+    ));
+    let example = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../examples/policy-controller/src/main.rs"
+    ));
+    let ours = settings_after(binary, "const SETTINGS").expect("the binary's settings");
+    let theirs = settings_after(example, "pub static MALLOC_CONF").expect("the example's copy");
+    assert_eq!(theirs, ours, "the example's settings are not the binary's");
+}
+
+/// The served bench counts over the allocator this binary registers, under
+/// a copy of its settings: a row read under other settings is not the
+/// binary's row. The bench's source is read by path: its copy moves with
+/// the binary's, or this case fails.
+#[test]
+fn the_served_benchs_settings_are_the_binarys() {
+    let binary = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/bin/smg-policy-controller.rs"
+    ));
+    let bench = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/benches/decide_stream.rs"
+    ));
+    let ours = settings_after(binary, "const SETTINGS").expect("the binary's settings");
+    let theirs = settings_after(bench, "pub static MALLOC_CONF").expect("the bench's copy");
+    assert_eq!(theirs, ours, "the bench's settings are not the binary's");
 }
 
 /// The byte string a source assigns after `name`, without its quotes.

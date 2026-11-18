@@ -4,10 +4,13 @@
 //! and sent, the wait, the answer read. Bound as the three stages (asked at
 //! the open) and as the picker alone (asked at the pick with the combined
 //! scores), at 8, 64 and 512 candidates; a decision the open breaker
-//! bypasses; one lifecycle event; and the same profile out of built-in
-//! stages as the floor. Ids: `policy_grpc/decide/<binding>/<n>`,
-//! `policy_grpc/bypassed/<n>`, `policy_grpc/observe` and
-//! `policy_grpc/native/<n>`.
+//! bypasses; one lifecycle event the plugin hears and one it does not; the
+//! same profile out of built-in stages as the floor; and a request that
+//! carries a prompt's block hashes, to a plugin whose row declares them and
+//! to one whose row does not. Ids: `policy_grpc/decide/<binding>/<n>`,
+//! `policy_grpc/bypassed/<n>`, `policy_grpc/observe`, `policy_grpc/unheard`,
+//! `policy_grpc/native/<n>` and `policy_grpc/prompt/<row>/<hashes>`. A
+//! closing check is asked of the cells that ran: a filter times a cell alone.
 #![expect(
     clippy::expect_used,
     reason = "a bench's setup has no caller to answer; a plugin that fails to load is a bug the tests catch"
@@ -33,7 +36,8 @@ use served::{Behaviour, TestPlugin, ALL, FILTER, PICK, SCORE};
 use smg_policy_controller::{
     builtins::{Best, Healthy, LeastRequests},
     grpc::{
-        BreakerSpec, GrpcFilter, GrpcPicker, GrpcPluginSpec, GrpcScorer, Plugin, Runtime, Transport,
+        BreakerSpec, EventSet, GrpcFilter, GrpcPicker, GrpcPluginSpec, GrpcScorer, Plugin, Runtime,
+        Transport,
     },
     plugins::OpenDecisions,
     Binding, Constraints, Engine, Filter, Lease, Lifecycle, Needs, Picker, Plan, PoolFacts,
@@ -41,6 +45,9 @@ use smg_policy_controller::{
 };
 
 const SIZES: [usize; 3] = [8, 64, 512];
+
+/// A prompt's block hashes: the view's default cap and the contract's most.
+const HASHES: [usize; 2] = [256, 8_190];
 
 /// A budget of one second per decision: no honest round trip meets it, so
 /// every cell is an answered decision.
@@ -63,6 +70,8 @@ fn spec(served: &TestPlugin, name: &str) -> GrpcPluginSpec {
     );
     spec.connect_micros = 5_000_000;
     spec.max_candidates = 512;
+    // Every kind of event, as the `observe` cell tells one.
+    spec.observes = EventSet::ALL;
     spec
 }
 
@@ -157,6 +166,7 @@ fn decide(c: &mut Criterion) {
         spec.breaker.cooldown_micros = 0;
         let plugin = Plugin::load(&runtime, spec).expect("the plugin loads");
         let engine = plugin_engine(&plugin, stages);
+        let mut ran = false;
         for &n in &SIZES {
             let fleet = fleet(n);
             let mut view = Vec::with_capacity(n);
@@ -166,6 +176,7 @@ fn decide(c: &mut Criterion) {
             let cx = Constraints::default();
             group.throughput(Throughput::Elements(n as u64));
             group.bench_with_input(BenchmarkId::new(binding, n), &n, |b, _| {
+                ran = true;
                 let mut seed = 0u64;
                 b.iter(|| {
                     seed += 1;
@@ -173,20 +184,70 @@ fn decide(c: &mut Criterion) {
                 });
             });
         }
-        let stats = plugin.stats();
-        assert_eq!(
-            (
-                stats.missed,
-                stats.invalid,
-                stats.declined,
-                stats.cold,
-                stats.refused,
-                stats.bypassed
-            ),
-            (0, 0, 0, 0, 0, 0),
-            "{binding}: the plugin answered every frame and no decision was bypassed: {stats:?}"
-        );
-        assert!(stats.answered > 0, "{binding}: {stats:?}");
+        assert_answered(binding, &plugin, ran);
+    }
+    group.finish();
+}
+
+/// The plugin answered every frame of its cells and no decision took a
+/// fallback: a run that timed anything else fails here. `ran` is whether a
+/// cell of the plugin ran: under a filter or a listing none may, and the
+/// plugin was then asked nothing.
+fn assert_answered(row: &str, plugin: &Plugin, ran: bool) {
+    let stats = plugin.stats();
+    assert_eq!(
+        (
+            stats.missed,
+            stats.invalid,
+            stats.declined,
+            stats.cold,
+            stats.refused,
+            stats.bypassed
+        ),
+        (0, 0, 0, 0, 0, 0),
+        "{row}: the plugin answered every frame and no decision was bypassed: {stats:?}"
+    );
+    assert!(!ran || stats.answered > 0, "{row}: {stats:?}");
+}
+
+/// A request that carries a prompt's block hashes, at 64 candidates, bound
+/// as the three stages. A plugin whose row declares the hashes is sent
+/// them; one whose row declares none is sent none, so its cell is the
+/// decision's without a prompt, whatever the prompt's length.
+fn prompt(c: &mut Criterion) {
+    let runtime = Runtime::new(&OpenDecisions::new()).expect("a runtime");
+    let n = 64;
+    let fleet = fleet(n);
+    let mut view = Vec::with_capacity(n);
+    build_view(&fleet, &mut view);
+    let pool = pool_of(n);
+    let cx = Constraints::default();
+    let mut group = c.benchmark_group("policy_grpc/prompt");
+    for (row, declared) in [("declared", true), ("undeclared", false)] {
+        let served = serve();
+        let mut spec = spec(&served, row);
+        spec.breaker.cooldown_micros = 0;
+        spec.needs.token_hashes = declared;
+        let plugin = Plugin::load(&runtime, spec).expect("the plugin loads");
+        let engine = plugin_engine(&plugin, ALL);
+        let mut ran = false;
+        for &hashes in &HASHES {
+            let held: Vec<u64> = (1..).take(hashes).collect();
+            let mut scratch = Scratch::new();
+            group.bench_with_input(BenchmarkId::new(row, hashes), &hashes, |b, _| {
+                ran = true;
+                let mut seed = 0u64;
+                b.iter(|| {
+                    seed += 1;
+                    let facts = RequestFacts {
+                        block_hashes: black_box(&held),
+                        ..facts(seed)
+                    };
+                    engine.decide(&facts, &pool, black_box(&view), &cx, &mut scratch)
+                });
+            });
+        }
+        assert_answered(row, &plugin, ran);
     }
     group.finish();
 }
@@ -245,19 +306,37 @@ fn bypassed(c: &mut Criterion) {
     group.finish();
 }
 
-/// One lifecycle event handed to the plugin's `Observe` queue.
+/// One lifecycle event handed to the `Observe` queue of a plugin whose row
+/// lists its kind, and one told where the row lists no kind: nothing is
+/// handed, and the plugin has no such stream.
 fn observe(c: &mut Criterion) {
     let runtime = Runtime::new(&OpenDecisions::new()).expect("a runtime");
     let served = serve();
-    let plugin = Plugin::load(&runtime, spec(&served, "observer")).expect("the plugin loads");
-    let engine = plugin_engine(&plugin, ALL);
     let lease = Lease::default();
     let target = Target::default();
+
+    let plugin = Plugin::load(&runtime, spec(&served, "observer")).expect("the plugin loads");
+    let engine = plugin_engine(&plugin, ALL);
+    let mut ran = false;
     c.bench_function("policy_grpc/observe", |b| {
+        ran = true;
         b.iter(|| engine.on_dispatched(black_box(&lease), &target, Side::Single, 3));
     });
     let stats = plugin.stats();
-    assert!(stats.observed + stats.observe_dropped > 0, "{stats:?}");
+    assert!(
+        !ran || stats.observed + stats.observe_dropped > 0,
+        "{stats:?}"
+    );
+
+    let mut unlisted = spec(&served, "unheard");
+    unlisted.observes = EventSet::NONE;
+    let plugin = Plugin::load(&runtime, unlisted).expect("the plugin loads");
+    let engine = plugin_engine(&plugin, ALL);
+    c.bench_function("policy_grpc/unheard", |b| {
+        b.iter(|| engine.on_dispatched(black_box(&lease), &target, Side::Single, 3));
+    });
+    let stats = plugin.stats();
+    assert_eq!((stats.observed, stats.observe_dropped), (0, 0), "{stats:?}");
 }
 
 fn native(c: &mut Criterion) {
@@ -282,5 +361,5 @@ fn native(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, decide, bypassed, observe, native);
+criterion_group!(benches, decide, bypassed, observe, native, prompt);
 criterion_main!(benches);

@@ -1,7 +1,7 @@
 # Regression gate for `cargo bench -p smg-policy-controller --bench store_view`, run by
 # .github/workflows/benchmark-policy-store.yml on pull requests through scripts/bench_gate.py.
 #
-# The gate runs thirty single-threaded rows of the store's view and holds twenty-nine of them to a threshold.
+# The gate runs thirty-two single-threaded rows of the store's view and holds each of them to a threshold.
 # Twenty-one are at 8, 64 and 512 workers:
 # a decision's build from the published world without the affinity column (`policy_store/view_build/<n>`) and
 # with it (`policy_store/view_build_column/<n>`), the build with one and with eight standing vetoes of the asking
@@ -30,31 +30,46 @@
 # when a run is reserved for the whole list, which no case can see. With that reserve put back the row read
 # 790.8 µs against 321.5 through this gate, and the gate failed it.
 #
+# One row reads a membership write under a generation that declares the view's three lists: 512 members of one
+# pool, each stating an engine family, a zone and twelve labels, under two families, four zones and eight
+# selectors (`policy_store/member_write_listed/512`). A membership write reads the worker it writes under the
+# lists and carries every other member's fields: the row fails when a write reads every member again. Its
+# identical-build spread is not read yet, so it stands at the membership write's threshold.
+#
 # Two rows read one membership write of a fleet of pairs, 512 prefills and 512 decodes of one model that name
 # no runtime and report no descriptor: one prefill's registration written again as it stands, which moves no
 # offer (`policy_store_pairs/kept/512`), and its runtime named and unnamed in turn, which moves its offer at
-# every write (`policy_store_pairs/moved/512`). The first is gated: it fails when a write that moves no offer
-# derives the pair classes again. Its identical-build spread is not read yet, so it stands at the membership
-# write's threshold. The second is run and reported and holds no gate entry: a write that moves an offer
-# derives the pair classes, which a base from before the derivation does not, so the row cannot read level
-# against that base. The change after the derivation's gates it.
+# every write (`policy_store_pairs/moved/512`). Each is gated at its own identical-build spread. The first
+# fails when a write that moves no offer derives the pair classes again. The second holds the whole write of a
+# moved offer: at 512 a side, deriving every worker's class again is under a tenth of that write by instruction
+# count, inside the row's threshold, so the row does not hold the derivation to the written worker. The crate's
+# cases do: the count of whole derivations a store ran, and the classes carried by address.
+#
+# One row reads a membership write beside a worker that lists many models: one of eight workers of one model
+# written again, in a store that also holds one worker of 1,024 models
+# (`policy_store_models/member_write/1024`). A write builds every pool again and reads each row's models as it
+# goes: the row fails when a model is looked for among the row's earlier ones, a scan that grows with the square
+# of the list. With that scan in place the row read 1.73 ms against 0.72, six rounds a side.
 #
 # The filter leaves out the binary's other rows. The nine `policy_store_vetoes/` rows are the veto cells outside
 # the gate: three vetoes of the asking gateway, and other gateways' vetoes at every size. The nine
 # `policy_store_cadence/` rows run the build beside a writer thread on a second core: they are for a run pinned
 # to two cores. The three `policy_store_held/` rows time a publication beside a reader that holds the rows it
 # would write over. The four `policy_store_pairs/` rows at 8 and at 64 a side are the two membership writes
-# of smaller fleets of pairs.
+# of smaller fleets of pairs. The two other `policy_store_models/` rows read the same write beside a list of
+# 128 and of 4,096 models: the scan is a tenth of the first, and six rounds of one build read the second at 3.4
+# to 8.9 ms.
 #
 # Threshold (the method is described in tokenizer.toml). The identical-build spread, (max - min) / median of the
 # per-run criterion medians over six runs of one build pinned to one core, read through this gate as three base
 # and three pull-request runs (the base a copy of the binary with one byte appended, so the gate does not take
-# the two for one file), on a shared many-core build host. Two readings and a later pair stand in the table. The
+# the two for one file), on a shared many-core build host. Three readings and a later pair stand in the table. The
 # first twenty-one rows are of a reading launched at a load of 47, its six runs begun at 28 to 47. The six rows
 # beside other gateways' vetoes are of a reading of the whole gate that did not wait for a quiet host: its six
-# runs began at a load of 43 to 81, with a second run of the gate on a core beside it. The last row, the spread
-# membership write, is of the later pair, five runs a side: the two write rows alone at a load of 78 to 161, and
-# the whole gate while the load rose from 9 to 113:
+# runs began at a load of 43 to 81, with a second run of the gate on a core beside it. The spread membership
+# write is of the later pair, five runs a side: the two write rows alone at a load of 78 to 161, and the whole
+# gate while the load rose from 9 to 113. The two rows of pairs are of a reading of their own, six runs of the
+# two alone at a load of 112 to 123, and the row of many models of six runs at a load of 59 to 141:
 #
 #   rows                                        identical build   threshold
 #   floor/{8,64,512}                            0.5 - 1.3 %       10 %
@@ -71,8 +86,10 @@
 #   veto_write/512                              1.2 %             10 %
 #   member_write/512                            7.8 %             20 %
 #   member_write_spread/512                     12.9 - 17.6 %     40 %
-#   pairs kept/512                              not read          20 %
-#   pairs moved/512                             not read          none: reported
+#   member_write_listed/512                     not read          20 %
+#   pairs kept/512                              8.5 %             20 %
+#   pairs moved/512                             12.5 %            25 %
+#   models member_write/1024                    5.8 %             15 %
 #
 # The threshold is the smallest multiple of 5 % that is at least twice the identical-build spread, never under
 # 10 % (the hosted runner is noisier than the build host). One row stands under that rule: `publish/512` at
@@ -107,8 +124,8 @@
 # of four. Read on the 28 ids this file held then, two copies of one binary of main: 21 count the same in every
 # batch after the first, four do not count steadily (`publish/8`, `publish/64`, `view_build/8`,
 # `member_write_spread/512`) and three were not read, the bench having stopped under the counter. The two rows of
-# a fleet of pairs, added since, do not count steadily either. A row that does not count steadily, or whose count
-# is not read, keeps the time's verdict.
+# a fleet of pairs and the row of many models, added since, do not count steadily either. A row that does not
+# count steadily, or whose count is not read, keeps the time's verdict.
 #
 # Every job uploads bench-gate/results.json with the raw per-run medians of both sides; the hosted runner's
 # own spread can be read from those and the thresholds tightened once it is known.
@@ -118,7 +135,7 @@ count = true
 # The count ends 3,180 s into the run: the gate step's bound is 55 minutes, and the report is written
 # in the two minutes behind the count. No count starts in the budget's last 30 s.
 run_budget = 3180
-filter = "^policy_store/|^policy_store_pairs/(kept|moved)/512$"
+filter = "^policy_store/|^policy_store_pairs/(kept|moved)/512$|^policy_store_models/member_write/1024$"
 
 # The files that feed this binary beyond the measured crate: the base side is built with them as the
 # pull request has them (bench_gate.py build --sources-from), so a row added here cannot move the
@@ -148,9 +165,24 @@ threshold = 0.20
 note = "identical build 7.8 %, read on a busier host"
 
 [[gate]]
-pattern = "^policy_store_pairs/kept/512$"
+pattern = "^policy_store/member_write_listed/512$"
 threshold = 0.20
 note = "a membership write, held as member_write/512 is: its own identical-build spread is not read yet"
+
+[[gate]]
+pattern = "^policy_store_pairs/kept/512$"
+threshold = 0.20
+note = "identical build 8.5 %, read at a load of 112 to 123"
+
+[[gate]]
+pattern = "^policy_store_pairs/moved/512$"
+threshold = 0.25
+note = "identical build 12.5 %, read at a load of 112 to 123"
+
+[[gate]]
+pattern = "^policy_store_models/member_write/1024$"
+threshold = 0.15
+note = "identical build 5.8 %, read at a load of 59 to 141"
 
 [[gate]]
 pattern = "^policy_store/(view_build|view_build_veto8)/8$"

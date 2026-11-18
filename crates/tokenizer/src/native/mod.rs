@@ -80,6 +80,8 @@ use thread_local::ThreadLocal;
 use tokenizers::{models::ModelWrapper, Model};
 use unicode_normalization_alignments::UnicodeNormalization;
 
+mod block;
+mod byte_split;
 mod cased;
 mod chain;
 mod long_entries;
@@ -1193,6 +1195,10 @@ pub(crate) struct NativeEncoder {
     /// pool's cut check then chooses its window's start with care
     /// ([`Self::window_start`]).
     space_inside: bool,
+    /// Whether a stage is the byte-level split, which its scanner matches
+    /// in the walk: the walk then runs in the copy that carries the scanner
+    /// ([`Self::staged_pieces`]).
+    byte_split: bool,
     /// The one-pass matcher of the stages, when they are a chain it covers
     /// (the stages stay for the cut checks and as the matcher of record).
     chain: Option<chain::Scanner>,
@@ -1343,6 +1349,7 @@ impl NativeEncoder {
             normalizer,
             raw_added: AddedTokens::build(&raw)?,
             normalized_added: AddedTokens::build(&normalized)?,
+            byte_split: stages.iter().any(|stage| stage.pattern.has_byte_split()),
             space_inside: stages
                 .iter()
                 .any(|stage| stage.pattern.reads_space_inside()),
@@ -1428,6 +1435,7 @@ impl NativeEncoder {
             normalized_added: AddedTokens::build(&normalized)?,
             stages: Vec::new(),
             space_inside: false,
+            byte_split: false,
             chain: None,
             frame,
             alphabet: bytes_char(),
@@ -2046,6 +2054,7 @@ impl NativeEncoder {
             end_anchored: false,
             mapped_from: None,
             image_opens: None,
+            byte_split: stages.iter().any(|stage| stage.pattern.has_byte_split()),
             space_inside: stages
                 .iter()
                 .any(|stage| stage.pattern.reads_space_inside()),
@@ -2770,7 +2779,7 @@ impl NativeEncoder {
     /// ([`Self::pieces`]), as spans of byte offsets into `text`.
     fn piece_spans(&self, text: &str, out: &mut Vec<(usize, usize)>) {
         let base = text.as_ptr() as usize;
-        self.pieces(0, text, &mut |piece| {
+        self.staged_pieces(text, |piece| {
             let from = piece.as_ptr() as usize - base;
             out.push((from, from + piece.len()));
         });
@@ -3011,12 +3020,12 @@ impl NativeEncoder {
                 // byte-level image; a final piece is a byte range of the
                 // unit, not always a `str`.
                 let mut image = String::new();
-                let mut per_piece = |piece: &[u8]| {
+                let per_piece = |piece: &[u8]| {
                     if let Err(declined) = self.tokenize_piece(model, piece, mapped, ids, cache) {
                         fallback = Some(declined);
                     }
                 };
-                self.pieces_mapping(0, from, text, &mut image, &mut per_piece);
+                self.staged_pieces_mapping(from, text, &mut image, per_piece);
             }
             (Some(chain), _, None) => {
                 // The chain's scanned walk costs a repeated text no more
@@ -3037,9 +3046,17 @@ impl NativeEncoder {
                 if matches!(stage.pieces.walk(), Walk::Apart { matches: true, .. }) =>
             {
                 // An all-ASCII unit has a copy of the stage's loop compiled
-                // for it (see `encode_single_stage`).
+                // for it (see `encode_single_stage`). Any other unit goes by
+                // blocks where its pattern gives that reader. The all-ASCII
+                // unit does not: its lean scan reads long words in fewer
+                // instructions than the block pass (measured: the pass costs
+                // a sixth more on a text of 18-byte words).
                 let encoded = if cache.unit_ascii {
                     self.encode_single_stage::<true>(model, stage, text, words, mapped, ids, cache)
+                } else if let Some(blocks) = stage.pattern.by_blocks(text) {
+                    self.encode_single_stage_by_blocks(
+                        model, blocks, text, words, mapped, ids, cache,
+                    )
                 } else {
                     self.encode_single_stage::<false>(model, stage, text, words, mapped, ids, cache)
                 };
@@ -3048,23 +3065,65 @@ impl NativeEncoder {
                 }
             }
             (None, _, None) => {
-                let mut per_piece = |piece: &str| {
-                    if let Err(declined) =
-                        self.tokenize_piece(model, piece.as_bytes(), mapped, ids, cache)
-                    {
-                        fallback = Some(declined);
-                    }
-                };
-                self.pieces(0, text, &mut per_piece);
+                // The probe compiles into the walk, and the attribute holds
+                // it there in both copies of the walk (`staged_pieces`):
+                // left to the optimiser, a probe with two callers stays a
+                // call a piece (counted: 8 to 14 instructions a token).
+                self.staged_pieces(
+                    text,
+                    #[inline(always)]
+                    |piece: &str| {
+                        if let Err(declined) =
+                            self.tokenize_piece(model, piece.as_bytes(), mapped, ids, cache)
+                        {
+                            fallback = Some(declined);
+                        }
+                    },
+                );
             }
         }
         fallback.map_or(Ok(()), Err)
     }
 
+    /// [`Self::pieces`] from the first stage on, in the copy these stages
+    /// take: with the byte-level split's scanner when one of them is that
+    /// split, else without it.
+    #[inline(always)]
+    fn staged_pieces<F: FnMut(&str)>(&self, text: &str, mut f: F) {
+        if self.byte_split {
+            self.pieces::<true, F>(0, text, &mut f);
+        } else {
+            self.pieces::<false, F>(0, text, &mut f);
+        }
+    }
+
+    /// [`Self::pieces_mapping`] from the first stage on, in the copy these
+    /// stages take ([`Self::staged_pieces`]).
+    #[inline(always)]
+    fn staged_pieces_mapping<F: FnMut(&[u8])>(
+        &self,
+        from: usize,
+        text: &str,
+        image: &mut String,
+        mut f: F,
+    ) {
+        if self.byte_split {
+            self.pieces_mapping::<true, F>(0, from, text, image, &mut f);
+        } else {
+            self.pieces_mapping::<false, F>(0, from, text, image, &mut f);
+        }
+    }
+
     /// Applies the stages from `depth` on to `text`, calling `f` with each
     /// final piece. `f` is taken by static dispatch so that the per-piece
-    /// work compiles into the walk.
-    fn pieces<F: FnMut(&str)>(&self, depth: usize, text: &str, f: &mut F) {
+    /// work compiles into the walk. `SPLIT` says this copy of the walk
+    /// carries the byte-level split's scanner: a stage that is that split
+    /// then takes its matches from the scanner. It is a constant and no
+    /// test in the walk, so the copy for stages without the split holds
+    /// nothing for it (one more test a piece in the patterns' iterator
+    /// costs a pattern the program runs 0.6 % of a warm encode's
+    /// instructions, counted).
+    fn pieces<const SPLIT: bool, F: FnMut(&str)>(&self, depth: usize, text: &str, f: &mut F) {
         if text.is_empty() {
             return;
         }
@@ -3080,29 +3139,49 @@ impl NativeEncoder {
                 let mut merged = None;
                 for (start, _) in stage.pattern.find_iter(text) {
                     match merged {
-                        Some(from) => self.pieces(depth + 1, &text[from..start], f),
-                        None if start > 0 => self.pieces(depth + 1, &text[..start], f),
+                        Some(from) => self.pieces::<SPLIT, F>(depth + 1, &text[from..start], f),
+                        None if start > 0 => self.pieces::<SPLIT, F>(depth + 1, &text[..start], f),
                         None => {}
                     }
                     merged = Some(start);
                 }
-                self.pieces(depth + 1, &text[merged.unwrap_or(0)..], f);
+                self.pieces::<SPLIT, F>(depth + 1, &text[merged.unwrap_or(0)..], f);
                 return;
             }
             Walk::Apart { gaps, matches } => (gaps, matches),
         };
         let mut cursor = 0;
+        if SPLIT {
+            if let Some(found) = stage.pattern.split_matches(text) {
+                // The byte-level split: the same walk over its scanner's
+                // matches, in a loop of its own so that the one below
+                // holds no test for it.
+                for (start, end) in found {
+                    if gaps && cursor < start {
+                        self.pieces::<SPLIT, F>(depth + 1, &text[cursor..start], f);
+                    }
+                    if matches {
+                        self.pieces::<SPLIT, F>(depth + 1, &text[start..end], f);
+                    }
+                    cursor = end;
+                }
+                if gaps && cursor < text.len() {
+                    self.pieces::<SPLIT, F>(depth + 1, &text[cursor..], f);
+                }
+                return;
+            }
+        }
         for (start, end) in stage.pattern.find_iter(text) {
             if gaps && cursor < start {
-                self.pieces(depth + 1, &text[cursor..start], f);
+                self.pieces::<SPLIT, F>(depth + 1, &text[cursor..start], f);
             }
             if matches {
-                self.pieces(depth + 1, &text[start..end], f);
+                self.pieces::<SPLIT, F>(depth + 1, &text[start..end], f);
             }
             cursor = end;
         }
         if gaps && cursor < text.len() {
-            self.pieces(depth + 1, &text[cursor..], f);
+            self.pieces::<SPLIT, F>(depth + 1, &text[cursor..], f);
         }
     }
 
@@ -3113,7 +3192,7 @@ impl NativeEncoder {
     /// ([`Self::pieces_in_alphabet`]). `f` takes each final piece's raw
     /// bytes: a cut inside a multi-byte character is one the reference
     /// makes too, so a piece is not always a `str`.
-    fn pieces_mapping<F: FnMut(&[u8])>(
+    fn pieces_mapping<const SPLIT: bool, F: FnMut(&[u8])>(
         &self,
         depth: usize,
         from: usize,
@@ -3149,32 +3228,82 @@ impl NativeEncoder {
                 for (start, _) in stage.pattern.find_iter(text) {
                     match merged {
                         Some(at) => {
-                            self.pieces_mapping(depth + 1, from, &text[at..start], image, f);
+                            self.pieces_mapping::<SPLIT, F>(
+                                depth + 1,
+                                from,
+                                &text[at..start],
+                                image,
+                                f,
+                            );
                         }
                         None if start > 0 => {
-                            self.pieces_mapping(depth + 1, from, &text[..start], image, f);
+                            self.pieces_mapping::<SPLIT, F>(
+                                depth + 1,
+                                from,
+                                &text[..start],
+                                image,
+                                f,
+                            );
                         }
                         None => {}
                     }
                     merged = Some(start);
                 }
-                self.pieces_mapping(depth + 1, from, &text[merged.unwrap_or(0)..], image, f);
+                self.pieces_mapping::<SPLIT, F>(
+                    depth + 1,
+                    from,
+                    &text[merged.unwrap_or(0)..],
+                    image,
+                    f,
+                );
                 return;
             }
             Walk::Apart { gaps, matches } => (gaps, matches),
         };
         let mut cursor = 0;
+        if SPLIT {
+            if let Some(found) = stage.pattern.split_matches(text) {
+                // The byte-level split: the same walk over its scanner's
+                // matches, in a loop of its own so that the one below
+                // holds no test for it.
+                for (start, end) in found {
+                    if gaps && cursor < start {
+                        self.pieces_mapping::<SPLIT, F>(
+                            depth + 1,
+                            from,
+                            &text[cursor..start],
+                            image,
+                            f,
+                        );
+                    }
+                    if matches {
+                        self.pieces_mapping::<SPLIT, F>(
+                            depth + 1,
+                            from,
+                            &text[start..end],
+                            image,
+                            f,
+                        );
+                    }
+                    cursor = end;
+                }
+                if gaps && cursor < text.len() {
+                    self.pieces_mapping::<SPLIT, F>(depth + 1, from, &text[cursor..], image, f);
+                }
+                return;
+            }
+        }
         for (start, end) in stage.pattern.find_iter(text) {
             if gaps && cursor < start {
-                self.pieces_mapping(depth + 1, from, &text[cursor..start], image, f);
+                self.pieces_mapping::<SPLIT, F>(depth + 1, from, &text[cursor..start], image, f);
             }
             if matches {
-                self.pieces_mapping(depth + 1, from, &text[start..end], image, f);
+                self.pieces_mapping::<SPLIT, F>(depth + 1, from, &text[start..end], image, f);
             }
             cursor = end;
         }
         if gaps && cursor < text.len() {
-            self.pieces_mapping(depth + 1, from, &text[cursor..], image, f);
+            self.pieces_mapping::<SPLIT, F>(depth + 1, from, &text[cursor..], image, f);
         }
     }
 
@@ -3340,6 +3469,41 @@ impl NativeEncoder {
                 fallback = Some(declined);
             }
         }
+        fallback.map_or(Ok(()), Err)
+    }
+
+    /// [`Self::encode_single_stage`] for a unit its pattern reads by blocks,
+    /// a routine of its own: the block pass and the walk between its
+    /// stretches compile in here with a probe of their own, and
+    /// [`Self::encode_single_stage`] keeps its text and its loops as they
+    /// are. A pattern that gives a reader by blocks leaves no gap in any
+    /// text (`Pattern::by_blocks`), so there is none to tokenize here and
+    /// no cursor to keep.
+    #[inline(never)]
+    #[expect(clippy::too_many_arguments)]
+    fn encode_single_stage_by_blocks(
+        &self,
+        model: Option<&ModelWrapper>,
+        blocks: pattern::ByBlocks<'_>,
+        text: &str,
+        words: bool,
+        mapped: &mut String,
+        ids: &mut Vec<u32>,
+        cache: &mut PieceCache,
+    ) -> Result<(), Fallback> {
+        let mut fallback = None;
+        blocks.for_each_match(
+            text,
+            words,
+            #[inline(always)]
+            |start, end| {
+                if let Err(declined) =
+                    self.tokenize_piece_at(model, text, start..end, mapped, ids, cache)
+                {
+                    fallback = Some(declined);
+                }
+            },
+        );
         fallback.map_or(Ok(()), Err)
     }
 

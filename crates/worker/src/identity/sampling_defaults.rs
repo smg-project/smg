@@ -11,17 +11,17 @@ pub const DEFAULT_SAMPLING_PARAMS_LABEL: &str = "default_sampling_params_json";
 /// limits such as `max_new_tokens` are ignored even when present in a model's
 /// `generation_config.json`.
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Serialize)]
-pub(crate) struct SamplingDefaults {
+pub struct SamplingDefaults {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) temperature: Option<f32>,
+    pub temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) top_p: Option<f32>,
+    pub top_p: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) top_k: Option<i32>,
+    pub top_k: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) min_p: Option<f32>,
+    pub min_p: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) repetition_penalty: Option<f32>,
+    pub repetition_penalty: Option<f32>,
 }
 
 impl SamplingDefaults {
@@ -33,12 +33,16 @@ impl SamplingDefaults {
             && self.repetition_penalty.is_none()
     }
 
-    pub(crate) fn from_json_str(json: &str) -> Result<Option<Self>, serde_json::Error> {
+    /// The defaults a JSON object sets, or `None` when it sets none of the
+    /// knobs.
+    pub fn from_json_str(json: &str) -> Result<Option<Self>, serde_json::Error> {
         let defaults: Self = serde_json::from_str(json)?;
         Ok((!defaults.is_empty()).then_some(defaults))
     }
 
-    pub(crate) fn canonical_json_from_str(json: &str) -> Result<Option<String>, String> {
+    /// The JSON object again with the knobs it sets and nothing else, in this
+    /// struct's order: what a worker's label carries. `None` when it sets none.
+    pub fn canonical_json_from_str(json: &str) -> Result<Option<String>, String> {
         let Some(defaults) = Self::from_json_str(json)
             .map_err(|e| format!("failed to parse sampling defaults JSON: {e}"))?
         else {

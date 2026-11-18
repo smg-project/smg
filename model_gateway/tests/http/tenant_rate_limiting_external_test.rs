@@ -131,7 +131,7 @@ async fn an_impossible_request_is_denied_on_every_provider_route() {
             (
                 "messages",
                 anthropic
-                    .route_messages(None, &tenant, messages, MODEL)
+                    .route_messages(None, &tenant, Arc::new(messages), MODEL)
                     .await,
             ),
             (

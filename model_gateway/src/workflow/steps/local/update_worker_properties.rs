@@ -14,12 +14,10 @@ use super::create_worker::{
     warn_on_conflicting_parser_overrides, DP_WIDTH_LABELS,
 };
 use crate::{
+    admin::worker_service::MAX_WORKER_LABELS,
     service_discovery::DISCOVERY_PROVIDER_LABEL,
-    worker::{
-        identity::basic::merge_labels, registry::service::MAX_WORKER_LABELS, BasicWorker,
-        BasicWorkerBuilder, RuntimeType, Worker,
-    },
-    workflow::data::WorkerUpdateWorkflowData,
+    worker::{identity::basic::merge_labels, BasicWorker, BasicWorkerBuilder, RuntimeType, Worker},
+    workflow::data::{require_app_context, WorkerUpdateWorkflowData},
 };
 
 /// Step to update worker properties.
@@ -59,12 +57,7 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
             context.data.updated_workers = Some(Vec::new());
             return Ok(StepResult::Skip);
         }
-        let app_context = context
-            .data
-            .app_context
-            .as_ref()
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?
-            .clone();
+        let app_context = require_app_context(context.data.app_context.as_ref())?.clone();
         let workers_to_update = context
             .data
             .workers_to_update

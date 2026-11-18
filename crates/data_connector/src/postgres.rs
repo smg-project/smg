@@ -486,6 +486,15 @@ impl PostgresConversationStorage {
         Self { store }
     }
 
+    /// A pooled client, or this store's error for an unavailable pool.
+    async fn client(&self) -> Result<deadpool_postgres::Client, ConversationStorageError> {
+        self.store
+            .pool
+            .get()
+            .await
+            .map_err(|e| ConversationStorageError::pool_unavailable(&e))
+    }
+
     /// The conversations table in its current shape, created by the store's
     /// bootstrap (`IF NOT EXISTS`).
     pub(crate) fn table_ddl(schema: &SchemaConfig) -> String {
@@ -621,12 +630,7 @@ impl ConversationStorage for PostgresConversationStorage {
 
         let sql = insert_sql(&table, &col_names);
 
-        let client = self
-            .store
-            .pool
-            .get()
-            .await
-            .map_err(|e| ConversationStorageError::pool_unavailable(&e))?;
+        let client = self.client().await?;
         execute_cached(&client, &sql, &params)
             .await
             .map_err(ConversationStorageError::from_pg)?;
@@ -645,12 +649,7 @@ impl ConversationStorage for PostgresConversationStorage {
             Self::row_columns(s).join(", ")
         );
 
-        let client = self
-            .store
-            .pool
-            .get()
-            .await
-            .map_err(|e| ConversationStorageError::pool_unavailable(&e))?;
+        let client = self.client().await?;
         let rows = query_cached(&client, &sql, &[&id.0.as_str()])
             .await
             .map_err(ConversationStorageError::from_pg)?;
@@ -691,12 +690,7 @@ impl ConversationStorage for PostgresConversationStorage {
         // Bind the JSON column as `Value`, not a serialized `String` (see
         // `create_conversation` for why `tokio-postgres` requires this).
         let metadata_value: Option<Value> = metadata.map(Value::Object);
-        let client = self
-            .store
-            .pool
-            .get()
-            .await
-            .map_err(|e| ConversationStorageError::pool_unavailable(&e))?;
+        let client = self.client().await?;
         let rows = query_cached(&client, &sql, &[&metadata_value, &id.0.as_str()])
             .await
             .map_err(ConversationStorageError::from_pg)?;
@@ -711,12 +705,7 @@ impl ConversationStorage for PostgresConversationStorage {
         let table = s.qualified_table(self.store.schema.owner.as_deref());
         let col_id = s.col("id");
 
-        let client = self
-            .store
-            .pool
-            .get()
-            .await
-            .map_err(|e| ConversationStorageError::pool_unavailable(&e))?;
+        let client = self.client().await?;
         let rows_deleted = execute_cached(
             &client,
             &format!("DELETE FROM {table} WHERE {col_id} = $1"),
@@ -735,6 +724,15 @@ pub(super) struct PostgresConversationItemStorage {
 impl PostgresConversationItemStorage {
     pub fn new(store: PostgresStore) -> Self {
         Self { store }
+    }
+
+    /// A pooled client, or this store's error for an unavailable pool.
+    async fn client(&self) -> Result<deadpool_postgres::Client, ConversationItemStorageError> {
+        self.store
+            .pool
+            .get()
+            .await
+            .map_err(|e| ConversationItemStorageError::pool_unavailable(&e))
     }
 
     /// The conversation items and links tables in their current shape,
@@ -872,12 +870,7 @@ impl ConversationItemStorage for PostgresConversationItemStorage {
 
         let sql = insert_if_absent_sql(&table, &col_names);
 
-        let client = self
-            .store
-            .pool
-            .get()
-            .await
-            .map_err(|e| ConversationItemStorageError::pool_unavailable(&e))?;
+        let client = self.client().await?;
         let inserted = execute_cached(&client, &sql, &params)
             .await
             .map_err(ConversationItemStorageError::from_pg)?;
@@ -932,12 +925,7 @@ impl ConversationItemStorage for PostgresConversationItemStorage {
 
         let sql = link_sql(&table, &col_names);
 
-        let client = self
-            .store
-            .pool
-            .get()
-            .await
-            .map_err(|e| ConversationItemStorageError::pool_unavailable(&e))?;
+        let client = self.client().await?;
         execute_cached(&client, &sql, &params)
             .await
             .map_err(ConversationItemStorageError::from_pg)?;
@@ -965,12 +953,7 @@ impl ConversationItemStorage for PostgresConversationItemStorage {
         let order_desc = matches!(params.order, SortOrder::Desc);
 
         let after_key: Option<(DateTime<Utc>, String)> = if let Some(ref aid) = params.after {
-            let client = self
-                .store
-                .pool
-                .get()
-                .await
-                .map_err(|e| ConversationItemStorageError::pool_unavailable(&e))?;
+            let client = self.client().await?;
             let cursor_sql = format!(
                 "SELECT {l_added_at} FROM {links_table} WHERE {l_conv_id} = $1 AND {l_item_id} = $2"
             );
@@ -1034,12 +1017,7 @@ impl ConversationItemStorage for PostgresConversationItemStorage {
             sql.push_str(" LIMIT $2");
         }
 
-        let client = self
-            .store
-            .pool
-            .get()
-            .await
-            .map_err(|e| ConversationItemStorageError::pool_unavailable(&e))?;
+        let client = self.client().await?;
         let rows = if let Some((ts, iid)) = &after_key {
             query_cached(&client, &sql, &[&cid, ts, iid, &limit])
                 .await
@@ -1085,12 +1063,7 @@ impl ConversationItemStorage for PostgresConversationItemStorage {
             select_cols.join(", "),
         );
 
-        let client = self
-            .store
-            .pool
-            .get()
-            .await
-            .map_err(|e| ConversationItemStorageError::pool_unavailable(&e))?;
+        let client = self.client().await?;
         let rows = query_cached(&client, &sql, &[&item_id.0.as_str()])
             .await
             .map_err(ConversationItemStorageError::from_pg)?;
@@ -1110,12 +1083,7 @@ impl ConversationItemStorage for PostgresConversationItemStorage {
 
         let sql = format!("SELECT COUNT(*) FROM {table} WHERE {col_conv} = $1 AND {col_item} = $2");
 
-        let client = self
-            .store
-            .pool
-            .get()
-            .await
-            .map_err(|e| ConversationItemStorageError::pool_unavailable(&e))?;
+        let client = self.client().await?;
         let row = query_one_cached(
             &client,
             &sql,
@@ -1136,12 +1104,7 @@ impl ConversationItemStorage for PostgresConversationItemStorage {
 
         let sql = format!("DELETE FROM {table} WHERE {col_conv} = $1 AND {col_item} = $2");
 
-        let client = self
-            .store
-            .pool
-            .get()
-            .await
-            .map_err(|e| ConversationItemStorageError::pool_unavailable(&e))?;
+        let client = self.client().await?;
         execute_cached(
             &client,
             &sql,
@@ -1243,6 +1206,15 @@ impl PostgresResponseStorage {
             select_base,
             store_path,
         })
+    }
+
+    /// A pooled client, or this store's error for an unavailable pool.
+    async fn client(&self) -> Result<deadpool_postgres::Client, ResponseStorageError> {
+        self.store
+            .pool
+            .get()
+            .await
+            .map_err(|e| ResponseStorageError::pool_unavailable(&e))
     }
 
     /// The responses table in its current shape, created by the store's
@@ -1837,12 +1809,7 @@ impl ResponseStorage for PostgresResponseStorage {
         let (col_names, params) = write_columns(s, &response, &previous_id, &extra_cols);
         let response_id = response.id.clone();
 
-        let mut client = self
-            .store
-            .pool
-            .get()
-            .await
-            .map_err(|e| ResponseStorageError::pool_unavailable(&e))?;
+        let mut client = self.client().await?;
         let store_err = ResponseStorageError::from_pg;
         // The statement is prepared once per pooled connection (the cache
         // keeps it), so a store on the upsert path is one round trip.
@@ -1903,12 +1870,7 @@ impl ResponseStorage for PostgresResponseStorage {
         let open = open_predicate_for(s);
         let sql = update_if_open_sql(&table, &col_names, open.as_deref());
 
-        let client = self
-            .store
-            .pool
-            .get()
-            .await
-            .map_err(|e| ResponseStorageError::pool_unavailable(&e))?;
+        let client = self.client().await?;
         let rows = execute_cached(&client, &sql, &params)
             .await
             .map_err(ResponseStorageError::from_pg)?;
@@ -1940,12 +1902,7 @@ impl ResponseStorage for PostgresResponseStorage {
             &[s.col("id"), col_raw],
             Some(&open_predicate(col_raw)),
         );
-        let client = self
-            .store
-            .pool
-            .get()
-            .await
-            .map_err(|e| ResponseStorageError::pool_unavailable(&e))?;
+        let client = self.client().await?;
         let rows = execute_cached(&client, &sql, &[&id.0, &raw_response])
             .await
             .map_err(ResponseStorageError::from_pg)?;
@@ -1966,12 +1923,7 @@ impl ResponseStorage for PostgresResponseStorage {
         let col_id = self.store.schema.responses.col("id");
         let sql = format!("{} WHERE {col_id} = $1", self.select_base);
 
-        let client = self
-            .store
-            .pool
-            .get()
-            .await
-            .map_err(|e| ResponseStorageError::pool_unavailable(&e))?;
+        let client = self.client().await?;
         let rows = query_cached(&client, &sql, &[&response_id.0.as_str()])
             .await
             .map_err(ResponseStorageError::from_pg)?;
@@ -1989,12 +1941,7 @@ impl ResponseStorage for PostgresResponseStorage {
             return Ok(None);
         };
 
-        let client = self
-            .store
-            .pool
-            .get()
-            .await
-            .map_err(|e| ResponseStorageError::pool_unavailable(&e))?;
+        let client = self.client().await?;
         let rows = query_cached(&client, &sql, &[&item_id])
             .await
             .map_err(ResponseStorageError::from_pg)?;
@@ -2009,12 +1956,7 @@ impl ResponseStorage for PostgresResponseStorage {
         let table = s.qualified_table(self.store.schema.owner.as_deref());
         let col_id = s.col("id");
 
-        let client = self
-            .store
-            .pool
-            .get()
-            .await
-            .map_err(|e| ResponseStorageError::pool_unavailable(&e))?;
+        let client = self.client().await?;
         execute_cached(
             &client,
             &format!("DELETE FROM {table} WHERE {col_id} = $1"),
@@ -2055,12 +1997,7 @@ impl ResponseStorage for PostgresResponseStorage {
             params.push(limit);
         }
 
-        let client = self
-            .store
-            .pool
-            .get()
-            .await
-            .map_err(|e| ResponseStorageError::pool_unavailable(&e))?;
+        let client = self.client().await?;
         let rows = query_cached(&client, &sql, &params)
             .await
             .map_err(ResponseStorageError::from_pg)?;
@@ -2085,12 +2022,7 @@ impl ResponseStorage for PostgresResponseStorage {
         // the pool is the store being unavailable; a statement the server
         // refuses keeps the server's message (`e.to_string()` alone is the
         // kind, `db error`, without it).
-        let client = self
-            .store
-            .pool
-            .get()
-            .await
-            .map_err(|e| ResponseStorageError::pool_unavailable(&e))?;
+        let client = self.client().await?;
         let cutoff_secs: i64 = cutoff.timestamp();
         let rows_deleted = client
             .execute(&sql, &[&cutoff_secs])
@@ -2121,12 +2053,7 @@ impl ResponseStorage for PostgresResponseStorage {
             params.push(&tenant);
         }
 
-        let client = self
-            .store
-            .pool
-            .get()
-            .await
-            .map_err(|e| ResponseStorageError::pool_unavailable(&e))?;
+        let client = self.client().await?;
         let rows_deleted = execute_cached(&client, &sql, &params)
             .await
             .map_err(ResponseStorageError::from_pg)?;

@@ -94,6 +94,17 @@ pub mod mode {
     /// fills it in a loop: a call of milliseconds that answers, then an
     /// endless one.
     pub const FILL_BRIEFLY_THEN_FILL: u8 = 30;
+    /// `observe` counts the dispatches told to its instance and `pick`
+    /// names the row at that count: what one instance heard, read from a
+    /// decision made on it.
+    pub const COUNT_DISPATCHES: u8 = 31;
+    /// `observe` counts the members the feed told its instance (a snapshot's
+    /// length, one up an addition, one down a removal) and `pick` names the
+    /// row at that count.
+    pub const COUNT_MEMBERS: u8 = 32;
+    /// As `COUNT_MEMBERS`, and `observe` traps on a snapshot of five
+    /// members: a telling that faults one instance and not the next.
+    pub const TRAP_ON_FIVE_MEMBERS: u8 = 33;
     /// A second config byte: `init` asks the host's live clock once. An
     /// answer of zero lets it go on, of one makes it refuse, of two spin
     /// without end, of three trap at once.
@@ -117,6 +128,9 @@ pub mod counter {
     pub const OBSERVE_SESSION: u32 = 4;
     /// `random-u64` as drawn in `pick` under `DRAW_IN_PICK`.
     pub const PICK_RANDOM: u32 = 5;
+    /// The block hashes each request handed a guest of
+    /// [`hash_counting_guests`](super::hash_counting_guests), summed.
+    pub const HASHES: u32 = 6;
 }
 
 /// The canonical ABI layout the record guest reads: the constructor's
@@ -126,6 +140,9 @@ pub mod canonical {
     pub const ARGS_CANDIDATES_PTR: usize = 136;
     /// Offset of the candidate list's length in the arguments.
     pub const ARGS_CANDIDATES_LEN: usize = 140;
+    /// Offset of the length of the request's `block-hashes` list in the
+    /// arguments: the request is their first field.
+    pub const ARGS_HASHES_LEN: usize = 52;
     /// Size of one `candidate` record in guest memory.
     pub const CANDIDATE_SIZE: usize = 120;
     /// Offset of `in-flight` within a `candidate`.
@@ -183,6 +200,14 @@ pub fn check_canonical_layout() {
     let list_at = request_size.size_wasm32().next_multiple_of(4);
     assert_eq!(list_at, canonical::ARGS_CANDIDATES_PTR);
     assert_eq!(list_at + 4, canonical::ARGS_CANDIDATES_LEN);
+    let request = record_offsets("request");
+    let hashes = request
+        .iter()
+        .find(|(n, _)| n == "block-hashes")
+        .map(|(_, o)| *o)
+        .expect("request has block-hashes");
+    // A list is a pointer, then its length.
+    assert_eq!(hashes + 4, canonical::ARGS_HASHES_LEN, "{request:?}");
 }
 
 /// Assembles `wat_text` and wraps it as a component of `world`.
@@ -210,6 +235,43 @@ pub fn record_guest() -> Vec<u8> {
 /// A guest of the packed world.
 pub fn packed_guest() -> Vec<u8> {
     component("policy-packed", &guest_wat(Guest::Packed))
+}
+
+/// Both guests with a constructor that first tells the host, through the
+/// counter [`counter::HASHES`], how many block hashes the request handed
+/// it: the record guest reads the list's length in its arguments, the
+/// packed guest its request block's hash-count. Each by its world's name.
+pub fn hash_counting_guests() -> [(&'static str, Vec<u8>); 2] {
+    let counting = |guest: Guest, read: &str| {
+        let constructed = "    (call $on_construct)\n";
+        let counted = format!(
+            "    (call $counter (i32.const {}) (i64.extend_i32_u {read}))\n{constructed}",
+            counter::HASHES
+        );
+        let text = guest_wat(guest);
+        assert_eq!(
+            text.matches(constructed).count(),
+            1,
+            "the constructor tells the host once"
+        );
+        text.replacen(constructed, &counted, 1)
+    };
+    let record = format!(
+        "(i32.load offset={} (local.get $args))",
+        canonical::ARGS_HASHES_LEN
+    );
+    // The packed request block holds its hash-count at 48, a u16.
+    let packed = "(i32.load16_u offset=48 (local.get $rptr))";
+    [
+        (
+            "record",
+            component("policy", &counting(Guest::Record, &record)),
+        ),
+        (
+            "packed",
+            component("policy-packed", &counting(Guest::Packed, packed)),
+        ),
+    ]
 }
 
 /// A guest that imports a WASI interface: refused at load.
@@ -300,6 +362,8 @@ fn guest_wat(guest: Guest) -> String {
   (table $t 1 funcref)
   (global $heap (mut i32) (i32.const 1024))
   (global $mode (mut i32) (i32.const 0))
+  (global $heard (mut i32) (i32.const 0))
+  (global $members (mut i32) (i32.const 0))
   (data (i32.const 16) "refused")
   (data (i32.const 32) "observed")
 
@@ -502,6 +566,16 @@ fn guest_wat(guest: Guest) -> String {
       (then
         (i32.store8 offset=4 (local.get $r) (i32.const 0))
         (return (local.get $r))))
+    (if (i32.eq (global.get $mode) (i32.const {count_dispatches}))
+      (then
+        (i32.store8 offset=4 (local.get $r) (i32.const 1))
+        (i32.store offset=8 (local.get $r) (global.get $heard))
+        (return (local.get $r))))
+    (if (i32.or (i32.eq (global.get $mode) (i32.const {count_members})) (i32.eq (global.get $mode) (i32.const {trap_on_five_members})))
+      (then
+        (i32.store8 offset=4 (local.get $r) (i32.const 1))
+        (i32.store offset=8 (local.get $r) (global.get $members))
+        (return (local.get $r))))
     (local.set $i (i32.const 0))
     (local.set $found (i32.const 0))
     (local.set $top (f32.const -2))
@@ -536,6 +610,23 @@ fn guest_wat(guest: Guest) -> String {
   ;; sixth value is the lease's session key on every lease-bearing case.
   (func (export "{iface}#observe") (param i32 i64 i64 i64 i32 i64 i64 i32 i64 i64 i32 i64 i32 i32 i32 i32)
     (if (i32.eq (global.get $mode) (i32.const {trap_in_observe})) (then unreachable))
+    ;; A membership event is the outer case 4. Its inner case is the second
+    ;; value (an addition 0, a removal 1, a snapshot 5) and a snapshot's
+    ;; length the fourth: the members told to this instance, counted.
+    (if (i32.eq (local.get 0) (i32.const 4))
+      (then
+        (if (i64.eq (local.get 1) (i64.const 5))
+          (then
+            (if (i32.and (i32.eq (global.get $mode) (i32.const {trap_on_five_members})) (i64.eq (local.get 3) (i64.const 5)))
+              (then unreachable))
+            (global.set $members (i32.wrap_i64 (local.get 3)))))
+        (if (i64.eq (local.get 1) (i64.const 0))
+          (then (global.set $members (i32.add (global.get $members) (i32.const 1)))))
+        (if (i64.eq (local.get 1) (i64.const 1))
+          (then (global.set $members (i32.sub (global.get $members) (i32.const 1)))))))
+    ;; A dispatch is the outer case 1 of the event: counted on this instance.
+    (if (i32.eq (local.get 0) (i32.const 1))
+      (then (global.set $heard (i32.add (global.get $heard) (i32.const 1)))))
     (call $counter (i32.const 0) (i64.const 1))
     (call $counter (i32.const 3) (call $now))
     (call $counter (i32.const 4) (local.get 6))
@@ -595,6 +686,9 @@ fn guest_wat(guest: Guest) -> String {
         log_then_burn = mode::LOG_THEN_BURN,
         log_then_decline = mode::LOG_THEN_DECLINE,
         fill_briefly = mode::FILL_BRIEFLY_THEN_FILL,
+        count_dispatches = mode::COUNT_DISPATCHES,
+        count_members = mode::COUNT_MEMBERS,
+        trap_on_five_members = mode::TRAP_ON_FIVE_MEMBERS,
     )
 }
 

@@ -8,6 +8,8 @@
 //! calls the lifecycle once per side. Every stateful built-in keeps its state
 //! behind these events alone.
 
+use std::fmt;
+
 use crate::{
     decision::{Decision, Target},
     sessions::SessionVerdict,
@@ -102,7 +104,8 @@ pub struct Outcome {
 pub enum ReleaseReason {
     /// The host gave up before dispatch.
     Abandoned,
-    /// A late decision arrived after a fallback dispatch.
+    /// A late decision: it arrived after a fallback dispatch, or was cut
+    /// before it left.
     LateDecision,
     /// The client went away.
     ClientGone,
@@ -153,7 +156,83 @@ pub enum Signal {
     },
 }
 
-/// The lifecycle a stateful stage implements. Every method defaults to a
+/// One kind of lifecycle event: one of the six calls of [`Lifecycle`], as
+/// both plugin contracts name them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EventKind {
+    Issued,
+    Dispatched,
+    Completed,
+    Released,
+    Membership,
+    Signal,
+}
+
+impl EventKind {
+    /// Every kind, in the order of its bit.
+    pub const ALL: [Self; 6] = [
+        Self::Issued,
+        Self::Dispatched,
+        Self::Completed,
+        Self::Released,
+        Self::Membership,
+        Self::Signal,
+    ];
+
+    const fn bit(self) -> u8 {
+        1 << self as u8
+    }
+}
+
+/// A set of kinds of lifecycle event, as bits over [`EventKind`]. Empty by
+/// default. A plugin's row lists in one the kinds its plugin hears, and a
+/// plugin whose row lists nothing is told nothing. It prints the kinds it
+/// holds by name, as `{Completed, Signal}`.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub struct EventSet(u8);
+
+impl EventSet {
+    /// No event.
+    pub const NONE: Self = Self(0);
+
+    /// Every kind.
+    pub const ALL: Self = {
+        let mut set = Self::NONE;
+        let mut at = 0;
+        while at < EventKind::ALL.len() {
+            set.0 |= EventKind::ALL[at].bit();
+            at += 1;
+        }
+        set
+    };
+
+    /// The set of these kinds.
+    pub fn of(kinds: impl IntoIterator<Item = EventKind>) -> Self {
+        let mut set = Self::NONE;
+        for kind in kinds {
+            set.0 |= kind.bit();
+        }
+        set
+    }
+
+    pub const fn contains(self, kind: EventKind) -> bool {
+        self.0 & kind.bit() != 0
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+}
+
+impl fmt::Debug for EventSet {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_set()
+            .entries(EventKind::ALL.iter().filter(|kind| self.contains(**kind)))
+            .finish()
+    }
+}
+
+/// The lifecycle a stateful stage implements. Every hook defaults to a
 /// no-op, so a stateless stage implements nothing.
 pub trait Lifecycle: Send + Sync {
     /// The engine issued `decision` under `lease`. In the embedded mode the
@@ -181,9 +260,28 @@ pub trait Lifecycle: Send + Sync {
     /// The host gave the lease up before its completion.
     fn on_released(&self, _lease: &Lease, _reason: ReleaseReason) {}
 
+    /// The host's membership changed. A host may call this under its own
+    /// membership lock, as the policy store does: a stage that calls from
+    /// here a door of the host that takes that lock waits on itself. A read
+    /// that takes no lock does not.
     fn on_membership(&self, _change: &Membership<'_>) {}
 
     fn on_signal(&self, _signal: &Signal) {}
+
+    /// Whether the stage decides wrong under a host that makes none of
+    /// these calls: `true` for one whose state the calls keep, as the
+    /// workers it lists or the bookings it learns from. The standalone
+    /// controller makes the membership call and tells a stage of a lease's
+    /// issue, of its dispatch, completion and release at its gateway's word
+    /// and of its end at the dispatch deadline, and not yet of the end of a
+    /// lease whose gateway was let go: it refuses a document that names such
+    /// a stage as not in this build ([`crate::SpecError::NotInBuild`]). A
+    /// host that embeds the engine makes every call. `false` by default: a
+    /// stage that takes a call to shed state early decides the same without
+    /// it.
+    fn needs_lifecycle(&self) -> bool {
+        false
+    }
 }
 
 /// A boxed stage forwards to the stage it holds.
@@ -217,6 +315,10 @@ impl<T: Lifecycle + ?Sized> Lifecycle for Box<T> {
     fn on_signal(&self, signal: &Signal) {
         (**self).on_signal(signal);
     }
+
+    fn needs_lifecycle(&self) -> bool {
+        (**self).needs_lifecycle()
+    }
 }
 
 #[cfg(test)]
@@ -224,6 +326,55 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
+
+    /// The type's list of every kind, held to the order of the bits. The
+    /// match names each, so a new kind does not compile until it has its
+    /// place here, which is its place in [`EventKind::ALL`]: the one list
+    /// that the set of every kind, the set's print and the cases read.
+    fn kinds() -> [EventKind; 6] {
+        let kinds = EventKind::ALL;
+        for (at, kind) in kinds.into_iter().enumerate() {
+            let place = match kind {
+                EventKind::Issued => 0,
+                EventKind::Dispatched => 1,
+                EventKind::Completed => 2,
+                EventKind::Released => 3,
+                EventKind::Membership => 4,
+                EventKind::Signal => 5,
+            };
+            // Its place in the list is its bit.
+            assert_eq!((place, EventSet::of([kind]).0), (at, 1 << at), "{kind:?}");
+        }
+        kinds
+    }
+
+    #[test]
+    fn an_event_set_holds_the_kinds_it_was_made_of_and_no_other() {
+        let kinds = kinds();
+        assert_eq!(EventSet::default(), EventSet::NONE);
+        assert!(EventSet::NONE.is_empty() && !EventSet::ALL.is_empty());
+        assert_eq!(EventSet::of(kinds), EventSet::ALL);
+        for kind in kinds {
+            let alone = EventSet::of([kind]);
+            assert!(EventSet::ALL.contains(kind) && !EventSet::NONE.contains(kind));
+            for other in kinds {
+                assert_eq!(alone.contains(other), other == kind, "{kind:?} {other:?}");
+            }
+        }
+    }
+
+    /// A set prints the kinds it holds by name, in the order of the bits: a
+    /// row in a log line or a failing case names what the row lists.
+    #[test]
+    fn an_event_set_prints_the_kinds_it_holds_by_name() {
+        let two = EventSet::of([EventKind::Signal, EventKind::Completed]);
+        assert_eq!(format!("{two:?}"), "{Completed, Signal}");
+        assert_eq!(format!("{:?}", EventSet::NONE), "{}");
+        assert_eq!(
+            format!("{:?}", EventSet::ALL),
+            "{Issued, Dispatched, Completed, Released, Membership, Signal}"
+        );
+    }
 
     /// A stage that counts what reached it, to prove the box forwards every
     /// hook and a stateless stage needs none.
@@ -243,6 +394,23 @@ mod tests {
     struct Stateless;
 
     impl Lifecycle for Stateless {}
+
+    /// A stage whose state the calls keep.
+    struct Kept;
+
+    impl Lifecycle for Kept {
+        fn needs_lifecycle(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn a_boxed_stage_says_what_its_stage_says_of_the_calls() {
+        let kept: Box<dyn Lifecycle> = Box::new(Kept);
+        assert!(Lifecycle::needs_lifecycle(&kept));
+        let stateless: Box<dyn Lifecycle> = Box::new(Stateless);
+        assert!(!Lifecycle::needs_lifecycle(&stateless));
+    }
 
     #[test]
     fn a_boxed_stage_forwards_its_hooks_and_a_stateless_one_ignores_them() {

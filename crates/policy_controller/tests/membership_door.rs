@@ -39,7 +39,6 @@ use std::{
 
 use net::{http_get, loopback};
 use openai_protocol::worker::RuntimeType;
-use prost::Message as _;
 use replicas::{Lease, Record, Replica};
 use smg_policy_controller::{
     controller::{Config, Controller, Election, Listener, Scope, State, SERVICE_NAME},
@@ -190,18 +189,6 @@ fn later(first: u64, writes: u64) -> u64 {
     first + writes
 }
 
-/// `google.rpc.Status`, as a client of any gRPC stack decodes a status's
-/// details.
-#[derive(Clone, PartialEq, prost::Message)]
-struct RpcStatus {
-    #[prost(int32, tag = "1")]
-    code: i32,
-    #[prost(string, tag = "2")]
-    message: String,
-    #[prost(message, repeated, tag = "3")]
-    details: Vec<prost_types::Any>,
-}
-
 /// The value of an unlabelled counter in a scrape.
 fn counter(scrape: &str, name: &str) -> Option<u64> {
     scrape
@@ -259,24 +246,8 @@ async fn the_leader_takes_a_fleet_through_the_door_and_polls_the_engine_it_was_g
         (Code::FailedPrecondition, "this replica does not lead")
     );
     // The details are a `google.rpc.Status`, the form every gRPC client
-    // decodes them as: the code and the message again, and the NotLeader
-    // under its type's URL. Its address is the leader's gateway listener.
-    let details = RpcStatus::decode(refused.details()).expect("a google.rpc.Status");
-    assert_eq!(
-        (details.code, details.message.as_str()),
-        (
-            Code::FailedPrecondition as i32,
-            "this replica does not lead"
-        )
-    );
-    let [detail] = details.details.as_slice() else {
-        panic!("one detail: {details:?}");
-    };
-    assert_eq!(
-        detail.type_url,
-        "type.googleapis.com/smg.policy.v1.NotLeader"
-    );
-    let named = proto::NotLeader::decode(detail.value.as_slice()).expect("a NotLeader");
+    // decodes them as; the address is the leader's gateway listener.
+    let named = replicas::not_leader(&refused);
     assert_eq!(named.leader_address, replicas[leader].gateway.to_string());
 
     // The leader takes three checked workers: each answer is the row as
