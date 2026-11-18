@@ -1975,9 +1975,8 @@ mod native_loads_tests {
         model_card::ModelCard,
         worker::{HealthCheckConfig, OverloadUpdate},
     };
-    use smg_grpc_client::common_proto::EngineLoad;
 
-    use super::*;
+    use super::{tests::PushedRecord, *};
     use crate::worker::{
         test_support::LoadReaders, BasicWorkerBuilder, ConnectionMode, WorkerLoadGuard,
         WorkerMonitor, WorkerRegistry, WorkerType,
@@ -2807,7 +2806,7 @@ mod native_loads_tests {
             let t0 = Instant::now();
             let polled_at = t0 + interval;
             for rank in 0..2 {
-                monitor.apply_pushed_load(&worker, rank, &EngineLoad::default(), t0);
+                monitor.apply_pushed_load(&worker, rank, &PushedRecord::default(), t0);
             }
             let absolute = WorkerLoadResponse {
                 loads: (0..2)
@@ -2822,7 +2821,7 @@ mod native_loads_tests {
             };
             monitor.apply_polled_load(worker.url(), &absolute, t0 + Duration::from_secs(1));
             if let Some(offset) = fresh_offset {
-                monitor.apply_pushed_load(&worker, 1, &EngineLoad::default(), polled_at + offset);
+                monitor.apply_pushed_load(&worker, 1, &PushedRecord::default(), polled_at + offset);
             }
             let key = WorkerGroupKey {
                 model_id: "a".to_string(),
@@ -2844,7 +2843,7 @@ mod native_loads_tests {
             monitor.apply_pushed_load(
                 &worker,
                 0,
-                &EngineLoad::default(),
+                &PushedRecord::default(),
                 polled_at + Duration::from_secs(1),
             );
             monitor.flush_pushed();
@@ -3036,14 +3035,11 @@ mod native_loads_tests {
         };
         let interval = Duration::from_secs(10);
         let t0 = Instant::now();
-        let record = |running: u32, hit_rate: f64, sample: u64| EngineLoad {
-            running_requests: running,
-            cache_hit_rate: Some(hit_rate),
-            sample,
-            ..Default::default()
+        let record = |running: i32, hit_rate: f64| {
+            PushedRecord::requests(running, 0).cache_hit_rate(hit_rate)
         };
-        monitor.apply_pushed_load(&worker, 0, &record(2, 0.5, 1), t0);
-        monitor.apply_pushed_load(&worker, 1, &record(8, 0.65, 2), t0);
+        monitor.apply_pushed_load(&worker, 0, &record(2, 0.5), t0);
+        monitor.apply_pushed_load(&worker, 1, &record(8, 0.65), t0);
 
         // One interval later rank 1's record is older than the interval:
         // the tick polls the worker.
@@ -3054,7 +3050,7 @@ mod native_loads_tests {
         monitor.apply_pushed_load(
             &worker,
             0,
-            &record(4, 0.5, 3),
+            &record(4, 0.5),
             t0 + interval + Duration::from_millis(1),
         );
         monitor.flush_pushed();
@@ -3081,14 +3077,10 @@ mod native_loads_tests {
         worker.set_status(WorkerStatus::Ready);
         registry.register(Arc::clone(&worker)).unwrap();
         let t0 = Instant::now();
-        let record = |running: u32, sample: u64| EngineLoad {
-            running_requests: running,
-            sample,
-            ..Default::default()
-        };
-        monitor.apply_pushed_load(&worker, 1, &record(8, 1), t0);
+        let record = |running: i32| PushedRecord::requests(running, 0);
+        monitor.apply_pushed_load(&worker, 1, &record(8), t0);
         let last = t0 + Duration::from_millis(5);
-        monitor.apply_pushed_load(&worker, 0, &record(2, 2), last);
+        monitor.apply_pushed_load(&worker, 0, &record(2), last);
         assert_eq!(monitor.pending_pushed_len(), 1, "one publish per worker");
         monitor.flush_pushed();
         let snapshot = monitor.load_state.snapshot();
@@ -3126,21 +3118,12 @@ mod native_loads_tests {
         worker.set_status(WorkerStatus::Ready);
         registry.register(Arc::clone(&worker)).unwrap();
         let t0 = Instant::now();
-        let heartbeat = EngineLoad {
-            running_requests: 2,
-            cache_hit_rate: Some(0.75),
-            num_used_tokens: Some(1024),
-            max_total_num_tokens: Some(4096),
-            sample: 1,
-            ..Default::default()
-        };
+        let heartbeat = PushedRecord::requests(2, 0)
+            .cache_hit_rate(0.75)
+            .used_tokens(1024)
+            .total_tokens(4096);
         monitor.apply_pushed_load(&worker, 0, &heartbeat, t0);
-        let core = EngineLoad {
-            running_requests: 5,
-            num_used_tokens: Some(2048),
-            sample: 2,
-            ..Default::default()
-        };
+        let core = PushedRecord::requests(5, 0).used_tokens(2048);
         monitor.apply_pushed_load(&worker, 0, &core, t0 + Duration::from_millis(1));
         monitor.flush_pushed();
         let snapshot = monitor.load_state.snapshot();
@@ -3208,13 +3191,10 @@ mod native_loads_tests {
         let t0 = tick
             .checked_sub(interval)
             .expect("the clock is older than the interval");
-        let record = |running: u32, waiting: u32, used: i32, sample: u64| EngineLoad {
-            running_requests: running,
-            waiting_requests: waiting,
-            num_used_tokens: Some(used),
-            max_total_num_tokens: Some(1000),
-            sample,
-            ..Default::default()
+        let record = |running: i32, waiting: i32, used: i32| {
+            PushedRecord::requests(running, waiting)
+                .used_tokens(used)
+                .total_tokens(1000)
         };
         // What an earlier poll left in the rank cache. No record writes
         // there, so the tick's poll is what replaces this entry or takes it
@@ -3225,11 +3205,11 @@ mod native_loads_tests {
                 stub.url.clone(),
                 HashMap::from([(0, 150), (1, 250)]),
             )]));
-        monitor.apply_pushed_load(&worker, 0, &record(2, 0, 200, 1), t0);
-        monitor.apply_pushed_load(&worker, 1, &record(8, 0, 500, 2), t0);
+        monitor.apply_pushed_load(&worker, 0, &record(2, 0, 200), t0);
+        monitor.apply_pushed_load(&worker, 1, &record(8, 0, 500), t0);
 
         let pushed_at = tick + Duration::from_millis(1);
-        monitor.apply_pushed_load(&worker, 0, &record(10, 8, 900, 3), pushed_at);
+        monitor.apply_pushed_load(&worker, 0, &record(10, 8, 900), pushed_at);
         monitor.flush_pushed();
         let published = |monitor: &WorkerMonitor| {
             let snapshot = monitor.load_state.snapshot();
@@ -3260,7 +3240,7 @@ mod native_loads_tests {
         };
         // The worker's next record publishes the report on file.
         let next = pushed_at + Duration::from_millis(1);
-        monitor.apply_pushed_load(&worker, 1, &record(8, 0, 500, 4), next);
+        monitor.apply_pushed_load(&worker, 1, &record(8, 0, 500), next);
         monitor.flush_pushed();
         AfterFallbackPoll {
             rows,
@@ -3440,13 +3420,10 @@ mod native_loads_tests {
         let t0 = tick
             .checked_sub(interval)
             .expect("the clock is older than the interval");
-        let record = |running: u32, waiting: u32, used: i32, sample: u64| EngineLoad {
-            running_requests: running,
-            waiting_requests: waiting,
-            num_used_tokens: Some(used),
-            max_total_num_tokens: Some(1000),
-            sample,
-            ..Default::default()
+        let record = |running: i32, waiting: i32, used: i32| {
+            PushedRecord::requests(running, waiting)
+                .used_tokens(used)
+                .total_tokens(1000)
         };
         // What an earlier poll left in the rank cache: a count of its own
         // for every rank on file, none of them a record's.
@@ -3461,10 +3438,10 @@ mod native_loads_tests {
                 stub.url.clone(),
                 earlier_poll.iter().copied().collect(),
             )]));
-        monitor.apply_pushed_load(&worker, 0, &record(10, 8, 900, 1), t0);
-        monitor.apply_pushed_load(&worker, 1, &record(8, 0, 500, 2), t0);
+        monitor.apply_pushed_load(&worker, 0, &record(10, 8, 900), t0);
+        monitor.apply_pushed_load(&worker, 1, &record(8, 0, 500), t0);
         for &rank in also_quiet {
-            monitor.apply_pushed_load(&worker, rank, &record(3, 0, 300, 3), t0);
+            monitor.apply_pushed_load(&worker, rank, &record(3, 0, 300), t0);
         }
         monitor.flush_pushed();
         assert!(
@@ -3499,7 +3476,7 @@ mod native_loads_tests {
             .and_then(|report| report.sampled_at);
 
         let next = tick + Duration::from_secs(2);
-        monitor.apply_pushed_load(&worker, 1, &record(8, 0, 500, 4), next);
+        monitor.apply_pushed_load(&worker, 1, &record(8, 0, 500), next);
         monitor.flush_pushed();
         let snapshot = monitor.load_state.snapshot();
         let report = snapshot.get(stub.url.as_str()).expect("published");
@@ -3734,18 +3711,10 @@ mod native_loads_tests {
 
         // A core-only record, then one that carries a token count and its
         // capacity for a rank the entry names.
-        let core_only = EngineLoad {
-            running_requests: 3,
-            sample: 1,
-            ..Default::default()
-        };
-        let with_tokens = EngineLoad {
-            running_requests: 4,
-            num_used_tokens: Some(2048),
-            max_total_num_tokens: Some(4096),
-            sample: 2,
-            ..Default::default()
-        };
+        let core_only = PushedRecord::requests(3, 0);
+        let with_tokens = PushedRecord::requests(4, 0)
+            .used_tokens(2048)
+            .total_tokens(4096);
         for record in [&core_only, &with_tokens] {
             monitor.apply_pushed_load(&worker, 0, record, Instant::now());
             assert_eq!(

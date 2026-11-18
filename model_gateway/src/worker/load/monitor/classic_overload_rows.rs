@@ -33,9 +33,8 @@ use openai_protocol::{
     worker::{HealthCheckConfig, OverloadUpdate, WorkerStatus},
 };
 use serde::Serialize;
-use smg_grpc_client::common_proto::EngineLoad;
 
-use super::*;
+use super::{tests::PushedRecord, *};
 use crate::worker::{
     health::overload::OverloadThresholds, test_support::LoadReaders, BasicWorkerBuilder,
     WorkerMonitor, WorkerRegistry, WorkerType,
@@ -256,17 +255,17 @@ fn run(gateway: Thresholds, own: Thresholds, ranks: usize, steps: &[Step]) -> Ve
                     }
                 }
                 Step::NoReport => monitor.apply_overload_verdict(&worker, None, "poll"),
-                Step::Record { rank, figures } => monitor.apply_pushed_load(
-                    &worker,
-                    i32::try_from(*rank).expect("a rank fits the record's field"),
-                    &EngineLoad {
-                        waiting_requests: figures.waiting,
-                        token_usage: figures.usage,
-                        active_token_usage: figures.active,
-                        ..EngineLoad::default()
-                    },
-                    now,
-                ),
+                Step::Record { rank, figures } => {
+                    let mut record = PushedRecord::requests(0, count(figures.waiting))
+                        .token_usage(figures.usage);
+                    record.snapshot.active_token_usage = figures.active;
+                    monitor.apply_pushed_load(
+                        &worker,
+                        i32::try_from(*rank).expect("a rank fits the record's field"),
+                        &record,
+                        now,
+                    );
+                }
                 Step::Evict => monitor.evict_worker_loads(&worker),
             }
             worker.is_overloaded()
