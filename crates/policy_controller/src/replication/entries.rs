@@ -108,7 +108,7 @@ pub const ENTRIES: &[(&str, &str, Fate)] = &[
     ("LeasesStore", "get", Fate::Read),
     ("LeasesStore", "expire", Fate::NotYet(PINS)),
     ("LeasesStore", "restore", Fate::Rebuilt(HELLO)),
-    ("LeasesStore", "drop_gateway", Fate::NotYet(PINS)),
+    ("LeasesStore", "drop_gateways", Fate::NotYet(PINS)),
     ("LeasesStore", "live", Fate::Read),
     // The store type's own entries. A generation's apply is its one write:
     // a standby holds the generation applied to it, not its leader's.
@@ -127,6 +127,7 @@ pub const ENTRIES: &[(&str, &str, Fate)] = &[
     ("MemoryStore", "overload_flips", Fate::Read),
     ("MemoryStore", "outside_lists", Fate::Read),
     ("MemoryStore", "publication_allocations", Fate::Read),
+    ("MemoryStore", "publications", Fate::Read),
     ("MemoryStore", "resyncs", Fate::Read),
     ("MemoryStore", "indexed_blocks", Fate::Read),
     ("MemoryStore", "lane_counts", Fate::Read),

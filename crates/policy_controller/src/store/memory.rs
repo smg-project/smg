@@ -420,11 +420,11 @@ impl MemoryStore {
         self.show(&mut loads.writer, world);
     }
 
-    /// Publish the lifting of every veto of `gateway` at once. Called under
-    /// the health lock, as a veto's own write is.
-    fn show_gateway_gone(&self, gateway: GatewayId) {
+    /// Publish the lifting of every veto of the gateways in `gone` at once,
+    /// in one world. Called under the health lock, as a veto's own write is.
+    fn show_gateways_gone(&self, gone: &[GatewayId]) {
         let mut loads = self.loads.lock();
-        let world = loads.writer.drop_gateway(gateway);
+        let world = loads.writer.drop_gateways(gone);
         self.show(&mut loads.writer, world);
     }
 
@@ -543,6 +543,13 @@ impl MemoryStore {
     /// membership write's own rows are not counted.
     pub fn publication_allocations(&self) -> u64 {
         self.loads.lock().writer.allocations()
+    }
+
+    /// How many worlds the store published since it was made. A write that
+    /// changes nothing publishes none, and the gateways one sweep lets go
+    /// leave in one.
+    pub fn publications(&self) -> u64 {
+        self.loads.lock().writer.publications()
     }
 
     /// Give the row of `id` its KV lane as its facts ask
@@ -975,10 +982,14 @@ impl HealthTables {
         });
     }
 
-    /// Drop the gateway's entries on every worker.
-    fn forget_gateway(&mut self, gateway: GatewayId) {
-        self.vetoes.retain(|(owner, _), _| *owner != gateway);
-        self.ok_at.remove(&gateway);
+    /// Drop the entries of every gateway in `gone`, a sorted list, on every
+    /// worker: one pass over the vetoes for them all.
+    fn forget_gateways(&mut self, gone: &[GatewayId]) {
+        self.vetoes
+            .retain(|(owner, _), _| gone.binary_search(owner).is_err());
+        for gateway in gone {
+            self.ok_at.remove(gateway);
+        }
     }
 }
 
@@ -1725,21 +1736,38 @@ impl LeasesStore for MemoryStore {
             .count()
     }
 
-    fn drop_gateway(&self, gateway: GatewayId) -> usize {
-        let released = {
+    fn drop_gateways(&self, gone: &[GatewayId]) -> Vec<usize> {
+        if gone.is_empty() {
+            return Vec::new();
+        }
+        // Sorted once: each table's one pass asks the list by search. A
+        // gateway named twice is found at one place, so its one count is
+        // said twice.
+        let mut sorted = gone.to_vec();
+        sorted.sort_unstable();
+        let mut released = vec![0_usize; sorted.len()];
+        {
             let mut leases = self.leases.lock();
-            let before = leases.records.len();
-            leases.records.retain(|(owner, _), _| *owner != gateway);
-            before - leases.records.len()
-        };
+            leases
+                .records
+                .retain(|(owner, _), _| match sorted.binary_search(owner) {
+                    Ok(at) => {
+                        released[at] += 1;
+                        false
+                    }
+                    Err(_) => true,
+                });
+        }
         // The leases lock nests with no other, so it is let go first. The
-        // gateway's vetoes and completed dispatches leave under the health
+        // gateways' vetoes and completed dispatches leave under the health
         // lock and the published vetoes under the load lock inside it: the
         // order a veto's own write takes.
         let mut health = self.health.lock();
-        health.forget_gateway(gateway);
-        self.show_gateway_gone(gateway);
-        released
+        health.forget_gateways(&sorted);
+        self.show_gateways_gone(&sorted);
+        gone.iter()
+            .map(|gateway| sorted.binary_search(gateway).map_or(0, |at| released[at]))
+            .collect()
     }
 
     fn live(&self, gateway: GatewayId) -> usize {

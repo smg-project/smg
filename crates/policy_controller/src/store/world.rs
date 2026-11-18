@@ -1382,6 +1382,8 @@ pub(super) struct Writer {
     /// frees nothing: not the world, its list of pools, its vetoes, its
     /// derived tables nor its generation.
     worlds: Vec<Arc<World>>,
+    /// How many worlds the writer published.
+    publications: u64,
     /// Every member's rows, sorted by worker id: a worker serving several
     /// models has a row in each model's pool.
     places: Vec<Place>,
@@ -1457,6 +1459,7 @@ impl Writer {
             unlisted: Vec::new(),
             allocations: 0,
             worlds: Vec::new(),
+            publications: 0,
             places: Vec::new(),
             vetoes: Arc::default(),
             pool_vetoes: Arc::default(),
@@ -2486,16 +2489,20 @@ impl Writer {
         Some(self.publish())
     }
 
-    /// Lift every veto of `gateway` and publish at once: the gateway is
-    /// gone past its grace period. Every pool's runs are built again, as
-    /// for a membership write. `None` when the gateway held no veto.
+    /// Lift every veto of the gateways in `gone` and publish once: they
+    /// are gone past their grace period. Every pool's runs are built again,
+    /// once for them all, as for a membership write. `None` when none of
+    /// them held a veto.
     #[must_use]
-    pub(super) fn drop_gateway(&mut self, gateway: GatewayId) -> Option<Arc<World>> {
-        if !self.vetoes.by_gateway.contains_key(&gateway) {
+    pub(super) fn drop_gateways(&mut self, gone: &[GatewayId]) -> Option<Arc<World>> {
+        let held = |gateway: &GatewayId| self.vetoes.by_gateway.contains_key(gateway);
+        if !gone.iter().any(held) {
             return None;
         }
         let mut by_gateway = self.vetoes.by_gateway.clone();
-        by_gateway.remove(&gateway);
+        for gateway in gone {
+            by_gateway.remove(gateway);
+        }
         self.vetoes = Arc::new(Vetoes { by_gateway });
         self.derive_vetoes();
         Some(self.publish())
@@ -2576,7 +2583,14 @@ impl Writer {
         // Rows no world lists and no pool took are freed here, by a write.
         self.unlisted.clear();
         self.waiting = false;
+        self.publications += 1;
         self.world()
+    }
+
+    /// How many worlds the writer published: the first world, made with
+    /// the store, is not one.
+    pub(super) fn publications(&self) -> u64 {
+        self.publications
     }
 
     /// How many times a publication allocated a pool's rows: it found

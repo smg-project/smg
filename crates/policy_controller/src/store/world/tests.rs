@@ -4419,7 +4419,7 @@ fn a_dropped_gateways_vetoes_leave_in_one_publication_and_every_other_stands() {
     assert_eq!(stalled(&store, ASKER, t0), both);
 
     let before = store.world();
-    store.drop_gateway(ASKER);
+    store.drop_gateways(&[ASKER]);
     assert_eq!(stalled(&store, ASKER, t0), []);
     assert_eq!(
         stalled(&store, other, t0),
@@ -4432,9 +4432,42 @@ fn a_dropped_gateways_vetoes_leave_in_one_publication_and_every_other_stands() {
         !Arc::ptr_eq(&before, &lifted),
         "the lifting is a publication"
     );
-    store.drop_gateway(ASKER);
-    store.drop_gateway(GatewayId(3));
+    store.drop_gateways(&[ASKER]);
+    store.drop_gateways(&[GatewayId(3)]);
     assert!(Arc::ptr_eq(&lifted, &store.world()));
+}
+
+#[test]
+fn gateways_dropped_together_leave_in_one_publication() {
+    let store = MemoryStore::new();
+    let t0 = Instant::now();
+    let until = t0 + Duration::from_secs(60);
+    let one = member(&store, "http://a:8000");
+    let two = member(&store, "http://b:8000");
+    let (second, other) = (GatewayId(7), GatewayId(8));
+    store.gateway_veto(ASKER, one, Some(until));
+    store.gateway_veto(second, two, Some(until));
+    store.gateway_veto(other, two, Some(until));
+
+    let published = store.publications();
+    store.drop_gateways(&[second, ASKER]);
+    assert_eq!(store.publications(), published + 1, "one world for the two");
+    assert_eq!(stalled(&store, ASKER, t0), []);
+    assert_eq!(stalled(&store, second, t0), []);
+    assert_eq!(
+        stalled(&store, other, t0),
+        [two],
+        "another gateway's stands"
+    );
+    // Gateways that hold no veto, and no gateway at all: no world is made.
+    store.drop_gateways(&[second, ASKER, GatewayId(9)]);
+    store.drop_gateways(&[]);
+    assert_eq!(store.publications(), published + 1);
+    // A gateway that holds no veto, listed ahead of one that does, hides
+    // nothing: the holder's veto leaves in a world.
+    store.drop_gateways(&[GatewayId(2), other]);
+    assert_eq!(store.publications(), published + 2);
+    assert_eq!(stalled(&store, other, t0), []);
 }
 
 /// A generation that declares the view's three lists.

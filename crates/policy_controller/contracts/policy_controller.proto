@@ -197,7 +197,8 @@ message Hello {
   // The length of `vetoes`: a Hello that counts otherwise is refused.
   uint32 veto_count = 10;
   // A reconnect inside the grace period: restore exactly what the pages list
-  // and release at once what they omit (the inverse rule, design 4.3).
+  // and release at once what they omit (the inverse rule, design 4.3). The
+  // vetoes are no page's: `vetoes` below lists them whole.
   bool resume = 11;
   // The gateway's release string, for the audit log.
   string version = 16;
@@ -219,7 +220,9 @@ message Locality {
   repeated string topology = 2;
 }
 
-// At most 64 KB a page (about 900 leases); the counts in Hello size the whole.
+// At most 64 KB a page (about 900 leases); the lease and pin counts in Hello
+// size the whole. Vetoes ride Hello.vetoes and never a page: no build reads
+// `vetoes` here.
 message HelloPage {
   repeated LeaseAssertion leases = 1;
   repeated Pin pins = 2;

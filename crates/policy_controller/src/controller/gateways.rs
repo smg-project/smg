@@ -214,6 +214,16 @@ impl Row {
         });
         self.held = self.vetoes.values().map(Vec::len).sum();
     }
+
+    /// The ends of workers whose rows left since they were noted go: the
+    /// store shows no veto of `gateway` on them. One question a noted
+    /// worker, asked where a gateway's ceiling stands in the way of a frame
+    /// and nowhere else.
+    fn left(&mut self, store: &MemoryStore, gateway: GatewayId, now: Instant) {
+        self.vetoes
+            .retain(|worker, _| store.vetoed(gateway, *worker, now));
+        self.held = self.vetoes.values().map(Vec::len).sum();
+    }
 }
 
 impl Seat {
@@ -355,7 +365,7 @@ impl Gateways {
             .is_some_and(|row| self.over(row, now))
         {
             if let Some(row) = table.rows.remove(&gateway) {
-                self.end(gateway, row);
+                self.end(vec![(gateway, row)]);
             }
         }
         match table.rows.get(&gateway) {
@@ -425,8 +435,8 @@ impl Gateways {
     }
 
     /// One pass of the sweep at `now`: every gateway whose period is over
-    /// is let go. Returns how many were let go. A replica that does not
-    /// lead at `now` lets nothing go.
+    /// is let go, in one write of the store for them all. Returns how many
+    /// were let go. A replica that does not lead at `now` lets nothing go.
     pub(crate) fn sweep(&self, now: Instant) -> usize {
         let mut table = self.table.lock();
         if !Self::observe(&mut table, self.fence.leader_term(now), now) {
@@ -435,18 +445,13 @@ impl Gateways {
         for row in table.rows.values_mut() {
             row.prune(now);
         }
-        let over: Vec<GatewayId> = table
+        let over: Vec<(GatewayId, Row)> = table
             .rows
-            .iter()
-            .filter(|(_, row)| self.over(row, now))
-            .map(|(gateway, _)| *gateway)
+            .extract_if(|_, row| self.over(row, now))
             .collect();
-        for gateway in &over {
-            if let Some(row) = table.rows.remove(gateway) {
-                self.end(*gateway, row);
-            }
-        }
-        over.len()
+        let let_go = over.len();
+        self.end(over);
+        let_go
     }
 
     /// The sweep's task: a pass every tenth of the grace period until
@@ -517,8 +522,13 @@ impl Gateways {
                         break Vetoed::Full;
                     }
                     // One veto more than a gateway holds, once the ends
-                    // past their instants are out of the count.
+                    // past their instants are out of the count, and then
+                    // the ends of rows that left: the ceiling counts the
+                    // vetoes the store shows.
                     row.prune(now);
+                    if row.held + ends.len() >= VETOES_MAX {
+                        row.left(&self.store, gateway, now);
+                    }
                     if row.held + ends.len() >= VETOES_MAX {
                         break Vetoed::Over;
                     }
@@ -651,19 +661,23 @@ impl Gateways {
         })
     }
 
-    /// The end of a presence, under the table's lock: what the store holds
-    /// for the gateway (its lease records, its vetoes and its completions)
-    /// is let go through the store's one door for a gone gateway, then the
-    /// row goes and its decide streams are told.
-    fn end(&self, gateway: GatewayId, row: Row) {
-        let leases = self.store.drop_gateway(gateway);
-        info!(
-            gateway = %row.subject,
-            leases,
-            vetoed = row.vetoes.len(),
-            "a gateway's grace period ended with no new Hello: its leases and its vetoes are released"
-        );
-        drop(row);
+    /// The end of presences, under the table's lock: what the store holds
+    /// for each gateway (its lease records, its vetoes and its completions)
+    /// is let go through the store's one door for a gone gateway, in one
+    /// write for them all, then the rows go and their decide streams are
+    /// told.
+    fn end(&self, gone: Vec<(GatewayId, Row)>) {
+        let gateways: Vec<GatewayId> = gone.iter().map(|(gateway, _)| *gateway).collect();
+        let leases = self.store.drop_gateways(&gateways);
+        for ((_, row), leases) in gone.iter().zip(leases) {
+            info!(
+                gateway = %row.subject,
+                leases,
+                vetoed = row.vetoes.len(),
+                "a gateway's grace period ended with no new Hello: its leases and its vetoes are released"
+            );
+        }
+        drop(gone);
     }
 
     /// The session `session` of `gateway` ended at `now`: its grace period
@@ -1457,6 +1471,36 @@ pub(crate) mod tests {
         drop(stands);
     }
 
+    /// One pass lets every gateway whose period is over go in one write of
+    /// the store: their vetoes leave in one publication, and a present
+    /// gateway's stands. A pass that lets none go publishes nothing.
+    #[test]
+    fn a_pass_lets_its_gateways_go_in_one_publication_of_the_store() {
+        let (_elector, store, gateways, t0) = leading(GRACE);
+        let w = worker(&store, "http://a:8000");
+        let until = t0 + 100 * GRACE;
+        let stands = welcomed(&gateways, C, "gateway-c", TERM, t0);
+        assert_eq!(stands.veto(w, BREAKER, Some(until), t0), Vetoed::Shown);
+        for (gateway, subject) in [(A, "gateway-a"), (B, "gateway-b")] {
+            let gone = welcomed(&gateways, gateway, subject, TERM, t0);
+            assert_eq!(gone.veto(w, BREAKER, Some(until), t0), Vetoed::Shown);
+            gone.end(t0);
+        }
+
+        let published = store.publications();
+        assert_eq!(gateways.sweep(t0 + GRACE - MS), 0);
+        assert_eq!(store.publications(), published);
+        assert_eq!(gateways.sweep(t0 + GRACE), 2);
+        assert_eq!(
+            store.publications(),
+            published + 1,
+            "one world for the pass"
+        );
+        assert!(!store.vetoed(A, w, t0 + GRACE) && !store.vetoed(B, w, t0 + GRACE));
+        assert!(store.vetoed(C, w, t0 + GRACE), "a present gateway's stands");
+        drop(stands);
+    }
+
     #[test]
     fn a_replaced_sessions_veto_writes_nothing() {
         let (_elector, store, gateways, t0) = leading(GRACE);
@@ -1628,6 +1672,42 @@ pub(crate) mod tests {
         );
         assert!(store.vetoed(A, one_more, t0 + 5 * S));
         assert_eq!(gateways.kept(A), VETOES_MAX - KINDS_MAX + 1);
+        drop(seat);
+    }
+
+    /// A gateway's ceiling counts the vetoes the store shows: the ends of
+    /// workers whose rows left go before the refusal, and the frame that
+    /// would set one more is taken.
+    #[test]
+    fn a_gateways_ceiling_counts_no_end_of_a_row_that_left() {
+        let (_elector, store, gateways, t0) = leading(GRACE);
+        let seat = welcomed(&gateways, A, "gateway-a", TERM, t0);
+        let kinds = i32::try_from(KINDS_MAX).expect("a small number");
+        let workers: Vec<WorkerId> = (0..VETOES_MAX / KINDS_MAX)
+            .map(|n| worker(&store, &format!("http://w{n}:8000")))
+            .collect();
+        let list: Vec<(WorkerId, i32, Instant)> = workers
+            .iter()
+            .flat_map(|&w| (1..=kinds).map(move |kind| (w, kind, t0 + 60 * S)))
+            .collect();
+        assert_eq!(seat.restore(&list, t0), VETOES_MAX);
+        // Every row but the first leaves, and its vetoes with it: the note
+        // still holds their ends.
+        for &w in &workers[1..] {
+            let revision = WorkersStore::get(&*store, w).expect("the row").revision;
+            WorkersStore::remove(&*store, w, revision).expect("removed");
+        }
+        assert_eq!(gateways.kept(A), VETOES_MAX);
+
+        // One veto more, on a worker that holds none: the ends of the rows
+        // that left go, and the veto is shown.
+        let one_more = worker(&store, "http://one-more:8000");
+        assert_eq!(
+            seat.veto(one_more, BREAKER, Some(t0 + 60 * S), t0 + S),
+            Vetoed::Shown
+        );
+        assert!(store.vetoed(A, one_more, t0 + S));
+        assert_eq!(gateways.kept(A), KINDS_MAX + 1);
         drop(seat);
     }
 
