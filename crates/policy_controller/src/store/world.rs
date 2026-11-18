@@ -1640,8 +1640,9 @@ struct EngineRows {
     /// first, and how many.
     at: u32,
     len: u32,
-    /// A row of the engine has a threshold. An engine with none is not
-    /// judged at a write: its rows' bits are clear and stay so.
+    /// A row of the engine has a threshold, or an answer left one of its
+    /// ranks unnamed. An engine with neither is not judged at a write: its
+    /// rows' bits are clear and stay so.
     judged: bool,
     /// The last word of the engine's poll was that no report came: its
     /// verdict reads clear, whatever is on file, until its next record or
@@ -1809,6 +1810,15 @@ pub(super) struct Writer {
     judging: bool,
     /// How many engines' last word was that no report came.
     silenced: u32,
+    /// The ranks an engine's last answer left unnamed beside a rank it
+    /// named, each by its member and its rank's number, sorted. A rank
+    /// stands here until an answer or a record names it again, or its
+    /// member's rows go. While a rank the answer named has a record on
+    /// file, an unnamed rank's rows carry the overload bit
+    /// ([`Self::judge`]): no decision takes a rank its engine stopped
+    /// naming while another answers. Empty until an answer names part of
+    /// an engine.
+    unnamed: Vec<(WorkerId, u16)>,
     /// How many writes to the load table moved an overload verdict.
     flips: u64,
     /// The standing members outside the standing generation's lists.
@@ -1866,6 +1876,7 @@ impl Writer {
             sample_bound: None,
             judging: false,
             silenced: 0,
+            unnamed: Vec::new(),
             flips: 0,
             outside: OutsideLists::default(),
             listed: Vec::new(),
@@ -2088,7 +2099,9 @@ impl Writer {
     fn judge_every(&mut self) {
         self.judging = false;
         for index in 0..self.engines.len() {
-            let has = self.has_threshold(index);
+            // A rank stands unnamed only while the writer judges: a record
+            // reads a mark behind that one test.
+            let has = self.has_threshold(index) || self.unnamed_in(index);
             self.judging |= has;
             let Some(engine) = self.engines.get_mut(index) else {
                 continue;
@@ -2113,7 +2126,10 @@ impl Writer {
     /// own pair: the value its registration names, else its pool's
     /// binding's. An engine with nothing on file reads clear, and so does
     /// one whose last poll brought no report. An engine no row of which
-    /// has a threshold is not judged.
+    /// has a threshold is not judged, unless an answer left a rank of it
+    /// unnamed ([`Self::name`]): that rank's rows carry the bit while a
+    /// rank the answer named has a record on file, whatever the
+    /// thresholds say, and with no such rank it reads as its engine does.
     fn judge(&mut self, engine: u32) -> bool {
         let Self {
             engines,
@@ -2121,6 +2137,7 @@ impl Writer {
             working,
             heard,
             sample_bound,
+            unnamed,
             ..
         } = self;
         let Some(engine) = engines.get(engine as usize).filter(|engine| engine.judged) else {
@@ -2133,6 +2150,16 @@ impl Writer {
                 .and_then(|pool| pool.rows.get(at.row as usize))
                 .and_then(|row| row.load)
         };
+        // A rank the engine's last answer left unnamed is avoided while a
+        // rank that answer named has a record on file: alone it answers.
+        let is_unnamed = |id: WorkerId, rank: u16| unnamed.binary_search(&(id, rank)).is_ok();
+        let named = !unnamed.is_empty()
+            && rows.iter().filter(|at| at.rank).any(|at| {
+                working
+                    .get(at.pool as usize)
+                    .and_then(|pool| pool.rows.get(at.row as usize))
+                    .is_some_and(|row| row.load.is_some() && !is_unnamed(row.id, row.dp_rank))
+            });
         // A sample is a fact while its engine still says it: once a report
         // period is told, a rank whose receipt lies further behind the
         // engine's newest than the bound is not counted. One rank's sample
@@ -2200,6 +2227,7 @@ impl Writer {
             let Some(row) = pool.rows.get_mut(row as usize) else {
                 continue;
             };
+            let over = over || (named && is_unnamed(row.id, row.dp_rank));
             if row.health.overloaded != over {
                 row.health.overloaded = over;
                 pool.dirty = true;
@@ -2247,18 +2275,34 @@ impl Writer {
 
     /// A record received at `at` changed what is on file for the member
     /// whose first place stands at `place`: its engine is heard, and
-    /// judged once ([`Self::judged`]). While no engine has a threshold
-    /// and none is silent there is no word to end and no verdict to
-    /// move, and the write reads no engine.
-    pub(super) fn recorded(&mut self, place: u32, at: Instant) -> bool {
+    /// judged once ([`Self::judged`]). The record names its rank, so a
+    /// mark an answer left on it ends ([`Self::named_again`]). While no engine
+    /// has a threshold, none is silent and no rank stands unnamed there
+    /// is no word to end and no verdict to move, and the write reads no
+    /// engine and no mark.
+    pub(super) fn recorded(&mut self, place: u32, id: WorkerId, rank: u16, at: Instant) -> bool {
         if !self.judging && self.silenced == 0 {
             return false;
+        }
+        if !self.unnamed.is_empty() {
+            self.named_again(id, rank);
         }
         let Some(engine) = self.engine_at(place) else {
             return false;
         };
         self.hear(place, at);
         self.judged(engine, true)
+    }
+
+    /// A record names its rank again, which ends the mark an answer left
+    /// on the rank ([`Self::name`]). Cold and out of line: the record door
+    /// runs at every pushed record and comes here only while a mark
+    /// stands, and with this step inlined a record paid for it in a store
+    /// that holds no mark.
+    #[cold]
+    #[inline(never)]
+    fn named_again(&mut self, id: WorkerId, rank: u16) {
+        self.name(id, rank, false);
     }
 
     /// The member whose first place stands at `place` was heard at `at`:
@@ -2349,6 +2393,80 @@ impl Writer {
         let was = mem::replace(&mut rows.silent, true);
         self.silenced += u32::from(!was);
         self.judged(engine, false)
+    }
+
+    /// The engine's last answer named another of its ranks and not `rank`
+    /// of the member `id` (`unnamed`), or an answer or a record names the
+    /// rank again. The caller judges the engine once its write is whole
+    /// ([`Self::judged`]). From the mark on the engine is judged at each
+    /// write, threshold or none, until a membership write or a generation
+    /// finds it with no mark and no threshold. Whether the mark moved.
+    pub(super) fn name(&mut self, id: WorkerId, rank: u16, unnamed: bool) -> bool {
+        match (self.unnamed.binary_search(&(id, rank)), unnamed) {
+            (Err(at), true) => {
+                self.unnamed.insert(at, (id, rank));
+                let engine = self
+                    .engine_of(id)
+                    .and_then(|engine| self.engines.get_mut(engine as usize));
+                if let Some(engine) = engine {
+                    engine.judged = true;
+                }
+                self.judging = true;
+                true
+            }
+            (Ok(at), false) => {
+                self.unnamed.remove(at);
+                // The last mark went: every engine is judged once more, and
+                // one with no threshold is judged at no write after it.
+                if self.unnamed.is_empty() {
+                    self.judge_every();
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether any rank stands unnamed: a door's one test before it reads
+    /// an answer or a record for a mark.
+    pub(super) fn any_unnamed(&self) -> bool {
+        !self.unnamed.is_empty()
+    }
+
+    /// The member's rows went with an eviction: its ranks' marks go with
+    /// them, and a rank with nothing on file is a rank again. Whether a
+    /// mark went.
+    pub(super) fn forget(&mut self, id: WorkerId) -> bool {
+        let before = self.unnamed.len();
+        self.unnamed.retain(|&(member, _)| member != id);
+        let went = self.unnamed.len() != before;
+        if went && self.unnamed.is_empty() {
+            self.judge_every();
+        }
+        went
+    }
+
+    /// The marks of the members a membership write removed go with them.
+    fn forget_gone(&mut self) {
+        let Self {
+            unnamed, places, ..
+        } = self;
+        unnamed.retain(|&(id, _)| places_of(places, id).next().is_some());
+    }
+
+    /// Whether an answer left a rank of the engine unnamed.
+    fn unnamed_in(&self, engine: usize) -> bool {
+        !self.unnamed.is_empty()
+            && self.engines.get(engine).is_some_and(|engine| {
+                rows_of(&self.engine_rows, engine).iter().any(|at| {
+                    self.working
+                        .get(at.pool as usize)
+                        .and_then(|pool| pool.rows.get(at.row as usize))
+                        .is_some_and(|row| {
+                            self.unnamed.binary_search(&(row.id, row.dp_rank)).is_ok()
+                        })
+                })
+            })
     }
 
     /// How many writes to the load table moved an overload verdict.
@@ -2787,8 +2905,11 @@ impl Writer {
         // write with no pair in any pool and none of a member's own has no
         // engine to judge. A pool's rows are cut for the publication after
         // that judgment, so the write copies each pool once, with a
-        // verdict on it or none.
-        if self.bind() || owned {
+        // verdict on it or none. A rank an answer left unnamed keeps its
+        // mark across the write while its member stands, and its engine
+        // is judged for it.
+        self.forget_gone();
+        if self.bind() || owned || !self.unnamed.is_empty() {
             self.judge_every();
         } else {
             self.judging = false;
@@ -3100,6 +3221,18 @@ impl Writer {
     /// every world. A membership write's own rows are not counted.
     pub(super) fn allocations(&self) -> u64 {
         self.allocations
+    }
+
+    /// How many ranks stand unnamed by their engine's last answer.
+    #[cfg(test)]
+    pub(super) fn unnamed_ranks(&self) -> usize {
+        self.unnamed.len()
+    }
+
+    /// Whether a load write is judged ([`Self::recorded`]).
+    #[cfg(test)]
+    pub(super) fn judges_writes(&self) -> bool {
+        self.judging
     }
 
     /// How many rows that left their pool the writer still keeps.

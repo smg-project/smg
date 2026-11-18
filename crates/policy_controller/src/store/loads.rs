@@ -74,6 +74,14 @@ pub struct LoadSample {
 /// told how often it hears a rank ([`LoadSink::heard_every`]), a judgment
 /// counts a rank's sample only while its engine still says it.
 ///
+/// A rank its engine stops naming is avoided at once. Where an answer
+/// brings a row for one rank of an engine and none for another, the rank it
+/// left out carries the overload bit on its rows while a rank the answer
+/// named has a record on file, whether or not a threshold stands. The mark
+/// ends when an answer or a record names the rank again, and goes with the
+/// member's rows. A rank alone is never avoided: with no named rank on file
+/// it reads as its engine does.
+///
 /// A worker's rows live exactly as long as its membership row: the write
 /// that removes or replaces the worker deletes them, and a record or a
 /// report for a worker that is not a member is dropped, so a read that lands
@@ -95,9 +103,11 @@ pub trait LoadSink: Send + Sync {
     /// answer brought, or `None` where it brought none. The rows are
     /// written and the engine is judged once, so two ranks that trade
     /// their load in one answer are never read as one new rank beside one
-    /// old. A rank the answer omits keeps what is on file. An answer with
-    /// no row for any rank of an engine is the word that no report came:
-    /// nothing on file changes, and the engine's overload verdict reads
+    /// old. A rank the answer omits keeps what is on file, and beside a
+    /// rank the answer names it is avoided from this write on. An answer
+    /// with no row for any rank of an engine is the word that no report
+    /// came: nothing on file changes, no rank is marked or named again,
+    /// and the engine's overload verdict reads
     /// clear until its next record or report. The word stands over no
     /// engine a rank of which pushed since the poll began, whether the
     /// answer names that rank or not. Whether a stream still serves a

@@ -29,11 +29,20 @@
 //! An overload row picks nothing: it holds whether the gateway read one
 //! worker as overloaded after each write of its loads, and must replay
 //! verdict for verdict.
+//! A minimum-tokens row holds the rank each request took on one worker, and
+//! must replay rank for rank. A sticky rank row holds the rank each request
+//! of one grouped worker was pinned to by its key. Two hashes place no key
+//! alike, so it must replay with the requests of one key on one rank, and
+//! a counted row count for count or share for share.
 //! No row is decided differently but where its module names it. The store
 //! judges an engine by rules of its own, and the overload module holds a
 //! recorded row they decide apart from the gateway to the verdicts its
 //! entry gives. The prefix hash module holds a recorded row that a key of
 //! whole blocks cannot decide as recorded to the outcome its entry gives.
+//! The store decides a rank by rules of its own too: the minimum-tokens
+//! module holds a recorded row they decide apart to the ranks its entry
+//! gives, and the sticky rank module holds a row on which the gateway sets
+//! no rank to a rank of the worker for every request.
 //! A row whose form this crate does not build yet is owed: [`OWED`] names
 //! it with the validator's words and the
 //! change that builds it, and the replay fails once the row is no longer
@@ -55,10 +64,12 @@ mod classic {
     pub mod bucket;
     pub mod encode_pair;
     pub mod manual;
+    pub mod minimum_tokens;
     pub mod overload;
     pub mod pair_index;
     pub mod power_of_two;
     pub mod prefix_hash;
+    pub mod sticky_rank;
 }
 
 /// What a row recorded, and what its replay gives in the same shape: the
@@ -281,11 +292,13 @@ const fn module<R: Recorded>(inline: &'static str) -> Module {
 /// rows and the pair index's rows pick nothing, so each of the two modules
 /// brings its own replay and its own rule for a copied row. The prefix
 /// hash module brings its own replay too, which holds the rows it names
-/// apart to its entries.
+/// apart to its entries. A rank row names a rank or none, so the
+/// minimum-tokens module and the sticky rank module bring their own replays
+/// as well, and hold a copied row whole, as the overload module does.
 /// An encode-pair row is replayed in its store part by its own module;
 /// its copied rows name no runtime either, and the pair index's rule
 /// holds them.
-const MODULES: [Module; 8] = [
+const MODULES: [Module; 10] = [
     module::<classic::all_vetoed::Row>(classic::all_vetoed::INLINE),
     module::<classic::bucket::Row>(classic::bucket::INLINE),
     Module {
@@ -295,6 +308,12 @@ const MODULES: [Module; 8] = [
         copied: classic::pair_index::copied_row_defects,
     },
     module::<classic::manual::Row>(classic::manual::INLINE),
+    Module {
+        policy: classic::minimum_tokens::POLICY,
+        inline: classic::minimum_tokens::INLINE,
+        replay: classic::minimum_tokens::replay_rows,
+        copied: classic::overload::copied_row_defects,
+    },
     Module {
         policy: classic::overload::POLICY,
         inline: classic::overload::INLINE,
@@ -313,6 +332,12 @@ const MODULES: [Module; 8] = [
         inline: classic::prefix_hash::INLINE,
         replay: classic::prefix_hash::replay_rows,
         copied: copied_row_defects,
+    },
+    Module {
+        policy: classic::sticky_rank::POLICY,
+        inline: classic::sticky_rank::INLINE,
+        replay: classic::sticky_rank::replay_rows,
+        copied: classic::overload::copied_row_defects,
     },
 ];
 
@@ -584,6 +609,13 @@ fn the_classic_manual_rows_replay_pick_for_pick_and_share_for_share() {
 }
 
 #[test]
+fn the_classic_minimum_tokens_rows_replay_rank_for_rank() {
+    let (rows, defects) = replay_sheet(classic::minimum_tokens::INLINE, "the inline rows");
+    assert!(rows >= 8, "{rows} inline rows");
+    assert!(defects.is_empty(), "{defects:#?}");
+}
+
+#[test]
 fn the_classic_overload_rows_replay_verdict_for_verdict() {
     let (rows, defects) = replay_sheet(classic::overload::INLINE, "the inline rows");
     assert!(rows >= 8, "{rows} inline rows");
@@ -593,6 +625,13 @@ fn the_classic_overload_rows_replay_verdict_for_verdict() {
 #[test]
 fn the_classic_prefix_hash_rows_replay_pick_for_pick_and_share_for_share() {
     let (rows, defects) = replay_sheet(classic::prefix_hash::INLINE, "the inline rows");
+    assert!(rows >= 8, "{rows} inline rows");
+    assert!(defects.is_empty(), "{defects:#?}");
+}
+
+#[test]
+fn the_classic_sticky_rank_rows_replay_rank_for_rank_and_count_for_count() {
+    let (rows, defects) = replay_sheet(classic::sticky_rank::INLINE, "the inline rows");
     assert!(rows >= 8, "{rows} inline rows");
     assert!(defects.is_empty(), "{defects:#?}");
 }
@@ -1061,10 +1100,12 @@ fn every_json_file_of_the_directory_is_a_sheet_to_answer_for() {
             "bucket.json",
             "encode_pair.json",
             "manual.json",
+            "minimum_tokens.json",
             "overload.json",
             "pair-index.json",
             "power_of_two.json",
             "prefix_hash.json",
+            "sticky_rank.json",
             "stray.json",
         ]
     );

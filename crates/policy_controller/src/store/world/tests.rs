@@ -34,6 +34,7 @@ mod membership_call;
 mod mode_and_overload;
 mod pool_binding;
 mod repeated_models;
+mod unnamed_rank;
 mod written;
 
 const MODEL: &str = "m";
@@ -4150,7 +4151,9 @@ fn a_poll_s_rows_are_heard_at_the_instant_their_poll_began() {
     store.report(&omitting, at(30), LoadSource::Poll);
     assert_eq!(overloaded(&store, at(30)), [zero, one]);
     store.report(&omitting, at(31), LoadSource::Poll);
-    assert_eq!(overloaded(&store, at(31)), []);
+    // The engine's verdict ends with the sample. The rank its answers
+    // leave out beside rank 0 stays avoided.
+    assert_eq!(overloaded(&store, at(31)), [one]);
 }
 
 #[test]

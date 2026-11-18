@@ -726,6 +726,19 @@ impl MemoryStore {
         self.loads.lock().ranks.len()
     }
 
+    /// How many ranks stand unnamed by their engine's last answer.
+    #[cfg(test)]
+    pub(super) fn unnamed_ranks(&self) -> usize {
+        self.loads.lock().writer.unnamed_ranks()
+    }
+
+    /// Whether a load write is judged: an engine has a threshold, or a rank
+    /// stands unnamed.
+    #[cfg(test)]
+    pub(super) fn judges_writes(&self) -> bool {
+        self.loads.lock().writer.judges_writes()
+    }
+
     /// How many rows that left their pool the writer still keeps.
     #[cfg(test)]
     pub(super) fn held_rows(&self) -> usize {
@@ -1508,7 +1521,7 @@ impl LoadSink for MemoryStore {
             journal.load(id, rank, &sample);
         }
         if let Some(place) = writer.fold_load(id, rank, Some(&sample)) {
-            writer.recorded(place, received_at);
+            writer.recorded(place, id, rank, received_at);
             let world = writer.folded_at(received_at);
             self.show(writer, world);
         }
@@ -1531,6 +1544,7 @@ impl LoadSink for MemoryStore {
         // and each engine is heard by its own ranks' rows.
         let mut first: Option<(u32, bool)> = None;
         let mut others: Vec<(u32, bool)> = Vec::new();
+        let mut omits = false;
         for &(id, rank, row) in answer {
             // A report that lands after its worker left (the poll was out
             // when the row went) finds no entry and is dropped.
@@ -1564,7 +1578,10 @@ impl LoadSink for MemoryStore {
                     (engine, true)
                 }
                 // A rank the answer omits keeps what is on file.
-                None => (writer.engine_of(id), false),
+                None => {
+                    omits = true;
+                    (writer.engine_of(id), false)
+                }
             };
             let Some(engine) = engine else {
                 continue;
@@ -1581,6 +1598,33 @@ impl LoadSink for MemoryStore {
         let Some(first) = first else {
             return;
         };
+        // A rank an answer leaves unnamed beside a rank it names is marked,
+        // and a rank an answer names is named again: read once the
+        // answer's engines are known and before any is judged. An answer
+        // with no row for an engine is the word that none came, which
+        // moves no mark, and a rank that pushed since the poll began
+        // named itself.
+        if omits || writer.any_unnamed() {
+            for &(id, rank, row) in answer {
+                let pushed = table
+                    .get(&id)
+                    .is_none_or(|ranks| ranks.pushed_since(rank, polled_at));
+                if pushed {
+                    continue;
+                }
+                let Some(engine) = writer.engine_of(id) else {
+                    continue;
+                };
+                let heard = if first.0 == engine {
+                    first.1
+                } else {
+                    others.iter().any(|seen| seen.0 == engine && seen.1)
+                };
+                if heard {
+                    writer.name(id, rank, row.is_none());
+                }
+            }
+        }
         let mut changed = false;
         for (engine, heard) in std::iter::once(first).chain(others) {
             changed |= if heard {
@@ -1673,8 +1717,16 @@ impl LoadSink for MemoryStore {
                 folded = writer.fold_load(id, rank, None).or(folded);
             }
             *ranks = Ranks::default();
-            if let Some(place) = folded {
-                if let Some(engine) = writer.engine_at(place) {
+            // The member's marks go with its rows: a rank with nothing on
+            // file is a rank again, and its engine is judged for it.
+            let forgot = writer.forget(id);
+            let engine = match folded {
+                Some(place) => writer.engine_at(place),
+                None if forgot => writer.engine_of(id),
+                None => None,
+            };
+            if folded.is_some() || forgot {
+                if let Some(engine) = engine {
                     writer.judged(engine, false);
                 }
                 let world = writer.folded();
