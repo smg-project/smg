@@ -89,6 +89,10 @@ pub(crate) struct LateBoundModel {
     /// What the one-pass read of a BPE section saw, for the loader's own
     /// tables; `None` for a model built in memory or read by the crate.
     read: Option<ReadBpe>,
+    /// Whether the crate's reader made a Unigram model of the section: the
+    /// scores are then that reader's, and the loader reads the section once
+    /// more for them ([`unigram_scores::of_file`]).
+    rescore: bool,
 }
 
 /// What the one-pass read of a BPE section saw that the loader's own tables
@@ -257,6 +261,12 @@ impl LateBoundModel {
     pub(crate) fn bound(&self, words: usize) {
         self.words.store(words, Ordering::Relaxed);
     }
+
+    /// Whether the crate's reader made a Unigram model of the section, so
+    /// that the loader reads the section once more for its scores.
+    pub(crate) fn rescore(&self) -> bool {
+        self.rescore
+    }
 }
 
 impl ModelView for LateBoundModel {
@@ -275,6 +285,7 @@ impl From<ModelWrapper> for LateBoundModel {
             model,
             words: AtomicUsize::new(HuggingFaceTokenizer::BPE_WORDS_CACHED_PER_THREAD),
             read: None,
+            rescore: false,
         }
     }
 }
@@ -286,6 +297,7 @@ impl From<LateBoundModel> for ModelWrapper {
             mut model,
             words,
             read: _,
+            rescore: _,
         } = late;
         if let ModelWrapper::BPE(bpe) = &mut model {
             bpe.resize_cache(words.into_inner());
@@ -322,14 +334,17 @@ impl<'de> Deserialize<'de> for LateBoundModel {
 /// order of its keys (`type`, `unk_id`, `vocab`, `byte_fallback`): the
 /// entries are read until one tells the kind, which is the value of `type`
 /// or a vocabulary that is a list of pieces with their scores. Any other
-/// entry is held until then, so a `type` behind any key still tells the
-/// kind. A section that has shown a key of another kind (`unk_token`,
-/// `dropout` and the like) and not yet its `type` goes to the crate's own
-/// reader when its vocabulary or its merges come, that value unread, so an
-/// older file of another kind, written without `type`, loads at the cost
-/// it had. Any other section (another model kind, a BPE section with `type`
-/// later) goes to the crate's own reader as well, which streams it as
-/// before with the entries already read put back in front.
+/// entry is held until then, so a `type` behind it still tells the kind.
+/// The merges of a BPE section, and the vocabulary of a section that has
+/// shown a key of another kind (`unk_token`, `dropout` and the like) and
+/// not yet its `type`, hand the section to the crate's own reader, that
+/// value unread, so a file of another kind, written without `type` or with
+/// its keys sorted, loads at the cost it had. Any other section (another
+/// model kind, a BPE section with `type` later) goes to the crate's own
+/// reader as well, which streams it as before with the entries already read
+/// put back in front. When that reader makes a Unigram model of a section,
+/// the loader reads the section once more for its scores
+/// ([`unigram_scores::of_file`]).
 struct ModelSection;
 
 impl<'de> Visitor<'de> for ModelSection {
@@ -360,9 +375,14 @@ impl<'de> Visitor<'de> for ModelSection {
                     read.push((key, Value::String(kind)));
                     break;
                 }
-                // Behind a key of another kind the crate's reader takes the
-                // section from here, with this value unread.
-                "vocab" | "merges" if another => {
+                // The merges of a BPE section, wherever they stand, and the
+                // vocabulary behind a key of another kind: the crate's
+                // reader takes the section from here, with this value unread.
+                "merges" => {
+                    pending = Some(key);
+                    break;
+                }
+                "vocab" if another => {
                     pending = Some(key);
                     break;
                 }
@@ -386,7 +406,6 @@ impl<'de> Visitor<'de> for ModelSection {
                 | "end_of_word_suffix"
                 | "fuse_unk"
                 | "ignore_merges"
-                | "merges"
                 | "max_input_chars_per_word" => {
                     another = true;
                     read.push((key, map.next_value()?));
@@ -399,10 +418,15 @@ impl<'de> Visitor<'de> for ModelSection {
                 _ => read.push((key, map.next_value()?)),
             }
         }
-        ModelWrapper::deserialize(de::value::MapAccessDeserializer::new(Replay::new(
+        let model = ModelWrapper::deserialize(de::value::MapAccessDeserializer::new(Replay::new(
             read, pending, map,
-        )))
-        .map(LateBoundModel::from)
+        )))?;
+        // A Unigram model from the crate's reader has that reader's scores.
+        let rescore = matches!(model, ModelWrapper::Unigram(_));
+        Ok(LateBoundModel {
+            rescore,
+            ..LateBoundModel::from(model)
+        })
     }
 }
 
@@ -533,6 +557,7 @@ fn bpe_section<'de, A: MapAccess<'de>>(mut map: A) -> Result<LateBoundModel, A::
         model: ModelWrapper::BPE(model),
         words: AtomicUsize::new(HuggingFaceTokenizer::BPE_WORDS_CACHED_PER_THREAD),
         read: Some(read),
+        rescore: false,
     })
 }
 
@@ -868,6 +893,23 @@ mod tests {
     }
 
     #[test]
+    fn only_a_unigram_model_of_the_crate_reader_asks_for_a_second_read() {
+        // A Unigram section the section's own reader takes, named and
+        // unnamed; a BPE section in one pass and through the crate's reader.
+        let sorted: std::collections::BTreeMap<String, Value> =
+            serde_json::from_str(&full_bpe_json()).expect("a BPE section");
+        for json in [
+            r#"{"type":"Unigram","unk_id":0,"vocab":[["<unk>",0.0],["a",-1.0]]}"#.to_string(),
+            r#"{"unk_id":0,"vocab":[["<unk>",0.0],["a",-1.0]]}"#.to_string(),
+            full_bpe_json(),
+            serde_json::to_string(&sorted).expect("serializes"),
+        ] {
+            let late: LateBoundModel = serde_json::from_str(&json).expect("the section reads");
+            assert!(!late.rescore(), "{json}");
+        }
+    }
+
+    #[test]
     fn a_key_of_another_kind_hands_the_section_to_the_crate_reader() {
         // Each is a key of a BPE, WordPiece or WordLevel section, and no
         // Unigram section has it. The section names no kind, so it is the
@@ -888,6 +930,9 @@ mod tests {
                 r#"{{{entry},"unk_id":0,"vocab":[["<unk>",0.0],["a",-1.1695698339729451],["aa",-2.3391396679458905]]}}"#
             );
             assert_eq!(loading_reading(&json), crate_reading(&json), "{json}");
+            // The loader reads the scores of such a model once more.
+            let late: LateBoundModel = serde_json::from_str(&json).expect("the section reads");
+            assert!(late.rescore(), "{json}");
         }
     }
 
