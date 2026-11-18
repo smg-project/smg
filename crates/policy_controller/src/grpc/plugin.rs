@@ -404,6 +404,12 @@ impl Plugin {
         self.inner.needs
     }
 
+    /// The kinds of lifecycle event the plugin hears, as its row lists
+    /// them.
+    pub fn observes(&self) -> EventSet {
+        self.inner.observes
+    }
+
     /// The counters the plugin adds to.
     pub fn counters(&self) -> &Counters {
         &self.inner.counters
@@ -1107,19 +1113,19 @@ impl DecisionScope for Bound {
 /// kind's answers, named by the plugin.
 impl BoundPlugin for Bound {
     fn name(&self) -> &'static str {
-        self.plugin.inner.name
+        self.plugin.name()
     }
 
     fn failure(&self) -> Failure {
-        self.plugin.inner.failure
+        self.plugin.failure()
     }
 
     fn needs(&self) -> Needs {
-        self.plugin.inner.needs
+        self.plugin.needs()
     }
 
     fn observes(&self) -> EventSet {
-        self.plugin.inner.observes
+        self.plugin.observes()
     }
 
     fn take_observer(&self) -> bool {

@@ -490,16 +490,6 @@ mod tests {
         fn observe_signal(&self, _: &Signal) {}
     }
 
-    /// The six kinds, in the order [`tell`] raises them.
-    const KINDS: [EventKind; 6] = [
-        EventKind::Issued,
-        EventKind::Dispatched,
-        EventKind::Completed,
-        EventKind::Released,
-        EventKind::Membership,
-        EventKind::Signal,
-    ];
-
     /// A bound plugin that answers no stage and counts the events it is
     /// told, by kind.
     #[derive(Debug, Default)]
@@ -518,14 +508,14 @@ mod tests {
         }
 
         fn note(&self, kind: EventKind) {
-            let at = KINDS
+            let at = EventKind::ALL
                 .iter()
                 .position(|known| *known == kind)
                 .expect("a kind of the six");
             self.told[at].fetch_add(1, Ordering::Relaxed);
         }
 
-        /// How often each kind was told, in the order of [`KINDS`].
+        /// How often each kind was told, in the order of [`EventKind::ALL`].
         fn told(&self) -> [u32; 6] {
             std::array::from_fn(|at| self.told[at].load(Ordering::Relaxed))
         }
@@ -657,7 +647,7 @@ mod tests {
         }
     }
 
-    /// Every lifecycle call once, in the order of [`KINDS`].
+    /// Every lifecycle call once, in the order of [`EventKind::ALL`].
     fn tell(stage: &dyn Lifecycle) {
         let lease = Lease::default();
         stage.on_decision_issued(&lease, &Decision::Pick(Pick::default()));
@@ -706,13 +696,13 @@ mod tests {
     /// for one that lists them all, and each kind alone its own call.
     #[test]
     fn an_adapter_hands_the_kinds_the_row_lists_and_no_other() {
-        let alone = KINDS.map(|kind| EventSet::of([kind]));
+        let alone = EventKind::ALL.map(|kind| EventSet::of([kind]));
         let two = EventSet::of([EventKind::Completed, EventKind::Signal]);
         for listed in [EventSet::NONE, EventSet::ALL, two]
             .into_iter()
             .chain(alone)
         {
-            let wanted = KINDS.map(|kind| u32::from(listed.contains(kind)));
+            let wanted = EventKind::ALL.map(|kind| u32::from(listed.contains(kind)));
             let scored = Told::listing(listed);
             tell(&PluginScorer::new(Arc::clone(&scored), None));
             assert_eq!(scored.told(), wanted, "the scorer, {listed:?}");
