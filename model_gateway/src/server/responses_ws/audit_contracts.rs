@@ -529,14 +529,13 @@ async fn the_lifetime_limit_cancels_an_active_response_and_clears_its_guard() {
     );
     tokio::time::pause();
     tokio::time::advance(CONNECTION_LIFETIME + Duration::from_secs(1)).await;
-    let error = fixture
-        .socket
-        .next()
-        .await
-        .unwrap()
-        .unwrap()
-        .into_text()
-        .unwrap();
+    let error = loop {
+        let message = fixture.socket.next().await.unwrap().unwrap();
+        if let ClientMessage::Text(error) = message {
+            break error;
+        }
+        assert!(message.is_ping());
+    };
     assert_eq!(
         serde_json::from_str::<Value>(&error).unwrap()["error"]["code"],
         "websocket_connection_limit_reached"
@@ -712,6 +711,15 @@ async fn drain_allows_an_active_response_to_finish_and_then_closes_the_socket() 
     );
     assert_eq!(tracker.len(), 1);
     assert_eq!(bucket.available_tokens(), 0.0);
+    tokio::time::pause();
+    tokio::time::advance(HEARTBEAT_INTERVAL).await;
+    let ping = tokio::time::timeout(Duration::from_secs(2), fixture.socket.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(ping.is_ping());
+    tokio::time::resume();
     tracker.begin_drain();
     assert!(!tracker.wait_for_shutdown(Duration::ZERO).await);
     resume.notify_one();

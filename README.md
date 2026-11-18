@@ -136,10 +136,12 @@ A listener accepts up to 32 Responses sockets, with up to four per authenticated
 tenant. A frame or expanded request is limited to the smaller of 4 MiB and the
 configured HTTP payload limit. History keeps up to four responses per socket.
 Its accounting limits are 16 MiB per socket and 128 MiB per process. The
-accounting charges three times the serialized JSON size. Sessions expire after
-15 minutes of idle time or one hour of total connection time. During shutdown,
-idle sockets receive close code 1012, and active responses can finish within
-the gateway's shutdown grace period.
+accounting charges three times the serialized JSON size. The gateway sends a
+WebSocket ping every 15 seconds, including while a worker is quiet. Set proxy
+idle timeouts above that interval. Control frames do not renew the session's
+15-minute wait for the next turn, and every connection expires after one hour.
+During shutdown, idle sockets receive close code 1012, and active responses can
+finish within the gateway's shutdown grace period.
 
 ## Contributing
 

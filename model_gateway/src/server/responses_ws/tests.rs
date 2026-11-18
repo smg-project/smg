@@ -82,7 +82,7 @@ fn sse_handles_split_utf8_crlf_comments_and_multiline_data() {
     reason = "owned loopback server is aborted after the fixture and by test runtime shutdown"
 )]
 #[tokio::test]
-async fn idle_socket_expires_after_prewarm_and_releases_session() {
+async fn heartbeat_keeps_the_transport_alive_without_extending_session_idle_time() {
     use futures::{SinkExt, StreamExt};
     use tokio::sync::oneshot;
     use tokio_tungstenite::{connect_async, tungstenite::Message as ClientMessage};
@@ -113,7 +113,7 @@ async fn idle_socket_expires_after_prewarm_and_releases_session() {
                         HeaderMap::new(),
                         None,
                         "fixture".into(),
-                        Duration::from_millis(500),
+                        HEARTBEAT_INTERVAL + Duration::from_secs(5),
                     )
                     .await;
                     if let Some(finished) = finished.lock().unwrap().take() {
@@ -133,6 +133,14 @@ async fn idle_socket_expires_after_prewarm_and_releases_session() {
     for _ in 0..2 {
         assert!(socket.next().await.unwrap().unwrap().is_text());
     }
+    tokio::time::pause();
+    tokio::time::advance(HEARTBEAT_INTERVAL).await;
+    let ping = socket.next().await.unwrap().unwrap();
+    let ClientMessage::Ping(payload) = ping else {
+        panic!("expected a server heartbeat, got {ping:?}");
+    };
+    socket.send(ClientMessage::Pong(payload)).await.unwrap();
+    tokio::time::advance(Duration::from_secs(6)).await;
     let close = tokio::time::timeout(Duration::from_secs(3), socket.next())
         .await
         .unwrap()

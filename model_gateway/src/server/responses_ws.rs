@@ -166,6 +166,7 @@ const MAX_CACHE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_CACHE_ENTRIES: usize = 4;
 const GLOBAL_CACHE_BYTES: usize = 128 * 1024 * 1024;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(900);
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(15);
 const RESPONSE_READ_TIMEOUT: Duration = Duration::from_secs(15);
 const POST_TAIL_TIMEOUT: Duration = Duration::from_secs(1);
@@ -434,6 +435,10 @@ async fn write_message(socket: &mut WebSocket, message: Message) -> bool {
     )
 }
 
+async fn heartbeat(socket: &mut WebSocket) -> bool {
+    write_message(socket, Message::Ping(Default::default())).await
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum ResponseBodyError {
     Timeout,
@@ -614,44 +619,46 @@ async fn serve(
     idle_timeout: Duration,
 ) {
     let mut cache = SessionCache::default();
-    let expires = tokio::time::Instant::now() + CONNECTION_LIFETIME;
+    let opened_at = tokio::time::Instant::now();
+    let expires = opened_at + CONNECTION_LIFETIME;
+    let mut ping = tokio::time::interval_at(opened_at + HEARTBEAT_INTERVAL, HEARTBEAT_INTERVAL);
+    ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         let deadline = expires.min(tokio::time::Instant::now() + idle_timeout);
-        let incoming = tokio::select! {
-            biased;
-            () = dispatch.tracker.draining() => {
-                let _ = write_message(&mut socket, Message::Close(Some(CloseFrame {
-                    code: 1012,
-                    reason: "Gateway is draining".into(),
-                }))).await;
-                return;
-            }
-            incoming = tokio::time::timeout_at(deadline, socket.recv()) => incoming,
-        };
-        let message = match incoming {
-            Ok(Some(Ok(Message::Text(text)))) => text,
-            Ok(Some(Ok(Message::Ping(bytes)))) => {
-                if !write_message(&mut socket, Message::Pong(bytes)).await {
+        // Control frames keep the transport alive without extending the time
+        // the session can wait for its next turn.
+        let message = loop {
+            tokio::select! {
+                biased;
+                () = dispatch.tracker.draining() => {
+                    let _ = write_message(&mut socket, Message::Close(Some(CloseFrame {
+                        code: 1012,
+                        reason: "Gateway is draining".into(),
+                    }))).await;
                     return;
                 }
-                continue;
-            }
-            Ok(Some(Ok(Message::Pong(_)))) => continue,
-            Err(_) => {
-                if tokio::time::Instant::now() >= expires {
-                    let _ = send(&mut socket, &connection_expired_error()).await;
-                }
-                let _ = write_message(
-                    &mut socket,
-                    Message::Close(Some(CloseFrame {
+                () = tokio::time::sleep_until(deadline) => {
+                    if tokio::time::Instant::now() >= expires {
+                        let _ = send(&mut socket, &connection_expired_error()).await;
+                    }
+                    let _ = write_message(&mut socket, Message::Close(Some(CloseFrame {
                         code: 1000,
                         reason: "Idle connection expired".into(),
-                    })),
-                )
-                .await;
-                return;
+                    }))).await;
+                    return;
+                }
+                _ = ping.tick() => {
+                    if !heartbeat(&mut socket).await { return; }
+                }
+                incoming = socket.recv() => match incoming {
+                    Some(Ok(Message::Text(text))) => break text,
+                    Some(Ok(Message::Ping(bytes))) => {
+                        if !write_message(&mut socket, Message::Pong(bytes)).await { return; }
+                    }
+                    Some(Ok(Message::Pong(_))) => {}
+                    _ => return,
+                }
             }
-            _ => return,
         };
         let value = match serde_json::from_str(&message) {
             Ok(value) => value,
@@ -754,6 +761,9 @@ async fn serve(
                 message = socket.recv() => {
                     if !busy_message(&mut socket, message).await { return; }
                 },
+                _ = ping.tick() => {
+                    if !heartbeat(&mut socket).await { return; }
+                },
             }
         };
         if !response.status().is_success() {
@@ -837,6 +847,9 @@ async fn serve(
                 },
                 message = socket.recv() => {
                     if !busy_message(&mut socket, message).await { return; }
+                },
+                _ = ping.tick() => {
+                    if !heartbeat(&mut socket).await { return; }
                 },
                 chunk = stream.next() => {
                     let chunk = match chunk {
