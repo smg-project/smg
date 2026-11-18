@@ -645,8 +645,8 @@ mod tests {
     use crate::{
         catalog::Catalog,
         controller::{
-            membership::tests::Logged, Config, ConfigError, Election, Error, LeasePlace, Scope,
-            SpecRejected, StoreRefused,
+            membership::tests::Logged, spec_store::SpecStore, Config, ConfigError, Controller,
+            Election, Error, LeasePlace, Scope, SpecRejected, StoreRefused,
         },
         elector::ElectionSettings,
         spec::SpecError,
@@ -1465,6 +1465,40 @@ mod tests {
                     .contains("no spec source is named: a start takes --spec-file or --spec-store"),
             "{said}"
         );
+    }
+
+    /// A caller that drops the spec store call while its start waits on a
+    /// held directory leaves the task to bind the store once the holder
+    /// lets go: its series are bound with it, and a second call is refused
+    /// as a second source.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dropped_spec_store_call_that_binds_later_leaves_its_series() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let holder = SpecStore::open(dir.path().to_owned()).expect("the holder");
+        let config = parse(&EPHEMERAL).config().expect("the flags are in order");
+        let mut controller = Controller::bind_with(config, Catalog::builtin())
+            .await
+            .expect("the controller binds");
+        let call = controller.spec_store(dir.path().to_owned());
+        let dropped = tokio::time::timeout(Duration::from_millis(200), call).await;
+        assert!(dropped.is_err(), "the call waits on the held directory");
+        drop(holder);
+        let bound = async {
+            while !controller.metrics.spec_bound() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), bound)
+            .await
+            .expect("the task binds the store with its series");
+        assert!(controller.shared.generations.bound());
+        match controller.spec_store(dir.path().to_owned()).await {
+            Err(Error::SpecStore {
+                source: StoreRefused::SecondSource,
+                ..
+            }) => {}
+            other => panic!("a second source: {other:?}"),
+        }
     }
 
     /// A spec store starts the controller on the newest generation on file,

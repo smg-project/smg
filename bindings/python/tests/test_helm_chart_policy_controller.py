@@ -675,6 +675,7 @@ def test_a_spec_store_is_refused_beside_what_the_controller_refuses(tmp_path):
     # the two flags under which it clears the document.
     assert "Set policyController.spec to null" in both
     assert "--reset-then-reuse-values or --reset-values" in both
+    assert "other overrides" in both
     document = spec_values(tmp_path, LEAST_LOAD)
     assert "names two sources of its policy spec" in render_error(*STORED, files=(document,))
     for settings in ((ELECTION,), (ELECTION, "policyController.replicas=2")):

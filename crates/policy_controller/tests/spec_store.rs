@@ -505,3 +505,28 @@ fn a_start_a_spec_store_refuses_exits_naming_why() {
         "the generation and its field are named: {log}"
     );
 }
+
+/// A start on a spec store named through a link says the directory it
+/// holds: its line names the path as resolved, the one the line of a wait
+/// names.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_start_through_a_link_names_the_directory_it_holds() {
+    use std::os::unix::fs::symlink;
+
+    let base = tempfile::tempdir().expect("a directory");
+    let (dir, link) = (base.path().join("held"), base.path().join("link"));
+    fs::create_dir(&dir).expect("the directory");
+    symlink(&dir, &link).expect("the link");
+    let replica = start("store-link", &link);
+    let said = replica.logs(|replica| replica.logged("spec store")).await;
+    let log = replica.log();
+    assert!(said, "{log}");
+    let named = log
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|entry| entry["fields"]["message"] == "spec store")
+        .and_then(|entry| entry["fields"]["path"].as_str().map(str::to_owned));
+    let held = fs::canonicalize(&dir).expect("its path");
+    assert_eq!(named.as_deref(), held.to_str(), "{log}");
+}

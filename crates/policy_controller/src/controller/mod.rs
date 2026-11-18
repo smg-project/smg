@@ -594,8 +594,8 @@ impl Controller {
     ///
     /// Refused here, before anything serves ([`StoreRefused`]): a path that
     /// leads to no directory, a directory another controller still holds at
-    /// the end of that wait, a lock the system does not give (a directory
-    /// with no lock file, where the controller may make none, has none), a
+    /// the end of that wait, a lock the system does not give, a directory
+    /// with no lock file where the controller may make none, a
     /// directory that is not read, two files under one number, a newest
     /// generation that does not run, a spec source taken before this one,
     /// and a lease another replica can take ([`LeasePlace`]). A standby does
@@ -617,28 +617,37 @@ impl Controller {
             return Err(refused(StoreRefused::SecondSource));
         }
         let generations = Arc::clone(&self.shared.generations);
+        let metrics = Arc::clone(&self.metrics);
+        let controller_id = self.config.controller_id.clone();
         let bound = {
             let path = path.clone();
             // A controller that stops lets the directory go inside its
             // grace period: a start waits that long for one before it.
             let wait = self.config.shutdown_grace;
+            // The bind, its line and its series are one step of the task:
+            // a caller that drops this call while the start waits leaves a
+            // store bound with both.
             tokio::task::spawn_blocking(move || {
-                generations.bind_store(SpecStore::open_within(path, wait)?)
+                let store = SpecStore::open_within(path, wait)?;
+                // The line names the directory held: its path as resolved,
+                // the one the line of a wait names.
+                let held = store.dir().to_owned();
+                generations.bind_store(store)?;
+                info!(
+                    controller_id = %controller_id,
+                    path = %held.display(),
+                    generation = generations.generation(),
+                    "spec store"
+                );
+                metrics.spec(generations);
+                Ok(())
             })
         };
         match bound.await {
-            Ok(Ok(())) => {}
-            Ok(Err(source)) => return Err(refused(source)),
-            Err(join) => return Err(Error::Task(join.to_string())),
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(source)) => Err(refused(source)),
+            Err(join) => Err(Error::Task(join.to_string())),
         }
-        info!(
-            controller_id = %self.config.controller_id,
-            path = %path.display(),
-            generation = self.shared.generations.generation(),
-            "spec store"
-        );
-        self.metrics.spec(Arc::clone(&self.shared.generations));
-        Ok(())
     }
 
     /// The store the ingestion drivers and the scopes' calls feed and read.

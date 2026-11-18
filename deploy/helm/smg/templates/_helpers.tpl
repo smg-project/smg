@@ -1130,7 +1130,7 @@ schema's check is skipped.
 {{- end -}}
 {{- if $claim -}}
 {{- if (.Values.policyController).spec -}}
-{{- fail (printf "policyController.specStoreClaim names %s and policyController.spec holds a document: the controller refuses a start that names two sources of its policy spec. Set policyController.spec to null and upgrade with --reset-then-reuse-values or --reset-values (an empty map does not clear a reused document, and under --reuse-values a null does not either), or leave the claim unnamed" $claim) -}}
+{{- fail (printf "policyController.specStoreClaim names %s and policyController.spec holds a document: the controller refuses a start that names two sources of its policy spec. Set policyController.spec to null and upgrade with --reset-then-reuse-values or --reset-values, which drops the release's other overrides: give them again (an empty map does not clear a reused document, and under --reuse-values a null does not either), or leave the claim unnamed" $claim) -}}
 {{- end -}}
 {{- if include "smg.policyControllerElection" . -}}
 {{- fail (printf "policyController.specStoreClaim names %s with policyController.election.enabled on: another replica can take the controller's lease, and a standby does not follow an applied generation in this build. Turn the election off, or keep the spec document" $claim) -}}
