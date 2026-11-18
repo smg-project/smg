@@ -2102,6 +2102,74 @@ impl<G: Generation> WorkerRegistry<G> {
             .remove_if(url, |_, id| !self.workers.contains_key(id));
     }
 
+    /// Retire the series of a worker that a registration built and did not
+    /// register. Its builder wrote the address's health, HTTP/2 and breaker
+    /// series, and no removal follows a registration that did not happen, so
+    /// nothing else drops them. An address that holds a registered worker
+    /// keeps its series: they are that worker's.
+    ///
+    /// The address is read under the lock a registration holds from before
+    /// its worker is visible until its series are written, and its series
+    /// are retired while its index entry is held, so no registration of the
+    /// address has its fresh series retired under it. An address whose id
+    /// changed in between is another registration's by now and is left
+    /// alone. A lock the map dropped while the retirement waited on it is
+    /// given up, and the id's lock is taken again.
+    pub fn retire_unregistered(&self, worker: &Arc<dyn Worker>) {
+        while !self.retire_unregistered_once(worker) {}
+    }
+
+    /// One attempt of [`Self::retire_unregistered`]: `false` when the lock
+    /// it waited on is no longer the id's lock in the map, with nothing read
+    /// or retired. A removal drops the id's lock from the map under its
+    /// guard, waiters and all, and a registration under the same id, as a
+    /// mesh import's is, then makes another and holds that one.
+    fn retire_unregistered_once(&self, worker: &Arc<dyn Worker>) -> bool {
+        let url = worker.url();
+        let reserved = self.url_to_id.get(url).map(|id| id.clone());
+        // The lock first and the index entry after it, the order a removal
+        // takes the two in.
+        let lock = reserved.as_ref().map(|id| {
+            self.worker_mutation_locks
+                .entry(id.clone())
+                .or_insert_with(|| Arc::new(parking_lot::Mutex::new(())))
+                .clone()
+        });
+        let guard = lock.as_ref().map(|lock| lock.lock());
+        if let (Some(id), Some(lock)) = (&reserved, &lock) {
+            let current = self
+                .worker_mutation_locks
+                .get(id)
+                .is_some_and(|held| Arc::ptr_eq(held.value(), lock));
+            if !current {
+                return false;
+            }
+        }
+        match self.url_to_id.entry(url.to_string()) {
+            Entry::Occupied(entry)
+                if Some(entry.get()) != reserved.as_ref()
+                    || self.workers.contains_key(entry.get()) => {}
+            _held => Metrics::remove_worker_metrics(url, Arc::downgrade(worker)),
+        }
+        if let (Some(id), Some(lock)) = (&reserved, &lock) {
+            self.sweep_mutation_lock(id, lock);
+        }
+        drop(guard);
+        true
+    }
+
+    /// Take `lock` out of the map again when `id` holds no worker and
+    /// nothing else holds the lock: the map's handle and the caller's are
+    /// two, and a registration that waits on it is a third. A lock the map
+    /// holds under the id that is not `lock` is another holder's, and stays.
+    fn sweep_mutation_lock(&self, id: &WorkerId, lock: &Arc<parking_lot::Mutex<()>>) {
+        self.worker_mutation_locks.remove_if(id, |_, held| {
+            Arc::ptr_eq(held, lock)
+                && Arc::strong_count(held) == 2
+                && !self.workers.contains_key(id)
+        });
+    }
+
     // ───────────────────────────────────────────────────────────────────
     // 7. Remove
     // ───────────────────────────────────────────────────────────────────
