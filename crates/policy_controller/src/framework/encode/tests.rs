@@ -931,6 +931,65 @@ fn a_pair_column_of_another_length_declines_before_a_cut() {
     }
 }
 
+/// A hard filter that counts what it is asked and keeps every row.
+#[derive(Debug)]
+struct CountsItsAsks(Arc<AtomicU32>);
+
+impl crate::framework::Filter for CountsItsAsks {
+    fn name(&self) -> &'static str {
+        "counts-its-asks"
+    }
+
+    fn keep(&self, _: &RequestFacts<'_>, _: &Candidate, _: &Constraints<'_>) -> bool {
+        self.0.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+}
+
+/// A request that carries a column of its own, or names rows, declines as
+/// the pair entry declines it, before a stage of the encode side is asked.
+#[test]
+fn a_request_with_a_column_or_named_rows_declines_before_a_stage_is_asked() {
+    let asked = Arc::new(AtomicU32::new(0));
+    let mut engine = engine();
+    for profile in &mut engine.profiles {
+        let counts = CountsItsAsks(Arc::clone(&asked));
+        profile.filters.push(Box::new(counts));
+    }
+    let bed = Bed::new();
+    let cx = Constraints::default();
+    let holders = [crate::NamedHolder {
+        row: 1,
+        overlap_blocks: 8,
+        predicted_blocks: 0,
+    }];
+    let named = RequestFacts {
+        named: Some(crate::NamedAffinity {
+            holders: &holders,
+            ..crate::NamedAffinity::default()
+        }),
+        ..bed.asked().0
+    };
+    let column = [AffinityFacts::default()];
+    let carried = RequestFacts {
+        affinity: &column,
+        ..bed.asked().0
+    };
+    for facts in [&named, &carried] {
+        let (decision, placed) = decide_under(&bed, &engine, facts, bed.pools(), [&cx; 3]);
+        assert_eq!(
+            shed_of(&decision),
+            (ShedReason::PolicyDeclined, "affinity-column")
+        );
+        assert!(placed.encoders().is_empty());
+        assert_eq!(asked.load(Ordering::Relaxed), 0, "no stage is asked");
+    }
+    // The same engine decides a request that carries neither, and asks.
+    let (decision, _) = bed.decide_with(&engine);
+    assert!(decision.pick().is_some(), "a pick, not {decision:?}");
+    assert_ne!(asked.load(Ordering::Relaxed), 0);
+}
+
 /// The constraints of a host whose standing veto masks the rows `at`.
 fn masking(at: &[u32]) -> Constraints<'_> {
     Constraints {

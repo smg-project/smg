@@ -2656,6 +2656,13 @@ impl<'a> PairPools<'a> {
 /// what a host counts its sheds under.
 const AFFINITY_COLUMN: &str = "affinity-column";
 
+/// Whether the request carries a column of its own or names rows. A pair
+/// reads neither: its columns ride its two pools ([`PairPools`]), and
+/// either on the request names neither pool.
+fn carries_a_column(facts: &RequestFacts<'_>) -> bool {
+    !facts.affinity.is_empty() || facts.named.is_some()
+}
+
 /// The stage a decision names when a profile that shows its rows to a
 /// plugin was handed rows that carry a mask or a pin beside them.
 const WRITTEN_ROWS: &str = "written-rows";
@@ -3435,7 +3442,7 @@ impl Engine {
         // A pair's columns ride its two pools. One on the request, or rows
         // named on it, name neither pool: refused, where they would be
         // dropped in silence and both sides scored as if nothing were held.
-        if !facts.affinity.is_empty() || facts.named.is_some() {
+        if carries_a_column(facts) {
             return shed(ShedReason::PolicyDeclined, AFFINITY_COLUMN, bare);
         }
         // Each side's stages read their own pool and its own column.

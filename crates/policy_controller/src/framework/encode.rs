@@ -20,8 +20,8 @@
 //! reads no membership: it pays the pair entry's cost alone.
 
 use super::{
-    column_fits, debug_assert_indexed, run_profile, shed, Buffers, ClassBits, Engine, PairPools,
-    Plan, Scratch, Set, AFFINITY_COLUMN,
+    carries_a_column, column_fits, debug_assert_indexed, run_profile, shed, Buffers, ClassBits,
+    Engine, PairPools, Plan, Scratch, Set, AFFINITY_COLUMN,
 };
 use crate::{
     decision::{Decision, ShedReason, Target, Targets, Trace},
@@ -309,8 +309,9 @@ impl Engine {
     /// under an encode profile that shows its rows to a plugin names
     /// `encode-scope`: no scope is opened over the encoders offered to a
     /// key. A pair column of another length than its pool names
-    /// `affinity-column` before a cut, as the pair entry names it. The
-    /// encode side's stages are handed no pin
+    /// `affinity-column` before a cut, as the pair entry names it. So does
+    /// a column on the request, or rows named on it, before a stage of the
+    /// encode side is asked. The encode side's stages are handed no pin
     /// ([`RequestFacts::pinned_at`]): a pin is a position in another pool.
     ///
     /// A list this side hands on in a pool's stead (the prefills or the
@@ -403,6 +404,12 @@ impl Engine {
         if !column_fits(pools.prefill_affinity, pools.prefills)
             || !column_fits(pools.decode_affinity, pools.decodes)
         {
+            return declined(AFFINITY_COLUMN);
+        }
+        // A column on the request, or rows named on it, name neither pool.
+        // The pair entry refuses them: here they are refused before a stage
+        // of the encode side is asked.
+        if carries_a_column(facts) {
             return declined(AFFINITY_COLUMN);
         }
         debug_assert_indexed(encode.encoders);
