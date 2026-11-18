@@ -543,8 +543,14 @@ impl Scorer for ConsistentHash {
         out: &mut [f32],
     ) -> TieBand {
         out.fill(0.0);
-        let mut keys = self.keys(facts);
-        let first = match keys.next() {
+        // A ring that names no prefix form has one key, the routing key: it
+        // is read here, and the walk is built for the prefix form alone.
+        let mut keys = self.prefix.is_some().then(|| self.keys(facts));
+        let first = match &mut keys {
+            Some(keys) => keys.next(),
+            None => Some(facts.session_key.hash).filter(|&key| key != 0),
+        };
+        let first = match first {
             Some(key) if !kept.is_empty() => key,
             _ => return TieBand::NORMALIZED,
         };
@@ -587,7 +593,7 @@ impl Scorer for ConsistentHash {
                     if !Self::passed_over(&ring, tried, candidates, kept, &slots, bound) {
                         break;
                     }
-                    key = keys.next();
+                    key = keys.as_mut().and_then(Iterator::next);
                 }
             }
             if let Some(key) = key {
