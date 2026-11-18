@@ -343,6 +343,12 @@ impl Metrics {
         metrics
     }
 
+    /// Whether the spec series are bound, as a case reads it.
+    #[cfg(test)]
+    pub(crate) fn spec_bound(&self) -> bool {
+        self.spec.get().is_some()
+    }
+
     /// Renders the generation `generations` runs and its apply counter by
     /// result from here on. Bound once, when a spec source has applied its
     /// first document; a controller with no source renders no spec series.
