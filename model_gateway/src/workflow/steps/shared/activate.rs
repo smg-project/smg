@@ -64,7 +64,7 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for ActivateWorke
                         ((), status)
                     });
                 activated +=
-                    usize::from(changed.is_some_and(|(_, transition)| transition.is_some()));
+                    usize::from(changed.is_some_and(|((), transition)| transition.is_some()));
             }
         }
 

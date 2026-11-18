@@ -20,7 +20,10 @@ use crate::{
         registry::{worker_model_ids, WorkerId},
         Worker, WorkerRegistry,
     },
-    workflow::data::{require_app_context, WorkerRegistrationData, WorkerRegistrationMode},
+    workflow::{
+        data::{require_app_context, WorkerRegistrationData, WorkerRegistrationMode},
+        steps::local::ReleaseTokenizerStep,
+    },
 };
 
 /// Unified step to register workers in the registry.
@@ -327,10 +330,7 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for RegisterWorke
                 app_context.policy_registry.on_model_unserved(model_id);
             }
             if app_context.router_config.wait_for_tokenizer {
-                crate::workflow::steps::local::ReleaseTokenizerStep::release_if_unserved(
-                    &app_context,
-                    model_id,
-                );
+                ReleaseTokenizerStep::release_if_unserved(&app_context, model_id);
             }
         }
 

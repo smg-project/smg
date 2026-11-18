@@ -1077,7 +1077,11 @@ mod tests {
     use tracing_test::traced_test;
 
     use super::*;
-    use crate::worker::{BasicWorkerBuilder, WorkerType};
+    use crate::{
+        app_context::testing::app_context_for_tests,
+        config::RouterConfig,
+        worker::{BasicWorkerBuilder, WorkerType},
+    };
 
     fn worker_namespace(mesh: &MeshKV) -> Arc<CrdtNamespace> {
         mesh.configure_crdt_prefix(PREFIX, MergeStrategy::LastWriterWins)
@@ -1203,8 +1207,8 @@ mod tests {
             let mesh = MeshKV::new("node-a".into());
             let ns = worker_namespace(&mesh);
             let registry = Arc::new(WorkerRegistry::new());
-            let app = crate::app_context::testing::app_context_for_tests(
-                crate::config::RouterConfig::builder()
+            let app = app_context_for_tests(
+                RouterConfig::builder()
                     .round_robin_policy()
                     .wait_for_tokenizer(true)
                     .build_unchecked(),

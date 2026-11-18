@@ -61,7 +61,7 @@ def test_wait_for_tokenizer_reaches_the_native_constructor(enabled: bool):
     with patch("smg.router._Router") as constructor:
         Router.from_args(args)
     assert constructor.call_args.kwargs["wait_for_tokenizer"] is enabled
-    _Router(enable_igw=True, wait_for_tokenizer=enabled)
+    _Router(worker_urls=[], enable_igw=True, wait_for_tokenizer=enabled)
 
 
 def constructor_parameters() -> set[str]:

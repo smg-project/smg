@@ -86,7 +86,7 @@ impl WorkerSyncAdapter {
         // remains authoritative for identity, cancellation and reconciliation.
         let mut state = state;
         if state.worker_id.is_empty() {
-            state.worker_id = worker_id.to_owned();
+            worker_id.clone_into(&mut state.worker_id);
         }
         // A pending local REST registration owns its reserved UUID. A peer
         // must not fill it while its local preparation is still running.

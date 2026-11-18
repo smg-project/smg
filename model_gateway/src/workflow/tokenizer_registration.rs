@@ -354,13 +354,13 @@ pub(crate) async fn register_tokenizer(
 
     match result {
         Ok(outcome) => {
-            let vocab_size = note_load_outcome(&app_context, config, &outcome)?;
+            let vocab_size = note_load_outcome(app_context, config, &outcome)?;
             app_context.tokenizer_load_failures.clear(&name);
             // A worker's load looks at the worker registry again once it
             // has published: the removal of the model's last worker while
             // the load ran found no entry to take.
             if for_worker && matches!(outcome, LoadOutcome::Loaded { .. }) {
-                ReleaseTokenizerStep::release_if_unserved(&app_context, &name);
+                ReleaseTokenizerStep::release_if_unserved(app_context, &name);
             }
 
             Ok(vocab_size)
