@@ -244,7 +244,8 @@ pub(crate) struct Lag {
     /// The lag this replica reads synced under ([`synced_within`]).
     within: Duration,
     /// The last frame at the head, in microseconds past the origin plus one;
-    /// `0` before any, and once this replica has led since.
+    /// `0` before any, and once this replica has led since or its lease
+    /// has named another leader's term.
     frame: AtomicU64,
     /// Whether the serve runs a standby that writes this lag.
     follows: AtomicBool,
@@ -278,9 +279,9 @@ impl Lag {
     }
 
     /// Forgets the last frame at the head, and tells a turn where there was
-    /// one. The standby loop's call once this replica has held the lease:
-    /// a frame it applied before its own lead says nothing of the leader
-    /// it follows next.
+    /// one. The standby loop's call once this replica has held the lease,
+    /// and once its lease names another leader's term: a frame it applied
+    /// before says nothing of the leader it follows next.
     pub(crate) fn forget(&self) {
         if self.frame.swap(0, Ordering::Relaxed) != 0 {
             self.turns.send_modify(|turns| *turns += 1);
@@ -559,11 +560,15 @@ impl Standby {
     /// stream ([`backoff`]); the lease naming another holder ends the wait,
     /// and the stream wherever it stands, the leader's answer not waited
     /// for. A replica that has held the lease is synced again at the first
-    /// frame of the leader it follows next ([`Lag::forget`]).
+    /// frame of the leader it follows next, and so is one whose lease
+    /// names another leader, or the same one under another term: the sync
+    /// is with one leader's term ([`Lag::forget`]).
     pub(crate) async fn run(self, mut stop: watch::Receiver<bool>) {
         let mut steps = self.shared.standing.clone();
         let mut streak = Streak::default();
         let mut led = self.shared.fence.term();
+        // The term of the leader the last stream was opened against.
+        let mut followed = None;
         loop {
             let leading = self.shared.fence.leader_term(Instant::now());
             let leader = self.shared.leader(leading);
@@ -577,6 +582,12 @@ impl Standby {
             let next = if leader.is_leader || leader.address.is_empty() {
                 Next::Lease
             } else {
+                // A term names one leader. A frame applied under another
+                // says nothing of the one the lease names now: this
+                // replica reads not synced until that leader's first.
+                if followed.replace(leader.term) != Some(leader.term) {
+                    self.shared.lag.forget();
+                }
                 let applied = AtomicBool::new(false);
                 let ended = tokio::select! {
                     ended = self.stream(&leader, &applied) => ended,
@@ -2370,6 +2381,39 @@ mod tests {
         assert!(matches!(ended, Ok(Some(Ok(())))), "the stop ends the loop");
     }
 
+    /// The sync is with one leader's term: once the lease names another
+    /// leader, or the same one's next term, the frame applied before is
+    /// forgotten, and the replica is synced again at that leader's first.
+    #[tokio::test]
+    async fn a_standby_forgets_its_sync_once_its_lease_names_another_leaders_term() {
+        let far = Duration::from_secs(60);
+        let mut bed = Bed::new().await;
+        let (_elector, standing, standby) = standing_by(&bed, FIVE);
+        let shared = Arc::clone(&standby.shared);
+        let mut turns = shared.lag.turns();
+        let holds = || shared.lag.age(Instant::now()).is_some();
+        let (stop, stopped) = watch::channel(false);
+        let mut running = JoinSet::new();
+        running.spawn(standby.run(stopped));
+        for (leader, term) in [("leader-1", 1), ("leader-2", 2), ("leader-2", 3)] {
+            standing.send_replace(bed.holds(leader, term));
+            let mut opened = bed.opened().await;
+            assert!(matches!(opened.frame().await, Some(Frame::Hello(_))));
+            // The stream stands and no frame of it came: what the last
+            // leader's left is forgotten before the dial.
+            assert!(!holds(), "{leader} under term {term}, before its frame");
+            // A heartbeat that states no head: the frame is at the head.
+            let _ = turns.borrow_and_update();
+            opened.says(proto::ReplicationBatch::default()).await;
+            let turned = timeout(far, turns.changed()).await;
+            assert!(matches!(turned, Ok(Ok(()))), "{leader} under term {term}");
+            assert!(holds(), "{leader} under term {term}, at its frame");
+        }
+        stop.send_replace(true);
+        let ended = timeout(FIVE, running.join_next()).await;
+        assert!(matches!(ended, Ok(Some(Ok(())))), "the stop ends the loop");
+    }
+
     #[tokio::test]
     async fn a_replica_that_led_is_not_synced_before_a_frame_of_its_present_leader() {
         let mut bed = Bed::new().await;
@@ -2394,13 +2438,22 @@ mod tests {
         }
         assert!(held());
 
-        // The lease names another leader: the replica held no lease
-        // between the two, and its frame stands.
+        // The lease names another leader: the last one's frame says
+        // nothing of it, though this replica held no lease between the
+        // two. It is synced again at a frame of the leader named.
         standing.send_replace(bed.holds("leader-2", 2));
         let mut second = bed.opened().await;
         assert!(hello(second.frame().await));
         assert_eq!(first.frame().await, None, "the first stream is left");
-        assert!(held(), "a follower's frame outlives a change of leader");
+        assert!(!held(), "no frame of its present leader yet");
+        leader.0.upsert(facts("http://b:8000", 1));
+        for entry in entries(&leader.1, place) {
+            second.says(batch(&entry, Instant::now())).await;
+            place = entry.at;
+            let ack = Frame::Ack(proto::ReplicationAck { seq: place.seq });
+            assert_eq!(second.frame().await, Some(ack));
+        }
+        assert!(held());
 
         // This replica takes the lease: the frame it applied before its
         // lead is forgotten.
@@ -2421,7 +2474,7 @@ mod tests {
         let mut third = bed.opened().await;
         assert!(hello(third.frame().await));
         assert!(!held(), "no frame of its present leader yet");
-        leader.0.upsert(facts("http://b:8000", 1));
+        leader.0.upsert(facts("http://c:8000", 1));
         for entry in entries(&leader.1, place) {
             third.says(batch(&entry, Instant::now())).await;
             let ack = Frame::Ack(proto::ReplicationAck { seq: entry.at.seq });
