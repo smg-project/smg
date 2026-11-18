@@ -377,6 +377,7 @@ async fn a_gateway_gone_past_its_grace_period_is_let_go_by_the_run_loop() {
                 issued_at: now,
                 dispatch_deadline: now + Duration::from_secs(600),
                 state: LeaseState::Issued,
+                session_ttl_micros: None,
             })
             .expect("a lease under the leader's term");
         assert_eq!(store.live(gateway), 1);

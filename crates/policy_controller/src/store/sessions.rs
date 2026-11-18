@@ -16,12 +16,10 @@ pub struct Pin {
     /// key: at or past it the sweep drops the pin and a decision's read
     /// takes none. It stands on the decision clock, in microseconds since
     /// the store's origin, as the engine's table holds the instant it
-    /// forgets the key: a dispatch writes it as read, and converts a
-    /// clock, once, only where the key's rule is not known. `None` for a
-    /// key its rule keeps with no TTL, and for a key whose rule the
-    /// writer could not name beside a standing rule with no TTL: such a
-    /// pin stays until the key's next dispatch writes it anew, or its
-    /// worker's row goes.
+    /// forgets the key: a dispatch writes it as read, or as its lease's
+    /// own rule counts it from the lease's issue, and converts no clock.
+    /// `None` for a key its rule keeps with no TTL: such a pin stays until
+    /// its worker's row goes.
     pub ends: Option<u64>,
 }
 
@@ -46,7 +44,8 @@ pub trait SessionsStore: Send + Sync {
     fn expire(&self, now: u64) -> usize;
 
     /// Merge a pin a gateway replayed: a key already pinned keeps the later
-    /// use.
+    /// use. The pin's end is a number of the clock of the store that wrote
+    /// it: a caller turns it into this store's before it merges.
     fn merge(&self, key: u64, pin: Pin);
 
     fn len(&self) -> usize;
