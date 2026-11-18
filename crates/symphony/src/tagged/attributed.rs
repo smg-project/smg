@@ -60,6 +60,7 @@ use super::object::{Mode, Object};
 use crate::{
     engine::part,
     event::{runs, DropReason, Event, Events, MalformedReason, Text},
+    json::named_arguments,
     markers::Scanner,
     tagged::{
         end_cut_call, held_text,
@@ -154,6 +155,11 @@ pub struct Tags {
     /// never the model's text, and is dropped as the engine drops its own terminals' held
     /// prefixes. Empty where the tags are text the model can write (`</parameter>`).
     pub structural_tokens: &'static [&'static str],
+    /// Whether the arguments may be one JSON object between the invoke tag and its close, in
+    /// place of the parameter tags (DSML: the serving engines' parsers for the family read an
+    /// invoke so, and their structural tag writes one): read as the JSON family's arguments
+    /// object, every byte a fragment while the bytes keep it a JSON prefix.
+    pub json_arguments: bool,
 }
 
 impl Tags {
@@ -171,6 +177,7 @@ impl Tags {
         tag_end: TagEnd::Angle,
         indexed_calls: false,
         structural_tokens: &[],
+        json_arguments: false,
     };
     /// dots3's: MiniMax M2's tags, a block around each call, every value on a line of its own.
     pub const DOTS3: Self = Self {
@@ -186,6 +193,7 @@ impl Tags {
         tag_end: TagEnd::Angle,
         indexed_calls: false,
         structural_tokens: &[],
+        json_arguments: false,
     };
     /// MiniCPM5's: `<param name="…">`, `</param>` and `</function>`, a value a CDATA section when
     /// it holds `<`, `&` or a newline.
@@ -202,10 +210,12 @@ impl Tags {
         tag_end: TagEnd::Angle,
         indexed_calls: false,
         structural_tokens: &[],
+        json_arguments: false,
     };
     /// DeepSeek's DSML: `<｜DSML｜ parameter name="…" string="…">`, `</｜DSML｜ parameter>`
     /// and `</｜DSML｜ invoke>`, each tag on a line of its own, the value typed by its `string`
-    /// attribute, the calls block opened after the template's two newlines.
+    /// attribute, the calls block opened after the template's two newlines; or the arguments as
+    /// one JSON object in place of the parameter tags.
     pub const DSML: Self = Self {
         parameter_open: "<｜DSML｜ parameter name=\"",
         parameter_close: "</｜DSML｜ parameter>",
@@ -219,11 +229,13 @@ impl Tags {
         tag_end: TagEnd::Angle,
         indexed_calls: false,
         structural_tokens: &[],
+        json_arguments: true,
     };
     /// DeepSeek's DSML as V4 spells it, before V4.1 put a space after the sentinel:
     /// `<｜DSML｜parameter name="…" string="…">`, `</｜DSML｜parameter>` and `</｜DSML｜invoke>`,
     /// otherwise [`Self::DSML`]: each tag on a line of its own, the value typed by its `string`
-    /// attribute, the calls block opened after the template's two newlines.
+    /// attribute, the calls block opened after the template's two newlines, or the arguments as
+    /// one JSON object.
     pub const DSML_V4: Self = Self {
         parameter_open: "<｜DSML｜parameter name=\"",
         parameter_close: "</｜DSML｜parameter>",
@@ -237,6 +249,7 @@ impl Tags {
         tag_end: TagEnd::Angle,
         indexed_calls: false,
         structural_tokens: &[],
+        json_arguments: true,
     };
     /// Kimi K3's XTML: `<|open|>argument key="…" type="…"<|sep|>`, `<|close|>argument<|sep|>` and
     /// `<|close|>call<|sep|>`, nothing between the tags, the value typed by its `type` attribute,
@@ -254,6 +267,7 @@ impl Tags {
         tag_end: TagEnd::Marker("<|sep|>"),
         indexed_calls: true,
         structural_tokens: &["<|open|>", "<|close|>"],
+        json_arguments: false,
     };
 
     /// Whether `tail`, held by the scanner at the model's own stop, is a tag the end cut short:
@@ -329,6 +343,12 @@ enum Stage {
     ParameterTail { key: String, start: usize },
     /// Inside a value.
     Value(ValueState),
+    /// Inside the arguments written as one JSON object ([`Tags::json_arguments`]), from its `{`:
+    /// every byte is the object's, the parameter tags included, until its closing brace.
+    Json(Box<named_arguments::Object>),
+    /// After the JSON object's closing brace: only whitespace, the template's, before the
+    /// invoke's close.
+    AfterJson,
 }
 
 #[derive(Clone, Debug)]
@@ -416,6 +436,10 @@ impl Assembler {
         if self.done {
             return;
         }
+        if matches!(self.stage, Stage::Json(_) | Stage::AfterJson) {
+            self.end_json(terminal, out);
+            return;
+        }
         let cut_tag = self.close_open_string(MalformedReason::OpenAtTheMarker, out);
         // The value's held bytes (a trailing newline that may be the template's framing) came
         // before the start of a tag the scanner holds: they leave in that order.
@@ -491,6 +515,10 @@ impl Assembler {
     /// (a `Malformed` event with bytes would end that release).
     pub fn finish(mut self, out: &mut Events) {
         if self.done {
+            return;
+        }
+        if matches!(self.stage, Stage::Json(_) | Stage::AfterJson) {
+            self.end_json("", out);
             return;
         }
         if !self.started() {
@@ -638,6 +666,13 @@ impl Assembler {
         if self.done {
             return;
         }
+        // Arguments written as one JSON object are the model's own, braces and all: nothing is
+        // closed for it, so an object the stop found open ends as a cut ends it, and one that
+        // closed ends the call with nothing announced, as the JSON assembler ends one.
+        if matches!(self.stage, Stage::Json(_) | Stage::AfterJson) {
+            self.end_json("", out);
+            return;
+        }
         let string_open = matches!(
             self.stage,
             Stage::Value(ValueState {
@@ -732,6 +767,9 @@ impl Assembler {
             Stage::Value(_) if tag == CLOSE => self.close_value(bytes, out),
             // Inside a value, the other tags are the value's text.
             Stage::Value(_) => self.text(bytes, declared, out),
+            // Inside the JSON object every tag is its text; after it no tag has a place.
+            Stage::Json(_) => self.json_text(bytes, out),
+            Stage::AfterJson => self.release(bytes, MalformedReason::TagOutOfPlace, out),
             // A tag cuts a name or a tag's tail short: the bytes so far are refused, and the tag
             // is read where they began.
             _ => {
@@ -800,7 +838,9 @@ impl Assembler {
                     None => self.object.carried.push_str(text),
                 }
             }
-            Stage::Between => self.text_between(text, out),
+            Stage::Between if self.opens_json(text) => self.open_json(text, out),
+            Stage::Between | Stage::AfterJson => self.text_between(text, out),
+            Stage::Json(_) => self.json_text(text, out),
             Stage::ParameterName { start } => {
                 let start = *start;
                 match text.split_once('"') {
@@ -855,6 +895,93 @@ impl Assembler {
             }
             other => self.stage = other,
         }
+    }
+
+    /// Whether `text`, between tags, opens the arguments as one JSON object: the family's tags
+    /// let them be one ([`Tags::json_arguments`]), the call is named, nothing was read or refused
+    /// inside it yet, and the first byte that is not whitespace is `{`.
+    fn opens_json(&self, text: &str) -> bool {
+        self.tags.json_arguments
+            && self.started()
+            && !self.refused
+            && !self.released
+            && self.object.is_empty()
+            && text
+                .trim_start_matches(char::is_whitespace)
+                .starts_with('{')
+    }
+
+    /// The arguments begin as one JSON object: the whitespace before its `{` (the template's
+    /// newline after the invoke tag, carried or in `text`) is dropped as the template's wrapping,
+    /// and the object is read from its first byte by the JSON family's arguments reader
+    /// ([`named_arguments::Object`]), every byte a fragment for as long as the bytes keep it a
+    /// JSON prefix, `Malformed { InvalidArguments }` from the first byte that does not, the
+    /// model's bytes as written after it. The values are the model's JSON, not typed by the
+    /// request's tools: the serving engines' parsers hand the object on as written.
+    fn open_json<'d>(&mut self, text: &'d str, out: &mut Events<'d>) {
+        let start = text.len() - text.trim_start_matches(char::is_whitespace).len();
+        self.object.carried.push_str(&text[..start]);
+        self.object.drop_carried(out);
+        self.stage = Stage::Json(Box::new(named_arguments::Object::new(self.object.index)));
+        self.json_text(&text[start..], out);
+    }
+
+    /// The next bytes of the JSON object, the tags' bytes among them, which are its text. The
+    /// bytes after its closing brace are text where the syntax has tags: whitespace, the
+    /// template's before the invoke's close, is carried, anything else refused, its event inside
+    /// the call after the object's fragments, which stay whole as the model closed them.
+    fn json_text<'d>(&mut self, text: &'d str, out: &mut Events<'d>) {
+        let Stage::Json(object) = &mut self.stage else {
+            return;
+        };
+        let taken = object.read(text, out);
+        if object.closed() {
+            self.stage = Stage::AfterJson;
+            self.released = false;
+            self.text_between(&text[taken..], out);
+        }
+    }
+
+    /// Bytes the scanner held as a tag's start inside the JSON object, which no tag followed:
+    /// the object's text after all, read as a copy that is nobody's delta. After the object's
+    /// close they stay held: a tag the end cut short, the caller's to drop.
+    fn json_held(&mut self, out: &mut Events) {
+        if !matches!(self.stage, Stage::Json(_)) {
+            return;
+        }
+        let held = self.scanner.set_aside();
+        if held.is_empty() {
+            return;
+        }
+        let mut scratch = std::mem::take(&mut self.scratch);
+        super::take_owned(&held, &mut scratch, out, |held, out| {
+            self.json_text(held, out);
+        });
+        self.scratch = scratch;
+    }
+
+    /// The call's end after arguments written as one JSON object: the invoke's close
+    /// (`terminal`, whose bytes the call's end carries), or the stream's cut or the model's stop
+    /// inside the call (no bytes). The bytes held inside the object are its text. An object the
+    /// end found open stays as the model wrote it, as the JSON family's reader leaves one
+    /// ([`named_arguments::Object::cut`]): the word it held, then one `Malformed` event of no
+    /// bytes that says the arguments are no whole value, no brace made up for the model. After
+    /// the object's closing brace the arguments are whole as the model wrote them, and the
+    /// whitespace carried and a tag's start held are the template's, dropped; a refusal after
+    /// the object (a word, a tag) stands inside the call.
+    fn end_json(&mut self, terminal: &str, out: &mut Events) {
+        self.json_held(out);
+        if let Stage::Json(object) = std::mem::replace(&mut self.stage, Stage::AfterJson) {
+            object.cut(out);
+        }
+        let held = self.scanner.set_aside();
+        self.object.carried.push_str(&held);
+        self.object.drop_carried(out);
+        out.push(Event::ToolCallEnd {
+            index: self.object.index,
+            source: Text::uncounted(terminal.to_owned()),
+        });
+        self.done = true;
     }
 
     /// Text where the syntax has tags: whitespace is carried, since whose it is depends on what
@@ -2563,5 +2690,171 @@ mod tests {
         let events = run_with(Tags::DSML_V4, &[&clean], false);
         assert_eq!(arguments(&events), r#"{"s": "Paris", "n": 3}"#);
         assert!(malformed(&events).is_empty());
+    }
+
+    /// Arguments written as one JSON object in place of the parameter tags, where the family's
+    /// tags allow one (`Tags::json_arguments`: DSML in both spellings, as the serving engines'
+    /// parsers for the family read it): every byte of the object is a fragment, as written, a
+    /// tag inside one of its strings is its text, the template's newlines around it are dropped,
+    /// and the invoke's close is the call's end, however the bytes are cut. Where the family's
+    /// tags allow none, the object is text between tags, refused as before, and the call gets no
+    /// close.
+    #[test]
+    fn arguments_written_as_one_json_object_are_the_objects_bytes_where_the_tags_allow_one() {
+        for tags in [Tags::DSML, Tags::DSML_V4] {
+            // A closing tag inside a string, and the start of an opening tag the scanner holds
+            // until the next byte says it is none.
+            let object = format!(
+                "{{\"s\": \"a {} b <｜DSML｜\", \"n\": [1, {{\"k\": null}}]}}",
+                tags.parameter_close
+            );
+            let call = format!("f\">\n{object}\n");
+            let all = format!("{call}{}", tags.invoke_close);
+            let whole = run_with(tags, &[&call], false);
+            assert!(
+                matches!(&whole[0], Event::ToolCallStart { name, .. } if name == "f"),
+                "{tags:?}: {whole:?}"
+            );
+            assert!(
+                matches!(whole.last(), Some(Event::ToolCallEnd { source, .. })
+                    if source.text == tags.invoke_close),
+                "{tags:?}: {whole:?}"
+            );
+            assert!(malformed(&whole).is_empty(), "{tags:?}: {whole:?}");
+            assert_eq!(dropped(&whole), vec!["\n", "\n"], "{tags:?}");
+            nothing_empty(&whole);
+            let mut cuts: Vec<Vec<&str>> = (1..call.len())
+                .filter(|&cut| call.is_char_boundary(cut))
+                .map(|cut| vec![&call[..cut], &call[cut..]])
+                .collect();
+            cuts.push(vec![&call]);
+            cuts.push(
+                call.char_indices()
+                    .map(|(at, c)| &call[at..at + c.len_utf8()])
+                    .collect(),
+            );
+            for pieces in cuts {
+                let events = run_with(tags, &pieces, false);
+                assert_eq!(arguments(&events), object, "{tags:?}: {pieces:?}");
+                assert_eq!(bytes(&events), all, "{tags:?}: {pieces:?}");
+                assert_eq!(shown(&events), "", "{tags:?}: {pieces:?}");
+                assert!(refused(&events).is_empty(), "{tags:?}: {pieces:?}");
+                assert!(malformed(&events).is_empty(), "{tags:?}: {pieces:?}");
+            }
+        }
+        for (tags, call) in [
+            (Tags::MINIMAX_M2, "f\">\n{\"s\": \"x\"}\n"),
+            (Tags::MINICPM5, "f\">{\"s\": \"x\"}"),
+            (Tags::XTML, "f\" index=\"1\"<|sep|>{\"s\": \"x\"}"),
+        ] {
+            let events = run_with(tags, &[call], false);
+            assert_eq!(arguments(&events), "", "{tags:?}");
+            assert_eq!(refused(&events).concat(), "{\"s\": \"x\"}", "{tags:?}");
+            assert_eq!(shown(&events), "", "{tags:?}");
+        }
+    }
+
+    /// Around the object the syntax keeps its rules. An object after a parameter is refused, and
+    /// the call gets no close, the pairs read before a strict JSON prefix; a word or a tag after
+    /// the object is refused, the object's fragments whole before the refusal's event. An object
+    /// a strict reader refuses is the model's bytes as written from one `Malformed
+    /// { InvalidArguments }` event. One the invoke's close or the stream cut before its closing
+    /// brace is no whole value and says so, no brace made up; one that closed before the stream
+    /// was cut, or before the model stopped, is whole, nothing announced.
+    #[test]
+    fn around_a_json_object_the_syntax_refuses_what_it_refuses_and_a_cut_object_says_so() {
+        let tags = Tags::DSML;
+        let after_a_parameter = concat!(
+            "f\">\n<｜DSML｜ parameter name=\"s\" string=\"true\">x</｜DSML｜ parameter>\n",
+            "{\"n\": 3}\n"
+        );
+        let events = run_with(tags, &[after_a_parameter], false);
+        assert_eq!(arguments(&events), "{\"s\": \"x\"");
+        assert_eq!(refused(&events).concat(), "{\"n\": 3}");
+        assert_eq!(shown(&events), "");
+        for (after, refused_bytes) in [
+            (" and more\n", "and more"),
+            (
+                "\n<｜DSML｜ parameter name=\"s\" string=\"true\">x</｜DSML｜ parameter>\n",
+                "",
+            ),
+        ] {
+            let call = format!("f\">\n{{\"n\": 3}}{after}");
+            let events = run_with(tags, &[&call], false);
+            assert_eq!(arguments(&events), "{\"n\": 3}", "{after:?}");
+            assert!(!malformed(&events).is_empty(), "{after:?}: {events:?}");
+            if !refused_bytes.is_empty() {
+                assert_eq!(refused(&events).concat(), refused_bytes, "{after:?}");
+            }
+            assert_eq!(shown(&events), "", "{after:?}");
+            assert_eq!(bytes(&events), format!("{call}{}", tags.invoke_close));
+        }
+        let events = run_with(tags, &["f\">\n{\"n\": 3,}\n"], false);
+        assert_eq!(arguments(&events), "{\"n\": 3,}");
+        assert!(
+            malformed(&events)
+                .iter()
+                .any(|(_, why)| *why == MalformedReason::InvalidArguments),
+            "{events:?}"
+        );
+        for cut in [false, true] {
+            let events = run_with(tags, &["f\">\n{\"n\": 3, \"s\": \"Par"], cut);
+            assert_eq!(arguments(&events), "{\"n\": 3, \"s\": \"Par", "{cut}");
+            assert_eq!(
+                malformed(&events),
+                vec![(String::new(), MalformedReason::UnterminatedRegion)],
+                "{cut}"
+            );
+        }
+        let events = run_with(tags, &["f\">\n{\"n\": 3}\n"], true);
+        assert_eq!(arguments(&events), "{\"n\": 3}");
+        assert!(malformed(&events).is_empty(), "{events:?}");
+        // The start of a tag held after the object, which the end cut short: the template's,
+        // dropped after the object, its bytes kept at every ending.
+        for tail in ["</｜D", "</｜DSML｜ parame", "<｜DSML｜ par"] {
+            let output = format!("f\">\n{{\"n\": 3}}\n{tail}");
+            for cut in [false, true] {
+                let events = run_with(tags, &[&output], cut);
+                let end = if cut { "" } else { tags.invoke_close };
+                assert_eq!(bytes(&events), format!("{output}{end}"), "{tail:?} {cut}");
+                assert_eq!(arguments(&events), "{\"n\": 3}", "{tail:?} {cut}");
+                assert_eq!(shown(&events), "", "{tail:?} {cut}");
+            }
+            let mut assembler = Assembler::new(0, "call_0", tags);
+            let mut out = Events::new();
+            assembler.feed(&output, &declared(), &mut out);
+            assembler.stop(false, &mut out);
+            let events = out.drain();
+            assert_eq!(bytes(&events), output, "{tail:?} at the stop");
+            assert_eq!(arguments(&events), "{\"n\": 3}", "{tail:?} at the stop");
+        }
+        for (output, expected, open) in [
+            ("f\">\n{\"n\": 3}\n", "{\"n\": 3}", false),
+            (
+                "f\">\n{\"n\": 3, \"s\": \"Par",
+                "{\"n\": 3, \"s\": \"Par",
+                true,
+            ),
+        ] {
+            for as_marker in [false, true] {
+                let mut assembler = Assembler::new(0, "call_0", tags);
+                let mut out = Events::new();
+                assembler.feed(output, &declared(), &mut out);
+                assembler.stop(as_marker, &mut out);
+                let events = out.drain();
+                assert_eq!(arguments(&events), expected, "{output:?} {as_marker}");
+                assert_eq!(bytes(&events), output, "{output:?} {as_marker}");
+                let expected_malformed = if open {
+                    vec![(String::new(), MalformedReason::UnterminatedRegion)]
+                } else {
+                    vec![]
+                };
+                assert_eq!(
+                    malformed(&events),
+                    expected_malformed,
+                    "{output:?} {as_marker}"
+                );
+            }
+        }
     }
 }

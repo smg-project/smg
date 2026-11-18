@@ -355,6 +355,78 @@ pub(crate) fn an_invoke_outside_a_block_reads_as_the_engines_do(
     assert_eq!(said.reasoning, format!("Let me add.{invoke}"));
 }
 
+/// Every shape of an invoke whose arguments the model wrote as one JSON object in place of the
+/// parameter tags, on a DSML table whose `run` reads an output after a prompt, read whole, one
+/// character at a time and at every two-way cut as the serving engines' own parsers read them
+/// (SGLang's DSML detector takes the object as the arguments, as written, and the structural tag
+/// it builds for a call writes the object between the invoke tag and its close): right after the
+/// tag, on lines of its own, two such invokes after a preamble, and an invoke outside a block.
+/// `invoke` is the invoke tag up to the name's quote, `close` its closing tag, `open` and
+/// `block_close` the block's tags, `chat` the prompt that closed the thought. Nothing is
+/// malformed, every byte lands in one event, and a chat client reads the calls.
+pub(crate) fn an_invoke_whose_arguments_are_json_reads_as_the_engines_do(
+    run: impl Fn(&str, &[&str]) -> Vec<Event<'static>>,
+    invoke: &str,
+    close: &str,
+    open: &str,
+    block_close: &str,
+    chat: &str,
+) {
+    let call = |arguments: &str| ("get_weather".to_string(), arguments.to_string());
+    let compact = r#"{"location": "Paris", "days": 3}"#;
+    let on_lines = "{\n    \"location\": \"Paris\"\n}";
+    // A shape's name, the output, the content and the calls it gives.
+    type Shape<'a> = (&'a str, String, &'a str, Vec<(String, String)>);
+    let shapes: [Shape; 4] = [
+        (
+            "right after the tag",
+            format!("\n\n{open}\n{invoke}get_weather\">{compact}{close}\n{block_close}"),
+            "",
+            vec![call(compact)],
+        ),
+        (
+            "on lines of its own",
+            format!("{open}\n{invoke}get_weather\">\n{on_lines}\n{close}\n{block_close}"),
+            "",
+            vec![call(on_lines)],
+        ),
+        (
+            "two after a preamble",
+            format!(
+                "Let me check.\n\n{open}\n{invoke}get_weather\">\n{compact}\n{close}\n\
+                 {invoke}get_weather\">\n{on_lines}\n{close}\n{block_close}"
+            ),
+            "Let me check.",
+            vec![call(compact), call(on_lines)],
+        ),
+        (
+            "outside a block",
+            format!("{invoke}get_weather\">\n{compact}\n{close}"),
+            "",
+            vec![call(compact)],
+        ),
+    ];
+    for (name, output, content, calls) in shapes {
+        let events = run(chat, &[&output]);
+        assert_eq!(bytes(&events), output, "{name}");
+        assert!(malformed(&events).is_empty(), "{name}: {events:?}");
+        let said = the_same_at_every_cut(|pieces| run(chat, pieces), &output);
+        assert_eq!(said.content, content, "{name}");
+        assert_eq!(said.calls, calls, "{name}");
+        assert_eq!(
+            said.finish.map(|(_, count)| count),
+            Some(calls.len() as u32),
+            "{name}"
+        );
+        let choice = adapt::chat::message(0, &events);
+        assert_eq!(
+            choice.finish_reason.as_deref(),
+            Some("tool_calls"),
+            "{name}"
+        );
+    }
+}
+
 /// The structural tag of a forced call on `format`, a table whose layout writes `after` after
 /// the thought's close (`close`), in every configuration a request and an engine present:
 /// `tool_choice` naming a function (the first of `tools`) and `required` (all of them), the

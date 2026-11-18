@@ -64,6 +64,8 @@ What this table says beyond the Qwen ones:
 - **An invoke written outside a block is the call** (`content + invoke_open = invoke`), as under
   V4's table (its section): the serving engines' parsers for this spelling read it so as well, and
   the gateway's older `deepseek_v41` parser did already.
+- **An invoke's arguments may be one JSON object** (`Tags::DSML.json_arguments`), as under V4's
+  table (its section), which says why.
 - **The block's opener is the blank line and the tag.** The template writes two newlines between
   a message's content and its calls block, and the family's reference parser (the checkpoint's
   `encoding` module) looks for the block as `\n\n<｜DSML｜ calls`, reading the content up to
@@ -129,6 +131,16 @@ V4.1's, and the registry reads each checkpoint with its own. Beyond that:
   content by the chat adapter where the engines drop it), and the model's end of output there
   closes nothing. The structural tag is unchanged: the grammar takes the block from a row into the
   invoke from the wrapping state alone, so a forced call is still written as the block.
+- **An invoke's arguments may be one JSON object** in place of the parameter tags
+  (`Tags::DSML_V4.json_arguments`; `docs/assemblers.md`, the attributed assembler), as the serving
+  engines' own parser for the family reads it: SGLang's DSML detector takes the object as the
+  call's arguments, as written, and the structural tag it builds for a call writes the object
+  between the invoke tag and its close, so an engine that constrains a call that way gets the
+  shape back. The family's reference encoder writes parameter tags alone and its parser refuses
+  the shape (`Tool name format error`), so it reads no call there. Before, the table read the call
+  with no arguments (`arguments: ""`), where the gateway's legacy `deepseek_dsml` parser passed the
+  object on. The structural tag this table writes is unchanged: a forced call is still written
+  with parameter tags.
 - **A turn the prompt leaves unopened starts inside the thought.** The template writes
   `<｜Assistant｜>` and the thought's opener after a user message, and after a system message that
   ends the conversation or that an assistant turn follows (a coding agent's environment notes and
@@ -158,7 +170,7 @@ V4.1's, and the registry reads each checkpoint with its own. Beyond that:
 DSML as V4 spells it, with `function_calls` for the block's name: the table is V4's with the block's
 two terminals changed and the same `Tags::DSML_V4` for the invoke and parameter tags, so what the
 V4 section says of the format holds here (a calls block ends the thought; an invoke written outside
-a block is the call; the blank line before
+a block is the call; an invoke's arguments may be one JSON object; the blank line before
 the block is the opener's, `\n\n<｜DSML｜function_calls>` beside the bare tag, as the encoder's
 parser reads it; the prompt ends with `<think>` or `</think>` right after `<｜Assistant｜>`), with two
 exceptions at the turn's start. The table has no unopened row, and must not take V4's: the encoder
