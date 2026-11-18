@@ -364,13 +364,14 @@ What the syntax says, and what the assembler does with it:
   it a JSON prefix, `Malformed { InvalidArguments }` at the first that does not and the model's
   bytes as written after it, a parameter tag inside it its text, the values the model's JSON and
   not typed by the request's tools. Only the two parameter tags are the object's text: they are
-  the tags the assembler scans for. The invoke's close and the block's close are the table's
-  terminals, and either ends the call where it stands, inside one of the object's strings too, as
-  it does inside a parameter's value: the object then ends as one the stream cut, and the table
-  reads what follows the tag from where it stands. The newlines around the object are the
-  template's, dropped, and the invoke's close is the call's end. An object the invoke's close, the
-  cut or the stop found open stays as written, and the reader's `Malformed` event of no bytes says
-  it is no whole value, no brace made up; an object closed before a cut or a stop is whole, as the
+  the tags the assembler scans for. The invoke's close, the next invoke's opening and the block's
+  close are the table's terminals, and any of them ends the call where it stands, inside one of
+  the object's strings too, as it does inside a parameter's value: the object then ends as one the
+  stream cut, and the table reads what follows the tag from where it stands, after the next
+  invoke's opening the next call. The newlines around the object are the template's, dropped, and
+  the invoke's close is the call's end. An object a terminal, the cut or the stop found open stays
+  as written, and the reader's `Malformed` event of no bytes says it is no whole value, no brace
+  made up; an object closed before a cut or a stop is whole, as the
   JSON assembler ends one. A word or a tag after the object is text where the syntax has tags,
   refused as below, its event inside the call after the object's fragments, which stay whole as
   the model closed them; an object after a parameter is refused whole, and that call gets no
