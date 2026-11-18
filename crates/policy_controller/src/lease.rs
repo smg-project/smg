@@ -66,8 +66,10 @@ pub struct Lease {
     /// The host's clock at issue, microseconds since its origin. In-process
     /// only; the wire carries the dispatch deadline as a duration.
     pub issued_micros: u64,
-    /// Token-work the decision books on its target: the prompt, or the
-    /// host's mean estimate when the prompt's size is unknown.
+    /// The prompt size the request stated, in tokens: 0 where it stated
+    /// none. The `least-load` and `resident-work` stages credit a dispatch
+    /// of no stated size at their own mean prefill; every other reader
+    /// takes the 0 as stated.
     pub tokens: u32,
 }
 
