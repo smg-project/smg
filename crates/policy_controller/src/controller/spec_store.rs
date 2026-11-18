@@ -297,11 +297,13 @@ impl SpecStore {
     /// a file system that locks as a local one does, the lock asks no write
     /// of the file either: one that stands under bits this user may not
     /// write, as after a change of the controller's user, is opened to
-    /// read. Where a lock is made of a byte-range lock, as a network file
-    /// system's client may make it, it asks a file opened to write: the
-    /// lock of a file this user may not write is not given there, and the
-    /// refusal is the system's for the lock. Where the file is not there
-    /// and may not be made, the refusal is the system's for the making.
+    /// read, without waiting and as a regular file alone: a pipe there
+    /// holds no start. Where a lock is made of a byte-range lock, as a
+    /// network file system's client may make it, it asks a file opened to
+    /// write: the lock of a file this user may not write is not given
+    /// there, and the refusal is the system's for the lock. Where the file
+    /// may not be made and that open fails too, the file not there or no
+    /// regular file, the refusal is the system's for the making.
     fn lock_file(dir: &Path) -> Result<fs::File, StoreRefused> {
         let path = dir.join(HELD);
         let made = fs::OpenOptions::new()
@@ -312,7 +314,7 @@ impl SpecStore {
             .open(&path);
         match made {
             Err(denied) if denied.kind() == io::ErrorKind::PermissionDenied => {
-                fs::File::open(&path).map_err(|_| denied)
+                open_regular(&path).map_err(|_| denied)
             }
             opened => opened,
         }
@@ -738,6 +740,87 @@ pub(crate) mod tests {
             StoreRefused::Held(Duration::ZERO)
         );
         drop(first);
+    }
+
+    /// Where the lock file is not there and may not be made, the refusal is
+    /// the system's for the making: the open to read that follows finds no
+    /// file, and its words are not the ones told.
+    #[cfg(unix)]
+    #[test]
+    #[expect(
+        clippy::print_stdout,
+        reason = "a run the bits do not hold in reports it on stdout under --nocapture"
+    )]
+    fn a_lock_file_that_may_not_be_made_refuses_the_start_in_the_makings_words() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("a temp dir");
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o555)).expect("its bits");
+        if fs::File::create(dir.path().join("made")).is_ok() {
+            // The bits do not hold for this user (the superuser): the lock
+            // file is made, and there is no refusal to read here.
+            println!(
+                "a lock file that may not be made: this run asserted another lawful world: \
+                 the directory's bits do not hold for this user"
+            );
+            return;
+        }
+        let refused = SpecStore::open_within(dir.path().to_owned(), Duration::ZERO);
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).expect("its bits");
+        let refused = refused.expect_err("no lock");
+        assert!(
+            matches!(&refused, StoreRefused::Unlocked(told) if told.contains("denied")),
+            "{refused:?}"
+        );
+    }
+
+    /// A pipe under the lock file's name, under bits its user may not
+    /// write, holds no start: the open to read does not wait on it, what
+    /// is no regular file is refused unread, and the refusal is the
+    /// system's for the making. The open runs on a thread of its own,
+    /// waited five seconds, so an open that waits fails the case.
+    #[cfg(unix)]
+    #[test]
+    #[expect(
+        clippy::print_stdout,
+        reason = "a run the bits do not hold in reports it on stdout under --nocapture"
+    )]
+    fn a_pipe_its_user_may_not_write_under_the_locks_name_holds_no_start() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let lock = dir.path().join(HELD);
+        pipe_at(&lock);
+        fs::set_permissions(&lock, fs::Permissions::from_mode(0o444)).expect("its bits");
+        // An open to read and write of a pipe does not wait, as one to
+        // write alone would where the bits do not hold.
+        if fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock)
+            .is_ok()
+        {
+            // The bits do not hold for this user (the superuser): the first
+            // open serves, and there is nothing of the second to read here.
+            println!(
+                "a pipe its user may not write: this run asserted another lawful world: \
+                 the pipe's bits do not hold for this user"
+            );
+            return;
+        }
+        let path = dir.path().to_owned();
+        let (answer, answered) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = answer.send(SpecStore::open_within(path, Duration::ZERO));
+        });
+        let opened = answered
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the open answers: it does not wait on the pipe");
+        let refused = opened.expect_err("no lock on a pipe");
+        assert!(
+            matches!(&refused, StoreRefused::Unlocked(told) if told.contains("denied")),
+            "{refused:?}"
+        );
     }
 
     /// A lock the system does not give refuses the start in the system's
