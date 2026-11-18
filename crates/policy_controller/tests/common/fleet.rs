@@ -1373,6 +1373,9 @@ impl Harness {
             .filter(|(_, (of, _))| *of == engine)
             .map(|(id, _)| *id)
             .collect();
+        if ids.is_empty() {
+            return Err(format!("engine {engine} holds no rank to patch"));
+        }
         for id in ids {
             let row = self
                 .store
