@@ -15,27 +15,46 @@
 //! store's entry, one apply at a time: one process writes the directory,
 //! under the door's lock alone.
 //!
-//! One process holds a directory, and nothing here holds two apart. Where
-//! a second one writes it too, its apply of a number the first has on file
-//! is refused by name, and from then on it takes no write until it starts
-//! again: a store reads its directory at its start alone, so that process
-//! runs the generation it started with. Two that write one number at one
-//! moment in the two forms never both stay: each looks for the other
-//! form's name after its own link and backs out where it stands, so one
-//! lands or neither. A write that backs out says so, apart from a number
-//! that is on file: where both back out the number is free, and the next
-//! apply of either lands. A start removes every temporary name, a live
-//! writer's among them: that write is refused. The directory stands on a
-//! file system that links: where no link is made, every write is refused
-//! at the link in the system's own words, and nothing of it stays on file.
-//! A write refused after its link removes its name and syncs the directory
-//! again, and says which of the two failed. A name that stays may run at a
-//! start, or refuse it beside the other form's name. A name that is gone
-//! where the directory did not sync may come back after a crash.
+//! One process holds a directory: a store takes the lock of a file it
+//! keeps there (`.lock`) before it reads a name, and holds it until it is
+//! dropped; the system lets it go at any exit. A start that finds the lock
+//! held waits a bound for its holder to stop and takes the directory then.
+//! One still held at the bound's end is refused by name, and one whose
+//! lock the system does not give is refused in the system's own words: the
+//! lock asks that its file is there or can be made, and no write of it on
+//! a file system that locks as a local one does. So a start reads the
+//! directory once the process before it writes no more, and runs that
+//! one's last apply. The lock is on the file, not on its name: the file is
+//! made once and never removed, and one removed under a running store lets
+//! a second one in. It is the open file's, too: a child the process forks
+//! holds a copy until it runs its program, so the lock may outlast a drop
+//! by that moment, and a start that follows a drop in one process waits
+//! like any other. The directory stands on a file system that links and
+//! locks. Where no link is made, every write is refused at the link in the
+//! system's own words, and nothing of it stays on file.
+//!
+//! The lock holds two apart as far as the file system's locks reach:
+//! between two hosts of a network file system only where it carries them.
+//! A second process such a directory lets in writes it too, and the write
+//! itself keeps the two from one number. Its apply of a number the first
+//! has on file is refused by name, and from then on it takes no write
+//! until it starts again: a store reads its directory at its start alone,
+//! so that process runs the generation it started with. Two that write one
+//! number at one moment in the two forms never both stay: each looks for
+//! the other form's name after its own link and backs out where it stands,
+//! so one lands or neither. A write that backs out says so, apart from a
+//! number that is on file: where both back out the number is free, and the
+//! next apply of either lands. A start removes every temporary name, a
+//! live writer's among them: that write is refused. A write refused after
+//! its link removes its name and syncs the directory again, and says which
+//! of the two failed. A name that stays may run at a start, or refuse it
+//! beside the other form's name. A name that is gone where the directory
+//! did not sync may come back after a crash.
 //!
 //! A start reads the directory: the highest number is the generation to
 //! run, and a file a write left under its temporary name is removed. Any
-//! other name is left alone. Two files under one number, or a path that
+//! other name is left alone, the lock file's among them. Two files under
+//! one number, a directory another process holds, or a path that
 //! leads to no directory, refuse the start by name. The [`RETAINED`]
 //! highest numbers are kept; an apply removes the files under them. A
 //! generation on file is read by the read call and by a rollback; the read
@@ -48,9 +67,11 @@ use std::{
     fs,
     io::{self, Read as _, Write as _},
     path::{Path, PathBuf},
-    process,
-    time::{SystemTime, UNIX_EPOCH},
+    process, thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+
+use tracing::info;
 
 use super::{
     generations::{Format, SpecRejected, MAX_DOCUMENT_BYTES},
@@ -65,6 +86,13 @@ pub(crate) const RETAINED: usize = 8;
 /// it.
 const WRITING: &str = ".writing-";
 
+/// The name of the lock file in a store's directory: no generation's name
+/// and no temporary one, so a start neither reads it nor removes it.
+const HELD: &str = ".lock";
+
+/// Between two tries of a lock another process holds.
+const HELD_PACE: Duration = Duration::from_millis(50);
+
 /// How many digits a generation's file name writes its number in: the
 /// widest number's.
 const DIGITS: usize = 20;
@@ -78,6 +106,16 @@ pub enum StoreRefused {
     /// The directory could not be read.
     #[error("not read: {0}")]
     Unreadable(String),
+    /// Another controller holds the directory's lock, past the wait the
+    /// start was given.
+    #[error(
+        "another controller holds the directory, waited on for {0:?}: one controller holds a spec store"
+    )]
+    Held(Duration),
+    /// The directory's lock was not taken, in the system's own words: the
+    /// lock file does not open, or the file system takes no lock.
+    #[error("not locked: {0}")]
+    Unlocked(String),
     /// Two files, one in each form, are named by one number.
     #[error("generation {0} stands under two names")]
     TwoNames(u64),
@@ -195,6 +233,9 @@ fn unsynced(generation: u64, failed: &io::Error, left: &io::Error) -> io::Error 
 #[derive(Debug)]
 pub(crate) struct SpecStore {
     dir: PathBuf,
+    /// The lock file, open: the directory's lock is held until the store
+    /// is dropped.
+    _held: fs::File,
     /// The generations on file, ascending.
     kept: Vec<Persisted>,
     /// When this store was opened, in nanoseconds: with the process's id it
@@ -206,18 +247,112 @@ pub(crate) struct SpecStore {
 }
 
 impl SpecStore {
-    /// Reads the directory at `dir`: the generations on file. A file left
-    /// under a temporary name is removed: its write never ended.
+    /// [`SpecStore::open_within`] as the cases open theirs: a start that
+    /// waits a case's room, as the controller's waits its grace period. A
+    /// directory whose store a case dropped is free a moment later where
+    /// another case's child process holds a copy of the lock file.
+    #[cfg(test)]
     pub(crate) fn open(dir: PathBuf) -> Result<Self, StoreRefused> {
-        let unreadable = |error: io::Error| StoreRefused::Unreadable(error.to_string());
-        match fs::metadata(&dir) {
-            Ok(found) if found.is_dir() => {}
-            Ok(_) => return Err(StoreRefused::NotADirectory),
+        Self::open_within(dir, Duration::from_secs(30))
+    }
+
+    /// Takes the directory at `dir` and reads it: the generations on file.
+    /// A file left under a temporary name is removed: its write never
+    /// ended. Where another process holds the directory's lock it is tried
+    /// again every [`HELD_PACE`]: the directory is taken once the holder
+    /// lets go, and a start still held when `wait` has passed is refused by
+    /// name. A process that stops lets the lock go at its exit, so a start
+    /// given the time a stop takes reads the directory after that process's
+    /// last write.
+    pub(crate) fn open_within(dir: PathBuf, wait: Duration) -> Result<Self, StoreRefused> {
+        Self::found(&dir)?;
+        let held = Self::hold(&dir, wait)?;
+        Self::read_under(dir, held)
+    }
+
+    /// A second store on a directory another holds, its lock file open and
+    /// not locked, as a file system whose locks do not hold between two
+    /// hosts lets one in: the cases of two writers open theirs so.
+    #[cfg(test)]
+    pub(crate) fn open_beside(dir: PathBuf) -> Result<Self, StoreRefused> {
+        Self::found(&dir)?;
+        let unheld = Self::lock_file(&dir)?;
+        Self::read_under(dir, unheld)
+    }
+
+    /// Refuses a path that leads to no directory.
+    fn found(dir: &Path) -> Result<(), StoreRefused> {
+        match fs::metadata(dir) {
+            Ok(found) if found.is_dir() => Ok(()),
+            Ok(_) => Err(StoreRefused::NotADirectory),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return Err(StoreRefused::NotADirectory)
+                Err(StoreRefused::NotADirectory)
             }
-            Err(error) => return Err(unreadable(error)),
+            Err(error) => Err(StoreRefused::Unreadable(error.to_string())),
         }
+    }
+
+    /// The lock file of `dir`, open: made empty where it is not there, and
+    /// never truncated, since what stands in it is no part of the lock. On
+    /// a file system that locks as a local one does, the lock asks no write
+    /// of the file either: one that stands under bits this user may not
+    /// write, as after a change of the controller's user, is opened to
+    /// read. Where a lock is made of a byte-range lock, as a network file
+    /// system's client may make it, it asks a file opened to write: the
+    /// lock of a file this user may not write is not given there, and the
+    /// refusal is the system's for the lock. Where the file is not there
+    /// and may not be made, the refusal is the system's for the making.
+    fn lock_file(dir: &Path) -> Result<fs::File, StoreRefused> {
+        let path = dir.join(HELD);
+        let made = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path);
+        match made {
+            Err(denied) if denied.kind() == io::ErrorKind::PermissionDenied => {
+                fs::File::open(&path).map_err(|_| denied)
+            }
+            opened => opened,
+        }
+        .map_err(|error| StoreRefused::Unlocked(error.to_string()))
+    }
+
+    /// The directory's lock: an exclusive advisory lock on the lock file,
+    /// tried every [`HELD_PACE`] until `wait` has passed. The system lets
+    /// the lock go when the file is dropped, and at any exit.
+    fn hold(dir: &Path, wait: Duration) -> Result<fs::File, StoreRefused> {
+        let lock = Self::lock_file(dir)?;
+        let started = Instant::now();
+        let mut told = false;
+        loop {
+            match lock.try_lock() {
+                Ok(()) => return Ok(lock),
+                Err(fs::TryLockError::WouldBlock) => {
+                    let Some(left) = wait.checked_sub(started.elapsed()) else {
+                        return Err(StoreRefused::Held(wait));
+                    };
+                    if !told {
+                        info!(
+                            path = %dir.display(),
+                            ?wait,
+                            "spec store held by another controller: waiting for it to stop"
+                        );
+                        told = true;
+                    }
+                    thread::sleep(left.min(HELD_PACE));
+                }
+                Err(fs::TryLockError::Error(error)) => {
+                    return Err(StoreRefused::Unlocked(error.to_string()))
+                }
+            }
+        }
+    }
+
+    /// Reads the directory at `dir` under `held`, its lock file.
+    fn read_under(dir: PathBuf, held: fs::File) -> Result<Self, StoreRefused> {
+        let unreadable = |error: io::Error| StoreRefused::Unreadable(error.to_string());
         let mut kept = Vec::new();
         for entry in fs::read_dir(&dir).map_err(unreadable)? {
             let name = entry.map_err(unreadable)?.file_name();
@@ -240,6 +375,7 @@ impl SpecStore {
             .map_or(0, |since| since.as_nanos());
         Ok(Self {
             dir,
+            _held: held,
             kept,
             opened,
             writes: 0,
@@ -399,6 +535,7 @@ pub(crate) mod tests {
     use std::{collections::BTreeSet, sync::mpsc};
 
     use super::*;
+    use crate::controller::membership::tests::Logged;
     #[cfg(unix)]
     use crate::controller::spec_file::tests::pipe_at;
 
@@ -408,12 +545,13 @@ pub(crate) mod tests {
         Persisted { generation, format }
     }
 
-    /// The names in `dir`, sorted.
+    /// The names in `dir`, sorted, the store's own lock file apart.
     pub(crate) fn names(dir: &Path) -> BTreeSet<String> {
         fs::read_dir(dir)
             .expect("the directory reads")
             .map(|entry| entry.expect("an entry").file_name())
             .map(|name| name.into_string().expect("a name in UTF-8"))
+            .filter(|name| name != HELD)
             .collect()
     }
 
@@ -489,6 +627,133 @@ pub(crate) mod tests {
         assert_eq!(refused.to_string(), "generation 7 stands under two names");
     }
 
+    /// One store holds a directory: a second open is refused by name while
+    /// the first stands, at once or at the end of the wait it was given,
+    /// and lands once the first is dropped. The lock file is the store's
+    /// own: made empty, and a start leaves its bytes as it finds them.
+    #[test]
+    fn a_held_directory_refuses_a_second_store_until_its_holder_is_dropped() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let open = |wait| SpecStore::open_within(dir.path().to_owned(), wait);
+        let first = open(Duration::ZERO).expect("it opens");
+        let lock = dir.path().join(HELD);
+        assert_eq!(fs::read(&lock).expect("the lock file"), b"");
+
+        let refused = open(Duration::ZERO).expect_err("it is held");
+        assert_eq!(refused, StoreRefused::Held(Duration::ZERO));
+        let wait = 3 * HELD_PACE;
+        let asked = Instant::now();
+        let refused = open(wait).expect_err("it is held");
+        assert!(asked.elapsed() >= wait, "{:?}", asked.elapsed());
+        assert_eq!(refused, StoreRefused::Held(wait));
+        assert_eq!(
+            refused.to_string(),
+            "another controller holds the directory, waited on for 150ms: one controller holds a spec store"
+        );
+
+        // What stands in the lock file is no part of the lock. A start
+        // after the drop waits: a child process of another case may hold a
+        // copy of the open file for a moment.
+        fs::write(&lock, "a note").expect("the file");
+        drop(first);
+        let second = open(Duration::from_secs(30)).expect("the directory is free");
+        assert_eq!(second.kept(), []);
+        assert_eq!(fs::read(&lock).expect("the lock file"), b"a note");
+    }
+
+    /// A start that waits reads the directory only once it holds it: what
+    /// the holder wrote while the start waited is on file for it. The wait
+    /// is said in one line.
+    #[test]
+    fn a_waiting_start_reads_the_directory_once_its_holder_let_go() {
+        const ROOM: Duration = Duration::from_secs(30);
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let mut first = SpecStore::open(dir.path().to_owned()).expect("it opens");
+        // The waiter's own subscriber keeps its thread's lines, a second
+        // one registered beside it, as in the door's audit case.
+        let lines = Logged::default();
+        let _beside = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+        let (path, writer) = (dir.path().to_owned(), lines.clone());
+        let waiter = thread::spawn(move || {
+            let subscriber = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_writer(move || writer.clone())
+                .finish();
+            tracing::subscriber::with_default(subscriber, || SpecStore::open_within(path, ROOM))
+        });
+        let said = || {
+            let text = String::from_utf8(lines.0.lock().clone()).expect("the lines are text");
+            text.matches("held by another controller: waiting for it to stop")
+                .count()
+        };
+        // The waiter found the directory held, and has read no name yet.
+        let asked = Instant::now();
+        while said() == 0 {
+            assert!(asked.elapsed() < ROOM, "the waiter never said it waits");
+            thread::sleep(Duration::from_millis(5));
+        }
+        // Three more tries pass under the lock: a line at every try would
+        // be said again.
+        thread::sleep(3 * HELD_PACE);
+        first.persist(at(1, YAML), b"first").expect("it persists");
+        drop(first);
+        let second = waiter
+            .join()
+            .expect("the waiter's thread")
+            .expect("the directory is free");
+        assert_eq!(second.kept(), [at(1, YAML)]);
+        assert_eq!(said(), 1, "one line for the wait");
+    }
+
+    /// On a file system that locks as a local one does, the lock asks no
+    /// write of its file: one that stands under bits its user may not
+    /// write, as after a change of the controller's user, is opened to read
+    /// and locks all the same.
+    #[cfg(unix)]
+    #[test]
+    #[expect(
+        clippy::print_stdout,
+        reason = "a run the bits do not hold in reports it on stdout under --nocapture"
+    )]
+    fn a_lock_file_its_user_may_not_write_locks_a_local_directory() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let lock = dir.path().join(HELD);
+        fs::write(&lock, "").expect("the file");
+        fs::set_permissions(&lock, fs::Permissions::from_mode(0o444)).expect("its bits");
+        if fs::OpenOptions::new().write(true).open(&lock).is_ok() {
+            // The bits do not hold for this user (the superuser): the first
+            // open serves, and there is nothing of the second to read here.
+            println!(
+                "a lock file its user may not write: this run asserted another lawful world: \
+                 the file's bits do not hold for this user"
+            );
+            return;
+        }
+        let open = || SpecStore::open_within(dir.path().to_owned(), Duration::ZERO);
+        let first = open().expect("the lock is taken on a file opened to read");
+        assert_eq!(
+            open().expect_err("it is held"),
+            StoreRefused::Held(Duration::ZERO)
+        );
+        drop(first);
+    }
+
+    /// A lock the system does not give refuses the start in the system's
+    /// own words: here a directory stands under the lock file's name.
+    #[test]
+    fn a_lock_the_system_does_not_give_refuses_the_start_in_its_words() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        fs::create_dir(dir.path().join(HELD)).expect("a directory");
+        let refused = SpecStore::open(dir.path().to_owned()).expect_err("no lock");
+        assert!(
+            matches!(&refused, StoreRefused::Unlocked(told) if told.contains("directory")),
+            "{refused:?}"
+        );
+        assert!(refused.to_string().starts_with("not locked: "), "{refused}");
+    }
+
     /// The bound of what a store keeps: at no apply does it hold more than
     /// the retained generations, on file or in its own list.
     #[test]
@@ -548,8 +813,9 @@ pub(crate) mod tests {
     fn two_stores_that_write_one_number_at_one_moment_land_one_file() {
         const ROUNDS: u64 = 100;
         let dir = tempfile::tempdir().expect("a temp dir");
-        let open = || SpecStore::open(dir.path().to_owned()).expect("it opens");
-        let (mut first, mut second) = (open(), open());
+        let mut first = SpecStore::open(dir.path().to_owned()).expect("it opens");
+        // A second writer the lock did not keep out.
+        let mut second = SpecStore::open_beside(dir.path().to_owned()).expect("it opens");
         // Two processes' temporary names differ, whatever the clock read.
         second.writes = 1 << 32;
         let barrier = std::sync::Barrier::new(2);
@@ -558,7 +824,7 @@ pub(crate) mod tests {
                 barrier.wait();
                 store.persist(at(generation, YAML), bytes)
             };
-            let (one, two) = std::thread::scope(|scope| {
+            let (one, two) = thread::scope(|scope| {
                 let one = scope.spawn(|| write(&mut first, b"first"));
                 let two = scope.spawn(|| write(&mut second, b"second"));
                 (one.join().expect("no panic"), two.join().expect("no panic"))
@@ -698,8 +964,9 @@ pub(crate) mod tests {
     fn two_stores_that_write_one_number_in_the_two_forms_do_not_both_land() {
         const ROUNDS: u64 = 100;
         let dir = tempfile::tempdir().expect("a temp dir");
-        let open = || SpecStore::open(dir.path().to_owned()).expect("it opens");
-        let (mut first, mut second) = (open(), open());
+        let mut first = SpecStore::open(dir.path().to_owned()).expect("it opens");
+        // A second writer the lock did not keep out.
+        let mut second = SpecStore::open_beside(dir.path().to_owned()).expect("it opens");
         // Two processes' temporary names differ, whatever the clock read.
         second.writes = 1 << 32;
         let barrier = std::sync::Barrier::new(2);
@@ -708,7 +975,7 @@ pub(crate) mod tests {
                 barrier.wait();
                 store.persist(at(generation, format), b"a document")
             };
-            let (yaml, json) = std::thread::scope(|scope| {
+            let (yaml, json) = thread::scope(|scope| {
                 let yaml = scope.spawn(|| write(&mut first, YAML));
                 let json = scope.spawn(|| write(&mut second, Format::Json));
                 (
@@ -735,7 +1002,9 @@ pub(crate) mod tests {
             }
         }
         // No number holds two names, and no temporary name is left.
-        assert_eq!(names(dir.path()).len(), open().kept().len());
+        let left = names(dir.path());
+        let beside = SpecStore::open_beside(dir.path().to_owned()).expect("it opens");
+        assert_eq!(left.len(), beside.kept().len());
     }
 
     /// A pipe under a generation's name, with no writer, is refused by its
@@ -751,11 +1020,11 @@ pub(crate) mod tests {
         assert_eq!(store.kept(), [at(1, YAML)]);
 
         let (answer, answered) = mpsc::channel();
-        std::thread::spawn(move || {
+        thread::spawn(move || {
             let _ = answer.send(store.read(at(1, YAML)));
         });
         let read = answered
-            .recv_timeout(std::time::Duration::from_secs(5))
+            .recv_timeout(Duration::from_secs(5))
             .expect("the read answers: its open does not wait");
         let refused = read.expect_err("no regular file");
         assert_eq!(refused.to_string(), "the path leads to no regular file");

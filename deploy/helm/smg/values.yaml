@@ -490,12 +490,12 @@ policyController:
   #    goes with the release, and the generations on file are the only copy
   #    of an applied document. It is ReadWriteOncePod where the cluster
   #    offers that mode, else ReadWriteOnce, on a file system that links a
-  #    file under a second name, as the store's write does, and it holds
-  #    eight documents. One pod at a time opens the store: an upgrade
-  #    recreates the pod, the old one gone before the new one is made. A pod
-  #    replaced otherwise, after an eviction, may start while the old one
-  #    stops unless the claim is ReadWriteOncePod, and can then run a
-  #    generation the old pod has passed: see the README.
+  #    file under a second name and locks one, as the store does, and it
+  #    holds eight documents. One pod at a time holds the store, under a
+  #    lock on a file the controller keeps there: an upgrade recreates the
+  #    pod, the old one gone before the new one is made, and a pod replaced
+  #    otherwise, after an eviction, waits for the old one to stop, for its
+  #    grace period at most, before it reads the store: see the README.
   #    The chart refuses at render what the controller refuses at start
   #    beside a store: a document in spec, since a start names one source of
   #    its spec, and the election, since a standby does not follow an
@@ -612,7 +612,9 @@ policyController:
   # -- Graceful shutdown: how long a shutdown may take in all after SIGTERM
   #    (passed as --shutdown-grace-period-secs; 30 is the controller's own
   #    default). The pod's terminationGracePeriodSeconds is this plus
-  #    terminationGraceMarginSeconds.
+  #    terminationGraceMarginSeconds. On a spec store a pod started beside
+  #    one that still holds the store waits this long for it, and answers
+  #    no probe meanwhile.
   shutdownGracePeriodSeconds: 30
   # -- The window the listeners keep accepting after readiness fails; null
   #    keeps the controller's default of 5 seconds. More than half the grace
