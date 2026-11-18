@@ -79,7 +79,10 @@ as of `tokenizer/src/*`.
   asked whether it is empty), each of those values is empty, one control spelling, or a string
   that begins with a control spelling and ends with one (that last kind only where the pipeline
   matches every added token as it is spelled), and the
-  marks cover every control it writes on a few probe conversations; any other checkpoint renders
+  marks cover every control it writes on a few probe conversations (under a pipeline that matches
+  an added token after normalization the flat `encode` is asked what it cuts out of the text a
+  template writes: one that writes a text the normalizer turns into an added token is left as it
+  is); any other checkpoint renders
   and encodes as before. The flat `encode` of a rendered text reads a spelling as its token.
 - GLM-5.3 and GLM-5.3-Flash use native Rust chat rendering when checkpoint metadata and
   the template matches the current official one. Any other template keeps MiniJinja.

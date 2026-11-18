@@ -689,6 +689,8 @@ impl TiktokenTokenizer {
             },
             // This file's reader takes every added token as it is spelled.
             &|| true,
+            // So it is not asked what it cuts out of a text.
+            &|_: &str| Vec::new(),
             &self.special_tokens,
         );
         if let Some(written) = written {

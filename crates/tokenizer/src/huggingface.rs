@@ -22,7 +22,7 @@ use tokenizers::{
         PreTokenizerWrapper,
     },
     processors::template::TemplateProcessing,
-    tokenizer::{SplitDelimiterBehavior, Tokenizer as HfTokenizer},
+    tokenizer::{OffsetReferential, OffsetType, SplitDelimiterBehavior, Tokenizer as HfTokenizer},
     AddedToken, AddedVocabulary, Model,
 };
 use tracing::{debug, info, warn};
@@ -487,6 +487,21 @@ impl EncoderCore {
                     .values()
                     .any(|token| token.normalized)
         })
+    }
+
+    /// The added tokens the flat encode cuts out of `text`, in order, as the
+    /// reference pipeline finds them: the entries matched as spelled, then,
+    /// in what is left, the ones matched after normalization. Only the load
+    /// of a template asks, where [`Self::matches_after_normalization`].
+    fn cut_out(&self, text: &str) -> Vec<Range<usize>> {
+        self.tokenizer
+            .get_added_vocabulary()
+            .extract_and_normalize(self.tokenizer.get_normalizer(), text)
+            .get_splits(OffsetReferential::Original, OffsetType::Byte)
+            .into_iter()
+            .filter(|(_, _, tokens)| tokens.is_some())
+            .map(|(_, (start, end), _)| start..end)
+            .collect()
     }
 
     /// Whether the flat encode of `text` cuts out exactly the added tokens at
@@ -1055,6 +1070,7 @@ impl HuggingFaceTokenizer {
                     || core.added_entries(),
                     || core.added(),
                     &|| !core.matches_after_normalization(),
+                    &|text: &str| core.cut_out(text),
                     &special_tokens,
                 )
                 .map(|written| {
@@ -2781,6 +2797,7 @@ impl TokenizerTrait for HuggingFaceTokenizer {
                 || core.added_entries(),
                 || core.added(),
                 &|| !core.matches_after_normalization(),
+                &|text: &str| core.cut_out(text),
                 &self.special_tokens,
             );
             self.kept = written.as_deref().and_then(|written| core.kept(written));

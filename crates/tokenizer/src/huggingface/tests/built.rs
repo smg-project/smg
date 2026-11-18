@@ -373,7 +373,8 @@ fn a_replaced_template_that_writes_a_kept_token_reads_the_typed_one_as_text() {
 /// stands above the choice of encoder. On a byte-level file that the direct
 /// encoder takes, under NFC, a text that only the normalizer makes an
 /// entry's spelling is read by its characters, and every prompt of that
-/// pipeline is encoded by segments.
+/// pipeline is encoded by segments. A template that writes such a text
+/// itself stays as it is.
 #[cfg(not(feature = "tokenizers-v1"))]
 #[test]
 fn a_text_the_normalizer_turns_into_an_added_token_stays_text_on_the_direct_encoder() {
@@ -430,6 +431,27 @@ fn a_text_the_normalizer_turns_into_an_added_token_stays_text_on_the_direct_enco
     assert_eq!(ids.len(), 11);
     let (_, _, from_text) = render(&tok, json!("ab"));
     assert!(!from_text);
+    // The same text written by the template itself: the flat encode reads
+    // the entry there, so the template stays as it is and the prompt is
+    // encoded from its text.
+    let writes_it = template(
+        CONSTANTS,
+        "{{ open }}",
+        "{{ close }}<e\u{301}>",
+        "{{ end }}",
+    );
+    let temp = TempDir::new().unwrap();
+    let tok = checkpoint_of(temp.path(), &conversion, &writes_it);
+    assert!(!tok.chat_template.marked());
+    let (_, ids, from_text) = render(&tok, json!("ab"));
+    assert!(from_text);
+    assert!(ids.contains(&entry));
+    // A text the normalizer shortens into no entry, written before a
+    // control: the marks stand where the controls stand in the prompt.
+    let shortened = template(CONSTANTS, "e\u{301}{{ open }}", "{{ close }}", "{{ end }}");
+    let temp = TempDir::new().unwrap();
+    let tok = checkpoint_of(temp.path(), &conversion, &shortened);
+    assert!(tok.chat_template.marked());
 }
 
 #[test]
@@ -2067,6 +2089,20 @@ fn every_control_of_a_built_value_is_read_against_the_vocabulary() {
     }
 }
 
+/// [`TOKENIZER_JSON`] with one more added token, `<b>`, special and matched
+/// after normalization.
+fn with_a_normalized_entry() -> String {
+    let conversion = TOKENIZER_JSON
+        .replace(
+            r#""special": true}],"#,
+            r#""special": true},
+        {"id": 19, "content": "<b>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": true, "special": true}],"#,
+        )
+        .replace(r#"">": 18}"#, r#"">": 18, "<b>": 19}"#);
+    assert!(conversion.contains(r#""id": 19"#) && conversion.contains(r#"": 19}"#));
+    conversion
+}
+
 /// A built value of several controls holds text between them, and a bound
 /// value's text is read by its characters. The flat encode reads it so
 /// where it matches every added token as it is spelled: there the value is
@@ -2076,14 +2112,7 @@ fn every_control_of_a_built_value_is_read_against_the_vocabulary() {
 /// turns into an entry's spelling is that entry's token.
 #[test]
 fn a_built_value_of_several_controls_is_bound_where_added_tokens_match_as_spelled() {
-    let conversion = TOKENIZER_JSON
-        .replace(
-            r#""special": true}],"#,
-            r#""special": true},
-        {"id": 19, "content": "<b>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": true, "special": true}],"#,
-        )
-        .replace(r#"">": 18}"#, r#"">": 18, "<b>": 19}"#);
-    assert!(conversion.contains(r#""id": 19"#) && conversion.contains(r#"": 19}"#));
+    let conversion = with_a_normalized_entry();
     let several = template(
         &format!("{CONSTANTS}{{% set both = close ~ '<B>' ~ end %}}"),
         "{{ open }}",
@@ -2110,6 +2139,47 @@ fn a_built_value_of_several_controls_is_bound_where_added_tokens_match_as_spelle
     assert!(from_text);
     assert_eq!(text, "[INST:x]a[/INST:x]<B></s:x>ab</s:x>");
     assert_eq!(ids, [2, 13, 3, 19, 1, 13, 14, 1]);
+}
+
+/// Under a pipeline that matches an added token after normalization the
+/// flat encode reads as that token a text the normalizer turns into its
+/// spelling, a text of the template as well. A marked prompt would read
+/// that text by its characters, so a template that writes it stays as it
+/// is: a prompt is encoded from its text, and the text is the entry's
+/// token. The template may write the text whole, in two pieces side by
+/// side, or only under an argument no probe conversation passes. Where the
+/// entry matches as it is spelled the same text is no added token: the
+/// template is marked.
+#[test]
+fn a_template_text_the_normalizer_turns_into_an_added_token_leaves_the_template_as_it_was() {
+    let conversion = with_a_normalized_entry();
+    let lowered = conversion.replace(
+        r#""normalizer": null"#,
+        r#""normalizer": {"type": "Lowercase"}"#,
+    );
+    assert_ne!(lowered, conversion);
+    let kwargs = HashMap::from([("tag".to_owned(), json!(true))]);
+    for close in [
+        "{{ close }}<B>",
+        "{{ close }}{{ '<' }}B>",
+        "{{ close }}{% if tag %}<B>{% endif %}",
+    ] {
+        let writes_it = template(CONSTANTS, "{{ open }}", close, "{{ end }}");
+        let temp = TempDir::new().unwrap();
+        let tok = checkpoint_of(temp.path(), &lowered, &writes_it);
+        assert!(!tok.chat_template.marked(), "{close}");
+        let tagged = ChatTemplateParams {
+            template_kwargs: Some(&kwargs),
+            ..ChatTemplateParams::default()
+        };
+        let (text, ids, from_text) = render_under(&tok, json!("a"), tagged);
+        assert!(from_text, "{close}");
+        assert_eq!(text, "[INST:x]a[/INST:x]<B>ab</s:x>", "{close}");
+        assert_eq!(ids, [2, 13, 3, 19, 13, 14, 1], "{close}");
+        let temp = TempDir::new().unwrap();
+        let tok = checkpoint_of(temp.path(), &conversion, &writes_it);
+        assert!(tok.chat_template.marked(), "{close}");
+    }
 }
 
 #[test]

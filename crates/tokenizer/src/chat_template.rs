@@ -2453,6 +2453,9 @@ fn several_controls(value: &str, added: &AddedTokens) -> Option<Vec<Range<usize>
     at_both_edges.then_some(controls)
 }
 
+/// What says the added tokens a flat encode cuts out of a text, in order.
+type CutOut<'a> = &'a dyn Fn(&str) -> Vec<Range<usize>>;
+
 /// `source`, a chat template, with the expression of each of `bindings`
 /// ([`ChatTemplateState::control_bindings`], in the template's order) replaced by its
 /// value, the control spellings between marks ([`marked_literal`]). `None`
@@ -4366,11 +4369,14 @@ impl ChatTemplateState {
     /// plain literal holds that is neither a control spelling nor empty,
     /// so a checkpoint without either never builds it. `as_spelled` says
     /// whether the flat encode matches every added token as it is spelled,
-    /// and is asked only at such a built value: the text between two
+    /// and is asked at such a built value: the text between two
     /// controls of a bound value is read by its characters, and the flat
     /// encode reads it so only then. Under a pipeline that matches an added
     /// token after normalization a value of several controls stays unbound,
-    /// and its template as it is.
+    /// and its template as it is. It is asked again before the marks are
+    /// made: under such a pipeline `cut_out` says the added tokens the flat
+    /// encode cuts out of a text, a text the normalizer turns into one among
+    /// them, and a template that writes such a text stays as it is.
     ///
     /// Before that the vocabulary is read once: `added` is every added
     /// token, with whether its entry carries a flag. Where the flat encode
@@ -4388,6 +4394,7 @@ impl ChatTemplateState {
         added: impl FnOnce() -> I,
         controls: impl Fn() -> Option<&'a AddedTokens>,
         as_spelled: &dyn Fn() -> bool,
+        cut_out: &dyn Fn(&str) -> Vec<Range<usize>>,
         special_tokens: &SpecialTokens,
     ) -> Option<Vec<String>>
     where
@@ -4428,14 +4435,16 @@ impl ChatTemplateState {
             return None;
         }
         let controls = controls()?;
-        let own = self.built_controls_marked(&own, controls, special_tokens)?;
+        // Where the flat encode matches after normalization, it is asked too.
+        let cut_out = (!as_spelled()).then_some(cut_out);
+        let own = self.built_controls_marked(&own, controls, cut_out, special_tokens)?;
         let mut envs = Vec::new();
         for (state, bindings) in [&self.tool_use, &self.processor]
             .into_iter()
             .flatten()
             .zip(&nested)
         {
-            envs.push(state.built_controls_marked(bindings, controls, special_tokens)?);
+            envs.push(state.built_controls_marked(bindings, controls, cut_out, special_tokens)?);
         }
         self.env = Some(own);
         self.marked = true;
@@ -4669,6 +4678,7 @@ impl ChatTemplateState {
         &self,
         bindings: &[ControlBinding],
         controls: &AddedTokens,
+        cut_out: Option<CutOut<'_>>,
         special_tokens: &SpecialTokens,
     ) -> Option<Environment<'static>> {
         let plain = self.env.as_ref()?;
@@ -4689,17 +4699,18 @@ impl ChatTemplateState {
         // which is not made here. The whole source is asked first, and what
         // the template writes only where the source holds an added token
         // somewhere: in a comment, or in the pattern a bound spelling is
-        // built from, the template writes none.
-        if controls.ranges(source).next().is_some() {
+        // built from, the template writes none. Where the flat encode
+        // matches an added token after normalization it is asked too,
+        // whatever the source holds: the normalizer may make one of a text.
+        if cut_out.is_some() || controls.ranges(source).next().is_some() {
             let bound = |at| {
                 bindings
                     .iter()
                     .any(|binding| (binding.span.0..binding.span.1).contains(&at))
             };
-            if controls
-                .ranges(&written_text(source, bound))
-                .next()
-                .is_some()
+            let written = written_text(source, bound);
+            if controls.ranges(&written).next().is_some()
+                || cut_out.is_some_and(|cut_out| !cut_out(&written).is_empty())
             {
                 return declined("it writes an added token whole by itself");
             }
@@ -4713,7 +4724,7 @@ impl ChatTemplateState {
         let marked = self.twin(marked);
         if !self
             .twin(plain.clone())
-            .marks_every_control(&marked, controls, special_tokens)
+            .marks_every_control(&marked, controls, cut_out, special_tokens)
         {
             return declined(
                 "the marked template does not stand for it on the probe conversations",
@@ -4735,7 +4746,8 @@ impl ChatTemplateState {
     /// this template writes, every added token in it between marks. Then no
     /// control the template writes there would be encoded as text, and a
     /// request that types no spelling is encoded as it was. The bare turn
-    /// must render, and a control must be written.
+    /// must render, and a control must be written. `cut_out`, where there is
+    /// one, must cut out of that text the marked tokens and no other.
     ///
     /// A conversation this template refuses is not judged; `marked` must
     /// refuse it as well.
@@ -4743,6 +4755,7 @@ impl ChatTemplateState {
         &self,
         marked: &Self,
         controls: &AddedTokens,
+        cut_out: Option<CutOut<'_>>,
         special_tokens: &SpecialTokens,
     ) -> bool {
         let marked_tokens = marks::marked_special_tokens(special_tokens);
@@ -4782,7 +4795,10 @@ impl ChatTemplateState {
                     let Ok((text, written)) = marks::flatten(&rendered) else {
                         return false;
                     };
-                    if text != expected || !controls.ranges(&text).eq(written.iter().cloned()) {
+                    if text != expected
+                        || !controls.ranges(&text).eq(written.iter().cloned())
+                        || cut_out.is_some_and(|cut_out| cut_out(&text) != written)
+                    {
                         return false;
                     }
                     writes_a_control |= !written.is_empty();
