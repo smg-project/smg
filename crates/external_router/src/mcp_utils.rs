@@ -160,12 +160,16 @@ pub async fn connect_mcp_servers(
         // bind it is dropped with the warning, alone it leaves the request to
         // fail on the missing connection (`ensure_request_mcp_routing`),
         // instead of listing no tools under a key that resolves to nothing.
+        // A URL of the same string is a binding of its own, before or after.
         else if !mcp_orchestrator.has_static_server(&input.label) {
             warn!(
                 "Ignoring MCP tool '{}': no server_url and no connected MCP server of that name",
                 input.label
             );
-        } else if !mcp_servers.iter().any(|b| b.server_key == input.label) {
+        } else if !mcp_servers
+            .iter()
+            .any(|b| b.pool_key.is_none() && b.server_key == input.label)
+        {
             mcp_servers.push(McpServerBinding {
                 label: input.label.clone(),
                 server_key: input.label.clone(),
@@ -2386,21 +2390,30 @@ mod tests {
     }
 
     /// A configured server is named by the URL of another server, and one
-    /// request binds the name and that URL. Each binding lists its own
-    /// server's tools under its own label. A tool both servers list is
-    /// listed once, from the first binding whose allowlist admits it, and
-    /// each call reaches the server of the binding that lists its tool.
+    /// request binds the name and that URL, in either order. Each binding
+    /// lists its own server's tools under its own label. A tool both servers
+    /// list is listed once, from the first binding whose allowlist admits
+    /// it, and each call reaches the server of the binding that lists its
+    /// tool.
     #[tokio::test]
     async fn a_configured_server_and_a_url_of_one_name_each_list_and_call_their_own_tools() {
-        for (first_allows, lists, reaches) in [
+        for (name_first, name_allows, lists, reaches) in [
             (
+                true,
                 None,
                 [vec!["echo", "own"], vec!["other"]],
                 [(1, 0), (2, 0), (2, 1)],
             ),
             (
+                true,
                 Some("own"),
                 [vec!["own"], vec!["echo", "other"]],
+                [(0, 1), (1, 1), (1, 2)],
+            ),
+            (
+                false,
+                None,
+                [vec!["echo", "other"], vec!["own"]],
                 [(0, 1), (1, 1), (1, 2)],
             ),
         ] {
@@ -2420,13 +2433,13 @@ mod tests {
             .await;
             let config = config_holding(&url, named_at);
             let orchestrator = Arc::new(McpOrchestrator::new(config).await.unwrap());
-            let inputs = [
+            let mut inputs = [
                 McpServerInput {
                     label: url.clone(),
                     url: None,
                     authorization: None,
                     headers: HashMap::new(),
-                    allowed_tools: first_allows.map(|tool: &str| vec![tool.to_string()]),
+                    allowed_tools: name_allows.map(|tool: &str| vec![tool.to_string()]),
                 },
                 McpServerInput {
                     label: "by-url".to_string(),
@@ -2436,6 +2449,11 @@ mod tests {
                     allowed_tools: None,
                 },
             ];
+            let mut kinds = [(url.as_str(), false), ("by-url", true)];
+            if !name_first {
+                inputs.reverse();
+                kinds.reverse();
+            }
             let bindings =
                 connect_mcp_servers(&orchestrator, &FormatRegistry::new(), &inputs).await;
             let session = McpToolSession::new(&orchestrator, bindings, "test-request");
@@ -2445,9 +2463,8 @@ mod tests {
                 .map(|binding| (binding.label.as_str(), binding.pool_key.is_some()))
                 .collect();
             assert_eq!(
-                bound,
-                [(url.as_str(), false), ("by-url", true)],
-                "the name binds the configured server, the URL a pooled connection"
+                bound, kinds,
+                "the name binds the configured server and the URL a pooled connection, in the request's order"
             );
             let listed: Vec<Vec<String>> = session
                 .mcp_servers()
