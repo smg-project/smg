@@ -18,6 +18,11 @@
 //! metrics around an applied batch); `apply.rs` takes one event into the
 //! index (tiers, cache groups, namespaces, and the physical copies of a
 //! block, counted per worker).
+//!
+//! The task and the index meet at one port (`port.rs`): the task says what
+//! its stream brought, and `index_sink.rs`, the sink over the models'
+//! indexes, keeps each worker's stream state and applies what its cursor
+//! admits.
 
 use std::{
     collections::HashMap,
@@ -50,11 +55,15 @@ use crate::worker::{
 
 mod admission;
 mod apply;
+mod index_sink;
+mod port;
 mod recovery;
 mod subscription;
 
 #[cfg(any(test, feature = "test-util"))]
 pub(crate) use apply::WorkerIndexState;
+use index_sink::{IndexSink, OpenRow};
+use port::KvEventSink;
 pub(crate) use subscription::EngineStreams;
 
 /// Interval between publications of each model's index size and, for the chain
@@ -103,6 +112,9 @@ pub struct KvEventMonitor {
     /// Used by CacheAwarePolicy to chunk request tokens at query time.
     /// Arc-wrapped so subscription tasks can update it from events.
     block_sizes: Arc<DashMap<String, KvBlockSize>>,
+    /// Where the events subscriptions' batches go: the sink over the models'
+    /// indexes, which keeps each worker's stream state by its row.
+    sink: Arc<IndexSink>,
     /// Per-worker subscription slots: worker_url → the live subscription, or
     /// the reservation a removal leaves until the old task has cleaned up.
     /// Mutex matches LoadMonitor pattern for atomic abort + remove; Arc so a
@@ -203,8 +215,9 @@ struct WorkerSubscription {
     /// the object under the URL, and the records on the stream reach the
     /// one the task holds, so an add with another object restarts it.
     started_for: Weak<dyn Worker>,
-    /// Signals the subscription task to shut down gracefully. The task owns
-    /// the worker's index state and takes its blocks out of the index on exit.
+    /// Signals the subscription task to shut down gracefully. On exit the
+    /// task tells the sink the worker left, and the sink takes the worker's
+    /// blocks out of the index.
     shutdown_tx: oneshot::Sender<()>,
     /// Closes when the task has ended; a removal moves it into the
     /// reservation it leaves in the slot.
@@ -225,9 +238,11 @@ static NEXT_SUBSCRIPTION_ID: AtomicU64 = AtomicU64::new(1);
 impl KvEventMonitor {
     /// A monitor whose models get chain indexes.
     pub fn new() -> Self {
+        let block_sizes = Arc::new(DashMap::new());
         Self {
             indexers: Arc::new(DashMap::new()),
-            block_sizes: Arc::new(DashMap::new()),
+            sink: Arc::new(IndexSink::new(Arc::clone(&block_sizes))),
+            block_sizes,
             worker_handles: Arc::new(Mutex::new(HashMap::new())),
             stats_task: parking_lot::Mutex::new(None),
             load_sink: OnceLock::new(),
@@ -457,17 +472,8 @@ impl KvEventMonitor {
             .filter(|_| kind == SubscriptionKind::Events)
         {
             if bs > 0 {
-                let known = self
-                    .block_sizes
-                    .entry(model_id.clone())
-                    .or_insert(KvBlockSize {
-                        tokens: bs,
-                        from_events: false,
-                    });
-                // Under the entry's lock, as the learn site writes it, so a
-                // size a stream learns meanwhile is not overwritten on the
-                // gauge by the seed.
-                Metrics::set_kv_block_size(&model_id, known.tokens);
+                self.sink
+                    .set_block_size(&model_id, u32::try_from(bs).unwrap_or(u32::MAX));
             } else {
                 warn!(worker_url = %Endpoint::redacted_str(&url), "Worker reports kv_block_size=0, ignoring");
             }
@@ -476,7 +482,7 @@ impl KvEventMonitor {
         let started_for = Arc::downgrade(worker);
         let worker = Arc::clone(worker);
         let worker_url = url.clone();
-        let block_sizes = Arc::clone(&self.block_sizes);
+        let sink = Arc::clone(&self.sink);
 
         info!(
             worker_url = %Endpoint::redacted_str(&url),
@@ -511,15 +517,40 @@ impl KvEventMonitor {
             // Catch panics here so they surface when they happen — a bare
             // JoinError would only be observed at worker removal, leaving the
             // index silently frozen for this worker until then.
-            let result = std::panic::AssertUnwindSafe(Self::subscription_loop(
-                worker,
-                worker_url,
-                indexer,
-                block_sizes,
-                loop_model_id,
-                shutdown_rx,
-                load_sink,
-            ))
+            let result = std::panic::AssertUnwindSafe(async move {
+                // An events subscription opens its row in the sink first. The
+                // row is the task's for its whole life and goes with it.
+                let row = match indexer {
+                    Some(index) => {
+                        match sink.open(index, &loop_model_id, &worker_url, worker.dp_rank()) {
+                            Ok(row) => Some(row),
+                            Err(e) => {
+                                error!(
+                                    worker_url = %Endpoint::redacted_str(&worker_url),
+                                    error = %e,
+                                    "Failed to intern worker; KV events from this worker will \
+                                     not feed cache-aware routing"
+                                );
+                                Metrics::record_kv_event_subscription_failure(
+                                    &worker_url,
+                                    "intern_failed",
+                                );
+                                return;
+                            }
+                        }
+                    }
+                    None => None,
+                };
+                Self::subscription_loop(
+                    worker,
+                    worker_url,
+                    row.as_ref().map(OpenRow::feed),
+                    loop_model_id,
+                    shutdown_rx,
+                    load_sink,
+                )
+                .await;
+            })
             .catch_unwind()
             .await;
             if let Err(payload) = result {
@@ -621,8 +652,9 @@ impl KvEventMonitor {
 
     /// Stop the KV event subscription for a worker.
     ///
-    /// Sends a graceful shutdown signal. The subscription task takes the
-    /// worker's blocks out of the index from its own per-worker map; that
+    /// Sends a graceful shutdown signal. The subscription task tells the
+    /// sink the worker left, and the sink takes the worker's blocks out of
+    /// the index from the row it keeps for the worker; that
     /// CPU-bound cleanup runs on the bounded blocking pool rather than a Tokio
     /// runtime worker. A write made here once the task is gone (the join
     /// error, the gauge of a task that ended before the removal) is made

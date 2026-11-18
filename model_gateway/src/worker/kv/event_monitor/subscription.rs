@@ -1,6 +1,6 @@
 //! The subscription task of one worker: connect, read the stream, reconnect
-//! with backoff, hand the pushed load records on, and take the worker's
-//! blocks out of the index when it leaves.
+//! with backoff, hand the pushed load records on, say to the sink what the
+//! stream brought, and say to it that the worker left.
 
 use std::{
     sync::{Arc, Weak},
@@ -8,25 +8,17 @@ use std::{
 };
 
 use async_trait::async_trait;
-use dashmap::DashMap;
-use smg_grpc_client::common_proto::{kv_cache_event, EngineLoad, KvEventBatch};
+use smg_grpc_client::common_proto::{kv_cache_event, EngineLoad, KvEventBatch, KvSnapshotChunk};
 use tokio::sync::{oneshot, Semaphore};
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 use super::{
-    admission::{BatchOutcome, WorkerStreamState},
-    apply::{WorkerIndexCounters, WorkerIndexState},
-    KvBlockSize, KvEventMonitor, PushedLoadSink, SubscriptionKind,
+    port::{BatchFacts, BatchOutcome, KvEventSink, ResyncReason, SnapshotChunk},
+    KvEventMonitor, PushedLoadSink, SubscriptionKind,
 };
 use crate::{
     routers::grpc::backend_client::typed,
-    worker::{
-        health::liveness,
-        identity::endpoint::Endpoint,
-        kv::{event_monitor::recovery::ResyncReason, index_backend::KvIndex},
-        metrics::Metrics,
-        Worker,
-    },
+    worker::{health::liveness, identity::endpoint::Endpoint, metrics::Metrics, Worker},
 };
 
 /// Initial reconnection delay after stream failure.
@@ -145,8 +137,8 @@ enum Subscribed {
 
 /// How a stream was drained.
 enum Drained {
-    /// The stream ended as `result` says; `applied` is whether the index
-    /// applied a batch of it.
+    /// The stream ended as `result` says; `applied` is whether the sink took
+    /// a batch of it.
     Ended { result: StreamResult, applied: bool },
     /// The worker left while the stream was open.
     Shutdown,
@@ -183,35 +175,49 @@ impl Backoff {
     }
 }
 
-/// What a worker's stream feeds: the model's index (its KV events, with the
-/// load records that ride them), or the worker monitor alone (its load
-/// records, asked for with `loads_only`; a servicer that predates the field
-/// streams its events too, which are dropped).
-#[derive(Clone, Copy)]
-enum Role<'a> {
-    Index {
-        worker_id: u32,
-        indexer: &'a KvIndex,
-        block_sizes: &'a DashMap<String, KvBlockSize>,
-    },
+/// What a worker's stream feeds: a sink (its KV events, under the sink's id
+/// for the worker, with the load records that ride them), or the worker
+/// monitor alone (its load records, asked for with `loads_only`; a servicer
+/// that predates the field streams its events too, which are dropped).
+enum Role<'a, S: KvEventSink> {
+    Index { sink: &'a S, id: S::Id },
     Loads,
 }
 
-impl Role<'_> {
+impl<S: KvEventSink> Clone for Role<'_, S> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<S: KvEventSink> Copy for Role<'_, S> {}
+
+impl<S: KvEventSink> Role<'_, S> {
     fn kind(self) -> SubscriptionKind {
         match self {
             Self::Index { .. } => SubscriptionKind::Events,
             Self::Loads => SubscriptionKind::Loads,
         }
     }
+
+    /// The cursor to send when (re)subscribing: rank 0's last applied
+    /// sequence as the sink holds it (the servicers replay rank 0's
+    /// publisher), 0 where the sink has no cursor for it or the stream feeds
+    /// no sink.
+    fn resume_sequence(self) -> u64 {
+        match self {
+            Self::Index { sink, id } => sink.cursor(id, 0).map_or(0, |cursor| cursor.applied),
+            Self::Loads => 0,
+        }
+    }
 }
 
 /// What one worker's subscription task holds for its whole life, borrowed by
 /// every round: the worker, what its stream feeds and its contact source.
-struct WorkerSubscription<'a> {
+struct WorkerSubscription<'a, S: KvEventSink> {
     worker: &'a Arc<dyn Worker>,
     worker_url: &'a str,
-    role: Role<'a>,
+    role: Role<'a, S>,
     model_id: &'a str,
     load_sink: Option<&'a Weak<dyn PushedLoadSink>>,
     wake: Option<&'a Arc<tokio::sync::Notify>>,
@@ -294,146 +300,63 @@ async fn subscribe_with_deadline(
 }
 
 impl KvEventMonitor {
-    /// Learn the model's `block_size` from the stored blocks of a batch.
-    ///
-    /// The first stored block replaces a provisional size (a `WorkerSpec`
-    /// seed): the event stream reflects the backend's actual page size.
-    /// After that a block only raises the size. Hybrid engines publish,
-    /// beside their full blocks, partial entries at their hash granularity
-    /// (a fraction of the block, for a prefix boundary a later request can
-    /// resume at); a request chunked at that size would never match a full
-    /// block, so a smaller block never lowers the size of record.
-    /// `CacheAwarePolicy` uses the size to chunk request tokens into blocks
-    /// for overlap scoring.
-    fn learn_block_size(
-        block_sizes: &DashMap<String, KvBlockSize>,
-        model_id: &str,
-        batch: &KvEventBatch,
-    ) {
-        for event in &batch.events {
-            let Some(kv_cache_event::Data::Stored(stored)) = &event.data else {
-                continue;
-            };
-            let Some(block) = stored.blocks.first() else {
-                continue;
-            };
-            let Ok(tokens) = usize::try_from(block.block_size) else {
-                continue;
-            };
-            if tokens == 0 {
-                continue;
-            }
-            // The common case, a block of the size of record, costs one shared
-            // read; the write lock is taken only to change the size.
-            if block_sizes
-                .get(model_id)
-                .is_some_and(|size| size.from_events && tokens <= size.tokens)
-            {
-                continue;
-            }
-            let mut entry = block_sizes
-                .entry(model_id.to_string())
-                .or_insert(KvBlockSize {
-                    tokens: 0,
-                    from_events: false,
-                });
-            if entry.from_events && tokens <= entry.tokens {
-                continue;
-            }
-            let previous = (entry.tokens > 0).then_some(entry.tokens);
-            *entry = KvBlockSize {
-                tokens,
-                from_events: true,
-            };
-            Metrics::set_kv_block_size(model_id, tokens);
-            info!(
-                model_id = %model_id,
-                block_size = tokens,
-                previous,
-                "Learned block_size from KV event"
-            );
-        }
-    }
-
-    /// Take the worker's blocks out of the index when its subscription ends,
-    /// on the blocking pool and under a fleet-wide bound, and log what its
-    /// stream carried that the index did not take as is.
-    async fn remove_indexer_worker(
-        indexer: Arc<KvIndex>,
-        worker_id: u32,
-        worker_url: &str,
-        worker_blocks: WorkerIndexState,
-    ) {
+    /// Tell the sink the worker left, when its subscription ends: on the
+    /// blocking pool and under a fleet-wide bound, since the worker's blocks
+    /// leave the sink's index inside the call.
+    async fn remove_from_sink<S>(sink: Arc<S>, id: S::Id, worker_url: &str)
+    where
+        S: KvEventSink + 'static,
+    {
         let Ok(permit) = INDEX_REMOVAL_PERMITS.acquire().await else {
-            error!(worker_id, "Index cleanup semaphore closed");
+            error!(
+                worker_url = %Endpoint::redacted_str(worker_url),
+                "Index cleanup semaphore closed"
+            );
             return;
         };
-        let WorkerIndexState {
-            blocks, counters, ..
-        } = worker_blocks;
-        if counters != WorkerIndexCounters::default() {
-            debug!(
-                worker_id,
-                ?counters,
-                "KV events the index did not take as is"
-            );
-        }
         let result = tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            indexer.remove_worker(worker_id, blocks);
+            sink.removed(id);
         })
         .await;
 
         if let Err(error) = result {
-            error!(worker_id, %error, "Index worker cleanup task failed");
+            error!(
+                worker_url = %Endpoint::redacted_str(worker_url),
+                %error,
+                "Index worker cleanup task failed"
+            );
         }
-        Metrics::set_kv_index_blocks(worker_url, 0);
     }
 
     /// Main subscription loop for a single worker.
     ///
-    /// With an `indexer` (an events subscription) it owns the worker's index
-    /// state and takes its blocks out of the index on exit; without one it
-    /// streams the worker's load records alone. Exits when `shutdown_rx`
+    /// With a `feed` (an events subscription: the sink and its id for the
+    /// worker) it says to the sink what the stream brings and, on exit, that
+    /// the worker left; without one it streams the worker's load records
+    /// alone. Exits when `shutdown_rx`
     /// fires or the backend returns `Unimplemented`. Each round
     /// ([`Self::subscription_round`]) gets the backend client, subscribes
     /// under the deadline and drains one stream, then says what comes next;
     /// this loop is the one place that sleeps the reconnect backoff and the
     /// one place that ends the task.
-    pub(super) async fn subscription_loop(
+    pub(super) async fn subscription_loop<S>(
         worker: Arc<dyn Worker>,
         worker_url: String,
-        indexer: Option<Arc<KvIndex>>,
-        block_sizes: Arc<DashMap<String, KvBlockSize>>,
+        feed: Option<(Arc<S>, S::Id)>,
         model_id: String,
         mut shutdown_rx: oneshot::Receiver<()>,
         load_sink: Option<Weak<dyn PushedLoadSink>>,
-    ) {
-        let index = match &indexer {
-            Some(indexer) => match indexer.intern_worker(&worker_url) {
-                Ok(worker_id) => Some((indexer, worker_id)),
-                Err(e) => {
-                    error!(
-                        worker_url = %Endpoint::redacted_str(&worker_url),
-                        error = %e,
-                        "Failed to intern worker; KV events from this worker will \
-                         not feed cache-aware routing"
-                    );
-                    Metrics::record_kv_event_subscription_failure(&worker_url, "intern_failed");
-                    return;
-                }
-            },
-            None => None,
-        };
-        let role = match index {
-            Some((indexer, worker_id)) => Role::Index {
-                worker_id,
-                indexer: Arc::as_ref(indexer),
-                block_sizes: &block_sizes,
+    ) where
+        S: KvEventSink<Batch = KvEventBatch> + 'static,
+    {
+        let role = match &feed {
+            Some((sink, id)) => Role::Index {
+                sink: Arc::as_ref(sink),
+                id: *id,
             },
             None => Role::Loads,
         };
-        let mut state = WorkerStreamState::of_rank(worker.dp_rank());
         // A contact with the worker (a poll answered, a probe passed) ends the
         // reconnect backoff early: a worker that is back gets its stream back
         // at once instead of after the remaining delay.
@@ -449,14 +372,7 @@ impl KvEventMonitor {
         let mut backoff = Backoff::new();
 
         let unsupported = loop {
-            match Self::subscription_round(
-                &subscription,
-                &mut state,
-                &mut backoff,
-                &mut shutdown_rx,
-            )
-            .await
-            {
+            match Self::subscription_round(&subscription, &mut backoff, &mut shutdown_rx).await {
                 Round::Again => {}
                 Round::Backoff => {
                     if sleep_or_shutdown(backoff.delay(), wake.as_ref(), &mut shutdown_rx).await {
@@ -468,13 +384,13 @@ impl KvEventMonitor {
                 Round::Unsupported => break true,
             }
         };
-        if let Some((indexer, worker_id)) = index {
-            Self::remove_indexer_worker(Arc::clone(indexer), worker_id, &worker_url, state.index)
-                .await;
+        let events = feed.is_some();
+        if let Some((sink, id)) = feed {
+            Self::remove_from_sink(sink, id, &worker_url).await;
         }
         // The gauge is the index's: a loads-only subscription a backend refuses
         // leaves the worker on the poll, which is the designed fallback.
-        if unsupported && index.is_some() {
+        if unsupported && events {
             Metrics::set_kv_events_unavailable(&worker_url, true);
         }
     }
@@ -482,9 +398,8 @@ impl KvEventMonitor {
     /// One round of a worker's subscription: the backend client, the
     /// subscribe call under its deadline, the stream drained to its end;
     /// returns what the loop does next.
-    async fn subscription_round(
-        sub: &WorkerSubscription<'_>,
-        state: &mut WorkerStreamState,
+    async fn subscription_round<S: KvEventSink<Batch = KvEventBatch>>(
+        sub: &WorkerSubscription<'_, S>,
         backoff: &mut Backoff,
         shutdown_rx: &mut oneshot::Receiver<()>,
     ) -> Round {
@@ -513,7 +428,7 @@ impl KvEventMonitor {
             }
         };
 
-        let start_seq = state.resume_sequence();
+        let start_seq = sub.role.resume_sequence();
         // The streams are the gateway's client's: the loop reads it back from
         // the handle through the request path's reader. A connection of another
         // type carries no stream: said once, in that reader's words, and read
@@ -549,7 +464,9 @@ impl KvEventMonitor {
                 // a working stream (one that fails on its first message
                 // would be retried at the initial delay forever); it is
                 // reset once the stream has delivered a batch.
-                state.reconnected();
+                if let Role::Index { sink, id } = sub.role {
+                    sink.reconnected(id);
+                }
                 liveness::on_contact(sub.worker);
                 stream
             }
@@ -594,17 +511,8 @@ impl KvEventMonitor {
                         start_seq,
                         "KV event replay cursor expired; clearing worker state and requesting a current snapshot"
                     );
-                    if let Role::Index {
-                        worker_id, indexer, ..
-                    } = sub.role
-                    {
-                        Self::reset_worker(
-                            indexer,
-                            worker_id,
-                            state,
-                            worker_url,
-                            ResyncReason::OutOfRange,
-                        );
+                    if let Role::Index { sink, id } = sub.role {
+                        sink.resync(id, None, ResyncReason::OutOfRange);
                     }
                     backoff.reset();
                     return Round::Again;
@@ -622,15 +530,22 @@ impl KvEventMonitor {
             }
         };
 
-        let (result, applied) = match Self::drain_stream(sub, stream, state, shutdown_rx).await {
-            Drained::Ended { result, applied } => (result, applied),
-            Drained::Shutdown => return Round::Shutdown,
-        };
+        // The chunks still to come of a relay's snapshot the stream is
+        // inside, by this round's own count.
+        let mut snapshot = None;
+        let (result, applied) =
+            match Self::drain_stream(sub, stream, &mut snapshot, shutdown_rx).await {
+                Drained::Ended { result, applied } => (result, applied),
+                Drained::Shutdown => return Round::Shutdown,
+            };
         if applied {
             // The stream worked: its failure starts the backoff over.
             backoff.reset();
         }
-        if state.abandon_snapshot() {
+        if snapshot.is_some() {
+            if let Role::Index { sink, id } = sub.role {
+                sink.resync(id, None, ResyncReason::SnapshotAbandoned);
+            }
             warn!(
                 worker_url = %Endpoint::redacted_str(worker_url),
                 "KV event stream ended during a relay snapshot; the next subscription \
@@ -641,7 +556,7 @@ impl KvEventMonitor {
             StreamResult::Ended => {
                 info!(
                     worker_url = %Endpoint::redacted_str(worker_url),
-                    resume_from = state.resume_sequence(),
+                    resume_from = sub.role.resume_sequence(),
                     delay_ms = backoff.delay_ms(),
                     "KV event stream ended, reconnecting"
                 );
@@ -655,20 +570,11 @@ impl KvEventMonitor {
                     warn!(
                         worker_url = %Endpoint::redacted_str(worker_url),
                         error = %e,
-                        resume_from = state.resume_sequence(),
+                        resume_from = sub.role.resume_sequence(),
                         "KV event subscriber fell behind; clearing worker state and requesting a current snapshot"
                     );
-                    if let Role::Index {
-                        worker_id, indexer, ..
-                    } = sub.role
-                    {
-                        Self::reset_worker(
-                            indexer,
-                            worker_id,
-                            state,
-                            worker_url,
-                            ResyncReason::DataLoss,
-                        );
+                    if let Role::Index { sink, id } = sub.role {
+                        sink.resync(id, None, ResyncReason::DataLoss);
                     }
                     backoff.reset();
                     return Round::Again;
@@ -679,7 +585,7 @@ impl KvEventMonitor {
                 warn!(
                     worker_url = %Endpoint::redacted_str(worker_url),
                     error = %e,
-                    resume_from = state.resume_sequence(),
+                    resume_from = sub.role.resume_sequence(),
                     delay_ms = backoff.delay_ms(),
                     "KV event stream error, reconnecting"
                 );
@@ -702,7 +608,11 @@ impl KvEventMonitor {
 
     /// The load record on a batch is a poll of this worker, received now:
     /// forwarded to the monitor only if its rank belongs to this worker.
-    fn forward_record(sub: &WorkerSubscription<'_>, batch: &KvEventBatch, load: &EngineLoad) {
+    fn forward_record<S: KvEventSink>(
+        sub: &WorkerSubscription<'_, S>,
+        batch: &KvEventBatch,
+        load: &EngineLoad,
+    ) {
         let dp_rank = batch.dp_rank.unwrap_or(0);
         if dp_rank < 0
             || sub
@@ -718,34 +628,31 @@ impl KvEventMonitor {
         }
     }
 
-    /// Drain `stream` to its end: on an events subscription each batch is
-    /// applied to the index (a batch the index applied is the stream
-    /// working) and each batch's load record forwarded; on a loads-only one
-    /// every batch is the stream working, its record forwarded and its
-    /// events, if any, dropped. The worker's removal ends the stream at once.
-    async fn drain_stream(
-        sub: &WorkerSubscription<'_>,
+    /// Drain `stream` to its end: on an events subscription each batch goes
+    /// to the sink (a batch the sink took is the stream working, and a
+    /// contact with the worker) and each batch's load record is forwarded;
+    /// on a loads-only one every batch is the stream working, its record
+    /// forwarded and its events, if any, dropped. `snapshot` is left at the
+    /// chunks still to come of a relay's snapshot the stream ended inside.
+    /// The worker's removal ends the stream at once.
+    async fn drain_stream<S: KvEventSink<Batch = KvEventBatch>>(
+        sub: &WorkerSubscription<'_, S>,
         stream: tonic::Streaming<KvEventBatch>,
-        state: &mut WorkerStreamState,
+        snapshot: &mut Option<u32>,
         shutdown_rx: &mut oneshot::Receiver<()>,
     ) -> Drained {
         let mut applied = false;
         let on_load =
             |batch: &KvEventBatch, load: &EngineLoad| Self::forward_record(sub, batch, load);
         let result = match sub.role {
-            Role::Index {
-                worker_id,
-                indexer,
-                block_sizes,
-            } => {
-                let on_batch = |batch: &KvEventBatch| {
+            Role::Index { sink, id } => {
+                let on_batch = || {
                     applied = true;
                     liveness::on_contact(sub.worker);
-                    Self::learn_block_size(block_sizes, sub.model_id, batch);
                 };
                 tokio::select! {
                     result = Self::process_stream(
-                        stream, sub.worker_url, worker_id, indexer, state, on_batch, on_load,
+                        stream, sub.worker_url, sink, id, snapshot, on_batch, on_load,
                     ) => result,
                     _ = &mut *shutdown_rx => return Drained::Shutdown,
                 }
@@ -793,14 +700,17 @@ impl KvEventMonitor {
         StreamResult::Ended
     }
 
-    /// Process batches from a single stream connection.
-    async fn process_stream(
+    /// Process batches from a single stream connection: every batch that is
+    /// more than a load record goes to the sink with its header facts, a
+    /// snapshot's start said ahead of its first chunk. A batch the sink took
+    /// is `on_batch`'s; a gap ends the stream, for a replay.
+    async fn process_stream<S: KvEventSink<Batch = KvEventBatch>>(
         mut stream: tonic::Streaming<KvEventBatch>,
         worker_url: &str,
-        worker_id: u32,
-        indexer: &KvIndex,
-        state: &mut WorkerStreamState,
-        mut on_batch: impl FnMut(&KvEventBatch),
+        sink: &S,
+        id: S::Id,
+        snapshot: &mut Option<u32>,
+        mut on_batch: impl FnMut(),
         mut on_load: impl FnMut(&KvEventBatch, &EngineLoad),
     ) -> StreamResult {
         use tokio_stream::StreamExt;
@@ -817,10 +727,17 @@ impl KvEventMonitor {
                     continue;
                 }
             }
-            if let BatchOutcome::Gap { expected, received } =
-                Self::admit_batch(&batch, worker_url, worker_id, indexer, state, &mut on_batch)
-            {
-                return StreamResult::GapDetected { expected, received };
+            if let Some(chunk) = &batch.snapshot {
+                if count_snapshot_chunk(snapshot, chunk) {
+                    sink.resync(id, None, ResyncReason::Snapshot);
+                }
+            }
+            match sink.admit(id, batch_rank(&batch), batch_facts(&batch), &batch) {
+                BatchOutcome::Applied => on_batch(),
+                BatchOutcome::Skipped => {}
+                BatchOutcome::Gap { expected, received } => {
+                    return StreamResult::GapDetected { expected, received };
+                }
             }
         }
 
@@ -834,12 +751,49 @@ impl KvEventMonitor {
     }
 }
 
+/// The header facts of a batch, as a sink's cursor reads them.
+pub(super) fn batch_facts(batch: &KvEventBatch) -> BatchFacts {
+    BatchFacts {
+        sequence: batch.sequence_number,
+        clears: batch.events.iter().any(|event| {
+            matches!(&event.data, Some(kv_cache_event::Data::Cleared(cleared)) if cleared.ownership.is_none())
+        }),
+        snapshot: batch.snapshot.as_ref().map(|chunk| SnapshotChunk {
+            unknown_before: chunk.unknown_before > 0,
+        }),
+    }
+}
+
+/// The rank a batch names, 0 for a batch that names none.
+pub(super) fn batch_rank(batch: &KvEventBatch) -> u16 {
+    batch
+        .dp_rank
+        .and_then(|rank| u16::try_from(rank).ok())
+        .unwrap_or(0)
+}
+
+/// Count one chunk of a relay's snapshot on its stream. `open` is the chunks
+/// still to come of the snapshot the stream is inside, `None` outside one: a
+/// first chunk, or a chunk outside a snapshot, opens one of the count the
+/// chunk says, and the chunk that fills the count closes it. A stream that
+/// ends with a snapshot open has brought a partial live set, which the
+/// collector says to the sink. Returns whether the chunk opened a snapshot:
+/// the start the collector says ahead of the chunk.
+fn count_snapshot_chunk(open: &mut Option<u32>, chunk: &KvSnapshotChunk) -> bool {
+    let (opens, left) = match *open {
+        Some(left) if chunk.index != 0 => (false, left),
+        _ => (true, chunk.count.max(1)),
+    };
+    *open = (left > 1).then(|| left - 1);
+    opens
+}
+
 #[cfg(test)]
 mod tests {
     use std::{net::SocketAddr, pin::Pin, sync::Mutex};
 
+    use dashmap::DashMap;
     use futures::Stream;
-    use kv_index::{compute_content_hash, SequenceHash, StoredBlock};
     use openai_protocol::{
         model_card::ModelCard,
         worker::{ConnectionMode, HealthCheckConfig, RuntimeType, WorkerType},
@@ -854,16 +808,97 @@ mod tests {
     use tonic::{transport::Server, Request, Response, Status};
     use tracing_test::traced_test;
 
-    use super::*;
+    use super::{
+        super::{
+            index_sink::{IndexSink, OpenRow},
+            port::KvCursor,
+            KvBlockSize,
+        },
+        *,
+    };
     use crate::{
         config::types::PolicyConfig,
         policies::PolicyRegistry,
         routers::grpc::{backend_client::BackendClient, test_engine::serve_on_loopback},
         worker::{
-            identity::basic::StallReason, BasicWorkerBuilder, WorkerMonitor, WorkerRegistry,
-            UNKNOWN_MODEL_ID,
+            identity::basic::StallReason, kv::index_backend::KvIndex, BasicWorkerBuilder,
+            WorkerMonitor, WorkerRegistry, UNKNOWN_MODEL_ID,
         },
     };
+
+    /// A sink over one fresh index with a row open in it, as an events
+    /// subscription starts: for a worker that stands for `rank` of its
+    /// engine, or for the whole of it.
+    fn open_row(worker_url: &str, rank: Option<usize>) -> (Arc<KvIndex>, Arc<IndexSink>, OpenRow) {
+        let index = Arc::new(KvIndex::chain());
+        let sink = Arc::new(IndexSink::new(Arc::new(DashMap::new())));
+        let row = sink
+            .open(Arc::clone(&index), "m", worker_url, rank)
+            .expect("the index interns the worker");
+        (index, sink, row)
+    }
+
+    /// A sink that keeps what the collector said to it, in order, and
+    /// answers from a script: every batch taken, the cursor at `applied`.
+    #[derive(Default)]
+    struct Said {
+        calls: Mutex<Vec<String>>,
+        applied: u64,
+    }
+
+    impl Said {
+        fn note(&self, call: String) {
+            self.calls.lock().unwrap().push(call);
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl KvEventSink for Said {
+        type Batch = KvEventBatch;
+        type Id = u8;
+
+        fn admit(&self, id: u8, rank: u16, facts: BatchFacts, _: &KvEventBatch) -> BatchOutcome {
+            let chunk = if facts.snapshot.is_some() {
+                " chunk"
+            } else {
+                ""
+            };
+            self.note(format!(
+                "admit {id} rank {rank} seq {}{chunk}",
+                facts.sequence
+            ));
+            BatchOutcome::Applied
+        }
+
+        fn reconnected(&self, id: u8) {
+            self.note(format!("reconnected {id}"));
+        }
+
+        fn resync(&self, id: u8, rank: Option<u16>, reason: ResyncReason) {
+            self.note(format!("resync {id} {rank:?} {}", reason.as_str()));
+        }
+
+        fn cursor(&self, id: u8, rank: u16) -> Option<KvCursor> {
+            self.note(format!("cursor {id} rank {rank}"));
+            Some(KvCursor {
+                applied: self.applied,
+                ..KvCursor::default()
+            })
+        }
+
+        fn removed(&self, id: u8) {
+            self.note(format!("removed {id}"));
+        }
+
+        fn block_size(&self, _: &str) -> Option<u32> {
+            None
+        }
+
+        fn set_block_size(&self, _: &str, _: u32) {}
+    }
 
     /// One batch of stored events, one block per event, `(hash, block_size)` each.
     fn stored_batch(blocks: &[(i64, usize)]) -> KvEventBatch {
@@ -1250,23 +1285,21 @@ mod tests {
         for (which, behaviour) in behaviours.into_iter().enumerate() {
             let (addr, server) = serve(behaviour).await;
             let (worker, client) = connected(addr).await;
-            let indexer = KvIndex::chain();
-            let worker_id = indexer.intern_worker(worker.url()).unwrap();
-            let block_sizes = DashMap::new();
+            let (_index, sink, row) = open_row(worker.url(), None);
+            let (_, id) = row.feed();
             let wake = worker.runtime_state().map(|state| state.contact_wake());
             let sub = WorkerSubscription {
                 worker: &worker,
                 worker_url: worker.url(),
                 role: Role::Index {
-                    worker_id,
-                    indexer: &indexer,
-                    block_sizes: &block_sizes,
+                    sink: sink.as_ref(),
+                    id,
                 },
                 model_id: "m",
                 load_sink: None,
                 wake: wake.as_ref(),
             };
-            let mut state = WorkerStreamState::default();
+            let mut snapshot = None;
             let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
             let Subscribed::Stream(stream) = subscribe_with_deadline(
                 client.as_ref(),
@@ -1293,7 +1326,7 @@ mod tests {
             }
             let drained = tokio::time::timeout(
                 Duration::from_secs(5),
-                KvEventMonitor::drain_stream(&sub, stream, &mut state, &mut shutdown_rx),
+                KvEventMonitor::drain_stream(&sub, stream, &mut snapshot, &mut shutdown_rx),
             )
             .await
             .unwrap_or_else(|_| panic!("case {which}: the drain ends"));
@@ -1385,12 +1418,12 @@ mod tests {
         let sub = WorkerSubscription {
             worker: &worker,
             worker_url: worker.url(),
-            role: Role::Loads,
+            role: Role::<IndexSink>::Loads,
             model_id: "m",
             load_sink: Some(&sink),
             wake: wake.as_ref(),
         };
-        let mut state = WorkerStreamState::default();
+        let mut snapshot = None;
         let (_keep, mut shutdown_rx) = oneshot::channel::<()>();
         let Subscribed::Stream(stream) = subscribe_with_deadline(
             client.as_ref(),
@@ -1406,7 +1439,7 @@ mod tests {
         };
         let drained = tokio::time::timeout(
             Duration::from_secs(5),
-            KvEventMonitor::drain_stream(&sub, stream, &mut state, &mut shutdown_rx),
+            KvEventMonitor::drain_stream(&sub, stream, &mut snapshot, &mut shutdown_rx),
         )
         .await
         .expect("the drain ends");
@@ -1437,11 +1470,6 @@ mod tests {
             ranks,
             vec![(0, 5)],
             "rank 0's newer record from the event batch; rank 1's dropped"
-        );
-        assert_eq!(
-            state.index.counters,
-            WorkerIndexCounters::default(),
-            "nothing was admitted on a loads-only stream"
         );
         server.abort();
     }
@@ -1520,16 +1548,14 @@ mod tests {
                 builder = builder.dp_config(pinned, 8);
             }
             let worker: Arc<dyn Worker> = Arc::new(builder.build());
-            let indexer = KvIndex::chain();
-            let worker_id = indexer.intern_worker(worker.url()).unwrap();
-            let block_sizes = DashMap::new();
+            let (_index, sink, row) = open_row(worker.url(), None);
+            let (_, id) = row.feed();
             let sub = WorkerSubscription {
                 worker: &worker,
                 worker_url: worker.url(),
                 role: Role::Index {
-                    worker_id,
-                    indexer: &indexer,
-                    block_sizes: &block_sizes,
+                    sink: sink.as_ref(),
+                    id,
                 },
                 model_id: "m",
                 load_sink: None,
@@ -1549,10 +1575,10 @@ mod tests {
                 panic!("the server answers with a stream");
             };
             worker.set_stall(Some(StallReason::Unreachable));
-            let mut state = WorkerStreamState::default();
+            let mut snapshot = None;
             let drained = tokio::time::timeout(
                 Duration::from_secs(5),
-                KvEventMonitor::drain_stream(&sub, stream, &mut state, &mut shutdown_rx),
+                KvEventMonitor::drain_stream(&sub, stream, &mut snapshot, &mut shutdown_rx),
             )
             .await
             .expect("the finite stream ends");
@@ -1603,16 +1629,15 @@ mod tests {
                 builder = builder.dp_config(pinned, 2);
             }
             let worker: Arc<dyn Worker> = Arc::new(builder.build());
-            let indexer = KvIndex::chain();
+            let (indexer, sink, row) = open_row(worker.url(), worker.dp_rank());
             let worker_id = indexer.intern_worker(worker.url()).unwrap();
-            let block_sizes = DashMap::new();
+            let (_, id) = row.feed();
             let sub = WorkerSubscription {
                 worker: &worker,
                 worker_url: worker.url(),
                 role: Role::Index {
-                    worker_id,
-                    indexer: &indexer,
-                    block_sizes: &block_sizes,
+                    sink: sink.as_ref(),
+                    id,
                 },
                 model_id: "m",
                 load_sink: None,
@@ -1631,10 +1656,10 @@ mod tests {
             else {
                 panic!("the server answers with a stream");
             };
-            let mut state = WorkerStreamState::of_rank(worker.dp_rank());
+            let mut snapshot = None;
             let drained = tokio::time::timeout(
                 Duration::from_secs(5),
-                KvEventMonitor::drain_stream(&sub, stream, &mut state, &mut shutdown_rx),
+                KvEventMonitor::drain_stream(&sub, stream, &mut snapshot, &mut shutdown_rx),
             )
             .await
             .expect("the finite stream ends");
@@ -1651,7 +1676,7 @@ mod tests {
                 "pinned={pinned:?}"
             );
             assert_eq!(
-                state.resume_sequence(),
+                sub.role.resume_sequence(),
                 2,
                 "rank 0's cursor moved by rank 0's and the unranked batch, pinned={pinned:?}"
             );
@@ -2054,29 +2079,190 @@ mod tests {
 
     #[tokio::test]
     async fn a_removed_workers_blocks_leave_the_index_off_the_runtime() {
-        let indexer = Arc::new(KvIndex::chain());
-        let worker_id = indexer.intern_worker("http://w1:8000").unwrap();
-        let mut worker_blocks = WorkerIndexState::default();
-        indexer
-            .apply_stored(
-                worker_id,
-                &[StoredBlock {
-                    seq_hash: SequenceHash(1),
-                    content_hash: compute_content_hash(&[1, 2, 3]),
-                }],
-                None,
-                &mut worker_blocks.blocks,
-            )
-            .unwrap();
+        let (indexer, sink, row) = open_row("http://w1:8000", None);
+        let (_, id) = row.feed();
+        let batch = stored_batch(&[(1, 16)]);
+        assert_eq!(
+            sink.admit(id, batch_rank(&batch), batch_facts(&batch), &batch),
+            BatchOutcome::Applied
+        );
+        assert_ne!(indexer.current_size(), 0, "the stored block is indexed");
 
-        KvEventMonitor::remove_indexer_worker(
-            Arc::clone(&indexer),
-            worker_id,
-            "grpc://w1:9000",
-            worker_blocks,
-        )
-        .await;
+        KvEventMonitor::remove_from_sink(sink, id, "grpc://w1:9000").await;
 
         assert_eq!(indexer.current_size(), 0);
+    }
+
+    /// A subscription of `worker` that feeds `sink` under id 7.
+    fn said_subscription<'a>(
+        worker: &'a Arc<dyn Worker>,
+        sink: &'a Said,
+    ) -> WorkerSubscription<'a, Said> {
+        WorkerSubscription {
+            worker,
+            worker_url: worker.url(),
+            role: Role::Index { sink, id: 7 },
+            model_id: "m",
+            load_sink: None,
+            wake: None,
+        }
+    }
+
+    /// The sequence a round subscribes from is the sink's cursor for rank 0:
+    /// the collector keeps none of its own, so a reconnect resumes wherever
+    /// the sink stands.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_round_subscribes_from_the_sinks_cursor() {
+        let seen = Arc::new(Mutex::new(None));
+        let (addr, server) = serve(Subscribe::RecordRequest(Arc::clone(&seen))).await;
+        let worker = grpc_worker(addr);
+        let sink = Said {
+            applied: 41,
+            ..Said::default()
+        };
+        let sub = said_subscription(&worker, &sink);
+        let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
+        let mut backoff = Backoff::new();
+        let request = async {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let request = loop {
+                if let Some(request) = *seen.lock().unwrap() {
+                    break request;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "the subscribe call never reached the scheduler"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            };
+            // The scheduler never answers: the worker's removal ends the round.
+            let _ = shutdown_tx.send(());
+            request
+        };
+        let (round, request) = tokio::join!(
+            KvEventMonitor::subscription_round(&sub, &mut backoff, &mut shutdown_rx),
+            request,
+        );
+        assert!(matches!(round, Round::Shutdown | Round::Backoff));
+        assert_eq!(request.start_sequence_number, 41);
+        assert_eq!(sink.calls(), ["cursor 7 rank 0"]);
+        server.abort();
+    }
+
+    /// What crosses the port from the collector's side, call by call, held
+    /// against a sink that only keeps what it was told: a round reads the
+    /// sink's cursor first; a connection, each batch with its rank and its
+    /// sequence, a snapshot's start, a snapshot the stream ended inside and
+    /// a server's lost history are said to the sink; and the worker's
+    /// leaving is said once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_collector_says_what_its_stream_brought_to_the_sink() {
+        let ranked = KvEventBatch {
+            sequence_number: 5,
+            dp_rank: Some(1),
+            ..stored_batch(&[(1, 16)])
+        };
+        let chunk = KvEventBatch {
+            sequence_number: 6,
+            snapshot: Some(KvSnapshotChunk {
+                index: 0,
+                count: 2,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let scripts = [
+            (
+                vec![Ok(ranked), Ok(chunk)],
+                vec![
+                    "reconnected 7",
+                    "admit 7 rank 1 seq 5",
+                    "resync 7 None snapshot",
+                    "admit 7 rank 0 seq 6 chunk",
+                    "resync 7 None snapshot_abandoned",
+                ],
+                false,
+            ),
+            (
+                vec![Err(Status::data_loss("the subscriber fell behind"))],
+                vec!["reconnected 7", "resync 7 None data_loss"],
+                true,
+            ),
+        ];
+        for (script, expected, again) in scripts {
+            let (addr, server) = serve(Subscribe::Stream(script)).await;
+            let worker = grpc_worker(addr);
+            let sink = Said::default();
+            let sub = said_subscription(&worker, &sink);
+            let (_keep, mut shutdown_rx) = oneshot::channel::<()>();
+            let round =
+                KvEventMonitor::subscription_round(&sub, &mut Backoff::new(), &mut shutdown_rx)
+                    .await;
+            if again {
+                assert!(matches!(round, Round::Again), "{expected:?}");
+            } else {
+                assert!(matches!(round, Round::Backoff), "{expected:?}");
+            }
+            let calls = sink.calls();
+            assert_eq!(calls[0], "cursor 7 rank 0");
+            // A log line of the round reads the cursor again where a
+            // subscriber is installed: the reads are left out here.
+            let said: Vec<String> = calls
+                .into_iter()
+                .filter(|call| !call.starts_with("cursor"))
+                .collect();
+            assert_eq!(said, expected);
+            server.abort();
+        }
+
+        let sink = Arc::new(Said::default());
+        KvEventMonitor::remove_from_sink(Arc::clone(&sink), 7, "grpc://w1:9000").await;
+        assert_eq!(sink.calls(), ["removed 7"]);
+    }
+
+    /// A snapshot's start is said once, ahead of its first chunk: the chunks
+    /// that follow in its count say nothing more, and a count the stream
+    /// filled is no abandoned snapshot.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_snapshots_start_is_said_once_ahead_of_its_first_chunk() {
+        let chunk = |sequence_number, index| KvEventBatch {
+            sequence_number,
+            snapshot: Some(KvSnapshotChunk {
+                index,
+                count: 3,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let live = KvEventBatch {
+            sequence_number: 9,
+            ..stored_batch(&[(1, 16)])
+        };
+        let script = vec![Ok(chunk(6, 0)), Ok(chunk(7, 1)), Ok(chunk(8, 2)), Ok(live)];
+        let (addr, server) = serve(Subscribe::Stream(script)).await;
+        let worker = grpc_worker(addr);
+        let sink = Said::default();
+        let sub = said_subscription(&worker, &sink);
+        let (_keep, mut shutdown_rx) = oneshot::channel::<()>();
+        let round =
+            KvEventMonitor::subscription_round(&sub, &mut Backoff::new(), &mut shutdown_rx).await;
+        assert!(matches!(round, Round::Backoff));
+        let said: Vec<String> = sink
+            .calls()
+            .into_iter()
+            .filter(|call| !call.starts_with("cursor"))
+            .collect();
+        assert_eq!(
+            said,
+            [
+                "reconnected 7",
+                "resync 7 None snapshot",
+                "admit 7 rank 0 seq 6 chunk",
+                "admit 7 rank 0 seq 7 chunk",
+                "admit 7 rank 0 seq 8 chunk",
+                "admit 7 rank 0 seq 9",
+            ]
+        );
+        server.abort();
     }
 }
