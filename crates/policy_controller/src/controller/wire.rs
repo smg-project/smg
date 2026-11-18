@@ -316,6 +316,9 @@ impl Checked {
                 pinned_at: 0,
                 // What the leases book, beside rows a view lent.
                 lent_in_flight: view.in_flight.as_ref(),
+                // The store writes no count of a key's requests into a
+                // decision's rows yet.
+                session_counted: false,
             },
             &Constraints {
                 excluded: &lists.excluded,

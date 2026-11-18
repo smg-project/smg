@@ -148,7 +148,10 @@ impl Engine {
 /// the veto: an owner over its thresholds passes the key on, and a pool
 /// over on every worker is shed. So does a sessions rule whose own
 /// assignment places a key no pin takes: no stage is asked where that key
-/// goes, and nothing is lifted.
+/// goes, and nothing is lifted. So does a rule with an in-flight cap under
+/// a host that writes no count of the key's requests into its rows
+/// ([`RequestFacts::session_counted`]): a kept key leaves its worker at the
+/// cap alone, and a cap that reads no count hands no key on.
 pub(super) fn keeps_its_key(
     binding: &Binding,
     placing: Assignment,
@@ -158,7 +161,13 @@ pub(super) fn keeps_its_key(
     rule == AllVetoed::Steer
         && binding.plan == Plan::Single
         && !facts.session_key.is_none()
-        && (binding.sessions.is_none() || placing == Assignment::Delegate)
+        && match &binding.sessions {
+            None => true,
+            Some(sessions) => {
+                placing == Assignment::Delegate
+                    && (sessions.inflight_cap == 0 || facts.session_counted)
+            }
+        }
 }
 
 /// The profile's filters again with the overload veto lifted, for a keyed
@@ -399,10 +408,13 @@ mod tests {
         spec.validate().expect("the document builds")
     }
 
+    /// A request of the cases' host, which writes a key's counts into its
+    /// rows.
     fn facts(seed: u64) -> RequestFacts<'static> {
         RequestFacts {
             model: "m",
             seed,
+            session_counted: true,
             ..RequestFacts::default()
         }
     }
@@ -2155,6 +2167,51 @@ mod tests {
         let pick = lifted.pick().expect("a pick");
         assert_eq!(pick.session_verdict, SessionVerdict::Respill);
         assert_eq!(lifted.trace().lifted, Lifted::Overload);
+    }
+
+    /// A kept key leaves its worker at the rule's cap alone, so a capped
+    /// rule keeps no key where the host writes no count of the key's
+    /// requests: the veto stands for the key as for any request, and a pin
+    /// over its thresholds yields it to the ring's next worker. The same
+    /// request with its count written is kept, and a rule with no cap reads
+    /// no count.
+    #[test]
+    fn a_capped_rule_keeps_no_key_where_the_host_writes_no_count() {
+        let free_pool = [free(0, 4), free(1, 4), free(2, 4), free(3, 4)];
+        let ring = ring_order(
+            &engine_of("consistent_hashing", false),
+            &keyed("k1"),
+            &free_pool,
+        );
+        let mut pool = [free(0, 4), free(1, 4), free(2, 4), free(3, 4)];
+        pool[ring[0] as usize].health.overloaded = true;
+        // The key's pin on its ring worker, then a request of the key with
+        // that worker over its thresholds beside three free ones.
+        let asked = |engine: &Engine, counted: bool| {
+            assert_eq!(dispatched(engine, &free_pool, 1_000), ring[0], "the pin");
+            let request = RequestFacts {
+                now_micros: 2_000,
+                session_counted: counted,
+                ..keyed("k1")
+            };
+            let decision = decide(engine, &request, &pool);
+            (order(&decision)[0], decision.trace().lifted)
+        };
+        assert_eq!(
+            asked(&ring_under_a_cap(2), false),
+            (ring[1], Lifted::None),
+            "no count: the veto stands for the key"
+        );
+        assert_eq!(
+            asked(&ring_under_a_cap(2), true),
+            (ring[0], Lifted::None),
+            "the count written: the key is kept"
+        );
+        assert_eq!(
+            asked(&ring_under_a_rule(Assignment::Delegate), false),
+            (ring[0], Lifted::None),
+            "no cap: no count is read"
+        );
     }
 
     /// A profile the engine does not hold cannot be marked: the index is

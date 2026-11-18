@@ -811,6 +811,13 @@ pub struct RequestFacts<'a> {
     /// pool, and a pair's rows carry what counts their host wrote.
     /// In-process only.
     pub lent_in_flight: Option<&'a crate::counts::LentCounts<'a>>,
+    /// The host wrote each row's count of this request's session key
+    /// ([`Candidate::session_in_flight`]). A sessions rule's in-flight cap
+    /// reads the count either way. A key kept on its worker over the
+    /// overload veto is kept under a capped rule only where this is set:
+    /// with the count unwritten the cap could not hand the key on, so the
+    /// veto stands for it as for any request. In-process only.
+    pub session_counted: bool,
     /// The candidates' affinity facts, by index in the candidate slice the
     /// decision is made over: the one column the affinity stages read, in
     /// the candidates' own order. It is EMPTY or holds exactly one entry a
