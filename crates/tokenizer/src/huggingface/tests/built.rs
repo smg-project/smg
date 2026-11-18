@@ -341,6 +341,24 @@ fn a_text_the_normalizer_turns_into_an_added_token_stays_text() {
     }
 }
 
+/// A replaced template makes the kept tokens anew: a token that kept its id
+/// is read by its characters once the template writes it as a control.
+#[test]
+fn a_replaced_template_that_writes_a_kept_token_reads_the_typed_one_as_text() {
+    let temp = TempDir::new().unwrap();
+    let mut tok = checkpoint_of(temp.path(), &with_added_token("<a:x>"), &builds());
+    let (_, ids, from_text) = render(&tok, json!("a<a:x>b"));
+    assert!(from_text);
+    assert_eq!(ids, [2, 13, 19, 14, 3, 13, 14, 1]);
+    let writes_it = builds() + "{% set tag = '<a{}>'.format(suffix) %}{{ tag }}";
+    tok.set_chat_template(writes_it).unwrap();
+    assert!(tok.chat_template.marked());
+    let (text, ids, from_text) = render(&tok, json!("a<a:x>b"));
+    assert!(!from_text);
+    assert_eq!(text, "[INST:x]a<a:x>b[/INST:x]ab</s:x><a:x>");
+    assert_eq!(ids, [2, 13, 16, 13, 10, 11, 18, 14, 3, 13, 14, 1, 19]);
+}
+
 #[test]
 fn a_mark_typed_into_a_message_is_no_mark() {
     let temp = TempDir::new().unwrap();
