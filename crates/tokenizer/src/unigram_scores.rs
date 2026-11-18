@@ -16,19 +16,23 @@
 //! parser has.
 
 use serde::{
-    de::{Error as _, IgnoredAny, MapAccess},
+    de::{Error as _, IgnoredAny, MapAccess, Unexpected},
     Deserialize, Deserializer,
 };
 use serde_json::value::RawValue;
 use tokenizers::models::{unigram::Unigram, ModelWrapper};
 
-/// Reads a Unigram section whose `type` entry the caller has read: the
+/// Reads a Unigram section from its second entry on. The caller has read
+/// the first: `type`, or `unk_id` in a file written before the
+/// `tokenizers` crate named the kind, whose value comes along. These are the
 /// entries the `tokenizers` crate's reader takes (`unk_id`, `vocab`,
 /// `byte_fallback`; any other is skipped), handed to the crate's own
 /// builder, so the model is the one that crate builds from the same file
 /// when its parser has no `float_roundtrip`.
-pub(crate) fn section<'de, A: MapAccess<'de>>(mut map: A) -> Result<ModelWrapper, A::Error> {
-    let mut unk_id = None;
+pub(crate) fn section<'de, A: MapAccess<'de>>(
+    mut unk_id: Option<usize>,
+    mut map: A,
+) -> Result<ModelWrapper, A::Error> {
     let mut byte_fallback = false;
     let mut vocab: Option<Vec<(String, Score)>> = None;
     while let Some(key) = map.next_key::<String>()? {
@@ -36,6 +40,12 @@ pub(crate) fn section<'de, A: MapAccess<'de>>(mut map: A) -> Result<ModelWrapper
             "unk_id" => unk_id = map.next_value()?,
             "byte_fallback" => byte_fallback = map.next_value()?,
             "vocab" => vocab = Some(map.next_value()?),
+            "type" => {
+                let kind: String = map.next_value()?;
+                if kind != "Unigram" {
+                    return Err(A::Error::invalid_value(Unexpected::Str(&kind), &"Unigram"));
+                }
+            }
             _ => {
                 map.next_value::<IgnoredAny>()?;
             }
@@ -275,6 +285,10 @@ mod tests {
     /// to zero, and read that way "a" twice scores higher.
     const TIED: &str = r#"{"type":"Unigram","unk_id":0,"vocab":[["<unk>",0.0],["a",-1.1695698339729451],["aa",-2.3391396679458905]],"byte_fallback":false}"#;
 
+    /// The same section in the form of a file written before the
+    /// `tokenizers` crate named the kind: no `type` entry.
+    const TIED_OLD: &str = r#"{"unk_id":0,"vocab":[["<unk>",0.0],["a",-1.1695698339729451],["aa",-2.3391396679458905]]}"#;
+
     /// Loads a tokenizer file that holds nothing but the model section.
     fn load(model: &str) -> Result<HuggingFaceTokenizer, String> {
         let dir = tempfile::tempdir().expect("a temporary directory");
@@ -314,7 +328,13 @@ mod tests {
 
     #[test]
     fn the_scores_of_a_section_are_the_plain_rules() {
-        let model: LateBoundModel = serde_json::from_str(TIED).expect("the section reads");
+        for section in [TIED, TIED_OLD] {
+            scores_of(section);
+        }
+    }
+
+    fn scores_of(section: &str) {
+        let model: LateBoundModel = serde_json::from_str(section).expect("the section reads");
         let ModelWrapper::Unigram(unigram) = ModelWrapper::from(model) else {
             panic!("the section builds a Unigram model");
         };
@@ -328,17 +348,19 @@ mod tests {
 
     #[test]
     fn a_tie_under_the_plain_rule_stays_a_tie() {
-        let tokenizer = load(TIED).expect("the file loads");
-        // The model keeps the longer piece on a tie, as the reference does.
-        assert_eq!(ids(&tokenizer, "aa"), [2]);
-        assert_eq!(ids(&tokenizer, "aaa"), [1, 2]);
+        for section in [TIED, TIED_OLD] {
+            let tokenizer = load(section).expect("the file loads");
+            // The model keeps the longer piece on a tie, as the reference does.
+            assert_eq!(ids(&tokenizer, "aa"), [2], "{section}");
+            assert_eq!(ids(&tokenizer, "aaa"), [1, 2], "{section}");
+        }
     }
 
     #[test]
-    fn a_section_with_its_type_later_or_absent_still_loads() {
+    fn a_section_in_another_key_order_still_loads() {
         for model in [
             r#"{"unk_id":0,"vocab":[["<unk>",0.0],["a",-1.5]],"byte_fallback":false,"type":"Unigram"}"#,
-            r#"{"unk_id":0,"vocab":[["<unk>",0.0],["a",-1.5]]}"#,
+            r#"{"vocab":[["<unk>",0.0],["a",-1.5]],"unk_id":0}"#,
         ] {
             let tokenizer = load(model).expect("the file loads");
             assert_eq!(ids(&tokenizer, "a"), [1], "{model}");
@@ -349,6 +371,10 @@ mod tests {
     fn a_section_that_cannot_be_read_says_why() {
         for (model, why) in [
             (r#"{"type":"Unigram","unk_id":0}"#, "Missing vocab"),
+            (
+                r#"{"unk_id":0,"vocab":[["<unk>",0.0]],"type":"BPE"}"#,
+                "expected Unigram",
+            ),
             (
                 r#"{"type":"Unigram","unk_id":0,"vocab":[["<unk>","0.0"]]}"#,
                 "a Unigram score that is no number in range: \"0.0\"",

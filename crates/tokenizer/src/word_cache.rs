@@ -317,9 +317,10 @@ impl<'de> Deserialize<'de> for LateBoundModel {
 /// A BPE section, whose `type` key comes first in every file the crate
 /// writes, streams here: the vocabulary into its hash map, the merges into
 /// their list, both handed to the crate's own builder, so the model is the
-/// one the crate builds from the same file. A Unigram section with the
-/// same first key is read by [`unigram_scores::section`], for the scores
-/// the reference reads. Any other section (another model kind, a file
+/// one the crate builds from the same file. A Unigram section, which
+/// starts with `type` or, in a file written before the crate named the
+/// kind, with `unk_id`, is read by [`unigram_scores::section`], for the
+/// scores the reference reads. Any other section (another model kind, a file
 /// without the `type` key or with it later) goes to the crate's own reader,
 /// which streams it as before with the one entry already read put back in
 /// front.
@@ -345,9 +346,14 @@ impl<'de> Visitor<'de> for ModelSection {
                     return bpe_section(replay.rest);
                 }
                 if kind == "Unigram" {
-                    return unigram_scores::section(replay.rest).map(LateBoundModel::from);
+                    return unigram_scores::section(None, replay.rest).map(LateBoundModel::from);
                 }
                 Value::String(kind)
+            } else if key == "unk_id" {
+                // Only a Unigram section starts with this key: the form of
+                // a file written before the crate named the kind.
+                let unk_id = replay.rest.next_value()?;
+                return unigram_scores::section(unk_id, replay.rest).map(LateBoundModel::from);
             } else {
                 replay.rest.next_value()?
             };
