@@ -26,6 +26,14 @@
 //!   streams' measured answers together over the one interval they share,
 //!   from the first of them to the last: a stream that ends early idles
 //!   in it, so the row reads no higher than the streams did together.
+//! - `policy_decide_stream/gateway/64/<deciders>`: the rate rows over 64
+//!   members, on one decider and on eight, with each answered request told
+//!   on the gateway's `Session` as a gateway tells one served to its end: a
+//!   `Dispatched` and a `Completed`, sent by the thread that holds the
+//!   session. The frames name the lease the answer carried; where it
+//!   carried none they name no lease, which a session takes. A stream
+//!   hands the session its reports sixteen at a time: a hand-over wakes
+//!   the session's thread, and one a request would time the wake.
 //! - `policy_decide_stream/count/<mode>/<members>`, one cell a run, named by
 //!   `DECIDE_STREAM_COUNT=<mode>:<members>:<decisions>`: the whole process's
 //!   allocator calls a decision, `in_process` (the store's deciding door, a
@@ -54,16 +62,17 @@
 //! whose slot of the ring a later request took while it waited. Every
 //! decision of a row or a count cell is a pick over its fleet, or the
 //! bench stops: a setup that drifted to another outcome would print
-//! another path's numbers. A stream ends each answer's lease through its
-//! hand at the leases' file as it reads the answer, as a session hands a
-//! gateway's frame, so a wire row holds as many leases as it has
-//! decisions in flight and its numbers hold a lease's issue and its end.
-//! A build that files no lease answers with none: its rows run the same,
-//! and every wire row prints the leases its measured picks carried
-//! (`leases`). A row whose picks carry a lease for some and none for
-//! others stops the bench.
-//! `DECIDE_STREAM_ROWS=round_trip`, `offered` or `rate` runs one kind
-//! alone, and `--test` runs every row for a moment. A run with no
+//! another path's numbers. Outside the gateway rows a stream ends the
+//! lease an answer carries through its hand at the leases' file as it
+//! reads the answer, as a session hands a gateway's frame, so a wire row
+//! holds as many leases as it has decisions in flight (a gateway row,
+//! those of its frames on their way too) and its numbers hold a lease's
+//! issue and its end. A build that
+//! files no lease answers with none: its rows run the same, and every wire
+//! row prints the leases its measured picks carried (`leases`). A row
+//! whose picks carry a lease for some and none for others stops the bench.
+//! `DECIDE_STREAM_ROWS=round_trip`, `offered`, `rate` or `gateway` runs one
+//! kind alone, and `--test` runs every row for a moment. A run with no
 //! `--bench` is a test too, as criterion reads one: `cargo bench` passes
 //! `--bench`, and a test of every target passes neither.
 //!
@@ -75,10 +84,10 @@
 //! a pick has places. A pick's places are then drawn as leases in flight
 //! make the least loaded rows tie: over 8 and 64 members one row alone, a
 //! band of two and the next band's row; over 512 members from one band.
-//! Every member reports 1,024 requests beneath its band, more than the
-//! leases this bench holds on one member, so a lease on file moves no
-//! row's cost: a build that files leases and one that files none pick
-//! over the same costs. Every wire row prints how the three best rows of
+//! Every member reports 2,097,152 requests beneath its band, more than a
+//! row has decisions, so no count of leases on file reaches it and a
+//! lease on file moves no row's cost: a build that files leases and one
+//! that files none pick over the same costs. Every wire row prints how the three best rows of
 //! its measured decisions scored (`ties`, four counts): each alone, the
 //! best alone and the next two alike, the best two alike, all three
 //! alike. Two builds are compared where they print one tally.
@@ -115,6 +124,7 @@ use std::{
     env, fs,
     hint::black_box,
     io::{self, Write},
+    mem,
     net::{Ipv4Addr, SocketAddr},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -127,9 +137,10 @@ use std::{
 use smg_policy_controller::{
     controller::{Config, Controller, Election, Listener, Scope, State},
     proto::{
-        controller_frame, decide_answer::Answer, decision::Outcome, gateway_frame::Frame,
-        policy_controller_client::PolicyControllerClient, ControllerFrame, DecideRequest, Decision,
-        GatewayFrame, Hello, RequestFacts as WireFacts,
+        completed::Class, controller_frame, decide_answer::Answer, decision::Outcome,
+        gateway_frame::Frame, policy_controller_client::PolicyControllerClient, Completed,
+        ControllerFrame, DecideRequest, Decision, Dispatched, GatewayFrame, Hello,
+        RequestFacts as WireFacts, Side,
     },
     store::{
         Ask, GatewayId, Hand, LeaseRecord, LeaseState, LeasesStore, LoadSink, LoadSource,
@@ -348,10 +359,13 @@ const WINDOW: u64 = 128;
 /// An offered request handed over this long after it was due is counted
 /// late: the client's own lag.
 const LATE: Duration = Duration::from_micros(100);
-/// The requests every member reports beneath its band: more than the
-/// leases this bench holds on one member (four streams' windows), so a
-/// lease on file moves no row's cost.
-const HELD: u32 = 1_024;
+/// The requests every member reports beneath its band: more than a row has
+/// decisions ([`wire`] checks each row's count), so no count of leases on
+/// file reaches it and a lease on file moves no row's cost.
+const HELD: u32 = 1 << 21;
+/// The reports a stream hands the session together: a hand-over wakes the
+/// session's thread, and one a request would time the wake.
+const REPORTS: usize = 16;
 /// The seed of the order the members are dealt to their bands in.
 const DEAL: u64 = 0x0B_A4D5;
 
@@ -371,6 +385,9 @@ struct Shape {
     measured: u64,
     /// The allocator counts over the measured decisions.
     counted: bool,
+    /// The streams tell each answered request on the gateway's session, as
+    /// a gateway does; otherwise they end its lease at the store's door.
+    frames: bool,
 }
 
 /// A controller served on its own thread and runtime.
@@ -573,7 +590,8 @@ async fn connect(addr: SocketAddr) -> PolicyControllerClient<Channel> {
 /// for as long as the returned ends are held.
 async fn hello(addr: SocketAddr) -> (mpsc::Sender<GatewayFrame>, Streaming<ControllerFrame>) {
     let mut client = connect(addr).await;
-    let (frames, sent) = mpsc::channel(4);
+    // Room for the frames of one hand-over of reports: they leave together.
+    let (frames, sent) = mpsc::channel(2 * REPORTS);
     let mut answers = client
         .session(stated(ReceiverStream::new(sent)))
         .await
@@ -641,14 +659,14 @@ struct Tally {
 impl Tally {
     /// Counts a measured pick: under its place of [`Self::ties`], and its
     /// lease where its answer carried one.
-    fn picked(&mut self, pick: Option<(usize, bool)>) {
-        let Some((place, leased)) = pick else {
+    fn picked(&mut self, pick: Option<&Answered>) {
+        let Some(pick) = pick else {
             return;
         };
-        if let Some(count) = self.ties.get_mut(place) {
+        if let Some(count) = self.ties.get_mut(pick.place) {
             *count += 1;
         }
-        self.leases += u64::from(leased);
+        self.leases += u64::from(pick.lease.is_some());
     }
 }
 
@@ -658,26 +676,110 @@ fn gateway() -> GatewayId {
     GatewayId(smg_policy_controller::fingerprint(GATEWAY.as_bytes()))
 }
 
-/// Every decision of a row is a pick over its fleet. Another outcome means
-/// the setup drifted, and the row would print another path's numbers. The
-/// lease the pick's answer carries ends here, through the hand a session's
-/// frames go through at the leases' file, as a gateway's frame ends one
-/// when its request is over: a row holds as many leases as it has
-/// decisions in flight and frames not yet applied. Returns the decision's
-/// place in a stream's tally of ties ([`Tally::ties`]), by its trace's
-/// three best rows (two score alike where their scores are one value, bit
-/// for bit), and whether its answer carried a lease.
-fn picked(decision: &Decision, store: &MemoryStore, hand: &Hand) -> (usize, bool) {
-    assert!(
-        matches!(decision.outcome, Some(Outcome::Pick(_))),
-        "a pick over the fleet: {decision:?}"
-    );
-    let lease = decision.leases.first();
-    if let Some(lease) = lease {
-        let ended = Said::Released(None, ReleaseReason::ClientGone);
-        store.hand(hand, LeaseId(lease.id), ended);
+/// What a stream reads of a pick's answer.
+struct Answered {
+    /// Its place in the stream's tally of ties ([`Tally::ties`]).
+    place: usize,
+    /// The lease the answer carried.
+    lease: Option<u64>,
+    /// The pick's first target: the member a gateway dispatches to.
+    served: u64,
+}
+
+/// A request that is over, as its stream tells the gateway's session: the
+/// lease its answer carried, zero where it carried none (a lease the store
+/// does not hold is no error to a session), and the member that served it.
+#[derive(Clone, Copy)]
+struct Over {
+    lease: u64,
+    served: u64,
+}
+
+/// How a stream reports an answered request as over.
+enum Ends {
+    /// Through the stream's own hand at the leases' file, in process: the
+    /// hand is made at the stream's first report.
+    Door(Arc<MemoryStore>, Option<Hand>),
+    /// As a gateway does: a `Dispatched` and a `Completed` on its session,
+    /// whose thread takes the stream's reports [`REPORTS`] at a time.
+    Session {
+        reports: mpsc::Sender<Vec<Over>>,
+        held: Vec<Over>,
+    },
+}
+
+impl Clone for Ends {
+    /// A stream's own end: a door's hand is not shared.
+    fn clone(&self) -> Self {
+        match self {
+            Self::Door(store, _) => Self::Door(Arc::clone(store), None),
+            Self::Session { reports, held } => Self::Session {
+                reports: reports.clone(),
+                held: held.clone(),
+            },
+        }
     }
+}
+
+impl Ends {
+    /// Reports a picked request as over: its lease, where its answer
+    /// carried one, ends at the store's door, or the gateway's session is
+    /// told. A row holds as many leases as it has decisions in flight and
+    /// frames on their way.
+    async fn over(&mut self, gateway: GatewayId, pick: &Answered) {
+        match self {
+            Self::Door(store, hand) => {
+                if let Some(lease) = pick.lease {
+                    let hand = hand.get_or_insert_with(|| store.handover(gateway));
+                    let ended = Said::Released(None, ReleaseReason::ClientGone);
+                    store.hand(hand, LeaseId(lease), ended);
+                }
+            }
+            Self::Session { reports, held } => {
+                held.push(Over {
+                    lease: pick.lease.unwrap_or(0),
+                    served: pick.served,
+                });
+                if held.len() >= REPORTS {
+                    let together = mem::replace(held, Vec::with_capacity(REPORTS));
+                    reports
+                        .send(together)
+                        .await
+                        .expect("the session takes a stream's reports");
+                }
+            }
+        }
+    }
+
+    /// Hands the session the reports the stream still holds, as it ends.
+    async fn rest(&mut self) {
+        if let Self::Session { reports, held } = self {
+            if !held.is_empty() {
+                reports
+                    .send(mem::take(held))
+                    .await
+                    .expect("the session takes a stream's last reports");
+            }
+        }
+    }
+}
+
+/// Every decision of a row is a pick over its fleet. Another outcome means
+/// the setup drifted, and the row would print another path's numbers.
+/// Reads the decision's place in a stream's tally of ties, by its trace's
+/// three best rows (two score alike where their scores are one value, bit
+/// for bit), the lease its answer carried and its first target.
+fn picked(decision: &Decision) -> Answered {
+    let first = match &decision.outcome {
+        Some(Outcome::Pick(pick)) => pick.targets.first(),
+        _ => None,
+    };
+    assert!(first.is_some(), "a pick over the fleet: {decision:?}");
     let top = decision.trace.as_ref().map_or(&[][..], |trace| &trace.top);
+    assert!(
+        top.len() >= 3,
+        "a pick's trace holds its three best rows: {decision:?}"
+    );
     let place = match top {
         [first, second, third, ..] => {
             let alike = |one: f32, other: f32| usize::from(one.to_bits() == other.to_bits());
@@ -685,7 +787,11 @@ fn picked(decision: &Decision, store: &MemoryStore, hand: &Hand) -> (usize, bool
         }
         _ => 0,
     };
-    (place, lease.is_some())
+    Answered {
+        place,
+        lease: decision.leases.first().map(|lease| lease.id),
+        served: first.map_or(0, |target| target.id),
+    }
 }
 
 /// Opens the allocator's count.
@@ -736,8 +842,8 @@ async fn hand(
 
 /// One stream of the shape: `in_flight` requests kept in flight until the
 /// warm and the measured decisions are answered.
-async fn ask(addr: SocketAddr, shape: Shape, store: &MemoryStore) -> Tally {
-    let ends = store.handover(gateway());
+async fn ask(addr: SocketAddr, shape: Shape, ends: &mut Ends) -> Tally {
+    let gateway = gateway();
     let models: Vec<String> = (0..shape.models).map(model).collect();
     let mut client = connect(addr).await;
     let (requests, sent) = mpsc::channel(256);
@@ -776,19 +882,22 @@ async fn ask(addr: SocketAddr, shape: Shape, store: &MemoryStore) -> Tally {
             .expect("an answer, not the stream's end");
         let received = Instant::now();
         let pick = match &answer.answer {
-            Some(Answer::Decision(decision)) => Some(picked(decision, store, &ends)),
+            Some(Answer::Decision(decision)) => Some(picked(decision)),
             Some(Answer::Busy(_)) => {
                 tally.busy += 1;
                 None
             }
             Some(Answer::Credit(_)) | None => continue,
         };
+        if let Some(pick) = &pick {
+            ends.over(gateway, pick).await;
+        }
         if done == shape.warm {
             tally.opened = received;
         }
         if done >= shape.warm {
             tally.answered += 1;
-            tally.picked(pick);
+            tally.picked(pick.as_ref());
         }
         // A counted run keeps no round trip: a sort of them would stay in
         // the difference of two runs.
@@ -828,6 +937,7 @@ async fn ask(addr: SocketAddr, shape: Shape, store: &MemoryStore) -> Tally {
         tally.calls = CALLS.load(Ordering::Relaxed);
     }
     tally.closed = Instant::now();
+    ends.rest().await;
     tally
 }
 
@@ -839,8 +949,8 @@ async fn ask(addr: SocketAddr, shape: Shape, store: &MemoryStore) -> Tally {
 /// at once, counted and never sent. The client spins between instants,
 /// since a timer's millisecond is coarser than the gaps, and yields to its
 /// runtime each turn so the connection is read and written.
-async fn offer(addr: SocketAddr, shape: Shape, store: &MemoryStore) -> Tally {
-    let ends = store.handover(gateway());
+async fn offer(addr: SocketAddr, shape: Shape, ends: &mut Ends) -> Tally {
+    let gateway = gateway();
     let models: Vec<String> = (0..shape.models).map(model).collect();
     let mut client = connect(addr).await;
     let (requests, sent) = mpsc::channel(256);
@@ -899,7 +1009,7 @@ async fn offer(addr: SocketAddr, shape: Shape, store: &MemoryStore) -> Tally {
             .expect("an answer, not the stream's end");
         let received = Instant::now();
         let pick = match &answer.answer {
-            Some(Answer::Decision(decision)) => Some(picked(decision, store, &ends)),
+            Some(Answer::Decision(decision)) => Some(picked(decision)),
             Some(Answer::Busy(_)) => {
                 tally.busy += 1;
                 None
@@ -910,6 +1020,9 @@ async fn offer(addr: SocketAddr, shape: Shape, store: &MemoryStore) -> Tally {
             }
             None => continue,
         };
+        if let Some(pick) = &pick {
+            ends.over(gateway, pick).await;
+        }
         let id: [u8; 8] = answer
             .request_id
             .as_slice()
@@ -921,7 +1034,7 @@ async fn offer(addr: SocketAddr, shape: Shape, store: &MemoryStore) -> Tally {
                 tally.opened = received;
             }
             tally.answered += 1;
-            tally.picked(pick);
+            tally.picked(pick.as_ref());
             let took = received.saturating_duration_since(due(id));
             tally
                 .nanos
@@ -930,7 +1043,69 @@ async fn offer(addr: SocketAddr, shape: Shape, store: &MemoryStore) -> Tally {
         done += 1;
     }
     tally.closed = Instant::now();
+    ends.rest().await;
     tally
+}
+
+/// The gateway's session on a thread of its own: its `Hello` is welcomed,
+/// then each request a stream reports as over is told as a gateway tells
+/// one served to its end, a `Dispatched` and a `Completed`. Once every
+/// reporting end is dropped the thread ends its side of the stream and
+/// reads the controller's to its end: every frame was applied by then.
+/// Returns the frames it sent.
+fn session(addr: SocketAddr) -> (mpsc::Sender<Vec<Over>>, thread::JoinHandle<u64>) {
+    let (ready, opened) = std_mpsc::channel();
+    let thread = thread::Builder::new()
+        .name("session".to_owned())
+        .spawn(move || {
+            current_thread().block_on(async move {
+                let (frames, mut answers) = hello(addr).await;
+                let (reports, mut over) = mpsc::channel::<Vec<Over>>(64);
+                ready.send(reports).expect("the row waits for the session");
+                let mut seq = 0;
+                while let Some(together) = over.recv().await {
+                    for Over { lease, served } in together {
+                        let dispatched = Dispatched {
+                            lease_id: lease,
+                            target_index: 0,
+                            side: Side::Single.into(),
+                            since_decision_micros: 0,
+                        };
+                        let completed = Completed {
+                            lease_id: lease,
+                            side: Side::Single.into(),
+                            served,
+                            status: 200,
+                            class: Class::Ok.into(),
+                            ..Completed::default()
+                        };
+                        for frame in [Frame::Dispatched(dispatched), Frame::Completed(completed)] {
+                            seq += 1;
+                            let taken = frames
+                                .send(GatewayFrame {
+                                    seq,
+                                    term_floor: 0,
+                                    frame: Some(frame),
+                                })
+                                .await;
+                            // A session the controller ended takes no
+                            // frame, and its status says why.
+                            let ended = if taken.is_err() {
+                                answers.message().await.err()
+                            } else {
+                                None
+                            };
+                            assert!(taken.is_ok(), "the controller ended the session: {ended:?}");
+                        }
+                    }
+                }
+                drop(frames);
+                while let Ok(Some(_)) = answers.message().await {}
+                seq
+            })
+        })
+        .expect("the session's thread");
+    (opened.recv().expect("the session opens"), thread)
 }
 
 fn current_thread() -> runtime::Runtime {
@@ -984,27 +1159,44 @@ struct Row {
     ties: [u64; 4],
     /// The leases the streams' measured picks carried.
     leases: u64,
+    /// The frames the gateway's session sent for the streams' reports.
+    frames: u64,
 }
 
 /// Runs one wire row: a served controller, the gateway's session, and the
 /// shape's streams, each on its own thread.
 fn wire(shape: Shape) -> Row {
+    // The floor under the bands stands above the row's whole count of
+    // decisions: whatever leases its streams and its session's frames hold
+    // at once, a member's leases stay beneath what it reports.
+    let decisions = u64::from(shape.streams) * (shape.warm + shape.measured);
+    assert!(
+        decisions < u64::from(HELD),
+        "a row of {decisions} decisions reaches the {HELD} requests beneath a member's band"
+    );
     let served = serve(shape);
     let addr = served.addr;
-    let session_runtime = current_thread();
-    let session = session_runtime.block_on(hello(addr));
+    let (reports, session) = session(addr);
+    let ends = if shape.frames {
+        Ends::Session {
+            reports: reports.clone(),
+            held: Vec::with_capacity(REPORTS),
+        }
+    } else {
+        Ends::Door(Arc::clone(&served.store), None)
+    };
     let before = cpu_ticks();
     let streams: Vec<_> = (0..shape.streams)
         .map(|index| {
-            let store = Arc::clone(&served.store);
+            let mut ends = ends.clone();
             thread::Builder::new()
                 .name(format!("client-{index}"))
                 .spawn(move || {
                     current_thread().block_on(async move {
                         if shape.offered == 0 {
-                            ask(addr, shape, &store).await
+                            ask(addr, shape, &mut ends).await
                         } else {
-                            offer(addr, shape, &store).await
+                            offer(addr, shape, &mut ends).await
                         }
                     })
                 })
@@ -1015,15 +1207,20 @@ fn wire(shape: Shape) -> Row {
         .into_iter()
         .map(|stream| stream.join().expect("a client's thread ends cleanly"))
         .collect();
+    // The row's own reporting end kept the session standing for the whole
+    // row, whoever reported on it: a gateway whose session ended is let go
+    // after its grace period, its streams and its leases with it. With the
+    // last end dropped the session tells what is left, ends its stream and
+    // is read to its end, so the row's CPU holds every frame.
+    drop(ends);
+    drop(reports);
+    let frames = session.join().expect("the session's thread ends cleanly");
     let ticks = cpu_ticks()
         .zip(before)
         .map(|(after, before)| after.saturating_sub(before));
     let rss_mib = rss_mib();
-    drop(session);
-    drop(session_runtime);
     served.stop();
 
-    let decisions = u64::from(shape.streams) * (shape.warm + shape.measured);
     let mut row = Row {
         nanos: Vec::new(),
         busy: 0,
@@ -1037,6 +1234,7 @@ fn wire(shape: Shape) -> Row {
         overtaken: 0,
         ties: [0; 4],
         leases: 0,
+        frames,
     };
     // The streams' answers together over the one interval they share, from
     // the first measured answer of any to the last of all: a sum of each
@@ -1214,6 +1412,7 @@ fn count(cell: &str, out: &mut impl Write) -> io::Result<()> {
         warm: 2_000,
         measured: decisions,
         counted: true,
+        frames: false,
     };
     let (calls, busy) = match mode {
         "in_process" | "commit" => {
@@ -1275,6 +1474,7 @@ fn main() -> io::Result<()> {
                 warm,
                 measured,
                 counted: false,
+                frames: false,
             });
             writeln!(
                 out,
@@ -1310,6 +1510,7 @@ fn main() -> io::Result<()> {
                 warm: warm / u64::from(streams),
                 measured: measured / u64::from(streams),
                 counted: false,
+                frames: false,
             });
             writeln!(
                 out,
@@ -1343,6 +1544,7 @@ fn main() -> io::Result<()> {
                     warm,
                     measured,
                     counted: false,
+                    frames: false,
                 });
                 writeln!(
                     out,
@@ -1360,6 +1562,38 @@ fn main() -> io::Result<()> {
                 )?;
                 out.flush()?;
             }
+        }
+    }
+    if all || rows == "gateway" {
+        for (deciders, models) in [(1, 1), (8, 64)] {
+            let row = wire(Shape {
+                members: 64,
+                deciders,
+                models,
+                streams: 4,
+                in_flight: 32,
+                offered: 0,
+                warm,
+                measured,
+                counted: false,
+                frames: true,
+            });
+            writeln!(
+                out,
+                "policy_decide_stream/gateway/64/{deciders} models={models} streams=4 in_flight=32 decisions={} per_s={} p50_us={} p99_us={} busy={} cpu_s_per_million={} rss_mib={} overtaken={} ties={} leases={} frames={}",
+                row.nanos.len(),
+                row.per_second,
+                percentile(&row.nanos, 1, 2),
+                percentile(&row.nanos, 99, 100),
+                row.busy,
+                read(row.cpu_millis_per_million, seconds),
+                read(row.rss_mib, |mib| mib.to_string()),
+                row.overtaken,
+                ties(row.ties),
+                row.leases,
+                row.frames,
+            )?;
+            out.flush()?;
         }
     }
     Ok(())
