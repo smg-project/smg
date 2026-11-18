@@ -467,7 +467,11 @@ impl Gateways {
         loop {
             tokio::select! {
                 _ = tick.tick() => {
-                    self.sweep(Instant::now());
+                    let now = Instant::now();
+                    self.sweep(now);
+                    // The pins of record ride this clock: a pass of theirs
+                    // is due far less often than a tick.
+                    self.store.sweep_pins(now);
                 }
                 _ = stop.wait_for(|stop| *stop) => break,
             }
@@ -724,7 +728,8 @@ pub(crate) mod tests {
         elector::{ElectionSettings, Elector, Tick},
         lease::{Lease, LeaseId},
         store::{
-            GatewayId, HealthSink, LeaseRecord, LeaseState, LeasesStore, MemoryStore, WorkersStore,
+            GatewayId, HealthSink, LeaseRecord, LeaseState, LeasesStore, MemoryStore, Picked,
+            WorkersStore,
         },
         view::WorkerId,
     };
@@ -796,6 +801,7 @@ pub(crate) mod tests {
             gateway,
             request: id,
             target: WorkerId(7),
+            picked: Picked::default(),
             decode: None,
             term: 0,
             issued_at: now,

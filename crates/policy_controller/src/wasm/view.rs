@@ -1650,4 +1650,15 @@ mod tests {
         assert_eq!(signal(&veto, 1_000), wit::Signal::GatewayVeto((4, 500)));
         assert_eq!(signal(&veto, 2_000), wit::Signal::GatewayVeto((4, 0)));
     }
+
+    /// A dispatch on another target of its pick is told with a lease that
+    /// names that target's index, and the guest's lease record carries it.
+    #[test]
+    fn a_lease_record_names_the_index_of_its_lease() {
+        let told = Lease {
+            target_index: 1,
+            ..Lease::default()
+        };
+        assert_eq!(lease(&told, &Exposure::default()).target_index, 1);
+    }
 }

@@ -97,4 +97,10 @@ pub trait Journal: Send + Sync {
     /// wakes nobody leaves it empty. A journal that hands its writes on to
     /// another hands this call on too, or the other's wake is never made.
     fn released(&self) {}
+
+    /// The store restores a snapshot that stands at `at`: the journal starts
+    /// again there, inside the restore's own locks, and wakes nobody there:
+    /// the restore's release follows ([`Journal::released`]). `false` where
+    /// the journal refuses the place, and the store then restores nothing.
+    fn restart(&self, at: Position) -> bool;
 }

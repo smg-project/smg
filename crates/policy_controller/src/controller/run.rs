@@ -59,7 +59,11 @@ struct Cli {
     #[arg(long, default_value = DEFAULT_CONTROL_LISTEN, help_heading = "Listeners")]
     control_listen: SocketAddr,
 
-    /// The standbys' listener: Replicate
+    /// The standbys' listener: Replicate and the complete snapshot. Under
+    /// a shared lease a replica that does not lead follows its leader: it
+    /// dials the leader's advertised host at this port, so every replica
+    /// listens on the same one, and the listener takes identities as told
+    /// in the clear
     #[arg(long, default_value = DEFAULT_REPLICATION_LISTEN, help_heading = "Listeners")]
     replication_listen: SocketAddr,
 
@@ -1139,10 +1143,10 @@ mod tests {
         }
     }
 
-    /// The controller makes the membership call and two of a lease's calls
-    /// and not the rest yet: a spec file that names a stage in need of
-    /// them refuses the start by the stage's field, and the same stage
-    /// with no such need starts.
+    /// The controller makes the membership call and a lease's calls but
+    /// the end of a lease whose gateway was let go: a spec file that names
+    /// a stage in need of them refuses the start by the stage's field, and
+    /// the same stage with no such need starts.
     #[tokio::test]
     async fn a_spec_file_that_names_a_stage_in_need_of_the_lifecycle_refuses_the_start() {
         let dir = tempfile::tempdir().expect("a directory");

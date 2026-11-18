@@ -13,8 +13,11 @@
 //! the servicer's to set: whether the figure is an estimate for one rank or
 //! the engine's own is a per-servicer rule.
 
+use std::time::Duration;
+
 use openai_protocol::worker::{
-    EngineMemoryMetricsSnapshot, EngineQueueMetricsSnapshot, SchedulerLoadSnapshot,
+    EngineMemoryMetricsSnapshot, EngineQueueMetricsSnapshot, LoadRecord, LoadTelemetry,
+    SchedulerLoadSnapshot,
 };
 
 use crate::{common_proto as common, sglang_proto, tokenspeed_proto, trtllm_proto, vllm_proto};
@@ -245,6 +248,50 @@ impl From<&common::EngineLoad> for SchedulerLoadSnapshot {
             disagg_mode: disagg.map(|d| d.mode.clone()),
             ..Default::default()
         }
+    }
+}
+
+/// The record as the worker's load report and its liveness read it.
+impl LoadRecord for common::EngineLoad {
+    #[inline]
+    fn age(&self) -> Duration {
+        Duration::from_millis(u64::from(self.age_ms))
+    }
+
+    #[inline]
+    fn telemetry(&self) -> LoadTelemetry {
+        let mut carried = LoadTelemetry::empty();
+        carried.set(LoadTelemetry::CACHE_HIT_RATE, self.cache_hit_rate.is_some());
+        carried.set(LoadTelemetry::USED_TOKENS, self.num_used_tokens.is_some());
+        carried.set(
+            LoadTelemetry::TOTAL_TOKENS,
+            self.max_total_num_tokens.is_some(),
+        );
+        carried.set(LoadTelemetry::MEMORY, self.memory.is_some());
+        carried.set(LoadTelemetry::QUEUES, self.queues.is_some());
+        carried.set(LoadTelemetry::DISAGGREGATION, self.disaggregation.is_some());
+        carried
+    }
+
+    #[inline]
+    fn snapshot(&self) -> SchedulerLoadSnapshot {
+        SchedulerLoadSnapshot::from(self)
+    }
+
+    #[inline]
+    fn engine_silence(&self) -> Option<Duration> {
+        self.engine_silence_ms
+            .map(|ms| Duration::from_millis(u64::from(ms)))
+    }
+
+    #[inline]
+    fn reports_every_step(&self) -> bool {
+        self.engine_reports_steps.unwrap_or(false)
+    }
+
+    #[inline]
+    fn prefill_pending(&self) -> Option<u64> {
+        self.prefill_pending_tokens.map(u64::from)
     }
 }
 
@@ -507,5 +554,73 @@ mod tests {
             (snapshot.num_running_reqs, snapshot.max_total_num_tokens),
             (7, 0)
         );
+    }
+
+    /// Under the worker's reader each telemetry section a record carries is
+    /// its own flag, a record cut to its core carries none, and the age and
+    /// the liveness figures are the wire's fields.
+    #[test]
+    fn a_record_reads_as_the_load_report_reads_it() {
+        let only = |set: fn(&mut common::EngineLoad)| {
+            let mut record = common::EngineLoad::default();
+            set(&mut record);
+            record.telemetry()
+        };
+        assert_eq!(
+            only(|r| r.cache_hit_rate = Some(0.5)),
+            LoadTelemetry::CACHE_HIT_RATE
+        );
+        assert_eq!(
+            only(|r| r.num_used_tokens = Some(1)),
+            LoadTelemetry::USED_TOKENS
+        );
+        assert_eq!(
+            only(|r| r.max_total_num_tokens = Some(1)),
+            LoadTelemetry::TOTAL_TOKENS
+        );
+        assert_eq!(
+            only(|r| r.memory = Some(common::EngineMemory::default())),
+            LoadTelemetry::MEMORY
+        );
+        assert_eq!(
+            only(|r| r.queues = Some(common::EngineQueues::default())),
+            LoadTelemetry::QUEUES
+        );
+        assert_eq!(
+            only(|r| r.disaggregation = Some(common::EngineDisaggregation::default())),
+            LoadTelemetry::DISAGGREGATION
+        );
+        let mut full = common::EngineLoad {
+            cache_hit_rate: Some(0.5),
+            num_used_tokens: Some(1),
+            max_total_num_tokens: Some(1),
+            memory: Some(common::EngineMemory::default()),
+            queues: Some(common::EngineQueues::default()),
+            disaggregation: Some(common::EngineDisaggregation::default()),
+            ..Default::default()
+        };
+        assert_eq!(full.telemetry(), LoadTelemetry::all());
+        core_only(&mut full);
+        assert_eq!(full.telemetry(), LoadTelemetry::empty());
+
+        let record = common::EngineLoad {
+            running_requests: 3,
+            age_ms: 40,
+            engine_silence_ms: Some(1_500),
+            engine_reports_steps: Some(true),
+            prefill_pending_tokens: Some(9),
+            ..Default::default()
+        };
+        assert_eq!(record.age(), Duration::from_millis(40));
+        assert_eq!(record.engine_silence(), Some(Duration::from_millis(1_500)));
+        assert!(record.reports_every_step());
+        assert_eq!(record.prefill_pending(), Some(9));
+        assert_eq!(record.snapshot().num_running_reqs, 3);
+        let quiet = common::EngineLoad::default();
+        assert_eq!(
+            (quiet.age(), quiet.engine_silence(), quiet.prefill_pending()),
+            (Duration::ZERO, None, None)
+        );
+        assert!(!quiet.reports_every_step());
     }
 }

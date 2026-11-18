@@ -362,20 +362,25 @@ What the syntax says, and what the assembler does with it:
   the object is the call's arguments as the model wrote it, read by the JSON family's arguments
   reader (`json::named_arguments`, Mistral's): every byte a fragment for as long as the bytes keep
   it a JSON prefix, `Malformed { InvalidArguments }` at the first that does not and the model's
-  bytes as written after it, a tag inside it its text, the values the model's JSON and not typed
-  by the request's tools. The newlines around it are the template's, dropped, and the invoke's
-  close is the call's end. An object the invoke's close, the cut or the stop found open stays as
-  written, and the reader's `Malformed` event of no bytes says it is no whole value, no brace made
-  up; an object closed before a cut or a stop is whole, as the JSON assembler ends one. A word or
-  a tag after the object is text where the syntax has tags, refused as below, its event inside the
-  call after the object's fragments, which stay whole as the model closed them; an object after a
-  parameter is refused whole, and that call gets no close. The family's reference encoder never
-  writes the shape, and its parser refuses it (`Tool name format error`); the serving engines'
-  parser for the family (SGLang's DSML detector) reads it, the object as written, and the
-  structural tag it builds for a call writes it (the invoke tag, the parameters' schema, the
-  invoke's close), so an engine that constrains a call that way gets it back. Before, the object
-  was refused as text between tags, and the call reached the client with no arguments. The other
-  spellings (MiniMax M2, dots3, MiniCPM5, XTML) keep refusing it.
+  bytes as written after it, a parameter tag inside it its text, the values the model's JSON and
+  not typed by the request's tools. Only the two parameter tags are the object's text: they are
+  the tags the assembler scans for. The invoke's close, the next invoke's opening and the block's
+  close are the table's terminals, and any of them ends the call where it stands, inside one of
+  the object's strings too, as it does inside a parameter's value: the object then ends as one the
+  stream cut, and the table reads what follows the tag from where it stands, after the next
+  invoke's opening the next call. The newlines around the object are the template's, dropped, and
+  the invoke's close is the call's end. An object a terminal, the cut or the stop found open stays
+  as written, and the reader's `Malformed` event of no bytes says it is no whole value, no brace
+  made up; an object closed before a cut or a stop is whole, as the
+  JSON assembler ends one. A word or a tag after the object is text where the syntax has tags,
+  refused as below, its event inside the call after the object's fragments, which stay whole as
+  the model closed them; an object after a parameter is refused whole, and that call gets no
+  close. The family's reference encoder never writes the shape, and its parser refuses it
+  (`Tool name format error`); one serving engine's parser for the family reads it, the object as
+  written, and the structural tag that engine builds for a call writes it (the invoke tag, the
+  parameters' schema, the invoke's close), so an engine that constrains a call that way gets it
+  back. Before, the object was refused as text between tags, and the call reached the client with
+  no arguments. The other spellings (MiniMax M2, dots3, MiniCPM5, XTML) keep refusing it.
 - **A tag ends at `>`, or at a marker** (`TagEnd`): XTML's `<|sep|>` is a token of its own
   and may arrive in pieces, so the scanner holds it like the other tags, and inside a value it
   is the value's text. XTML's call tag carries the model's count of the turn's calls,

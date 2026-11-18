@@ -21,19 +21,30 @@ use metrics::{Counter, Gauge, Key, KeyName, Label, Level, Metadata, Recorder};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle, PrometheusRecorder};
 use parking_lot::Mutex;
 
-use super::{deciders::Counts, generations::Generations, readiness::State};
+use super::{
+    deciders::Counts,
+    generations::Generations,
+    readiness::{Sample, State},
+};
 use crate::{
     ingest::loads::{Failures, Stats},
     store::StoreCounts,
 };
 
-/// `1` for the controller's state (`starting`, `leader`, `follower`,
-/// `draining`), `0` for the other three. The admin listener sets it from the
+/// `1` for the controller's state (`starting`, `leader`, `syncing`,
+/// `follower`, `draining`), `0` for the other four. The admin listener sets it from the
 /// readiness at each render, so the role is the fence's at the scrape, and
 /// one scrape's sample is one write: two scrapes never mix theirs.
 pub const STATE: &str = "smg_policy_controller_state";
 /// The controller's start, in seconds since the Unix epoch.
 pub const START_TIME_SECONDS: &str = "smg_policy_controller_start_time_seconds";
+/// `1` while this replica does not lead and its standby is synced with its
+/// leader, `0` otherwise: a leader's is `0`.
+pub const REPLICATION_SYNCED: &str = "smg_policy_controller_replication_synced";
+/// The age in seconds of the last frame this replica applied from its
+/// leader. `0` while it leads and before any frame, where
+/// [`REPLICATION_SYNCED`] is `0` too.
+pub const REPLICATION_LAG_SECONDS: &str = "smg_policy_controller_replication_lag_seconds";
 /// Load polls by the arbitration's decision (`mode`: `poll`, `fallback`,
 /// `suppressed`; a suppressed one made no call), each counted once per
 /// engine and poll interval.
@@ -73,9 +84,9 @@ pub const DECIDE_ANSWERS_DROPPED_TOTAL: &str = "smg_policy_controller_decide_ans
 /// share no wire with the gateway that asked.
 pub const DECIDE_CANDIDATES_UNDIALED_TOTAL: &str =
     "smg_policy_controller_decide_candidates_undialed_total";
-/// Decisions whose budget ended while they were made: each is answered
-/// `Busy` under `budget_gone_on_arrival`, and counted here apart from a
-/// request that arrived late.
+/// Decisions whose budget, or whose lease's dispatch span, ended while they
+/// were made: each is answered `Busy` under `budget_gone_on_arrival`, and
+/// counted here apart from a request that arrived late.
 pub const DECIDE_BUDGET_OUTLASTED_TOTAL: &str =
     "smg_policy_controller_decide_budget_outlasted_total";
 /// Members whose engine family or zone the standing generation's list does
@@ -89,14 +100,17 @@ pub const OVERLOAD_FLIPS_TOTAL: &str = "smg_policy_controller_overload_flips_tot
 pub(crate) struct Metrics {
     handle: PrometheusHandle,
     /// One gauge per [`State::ALL`] entry, in that order.
-    state: [Gauge; 4],
+    state: [Gauge; 5],
+    /// The standby's sync and its lag, from the same sample as the state.
+    synced: Gauge,
+    lag: Gauge,
     loads: LoadCounters,
     decides: DecideCounters,
     /// The members outside a list: `engines`, then `zones`.
     outside: [Gauge; 2],
     overload_flips: Counter,
     /// Held from a scrape's sample of the state to the end of its render:
-    /// the four gauges are written from one sample and read back whole.
+    /// the gauges are written from one sample and read back whole.
     scrape: Mutex<()>,
     /// The recorder itself: the spec's series is registered on it when a
     /// spec source is bound, so a controller with none renders none.
@@ -152,13 +166,23 @@ impl Metrics {
         recorder.describe_gauge(
             KeyName::from_const_str(STATE),
             None,
-            "1 for the controller's state (starting, leader, follower, draining), 0 for the others"
+            "1 for the controller's state (starting, leader, syncing, follower, draining), 0 for the others"
                 .into(),
         );
         recorder.describe_gauge(
             KeyName::from_const_str(START_TIME_SECONDS),
             None,
             "The controller's start, in seconds since the Unix epoch".into(),
+        );
+        recorder.describe_gauge(
+            KeyName::from_const_str(REPLICATION_SYNCED),
+            None,
+            "1 while this replica does not lead and its standby is synced with its leader, 0 otherwise".into(),
+        );
+        recorder.describe_gauge(
+            KeyName::from_const_str(REPLICATION_LAG_SECONDS),
+            None,
+            "Seconds since the last frame applied from the leader, 0 while this replica leads and before any frame".into(),
         );
         recorder.describe_counter(
             KeyName::from_const_str(LOAD_POLLS_TOTAL),
@@ -213,7 +237,7 @@ impl Metrics {
         recorder.describe_counter(
             KeyName::from_const_str(DECIDE_BUDGET_OUTLASTED_TOTAL),
             None,
-            "Decisions whose budget ended while they were made, of the Busy answers under budget_gone_on_arrival"
+            "Decisions whose budget or lease's dispatch span ended while they were made, of the Busy answers under budget_gone_on_arrival"
                 .into(),
         );
         recorder.describe_gauge(
@@ -231,6 +255,8 @@ impl Metrics {
             recorder.register_gauge(&key, &metadata)
         });
         let start = recorder.register_gauge(&Key::from_name(START_TIME_SECONDS), &metadata);
+        let synced = recorder.register_gauge(&Key::from_name(REPLICATION_SYNCED), &metadata);
+        let lag = recorder.register_gauge(&Key::from_name(REPLICATION_LAG_SECONDS), &metadata);
         let counter = |name: &'static str, label: &'static str, value: &'static str| {
             recorder.register_counter(
                 &Key::from_parts(name, vec![Label::new(label, value)]),
@@ -285,6 +311,8 @@ impl Metrics {
         let metrics = Self {
             handle,
             state,
+            synced,
+            lag,
             loads,
             decides,
             outside,
@@ -330,20 +358,24 @@ impl Metrics {
         });
     }
 
-    /// One scrape's text form: the state sampled once by `state` and its
-    /// gauge written, the load driver's counts, the decide call's and the
-    /// store's read, and the render, with no other scrape between the
-    /// sample and the render. Two scrapes across a change of role each
-    /// render one state, their own.
-    pub(crate) fn render(
+    /// One scrape's text form: the state and the standby's lag sampled once
+    /// by `sample` and their gauges written, the load driver's counts, the
+    /// decide call's and the store's read, and the render, with no other
+    /// scrape between the sample and the render. Two scrapes across a change
+    /// of role each render one state, their own.
+    pub(crate) fn render<S: Into<Sample>>(
         &self,
-        state: impl FnOnce() -> State,
+        sample: impl FnOnce() -> S,
         loads: &Stats,
         decides: &Counts,
         store: impl FnOnce() -> StoreCounts,
     ) -> String {
         let _one = self.scrape.lock();
-        self.set_state(state());
+        let sample = sample().into();
+        self.set_state(sample.state);
+        self.synced.set(if sample.synced { 1.0 } else { 0.0 });
+        self.lag
+            .set(sample.lag.map_or(0.0, |lag| lag.as_secs_f64()));
         self.observe_loads(loads);
         if let Some(spec) = self.spec.get() {
             let counts = spec.generations.counts();
@@ -430,11 +462,14 @@ mod tests {
     use std::{sync::Arc, time::Duration};
 
     use super::{
-        Generations, Metrics, StoreCounts, MEMBERS_OUTSIDE_LIST, SPEC_APPLY_TOTAL, SPEC_GENERATION,
-        START_TIME_SECONDS, STATE,
+        Generations, Metrics, StoreCounts, MEMBERS_OUTSIDE_LIST, REPLICATION_LAG_SECONDS,
+        REPLICATION_SYNCED, SPEC_APPLY_TOTAL, SPEC_GENERATION, START_TIME_SECONDS, STATE,
     };
     use crate::{
-        controller::{deciders::Counts, readiness::State},
+        controller::{
+            deciders::Counts,
+            readiness::{Sample, State},
+        },
         ingest::loads::Stats,
         store::OutsideLists,
     };
@@ -838,5 +873,56 @@ mod tests {
             .apply(RANDOM.into(), Format::Yaml)
             .expect("a valid document");
         series(2, 2, 1);
+    }
+
+    #[test]
+    fn a_scrape_tells_the_standbys_sync_and_its_lag_from_one_sample() {
+        let metrics = Metrics::new();
+        let scrape = |state, lag, synced| {
+            let rendered = metrics.render(
+                || Sample { state, lag, synced },
+                &Stats::default(),
+                &Counts::default(),
+                StoreCounts::default,
+            );
+            (
+                line(&rendered, REPLICATION_SYNCED, ""),
+                line(&rendered, REPLICATION_LAG_SECONDS, ""),
+            )
+        };
+        let read = |synced: &str, lag: &str| {
+            (
+                Some(format!("smg_policy_controller_replication_synced {synced}")),
+                Some(format!(
+                    "smg_policy_controller_replication_lag_seconds {lag}"
+                )),
+            )
+        };
+        // A follower a second and a half behind its leader, and synced.
+        assert_eq!(
+            scrape(State::Follower, Some(Duration::from_millis(1500)), true),
+            read("1", "1.5")
+        );
+        // Its stream fell silent: the lag grows and the sync is gone.
+        assert_eq!(
+            scrape(State::Syncing, Some(Duration::from_secs(40)), false),
+            read("0", "40")
+        );
+        // A leader follows nobody: both read zero, as before any frame.
+        let rendered = metrics.render(
+            || State::Leader,
+            &Stats::default(),
+            &Counts::default(),
+            StoreCounts::default,
+        );
+        assert_eq!(
+            (
+                line(&rendered, REPLICATION_SYNCED, ""),
+                line(&rendered, REPLICATION_LAG_SECONDS, "")
+            ),
+            read("0", "0")
+        );
+        assert!(rendered.contains("# HELP smg_policy_controller_replication_synced "));
+        assert!(rendered.contains("# HELP smg_policy_controller_replication_lag_seconds "));
     }
 }

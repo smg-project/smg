@@ -17,7 +17,6 @@ use openai_protocol::{
     model_card::ModelCard,
     worker::{ProviderType, WorkerInfo, WorkerModels, WorkerStatus},
 };
-use smg_grpc_client::common_proto;
 use tokio::{
     sync::{mpsc, Notify, OnceCell},
     task::AbortHandle,
@@ -864,11 +863,7 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
                     self.engine_connection().await?,
                 )?;
                 let result = client.flush_cache(0.0).await;
-                admin_grpc_result(
-                    self.url(),
-                    "flush_cache",
-                    result.map(|r| (r.success, r.message)),
-                )
+                admin_grpc_result(self.url(), "flush_cache", result)
             }
         }
     }
@@ -900,21 +895,8 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
                     "start_profile",
                     self.engine_connection().await?,
                 )?;
-                let req = common_proto::StartProfileRequest {
-                    output_dir: options.output_dir.clone(),
-                    start_step: options.start_step,
-                    num_steps: options.num_steps,
-                    activities: options.activities.clone().unwrap_or_default(),
-                    with_stack: options.with_stack,
-                    record_shapes: options.record_shapes,
-                    profile_by_stage: options.profile_by_stage,
-                };
-                let result = client.start_profile(req).await;
-                admin_grpc_result(
-                    self.url(),
-                    "start_profile",
-                    result.map(|r| (r.success, r.message)),
-                )
+                let result = client.start_profile(options).await;
+                admin_grpc_result(self.url(), "start_profile", result)
             }
         }
     }
@@ -941,11 +923,7 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
                     self.engine_connection().await?,
                 )?;
                 let result = client.stop_profile().await;
-                admin_grpc_result(
-                    self.url(),
-                    "stop_profile",
-                    result.map(|r| (r.success, r.message)),
-                )
+                admin_grpc_result(self.url(), "stop_profile", result)
             }
         }
     }

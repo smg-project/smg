@@ -32,6 +32,7 @@ crates/policy_controller/tests/classic/sheets/
   encode_pair.json
   pair_select.json
   overload.json
+  bucket.json
 model_gateway/src/         each recorder, a test module beside the code it runs
   policies/classic_rows.rs                                                  power_of_two.json
   policies/classic_manual_rows.rs                                           manual.json
@@ -41,6 +42,7 @@ model_gateway/src/         each recorder, a test module beside the code it runs
   routers/grpc/common/stages/worker_selection/classic_encode_pair_rows.rs   encode_pair.json
   routers/common/classic_pair_select_rows.rs                                pair_select.json
   worker/load/monitor/classic_overload_rows.rs                              overload.json
+  policies/bucket/classic_bucket_rows.rs                                    bucket.json
 ```
 
 ## A sheet
@@ -73,6 +75,21 @@ placing the key with every worker free and then with the members found so far do
 way on its own ring. A ring row's loads, states, tried lists and answers all count in that order, so an answer of 0
 is the key's own worker and 1 the next member of the ring, on whatever ring replays the row. A row under consistent
 hashing with no `ring_key` records what a request without a routing key gets.
+
+The rows of `bucket.json` are sequence rows and one drawn row. A row names the policy's configuration in the
+gateway's own spelling: the two parts of its balance rule and the interval of its adjustment in seconds. Its pool is
+prefill workers the policy lists (`prefill`), or regular workers nobody listed (`regular`), which the policy draws
+from. A step is a pick, which workers are ready from here on (`ready`), a prefill worker that registers (`join`: it
+takes the next number, and the policy is handed every listed worker again, as the registration does) or a worker
+that leaves (`leave`). A request carries the row's clock at its placement in milliseconds (`at_ms`) and its size as
+the policy reads it: the count of its token ids (`tokens`), else the characters of its text (`text`), else zero,
+with the workers an earlier attempt `tried`. An answer is the worker's number: its place in the row's first listing,
+or the number it joined under. The policy reads two clocks, and the recorder stands for both. The window dates each
+booking by the system clock, so before a step the recorder moves every queued booking back by the time the row's
+clock advanced. The adjustment runs on a thread once an interval, and the recorder runs the same adjustment at every
+whole interval of the row's clock, counted from the row's first request, before the request that reaches or passes
+it. No row places a request where a booking's age stands within a second under the window's length, so the system
+clock's own microseconds between two steps decide nothing.
 
 The rows of `encode_pair.json` are sequence rows of their own shape. A row is a fleet: its encoders, its prefill
 workers and its decode workers, each named by its place in its list, with what the gateway reads of it from its
@@ -175,6 +192,7 @@ directory. The sha256 is of the file as committed.
 | `encode_pair.json` | a request with encode items: the pair, the encoders offered and each item's encoder | `4ba2a6431357be5411a2383cdc4916b41471d722` | 52: 52 sequence, 0 drawn | `988bf253da9310aeedd08ec2704d8e01ecc4a1210453353723ba0faa9001de33` | `classic_encode_pair_rows.rs` |
 | `pair_select.json` | the placement of a prefill and decode pair: each side under its policy, a side over its overload thresholds or doubted whole, a decode's rooms, the prefill admission's bound, the least-loaded default's own rules, a role with no worker | `4ba2a6431357be5411a2383cdc4916b41471d722` | 40: 23 sequence, 17 drawn | `bd8426316ae7337ede82b5a931c1d00cd9dee1aca22c528278f32b2671846eb8` | `classic_pair_select_rows.rs` |
 | `overload.json` | the overload verdict of one worker: the gateway's thresholds and the worker's own, a poll's answer, a poll with no report, a pushed record, an eviction | `436f0c8c5725b0a408b990003d76eaddc72c4be4` | 25 verdict rows | `29c10ee8876e53d23a824a3b7bd0481efd118e8ac5a0d2822477729f6e21283a` | `classic_overload_rows.rs` |
+| `bucket.json` | bucket: a size's range and its worker, the hand-down when that worker is not offered, the two parts of the balance rule, the window a booking leaves, the adjustment's cut, a worker that joins or leaves, a pool nobody listed | `d92647556e91a3601ef647f12ae5784df2080dc3` | 19: 18 sequence, 1 drawn | `71a533017809566486335bb9f212ea49712a833bbe5ebcbde7c5d6319ee764e4` | `classic_bucket_rows.rs` |
 
 ## Recording
 
@@ -196,6 +214,7 @@ CLASSIC_ROWS_OUT=$PWD/crates/policy_controller/tests/classic/sheets CLASSIC_ROWS
 | `encode_pair.json` | `worker_selection::classic_encode_pair_rows` |
 | `pair_select.json` | `routers::common::classic_pair_select_rows` |
 | `overload.json` | `worker::load::monitor::classic_overload_rows` |
+| `bucket.json` | `policies::bucket::classic_bucket_rows` |
 
 The pair sheet's recorder is a child of the module that derives a worker's pairing descriptor, so it records the
 descriptor the gateway derived and never a second reading of the registration. The encode sheet's recorder is a
@@ -203,7 +222,9 @@ child of the gateway's worker selection stage: it runs the stage's own selection
 write down each call (the encoders offered and the key) and passes every call on unchanged. The pair placement
 sheet's recorder sits beside the placement it calls and builds its pools, policies and pair index with the gateway's
 own types. The overload sheet's recorder is a child of the gateway's load monitor, so each step enters the monitor
-through the monitor's own functions and the verdict is read off the worker the monitor wrote it on.
+through the monitor's own functions and the verdict is read off the worker the monitor wrote it on. The bucket
+sheet's recorder is a child of the policy's own module and stands in that policy's directory: the adjustment and
+the window are the policy's private state, and a module beside the policy's could reach neither.
 
 A sheet is never edited by hand. A new recording replaces the whole sheet and its row in the table above, in one
 pull request that names the commit and says which rows moved: a sequence row moves only when the policy's
@@ -225,11 +246,9 @@ A limit is a recorded row the replay does not decide as recorded, with the reaso
 fails once the reason no longer holds.
 
 - `power_of_two.json`: none. All 44 rows replay.
-- `all_vetoed.json`: ten rows are owed. Two are the rows of the `bucket` policy (a pool over on every worker, with
-  shedding off and on). The gateway answers them as it answers every other policy; the crate has no `bucket`
-  preset yet, so it cannot build them. Eight are the ring rows: the crate does not keep a routing key on its ring
-  worker yet, and their module refuses them by name. The other 32 rows replay, the keyed round robin row among
-  them.
+- `all_vetoed.json`: eight rows are owed, the ring rows: the crate does not keep a routing key on its ring worker
+  yet, and their module refuses them by name. The other 34 rows replay, the keyed round robin row and the two rows
+  of the `bucket` policy (a pool over on every worker, with shedding off and on) among them.
 - `pair_index.json`: none. All 23 rows replay.
 - `encode_pair.json`: none is recorded yet. The module that replays it arrives with the crate's encoder lists
   and its rule for encode items; until then the replay owes this sheet.
@@ -257,3 +276,4 @@ fails once the reason no longer holds.
   outside the key (`the-last-token-of-a-prompt-under-256-tokens-is-in-the-key`), and a request under one block has
   no key and is placed as one with nothing to hash, on the fewest requests
   (`a-ten-token-prompt-keeps-its-key-s-worker-over-the-fewest-requests`). The other 45 rows replay.
+- `bucket.json`: none. All 19 rows replay.

@@ -190,6 +190,27 @@ impl WireWriter {
             }
         }
     }
+
+    /// [`Self::write_run`] for one channel of interleaved RGB pixels: the
+    /// `channel` byte of every pixel as `dst`, through the tables (a strided
+    /// source has no vector formula).
+    pub(crate) fn write_channel(&self, dst: &mut [u8], pixels: &[[u8; 3]], channel: usize) {
+        debug_assert_eq!(dst.len(), pixels.len() * self.element_size());
+        match self {
+            Self::Half { tables, .. } => {
+                let table = &tables[channel];
+                for (d, pixel) in dst.as_chunks_mut::<2>().0.iter_mut().zip(pixels) {
+                    *d = table[usize::from(pixel[channel])].to_le_bytes();
+                }
+            }
+            Self::Single { tables, .. } => {
+                let table = &tables[channel];
+                for (d, pixel) in dst.as_chunks_mut::<4>().0.iter_mut().zip(pixels) {
+                    *d = table[usize::from(pixel[channel])].to_le_bytes();
+                }
+            }
+        }
+    }
 }
 
 /// `(dst, src)` per channel block: `block` source bytes and their `width`
@@ -672,6 +693,37 @@ mod tests {
                 .flat_map(|(i, &v)| wide[(i / block) % 3][v as usize].to_le_bytes())
                 .collect();
             assert_eq!(dst, expected, "u32, block {block}");
+        }
+    }
+
+    /// One channel of interleaved pixels takes the values its bytes take as
+    /// a run: every byte of every channel, in every float dtype, into a
+    /// buffer that held other bytes.
+    #[test]
+    fn a_channel_of_interleaved_pixels_is_written_as_its_run() {
+        let norm = PixelNorm {
+            scale: 1.0,
+            offset: [123.675, 116.28, 103.53],
+            divisor: [58.395, 57.12, 57.375],
+            channel_block: 16,
+        };
+        let pixels: Vec<[u8; 3]> = (0..=255u8)
+            .map(|value| [value, value.wrapping_mul(7), 255 - value])
+            .collect();
+        for dtype in [
+            EncoderDtype::BFloat16,
+            EncoderDtype::Float16,
+            EncoderDtype::Float32,
+        ] {
+            let writer = WireWriter::new(&norm, dtype).unwrap();
+            for channel in 0..3 {
+                let run: Vec<u8> = pixels.iter().map(|pixel| pixel[channel]).collect();
+                let mut expected = vec![0u8; run.len() * writer.element_size()];
+                writer.write_run(&mut expected, &run, channel);
+                let mut written = vec![0xAAu8; expected.len()];
+                writer.write_channel(&mut written, &pixels, channel);
+                assert_eq!(written, expected, "{dtype}, channel {channel}");
+            }
         }
     }
 

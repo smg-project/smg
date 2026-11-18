@@ -98,7 +98,7 @@ async fn metrics(AxumState(admin): AxumState<Admin>) -> Response {
             "text/plain; version=0.0.4; charset=utf-8",
         )],
         admin.metrics.render(
-            || admin.readiness.state(),
+            || admin.readiness.sample(),
             &admin.loads,
             &admin.decides,
             || admin.store.counts(),

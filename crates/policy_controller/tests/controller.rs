@@ -34,7 +34,7 @@ use smg_policy_controller::{
         WatchWorkersRequest,
     },
     store::{
-        GatewayId, LeaseRecord, LeaseState, LeasesStore, LoadSink, LoadSource, WorkerFacts,
+        GatewayId, LeaseRecord, LeaseState, LeasesStore, LoadSink, LoadSource, Picked, WorkerFacts,
         WorkerStatus, WorkersStore,
     },
     view::{fingerprint, LoadRow, Role, WorkerId},
@@ -371,6 +371,7 @@ async fn a_gateway_gone_past_its_grace_period_is_let_go_by_the_run_loop() {
                 gateway,
                 request: 1,
                 target: WorkerId(7),
+                picked: Picked::default(),
                 decode: None,
                 term: 1,
                 issued_at: now,
