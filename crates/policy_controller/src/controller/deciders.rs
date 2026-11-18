@@ -55,11 +55,18 @@
 //!
 //! What a lease does not do yet. It books the pick's first target alone: a
 //! dispatch that names another target moves no count. A request sent twice
-//! under one id is issued two leases. A term mints 2^32 - 1 ids: a leader
-//! past them has no answer for a pick until it leads under another term. A
-//! stage hears a lease's issue and its end at the dispatch deadline, and no
-//! dispatch, completion or release at its gateway's word: a document that
-//! names a stage in need of those calls stays refused.
+//! under one id is issued two leases. A stage hears a lease's issue and its
+//! end at the dispatch deadline, and no dispatch, completion or release at
+//! its gateway's word: a document that names a stage in need of those calls
+//! stays refused.
+//!
+//! A term mints 2^32 - 1 ids, and under every term but the last a leader
+//! leaves before they end. The first answer a term hands over with an id at
+//! or past its mark ([`past_mark`], three quarters of the ids) tells the
+//! election to hand the lease over ([`Deciders::leave_through`]), once a
+//! term whichever decider's it is: the next take brings a term whose ids
+//! start again. The counter's end stands as the last guard, where a pick is
+//! answered `Busy`: under the last term a replica can take no word is said.
 //!
 //! A gateway's wires are a fact before the profile, as its vetoes are: no
 //! filter of the catalog reads them, and no profile picks a member its
@@ -101,14 +108,14 @@ use std::{
     sync::{
         atomic::{AtomicU64, Ordering},
         mpsc::{sync_channel, Receiver, SyncSender, TrySendError},
-        Arc,
+        Arc, OnceLock,
     },
     thread,
     time::{Duration, Instant},
 };
 
 use tokio::sync::{mpsc, watch};
-use tracing::error;
+use tracing::{error, info};
 
 use super::{
     election::Standing,
@@ -116,7 +123,7 @@ use super::{
 };
 use crate::{
     decision::{Decision, Shed, ShedReason, Trace},
-    elector::Fence,
+    elector::{term_said, Fence},
     framework::{release, Plan, Scratch},
     lease::{Lease, LeaseId, LeaseKind, Lifecycle, ReleaseReason, Side},
     proto::{self, busy::Reason},
@@ -239,6 +246,36 @@ pub(crate) const QUEUE_DEPTH: usize = 128;
 /// The clock a decider reads, twice a decision.
 pub(crate) type Clock = Arc<dyn Fn() -> Instant + Send + Sync>;
 
+/// The counter at which a term's leader is told to leave: three quarters of
+/// the ids one term mints. A leader that leaves there takes its next term
+/// with the counter at its start, so no term reaches the counter's end; the
+/// quarter left is what the term still mints between the word and its
+/// fence's close.
+pub(crate) const TERM_MARK: u32 = 3 << 30;
+
+/// Whether `id` is at or past its term's mark ([`TERM_MARK`]): the counter
+/// is the id's low half, as the contract lays an id out. At or past, and
+/// not the mark's own id alone: the mint steps over an id on file, and a
+/// term's ids need not all pass through one decider.
+fn past_mark(id: LeaseId) -> bool {
+    (id.0 & u64::from(u32::MAX)) >= u64::from(TERM_MARK)
+}
+
+/// What a decider calls once it handed over a term's first answer at or
+/// past the mark: the election's planned hand-over.
+pub(crate) type Leave = Box<dyn Fn() + Send + Sync>;
+
+/// What the deciders share of a term's mark: the word, and the highest term
+/// it was said under, so one decider says it and once.
+#[derive(Default)]
+struct Mark {
+    /// The word ([`Deciders::leave_through`]): none until the election runs.
+    leave: OnceLock<Leave>,
+    /// The highest term whose word was said, or was found to have none to
+    /// say: the last term a replica can take.
+    said: AtomicU64,
+}
+
 /// What every decider reads.
 #[derive(Clone)]
 pub(crate) struct Reads {
@@ -304,6 +341,8 @@ pub(crate) struct Deciders {
     /// frame's receipt is stamped by and the term the reader's own answers
     /// carry.
     reads: Reads,
+    /// A term's mark, as every decider reads it.
+    mark: Arc<Mark>,
 }
 
 /// A decider's thread holds one: it tells when the thread unwinds. A thread
@@ -323,6 +362,7 @@ impl Deciders {
     /// at least one thread, and a queue of at least one.
     pub(crate) fn start(deciders: usize, depth: usize, reads: &Reads) -> io::Result<Self> {
         let told = Arc::new(watch::Sender::new(false));
+        let mark = Arc::new(Mark::default());
         let queues = (0..deciders.max(1))
             .map(|index| {
                 let (queue, jobs) = sync_channel(depth.max(1));
@@ -331,6 +371,8 @@ impl Deciders {
                     buffers: Buffers::default(),
                     faulted: false,
                     index,
+                    marked: None,
+                    mark: Arc::clone(&mark),
                 };
                 watched(index, &told, move || decider.run(&jobs)).map(|_running| queue)
             })
@@ -339,6 +381,7 @@ impl Deciders {
             queues,
             told,
             reads: reads.clone(),
+            mark,
         })
     }
 
@@ -348,6 +391,14 @@ impl Deciders {
     /// unwind has seen it.
     pub(crate) fn ended(&self) -> watch::Receiver<bool> {
         self.told.subscribe()
+    }
+
+    /// Hands the deciders the word a term's mark says: the decider that
+    /// hands over a term's first answer at or past the mark ([`past_mark`])
+    /// calls `leave` once that answer is handed over. Set once, when the
+    /// election runs: a second call changes nothing.
+    pub(crate) fn leave_through(&self, leave: impl Fn() + Send + Sync + 'static) {
+        let _ = self.mark.leave.set(Box::new(leave));
     }
 
     /// What a decider's thread tells at its unwind, told by a case.
@@ -428,6 +479,11 @@ struct Decider {
     faulted: bool,
     /// Its place among the deciders, which names its part of a count.
     index: usize,
+    /// The term of the answer in hand where its lease's id is at or past
+    /// the term's mark: the word follows the answer's hand-over.
+    marked: Option<u64>,
+    /// The mark's word and its latch, shared by the deciders.
+    mark: Arc<Mark>,
 }
 
 impl Decider {
@@ -441,12 +497,46 @@ impl Decider {
                 answers,
             } = job;
             let answer = self.answer(request, gateway, received);
-            let dropped = match answers.try_send(answer) {
+            let sent = answers.try_send(answer);
+            // The answer is handed over, or dropped with its lease on file:
+            // the word of its term's mark follows it.
+            if let Some(term) = self.marked.take() {
+                self.leave_at(term);
+            }
+            let dropped = match sent {
                 Ok(()) => continue,
                 Err(mpsc::error::TrySendError::Full(_)) => &self.reads.counts.dropped_full,
                 Err(mpsc::error::TrySendError::Closed(_)) => &self.reads.counts.dropped_gone,
             };
             dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// The word of `term`'s mark: the planned hand-over, so the next take
+    /// brings a term whose ids start again. Once a term: every answer past
+    /// the mark comes here, and the first alone goes on. Under the last
+    /// term below the ceiling no word is said: a hand-over there leaves no
+    /// term to take, and the counter runs on to its end, where a pick is
+    /// answered `Busy` ([`Counts::unleased`]).
+    #[cold]
+    fn leave_at(&self, term: u64) {
+        // A read first: past the mark every answer comes here until the
+        // hand-over lands, and a write each time would pass the line from
+        // decider to decider.
+        if self.mark.said.load(Ordering::Relaxed) >= term
+            || self.mark.said.fetch_max(term, Ordering::Relaxed) >= term
+        {
+            return;
+        }
+        if term_said(Some(term)).is_err() {
+            return;
+        }
+        if let Some(leave) = self.mark.leave.get() {
+            info!(
+                term,
+                "the term's lease ids passed their mark: this leader hands the lease over, and the next take mints under a new term"
+            );
+            leave();
         }
     }
 
@@ -468,6 +558,11 @@ impl Decider {
         let faulted = decided.is_err();
         let answer = match decided {
             Ok(Ok((term, decision, lease))) => {
+                // An id at or past the term's mark: the word follows this
+                // answer, where no answer of the term said it yet.
+                if lease.as_ref().is_some_and(|lease| past_mark(lease.id)) {
+                    self.marked = Some(term);
+                }
                 wire::decided(request.into_id(), term, &decision, lease.as_ref())
             }
             Ok(Err(reason)) => self.reads.busy(request.into_id(), reason),
@@ -995,7 +1090,7 @@ pub(crate) mod tests {
 
     use super::{
         cut_reach, hand, narrow, watched, Buffers, Clock, Counts, Decider, Deciders, Job, Part,
-        Reads, Refused, Taken, PARTS,
+        Reads, Refused, Taken, PARTS, TERM_MARK,
     };
     use crate::{
         builtins::Random,
@@ -1006,7 +1101,7 @@ pub(crate) mod tests {
             wire::{self, Checked},
         },
         decision::{Decision, Targets},
-        elector::{Elector, Tick},
+        elector::{Elector, Tick, TERM_CEILING},
         framework::{DecisionScope, Filter, Picker, Scratch, TieBand},
         lease::{Lease, LeaseId, Lifecycle, ReleaseReason},
         proto::{self, busy::Reason, decide_answer::Answer, decision::Outcome},
@@ -1537,6 +1632,167 @@ pub(crate) mod tests {
         assert_eq!(bed.store.live(GATEWAY), 0);
     }
 
+    /// Sixteen requests of one stream in flight at once, and their answers:
+    /// a pick's lease id, or the reason of a `Busy`.
+    pub(crate) async fn burst(
+        deciders: &Deciders,
+        sender: &mpsc::Sender<proto::DecideAnswer>,
+        answers: &mut mpsc::Receiver<proto::DecideAnswer>,
+    ) -> Vec<Result<u64, Reason>> {
+        for id in 0..16 {
+            let job = Job {
+                request: checked(frame(id, u64::from(id))),
+                gateway: GATEWAY,
+                received: Instant::now(),
+                answers: sender.clone(),
+            };
+            assert!(deciders.submit(job).is_none(), "the queue takes sixteen");
+        }
+        let mut read = Vec::new();
+        for _ in 0..16 {
+            let answer = timeout(PATIENCE, answers.recv())
+                .await
+                .expect("an answer within the case's patience")
+                .expect("the case holds a sender");
+            read.push(match &answer.answer {
+                Some(Answer::Decision(decision)) => match decision.leases.as_slice() {
+                    [lease] => Ok(lease.id),
+                    other => panic!("one lease a pick: {other:?}"),
+                },
+                _ => Err(busy(&answer)),
+            });
+        }
+        read
+    }
+
+    /// The word a term's mark says, as a case hears it: each call tells the
+    /// case, then waits for its go.
+    fn heard(bed: &Bed) -> (std_mpsc::Receiver<()>, std_mpsc::SyncSender<()>) {
+        let (reached, words) = std_mpsc::sync_channel(8);
+        let (go, held) = std_mpsc::sync_channel::<()>(8);
+        let held = Mutex::new(held);
+        bed.deciders.leave_through(move || {
+            reached.send(()).expect("the case hears the word");
+            held.lock().recv().expect("the case lets the decider go");
+        });
+        (words, go)
+    }
+
+    /// The answer that carries the id at a term's mark says the word to
+    /// leave, only once it is handed over, and no id past it says another.
+    #[tokio::test]
+    async fn the_id_at_a_terms_mark_says_the_word_once_its_answer_is_handed_over() {
+        let mut bed = leading([]);
+        let (words, go) = heard(&bed);
+        // The mark is three quarters of a term's ids. The id under it, the
+        // mark's, and three past it.
+        assert_eq!(u64::from(TERM_MARK) * 4, 3 << 32);
+        bed.store.spend_ids(u32::MAX - TERM_MARK + 2);
+        let under = bed.ask(frame(1, 1)).await;
+        assert_eq!(lease_of(&under).id, 1 << 32 | u64::from(TERM_MARK - 1));
+        // The decider is held inside the word: an answer that reaches the
+        // case was handed over before the word was said.
+        let at = bed.ask(frame(2, 1)).await;
+        assert_eq!(lease_of(&at).id, 1 << 32 | u64::from(TERM_MARK));
+        words
+            .recv_timeout(PATIENCE)
+            .expect("the mark's decider says the word");
+        // A later word finds its go waiting. The ids past the mark say
+        // none: the answer after each shows its decider said nothing.
+        for _ in 0..8 {
+            go.send(()).expect("the decider holds the other end");
+        }
+        for (id, past) in [(3, 1), (4, 2), (5, 3)] {
+            let answer = bed.ask(frame(id, 1)).await;
+            assert_eq!(lease_of(&answer).id, 1 << 32 | u64::from(TERM_MARK + past));
+        }
+        assert!(words.try_recv().is_err(), "one answer a term says the word");
+        assert_eq!(bed.counts.unleased.load(Ordering::Relaxed), 0);
+    }
+
+    /// The mark's own id need not be one an answer carries: the mint steps
+    /// over an id on file. The first answer past the mark says the word
+    /// then, and once.
+    #[tokio::test]
+    async fn an_id_past_a_terms_mark_says_the_word_the_marks_own_never_said() {
+        let mut bed = leading([]);
+        let (words, go) = heard(&bed);
+        for _ in 0..8 {
+            go.send(()).expect("the decider holds the other end");
+        }
+        // The term's counter stands two ids past its mark.
+        bed.store.spend_ids(u32::MAX - TERM_MARK - 2);
+        let first = bed.ask(frame(1, 1)).await;
+        assert_eq!(lease_of(&first).id, 1 << 32 | u64::from(TERM_MARK + 3));
+        words
+            .recv_timeout(PATIENCE)
+            .expect("the first answer past the mark says the word");
+        // The answer after each shows its decider said nothing.
+        for (id, past) in [(2, 4), (3, 5)] {
+            let answer = bed.ask(frame(id, 1)).await;
+            assert_eq!(lease_of(&answer).id, 1 << 32 | u64::from(TERM_MARK + past));
+        }
+        assert!(words.try_recv().is_err(), "one answer a term says the word");
+    }
+
+    /// Each term says its own word: a leader past its mark under one term,
+    /// then under the next, hands the lease over twice.
+    #[tokio::test]
+    async fn two_terms_in_a_row_each_say_the_word_at_their_mark() {
+        let mut bed = leading([]);
+        let (words, go) = heard(&bed);
+        let taken = bed.script.taken;
+        for term in 1..=2 {
+            go.send(()).expect("the decider holds the other end");
+            if term > 1 {
+                // The bed's candidate, alone over its lease, leaves and
+                // takes again at one instant, as its election would.
+                let left = bed.elector.step_down(None, taken);
+                assert!(left.expect("a planned hand-over"));
+                let took = bed.elector.tick(taken).expect("the take");
+                assert_eq!(took, Tick::Acquired { term });
+                bed.store.set_term(term);
+            }
+            bed.store.spend_ids(u32::MAX - TERM_MARK + 1);
+            let at = bed.ask(frame(1, 1)).await;
+            assert_eq!(lease_of(&at).id, term << 32 | u64::from(TERM_MARK));
+            // The answer after the mark's shows its decider said its word.
+            let past = bed.ask(frame(2, 1)).await;
+            assert_eq!(lease_of(&past).id, term << 32 | u64::from(TERM_MARK + 1));
+            assert!(words.try_recv().is_ok(), "the word under term {term}");
+            assert!(words.try_recv().is_err(), "one word under term {term}");
+        }
+    }
+
+    /// Under the last term a replica can take, the mark says no word: a
+    /// hand-over there leaves no term to take. The term before it says its
+    /// own.
+    #[tokio::test]
+    async fn the_mark_of_the_last_term_says_no_word() {
+        let mut bed = leading([]);
+        let (words, go) = heard(&bed);
+        go.send(()).expect("the decider holds the other end");
+        // The bed's candidate, alone over its lease, leaves and takes again
+        // at one instant, twice: above a term said, the term before the
+        // last; then at a planned hand-over, the last under the ceiling.
+        let (last, taken) = (TERM_CEILING - 1, bed.script.taken);
+        for (term, above, says) in [(last - 1, Some(last - 2), true), (last, None, false)] {
+            let left = bed.elector.step_down(above, taken);
+            assert!(left.expect("a term that leaves one to take"));
+            let took = bed.elector.tick(taken).expect("the take");
+            assert_eq!(took, Tick::Acquired { term });
+            bed.store.set_term(term);
+            bed.store.spend_ids(u32::MAX - TERM_MARK + 1);
+            let at = bed.ask(frame(1, 1)).await;
+            assert_eq!(lease_of(&at).id, term << 32 | u64::from(TERM_MARK));
+            // The answer after the mark's shows its decider said what it
+            // had to say.
+            let past = bed.ask(frame(2, 1)).await;
+            assert_eq!(lease_of(&past).id, term << 32 | u64::from(TERM_MARK + 1));
+            assert_eq!(words.try_recv().is_ok(), says, "under term {term}");
+        }
+    }
+
     /// What the engine told a stage of leases: an issue by its id, a release
     /// by its id and reason.
     type Calls = Vec<(u64, Option<ReleaseReason>)>;
@@ -1941,6 +2197,7 @@ pub(crate) mod tests {
             queues: Box::new([queue]),
             told: Arc::new(watch::Sender::new(false)),
             reads: reads.clone(),
+            mark: Arc::default(),
         }
     }
 
@@ -2498,6 +2755,8 @@ pub(crate) mod tests {
             buffers: Buffers::default(),
             faulted: false,
             index: 0,
+            marked: None,
+            mark: Arc::default(),
         };
         let lines = Logged::default();
         let writer = lines.clone();
