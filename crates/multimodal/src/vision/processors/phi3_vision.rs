@@ -397,16 +397,13 @@ impl VisionPreProcessor for Phi3VisionProcessor {
         }
 
         // The batch [B, num_crops+1, 3, 336, 336], written once per image.
-        // Allocated at its size, not taken from the scratch pool: the pool's
-        // top buffer here is the previous image's planes, which are smaller,
-        // and growing that buffer reallocates it (the allocator moves it,
-        // dead bytes and all, when it cannot extend it in place). The planes
-        // and the global image then find their own buffers again.
+        // Pooled: it is the encoder input's storage, which returns to the
+        // pool when the input is written out.
         let max_crops = self.num_crops + 1;
         let batch_size = images.len();
         let tile = TILE_SIZE as usize;
         let shape = vec![batch_size, max_crops, 3, tile, tile];
-        let mut flat_data: Vec<f32> = Vec::with_capacity(shape.iter().product());
+        let mut flat_data = scratch::take_f32_cap(shape.iter().product());
         let mut all_image_sizes = Vec::with_capacity(images.len());
         let mut all_num_tokens = Vec::with_capacity(images.len());
 
