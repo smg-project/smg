@@ -88,11 +88,16 @@ pub trait BoundPlugin: DecisionScope + 'static {
 }
 
 /// What one adapter needs from the host: its plugin's declared needs and
-/// its fallback's, since either answers the call. The same for each stage
-/// kind: a plugin that reads the affinity facts as the filter alone or as
-/// the picker alone is a reader as one that scores is.
+/// its fallback's, since either answers the call, and each row's requests
+/// in flight: a plugin's row carries that count whether the plugin reads
+/// it or not, and a plugin's declaration has no word for it. The same for
+/// each stage kind: a plugin that reads the affinity facts as the filter
+/// alone or as the picker alone is a reader as one that scores is.
 fn stage_needs<B: BoundPlugin>(bound: &B, fallback: Option<Needs>) -> Needs {
-    let own = bound.needs();
+    let own = Needs {
+        in_flight: true,
+        ..bound.needs()
+    };
     fallback.map_or(own, |fallback| own.or(fallback))
 }
 
@@ -377,3 +382,83 @@ macro_rules! forward_lifecycle {
 
 forward_lifecycle!(PluginScorer);
 forward_lifecycle!(PluginPicker);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::view::PoolFacts;
+
+    /// A plugin that declares nothing and answers no call.
+    #[derive(Debug)]
+    struct Quiet;
+
+    impl DecisionScope for Quiet {
+        fn open(&self, _: &RequestFacts<'_>, _: &[Candidate], _: &PoolFacts<'_>) {}
+
+        fn close(&self) {}
+    }
+
+    impl BoundPlugin for Quiet {
+        fn name(&self) -> &'static str {
+            "quiet"
+        }
+
+        fn failure(&self) -> Failure {
+            Failure::Open
+        }
+
+        fn needs(&self) -> Needs {
+            Needs::default()
+        }
+
+        fn take_observer(&self) -> bool {
+            false
+        }
+
+        fn retain(&self, _: &RequestFacts<'_>, _: &mut Vec<u32>) -> Result<(), Fallback> {
+            Err(Fallback)
+        }
+
+        fn keep(&self, _: &RequestFacts<'_>, _: u32) -> Result<bool, Fallback> {
+            Err(Fallback)
+        }
+
+        fn score(&self, _: &RequestFacts<'_>, _: &[u32], _: &mut [f32]) -> Result<(), Fallback> {
+            Err(Fallback)
+        }
+
+        fn pick(&self, _: &RequestFacts<'_>, _: &[u32], _: &[f32]) -> Result<u32, Fallback> {
+            Err(Fallback)
+        }
+
+        fn observe_issued(&self, _: &Lease, _: &Decision) {}
+
+        fn observe_dispatched(&self, _: &Lease, _: &Target, _: Side, _: u32) {}
+
+        fn observe_completed(&self, _: &Lease, _: &Outcome) {}
+
+        fn observe_released(&self, _: &Lease, _: ReleaseReason) {}
+
+        fn observe_membership(&self, _: &Membership<'_>) {}
+
+        fn observe_signal(&self, _: &Signal) {}
+    }
+
+    /// A plugin's row carries its worker's requests in flight, and a
+    /// plugin's declaration has no word for that count: each stage a plugin
+    /// is bound as declares it, beside what the plugin declares.
+    #[test]
+    fn a_plugins_stage_declares_its_rows_requests_in_flight() {
+        let bound = Arc::new(Quiet);
+        let needs = [
+            PluginFilter::new(Arc::clone(&bound), None).needs(),
+            PluginScorer::new(Arc::clone(&bound), None).needs(),
+            PluginPicker::new(bound, None).needs(),
+        ];
+        let counted = Needs {
+            in_flight: true,
+            ..Needs::default()
+        };
+        assert_eq!(needs, [counted; 3]);
+    }
+}

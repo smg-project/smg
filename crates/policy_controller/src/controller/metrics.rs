@@ -59,8 +59,8 @@ pub const SPEC_APPLY_TOTAL: &str = "smg_policy_spec_apply_total";
 /// `not_leader`): each is one the gateway decided locally.
 pub const DECIDE_BUSY_TOTAL: &str = "smg_policy_controller_decide_busy_total";
 /// Decide requests this build had no decision for, by `cause` (`fault`,
-/// `pair_side`, `prompt_text`, `decider_gone`): the `Busy` answers with no
-/// reason, each under what took its decision.
+/// `pair_side`, `prompt_text`, `decider_gone`, `lease_ids_spent`): the
+/// `Busy` answers with no reason, each under what took its decision.
 pub const DECIDE_NO_DECISION_TOTAL: &str = "smg_policy_controller_decide_no_decision_total";
 /// Decide requests that carried more block hashes than their generation
 /// reads of them: decided over the first ones, the rest hashed for nothing.
@@ -131,8 +131,8 @@ struct LoadCounters {
 struct DecideCounters {
     /// In the order of [`Counts::BUSY`].
     busy: [Counter; 5],
-    /// `fault`, `pair_side`, `prompt_text`, `decider_gone`.
-    no_decision: [Counter; 4],
+    /// `fault`, `pair_side`, `prompt_text`, `decider_gone`, `lease_ids_spent`.
+    no_decision: [Counter; 5],
     hashes_cut: Counter,
     /// `queue_full`, `stream_gone`.
     dropped: [Counter; 2],
@@ -272,8 +272,14 @@ impl Metrics {
         };
         let decides = DecideCounters {
             busy: Counts::BUSY.map(|reason| counter(DECIDE_BUSY_TOTAL, "reason", reason)),
-            no_decision: ["fault", "pair_side", "prompt_text", "decider_gone"]
-                .map(|cause| counter(DECIDE_NO_DECISION_TOTAL, "cause", cause)),
+            no_decision: [
+                "fault",
+                "pair_side",
+                "prompt_text",
+                "decider_gone",
+                "lease_ids_spent",
+            ]
+            .map(|cause| counter(DECIDE_NO_DECISION_TOTAL, "cause", cause)),
             hashes_cut: recorder
                 .register_counter(&Key::from_name(DECIDE_HASHES_CUT_TOTAL), &metadata),
             dropped: ["queue_full", "stream_gone"]
@@ -380,6 +386,7 @@ impl Metrics {
             &counts.pair_sides,
             &counts.texts,
             &counts.gone,
+            &counts.unleased,
         ];
         for (counter, count) in self.decides.no_decision.iter().zip(causes) {
             counter.absolute(read(count));
@@ -649,8 +656,14 @@ mod tests {
             ),
             (
                 "decide_no_decision_total",
-                &["fault", "pair_side", "prompt_text", "decider_gone"]
-                    .map(|cause| format!("{{cause=\"{cause}\"}}"))[..],
+                &[
+                    "fault",
+                    "pair_side",
+                    "prompt_text",
+                    "decider_gone",
+                    "lease_ids_spent",
+                ]
+                .map(|cause| format!("{{cause=\"{cause}\"}}"))[..],
             ),
             ("decide_hashes_cut_total", &[String::new()][..]),
             (
@@ -675,6 +688,7 @@ mod tests {
             &counts.dropped_full,
             &counts.dropped_gone,
             &counts.outlasted,
+            &counts.unleased,
         ]);
         for (count, value) in all.zip(1..) {
             count.store(value, Ordering::Relaxed);
@@ -705,6 +719,7 @@ mod tests {
             "decide_answers_dropped_total{cause=\"queue_full\"} 10",
             "decide_answers_dropped_total{cause=\"stream_gone\"} 11",
             "decide_budget_outlasted_total 12",
+            "decide_no_decision_total{cause=\"lease_ids_spent\"} 13",
             "decide_candidates_undialed_total 31",
             "decide_hashes_cut_total 42",
         ] {

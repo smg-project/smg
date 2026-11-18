@@ -513,7 +513,7 @@ mod tests {
         },
         elector::{Elector, Tick},
         proto::{self, busy::Reason, decide_answer::Answer, identity::Form},
-        store::HealthSink,
+        store::{HealthSink, LeasesStore},
         view::WorkerId,
     };
 
@@ -581,6 +581,9 @@ mod tests {
             elector.tick(taken).expect("the take"),
             Tick::Acquired { term: 1 }
         );
+        // The election's report tells the store the term of each take: a
+        // lease is minted under the store's own term.
+        store.set_term(1);
         let (standing, stood) = watch::channel(Standing {
             holder: IDENTITY.to_owned(),
             term: 1,
@@ -679,10 +682,12 @@ mod tests {
         }
 
         /// The candidate takes its lease again at the clock's hour, under
-        /// `term`, and the election publishes the look.
+        /// `term`, and the election publishes the look and tells the store
+        /// the term.
         fn takes(&mut self, term: u64) {
             let tick = self.elector.tick(self.now()).expect("the take");
             assert_eq!(tick, Tick::Acquired { term });
+            self.shared.store.set_term(term);
             self.standing.send_replace(Standing {
                 holder: IDENTITY.to_owned(),
                 term,

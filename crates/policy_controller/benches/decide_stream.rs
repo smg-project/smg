@@ -29,11 +29,14 @@
 //! - `policy_decide_stream/count/<mode>/<members>`, one cell a run, named by
 //!   `DECIDE_STREAM_COUNT=<mode>:<members>:<decisions>`: the whole process's
 //!   allocator calls a decision, `in_process` (the store's deciding door, a
-//!   lent view and the engine's decide on this thread) or `stream` (the
-//!   same decision asked over one stream, one at a time so every decision
-//!   wakes the same threads whatever its fleet, the client's own calls
-//!   included). A run's instructions are read from outside it
-//!   (`perf stat -e instructions:u`): two runs of different length give a
+//!   view as the row's decider reads it and the engine's decide on this
+//!   thread), `commit` (the same with the pick's lease issued at the
+//!   store's leases door and ended there, as a host that embeds the engine
+//!   commits a decision) or `stream` (the decision asked over one stream,
+//!   one at a time so every decision wakes the same threads whatever its
+//!   fleet, the client's own calls included). A run's instructions are read
+//!   from outside it (`perf stat -e instructions:u`): two runs of different
+//!   length give a
 //!   decision's by their difference. A counted run's window holds whole
 //!   exchanges: it opens before the first measured request is handed over
 //!   and closes at the last measured answer, which no request follows. A
@@ -51,10 +54,14 @@
 //! whose slot of the ring a later request took while it waited. Every
 //! decision of a row or a count cell is a pick over its fleet, or the
 //! bench stops: a setup that drifted to another outcome would print
-//! another path's numbers. `DECIDE_STREAM_ROWS=round_trip`, `offered` or
-//! `rate` runs one kind alone, and `--test` runs every row for a moment.
-//! A run with no `--bench` is a test too, as criterion reads one: `cargo
-//! bench` passes `--bench`, and a test of every target passes neither.
+//! another path's numbers. A stream ends each answer's lease at the
+//! store's leases door as it reads the answer, as a gateway's frame ends
+//! one, so a wire row holds as many leases as it has decisions in flight
+//! and its numbers hold a lease's issue and its end.
+//! `DECIDE_STREAM_ROWS=round_trip`, `offered` or `rate` runs one kind
+//! alone, and `--test` runs every row for a moment. A run with no
+//! `--bench` is a test too, as criterion reads one: `cargo bench` passes
+//! `--bench`, and a test of every target passes neither.
 //!
 //! The process installs a tracing subscriber that takes nothing, as the
 //! binary installs one of its own: with none, each span of the transport
@@ -90,10 +97,11 @@ use smg_policy_controller::{
         GatewayFrame, Hello, RequestFacts as WireFacts,
     },
     store::{
-        Ask, GatewayId, LoadSink, LoadSource, MemoryStore, ViewBuffers, WorkerFacts, WorkerStatus,
-        WorkersStore,
+        Ask, GatewayId, LeaseRecord, LeaseState, LeasesStore, LoadSink, LoadSource, MemoryStore,
+        ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore,
     },
-    AppliedSpec, Constraints, LoadRow, PolicySpec, PoolFacts, RequestFacts, Role, Scratch,
+    AppliedSpec, Constraints, Lease, LeaseId, LoadRow, Phase, PolicySpec, PoolFacts, ReleaseReason,
+    RequestFacts, Role, Scratch,
 };
 use tokio::{
     runtime,
@@ -157,6 +165,8 @@ const SERVER_THREADS: usize = 2;
 const RING: u64 = 1_024;
 /// The budget every request brings.
 const BUDGET_MICROS: u32 = 5_000_000;
+/// The dispatch deadline an in-process commit files its lease with.
+const DISPATCH: Duration = Duration::from_secs(5);
 /// A stream's window of credit, as the `Welcome` states it.
 const WINDOW: u64 = 128;
 /// An offered request handed over this long after it was due is counted
@@ -404,12 +414,28 @@ struct Tally {
     overtaken: u64,
 }
 
+/// The bench's gateway as the store keys its leases: by the fingerprint of
+/// the subject its calls state.
+fn gateway() -> GatewayId {
+    GatewayId(smg_policy_controller::fingerprint(GATEWAY.as_bytes()))
+}
+
 /// Every decision of a row is a pick over its fleet. Another outcome means
-/// the setup drifted, and the row would print another path's numbers.
-fn picked(decision: &Decision) {
+/// the setup drifted, and the row would print another path's numbers. The
+/// pick's lease ends here, at the store's leases door, as a gateway's
+/// frame ends one when its request is over: a row holds as many leases as
+/// it has decisions in flight.
+fn picked(decision: &Decision, store: &MemoryStore, gateway: GatewayId) {
     assert!(
         matches!(decision.outcome, Some(Outcome::Pick(_))),
         "a pick over the fleet: {decision:?}"
+    );
+    let ended = decision.leases.first().is_some_and(|lease| {
+        store.released(gateway, LeaseId(lease.id), None, ReleaseReason::ClientGone)
+    });
+    assert!(
+        ended,
+        "a pick's answer carries a lease the store filed: {decision:?}"
     );
 }
 
@@ -461,7 +487,8 @@ async fn hand(
 
 /// One stream of the shape: `in_flight` requests kept in flight until the
 /// warm and the measured decisions are answered.
-async fn ask(addr: SocketAddr, shape: Shape) -> Tally {
+async fn ask(addr: SocketAddr, shape: Shape, store: &MemoryStore) -> Tally {
+    let gateway = gateway();
     let models: Vec<String> = (0..shape.models).map(model).collect();
     let mut client = connect(addr).await;
     let (requests, sent) = mpsc::channel(256);
@@ -498,7 +525,7 @@ async fn ask(addr: SocketAddr, shape: Shape) -> Tally {
             .expect("an answer, not the stream's end");
         let received = Instant::now();
         match &answer.answer {
-            Some(Answer::Decision(decision)) => picked(decision),
+            Some(Answer::Decision(decision)) => picked(decision, store, gateway),
             Some(Answer::Busy(_)) => tally.busy += 1,
             Some(Answer::Credit(_)) | None => continue,
         }
@@ -557,7 +584,8 @@ async fn ask(addr: SocketAddr, shape: Shape) -> Tally {
 /// at once, counted and never sent. The client spins between instants,
 /// since a timer's millisecond is coarser than the gaps, and yields to its
 /// runtime each turn so the connection is read and written.
-async fn offer(addr: SocketAddr, shape: Shape) -> Tally {
+async fn offer(addr: SocketAddr, shape: Shape, store: &MemoryStore) -> Tally {
+    let gateway = gateway();
     let models: Vec<String> = (0..shape.models).map(model).collect();
     let mut client = connect(addr).await;
     let (requests, sent) = mpsc::channel(256);
@@ -614,7 +642,7 @@ async fn offer(addr: SocketAddr, shape: Shape) -> Tally {
             .expect("an answer, not the stream's end");
         let received = Instant::now();
         match &answer.answer {
-            Some(Answer::Decision(decision)) => picked(decision),
+            Some(Answer::Decision(decision)) => picked(decision, store, gateway),
             Some(Answer::Busy(_)) => tally.busy += 1,
             Some(Answer::Credit(grant)) => {
                 credit += u64::from(grant.window);
@@ -703,14 +731,15 @@ fn wire(shape: Shape) -> Row {
     let before = cpu_ticks();
     let streams: Vec<_> = (0..shape.streams)
         .map(|index| {
+            let store = Arc::clone(&served.store);
             thread::Builder::new()
                 .name(format!("client-{index}"))
                 .spawn(move || {
                     current_thread().block_on(async move {
                         if shape.offered == 0 {
-                            ask(addr, shape).await
+                            ask(addr, shape, &store).await
                         } else {
-                            offer(addr, shape).await
+                            offer(addr, shape, &store).await
                         }
                     })
                 })
@@ -788,24 +817,33 @@ fn read<T>(reading: Option<T>, print: impl FnOnce(T) -> String) -> String {
     reading.map_or_else(|| "n/a".to_owned(), print)
 }
 
-/// The engine's own decision, in process: the store's deciding door, a lent
-/// view and the engine's decide on this thread, over buffers kept across
-/// decisions. Returns the allocator's calls over `decisions` of them.
-fn in_process(store: &MemoryStore, decisions: u64) -> u64 {
+/// The engine's own decision, in process: the store's deciding door, the
+/// view as the row's decider reads it and the engine's decide on this
+/// thread, over buffers kept across decisions. With `commit` the pick's
+/// lease is issued at the store's leases door and ended there, as a host
+/// that embeds the engine commits a decision and reports its end: one lease
+/// on file at a time. Returns the allocator's calls over `decisions` of
+/// them.
+fn in_process(store: &MemoryStore, decisions: u64, commit: bool) -> u64 {
     let name = model(0);
     let mut view = ViewBuffers::default();
     let mut scratch = Scratch::new();
+    let gateway = GatewayId(1);
+    let term = store.term();
+    // Whether the row's profile declares the count, as its decider reads
+    // the engine's needs: read once, the preset stands for the whole row.
+    let counted = store.deciding(|world| {
+        let needs = world.spec().engine().needs_for(&name, Phase::Single);
+        needs.in_flight
+    });
     let mut decide = |seed: u64| {
         let ask = Ask {
-            gateway: GatewayId(1),
+            gateway,
             now: Instant::now(),
             pinned: None,
             affinity: false,
         };
         let decision = store.deciding(|world| {
-            // The door a decider reads a plain request's pool by: the
-            // publication's own rows, the asking gateway's vetoes beside them.
-            let read = world.view(&name, Role::Single, &ask, false, &mut view);
             let facts = RequestFacts {
                 model: &name,
                 seed,
@@ -813,16 +851,29 @@ fn in_process(store: &MemoryStore, decisions: u64) -> u64 {
                 now_micros: world.micros(ask.now),
                 ..RequestFacts::default()
             };
-            let pool = read.map_or_else(
-                || PoolFacts {
-                    generation: world.spec().generation(),
-                    ..PoolFacts::default()
-                },
-                |read| read.built.pool_facts(),
-            );
-            let (candidates, stalled) = read
-                .map(|read| (read.candidates, read.stalled))
-                .unwrap_or_default();
+            // The doors a decider reads a plain request's pool by. For a
+            // profile that declares a worker's requests in flight: rows
+            // written for the decision, the leases' count over them. For
+            // any other: the publication's own rows, the asking gateway's
+            // vetoes beside them.
+            let none = || PoolFacts {
+                generation: world.spec().generation(),
+                ..PoolFacts::default()
+            };
+            let (pool, candidates, stalled): (PoolFacts<'_>, &[_], &[u32]) = if counted {
+                match world.build(&name, Role::Single, &ask, &mut view) {
+                    Some(built) => {
+                        world.count_in_flight(&built, &ask, &mut view.candidates);
+                        (built.pool_facts(), &view.candidates, &[])
+                    }
+                    None => (none(), &[], &[]),
+                }
+            } else {
+                match world.view(&name, Role::Single, &ask, false, &mut view) {
+                    Some(read) => (read.built.pool_facts(), read.candidates, read.stalled),
+                    None => (none(), &[], &[]),
+                }
+            };
             world.spec().engine().decide(
                 &facts,
                 &pool,
@@ -834,10 +885,32 @@ fn in_process(store: &MemoryStore, decisions: u64) -> u64 {
                 &mut scratch,
             )
         });
-        assert!(
-            decision.pick().is_some(),
-            "a pick over the fleet, in process"
-        );
+        let target = decision
+            .pick()
+            .and_then(|pick| pick.targets.first())
+            .expect("a pick over the fleet, in process")
+            .id;
+        if commit {
+            // An id of the host's own minting: the high bit.
+            let lease = LeaseId(1 << 63 | seed);
+            let filed = store.issue(LeaseRecord {
+                lease: Lease {
+                    id: lease,
+                    ..Lease::default()
+                },
+                gateway,
+                request: seed,
+                target,
+                decode: None,
+                term,
+                issued_at: ask.now,
+                dispatch_deadline: ask.now + DISPATCH,
+                state: LeaseState::Issued,
+            });
+            assert_eq!(filed, Ok(()), "the store files the lease");
+            let ended = store.released(gateway, lease, None, ReleaseReason::ClientGone);
+            assert!(ended, "the lease is on the store's file");
+        }
         black_box(&decision);
     };
     for seed in 0..2_000 {
@@ -871,9 +944,9 @@ fn count(cell: &str, out: &mut impl Write) -> io::Result<()> {
         counted: true,
     };
     let (calls, busy) = match mode {
-        "in_process" => {
+        "in_process" | "commit" => {
             let served = serve(shape);
-            let calls = in_process(&served.store, decisions);
+            let calls = in_process(&served.store, decisions, mode == "commit");
             served.stop();
             (calls, 0)
         }
@@ -881,7 +954,7 @@ fn count(cell: &str, out: &mut impl Write) -> io::Result<()> {
             let row = wire(shape);
             (row.calls, row.busy)
         }
-        _ => return writeln!(out, "a count row's mode is in_process or stream"),
+        _ => return writeln!(out, "a count row's mode is in_process, commit or stream"),
     };
     writeln!(
         out,

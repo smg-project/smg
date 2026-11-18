@@ -665,8 +665,9 @@ impl SpecRejected {
 /// What a host must feed under `engine`, as the contract writes it: a row
 /// for each of the engine's rows that has a flag to set
 /// ([`Engine::needs_rows`]), in their order. A need the contract's row has
-/// no flag for is not told here: the sessions in flight, a key's in-flight
-/// count and the affinity column are the controller's own to hold.
+/// no flag for is not told here: a worker's requests in flight, the
+/// sessions in flight, a key's in-flight count and the affinity column are
+/// the controller's own to hold.
 pub(crate) fn needs_summary(engine: &Engine) -> proto::NeedsSummary {
     let models = engine
         .needs_rows()

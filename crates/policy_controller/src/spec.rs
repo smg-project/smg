@@ -163,6 +163,15 @@ pub struct Needs {
     /// Allow-listed headers in the view.
     pub headers: bool,
     pub media: bool,
+    /// The count of requests in flight, per worker
+    /// ([`Candidate::in_flight`](crate::Candidate::in_flight)): the
+    /// `least-requests` scorer, the load scorers' unreported term, the
+    /// count pickers, the ring's bounded-load rule and the affinity stages'
+    /// spill. A host that books its own dispatches holds it on every row;
+    /// a host that counts leases writes it for a decision whose profile
+    /// declares it, and a row reads zero elsewhere. A stage that shows its
+    /// rows to a plugin declares it for the guest.
+    pub in_flight: bool,
     /// The count of session keys with a request in flight, per worker (the
     /// `min_group` assignment and the `fewest-sessions` scorer).
     pub active_sessions: bool,
@@ -220,6 +229,7 @@ impl Needs {
             ring: self.ring || other.ring,
             headers: self.headers || other.headers,
             media: self.media || other.media,
+            in_flight: self.in_flight || other.in_flight,
             active_sessions: self.active_sessions || other.active_sessions,
             session_in_flight: self.session_in_flight || other.session_in_flight,
             affinity: self.affinity || other.affinity,
@@ -4016,6 +4026,11 @@ mod tests {
             assert_eq!(engine.needs().headers, name == "manual", "{name}");
             assert!(!engine.needs().active_sessions, "{name}");
             assert!(!engine.needs().session_in_flight, "{name}");
+            // A worker's requests in flight are declared where a stage
+            // reads them: the load scorer, the ring's bounded-load rule
+            // beside the fewest requests, the affinity stages.
+            let counted = ["power_of_two", "least_load", "prefix_hash", "cache_aware"];
+            assert_eq!(engine.needs().in_flight, counted.contains(&name), "{name}");
             assert!(engine.profile_for("any", Phase::Single).is_some(), "{name}");
             // One profile bound to every model and phase: the per-phase and
             // per-binding reads are the summary.
@@ -4049,7 +4064,10 @@ mod tests {
           ]
         }"#;
         let engine = doc(text).validate().expect("validates");
+        // What the `least-load` scorer reads: a worker's reports and its
+        // requests in flight.
         let loads = Needs {
+            in_flight: true,
             loads: true,
             ..Needs::default()
         };
@@ -4146,7 +4164,10 @@ mod tests {
                 })
                 .fold(Needs::default(), |fed, (_, _, needs)| fed.or(needs))
         }
+        // What the `least-load` scorer reads: a worker's reports and its
+        // requests in flight.
         let loads = Needs {
+            in_flight: true,
             loads: true,
             ..Needs::default()
         };

@@ -289,6 +289,13 @@ impl Scorer for LeastRequests {
         normalize_costs(out);
         TieBand::NORMALIZED
     }
+
+    fn needs(&self) -> Needs {
+        Needs {
+            in_flight: true,
+            ..Needs::default()
+        }
+    }
 }
 
 /// The owner of the request's session key scores `1.0`, every other `0.0`.
@@ -988,6 +995,7 @@ impl Scorer for LeastLoad {
 
     fn needs(&self) -> Needs {
         Needs {
+            in_flight: true,
             loads: true,
             ..Needs::default()
         }
@@ -1138,6 +1146,7 @@ impl Scorer for ResidentWork {
 
     fn needs(&self) -> Needs {
         Needs {
+            in_flight: true,
             loads: true,
             ..Needs::default()
         }
@@ -1968,6 +1977,13 @@ impl Picker for CountFirst {
             out.push(target_of(&candidates[kept[b] as usize]));
         }
     }
+
+    fn needs(&self) -> Needs {
+        Needs {
+            in_flight: true,
+            ..Needs::default()
+        }
+    }
 }
 
 /// Two uniform draws, the one with fewer requests in flight taken and the
@@ -2024,6 +2040,13 @@ impl Picker for PowerOfTwoCountFirst {
                 .then_with(|| score_order(scores, band, a, b))
         };
         push_two(facts.seed, candidates, kept, by_count, out);
+    }
+
+    fn needs(&self) -> Needs {
+        Needs {
+            in_flight: true,
+            ..Needs::default()
+        }
     }
 }
 
@@ -4468,6 +4491,17 @@ mod tests {
         assert_eq!(scores, [0.0, 1.0]);
         assert!(SessionAffinity.needs().headers);
         assert!(LeastLoad::new(0.15, 1024, 2000.0).needs().loads);
+        // A stage that reads a worker's requests in flight declares the
+        // count, and a stage that reads none of it does not.
+        assert!(LeastRequests.needs().in_flight);
+        assert!(LeastLoad::new(0.15, 1024, 2000.0).needs().in_flight);
+        assert!(ResidentWork::new(512).needs().in_flight);
+        assert!(CountFirst.needs().in_flight);
+        assert!(PowerOfTwoCountFirst.needs().in_flight);
+        assert!(!SessionAffinity.needs().in_flight);
+        assert!(!FewestSessions.needs().in_flight);
+        assert!(!PowerOfTwo.needs().in_flight);
+        assert!(!Random.needs().in_flight);
     }
 
     /// A sampled `best` draws over a pool of more than twice its sample and

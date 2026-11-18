@@ -65,11 +65,11 @@ use smg_policy_controller::{
     },
     store::{
         Ask, BatchFacts, BatchOutcome, GatewayId, HealthPolicy, HealthSink, KvCursor, KvEvent,
-        KvEventSink, LaneCounts, MemoryStore, SequenceHash, Signals, StoredBlock, ViewBuffers,
-        WorkerFacts, WorkerStatus, WorkersStore,
+        KvEventSink, LaneCounts, LeaseState, MemoryStore, SequenceHash, Signals, StoredBlock,
+        ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore,
     },
     view::{fingerprint, LoadRow, Role, WireModes, WorkerId},
-    AppliedSpec, PolicySpec,
+    AppliedSpec, LeaseId, PolicySpec,
 };
 use tokio::{
     io::{copy, sink},
@@ -1389,6 +1389,43 @@ impl Harness {
     /// The client: a case reports what the harness has no form for.
     pub fn client(&mut self) -> &mut Client {
         &mut self.client
+    }
+
+    /// The leases the store holds for the gateway named `gateway`, issued
+    /// or dispatched: each books a request in flight on its worker.
+    pub fn leases(&self, gateway: &str) -> usize {
+        let gateway = GatewayId(fingerprint(gateway.as_bytes()));
+        // By the trait's path: in scope, its `get` would meet the rows' own.
+        smg_policy_controller::store::LeasesStore::live(self.store.as_ref(), gateway)
+    }
+
+    /// Names the dispatch of the client's lease `lease` on its session, to
+    /// the pick's first target, and waits until the store reads the lease
+    /// dispatched: no dispatch deadline ends it then, so it books its
+    /// worker until its gateway gives it up.
+    pub async fn dispatch(&mut self, lease: u64) -> Result<(), String> {
+        let dispatched = Dispatched {
+            lease_id: lease,
+            target_index: 0,
+            side: Side::Single.into(),
+            since_decision_micros: 0,
+        };
+        bounded(
+            "the client reports a dispatch",
+            ROOM,
+            self.client.dispatched(dispatched),
+        )
+        .await?
+        .map_err(|error| error.to_string())?;
+        let gateway = GatewayId(fingerprint(GATEWAY.as_bytes()));
+        let store = self.store.as_ref();
+        within("the store reads the lease dispatched", ROOM, || {
+            // By the trait's path, as `leases` reads the file.
+            smg_policy_controller::store::LeasesStore::get(store, gateway, LeaseId(lease))
+                .is_some_and(|record| matches!(record.state, LeaseState::Dispatched { .. }))
+        })
+        .await
+        .map(|_| ())
     }
 
     /// Whether the store holds a completion of class ok by the gateway named

@@ -43,15 +43,19 @@
 //! decision for it until a step does. Until one reads the text it is
 //! dropped at the check, so a frame that waits in a queue holds none.
 //!
-//! An answer carries no lease here: a decision is written as the engine
-//! made it, and the call that issues leases adds them.
+//! A pick's answer carries the lease its decider had the store file for it
+//! ([`decided`]): one a decision, minted under the answer's term, a credit
+//! on the pick's first target, with the time its gateway has to name the
+//! dispatch. A shed and a queue ticket carry none.
 
 use std::{mem, time::Duration};
 
 use crate::{
     decision::{Decision, Lifted, ShedReason, Target, Trace},
+    lease::Lease,
     proto::{self, busy::Reason, decide_answer::Answer, decision::Outcome, identity::Form},
     spec::{AppliedSpec, MAX_HEADERS},
+    store::leases::DISPATCH_TTL,
     view::{
         fingerprint, key_of_session, AffinityFacts, Constraints, HashKind, Header, Identity,
         MediaCounts, ModelFingerprint, Phase, RequestFacts, WireModes, WorkerId,
@@ -197,6 +201,12 @@ impl Checked {
     /// hashed them ([`AppliedSpec::block_hashes_read`]).
     pub(crate) fn hashes_read(&self, spec: &AppliedSpec) -> usize {
         spec.block_hashes_read(self.hash_kind, self.facts.block_size)
+    }
+
+    /// The request's id as its frame carried it: its lease's record keeps
+    /// the id's fingerprint.
+    pub(crate) fn id(&self) -> &[u8] {
+        &self.id
     }
 
     /// The request's id, for its answer.
@@ -366,12 +376,47 @@ fn narrowed(count: u32) -> u16 {
     u16::try_from(count).unwrap_or(u16::MAX)
 }
 
-/// The answer that carries `decision`, made under `term`.
-pub(crate) fn decided(id: Vec<u8>, term: u64, decision: &Decision) -> proto::DecideAnswer {
+/// The answer that carries `decision`, made under `term`, with the lease
+/// the store filed for it where it is a pick that was issued one.
+pub(crate) fn decided(
+    id: Vec<u8>,
+    term: u64,
+    decision: &Decision,
+    lease: Option<&Lease>,
+) -> proto::DecideAnswer {
+    let mut decision = self::decision(decision);
+    if let Some(lease) = lease {
+        decision.leases = vec![self::lease(lease, term)];
+    }
     proto::DecideAnswer {
         request_id: id,
         term,
-        answer: Some(Answer::Decision(self::decision(decision))),
+        answer: Some(Answer::Decision(decision)),
+    }
+}
+
+/// A duration as a wire field's milliseconds: the field's largest value
+/// for a longer one.
+pub(super) fn millis(duration: Duration) -> u32 {
+    u32::try_from(duration.as_millis()).unwrap_or(u32::MAX)
+}
+
+/// A lease this controller minted, as the wire carries it under the term
+/// that minted it, with the time its gateway has to name the dispatch. The
+/// decide call issues one kind of lease, a credit on a single request's
+/// target, so the kind and the side are those two.
+fn lease(lease: &Lease, term: u64) -> proto::Lease {
+    proto::Lease {
+        id: lease.id.0,
+        kind: proto::LeaseKind::Credit.into(),
+        side: proto::Side::Single.into(),
+        target_index: u32::from(lease.target_index),
+        generation: lease.generation,
+        session_key: lease.session.get(),
+        tokens: lease.tokens,
+        term,
+        dispatch_ttl_ms: millis(DISPATCH_TTL),
+        origin: proto::LeaseOrigin::Controller.into(),
     }
 }
 
@@ -398,7 +443,8 @@ pub(crate) fn credit(term: u64, window: u32) -> proto::DecideAnswer {
     }
 }
 
-/// A decision as the wire carries it, with no lease.
+/// A decision as the wire carries it; its lease is its answer's to add
+/// ([`decided`]).
 fn decision(decision: &Decision) -> proto::Decision {
     let outcome = match decision {
         Decision::Pick(pick) => Outcome::Pick(proto::Pick {
@@ -1064,7 +1110,7 @@ mod tests {
             trace: traced(),
             ..Pick::default()
         });
-        let answer = decided(vec![1, 2], 9, &pick);
+        let answer = decided(vec![1, 2], 9, &pick, None);
         assert_eq!(
             (answer.request_id.as_slice(), answer.term),
             (&[1, 2][..], 9)
@@ -1115,7 +1161,7 @@ mod tests {
             },
             ..Pick::default()
         });
-        let (_, trace, _) = carried(decided(Vec::new(), 1, &pick));
+        let (_, trace, _) = carried(decided(Vec::new(), 1, &pick, None));
         let drawn = proto::Trace {
             survivors: None,
             drew_first: true,
@@ -1143,7 +1189,7 @@ mod tests {
                 wait_allowed: true,
                 trace: traced(),
             });
-            let (outcome, trace, leases) = carried(decided(Vec::new(), 1, &shed));
+            let (outcome, trace, leases) = carried(decided(Vec::new(), 1, &shed, None));
             assert_eq!(
                 outcome,
                 Outcome::Shed(proto::Shed {
@@ -1161,7 +1207,7 @@ mod tests {
             max_wait_micros: 62,
             trace: traced(),
         });
-        let (outcome, trace, leases) = carried(decided(Vec::new(), 1, &queue));
+        let (outcome, trace, leases) = carried(decided(Vec::new(), 1, &queue, None));
         assert_eq!(
             outcome,
             Outcome::Queue(proto::Queue {

@@ -192,10 +192,12 @@ pub trait Lifecycle: Send + Sync {
     /// Whether the stage decides wrong under a host that makes none of
     /// these calls: `true` for one whose state the calls keep, as the
     /// workers it lists or the bookings it learns from. The standalone
-    /// controller makes the membership call alone and refuses a document
-    /// that names such a stage as not in this build
-    /// ([`crate::SpecError::NotInBuild`]); a host that embeds the engine
-    /// makes them all. `false` by default: a stage that takes a call to
+    /// controller makes the membership call and tells a stage of a lease's
+    /// issue and of its end at the dispatch deadline, and of no dispatch,
+    /// completion or release yet: it refuses a document that names such a
+    /// stage as not in this build ([`crate::SpecError::NotInBuild`]). A
+    /// host that embeds the engine makes every call. `false` by default: a
+    /// stage that takes a call to
     /// shed state early decides the same without it.
     fn needs_lifecycle(&self) -> bool {
         false

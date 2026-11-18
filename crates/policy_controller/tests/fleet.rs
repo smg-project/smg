@@ -26,6 +26,12 @@
 //! client's answers alone: a load-led pick leaves the engine that holds
 //! requests, a rotation names each row in turn, a routing key returns to its
 //! worker and a retry leaves it, and no decision names the dead engine.
+//! A decision by count follows the leases the decisions before it left on
+//! the store's file: with every lease kept, a round of asks by the fewest
+//! requests names each row once, and once its own leases are given up the
+//! engine that holds requests takes the next pick by the fewest requests,
+//! of two draws compared by count, and of a keyless ask under the prefix
+//! ring.
 //! A prompt returns to its worker as a key does: under the prefix preset a
 //! head of 256 tokens names one row whatever follows it, a routing key
 //! leads it, a retry walks to one next worker, and a boundary of the
@@ -258,8 +264,15 @@ fn bounded_at(tokens: u32) -> Result<PolicySpec, SpecError> {
 }
 
 /// Asks, and reads the pick's first target as the row of the fleet it
-/// names. A pick that carries a lease is refused: the case releases none.
-async fn picked(harness: &mut Harness, ask: DecideRequest) -> Result<Picked, String> {
+/// names, with the leases the answer carries: the caller's to keep or to
+/// give up. A lease names its request's session: an answer whose lease
+/// names one where the ask states no routing key, or none where it states
+/// one, is refused.
+async fn leased(harness: &mut Harness, ask: DecideRequest) -> Result<(Picked, Vec<u64>), String> {
+    let keyed = ask
+        .facts
+        .as_ref()
+        .is_some_and(|facts| facts.session_key.is_some());
     let answer = harness.client().decide(ask).await;
     let Ok(Answer::Decision(Decision {
         leases,
@@ -269,23 +282,76 @@ async fn picked(harness: &mut Harness, ask: DecideRequest) -> Result<Picked, Str
     else {
         return Err(format!("no pick: {answer:?}"));
     };
-    // The asserts by count lean on a served decision booking nothing: once
-    // a decision carries a lease, a pick releases it here, before the next
-    // ask reads the rows.
-    if !leases.is_empty() {
+    if let Some(lease) = leases
+        .iter()
+        .find(|lease| (lease.session_key != 0) != keyed)
+    {
         return Err(format!(
-            "a served decision carries a lease, released by no ask of this case: {leases:?}"
+            "a lease names a session where its ask states a key, and there alone: {lease:?}"
         ));
     }
+    let leases = leases.iter().map(|lease| lease.id).collect();
     let target = pick.targets.first().ok_or("a pick with no target")?;
     match harness.named(target.id) {
-        Some((engine, rank)) if target.dp_rank == u32::from(rank) => Ok(Picked {
-            engine,
-            rank,
-            id: target.id,
-        }),
+        Some((engine, rank)) if target.dp_rank == u32::from(rank) => {
+            let row = Picked {
+                engine,
+                rank,
+                id: target.id,
+            };
+            Ok((row, leases))
+        }
         _ => Err(format!("a target that is no row of the fleet: {target:?}")),
     }
+}
+
+/// Gives `leases` up on the session, as a gateway whose client left, and
+/// waits until the store's file holds `left` leases of the gateway.
+async fn given_up(harness: &mut Harness, leases: &[u64], left: usize) -> Result<(), String> {
+    for &lease in leases {
+        let released = Released {
+            what: Some(released::What::LeaseId(lease)),
+            reason: released::Reason::ClientGone.into(),
+            ..Released::default()
+        };
+        let reported = harness.client().released(released).await;
+        reported.map_err(|status| format!("a lease is not given up: {status:?}"))?;
+    }
+    // Every pick of the case passes here, and a report is one frame the
+    // session reads in its turn: the wait steps by a millisecond, where
+    // the harness's own step would cost each pick twenty-five.
+    let gone = async {
+        while harness.leases(GATEWAY) != left {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    };
+    tokio::time::timeout(ROOM, gone)
+        .await
+        .map_err(|_| format!("the leases given up leave the store's file: not within {ROOM:?}"))
+}
+
+/// Asks, and reads the pick's first target as the row of the fleet it
+/// names. The pick's lease is given up on the session and has left the
+/// store's file before the next ask reads the rows: the file holds what it
+/// held before the ask.
+async fn picked(harness: &mut Harness, ask: DecideRequest) -> Result<Picked, String> {
+    // The asserts by count lean on a decision that books nothing past its
+    // own ask: a lease on file is a request in flight on its worker.
+    let before = harness.leases(GATEWAY);
+    let (row, leases) = leased(harness, ask).await?;
+    given_up(harness, &leases, before).await?;
+    Ok(row)
+}
+
+/// Asks as [`picked`] asks and keeps the pick's lease: its dispatch is
+/// named, so it books its row until the case gives it up.
+async fn kept(harness: &mut Harness, ask: DecideRequest) -> Result<(Picked, u64), String> {
+    let (row, leases) = leased(harness, ask).await?;
+    let &[lease] = leases.as_slice() else {
+        return Err(format!("a pick to keep carries one lease: {leases:?}"));
+    };
+    harness.dispatch(lease).await?;
+    Ok((row, lease))
 }
 
 /// The whole case's bound: its waits sum to seconds on an idle host.
@@ -586,6 +652,107 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             turns.len() == ranks && turns.values().all(|asks| *asks == 2),
             "two turns of a rotation name each row twice: {turns:?}"
         );
+
+        // A decision by count reads what the decisions before it left on
+        // file. Under the two-draw preset's form by the fewest requests
+        // each pick keeps its lease, and every round of asks names each
+        // row once: the engine that holds requests too, which no pick by
+        // the expected wait names.
+        let fewest = PolicySpec::power_of_two(PowerOfTwoMetric::LeastRequests)
+            .expect("a form of this build's preset");
+        harness
+            .apply_document(fewest)
+            .expect("a form of this build's preset applies");
+        let mut booked = Vec::new();
+        for n in (0u64..).take(2 * ranks) {
+            let pick = kept(&mut harness, nth("fewest", n))
+                .await
+                .expect("a pick answers an ask over a ready fleet");
+            booked.push(pick);
+        }
+        for round in booked.chunks(ranks) {
+            let named: HashSet<Picked> = round.iter().map(|(row, _)| *row).collect();
+            assert_eq!(
+                named.len(),
+                ranks,
+                "a round by the fewest requests names each row once: {round:?}"
+            );
+        }
+        assert_eq!(
+            harness.leases(GATEWAY),
+            booked.len(),
+            "a kept lease stands on the store's file"
+        );
+        // A lease given up frees its row. Once the leases on the engine
+        // that holds requests are gone, no lease books that engine and two
+        // book every other row: by count the next picks are its own,
+        // whatever its wait.
+        let (freed, booked): (Vec<_>, Vec<_>) =
+            booked.into_iter().partition(|(row, _)| row.engine == busy);
+        let freed: Vec<u64> = freed.into_iter().map(|(_, lease)| lease).collect();
+        given_up(&mut harness, &freed, booked.len())
+            .await
+            .expect("the leases given up leave the file");
+        for n in 0..2 {
+            let pick = picked(&mut harness, nth("freed", n))
+                .await
+                .expect("a pick answers an ask over a ready fleet");
+            assert_eq!(
+                pick.engine, busy,
+                "the row with the fewest requests in flight is taken: {pick:?}"
+            );
+        }
+
+        // Two draws compared by the requests in flight: an ask that names
+        // every row tried but that engine's and one idle engine's draws
+        // those two, and under the form by requests each pick is the
+        // engine that holds requests.
+        let (other, _) = booked.first().copied().expect("a kept lease");
+        let mut tried: Vec<u64> = booked
+            .iter()
+            .map(|(row, _)| row.id)
+            .filter(|id| *id != other.id)
+            .collect();
+        tried.sort_unstable();
+        tried.dedup();
+        let requests = PolicySpec::power_of_two(PowerOfTwoMetric::Requests)
+            .expect("a form of this build's preset");
+        harness
+            .apply_document(requests)
+            .expect("a form of this build's preset applies");
+        for n in 0..8 {
+            let mut retry = nth("requests", n);
+            let facts = retry.facts.as_mut().expect("the ask states facts");
+            facts.tried.clone_from(&tried);
+            facts.attempt = 1;
+            let pick = picked(&mut harness, retry)
+                .await
+                .expect("a pick answers an ask over a ready fleet");
+            assert_eq!(
+                pick.engine, busy,
+                "of two draws the one with fewer requests in flight is taken: {pick:?}"
+            );
+        }
+
+        // The fewest requests in flight take a request that brings no key:
+        // under the prefix-hash preset each keyless pick is that engine
+        // too, one pick in six where the count is not read.
+        harness
+            .apply("prefix_hash")
+            .expect("a preset of this build applies");
+        for n in 0..8 {
+            let pick = picked(&mut harness, nth("keyless", n))
+                .await
+                .expect("a pick answers an ask over a ready fleet");
+            assert_eq!(
+                pick.engine, busy,
+                "a request with no key goes where the fewest requests are in flight: {pick:?}"
+            );
+        }
+        let rest: Vec<u64> = booked.into_iter().map(|(_, lease)| lease).collect();
+        given_up(&mut harness, &rest, 0)
+            .await
+            .expect("the leases given up leave the file");
 
         // The KV events follow the fleet: the busy engine's held requests
         // stored blocks, its stream's batches reached its rank's cursor, and
