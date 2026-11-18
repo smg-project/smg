@@ -25,6 +25,10 @@ axum = ["dep:axum"]
 # The mechanism the worker's metric writers share with a host's: the bounded
 # label set, the model labels' one set and the handles a record keeps.
 metrics = ["dep:dashmap", "dep:rustc-hash"]
+# The messages every engine's gRPC service shares, generated from
+# `proto/common.proto` into the module `common_proto`. The build then runs
+# `protoc`.
+proto = ["dep:prost", "dep:prost-build"]
 # The worker's runtime, for the process that hosts the workers: the worker
 # with its builder, its registry, its health and its metric writers, the
 # engine handle, the HTTP client factory and the cache of worker-directed
@@ -69,6 +73,7 @@ metrics-util = { version = "0.20.4", default-features = false, features = ["regi
 once_cell = { version = "1.21.4", optional = true }
 openmetrics-parser = { version = "0.4.4", optional = true }
 parking_lot = { workspace = true, optional = true }
+prost = { workspace = true, optional = true }
 quanta = { version = "0.12", optional = true }
 reqwest = { workspace = true, optional = true, features = ["blocking", "http2", "json", "rustls-no-provider"] }
 rustc-hash = { version = "2", optional = true }
@@ -91,6 +96,12 @@ http.workspace = true
 openssl = "0.10.81"
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "sync", "test-util", "time"] }
 tracing-test = "0.2"
+
+[build-dependencies]
+# The generator, with the feature `tonic-prost-build` gives the engine
+# files: a code block in a proto comment is marked as text, so rustdoc does
+# not run it as a test.
+prost-build = { version = "0.14.4", optional = true, features = ["cleanup-markdown"] }
 
 [lints]
 workspace = true

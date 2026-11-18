@@ -8312,6 +8312,8 @@ dependencies = [
  "openmetrics-parser",
  "openssl",
  "parking_lot 0.13.0",
+ "prost",
+ "prost-build",
  "quanta",
  "reqwest 0.13.4",
  "rustc-hash 2.1.3",

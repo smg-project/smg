@@ -9,8 +9,8 @@ fn main() {
 
 /// One step for the server and the client, so the two cannot drift. The
 /// engine wire's package (`smg.grpc.common`: the load record and the event
-/// batch a relay forwards unchanged) is the gRPC client crate's own types,
-/// never a second copy.
+/// batch a relay forwards unchanged) is the types the gRPC client crate
+/// re-exports from the worker crate, never a second copy.
 #[cfg(feature = "controller")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     const CONTRACTS: [&str; 2] = [
