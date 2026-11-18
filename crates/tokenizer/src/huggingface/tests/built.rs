@@ -369,6 +369,69 @@ fn a_replaced_template_that_writes_a_kept_token_reads_the_typed_one_as_text() {
     assert_eq!(ids, [2, 13, 16, 13, 10, 11, 18, 14, 3, 13, 14, 1, 19]);
 }
 
+/// The guard on a pipeline that matches an added token after normalization
+/// stands above the choice of encoder. On a byte-level file that the direct
+/// encoder takes, under NFC, a text that only the normalizer makes an
+/// entry's spelling is read by its characters, and every prompt of that
+/// pipeline is encoded by segments.
+#[cfg(not(feature = "tokenizers-v1"))]
+#[test]
+fn a_text_the_normalizer_turns_into_an_added_token_stays_text_on_the_direct_encoder() {
+    use tokenizers::pre_tokenizers::byte_level::ByteLevel;
+
+    let mut alphabet: Vec<char> = ByteLevel::alphabet().into_iter().collect();
+    alphabet.sort_unstable();
+    let mut vocab = serde_json::Map::new();
+    for (id, ch) in alphabet.iter().enumerate() {
+        vocab.insert(ch.to_string(), json!(id));
+    }
+    // The controls of [`builds`], the unknown token, and one entry matched
+    // after normalization: `<é>`, its letter one character.
+    let added = [
+        ("<unk>", true, false),
+        ("</s:x>", true, false),
+        ("[INST:x]", true, false),
+        ("[/INST:x]", true, false),
+        ("<\u{e9}>", false, true),
+    ];
+    let entries: Vec<Value> = added
+        .iter()
+        .enumerate()
+        .map(|(at, (content, special, normalized))| {
+            vocab.insert((*content).to_owned(), json!(alphabet.len() + at));
+            json!({"id": alphabet.len() + at, "content": content, "single_word": false,
+                "lstrip": false, "rstrip": false, "normalized": normalized, "special": special})
+        })
+        .collect();
+    let conversion = json!({
+        "version": "1.0", "truncation": null, "padding": null, "added_tokens": entries,
+        "normalizer": {"type": "NFC"},
+        "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": true,
+            "use_regex": true},
+        "post_processor": null,
+        "decoder": {"type": "ByteLevel", "add_prefix_space": true, "trim_offsets": true,
+            "use_regex": true},
+        "model": {"type": "BPE", "dropout": null, "unk_token": null,
+            "continuing_subword_prefix": null, "end_of_word_suffix": null, "fuse_unk": false,
+            "byte_fallback": false, "ignore_merges": false, "vocab": vocab, "merges": []}
+    })
+    .to_string();
+    let temp = TempDir::new().unwrap();
+    let tok = checkpoint_of(temp.path(), &conversion, &builds());
+    assert!(tok.chat_template.marked());
+    assert!(tok.core.native.is_some());
+    let entry = alphabet.len() as u32 + 4;
+    // `e` and a combining acute: NFC makes the two the entry's letter.
+    let (_, ids, from_text) = render(&tok, json!("a<e\u{301}>b"));
+    assert!(!from_text);
+    assert!(!ids.contains(&entry));
+    // The opening control, six bytes of text, the closing control, `ab`
+    // and the end token.
+    assert_eq!(ids.len(), 11);
+    let (_, _, from_text) = render(&tok, json!("ab"));
+    assert!(!from_text);
+}
+
 #[test]
 fn a_mark_typed_into_a_message_is_no_mark() {
     let temp = TempDir::new().unwrap();
