@@ -2512,9 +2512,13 @@ fn check_profile(
     };
     // The scores combine by each weight's share of the weights' sum: a sum
     // that is not finite, or whose reciprocal is not, gives shares that
-    // lose the order of every row.
+    // lose the order of every row. A stage this build does not carry adds
+    // no weight, so a deferred profile's sum is over part of its list. An
+    // infinite part is an infinite whole, every weight being above zero,
+    // and a part's reciprocal says nothing of the whole's.
     let total: f32 = scorers.iter().map(|weighted| weighted.weight).sum();
-    if !scorers.is_empty() && !(total.is_finite() && total.recip().is_finite()) {
+    let no_shares = !total.is_finite() || (complete && !total.recip().is_finite());
+    if !scorers.is_empty() && no_shares {
         return Err(at.bad(
             "score",
             total,
@@ -4781,6 +4785,24 @@ mod tests {
         spec_with_score(r#"{"least-load":{"weight":1e-40}},"least-requests""#)
             .validate()
             .expect("a sum in the normal range");
+    }
+
+    /// A profile with a stage this build does not carry is judged by the
+    /// weights the build does carry only where a part decides for the
+    /// whole. A part with no finite reciprocal defers with the profile:
+    /// the stage left out may bring the sum into range. An infinite part
+    /// is refused: no weight left out can bring it back.
+    #[test]
+    fn a_deferred_profile_is_refused_for_an_infinite_part_of_its_weights_alone() {
+        let deferred = r#"{"prefix-affinity":{"decay":0.9}}"#;
+        let small = format!(r#"{{"least-load":{{"weight":1e-40}}}},{deferred}"#);
+        let (path, what) = not_in_build(&spec_with_score(&small));
+        assert_eq!(path, "profiles.p.score[1].prefix-affinity");
+        assert!(what.contains("prefix-affinity"), "{what}");
+        let large = format!(
+            r#"{{"least-load":{{"weight":3e38}}}},{{"least-requests":{{"weight":3e38}}}},{deferred}"#
+        );
+        assert_eq!(bad_field(&spec_with_score(&large)), "profiles.p.score");
     }
 
     #[test]
