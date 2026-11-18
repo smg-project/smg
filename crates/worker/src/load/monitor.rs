@@ -3042,6 +3042,31 @@ mod native_loads_tests {
         );
     }
 
+    /// A record's age is the engine's word. One the one-way margin overflows,
+    /// or one older than the clock, keeps its record and reads as sampled at
+    /// the receipt. No wire message carries such an age, so the case states
+    /// both on a plain record.
+    #[tokio::test]
+    async fn an_age_past_the_clock_reads_as_sampled_at_the_receipt() {
+        for age in [Duration::MAX, Duration::MAX - PUSHED_ONE_WAY_MARGIN] {
+            let (registry, monitor) = monitor_with_readers(LoadReaders::Blind);
+            let worker = gauge_worker("http://w1:8000");
+            worker.set_status(WorkerStatus::Ready);
+            registry.register(Arc::clone(&worker)).unwrap();
+            let received = Instant::now();
+            let record = PushedRecord {
+                age,
+                ..PushedRecord::requests(3, 0)
+            };
+            monitor.apply_pushed_load(&worker, 0, &record, received);
+            monitor.flush_pushed();
+            let snapshot = monitor.load_state.snapshot();
+            let (report, sampled_at) = snapshot.report(worker.url()).expect("published");
+            assert_eq!(report.loads[0].num_running_reqs, 3, "the record is kept");
+            assert_eq!(sampled_at, received, "an age of {age:?}");
+        }
+    }
+
     /// A record for a rank on file replaces the rank's entry in place: the
     /// figures are the record's, the telemetry it left out stays what the
     /// last record that carried it said, and the report keeps one entry per
