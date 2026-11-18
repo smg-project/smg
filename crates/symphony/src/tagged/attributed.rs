@@ -963,7 +963,12 @@ impl Assembler {
         };
         let taken = object.read(text, out);
         if object.closed() {
-            self.close_held = object.whole() && take_back_the_brace(out);
+            let whole = object.whole();
+            self.close_held = whole && take_back_the_brace(out);
+            debug_assert!(
+                !whole || self.close_held,
+                "a whole object's last event is the fragment that carries its brace"
+            );
             self.stage = Stage::AfterJson;
             self.text_between(&text[taken..], out);
         }
@@ -1540,6 +1545,19 @@ mod tests {
         } else {
             assembler.close(tags.invoke_close, &mut out);
         }
+        out.drain()
+    }
+
+    /// The events of one invoke fed in `pieces` and ended at the model's stop, read as the call's
+    /// marker where `as_marker` says so.
+    fn stopped<'p>(tags: Tags, pieces: &[&'p str], as_marker: bool) -> Vec<Event<'p>> {
+        let mut assembler = Assembler::new(0, "call_0", tags);
+        let mut out = Events::new();
+        let declared = declared();
+        for &piece in pieces {
+            assembler.feed(piece, &declared, &mut out);
+        }
+        assembler.stop(as_marker, &mut out);
         out.drain()
     }
 
@@ -2854,8 +2872,9 @@ mod tests {
     /// Around the object the syntax keeps its rules. An object after a parameter is refused, and
     /// the call gets no close, the pairs read before a strict JSON prefix; a word or a tag after
     /// the object is refused, and the object's closing brace with it, so that the arguments stay
-    /// a strict JSON prefix and no whole value, whole and at every cut. An object
-    /// a strict reader refuses is the model's bytes as written from one `Malformed
+    /// a strict JSON prefix and no whole value, whole and at every cut, in both spellings, and
+    /// whether the call then ends at the invoke's close, the stream's cut or the model's stop.
+    /// An object a strict reader refuses is the model's bytes as written from one `Malformed
     /// { InvalidArguments }` event. One the invoke's close or the stream cut before its closing
     /// brace is no whole value and says so, no brace made up; one that closed before the stream
     /// was cut, or before the model stopped, is whole, nothing announced.
@@ -2870,41 +2889,55 @@ mod tests {
         assert_eq!(arguments(&events), "{\"s\": \"x\"");
         assert_eq!(refused(&events).concat(), "{\"n\": 3}");
         assert_eq!(shown(&events), "");
-        for (after, refused_bytes) in [
-            (" and more\n", "} and more"),
-            (
-                "\n<｜DSML｜ parameter name=\"s\" string=\"true\">x</｜DSML｜ parameter>\n",
-                "}\n<｜DSML｜ parameter name=\"s\" string=\"true\">x</｜DSML｜ parameter>",
-            ),
-            ("</｜DSML｜ parameter>", "}</｜DSML｜ parameter>"),
-        ] {
-            let call = format!("f\">\n{{\"n\": 3}}{after}");
-            let mut cuts: Vec<Vec<&str>> = (1..call.len())
-                .filter(|&cut| call.is_char_boundary(cut))
-                .map(|cut| vec![&call[..cut], &call[cut..]])
-                .collect();
-            cuts.push(vec![&call]);
-            cuts.push(
-                call.char_indices()
-                    .map(|(at, c)| &call[at..at + c.len_utf8()])
-                    .collect(),
+        for tags in [Tags::DSML, Tags::DSML_V4] {
+            let parameter = format!(
+                "{}s\" string=\"true\">x{}",
+                tags.parameter_open, tags.parameter_close
             );
-            for pieces in cuts {
-                let events = run_with(tags, &pieces, false);
-                assert_eq!(arguments(&events), "{\"n\": 3", "{after:?}: {pieces:?}");
-                assert!(!malformed(&events).is_empty(), "{after:?}: {pieces:?}");
-                assert_eq!(
-                    refused(&events).concat(),
-                    refused_bytes,
-                    "{after:?}: {pieces:?}"
+            for (after, refused_bytes) in [
+                (" and more\n".to_string(), "} and more".to_string()),
+                (format!("\n{parameter}\n"), format!("}}\n{parameter}")),
+                (
+                    tags.parameter_close.to_string(),
+                    format!("}}{}", tags.parameter_close),
+                ),
+            ] {
+                let call = format!("f\">\n{{\"n\": 3}}{after}");
+                let mut cuts: Vec<Vec<&str>> = (1..call.len())
+                    .filter(|&cut| call.is_char_boundary(cut))
+                    .map(|cut| vec![&call[..cut], &call[cut..]])
+                    .collect();
+                cuts.push(vec![&call]);
+                cuts.push(
+                    call.char_indices()
+                        .map(|(at, c)| &call[at..at + c.len_utf8()])
+                        .collect(),
                 );
-                assert_eq!(shown(&events), "", "{after:?}: {pieces:?}");
-                assert_eq!(
-                    bytes(&events),
-                    format!("{call}{}", tags.invoke_close),
-                    "{after:?}: {pieces:?}"
-                );
-                nothing_empty(&events);
+                let closed = format!("{call}{}", tags.invoke_close);
+                for pieces in cuts {
+                    // The call's end changes nothing of it: the invoke's close, the stream's cut
+                    // and the model's stop each find the brace gone with the refused bytes.
+                    for (end, events, read) in [
+                        ("the close", run_with(tags, &pieces, false), closed.as_str()),
+                        ("the cut", run_with(tags, &pieces, true), call.as_str()),
+                        ("the stop", stopped(tags, &pieces, false), call.as_str()),
+                        (
+                            "the stop as the marker",
+                            stopped(tags, &pieces, true),
+                            call.as_str(),
+                        ),
+                    ] {
+                        let at = format!("{after:?} at {end}: {pieces:?}");
+                        assert_eq!(arguments(&events), "{\"n\": 3", "{at}");
+                        assert!(!malformed(&events).is_empty(), "{at}");
+                        assert_eq!(refused(&events).concat(), refused_bytes, "{at}");
+                        assert_eq!(shown(&events), "", "{at}");
+                        assert_eq!(bytes(&events), read, "{at}");
+                        if end == "the close" {
+                            nothing_empty(&events);
+                        }
+                    }
+                }
             }
         }
         let events = run_with(tags, &["f\">\n{\"n\": 3,}\n"], false);
