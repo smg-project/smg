@@ -1284,7 +1284,7 @@ mod tests {
             (3, r#""max_input_chars_per_word":"7""#),
             (3, r#""max_input_chars_per_word":-7"#),
             (3, r#""max_input_chars_per_word":7.5"#),
-            (4, r#""vocab":{"<unk>":0,"a":1.5}"#),
+            (4, r#""vocab":{"<unk>":0,"a":1.5,"_b":2,"ab":3}"#),
             (4, r#""vocab":{"<unk>":0,"a":-1}"#),
             (4, r#""vocab":{"<unk>":0,"a":4294967296}"#),
             (4, r#""vocab":{"<unk>":0,"a":"1"}"#),
