@@ -3904,6 +3904,45 @@ impl Engine {
     }
 }
 
+impl Engine {
+    /// The table's half of a dispatch ([`Lifecycle::on_dispatched`]): the
+    /// session pin follows the dispatched worker of the side, the decode
+    /// of a pair target on the decode side and the target itself
+    /// otherwise. A host that keeps its own record of the pin reads the
+    /// table behind this half, and tells the stages last
+    /// ([`dispatched_stages`](Self::dispatched_stages)).
+    pub fn dispatched_key(&self, lease: &Lease, target: &Target, side: Side) {
+        let dispatched = match (side, target.pair) {
+            (Side::Decode, Some(pair)) => pair.decode_id,
+            _ => target.id,
+        };
+        if lease.session_verdict != SessionVerdict::None {
+            self.sessions
+                .dispatched(lease.session, lease.session_verdict, dispatched);
+        }
+    }
+
+    /// The stages' half of a dispatch: each profile's scorers and its
+    /// picker hear it.
+    pub fn dispatched_stages(
+        &self,
+        lease: &Lease,
+        target: &Target,
+        side: Side,
+        since_decision_micros: u32,
+    ) {
+        for profile in &self.profiles {
+            for w in &profile.scorers {
+                w.scorer
+                    .on_dispatched(lease, target, side, since_decision_micros);
+            }
+            profile
+                .picker
+                .on_dispatched(lease, target, side, since_decision_micros);
+        }
+    }
+}
+
 impl Lifecycle for Engine {
     fn on_decision_issued(&self, lease: &Lease, decision: &Decision) {
         for profile in &self.profiles {
@@ -3921,26 +3960,8 @@ impl Lifecycle for Engine {
         side: Side,
         since_decision_micros: u32,
     ) {
-        // The session pin follows the dispatched worker of the side: the
-        // decode of a pair target on the decode side, the target itself
-        // otherwise.
-        let dispatched = match (side, target.pair) {
-            (Side::Decode, Some(pair)) => pair.decode_id,
-            _ => target.id,
-        };
-        if lease.session_verdict != SessionVerdict::None {
-            self.sessions
-                .dispatched(lease.session, lease.session_verdict, dispatched);
-        }
-        for profile in &self.profiles {
-            for w in &profile.scorers {
-                w.scorer
-                    .on_dispatched(lease, target, side, since_decision_micros);
-            }
-            profile
-                .picker
-                .on_dispatched(lease, target, side, since_decision_micros);
-        }
+        self.dispatched_key(lease, target, side);
+        self.dispatched_stages(lease, target, side, since_decision_micros);
     }
 
     fn on_completed(&self, lease: &Lease, outcome: &Outcome) {

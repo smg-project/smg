@@ -151,22 +151,29 @@ fn told(store: &MemoryStore, record: &LeaseRecord, said: Said, by: Option<Decide
                     dp_rank,
                     ..Target::default()
                 };
+                // The record was read before the door wrote the dispatched
+                // index: the lease told carries it, for a stage that reads
+                // the index off the lease.
+                let lease = Lease {
+                    target_index: dispatch.target_index,
+                    ..record.lease
+                };
+                // The table hears first and the pin of record reads it.
+                // The stages hear last, so nothing is held across their
+                // loop: a value kept for the pin behind it cost every
+                // lease a store and a reload a profile.
                 if let Some(engine) = engine {
-                    // The record was read before the door wrote the
-                    // dispatched index: the lease told carries it, for a
-                    // stage that reads the index off the lease.
-                    let lease = Lease {
-                        target_index: dispatch.target_index,
-                        ..record.lease
-                    };
-                    engine.on_dispatched(
+                    engine.dispatched_key(&lease, &target, dispatch.side);
+                }
+                pinned(store, record, engine, id, at);
+                if let Some(engine) = engine {
+                    engine.dispatched_stages(
                         &lease,
                         &target,
                         dispatch.side,
                         dispatch.since_decision_micros,
                     );
                 }
-                pinned(store, record, engine, id, at);
             }
             (Said::Completed(outcome), Some(engine)) => {
                 engine.on_completed(&record.lease, &outcome);
