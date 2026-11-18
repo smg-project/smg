@@ -294,23 +294,28 @@ impl NemotronOmniProcessor {
     ) -> Result<(), TransformError> {
         let p = PATCH_SIZE;
         let (out_w, out_h) = (cols * p, rows * p);
-        let mut resized =
-            resize_bicubic_torch_aa_f32(raw, width, height, out_w as u32, out_h as u32)?;
+        let resized = resize_bicubic_torch_aa_f32(raw, width, height, out_w as u32, out_h as u32)?;
         let scale = CLIP_STD.map(|s| s as f32);
         let mean = CLIP_MEAN.map(|m| m as f32);
-        let (pixels, _) = resized.as_chunks_mut::<3>();
-        for pixel in pixels.iter_mut() {
-            for ((value, mean), scale) in pixel.iter_mut().zip(mean).zip(scale) {
-                // f32 op order matches the reference: x / 255, - mean, / std.
-                *value = (*value / 255.0 - mean) / scale;
-            }
-        }
+        let (pixels, _) = resized.as_chunks::<3>();
         for i in 0..rows {
             for j in 0..cols {
                 for c in 0..3 {
+                    let (mean, scale) = (mean[c], scale[c]);
                     for dy in 0..p {
                         let row = &pixels[(i * p + dy) * out_w + j * p..][..p];
-                        out.extend(row.iter().map(|pixel| pixel[c]));
+                        // One channel of a patch row is gathered, then normalized
+                        // as a block with that channel's mean and scale: the
+                        // resized image is passed over once, not twice.
+                        let mut values = [0.0_f32; PATCH_SIZE];
+                        for (value, pixel) in values.iter_mut().zip(row) {
+                            *value = pixel[c];
+                        }
+                        // f32 op order matches the reference: x / 255, - mean, / std.
+                        for value in &mut values {
+                            *value = (*value / 255.0 - mean) / scale;
+                        }
+                        out.extend_from_slice(&values);
                     }
                 }
             }
@@ -581,6 +586,40 @@ mod tests {
         let exhausted = preprocess(&images[..1], Some(0));
         assert_eq!(exhausted.feature_token_counts, [252]);
         assert_eq!(grids(&exhausted), [28, 36]);
+    }
+
+    /// Every value of a patch is its resized pixel's, normalized in the
+    /// reference's `f32` operation order, at its place: patches row-major,
+    /// then channel, row, column.
+    #[test]
+    fn a_patch_value_is_its_resized_pixel_normalized_at_its_place() {
+        let (width, height, rows, cols) = (37_u32, 29_u32, 2_usize, 4_usize);
+        let raw: Vec<u8> = (0..width * height * 3)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8)
+            .collect();
+        let mut patches = Vec::new();
+        NemotronOmniProcessor::patches(&raw, width, height, rows, cols, &mut patches).unwrap();
+
+        let p = PATCH_SIZE;
+        let resized =
+            resize_bicubic_torch_aa_f32(&raw, width, height, (cols * p) as u32, (rows * p) as u32)
+                .unwrap();
+        let mut expected = Vec::with_capacity(patches.len());
+        for i in 0..rows {
+            for j in 0..cols {
+                for c in 0..3 {
+                    for dy in 0..p {
+                        for dx in 0..p {
+                            let value = resized[((i * p + dy) * cols * p + j * p + dx) * 3 + c];
+                            expected
+                                .push((value / 255.0 - CLIP_MEAN[c] as f32) / CLIP_STD[c] as f32);
+                        }
+                    }
+                }
+            }
+        }
+        let bits = |values: &[f32]| values.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+        assert_eq!(bits(&patches), bits(&expected));
     }
 
     /// Frame grids the engine's `_compute_aspect_preserving_size` gives these sizes.
