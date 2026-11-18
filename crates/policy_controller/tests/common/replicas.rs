@@ -12,7 +12,7 @@
 use std::{
     ffi::OsStr,
     io::{BufRead, BufReader, Write},
-    net::SocketAddr,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     path::Path,
     process::{Child, Command, ExitStatus, Stdio},
     sync::Arc,
@@ -184,6 +184,10 @@ pub struct Replica {
     _spec: Option<tempfile::TempDir>,
 }
 
+/// Where a replica listens unless its start names a place: the loopback
+/// address, every port the system's pick.
+const LOOPBACK: (IpAddr, u16) = (IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+
 /// A document of one plain profile: what a replica runs where its flags
 /// name no spec source and a store is refused.
 const PLAIN_SPEC: &str =
@@ -202,7 +206,7 @@ impl Replica {
         settings: ElectionSettings,
         settle_secs: u64,
     ) -> Result<Self, String> {
-        Self::start_as(id, None, lease, settings, settle_secs, &[])
+        Self::start_as(id, None, lease, settings, settle_secs, &[], LOOPBACK)
     }
 
     /// Starts the binary as [`Replica::start`] does, under an advertised
@@ -216,7 +220,15 @@ impl Replica {
         settings: ElectionSettings,
         settle_secs: u64,
     ) -> Result<Self, String> {
-        Self::start_as(id, Some(advertise), lease, settings, settle_secs, &[])
+        Self::start_as(
+            id,
+            Some(advertise),
+            lease,
+            settings,
+            settle_secs,
+            &[],
+            LOOPBACK,
+        )
     }
 
     /// [`Replica::start`] with `flags` after its own on the command line.
@@ -227,7 +239,22 @@ impl Replica {
         settle_secs: u64,
         flags: &[&OsStr],
     ) -> Result<Self, String> {
-        Self::start_as(id, None, lease, settings, settle_secs, flags)
+        Self::start_as(id, None, lease, settings, settle_secs, flags, LOOPBACK)
+    }
+
+    /// [`Replica::start_with`] with every listener at the address `ip` and
+    /// the replication listener at `port` there (`0` takes one), its
+    /// listeners closed at once on a stop's signal. A standby dials its
+    /// leader's host at its own replication port: the replicas of a pair
+    /// listen on one replication port, each at an address of its own.
+    pub fn start_on(
+        id: &str,
+        place: (IpAddr, u16),
+        lease: Lease<'_>,
+        settings: ElectionSettings,
+        flags: &[&OsStr],
+    ) -> Result<Self, String> {
+        Self::start_as(id, None, lease, settings, 0, flags, place)
     }
 
     fn start_as(
@@ -237,7 +264,9 @@ impl Replica {
         settings: ElectionSettings,
         settle_secs: u64,
         flags: &[&OsStr],
+        (ip, replication): (IpAddr, u16),
     ) -> Result<Self, String> {
+        let at = |port: u16| SocketAddr::new(ip, port).to_string();
         let millis = |duration: Duration| duration.as_millis().to_string();
         let grace_secs = (2 * settle_secs).max(5);
         let mut command = Command::new(BIN);
@@ -285,10 +314,10 @@ impl Replica {
         };
         command
             .args(["--controller-id", id])
-            .args(["--gateway-listen", "127.0.0.1:0"])
-            .args(["--control-listen", "127.0.0.1:0"])
-            .args(["--replication-listen", "127.0.0.1:0"])
-            .args(["--admin-listen", "127.0.0.1:0"])
+            .args(["--gateway-listen", &at(0)])
+            .args(["--control-listen", &at(0)])
+            .args(["--replication-listen", &at(replication)])
+            .args(["--admin-listen", &at(0)])
             .args(["--lease-duration-ms", &millis(settings.duration)])
             .args(["--lease-renew-period-ms", &millis(settings.renew_period)])
             .args([
