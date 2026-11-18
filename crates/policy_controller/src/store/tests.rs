@@ -3248,6 +3248,66 @@ fn no_thread_acts_at_a_file_beside_the_thread_at_work() {
     assert_eq!(LeasesStore::live(&*store, GatewayId(1)), 1);
 }
 
+/// A decider that takes up its work waits out a hand that applies at its
+/// file. The hand found no thread at work, took the file's turn and tells
+/// a lease's event under the decider's name: the decider says it works,
+/// then takes that turn, so no thread tells under its name beside its
+/// first decision.
+#[test]
+fn a_decider_takes_up_its_work_behind_a_hand_that_tells_at_its_file() {
+    type Ends = (mpsc::SyncSender<()>, mpsc::Receiver<()>);
+    static ENDS: Mutex<Option<Ends>> = Mutex::new(None);
+    fn parks(_: &MemoryStore, _: &LeaseRecord, _: Said, _: Option<Decider>) {
+        let ends = ENDS.lock().expect("no case fails under it").take();
+        if let Some((reached, word)) = ends {
+            reached.send(()).expect("the case hears the tell");
+            word.recv().expect("the case lets the teller go");
+        }
+    }
+    let store = Arc::new(MemoryStore::new().with_deciders(2));
+    let a = ready(&store, "http://a:1");
+    LeasesStore::set_term(&*store, 1);
+    store.tell_through(parks);
+    let (gateway, now) = (GatewayId(1), Instant::now());
+    // A lease on the second decider's file.
+    let lease = {
+        let _acting = Decider::new(1).enter();
+        let record = booking(gateway, 0, a, now);
+        let lease = store.issue_decided(record, store.world().booked_of(a), |_| ());
+        lease.expect("minted under the store's term").id
+    };
+    let (reached, parked) = mpsc::sync_channel(1);
+    let (go, word) = mpsc::sync_channel::<()>(1);
+    *ENDS.lock().expect("no case fails under it") = Some((reached, word));
+    let (began, working) = mpsc::sync_channel(1);
+    std::thread::scope(|scope| {
+        // The case's own ends go with it where it fails: the teller's
+        // wait ends, and the case with it.
+        let (parked, go, working) = (parked, go, working);
+        let store = &store;
+        // A hand finds no thread at work at the file: it takes the turn
+        // and stands in the tell of the frame it applies.
+        scope.spawn(move || store.hand(&Hand::new(gateway), lease, GONE));
+        // Bounded: where no tell is made the case fails, and does not
+        // wait on an end the teller holds.
+        let told = parked.recv_timeout(Duration::from_secs(20));
+        told.expect("the hand's tell");
+        // The file's decider takes up its work behind that turn.
+        scope.spawn(move || {
+            let _acting = Decider::new(1).enter();
+            let at_work = store.at_work();
+            began.send(()).expect("the case waits for the seat");
+            drop(at_work);
+        });
+        let early = working.recv_timeout(Duration::from_millis(250));
+        assert!(early.is_err(), "a decider worked beside a hand's tell");
+        go.send(()).expect("the teller holds the other end");
+        let at_work = working.recv_timeout(Duration::from_secs(20));
+        at_work.expect("the decider is at work behind the tell");
+    });
+    assert_eq!(LeasesStore::live(&*store, gateway), 0);
+}
+
 /// A full ring stops its hand until a holder applied: the thread at work
 /// at the file, which the hand yields to. No frame is dropped, and none is
 /// applied by the hand beside that thread.
