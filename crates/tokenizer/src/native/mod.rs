@@ -1052,6 +1052,16 @@ impl AddedTokens {
         self.matches(text).map(|(range, _)| range)
     }
 
+    /// The added tokens in `text`, in order, each as its byte range and its
+    /// id.
+    pub(crate) fn tokens<'a>(
+        &'a self,
+        text: &'a str,
+    ) -> impl Iterator<Item = (Range<usize>, u32)> + 'a {
+        self.matches(text)
+            .map(|(range, index)| (range, self.ids[index]))
+    }
+
     /// Calls `f` with each segment in order: an added token's id, or a text
     /// span between added tokens.
     fn split<'t>(&self, text: &'t str, mut f: impl FnMut(Segment<'t>)) {
