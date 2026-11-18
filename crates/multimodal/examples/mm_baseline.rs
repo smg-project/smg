@@ -32,6 +32,13 @@
 //! same concurrency: the row reports that steady state, and at a low `--repeats`
 //! its averaged columns and its p90 carry each thread's first cold take (the median
 //! only at `--repeats 1`).
+//! The move of the wire bytes runs on a thread of its own, one beside each worker, as
+//! the gateway runs it on a runtime worker that never preprocesses: a float tensor's
+//! storage is dropped there and does not return to the scratch pool of the thread that
+//! made it. `--write-thread same` runs the move on the worker itself, where the storage
+//! returns to that pool and the next iteration takes it warm: a reuse the gateway does
+//! not have, kept for comparison. In the default mode the serialize stage includes the
+//! hand-over to that thread and back.
 //! Video decodes through the media connector under the family's own sampling rule;
 //! audio through the in-process decoder.
 //!
@@ -72,7 +79,7 @@ use std::{
     num::NonZeroUsize,
     path::{Path, PathBuf},
     process::ExitCode,
-    sync::{Arc, Barrier},
+    sync::{mpsc, Arc, Barrier},
     thread,
     time::Instant,
 };
@@ -146,6 +153,7 @@ const USAGE: &str = "mm_baseline: SMG's media pipeline per class, stage by stage
     \x20 --repeats <n>       iterations per thread [10]\n\
     \x20 --wire <dtype>      bf16, f16, f32 or u8: the destination's dtype [bf16]\n\
     \x20 --transparency <p>  composite_white, drop_alpha or keep_alpha [composite_white]\n\
+    \x20 --write-thread <t>  other or same: the thread of the consuming write [other]\n\
     \x20 --only <a,b,...>    run these classes only\n\
     \x20 --help              this text";
 
@@ -176,6 +184,7 @@ struct Options {
     repeats: usize,
     wire: EncoderDtype,
     transparency: TransparencyPolicy,
+    write_thread: WriteThread,
     only: Option<HashSet<String>>,
 }
 
@@ -188,6 +197,7 @@ impl Options {
         let mut repeats = 10;
         let mut wire = EncoderDtype::BFloat16;
         let mut transparency = TransparencyPolicy::CompositeOverWhite;
+        let mut write_thread = WriteThread::Other;
         let mut only = None;
         while let Some(arg) = args.next() {
             if arg == "--help" || arg == "-h" {
@@ -219,6 +229,13 @@ impl Options {
                         other => return Err(format!("unknown transparency {other:?}").into()),
                     }
                 }
+                "--write-thread" => {
+                    write_thread = match value.as_str() {
+                        "other" => WriteThread::Other,
+                        "same" => WriteThread::Same,
+                        other => return Err(format!("unknown write thread {other:?}").into()),
+                    }
+                }
                 "--only" => only = Some(value.split(',').map(str::to_string).collect()),
                 other => return Err(format!("unknown argument {other:?}\n{USAGE}").into()),
             }
@@ -230,6 +247,7 @@ impl Options {
             repeats: repeats.max(1),
             wire,
             transparency,
+            write_thread,
             only,
         }))
     }
@@ -294,6 +312,42 @@ enum Work {
         processor: Arc<Qwen3AudioProcessor>,
         bytes: Bytes,
     },
+}
+
+/// The thread an iteration's consuming write runs on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WriteThread {
+    /// A thread that only writes, as the gateway's runtime workers do: a float
+    /// tensor's storage is dropped there.
+    Other,
+    /// The worker that preprocessed: the storage returns to its scratch pool.
+    Same,
+}
+
+/// A thread that runs one worker's consuming writes and never preprocesses.
+struct Writer {
+    inputs: mpsc::Sender<(EncoderInput, EncoderDtype)>,
+    written: mpsc::Receiver<Result<Vec<u8>, String>>,
+}
+
+impl Writer {
+    fn spawn() -> Self {
+        let (inputs, queue) = mpsc::channel::<(EncoderInput, EncoderDtype)>();
+        let (results, written) = mpsc::channel();
+        thread::spawn(move || {
+            for (input, wire) in queue {
+                if results.send(input.into_bytes_as(wire)).is_err() {
+                    break;
+                }
+            }
+        });
+        Self { inputs, written }
+    }
+
+    fn write(&self, input: EncoderInput, wire: EncoderDtype) -> Result<Vec<u8>, String> {
+        self.inputs.send((input, wire)).map_err(|e| e.to_string())?;
+        self.written.recv().map_err(|e| e.to_string())?
+    }
 }
 
 /// The per-item stage times of one iteration, in milliseconds, with the byte counts.
@@ -461,6 +515,7 @@ fn iterate(
     wire: EncoderDtype,
     transparency: TransparencyPolicy,
     runtime: &Runtime,
+    writer: Option<&Writer>,
 ) -> Result<(Sample, Vec<u8>), String> {
     let mut sample = Sample::default();
     let (inputs, started) = match work {
@@ -520,7 +575,10 @@ fn iterate(
             (inputs, Instant::now())
         }
     };
-    let bytes = inputs.encoder_input.into_bytes_as(wire)?;
+    let bytes = match writer {
+        Some(writer) => writer.write(inputs.encoder_input, wire)?,
+        None => inputs.encoder_input.into_bytes_as(wire)?,
+    };
     sample.serialize_ms = ms(started);
     sample.wire_bytes = bytes.len();
     Ok((sample, bytes))
@@ -539,7 +597,7 @@ fn facts(
         Work::Video { bytes, .. } => bytes.len(),
         Work::Audio { bytes, .. } => bytes.len(),
     };
-    let (_, one_pass) = iterate(work, wire, transparency, runtime)?;
+    let (_, one_pass) = iterate(work, wire, transparency, runtime, None)?;
     let wire_sha256 = sha256(&one_pass);
     // The warm-up's pooled buffers return to the pool as the timed loop's wire does,
     // so the pool is warm before the timed loop starts.
@@ -749,15 +807,18 @@ fn run_class(
             let barrier = barrier.clone();
             let wire = options.wire;
             let transparency = options.transparency;
+            let write_thread = options.write_thread;
             thread::spawn(move || -> Result<Vec<Sample>, String> {
                 let runtime = RuntimeBuilder::new_current_thread()
                     .enable_all()
                     .build()
                     .map_err(|e| e.to_string())?;
+                let writer = (write_thread == WriteThread::Other).then(Writer::spawn);
                 let mut samples = Vec::with_capacity(repeats);
                 barrier.wait();
                 for _ in 0..repeats {
-                    let (sample, bytes) = iterate(&work, wire, transparency, &runtime)?;
+                    let (sample, bytes) =
+                        iterate(&work, wire, transparency, &runtime, writer.as_ref())?;
                     // The wire back to the pool, as a sent payload returns it.
                     drop(recycled_bytes(bytes));
                     samples.push(sample);
@@ -873,6 +934,7 @@ fn meta(options: &Options) -> Value {
         "allocator_env": env::var("_RJEM_MALLOC_CONF").ok(),
         "wire": format!("{:?}", options.wire),
         "transparency": format!("{:?}", options.transparency),
+        "write_thread": format!("{:?}", options.write_thread),
         "threads": options.threads,
         "repeats": options.repeats,
         "build": if cfg!(debug_assertions) { "debug" } else { "release" },
