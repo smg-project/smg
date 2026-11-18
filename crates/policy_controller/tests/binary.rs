@@ -147,6 +147,25 @@ fn the_examples_settings_are_the_binarys() {
     assert_eq!(theirs, ours, "the example's settings are not the binary's");
 }
 
+/// The served bench counts over the allocator this binary registers, under
+/// a copy of its settings: a row read under other settings is not the
+/// binary's row. The bench's source is read by path: its copy moves with
+/// the binary's, or this case fails.
+#[test]
+fn the_served_benchs_settings_are_the_binarys() {
+    let binary = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/bin/smg-policy-controller.rs"
+    ));
+    let bench = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/benches/decide_stream.rs"
+    ));
+    let ours = settings_after(binary, "const SETTINGS").expect("the binary's settings");
+    let theirs = settings_after(bench, "pub static MALLOC_CONF").expect("the bench's copy");
+    assert_eq!(theirs, ours, "the bench's settings are not the binary's");
+}
+
 /// The byte string a source assigns after `name`, without its quotes.
 fn settings_after<'a>(source: &'a str, name: &str) -> Option<&'a str> {
     let (_, rest) = source.split_once(name)?;
