@@ -305,7 +305,8 @@ fn a_typed_added_token_is_text_under_a_renderer_with_its_own_encoder() {
 /// prompt is encoded by segments: such a text is read by its characters,
 /// alone and beside a typed token that keeps its id. With no normalizer,
 /// or an empty sequence of them, the entry matches as it is spelled, and a
-/// prompt is encoded from its text.
+/// prompt is encoded from its text; so is the prompt of a vocabulary whose
+/// entries all match as they are spelled, under any normalizer.
 #[test]
 fn a_text_the_normalizer_turns_into_an_added_token_stays_text() {
     let conversion = with_added_token("<a>")
@@ -339,6 +340,15 @@ fn a_text_the_normalizer_turns_into_an_added_token_stays_text() {
         assert!(from_text, "{normalizer}");
         assert_eq!(ids, [2, 13, 19, 14, 3, 13, 14, 1], "{normalizer}");
     }
+    let lowered = with_added_token("<a>").replace(
+        r#""normalizer": null"#,
+        r#""normalizer": {"type": "Lowercase"}"#,
+    );
+    let temp = TempDir::new().unwrap();
+    let tok = checkpoint_of(temp.path(), &lowered, &builds());
+    let (_, ids, from_text) = render(&tok, json!("a<a>b"));
+    assert!(from_text);
+    assert_eq!(ids, [2, 13, 19, 14, 3, 13, 14, 1]);
 }
 
 /// A replaced template makes the kept tokens anew: a token that kept its id
