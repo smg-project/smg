@@ -2825,6 +2825,20 @@ mod tests {
         }
     }
 
+    /// A statement that spells one control whole in its own literal, beside
+    /// the ones that build theirs, binds it the same way on a tiktoken
+    /// file's checkpoint (see `ChatTemplateState::mark_built_controls`).
+    #[test]
+    fn a_tiktoken_file_s_control_spelled_in_its_own_statement_is_bound_beside_built_ones() {
+        let built = "{% set close = '[/INST{}]'.format(suffix) %}";
+        let template = builds_its_controls().replace(built, "{% set close = '[/INST:x]' %}");
+        assert!(!template.contains(built));
+        let dir = suffixed_controls_dir(&template, None);
+        let tokenizer = TiktokenTokenizer::from_dir(dir.path()).unwrap();
+        assert!(tokenizer.controls.is_some());
+        assert_eq!(typed_turn_ids(&tokenizer), (TYPED_AS_TEXT.to_vec(), false));
+    }
+
     /// A value the template builds out of several controls, with text
     /// between them, takes the marks around each on a tiktoken file's
     /// checkpoint as on any other (see

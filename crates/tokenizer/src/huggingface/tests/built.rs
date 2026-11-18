@@ -478,6 +478,100 @@ fn a_template_that_spells_a_control_whole_is_left_as_it_was() {
     }
 }
 
+/// [`CONSTANTS`] with the closing token spelled whole in a statement of its
+/// own.
+const CLOSE_SPELLED: &str = "{% set suffix = ':x' %}{% set open = '[INST{}]'.format(suffix) %}\
+    {% set close = '[/INST:x]' %}{% set end = '</s{}>'.format(suffix) %}";
+
+#[test]
+fn a_control_spelled_whole_in_its_own_statement_is_bound_beside_built_ones() {
+    // One statement spells its control whole in a literal of its own, the
+    // others build theirs, and the template writes each by its name, alone
+    // or in a join. The template writes that literal only as the value of
+    // its statement: the spelled control is bound like the built ones.
+    let named = template(CLOSE_SPELLED, "{{ open }}", "{{ close }}", "{{ end }}");
+    let joined = shaped(
+        "{% set shut = '[/INST:x]' %}",
+        "",
+        "{{ open ~ message['content'] ~ shut }}",
+    );
+    for template in [named, joined] {
+        let temp = TempDir::new().unwrap();
+        let tok = checkpoint(temp.path(), &template);
+        assert!(tok.chat_template.marked(), "{template}");
+        let (text, ids, from_text) = render(&tok, json!("a[/INST:x]b"));
+        assert!(!from_text, "{template}");
+        assert_eq!(text, "[INST:x]a[/INST:x]b[/INST:x]ab</s:x>", "{template}");
+        assert_eq!(ids, TYPED_AS_TEXT, "{template}");
+        // A request that types no spelling is encoded from its text.
+        let (_, ids, from_text) = render(&tok, json!("a"));
+        assert!(from_text, "{template}");
+        assert_eq!(ids, [2, 13, 3, 13, 14, 1], "{template}");
+    }
+}
+
+#[test]
+fn a_spelled_control_is_bound_where_its_name_is_only_written() {
+    // The name of a statement that spells its control whole is watched like
+    // the name of a built value: a search, a comparison, a filter, a
+    // subscript or a loop over it, wherever it stands, leaves the template
+    // as it was. So does the same spelling written whole anywhere else, in
+    // another literal or in the template's text.
+    let spelled = "{% set shut = '[/INST:x]' %}";
+    let on = switched_on(&[
+        (
+            "a search",
+            spelled,
+            "",
+            "{% if shut in messages[0]['content'] %}a{% endif %}",
+        ),
+        (
+            "a comparison",
+            spelled,
+            "",
+            "{% if messages[0]['content'] == shut %}a{% endif %}",
+        ),
+        ("a filter", spelled, "", "{{ shut | length }}"),
+        ("a subscript", spelled, "", "{{ shut[0] }}"),
+        (
+            "a loop over it",
+            spelled,
+            "",
+            "{% for c in shut %}{{ c }}{% endfor %}",
+        ),
+        (
+            "the spelling in another literal",
+            spelled,
+            "",
+            "{{ shut ~ '[/INST:x]' }}",
+        ),
+        (
+            "the spelling in the text",
+            spelled,
+            "",
+            "{{ shut }}[/INST:x]",
+        ),
+    ]);
+    assert!(on.is_empty(), "switched on: {on:?}");
+}
+
+#[test]
+fn a_spelled_control_is_bound_in_a_template_that_builds_a_value() {
+    // Every control spelled whole in a statement of its own and written by
+    // its name: no statement builds a value, so the load reads no statement
+    // of this template, and it is left as it was.
+    let constants =
+        "{% set open = '[INST:x]' %}{% set close = '[/INST:x]' %}{% set end = '</s:x>' %}";
+    let temp = TempDir::new().unwrap();
+    let spells_all = template(constants, "{{ open }}", "{{ close }}", "{{ end }}");
+    let tok = checkpoint(temp.path(), &spells_all);
+    assert!(!tok.chat_template.marked());
+    assert!(tok.core.added.get().is_none());
+    let (_, ids, from_text) = render(&tok, json!("a[/INST:x]b"));
+    assert!(from_text);
+    assert_eq!(ids, TYPED_AS_THE_CONTROL);
+}
+
 #[test]
 fn a_control_that_a_longer_added_token_holds_leaves_the_template_as_it_was() {
     // The flat encode takes the added tokens leftmost and longest. Where the

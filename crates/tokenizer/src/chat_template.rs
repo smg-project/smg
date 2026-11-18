@@ -4338,7 +4338,9 @@ impl ChatTemplateState {
     /// `encoders::marks`, as a literal in the statement's place. A value
     /// such a statement builds that begins with an added token and ends
     /// with one holds several, and takes the marks around each
-    /// ([`several_controls`]). Compiled
+    /// ([`several_controls`]). A statement beside them that spells one
+    /// control whole in a literal of its own binds it the same way, where
+    /// its name is read as theirs. Compiled
     /// so, the template writes control tokens where it writes the names,
     /// alone or inside a longer value, and the same spellings in request
     /// text stay text, as under [`Self::mark_controls`]; a render builds no
@@ -4489,7 +4491,12 @@ impl ChatTemplateState {
     /// spellings whole by itself, in its text or in a string literal
     /// ([`written_text`]): that template is of the other kind, and it says
     /// so here. A comment that names a spelling is nothing the template
-    /// writes, and neither is the pattern a value is built from.
+    /// writes, and neither is the pattern a value is built from, nor the
+    /// literal of a statement that spells one control whole. Such a
+    /// statement binds its control like the ones that build theirs, where
+    /// the syntax, read again with it counted among them, shows its name
+    /// read as theirs ([`built_values_read_plainly`]); None where it does
+    /// not.
     ///
     /// `matcher`, the matcher over the added tokens, is asked for only at a
     /// value a statement builds that is neither a control spelling nor
@@ -4511,7 +4518,7 @@ impl ChatTemplateState {
             return Vec::new();
         };
         let source = template.source();
-        let (computed, unsettled) = computed_statements(root_sets(source));
+        let (mut computed, unsettled) = computed_statements(root_sets(source));
         let mut statements = String::new();
         for statement in &computed {
             let (start, end) = statement.span;
@@ -4560,16 +4567,25 @@ impl ChatTemplateState {
         if values.len() != computed.len() {
             return Vec::new();
         }
-        let built = |at| {
-            computed.iter().any(|statement| {
-                statement.builds && (statement.span.0..statement.span.1).contains(&at)
-            })
-        };
         // What the template writes by itself, read once the source holds a
-        // control spelling somewhere.
+        // control spelling somewhere. The expression of a statement that
+        // builds its value, or that spells one control whole, is no part of
+        // it: the template writes that literal only as the value.
+        let written_by_itself = || {
+            let bound: Vec<_> = computed
+                .iter()
+                .zip(&values)
+                .filter(|(statement, value)| statement.builds || is_control(value))
+                .map(|(statement, _)| statement.span.0..statement.span.1)
+                .collect();
+            written_text(source, |at| bound.iter().any(|span| span.contains(&at)))
+        };
         let mut written = None;
         let mut bindings = Vec::new();
-        for (statement, value) in computed.iter().zip(values) {
+        // The statements that spell one control whole in a literal of their
+        // own.
+        let mut spelled = Vec::new();
+        for (index, (statement, &value)) in computed.iter().zip(&values).enumerate() {
             let whole = is_control(value);
             if !whole && (!statement.builds || value.is_empty()) {
                 continue;
@@ -4601,17 +4617,34 @@ impl ChatTemplateState {
                 let spelling = &value[control.clone()];
                 if source.contains(spelling)
                     && written
-                        .get_or_insert_with(|| written_text(source, built))
+                        .get_or_insert_with(written_by_itself)
                         .contains(spelling)
                 {
                     return Vec::new();
                 }
+            }
+            if !statement.builds {
+                spelled.push(index);
             }
             bindings.push(ControlBinding {
                 span: statement.span,
                 value: value.to_owned(),
                 controls,
             });
+        }
+        // A statement that spells one control whole binds it like the ones
+        // that build theirs only where the template reads its name as it may
+        // read theirs: the syntax is read again, with that statement counted
+        // among the ones that build.
+        if !spelled.is_empty() {
+            for index in spelled {
+                computed[index].builds = true;
+            }
+            let read_plainly = parse(source, "chat", SyntaxConfig {}, WhitespaceConfig::default())
+                .is_ok_and(|ast| built_values_read_plainly(&ast, &computed));
+            if !read_plainly {
+                return Vec::new();
+            }
         }
         bindings
     }
