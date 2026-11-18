@@ -146,9 +146,8 @@ impl CharSymbols {
                 "the token {token:?} spells a byte token inside it"
             )));
         }
-        for pair in token.as_bytes().windows(2) {
-            let bit = pair_bit([pair[0], pair[1]]);
-            self.bridge[bit >> 6] |= 1 << (bit & 63);
+        for pair in token.as_bytes().array_windows() {
+            Self::set(&mut self.bridge, pair_bit(*pair));
         }
         let mut chars = token.chars();
         if let (Some(c), None) = (chars.next(), chars.next()) {
@@ -174,8 +173,7 @@ impl CharSymbols {
                 let before = if prev == b' ' { MARKER_BYTES[2] } else { prev };
                 let after = if cur == b' ' { MARKER_BYTES[0] } else { cur };
                 if is_continuation(cur) || self.bridged(before, after) {
-                    let bit = pair_bit([prev, cur]);
-                    raw[bit >> 6] |= 1 << (bit & 63);
+                    Self::set(&mut raw, pair_bit([prev, cur]));
                 }
             }
         }
@@ -247,6 +245,12 @@ impl CharSymbols {
     #[inline(always)]
     fn holds(&self, bit: usize) -> bool {
         (self.bridge[bit >> 6] >> (bit & 63)) & 1 != 0
+    }
+
+    /// Sets `bit`, the bit of a pair of bytes ([`pair_bit`]), in `table`:
+    /// the write of what [`Self::holds`] reads.
+    fn set(table: &mut [u64; BRIDGE_WORDS], bit: usize) {
+        table[bit >> 6] |= 1 << (bit & 63);
     }
 
     /// The token of `c`, or [`NO_ID`].
