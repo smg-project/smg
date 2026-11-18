@@ -74,6 +74,14 @@ pub enum Unled {
     Past(u64),
 }
 
+/// What one reader of the watched kinds keeps between its reads
+/// ([`Log::read_if_moved`]): the state of those kinds its last read reached
+/// the end of, or none. The reader keeps it and hands it back, nothing
+/// else. It is no place of the log: a restart moves the log past it and
+/// writes no entry.
+#[derive(Debug, Default)]
+pub struct Stamp(Option<u64>);
+
 /// One ring: the retained events of its kinds, oldest first.
 struct Kept {
     events: VecDeque<Entry>,
@@ -221,6 +229,10 @@ pub struct Log {
     /// Whether a write of the watched kinds landed that `told` has not
     /// heard of: set under the log's lock, taken where the telling is made.
     untold: AtomicBool,
+    /// How often the watched kinds moved: a write of them, a mark, a
+    /// restart. It moves under the log's lock, and a reader that keeps a
+    /// [`Stamp`] loads it under none.
+    moves: AtomicU64,
 }
 
 impl fmt::Debug for Log {
@@ -260,6 +272,7 @@ impl Log {
             loads,
             told: None,
             untold: AtomicBool::new(false),
+            moves: AtomicU64::new(0),
         }
     }
 
@@ -422,6 +435,49 @@ impl Log {
         at_most: usize,
         out: &mut Vec<Entry>,
     ) -> Result<(), Lost> {
+        self.batch(kinds, after, at_most, out)?;
+        Ok(())
+    }
+
+    /// [`Log::read`] of the watched kinds for a reader that comes back
+    /// whether or not the log moved, a watch's stream. `stamp` is what
+    /// that one reader keeps between its reads, and `after` is where it
+    /// stands. While those kinds stand as the read that set the stamp left
+    /// them, nothing is read (`out` is cleared) and no lock of the log is
+    /// taken: the reader was handed every entry after its place.
+    ///
+    /// A read sets the stamp where it reached the end of the log, under
+    /// the lock every move of those kinds takes: a write of them, a mark
+    /// and a restart each move the log past it, and a load row does not. A
+    /// read that stopped short of the end, at a full batch or where the
+    /// term changed, sets none, and the next reads on. Whether the
+    /// reader's place is still the log's is asked where the log is read:
+    /// a reader that is [`Lost`] hears it at its first read after a move.
+    pub fn read_if_moved(
+        &self,
+        stamp: &mut Stamp,
+        after: Position,
+        at_most: usize,
+        out: &mut Vec<Entry>,
+    ) -> Result<(), Lost> {
+        if stamp.0 == Some(self.moves.load(Ordering::Acquire)) {
+            out.clear();
+            return Ok(());
+        }
+        stamp.0 = self.batch(Kinds::Watched, after, at_most, out)?;
+        Ok(())
+    }
+
+    /// One batch for [`Log::read`]. Where it reached the end of what the
+    /// log holds of `kinds`, it says how often the watched kinds had moved
+    /// by then: a [`Stamp`] of the state it read.
+    fn batch(
+        &self,
+        kinds: Kinds,
+        after: Position,
+        at_most: usize,
+        out: &mut Vec<Entry>,
+    ) -> Result<Option<u64>, Lost> {
         out.clear();
         let at_most = at_most.min(Self::BATCH);
         if !self.serves(kinds) {
@@ -442,6 +498,7 @@ impl Log {
             })
             .peekable();
         let mut batch_term = None;
+        let mut ended = false;
         while out.len() < at_most {
             // The two rings in the log's order: the lower position first.
             let next = match (watched.peek(), loads.peek()) {
@@ -451,6 +508,7 @@ impl Log {
                 (None, None) => None,
             };
             let Some(entry) = next else {
+                ended = true;
                 break;
             };
             if batch_term.is_some_and(|of_batch| of_batch != entry.at.term) {
@@ -459,7 +517,9 @@ impl Log {
             batch_term = Some(entry.at.term);
             out.push(entry.clone());
         }
-        Ok(())
+        // Loaded under the lock still, which every move takes: the count
+        // names the state this batch read.
+        Ok(ended.then(|| self.moves.load(Ordering::Relaxed)))
     }
 
     fn push(&self, event: Event) {
@@ -512,9 +572,19 @@ impl Log {
             ring.loads.push(self.loads, entry);
         } else {
             ring.watched.push(self.watched, entry);
-            // Held back: the listener is told under no lock.
-            self.untold.store(true, Ordering::Release);
+            self.moved(ring);
         }
+    }
+
+    /// Notes that the watched kinds moved: a write of them, a mark, a
+    /// restart. `_held` is the log's lock, held: the count moves under it,
+    /// so a batch read under that lock names the state it read. The count
+    /// moves before the flag: the telling the flag owes is made after it,
+    /// and the reader that telling wakes finds the log past its [`Stamp`].
+    fn moved(&self, _held: &Ring) {
+        self.moves.fetch_add(1, Ordering::Release);
+        // Held back: the listener is told under no lock.
+        self.untold.store(true, Ordering::Release);
     }
 
     /// Tells the listener that the watched kinds moved since its last
@@ -528,6 +598,12 @@ impl Log {
         if self.untold.swap(false, Ordering::AcqRel) {
             told();
         }
+    }
+
+    /// The log's lock, held: for a case that shows what waits for it.
+    #[cfg(test)]
+    pub(crate) fn held(&self) -> impl Sized + '_ {
+        self.ring.lock()
     }
 
     /// A standby's application of the leader's event at `at`: while the
@@ -580,7 +656,7 @@ impl Log {
         ring.head = at;
         ring.adopting = None;
         self.follow(&mut ring, at);
-        self.untold.store(true, Ordering::Release);
+        self.moved(&ring);
         drop(ring);
         self.tell();
     }
@@ -1215,6 +1291,89 @@ mod tests {
             .expect("the telling waited for the log's lock");
         drop(ring);
         teller.join().expect("the teller");
+    }
+
+    /// A reader of the watched kinds that keeps its stamp
+    /// ([`Log::read_if_moved`]): it stands at the last entry it read.
+    #[derive(Debug, Default)]
+    struct Reader {
+        stamp: Stamp,
+        at: Position,
+    }
+
+    impl Reader {
+        /// One read of at most `at_most` entries: their marks.
+        fn reads(&mut self, log: &Log, at_most: usize) -> Result<Vec<u32>, Lost> {
+            let mut out = Vec::new();
+            log.read_if_moved(&mut self.stamp, self.at, at_most, &mut out)?;
+            if let Some(last) = out.last() {
+                self.at = last.at;
+            }
+            Ok(marks(&out))
+        }
+
+        /// One read made while this thread holds the log's lock: `None`
+        /// where the read waited for the lock.
+        fn reads_beside_the_lock(&mut self, log: &Log) -> Option<Result<Vec<u32>, Lost>> {
+            let (done, read) = mpsc::channel();
+            thread::scope(|scope| {
+                let held = log.held();
+                scope.spawn(move || {
+                    let _ = done.send(self.reads(log, 8));
+                });
+                let read = read.recv_timeout(Duration::from_secs(10)).ok();
+                drop(held);
+                read
+            })
+        }
+    }
+
+    #[test]
+    fn a_reader_at_its_stamp_takes_no_lock_until_the_watched_kinds_move() {
+        let log = Log::new(8, 8);
+        let mut reader = Reader::default();
+        log.term_rose(2);
+        member(&log, 1);
+        assert_eq!(reader.reads(&log, 8), Ok(vec![TERM, MEMBER + 1]));
+        // The read reached the log's end: the next reads nothing, and
+        // waits for no lock to learn it.
+        assert_eq!(reader.reads_beside_the_lock(&log), Some(Ok(vec![])));
+        // A load row moves no stamp.
+        load(&log, 5);
+        assert_eq!(reader.reads_beside_the_lock(&log), Some(Ok(vec![])));
+        // A write of the watched kinds moves the log past the stamp, and
+        // the read of it sets the next.
+        member(&log, 2);
+        assert_eq!(reader.reads(&log, 8), Ok(vec![MEMBER + 2]));
+        assert_eq!(reader.reads_beside_the_lock(&log), Some(Ok(vec![])));
+        // So does a standby's mark.
+        log.adopt(at(5, 3)).expect("the next position").mark();
+        assert_eq!(reader.reads(&log, 8), Ok(vec![TERM]));
+        assert_eq!(reader.reads_beside_the_lock(&log), Some(Ok(vec![])));
+        // And a restart, which writes no entry: the reader stood
+        // elsewhere, and hears it at each read from there.
+        log.restart(at(11, 4));
+        assert_eq!(reader.reads(&log, 8), Err(Lost));
+        assert_eq!(reader.reads(&log, 8), Err(Lost));
+    }
+
+    #[test]
+    fn a_read_that_stops_short_of_the_logs_end_sets_no_stamp() {
+        let log = Log::new(8, 8);
+        for epoch in 1..=5 {
+            member(&log, epoch);
+        }
+        log.term_rose(2);
+        member(&log, 6);
+        // A full batch: the next reads what it left behind.
+        let mut reader = Reader::default();
+        assert_eq!(reader.reads(&log, 2), Ok(vec![MEMBER + 1, MEMBER + 2]));
+        assert_eq!(reader.reads(&log, 2), Ok(vec![MEMBER + 3, MEMBER + 4]));
+        // A batch that ends where the term changed, short of its bound.
+        assert_eq!(reader.reads(&log, 8), Ok(vec![MEMBER + 5]));
+        assert_eq!(reader.reads(&log, 8), Ok(vec![TERM, MEMBER + 6]));
+        // The log's end: the stamp is set.
+        assert_eq!(reader.reads_beside_the_lock(&log), Some(Ok(vec![])));
     }
 
     #[test]
