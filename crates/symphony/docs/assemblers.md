@@ -372,13 +372,13 @@ What the syntax says, and what the assembler does with it:
   the invoke's close is the call's end. An object a terminal, the cut or the stop found open stays
   as written, no brace made up, and one `Malformed` event of no bytes says it is no whole value:
   the reader's at the first byte that is no JSON where it refused the object, else the one at
-  the call's end; an object closed before a cut or a stop is whole, as the
+  the call's end; an object that closed whole before a cut or a stop is whole, as the
   JSON assembler ends one. A word or a tag after the object is text where the syntax has tags,
   refused as below, and the call it stands in is no whole call, as a call of parameter tags the
-  syntax refused bytes in is none: the object's closing brace, held back until the call ends, is
-  refused with the text, and the arguments stay the strict JSON prefix the fragments wrote. An
-  object after a parameter is refused whole, and that call gets no close. The family's reference
-  encoder never writes the shape, and its parser refuses it
+  syntax refused bytes in is none: the closing brace of an object that closed whole, held back
+  until the call ends, is refused with the text, and the arguments stay the strict JSON prefix the
+  fragments wrote. An object after a parameter is refused whole, and that call gets no close. The
+  family's reference encoder never writes the shape, and its parser refuses it
   (`Tool name format error`); one serving engine's parser for the family reads it, the object as
   written, and the structural tag that engine builds for a call writes it (the invoke tag, the
   parameters' schema, the invoke's close), so an engine that constrains a call that way gets it

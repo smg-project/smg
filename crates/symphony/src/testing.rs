@@ -498,14 +498,22 @@ pub(crate) fn a_call_terminal_ends_an_invoke_whose_arguments_are_json(
             Some(""),
             "{name}: {events:?}"
         );
-        // It is the one report before the first call's end: a second one of the same reason
-        // would hide behind the first below, where a reason that repeats is said once.
-        let first_end = events
+        // It is the one report before the first call's own end, which stands before a next call
+        // starts: a second one of the same reason would hide behind the first below, where a
+        // reason that repeats is said once.
+        let first_call = events
             .iter()
-            .position(|event| matches!(event, Event::ToolCallEnd { .. }))
-            .unwrap_or(events.len());
+            .position(|event| matches!(event, Event::ToolCallStart { index: 1, .. }))
+            .map_or(&events[..], |next| &events[..next]);
+        let first_end = first_call
+            .iter()
+            .position(|event| matches!(event, Event::ToolCallEnd { index: 0, .. }));
+        assert!(
+            first_end.is_some(),
+            "{name}: the first call has no end of its own: {events:?}"
+        );
         assert_eq!(
-            malformed(&events[..first_end]).len(),
+            malformed(&first_call[..first_end.unwrap_or(first_call.len())]).len(),
             1,
             "{name}: {events:?}"
         );
