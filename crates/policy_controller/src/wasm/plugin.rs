@@ -800,13 +800,6 @@ impl Rest {
 /// One named decider's place of rest: empty until the decider first acts.
 type Resting = Mutex<Option<Box<Rest>>>;
 
-thread_local! {
-    /// How many plugins' named deciders the thread holds the kept state of,
-    /// from a bring to its give-back: what a thread under no name reads
-    /// before it acts as itself.
-    static HOLDS: Cell<u32> = const { Cell::new(0) };
-}
-
 /// What a thread is to a plugin, beside what stands in its working slots.
 #[derive(Clone, Copy, Default)]
 struct Standing {
@@ -817,6 +810,16 @@ struct Standing {
     /// The named decider whose kept state stands in the thread's working
     /// slots, from the time it is brought to the time it is given back.
     lent: Option<Decider>,
+}
+
+/// A thread's working place for a plugin: its slot, and what the thread is
+/// to the plugin, under the one key. The mark of a lent state stands beside
+/// the slot it marks, so whoever reads the slot reads the mark: a thread
+/// that takes the place of one that exited does, as that thread left both.
+#[derive(Default)]
+struct Working {
+    standing: Cell<Standing>,
+    slot: RefCell<Option<Instance>>,
 }
 
 /// The apply's own instance (`init` ran at the load, and its failure was the
@@ -839,13 +842,15 @@ struct Spare {
 /// brought it.
 struct Lent<'a> {
     plugin: &'a Plugin,
+    /// The thread's working place: the call reads its slot here.
+    working: &'a Working,
     brought: bool,
 }
 
 impl Drop for Lent<'_> {
     fn drop(&mut self) {
         if self.brought {
-            self.plugin.rest();
+            self.plugin.rest(self.working);
         }
     }
 }
@@ -869,14 +874,16 @@ pub struct Plugin {
     counters: Counters,
     breaker: Breaker,
     tally: Tally,
-    /// A thread's working slot, by `thread_local`'s thread id: the kept
-    /// instance of a thread that names no decider (it is a decider of its
-    /// own), and the place a named decider's instance is brought to for a
-    /// decision or a told event. That crate recycles the id of a thread that
-    /// exited, so a later thread may adopt the instance a dead one left: an
-    /// instance is `Send`, one live thread holds an id at a time, and the
-    /// adopter keeps it warm.
-    instances: ThreadLocal<RefCell<Option<Instance>>>,
+    /// A thread's working place, by `thread_local`'s thread id. Its slot is
+    /// the kept instance of a thread that names no decider (it is a decider
+    /// of its own), and the place a named decider's instance is brought to
+    /// for a decision or a told event. That crate recycles the id of a
+    /// thread that exited, so a later thread may adopt the instance a dead
+    /// one left: an instance is `Send`, one live thread holds an id at a
+    /// time, and the adopter keeps it warm. What the thread is to the plugin
+    /// stands in the same place: an adopter reads a state the dead thread
+    /// left lent there, and gives it back before it acts.
+    instances: ThreadLocal<Working>,
     /// Where a named decider's kept state rests between its decisions, one
     /// place a name ([`Decider`]), made at the first named use. A place's
     /// lock is taken where a decision brings the state and where it gives it
@@ -887,8 +894,6 @@ pub struct Plugin {
     /// Per thread: the thread's own instance (it also decides under no
     /// name) while a named decider's stands in its working slot.
     aside: ThreadLocal<RefCell<Option<Instance>>>,
-    /// Per thread: what the thread is to this plugin.
-    standing: ThreadLocal<Cell<Standing>>,
     /// The apply's own instance, until a decider needs one.
     spare: Spare,
     /// Whether the plugin's one warning of a dropped event is written.
@@ -1033,7 +1038,6 @@ impl Plugin {
             instances: ThreadLocal::new(),
             rests: OnceLock::new(),
             aside: ThreadLocal::new(),
-            standing: ThreadLocal::new(),
             spare: Spare {
                 instance: Mutex::new(None),
                 left: AtomicBool::new(false),
@@ -1082,8 +1086,8 @@ impl Plugin {
     /// own instance for that thread, one more than the host has deciders,
     /// and no decision reads what that instance hears.
     pub fn warm(&self) -> Result<(), LoadError> {
-        let _lent = self.lent_here();
-        let slot = self.slot();
+        let lent = self.lent_here();
+        let slot = &lent.working.slot;
         if slot.borrow().is_none() {
             let instance = match self.adopt() {
                 Some(instance) => instance,
@@ -1108,11 +1112,8 @@ impl Plugin {
     /// counts for no decider: the first to warm or decide takes it, so a
     /// warm-up that asks here first still warms every decider.
     pub fn is_warm(&self) -> bool {
-        let _lent = self.lent_here();
-        let kept = self
-            .instances
-            .get()
-            .is_some_and(|slot| slot.borrow().is_some());
+        let lent = self.lent_here();
+        let kept = lent.working.slot.borrow().is_some();
         kept || (Decider::acting().is_none() && self.spare_is_mine())
     }
 
@@ -1122,13 +1123,13 @@ impl Plugin {
     /// instance would pay per decision, for the measurements.
     #[doc(hidden)]
     pub fn forget_instance(&self) {
-        let _lent = self.lent_here();
+        let lent = self.lent_here();
         if self.adopt().is_some() {
             // The load's instance was this thread's to take: it is
             // forgotten as one that stood here.
             self.stand();
         }
-        *self.slot().borrow_mut() = None;
+        *lent.working.slot.borrow_mut() = None;
     }
 
     pub fn name(&self) -> &'static str {
@@ -1206,8 +1207,13 @@ impl Plugin {
         self.binder().bind()
     }
 
-    fn slot(&self) -> &RefCell<Option<Instance>> {
+    /// This thread's working place.
+    fn working(&self) -> &Working {
         self.instances.get_or_default()
+    }
+
+    fn slot(&self) -> &RefCell<Option<Instance>> {
+        &self.working().slot
     }
 
     /// This thread's latency ring.
@@ -1248,7 +1254,7 @@ impl Plugin {
     /// reaches its instance.
     fn stand(&self) {
         if Decider::acting().is_none() {
-            let standing = self.standing.get_or_default();
+            let standing = &self.working().standing;
             standing.set(Standing {
                 own: true,
                 ..standing.get()
@@ -1265,33 +1271,33 @@ impl Plugin {
     }
 
     /// Brings the kept state of the decider the calling thread acts as into
-    /// the thread's working slots, where the thread names one and does not
+    /// the thread's working place, where the thread names one and does not
     /// hold it already, and says whether it did. A decision's first open
     /// brings it and the plugin's last close of the decision gives it back;
-    /// a told event holds it for its one call. What the thread never gave
-    /// back (a close that did not return) goes back first, under another
-    /// name or under none: a thread decides on no instance but the one of
-    /// the decider it acts as.
-    fn lend(&self) -> bool {
+    /// a told event holds it for its one call. What the place never gave
+    /// back (a close that did not return, on this thread or on one that
+    /// exited and left it the place) goes back first, under another name or
+    /// under none: a thread decides on no instance but the one of the
+    /// decider it acts as.
+    fn lend(&self, working: &Working) -> bool {
+        let mut now = working.standing.get();
         let Some(decider) = Decider::acting() else {
-            // Under no name the thread acts as itself. One count says
-            // whether it holds any named decider's state, so a host that
-            // names none pays one load here.
-            if HOLDS.get() != 0 {
-                self.rest();
+            // Under no name the thread acts as itself. The mark is read in
+            // the place the slot is read in, so a host that names none pays
+            // one load here.
+            if now.lent.is_some() {
+                self.rest(working);
             }
             return false;
         };
-        let standing = self.standing.get_or_default();
-        let mut now = standing.get();
         match now.lent {
             Some(held) if held == decider => return false,
-            Some(held) => self.give_back(held),
+            Some(held) => self.give_back(working, held),
             None => {}
         }
         let mut rest = self.rest_of(decider).lock();
         let rest = rest.get_or_insert_with(Rest::new);
-        let mut slot = self.slot().borrow_mut();
+        let mut slot = working.slot.borrow_mut();
         if slot.is_some() {
             // The thread's own instance (it also decides under no name)
             // stands aside while the thread acts as the decider.
@@ -1300,33 +1306,35 @@ impl Plugin {
         *slot = rest.instance.take();
         std::mem::swap(&mut rest.ring, &mut *self.ring().borrow_mut());
         now.lent = Some(decider);
-        standing.set(now);
-        HOLDS.set(HOLDS.get() + 1);
+        working.standing.set(now);
         true
     }
 
-    /// Gives the working slots back to the named decider whose kept state
-    /// stands in them, where one does.
-    fn rest(&self) {
-        let Some(standing) = self.standing.get() else {
-            return;
-        };
-        let mut now = standing.get();
+    /// Gives the working place back to the named decider whose kept state
+    /// stands in it, where one does.
+    fn rest(&self, working: &Working) {
+        let mut now = working.standing.get();
         if let Some(held) = now.lent.take() {
-            standing.set(now);
-            self.give_back(held);
+            working.standing.set(now);
+            self.give_back(working, held);
         }
     }
 
-    /// The working slots' instance and ring go to `decider`'s rest, and the
+    /// [`Plugin::rest`] where the calling thread has a working place.
+    fn rest_here(&self) {
+        if let Some(working) = self.instances.get() {
+            self.rest(working);
+        }
+    }
+
+    /// The working place's instance and ring go to `decider`'s rest, and the
     /// thread's own come back. An instance already resting there was made by
     /// a second thread acting as the decider at the same time, against the
     /// turn's rule: it is dropped here.
-    fn give_back(&self, decider: Decider) {
-        HOLDS.set(HOLDS.get().saturating_sub(1));
+    fn give_back(&self, working: &Working, decider: Decider) {
         let mut rest = self.rest_of(decider).lock();
         let rest = rest.get_or_insert_with(Rest::new);
-        let mut slot = self.slot().borrow_mut();
+        let mut slot = working.slot.borrow_mut();
         rest.instance = slot.take();
         if let Some(aside) = self.aside.get() {
             *slot = aside.borrow_mut().take();
@@ -1334,12 +1342,18 @@ impl Plugin {
         std::mem::swap(&mut rest.ring, &mut *self.ring().borrow_mut());
     }
 
-    /// The acting decider's kept state in this thread's working slots until
+    /// The acting decider's kept state in this thread's working place until
     /// the guard drops.
     fn lent_here(&self) -> Lent<'_> {
+        self.lent_at(self.working())
+    }
+
+    /// [`Plugin::lent_here`], for a caller that has the place.
+    fn lent_at<'a>(&'a self, working: &'a Working) -> Lent<'a> {
         Lent {
             plugin: self,
-            brought: self.lend(),
+            working,
+            brought: self.lend(working),
         }
     }
 
@@ -1351,11 +1365,9 @@ impl Plugin {
     /// for it would hear what no decision reads. Such an event is dropped
     /// and counted, and the plugin's first writes its one warning.
     fn telling(&self) -> Option<Lent<'_>> {
+        let working = self.instances.get();
         if Decider::acting().is_none()
-            && !self
-                .standing
-                .get()
-                .is_some_and(|standing| standing.get().own)
+            && !working.is_some_and(|working| working.standing.get().own)
             && !self.spare_is_mine()
         {
             bump(&self.tally.events_dropped);
@@ -1369,7 +1381,7 @@ impl Plugin {
             }
             return None;
         }
-        Some(self.lent_here())
+        Some(self.lent_at(working.unwrap_or_else(|| self.working())))
     }
 
     /// The fuel of `init` when nothing clamps it.
@@ -1944,11 +1956,10 @@ impl Plugin {
     /// calling thread acts as: the thread's own where it names none and is
     /// one. A thread that only tells delivers nothing ([`Plugin::telling`]).
     fn observe(&self, event: wit::LifecycleEvent<'_>) {
-        let Some(_lent) = self.telling() else {
+        let Some(lent) = self.telling() else {
             return;
         };
-        let slot = self.slot();
-        let mut guard = slot.borrow_mut();
+        let mut guard = lent.working.slot.borrow_mut();
         let now = self.runtime.now_micros();
         if self.breaker.is_open(now) {
             return;
@@ -2281,9 +2292,9 @@ impl Bound {
         }
         // A named decider's kept state comes to this thread for the
         // decision; the plugin's last close of it gives it back.
-        plugin.lend();
-        let slot = plugin.slot();
-        let mut guard = slot.borrow_mut();
+        let working = plugin.working();
+        plugin.lend(working);
+        let mut guard = working.slot.borrow_mut();
         if guard.is_none() {
             if plugin.emptied.get_or_default().get() {
                 // An earlier open or call of this decision dropped the
@@ -2564,7 +2575,7 @@ impl Bound {
         // The decision is over for the plugin: a named decider's kept state
         // goes back to its rest, rebuilt here where the decision emptied it.
         if last {
-            plugin.rest();
+            plugin.rest_here();
         }
     }
 
