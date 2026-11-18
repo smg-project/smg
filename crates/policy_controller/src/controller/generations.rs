@@ -1616,7 +1616,7 @@ pub(crate) mod tests {
         collections::BTreeSet,
         fmt::Write as _,
         io::Write as _,
-        sync::{atomic::AtomicBool, OnceLock, Weak},
+        sync::{atomic::AtomicBool, mpsc, OnceLock, Weak},
         thread,
         time::{Duration, Instant},
     };
@@ -1624,6 +1624,8 @@ pub(crate) mod tests {
     use tokio::task::JoinSet;
 
     use super::*;
+    #[cfg(unix)]
+    use crate::controller::spec_file::tests::pipe_at;
     use crate::{
         controller::spec_store::{
             tests::{name_of, names},
@@ -4606,10 +4608,11 @@ pub(crate) mod tests {
         }
     }
 
-    /// A call holds its place until its write ends. With the door's lock
-    /// held, as a write in flight holds it, the calls that fill the places
-    /// stay in them and one more is refused; once the door is free each of
-    /// them runs and gives its place back.
+    /// A call holds its place until its write ends, and the one whose
+    /// thread started holds the turn as long. With the door's lock held, as
+    /// a write in flight holds it, the calls that fill the places stay in
+    /// them, the turn stays taken and one more call is refused; once the
+    /// door is free each of them runs and gives its place back.
     #[tokio::test]
     #[expect(
         clippy::await_holding_lock,
@@ -4629,6 +4632,15 @@ pub(crate) mod tests {
             calls.spawn(enforce(Arc::clone(&generations), n));
         }
         places_free(&generations, 0).await;
+        // The call whose thread waits on the door holds the turn: no other
+        // call's thread starts behind it, however long the door is held.
+        for _ in 0..50 {
+            assert!(
+                generations.write_turn.try_lock().is_err(),
+                "the turn was given back before the write ended"
+            );
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
         let past = enforce(Arc::clone(&generations), 0).await;
         assert!(matches!(past, Err(Unanswered::Waiting)), "{past:?}");
         assert_eq!(standing(&store).0, 0);
@@ -4657,6 +4669,49 @@ pub(crate) mod tests {
             panic!("generation 1 has no file: {gone:?}");
         };
         assert_eq!((not_held.asked, not_held.standing), (1, 2));
+    }
+
+    /// A pipe under a generation's name, with no writer, holds no start:
+    /// under the newest name it refuses the bind by that generation, and
+    /// under an older one it is not listed, as a file that is no document.
+    /// A bind runs on a thread of its own, waited five seconds, so an open
+    /// that waits fails the case.
+    #[cfg(unix)]
+    #[test]
+    fn a_pipe_under_a_generations_name_holds_no_start() {
+        let bound_in_time = |dir: &Path| {
+            let (store, generations) = generations();
+            let opened = SpecStore::open(dir.to_owned()).expect("the directory opens");
+            let (answer, answered) = mpsc::channel();
+            thread::spawn(move || {
+                let _ = answer.send(generations.bind_store(opened));
+            });
+            let bound = answered
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the bind answers: its open does not wait");
+            (bound, standing(&store).0)
+        };
+        let dir = tempfile::tempdir().expect("a temp dir");
+        pipe_at(&dir.path().join(name_of(1, "yaml")));
+
+        let (bound, runs) = bound_in_time(dir.path());
+        let refused = bound.expect_err("no regular file");
+        assert!(
+            matches!(
+                &refused,
+                StoreRefused::Rejected {
+                    generation: 1,
+                    source: SpecRejected::Unreadable(told)
+                } if told == "the path leads to no regular file"
+            ),
+            "{refused:?}"
+        );
+        assert_eq!(runs, 0);
+
+        std::fs::write(dir.path().join(name_of(2, "yaml")), LEAST_LOAD).expect("the file");
+        let (bound, runs) = bound_in_time(dir.path());
+        bound.expect("the newest runs");
+        assert_eq!(runs, 2);
     }
 
     /// A caller that leaves while its call waits for the turn writes
