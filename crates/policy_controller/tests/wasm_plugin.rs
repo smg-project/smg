@@ -4,7 +4,7 @@
 //! budget or an invalid answer drops it and counts on the breaker, the
 //! breaker bypasses, the fallbacks and the closed policy), one resource per
 //! decision and per side of a pair, the lifecycle once per engine build, and
-//! the instances kept per thread.
+//! the instances kept per decider.
 #![cfg(feature = "wasm")]
 #![expect(
     clippy::expect_used,
@@ -22,6 +22,7 @@ use std::sync::{
 
 use smg_policy_controller::{
     builtins::{Best, Healthy, LeastRequests, PowerOfTwo},
+    decider::Decider,
     plugins::OpenDecisions,
     wasm::{
         Abi, Bound, BreakerSpec, EventKind, EventSet, Failure, LoadError, Plugin, PluginSpec,
@@ -7664,4 +7665,246 @@ fn a_plugin_stages_fallback_counts_in_the_stages_needs() {
     for (bound_as, needs) in over {
         assert!(needs.affinity, "the fallback's needs, bound as {bound_as}");
     }
+}
+
+/// A named decider's kept instance is its name's, on whichever thread acts
+/// as it. Three threads act as one decider in turn: the first decides, the
+/// second is told a dispatch and decides, the third decides, and each pick
+/// names the row at the count the instance heard. A second name has an
+/// instance of its own, which heard nothing. The apply's own instance went
+/// to the first decider that needed one: the instances made are the deciders.
+#[test]
+fn a_named_deciders_instance_is_its_names_on_whichever_thread_acts_as_it() {
+    let runtime = runtime();
+    let plugin = load(
+        &runtime,
+        "named",
+        guest::record_guest(),
+        mode::COUNT_DISPATCHES,
+    );
+    let engine = plugin_engine(&plugin);
+    // One thread a call, acting as the decider of that number.
+    let acting = |number: u8, dispatch: bool| {
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let _turn = Decider::new(number).enter();
+                    if dispatch {
+                        engine.on_dispatched(
+                            &Lease::default(),
+                            &Target::default(),
+                            Side::Single,
+                            3,
+                        );
+                    }
+                    pick_ids(&decide(&engine, &pool(4), 1)).first().copied()
+                })
+                .join()
+                .expect("the acting thread")
+        })
+    };
+    assert_eq!(acting(0, false), Some(100), "nothing told yet");
+    assert_eq!(
+        acting(0, true),
+        Some(101),
+        "told on a second thread, to the instance the first decided on"
+    );
+    assert_eq!(
+        acting(0, false),
+        Some(101),
+        "and a third thread decides on it"
+    );
+    assert_eq!(
+        acting(1, false),
+        Some(100),
+        "another name's instance heard nothing"
+    );
+    let stats = plugin.stats();
+    assert_eq!(
+        (
+            stats.instantiations,
+            stats.lazy_instantiations,
+            stats.observed,
+            stats.events_dropped
+        ),
+        (2, 1, 1, 0),
+        "two deciders, two instances, the apply's own among them: {stats:?}"
+    );
+    assert!(!plugin.is_warm(), "the loading thread kept none");
+}
+
+/// A thread that decides under no name and also acts as a named decider
+/// keeps the two apart: its own instance stands aside while it acts, and is
+/// as it left it after.
+#[test]
+fn a_threads_own_instance_stands_aside_while_it_acts_as_a_named_decider() {
+    let runtime = runtime();
+    let plugin = load(
+        &runtime,
+        "aside",
+        guest::record_guest(),
+        mode::COUNT_DISPATCHES,
+    );
+    let engine = plugin_engine(&plugin);
+    let pick = || pick_ids(&decide(&engine, &pool(4), 1)).first().copied();
+    let dispatch = || engine.on_dispatched(&Lease::default(), &Target::default(), Side::Single, 3);
+    dispatch();
+    assert_eq!(pick(), Some(101), "the thread's own instance heard it");
+    {
+        let _turn = Decider::new(5).enter();
+        assert_eq!(pick(), Some(100), "the named decider's heard nothing");
+        dispatch();
+        dispatch();
+        assert_eq!(pick(), Some(102), "and hears what is told as it");
+    }
+    assert_eq!(pick(), Some(101), "the thread's own is as it left it");
+    assert_eq!(plugin.stats().instantiations, 2);
+}
+
+/// A thread that names no decider and never decided with the plugin only
+/// tells: its lease event has no instance to reach and makes none. The
+/// event is dropped and counted, and the plugin's first drop writes its one
+/// warning. The thread that loaded is told as before: the apply's instance
+/// is its own.
+#[test]
+fn a_thread_that_only_tells_makes_no_instance_and_its_events_are_dropped() {
+    let runtime = runtime();
+    let plugin = load(
+        &runtime,
+        "only-told",
+        guest::record_guest(),
+        mode::COUNT_DISPATCHES,
+    );
+    let engine = plugin_engine(&plugin);
+    let tell = || engine.on_dispatched(&Lease::default(), &Target::default(), Side::Single, 3);
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                tell();
+                tell();
+            })
+            .join()
+            .expect("the telling thread");
+    });
+    let stats = plugin.stats();
+    assert_eq!(
+        (stats.events_dropped, stats.observed, stats.instantiations),
+        (2, 0, 1),
+        "dropped, and no instance made: {stats:?}"
+    );
+    let said = warnings(plugin.name());
+    assert_eq!(
+        said.iter()
+            .filter(|line| line.contains("names no decider"))
+            .count(),
+        1,
+        "one warning a plugin, at its first drop: {said:?}"
+    );
+    tell();
+    let stats = plugin.stats();
+    assert_eq!(
+        (stats.events_dropped, stats.observed, stats.instantiations),
+        (2, 1, 1),
+        "the loading thread is told: {stats:?}"
+    );
+    assert_eq!(
+        pick_ids(&decide(&engine, &pool(4), 1)).first().copied(),
+        Some(101),
+        "and decides on the instance that heard"
+    );
+}
+
+/// A thread that decided or warmed under no name is a decider of its own:
+/// what it tells reaches the instance it decides on.
+#[test]
+fn a_thread_that_decided_or_warmed_under_no_name_hears_what_it_tells() {
+    let runtime = runtime();
+    // On a thread that did not load: the pick before the dispatch (none
+    // where the thread warmed first), the pick after it, the drops.
+    let heard_by = |name: &str, warm_first: bool| {
+        let plugin = load(
+            &runtime,
+            name,
+            guest::record_guest(),
+            mode::COUNT_DISPATCHES,
+        );
+        let engine = plugin_engine(&plugin);
+        let picks = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let pick = || pick_ids(&decide(&engine, &pool(4), 1)).first().copied();
+                    let before = if warm_first {
+                        plugin.warm().expect("it warms");
+                        None
+                    } else {
+                        pick()
+                    };
+                    engine.on_dispatched(&Lease::default(), &Target::default(), Side::Single, 3);
+                    (before, pick())
+                })
+                .join()
+                .expect("the thread")
+        });
+        (picks, plugin.stats().events_dropped)
+    };
+    assert_eq!(
+        heard_by("own-decided", false),
+        ((Some(100), Some(101)), 0),
+        "it decided first"
+    );
+    assert_eq!(
+        heard_by("own-warmed", true),
+        ((None, Some(101)), 0),
+        "it warmed first"
+    );
+}
+
+/// A pair decided as a named decider keeps the decider's instance on the
+/// thread until the plugin's last close of the decision: each side's
+/// resource is dropped on it. So two pairs decided by two threads that act
+/// as one decider use the fuel two pairs use under no name, to the unit, on
+/// one instance.
+#[test]
+fn a_named_pair_decision_keeps_its_instance_to_the_plugins_last_close() {
+    let runtime = runtime();
+    // The fuel of two pair decisions, one after the other, and the
+    // instances made: on this thread under no name, or on two threads that
+    // act as one decider in turn.
+    let two_pairs = |name: &str, named: bool| {
+        let plugin = load(&runtime, name, guest::record_guest(), mode::LEAST_IN_FLIGHT);
+        let prefill = plugin_profile(&plugin, None, None, None);
+        let decode = plugin_profile(&plugin, None, None, None);
+        let engine = pair_engine(vec![prefill, decode], 1);
+        let loaded = plugin.stats().fuel_used;
+        let pair = || {
+            let decision = pair_decide(&engine);
+            assert!(decision.pick().is_some(), "a pair pick, not {decision:?}");
+            plugin.stats().fuel_used
+        };
+        let acting = || {
+            std::thread::scope(|scope| {
+                scope
+                    .spawn(|| {
+                        let _turn = Decider::new(4).enter();
+                        pair()
+                    })
+                    .join()
+                    .expect("the acting thread")
+            })
+        };
+        let first = if named { acting() } else { pair() };
+        let second = if named { acting() } else { pair() };
+        (
+            first - loaded,
+            second - first,
+            plugin.stats().instantiations,
+        )
+    };
+    let under_no_name = two_pairs("pair-own", false);
+    assert_eq!(under_no_name.2, 1);
+    assert_eq!(
+        two_pairs("pair-named", true),
+        under_no_name,
+        "the same calls, the two destructors of each pair among them, on one instance"
+    );
 }

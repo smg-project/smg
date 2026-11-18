@@ -94,6 +94,10 @@ pub mod mode {
     /// fills it in a loop: a call of milliseconds that answers, then an
     /// endless one.
     pub const FILL_BRIEFLY_THEN_FILL: u8 = 30;
+    /// `observe` counts the dispatches told to its instance and `pick`
+    /// names the row at that count: what one instance heard, read from a
+    /// decision made on it.
+    pub const COUNT_DISPATCHES: u8 = 31;
     /// A second config byte: `init` asks the host's live clock once. An
     /// answer of zero lets it go on, of one makes it refuse, of two spin
     /// without end, of three trap at once.
@@ -351,6 +355,7 @@ fn guest_wat(guest: Guest) -> String {
   (table $t 1 funcref)
   (global $heap (mut i32) (i32.const 1024))
   (global $mode (mut i32) (i32.const 0))
+  (global $heard (mut i32) (i32.const 0))
   (data (i32.const 16) "refused")
   (data (i32.const 32) "observed")
 
@@ -553,6 +558,11 @@ fn guest_wat(guest: Guest) -> String {
       (then
         (i32.store8 offset=4 (local.get $r) (i32.const 0))
         (return (local.get $r))))
+    (if (i32.eq (global.get $mode) (i32.const {count_dispatches}))
+      (then
+        (i32.store8 offset=4 (local.get $r) (i32.const 1))
+        (i32.store offset=8 (local.get $r) (global.get $heard))
+        (return (local.get $r))))
     (local.set $i (i32.const 0))
     (local.set $found (i32.const 0))
     (local.set $top (f32.const -2))
@@ -587,6 +597,9 @@ fn guest_wat(guest: Guest) -> String {
   ;; sixth value is the lease's session key on every lease-bearing case.
   (func (export "{iface}#observe") (param i32 i64 i64 i64 i32 i64 i64 i32 i64 i64 i32 i64 i32 i32 i32 i32)
     (if (i32.eq (global.get $mode) (i32.const {trap_in_observe})) (then unreachable))
+    ;; A dispatch is the outer case 1 of the event: counted on this instance.
+    (if (i32.eq (local.get 0) (i32.const 1))
+      (then (global.set $heard (i32.add (global.get $heard) (i32.const 1)))))
     (call $counter (i32.const 0) (i64.const 1))
     (call $counter (i32.const 3) (call $now))
     (call $counter (i32.const 4) (local.get 6))
@@ -646,6 +659,7 @@ fn guest_wat(guest: Guest) -> String {
         log_then_burn = mode::LOG_THEN_BURN,
         log_then_decline = mode::LOG_THEN_DECLINE,
         fill_briefly = mode::FILL_BRIEFLY_THEN_FILL,
+        count_dispatches = mode::COUNT_DISPATCHES,
     )
 }
 

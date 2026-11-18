@@ -16,10 +16,18 @@
 //! functions: a rate-limited log with a level cap, the decision's clock, the
 //! counters the spec declared, and a draw from the decision's seed.
 //!
-//! How a module runs: one instance per module per deciding thread, created
-//! at apply ([`Plugin::warm`] on every shard thread; a thread that was not
-//! warmed instantiates at its first decision and the plugin counts it) and
-//! kept. Each profile that binds the plugin holds one [`Bound`] set, taken
+//! How a module runs: one instance per module per decider, created at apply
+//! ([`Plugin::warm`] as every decider; one that was not warmed instantiates
+//! at its first decision and the plugin counts it) and kept. A decider is a
+//! thread that decides, or the name a host gives one of its deciders
+//! ([`Decider`](crate::decider::Decider)): a named decider's instance rests
+//! with the name and is brought to the thread that acts as it, for a
+//! decision or a told event, so it is one instance whichever thread holds
+//! the decider's turn. The apply's own instance goes to the first decider
+//! that needs one. A thread that names no decider and never decided with the
+//! plugin only tells: its lifecycle events reach no instance and make none
+//! ([`Stats::events_dropped`]). Each profile that binds the plugin holds one
+//! [`Bound`] set, taken
 //! from its engine build's [`Binder`] (one adapter of a build forwards the
 //! lifecycle, so an event reaches the plugin once per engine); the
 //! engine opens it once per decision over the profile's view (a pair
@@ -118,11 +126,11 @@
 //!
 //! What a module hears: `observe` is called with the kinds of lifecycle
 //! event the plugin's row lists ([`PluginSpec::observes`]), none by default,
-//! on the thread that tells the event and on that thread's instance. A row
-//! that lists none is never told: no call is made, and a thread that only
-//! tells makes no instance. A row that lists any has its plugin's scorer
-//! and picker say they need the lifecycle's calls
-//! ([`crate::Lifecycle::needs_lifecycle`]), so a host that makes none
+//! on the thread that tells the event and on the instance of the decider
+//! that thread acts as. A row that lists none is never told: no call is
+//! made, and a thread that only tells makes no instance. A row that lists
+//! any has its plugin's scorer and picker say they need the lifecycle's
+//! calls ([`crate::Lifecycle::needs_lifecycle`]), so a host that makes none
 //! refuses them.
 //!
 //! What a failure does: a `decline` falls back to the stage's configured
