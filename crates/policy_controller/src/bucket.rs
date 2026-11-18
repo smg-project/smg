@@ -60,7 +60,7 @@ use std::{cmp::Ordering, collections::VecDeque, sync::Arc, time::Instant};
 
 use arc_swap::ArcSwap;
 use parking_lot::Mutex;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::{
     decision::Decision,
@@ -471,12 +471,12 @@ impl Pool {
         }
     }
 
-    /// The listed workers `ids` does not name.
-    fn unnamed(&self, ids: &[WorkerId]) -> Vec<WorkerId> {
+    /// The listed workers `stays`, a snapshot's names, leaves out.
+    fn unnamed(&self, stays: &FxHashSet<WorkerId>) -> Vec<WorkerId> {
         self.members
             .iter()
             .map(|member| member.id)
-            .filter(|id| !ids.contains(id))
+            .filter(|id| !stays.contains(id))
             .collect()
     }
 
@@ -657,6 +657,12 @@ impl Lifecycle for Bucket {
         // partition forgets it, so no decision finds it unlisted and
         // unfenced, and a worker the feed names is admitted at once.
         let now = Instant::now();
+        // A snapshot's names as a set, built once: its word's pass and each
+        // partition's ask it of every worker they list.
+        let stays: FxHashSet<WorkerId> = match *change {
+            Membership::Snapshot(ids) => ids.iter().copied().collect(),
+            _ => FxHashSet::default(),
+        };
         match *change {
             Membership::Added(id) => self.fence.lock().admit(id),
             Membership::Removed(id) => self.fence.lock().retire(id, now),
@@ -670,18 +676,23 @@ impl Lifecycle for Bucket {
                 // and it leaves out are its leavers, fenced here, before
                 // the walk reads the table: a partition a decision makes
                 // behind that read lists none of them, and neither does
-                // one the walk has passed.
-                let listed = self.listed.load();
+                // one the walk has passed. The leavers are read before the
+                // fence is taken: every decision that lists waits on it.
+                let leavers: Vec<WorkerId> = self
+                    .listed
+                    .load()
+                    .keys()
+                    .copied()
+                    .filter(|id| !stays.contains(id))
+                    .collect();
                 let mut fence = self.fence.lock();
                 if !fence.is_empty() {
                     for &id in ids {
                         fence.admit(id);
                     }
                 }
-                for &id in listed.keys() {
-                    if !ids.contains(&id) {
-                        fence.retire(id, now);
-                    }
+                for id in leavers {
+                    fence.retire(id, now);
                 }
             }
             Membership::Relabelled(_) | Membership::Resized(_) => {}
@@ -695,12 +706,12 @@ impl Lifecycle for Bucket {
                     false
                 }
                 Membership::Replaced { old, new } => pool.rename(old, new),
-                Membership::Snapshot(ids) => {
+                Membership::Snapshot(_) => {
                     // The workers the snapshot does not name leave. The
                     // fence holds those the index listed at the word; one
                     // a decision was listing then is fenced here, before
                     // its partition forgets it.
-                    let gone = pool.unnamed(ids);
+                    let gone = pool.unnamed(&stays);
                     if !gone.is_empty() {
                         let mut fence = self.fence.lock();
                         for &id in &gone {
