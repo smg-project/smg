@@ -770,10 +770,12 @@ async fn a_present_gateway_is_answered_which_worker_on_its_decide_stream() {
 }
 
 /// A worker added through the control listener is decided for a present
-/// gateway within the store's window, with no ask for a build anywhere: the
-/// store wakes the served controller's own loop, whose tick is seconds away.
+/// gateway with no ask for a build anywhere: the served controller's own
+/// loop pays the build the registration owes. Its tick alone pays inside
+/// this case's bound, so the wake that pays at the window's end is held by
+/// the loop's own case, under paused time.
 #[tokio::test]
-async fn a_worker_added_over_the_wire_is_decided_before_the_loops_next_tick() {
+async fn a_worker_added_over_the_wire_is_decided_with_no_ask_for_a_build() {
     use smg_policy_controller::proto::{
         register_worker_request::Mode, worker_event::Event, RegisterWorkerRequest, WireMode,
         WorkerSpec,
@@ -849,7 +851,7 @@ async fn a_worker_added_over_the_wire_is_decided_before_the_loops_next_tick() {
             .into_inner();
 
         // The add, then its status at the store's door. No call asks for a
-        // build, and the loop's next tick is the poll interval away.
+        // build: the served loop pays it.
         let builds = store.membership_builds();
         let request = RegisterWorkerRequest {
             spec: Some(WorkerSpec {
