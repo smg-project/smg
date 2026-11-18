@@ -6,7 +6,7 @@ use crate::store::{EncodeHandoff, EncodeOffer};
 
 /// A worker of the model, of one known runtime, that states `offer` as its
 /// end of the encode handoff.
-fn encode_facts(key: &str, role: Role, offer: EncodeOffer) -> WorkerFacts {
+pub(super) fn encode_facts(key: &str, role: Role, offer: EncodeOffer) -> WorkerFacts {
     WorkerFacts {
         engine_kind: "rt-a".to_string(),
         encode: offer,
@@ -15,12 +15,13 @@ fn encode_facts(key: &str, role: Role, offer: EncodeOffer) -> WorkerFacts {
 }
 
 /// The end of a worker that pushes, or takes a push, on `connector`.
-fn push_on(connector: &str) -> EncodeOffer {
+pub(super) fn push_on(connector: &str) -> EncodeOffer {
     EncodeOffer {
         handoff: EncodeHandoff::Push,
         producer: true,
         consumer: true,
         connector: Some(connector.to_string()),
+        ..EncodeOffer::default()
     }
 }
 

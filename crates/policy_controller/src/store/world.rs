@@ -97,7 +97,7 @@ use crate::{
     framework::{OverloadThresholds, PairPools, PairTable},
     spec::{AppliedSpec, Listed, Pairing},
     store::{
-        encoding::{EncodeClasses, EncodeMember},
+        encoding::{EncodeClasses, EncodeHandoff, EncodeMember},
         index::{KvTables, Named, PoolIndex, Reading},
         leases::{Counts, Slot},
         loads::LoadSample,
@@ -109,6 +109,7 @@ use crate::{
         fingerprint, AffinityFacts, Candidate, Health, OverloadRegime, Phase, PoolFacts, Role,
         WireModes, WorkerId,
     },
+    EncodePool, EncoderFacts,
 };
 
 #[cfg(test)]
@@ -231,6 +232,40 @@ impl PairBuffers {
     }
 }
 
+/// The buffers a host keeps across the decisions of requests that carry
+/// encode items: a pair's buffers, the encode pool's view and the two
+/// columns the encode side reads, all of one publication
+/// ([`World::build_encode_pair`]).
+///
+/// An encode class is numbered for the publication that holds it, as a pair
+/// class is for its table. So nothing here is read apart:
+/// [`EncodePairBuffers::pools`] hands the engine's entry all of it.
+#[derive(Debug, Default)]
+pub struct EncodePairBuffers {
+    pair: PairBuffers,
+    /// The encode pool's view.
+    encode: ViewBuffers,
+    /// Each encoder's facts: one entry a row of the encode view.
+    facts: Vec<EncoderFacts>,
+    /// The encode class each row of the prefill view names.
+    prefill_classes: Vec<u32>,
+}
+
+impl EncodePairBuffers {
+    /// What the engine's encode-pair entry reads: the pair's pools with
+    /// their table, and the encode pool with its columns, of the
+    /// publication the rows were built from.
+    pub fn pools(&self) -> (PairPools<'_>, EncodePool<'_>) {
+        let encode = EncodePool {
+            encoders: &self.encode.candidates,
+            facts: &self.facts,
+            prefill_classes: &self.prefill_classes,
+            affinity: &self.encode.affinity,
+        };
+        (self.pair.pools(), encode)
+    }
+}
+
 /// What a build read beside the rows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Built {
@@ -322,6 +357,10 @@ struct PoolShape {
     /// items reads its chosen prefill's class beside the pool it chose in.
     /// Counted and carried as the pair classes are.
     encodes: Option<Arc<EncodeClasses>>,
+    /// On an encode pool: what a decision reads of each encoder beside its
+    /// row, in the rows' order, counted and carried as the classes are.
+    /// `None` on every other pool.
+    encoders: Option<Arc<[EncoderFacts]>>,
 }
 
 /// The roles a model's pools are derived for: one slot each.
@@ -367,10 +406,15 @@ struct Derived {
 }
 
 impl Derived {
+    /// The shape of `model`'s pool of `role`.
+    fn shape(&self, model: &str, role: Role) -> Option<&PoolShape> {
+        let pool = self.by_model.get(model)?[role_slot(role)]?;
+        self.pools.get(pool as usize)
+    }
+
     /// The shape of `model`'s prefill pool: the model's classes stand on it.
     fn prefill(&self, model: &str) -> Option<&PoolShape> {
-        let prefill = self.by_model.get(model)?[role_slot(Role::Prefill)]?;
-        self.pools.get(prefill as usize)
+        self.shape(model, Role::Prefill)
     }
 
     /// The pair classes of `model`, where it has a prefill and a decode.
@@ -840,8 +884,8 @@ impl World {
     ///
     /// What no fact of the store feeds yet reads as the row's default: the
     /// two session counts, the two admission bits, the breaker
-    /// bit, the four positions into declared lists, the
-    /// vision and encode bits, and the column's four index facts. The
+    /// bit, the four positions into declared lists, the encode bit, and the
+    /// column's four index facts. The
     /// healthy bit is the status alone: the health sink's precedence rule
     /// (a gateway's completed dispatches against the prober) is not
     /// applied here yet.
@@ -1060,6 +1104,62 @@ impl World {
         built
     }
 
+    /// Build one decision's pair and its encode pool into `out`: the two
+    /// pools and the table of [`World::build_pair`], the model's encode
+    /// pool, the encode class each prefill names and each encoder's facts,
+    /// all as this publication holds them. A class's number is read here
+    /// beside the rows it names and leaves with them through
+    /// [`EncodePairBuffers::pools`], never apart.
+    ///
+    /// The columns follow the rows: a row left out of the asking gateway's
+    /// view, another gateway's host-local worker, takes its entry with it.
+    /// A model with no encoder builds an empty encode pool, and a model
+    /// whose encoders state no end names class `0` on every row. `None`,
+    /// with every buffer cleared, when either side of the pair has no
+    /// member. The pair is built by the pair's door as it stands; the
+    /// encode side looks the model up once more.
+    pub fn build_encode_pair(
+        &self,
+        model: &str,
+        ask: &Ask,
+        out: &mut EncodePairBuffers,
+    ) -> Option<(Built, Built)> {
+        out.encode.candidates.clear();
+        out.encode.affinity.clear();
+        out.facts.clear();
+        out.prefill_classes.clear();
+        let pair = self.build_pair(model, ask, &mut out.pair);
+        // `None`: the pair's door cleared its buffers, and the encode side's
+        // are clear already.
+        let built = pair?;
+        // The pair was built, so the index names the model and its pools.
+        let pools = self.derived.by_model.get(model);
+        let shape_of = |role: Role| {
+            let at = pools?[role_slot(role)]? as usize;
+            Some((at, self.derived.pools.get(at)?))
+        };
+        let classes =
+            shape_of(Role::Prefill).and_then(|(_, shape)| Some((shape, shape.encodes.as_deref()?)));
+        match classes {
+            Some((shape, classes)) => {
+                let named = classes.prefills();
+                for (from, to) in Segments::of(&shape.locals, ask.gateway, named.len()) {
+                    out.prefill_classes.extend_from_slice(&named[from..to]);
+                }
+            }
+            None => out.prefill_classes.resize(built.0.pool_size as usize, 0),
+        }
+        if let Some((encode, shape)) = shape_of(Role::Encode) {
+            if self.build_at(encode, ask, &mut out.encode).is_some() {
+                let stated = shape.encoders.as_deref().unwrap_or(&[]);
+                for (from, to) in Segments::of(&shape.locals, ask.gateway, stated.len()) {
+                    out.facts.extend_from_slice(&stated[from..to]);
+                }
+            }
+        }
+        Some(built)
+    }
+
     /// Name the rows the affinity stages read in the column's place
     /// ([`NamedAffinity`](crate::NamedAffinity)) for `view`, the rows a
     /// decision of `model` in `role` is made over: the pool's as
@@ -1254,6 +1354,7 @@ fn row_of(
         load: sample.map(|sample| sample.row),
         load_sampled_at_micros: sample.map_or(0, |sample| micros(origin, sample.sampled_at)),
         host_local: facts.reachable_from != Reachability::Any,
+        vision: facts.vision,
         // The low 32 bits of the registration key's fingerprint.
         key: fingerprint(facts.key.as_bytes()) as u32,
         engine_kind: listed.engine_kind,
@@ -1457,6 +1558,42 @@ fn encode_up(
         prefills.iter().map(encode_member),
     );
     (classes.classes() != 0).then(|| Arc::new(classes))
+}
+
+/// What a decision reads of each encoder beside its row, in the rows'
+/// order: its class among `classes`, `0` where it states no end or the
+/// model has no class; whether its registration states a push, with its
+/// role or without; and whether it takes an item's references. They are
+/// what the last write left on the model's encode pool (`kept`) where this
+/// write moved no member and no offer ([`Classes::Carry`]), and `None`
+/// where the model has no encoder.
+fn encoder_facts(
+    encoders: &[Entry<'_>],
+    classes: Option<&EncodeClasses>,
+    kept: Option<&PoolShape>,
+) -> Option<Arc<[EncoderFacts]>> {
+    if let Some(kept) = kept {
+        debug_assert!(
+            kept.encoders
+                .iter()
+                .all(|stated| stated.len() == encoders.len()),
+            "the facts are these members'"
+        );
+        return kept.encoders.clone();
+    }
+    if encoders.is_empty() {
+        return None;
+    }
+    let classed = classes.map_or(&[][..], EncodeClasses::encoders);
+    let stated = encoders.iter().enumerate().map(|(at, entry)| {
+        let offer = &entry.facts.encode;
+        EncoderFacts {
+            class: classed.get(at).copied().unwrap_or(0),
+            pushes: offer.handoff == EncodeHandoff::Push,
+            references: offer.references,
+        }
+    });
+    Some(stated.collect())
 }
 
 /// One member's row in one pool of the writer's working copy.
@@ -2395,6 +2532,15 @@ impl Writer {
                 Classes::Derive | Classes::Written { .. } => None,
             };
             let mut encodes = encode_up(&sides, kept);
+            // The encoders' facts are carried as the encode classes are.
+            let kept = match classes {
+                Classes::Carry => last
+                    .as_deref()
+                    .and_then(|last| last.shape(&model, Role::Encode)),
+                Classes::Derive | Classes::Written { .. } => None,
+            };
+            let mut stated =
+                encoder_facts(&sides[role_slot(Role::Encode)], encodes.as_deref(), kept);
             let mut indexes = [None; ROLES];
             for (side, entries) in sides.into_iter().enumerate() {
                 if entries.is_empty() {
@@ -2431,6 +2577,11 @@ impl Writer {
                     },
                     encodes: if side == role_slot(Role::Prefill) {
                         encodes.take()
+                    } else {
+                        None
+                    },
+                    encoders: if side == role_slot(Role::Encode) {
+                        stated.take()
                     } else {
                         None
                     },

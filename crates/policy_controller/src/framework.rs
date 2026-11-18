@@ -22,8 +22,10 @@ use crate::{
     Draw,
 };
 
+mod encode;
 mod vetoed;
 
+pub use encode::{EncodeItems, EncodePlaced, EncodePool, EncoderFacts};
 use vetoed::AllVetoed;
 
 /// Drops candidates before scoring. A `soft` filter steps aside when it would
@@ -660,6 +662,9 @@ pub struct Scratch {
     /// decode the decode profile keeps, then the ones the routable prefills
     /// pair with.
     marks: ClassBits,
+    /// The encode side of an encode-pair decision, boxed: the entry moves
+    /// one pointer out of the scratch while the pair entry holds the rest.
+    encode: Option<Box<encode::EncodeScratch>>,
 }
 
 /// The buffers of one profile run: the survivors, the combined scores of the
@@ -708,7 +713,8 @@ impl Scratch {
     }
 }
 
-/// A set of a pair table's decode classes: one bit a class number.
+/// A set of class numbers, a pair table's decode classes or a pool's encode
+/// classes: one bit a number.
 #[derive(Debug, Default)]
 struct ClassBits {
     words: Vec<u64>,
@@ -722,7 +728,7 @@ impl ClassBits {
     }
 
     /// Adds `class` and says whether the set holds it. A number the set was
-    /// not sized for is no class of the table and is left out.
+    /// not sized for is left out: what it means is each caller's to say.
     fn insert(&mut self, class: u32) -> bool {
         let Some(word) = self.words.get_mut(class as usize / 64) else {
             return false;
@@ -2466,6 +2472,7 @@ impl<'a> PairTable<'a> {
             classes.dedup();
             return;
         }
+        // A number above the table's width is no class of the table.
         marks.reset(self.width());
         let mut any = false;
         for class in open {
