@@ -63,6 +63,15 @@
 //! `--bench` is a test too, as criterion reads one: `cargo bench` passes
 //! `--bench`, and a test of every target passes neither.
 //!
+//! Every row runs on the allocator the binary registers, under a copy of
+//! its settings (`MALLOC_CONF`). A served decision's frame holds lists
+//! made on a deciding thread and freed on a stream's, and what a list
+//! freed on another thread costs is the allocator's own: over the
+//! system's a row reads a rate the binary does not serve. Two runs of one
+//! count cell are some tens of thousands of instructions apart under it,
+//! whatever their length: a decision's instructions are read by the
+//! difference of two lengths, as above, never from one run.
+//!
 //! The process installs a tracing subscriber that takes nothing, as the
 //! binary installs one of its own: with none, each span of the transport
 //! takes the tracing crate's log path, a cost no served controller pays.
@@ -72,11 +81,11 @@
 )]
 #![expect(
     unsafe_code,
-    reason = "a counting global allocator is the only way to see what a decision allocated"
+    reason = "a counting global allocator is the only way to see what a decision allocated, and the allocator reads its settings from an exported symbol"
 )]
 
 use std::{
-    alloc::{GlobalAlloc, Layout, System},
+    alloc::{GlobalAlloc, Layout},
     env, fs,
     hint::black_box,
     io::{self, Write},
@@ -117,7 +126,34 @@ static COUNTING: AtomicBool = AtomicBool::new(false);
 /// The allocation and reallocation calls of every thread while it counts.
 static CALLS: AtomicU64 = AtomicU64::new(0);
 
-/// The system allocator, counting its calls while [`COUNTING`] is on. The
+/// The allocator every row runs on: the one the binary registers
+/// (`src/bin/smg-policy-controller.rs`), on the targets it registers it. A
+/// served decision's lists are made on one thread and freed on another,
+/// and what that costs is the allocator's: a row read over another one is
+/// not the binary's row.
+#[cfg(all(not(target_env = "msvc"), not(target_env = "musl")))]
+static SHIPPED: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+/// The system allocator, on a target where the binary registers none.
+#[cfg(any(target_env = "msvc", target_env = "musl"))]
+static SHIPPED: std::alloc::System = std::alloc::System;
+
+/// The shipped allocator's settings, in the symbol it reads them from as
+/// it starts: a copy of the binary's line, which a bench cannot import. A
+/// case reads both sources by path (`tests/binary.rs`): the copy moves
+/// with the binary's, or that case fails. An Apple target keeps the
+/// allocator's own settings: it compiles no background thread there, and
+/// no row read there is the binary's.
+#[cfg(all(
+    not(target_env = "msvc"),
+    not(target_env = "musl"),
+    not(target_vendor = "apple")
+))]
+#[export_name = "_rjem_malloc_conf"]
+pub static MALLOC_CONF: &[u8; 100] =
+    b"background_thread:true,dirty_decay_ms:10000,muzzy_decay_ms:0,narenas:16,oversize_threshold:33554432\0";
+
+/// The shipped allocator, counting its calls while [`COUNTING`] is on. The
 /// rows that read time pay one read of a flag nobody writes.
 struct Counted;
 
@@ -130,25 +166,25 @@ fn count_call() {
 unsafe impl GlobalAlloc for Counted {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         count_call();
-        // SAFETY: the caller's layout contract, forwarded to the system allocator.
-        unsafe { System.alloc(layout) }
+        // SAFETY: the caller's layout contract, forwarded to the shipped allocator.
+        unsafe { SHIPPED.alloc(layout) }
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         count_call();
-        // SAFETY: the caller's layout contract, forwarded to the system allocator.
-        unsafe { System.alloc_zeroed(layout) }
+        // SAFETY: the caller's layout contract, forwarded to the shipped allocator.
+        unsafe { SHIPPED.alloc_zeroed(layout) }
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         // SAFETY: `ptr` came from this allocator with this layout.
-        unsafe { System.dealloc(ptr, layout) }
+        unsafe { SHIPPED.dealloc(ptr, layout) }
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         count_call();
         // SAFETY: `ptr` came from this allocator with this layout; the caller upholds `new_size`.
-        unsafe { System.realloc(ptr, layout, new_size) }
+        unsafe { SHIPPED.realloc(ptr, layout, new_size) }
     }
 }
 
