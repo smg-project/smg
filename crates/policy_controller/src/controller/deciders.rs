@@ -378,7 +378,7 @@ impl Deciders {
         let queues = (0..deciders.max(1))
             .map(|index| {
                 let (queue, jobs) = sync_channel(depth.max(1));
-                let decider = Decider {
+                let decider = Deciding {
                     reads: reads.clone(),
                     buffers: Buffers::default(),
                     faulted: false,
@@ -486,7 +486,7 @@ fn watched(
 }
 
 /// One deciding thread.
-struct Decider {
+struct Deciding {
     reads: Reads,
     buffers: Buffers,
     /// The last decision panicked: a streak of them writes one line.
@@ -500,7 +500,7 @@ struct Decider {
     mark: Arc<Mark>,
 }
 
-impl Decider {
+impl Deciding {
     /// Decides until the last handle of the queue is dropped.
     fn run(mut self, jobs: &Receiver<Job>) {
         while let Ok(job) = jobs.recv() {
@@ -1269,7 +1269,7 @@ pub(crate) mod tests {
     };
 
     use super::{
-        cut_reach, hand, narrow, watched, Buffers, Clock, Counts, Decider, Deciders, Job, Part,
+        cut_reach, hand, narrow, watched, Buffers, Clock, Counts, Deciders, Deciding, Job, Part,
         Reads, Refused, Taken, PARTS, TERM_MARK,
     };
     use crate::{
@@ -3729,7 +3729,7 @@ pub(crate) mod tests {
         let fault = || [Step::At(Duration::ZERO), Step::Panic];
         let steps = fault().into_iter().chain(fault()).chain(fault());
         let bed = bed(Some(preset("random", 1)), true, (1, 8), steps);
-        let mut decider = Decider {
+        let mut decider = Deciding {
             reads: bed.reads.clone(),
             buffers: Buffers::default(),
             faulted: false,
@@ -3751,7 +3751,7 @@ pub(crate) mod tests {
             text.matches("a decision panicked").count()
         };
         tracing::subscriber::with_default(subscriber, || {
-            let ask = |decider: &mut Decider, id| {
+            let ask = |decider: &mut Deciding, id| {
                 let handed = decider.answer(checked(frame(id, 1)), GATEWAY, bed.script.taken);
                 handed.frame()
             };
