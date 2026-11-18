@@ -875,8 +875,11 @@ impl ClassBits {
 }
 
 /// Combined scores of the rows in `kept`, written into `scores`; the
-/// profile's tie band comes back. Inlined into its two callers, as it was
-/// into its one before a draw's rows were scored too.
+/// profile's tie band comes back. A profile's one stage, where its share
+/// is the whole sum, writes into `scores` itself, and its values and band
+/// are brought to the sum's own terms where they stand. Inlined into its
+/// two callers, as it was into its one before a draw's rows were scored
+/// too.
 #[inline(always)]
 fn combine(
     profile: &Profile,
@@ -890,6 +893,24 @@ fn combine(
     scores.resize(kept.len(), 0.0);
     if profile.scorers.is_empty() {
         return TieBand::NORMALIZED;
+    }
+    if let [weighted] = profile.scorers.as_slice() {
+        // One stage whose share is the whole sum writes the scores where
+        // they stand: each value and the band are the sum's own terms, a
+        // zero plus the stage's clamped value.
+        let weight = weighted.weight;
+        if weight > 0.0 && weight * (1.0 / weight) == 1.0 {
+            let stage_band = weighted.scorer.score(facts, candidates, kept, scores);
+            debug_assert!(
+                bandless(weighted, stage_band),
+                "{} orders nothing and returned a band",
+                weighted.scorer.name()
+            );
+            for sum in scores.iter_mut() {
+                *sum = 0.0 + sum.clamp(0.0, 1.0);
+            }
+            return TieBand(0.0 + stage_band.0.clamp(0.0, 1.0));
+        }
     }
     let total: f32 = profile.scorers.iter().map(|w| w.weight).sum();
     let norm = if total > 0.0 { 1.0 / total } else { 1.0 };
@@ -7595,6 +7616,69 @@ mod tests {
         assert!(scores
             .iter()
             .all(|&s| (s - (0.75 * 0.5 + 0.25)).abs() < 1e-6));
+    }
+
+    /// A profile of one stage whose share is the whole sum has that stage
+    /// write the scores where they stand, and each value and the band are
+    /// still the sum's own terms, bit for bit: a value past either end is
+    /// brought in, a negative zero reads as zero, and a weight whose share
+    /// of itself does not round to one scores through the sum.
+    #[test]
+    fn a_profile_of_one_stage_scores_as_the_sum_scores_it() {
+        /// The values a stage may write, some outside a score's range.
+        const GIVEN: [f32; 5] = [-0.0, 1.5, -3.0, 0.25, 1.0];
+        /// A scorer that writes [`GIVEN`] under a band outside the range.
+        #[derive(Debug)]
+        struct Given;
+        impl Lifecycle for Given {}
+        impl Scorer for Given {
+            fn name(&self) -> &'static str {
+                "given"
+            }
+            fn score(
+                &self,
+                _: &RequestFacts<'_>,
+                _: &[Candidate],
+                _: &[u32],
+                out: &mut [f32],
+            ) -> TieBand {
+                out.copy_from_slice(&GIVEN);
+                TieBand(2.0)
+            }
+        }
+        let pool: Vec<Candidate> = (0..5).map(|id| candidate(id, 1)).collect();
+        let kept = [0u32, 1, 2, 3, 4];
+        for weight in [1.0f32, 3.0, 41.0] {
+            let profile = Profile {
+                name: "one".into(),
+                filters: vec![],
+                scorers: vec![Weighted {
+                    scorer: Box::new(Given),
+                    weight,
+                }],
+                picker: Box::new(Best),
+            };
+            let (mut scores, mut stage) = (Vec::new(), Vec::new());
+            let band = combine(
+                &profile,
+                &RequestFacts::default(),
+                &pool,
+                &kept,
+                &mut scores,
+                &mut stage,
+            );
+            // The sum's own terms: a zero plus the stage's share of the
+            // value brought into range.
+            let share = weight * (1.0 / weight);
+            let term = |value: f32| (0.0 + share * value.clamp(0.0, 1.0)).to_bits();
+            let written: Vec<u32> = scores.iter().map(|score| score.to_bits()).collect();
+            let summed: Vec<u32> = GIVEN.iter().map(|&value| term(value)).collect();
+            assert_eq!(written, summed, "weight {weight}");
+            assert_eq!(band.0.to_bits(), term(2.0), "weight {weight}");
+        }
+        // The weights stand on both sides: the share of 41 is not one.
+        assert_eq!(3.0f32 * (1.0 / 3.0f32), 1.0);
+        assert_ne!(41.0f32 * (1.0 / 41.0f32), 1.0);
     }
 
     const SESSIONS: SessionRule = SessionRule {
