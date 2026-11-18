@@ -387,7 +387,8 @@ impl MemoryStore {
         let mut leases = self.turn();
         if cut.at.term > leases.term {
             leases.term = cut.at.term;
-            self.blocks.rise(cut.at.term);
+            let on_file = leases.records.keys().map(|&(_, lease)| lease);
+            self.blocks.rise(cut.at.term, on_file);
         }
         for (record, by) in leases.empty() {
             let said = Said::Released(None, ReleaseReason::WorkerRemoved);
@@ -586,7 +587,8 @@ impl MemoryStore {
         }
         if at.term > leases.term {
             leases.term = at.term;
-            self.blocks.rise(at.term);
+            let on_file = leases.records.keys().map(|&(_, lease)| lease);
+            self.blocks.rise(at.term, on_file);
         }
     }
 
@@ -2590,6 +2592,13 @@ impl MemoryStore {
         leases.minted = self.blocks.spend(leases.term, left, Self::FILE);
     }
 
+    /// The terms whose tables the blocks keep, the newest first: one file
+    /// names every id, so no door tells them.
+    #[cfg(test)]
+    pub(crate) fn kept_terms(&self) -> Vec<u64> {
+        self.blocks.kept_terms()
+    }
+
     /// The places of the deadline queue: no door tells its length.
     #[cfg(test)]
     pub(crate) fn queued(&self) -> usize {
@@ -2676,7 +2685,8 @@ impl LeasesStore for MemoryStore {
         let mut leases = self.turn();
         if term > leases.term {
             leases.term = term;
-            self.blocks.rise(term);
+            let on_file = leases.records.keys().map(|&(_, lease)| lease);
+            self.blocks.rise(term, on_file);
             if let Some(journal) = &self.journal {
                 journal.term_rose(term);
             }

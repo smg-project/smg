@@ -2290,6 +2290,37 @@ fn the_store_mints_a_decisions_lease_under_its_own_term_alone() {
     assert_eq!(decided(1 << 31), Err(wide));
 }
 
+/// A rise of the store's term hands the blocks the ids on file: the term a
+/// lease was issued under keeps its table through the rises past it, and
+/// the table goes at the first rise behind the lease's end. One file names
+/// every id either way, so the kept terms are read through a test's door.
+#[test]
+fn a_rise_keeps_the_table_of_a_term_whose_lease_is_on_file() {
+    let store = MemoryStore::new();
+    let a = ready(&store, "http://a:1");
+    let leases: &dyn LeasesStore = &store;
+    let (gateway, now) = (GatewayId(1), Instant::now());
+    leases.set_term(3);
+    let record = LeaseRecord {
+        term: 3,
+        ..booking(gateway, 0, a, now)
+    };
+    let booked = store.world().booked_of(a);
+    let issued = store.issue_decided(record, booked, |_| ());
+    issued.expect("minted under the store's term");
+    leases.set_term(4);
+    assert_eq!(store.kept_terms(), [3], "a lease of the term is on file");
+    leases.set_term(5);
+    assert_eq!(store.kept_terms(), [3], "through the rises that follow");
+    assert_eq!(leases.drop_gateways(&[gateway]), [1]);
+    assert_eq!(store.kept_terms(), [3], "until the next rise");
+    leases.set_term(6);
+    assert!(
+        store.kept_terms().is_empty(),
+        "the first rise behind its end"
+    );
+}
+
 thread_local! {
     /// What the store told of leases on this thread, in the order told.
     static TOLD: RefCell<Vec<(LeaseRecord, Said)>> = const { RefCell::new(Vec::new()) };
