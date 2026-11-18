@@ -668,7 +668,11 @@ pub struct Scratch {
 
 /// The buffers of one profile run: the survivors, the combined scores of the
 /// set the picker compares, one scorer's stage and the survivors a soft
-/// filter restores when it would leave nothing. A pair decision keeps the
+/// filter restores when it would leave nothing. A decision by rank lends
+/// two of them more ([`combine_ranked`]): the stage's buffer holds the sums
+/// of the rows in front behind a stage's scores of them, and the soft
+/// filter's backup holds their list, which keeps its length from one
+/// decision to the next. A pair decision keeps the
 /// prefill's apart from the decode side's, so the prefill's survivors stay
 /// for the next prefill target.
 #[derive(Debug, Default)]
@@ -682,13 +686,12 @@ struct Buffers {
 }
 
 impl Buffers {
-    /// Room in every buffer for the whole pass over a pool of `rows`, and
-    /// for the sums of the rows a rank puts in front, which stand behind
-    /// the rows' own ([`combine_few`]): at most half as many again. A
+    /// Room in every buffer for the whole pass over a pool of `rows`. A
     /// decision that draws first writes a few rows and asks for the room
     /// all the same: the pass it widens to may be many decisions away, and
-    /// it allocates nothing the thread's first decision did not. So does a
-    /// decision that puts no row in front.
+    /// it allocates nothing the thread's first decision did not. A decision
+    /// by rank asks for no more than the whole pass: what it keeps of the
+    /// rows in front stands in these buffers ([`combine_few`]).
     fn reserve(&mut self, rows: usize) {
         if self.room < rows {
             self.grow(rows);
@@ -702,8 +705,7 @@ impl Buffers {
             buffer.reserve(rows.saturating_sub(buffer.len()));
         }
         room(&mut self.kept, rows);
-        // The rows in front are at most half of the rows.
-        room(&mut self.scores, rows + rows / 2);
+        room(&mut self.scores, rows);
         room(&mut self.stage, rows);
         room(&mut self.before_soft, rows);
         self.room = rows;
@@ -784,7 +786,7 @@ fn combine(
         // A decision by rank does not ask a stage that orders nothing, so
         // the band of one is none here too ([`Spread::Alike`]).
         debug_assert!(
-            weighted.scorer.spread() != Spread::Alike || stage_band.0 == 0.0,
+            bandless(weighted, stage_band),
             "{} orders nothing and returned a band",
             weighted.scorer.name()
         );
@@ -842,6 +844,14 @@ fn score_and_pick(
     {
         targets.push(target_of(&candidates[i as usize]));
     }
+}
+
+/// Whether a stage's band is one its spread allows: a stage that says it
+/// orders nothing returns none ([`Spread::Alike`]). Read in debug builds
+/// at every ask of a stage: a leading one that orders nothing is not asked
+/// by rank, and one behind a stage that orders the rows is.
+fn bandless(weighted: &Weighted, band: TieBand) -> bool {
+    weighted.scorer.spread() != Spread::Alike || band.0 == 0.0
 }
 
 /// Whether a rank's scores are what it said of them ([`Front`]): at the
@@ -907,11 +917,15 @@ fn combine_ranked(
 ) -> (TieBand, usize) {
     let rows = kept.len();
     scores.clear();
-    // Room for the sums of the rows a rank may put in front, at most half
-    // of the rows, which stand behind the rows' own ([`combine_few`]): a
-    // decision with rows in front allocates nothing that one without took.
-    scores.reserve(rows + rows / 2);
     scores.resize(rows, 0.0);
+    // Room for the list of the rows a rank may put in front, their
+    // candidates and their places: at most the rows. The list lives in the
+    // buffer a soft filter fills, and a profile without one never sized it.
+    // A front's sums take no room of their own: they stand in the stage's
+    // buffer ([`combine_few`]).
+    if tied.capacity() < rows {
+        tied.reserve(rows - tied.len());
+    }
     if rows == 0 {
         return (TieBand::NORMALIZED, 0);
     }
@@ -1008,6 +1022,11 @@ fn combine_ranked(
         stage.clear();
         stage.resize(rows, 0.0);
         let stage_band = weighted.scorer.score(facts, candidates, kept, stage);
+        debug_assert!(
+            bandless(weighted, stage_band),
+            "{} orders nothing and returned a band",
+            weighted.scorer.name()
+        );
         band += share * stage_band.0.clamp(0.0, 1.0);
         for (sum, value) in scores.iter_mut().zip(stage.iter()) {
             *sum += share * value.clamp(0.0, 1.0);
@@ -1022,7 +1041,9 @@ fn combine_ranked(
 /// stage has parted them since they stood in front. The profile's tie band
 /// comes back, and how many rows stand in front at the
 /// end: their sums are written among the rows' then, and a row a later rank
-/// left behind keeps what the ranks asked of every row gave it.
+/// left behind keeps what the ranks asked of every row gave it. Until then
+/// each row in front holds its sum in the stage's buffer, behind the scores
+/// a stage writes of those rows: room the rank's own ask took.
 ///
 /// No stage of this build is asked here as a rank: its ranks say nothing of
 /// a front alone, and `least-load`, which answers for one, is no rank. A
@@ -1044,7 +1065,7 @@ fn combine_few(
     order: Order,
     facts: &RequestFacts<'_>,
     candidates: &[Candidate],
-    scores: &mut Vec<f32>,
+    scores: &mut [f32],
     stage: &mut Vec<f32>,
     tied: &mut [u32],
     mut few: usize,
@@ -1052,12 +1073,21 @@ fn combine_few(
     norm: f32,
     mut band: f32,
 ) -> Option<(TieBand, usize)> {
-    // What each row in front holds, kept behind the rows' own sums until
-    // the rows in front have decided.
-    let rows = scores.len();
-    for at in 0..few {
-        let held = scores[tied[few + at] as usize];
-        scores.push(held);
+    // What each row in front holds, kept in the stage's buffer behind the
+    // room a stage's scores of those rows take, until the rows in front
+    // have decided. The buffer held a score for every row when the rank
+    // was asked, and the rows in front are at most half of them: nothing
+    // is sized here, whatever the thread's first decision of this size was.
+    let first = few;
+    debug_assert!(
+        stage.capacity() >= 2 * first,
+        "the stage's buffer holds a score for every row"
+    );
+    stage.clear();
+    stage.resize(2 * first, 0.0);
+    let (outs, sums) = stage.split_at_mut(first);
+    for (sum, &place) in sums.iter_mut().zip(&tied[first..2 * first]) {
+        *sum = scores[place as usize];
     }
     let last = profile.scorers.len() - 1;
     let mut whole = false;
@@ -1068,33 +1098,37 @@ fn combine_few(
         let share = weighted.weight * norm;
         if order.alike(i) {
             // Not asked: every row in front holds its share.
-            for sum in &mut scores[rows..rows + few] {
+            for sum in &mut sums[..few] {
                 *sum += share;
             }
             continue;
         }
-        stage.clear();
-        stage.resize(few, 0.0);
-        let (stage_band, said) =
-            weighted
-                .scorer
-                .score_front(facts, candidates, &tied[..few], stage);
+        let out = &mut outs[..few];
+        out.fill(0.0);
+        let (stage_band, said) = weighted
+            .scorer
+            .score_front(facts, candidates, &tied[..few], out);
         if said == Front::Whole {
             whole = true;
             break;
         }
         debug_assert!(
-            as_said(weighted.scorer.spread(), said, stage),
+            as_said(weighted.scorer.spread(), said, out),
             "{} said {said:?} of scores that read otherwise",
             weighted.scorer.name()
         );
+        debug_assert!(
+            bandless(weighted, stage_band),
+            "{} orders nothing and returned a band",
+            weighted.scorer.name()
+        );
         band += share * stage_band.0.clamp(0.0, 1.0);
-        for (sum, value) in scores[rows..rows + few].iter_mut().zip(stage.iter()) {
+        for (sum, value) in sums[..few].iter_mut().zip(out.iter()) {
             *sum += share * value.clamp(0.0, 1.0);
         }
         match said {
             Front::At(front) if level && order.fronts(i) && i < last => {
-                let left = fewer(stage, tied, &mut scores[rows..], few, front as usize);
+                let left = fewer(out, tied, sums, few, front as usize);
                 // The rows it left in front stand at its ceiling. Where it
                 // left them all it parted them, unless all stand there.
                 level = left < few || front as usize == few;
@@ -1105,13 +1139,11 @@ fn combine_few(
         }
     }
     if whole || band > order.room {
-        scores.truncate(rows);
         return None;
     }
-    for at in 0..few {
-        scores[tied[few + at] as usize] = scores[rows + at];
+    for (&sum, &place) in sums[..few].iter().zip(&tied[few..2 * few]) {
+        scores[place as usize] = sum;
     }
-    scores.truncate(rows);
     Some((TieBand(band), few))
 }
 
@@ -10480,29 +10512,67 @@ mod tests {
         assert_eq!(shed, whole_pass(&engine, &facts, &pool));
     }
 
-    /// A profile of nine stages: a rank, seven stages that order nothing and
-    /// a ninth that says its front. The build reads eight stages as ranks,
-    /// so the ninth is none and its word leaves no fewer rows in front: the
-    /// decision is the weighted sum's. A stage past the eighth has no bit of
-    /// the build's to be read by.
+    /// A stage of the tests that orders nothing and notes how many rows
+    /// each ask handed it.
+    #[derive(Debug)]
+    struct Still(Arc<Mutex<Vec<usize>>>);
+
+    impl Lifecycle for Still {}
+
+    impl Scorer for Still {
+        fn name(&self) -> &'static str {
+            "still"
+        }
+
+        fn score(
+            &self,
+            _: &RequestFacts<'_>,
+            _: &[Candidate],
+            kept: &[u32],
+            out: &mut [f32],
+        ) -> TieBand {
+            self.0.lock().expect("the asks").push(kept.len());
+            out.fill(1.0);
+            TieBand(0.0)
+        }
+
+        fn spread(&self) -> Spread {
+            Spread::Alike
+        }
+    }
+
+    /// A profile of ten stages: a rank, seven stages that order nothing, a
+    /// ninth that says its front and a tenth that orders nothing. The build
+    /// reads eight stages as ranks, so the ninth is none and its word
+    /// leaves no fewer rows in front: the tenth is asked of the eight rows
+    /// the leading rank put there, and the decision is the weighted sum's.
+    /// A stage past the eighth has no bit of the build's to be read by.
+    /// Read by its index, the ninth stopped a debug build, and a release
+    /// build read the leading rank's bit and asked the tenth of four rows.
     #[test]
     fn a_stage_past_the_eighth_that_says_its_front_is_no_rank() {
         let lead: Vec<f32> = (0..16).map(|i| if i < 8 { 1.0 } else { 0.5 }).collect();
         let last: Vec<f32> = (0..16)
             .map(|i| if i % 2 == 0 { 1.0 } else { 0.5 })
             .collect();
-        let mut stages = vec![rank(&lead, 4.0, true)];
+        let handed = Arc::new(Mutex::new(Vec::new()));
+        let mut stages = vec![rank(&lead, 8.0, true)];
         stages.extend((0..7).map(|_| Weighted {
             scorer: Box::new(Flat(Arc::default())),
             weight: 1.0,
         }));
         stages.push(rank(&last, 1.0, true));
+        stages.push(Weighted {
+            scorer: Box::new(Still(Arc::clone(&handed))),
+            weight: 1.0,
+        });
         let engine = staged(stages, Box::new(Best));
         assert_ne!(engine.marks[0].0 & Marks::RANKED, 0);
         assert_eq!(usize::from(engine.orders[0].ranks), Order::MOST);
         let pool: Vec<Candidate> = (0..16).map(|i| candidate(i, 0)).collect();
         let facts = request(5);
         let ranked = rated(&engine, &facts, &pool);
+        assert_eq!(*handed.lock().expect("the asks"), vec![8]);
         // The four rows at both ceilings tie, and the seed draws their order.
         let mut targets = positions(&ranked);
         targets.sort_unstable();
@@ -10683,6 +10753,46 @@ mod tests {
         let engine = staged(stages, Box::new(Best));
         let pool: Vec<Candidate> = (0..16).map(|i| candidate(i, 0)).collect();
         whole_pass(&engine, &request(17), &pool);
+    }
+
+    /// The stage of the case above behind a stage that orders the rows: by
+    /// rank it is asked, and the decision ends at its band.
+    #[cfg(debug_assertions)]
+    fn banded_behind(levels: &[f32]) {
+        let stages = vec![
+            rank(levels, 8.0, true),
+            Weighted {
+                scorer: Box::new(Asked(Arc::default())),
+                weight: 1.0,
+            },
+            Weighted {
+                scorer: Box::new(Banded),
+                weight: 1.0,
+            },
+        ];
+        let engine = staged(stages, Box::new(Best));
+        assert_eq!(engine.orders[0].ranks, 1);
+        rated(&engine, &request(7), &ranked_pool(9));
+    }
+
+    /// Behind a stage that orders the rows, a stage that says it orders
+    /// nothing is asked by rank: of the rows in front where four of nine
+    /// stand at the rank's ceiling. A band of its own fails a debug build
+    /// there too.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "banded orders nothing and returned a band")]
+    fn a_band_from_a_stage_that_orders_nothing_fails_a_debug_build_behind_a_front() {
+        banded_behind(&[1.0, 0.5, 1.0, 0.0, 1.0, 0.5, 1.0, 0.0, 0.5]);
+    }
+
+    /// And of every row where three of nine stand at the rank's ceiling,
+    /// fewer than a decision's targets.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "banded orders nothing and returned a band")]
+    fn a_band_from_a_stage_that_orders_nothing_fails_a_debug_build_where_every_row_is_asked_on() {
+        banded_behind(&[1.0, 0.5, 1.0, 0.0, 1.0, 0.5, 0.0, 0.0, 0.5]);
     }
 
     /// A leading rank that says it must be asked whole was handed every
