@@ -46,7 +46,7 @@ For CI or environments where symlinks don't work:
 ```bash
 rm -rf crates/grpc_client/python/smg_grpc_proto/proto
 mkdir -p crates/grpc_client/python/smg_grpc_proto/proto
-cp crates/grpc_client/proto/*.proto crates/worker/proto/common.proto crates/grpc_client/python/smg_grpc_proto/proto/
+cp crates/grpc_client/proto/*.proto crates/worker/proto/*.proto crates/grpc_client/python/smg_grpc_proto/proto/
 pip install -e crates/grpc_client/python/
 ```
 
@@ -61,7 +61,7 @@ cd crates/grpc_client/python
 # won't survive wheel packaging)
 rm -rf smg_grpc_proto/proto
 mkdir -p smg_grpc_proto/proto
-cp ../proto/*.proto ../../worker/proto/common.proto smg_grpc_proto/proto/
+cp ../proto/*.proto ../../worker/proto/*.proto smg_grpc_proto/proto/
 pip wheel . --no-deps -w dist/
 
 # 2. Copy to remote

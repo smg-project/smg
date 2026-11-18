@@ -26,10 +26,14 @@ fn main() -> io::Result<()> {
 
     // The messages alone: the file holds no service. proto3 `optional` needs
     // the flag below protoc 3.15, the oldest the repository's build scripts
-    // run under.
+    // run under. The generator finds its compiler by `PROTOC`, so another
+    // compiler there makes the messages again.
     #[cfg(feature = "proto")]
-    prost_build::Config::new()
-        .protoc_arg("--experimental_allow_proto3_optional")
-        .compile_protos(&[PROTO], &["proto"])?;
+    {
+        println!("cargo::rerun-if-env-changed=PROTOC");
+        prost_build::Config::new()
+            .protoc_arg("--experimental_allow_proto3_optional")
+            .compile_protos(&[PROTO], &["proto"])?;
+    }
     Ok(())
 }

@@ -128,8 +128,8 @@ message EngineLoad {
   optional uint64 num_resident_tokens = 23;
 }
 
-// The sections below mirror the SGLang scheduler's GetLoads messages field
-// for field (TokenSpeed reports memory and queues in the same shape; vLLM
+// The sections below mirror one engine's scheduler load messages field for
+// field (another reports memory and queues in the same shape, a third
 // reports none), so a servicer copies them through.
 message EngineMemory {
   double weight_gb = 1;
@@ -204,10 +204,10 @@ message KvCacheEvent {
   }
 }
 
-// Storage tier of a KV block, from the engine's `medium` (vLLM: GPU, CPU,
-// STORAGE; SGLang: GPU, CPU_PINNED, DISK, EXTERNAL). `KvBlock.cache_level`
-// mirrors it for older consumers: 0 device, 1 host, 2 disk, 3 external; a
-// block with neither set is on the device.
+// Storage tier of a KV block, from the engine's `medium`, whose names for
+// the tiers differ by engine. `KvBlock.cache_level` mirrors it for older
+// consumers: 0 device, 1 host, 2 disk, 3 external; a block with neither set
+// is on the device.
 enum KvCacheTier {
   KV_CACHE_TIER_UNSPECIFIED = 0;
   KV_CACHE_TIER_DEVICE = 1;
@@ -252,9 +252,10 @@ message KvBlocksStored {
   optional uint64 group_mask = 13;
 }
 
-// One entry of vLLM's per-block `extra_keys`: the inputs beyond token ids
-// that went into the block hash, published untagged (a LoRA name or cache
-// salt as text, multimodal items as (identifier, offset), digests as bytes).
+// One entry of an engine's per-block `extra_keys`: the inputs beyond token
+// ids that went into the block hash, published untagged (a LoRA name or
+// cache salt as text, multimodal items as (identifier, offset), digests as
+// bytes).
 message KvBlockExtraKey {
   oneof key {
     string text = 1;
