@@ -58,10 +58,11 @@
 //! head of the store's deadline queue that no gateway named a dispatch
 //! for in time, two at most, and tells the engine of those its own
 //! generation issued. So a lease whose answer never reached its gateway
-//! (a stream that ended, a full queue, the stream's own fence at the
-//! send, a decision that panicked past its issue) stands until its
-//! deadline and the issues after it, and through a lull until the next
-//! issue: no timer ends one yet.
+//! (a stream that ended, a full queue, a decision that panicked past its
+//! issue) stands until its deadline and the issues after it, and through
+//! a lull until the next issue: no timer ends one yet. A decision its
+//! stream stops at the send is none of them: the stream gives its lease
+//! up there ([`super::decide`]).
 //!
 //! What a lease does not do yet. A request sent twice under one id is
 //! issued two leases. A stage hears a lease's issue here, its dispatch,
@@ -151,10 +152,10 @@ use crate::{
 /// for its scrape to render: each `Busy` by its reason, the requests this
 /// build has no decision for by cause, the requests whose block hashes
 /// were cut, the answers no stream took, the candidates a gateway's wires
-/// took from its decisions, and the decisions whose budget or lease's
-/// dispatch span ended while they were made. A request that is decided
-/// inside both, with its hashes inside the cap and every candidate one its
-/// gateway can dial, moves none of them.
+/// took from its decisions, and the decisions cut at their last read with
+/// their budget or their lease's dispatch span all but gone. A request that
+/// is decided inside both, with its hashes inside the cap and every
+/// candidate one its gateway can dial, moves none of them.
 #[derive(Debug, Default)]
 pub(crate) struct Counts {
     /// `Busy` answers, each at its reason's number on the wire.
@@ -177,9 +178,10 @@ pub(crate) struct Counts {
     /// its own: read whole by [`Counts::undialed`] and
     /// [`Counts::hashes_cut`].
     parts: [Part; PARTS],
-    /// Decisions whose budget, or whose lease's dispatch span, ended while
-    /// they were made. Each leaves as `Busy` under the reason a late arrival
-    /// is told, and this count is of them alone.
+    /// Decisions cut at their last read, with under a microsecond of the
+    /// budget or under a millisecond of the lease's dispatch span left. Each
+    /// leaves as `Busy` under the reason a late arrival is told, and this
+    /// count is of them alone.
     pub(crate) outlasted: AtomicU64,
     /// Picks the store minted no lease for, its term's ids being spent or
     /// the term past the width an id carries. Each leaves as `Busy` with
@@ -670,7 +672,7 @@ impl Decider {
             // millisecond left is none to hand over.
             let since = taken.since(handed);
             let left = DISPATCH_TTL.saturating_sub(since);
-            let spent = matches!(filed, Ok(Some(_))) && left < Duration::from_millis(1);
+            let spent = matches!(filed, Ok(Some(_))) && left < wire::Leased::LEAST;
             let failed = if fence.leader_term(handed) != Some(term) {
                 Some((Reason::NotLeader, ReleaseReason::Abandoned))
             } else if taken.outlasted(since) || spent {
@@ -684,7 +686,11 @@ impl Decider {
                     Ok(lease) => Ok((
                         term,
                         decision,
-                        lease.map(|lease| wire::Leased { lease, left }),
+                        lease.map(|lease| wire::Leased {
+                            lease,
+                            left,
+                            due: taken.due(),
+                        }),
                     )),
                     // The term mints no more ids. A pick with no lease is
                     // no answer: its gateway decides it locally.
@@ -747,6 +753,12 @@ impl<'a> Taken<'a> {
     /// would read its budget and build it whole.
     fn since(&self, later: Instant) -> Duration {
         later.saturating_duration_since(self.now)
+    }
+
+    /// When the dispatch span of a lease filed for the request ends: the
+    /// span counts from the read the request was taken at.
+    fn due(&self) -> Instant {
+        self.now + DISPATCH_TTL
     }
 
     /// Whether the budget is gone `since` the request was taken: what was
@@ -905,7 +917,7 @@ fn issue(
         decode: None,
         term,
         issued_at: taken.now,
-        dispatch_deadline: taken.now + DISPATCH_TTL,
+        dispatch_deadline: taken.due(),
         state: LeaseState::Issued,
     };
     let built = booking.built;
@@ -1574,7 +1586,7 @@ pub(crate) mod tests {
     }
 
     /// The one lease a pick's answer carries.
-    fn lease_of(answer: &proto::DecideAnswer) -> &proto::Lease {
+    pub(crate) fn lease_of(answer: &proto::DecideAnswer) -> &proto::Lease {
         match &answer.answer {
             Some(Answer::Decision(decision)) => match decision.leases.as_slice() {
                 [lease] => lease,
@@ -1951,7 +1963,7 @@ pub(crate) mod tests {
 
     /// What the engine told a stage of leases: an issue by its id, a release
     /// by its id and reason.
-    type Calls = Vec<(u64, Option<ReleaseReason>)>;
+    pub(crate) type Calls = Vec<(u64, Option<ReleaseReason>)>;
 
     /// The `random` picker, keeping what the engine tells it of leases.
     #[derive(Debug)]
@@ -1983,6 +1995,24 @@ pub(crate) mod tests {
         ) {
             Random.pick(facts, candidates, kept, scores, band, out);
         }
+    }
+
+    /// The `random` preset as `generation`, picking through [`Told`]: what
+    /// that generation's engine tells its stage of leases is kept in
+    /// `told`.
+    pub(crate) fn hearing(told: &Arc<Mutex<Calls>>, generation: u64) -> AppliedSpec {
+        let kept = Arc::clone(told);
+        let mut catalog = Catalog::builtin();
+        catalog
+            .picker("told", move || Box::new(Told(Arc::clone(&kept))))
+            .expect("a free name");
+        let mut document = PolicySpec::preset("random").expect("a preset of this build");
+        document.generation = generation;
+        let profile = document.profiles.get_mut("random");
+        profile.expect("the preset's profile").pick = "told".into();
+        let digest = document.digest().expect("the document digests");
+        AppliedSpec::validate_digested(&document, digest, &catalog)
+            .expect("the catalog holds the stage")
     }
 
     /// [`Told`], whose issue call waits for its case: what falls while a
@@ -2182,18 +2212,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn the_engine_that_decided_is_told_of_a_lease_and_of_its_end_at_the_dispatch_deadline() {
         let told = Arc::new(Mutex::new(Vec::new()));
-        let kept = Arc::clone(&told);
-        let mut catalog = Catalog::builtin();
-        catalog
-            .picker("told", move || Box::new(Told(Arc::clone(&kept))))
-            .expect("a free name");
-        let mut document = PolicySpec::preset("random").expect("a preset of this build");
-        let profile = document.profiles.get_mut("random");
-        profile.expect("the preset's profile").pick = "told".into();
-        let digest = document.digest().expect("the document digests");
-        let spec = AppliedSpec::validate_digested(&document, digest, &catalog)
-            .expect("the catalog holds the stage");
-        let mut bed = bed(Some(spec), true, (2, 8), []);
+        let mut bed = bed(Some(hearing(&told, 1)), true, (2, 8), []);
         let id = |count: u64| 1 << 32 | count;
         // Two leases at the take, the second dispatched.
         for request in 1..=2 {
@@ -2226,20 +2245,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_later_generations_engine_is_not_told_of_a_lease_it_did_not_issue() {
         let told = Arc::new(Mutex::new(Vec::new()));
-        let kept = Arc::clone(&told);
-        let mut catalog = Catalog::builtin();
-        catalog
-            .picker("told", move || Box::new(Told(Arc::clone(&kept))))
-            .expect("a free name");
-        let spec = |generation: u64| {
-            let mut document = PolicySpec::preset("random").expect("a preset of this build");
-            document.generation = generation;
-            let profile = document.profiles.get_mut("random");
-            profile.expect("the preset's profile").pick = "told".into();
-            let digest = document.digest().expect("the document digests");
-            AppliedSpec::validate_digested(&document, digest, &catalog)
-                .expect("the catalog holds the stage")
-        };
+        let spec = |generation: u64| hearing(&told, generation);
         let mut bed = bed(Some(spec(1)), true, (2, 8), []);
         let id = |count: u64| 1 << 32 | count;
         bed.ask(frame(1, 1)).await;

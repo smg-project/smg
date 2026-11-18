@@ -417,8 +417,8 @@ message Lease {
   // The leader's term that minted the lease.
   uint64 term = 8;
   // Bounds decision to Dispatched; then Completed or the stream rule ends it.
-  // A controller's lease tells what its decision left of the span, which
-  // counts from the request's take.
+  // A controller's lease tells what is left of the span as its answer is
+  // sent; the span counts from the request's take.
   uint32 dispatch_ttl_ms = 9;
   LeaseOrigin origin = 10;
 }

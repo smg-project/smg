@@ -105,13 +105,29 @@ pub(crate) fn released(
 ) -> Result<(), Status> {
     let (lease, side, reason) = release(frame)?;
     if let Some(lease) = lease {
-        let found = LeasesStore::get(store, gateway, lease);
-        let on_file = LeasesStore::released(store, gateway, lease, side, reason);
-        if let Some(record) = found.filter(|_| on_file) {
-            told(store, &record, Said::Released(reason));
-        }
+        given_up(store, gateway, lease, side, reason);
     }
     Ok(())
+}
+
+/// A gateway's lease is given up, on `side` or, with `None`, on every
+/// side: the store's release door first, then the engine that issued the
+/// lease told once, where the store held it. A `Released` frame comes
+/// through here, and so does a `Decide` stream for a decision it stops
+/// where it would send it. A lease ended already is held by nobody, and
+/// nothing is told of it.
+pub(crate) fn given_up(
+    store: &MemoryStore,
+    gateway: GatewayId,
+    lease: LeaseId,
+    side: Option<Side>,
+    reason: ReleaseReason,
+) {
+    let found = LeasesStore::get(store, gateway, lease);
+    let on_file = LeasesStore::released(store, gateway, lease, side, reason);
+    if let Some(record) = found.filter(|_| on_file) {
+        told(store, &record, Said::Released(reason));
+    }
 }
 
 /// What a frame says of a lease on file.
