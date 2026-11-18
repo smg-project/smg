@@ -12,7 +12,11 @@
 //! keeps in flight; the plugin's ack fixes the protocol version and the
 //! stages it implements, and an ack that says `init` failed fails the apply.
 //! A stage a profile binds and the ack leaves out takes its fallback on
-//! every decision, and one warning a bound set says so.
+//! every decision, and one warning a bound set says so. A plugin speaks
+//! one version on all its streams: the first `Decide` stream to settle
+//! fixes it, a stream opened while one stands is offered it alone, an ack
+//! that settles second and names another ends its stream with both named,
+//! and the end of the last stream frees it.
 //!
 //! How a decision runs: one `Decide` stream per deciding thread, opened at
 //! the apply ([`Plugin::warm`] on every shard thread) and kept. No decision
@@ -110,7 +114,11 @@
 //! line to stderr at every panicked turn. Each profile
 //! that binds the plugin holds one [`Bound`] set, taken from its engine
 //! build's [`Binder`]: one adapter of a build forwards, so an event reaches
-//! the plugin once per engine.
+//! the plugin once per engine. An `Observe` stream's hello names the
+//! version the plugin's `Decide` streams last fixed: none opens before one
+//! has settled (the events wait in the queue), a call that ends is opened
+//! again under that version, and once a settle fixes another the call is
+//! ended for the next to name that one.
 //!
 //! The runtime: one I/O thread per process ([`Runtime`]) owns every stream;
 //! a deciding thread hands it a frame and waits on that frame's place in
@@ -159,5 +167,9 @@ pub type GrpcScorer = crate::plugins::PluginScorer<Bound>;
 /// See [`GrpcFilter`].
 pub type GrpcPicker = crate::plugins::PluginPicker<Bound>;
 
-/// The protocol version this host speaks: the one committed major.
+/// The newest protocol version this host speaks.
 pub const PROTOCOL: u32 = 1;
+/// The oldest protocol version this host speaks. A `Decide` hello offers
+/// from this one to [`PROTOCOL`] until the plugin's first settled stream
+/// fixes the version it speaks.
+pub const PROTOCOL_MIN: u32 = 1;
