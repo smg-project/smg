@@ -64,9 +64,8 @@ request's executable, and the change is within twice the id's threshold. The sam
 that function where it was leaves the failure, with the count in its line. An id whose change
 is beyond twice its threshold is counted too, though no count makes it a placement: a count
 that reads level asks for the second measurement below. Two counts that differ are each taken
-once more, and
-the failure stands either way: the count moved, or it differs from itself on one executable
-(an id whose work follows the clock, a seed or the allocator's state) and tells nothing. A
+once more, and neither is a placement: the count moved, or it is unsteady on an executable
+(its work follows the clock, a seed or the allocator's state) and says nothing of work. A
 count that was not read (no valgrind on the host, one batch alone) leaves the failure too. The
 count ends by the run's budget: `run_budget`, the seconds from the run's start that a gate
 file asking the count must name, below its gate step's bound by the report's room. No count
@@ -103,12 +102,14 @@ same instruction count on both executables at the same address, the re-measured 
 agreeing, and each passed when its job ran again (2026-11-18). An id that still fails on a
 count that reads level is therefore measured again before it fails: the gate's N interleaved
 runs a side once more, from a fresh copy of each executable, read within itself. A count reads
-level when it is a level count as above, or when it is unsteady on one executable alone and
-every count is within `LEVEL_COUNT`. The id fails where the second measurement too is beyond
-its threshold with every pull-request run worse than every base run, and is reported as not
-repeated otherwise. No threshold moves. A count that moved beyond the level fails as before,
-and so does an id whose second measurement the run's budget has no room for: it starts only
-with room for all of its runs, by the longest run of the failing ids so far.
+level when it is the same on both executables, when it is a level count of an id that times a
+whole pass, or when it is not steady and every count is within `LEVEL_COUNT`: the two
+executables against each other, and each against its own second count. A count that moved on
+an id that times no whole pass is work the change moved, and fails as before. The id fails
+where the second measurement too is beyond its threshold with every pull-request run worse
+than every base run, and is reported as not repeated otherwise. No threshold moves. An id
+whose second measurement the run's budget has no room for keeps the first: it starts only with
+room for all of its runs, by the longest run of the failing ids so far.
 
 Usage:
     bench_gate.py build --out FILE [--name BENCH] [--gates FILE [--sources-from REV]]
@@ -489,6 +490,11 @@ def run_once(
     return medians
 
 
+def exactly(ids: list[str]) -> str:
+    """The filter that runs `ids` and no other id."""
+    return "^(" + "|".join(re.escape(bench_id) for bench_id in ids) + ")$"
+
+
 def round_sides(i: int) -> tuple[str, ...]:
     """The sides in the order run i takes them: odd runs base first, even runs the pull request
     first, so neither side always warms the other up."""
@@ -698,7 +704,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             return
         for side in SIDES:
             fresh[side] = copy_binary(binaries[side], out / SIDE_DIRS[side] / "second")
-        exact = "^(" + "|".join(re.escape(bench_id) for bench_id in level) + ")$"
+        exact = exactly(level)
         for i, side in interleaved_order(repeats):
             run(i, side, exact, f"second measurement {i}/{repeats}", second=True)
 
@@ -715,7 +721,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             )
             if failing and args.recheck > 0:
                 results["recheck"] = {"ids": failing, "rounds": 0}
-                exact = "^(" + "|".join(re.escape(bench_id) for bench_id in failing) + ")$"
+                exact = exactly(failing)
                 for extra in range(1, args.recheck + 1):
                     i = repeats + extra
                     results["recheck"]["rounds"] = extra
@@ -1246,37 +1252,44 @@ class Row:
 
     @property
     def reads_level(self) -> bool:
-        """Whether no count read more work on the pull request's executable than the level: a
-        level count, or one that is not steady on one executable alone while the two
-        executables, and that executable's own two counts, read within `LEVEL_COUNT`. Such
-        an id is measured again before it fails."""
-        if self.level_count:
-            return True
+        """Whether no count read more work on the pull request's executable than the level, so
+        that the id is measured again before it fails: the same count; for an id that times a
+        whole pass, a level count; or a count that is not steady while every count is within
+        `LEVEL_COUNT`, the two executables against each other and each against its own second
+        count. A count that moved on an id that times no whole pass is work the change moved,
+        and fails as it did."""
         counted = self.counted
-        if counted is None or counted.state != "unsteady" or self.beyond_once is not None:
+        if counted is None or self.beyond_once is not None:
             return False
-        apart = abs(counted.pr - counted.base) <= LEVEL_COUNT * counted.base
-        return apart and abs(counted.own) <= LEVEL_COUNT
+        if counted.state != "unsteady":
+            return counted.state == "same" or (self.whole_pass and self.level_count)
+        if not self.counted_twice:
+            return False
+        level = abs(counted.pr - counted.base) <= LEVEL_COUNT * counted.base
+        for side in SIDES:
+            first, again = self.counts[side]["batches"], self.counts[side]["again"]
+            own = differs_at(first, again)
+            if own is not None and abs(again[own] - first[own]) > LEVEL_COUNT * first[own]:
+                level = False
+        return level
 
     @property
     def measured_again(self) -> Row | None:
-        """The second measurement as a row of its own, read within itself; None for an id
-        not measured again."""
-        if not self.second or not all(self.second.get(side) for side in SIDES):
+        """The second measurement as a row of its own, read within itself. None for an id not
+        measured again, and for one a side of which is short of the first measurement's runs:
+        the first then decides."""
+        second = self.second or {}
+        sides = [second.get(side) or [] for side in SIDES]
+        if not self.base or any(len(side) < len(self.base) for side in sides):
             return None
-        return Row(self.bench_id, self.second["base"], self.second["pr"], self.gate)
+        return Row(self.bench_id, *sides, self.gate)
 
     @property
     def repeated(self) -> bool | None:
-        """Whether the second measurement fails the id as the first did: beyond the threshold
-        with every pull-request run worse than every base run. None for an id not measured
-        again."""
+        """Whether the second measurement fails the id as the first did, by the judge's own
+        two conditions. None for an id not measured again."""
         again = self.measured_again
-        if again is None:
-            return None
-        change, threshold = again.change, self.gate.threshold if self.gate else 0.0
-        beyond = again.pr_median > 0 if change is None else change > threshold
-        return beyond and min(again.pr) > max(again.base)
+        return None if again is None else judge(again) == "regression"
 
 
 def judge(row: Row) -> str:
@@ -1311,15 +1324,14 @@ def regression_or_suspect(row: Row) -> str:
     and not work the change adds, on three facts: the two executables run it in the same
     instruction count, its measured function starts elsewhere, and the change is within twice
     the threshold. An id that times a whole pass is one on two: a level count, and the change
-    within twice the threshold."""
+    within twice the threshold. A regression on a count that reads level was measured again:
+    it is not repeated where that second measurement does not fail it too."""
     if not row.separated:
         return "suspect (runs overlap)"
     if row.confirmed is False:
         return "suspect (not confirmed by the re-measurement)"
     if row.placed:
         return "placement"
-    # A count that reads level asked for a second measurement: the id fails where that one
-    # fails it too, and is reported where it does not.
     return "not repeated" if row.repeated is False else "regression"
 
 
@@ -1426,11 +1438,11 @@ def fmt_place(address: int) -> str:
     return f"0x{address % 4096:03x}"
 
 
-# Why an id that failed by time was not counted, as its line and the report say it.
 def stands(row: Row) -> str:
     """How the sentence of a count that places nothing ends: the failure stands, or, for an
     id measured again on that count, the second measurement decides."""
-    return "the failure stands" if row.second is None else "the second measurement decides"
+    again = row.measured_again
+    return "the failure stands" if again is None else "the second measurement decides"
 
 
 def fmt_second(row: Row, unit_suffix: str) -> str:
@@ -1446,6 +1458,7 @@ def fmt_second(row: Row, unit_suffix: str) -> str:
     )
 
 
+# Why an id that failed by time was not counted, as its line and the report say it.
 NOT_COUNTED = {
     "beyond": (
         f"a change beyond {PLACEMENT_CEILING:g} times the threshold, which no placement excuses"

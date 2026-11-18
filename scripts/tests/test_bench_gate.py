@@ -1985,6 +1985,47 @@ def test_a_second_measurement_starts_only_with_room_for_all_its_runs(mod, tmp_pa
     assert rc == 1 and len(saved["second"]["pr"]["runs"]) == 3
 
 
+def level_row(mod, base, pr, whole=False):
+    """A failing row whose count read `base` and `pr`: for each executable, the last batch of
+    its first count and of its second."""
+
+    def side(first, again):
+        return {"batches": [5, 10, first], "again": [5, 10, again]}
+
+    gate = mod.Gate("^encode/", 0.10, whole_pass=whole)
+    counts = {"base": side(*base), "pr": side(*pr)}
+    return mod.Row("encode/a", [100, 101, 102], [115, 116, 117], gate, counts=counts)
+
+
+def test_a_count_reads_level_where_every_count_is_within_the_level(mod):
+    # Not steady on the base alone, 0.02 % apart, the pull request's two counts the same.
+    assert level_row(mod, (100_020, 100_000), (100_000, 100_000)).reads_level
+    # Not steady on both, each inside the level.
+    assert level_row(mod, (100_020, 100_000), (100_010, 100_000)).reads_level
+    # The pull request's own two counts 10 % apart beside a base that is not steady either:
+    # the base's drift says nothing of them. The mirrored shape reads the same.
+    assert not level_row(mod, (100_020, 100_000), (100_000, 110_000)).reads_level
+    assert not level_row(mod, (100_000, 110_000), (100_020, 100_000)).reads_level
+    # The two executables further apart than the level.
+    assert not level_row(mod, (100_020, 100_000), (101_000, 101_000)).reads_level
+    # An executable counted once has no second count to be inside the level.
+    once = level_row(mod, (100_020, 100_000), (100_000, 100_000))
+    del once.counts["pr"]["again"]
+    assert not once.reads_level
+    # A count that moved, the same twice on each executable, is work the change moved: it
+    # reads level for an id that times a whole pass alone.
+    moved = (100_000, 100_000), (100_020, 100_020)
+    assert not level_row(mod, *moved).reads_level
+    assert level_row(mod, *moved, whole=True).reads_level
+
+
+def test_a_second_measurement_short_of_its_runs_leaves_the_first_to_decide(mod):
+    bench_id = "policy_engine/power_of_two/least_requests/8"
+    row = time_only(mod, bench_id, {"base": [100, 101, 102], "pr": [100, 101]})
+    assert row.measured_again is None and row.repeated is None
+    assert row.verdict == "regression"
+
+
 # ---------------------------------------------------------------- the same program
 
 
