@@ -135,8 +135,9 @@ struct Pool {
     /// Each listed worker's place in `members`, by its id: a row that does
     /// not stand at its member's place is found here, never searched for.
     by_id: FxHashMap<WorkerId, u32>,
-    /// The partition left the table with its model's last worker: the
-    /// decision that still holds it takes the model's next one.
+    /// The partition left the table, with its model's last worker or as an
+    /// entry a decision made and listed nobody in: the decision that still
+    /// holds it takes the model's next one.
     left: bool,
     /// Per member, the place among the kept of the candidate it is in the
     /// decision in progress, or [`NONE`]. Reused from decision to decision.
@@ -205,6 +206,22 @@ impl Bucket {
                 next
             });
         }
+    }
+
+    /// Take `partition` out of the table where it still stands under
+    /// `model`: an entry made since under the same name stays. The caller
+    /// holds the partition's guard and has marked it as one that left.
+    fn forget(&self, model: &str, partition: &Partition) {
+        self.partitions.rcu(|partitions| {
+            let mut next = FxHashMap::clone(partitions);
+            let stands = next
+                .get(model)
+                .is_some_and(|stands| Arc::ptr_eq(stands, partition));
+            if stands {
+                next.remove(model);
+            }
+            next
+        });
     }
 
     /// Write a partition's listing into the workers' index: the partition
@@ -645,16 +662,7 @@ impl Lifecycle for Bucket {
             // A model whose last worker left takes its partition with it.
             if listed != 0 && pool.members.is_empty() {
                 pool.left = true;
-                self.partitions.rcu(|partitions| {
-                    let mut next = FxHashMap::clone(partitions);
-                    let stands = next
-                        .get(&**model)
-                        .is_some_and(|stands| Arc::ptr_eq(stands, partition));
-                    if stands {
-                        next.remove(&**model);
-                    }
-                    next
-                });
+                self.forget(model, partition);
             }
         }
     }
@@ -726,7 +734,17 @@ impl Scorer for Bucket {
                     }
                     match pool.seat(candidates, kept, fenced) {
                         Some(loads) => loads,
-                        None => return TieBand::NORMALIZED,
+                        None => {
+                            // A view of fenced rows alone lists nobody. The
+                            // partition this decision made for it leaves
+                            // the table again: the feed's walk takes only
+                            // an entry whose last worker left.
+                            if pool.members.is_empty() {
+                                pool.left = true;
+                                self.forget(facts.model, &partition);
+                            }
+                            return TieBand::NORMALIZED;
+                        }
                     }
                 }
             };
@@ -1305,9 +1323,10 @@ mod tests {
         assert!(scorer.partitions.load().is_empty());
         assert!(scorer.listed.load().is_empty());
         assert!(held.lock().left, "a decision that holds it takes the next");
-        // The three are fenced: a view that still shows them lists none.
+        // The three are fenced: a view that still shows them lists none,
+        // and the partition its decision made leaves the table again.
         assert_eq!(led(&scorer, &pool, 3_000, 16 * SECOND), None);
-        assert_eq!(loads(&scorer), (vec![], 0));
+        assert!(scorer.partitions.load().is_empty());
         // The feed names them again, and the model's next decision lists
         // them from an even split.
         for worker in &pool {
@@ -1709,6 +1728,40 @@ mod tests {
         assert_eq!(led(&scorer, &pool, 3_000, SECOND), Some(2));
         assert_eq!(ranges(&scorer), [(0, 0, 2_047), (1, 2_048, u32::MAX)]);
         assert_eq!(loads(&scorer), (vec![0, 0], 0));
+    }
+
+    #[test]
+    fn a_view_of_fenced_rows_alone_leaves_no_partition_behind() {
+        let scorer = scorer(NEVER, 1.5, 5);
+        let pool = pool(2);
+        led(&scorer, &pool, 0, SECOND);
+        // The model's two workers leave, and its partition with the last.
+        scorer.on_membership(&Membership::Removed(pool[0].id));
+        scorer.on_membership(&Membership::Removed(pool[1].id));
+        assert!(scorer.partitions.load().is_empty());
+        // A decision whose view was captured before the leaves shows the
+        // two alone. Nobody is listed, and the partition the decision made
+        // leaves the table again: no later word of the feed would take it.
+        assert_eq!(led(&scorer, &pool, 300, 2 * SECOND), None);
+        assert!(scorer.partitions.load().is_empty(), "an empty entry stands");
+        scorer.on_membership(&Membership::Snapshot(&[]));
+        assert!(scorer.partitions.load().is_empty());
+        assert!(scorer.listed.load().is_empty());
+        // The feed names one of the two again, and the model's next view
+        // lists it in a partition of its own.
+        scorer.on_membership(&Membership::Added(pool[0].id));
+        assert_eq!(led(&scorer, &pool, 300, 3 * SECOND), Some(0));
+        assert_eq!(ranges(&scorer), [(0, 0, u32::MAX)]);
+
+        // A decider that took the entry before it left finds it marked,
+        // and takes the model's next one.
+        let scorer = self::scorer(NEVER, 1.5, 5);
+        scorer.on_membership(&Membership::Removed(pool[0].id));
+        scorer.on_membership(&Membership::Removed(pool[1].id));
+        let held = scorer.partition("m");
+        assert_eq!(led(&scorer, &pool, 300, SECOND), None);
+        assert!(held.lock().left, "a decision that holds it takes the next");
+        assert!(scorer.partitions.load().is_empty());
     }
 
     #[test]
