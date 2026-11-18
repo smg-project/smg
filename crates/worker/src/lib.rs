@@ -14,6 +14,11 @@
 //! share with a host's; [`worker::WorkerType::as_str`] and
 //! [`worker::ConnectionMode::as_str`] spell the two that a type carries.
 //!
+//! [`identity`] holds a worker's address, parsed once and keyed, and the
+//! sampling defaults a backend reports on a worker's labels; [`health`]
+//! holds the thresholds past which a load report marks a worker overloaded.
+//! The gateway re-exports each module at the path it had there.
+//!
 //! The `metrics` feature adds `metrics`, the mechanism those writers share
 //! with a host's: the bounded label set, the model labels' one set and the
 //! handles a record keeps.
@@ -30,6 +35,8 @@ pub const UNKNOWN_MODEL_ID: &str = "unknown";
 
 #[cfg(feature = "runtime")]
 pub mod connection;
+pub mod health;
+pub mod identity;
 pub mod labels;
 #[cfg(feature = "metrics")]
 pub mod metrics;
