@@ -22,13 +22,16 @@ use async_trait::async_trait;
 use metrics_exporter_prometheus::PrometheusBuilder;
 use openai_protocol::{
     model_card::ModelCard,
-    worker::{HealthCheckConfig, RuntimeType, WorkerLoadResponse, WorkerStatus, WorkerType},
+    worker::{
+        HealthCheckConfig, ProfileOptions, RuntimeType, WorkerLoadResponse, WorkerStatus,
+        WorkerType,
+    },
 };
-use smg_grpc_client::common_proto::{self, kv_cache_event, KvCacheCleared, KvCacheEvent};
+use smg_grpc_client::common_proto::{kv_cache_event, KvCacheCleared, KvCacheEvent};
 use tokio::net::{TcpListener, TcpSocket};
 
 use crate::worker::{
-    connection::engine::{EngineConnection, EngineConnector, ZmqLink},
+    connection::engine::{AdminAnswer, EngineConnection, EngineConnector, ZmqLink},
     BasicWorkerBuilder, ConnectionMode, LoadConsumer, Worker, WorkerRegistry,
 };
 
@@ -437,34 +440,15 @@ impl EngineConnection for NoEngine {
         no_engine()
     }
 
-    async fn flush_cache(
-        &self,
-        _timeout_s: f32,
-    ) -> Result<common_proto::FlushCacheResponse, tonic::Status> {
+    async fn flush_cache(&self, _timeout_s: f32) -> Result<AdminAnswer, tonic::Status> {
         no_engine()
     }
 
-    async fn start_profile(
-        &self,
-        _req: common_proto::StartProfileRequest,
-    ) -> Result<common_proto::ProfileResponse, tonic::Status> {
+    async fn start_profile(&self, _options: &ProfileOptions) -> Result<AdminAnswer, tonic::Status> {
         no_engine()
     }
 
-    async fn stop_profile(&self) -> Result<common_proto::ProfileResponse, tonic::Status> {
-        no_engine()
-    }
-
-    async fn subscribe_kv_events(
-        &self,
-        _start_seq: u64,
-    ) -> Result<tonic::Streaming<common_proto::KvEventBatch>, tonic::Status> {
-        no_engine()
-    }
-
-    async fn subscribe_load_records(
-        &self,
-    ) -> Result<tonic::Streaming<common_proto::KvEventBatch>, tonic::Status> {
+    async fn stop_profile(&self) -> Result<AdminAnswer, tonic::Status> {
         no_engine()
     }
 

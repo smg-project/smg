@@ -7,6 +7,7 @@ use openai_protocol::{
     model_card::ModelCard,
     worker::{HealthCheckConfig, WorkerStatus},
 };
+use smg_grpc_client::common_proto::EngineLoad;
 
 use super::*;
 use crate::worker::{
@@ -28,6 +29,56 @@ fn build_monitor() -> (Arc<WorkerRegistry>, Arc<WorkerMonitor>) {
         false,
     ));
     (registry, monitor)
+}
+
+/// A record whose every reader fails the case that calls it.
+struct Unread;
+
+impl LoadRecord for Unread {
+    fn age(&self) -> Duration {
+        panic!("the age of an ignored record was read")
+    }
+
+    fn telemetry(&self) -> LoadTelemetry {
+        panic!("the telemetry of an ignored record was read")
+    }
+
+    fn snapshot(&self) -> SchedulerLoadSnapshot {
+        panic!("the snapshot of an ignored record was built")
+    }
+
+    fn engine_silence(&self) -> Option<Duration> {
+        panic!("the silence of an ignored record was read")
+    }
+
+    fn reports_every_step(&self) -> bool {
+        panic!("the step word of an ignored record was read")
+    }
+
+    fn prefill_pending(&self) -> Option<u64> {
+        panic!("the pending prefill of an ignored record was read")
+    }
+}
+
+/// A record of a negative rank, or of a rank that is another virtual
+/// worker's, is dropped before any reader of it is called: the monitor
+/// builds no snapshot for a record it ignores.
+#[tokio::test]
+async fn an_ignored_record_is_never_read() {
+    let (registry, monitor) = build_monitor();
+    let worker: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new("grpc://decode:9000")
+            .worker_type(WorkerType::Decode)
+            .dp_config(1, 8)
+            .build(),
+    );
+    worker.set_status(WorkerStatus::Ready);
+    registry.register(Arc::clone(&worker)).unwrap();
+    let now = Instant::now();
+    monitor.apply_pushed_load(&worker, -1, &Unread, now);
+    monitor.apply_pushed_load(&worker, 0, &Unread, now);
+    assert_eq!(monitor.pending_pushed_len(), 0);
+    assert!(!worker.runtime_state().unwrap().pushes_load_records());
 }
 
 /// Backend-wide pushes only refresh the matching virtual rank; quiet ranks keep polling.

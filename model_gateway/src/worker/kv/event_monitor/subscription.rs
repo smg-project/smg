@@ -7,6 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use async_trait::async_trait;
 use dashmap::DashMap;
 use smg_grpc_client::common_proto::{kv_cache_event, EngineLoad, KvEventBatch};
 use tokio::sync::{oneshot, Semaphore};
@@ -15,16 +16,17 @@ use tracing::{debug, error, info, warn};
 use super::{
     admission::{BatchOutcome, WorkerStreamState},
     apply::{WorkerIndexCounters, WorkerIndexState},
-    KvBlockSize, KvEventMonitor, SubscriptionKind,
+    KvBlockSize, KvEventMonitor, PushedLoadSink, SubscriptionKind,
 };
-use crate::worker::{
-    connection::engine::EngineConnection,
-    health::liveness,
-    identity::endpoint::Endpoint,
-    kv::{event_monitor::recovery::ResyncReason, index_backend::KvIndex},
-    load::monitor::PushedLoadSink,
-    metrics::Metrics,
-    Worker,
+use crate::{
+    routers::grpc::backend_client::BackendClient,
+    worker::{
+        health::liveness,
+        identity::endpoint::Endpoint,
+        kv::{event_monitor::recovery::ResyncReason, index_backend::KvIndex},
+        metrics::Metrics,
+        Worker,
+    },
 };
 
 /// Initial reconnection delay after stream failure.
@@ -235,6 +237,23 @@ async fn sleep_or_shutdown(
     }
 }
 
+/// The two streams an engine pushes: its KV cache events and its load
+/// records. The subscription loop is their one caller, so the trait stands
+/// here. The gateway's client implements it, and the loop reads that client
+/// back from the worker's connection handle.
+#[async_trait]
+pub(crate) trait EngineStreams: Send + Sync {
+    /// Subscribe to the engine's KV cache events from `start_seq` on.
+    async fn subscribe_kv_events(
+        &self,
+        start_seq: u64,
+    ) -> Result<tonic::Streaming<KvEventBatch>, tonic::Status>;
+
+    /// Subscribe to the engine's load records alone, no events.
+    async fn subscribe_load_records(&self)
+        -> Result<tonic::Streaming<KvEventBatch>, tonic::Status>;
+}
+
 /// Subscribe to the worker's KV events from `start_seq` (`Events`), or to
 /// its load records alone (`Loads`), with `deadline` on the server's answer.
 /// A live server answers a subscription with headers
@@ -245,7 +264,7 @@ async fn sleep_or_shutdown(
 /// removal ends it at once (without this arm a call that never answers,
 /// retried at every contact, would keep the task alive past the removal).
 async fn subscribe_with_deadline(
-    backend_client: &dyn EngineConnection,
+    backend_client: &dyn EngineStreams,
     start_seq: u64,
     kind: SubscriptionKind,
     wake: Option<&Arc<tokio::sync::Notify>>,
@@ -495,15 +514,25 @@ impl KvEventMonitor {
         };
 
         let start_seq = state.resume_sequence();
-        let subscribed = subscribe_with_deadline(
-            backend_client.as_ref(),
-            start_seq,
-            sub.role.kind(),
-            sub.wake,
-            shutdown_rx,
-            SUBSCRIBE_DEADLINE,
-        )
-        .await;
+        // The streams are the gateway's client's: the loop reads it back from
+        // the handle, as the request path does. A connection of another type
+        // carries no stream, and reads as an engine that serves none.
+        let subscribed = match backend_client.downcast_arc::<BackendClient>() {
+            Some(streams) => {
+                subscribe_with_deadline(
+                    streams.as_ref(),
+                    start_seq,
+                    sub.role.kind(),
+                    sub.wake,
+                    shutdown_rx,
+                    SUBSCRIBE_DEADLINE,
+                )
+                .await
+            }
+            None => Subscribed::Refused(tonic::Status::unimplemented(
+                "the worker's connection carries no event stream",
+            )),
+        };
         let stream = match subscribed {
             Subscribed::Stream(stream) => {
                 info!(
@@ -1095,13 +1124,15 @@ mod tests {
     }
 
     /// A gRPC worker at `addr` and its backend client.
-    async fn connected(addr: SocketAddr) -> (Arc<dyn Worker>, Arc<dyn EngineConnection>) {
+    async fn connected(addr: SocketAddr) -> (Arc<dyn Worker>, Arc<BackendClient>) {
         let worker = grpc_worker(addr);
         let client = worker
             .engine_connection()
             .await
             .expect("a backend client")
-            .expect("a gRPC worker has one");
+            .expect("a gRPC worker has one")
+            .downcast_arc::<BackendClient>()
+            .expect("the gateway's client");
         (worker, client)
     }
 
@@ -1332,7 +1363,9 @@ mod tests {
             .engine_connection()
             .await
             .expect("a backend client")
-            .expect("a gRPC worker has one");
+            .expect("a gRPC worker has one")
+            .downcast_arc::<BackendClient>()
+            .expect("the gateway's client");
         let registry = Arc::new(WorkerRegistry::new());
         registry.register(Arc::clone(&worker));
         let monitor = Arc::new(WorkerMonitor::new(
@@ -1936,6 +1969,63 @@ mod tests {
                     "the worker's removal lowers it"
                 );
                 server.abort();
+            });
+        });
+    }
+
+    /// A worker whose connection is not the gateway's client carries no
+    /// event stream: its subscription is refused as unimplemented, the
+    /// worker's gauge rises, and no second connect is asked for.
+    #[test]
+    fn a_connection_that_is_not_the_gateways_client_carries_no_event_stream() {
+        use metrics_exporter_prometheus::PrometheusBuilder;
+
+        use crate::worker::{connection::engine::EngineConnector, test_support::CountingConnector};
+
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        // The subscription task publishes from the runtime's thread, which
+        // must be the one holding the local recorder.
+        metrics::with_local_recorder(&recorder, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let connector = Arc::new(CountingConnector::default());
+                let worker: Arc<dyn Worker> = Arc::new(
+                    BasicWorkerBuilder::new("grpc://no-engine:9000")
+                        .worker_type(WorkerType::Regular)
+                        .connection_mode(ConnectionMode::Grpc)
+                        .model(ModelCard::new("m"))
+                        .health_config(HealthCheckConfig {
+                            disable_health_check: true,
+                            ..Default::default()
+                        })
+                        .engine_connector(Arc::clone(&connector) as Arc<dyn EngineConnector>)
+                        .build(),
+                );
+                let prefix = format!("smg_kv_events_unavailable{{worker=\"{}\"}}", worker.url());
+                let gauge = || {
+                    handle
+                        .render()
+                        .lines()
+                        .find(|line| line.starts_with(&prefix))
+                        .and_then(|line| line.rsplit(' ').next()?.parse::<f64>().ok())
+                };
+                let monitor = KvEventMonitor::new();
+                monitor
+                    .on_worker_added(&worker, SubscriptionKind::Events)
+                    .await;
+                for _ in 0..500 {
+                    if gauge() == Some(1.0) {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                assert_eq!(gauge(), Some(1.0), "the refusal raises the gauge");
+                assert_eq!(connector.connects(), 1, "no second connect");
+                monitor.on_worker_removed(worker.url()).await;
             });
         });
     }
