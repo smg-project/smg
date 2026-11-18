@@ -137,7 +137,9 @@ pub use lease::{
     Side, Signal, TransportClass,
 };
 pub use ring::{ConsistentHash, Ring};
-pub use sessions::{Assignment, Pins, Recovery, SessionRule, SessionTable, SessionVerdict};
+pub use sessions::{
+    Assignment, Forgets, Pins, Recovery, SessionRule, SessionTable, SessionVerdict,
+};
 pub use spec::{
     AppliedSpec, Needs, PolicySpec, PowerOfTwoMetric, SessionsSpec, SpecError, API_VERSION, PRESETS,
 };
