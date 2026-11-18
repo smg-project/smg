@@ -28,7 +28,9 @@ pub use super::metadata::WorkerMetadata;
 pub(crate) use crate::worker::runtime::COLD_PREFILL_TOKENS_PER_SEC;
 use crate::worker::{
     connection::{
-        engine::{EngineConnection, EngineConnector, ZmqLink, NO_ENGINE_CONNECTOR},
+        engine::{
+            EngineConnection, EngineConnectionCache, EngineConnector, ZmqLink, NO_ENGINE_CONNECTOR,
+        },
         engine_admin::{
             admin_backend_client, admin_grpc_result, admin_http_post, failed, FLUSH_HTTP_TIMEOUT,
             PROFILE_HTTP_TIMEOUT,
@@ -991,12 +993,12 @@ pub struct BasicWorker {
     /// dedupes concurrent connects; the outer `ArcSwap` lets the ZMQ health
     /// probe evict a dead client by swapping in a fresh cell (gRPC never
     /// swaps — a failed gRPC worker is removed and re-added instead).
-    pub engine_connection: Arc<ArcSwap<OnceCell<Arc<dyn EngineConnection>>>>,
+    pub engine_connection: Arc<EngineConnectionCache>,
     /// What makes the engine connection: the host's connector, as the
     /// builder resolved it. Without one a gRPC or ZMQ connect is refused.
     pub engine_connector: Option<Arc<dyn EngineConnector>>,
     /// Guards the one-shot background ZMQ handshake driver so the health probe
-    /// never cancels a long (model-load) handshake. Self-clears on failure to
+    /// never cancels a long (model-load) handshake. Clears at completion to
     /// allow a retry. Unused for HTTP/gRPC.
     pub zmq_connect_started: Arc<AtomicBool>,
     /// Abort handle for that driver, so removing or replacing the worker
@@ -1144,6 +1146,9 @@ impl BasicWorker {
                 .await
             {
                 Ok(_) => {
+                    // Only an in-flight handshake needs this guard. A probe
+                    // holding another worker can evict the shared connection.
+                    started.store(false, Ordering::SeqCst);
                     // Handshake landed: wake the manager to promote now
                     // rather than on the next poll. A dropped signal (no
                     // manager, or receiver gone) is harmless — polling
@@ -1256,12 +1261,11 @@ impl BasicWorker {
         // replacement that arrived with its own client keeps it.
         if self.metadata.spec.connection_mode != other.metadata.spec.connection_mode
             || self.metadata.spec.runtime_type != other.metadata.spec.runtime_type
-            || self.engine_connection.load().get().is_some()
+            || self.engine_connection.load_full().get().is_some()
         {
             return;
         }
-        self.engine_connection
-            .store(other.engine_connection.load_full());
+        self.engine_connection.adopt(&other.engine_connection);
     }
 }
 
@@ -1355,8 +1359,7 @@ impl BasicWorker {
                 "ZMQ engine for {} is no longer alive; evicting the dead client and rebinding on a later probe",
                 self.metadata.redacted_url
             );
-            self.engine_connection
-                .compare_and_swap(&cell, Arc::new(OnceCell::new()));
+            self.engine_connection.evict(&cell);
             self.zmq_connect_started.store(false, Ordering::SeqCst);
             return false;
         }

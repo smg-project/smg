@@ -1306,7 +1306,15 @@ async fn zmq_health_check_evicts_a_dead_client_and_resets_the_guard() {
 
     // A live client stays cached and reports healthy.
     assert!(worker.zmq_health_check());
-    assert!(worker.engine_connection.load().get().is_some());
+    assert!(worker.engine_connection.load_full().get().is_some());
+
+    let replacement = BasicWorkerBuilder::new(ep("ts0.ipc"))
+        .connection_mode(ConnectionMode::Zmq)
+        .health_config(no_health_check())
+        .build();
+    assert!(replacement.inherit_shared_state_from(&worker));
+    worker.abort_background_tasks();
+    assert!(replacement.zmq_health_check());
 
     // Kill the engine and wait for the dispatcher to latch the client closed.
     engine
@@ -1317,7 +1325,7 @@ async fn zmq_health_check_evicts_a_dead_client_and_resets_the_guard() {
         loop {
             let alive = worker
                 .engine_connection
-                .load()
+                .load_full()
                 .get()
                 .map(|c| c.is_alive())
                 .unwrap_or(false);
@@ -1337,13 +1345,85 @@ async fn zmq_health_check_evicts_a_dead_client_and_resets_the_guard() {
     // probe re-runs the handshake for a replacement engine.
     assert!(!worker.zmq_health_check());
     assert!(
-        worker.engine_connection.load().get().is_none(),
+        worker.engine_connection.load_full().get().is_none(),
         "dead client must be evicted from the cell"
     );
     assert!(
         !worker.zmq_connect_started.load(Ordering::SeqCst),
         "handshake guard must reset to allow a reconnect"
     );
+    assert!(
+        replacement.engine_connection_if_initialized().is_none(),
+        "eviction by an outstanding old probe must reach the replacement"
+    );
+}
+
+/// A probe launched on an earlier registry handle can finish after a new
+/// worker's handshake. The registered worker must still start its next one.
+#[tokio::test]
+async fn a_replacement_reconnects_after_a_retired_workers_probe() {
+    use engine_zmq_client::{
+        mock_engine::{connect_to_frontend, default_ready_response},
+        EngineId, ENGINE_CORE_DEAD_SENTINEL,
+    };
+
+    use crate::worker::WorkerRegistry;
+
+    let dir = tempfile::tempdir().unwrap();
+    let base = format!("ipc://{}", dir.path().join("engine").display());
+    let port = portpicker::pick_unused_port().expect("an available handshake port");
+    let handshake = format!("tcp://127.0.0.1:{port}");
+    let build = || {
+        Arc::new(
+            BasicWorkerBuilder::new(&base)
+                .connection_mode(ConnectionMode::Zmq)
+                .runtime_type(RuntimeType::Vllm)
+                .zmq_handshake_address(&handshake)
+                .health_config(no_health_check())
+                .build(),
+        )
+    };
+    let registry = WorkerRegistry::new();
+    let old = build();
+    let id = registry.register(old.clone()).unwrap();
+    let new = build();
+    assert!(registry.replace(&id, new.clone()));
+
+    assert!(!new.zmq_health_check());
+    let mut first = connect_to_frontend(
+        &handshake,
+        EngineId::from_engine_index(0),
+        default_ready_response(),
+    )
+    .await
+    .unwrap();
+    assert!(wait_for(|| new.zmq_health_check()).await);
+    let first_cell = old.engine_connection.load_full();
+    first
+        .send_output(vec![bytes::Bytes::from_static(ENGINE_CORE_DEAD_SENTINEL)])
+        .await
+        .unwrap();
+    assert!(wait_for(|| !first_cell.get().unwrap().is_alive()).await);
+    assert!(!old.zmq_health_check());
+    assert!(
+        new.engine_connection.load_full().get().is_none(),
+        "eviction reached the registered worker"
+    );
+    drop(first);
+    assert!(!new.zmq_health_check());
+    let _second = connect_to_frontend(
+        &handshake,
+        EngineId::from_engine_index(0),
+        default_ready_response(),
+    )
+    .await
+    .expect("the registered worker must rebind after its peer evicts");
+    assert!(wait_for(|| new.zmq_health_check()).await);
+    // A second probe read the dead cell before eviction and resumes now.
+    old.engine_connection.evict(&first_cell);
+    let current = new.engine_connection.load_full();
+    assert!(!Arc::ptr_eq(&first_cell, &current));
+    assert!(Arc::ptr_eq(&current, &old.engine_connection.load_full()));
 }
 
 /// A ZMQ worker's health check is its probe's answer, as the checker reads
@@ -1653,7 +1733,7 @@ async fn zmq_get_backend_client_hands_the_handshake_to_the_background_driver() {
         "acquisition must report the backend as not connected yet"
     );
     assert!(
-        worker.engine_connection.load().get().is_none(),
+        worker.engine_connection.load_full().get().is_none(),
         "no client can be cached before the handshake lands"
     );
 
