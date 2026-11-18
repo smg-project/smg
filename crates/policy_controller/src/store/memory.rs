@@ -2772,10 +2772,13 @@ impl MemoryStore {
     /// it books would stand for good.
     #[must_use]
     pub fn with_deciders(mut self, deciders: usize) -> Self {
+        // Every file is read, each under its own turn: a lease on any of
+        // them would go with its file.
+        let mut files = self.files.iter();
+        let empty = files.all(|file| file.take().records.is_empty());
+        assert!(empty, "a store's files are laid before a lease is filed");
         let (term, counts) = {
             let leases = self.files[0].take();
-            let empty = leases.records.is_empty();
-            assert!(empty, "a store's files are laid before a lease is filed");
             (leases.term, Arc::clone(&leases.counts))
         };
         let files = turn::Files::of(deciders, &self.files, || Leases {

@@ -3640,3 +3640,22 @@ fn a_store_with_a_lease_on_file_is_not_laid_for_deciders() {
     filed.expect("a lease");
     drop(store.with_deciders(2));
 }
+
+/// Nor is a store laid again with a lease on a later file: the guard
+/// reads every file, each under its own turn.
+#[test]
+#[should_panic(expected = "a store's files are laid before a lease is filed")]
+fn a_store_with_a_lease_on_a_later_file_is_not_laid_again() {
+    let store = MemoryStore::new().with_deciders(4);
+    let a = ready(&store, "http://a:1");
+    LeasesStore::set_term(&store, 1);
+    {
+        // A thread that acts as the fourth decider files on the fourth
+        // file: the first file stays empty.
+        let (_acting, world) = (Decider::new(3).enter(), store.world());
+        let record = booking(GatewayId(1), 0, a, Instant::now());
+        let issued = store.issue_decided(record, world.booked_of(a), |_| ());
+        issued.expect("minted under the store's term");
+    }
+    drop(store.with_deciders(8));
+}
