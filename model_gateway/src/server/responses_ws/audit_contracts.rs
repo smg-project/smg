@@ -22,6 +22,7 @@ struct NativeFixture {
     auth: crate::middleware::AuthConfig,
     tracker: Arc<InFlightRequestTracker>,
     drops: Arc<AtomicUsize>,
+    post_body_ends: Arc<AtomicUsize>,
     resume: Arc<Notify>,
     url: String,
     bucket: Arc<crate::middleware::TokenBucket>,
@@ -187,11 +188,13 @@ impl Fixture {
         .unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
         let drops = Arc::new(AtomicUsize::new(0));
+        let post_body_ends = Arc::new(AtomicUsize::new(0));
         let resume = Arc::new(Notify::new());
         let bucket = Arc::new(crate::middleware::TokenBucket::new(1, 0));
         let admission = admission_state(bucket.clone());
         let counted = calls.clone();
         let dropped = drops.clone();
+        let body_ends = post_body_ends.clone();
         let release = resume.clone();
         let tracker = InFlightRequestTracker::new();
         struct DropProbe(Arc<AtomicUsize>);
@@ -203,6 +206,7 @@ impl Fixture {
         let protected = axum::Router::new().route("/v1/responses", axum::routing::post(move |Extension(meta): Extension<TenantRequestMeta>, turn: Option<Extension<SocketTurn>>, ValidatedJson(body): ValidatedJson<ResponsesRequest>| {
             let counted = counted.clone();
             let dropped = dropped.clone();
+            let body_ends = body_ends.clone();
             let release = release.clone();
             async move {
                 let number = counted.fetch_add(1, Ordering::SeqCst);
@@ -228,7 +232,11 @@ impl Fixture {
                         Ok::<_, io::Error>(axum::body::Bytes::from(format!("data: {event}\n\n")))
                     });
                     let first = futures::stream::once(async { Ok::<_, io::Error>(axum::body::Bytes::from_static(b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_wait\"}}\n\n")) });
-                    return Response::builder().header("content-type", "text/event-stream").body(Body::from_stream(first.chain(pending))).unwrap();
+                    let end = futures::stream::poll_fn(move |_| {
+                        body_ends.fetch_add(1, Ordering::SeqCst);
+                        std::task::Poll::Ready(None)
+                    });
+                    return Response::builder().header("content-type", "text/event-stream").body(Body::from_stream(first.chain(pending).chain(end))).unwrap();
                 }
                 let tenant = meta.tenant_key().as_str().to_owned();
                 let event = json!({"type":"response.completed","response":{"id":format!("resp_native_{number}"),"status":"completed","output":[{"type":"message","id":"msg_fixture","role":"assistant","content":[{"type":"output_text","text":tenant}]}]}});
@@ -288,6 +296,7 @@ impl Fixture {
             auth,
             tracker,
             drops,
+            post_body_ends,
             resume,
             url,
             bucket,
@@ -678,6 +687,7 @@ async fn drain_allows_an_active_response_to_finish_and_then_closes_the_socket() 
         tracker,
         resume,
         bucket,
+        post_body_ends,
         ..
     } = Fixture::native().await;
     fixture
@@ -724,4 +734,5 @@ async fn drain_allows_an_active_response_to_finish_and_then_closes_the_socket() 
     assert!(matches!(close, ClientMessage::Close(Some(frame)) if u16::from(frame.code) == 1012));
     assert!(tracker.wait_for_shutdown(Duration::from_secs(1)).await);
     assert_eq!(bucket.available_tokens(), 1.0);
+    assert_eq!(post_body_ends.load(Ordering::SeqCst), 1);
 }

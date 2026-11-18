@@ -168,6 +168,8 @@ const GLOBAL_CACHE_BYTES: usize = 128 * 1024 * 1024;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(900);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(15);
 const RESPONSE_READ_TIMEOUT: Duration = Duration::from_secs(15);
+const POST_TAIL_TIMEOUT: Duration = Duration::from_secs(1);
+const MAX_POST_TAIL_FRAMES: usize = 8;
 const MAX_ERROR_BYTES: usize = 1024 * 1024;
 const CONNECTION_LIFETIME: Duration = Duration::from_secs(3600);
 static CACHE_BYTES: AtomicUsize = AtomicUsize::new(0);
@@ -871,16 +873,27 @@ async fn serve(
                 }
             }
         }
-        if !complete
-            && !send(
-                &mut socket,
-                &error(
-                    "upstream_stream_error",
-                    "Upstream ended before a terminal response event",
-                    None,
-                ),
-            )
-            .await
+        if complete {
+            // Let the HTTP edge observe EOF and release its permit. The
+            // terminal event has already reached the client.
+            let deadline = expires.min(tokio::time::Instant::now() + POST_TAIL_TIMEOUT);
+            let _ = tokio::time::timeout_at(deadline, async {
+                for _ in 0..MAX_POST_TAIL_FRAMES {
+                    if !matches!(stream.next().await, Some(Ok(_))) {
+                        break;
+                    }
+                }
+            })
+            .await;
+        } else if !send(
+            &mut socket,
+            &error(
+                "upstream_stream_error",
+                "Upstream ended before a terminal response event",
+                None,
+            ),
+        )
+        .await
         {
             return;
         }
