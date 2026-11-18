@@ -136,6 +136,9 @@ pub(crate) struct PipelineDeps {
     /// `--grouped-dp-sticky`: whether, and how, an attempt pins a sticky
     /// request to one engine of a grouped data-parallel worker.
     grouped_dp_sticky: GroupedDpSticky,
+    /// `--parser-flags-over-registry`: Symphony reads the configured parser
+    /// names before its registry (`ParserResolver::with_flags_over_registry`).
+    parser_flags_over_registry: bool,
 }
 
 impl PipelineDeps {
@@ -168,6 +171,7 @@ impl PipelineDeps {
             queue_timeout,
             request_timeout: None,
             grouped_dp_sticky: GroupedDpSticky::Off,
+            parser_flags_over_registry: false,
         }
     }
 
@@ -192,6 +196,7 @@ impl PipelineDeps {
             queue_timeout,
             request_timeout: None,
             grouped_dp_sticky: GroupedDpSticky::Off,
+            parser_flags_over_registry: false,
         }
     }
 
@@ -212,6 +217,14 @@ impl PipelineDeps {
         self
     }
 
+    /// Have Symphony read the configured parser names before its registry
+    /// (`--parser-flags-over-registry`).
+    #[must_use]
+    pub(crate) fn with_parser_flags_over_registry(mut self, over: bool) -> Self {
+        self.parser_flags_over_registry = over;
+        self
+    }
+
     /// Build the chat/messages response processor pair from the configured
     /// parser factories, labeled with `backend`.
     fn configured_processors(
@@ -227,7 +240,8 @@ impl PipelineDeps {
             self.configured_reasoning_parser.clone(),
             &self.tool_parser_factory,
             &self.reasoning_parser_factory,
-        );
+        )
+        .with_flags_over_registry(self.parser_flags_over_registry);
         let processor = processor::ResponseProcessor::new(
             self.tool_parser_factory.clone(),
             self.reasoning_parser_factory.clone(),
@@ -281,6 +295,7 @@ impl PipelineDeps {
             queue_timeout: Duration::from_secs(60),
             request_timeout: None,
             grouped_dp_sticky: GroupedDpSticky::Off,
+            parser_flags_over_registry: false,
         }
     }
 }
