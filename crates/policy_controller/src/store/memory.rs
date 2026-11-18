@@ -50,7 +50,6 @@ mod turn;
 use blocks::Blocks;
 #[cfg(any(test, feature = "controller"))]
 use blocks::Minted;
-
 pub use turn::{AtWork, Hand};
 
 /// Membership changes kept for watchers; a watcher further behind snapshots
