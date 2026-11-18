@@ -65,6 +65,41 @@ pub(crate) fn section<'de, A: MapAccess<'de>>(
         .map_err(A::Error::custom)
 }
 
+/// The Unigram model of a tokenizer file, its section read by [`section`]
+/// whatever the order of its keys. It is for a file whose section the
+/// `tokenizers` crate's reader took, which reads the scores by its own rule:
+/// the loader asks for the section once more, from the text of the file.
+pub(crate) fn of_file(content: &str) -> serde_json::Result<ModelWrapper> {
+    struct Model(ModelWrapper);
+
+    impl<'de> Deserialize<'de> for Model {
+        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            struct Reader;
+
+            impl<'de> Visitor<'de> for Reader {
+                type Value = ModelWrapper;
+
+                fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                    f.write_str("a Unigram model section")
+                }
+
+                fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<ModelWrapper, A::Error> {
+                    section(None, map)
+                }
+            }
+
+            deserializer.deserialize_map(Reader).map(Model)
+        }
+    }
+
+    #[derive(Deserialize)]
+    struct File {
+        model: Model,
+    }
+
+    serde_json::from_str::<File>(content).map(|file| file.model.0)
+}
+
 /// The value of a `vocab` entry read before the section's kind is known.
 pub(crate) enum Vocab {
     /// A list of pieces with their scores: a Unigram section's, each score
@@ -407,6 +442,63 @@ mod tests {
         let in_front_of_an_old_file = TIED_OLD.replacen('{', r#"{"metadata":{},"#, 1);
         for section in [in_front, behind, in_front_of_an_old_file] {
             assert!(section.contains("metadata"), "{section}");
+            let tokenizer = load(&section).expect("the file loads");
+            assert_eq!(ids(&tokenizer, "aa"), [2], "{section}");
+            assert_eq!(ids(&tokenizer, "aaa"), [1, 2], "{section}");
+        }
+    }
+
+    #[test]
+    fn a_key_of_another_kind_leaves_the_scores_of_a_section_that_names_its_kind() {
+        for entry in [
+            r#""dropout":null"#,
+            r#""unk_token":"<unk>""#,
+            r#""continuing_subword_prefix":"""#,
+            r#""end_of_word_suffix":"""#,
+            r#""fuse_unk":false"#,
+            r#""ignore_merges":false"#,
+            r#""merges":[]"#,
+            r#""max_input_chars_per_word":100"#,
+        ] {
+            let in_front = TIED.replacen('{', &format!("{{{entry},"), 1);
+            let behind = TIED.replacen(
+                r#""type":"Unigram","#,
+                &format!(r#""type":"Unigram",{entry},"#),
+                1,
+            );
+            for section in [in_front, behind] {
+                assert!(section.contains(entry), "{section}");
+                let tokenizer = load(&section).expect("the file loads");
+                assert_eq!(ids(&tokenizer, "aa"), [2], "{section}");
+                assert_eq!(ids(&tokenizer, "aaa"), [1, 2], "{section}");
+            }
+        }
+    }
+
+    #[test]
+    fn merges_in_front_of_type_leave_the_scores_of_a_unigram_section() {
+        // The merges hand the section to the `tokenizers` reader: behind a
+        // key of another kind, and alone.
+        for section in [
+            TIED.replacen('{', r#"{"dropout":null,"merges":[],"#, 1),
+            TIED.replacen('{', r#"{"merges":[["a","a"]],"#, 1),
+        ] {
+            let tokenizer = load(&section).expect("the file loads");
+            assert_eq!(ids(&tokenizer, "aa"), [2], "{section}");
+            assert_eq!(ids(&tokenizer, "aaa"), [1, 2], "{section}");
+        }
+    }
+
+    #[test]
+    fn a_vocabulary_in_front_of_type_leaves_the_scores_of_a_unigram_section() {
+        // Behind a key of another kind the vocabulary hands the section to
+        // the `tokenizers` reader: with `type` behind the vocabulary, and
+        // with no `type` at all.
+        let vocab = ENTRIES[2];
+        for section in [
+            format!(r#"{{"unk_token":"<unk>","unk_id":0,{vocab},"type":"Unigram"}}"#),
+            format!(r#"{{"dropout":null,"unk_id":0,{vocab}}}"#),
+        ] {
             let tokenizer = load(&section).expect("the file loads");
             assert_eq!(ids(&tokenizer, "aa"), [2], "{section}");
             assert_eq!(ids(&tokenizer, "aaa"), [1, 2], "{section}");
