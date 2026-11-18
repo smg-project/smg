@@ -575,6 +575,44 @@ fn references_with_images_take_a_decode_with_vision_when_a_pair_has_one() {
     assert_eq!(bed.placed(), ((0, 0), vec![0], false));
 }
 
+/// A request with no item still asks what it asks of its decode. Images
+/// asked of the decode keep it off the encode entry's early answer: the pair
+/// is picked among the decodes that take images, and where none takes one
+/// the shed names the stage.
+#[test]
+fn a_request_without_items_that_asks_images_of_its_decode_takes_a_decode_with_vision() {
+    let blind = |at: u32, in_flight: u32| Candidate {
+        vision: false,
+        ..row(at, Role::Decode, 1, in_flight)
+    };
+    let mut bed = Bed::new();
+    bed.keys.clear();
+    bed.decode_images = true;
+    // The idle decode takes no image, the busy one does.
+    bed.decodes = vec![blind(0, 0), row(1, Role::Decode, 1, 9)];
+    assert_eq!(bed.placed(), ((0, 1), vec![], false));
+    bed.decodes = vec![blind(0, 0), blind(1, 9)];
+    assert_eq!(bed.stage(), "decode-vision");
+}
+
+/// References that carry images ask a decode with vision of a request
+/// with no item too, and nothing of one that carries no image.
+#[test]
+fn references_with_images_and_no_item_take_a_decode_with_vision() {
+    let blind = Candidate {
+        vision: false,
+        ..row(0, Role::Decode, 1, 0)
+    };
+    let mut bed = Bed::new();
+    bed.keys.clear();
+    bed.references = true;
+    // The idle decode takes no image, the busy one does.
+    bed.decodes = vec![blind, row(1, Role::Decode, 1, 9)];
+    assert_eq!(bed.placed(), ((0, 1), vec![], false));
+    bed.images = 0;
+    assert_eq!(bed.placed(), ((0, 0), vec![], false));
+}
+
 #[test]
 fn a_served_pair_without_vision_ahead_leaves_the_question_of_vision_open() {
     // Two pair classes under no table: the idle prefill's decode takes no
