@@ -7,6 +7,7 @@ use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
     fs, io, iter,
+    ops::Range,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc, Mutex, OnceLock, PoisonError,
@@ -2069,11 +2070,23 @@ const VALUE_SEPARATOR: u8 = 0x1f;
 /// separator, one byte that is no control spelling and is not empty.
 const NOT_A_STRING: u8 = 0x1e;
 
-/// A root `set` statement that binds one control spelling for every render:
-/// the byte span of its expression, and the spelling.
+/// A root `set` statement that binds control spellings for every render:
+/// the byte span of its expression, its value, and where the control
+/// spellings stand in the value. One spelling is the whole value, or the
+/// value begins with one and ends with one ([`several_controls`]).
 struct ControlBinding {
     span: (usize, usize),
-    spelling: String,
+    value: String,
+    controls: Vec<Range<usize>>,
+}
+
+impl ControlBinding {
+    /// The control spellings of the value, in its order.
+    fn spellings(&self) -> impl Iterator<Item = &str> {
+        self.controls
+            .iter()
+            .map(|control| &self.value[control.clone()])
+    }
 }
 
 /// A root `set` statement whose value the load computes
@@ -2169,10 +2182,10 @@ type Names<'a> = HashMap<&'a str, Watched>;
 /// each of the four special tokens between marks too. Such a name is a
 /// carrier; so is a name a plain `set` binds from a join that holds one, and
 /// a macro that writes one. Whether a built value is a control spelling is
-/// read later, with the vocabulary: one that is neither that nor empty
-/// leaves the template unmarked there
-/// ([`ChatTemplateState::control_bindings`]). A carrier may stand in three
-/// places:
+/// read later, with the vocabulary: one that is not empty and does not
+/// begin and end with a control spelling leaves the template unmarked
+/// there ([`ChatTemplateState::control_bindings`]). A carrier may stand in
+/// three places:
 ///
 /// - as a written value, alone or as a whole operand of a join: `~`, or
 ///   `+`, which joins two strings and fails on anything else, with the marks
@@ -2389,35 +2402,68 @@ fn without<'a>(names: &Names<'a>, targets: &'a [Expr<'a>]) -> Names<'a> {
     inner
 }
 
-/// `spelling` between the marks of `encoders::marks`, as a string literal of
-/// a template's source. `None` for a spelling a plain literal does not hold
-/// (a backslash, a control character, both kinds of quote).
-fn marked_literal(spelling: &str) -> Option<String> {
+/// The quote of a plain string literal of a template's source that holds
+/// `value`. `None` for a value none holds (a backslash, a control
+/// character, both kinds of quote).
+fn literal_quote(value: &str) -> Option<char> {
     let holds = |quote: u8| {
-        !spelling
+        !value
             .bytes()
             .any(|byte| byte == quote || byte == b'\\' || byte < b' ')
     };
     if holds(b'\'') {
-        Some(format!("'{}'", marks::mark(spelling)))
+        Some('\'')
     } else if holds(b'"') {
-        Some(format!("\"{}\"", marks::mark(spelling)))
+        Some('"')
     } else {
         None
     }
 }
 
+/// The value of `binding` as a string literal of a template's source, each
+/// of its control spellings between the marks of `encoders::marks`. `None`
+/// for a value no plain literal holds ([`literal_quote`]).
+fn marked_literal(binding: &ControlBinding) -> Option<String> {
+    let value = binding.value.as_str();
+    let quote = literal_quote(value)?;
+    let mut literal = String::from(quote);
+    let mut cursor = 0;
+    for control in &binding.controls {
+        literal.push_str(&value[cursor..control.start]);
+        literal.push_str(&marks::mark(&value[control.clone()]));
+        cursor = control.end;
+    }
+    literal.push_str(&value[cursor..]);
+    literal.push(quote);
+    Some(literal)
+}
+
+/// Where the control spellings stand in `value`, a string a statement
+/// builds that is no control spelling whole: the added tokens `added` finds
+/// in it, each as it stands, leftmost and the longest at one place. `None`
+/// unless the value begins with one and ends with one. Text at an edge may
+/// be a piece of a control: the template would complete that control where
+/// it writes the value, and no mark would stand around it. Text between two
+/// controls is closed in by them. A token whose entry carries a flag is
+/// found as its spelling, and the read of the vocabulary refuses it
+/// ([`contested`]).
+fn several_controls(value: &str, added: &AddedTokens) -> Option<Vec<Range<usize>>> {
+    let controls: Vec<_> = added.ranges(value).collect();
+    let at_both_edges = controls.first()?.start == 0 && controls.last()?.end == value.len();
+    at_both_edges.then_some(controls)
+}
+
 /// `source`, a chat template, with the expression of each of `bindings`
 /// ([`ChatTemplateState::control_bindings`], in the template's order) replaced by its
-/// spelling between marks ([`marked_literal`]). `None` when a spelling has
-/// no literal.
+/// value, the control spellings between marks ([`marked_literal`]). `None`
+/// when a value has no literal.
 fn with_marked_literals(source: &str, bindings: &[ControlBinding]) -> Option<String> {
     let mut marked = String::with_capacity(source.len());
     let mut cursor = 0;
     for binding in bindings {
         let (start, end) = binding.span;
         marked.push_str(&source[cursor..start]);
-        marked.push_str(&marked_literal(&binding.spelling)?);
+        marked.push_str(&marked_literal(binding)?);
         cursor = end;
     }
     marked.push_str(&source[cursor..]);
@@ -4289,7 +4335,10 @@ impl ChatTemplateState {
     /// root `set` statement whose value is the same at every render and is
     /// one added token (`is_control`) binds a control spelling, and a copy
     /// of the source takes that spelling, between the marks of
-    /// `encoders::marks`, as a literal in the statement's place. Compiled
+    /// `encoders::marks`, as a literal in the statement's place. A value
+    /// such a statement builds that begins with an added token and ends
+    /// with one holds several, and takes the marks around each
+    /// ([`several_controls`]). Compiled
     /// so, the template writes control tokens where it writes the names,
     /// alone or inside a longer value, and the same spellings in request
     /// text stay text, as under [`Self::mark_controls`]; a render builds no
@@ -4302,17 +4351,18 @@ impl ChatTemplateState {
     /// build is only written, joined or asked whether it is empty, and what
     /// it is built from is read by nothing else. A template that reads one
     /// any other way (a filter, a comparison, a search, a slice), binds one
-    /// from a request argument, builds a value that is neither a control
-    /// spelling nor empty, or writes an added token whole by itself (in
-    /// its text or in a string literal, not in a comment) stays as it is,
-    /// its prompts encoded from their text as before. So does one that
-    /// writes a control outside its constants on a probe conversation
-    /// ([`Self::marks_every_control`]). Every reading is
+    /// from a request argument, builds a value that is not empty and does
+    /// not begin and end with a control spelling, or writes an added token
+    /// whole by itself (in its text or in a string literal, not in a
+    /// comment) stays as it is, its prompts encoded from their text as
+    /// before. So does one that writes a control outside its constants on a
+    /// probe conversation ([`Self::marks_every_control`]). Every reading is
     /// made through copies of the templates ([`Self::twin`]), so the render
     /// of a request carries nothing for it. `controls`, the matcher over the
     /// added tokens, is asked for only once a template binds a control
-    /// spelling it does not write whole by itself, so a checkpoint without
-    /// one never builds it.
+    /// spelling it does not write whole by itself, or builds a value a
+    /// plain literal holds that is neither a control spelling nor empty,
+    /// so a checkpoint without either never builds it.
     ///
     /// Before that the vocabulary is read once: `added` is every added
     /// token, with whether its entry carries a flag. Where the flat encode
@@ -4328,20 +4378,20 @@ impl ChatTemplateState {
         &mut self,
         is_control: &dyn Fn(&str) -> bool,
         added: impl FnOnce() -> I,
-        controls: impl FnOnce() -> Option<&'a AddedTokens>,
+        controls: impl Fn() -> Option<&'a AddedTokens>,
         special_tokens: &SpecialTokens,
     ) -> Option<Vec<String>>
     where
         I: Iterator<Item = (&'b str, bool)>,
     {
-        let own = self.control_bindings(is_control, special_tokens);
+        let own = self.control_bindings(is_control, &controls, special_tokens);
         if own.is_empty() {
             return None;
         }
         let nested: Vec<_> = [&self.tool_use, &self.processor]
             .into_iter()
             .flatten()
-            .map(|state| state.control_bindings(is_control, special_tokens))
+            .map(|state| state.control_bindings(is_control, &controls, special_tokens))
             .collect();
         // Every spelling that would stand between marks: what the templates
         // bind, and the special tokens a render gives by name.
@@ -4354,7 +4404,7 @@ impl ChatTemplateState {
         let spellings: Vec<&str> = own
             .iter()
             .chain(nested.iter().flatten())
-            .map(|binding| binding.spelling.as_str())
+            .flat_map(ControlBinding::spellings)
             .chain(named.into_iter().flatten().map(String::as_str))
             .filter(|spelling| !spelling.is_empty())
             .collect();
@@ -4417,32 +4467,39 @@ impl ChatTemplateState {
         }
     }
 
-    /// The root `set` statements of this template that bind a control
-    /// spelling for every render: those whose value is the same at every
+    /// The root `set` statements of this template that bind control
+    /// spellings for every render: those whose value is the same at every
     /// render ([`computed_statements`]) and is one control spelling
-    /// (`is_control`), under a name no statement binds another way. The
-    /// template engine says the values: the statements the load computes,
-    /// alone, each followed by its value behind a separator
-    /// ([`VALUE_SEPARATOR`]), are rendered once, the way a request's
-    /// template is.
+    /// (`is_control`), or a string the statement builds that begins with a
+    /// control spelling and ends with one ([`several_controls`]), under a
+    /// name no statement binds another way. The template engine says the
+    /// values: the statements the load computes, alone, each followed by
+    /// its value behind a separator ([`VALUE_SEPARATOR`]), are rendered
+    /// once, the way a request's template is.
     ///
-    /// None when one of those values is a control spelling the load cannot
-    /// write as a literal: its statement reads a name that has no one
-    /// value, or another statement binds its name another way. The template
-    /// would write that control without marks wherever no probe
+    /// None when one of those values holds a control spelling the load
+    /// cannot write as a literal: its statement reads a name that has no
+    /// one value, or another statement binds its name another way. The
+    /// template would write that control without marks wherever no probe
     /// conversation goes, so it stays as it is. None when a statement
-    /// builds a value that is neither one control spelling nor empty,
-    /// whether a string or not ([`NOT_A_STRING`]): it may be a piece of a
-    /// control, which takes no marks, and the template would complete that
-    /// control where it writes the piece. None as well when the template
-    /// writes one of the spellings whole by itself, in its text or in a
-    /// string literal ([`written_text`]): that template is of the other
-    /// kind, and it says so here, before the matcher over the added tokens
-    /// is asked for. A comment that names a spelling is nothing the
-    /// template writes, and neither is the pattern a value is built from.
-    fn control_bindings(
+    /// builds any other value that is not empty, whether a string or not
+    /// ([`NOT_A_STRING`]): it may be a piece of a control, which takes no
+    /// marks, and the template would complete that control where it writes
+    /// the piece. None as well when the template writes one of the
+    /// spellings whole by itself, in its text or in a string literal
+    /// ([`written_text`]): that template is of the other kind, and it says
+    /// so here. A comment that names a spelling is nothing the template
+    /// writes, and neither is the pattern a value is built from.
+    ///
+    /// `matcher`, the matcher over the added tokens, is asked for only at a
+    /// value a statement builds that is neither a control spelling nor
+    /// empty and that a plain literal holds ([`literal_quote`]): it says
+    /// where the control spellings stand in that value. A default prompt
+    /// with a line break in it, which the load takes for built, never asks.
+    fn control_bindings<'a>(
         &self,
         is_control: &dyn Fn(&str) -> bool,
+        matcher: &dyn Fn() -> Option<&'a AddedTokens>,
         special_tokens: &SpecialTokens,
     ) -> Vec<ControlBinding> {
         // Only a template that writes the values its root statements build
@@ -4513,32 +4570,47 @@ impl ChatTemplateState {
         let mut written = None;
         let mut bindings = Vec::new();
         for (statement, value) in computed.iter().zip(values) {
-            if !is_control(value) {
-                // A built value that is no control whole may be a piece of
-                // one: the template would complete that control where it
-                // writes the piece, and no mark would stand around it.
-                if statement.builds && !value.is_empty() {
-                    return Vec::new();
-                }
+            let whole = is_control(value);
+            if !whole && (!statement.builds || value.is_empty()) {
                 continue;
             }
             if !statement.fixed || unsettled.contains(&statement.name) {
                 return Vec::new();
             }
-            // The source holds the spelling: the template may write it
-            // whole by itself, in its text or in a string literal. In a
-            // comment, or in the pattern a value is built from, it writes
-            // nothing.
-            if source.contains(value)
-                && written
-                    .get_or_insert_with(|| written_text(source, built))
-                    .contains(value)
-            {
+            let controls = if whole {
+                Some(iter::once(0..value.len()).collect())
+            } else if literal_quote(value).is_none() {
+                // No plain literal holds the value (one that is no string
+                // among them): it could take no marks, and the matcher is
+                // not asked.
+                None
+            } else {
+                matcher().and_then(|added| several_controls(value, added))
+            };
+            // A built value that does not begin and end with a control may
+            // be a piece of one: the template would complete that control
+            // where it writes the piece, and no mark would stand around it.
+            let Some(controls) = controls else {
                 return Vec::new();
+            };
+            for control in &controls {
+                // The source holds the spelling: the template may write it
+                // whole by itself, in its text or in a string literal. In a
+                // comment, or in the pattern a value is built from, it
+                // writes nothing.
+                let spelling = &value[control.clone()];
+                if source.contains(spelling)
+                    && written
+                        .get_or_insert_with(|| written_text(source, built))
+                        .contains(spelling)
+                {
+                    return Vec::new();
+                }
             }
             bindings.push(ControlBinding {
                 span: statement.span,
-                spelling: value.to_owned(),
+                value: value.to_owned(),
+                controls,
             });
         }
         bindings

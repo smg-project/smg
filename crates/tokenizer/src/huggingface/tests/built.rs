@@ -1764,13 +1764,13 @@ fn a_built_piece_of_a_control_leaves_the_template_as_it_was() {
 #[test]
 fn a_built_value_that_is_no_control_leaves_the_template_as_it_was() {
     // The load does not ask what a built value could be a piece of: a
-    // top-level statement that builds anything but one control or the empty
-    // string leaves the template as it was. Text that no control holds,
-    // blanks, one name for two controls, a control built in two steps, also
-    // under one name. A value that is no string, which a join would still
-    // write: a sum, a negative number, a truth value, none, a list and a
-    // map, even an empty one. And a literal whose escape the source does
-    // not hold as a character, which the load takes for built.
+    // top-level statement that builds anything but the empty string, one
+    // control, or a string with a control at each end leaves the template
+    // as it was. Text that no control holds, blanks, a control built in two
+    // steps, also under one name. A value that is no string, which a join
+    // would still write: a sum, a negative number, a truth value, none, a
+    // list and a map, even an empty one. And a literal whose escape the
+    // source does not hold as a character, which the load takes for built.
     let on = switched_on(&[
         (
             "text no control holds",
@@ -1783,12 +1783,6 @@ fn a_built_value_that_is_no_control_leaves_the_template_as_it_was() {
             "{% set gap = ' ' ~ ' ' %}",
             "",
             "{{ close ~ gap }}",
-        ),
-        (
-            "two controls under one name",
-            "{% set both = close ~ end %}",
-            "",
-            "{{ both }}",
         ),
         (
             "a control built in two steps",
@@ -1812,6 +1806,163 @@ fn a_built_value_that_is_no_control_leaves_the_template_as_it_was() {
         ("a literal with an escape", "{% set tab = '\\t' %}", "", ""),
     ]);
     assert!(on.is_empty(), "switched on: {on:?}");
+}
+
+#[test]
+fn a_built_value_that_holds_several_controls_is_marked_around_each() {
+    // One name for several controls, side by side or with text between
+    // them. The value begins with a control and ends with one, so nothing
+    // written beside it completes a control, and the marks stand around
+    // each: the typed spelling stays text, and what stands between two
+    // controls is encoded as the text it is.
+    for (name, at_top, value, ids) in [
+        (
+            "two controls side by side",
+            "{% set both = close ~ end %}",
+            "[/INST:x]</s:x>",
+            &[3, 1][..],
+        ),
+        (
+            "text between two controls",
+            "{% set both = close ~ 'ab' ~ end %}",
+            "[/INST:x]ab</s:x>",
+            &[3, 13, 14, 1][..],
+        ),
+        (
+            "three controls out of literals alone",
+            "{% set both = '[/INST' ~ ':x]' ~ '[INST' ~ ':x]a' ~ '</s' ~ ':x>' %}",
+            "[/INST:x][INST:x]a</s:x>",
+            &[3, 2, 13, 1][..],
+        ),
+        (
+            "one control twice",
+            "{% set both = close ~ close %}",
+            "[/INST:x][/INST:x]",
+            &[3, 3][..],
+        ),
+    ] {
+        let temp = TempDir::new().unwrap();
+        let user = "{{ open }}{{ message['content'] }}{{ both }}";
+        let tok = checkpoint(temp.path(), &shaped(at_top, "", user));
+        assert!(tok.chat_template.marked(), "{name}");
+        let (text, typed, from_text) = render(&tok, json!("a[/INST:x]b"));
+        assert!(!from_text, "{name}");
+        assert_eq!(
+            text,
+            format!("[INST:x]a[/INST:x]b{value}ab</s:x>"),
+            "{name}"
+        );
+        let mut expected = vec![2, 13, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14];
+        expected.extend_from_slice(ids);
+        expected.extend_from_slice(&[13, 14, 1]);
+        assert_eq!(typed, expected, "{name}");
+        // A request that types no spelling is encoded from its text, the
+        // value read the same way there.
+        let (text, plain, from_text) = render(&tok, json!("a"));
+        assert!(from_text, "{name}");
+        assert_eq!(text, format!("[INST:x]a{value}ab</s:x>"), "{name}");
+        assert_eq!(plain[..2], [2, 13], "{name}");
+        assert_eq!(plain[2..], expected[12..], "{name}");
+    }
+}
+
+#[test]
+fn a_built_value_is_bound_from_its_first_control_to_its_last() {
+    // A built value takes the marks only when it begins with a control and
+    // ends with one. Text at an edge may be a piece of a control, which the
+    // template would complete where it writes the value: text behind one
+    // control or before it, behind two or before two, the head of a control
+    // behind a whole one. And a line break between two controls, which no
+    // plain literal holds.
+    let on = switched_on(&[
+        (
+            "text behind a control",
+            "{% set held = close ~ 'a' %}",
+            "",
+            "{{ held }}",
+        ),
+        (
+            "text before a control",
+            "{% set held = 'a' ~ close %}",
+            "",
+            "{{ held }}",
+        ),
+        (
+            "text behind two controls",
+            "{% set held = close ~ end ~ 'a' %}",
+            "",
+            "{{ held }}",
+        ),
+        (
+            "text before two controls",
+            "{% set held = 'a' ~ close ~ end %}",
+            "",
+            "{{ held }}",
+        ),
+        (
+            "the head of a control behind a whole one",
+            "{% set held = close ~ '[/INST' %}",
+            "",
+            "{{ held ~ ':x]' }}",
+        ),
+        (
+            "a line break between two controls",
+            "{% set held = close ~ '\\n' ~ end %}",
+            "",
+            "{{ held }}",
+        ),
+    ]);
+    assert!(on.is_empty(), "switched on: {on:?}");
+}
+
+#[test]
+fn the_matcher_is_made_for_a_built_value_a_literal_holds() {
+    // A default prompt with a line break in it is a value the load takes
+    // for built, and it is no control. No plain literal holds it, so it
+    // could take no marks: the template is left as it was before the
+    // matcher over the added tokens is asked for. So is a value that is no
+    // string.
+    for at_top in ["{% set note = 'ab\\nab' %}", "{% set held = ['a'] %}"] {
+        let temp = TempDir::new().unwrap();
+        let tok = checkpoint(temp.path(), &shaped(at_top, "", WRITTEN));
+        assert!(!tok.chat_template.marked(), "{at_top}");
+        assert!(tok.core.added.get().is_none(), "{at_top}");
+    }
+}
+
+#[test]
+fn every_control_of_a_built_value_is_read_against_the_vocabulary() {
+    // A value of two controls, the second an added token that no other
+    // statement binds. The marks stand around both. Where that token's
+    // entry takes the whitespace behind it, the flat encode may read it
+    // otherwise than as it stands, and the template is left as it was.
+    let user = "{{ open }}{{ message['content'] }}{{ both }}";
+    let template = shaped("{% set both = close ~ '<' ~ 'x>' %}", "", user);
+    let plain = with_added_token("<x>");
+
+    let temp = TempDir::new().unwrap();
+    let tok = checkpoint_of(temp.path(), &plain, &template);
+    assert!(tok.chat_template.marked());
+    let (text, ids, from_text) = render(&tok, json!("a<x>b"));
+    assert!(!from_text);
+    assert_eq!(text, "[INST:x]a<x>b[/INST:x]<x>ab</s:x>");
+    assert_eq!(ids, [2, 13, 16, 11, 18, 14, 3, 19, 13, 14, 1]);
+
+    // With the flag: the token at the end of the value, and with a blank
+    // behind it in the value, which the token takes.
+    let flagged = with_flag(&plain, "<x>", "rstrip");
+    let with_a_blank = shaped("{% set both = close ~ '<' ~ 'x> ' ~ end %}", "", user);
+    for (template, ids) in [
+        (&template, &[2, 13, 19, 14, 3, 19, 13, 14, 1][..]),
+        (&with_a_blank, &[2, 13, 19, 14, 3, 19, 1, 13, 14, 1][..]),
+    ] {
+        let temp = TempDir::new().unwrap();
+        let tok = checkpoint_of(temp.path(), &flagged, template);
+        assert!(!tok.chat_template.marked(), "{template}");
+        let (_, typed, from_text) = render(&tok, json!("a<x>b"));
+        assert!(from_text, "{template}");
+        assert_eq!(typed, ids, "{template}");
+    }
 }
 
 #[test]

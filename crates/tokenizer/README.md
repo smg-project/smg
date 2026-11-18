@@ -75,7 +75,8 @@ as of `tokenizer/src/*`.
   `encode` reads it alone and as it stands. The second kind is recognised at load from the
   template itself, and
   only when its syntax shows that every value it builds is only written (alone, in a join, or
-  asked whether it is empty), each of those values is one control spelling or empty, and the
+  asked whether it is empty), each of those values is empty, one control spelling, or a string
+  that begins with a control spelling and ends with one, and the
   marks cover every control it writes on a few probe conversations; any other checkpoint renders
   and encodes as before. The flat `encode` of a rendered text reads a spelling as its token.
 - GLM-5.3 and GLM-5.3-Flash use native Rust chat rendering when checkpoint metadata and

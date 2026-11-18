@@ -650,7 +650,8 @@ impl TiktokenTokenizer {
     /// (`structural_controls`). Only the generic renderer is asked: the
     /// checkpoint renderers of this file prepare a request in their own
     /// ways. The matcher over the added tokens is built once a template
-    /// binds a control spelling its source does not hold.
+    /// binds a control spelling its source does not hold, or builds a
+    /// string that may hold several.
     fn mark_built_controls(&mut self) {
         if self.structural_controls || !matches!(self.renderer, Renderer::Jinja) {
             return;
@@ -2822,6 +2823,57 @@ mod tests {
                 assert!(typed_turn_ids(&tokenizer).1, "{shorter}, load {load}");
             }
         }
+    }
+
+    /// A value the template builds out of several controls, with text
+    /// between them, takes the marks around each on a tiktoken file's
+    /// checkpoint as on any other (see
+    /// `ChatTemplateState::mark_built_controls`): typed into a message the
+    /// spelling stays text, and a request that types none is encoded from
+    /// its text, the value read the same way there.
+    #[test]
+    fn a_tiktoken_file_s_built_value_that_holds_several_controls_is_marked_around_each() {
+        let template = builds_its_controls()
+            .replace("{% for", "{% set both = close ~ 'a' ~ end %}{% for")
+            .replace("{{ close }}", "{{ both }}");
+        let dir = suffixed_controls_dir(&template, None);
+        let tokenizer = TiktokenTokenizer::from_dir(dir.path()).unwrap();
+        assert!(tokenizer.controls.is_some());
+        let prompt = |content: &str| {
+            let messages = [serde_json::json!({"role": "user", "content": content})];
+            let rendered = tokenizer
+                .apply_chat_template_with_encoding(&messages, ChatTemplateParams::default(), None)
+                .unwrap();
+            match rendered.encoding {
+                PromptEncoding::FromText => {
+                    let ids = tokenizer.encode(&rendered.text, false).unwrap();
+                    (rendered.text, ids.token_ids().to_vec(), true)
+                }
+                PromptEncoding::Deferred(job) => {
+                    let ids = job.run().unwrap();
+                    (rendered.text, ids.token_ids().to_vec(), false)
+                }
+            }
+        };
+        let typed = [
+            301, 97, 91, 47, 73, 78, 83, 84, 58, 120, 93, 98, 302, 97, 300,
+        ];
+        assert_eq!(
+            prompt("a[/INST:x]b"),
+            (
+                "[INST:x]a[/INST:x]b[/INST:x]a</s:x>".to_owned(),
+                typed.to_vec(),
+                false
+            )
+        );
+        assert_eq!(
+            prompt("ab"),
+            (
+                "[INST:x]ab[/INST:x]a</s:x>".to_owned(),
+                vec![301, 97, 98, 302, 97, 300],
+                true
+            )
+        );
     }
 
     /// The ids of a user turn `content`, and whether the prompt is encoded
