@@ -1,8 +1,9 @@
 //! A worker's engine connection as the worker runtime sees it.
 //!
 //! [`EngineConnection`] holds the calls the runtime makes on a connected
-//! engine: liveness, the health and load reads and the admin calls, each in
-//! the worker's own types. [`EngineConnector`] makes a connection. The host
+//! engine: liveness, the health and load reads, the admin calls and the
+//! engine's two pushed streams, each in the crate's own types.
+//! [`EngineConnector`] makes a connection. The host
 //! implements both over its own client type and hands the connector to the
 //! worker builder; the request path reads its own client type back from the
 //! handle with `downcast_arc`.
@@ -13,7 +14,10 @@ use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use tokio::sync::OnceCell;
 
-use crate::worker::{ProfileOptions, RuntimeType, WorkerLoadResponse, WorkerType};
+use crate::{
+    common_proto::KvEventBatch,
+    worker::{ProfileOptions, RuntimeType, WorkerLoadResponse, WorkerType},
+};
 
 type ConnectionCell = OnceCell<Arc<dyn EngineConnection>>;
 
@@ -68,10 +72,10 @@ pub struct AdminAnswer {
 /// engine, over gRPC or ZMQ. The worker holds the host's client behind this
 /// trait and shares it with the request path.
 ///
-/// The engine's two event subscriptions are no call of this trait: they
-/// answer the wire's own messages, so the host's event monitor reads them
-/// from the host's client, read back through this handle. A connection of
-/// another type feeds that monitor no KV events and no load records.
+/// The engine's two pushed streams, its KV cache events and its load
+/// records, are calls of this trait: they answer the crate's own messages.
+/// A connection whose wire carries neither refuses both as unimplemented,
+/// and feeds no KV events and no load records.
 #[async_trait]
 pub trait EngineConnection: Any + Send + Sync {
     /// Whether the engine's wire carries the admin calls: the cache flush
@@ -101,6 +105,16 @@ pub trait EngineConnection: Any + Send + Sync {
     /// The KV transfer engine id the engine's server info reports; `None`
     /// when it reports none.
     async fn kv_engine_id(&self) -> Result<Option<String>, tonic::Status>;
+
+    /// Subscribe to the engine's KV cache events from `start_seq` on.
+    async fn subscribe_kv_events(
+        &self,
+        start_seq: u64,
+    ) -> Result<tonic::Streaming<KvEventBatch>, tonic::Status>;
+
+    /// Subscribe to the engine's load records alone, no events.
+    async fn subscribe_load_records(&self)
+        -> Result<tonic::Streaming<KvEventBatch>, tonic::Status>;
 }
 
 impl dyn EngineConnection {

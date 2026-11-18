@@ -64,7 +64,6 @@ mod subscription;
 pub(crate) use apply::WorkerIndexState;
 use index_sink::{IndexSink, OpenRow};
 use port::KvEventSink;
-pub(crate) use subscription::EngineStreams;
 
 /// Interval between publications of each model's index size and, for the chain
 /// index, its shape and memory (`smg_kv_index_*` gauges by model).

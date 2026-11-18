@@ -7,7 +7,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use async_trait::async_trait;
 use smg_grpc_client::common_proto::{kv_cache_event, EngineLoad, KvEventBatch, KvSnapshotChunk};
 use tokio::sync::{oneshot, Semaphore};
 use tracing::{error, info, warn};
@@ -16,9 +15,9 @@ use super::{
     port::{BatchFacts, BatchOutcome, KvEventSink, ResyncReason, SnapshotChunk},
     KvEventMonitor, PushedLoadSink, SubscriptionKind,
 };
-use crate::{
-    routers::grpc::backend_client::typed,
-    worker::{health::liveness, identity::endpoint::Endpoint, metrics::Metrics, Worker},
+use crate::worker::{
+    connection::engine::EngineConnection, health::liveness, identity::endpoint::Endpoint,
+    metrics::Metrics, Worker,
 };
 
 /// Initial reconnection delay after stream failure.
@@ -243,23 +242,6 @@ async fn sleep_or_shutdown(
     }
 }
 
-/// The two streams an engine pushes: its KV cache events and its load
-/// records. The subscription loop is their one caller, so the trait stands
-/// here. The gateway's client implements it, and the loop reads that client
-/// back from the worker's connection handle.
-#[async_trait]
-pub(crate) trait EngineStreams: Send + Sync {
-    /// Subscribe to the engine's KV cache events from `start_seq` on.
-    async fn subscribe_kv_events(
-        &self,
-        start_seq: u64,
-    ) -> Result<tonic::Streaming<KvEventBatch>, tonic::Status>;
-
-    /// Subscribe to the engine's load records alone, no events.
-    async fn subscribe_load_records(&self)
-        -> Result<tonic::Streaming<KvEventBatch>, tonic::Status>;
-}
-
 /// Subscribe to the worker's KV events from `start_seq` (`Events`), or to
 /// its load records alone (`Loads`), with `deadline` on the server's answer.
 /// A live server answers a subscription with headers
@@ -270,7 +252,7 @@ pub(crate) trait EngineStreams: Send + Sync {
 /// removal ends it at once (without this arm a call that never answers,
 /// retried at every contact, would keep the task alive past the removal).
 async fn subscribe_with_deadline(
-    backend_client: &dyn EngineStreams,
+    backend_client: &dyn EngineConnection,
     start_seq: u64,
     kind: SubscriptionKind,
     wake: Option<&Arc<tokio::sync::Notify>>,
@@ -429,29 +411,18 @@ impl KvEventMonitor {
         };
 
         let start_seq = sub.role.resume_sequence();
-        // The streams are the gateway's client's: the loop reads it back from
-        // the handle through the request path's reader. A connection of another
-        // type carries no stream: said once, in that reader's words, and read
-        // as an engine that serves none.
-        let subscribed = match typed(sub.worker.as_ref(), backend_client) {
-            Ok(streams) => {
-                subscribe_with_deadline(
-                    streams.as_ref(),
-                    start_seq,
-                    sub.role.kind(),
-                    sub.wake,
-                    shutdown_rx,
-                    SUBSCRIBE_DEADLINE,
-                )
-                .await
-            }
-            Err(error) => {
-                error!(%error, "The worker's connection carries no event stream");
-                Subscribed::Refused(tonic::Status::unimplemented(
-                    "the worker's connection carries no event stream",
-                ))
-            }
-        };
+        // The streams are the connection's own calls: one whose wire carries
+        // none refuses them as unimplemented, and is read as an engine that
+        // serves none.
+        let subscribed = subscribe_with_deadline(
+            backend_client.as_ref(),
+            start_seq,
+            sub.role.kind(),
+            sub.wake,
+            shutdown_rx,
+            SUBSCRIBE_DEADLINE,
+        )
+        .await;
         let stream = match subscribed {
             Subscribed::Stream(stream) => {
                 info!(

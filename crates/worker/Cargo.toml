@@ -33,9 +33,11 @@ proto = ["dep:prost", "dep:prost-build"]
 # with its builder, its registry, its health, its load monitor and its metric
 # writers, the engine handle, the HTTP client factory and the cache of
 # worker-directed clients, the worker errors, the periodic task and the merge
-# of scraped metrics.
+# of scraped metrics. The engine handle names the messages of the engine's two
+# pushed streams, so the runtime builds `proto`.
 runtime = [
     "metrics",
+    "proto",
     "dep:anyhow",
     "dep:arc-swap",
     "dep:async-trait",

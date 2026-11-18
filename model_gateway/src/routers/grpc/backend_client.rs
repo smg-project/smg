@@ -49,7 +49,6 @@ use crate::{
             AdminAnswer, ConnectorDefault, EngineConnection, EngineConnector, ZmqLink,
         },
         identity::endpoint::Endpoint,
-        kv::event_monitor::EngineStreams,
         RuntimeType, Worker, WorkerError, WorkerResult,
     },
 };
@@ -460,12 +459,7 @@ impl EngineConnection for BackendClient {
         let mut labels = BackendClient::get_server_info(self).await?.to_labels();
         Ok(labels.remove("kv_engine_id").filter(|id| !id.is_empty()))
     }
-}
 
-/// The engine's two pushed streams, for their one caller: the subscription
-/// loop of the KV event monitor.
-#[async_trait]
-impl EngineStreams for BackendClient {
     async fn subscribe_kv_events(
         &self,
         start_seq: u64,

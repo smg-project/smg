@@ -25,6 +25,7 @@ use metrics_exporter_prometheus::PrometheusBuilder;
 use tokio::net::{TcpListener, TcpSocket};
 
 use crate::{
+    common_proto::KvEventBatch,
     connection::engine::{AdminAnswer, EngineConnection, EngineConnector, ZmqLink},
     identity::{
         basic::{ConnectionMode, Worker},
@@ -404,14 +405,21 @@ mod tests {
 }
 
 /// An engine connection with no engine behind it: alive, without admin
-/// calls, and every call refused as unavailable. What a test hands a worker
-/// whose connection only has to exist.
+/// calls, every call refused as unavailable and its two streams as
+/// unimplemented. What a test hands a worker whose connection only has to
+/// exist.
 #[derive(Debug, Default)]
 pub struct NoEngine;
 
 fn no_engine<T>() -> Result<T, tonic::Status> {
     Err(tonic::Status::unavailable(
         "no engine behind the test's connection",
+    ))
+}
+
+fn no_stream<T>() -> Result<T, tonic::Status> {
+    Err(tonic::Status::unimplemented(
+        "the test's connection carries no event stream",
     ))
 }
 
@@ -447,6 +455,19 @@ impl EngineConnection for NoEngine {
 
     async fn kv_engine_id(&self) -> Result<Option<String>, tonic::Status> {
         no_engine()
+    }
+
+    async fn subscribe_kv_events(
+        &self,
+        _start_seq: u64,
+    ) -> Result<tonic::Streaming<KvEventBatch>, tonic::Status> {
+        no_stream()
+    }
+
+    async fn subscribe_load_records(
+        &self,
+    ) -> Result<tonic::Streaming<KvEventBatch>, tonic::Status> {
+        no_stream()
     }
 }
 
