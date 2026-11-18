@@ -234,14 +234,16 @@ impl Staged {
     }
 }
 
-/// How far behind its leader a standby is, as its last applied frame says
-/// it: the loop writes it, and `Leader` and the readiness read it.
+/// How far behind its leader a standby is, as its last frame at the head
+/// says it: a frame that left it at the head its leader stated there, or
+/// any applied frame of a leader that states none. The loop writes it, and
+/// `Leader` and the readiness read it.
 #[derive(Debug)]
 pub(crate) struct Lag {
     origin: Instant,
     /// The lag this replica reads synced under ([`synced_within`]).
     within: Duration,
-    /// The last applied frame, in microseconds past the origin plus one;
+    /// The last frame at the head, in microseconds past the origin plus one;
     /// `0` before any, and once this replica has led since.
     frame: AtomicU64,
     /// Whether the serve runs a standby that writes this lag.
@@ -266,8 +268,8 @@ impl Lag {
         }
     }
 
-    /// A frame of the leader's stream, or its snapshot, was applied at
-    /// `at`.
+    /// A frame of the leader's stream, or the last part of its snapshot,
+    /// left this replica at the head at `at`.
     pub(crate) fn applied(&self, at: Instant) {
         let before = self.store(at);
         // The clock is read after the write: whoever read the frame before
@@ -275,7 +277,7 @@ impl Lag {
         self.turn(before, Instant::now());
     }
 
-    /// Forgets the last applied frame, and tells a turn where there was
+    /// Forgets the last frame at the head, and tells a turn where there was
     /// one. The standby loop's call once this replica has held the lease:
     /// a frame it applied before its own lead says nothing of the leader
     /// it follows next.
@@ -307,9 +309,9 @@ impl Lag {
         }
     }
 
-    /// The last applied frame at `now`, by one read of it: its age, and the
-    /// instant the sync lapses with no further frame, none where the frame
-    /// is as old as the bound already. `None` where the lag holds no
+    /// The last frame at the head at `now`, by one read of it: its age, and
+    /// the instant the sync lapses with no further such frame, none where the
+    /// frame is as old as the bound already. `None` where the lag holds no
     /// frame. This replica is synced while there is such an instant: the
     /// `Leader` call's `synced` and a follower's readiness are this read.
     pub(crate) fn read(&self, now: Instant) -> Option<(Duration, Option<Instant>)> {
@@ -320,15 +322,15 @@ impl Lag {
         Some((age, (now < lapse).then_some(lapse)))
     }
 
-    /// The age at `now` of the last applied frame; `None` where the lag
+    /// The age at `now` of the last frame at the head; `None` where the lag
     /// holds none.
     #[cfg(test)]
     pub(crate) fn age(&self, now: Instant) -> Option<Duration> {
         self.read(now).map(|(age, _)| age)
     }
 
-    /// Whether this replica is synced at `now`: its last applied frame is
-    /// younger than the bound.
+    /// Whether this replica is synced at `now`: its last frame at the head
+    /// is younger than the bound.
     #[cfg(test)]
     pub(crate) fn synced(&self, now: Instant) -> bool {
         self.read(now).is_some_and(|(_, lapse)| lapse.is_some())
@@ -830,7 +832,14 @@ impl Standby {
                 }
             }
             applied.store(true, Ordering::Relaxed);
-            self.shared.lag.applied(now);
+            // The lag's instant is the last frame that left this replica at
+            // the head its leader stated: a frame inside a replay, or in
+            // the tail a restore leaves, moves nothing. A frame that states
+            // no head, a leader of a build before the field, moves it as
+            // every applied frame did.
+            if batch.head_seq == 0 || batch.head_seq == self.follower.place().seq {
+                self.shared.lag.applied(now);
+            }
         }
     }
 
@@ -955,14 +964,25 @@ mod tests {
         }
     }
 
-    /// One entry as the batch a leader sends it in at `now`.
+    /// One entry as the batch a leader sends it in at `now`, the last its
+    /// log holds.
     fn batch(entry: &Entry, now: Instant) -> proto::ReplicationBatch {
+        batch_of(std::slice::from_ref(entry), entry.at.seq, now)
+    }
+
+    /// `entries`, written under one term, as the batch a leader sends them
+    /// in at `now` while its log's head stands at `head`.
+    fn batch_of(entries: &[Entry], head: u64, now: Instant) -> proto::ReplicationBatch {
         proto::ReplicationBatch {
-            first_seq: entry.at.seq,
-            term: entry.at.term,
-            events: vec![worker_wire::replication(entry, now)],
+            first_seq: entries[0].at.seq,
+            term: entries[0].at.term,
+            events: entries
+                .iter()
+                .map(|entry| worker_wire::replication(entry, now))
+                .collect(),
             resync_required: false,
             snapshot: None,
+            head_seq: head,
         }
     }
 
@@ -1573,6 +1593,7 @@ mod tests {
                             .collect(),
                         resync_required: false,
                         snapshot: None,
+                        head_seq: 0,
                     })
                     .collect();
                 let began = Instant::now();
@@ -1828,6 +1849,98 @@ mod tests {
         assert_eq!(ended.why.as_deref(), Some("Aborted: deposed"));
         assert_eq!(standby.follower.place(), leader.1.head(Kinds::All));
         assert_eq!(*bed.names.lock(), ["standby-0"]);
+    }
+
+    #[tokio::test]
+    async fn a_standby_reads_synced_at_the_frame_that_leaves_it_at_its_leaders_head() {
+        // A leader that states its head, and one of a build before the
+        // field, which states none.
+        for stated in [true, false] {
+            let mut bed = Bed::new().await;
+            let (_elector, standing, standby) = standing_by(&bed, FIVE);
+            // The standby stands past a leader's first writes, and the
+            // leader wrote three rows since: a replay of two frames.
+            let leader = led();
+            let now = Instant::now();
+            follow(&standby.follower, &leader.1, now);
+            let place = standby.follower.place();
+            for key in ["http://b:8000", "http://c:8000", "http://d:8000"] {
+                leader.0.upsert(facts(key, 1));
+            }
+            let tail = entries(&leader.1, place);
+            let head = if stated {
+                leader.1.head(Kinds::All).seq
+            } else {
+                0
+            };
+            standing.send_replace(bed.holds("leader-1", 1));
+            let named = standby.shared.leader(None);
+            let applied = AtomicBool::new(false);
+            let synced = || standby.shared.lag.age(Instant::now()).is_some();
+            let script = async {
+                let mut opened = bed.opened().await;
+                assert!(matches!(opened.frame().await, Some(Frame::Hello(_))));
+                assert!(!synced(), "before any frame");
+                let ack = |entry: &Entry| {
+                    let seq = entry.at.seq;
+                    Some(Frame::Ack(proto::ReplicationAck { seq }))
+                };
+                // The replay's first frame ends short of the head it
+                // states: the standby applied it and stands behind.
+                opened.says(batch_of(&tail[..1], head, now)).await;
+                assert_eq!(opened.frame().await, ack(&tail[0]));
+                assert_eq!(synced(), !stated, "a frame short of the head");
+                // The frame that ends there leaves it at the head.
+                opened.says(batch_of(&tail[1..], head, now)).await;
+                assert_eq!(opened.frame().await, ack(&tail[2]));
+                assert!(synced(), "the frame that reached the head");
+                opened.refuses(Status::aborted("deposed")).await;
+            };
+            let (ended, ()) = tokio::join!(standby.stream(&named, &applied), script);
+            assert_eq!((ended.next, ended.applied), (Next::Lease, true));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_restored_standby_reads_synced_once_it_applied_what_was_written_during_the_send() {
+        for tail in [false, true] {
+            let mut bed = Bed::new().await;
+            let (_elector, standing, standby) = standing_by(&bed, FIVE);
+            let leader = led();
+            let now = Instant::now();
+            let parts = snapshot(&leader, now);
+            let place = leader.1.head(Kinds::All);
+            // A row written while the snapshot was sent: the last part
+            // states a head one past the snapshot's place.
+            leader.0.upsert(facts("http://b:8000", 1));
+            let written = entries(&leader.1, place);
+            let head = leader.1.head(Kinds::All).seq;
+            standing.send_replace(bed.holds("leader-1", 1));
+            let named = standby.shared.leader(None);
+            let applied = AtomicBool::new(false);
+            let script = async {
+                let mut opened = bed.opened().await;
+                assert!(matches!(opened.frame().await, Some(Frame::Hello(_))));
+                opened.says(resync()).await;
+                for part in &parts {
+                    let mut part = part.clone();
+                    part.head_seq = head;
+                    opened.says(part).await;
+                }
+                if tail {
+                    opened.says(batch_of(&written, head, now)).await;
+                    let ack = Frame::Ack(proto::ReplicationAck { seq: head });
+                    assert_eq!(opened.frame().await, Some(ack));
+                }
+                opened.refuses(Status::aborted("deposed")).await;
+            };
+            let (ended, ()) = tokio::join!(standby.stream(&named, &applied), script);
+            assert_eq!((ended.next, ended.applied), (Next::Lease, true));
+            // Restored and behind what was written since, it is not synced:
+            // the frame that brings that tail leaves it at the head.
+            let synced = standby.shared.lag.age(Instant::now()).is_some();
+            assert_eq!(synced, tail, "the tail applied: {tail}");
+        }
     }
 
     #[tokio::test]

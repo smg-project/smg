@@ -463,9 +463,9 @@ struct Feed {
     beat: Instant,
     entries: Vec<Entry>,
     /// The log the feed reads and the fence it reads before every frame,
-    /// with what a snapshot of the standby is cut from; then the standby's
-    /// name as its hello said it.
+    /// with what a snapshot of the standby is cut from.
     source: Replication,
+    /// The standby's name as its hello said it.
     standby: String,
     /// Where the feed stands in a restore of its standby.
     restore: Restore,
@@ -526,8 +526,15 @@ impl Feed {
         self.restore = Restore::Cut(why);
         Step::Batch(proto::ReplicationBatch {
             resync_required: true,
+            head_seq: self.head(),
             ..proto::ReplicationBatch::default()
         })
+    }
+
+    /// The log's head as a frame states it: one read of the log, after
+    /// whatever events the frame carries were read.
+    fn head(&self) -> u64 {
+        self.source.log.head(Kinds::All).seq
     }
 
     /// The snapshot's cut and its first part at `now`, or the stream's end
@@ -554,7 +561,8 @@ impl Feed {
     /// at the snapshot's place and owes no acknowledgement: the next look
     /// reads the log from there.
     fn part(&mut self, mut parts: Parts, now: Instant) -> Step {
-        let (batch, last) = parts.next(now);
+        let (mut batch, last) = parts.next(now);
+        batch.head_seq = self.head();
         if last {
             self.place = parts.cut.at;
             self.acked = self.place.seq;
@@ -573,7 +581,9 @@ impl Feed {
     /// the log no longer holds is. The looks after the word send the
     /// snapshot: the cut's first part, then a part each, the fence read
     /// before every one. A stream silent for a second is sent the
-    /// heartbeat: an empty batch at the position after the head.
+    /// heartbeat: an empty batch at the position after the head. Every
+    /// frame states the log's head as its look found it: the standby reads
+    /// there whether the frame left it at the head.
     fn look(&mut self, now: Instant) -> Step {
         if let Err(status) = leads(&self.source.fence, self.term, now) {
             return Step::Close(status);
@@ -609,8 +619,9 @@ impl Feed {
             if now.saturating_duration_since(self.beat) < BEAT {
                 return Step::Idle;
             }
-            // Nothing follows the place: it is the head, and the standby is
-            // told so.
+            // Nothing followed the place at the read. The head is read
+            // after it, as for every frame: the standby's place unless a
+            // write came since.
             self.beat = now;
             return Step::Batch(proto::ReplicationBatch {
                 first_seq: self.place.seq + 1,
@@ -618,6 +629,7 @@ impl Feed {
                 events: Vec::new(),
                 resync_required: false,
                 snapshot: None,
+                head_seq: self.head(),
             });
         };
         if first.term == 0 {
@@ -631,7 +643,11 @@ impl Feed {
         if !follows(self.place, &self.entries) {
             return self.resync(Why::Place(self.place));
         }
-        let (events, last) = fitting(first, &self.entries, now, MESSAGE_BYTES);
+        // The head is read after the batch, by the log's own door: it is
+        // never short of the batch's end, and a write between the two
+        // only leaves this frame short of the head it states.
+        let head = self.head();
+        let (events, last) = fitting(first, head, &self.entries, now, MESSAGE_BYTES);
         self.place = last;
         self.beat = now;
         Step::Batch(proto::ReplicationBatch {
@@ -640,6 +656,7 @@ impl Feed {
             events,
             resync_required: false,
             snapshot: None,
+            head_seq: head,
         })
     }
 }
@@ -661,14 +678,17 @@ fn follows(place: Position, entries: &[Entry]) -> bool {
 /// place.
 fn fitting(
     first: Position,
+    head: u64,
     entries: &[Entry],
     now: Instant,
     bound: usize,
 ) -> (Vec<proto::ReplicationEvent>, Position) {
-    // The batch's own fields: its position and its term.
+    // The batch's own fields: its position, its term and the head it
+    // states.
     let mut bytes = proto::ReplicationBatch {
         first_seq: first.seq,
         term: first.term,
+        head_seq: head,
         ..proto::ReplicationBatch::default()
     }
     .encoded_len();
@@ -889,11 +909,12 @@ mod tests {
         }
     }
 
-    /// Why the look at `at` says the word to re-sync: a batch that says it
-    /// and nothing else.
+    /// Why the look at `at` says the word to re-sync: a batch that says
+    /// it, the log's head and nothing else.
     fn resync(feed: &mut Feed, at: Instant) -> Why {
         let word = proto::ReplicationBatch {
             resync_required: true,
+            head_seq: feed.source.log.head(Kinds::All).seq,
             ..proto::ReplicationBatch::default()
         };
         match (feed.look(at), &feed.restore) {
@@ -1213,8 +1234,9 @@ mod tests {
         let read = leader.log.read(Kinds::All, START, Log::BATCH, &mut entries);
         assert!(read.is_ok());
         let first = entries.first().expect("the take's event").at;
-        let (all, last) = fitting(first, &entries, leader.at, usize::MAX);
-        assert_eq!((all.len(), last), (5, leader.log.head(Kinds::All)));
+        let head = leader.log.head(Kinds::All);
+        let (all, last) = fitting(first, head.seq, &entries, leader.at, usize::MAX);
+        assert_eq!((all.len(), last), (5, head));
         // What a batch of the first `count` events weighs on the wire.
         let weighs = |count: usize| {
             proto::ReplicationBatch {
@@ -1223,18 +1245,19 @@ mod tests {
                 events: all.iter().take(count).cloned().collect(),
                 resync_required: false,
                 snapshot: None,
+                head_seq: head.seq,
             }
             .encoded_len()
         };
         for count in 2..=5 {
-            let (fits, last) = fitting(first, &entries, leader.at, weighs(count));
+            let (fits, last) = fitting(first, head.seq, &entries, leader.at, weighs(count));
             assert_eq!(fits.len(), count);
             assert_eq!(last.seq, first.seq + count as u64 - 1);
-            let (short, _) = fitting(first, &entries, leader.at, weighs(count) - 1);
+            let (short, _) = fitting(first, head.seq, &entries, leader.at, weighs(count) - 1);
             assert_eq!(short.len(), count - 1, "one byte under {count} events");
         }
         // No bound is under the first event: a batch always moves the place.
-        let (alone, last) = fitting(first, &entries, leader.at, 0);
+        let (alone, last) = fitting(first, head.seq, &entries, leader.at, 0);
         assert_eq!((alone.len(), last), (1, first));
     }
 
@@ -1407,6 +1430,43 @@ mod tests {
             Step::Close(status) => assert_eq!(status.code(), Code::Aborted),
             other => panic!("the stream's end, not {other:?}"),
         }
+    }
+
+    #[test]
+    fn every_frame_states_the_logs_head_as_its_look_found_it() {
+        let leader = Leader::leading();
+        // The take, the registration and 300 load rows: more than a batch.
+        leader.writes(300);
+        let head = leader.log.head(Kinds::All);
+        let ends =
+            |batch: &proto::ReplicationBatch| batch.first_seq + batch.events.len() as u64 - 1;
+        let mut feed = leader.feed(START, RING);
+        // A batch short of the head states a head past its last event: a
+        // standby that applied it is not there yet.
+        let first = batch(feed.look(leader.at));
+        assert_eq!(first.events.len(), Log::BATCH);
+        assert!(ends(&first) < head.seq);
+        assert_eq!(first.head_seq, head.seq);
+        // The batch that ends at the head states its own last position,
+        let second = batch(feed.look(leader.at));
+        assert_eq!((ends(&second), second.head_seq), (head.seq, head.seq));
+        // and the heartbeat the position before its own.
+        let beat = batch(feed.look(leader.at + BEAT));
+        assert!(beat.events.is_empty());
+        assert_eq!((beat.first_seq - 1, beat.head_seq), (head.seq, head.seq));
+        // The word to re-sync and a snapshot's part read no event of the
+        // log: each states the head of its own instant.
+        let nowhere = Position {
+            seq: head.seq + 9,
+            term: head.term,
+        };
+        let mut lost = leader.feed(nowhere, RING);
+        let word = batch(lost.look(leader.at));
+        assert!(word.resync_required);
+        assert_eq!(word.head_seq, head.seq);
+        let part = batch(lost.look(leader.at));
+        assert!(part.snapshot.is_some());
+        assert_eq!(part.head_seq, head.seq);
     }
 
     #[test]

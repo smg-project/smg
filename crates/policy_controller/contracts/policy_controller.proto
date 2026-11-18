@@ -1159,7 +1159,8 @@ message LeaderInfo {
 }
 
 message SyncState {
-  // The age of the last frame of its leader's stream a follower applied.
+  // The age of the last frame that left a follower at the head its leader
+  // stated (ReplicationBatch.head_seq).
   uint32 replication_lag_ms = 1;
   uint32 ranks_live = 2;
   uint32 ranks_total = 3;
@@ -1264,6 +1265,13 @@ message ReplicationBatch {
   // snapshot stands at `first_seq - 1`, and the next batch of events starts
   // at `first_seq`.
   ReplicationSnapshot snapshot = 5;
+  // The leader's head as the frame was made: the last position its log
+  // holds. A standby that applied through it stood at the head then, and
+  // its lag's instant moves at such a frame alone: inside a replay, or in
+  // the tail a restore leaves, it reads not synced however fast the frames
+  // come. 0 states no head (a leader of a build before the field): the
+  // frame moves the instant, as every applied frame did.
+  uint64 head_seq = 6;
 }
 
 // One part of a snapshot a standby is restored from: the leader's rows and

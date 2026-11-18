@@ -41,8 +41,8 @@ pub const START_TIME_SECONDS: &str = "smg_policy_controller_start_time_seconds";
 /// `1` while this replica does not lead and its standby is synced with its
 /// leader, `0` otherwise: a leader's is `0`.
 pub const REPLICATION_SYNCED: &str = "smg_policy_controller_replication_synced";
-/// The age in seconds of the last frame this replica applied from its
-/// leader. `0` while it leads and before any frame, where
+/// The age in seconds of the last frame that left this replica at its
+/// leader's head. `0` while it leads and before any such frame, where
 /// [`REPLICATION_SYNCED`] is `0` too.
 pub const REPLICATION_LAG_SECONDS: &str = "smg_policy_controller_replication_lag_seconds";
 /// How many times this replica asked its leader to be restored from a
@@ -196,7 +196,7 @@ impl Metrics {
         recorder.describe_gauge(
             KeyName::from_const_str(REPLICATION_LAG_SECONDS),
             None,
-            "Seconds since the last frame applied from the leader, 0 while this replica leads and before any frame".into(),
+            "Seconds since the last frame that left this replica at its leader's head, 0 while this replica leads and before any such frame".into(),
         );
         recorder.describe_counter(
             KeyName::from_const_str(REPLICATION_RESTORES_ASKED_TOTAL),
