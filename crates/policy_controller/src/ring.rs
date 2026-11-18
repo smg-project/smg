@@ -51,10 +51,10 @@ use crate::{
     affinity::Gates,
     counts::with_counts,
     decision::MAX_TARGETS,
-    framework::{Scorer, TieBand},
+    framework::{Scorer, TieBand, DRAW_BOUND},
     lease::{Lifecycle, Membership},
     spec::{BoundedLoadParams, Needs},
-    view::{Candidate, RequestFacts, WorkerId},
+    view::{Candidate, PoolFacts, RequestFacts, WorkerId},
     Draw,
 };
 
@@ -507,7 +507,22 @@ pub struct ConsistentHash {
     /// The prefix form, for a request with no routing key.
     prefix: Option<Prefix>,
     ring: RwLock<Ring>,
+    /// The pools every row of which the ring was shown, the newest last,
+    /// [`LEARNED`] at the most: what a walk that reads no pool whole
+    /// ([`Scorer::own`]) asks before it takes the ring to hold a key's
+    /// owner.
+    learned: RwLock<Vec<Learned>>,
 }
+
+/// A pool the ring was shown whole: the membership epoch its rows came
+/// under, the place of its list of engines
+/// ([`Engines::place`](crate::view::Engines::place)), and whether its rows
+/// stood in the order of their ids, as the list's host says they do.
+type Learned = (u64, (usize, usize), bool);
+
+/// The pools the ring remembers it was shown: a pool a model and role, and
+/// a fleet's few at one membership epoch.
+const LEARNED: usize = 8;
 
 impl ConsistentHash {
     pub fn new(bounded: Option<&BoundedLoadParams>) -> Self {
@@ -516,7 +531,30 @@ impl ConsistentHash {
                 .map(|rule| (rule.factor.unwrap_or(1.25), rule.abs_margin.unwrap_or(10))),
             prefix: None,
             ring: RwLock::new(Ring::new()),
+            learned: RwLock::default(),
         }
+    }
+
+    /// Shows the ring every row of the pool at `place` under `epoch`, as a
+    /// whole pass shows it the survivors the feed never named, and
+    /// remembers the pool with whether its rows stand in the order of
+    /// their ids: a walk finds a member's row by that order, and the pool
+    /// of a host that hands another is left to the whole pass. Once a pool
+    /// and membership epoch: out of line, a decision that finds its pool
+    /// remembered walks the ring under the shared lock.
+    #[cold]
+    #[inline(never)]
+    fn learn(&self, epoch: u64, place: (usize, usize), candidates: &[Candidate]) -> bool {
+        let rows = candidates.iter().map(|row| (row.id, row.key));
+        self.ring.write().learn(rows, Instant::now());
+        let ordered = candidates.windows(2).all(|pair| pair[0].id < pair[1].id);
+        let mut learned = self.learned.write();
+        learned.retain(|&(at, of, _)| (at, of) != (epoch, place));
+        if learned.len() == LEARNED {
+            learned.remove(0);
+        }
+        learned.push((epoch, place, ordered));
+        ordered
     }
 
     /// The prefix form: a request with no routing key is keyed by its
@@ -636,6 +674,79 @@ impl Lifecycle for ConsistentHash {
 impl Scorer for ConsistentHash {
     fn name(&self) -> &'static str {
         "consistent-hash"
+    }
+
+    /// The ring places a request that carries a routing key by its walk
+    /// alone: under the prefix form too, where a routing key leads the
+    /// prefix. The bounded-load rule reads every survivor's count, and a
+    /// request keyed by its prefix is tried at more keys than one: both
+    /// read the pool whole.
+    fn owns(&self) -> bool {
+        self.bounded.is_none()
+    }
+
+    /// The walk a whole pass ranks, with no pool read: from the request's
+    /// routing key over the ring's members, each member's row found by its
+    /// id among the rows, the filters asked about the rows met and no
+    /// others, and the first [`MAX_TARGETS`] of them kept handed out in the
+    /// ring's order. The targets are the whole pass's, row for row.
+    ///
+    /// The pool's list of engines is the host's word for what the walk
+    /// takes on trust: the rows are a pool's own under a membership epoch,
+    /// in the order of their ids. `false`, with what `kept` holds to be
+    /// dropped, where the host does not say so, where the request has no
+    /// routing key, and once [`DRAW_BOUND`] rows were refused, which says
+    /// nothing of the rows behind them: the whole pass decides.
+    fn own(
+        &self,
+        facts: &RequestFacts<'_>,
+        pool: &PoolFacts<'_>,
+        candidates: &[Candidate],
+        keep: &mut dyn FnMut(&Candidate) -> bool,
+        kept: &mut Vec<u32>,
+    ) -> bool {
+        let key = facts.session_key.hash;
+        let unsaid = pool.membership_epoch == 0 || pool.engines.is_empty();
+        if key == 0 || unsaid || !self.owns() {
+            return false;
+        }
+        let (epoch, place) = (pool.membership_epoch, pool.engines.place());
+        let known = |&&(at, of, _): &&Learned| (at, of) == (epoch, place);
+        let ordered = self.learned.read().iter().find(known).map(|pool| pool.2);
+        if !ordered.unwrap_or_else(|| self.learn(epoch, place, candidates)) {
+            return false;
+        }
+        let ring = self.ring.read();
+        // The members met, kept or refused: a walk meets a member at each
+        // of its positions and asks about it once.
+        let mut met = [FREE; MAX_TARGETS + DRAW_BOUND as usize];
+        let (mut asked, mut refused) = (0, 0);
+        ring.walk(key, |member| {
+            if met[..asked].contains(&member) {
+                return Probe::Skip;
+            }
+            // A member of another pool is no row of this one.
+            let id = ring.members().get(member as usize);
+            let row = id.and_then(|id| candidates.binary_search_by_key(id, |row| row.id).ok());
+            let (Some(row), Some(slot)) = (row, met.get_mut(asked)) else {
+                return Probe::Skip;
+            };
+            *slot = member;
+            asked += 1;
+            if keep(&candidates[row]) {
+                kept.push(row as u32);
+                if kept.len() == MAX_TARGETS {
+                    return Probe::Take(());
+                }
+            } else {
+                refused += 1;
+                if refused == DRAW_BOUND {
+                    return Probe::Stop;
+                }
+            }
+            Probe::Skip
+        });
+        refused < DRAW_BOUND && !kept.is_empty()
     }
 
     fn score(

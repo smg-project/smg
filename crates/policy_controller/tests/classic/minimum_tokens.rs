@@ -4,8 +4,10 @@
 //! that asked the policy for a rank. A row holds the rank each request
 //! took, `null` where the gateway found none. Its replay writes each step
 //! through the store's load sink, as this crate's driver writes it, decides
-//! each request over the rows of the worker's ranks under the resident-work
-//! scorer picked by `best`, and books the request's tokens at its dispatch.
+//! each request over the store's list of the worker's engine under the
+//! resident-work scorer and the picker of two, whose unit is the engine, and
+//! books the request's tokens at its dispatch. One engine draws nothing: the
+//! decision is its rows, the least first.
 //!
 //! This crate decides a rank by rules of its own, and [`APART`] names each
 //! recorded row they decide apart from the gateway, with the ranks here.
@@ -20,8 +22,8 @@ use smg_policy_controller::{
         Ask, GatewayId, LoadSink, LoadSource, MemoryStore, ViewBuffers, WorkerFacts, WorkerStatus,
         WorkersStore,
     },
-    AppliedSpec, Constraints, Engine, Lease, Lifecycle, LoadRow, PolicySpec, PoolFacts,
-    PowerOfTwoMetric, RequestFacts, Role, Scratch, Side, SignalSource, WorkerId,
+    AppliedSpec, Constraints, Engine, Lease, Lifecycle, LoadRow, PolicySpec, PowerOfTwoMetric,
+    RequestFacts, Role, Scratch, Side, SignalSource, WorkerId,
 };
 
 /// What these rows record, as a sheet's head names it: the rank the
@@ -114,8 +116,11 @@ struct Apart {
 /// ranks. The store reads the context tokens of the requests a rank holds
 /// and keeps what is on file through an answer with no row. It hands a
 /// decision every rank of the worker: a rank with nothing on file scores
-/// beside its peers, and equal ranks are drawn. A rank an answer leaves out
-/// beside a rank it names is avoided on both sides: those rows replay.
+/// beside its peers, and equal ranks are drawn. Where no rank counts its
+/// context tokens the leases on file decide; this replay dispatches through
+/// the engine and files none, so those ranks stand equal and no entry says
+/// which of them a request takes. A rank an answer leaves out beside a rank
+/// it names is avoided on both sides: those rows replay.
 const APART: &[Apart] = &[
     Apart {
         row: "equal-ranks-go-to-the-lowest-rank",
@@ -144,14 +149,14 @@ const APART: &[Apart] = &[
     Apart {
         row: "a-worker-never-polled-has-no-rank",
         here: &[Here::Drawn, Here::Drawn],
-        each_once: 2,
-        rule: "a rank with nothing on file is a rank, and the requests in flight part equal ranks",
+        each_once: 0,
+        rule: "a rank with nothing on file is a rank, and with no lease on file equal ranks are drawn",
     },
     Apart {
         row: "an-evicted-worker-has-no-rank-until-its-next-answer",
         here: &[Here::Rank(0), Here::Drawn, Here::Rank(0)],
         each_once: 0,
-        rule: "a rank with nothing on file is a rank, and the requests in flight part equal ranks",
+        rule: "a rank with nothing on file is a rank, and with no lease on file equal ranks are drawn",
     },
     Apart {
         row: "a-worker-of-one-rank-the-answer-omits-has-none",
@@ -174,17 +179,22 @@ const APART: &[Apart] = &[
     Apart {
         row: "a-rank-that-reports-no-context-tokens-is-a-rank-by-its-used-tokens",
         here: &[Here::Drawn, Here::Drawn, Here::Drawn],
-        each_once: 2,
-        rule: "where no rank counts its context tokens the requests in flight decide",
+        each_once: 0,
+        rule: "where no rank counts its context tokens the leases on file decide, and with none equal ranks are drawn",
     },
 ];
 
-/// The generation that decides a rank: the resident-work scorer over every
-/// row, a request priced at no tokens of its own, picked by `best`.
+/// The generation that decides a rank: the resident-work scorer, a request
+/// priced at no tokens of its own, under the picker of two. Its unit is the
+/// engine, so over the worker's one engine it hands out that engine's rows,
+/// the least first; a worker of one row is no engine of the list and
+/// answers with its row.
 fn document() -> PolicySpec {
     let mut document =
         PolicySpec::power_of_two(PowerOfTwoMetric::ResidentTokens { request_tokens: 0 })
             .expect("a preset form of this build");
+    let profile = document.profiles.get_mut("power_of_two");
+    profile.expect("the preset's profile").pick = "power-of-two".into();
     document.generation = 1;
     document
 }
@@ -320,30 +330,28 @@ impl Bed {
             pinned: None,
             affinity: false,
         };
-        let built = self
-            .store
-            .build_view(MODEL, Role::Single, &ask, &mut self.out)?;
         let now_micros = self.store.micros(now);
-        let facts = RequestFacts {
-            model: MODEL,
-            prompt_tokens: cost,
-            seed,
-            now_micros,
-            ..RequestFacts::default()
-        };
-        let pool = PoolFacts {
-            pool_size: built.pool_size,
-            generation: 1,
-            ..PoolFacts::default()
-        };
-        let decision = self.engine.decide(
-            &facts,
-            &pool,
-            &self.out.candidates,
-            &Constraints::default(),
-            &mut self.scratch,
-        );
-        let target = *decision.pick()?.targets.first()?;
+        let (engine, out, scratch) = (&self.engine, &mut self.out, &mut self.scratch);
+        // The rows as the store lends them, with the pool's engines beside
+        // them: the door a host decides through.
+        let target = self.store.with_world(|world| {
+            let view = world.view(MODEL, Role::Single, &ask, false, out)?;
+            let facts = RequestFacts {
+                model: MODEL,
+                prompt_tokens: cost,
+                seed,
+                now_micros,
+                pinned_at: view.pinned_at,
+                ..RequestFacts::default()
+            };
+            let cx = Constraints {
+                stalled: view.stalled,
+                ..Constraints::default()
+            };
+            let pool = view.pool_facts();
+            let decision = engine.decide(&facts, &pool, view.candidates, &cx, scratch);
+            Some(*decision.pick()?.targets.first()?)
+        })?;
         let lease = Lease {
             issued_micros: now_micros,
             tokens: cost,

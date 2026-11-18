@@ -21,7 +21,7 @@ use crate::{
     counts::with_counts,
     decision::{Target, Targets, MAX_TARGETS},
     framework::{
-        top_drawn, top_pass, Filter, Front, Narrowed, Picker, Scorer, TieBand, DRAW_BOUND,
+        top_drawn, top_pass, Filter, Front, Narrowed, Picker, Scorer, TieBand, Unit, DRAW_BOUND,
     },
     lease::{Lease, Lifecycle, Membership, Side},
     spec::Needs,
@@ -1112,12 +1112,13 @@ impl Scorer for LeastLoad {
 /// that report (the credit the least-load scorer books too), and
 /// `request_tokens` for every request it holds: the reported ones, the
 /// credited ones, and the ones the host holds beyond both, those priced at
-/// the worker's mean context as well. Every survivor is scored. A worker
+/// the worker's mean context as well. Every row handed is scored: every
+/// survivor of a whole pass, or the rows a picker drew. A worker
 /// whose report does not count resident tokens (the row's
 /// `resident_counted`), or that has no report, scores as the best reporting
-/// peer plus its in-flight requests, each at the mean prefill and
-/// `request_tokens`; with no survivor counting them, the in-flight count
-/// decides.
+/// peer among the rows handed plus its in-flight requests, each at the mean
+/// prefill and `request_tokens`; with no row handed counting them, the
+/// in-flight count decides.
 #[derive(Debug)]
 pub struct ResidentWork {
     pub request_tokens: u32,
@@ -1189,6 +1190,13 @@ impl Lifecycle for ResidentWork {
 impl Scorer for ResidentWork {
     fn name(&self) -> &'static str {
         "resident-work"
+    }
+
+    /// The rows a picker drew are costed among themselves, as the
+    /// least-load scorer costs them: a row with no report, or whose report
+    /// counts no resident tokens, is costed against the rows handed.
+    fn row_wise(&self) -> bool {
+        true
     }
 
     fn score(
@@ -1539,6 +1547,73 @@ fn push_ranked<const DRAWN: bool>(
     draw_ranked::<DRAWN>(&mut draw, scores, band, slots, |row| {
         out.push(target_of(&candidates[kept[row] as usize]));
     });
+}
+
+/// The best rows of `scores` into `out`, best first: as many as `out`
+/// holds or the scores number. The order is the ranked push's, by its own
+/// rule a slot ([`draw_in_band`]): the best score left is found, the rows
+/// within the band of it stand equal, and one of them is drawn, by one
+/// value of `draw` where they are several. Returns the slots filled.
+///
+/// For the rows of the engine a picker took ([`Unit::Engine`]): a few rows
+/// in no order of their scores, of which the answer carries fewer than a
+/// ranked push fills. A slot's tie is marked in one word by two passes
+/// over the rows, and it stands for the next slot too while a row that
+/// scores the best itself is left: the level ranks of one engine are read
+/// once. More rows than a word marks are drawn by [`draw_in_band`] itself.
+pub(crate) fn draw_best(mut draw: Draw, scores: &[f32], band: TieBand, out: &mut [usize]) -> usize {
+    let slots = out.len().min(scores.len());
+    // A bit a row, set while the row is not taken.
+    let word = u32::try_from(scores.len())
+        .ok()
+        .and_then(|rows| u64::BITS.checked_sub(rows))
+        .and_then(|spare| u64::MAX.checked_shr(spare));
+    let Some(mut open) = word else {
+        for slot in 0..slots {
+            let (taken, _) = out.split_at(slot);
+            let Some(row) = draw_in_band(scores, band, &mut draw, |i| !taken.contains(&i)) else {
+                return slot;
+            };
+            out[slot] = row;
+        }
+        return slots;
+    };
+    // The rows within the band of the best score left, and those of them
+    // that score it.
+    let (mut tied, mut at_best) = (0u64, 0u64);
+    let mut filled = 0;
+    for slot in &mut out[..slots] {
+        if at_best & open == 0 {
+            let mut top = f32::NEG_INFINITY;
+            for (row, &score) in scores.iter().enumerate() {
+                if (open >> row) & 1 != 0 && score > top {
+                    top = score;
+                }
+            }
+            (tied, at_best) = (0, 0);
+            for (row, &score) in scores.iter().enumerate() {
+                tied |= u64::from(!below_band(score, top, band)) << row;
+                at_best |= u64::from(score == top) << row;
+            }
+        }
+        tied &= open;
+        // Counted from the tie's last row, as a slot of the ranked push
+        // counts: of two tied rows a zero takes the later one.
+        let rows = tied.count_ones() as usize;
+        let back = if rows > 1 { draw.below(rows) } else { 0 };
+        let Some(at) = rows.checked_sub(1 + back) else {
+            return filled;
+        };
+        let mut from = tied;
+        for _ in 0..at {
+            from &= from - 1;
+        }
+        let row = from.trailing_zeros() as usize;
+        open &= !(1 << row);
+        *slot = row;
+        filled += 1;
+    }
+    filled
 }
 
 /// The target that names `c`, on no pair.
@@ -2053,6 +2128,12 @@ impl Picker for PowerOfTwo {
 
     fn draws_first(&self) -> bool {
         true
+    }
+
+    /// Two engines, where the host lists them: the two rows that stand for
+    /// them are compared as two rows drawn are.
+    fn unit(&self) -> Unit {
+        Unit::Engine
     }
 
     fn draw_first(
@@ -4026,6 +4107,61 @@ mod tests {
             MAX_TARGETS + 1,
             |_| {},
         );
+    }
+
+    /// The best rows of an engine are the slots of the ranked push drawn
+    /// one by one, seed for seed and for every count of slots asked: among
+    /// few rows and many, where rows tie and where each stands alone in
+    /// its band, under a narrow band and a wide one.
+    #[test]
+    fn the_best_rows_of_an_engine_are_the_ranked_slots_one_by_one() {
+        let one_by_one = |scores: &[f32], band: TieBand, seed: u64, slots: usize| {
+            let (mut draw, mut taken) = (Draw::new(seed), Vec::new());
+            while taken.len() < slots.min(scores.len()) {
+                let open = |i: usize| !taken.contains(&i);
+                let Some(row) = draw_in_band(scores, band, &mut draw, open) else {
+                    break;
+                };
+                taken.push(row);
+            }
+            taken
+        };
+        let mut levels = Draw::new(7);
+        let mut tied = 0;
+        for rows in [0usize, 1, 2, 3, 4, 5, 8, 13, 63, 64, 65, 90] {
+            // Scores on a few levels, where rows tie, and on many, where
+            // few do; and on the last turn one score that is no number,
+            // which stands in every tie.
+            for spread in [1usize, 2, 3, 40, 41] {
+                let mut scores: Vec<f32> = (0..rows)
+                    .map(|_| levels.below(spread) as f32 / spread as f32)
+                    .collect();
+                if let (41, Some(score)) = (spread, scores.get_mut(rows / 2)) {
+                    *score = f32::NAN;
+                }
+                for band in [TieBand::NORMALIZED, TieBand(0.3)] {
+                    for seed in 0..40u64 {
+                        for slots in 0..=MAX_TARGETS {
+                            let mut out = [usize::MAX; MAX_TARGETS];
+                            let filled =
+                                draw_best(Draw::new(seed), &scores, band, &mut out[..slots]);
+                            let ruled = one_by_one(&scores, band, seed, slots);
+                            assert_eq!(
+                                &out[..filled],
+                                &ruled[..],
+                                "{rows} rows on {spread} levels, seed {seed}, {slots} slots"
+                            );
+                            assert_eq!(filled, slots.min(rows));
+                        }
+                        // The draw decides somewhere: the slots of one seed
+                        // are not the slots of every seed.
+                        let first = |seed| one_by_one(&scores, band, seed, 1);
+                        tied += usize::from(first(seed) != first(seed + 1));
+                    }
+                }
+            }
+        }
+        assert!(tied > 500, "{tied}");
     }
 
     /// Count-first orders no more of the workers it passed over than the

@@ -1065,7 +1065,7 @@ pub struct ZoneCapacity {
 /// The engines of a pool, as its host lists them beside the rows: each
 /// engine's rows by position, the ranks of a data-parallel engine together
 /// and in their ranks' order, a single-rank worker alone. A stage that
-/// takes the engine as the unit of its pick
+/// names the engine as its unit ([`Picker::unit`](crate::Picker::unit))
 /// draws over the list and reads the rows of the engine it takes, so a
 /// decision it makes does not grow with the ranks of the engines it passes
 /// by. Empty where the host lists none: a pool with no engine of several
@@ -1074,7 +1074,8 @@ pub struct ZoneCapacity {
 /// A host that lists a pool's engines hands the pool's own rows with the
 /// list, in the order of their ids and under a membership epoch
 /// ([`PoolFacts::membership_epoch`]). A stage that finds a member's row by
-/// its id, with no pool read whole, takes the list as that word.
+/// its id, with no pool read whole
+/// ([`Scorer::own`](crate::Scorer::own)), takes the list as that word.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Engines<'a> {
     rows: &'a [u32],
