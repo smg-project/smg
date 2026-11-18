@@ -7,7 +7,8 @@
 //! probe, its load from a poll, an engine that holds requests reading them.
 //! That engine's KV events follow: a subscriber of the case hands each batch
 //! of its stream to the sink, and its row's index holds every block the
-//! events left the engine holding. Then one engine is killed: the first dial
+//! events left the engine holding, where the cache-aware preset then asks a
+//! prompt that states them. Then one engine is killed: the first dial
 //! that hears it dead writes it, and the pool reads its rows unhealthy and
 //! every other row healthy. Next, an engine stops answering with its sockets
 //! open: a probe turn waits out its dial bound, writes it and goes on. Last,
@@ -792,6 +793,36 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             Some(LaneCounts::default()),
             "no store came without its parent and no block was refused: {fed:?}"
         );
+        // A prompt goes where its blocks are held. Under the cache-aware
+        // preset an ask that states the head the busy engine's events left
+        // it holding names that engine, which its load turns every load-led
+        // pick away from; the ask after it states no block and is placed by
+        // the load, on another engine: no ask reads the holders of the one
+        // before it.
+        let head = harness.head(busy);
+        assert!(!head.is_empty(), "the busy engine holds a prompt's head");
+        harness
+            .apply("cache_aware")
+            .expect("a preset of this build applies");
+        for n in 0..8 {
+            let mut ask = nth("holder", n);
+            let facts = ask.facts.as_mut().expect("the ask states facts");
+            facts.block_hashes.clone_from(&head);
+            let pick = picked(&mut harness, ask)
+                .await
+                .expect("a pick answers an ask over a ready fleet");
+            assert_eq!(
+                pick.engine, busy,
+                "a prompt goes to the engine that holds its blocks: {pick:?}"
+            );
+            let pick = picked(&mut harness, nth("unheld", n))
+                .await
+                .expect("a pick answers an ask over a ready fleet");
+            assert_ne!(
+                pick.engine, busy,
+                "a prompt that states no block is placed by the load: {pick:?}"
+            );
+        }
         for engine in engines.iter().filter(|engine| **engine != busy) {
             for idle in harness.heard(*engine) {
                 assert!(
