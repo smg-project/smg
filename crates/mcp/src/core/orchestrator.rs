@@ -1360,7 +1360,13 @@ impl McpOrchestrator {
                 // with side effects gets an unknown outcome whether or not
                 // the connection comes back.
                 let replayable = Self::replayable(entry);
-                let recovery = self.recover_after_disconnect(&name, initial_client).await;
+                // Recovery rebuilds a configured server: a bound call ran on
+                // its request's connection, and a configured server of the
+                // same name stays as it is.
+                let recovery = match pool_key {
+                    Some(_) => Err(McpError::ServerDisconnected(name.clone())),
+                    None => self.recover_after_disconnect(&name, initial_client).await,
+                };
                 Self::after_recovery(replayable, recovery, &name, entry.tool_name())?;
                 self.execute_tool_impl(entry, arguments, Self::remaining(deadline), pool_key)
                     .await

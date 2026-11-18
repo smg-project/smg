@@ -2740,6 +2740,51 @@ mod tests {
         );
     }
 
+    /// A configured server stays connected when a call loses its request's
+    /// connection to a URL of the same name: the server is not listed again,
+    /// and the call fails as any bound call that lost its connection.
+    #[tokio::test]
+    async fn a_configured_server_stays_connected_when_a_bound_call_under_its_name_drops() {
+        let listed = Arc::new(Notify::new());
+        let named_at = serve_local_mcp_server(LocalServer {
+            tools: Some(&["own"]),
+            arrived: Some(Arc::clone(&listed)),
+            ..Default::default()
+        })
+        .await;
+        let url = serve_local_mcp_server(LocalServer {
+            tools: Some(&["other"]),
+            drops_calls: true,
+            ..Default::default()
+        })
+        .await;
+        let config = config_holding(&url, named_at);
+        let orchestrator = Arc::new(McpOrchestrator::new(config).await.unwrap());
+        reached(&listed, "the configured server lists once at start-up").await;
+        let by_url = McpServerInput {
+            label: "by-url".to_string(),
+            url: Some(url.clone()),
+            authorization: Some("one-token".to_string()),
+            headers: HashMap::new(),
+            allowed_tools: None,
+        };
+        let bindings = connect_mcp_servers(&orchestrator, &FormatRegistry::new(), &[by_url]).await;
+        let output = McpToolSession::new(&orchestrator, bindings, "test-request")
+            .execute_tool(ToolExecutionInput {
+                call_id: "call-1".to_string(),
+                tool_name: "other".to_string(),
+                arguments: json!({}),
+            })
+            .await;
+        assert!(output.is_error, "the call that lost its connection fails");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), listed.notified())
+                .await
+                .is_err(),
+            "the configured server is not connected and listed again"
+        );
+    }
+
     /// A configured server named by a URL keeps its tools when a request's
     /// connection to that URL leaves the pool. The pool has room for one
     /// connection: a connect to a second URL takes the place of the first,
