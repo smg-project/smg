@@ -135,7 +135,9 @@ pub struct Health {
     pub stalled: bool,
     /// Being drained; nothing new goes there.
     pub draining: bool,
-    /// The latched overload verdict of the last load report.
+    /// The latched overload verdict of the last load report: the engine
+    /// is at a threshold, or its last answer named another of its ranks
+    /// and not this one.
     pub overloaded: bool,
 }
 

@@ -300,8 +300,9 @@ fails once the reason no longer holds.
   (`a-record-after-a-poll-is-judged-over-the-ranks-that-have-pushed`,
   `a-record-s-usage-is-judged-over-the-ranks-that-have-pushed`). An answer with no entry changes nothing the store
   holds (`an-answer-that-names-no-rank-takes-the-ranks-that-pushed-before-it-off-the-report`). Each of these five
-  rows repeats the step that leaves a rank unheard, and replays as recorded from its fourth repeat on. The other 19
-  rows replay.
+  rows repeats the step that leaves a rank unheard, and replays as recorded from its fourth repeat on. A rank an
+  answer leaves out beside a named one carries the overload bit alone, as the store's avoidance of that rank: the
+  replay reads a worker as overloaded when every rank row of it carries the bit. The other 19 rows replay.
 - `manual.json`: one row is owed, `manual-one-key-pins-apart-under-the-prefill-and-the-decode-role`. The gateway
   keeps a key's pins apart under each role of a prefill and decode pair. The crate refuses a sessions rule under a
   pair plan today, so it cannot build the row; the other 13 rows replay.
@@ -312,22 +313,23 @@ fails once the reason no longer holds.
   no key and is placed as one with nothing to hash, on the fewest requests
   (`a-ten-token-prompt-keeps-its-key-s-worker-over-the-fewest-requests`). The other 45 rows replay.
 - `bucket.json`: none. All 19 rows replay.
-- `minimum_tokens.json`: twelve rows are decided apart, each by a rule of the crate's store or scorer that the
+- `minimum_tokens.json`: ten rows are decided apart, each by a rule of the crate's store or scorer that the
   replay names with the ranks the crate gives. The gateway reads the tokens a rank's cache uses, and only from an
   entry that carries token capacity. The crate scores a rank by the context tokens of the requests it holds
   (`the-used-tokens-decide-where-a-rank-holds-fewer-context-tokens`), whatever capacity its entry carries
   (`a-row-with-no-token-capacity-is-no-rank`, `an-answer-with-no-token-capacity-drops-the-worker-s-ranks`). Where no
   rank counts its context tokens the requests in flight decide
-  (`a-rank-that-reports-no-context-tokens-is-a-rank-by-its-used-tokens`). The gateway forgets a rank the moment an
-  answer omits it, and a worker's ranks at an answer with no entry. The store keeps what is on file, through as
-  many answers as omit the rank (`a-rank-an-answer-omits-is-no-rank-at-once`,
-  `a-rank-five-answers-omit-is-no-rank-after-any-of-them`, `an-answer-with-no-row-drops-the-worker-s-ranks`): a
-  rank leaves a decision when its host takes its row out. The gateway has no rank for a worker it holds no answer
-  of. The crate hands a decision every rank row of the worker, and one with nothing on file scores beside its
-  peers (`a-worker-never-polled-has-no-rank`, `an-evicted-worker-has-no-rank-until-its-next-answer`), so a worker
-  of one rank row answers with it (`a-worker-of-one-rank-the-answer-omits-has-none`,
-  `an-answer-with-no-row-drops-the-one-rank-of-its-worker`). The gateway takes the lowest of equal ranks, and the
-  crate draws among them (`equal-ranks-go-to-the-lowest-rank`). The other six rows replay.
+  (`a-rank-that-reports-no-context-tokens-is-a-rank-by-its-used-tokens`). The gateway forgets a worker's ranks at an
+  answer with no entry. The store reads that answer as the word that no report came and keeps what is on file
+  (`an-answer-with-no-row-drops-the-worker-s-ranks`). A rank an answer leaves out beside a rank it names is avoided
+  on both sides from that answer on, and its two rows replay pick for pick
+  (`a-rank-an-answer-omits-is-no-rank-at-once`, `a-rank-five-answers-omit-is-no-rank-after-any-of-them`). The
+  gateway has no rank for a worker it holds no answer of. The crate hands a decision every rank row of the worker,
+  and one with nothing on file scores beside its peers (`a-worker-never-polled-has-no-rank`,
+  `an-evicted-worker-has-no-rank-until-its-next-answer`), so a worker of one rank row answers with it
+  (`a-worker-of-one-rank-the-answer-omits-has-none`, `an-answer-with-no-row-drops-the-one-rank-of-its-worker`). The
+  gateway takes the lowest of equal ranks, and the crate draws among them (`equal-ranks-go-to-the-lowest-rank`).
+  The other eight rows replay.
 - `sticky_rank.json`: four rows are decided apart. The gateway sets no rank on a request with no sticky key, on a
   worker of one engine or of no count it knows, and on a key whose hash rank its connection places no pin on: the
   connection then places the request on any engine. The crate gives every request a rank row of the worker, a

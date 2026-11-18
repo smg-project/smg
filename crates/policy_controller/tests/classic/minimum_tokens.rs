@@ -110,29 +110,18 @@ struct Apart {
 
 /// The rows decided apart. The gateway's rank cache reads the tokens a
 /// rank's cache uses, from a row that carries token capacity, forgets a
-/// rank the moment an answer omits it, and takes the lowest of equal ranks.
-/// The store reads the context tokens of the requests a rank holds and
-/// keeps what is on file for a rank an answer omits. It hands a decision
-/// every rank of the worker: a rank with nothing on file scores beside its
-/// peers, and equal ranks are drawn.
+/// worker's ranks at an answer with no entry, and takes the lowest of equal
+/// ranks. The store reads the context tokens of the requests a rank holds
+/// and keeps what is on file through an answer with no row. It hands a
+/// decision every rank of the worker: a rank with nothing on file scores
+/// beside its peers, and equal ranks are drawn. A rank an answer leaves out
+/// beside a rank it names is avoided on both sides: those rows replay.
 const APART: &[Apart] = &[
     Apart {
         row: "equal-ranks-go-to-the-lowest-rank",
         here: &[Here::Drawn, Here::Drawn, Here::Drawn, Here::Drawn],
         each_once: 3,
         rule: "equal ranks are the picker's draw, where the gateway takes the lowest",
-    },
-    Apart {
-        row: "a-rank-an-answer-omits-is-no-rank-at-once",
-        here: &[Here::Rank(0), Here::Rank(0), Here::Rank(0)],
-        each_once: 0,
-        rule: "a rank an answer omits keeps what is on file",
-    },
-    Apart {
-        row: "a-rank-five-answers-omit-is-no-rank-after-any-of-them",
-        here: &[Here::Rank(0), Here::Rank(0), Here::Rank(0), Here::Rank(0), Here::Rank(0), Here::Rank(0)],
-        each_once: 0,
-        rule: "a rank an answer omits keeps what is on file",
     },
     Apart {
         row: "a-row-with-no-token-capacity-is-no-rank",
