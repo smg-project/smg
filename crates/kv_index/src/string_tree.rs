@@ -1387,6 +1387,10 @@ impl Tree {
     /// [`Self::evict_tenant_by_size`] that stops early once `keep_going`
     /// says so, asked once before it starts and every [`CANCEL_CHECK_EVERY`]
     /// nodes walked or entries taken off its heap; whether it was stopped.
+    ///
+    /// `keep_going` must not insert into or evict from this tree. This walk
+    /// holds no node guard when it asks, but the token tree's does, and the
+    /// two share one contract. Reads are fine.
     pub fn evict_tenant_by_size_until(
         &self,
         max_size: usize,
