@@ -2433,46 +2433,95 @@ mod tests {
         assert!(matches!(ended, Ok(Some(Ok(())))), "the stop ends the loop");
     }
 
+    /// One stream of a standby driven to its end, while the scripted
+    /// leader says `first` on every stream it sees open. A stream the host
+    /// held past the standby's bound reaches the leader late, or never: a
+    /// late one is said the same frame, which nobody reads, and none is
+    /// waited for. The streams are returned held, so none ends from the
+    /// leader's side first.
+    async fn leaving<T>(
+        bed: &mut Bed,
+        stream: impl std::future::Future<Output = T>,
+        first: &proto::ReplicationBatch,
+    ) -> (T, Vec<Opened>) {
+        tokio::pin!(stream);
+        let mut opened = Vec::new();
+        loop {
+            tokio::select! {
+                ended = &mut stream => return (ended, opened),
+                Some(next) = bed.streams.recv() => {
+                    // The standby may have left this stream already.
+                    let _ = next.batches.send(Ok(first.clone())).await;
+                    opened.push(next);
+                }
+            }
+        }
+    }
+
+    /// The bound past which a step of the quiet case is not taken again:
+    /// far past any stall of a loaded host.
+    const WIDEST: Duration = Duration::from_secs(10);
+
     #[tokio::test]
     async fn a_leader_that_says_nothing_is_left_at_the_quiet_bound() {
         let mut bed = Bed::new().await;
-        let (_elector, standing, standby) = standing_by(&bed, Duration::from_millis(100));
+        let (_elector, standing, mut standby) = standing_by(&bed, Duration::from_millis(100));
         standing.send_replace(bed.holds("leader-1", 1));
         let named = standby.shared.leader(None);
-        // A stream that stands and brings no frame after its first.
-        let applied = AtomicBool::new(false);
-        let script = async {
-            let opened = bed.opened().await;
-            opened.says(proto::ReplicationBatch::default()).await;
-            opened
-        };
-        let left = async { tokio::join!(standby.stream(&named, &applied), script) };
-        let (ended, opened) = timeout(FIVE, left).await.expect("the stream is left");
-        assert_eq!((ended.next, ended.applied), (Next::Wait, true));
-        let why = "the leader sent no frame for 100ms";
-        assert_eq!(ended.why.as_deref(), Some(why));
-        drop(opened);
-        // A snapshot whose next part does not arrive: the same bound.
-        let applied = AtomicBool::new(false);
-        let script = async {
-            let opened = bed.opened().await;
-            opened.says(resync()).await;
-            opened
-        };
-        let left = async { tokio::join!(standby.stream(&named, &applied), script) };
-        let (ended, held) = timeout(FIVE, left).await.expect("the stream is left");
-        assert_eq!((ended.next, ended.applied), (Next::Wait, false));
-        let why = "the leader sent no frame for 100ms";
-        assert_eq!(ended.why.as_deref(), Some(why));
-        drop(held);
+        // A stream that stands and brings no frame after its first. The
+        // bound runs on the host's clock, from the dial to the stream's
+        // opening and from there to the first frame, and a held host runs
+        // either past it: the stream is then left with nothing applied.
+        // The step is taken again under twice the bound until a first
+        // frame was applied inside it.
+        let first = proto::ReplicationBatch::default();
+        loop {
+            let quiet = standby.quiet;
+            let applied = AtomicBool::new(false);
+            let left = leaving(&mut bed, standby.stream(&named, &applied), &first);
+            let left = timeout(FIVE + 3 * quiet, left).await;
+            let (ended, opened) = left.expect("the stream is left");
+            drop(opened);
+            assert_eq!(ended.next, Next::Wait);
+            if ended.applied {
+                let why = format!("the leader sent no frame for {quiet:?}");
+                assert_eq!(ended.why.as_deref(), Some(why.as_str()));
+                break;
+            }
+            assert!(quiet < WIDEST, "no first frame inside {quiet:?}");
+            standby.quiet = 2 * quiet;
+        }
+        // A snapshot whose next part does not arrive: the same bound. A
+        // stream the host held unopened past the bound is taken again the
+        // same way.
+        let word = resync();
+        loop {
+            let quiet = standby.quiet;
+            let applied = AtomicBool::new(false);
+            let left = leaving(&mut bed, standby.stream(&named, &applied), &word);
+            let left = timeout(FIVE + 3 * quiet, left).await;
+            let (ended, held) = left.expect("the stream is left");
+            drop(held);
+            assert_eq!((ended.next, ended.applied), (Next::Wait, false));
+            let unopened = format!("the leader opened no stream for {quiet:?}");
+            if ended.why.as_deref() != Some(unopened.as_str()) {
+                let why = format!("the leader sent no frame for {quiet:?}");
+                assert_eq!(ended.why.as_deref(), Some(why.as_str()));
+                break;
+            }
+            assert!(quiet < WIDEST, "no stream opened inside {quiet:?}");
+            standby.quiet = 2 * quiet;
+        }
         // A leader that opens no stream.
         bed.mute.store(true, Ordering::Relaxed);
+        let quiet = standby.quiet;
         let applied = AtomicBool::new(false);
         let left = standby.stream(&named, &applied);
-        let ended = timeout(FIVE, left).await.expect("the stream is left");
+        let ended = timeout(FIVE + quiet, left).await;
+        let ended = ended.expect("the stream is left");
         assert_eq!((ended.next, ended.applied), (Next::Wait, false));
-        let why = "the leader opened no stream for 100ms";
-        assert_eq!(ended.why.as_deref(), Some(why));
+        let why = format!("the leader opened no stream for {quiet:?}");
+        assert_eq!(ended.why.as_deref(), Some(why.as_str()));
     }
 
     /// The lines a case's subscriber kept.
