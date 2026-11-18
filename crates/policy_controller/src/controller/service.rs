@@ -278,7 +278,8 @@ impl Shared {
         let election = election::start(elector, Arc::clone(&self.store), standing)?;
         let door = election.door();
         self.floors.open(door.clone());
-        self.deciders.leave_through(move || door.hand_over());
+        self.deciders
+            .leave_through(move |term| door.hand_over(term));
         Ok(election)
     }
 

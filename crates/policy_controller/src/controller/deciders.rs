@@ -115,7 +115,7 @@ use std::{
 };
 
 use tokio::sync::{mpsc, watch};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use super::{
     election::Standing,
@@ -262,8 +262,8 @@ fn past_mark(id: LeaseId) -> bool {
 }
 
 /// What a decider calls once it handed over a term's first answer at or
-/// past the mark: the election's planned hand-over.
-pub(crate) type Leave = Box<dyn Fn() + Send + Sync>;
+/// past the mark: the election's planned hand-over, handed that term.
+pub(crate) type Leave = Box<dyn Fn(u64) + Send + Sync>;
 
 /// What the deciders share of a term's mark: the word, and the highest term
 /// it was said under, so one decider says it and once.
@@ -395,9 +395,9 @@ impl Deciders {
 
     /// Hands the deciders the word a term's mark says: the decider that
     /// hands over a term's first answer at or past the mark ([`past_mark`])
-    /// calls `leave` once that answer is handed over. Set once, when the
-    /// election runs: a second call changes nothing.
-    pub(crate) fn leave_through(&self, leave: impl Fn() + Send + Sync + 'static) {
+    /// calls `leave` with that term once that answer is handed over. Set
+    /// once, when the election runs: a second call changes nothing.
+    pub(crate) fn leave_through(&self, leave: impl Fn(u64) + Send + Sync + 'static) {
         let _ = self.mark.leave.set(Box::new(leave));
     }
 
@@ -530,15 +530,24 @@ impl Decider {
             return;
         }
         if term_said(Some(term)).is_err() {
+            warn!(
+                term,
+                "the last term a replica can take passed the mark of its lease ids: no hand-over is said, and picks are answered Busy once the ids end"
+            );
             return;
         }
-        if let Some(leave) = self.mark.leave.get() {
-            info!(
+        let Some(leave) = self.mark.leave.get() else {
+            warn!(
                 term,
-                "the term's lease ids passed their mark: this leader hands the lease over, and the next take mints under a new term"
+                "a term's lease ids passed their mark and no election listens: no hand-over is said, and picks are answered Busy once the ids end"
             );
-            leave();
-        }
+            return;
+        };
+        info!(
+            term,
+            "the term's lease ids passed their mark: this leader hands the lease over, and the next take mints under a new term"
+        );
+        leave(term);
     }
 
     /// One request's answer: its decision, or `Busy`.
@@ -1707,7 +1716,7 @@ pub(crate) mod tests {
         let (reached, words) = std_mpsc::sync_channel(8);
         let (go, held) = std_mpsc::sync_channel::<()>(8);
         let held = Mutex::new(held);
-        bed.deciders.leave_through(move || {
+        bed.deciders.leave_through(move |_term| {
             reached.send(()).expect("the case hears the word");
             held.lock().recv().expect("the case lets the decider go");
         });
