@@ -2503,6 +2503,44 @@ mod tests {
         assert!(matches!(ended, Ok(Some(Ok(())))), "the stop ends the loop");
     }
 
+    /// The sync is with one leader's term: a stream that ends and is dialed
+    /// again under that term keeps the instant its last frame left.
+    #[tokio::test]
+    async fn a_standby_keeps_its_sync_across_a_dial_under_one_term() {
+        let far = Duration::from_secs(60);
+        let mut bed = Bed::new().await;
+        let (_elector, standing, standby) = standing_by(&bed, FIVE);
+        let shared = Arc::clone(&standby.shared);
+        let mut turns = shared.lag.turns();
+        let (stop, stopped) = watch::channel(false);
+        let mut running = JoinSet::new();
+        running.spawn(standby.run(stopped));
+        standing.send_replace(bed.holds("leader-1", 1));
+        let mut first = bed.opened().await;
+        assert!(matches!(first.frame().await, Some(Frame::Hello(_))));
+        // A heartbeat that states no head: the frame is at the head.
+        let _ = turns.borrow_and_update();
+        first.says(proto::ReplicationBatch::default()).await;
+        let turned = timeout(far, turns.changed()).await;
+        assert!(matches!(turned, Ok(Ok(()))), "the first stream's frame");
+        let held = shared.lag.age(Instant::now());
+        assert!(held.is_some(), "synced at the first stream's frame");
+        // The leader ends the stream, and the lease names it still: the
+        // standby dials it again under the same term.
+        first.refuses(Status::unavailable("not yet")).await;
+        let mut second = bed.opened().await;
+        assert!(matches!(second.frame().await, Some(Frame::Hello(_))));
+        // No frame of the second stream came, and the first's still stands.
+        let kept = shared.lag.age(Instant::now());
+        assert!(
+            kept >= held,
+            "the dial forgot the sync: {kept:?} after {held:?}"
+        );
+        stop.send_replace(true);
+        let ended = timeout(FIVE, running.join_next()).await;
+        assert!(matches!(ended, Ok(Some(Ok(())))), "the stop ends the loop");
+    }
+
     #[tokio::test]
     async fn a_replica_that_led_is_not_synced_before_a_frame_of_its_present_leader() {
         let mut bed = Bed::new().await;
