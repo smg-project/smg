@@ -198,16 +198,23 @@ impl Blocks {
                 return Self::among(named, files);
             }
         }
-        let kept = (word & KEPT != 0).then(|| self.kept_byte(term, block));
-        Self::among(kept.flatten().unwrap_or(block), files)
+        if word & KEPT == 0 {
+            return Self::among(block, files);
+        }
+        self.kept_file(term, block, files)
     }
 
-    /// The byte of `block` in the table kept for `term`, the newest kept
-    /// table read first; `None` where no table is kept for the term.
-    fn kept_byte(&self, term: u64, block: u8) -> Option<u8> {
+    /// The file an id of `term` in `block` names while a table is kept: by
+    /// the table kept for the term, the newest kept table read first, and
+    /// by the block where none is kept for it. Out of line, and the last
+    /// thing [`Self::file_of`] does: the read of the kept tables saves
+    /// registers, and an id of the leading term would pay for them.
+    #[inline(never)]
+    fn kept_file(&self, term: u64, block: u8, files: usize) -> usize {
         let kept = self.kept.load();
-        let table = kept.iter().find(|table| table.term == term)?;
-        table.files.get(usize::from(block)).copied()
+        let table = kept.iter().find(|table| table.term == term);
+        let named = table.and_then(|table| table.files.get(usize::from(block)));
+        Self::among(named.copied().unwrap_or(block), files)
     }
 
     /// The terms whose tables are kept, the newest first.
@@ -434,6 +441,8 @@ mod tests {
         blocks.rise(3, [lease, own].into_iter());
         assert_eq!((blocks.file_of(lease, 3), blocks.file_of(next, 3)), (2, 0));
         assert_eq!(blocks.kept.load().len(), 1, "the ended term's is gone");
+        // Beside a kept table, an id of a term with none goes by its block.
+        assert_eq!(blocks.file_of(id(1, 2 * BLOCK), 3), 2);
     }
 
     /// A kept table goes at the first rise that finds no lease of its term
