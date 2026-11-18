@@ -37,6 +37,8 @@
 //! sent it: a dispatch on a pick's second target moves the key and the
 //! lease's count there, a key served on its failover keeps its worker,
 //! and the store's pin of record follows the dispatch.
+//! A pinned key outlives its generation: under the preset applied anew a
+//! key that was dispatched names the row of the store's pin of record.
 //! A prompt returns to its worker as a key does: under the prefix preset a
 //! head of 256 tokens names one row whatever follows it, a routing key
 //! leads it, a retry walks to one next worker, and a boundary of the
@@ -951,6 +953,48 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
         given_up(&mut harness, &[sent_lease, away_lease], 0)
             .await
             .expect("the leases given up leave the file");
+
+        // A new generation asks a pinned key on its row of record. An
+        // engine's table of sessions starts empty with its generation,
+        // and the store's pins of record outlive it. Eight keys are each
+        // dispatched where they were placed; under the preset applied
+        // anew each of them, and the key sent to its second target above,
+        // names the row its pin names. Placed afresh, a key names its old
+        // row once in as many asks as the fleet has rows.
+        let mut pinned = vec![(sticky, pin, sent)];
+        let mut held = Vec::new();
+        for key in (2 * ASKS..).take(8) {
+            let (offer, lease, session) = offered(&mut harness, keyed(nth("pinned", key), key))
+                .await
+                .expect("a pick answers an ask over a ready fleet");
+            let row = offer.first().copied().expect("a pick names a target");
+            harness
+                .dispatch_at(lease, 0)
+                .await
+                .expect("the store reads the lease dispatched");
+            pinned.push((key, session, row));
+            held.push(lease);
+        }
+        given_up(&mut harness, &held, 0)
+            .await
+            .expect("the leases given up leave the file");
+        harness
+            .apply("manual")
+            .expect("a preset of this build applies");
+        for (key, session, row) in pinned {
+            assert_eq!(
+                harness.pinned(session),
+                Some((row.engine, row.rank)),
+                "a pin of record outlives the generation that wrote it"
+            );
+            let again = picked(&mut harness, keyed(nth("anew", key), key))
+                .await
+                .expect("a pick answers an ask over a ready fleet");
+            assert_eq!(
+                again, row,
+                "a new generation asks a pinned key on its row of record"
+            );
+        }
 
         // A lease's count follows its dispatch. By the fewest requests a
         // kept lease books the first target of its pick; dispatched on the
