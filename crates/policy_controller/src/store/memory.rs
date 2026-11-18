@@ -465,7 +465,7 @@ impl MemoryStore {
                     joined: Some(id),
                 };
                 self.owe(classes, now);
-                self.tell(change);
+                self.tell_membership(change);
             }
             MembershipChange::Replaced { old, new } => {
                 self.loads.lock().ranks.insert(new, Ranks::default());
@@ -475,7 +475,7 @@ impl MemoryStore {
                     joined: Some(new),
                 };
                 self.pay_leave(&workers, classes, now);
-                self.tell(change);
+                self.tell_membership(change);
             }
             MembershipChange::Relabelled { id } | MembershipChange::Resized { id } => {
                 self.index_member(&workers, id);
@@ -488,7 +488,7 @@ impl MemoryStore {
                     }
                 };
                 self.owe(classes, now);
-                self.tell(change);
+                self.tell_membership(change);
             }
             MembershipChange::StatusChanged { id, to, .. } => self.show_status(id, to),
             MembershipChange::Removed { id } => {
@@ -497,7 +497,7 @@ impl MemoryStore {
                     joined: None,
                 };
                 self.pay_leave(&workers, classes, now);
-                self.tell(change);
+                self.tell_membership(change);
             }
         }
     }
@@ -705,7 +705,7 @@ impl MemoryStore {
     /// view before a leave's swap may still name the worker: a stage answers
     /// that from its own state, as the ring fences a pruned id
     /// ([`crate::ring::FENCE`]).
-    fn tell(&self, change: MembershipChange) {
+    fn tell_membership(&self, change: MembershipChange) {
         if let Some(change) = change.as_lifecycle() {
             self.world.load().spec().engine().on_membership(&change);
         }
@@ -1214,7 +1214,7 @@ impl WorkersStore for MemoryStore {
                 });
                 self.index_member(&workers, old_id);
                 self.owe(classes, now);
-                self.tell(change);
+                self.tell_membership(change);
                 return change;
             }
             // A new incarnation under the key: the old id leaves with its
@@ -1271,7 +1271,7 @@ impl WorkersStore for MemoryStore {
                 joined: Some(new_id),
             };
             self.pay_leave(&workers, classes, now);
-            self.tell(change);
+            self.tell_membership(change);
             drop(workers);
             self.forget_pins(old_id);
             return change;
@@ -1307,7 +1307,7 @@ impl WorkersStore for MemoryStore {
         };
         self.wake_host(first);
         self.index_member(&workers, id);
-        self.tell(change);
+        self.tell_membership(change);
         change
     }
 
@@ -1334,7 +1334,7 @@ impl WorkersStore for MemoryStore {
         let change = workers.record(MembershipChange::Relabelled { id });
         // Labels, a priority and an overload are no part of an offer.
         self.owe(Classes::Carry, Instant::now());
-        self.tell(change);
+        self.tell_membership(change);
         Some(change)
     }
 
@@ -1356,7 +1356,7 @@ impl WorkersStore for MemoryStore {
             joined: None,
         };
         self.pay_leave(&workers, classes, Instant::now());
-        self.tell(change);
+        self.tell_membership(change);
         drop(workers);
         self.forget_pins(id);
         Some(change)
