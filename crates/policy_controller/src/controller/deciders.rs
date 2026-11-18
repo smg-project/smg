@@ -3054,6 +3054,99 @@ pub(crate) mod tests {
         assert_eq!(decided(), (vec![vetoed], 0, true, 3), "a veto");
     }
 
+    /// A key under a sessions rule with an in-flight cap leaves an owner
+    /// over its thresholds in a decision this service makes. The store
+    /// writes no count of the key's requests into a decision's rows, so the
+    /// cap could not hand the key on: the veto stands for the key, and it
+    /// goes to the ring's next worker.
+    #[test]
+    fn a_key_under_a_capped_rule_leaves_an_owner_over_its_thresholds() {
+        let mut document =
+            PolicySpec::preset("consistent_hashing").expect("a preset of this build");
+        let manual = PolicySpec::preset("manual").expect("a preset of this build");
+        let mut rule = manual
+            .bindings
+            .first()
+            .and_then(|binding| binding.sessions.clone())
+            .expect("the manual preset's rule");
+        rule.assignment = crate::spec::Assignment::Delegate;
+        rule.inflight_cap = 2;
+        document.generation = 1;
+        document.view.headers = manual.view.headers.clone();
+        let binding = document.bindings.first_mut().expect("the preset's binding");
+        binding.sessions = Some(rule);
+        binding.overload = Some(crate::spec::OverloadSpec {
+            waiting_requests: Some(1),
+            ..crate::spec::OverloadSpec::default()
+        });
+        let store = MemoryStore::with_publish_window(Duration::ZERO);
+        let (singles, _) = fleet(&store);
+        store
+            .apply(applied(&document))
+            .expect("above the unbound start");
+        let now = Instant::now();
+        // The worker a request of the key is sent to, and the workers of
+        // its pool that read overloaded.
+        let decided = |id: u8| {
+            let mut keyed = frame(id, u64::from(id));
+            keyed
+                .facts
+                .as_mut()
+                .expect("the case's frame has facts")
+                .session_key = Some(proto::Identity {
+                form: Some(proto::identity::Form::Hash(17)),
+            });
+            let request = checked(keyed);
+            let taken = Taken::at(&request, GATEWAY, now, now).expect("budget is left");
+            let mut buffers = Buffers::default();
+            store.deciding(|world| {
+                hand(
+                    world,
+                    &taken,
+                    &mut buffers,
+                    &AtomicU64::new(0),
+                    |facts, pool, rows, cx, scratch| {
+                        let over: Vec<WorkerId> = rows
+                            .iter()
+                            .filter(|row| row.health.overloaded)
+                            .map(|row| row.id)
+                            .collect();
+                        let engine = world.spec().engine();
+                        let decision = engine.decide(facts, pool, rows, cx, scratch);
+                        let picked = decision
+                            .pick()
+                            .and_then(|pick| pick.targets.first())
+                            .map(|target| target.id);
+                        (picked, over)
+                    },
+                )
+                .0
+            })
+        };
+        let (owner, over) = decided(1);
+        let owner = owner.expect("a pick over a free pool");
+        assert!(singles.contains(&owner), "{owner:?} of {singles:?}");
+        assert_eq!(over, Vec::new(), "no worker is over its thresholds");
+        crate::store::LoadSink::record(
+            &store,
+            owner,
+            0,
+            crate::LoadRow {
+                queued: 1,
+                ..crate::LoadRow::default()
+            },
+            now,
+            crate::store::LoadSource::Stream,
+        );
+        let (next, over) = decided(2);
+        assert_eq!(over, vec![owner], "the key's owner reads overloaded, alone");
+        let next = next.expect("a pick beside two workers under their thresholds");
+        assert_ne!(
+            next, owner,
+            "the cap's count is not written, so the veto stands for the key"
+        );
+    }
+
     /// One lease on file reads as its worker's requests in flight on both
     /// forms of a decision's rows: in the row where the rows were written
     /// for a request that states its wires, beside the row where they were

@@ -100,37 +100,12 @@ struct Owed {
 }
 
 /// The owed rows. The classic manual policy keeps a key's pins apart under
-/// each role of a pair; here a sessions rule runs under the single plan. A
-/// request placed by its routing key on the hash ring keeps its worker over
-/// the thresholds there; its rows are refused by their module until a key
-/// keeps its ring worker here ([`ring`]). Those entries do not expire by
-/// themselves, since the module refuses a ring row before it builds an
-/// engine: the change that keeps a key on its ring worker deletes them
-/// together with that guard.
-const OWED: &[Owed] = &[
-    Owed {
-        row: "manual-one-key-pins-apart-under-the-prefill-and-the-decode-role",
-        refused: "sessions run under the single plan",
-        by: "sessions on the sides of a pair, which read the pair's partner lists",
-    },
-    ring("consistent-hashing-a-key-keeps-its-worker-over-its-thresholds-beside-free-workers"),
-    ring("consistent-hashing-a-key-keeps-its-worker-with-every-worker-over"),
-    ring("consistent-hashing-a-key-leaves-its-worker-over-its-thresholds-under-shedding"),
-    ring("consistent-hashing-a-key-is-shed-with-every-worker-over-under-shedding"),
-    ring("consistent-hashing-a-key-passes-to-the-next-member-when-its-worker-is-down"),
-    ring("consistent-hashing-a-retry-that-tried-the-keys-worker-passes-the-key-on"),
-    ring("consistent-hashing-a-key-keeps-its-worker-when-the-next-member-is-over-too"),
-    ring("consistent-hashing-a-key-passes-to-a-next-member-over-its-thresholds-when-its-worker-is-down"),
-];
-
-/// A ring row of the all-vetoed sheet, owed in its module's words.
-const fn ring(row: &'static str) -> Owed {
-    Owed {
-        row,
-        refused: classic::all_vetoed::RING_ROW,
-        by: "the change that keeps a session key on its ring worker",
-    }
-}
+/// each role of a pair; here a sessions rule runs under the single plan.
+const OWED: &[Owed] = &[Owed {
+    row: "manual-one-key-pins-apart-under-the-prefill-and-the-decode-role",
+    refused: "sessions run under the single plan",
+    by: "sessions on the sides of a pair, which read the pair's partner lists",
+}];
 
 /// A sheet of the directory whose module has not landed here: `policy`
 /// is its head's, and `by` names the change that brings the module. The

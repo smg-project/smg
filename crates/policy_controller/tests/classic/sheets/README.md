@@ -281,9 +281,7 @@ A limit is a recorded row the replay does not decide as recorded, with the reaso
 fails once the reason no longer holds.
 
 - `power_of_two.json`: none. All 44 rows replay.
-- `all_vetoed.json`: eight rows are owed, the ring rows: the crate does not keep a routing key on its ring worker
-  yet, and their module refuses them by name. The other 34 rows replay, the keyed round robin row and the two rows
-  of the `bucket` policy (a pool over on every worker, with shedding off and on) among them.
+- `all_vetoed.json`: none. All 42 rows replay.
 - `pair_index.json`: none. All 23 rows replay.
 - `encode_pair.json`: none is recorded yet. The module that replays it arrives with the crate's encoder lists
   and its rule for encode items; until then the replay owes this sheet.

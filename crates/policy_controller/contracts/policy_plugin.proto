@@ -459,14 +459,17 @@ message Trace {
   // `survivors` is unset and `drops` is empty, neither one a count, and
   // `top` is of the rows drawn.
   bool drew_first = 12;
-  // The soft veto the all-vetoed rule lifted to make this pick; none unless
-  // the rule made it. A host counts its steered picks from this field.
+  // The soft veto lifted to make this pick; none unless that veto left the
+  // pool nobody. The all-vetoed rule's pick sets it, and so does the pick of
+  // a session key kept on its worker. A host counts both from this field.
   LiftedVeto lifted = 13;
 }
 
 // The soft vetoes the all-vetoed rule lifts, in the order it lifts them. The
-// zero value is none, with no presence bit: a pick that no rule made reads it
-// truly, and a reader makes one comparison.
+// zero value is none, with no presence bit: a pick made with no veto lifted
+// reads it truly, and a reader makes one comparison. A zero with a meaning
+// departs on purpose from this file's rule, an UNSPECIFIED zero: an enum
+// with no such reason keeps the rule.
 enum LiftedVeto {
   LIFTED_VETO_NONE = 0;
   // Every usable worker was over its overload thresholds.

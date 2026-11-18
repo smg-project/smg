@@ -33,8 +33,8 @@ use criterion::{
 };
 use placed::page_start_buffer;
 use smg_policy_controller::{
-    Constraints, Decision, Identity, Lease, Lifecycle, ModelFingerprint, PolicySpec, PoolFacts,
-    RequestFacts, Scratch, Side, Target, PRESETS,
+    Constraints, Decision, Identity, Lease, Lifecycle, Lifted, ModelFingerprint, PolicySpec,
+    PoolFacts, RequestFacts, Scratch, Side, Target, PRESETS,
 };
 
 const SIZES: [usize; 3] = [8, 64, 512];
@@ -172,7 +172,7 @@ fn decide(c: &mut Criterion) {
         };
         let steers = matches!(
             engine.decide(&asked, &pool, &view, &cx, &mut scratch),
-            Decision::Pick(_)
+            Decision::Pick(pick) if pick.trace.lifted == Lifted::Overload
         );
         if !steers {
             continue;

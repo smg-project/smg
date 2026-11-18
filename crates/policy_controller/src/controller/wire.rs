@@ -54,7 +54,7 @@ use std::{
 };
 
 use crate::{
-    decision::{Decision, Lifted, ShedReason, Target, Trace},
+    decision::{Decision, ShedReason, Target, Trace},
     lease::Lease,
     proto::{self, busy::Reason, decide_answer::Answer, decision::Outcome, identity::Form},
     spec::{AppliedSpec, MAX_HEADERS},
@@ -316,6 +316,9 @@ impl Checked {
                 pinned_at: 0,
                 // What the leases book, beside rows a view lent.
                 lent_in_flight: view.in_flight.as_ref(),
+                // The store writes no count of a key's requests into a
+                // decision's rows yet.
+                session_counted: false,
             },
             &Constraints {
                 excluded: &lists.excluded,
@@ -610,16 +613,8 @@ fn trace(trace: &Trace) -> proto::Trace {
             .collect(),
         seed: trace.seed,
         generation: trace.generation,
-        lifted: lifted(trace.lifted) as i32,
+        lifted: proto::LiftedVeto::from(trace.lifted) as i32,
         ..proto::Trace::default()
-    }
-}
-
-/// The contract's word for the veto the all-vetoed rule lifted.
-const fn lifted(mark: Lifted) -> proto::LiftedVeto {
-    match mark {
-        Lifted::None => proto::LiftedVeto::None,
-        Lifted::Overload => proto::LiftedVeto::Overload,
     }
 }
 

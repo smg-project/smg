@@ -9,8 +9,8 @@ use crate::{
     affinity::WarmRule,
     builtins::{target_of, Best, FewestSessions, LeastRequests, Random, RowTests},
     decision::{
-        Decision, Pair, Pick, Shed, ShedReason, Survivors, Target, Targets, Trace, MAX_TARGETS,
-        TRACE_TOP,
+        Decision, Lifted, Pair, Pick, Shed, ShedReason, Survivors, Target, Targets, Trace,
+        MAX_TARGETS, TRACE_TOP,
     },
     lease::{Lease, Lifecycle, Membership, Outcome, ReleaseReason, Side, Signal},
     sessions::{Assignment, Claim, SessionRule, SessionTable, SessionVerdict},
@@ -1650,6 +1650,17 @@ impl<'a> Set<'a> {
             vetoed: AllVetoed::Shed,
         }
     }
+
+    /// The same rows put to no rule: a pass over them sheds a pool the
+    /// overload veto empties, whatever the binding says. The rule's own
+    /// second pass runs over such a set, and a kept key is decided over one
+    /// ([`Engine::keep`]): its lifted run stands in for the rule.
+    const fn shedding(self) -> Self {
+        Self {
+            vetoed: AllVetoed::Shed,
+            ..self
+        }
+    }
 }
 
 /// The `epd` plan's vision rule: a request carrying images takes an encoder
@@ -2211,6 +2222,16 @@ impl Marks {
     /// ([`Self::JOINED`]) that request is the draw's, and every other is
     /// the ranks'.
     const RANKED: u8 = 1 << 4;
+    /// The plain ring alone places a keyed request by its session key:
+    /// under a binding that steers, such a request keeps its key's worker
+    /// over the overload veto ([`Engine::keep`]). The validator sets it for
+    /// that one shape of profile, no stage does ([`Self::with_key`]).
+    const KEYED: u8 = 1 << 5;
+    /// The scope of a profile under the key's mark: its [`Self::SCOPED`]
+    /// word stands here. A decision's opening then asks the scope's and the
+    /// assignment's marks as it does without a key, and the key's arm opens
+    /// the scope.
+    const KEYED_SCOPE: u8 = 1 << 6;
 
     fn of(profile: &Profile, order: Order) -> Self {
         let scoped = if profile.scoped() { Self::SCOPED } else { 0 };
@@ -2241,9 +2262,9 @@ impl Marks {
     }
 
     /// Whether no stage asks anything before the profile's run: no scope
-    /// to open, no assignment that places.
+    /// to open, no assignment that places, no key that lifts the veto.
     const fn asks_nothing_first(self) -> bool {
-        self.0 & (Self::SCOPED | Self::BY_ASSIGNMENT) == 0
+        self.0 & (Self::SCOPED | Self::BY_ASSIGNMENT | Self::KEYED) == 0
     }
 
     /// How the profile draws, its two marks in one masked read: zero where
@@ -2255,7 +2276,13 @@ impl Marks {
         self.0 & (Self::DRAWS_FIRST | Self::JOINED)
     }
 
+    /// A scope to open, under the key's mark or under none.
     const fn scoped(self) -> bool {
+        self.0 & (Self::SCOPED | Self::KEYED_SCOPE) != 0
+    }
+
+    /// A scope to open and no key's mark: the opening's first arm.
+    const fn opens_first(self) -> bool {
         self.0 & Self::SCOPED != 0
     }
 
@@ -2265,6 +2292,26 @@ impl Marks {
 
     const fn by_assignment(self) -> bool {
         self.0 & Self::BY_ASSIGNMENT != 0
+    }
+
+    /// The scope the key's arm opens.
+    const fn keyed_scope(self) -> bool {
+        self.0 & Self::KEYED_SCOPE != 0
+    }
+
+    /// The marks of a profile the plain ring alone places by the session key.
+    /// A picker that leaves the placement to its rule asks no stage where a
+    /// key goes, so its marks stand as they are.
+    const fn with_key(self) -> Self {
+        if self.by_assignment() {
+            return self;
+        }
+        let scope = if self.0 & Self::SCOPED != 0 {
+            Self::KEYED_SCOPE
+        } else {
+            0
+        };
+        Self((self.0 & !Self::SCOPED) | Self::KEYED | scope)
     }
 }
 
@@ -3046,10 +3093,7 @@ impl Engine {
     }
 
     /// The first binding that matches, beside what the build derived from
-    /// it: the engine's own lookup. Always inlined: it is the head of every
-    /// decision, and its second caller (the all-vetoed rule resolves the
-    /// binding again where a pass left nobody) must not move it out of line.
-    #[inline(always)]
+    /// it: the engine's own lookup.
     fn entry(&self, model: &str, phase: Phase) -> Option<&Entry> {
         self.bindings
             .iter()
@@ -3103,11 +3147,8 @@ impl Engine {
     }
 
     /// The binding a request resolves to, with its profile for the phase: one
-    /// walk of the bindings per decision, and a second where a pass left
-    /// nobody; `None` when no binding matches or the binding's plan has no
-    /// side for the phase. Always inlined, as [`Self::entry`] is and for its
-    /// reason.
-    #[inline(always)]
+    /// walk of the bindings per decision; `None` when no binding matches or
+    /// the binding's plan has no side for the phase.
     fn resolve(&self, model: &str, phase: Phase) -> Option<(&Entry, u16, &Profile)> {
         let entry = self.entry(model, phase)?;
         let index = profile_index(&entry.binding, phase)?;
@@ -3127,15 +3168,18 @@ impl Engine {
     /// named join ([`Picker::joined_by_named`]) draws for a request that
     /// names rows and for no other. A pass the overload veto leaves nobody is
     /// put to the binding's all-vetoed rule: the request goes to the
-    /// least-vetoed worker, or is shed where the binding says so. A pool the
-    /// other hard filters empty keeps its shed. The request's affinity
-    /// column is empty or holds one entry a candidate; any other is
-    /// refused, as a decline under the stage name `affinity-column`. Rows
-    /// named in the column's place ([`NamedAffinity`]) are read as the host
-    /// derived them: a debug build asserts that they stand for the pool.
-    /// A profile that shows its rows to a plugin is declined over rows that
-    /// carry a mask or a pin beside them, under the stage name
-    /// `written-rows` ([`Self::reads_for`]).
+    /// least-vetoed worker, or is shed where the binding says so. A shed stands
+    /// where no row of the pool is over its thresholds, or where the pool
+    /// stays empty with the veto lifted. Where the binding steers, a
+    /// keyed request of a profile that places by the session key is decided
+    /// with the overload veto lifted, so the key keeps its worker. The
+    /// request's affinity column is empty or holds one entry a candidate;
+    /// any other is refused, as a decline under the stage name
+    /// `affinity-column`. Rows named in the column's place
+    /// ([`NamedAffinity`]) are read as the host derived them: a debug build
+    /// asserts that they stand for the pool. A profile that shows its rows
+    /// to a plugin is declined over rows that carry a mask or a pin beside
+    /// them, under the stage name `written-rows` ([`Self::reads_for`]).
     pub fn decide(
         &self,
         facts: &RequestFacts<'_>,
@@ -3172,32 +3216,58 @@ impl Engine {
             vetoed: *vetoed,
         };
         let marks = self.marks[usize::from(index)];
+        // A picker that leaves the placement to its rule is not asked: the
+        // rule's pin takes a keyed request first, below, and the binding's
+        // placing assignment places every other, under a rule or under none.
+        let placed = || {
+            marks.by_assignment()
+                && binding.plan == Plan::Single
+                && (binding.sessions.is_none() || facts.session_key.is_none())
+        };
+        // A plugin is shown each row as a record of the row's own fields:
+        // its host hands rows written for the decision
+        // ([`Self::reads_for`]). A mask or a pin beside the rows says they
+        // are not, and the arm that would open the scope declines.
+        let unwritten = || !cx.stalled.is_empty() || facts.pinned_at != 0;
+        // One arm a mark, the scope's and the assignment's first: a profile
+        // under those two alone meets no test for the key.
         let _opened = if marks.asks_nothing_first() {
             None
+        } else if marks.opens_first() {
+            if unwritten() {
+                return shed(ShedReason::PolicyDeclined, WRITTEN_ROWS, bare);
+            }
+            let opened = profile.open(facts, candidates, pool);
+            if placed() {
+                return self.assign(profile, index, *placing, facts, pool, set, cx, scratch);
+            }
+            Some(opened)
+        } else if marks.by_assignment() {
+            if placed() {
+                return self.assign(profile, index, *placing, facts, pool, set, cx, scratch);
+            }
+            None
         } else {
-            // A plugin is shown each row as a record of the row's own
-            // fields: its host hands rows written for the decision
-            // ([`Self::reads_for`]). A mask or a pin beside the rows says
-            // they are not, and the decision is declined.
-            if marks.scoped() && (!cx.stalled.is_empty() || facts.pinned_at != 0) {
+            // The key's mark: a keyed request keeps its key's worker over
+            // the overload veto, where the binding steers.
+            if marks.keyed_scope() && unwritten() {
                 return shed(ShedReason::PolicyDeclined, WRITTEN_ROWS, bare);
             }
             let opened = marks
-                .scoped()
+                .keyed_scope()
                 .then(|| profile.open(facts, candidates, pool));
-            // A picker that leaves the placement to its rule is not asked:
-            // the rule's pin takes a keyed request first, below, and the
-            // binding's placing assignment places every other, under a rule
-            // or under none.
-            let pinned_first = binding.sessions.is_some() && !facts.session_key.is_none();
-            if marks.by_assignment() && binding.plan == Plan::Single && !pinned_first {
-                return self.assign(profile, index, *placing, facts, pool, set, cx, scratch);
+            if vetoed::keeps_its_key(binding, *placing, *vetoed, facts) {
+                let rule = binding.sessions.as_ref();
+                // The lifted run stands in for the all-vetoed rule: no pass
+                // of a kept key is put to it.
+                let set = set.shedding();
+                return self.keep(profile, index, rule, facts, pool, set, cx, scratch);
             }
             opened
         };
         if let Some(rule) = binding.sessions {
             if binding.plan == Plan::Single && !facts.session_key.is_none() {
-                return self.decide_session(
+                return self.decide_session::<false>(
                     profile, index, &rule, *placing, facts, pool, set, cx, scratch,
                 );
             }
@@ -3244,11 +3314,21 @@ impl Engine {
     /// for one read: a key the table holds no pin of asks the pins of
     /// record the host lent ([`Constraints::pins`]), and a stored worker
     /// among the kept candidates is written back and decides as a pin.
+    ///
+    /// `KEPT` is the form of a profile that places by the session key, under
+    /// a binding that steers ([`Engine::keep`]): the pin's test reads the
+    /// overload veto as it stands, and a key no pin takes is placed by the
+    /// profile with the veto lifted. Where the pass with the veto standing
+    /// kept nobody, that placement says the lifted veto in its trace
+    /// ([`Lifted::Overload`]). A placement that lands on one of the key's
+    /// pins again follows that pin under the rule's in-flight cap
+    /// ([`Self::respill`]): nothing is claimed, and a key handed on reads
+    /// the veto as it stands before the lifted pass's survivors.
     #[expect(
         clippy::too_many_arguments,
         reason = "the profile run's inputs, as run_profile takes them"
     )]
-    fn decide_session(
+    fn decide_session<const KEPT: bool>(
         &self,
         profile: &Profile,
         index: u16,
@@ -3262,7 +3342,15 @@ impl Engine {
     ) -> Decision {
         let candidates = set.candidates;
         let buf = &mut scratch.single;
-        if let Some(answer) = single_survivors(profile, index, facts, pool, set, cx, buf) {
+        // Whether the veto as it stands left the pool nobody: the form of a
+        // kept key reads it, for the mark of its lifted placement.
+        let mut all_vetoed = false;
+        if KEPT {
+            // A pass that keeps nobody leaves no pin standing, and the
+            // lifted pass answers below. A kept key's set sheds, so this
+            // pass is put to no rule.
+            all_vetoed = filter(profile, facts, cx, buf, set).is_some();
+        } else if let Some(answer) = single_survivors(profile, index, facts, pool, set, cx, buf) {
             return answer;
         }
         let key = facts.session();
@@ -3297,23 +3385,13 @@ impl Engine {
         });
         if let Some(i) = owner {
             let c = &candidates[i as usize];
-            let under_cap = rule.inflight_cap == 0 || c.session_in_flight < rule.inflight_cap;
-            if !under_cap {
+            if Self::at_cap(rule, c) {
                 // Over the cap: the candidates under it decide; with none
                 // under it the key stays on its pin.
-                if buf
-                    .kept
-                    .iter()
-                    .any(|&k| candidates[k as usize].session_in_flight < rule.inflight_cap)
+                if let Some(respilled) =
+                    self.respill(profile, index, rule, placing, facts, pool, candidates, buf)
                 {
-                    buf.kept
-                        .retain(|&k| candidates[k as usize].session_in_flight < rule.inflight_cap);
-                    let mut decision =
-                        self.place(profile, index, placing, facts, pool, candidates, buf);
-                    if let Decision::Pick(pick) = &mut decision {
-                        pick.session_verdict = SessionVerdict::Respill;
-                    }
-                    return decision;
+                    return respilled;
                 }
             }
             let mut targets = Targets::new();
@@ -3338,13 +3416,65 @@ impl Engine {
                 session_verdict: SessionVerdict::Pinned,
             });
         }
+        if KEPT {
+            // No pin stands under the veto: the profile places the key with
+            // the veto lifted, and the claim's lead below reads that pass's
+            // survivors.
+            if let Some(shed) = vetoed::lifted(profile, index, facts, pool, set, cx, buf) {
+                return shed;
+            }
+        }
         let mut decision = self.place(profile, index, placing, facts, pool, candidates, buf);
         if let Decision::Pick(pick) = &mut decision {
             pick.session_verdict = SessionVerdict::Pinned;
+            if all_vetoed {
+                // The lifted pass alone kept a worker: the placement stands
+                // by the lift and says so, as the all-vetoed rule's pick does.
+                pick.trace.lifted = Lifted::Overload;
+            }
             // No routable pin (a fresh key, or every pin down): the key is
             // claimed at the decision, so concurrent requests agree on the
             // first claim when its worker is among this decision's survivors.
             if let Some(first) = pick.targets.first().map(|t| t.id) {
+                // A kept key the lifted pass put back on one of its pins is
+                // no claim: the pin stands as it was read. A claim would
+                // mark it provisional, and an alternate's dispatch would
+                // withdraw it. The plain form never names a pin here, and
+                // carries no test for one.
+                if KEPT && pins.contains(&first) {
+                    // The followed pin is put to the rule's cap as the pin
+                    // read first is: the lift is of the overload veto alone.
+                    let capped = buf
+                        .kept
+                        .iter()
+                        .find(|&&i| candidates[i as usize].id == first)
+                        .is_some_and(|&i| Self::at_cap(rule, &candidates[i as usize]));
+                    if capped {
+                        // The hand-on reads the veto as it stands, as the
+                        // pin read first does: that pass's survivors under
+                        // the cap decide.
+                        if !all_vetoed && filter(profile, facts, cx, buf, set).is_none() {
+                            if let Some(respilled) = self.respill(
+                                profile, index, rule, placing, facts, pool, candidates, buf,
+                            ) {
+                                return respilled;
+                            }
+                        }
+                        // It keeps none under the cap: the lifted pass's
+                        // survivors decide, and the trace says the lift.
+                        if vetoed::lifted(profile, index, facts, pool, set, cx, buf).is_none() {
+                            if let Some(mut respilled) = self.respill(
+                                profile, index, rule, placing, facts, pool, candidates, buf,
+                            ) {
+                                if let Decision::Pick(pick) = &mut respilled {
+                                    pick.trace.lifted = Lifted::Overload;
+                                }
+                                return respilled;
+                            }
+                        }
+                    }
+                    return decision;
+                }
                 let owner = match self.sessions.claim(key, pins, first) {
                     Claim::Made(id) => {
                         pick.session_verdict = SessionVerdict::Claimed(id);
@@ -3400,6 +3530,48 @@ impl Engine {
             return answer;
         }
         self.place(profile, index, assignment, facts, pool, candidates, buf)
+    }
+
+    /// Whether a pin carries its rule's in-flight cap of the key's requests.
+    /// A cap of zero is none.
+    const fn at_cap(rule: &SessionRule, pin: &Candidate) -> bool {
+        rule.inflight_cap != 0 && pin.session_in_flight >= rule.inflight_cap
+    }
+
+    /// A pin at its rule's in-flight cap ([`Self::at_cap`]) hands the key
+    /// on: the survivors under the cap decide, and this is their placement,
+    /// marked [`SessionVerdict::Respill`]. `None` where no survivor is under
+    /// the cap: the key stays on its pin. One home for the pin a decision
+    /// reads first and for the pin a kept key's lifted pass lands on.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the placement's inputs, as place takes them"
+    )]
+    fn respill(
+        &self,
+        profile: &Profile,
+        index: u16,
+        rule: &SessionRule,
+        placing: Assignment,
+        facts: &RequestFacts<'_>,
+        pool: &PoolFacts<'_>,
+        candidates: &[Candidate],
+        buf: &mut Buffers,
+    ) -> Option<Decision> {
+        if !buf
+            .kept
+            .iter()
+            .any(|&k| candidates[k as usize].session_in_flight < rule.inflight_cap)
+        {
+            return None;
+        }
+        buf.kept
+            .retain(|&k| candidates[k as usize].session_in_flight < rule.inflight_cap);
+        let mut decision = self.place(profile, index, placing, facts, pool, candidates, buf);
+        if let Decision::Pick(pick) = &mut decision {
+            pick.session_verdict = SessionVerdict::Respill;
+        }
+        Some(decision)
     }
 
     /// The stages of an assignment over the survivors in `buf.kept`: the

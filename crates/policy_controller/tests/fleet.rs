@@ -62,6 +62,11 @@
 //! three, answers each cache namespace of a request on a row of its own,
 //! and under either plugin passes over the row that holds a lease.
 //!
+//! The overload veto is read under an operator's patch on the control
+//! listener: the engine that holds requests, patched past its threshold,
+//! is no pick of a rotation until the gateway lifts the veto, and a session
+//! key keeps its ring worker over it.
+//!
 //! No stub server: the engines are the mock worker's, the controller is the
 //! one the binary runs and the client is the generated one. Every wait is
 //! bounded and named, and the case stands under one outer bound.
@@ -120,7 +125,8 @@ use smg_policy_controller::{
     controller::{State, PROTOCOL_VERSION},
     proto::{
         completed::Class, decision::Outcome, identity::Form, principal, released, Completed,
-        DecideRequest, Decision, Identity, Released, RequestFacts, ShedReason, Side,
+        DecideRequest, Decision, Identity, OverloadThresholds, Released, RequestFacts, ShedReason,
+        Side,
     },
     spec::{BindingSpec, Match},
     store::{LaneCounts, WorkerStatus},
@@ -225,6 +231,11 @@ fn ask(id: &[u8]) -> DecideRequest {
     }
 }
 
+/// The routing keys among which one is the busy engine's: a ring of even
+/// shares over six rows leaves 256 keys off one row less than once in
+/// 10^20 runs.
+const KEYS: usize = 256;
+
 /// The asks an assertion makes where one draw could hide what it reads.
 const ASKS: u64 = 64;
 
@@ -261,6 +272,22 @@ fn nth(run: &str, n: u64) -> DecideRequest {
         facts.seed = n;
     }
     ask
+}
+
+/// Waits until the rows of `engine` read overloaded and no other row of the
+/// fleet's pool does; with no engine, until no row does.
+async fn overloaded(harness: &mut Harness, engine: Option<usize>) -> Result<Duration, String> {
+    within(
+        "the pool reads overloaded where a patch stands, and there alone",
+        POLL_INTERVAL + ROOM,
+        || {
+            harness.view(MODEL, Role::Single).is_ok_and(|pool| {
+                pool.iter()
+                    .all(|row| row.overloaded == (Some(row.engine) == engine))
+            })
+        },
+    )
+    .await
 }
 
 /// `ask` under the routing key `key`.
@@ -803,6 +830,61 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             "past its tried first row a passthrough pick is the second: {next:?} of {listed:?}"
         );
 
+        // The overload veto, and the gateway's lift of it. An operator
+        // patches the engine that holds requests to the least KV usage a
+        // threshold states, a permille, and a sample that reads its held
+        // prompts there reads it overloaded: a rotation names every row
+        // but its own, and an ask that lifts the veto is turned over every
+        // row again. The patch taken back, the engine is a pick as before.
+        harness
+            .apply("round_robin")
+            .expect("a preset of this build applies");
+        let least = OverloadThresholds {
+            kv_usage_permille: Some(1),
+            ..OverloadThresholds::default()
+        };
+        harness
+            .patch_overload(busy, least)
+            .await
+            .expect("an operator's patch is taken");
+        overloaded(&mut harness, Some(busy))
+            .await
+            .expect("an engine at its patched limit reads overloaded");
+        let mut vetoed = HashSet::new();
+        for n in (0u64..).take(2 * ranks) {
+            let pick = picked(&mut harness, nth("veto", n))
+                .await
+                .expect("a pick answers an ask over a ready fleet");
+            assert_ne!(pick.engine, busy, "an overloaded engine is no pick");
+            vetoed.insert(pick);
+        }
+        assert_eq!(
+            vetoed.len(),
+            ranks - 1,
+            "a rotation under the veto names every other row: {vetoed:?}"
+        );
+        let mut lifted = HashSet::new();
+        for n in (0u64..).take(2 * ranks) {
+            let mut ask = nth("lift", n);
+            ask.constraints.get_or_insert_default().overload_lifted = true;
+            let pick = picked(&mut harness, ask)
+                .await
+                .expect("a pick answers an ask over a ready fleet");
+            lifted.insert(pick);
+        }
+        assert_eq!(
+            lifted.len(),
+            ranks,
+            "the gateway's lift of the veto keeps the overloaded row: {lifted:?}"
+        );
+        harness
+            .patch_overload(busy, OverloadThresholds::default())
+            .await
+            .expect("an operator's patch is taken");
+        overloaded(&mut harness, None)
+            .await
+            .expect("the patch taken back, no row reads overloaded");
+
         // A rotation names every row before it names one again: under the
         // round-robin preset two turns of asks name each row twice.
         harness
@@ -1255,6 +1337,48 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             0,
             "an engine's own stream carries no snapshot chunk"
         );
+
+        // A session key keeps its ring worker over the overload veto. A
+        // key of the engine that holds requests is found among 256, an
+        // operator patches that engine as before, and with the engine
+        // read overloaded the key's asks still name its row.
+        harness
+            .apply("consistent_hashing")
+            .expect("a preset of this build applies");
+        let mut held = None;
+        for key in (ASKS + 1..).take(KEYS) {
+            let pick = picked(&mut harness, keyed(nth("held", key), key))
+                .await
+                .expect("a pick answers an ask over a ready fleet");
+            if pick.engine == busy {
+                held = Some((key, pick));
+                break;
+            }
+        }
+        let (key, row) = held.expect("of 256 routing keys one is the busy engine's");
+        harness
+            .patch_overload(busy, least)
+            .await
+            .expect("an operator's patch is taken");
+        overloaded(&mut harness, Some(busy))
+            .await
+            .expect("an engine at its patched limit reads overloaded");
+        for n in 0..8 {
+            let again = picked(&mut harness, keyed(nth("kept", n), key))
+                .await
+                .expect("a pick answers an ask over a ready fleet");
+            assert_eq!(
+                again, row,
+                "a session key keeps its ring worker over the veto"
+            );
+        }
+        harness
+            .patch_overload(busy, OverloadThresholds::default())
+            .await
+            .expect("an operator's patch is taken");
+        overloaded(&mut harness, None)
+            .await
+            .expect("the patch taken back, no row reads overloaded");
 
         // A keyed ask returns to its worker: under the ring preset one
         // routing key names one row at each ask, and 64 keys do not all
