@@ -1017,11 +1017,6 @@ impl ChainIndex {
         if self.arena.partial_put(table, worker, cutoff) {
             return;
         }
-        // The growth copies, from this thread, the entry of every worker on the table. A
-        // release fence first, under the run's lock, as at a split: a reader that loads the
-        // grown table and then passes an acquire fence is ordered after what each of those
-        // workers' own writers did before its entry stood here.
-        fence(Ordering::Release);
         let grown = if table == NONE {
             self.arena.alloc_partials(MIN_TABLE_SLOTS)
         } else {
@@ -1083,13 +1078,6 @@ impl ChainIndex {
     }
 
     fn split_locked(&self, run_id: u32, _meta: &mut RunMeta, at: usize) -> u32 {
-        // The split writes, from this thread, the holdings of every worker on the run: the
-        // suffix's coverage and partial entries, the prefix holders it makes whole. A release
-        // fence first, under the run's lock: a reader that sees one of those writes and then
-        // passes an acquire fence is ordered after what each of those workers' own writers did
-        // before its holding stood here. A holding stands on a run by a write under this lock, or
-        // by its maker's before the run was published.
-        fence(Ordering::Release);
         let run = self.slab.run(run_id);
         let coverage = self.slab.coverage(run_id);
         let len = run.len();
