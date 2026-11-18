@@ -611,7 +611,14 @@ impl McpOrchestrator {
             McpConnectionPool::with_full_config(config.pool.max_connections, config.proxy.clone());
 
         let inventory_clone = Arc::clone(&tool_inventory);
+        let static_servers: Arc<DashMap<String, ServerEntry>> = Arc::new(DashMap::new());
+        let configured = Arc::clone(&static_servers);
         connection_pool.set_eviction_callback(move |key: &PoolKey| {
+            // Under a configured server's name the inventory keeps that
+            // server's tools.
+            if configured.contains_key(&key.url) {
+                return;
+            }
             debug!(
                 "LRU evicted dynamic server '{}' (tenant: {:?}) - clearing tools from inventory",
                 key.url, key.tenant_id
@@ -626,7 +633,7 @@ impl McpOrchestrator {
         let (refresh_tx, refresh_rx) = mpsc::channel(100);
 
         let orchestrator = Self {
-            static_servers: Arc::new(DashMap::new()),
+            static_servers,
             builtin_servers: RwLock::new(Vec::new()),
             tool_inventory,
             approval_manager,

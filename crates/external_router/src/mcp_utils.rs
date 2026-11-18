@@ -2486,6 +2486,46 @@ mod tests {
         }
     }
 
+    /// A configured server named by a URL keeps its tools when a request's
+    /// connection to that URL leaves the pool. The pool has room for one
+    /// connection: a connect to a second URL takes the place of the first,
+    /// and a request that binds the name then lists the configured server's
+    /// tool and its call runs.
+    #[tokio::test]
+    async fn a_configured_server_keeps_its_tools_when_a_connection_to_its_name_leaves_the_pool() {
+        let server = || {
+            serve_local_mcp_server(LocalServer {
+                tools: Some(&["echo"]),
+                calls: Some(Arc::default()),
+                ..Default::default()
+            })
+        };
+        let (named_at, url, second_url) = (server().await, server().await, server().await);
+        let mut config = config_holding(&url, named_at);
+        config.pool.max_connections = 1;
+        let orchestrator = Arc::new(McpOrchestrator::new(config).await.unwrap());
+        let format_registry = FormatRegistry::new();
+        let input = |label: &str, url: Option<&String>| McpServerInput {
+            label: label.to_string(),
+            url: url.cloned(),
+            authorization: None,
+            headers: HashMap::new(),
+            allowed_tools: None,
+        };
+        for bound in [&url, &second_url] {
+            let by_url = [input("by-url", Some(bound))];
+            let bindings = connect_mcp_servers(&orchestrator, &format_registry, &by_url).await;
+            assert_eq!(bindings.len(), 1, "the URL binds: {bindings:?}");
+        }
+        let by_name = [input(&url, None)];
+        let bindings = connect_mcp_servers(&orchestrator, &format_registry, &by_name).await;
+        assert_eq!(
+            lists_and_calls_echo(&orchestrator, bindings).await,
+            (vec!["echo".to_string()], None),
+            "the configured server lists its tool and its call runs after the connection to its name left the pool"
+        );
+    }
+
     /// The Responses routes' rule: a request whose only `mcp` tool names no
     /// held server is refused on the missing connection (424
     /// `connect_mcp_server_failed`) before anything goes upstream; next to a
