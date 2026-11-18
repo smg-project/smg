@@ -1032,7 +1032,13 @@ impl Assembler {
     /// unless it is the model's index of the call and the family's tags carry one.
     fn start_call(&mut self, name: String, tail: &str, out: &mut Events) {
         self.function = Some(name.clone());
-        if tail.is_empty() || (self.tags.indexed_calls && is_index(tail)) {
+        // DSML permits whitespace before the tag's closing angle, just as
+        // the reference invoke regex does. Keep those source bytes on the
+        // start event; only the grammar decision ignores the whitespace.
+        let dsml_whitespace = matches!(self.tags.typing, Typing::StringAttribute)
+            && matches!(self.tags.tag_end, TagEnd::Angle)
+            && tail.trim().is_empty();
+        if tail.is_empty() || dsml_whitespace || (self.tags.indexed_calls && is_index(tail)) {
             out.push(Event::ToolCallStart {
                 index: self.object.index,
                 id: self.id.clone(),
@@ -1076,8 +1082,20 @@ impl Assembler {
                 };
                 (kind, mode)
             }
-            (Typing::StringAttribute, STRING_TRUE) => (None, Mode::Streaming { opened: false }),
-            (Typing::StringAttribute, STRING_FALSE) => (None, Mode::Whole),
+            // The reference DSML parameter grammar accepts whitespace
+            // around the string attribute, including before `>`.
+            (Typing::StringAttribute, tail)
+                if tail.chars().next().is_some_and(char::is_whitespace)
+                    && tail.trim() == STRING_TRUE.trim() =>
+            {
+                (None, Mode::Streaming { opened: false })
+            }
+            (Typing::StringAttribute, tail)
+                if tail.chars().next().is_some_and(char::is_whitespace)
+                    && tail.trim() == STRING_FALSE.trim() =>
+            {
+                (None, Mode::Whole)
+            }
             (Typing::TypeAttribute, tail) if typed(tail).is_some_and(|kind| kind == "string") => {
                 (None, Mode::Streaming { opened: false })
             }
@@ -1444,6 +1462,76 @@ mod tests {
             assembler.close(tags.invoke_close, &mut out);
         }
         out.drain()
+    }
+
+    #[test]
+    fn dsml_whitespace_preserves_values_and_source_across_chunk_boundaries() {
+        for tags in [Tags::DSML, Tags::DSML_V4] {
+            for invoke_space in ["", " ", "\t", "\r\n", "\u{a0}"] {
+                for separator in [" ", "  ", "\t", "\n", "\u{a0}"] {
+                    for tail in ["", " ", "\t", "\r\n", "\u{a0}"] {
+                        let string = "  café\n\t\"kept\"  ";
+                        let text = format!(
+                            "f\"{invoke_space}>{open}s\"{separator}string=\"true\"{tail}>{string}{close}{open}n\"{separator}string=\"false\"{tail}> 2 {close}",
+                            open = tags.parameter_open,
+                            close = tags.parameter_close,
+                        );
+                        for split in text.char_indices().map(|(at, _)| at).chain([text.len()]) {
+                            let events = run_with(tags, &[&text[..split], &text[split..]], false);
+                            assert_eq!(bytes(&events), format!("{text}{}", tags.invoke_close));
+                            assert_eq!(
+                                serde_json::from_str::<serde_json::Value>(&arguments(&events))
+                                    .expect("whole arguments"),
+                                value!({"s": string, "n": 2}),
+                                "{invoke_space:?} {separator:?} {tail:?} at {split}",
+                            );
+                            assert!(!events
+                                .iter()
+                                .any(|event| matches!(event, Event::Malformed { .. })));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dsml_whitespace_does_not_accept_other_attributes_or_missing_separators() {
+        for tags in [Tags::DSML, Tags::DSML_V4] {
+            for tail in [
+                "string=\"true\"",
+                " string=\"true\"junk",
+                " other=\"true\"",
+                " string =\"true\"",
+            ] {
+                let text = format!(
+                    "f\">{}s\"{tail}>private{}",
+                    tags.parameter_open, tags.parameter_close
+                );
+                for split in text.char_indices().map(|(at, _)| at).chain([text.len()]) {
+                    let events = run_with(tags, &[&text[..split], &text[split..]], false);
+                    assert_eq!(bytes(&events), format!("{text}{}", tags.invoke_close));
+                    assert!(events.iter().any(|event| matches!(
+                        event,
+                        Event::Malformed {
+                            why: MalformedReason::TagTail,
+                            ..
+                        }
+                    )));
+                    assert!(
+                        serde_json::from_str::<serde_json::Value>(&arguments(&events)).is_err()
+                    );
+                }
+            }
+        }
+        let events = run_with(Tags::MINIMAX_M2, &["f\" >"], false);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            Event::Malformed {
+                why: MalformedReason::TagTail,
+                ..
+            }
+        )));
     }
 
     /// An object-typed value nested past the bound the crate's JSON reader puts on a call's
