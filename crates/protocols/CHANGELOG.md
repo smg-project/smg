@@ -286,7 +286,7 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   `response_modalities`. Each is written in lowercase, and a modality this build does not name is
   kept as written, as the SDK keeps the set open. An uppercase or a new modality refused the whole
   request, and a usage entry that counted a new one failed the typed parse of an answer
-  (`InteractionsUsage`), which a user of the crate runs: the gateway relays an answer without it.
+  (`InteractionsUsage`), which a user of the crate runs: the gateway relays an answer as written.
   A modality is read from a string alone: an object keyed by a name (`{"image": null}`), which
   the derived reading took as that modality, is refused. Breaking: `ResponseModality` gains
   `Video`, `Document` and `Other`, and is `#[non_exhaustive]`.

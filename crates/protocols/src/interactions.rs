@@ -74,7 +74,8 @@ pub struct InteractionsRequest {
     #[serde(alias = "agentConfig")]
     pub agent_config: Option<AgentConfig>,
 
-    /// Response modalities (text, image, audio)
+    /// Response modalities: `text`, `image`, `audio`, `video`, `document`,
+    /// or a name the API adds later, which is kept as written
     #[serde(alias = "responseModalities")]
     pub response_modalities: Option<Vec<ResponseModality>>,
 
@@ -1388,19 +1389,19 @@ mod tests {
             "model": "m",
             "input": "Hello",
             "store": false,
-            "response_modalities": ["a_modality_of_no_api"]
+            "response_modalities": ["A_Modality_Of_No_API"]
         }))
         .unwrap();
         assert_eq!(
             unknown.response_modalities,
             Some(vec![ResponseModality::Other(
-                "a_modality_of_no_api".to_string()
+                "A_Modality_Of_No_API".to_string()
             )])
         );
         let written = crate::common::to_value_exact(&unknown).unwrap();
         assert_eq!(
             written["response_modalities"],
-            serde_json::json!(["a_modality_of_no_api"])
+            serde_json::json!(["A_Modality_Of_No_API"])
         );
 
         // A modality is a name: an object keyed by one, which a derived
