@@ -888,6 +888,98 @@ impl LeastLoad {
             in_flight as f32
         }
     }
+
+    /// The mean rate of the kept rows that report one, which a report
+    /// without a rate drains at: the default where none reports one.
+    fn mean_rate(&self, candidates: &[Candidate], kept: &[u32]) -> f32 {
+        let (sum, n) = kept
+            .iter()
+            .filter_map(|&i| candidates[i as usize].load)
+            .filter(|r| r.live_rate > 0)
+            .fold((0.0f32, 0u32), |(s, n), r| (s + r.live_rate as f32, n + 1));
+        if n > 0 && sum.is_finite() {
+            sum / n as f32
+        } else {
+            self.default_throughput
+        }
+    }
+
+    /// The costs of `rows`, spread over their span, and their band: the one
+    /// body behind the stage's two entries, entered where each is. A row
+    /// costs what it costs among the kept rows where `nominal` is their
+    /// mean rate ([`Self::mean_rate`]).
+    #[inline(always)]
+    fn costs(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        rows: &[u32],
+        nominal: f32,
+        out: &mut [f32],
+    ) -> TieBand {
+        // One load of the tally: each reporting row's held work is read
+        // (released first when its report's sample reaches a dispatch) and
+        // its credit work written; the divisions and the KV barrier run after
+        // the load is gone. A row without a report is marked and costed after
+        // the peer baseline is known. No allocation.
+        let mut reporting = 0usize;
+        {
+            let tally = self.credits.tally.load();
+            with_counts!(facts, |counts| {
+                for (slot, &i) in out.iter_mut().zip(rows) {
+                    let c = &candidates[i as usize];
+                    *slot = match c.load {
+                        Some(_) => {
+                            let (tokens, requests) =
+                                tally.get(&(c.id, c.dp_rank)).map_or((0, 0), |since| {
+                                    since.credit_through(c.load_sampled_at_micros)
+                                });
+                            reporting += 1;
+                            self.credit_work(c, counts(c), tokens, requests)
+                        }
+                        None => PENDING,
+                    };
+                }
+            });
+        }
+        for (slot, &i) in out.iter_mut().zip(rows) {
+            if let Some(r) = candidates[i as usize].load {
+                *slot = self.reported_cost(r, *slot, nominal);
+            }
+        }
+        let fleet_has_loads = reporting > 0;
+        let mut peer_baseline = 0.0;
+        if reporting < rows.len() && fleet_has_loads {
+            peer_baseline = out
+                .iter()
+                .copied()
+                .filter(|cost| *cost != PENDING)
+                .fold(f32::INFINITY, f32::min);
+            if !peer_baseline.is_finite() {
+                peer_baseline = 0.0;
+            }
+        }
+        with_counts!(facts, |counts| {
+            for (slot, &i) in out.iter_mut().zip(rows) {
+                if *slot == PENDING {
+                    *slot = self.unreported_cost(
+                        counts(&candidates[i as usize]),
+                        nominal,
+                        fleet_has_loads,
+                        peer_baseline,
+                    );
+                }
+            }
+        });
+        // The band of a microsecond of expected wait on the normalized scale:
+        // exact for one scorer, additive under several.
+        let span = normalize_costs(out);
+        if span > 0.0 {
+            TieBand((TIE_EPSILON_SECS / span).min(1.0))
+        } else {
+            TieBand::NORMALIZED
+        }
+    }
 }
 
 /// A cost slot not written yet: a candidate without a report is costed
@@ -920,8 +1012,8 @@ impl Scorer for LeastLoad {
         true
     }
 
-    /// The rows a rank put in front are costed alone where each reports a
-    /// rate, and the stage says where one does not
+    /// The rows a rank put in front are costed alone where each holds a
+    /// report, and the stage says where one does not
     /// ([`Self::score_front`]).
     fn front_wise(&self) -> bool {
         true
@@ -934,87 +1026,24 @@ impl Scorer for LeastLoad {
         kept: &[u32],
         out: &mut [f32],
     ) -> TieBand {
-        let (sum, n) = kept
-            .iter()
-            .filter_map(|&i| candidates[i as usize].load)
-            .filter(|r| r.live_rate > 0)
-            .fold((0.0f32, 0u32), |(s, n), r| (s + r.live_rate as f32, n + 1));
-        let nominal = if n > 0 && sum.is_finite() {
-            sum / n as f32
-        } else {
-            self.default_throughput
-        };
-        // One load of the tally: each reporting row's held work is read
-        // (released first when its report's sample reaches a dispatch) and
-        // its credit work written; the divisions and the KV barrier run after
-        // the load is gone. A row without a report is marked and costed after
-        // the peer baseline is known. No allocation.
-        let mut reporting = 0usize;
-        {
-            let tally = self.credits.tally.load();
-            with_counts!(facts, |counts| {
-                for (slot, &i) in out.iter_mut().zip(kept) {
-                    let c = &candidates[i as usize];
-                    *slot = match c.load {
-                        Some(_) => {
-                            let (tokens, requests) =
-                                tally.get(&(c.id, c.dp_rank)).map_or((0, 0), |since| {
-                                    since.credit_through(c.load_sampled_at_micros)
-                                });
-                            reporting += 1;
-                            self.credit_work(c, counts(c), tokens, requests)
-                        }
-                        None => PENDING,
-                    };
-                }
-            });
-        }
-        for (slot, &i) in out.iter_mut().zip(kept) {
-            if let Some(r) = candidates[i as usize].load {
-                *slot = self.reported_cost(r, *slot, nominal);
-            }
-        }
-        let fleet_has_loads = reporting > 0;
-        let mut peer_baseline = 0.0;
-        if reporting < kept.len() && fleet_has_loads {
-            peer_baseline = out
-                .iter()
-                .copied()
-                .filter(|cost| *cost != PENDING)
-                .fold(f32::INFINITY, f32::min);
-            if !peer_baseline.is_finite() {
-                peer_baseline = 0.0;
-            }
-        }
-        with_counts!(facts, |counts| {
-            for (slot, &i) in out.iter_mut().zip(kept) {
-                if *slot == PENDING {
-                    *slot = self.unreported_cost(
-                        counts(&candidates[i as usize]),
-                        nominal,
-                        fleet_has_loads,
-                        peer_baseline,
-                    );
-                }
-            }
-        });
-        // The band of a microsecond of expected wait on the normalized scale:
-        // exact for one scorer, additive under several.
-        let span = normalize_costs(out);
-        if span > 0.0 {
-            TieBand((TIE_EPSILON_SECS / span).min(1.0))
-        } else {
-            TieBand::NORMALIZED
-        }
+        self.costs(
+            facts,
+            candidates,
+            kept,
+            self.mean_rate(candidates, kept),
+            out,
+        )
     }
 
-    /// As [`Self::score`], with one word more. A row without a report is
-    /// costed from its reporting peers' baseline, and a report without a
-    /// rate drains at the rows' mean rate: either reads rows the stage may
-    /// not have been handed. So where one stands among the rows handed, the
-    /// stage says it must be asked whole ([`Front::Whole`]) before it costs
-    /// any: the rows a rank put in front are costed alone only where each
-    /// reports a rate, and then as they are among every row. Their costs
+    /// As [`Self::score`], with one word more, of the rows asked. A row
+    /// without a report is costed from its reporting peers' baseline, the
+    /// least cost among them, which is a pass over every kept row: where
+    /// one is asked the stage says that it must be asked whole
+    /// ([`Front::Whole`]), before it costs any. A report without a rate
+    /// drains at the kept rows' mean rate: where one is asked that mean is
+    /// folded over the kept rows as the plain entry folds it, and where
+    /// each row asked reports a rate no other row is read. Either way a
+    /// row asked costs what it costs among every kept row. Their costs
     /// are spread over their own span and not the pool's, so the front can
     /// tell two of its rows apart where the whole pass cannot, whatever
     /// the rows behind them cost: a difference past the tie's microsecond
@@ -1028,17 +1057,27 @@ impl Scorer for LeastLoad {
         facts: &RequestFacts<'_>,
         candidates: &[Candidate],
         kept: &[u32],
+        asked: &[u32],
         out: &mut [f32],
     ) -> (TieBand, Front) {
-        let alone = kept.iter().all(|&i| {
-            candidates[i as usize]
-                .load
-                .is_some_and(|report| report.live_rate > 0)
-        });
-        if !alone {
-            return (TieBand::NORMALIZED, Front::Whole);
+        let mut rated = true;
+        for &i in asked {
+            let Some(report) = candidates[i as usize].load else {
+                return (TieBand::NORMALIZED, Front::Whole);
+            };
+            rated &= report.live_rate > 0;
         }
-        (self.score(facts, candidates, kept, out), Front::Unsaid)
+        // The mean is read by a report without a rate alone: where each row
+        // asked holds a rate none is folded, and no cost reads the default.
+        let nominal = if rated {
+            self.default_throughput
+        } else {
+            self.mean_rate(candidates, kept)
+        };
+        (
+            self.costs(facts, candidates, asked, nominal, out),
+            Front::Unsaid,
+        )
     }
 
     fn needs(&self) -> Needs {
@@ -2969,40 +3008,55 @@ mod tests {
         assert!(scores[0] > scores[1], "{scores:?}");
     }
 
-    /// What the load stage says of the rows it is handed
-    /// ([`Scorer::score_front`]): its scores and no word where each reports
-    /// a rate, and that it must be asked whole where one has no rate or no
-    /// report, before it costs any.
+    /// What the load stage says of the rows it is asked of
+    /// ([`Scorer::score_front`]). Where each holds a report it scores them
+    /// and says no word: a report without a rate drains at the mean rate
+    /// of the kept rows, not of the rows asked and not of the pool. Where
+    /// one holds no report it says that it must be asked whole, before it
+    /// costs any.
     #[test]
-    fn least_load_must_be_asked_whole_of_a_row_without_a_rate_or_a_report() {
+    fn least_load_answers_for_the_rows_asked_unless_one_holds_no_report() {
         let ll = LeastLoad::new(0.15, 1024, 2000.0);
-        let mut pool = [candidate(0, 0), candidate(1, 0), candidate(2, 0)];
-        for (row, running) in pool.iter_mut().zip([1, 3, 2]) {
-            row.load = Some(report(running, 0));
-        }
         let facts = RequestFacts::default();
+        // Five rows, the last two dropped by a filter. The second reports
+        // no rate: it drains at 10,000 tokens a second, the mean of the
+        // first's 2,000 and the third's 18,000, and waits 0.31 s where the
+        // first waits 0.51 s. At the first's rate alone, or at the pool's
+        // mean of 5,050, it would wait longer than the first.
+        let reports = [(1, 2_000), (3, 0), (2, 18_000), (1, 100), (1, 100)];
+        let mut pool: Vec<Candidate> = (0..5).map(|at| candidate(at, 0)).collect();
+        for (row, (running, live_rate)) in pool.iter_mut().zip(reports) {
+            row.load = Some(LoadRow {
+                live_rate,
+                ..report(running, 0)
+            });
+        }
         let (mut said, mut plain) = ([0.0f32; 3], [0.0f32; 3]);
         let band = ll.score(&facts, &pool, &kept(3), &mut plain);
+        // Asked of every kept row, it answers as the plain entry.
         assert_eq!(
-            ll.score_front(&facts, &pool, &kept(3), &mut said),
+            ll.score_front(&facts, &pool, &kept(3), &kept(3), &mut said),
             (band, Front::Unsaid)
         );
         assert_eq!(said, plain);
-        // A report without a rate drains at the rows' mean rate.
-        pool[1].load = Some(LoadRow {
-            live_rate: 0,
-            ..report(3, 0)
-        });
-        let mut untouched = [-1.0f32; 3];
-        let word = ll.score_front(&facts, &pool, &kept(3), &mut untouched).1;
-        assert_eq!(word, Front::Whole);
-        assert_eq!(untouched, [-1.0; 3], "nothing is costed");
+        // Asked of the first two, it orders them as among the three.
+        assert!(plain[1] > plain[0], "{plain:?}");
+        let word = ll
+            .score_front(&facts, &pool, &kept(3), &[0, 1], &mut said[..2])
+            .1;
+        assert_eq!((word, &said[..2]), (Front::Unsaid, &[0.0, 1.0][..]));
         // A row without a report is costed from its reporting peers.
         pool[1].load = None;
-        let word = ll.score_front(&facts, &pool, &kept(3), &mut untouched).1;
+        let mut untouched = [-1.0f32; 2];
+        let word = ll
+            .score_front(&facts, &pool, &kept(3), &[0, 1], &mut untouched)
+            .1;
         assert_eq!(word, Front::Whole);
-        // Handed the rows that report a rate alone, it answers for them.
-        let word = ll.score_front(&facts, &pool, &[0, 2], &mut said[..2]).1;
+        assert_eq!(untouched, [-1.0; 2], "nothing is costed");
+        // Asked of the rows that hold a report alone, it answers for them.
+        let word = ll
+            .score_front(&facts, &pool, &kept(3), &[0, 2], &mut said[..2])
+            .1;
         assert_eq!(word, Front::Unsaid);
     }
 
