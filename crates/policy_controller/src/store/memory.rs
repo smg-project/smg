@@ -772,12 +772,13 @@ impl MemoryStore {
     /// Build what the membership writes left owed, now, whatever the
     /// window. Where nothing is owed, nothing is done.
     ///
-    /// A registration, a refresh and a patch are in force for decisions
-    /// within one publication window of their answer, when the store's host
-    /// pays the due instant ([`LoadSink::publish_due`]). A caller that needs
-    /// its own write in force at once asks here: a test, a bench's fill, a
-    /// host with no loop. The ask builds the whole membership under the
-    /// workers lock and the load lock: a writer's wait, never a decision's.
+    /// The build of a registration, a refresh and a patch starts within one
+    /// publication window of their answer, when the store's host pays the
+    /// due instant ([`LoadSink::publish_due`]), and they are in force for
+    /// decisions when it ends. A caller that needs its own write in force
+    /// at once asks here: a test, a bench's fill, a host with no loop. The
+    /// ask builds the whole membership under the workers lock and the load
+    /// lock: a writer's wait, never a decision's.
     pub fn publish_now(&self) {
         let workers = self.workers.lock();
         self.pay(&workers, None);

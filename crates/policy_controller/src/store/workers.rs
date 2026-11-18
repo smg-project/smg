@@ -288,9 +288,11 @@ pub enum MembershipTail {
 /// counted in the epoch. What a decision reads follows it. The crate's
 /// store builds its pools from the membership once a publication window
 /// ([`crate::store::PUBLISH_WINDOW`]), however many writes the window
-/// took: a registration, its refresh and a patch are in force for decisions
-/// within one window of their answer, and a caller that needs its own write
-/// in force at once asks for the build
+/// took. The build of a registration, its refresh and a patch starts
+/// within one window of their answer, where the store's host pays the due
+/// instant ([`crate::store::LoadSink::publish_due`]), and they are in force
+/// for decisions when it ends. A caller that needs its own write in force
+/// at once, or whose host runs no loop, asks for the build
 /// ([`crate::store::MemoryStore::publish_now`]). A removal and a replaced
 /// incarnation pay the build before they answer, and a status change is
 /// published with its answer: no decision made after it is handed the
