@@ -25,8 +25,10 @@ use smg_policy_controller::{
         loads::{LoadDriver, LoadDriverConfig, LoadProbe, ReadError, Target},
         probe::EngineProbe,
     },
+    spec::{BindingSpec, OverloadSpec},
     store::{LoadSink, LoadSource, MemoryStore, Signals, WorkerFacts, WorkerStatus, WorkersStore},
     view::{Role, SignalSource, WireModes, WorkerId},
+    AppliedSpec, PolicySpec,
 };
 use tokio::{
     net::TcpListener,
@@ -333,6 +335,25 @@ async fn the_controller_runs_the_driver_and_renders_its_counters() {
     .expect("the controller binds");
     let admin = controller.addresses().admin;
     let store = controller.store();
+    // The standing generation names a queue bound the scraped engine's page
+    // is over: that engine's first row moves its verdict.
+    let mut document = PolicySpec::preset("round_robin").expect("a preset of this build");
+    document.generation = 1;
+    let profile = document
+        .profiles
+        .keys()
+        .next()
+        .expect("the preset's profile");
+    document.bindings = vec![BindingSpec {
+        profile: Some(profile.clone()),
+        overload: Some(OverloadSpec {
+            waiting_requests: Some(4),
+            ..OverloadSpec::default()
+        }),
+        ..BindingSpec::default()
+    }];
+    let bound = AppliedSpec::validate(&document).expect("the document validates");
+    store.apply(bound).expect("applied");
     let endpoint = format!("http://{addr}");
     let polled =
         ready(&store, &endpoint, &endpoint, 0, 1, WireModes::GRPC, 0).expect("the polled row");
@@ -379,6 +400,12 @@ async fn the_controller_runs_the_driver_and_renders_its_counters() {
     );
     assert!(
         body.contains("smg_policy_controller_load_rows_total "),
+        "{body}"
+    );
+    // The verdict the scraped row moved is counted at the controller's own
+    // scrape.
+    assert!(
+        body.contains("smg_policy_controller_overload_flips_total 1"),
         "{body}"
     );
 
