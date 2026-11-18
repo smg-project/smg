@@ -230,6 +230,11 @@ impl McpConnectionPool {
         let cached = CachedConnection::new(Arc::clone(&client_arc));
         {
             let mut connections = self.connections.lock();
+            // Another connect may have pooled this key while this one was
+            // connecting: its connection stands, and this one is dropped.
+            if let Some(pooled) = connections.get(&key) {
+                return Ok(Arc::clone(&pooled.client));
+            }
             match connections.push(key, cached) {
                 Some((evicted_key, _)) => {
                     // Eviction: count stays the same (replaced one entry).
