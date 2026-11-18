@@ -7828,7 +7828,6 @@ dependencies = [
  "portpicker",
  "prost",
  "prost-types",
- "quanta",
  "rand 0.10.2",
  "rayon",
  "reasoning-parser",
@@ -8298,12 +8297,21 @@ name = "smg-worker"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "arc-swap",
+ "async-trait",
  "axum",
  "bitflags 2.13.2",
+ "blake3",
  "dashmap",
  "http",
+ "metrics",
+ "metrics-exporter-prometheus",
+ "metrics-util",
+ "once_cell",
  "openmetrics-parser",
  "openssl",
+ "parking_lot 0.13.0",
+ "quanta",
  "reqwest 0.13.4",
  "rustc-hash 2.1.3",
  "rustls",
@@ -8313,8 +8321,11 @@ dependencies = [
  "serde_with",
  "thiserror 2.0.21",
  "tokio",
+ "tonic",
  "tracing",
+ "tracing-test",
  "url",
+ "uuid",
 ]
 
 [[package]]

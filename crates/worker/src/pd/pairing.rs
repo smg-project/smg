@@ -18,14 +18,15 @@
 //! The mode judges the KV handoff alone. What a wire cannot carry at all, a
 //! pair of two known runtimes where the requests are runtime-specific, is
 //! that wire's fact: it holds in every mode, where the pairs are made
-//! ([`super::pair_index`]).
+//! (the host's pair index).
 
 use std::collections::{BTreeMap, HashMap};
 
-use openai_protocol::worker::{RuntimeType, WorkerSpec};
-pub use smg_worker::settings::PdPairingMode;
-
-use crate::worker::MORIIO_MODE_LABEL;
+pub use crate::settings::PdPairingMode;
+use crate::{
+    identity::basic::MORIIO_MODE_LABEL,
+    worker::{RuntimeType, WorkerSpec},
+};
 
 /// Label under which the pairing protocol arrives when it is not on the
 /// worker spec: set by the operator as a worker label, or reported by the
@@ -256,7 +257,7 @@ impl PdPairing {
     /// Whether both workers' runtimes are known and differ: the one fact no
     /// pairing mode switches off on a wire whose requests are
     /// runtime-specific (see `PdWire::mismatch`).
-    pub(crate) fn runtime_differs(&self, other: &Self) -> bool {
+    pub fn runtime_differs(&self, other: &Self) -> bool {
         self.runtime_agreement(other) == Agreement::Differ
     }
 

@@ -15,14 +15,13 @@ use std::{
     time::Duration,
 };
 
-use openai_protocol::worker::WorkerStatus;
 use parking_lot::Mutex;
 use tokio::sync::Notify;
 
 // The trait is named only by the doc links of this module.
 #[cfg(doc)]
-use super::identity::basic::Worker;
-use super::identity::basic::WorkerRoutingKeyLoad;
+use crate::identity::basic::Worker;
+use crate::{identity::basic::WorkerRoutingKeyLoad, worker::WorkerStatus};
 
 /// Why the liveness tracker vetoes a worker (see the `liveness` module).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1304,7 +1303,7 @@ mod tests {
     use tokio::time;
 
     use super::*;
-    use crate::worker::health::liveness::now_ms;
+    use crate::health::liveness::now_ms;
 
     #[test]
     fn a_token_within_the_stamped_millisecond_records_nothing_new_and_keeps_the_semantics() {

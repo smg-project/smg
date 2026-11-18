@@ -13,17 +13,15 @@ use dashmap::DashMap;
 use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
 use once_cell::sync::Lazy;
 use rustc_hash::FxBuildHasher;
-use smg_worker::metrics::intern_model_label;
 
-use crate::worker::Worker;
-
-pub(crate) mod series;
+use super::series;
+use crate::{identity::basic::Worker, metrics::intern_model_label};
 
 /// `smg_kv_event_lag_seconds`, named for the exporter's bucket list: without
 /// buckets of its own the recorder renders a histogram as a summary.
-pub(crate) const KV_EVENT_LAG_SECONDS: &str = "smg_kv_event_lag_seconds";
+pub const KV_EVENT_LAG_SECONDS: &str = "smg_kv_event_lag_seconds";
 /// `smg_kv_event_apply_seconds`, named for the exporter's bucket list.
-pub(crate) const KV_EVENT_APPLY_SECONDS: &str = "smg_kv_event_apply_seconds";
+pub const KV_EVENT_APPLY_SECONDS: &str = "smg_kv_event_apply_seconds";
 
 // Interned strings are never freed; only intern low-cardinality, server-controlled
 // labels (model IDs, worker URLs, normalized paths), never user-controlled input.
@@ -39,7 +37,7 @@ static STRING_INTERNER: Lazy<DashMap<String, Arc<str>, FxBuildHasher>> =
 /// This function is designed for high-throughput scenarios where the same
 /// strings (model IDs, worker URLs) appear repeatedly. The first call allocates,
 /// subsequent calls just clone the Arc (very cheap - just a ref count increment).
-pub(crate) fn intern_string(s: &str) -> Arc<str> {
+pub fn intern_string(s: &str) -> Arc<str> {
     // Fast path: check if already interned
     if let Some(entry) = STRING_INTERNER.get(s) {
         return Arc::clone(entry.value());
@@ -53,8 +51,8 @@ pub(crate) fn intern_string(s: &str) -> Arc<str> {
         .clone()
 }
 
-#[cfg(test)]
-pub(crate) fn interner_size() -> usize {
+#[cfg(any(test, feature = "test-util"))]
+pub fn interner_size() -> usize {
     STRING_INTERNER.len()
 }
 
@@ -62,8 +60,8 @@ pub(crate) fn interner_size() -> usize {
 /// value never became a label asks this, which no neighbouring test's
 /// interning can disturb, where the interner's size moves with every
 /// label any test records.
-#[cfg(test)]
-pub(crate) fn is_interned(s: &str) -> bool {
+#[cfg(any(test, feature = "test-util"))]
+pub fn is_interned(s: &str) -> bool {
     STRING_INTERNER.contains_key(s)
 }
 
@@ -72,7 +70,7 @@ pub(crate) fn is_interned(s: &str) -> bool {
 /// breaker's outcomes'. The ones a worker's own streams move, with no request
 /// in hand: the engine load set, which a load record sets, and the KV-event
 /// set, which a batch of the event stream records. The helpers and the
-/// installed flag are the worker crate's (`smg_worker::metrics::handles`), so
+/// installed flag are the worker crate's (`crate::metrics::handles`), so
 /// every writer records the same way.
 mod handles {
     use std::{
@@ -86,13 +84,13 @@ mod handles {
 
     use metrics::{Counter, Gauge, Histogram};
     use rustc_hash::FxHashMap;
-    #[cfg(test)]
-    pub(super) use smg_worker::metrics::handles::force_on_this_thread;
-    pub(super) use smg_worker::metrics::handles::{
-        keep_handles, kept, nested, with_handle, with_model_handle,
-    };
 
     use super::{intern_model_label, intern_string};
+    #[cfg(test)]
+    pub(super) use crate::metrics::handles::force_on_this_thread;
+    pub(super) use crate::metrics::handles::{
+        keep_handles, kept, nested, with_handle, with_model_handle,
+    };
 
     /// The `smg_engine_*` handles of one rank of a worker under one model
     /// label, each built the first time a load has a figure for it, so the
@@ -378,9 +376,8 @@ mod handles {
 
     #[cfg(test)]
     mod tests {
-        use smg_worker::metrics::handles::MAX_KEPT_PER_MAP;
-
         use super::*;
+        use crate::metrics::handles::MAX_KEPT_PER_MAP;
 
         #[test]
         fn kept_worker_counters_go_when_the_worker_set_changes() {
@@ -422,7 +419,7 @@ mod handles {
 }
 
 /// Describes the series this module writes. The gateway's list calls it.
-pub(crate) fn describe_series() {
+pub fn describe_series() {
     describe_counter!(
         "smg_pd_rendezvous_failures_total",
         "PD rendezvous failures by side (the worker type of the side whose rendezvous failed) and phase: a bootstrap port that refused the registration probe (probe) or the same probe run when a decode side's engine failed a request without a reason (request, on the prefill side whose port it is), and the failures the engines report on the gRPC path when the sides never met (bootstrap) or the KV handoff after they met failed (transfer)"
@@ -1319,7 +1316,7 @@ impl Metrics {
     pub fn record_engine_load(
         worker_url: &str,
         model_id: &str,
-        response: &openai_protocol::worker::WorkerLoadResponse,
+        response: &crate::worker::WorkerLoadResponse,
     ) {
         for load in &response.loads {
             Self::record_engine_rank_load(worker_url, model_id, load);
@@ -1335,7 +1332,7 @@ impl Metrics {
     pub fn record_engine_rank_load(
         worker_url: &str,
         model_id: &str,
-        load: &openai_protocol::worker::SchedulerLoadSnapshot,
+        load: &crate::worker::SchedulerLoadSnapshot,
     ) {
         if handles::keep_handles() {
             let recorded = handles::ENGINE_LOADS.with_borrow_mut(|kept| {
@@ -1364,7 +1361,7 @@ impl Metrics {
         rank: &mut handles::EngineRankHandles,
         worker_url: &str,
         model_id: &str,
-        load: &openai_protocol::worker::SchedulerLoadSnapshot,
+        load: &crate::worker::SchedulerLoadSnapshot,
     ) {
         let dp_rank = load.dp_rank;
         let mut labels = None;
@@ -1543,7 +1540,5 @@ impl Metrics {
     }
 }
 
-#[cfg(test)]
-mod gateway_tests;
 #[cfg(test)]
 mod tests;

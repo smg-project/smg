@@ -12,7 +12,7 @@
 //! removed, not per request. See [`hash_ring`] for the ring
 //! itself — this file only wires registry events to ring rebuilds.
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 use std::sync::mpsc as test_mpsc;
 use std::{
     collections::{BTreeSet, HashSet},
@@ -24,25 +24,28 @@ use std::{
 
 use arc_swap::ArcSwap;
 use dashmap::{mapref::entry::Entry, DashMap};
-use openai_protocol::{model_card::ModelCard, worker::WorkerStatus};
 use rustc_hash::FxBuildHasher;
-use smg_worker::{metrics_labels, settings::RetryConfig};
 use tokio::sync::{broadcast, mpsc};
 use uuid::Uuid;
 
-use crate::worker::{
+use crate::{
     connection::engine::EngineConnector,
     health::circuit_breaker::CircuitState,
     identity::{
-        basic::{RuntimeType, WorkerType},
+        basic::{ConnectionMode, RuntimeType, Worker, WorkerType},
         endpoint::Endpoint,
+        sampling_defaults::DEFAULT_SAMPLING_PARAMS_LABEL,
     },
-    metrics::Metrics,
+    metrics::writers::Metrics,
+    metrics_labels,
+    model_card::ModelCard,
     registry::{
         event::{WorkerConnected, WorkerEvent},
         hash_ring::HashRing,
     },
-    ConnectionMode, Worker, DEFAULT_SAMPLING_PARAMS_LABEL, UNKNOWN_MODEL_ID,
+    settings::RetryConfig,
+    worker::WorkerStatus,
+    UNKNOWN_MODEL_ID,
 };
 
 pub mod event;
@@ -154,7 +157,7 @@ type ModelAliasIndex = Arc<DashMap<String, Arc<str>, FxBuildHasher>>;
 /// lock ([`WorkerRegistry::remove_if`]).
 type RemovalCondition<'a> = &'a dyn Fn(&Arc<dyn Worker>) -> bool;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 #[derive(Debug, Default)]
 struct HashRingTestHooks {
     before_rebuild: Option<test_mpsc::Sender<()>>,
@@ -165,7 +168,7 @@ struct HashRingTestHooks {
 /// the worker's mutation lock and before the lock is taken: the transition
 /// reports in, then waits to be let go. The interleaving proofs place
 /// another writer's transition in that window.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 #[derive(Debug, Default)]
 struct TransitionTestHooks {
     before_lock: Option<(test_mpsc::Sender<()>, test_mpsc::Receiver<()>)>,
@@ -232,10 +235,10 @@ pub struct WorkerRegistry<G> {
     /// a late publication cannot restore a superseded membership snapshot.
     hash_ring_update: parking_lot::Mutex<()>,
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-util"))]
     hash_ring_test_hooks: parking_lot::Mutex<HashRingTestHooks>,
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-util"))]
     transition_test_hooks: parking_lot::Mutex<TransitionTestHooks>,
 
     /// Workers indexed by worker type
@@ -337,9 +340,9 @@ impl<G: Generation> WorkerRegistry<G> {
             model_alias_index: Arc::new(DashMap::with_hasher(FxBuildHasher)),
             hash_rings: Arc::new(DashMap::with_hasher(FxBuildHasher)),
             hash_ring_update: parking_lot::Mutex::new(()),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-util"))]
             hash_ring_test_hooks: parking_lot::Mutex::new(HashRingTestHooks::default()),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-util"))]
             transition_test_hooks: parking_lot::Mutex::new(TransitionTestHooks::default()),
             type_workers: Arc::new(DashMap::new()),
             connection_workers: Arc::new(DashMap::new()),
@@ -1610,7 +1613,11 @@ impl<G: Generation> WorkerRegistry<G> {
             .or_insert_with(|| Arc::new(parking_lot::Mutex::new(())))
             .clone();
 
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-util"))]
+        #[expect(
+            clippy::expect_used,
+            reason = "test support: a hook nobody observes must fail the test that set it"
+        )]
         {
             let pause = self.transition_test_hooks.lock().before_lock.take();
             if let Some((reached, resume)) = pause {
@@ -1690,7 +1697,7 @@ impl<G: Generation> WorkerRegistry<G> {
     /// found by its handle, not by its cards.
     ///
     /// Returns whether the cards changed. Emits no events.
-    pub(crate) fn refresh_models(&self, worker: &Arc<dyn Worker>, models: Vec<ModelCard>) -> bool {
+    pub fn refresh_models(&self, worker: &Arc<dyn Worker>, models: Vec<ModelCard>) -> bool {
         if worker.models() == models {
             return false;
         }
@@ -2143,7 +2150,11 @@ impl<G: Generation> WorkerRegistry<G> {
     /// which at fleet scale turns a registration wave quadratic and
     /// saturates the runtime.
     fn rebuild_hash_ring(&self, model_id: &str) {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-util"))]
+        #[expect(
+            clippy::expect_used,
+            reason = "test support: a hook nobody observes must fail the test that set it"
+        )]
         if let Some(started) = self.hash_ring_test_hooks.lock().before_rebuild.take() {
             started.send(()).expect("rebuild observer is listening");
         }
@@ -2157,7 +2168,11 @@ impl<G: Generation> WorkerRegistry<G> {
         // under the index shard guard.
         let workers = self.model_index.get(model_id).map(|entry| entry.clone());
 
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-util"))]
+        #[expect(
+            clippy::expect_used,
+            reason = "test support: a hook nobody observes must fail the test that set it"
+        )]
         {
             let pause = self.hash_ring_test_hooks.lock().after_snapshot.take();
             if let Some((started, resume)) = pause {
@@ -2552,7 +2567,7 @@ impl<G: Generation> WorkerRegistry<G> {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 impl<G: Generation> WorkerRegistry<G> {
     /// Test support for the interleaving proofs. Runs `transition` on its
     /// own thread and pauses it at the next status transition's seam: after
@@ -2561,7 +2576,11 @@ impl<G: Generation> WorkerRegistry<G> {
     /// writer's transition, through the registry, so it lands under the
     /// lock), after which `transition` is let go and its result returned.
     /// No sleep determines the ordering.
-    pub(crate) fn with_another_write_before_the_lock<R: Send>(
+    #[expect(
+        clippy::expect_used,
+        reason = "test support: a hook nobody observes must fail the test that set it"
+    )]
+    pub fn with_another_write_before_the_lock<R: Send>(
         &self,
         transition: impl FnOnce(&Self) -> R + Send,
         other_write: impl FnOnce(&Self),
@@ -2589,7 +2608,11 @@ impl<G: Generation> WorkerRegistry<G> {
     /// membership operation after its model snapshot, then lets another
     /// operation reach the rebuild, and says whether that one waited for the
     /// first to publish. No sleep determines the ordering.
-    pub(crate) fn overlapping_hash_ring_updates(
+    #[expect(
+        clippy::expect_used,
+        reason = "test support: a hook nobody observes must fail the test that set it"
+    )]
+    pub fn overlapping_hash_ring_updates(
         self: &Arc<Self>,
         first: impl FnOnce(&Self) + Send + 'static,
         second: impl FnOnce(&Self) + Send + 'static,
@@ -2674,7 +2697,7 @@ enum PublishedSpec {
     /// A spec this build cannot decode: a newer publisher's field.
     Undecodable(serde_json::Error),
     /// The spec, boxed: it is the one large variant.
-    Spec(Box<openai_protocol::worker::WorkerSpec>),
+    Spec(Box<crate::worker::WorkerSpec>),
 }
 
 /// A worker as another node published it: what the registry reads of a
@@ -3025,7 +3048,7 @@ impl<G: Generation> WorkerRegistry<G> {
         if state.spec.is_empty() {
             return PublishedSpec::Absent;
         }
-        match serde_json::from_slice::<openai_protocol::worker::WorkerSpec>(&state.spec) {
+        match serde_json::from_slice::<crate::worker::WorkerSpec>(&state.spec) {
             Ok(spec) => {
                 // Same-host transport declared by the spec rather than by
                 // the URL scheme — not routable from this node.
@@ -3051,9 +3074,9 @@ impl<G: Generation> WorkerRegistry<G> {
     fn import_from(
         &self,
         state: &RemoteWorkerState,
-        spec: Option<openai_protocol::worker::WorkerSpec>,
+        spec: Option<crate::worker::WorkerSpec>,
     ) -> super::identity::basic::BasicWorker {
-        use openai_protocol::model_card::ModelCard;
+        use crate::model_card::ModelCard;
 
         // The builder without a default: an import connects through the
         // registry's own connector.

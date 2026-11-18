@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 
-use crate::worker::{BasicWorkerBuilder, Worker};
+use crate::{identity::basic::Worker, test_support::BasicWorkerBuilder};
 
 fn with_labels(pairs: &[(&str, &str)]) -> impl Worker {
     BasicWorkerBuilder::new("http://w:1")

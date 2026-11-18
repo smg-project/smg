@@ -204,7 +204,7 @@ impl HashRing {
         clippy::expect_used,
         reason = "blake3 always produces 32 bytes — converting a fixed 8-byte slice to [u8; 8] is infallible"
     )]
-    pub(crate) fn hash_position(s: &str) -> u64 {
+    pub fn hash_position(s: &str) -> u64 {
         let hash = blake3::hash(s.as_bytes());
         u64::from_le_bytes(
             hash.as_bytes()[..8]

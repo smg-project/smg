@@ -42,7 +42,7 @@ use metrics_util::{
 use parking_lot::{Mutex, RwLock};
 use quanta::Instant;
 
-use crate::worker::Worker;
+use crate::identity::basic::Worker;
 
 /// The label that keys a series to a worker; its value is the worker URL.
 const WORKER_LABEL: &str = "worker";
@@ -52,7 +52,7 @@ static INSTALLED: OnceLock<Arc<WorkerSeries>> = OnceLock::new();
 
 /// Install the store the global recorder routes to. The first call wins, as
 /// the recorder installation it accompanies does.
-pub(crate) fn install(series: Arc<WorkerSeries>) {
+pub fn install(series: Arc<WorkerSeries>) {
     let _ = INSTALLED.set(series);
 }
 
@@ -64,12 +64,12 @@ pub(crate) fn installed() -> Option<&'static Arc<WorkerSeries>> {
 /// The installed store, a default one (the exporter's quantiles, no
 /// buckets) installed first when the process has none: what a test of the
 /// registry's handoff to the store reads.
-#[cfg(test)]
-pub(crate) fn installed_or_default() -> &'static Arc<WorkerSeries> {
+#[cfg(any(test, feature = "test-util"))]
+pub fn installed_or_default() -> &'static Arc<WorkerSeries> {
     INSTALLED.get_or_init(|| Arc::new(WorkerSeries::with_exporter_quantiles()))
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 impl WorkerSeries {
     /// A store as a test builds one: a copy of the exporter's default
     /// quantiles, spelled here, and no buckets.
@@ -86,14 +86,14 @@ impl WorkerSeries {
 }
 
 /// Append the installed store's series to a scrape.
-pub(crate) fn render_into(out: &mut String) {
+pub fn render_into(out: &mut String) {
     if let Some(series) = INSTALLED.get() {
         series.render_into(out);
     }
 }
 
 /// Fold the installed store's histogram samples, as the exporter's upkeep does.
-pub(crate) fn run_upkeep() {
+pub fn run_upkeep() {
     if let Some(series) = INSTALLED.get() {
         series.run_upkeep();
     }
@@ -115,7 +115,7 @@ struct Address {
 }
 
 /// The per-worker series of the process, keyed by the worker URL.
-pub(crate) struct WorkerSeries {
+pub struct WorkerSeries {
     /// The addresses with a removed registration or a replaced worker (see
     /// [`Address`]); a retired one's writes are dropped until the address
     /// registers again or the upkeep finds every one of its workers gone.
@@ -133,7 +133,7 @@ pub(crate) struct WorkerSeries {
 
 impl WorkerSeries {
     /// A store whose histograms take the exporter's bucket configuration.
-    pub(crate) fn new(distribution_builder: DistributionBuilder) -> Self {
+    pub fn new(distribution_builder: DistributionBuilder) -> Self {
         Self {
             addresses: RwLock::new(HashMap::new()),
             registry: Registry::new(WorkerStorage),
@@ -171,7 +171,7 @@ impl WorkerSeries {
     /// writes that follow until the address registers again or `worker`, the
     /// removed one, and the instances replaced at the address before it are
     /// gone from every handle that could still write for them.
-    pub(crate) fn retire(&self, url: &str, worker: Weak<dyn Worker>) {
+    pub fn retire(&self, url: &str, worker: Weak<dyn Worker>) {
         let mut addresses = self.addresses.write();
         let address = addresses.entry(url.to_owned()).or_default();
         address.retired = true;
@@ -220,8 +220,8 @@ impl WorkerSeries {
     }
 
     /// The retired addresses, for the tests.
-    #[cfg(test)]
-    pub(crate) fn retired_len(&self) -> usize {
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn retired_len(&self) -> usize {
         self.addresses
             .read()
             .values()
@@ -230,8 +230,8 @@ impl WorkerSeries {
     }
 
     /// Whether `worker_url` is retired, for the tests.
-    #[cfg(test)]
-    pub(crate) fn is_retired(&self, worker_url: &str) -> bool {
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn is_retired(&self, worker_url: &str) -> bool {
         self.addresses
             .read()
             .get(worker_url)
@@ -245,7 +245,7 @@ impl WorkerSeries {
     /// that keys by the URL alone holds the worker through its write, as the
     /// KV-event subscription task does), so the retired set stays bounded by
     /// the removed and replaced workers still referenced.
-    pub(crate) fn run_upkeep(&self) {
+    pub fn run_upkeep(&self) {
         self.addresses.write().retain(|_, address| {
             address.writers.retain(|writer| writer.strong_count() > 0);
             !address.writers.is_empty()
@@ -264,7 +264,7 @@ impl WorkerSeries {
 
     /// Append the stored series to `out` in the exposition format: one
     /// family per metric name, the samples in label order.
-    pub(crate) fn render_into(&self, out: &mut String) {
+    pub fn render_into(&self, out: &mut String) {
         let descriptions = self.descriptions.read();
 
         let mut counters: BTreeMap<String, Vec<(Vec<String>, u64)>> = BTreeMap::new();
@@ -370,13 +370,13 @@ impl WorkerSeries {
 
 /// The gateway's recorder: series labelled `worker` go to the store, every
 /// other series to the Prometheus exporter.
-pub(crate) struct WorkerSeriesRecorder<R> {
+pub struct WorkerSeriesRecorder<R> {
     inner: R,
     series: Arc<WorkerSeries>,
 }
 
 impl<R> WorkerSeriesRecorder<R> {
-    pub(crate) fn new(inner: R, series: Arc<WorkerSeries>) -> Self {
+    pub fn new(inner: R, series: Arc<WorkerSeries>) -> Self {
         Self { inner, series }
     }
 }
@@ -516,7 +516,7 @@ mod tests {
     use metrics_util::parse_quantiles;
 
     use super::*;
-    use crate::worker::BasicWorker;
+    use crate::identity::basic::BasicWorker;
 
     const WORKER_A: &str = "grpc://[fd00::a]:50051";
     const WORKER_B: &str = "grpc://[fd00::b]:50051";

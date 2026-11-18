@@ -4,17 +4,16 @@
 
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
-use openai_protocol::{
+use crate::{
+    health::overload::OverloadThresholds,
+    identity::error::{WorkerError, WorkerResult},
     model_card::ModelCard,
     model_type::{Endpoint, ModelType},
+    pd::pairing::PdPairing,
     worker::{
         ConstrainedDecoding, GrammarStart, HealthCheckConfig, ProviderType, TagVocabulary,
         WorkerSpec,
     },
-};
-
-use crate::worker::{
-    health::overload::OverloadThresholds, pd::pairing::PdPairing, WorkerError, WorkerResult,
     UNKNOWN_MODEL_ID,
 };
 
@@ -286,7 +285,7 @@ impl WorkerMetadata {
 /// `http://h:8000` or `http://h:8000/`. Any other address (`ipc://`, `tcp://`,
 /// `grpc://`) is not a base routes join to and stays as given: the ZMQ
 /// adapter hashes the exact path for its handshake port and socket files.
-pub(crate) fn join_base(url: &str) -> &str {
+pub fn join_base(url: &str) -> &str {
     if url.starts_with("http://") || url.starts_with("https://") {
         url.trim_end_matches('/')
     } else {

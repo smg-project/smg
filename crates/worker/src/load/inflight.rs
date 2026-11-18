@@ -5,9 +5,9 @@
 
 use std::{fmt, sync::Arc};
 
-use crate::worker::{
+use crate::{
     identity::{basic::Worker, endpoint::Endpoint},
-    metrics::Metrics,
+    metrics::writers::Metrics,
 };
 
 pub struct WorkerRoutingKeyLoad {
@@ -140,7 +140,7 @@ impl WorkerLoadGuard {
     ///
     /// This is explicit instead of implementing `Clone` because replication
     /// increments externally visible worker load.
-    pub(crate) fn replicate(&self) -> Self {
+    pub fn replicate(&self) -> Self {
         self.worker.increment_load();
         if let Some(ref key) = self.routing_key {
             self.worker.increment_routing_key_load(key);
@@ -180,10 +180,11 @@ impl Drop for WorkerLoadGuard {
 
 #[cfg(test)]
 mod tests {
-    use openai_protocol::worker::WorkerType;
-
     use super::*;
-    use crate::worker::{BasicWorkerBuilder, RequestCompletionSink};
+    use crate::{
+        identity::basic::RequestCompletionSink, test_support::BasicWorkerBuilder,
+        worker::WorkerType,
+    };
 
     #[test]
     fn test_worker_routing_key_load_increment_decrement() {
@@ -257,7 +258,7 @@ mod tests {
 
     #[test]
     fn test_worker_load_guard_with_routing_key() {
-        use crate::worker::BasicWorkerBuilder;
+        use crate::test_support::BasicWorkerBuilder;
 
         let worker: Arc<dyn Worker> = Arc::new(
             BasicWorkerBuilder::new("http://test:8000")
@@ -280,7 +281,7 @@ mod tests {
 
     #[test]
     fn test_worker_load_guard_without_routing_key() {
-        use crate::worker::BasicWorkerBuilder;
+        use crate::test_support::BasicWorkerBuilder;
 
         let worker: Arc<dyn Worker> = Arc::new(
             BasicWorkerBuilder::new("http://test:8000")
@@ -303,7 +304,7 @@ mod tests {
 
     #[test]
     fn test_worker_load_guard_multiple_same_routing_key() {
-        use crate::worker::BasicWorkerBuilder;
+        use crate::test_support::BasicWorkerBuilder;
 
         let worker: Arc<dyn Worker> = Arc::new(
             BasicWorkerBuilder::new("http://test:8000")

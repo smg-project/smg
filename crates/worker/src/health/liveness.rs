@@ -80,7 +80,7 @@
 //!   configured threshold or, if longer, the time the engine may still need
 //!   to prefill what is in flight ([`WorkerRuntime::prefill_backlog`]): a batch that
 //!   is all in prefill streams nothing and is not wedged. The bound is the
-//!   cap outright ([`COLD_SHAPE_GRACE`]) while the worker is on a prompt
+//!   cap outright (`COLD_SHAPE_GRACE`) while the worker is on a prompt
 //!   longer than any it has answered, once it has answered one
 //!   ([`WorkerRuntime::prefill_cold_shape`]): an engine meeting a shape it has not
 //!   run may build a kernel for it first, a minute of silence on the engines
@@ -139,14 +139,13 @@ use std::{
     time::{Duration, Instant},
 };
 
-use openai_protocol::worker::WorkerStatus;
 use tracing::{info, warn};
 
-use crate::worker::{
-    identity::basic::{StallReason, COLD_PREFILL_TOKENS_PER_SEC},
-    metrics::Metrics,
+use crate::{
+    identity::basic::{StallReason, Worker, COLD_PREFILL_TOKENS_PER_SEC},
+    metrics::writers::Metrics,
     runtime::WorkerRuntime,
-    Worker,
+    worker::WorkerStatus,
 };
 
 const DEFAULT_STALL: Duration = Duration::from_secs(2);
@@ -158,7 +157,7 @@ const DEFAULT_WEDGE: Duration = Duration::from_secs(3);
 const DEFAULT_STALE: Duration = Duration::from_secs(15);
 
 /// How often the sweep runs.
-pub(crate) const SWEEP_INTERVAL: Duration = Duration::from_millis(250);
+pub const SWEEP_INTERVAL: Duration = Duration::from_millis(250);
 
 /// In-flight requests this many deep with no token for the wedge threshold
 /// are a wedged engine even when nothing new arrives (a saturated client
@@ -220,7 +219,7 @@ fn bound_over(wedge: Duration, eta: Duration) -> Duration {
 /// wedge rule's bound, with the side's own prompt behind what the worker is
 /// already prefilling ([`WorkerRuntime::prefill_eta`]) at twice the time the
 /// worker's rate gives, as the engine-reported rule allows for the prefill
-/// in hand ([`silence_allowance`]): the rate is an estimate, the answer can
+/// in hand (`silence_allowance`): the rate is an estimate, the answer can
 /// come an engine step after the prefill (a prefill worker that
 /// polls the KV transfer answers after its next forward), and
 /// a side's verdict fails its request where that rule's veto only steers.
@@ -231,7 +230,7 @@ fn bound_over(wedge: Duration, eta: Duration) -> Duration {
 /// ([`decode_side_bound`]). A PD side joins no pile and is never vetoed by
 /// one; the request is what the bound ends. `None` when the rule is off (a
 /// zero threshold).
-pub(crate) fn prefill_side_bound(worker: &Arc<dyn Worker>, prompt_tokens: u64) -> Option<Duration> {
+pub fn prefill_side_bound(worker: &Arc<dyn Worker>, prompt_tokens: u64) -> Option<Duration> {
     let (_, wedge, _) = thresholds();
     prefill_side_bound_with(worker, prompt_tokens, wedge)
 }
@@ -266,7 +265,7 @@ fn prefill_side_bound_with(
 /// answer is back at the threshold until it answers, so a real freeze met
 /// there costs the grace once. A worker that has answered is judged as a
 /// plain side is, the cold-shape grace for a longer prompt included.
-pub(crate) fn prefill_side_bound_behind_encode(
+pub fn prefill_side_bound_behind_encode(
     worker: &Arc<dyn Worker>,
     prompt_tokens: u64,
 ) -> Option<Duration> {
@@ -342,10 +341,7 @@ fn side_bound_given(
 /// takes, and nothing more than the cap. The side was admitted to a room on
 /// its decode worker before its dispatch. `None` when the rule is off (a
 /// zero threshold).
-pub(crate) fn decode_side_bound(
-    prefills: &Arc<dyn Worker>,
-    prompt_tokens: u64,
-) -> Option<Duration> {
+pub fn decode_side_bound(prefills: &Arc<dyn Worker>, prompt_tokens: u64) -> Option<Duration> {
     let (_, wedge, _) = thresholds();
     decode_side_bound_with(prefills, prompt_tokens, wedge)
 }
@@ -362,9 +358,9 @@ fn decode_side_bound_with(
 /// Where a prefill side past its own bound stands (see
 /// [`prefill_side_reprieve`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum SideReprieve {
+pub enum SideReprieve {
     /// The worker answered another prompt, or a decode side showed one of
-    /// its handoffs (see [`answered_or_handed_off`]), within the side's
+    /// its handoffs (see `answered_or_handed_off`), within the side's
     /// bound, or a cold-shape grace is left: the side is judged again after
     /// this.
     WithinBound(Duration),
@@ -387,7 +383,7 @@ impl SideReprieve {
     /// cold-shape grace is left: where the side was given up on before a
     /// run's first answer was allowed for, and where a stalled decode
     /// partner still takes the verdict.
-    pub(crate) fn past_bound(self) -> bool {
+    pub fn past_bound(self) -> bool {
         !matches!(self, Self::WithinBound(_))
     }
 }
@@ -415,7 +411,7 @@ impl SideReprieve {
 /// bounds after the later of the side's dispatch and the worker's latest
 /// answer, so an engine that keeps handing off while its answers never
 /// reach the gateway does not hold a side for good; on a worker that has
-/// never answered it counts for nothing ([`answered_or_handed_off`]). A
+/// never answered it counts for nothing (`answered_or_handed_off`). A
 /// handoff is good for one bound, as an answer is, so an engine step longer
 /// than the bound still gets the verdict, after the handoff as before it:
 /// an engine whose steps can take longer (a cold node building kernels)
@@ -428,13 +424,13 @@ impl SideReprieve {
 /// burst booked behind it first. Past the rule above, its side waits until
 /// the run has gone unanswered ([`WorkerRuntime::prefill_unanswered_run`]) for the
 /// time the worker's backlog takes at its prefill rate, capped
-/// ([`backlog_bound`]). That backlog is read once, the first time the rule
+/// (`backlog_bound`). That backlog is read once, the first time the rule
 /// above gives up on the side, and kept in `backlog`, so prompts that go on
 /// arriving at a frozen worker do not extend the wait; the side is judged
 /// again a bound at a time, so a first answer returns it to the rule above
 /// and a stalled decode partner is seen within a bound. A run that has
 /// answered is judged by the rule above alone.
-pub(crate) fn prefill_side_reprieve(
+pub fn prefill_side_reprieve(
     worker: &Arc<dyn Worker>,
     bound: Duration,
     dispatched_ago: Duration,
@@ -565,7 +561,7 @@ static EPOCH: OnceLock<Instant> = OnceLock::new();
 /// one diversion and idled for 25 minutes). `share == 0` disables;
 /// `thin_ratio == 0` keeps the age rule alone.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct Warmup {
+pub struct Warmup {
     pub secs: Duration,
     pub share: f32,
     pub blocks: usize,
@@ -583,7 +579,7 @@ impl Warmup {
     /// since its admission (`None` when the index has never seen it; the
     /// baseline restarts when the count drops), is warming up: thin against
     /// the fleet, or young and short of its first `blocks`.
-    pub(crate) fn applies(
+    pub fn applies(
         &self,
         age: Duration,
         growth: Option<usize>,
@@ -600,14 +596,14 @@ impl Warmup {
     /// fleet holds a cache worth catching up to (a level of at least the
     /// warm-up `blocks`). A fleet below that (young, or tiny) makes nobody
     /// thin; the age rule decides there.
-    pub(crate) fn is_thin(&self, indexed: usize, fleet_level: usize) -> bool {
+    pub fn is_thin(&self, indexed: usize, fleet_level: usize) -> bool {
         self.thin_ratio > 0.0
             && fleet_level >= self.blocks
             && (indexed == 0 || (indexed as f64) < fleet_level as f64 * f64::from(self.thin_ratio))
     }
 
     /// Every how many misses one goes to a warming worker.
-    pub(crate) fn period(&self) -> u64 {
+    pub fn period(&self) -> u64 {
         if self.share <= 0.0 {
             return u64::MAX;
         }
@@ -628,7 +624,7 @@ pub(crate) fn configure_warmup(warmup: Warmup) {
     let _ = WARMUP.set(warmup);
 }
 
-pub(crate) fn warmup() -> Warmup {
+pub fn warmup() -> Warmup {
     WARMUP.get().copied().unwrap_or(DEFAULT_WARMUP)
 }
 
@@ -703,13 +699,13 @@ pub fn budgets() -> Budgets {
 
 /// Milliseconds since the gateway started: the clock behind the workers'
 /// contact and progress stamps.
-pub(crate) fn now_ms() -> u64 {
+pub fn now_ms() -> u64 {
     ms_at(Instant::now())
 }
 
 /// `at` on the gateway clock ([`now_ms`]'s), for a stamp read once and shared
 /// by several notes.
-pub(crate) fn ms_at(at: Instant) -> u64 {
+pub fn ms_at(at: Instant) -> u64 {
     let epoch = *EPOCH.get_or_init(Instant::now);
     u64::try_from(at.saturating_duration_since(epoch).as_millis()).unwrap_or(u64::MAX)
 }
@@ -724,14 +720,14 @@ pub(crate) fn ms_at(at: Instant) -> u64 {
 /// reachable for work, and every way of being unreachable ends the
 /// monitors' polls and streams with one of these codes; which layer
 /// produced the status does not matter here. The gRPC client's
-/// [`smg_grpc_client::is_transport_failure`] asks a different question of a
+/// `smg_grpc_client::is_transport_failure` asks a different question of a
 /// status under a call, whether it is the HTTP/2 layer's doing rather than
 /// the worker's answer, and reads the status's source chain because the
 /// code cannot tell those apart. The two are not interchangeable: an
 /// `Unavailable` the worker answered with is a connection code here and no
 /// transport failure there; an `Internal` made of a protocol fault is a
 /// transport failure there and no connection code here.
-pub(crate) fn is_connection_code(code: tonic::Code) -> bool {
+pub fn is_connection_code(code: tonic::Code) -> bool {
     matches!(
         code,
         tonic::Code::Unavailable
@@ -753,7 +749,7 @@ pub(crate) fn is_connection_code(code: tonic::Code) -> bool {
 /// through a warm-up, still relays KV batches and answers `GetLoads`, and a
 /// worker promoted on one of those takes requests its engine is not ready
 /// for.
-pub(crate) fn on_contact(worker: &Arc<dyn Worker>) {
+pub fn on_contact(worker: &Arc<dyn Worker>) {
     let state = worker.runtime_state();
     let state = state.as_deref();
     if let Some(state) = state {
@@ -777,7 +773,7 @@ pub(crate) fn on_contact(worker: &Arc<dyn Worker>) {
 /// timeout apart, or an interval if that is shorter, once one passes); a
 /// probe that short-circuited it would make one passing probe out of a
 /// flapping engine's run a return to service.
-pub(crate) fn on_probe_passed(worker: &Arc<dyn Worker>) {
+pub fn on_probe_passed(worker: &Arc<dyn Worker>) {
     let state = worker.runtime_state();
     let state = state.as_deref();
     if let Some(state) = state {
@@ -800,7 +796,7 @@ pub(crate) fn on_probe_passed(worker: &Arc<dyn Worker>) {
 /// wedged at 3 s and loses its connection at 40 s, and a wedged veto that
 /// waited for progress from streams the keepalive had already failed held
 /// the worker out of routing for good.
-pub(crate) fn on_contact_failed(worker: &Arc<dyn Worker>, what: &'static str) {
+pub fn on_contact_failed(worker: &Arc<dyn Worker>, what: &'static str) {
     on_contact_failed_with(worker, what, thresholds().0);
 }
 
@@ -825,7 +821,7 @@ fn on_contact_failed_with(worker: &Arc<dyn Worker>, what: &'static str, stall: D
 /// Periodic check: a worker whose transport failed and that has then stayed
 /// silent for the stall threshold is vetoed now, not at its next failed poll,
 /// so the exclusion lands at the threshold itself.
-pub(crate) fn sweep(worker: &Arc<dyn Worker>) {
+pub fn sweep(worker: &Arc<dyn Worker>) {
     let (stall, wedge, stale) = thresholds();
     sweep_with(worker, stall, wedge, stale);
 }
@@ -920,7 +916,7 @@ fn sweep_with(worker: &Arc<dyn Worker>, stall: Duration, wedge: Duration, stale:
 /// A token or a completion from the worker at `now_ms` on the gateway clock
 /// (a stamp the caller read once for this note and the others of the same
 /// message): progress clears any veto.
-pub(crate) fn on_token_progress_at(worker: &Arc<dyn Worker>, now_ms: u64) {
+pub fn on_token_progress_at(worker: &Arc<dyn Worker>, now_ms: u64) {
     let state = worker.runtime_state();
     let state = state.as_deref();
     if let Some(state) = state {
@@ -936,7 +932,7 @@ pub(crate) fn on_token_progress_at(worker: &Arc<dyn Worker>, now_ms: u64) {
 /// read go to the runtime directly, without the worker's runtime load and
 /// its dispatch for every token; a veto is cleared through the worker as
 /// before.
-pub(crate) fn on_token_progress_on(runtime: &WorkerRuntime, worker: &Arc<dyn Worker>, now_ms: u64) {
+pub fn on_token_progress_on(runtime: &WorkerRuntime, worker: &Arc<dyn Worker>, now_ms: u64) {
     runtime.note_token_progress_at(now_ms);
     if runtime.stall_reason().is_some() {
         set(worker, Some(runtime), None, "progress");
@@ -951,13 +947,13 @@ pub(crate) fn on_token_progress_on(runtime: &WorkerRuntime, worker: &Arc<dyn Wor
 /// pushed record; a poll carries none), whatever this gateway has in flight
 /// on it: past the allowance for the prefill the servicer reports in hand
 /// (`engine_prefill_pending`, at the worker's rate, never under the wedge
-/// threshold; see [`silence_allowance`]), which a wire that reports every
+/// threshold; see `silence_allowance`), which a wire that reports every
 /// scheduler step (`engine_reports_steps`) gets from the cold prior while
 /// the worker has shown no rate and a token-batch wire only once it has.
 /// A standing veto is judged at the threshold on either wire, whatever
 /// the servicer reports pending: the allowance lifts no veto, as the
 /// cold-shape grace lifts none.
-pub(crate) fn on_load_report(
+pub fn on_load_report(
     worker: &Arc<dyn Worker>,
     waiting: i64,
     engine_silence: Option<Duration>,
@@ -1228,9 +1224,9 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::*;
-    use crate::worker::{
+    use crate::{
         health::circuit_breaker::CircuitBreakerConfig, registry::event::WorkerConnected,
-        BasicWorkerBuilder,
+        test_support::BasicWorkerBuilder,
     };
 
     fn worker() -> Arc<dyn Worker> {

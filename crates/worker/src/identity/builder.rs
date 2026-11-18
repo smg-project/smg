@@ -1,14 +1,6 @@
 use std::{collections::HashMap, marker::PhantomData, sync::Arc, time::Duration};
 
 use arc_swap::{ArcSwap, ArcSwapOption};
-use openai_protocol::{
-    model_card::ModelCard,
-    worker::{
-        ConstrainedDecoding, HealthCheckConfig, OverloadUpdate, WorkerModels, WorkerSpec,
-        WorkerStatus,
-    },
-};
-use smg_worker::settings::DEFAULT_ZMQ_STARTUP_TIMEOUT_SECS;
 use tokio::sync::mpsc;
 
 use super::{
@@ -16,7 +8,7 @@ use super::{
     endpoint::Endpoint,
     metadata::DecodingLabels,
 };
-use crate::worker::{
+use crate::{
     connection::{
         engine::{
             ConnectorDefault, EngineConnection, EngineConnectionCache, EngineConnector, NoConnector,
@@ -28,10 +20,16 @@ use crate::worker::{
         overload::OverloadThresholds,
         resilience::ResolvedResilience,
     },
-    metrics::Metrics,
+    identity::basic::Worker,
+    metrics::writers::Metrics,
+    model_card::ModelCard,
     pd::pairing::PdPairing,
     registry::event::WorkerConnected,
-    Worker,
+    settings::DEFAULT_ZMQ_STARTUP_TIMEOUT_SECS,
+    worker::{
+        ConstrainedDecoding, HealthCheckConfig, OverloadUpdate, WorkerModels, WorkerSpec,
+        WorkerStatus,
+    },
 };
 
 /// Builder for creating BasicWorker instances with fluent API.
@@ -124,7 +122,7 @@ impl<D: ConnectorDefault> BasicWorkerBuilder<D> {
     /// what registration resolved. The caller applies its own changes, the
     /// gateway's overload defaults and the connect signal, then shares the
     /// KV engine state with the worker it replaces.
-    pub(crate) fn carrying(worker: &Arc<dyn Worker>) -> Self {
+    pub fn carrying(worker: &Arc<dyn Worker>) -> Self {
         let metadata = worker.metadata();
         let mut builder = Self::from_spec((*metadata.spec).clone())
             .http2(worker.http2())
@@ -540,7 +538,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::worker::{connection::client_factory::http_client, identity::basic::Worker};
+    use crate::{connection::client_factory::http_client, identity::basic::Worker};
 
     /// The builder without a default connector, as this module has it.
     type BasicWorkerBuilder = super::BasicWorkerBuilder;

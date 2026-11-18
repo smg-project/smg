@@ -11,7 +11,7 @@ use std::{
 };
 
 use super::*;
-use crate::worker::test_support::ready_worker;
+use crate::test_support::ready_worker;
 
 /// The registry and the model a case watches.
 type Watched = (Weak<WorkerRegistry<Counted>>, &'static str);

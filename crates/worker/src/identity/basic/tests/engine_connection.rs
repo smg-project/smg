@@ -4,13 +4,11 @@
 
 use std::sync::Arc;
 
-use openai_protocol::worker::ConnectionMode;
-
-use crate::worker::{
+use crate::{
     connection::engine::{EngineConnector, NO_ENGINE_CONNECTOR},
-    identity::builder::BasicWorkerBuilder,
+    identity::{basic::Worker, builder::BasicWorkerBuilder, error::WorkerError},
     test_support::{no_health_check, CountingConnector, NoEngine},
-    Worker, WorkerError,
+    worker::ConnectionMode,
 };
 
 fn grpc_worker() -> BasicWorkerBuilder {

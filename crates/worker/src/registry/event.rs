@@ -1,11 +1,9 @@
-//! Events emitted by [`WorkerRegistry`](crate::worker::WorkerRegistry) on state mutations.
+//! Events emitted by [`WorkerRegistry`](crate::registry::WorkerRegistry) on state mutations.
 
 use std::sync::Arc;
 
-use openai_protocol::worker::WorkerStatus;
-
 use super::WorkerId;
-use crate::worker::identity::basic::Worker;
+use crate::{identity::basic::Worker, worker::WorkerStatus};
 
 /// Events broadcast when worker state changes.
 ///

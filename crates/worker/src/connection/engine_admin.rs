@@ -6,20 +6,20 @@
 use std::{sync::Arc, time::Duration};
 
 use super::engine::{AdminAnswer, EngineConnection};
-use crate::worker::{WorkerError, WorkerResult};
+use crate::identity::error::{WorkerError, WorkerResult};
 
 /// Timeout for worker HTTP `flush_cache` requests. Matches the gRPC
 /// client's local flush deadline.
-pub(in crate::worker) const FLUSH_HTTP_TIMEOUT: Duration = Duration::from_secs(45);
+pub(crate) const FLUSH_HTTP_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// Timeout for worker HTTP profile requests. Stopping a profile can take
 /// a long time while the backend serializes large traces. Matches the
 /// gRPC client's profile deadline.
-pub(in crate::worker) const PROFILE_HTTP_TIMEOUT: Duration = Duration::from_secs(630);
+pub(crate) const PROFILE_HTTP_TIMEOUT: Duration = Duration::from_secs(630);
 
 /// An admin call's failure as the worker reports it: the worker, the call
 /// and why.
-pub(in crate::worker) fn failed(url: &str, operation: &str, reason: String) -> WorkerError {
+pub(crate) fn failed(url: &str, operation: &str, reason: String) -> WorkerError {
     WorkerError::OperationFailed {
         url: url.to_string(),
         operation: operation.to_string(),
@@ -29,7 +29,7 @@ pub(in crate::worker) fn failed(url: &str, operation: &str, reason: String) -> W
 
 /// POST an admin endpoint on an HTTP worker and map the outcome to a
 /// [`WorkerResult`].
-pub(in crate::worker) async fn admin_http_post(
+pub(crate) async fn admin_http_post(
     client: &reqwest::Client,
     url: String,
     api_key: Option<&String>,
@@ -73,7 +73,7 @@ fn zmq_admin_unsupported(url: &str, operation: &str) -> WorkerError {
 
 /// The worker's backend client for an admin op, refused when the backend
 /// answers none ([`zmq_admin_unsupported`]).
-pub(in crate::worker) fn admin_backend_client(
+pub(crate) fn admin_backend_client(
     url: &str,
     operation: &str,
     client: Option<Arc<dyn EngineConnection>>,
@@ -87,7 +87,7 @@ pub(in crate::worker) fn admin_backend_client(
 
 /// Map a gRPC admin-op outcome (`success` flag plus message) to a
 /// [`WorkerResult`].
-pub(in crate::worker) fn admin_grpc_result(
+pub(crate) fn admin_grpc_result(
     url: &str,
     operation: &str,
     result: Result<AdminAnswer, tonic::Status>,

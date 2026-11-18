@@ -37,7 +37,8 @@ provider-gemini = ["smg-external-router/gemini"]
 providers = ["provider-openai", "provider-anthropic", "provider-gemini"]
 # Client-injection seam for this crate's own K8s discovery integration tests
 # (auto-enabled by the self dev-dependency below, never in production builds).
-test-util = []
+# It turns on the worker crate's test support, which the gateway's re-exports.
+test-util = ["smg-worker/test-util"]
 
 vendored-openssl = ["openssl/vendored"]
 
@@ -137,7 +138,6 @@ k8s-openapi = { version = "0.27.0", features = ["v1_33"] }
 metrics = "0.24.6"
 metrics-exporter-prometheus = { version = "0.18.3", default-features = false, features = ["http-listener"] }
 metrics-util = { version = "0.20.4", default-features = false, features = ["registry"] }
-quanta = "0.12"
 regex = "1.12"
 memchr = "2.8"
 url = "2.5.8"
@@ -164,7 +164,8 @@ toml = "1.1"
 # the provider routers) would leak into every test target whatever features the
 # build selected, so a `--no-default-features` test run would not be one.
 smg = { path = ".", default-features = false, features = ["test-util"] }
-# The worker runtime's test support: the root-store child runs and the lazy
+# The worker crate's test support for this crate's own tests: its workers and
+# doubles, its test readers and hooks, the root-store child runs and the lazy
 # client's observation.
 smg-worker = { workspace = true, features = ["test-util"] }
 # The gateway's test harness (the mock workers, app builders and launch helpers the

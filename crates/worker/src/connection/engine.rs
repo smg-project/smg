@@ -11,8 +11,9 @@ use std::{any::Any, fmt, sync::Arc, time::Duration};
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
-use openai_protocol::worker::{ProfileOptions, RuntimeType, WorkerLoadResponse, WorkerType};
 use tokio::sync::OnceCell;
+
+use crate::worker::{ProfileOptions, RuntimeType, WorkerLoadResponse, WorkerType};
 
 type ConnectionCell = OnceCell<Arc<dyn EngineConnection>>;
 
@@ -42,7 +43,7 @@ impl EngineConnectionCache {
 
     /// Retire only the cell the probe found dead. A later generation may
     /// already be serving requests by the time this probe resumes.
-    pub(crate) fn evict(&self, observed: &Arc<ConnectionCell>) {
+    pub fn evict(&self, observed: &Arc<ConnectionCell>) {
         self.slot
             .load()
             .compare_and_swap(observed, Arc::new(OnceCell::new()));

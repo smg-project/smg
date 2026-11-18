@@ -4,10 +4,9 @@ use std::{
 };
 
 use parking_lot::Mutex;
-use smg_worker::metrics_labels;
 use tracing::info;
 
-use crate::worker::{identity::endpoint::Endpoint, metrics::Metrics};
+use crate::{identity::endpoint::Endpoint, metrics::writers::Metrics, metrics_labels};
 
 /// Circuit breaker configuration
 #[derive(Debug, Clone, PartialEq, Eq)]

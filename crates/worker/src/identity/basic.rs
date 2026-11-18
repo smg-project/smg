@@ -11,12 +11,6 @@ use std::{
 
 use arc_swap::{ArcSwap, ArcSwapOption};
 use async_trait::async_trait;
-// Re-export protocol types as the canonical types for the gateway
-pub use openai_protocol::worker::{ConnectionMode, ProfileOptions, RuntimeType, WorkerType};
-use openai_protocol::{
-    model_card::ModelCard,
-    worker::{ProviderType, WorkerInfo, WorkerModels, WorkerStatus},
-};
 use tokio::{
     sync::{mpsc, Notify, OnceCell},
     task::AbortHandle,
@@ -24,8 +18,10 @@ use tokio::{
 };
 
 pub use super::metadata::WorkerMetadata;
-pub(crate) use crate::worker::runtime::COLD_PREFILL_TOKENS_PER_SEC;
-use crate::worker::{
+pub(crate) use crate::runtime::COLD_PREFILL_TOKENS_PER_SEC;
+// The wire type, re-exported beside the worker that carries it
+pub use crate::worker::ConnectionMode;
+use crate::{
     connection::{
         engine::{
             EngineConnection, EngineConnectionCache, EngineConnector, ZmqLink, NO_ENGINE_CONNECTOR,
@@ -36,18 +32,24 @@ use crate::worker::{
         },
         http_client::LazyHttpClient,
     },
-    health::circuit_breaker::{CircuitBreakerConfig, CircuitState},
-    metrics::Metrics,
+    health::{
+        circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, CircuitState},
+        resilience::ResolvedResilience,
+    },
+    identity::error::{WorkerError, WorkerResult},
+    metrics::writers::Metrics,
+    model_card::ModelCard,
     pd::pairing::PdPairing,
     registry::event::WorkerConnected,
     runtime::{
         routing_state_series, AVAILABLE_CODE, CIRCUIT_OPEN_CODE, ROUTING_STATE_SERIES, STALE_BIT,
     },
-    CircuitBreaker, ResolvedResilience, WorkerError, WorkerResult,
+    worker::{ProviderType, WorkerInfo, WorkerModels, WorkerStatus},
 };
-pub use crate::worker::{
+pub use crate::{
     load::inflight::{WorkerLoadGuard, WorkerRoutingKeyLoad},
     runtime::{RoutingState, StallReason, WorkerRuntime},
+    worker::{ProfileOptions, RuntimeType, WorkerType},
 };
 
 /// Connect the ZMQ backend for this worker. All connect mechanics — address
@@ -96,12 +98,12 @@ fn context_length_from(models: &WorkerModels, model_id: &str) -> Option<u32> {
 
 /// The labels that name a worker's running window, in the order the reader
 /// (`Worker::max_running_requests`) prefers them.
-pub(crate) const WINDOW_LABELS: [&str; 2] = ["max_num_seqs", "max_running_requests"];
+pub const WINDOW_LABELS: [&str; 2] = ["max_num_seqs", "max_running_requests"];
 
 /// The labels that name a model's context window (one spelling per engine
 /// family's model info), in the order the card's read
 /// (`create_worker::card_from_labels`) prefers them.
-pub(crate) const CONTEXT_WINDOW_LABELS: [&str; 5] = [
+pub const CONTEXT_WINDOW_LABELS: [&str; 5] = [
     "context_length",
     "max_context_length",
     "max_model_len",
@@ -119,7 +121,7 @@ pub(crate) const CONTEXT_WINDOW_LABELS: [&str; 5] = [
 /// reader would take over the operator's, on every worker, expanded per rank
 /// or not, is dropped. Registration, the admin label update, its early cap
 /// check and a refresh (`refreshed_labels`) all merge through here.
-pub(crate) fn merge_labels(
+pub fn merge_labels(
     current: &HashMap<String, String>,
     by_hand: &HashMap<String, String>,
 ) -> HashMap<String, String> {
@@ -458,7 +460,7 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
 
     /// Set the overload veto, returning `true` when the flag actually changed.
     ///
-    /// Route writes through [`WorkerRegistry::set_worker_overloaded`](crate::worker::WorkerRegistry::set_worker_overloaded) instead of
+    /// Route writes through [`WorkerRegistry::set_worker_overloaded`](crate::registry::WorkerRegistry::set_worker_overloaded) instead of
     /// calling this directly: the per-model counters and the
     /// `smg_workers_overloaded` gauge move only on transitions.
     fn set_overloaded(&self, _overloaded: bool) -> bool {
@@ -930,7 +932,7 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
 }
 
 /// Extension trait for model_gateway-specific ConnectionMode methods.
-pub(crate) trait ConnectionModeExt {
+pub trait ConnectionModeExt {
     fn as_metric_label(&self) -> &'static str;
 }
 
@@ -941,7 +943,7 @@ impl ConnectionModeExt for ConnectionMode {
 }
 
 /// Extension trait for model_gateway-specific WorkerType methods.
-pub(crate) trait WorkerTypeExt {
+pub trait WorkerTypeExt {
     fn as_metric_label(&self) -> &'static str;
 }
 
@@ -1056,14 +1058,14 @@ impl fmt::Debug for BasicWorker {
 
 impl BasicWorker {
     /// Keep the live KV state across a metadata update.
-    pub(crate) fn share_kv_engine_state(&mut self, previous: &BasicWorker) {
+    pub fn share_kv_engine_state(&mut self, previous: &BasicWorker) {
         self.kv_engine_id = Arc::clone(&previous.kv_engine_id);
         self.kv_engine_id_unconfirmed = Arc::clone(&previous.kv_engine_id_unconfirmed);
     }
 
     /// The circuit breaker configuration this worker runs with: the gateway
     /// defaults plus its own overrides, as resolved at registration.
-    pub(crate) fn circuit_breaker_config(&self) -> CircuitBreakerConfig {
+    pub fn circuit_breaker_config(&self) -> CircuitBreakerConfig {
         self.circuit_breaker.load().config().clone()
     }
 
@@ -1320,7 +1322,7 @@ impl BasicWorker {
     /// # Panics
     ///
     /// Outside a Tokio runtime, where it starts the connect driver.
-    pub(crate) fn zmq_health_check(&self) -> bool {
+    pub fn zmq_health_check(&self) -> bool {
         // Never drive (or cancel) the handshake from the probe: model load can
         // take far longer than the health timeout, and cancelling it mid-flight
         // would rebind the sockets on every probe and never connect. Peek the

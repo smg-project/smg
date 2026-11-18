@@ -1,16 +1,17 @@
 use std::collections::HashMap;
 
 use metrics_exporter_prometheus::PrometheusBuilder;
-use openai_protocol::model_card::ModelCard;
 
 use super::*;
-// The cases run over the gateway's registry.
-use crate::worker::WorkerRegistry;
-use crate::worker::{
+// The cases run over the test support's registry: its generations keep their
+// members alone.
+use crate::test_support::WorkerRegistry;
+use crate::{
     health::circuit_breaker::{CircuitBreakerConfig, CircuitState},
-    metrics::series::{self as worker_series, WorkerSeriesRecorder},
-    test_support::{no_health_check, worker_with_model_aliases},
-    BasicWorkerBuilder, WorkerLoadGuard,
+    identity::basic::WorkerLoadGuard,
+    metrics::{series as worker_series, series::WorkerSeriesRecorder},
+    model_card::ModelCard,
+    test_support::{no_health_check, worker_with_model_aliases, BasicWorkerBuilder},
 };
 
 /// A worker whose breaker opens on one failed request and would stay
@@ -694,7 +695,7 @@ fn mesh_state_for_zmq_worker_is_never_imported() {
     );
 
     // Same rejection when the transport is declared only by the spec.
-    let spec: openai_protocol::worker::WorkerSpec = serde_json::from_value(serde_json::json!({
+    let spec: crate::worker::WorkerSpec = serde_json::from_value(serde_json::json!({
         "url": "http://remote:8080",
         "connection_mode": "zmq"
     }))
@@ -734,7 +735,7 @@ fn rejected_zmq_state_leaves_no_url_to_id_residue() {
     );
 
     // Rejected by the spec's declared connection mode.
-    let spec: openai_protocol::worker::WorkerSpec = serde_json::from_value(serde_json::json!({
+    let spec: crate::worker::WorkerSpec = serde_json::from_value(serde_json::json!({
         "url": "http://remote:8080",
         "connection_mode": "zmq"
     }))
@@ -788,7 +789,7 @@ fn mesh_state_never_mutates_locally_owned_worker() {
 fn unhealthy_import_with_disabled_health_check_is_not_ready() {
     // The builder defaults disable_health_check workers to Ready; an
     // explicitly-unhealthy import must still land unroutable.
-    let spec: openai_protocol::worker::WorkerSpec = serde_json::from_value(serde_json::json!({
+    let spec: crate::worker::WorkerSpec = serde_json::from_value(serde_json::json!({
         "url": "http://remote:8080",
         "health": { "disable_health_check": true }
     }))

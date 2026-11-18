@@ -1,11 +1,13 @@
 use metrics_exporter_prometheus::PrometheusBuilder;
-use openai_protocol::worker::{SchedulerLoadSnapshot, WorkerLoadResponse};
 
 use super::{
     series::{WorkerSeries, WorkerSeriesRecorder},
     *,
 };
-use crate::worker::test_support::{assert_metric, gone, held, render_with_recorder, sorted_series};
+use crate::{
+    test_support::{assert_metric, gone, held, render_with_recorder, sorted_series},
+    worker::{SchedulerLoadSnapshot, WorkerLoadResponse},
+};
 
 /// Core engine gauges share these labels for the snapshot fixtures.
 const CORE_LABELS: [&str; 3] = ["dp_rank=\"2\"", "model=\"m\"", "worker=\"http://w:1\""];

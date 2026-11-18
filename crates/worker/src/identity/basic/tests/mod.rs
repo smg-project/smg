@@ -4,14 +4,16 @@ mod running_window_label;
 use std::{thread, time::Duration};
 
 use metrics_exporter_prometheus::PrometheusBuilder;
-use openai_protocol::worker::{HealthCheckConfig, WorkerSpec};
 
 use super::*;
-use crate::worker::{
-    health::circuit_breaker::{CircuitBreakerConfig, CircuitState},
+use crate::{
+    health::{
+        circuit_breaker::{CircuitBreakerConfig, CircuitState},
+        overload::OverloadThresholds,
+    },
     identity::metadata::DecodingLabels,
-    test_support::{no_health_check, RefusedAddress},
-    BasicWorkerBuilder, OverloadThresholds,
+    test_support::{no_health_check, BasicWorkerBuilder, RefusedAddress},
+    worker::{HealthCheckConfig, WorkerSpec},
 };
 
 /// The `smg_worker_cb_state` sample for the test worker's URL in a
@@ -98,7 +100,7 @@ fn test_worker_type_clone() {
 
 #[test]
 fn test_health_config_default() {
-    use openai_protocol::worker::HealthCheckConfig;
+    use crate::worker::HealthCheckConfig;
     let config = HealthCheckConfig::default();
     assert_eq!(config.timeout_secs, 30);
     assert_eq!(config.check_interval_secs, 60);
@@ -109,7 +111,7 @@ fn test_health_config_default() {
 
 #[test]
 fn test_health_config_custom() {
-    use openai_protocol::worker::HealthCheckConfig;
+    use crate::worker::HealthCheckConfig;
     let config = HealthCheckConfig {
         timeout_secs: 10,
         check_interval_secs: 60,
@@ -144,7 +146,7 @@ fn test_worker_with_labels() {
     labels.insert("env".to_string(), "prod".to_string());
     labels.insert("zone".to_string(), "us-west".to_string());
 
-    use crate::worker::BasicWorkerBuilder;
+    use crate::test_support::BasicWorkerBuilder;
     let worker = BasicWorkerBuilder::new("http://test:8080")
         .worker_type(WorkerType::Regular)
         .labels(labels.clone())
@@ -155,7 +157,7 @@ fn test_worker_with_labels() {
 
 #[test]
 fn test_max_running_requests_parses_from_label() {
-    use crate::worker::BasicWorkerBuilder;
+    use crate::test_support::BasicWorkerBuilder;
     let mut labels = HashMap::new();
     labels.insert("max_running_requests".to_string(), "256".to_string());
     let worker = BasicWorkerBuilder::new("http://w:9000")
@@ -166,14 +168,14 @@ fn test_max_running_requests_parses_from_label() {
 
 #[test]
 fn test_max_running_requests_returns_none_when_label_missing() {
-    use crate::worker::BasicWorkerBuilder;
+    use crate::test_support::BasicWorkerBuilder;
     let worker = BasicWorkerBuilder::new("http://w:9000").build();
     assert_eq!(worker.max_running_requests(), None);
 }
 
 #[test]
 fn test_max_running_requests_returns_none_on_bad_value() {
-    use crate::worker::BasicWorkerBuilder;
+    use crate::test_support::BasicWorkerBuilder;
     let mut labels = HashMap::new();
     labels.insert(
         "max_running_requests".to_string(),
@@ -187,7 +189,7 @@ fn test_max_running_requests_returns_none_on_bad_value() {
 
 #[test]
 fn test_max_running_requests_zero_treated_as_none() {
-    use crate::worker::BasicWorkerBuilder;
+    use crate::test_support::BasicWorkerBuilder;
     let mut labels = HashMap::new();
     labels.insert("max_running_requests".to_string(), "0".to_string());
     let worker = BasicWorkerBuilder::new("http://w:9000")
@@ -199,7 +201,7 @@ fn test_max_running_requests_zero_treated_as_none() {
 
 #[test]
 fn test_max_running_requests_reads_the_max_num_seqs_spelling() {
-    use crate::worker::BasicWorkerBuilder;
+    use crate::test_support::BasicWorkerBuilder;
     // Some engines advertise the same scheduler window as `max_num_seqs`;
     // without this such a worker looks like a non-reporter to both
     // fleet capacity and PD admission.
@@ -213,7 +215,7 @@ fn test_max_running_requests_reads_the_max_num_seqs_spelling() {
 
 #[test]
 fn test_max_running_requests_prefers_max_num_seqs_when_both_are_reported() {
-    use crate::worker::BasicWorkerBuilder;
+    use crate::test_support::BasicWorkerBuilder;
     // The servicer's `running_window` resolves in the same order, so a
     // worker reporting both spellings cannot have its discovery label
     // disagree with its GetLoads report.
@@ -228,7 +230,7 @@ fn test_max_running_requests_prefers_max_num_seqs_when_both_are_reported() {
 
 #[test]
 fn test_pd_admission_claims_are_atomic_and_bounded_by_the_window() {
-    use crate::worker::BasicWorkerBuilder;
+    use crate::test_support::BasicWorkerBuilder;
     let worker = BasicWorkerBuilder::new("grpc://w:30000").build();
 
     assert!(worker.try_admit_pd(2, 3));
@@ -250,7 +252,7 @@ fn test_pd_admission_claims_are_atomic_and_bounded_by_the_window() {
 fn test_pd_admission_never_overshoots_the_window_under_real_parallelism() {
     use std::{sync::Arc, thread};
 
-    use crate::worker::BasicWorkerBuilder;
+    use crate::test_support::BasicWorkerBuilder;
     // The whole point of claiming rather than reading: threads racing for
     // the last rooms must not all win.
     let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("grpc://w:30000").build());
@@ -274,7 +276,7 @@ fn test_pd_admission_never_overshoots_the_window_under_real_parallelism() {
 
 #[test]
 fn test_pd_admission_queue_is_arrival_ordered_and_closes_over_departures() {
-    use crate::worker::BasicWorkerBuilder;
+    use crate::test_support::BasicWorkerBuilder;
     let worker = BasicWorkerBuilder::new("grpc://w:30000").build();
 
     let (first, second, third) = (
@@ -318,7 +320,7 @@ fn test_pd_admission_queue_is_arrival_ordered_and_closes_over_departures() {
 
 #[test]
 fn test_pd_admission_queue_lets_a_narrower_place_pass_a_wider_older_one() {
-    use crate::worker::BasicWorkerBuilder;
+    use crate::test_support::BasicWorkerBuilder;
     let worker = BasicWorkerBuilder::new("grpc://w:30000").build();
 
     // Arrival order, with the rooms each needs: 4, 1, 2, 1, 3.
@@ -363,7 +365,7 @@ fn test_pd_admission_queue_lets_a_narrower_place_pass_a_wider_older_one() {
 
 #[test]
 fn test_is_realtime_capable_true_from_label() {
-    use crate::worker::BasicWorkerBuilder;
+    use crate::test_support::BasicWorkerBuilder;
     let mut labels = HashMap::new();
     labels.insert("realtime".to_string(), "true".to_string());
     let worker = BasicWorkerBuilder::new("http://w:9000")
@@ -374,14 +376,14 @@ fn test_is_realtime_capable_true_from_label() {
 
 #[test]
 fn test_is_realtime_capable_false_when_label_missing() {
-    use crate::worker::BasicWorkerBuilder;
+    use crate::test_support::BasicWorkerBuilder;
     let worker = BasicWorkerBuilder::new("http://w:9000").build();
     assert!(!worker.is_realtime_capable());
 }
 
 #[test]
 fn test_is_realtime_capable_false_on_non_true_value() {
-    use crate::worker::BasicWorkerBuilder;
+    use crate::test_support::BasicWorkerBuilder;
     let mut labels = HashMap::new();
     labels.insert("realtime".to_string(), "1".to_string());
     let worker = BasicWorkerBuilder::new("http://w:9000")
@@ -393,7 +395,7 @@ fn test_is_realtime_capable_false_on_non_true_value() {
 
 #[test]
 fn test_worker_with_health_config() {
-    use openai_protocol::worker::HealthCheckConfig;
+    use crate::worker::HealthCheckConfig;
     let custom_config = HealthCheckConfig {
         timeout_secs: 15,
         check_interval_secs: 45,
@@ -403,7 +405,7 @@ fn test_worker_with_health_config() {
         drain_settle_secs: 5,
     };
 
-    use crate::worker::BasicWorkerBuilder;
+    use crate::test_support::BasicWorkerBuilder;
     let worker = BasicWorkerBuilder::new("http://test:8080")
         .worker_type(WorkerType::Regular)
         .health_config(custom_config.clone())
@@ -417,7 +419,7 @@ fn test_worker_with_health_config() {
 
 #[test]
 fn test_worker_url() {
-    use crate::worker::BasicWorkerBuilder;
+    use crate::test_support::BasicWorkerBuilder;
     let worker = BasicWorkerBuilder::new("http://worker1:8080")
         .worker_type(WorkerType::Regular)
         .build();
@@ -426,7 +428,7 @@ fn test_worker_url() {
 
 #[test]
 fn test_worker_type_getter() {
-    use crate::worker::BasicWorkerBuilder;
+    use crate::test_support::BasicWorkerBuilder;
     let regular = BasicWorkerBuilder::new("http://test:8080")
         .worker_type(WorkerType::Regular)
         .build();
@@ -478,7 +480,7 @@ fn test_pending_worker_not_routable() {
 
 #[test]
 fn test_load_counter_operations() {
-    use crate::worker::BasicWorkerBuilder;
+    use crate::test_support::BasicWorkerBuilder;
     let worker = BasicWorkerBuilder::new("http://test:8080")
         .worker_type(WorkerType::Regular)
         .build();
@@ -505,7 +507,7 @@ fn test_load_counter_operations() {
 
 #[test]
 fn test_processed_counter() {
-    use crate::worker::BasicWorkerBuilder;
+    use crate::test_support::BasicWorkerBuilder;
     let worker = BasicWorkerBuilder::new("http://test:8080")
         .worker_type(WorkerType::Regular)
         .build();
@@ -520,7 +522,7 @@ fn test_processed_counter() {
 
 #[tokio::test]
 async fn test_concurrent_load_increments() {
-    use crate::worker::BasicWorkerBuilder;
+    use crate::test_support::BasicWorkerBuilder;
     let worker = Arc::new(
         BasicWorkerBuilder::new("http://test:8080")
             .worker_type(WorkerType::Regular)
@@ -550,7 +552,7 @@ async fn test_concurrent_load_increments() {
 
 #[tokio::test]
 async fn test_concurrent_load_decrements() {
-    use crate::worker::BasicWorkerBuilder;
+    use crate::test_support::BasicWorkerBuilder;
     let worker = Arc::new(
         BasicWorkerBuilder::new("http://test:8080")
             .worker_type(WorkerType::Regular)
@@ -585,7 +587,7 @@ async fn test_concurrent_load_decrements() {
 
 #[tokio::test]
 async fn test_concurrent_health_updates() {
-    use crate::worker::BasicWorkerBuilder;
+    use crate::test_support::BasicWorkerBuilder;
     let worker = Arc::new(
         BasicWorkerBuilder::new("http://test:8080")
             .worker_type(WorkerType::Regular)
@@ -619,7 +621,7 @@ async fn test_concurrent_health_updates() {
 
 #[test]
 fn test_create_regular_worker() {
-    use crate::worker::BasicWorkerBuilder;
+    use crate::test_support::BasicWorkerBuilder;
     let worker: Box<dyn Worker> = Box::new(
         BasicWorkerBuilder::new("http://regular:8080")
             .worker_type(WorkerType::Regular)
@@ -631,7 +633,7 @@ fn test_create_regular_worker() {
 
 #[test]
 fn test_create_prefill_worker() {
-    use crate::worker::BasicWorkerBuilder;
+    use crate::test_support::BasicWorkerBuilder;
     let worker1: Box<dyn Worker> = Box::new(
         BasicWorkerBuilder::new("http://prefill:8080")
             .worker_type(WorkerType::Prefill)
@@ -653,7 +655,7 @@ fn test_create_prefill_worker() {
 
 #[test]
 fn test_create_decode_worker() {
-    use crate::worker::BasicWorkerBuilder;
+    use crate::test_support::BasicWorkerBuilder;
     let worker: Box<dyn Worker> = Box::new(
         BasicWorkerBuilder::new("http://decode:8080")
             .worker_type(WorkerType::Decode)
@@ -665,7 +667,7 @@ fn test_create_decode_worker() {
 
 #[tokio::test]
 async fn test_check_health_async() {
-    use crate::worker::BasicWorkerBuilder;
+    use crate::test_support::BasicWorkerBuilder;
     let worker = BasicWorkerBuilder::new("http://test:8080")
         .worker_type(WorkerType::Regular)
         .build();
@@ -685,7 +687,7 @@ async fn test_check_health_async() {
 fn test_load_counter_performance() {
     use std::time::Instant;
 
-    use crate::worker::BasicWorkerBuilder;
+    use crate::test_support::BasicWorkerBuilder;
 
     let worker = BasicWorkerBuilder::new("http://test:8080")
         .worker_type(WorkerType::Regular)
