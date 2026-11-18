@@ -2524,6 +2524,91 @@ fn a_tell_that_takes_a_door_of_the_leases_is_refused_in_a_debug_build() {
     store.hand(&hand, issued.expect("minted").id, GONE);
 }
 
+/// One hand against one thread that leaves its work, the two started
+/// together by a spin and moved a little each round. When both have ended
+/// no door of the leases is asked: the handed frame is told by then, by the
+/// thread that left or by the hand. A leaver that looked before it said it
+/// leaves would let a frame wait on a lull.
+#[test]
+fn a_frame_handed_as_a_thread_leaves_its_work_is_applied_by_one_of_the_two() {
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::SeqCst};
+    static HEARD: AtomicUsize = AtomicUsize::new(0);
+    fn counted(_: &MemoryStore, _: &LeaseRecord, _: Said, _: Option<Decider>) {
+        HEARD.fetch_add(1, SeqCst);
+    }
+    const ROUNDS: usize = 100_000;
+    let store = Arc::new(MemoryStore::new());
+    let a = ready(&store, "http://a:1");
+    LeasesStore::set_term(&*store, 1);
+    store.tell_through(counted);
+    let (gateway, now, world) = (GatewayId(1), Instant::now(), store.world());
+    let marks = [const { AtomicUsize::new(0) }; 4];
+    let lease = AtomicU64::new(0);
+    let (mut short, mut ran) = (0_usize, 0_usize);
+    std::thread::scope(|scope| {
+        let (store, [round, set, go, done], lease) = (&store, &marks, &lease);
+        let next = move |seen: usize| loop {
+            let asked = round.load(SeqCst);
+            if asked != seen {
+                break asked;
+            }
+            std::hint::spin_loop();
+        };
+        let start = move |asked: usize, spins: usize| {
+            set.fetch_add(1, SeqCst);
+            while go.load(SeqCst) != asked {
+                std::hint::spin_loop();
+            }
+            for _ in 0..spins {
+                std::hint::spin_loop();
+            }
+        };
+        scope.spawn(move || {
+            let mut asked = next(0);
+            while asked != usize::MAX {
+                let at_work = store.at_work();
+                start(asked, asked / 24 % 24);
+                drop(at_work);
+                done.fetch_add(1, SeqCst);
+                asked = next(asked);
+            }
+        });
+        scope.spawn(move || {
+            let hand = store.handover(gateway);
+            let mut asked = next(0);
+            while asked != usize::MAX {
+                let id = LeaseId(lease.load(SeqCst));
+                start(asked, asked % 24);
+                store.hand(&hand, id, GONE);
+                done.fetch_add(1, SeqCst);
+                asked = next(asked);
+            }
+        });
+        for asked in 1..=ROUNDS {
+            if now.elapsed() > Duration::from_secs(20) {
+                break;
+            }
+            let record = booking(gateway, 0, a, now);
+            let issued = store.issue_decided(record, world.booked_of(a), |_| ());
+            lease.store(issued.expect("minted under the store's term").id.0, SeqCst);
+            let before = HEARD.load(SeqCst);
+            round.store(asked, SeqCst);
+            while set.load(SeqCst) != 2 * asked {
+                std::hint::spin_loop();
+            }
+            go.store(asked, SeqCst);
+            while done.load(SeqCst) != 2 * asked {
+                std::hint::spin_loop();
+            }
+            short += usize::from(HEARD.load(SeqCst) == before);
+            ran = asked;
+        }
+        round.store(usize::MAX, SeqCst);
+    });
+    assert!(ran > 0, "no round ran");
+    assert_eq!(short, 0, "of {ran} rounds, a handed frame waited on a lull");
+}
+
 /// A line that prints the store from under the turn, a tell's or a panic's,
 /// does not take the turn again: it reads no count of the leases there.
 #[test]
