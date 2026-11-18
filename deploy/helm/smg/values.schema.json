@@ -335,11 +335,17 @@
           "livenessProbe",
           "readinessProbe",
           "shutdownGracePeriodSeconds",
-          "terminationGraceMarginSeconds",
-          "spec"
+          "terminationGraceMarginSeconds"
         ],
+        "if": {
+          "required": ["specStoreClaim"],
+          "properties": { "specStoreClaim": { "type": "string", "minLength": 1 } }
+        },
+        "else": {
+          "required": ["spec"],
+          "properties": { "spec": { "type": "object", "minProperties": 1 } }
+        },
         "properties": {
-          "spec": { "type": "object", "minProperties": 1 },
           "replicas": { "type": "integer" },
           "ports": {
             "type": "object",
@@ -415,6 +421,11 @@
           }
         },
         "spec": { "type": ["object", "null"] },
+        "specStoreClaim": {
+          "type": ["string", "null"],
+          "maxLength": 253,
+          "pattern": "^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$"
+        },
         "ports": {
           "type": ["object", "null"],
           "additionalProperties": false,

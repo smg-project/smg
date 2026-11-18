@@ -4,9 +4,11 @@
      controller's own service account and mounts its token, for the one
      Lease; with it off the pod mounts none: the controller then calls no
      Kubernetes API. The pod mounts the spec document's ConfigMap,
-     read-only. */}}
+     read-only, or the spec store's claim where one is named: the one
+     volume the controller writes. */}}
 {{- $controller := .Values.policyController }}
 {{- $elected := include "smg.policyControllerElection" . }}
+{{- $store := include "smg.policyControllerSpecStore" . }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -72,6 +74,14 @@ spec:
       {{- else }}
       automountServiceAccountToken: false
       {{- end }}
+      {{- if $store }}
+      {{- with ($controller.securityContext).runAsUser }}
+      {{- /* The store's volume belongs to this group and the container's
+           user is in it, so the user the image runs as writes the claim. */}}
+      securityContext:
+        fsGroup: {{ . }}
+      {{- end }}
+      {{- end }}
       terminationGracePeriodSeconds: {{ add (int $controller.shutdownGracePeriodSeconds) (int $controller.terminationGraceMarginSeconds) }}
       containers:
         - name: policy-controller
@@ -124,11 +134,18 @@ spec:
             {{- toYaml . | nindent 12 }}
             {{- end }}
           {{- end }}
-          {{- /* The directory of the file --spec-file names. */}}
           volumeMounts:
+            {{- if $store }}
+            {{- /* The directory --spec-store names: the claim, which the
+                 controller writes. */}}
+            - name: policy-spec-store
+              mountPath: /var/lib/smg/spec
+            {{- else }}
+            {{- /* The directory of the file --spec-file names. */}}
             - name: policy-spec
               mountPath: /etc/smg/policy-spec
               readOnly: true
+            {{- end }}
       {{- with $controller.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
@@ -153,16 +170,26 @@ spec:
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- /* The spec document's ConfigMap, whole: when the document changes
-           the kubelet turns a link under the mount, which the controller's
-           watch follows; a file mounted by subPath is never turned. No
-           checksum of the document stands on the pod, so a changed document
-           moves no pod: the running controller applies it in place, or
-           rejects one that does not run and keeps the generation it runs,
-           where a pod started on such a document refuses to start. Not
-           optional: the pod waits for its ConfigMap. */}}
       volumes:
+        {{- if $store }}
+        {{- /* The spec store's claim, the operator's own and not the
+             release's: the generations on file are the only copy of an
+             applied document, and a claim the release owned would go with
+             the release. The pod waits for its claim. */}}
+        - name: policy-spec-store
+          persistentVolumeClaim:
+            claimName: {{ $store | quote }}
+        {{- else }}
+        {{- /* The spec document's ConfigMap, whole: when the document changes
+             the kubelet turns a link under the mount, which the controller's
+             watch follows; a file mounted by subPath is never turned. No
+             checksum of the document stands on the pod, so a changed document
+             moves no pod: the running controller applies it in place, or
+             rejects one that does not run and keeps the generation it runs,
+             where a pod started on such a document refuses to start. Not
+             optional: the pod waits for its ConfigMap. */}}
         - name: policy-spec
           configMap:
             name: {{ include "smg.policyControllerName" . }}
+        {{- end }}
 {{- end }}
