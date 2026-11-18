@@ -53,6 +53,7 @@ use crate::{
         SpecialTokens, TokenIdType, Tokenizer as TokenizerTrait,
     },
     word_cache::{LateBoundModel, Listing, LoadingTokenizer, ModelView, TokenizerOf},
+    wordpiece::WordPieceEncoder,
 };
 
 mod deepseek_v31;
@@ -239,12 +240,14 @@ struct DirectEncoders {
     #[cfg(feature = "tokenizers-v1")]
     v1: Option<V1Encoder>,
     native: Option<NativeEncoder>,
+    wordpiece: Option<WordPieceEncoder>,
 }
 
 impl DirectEncoders {
     /// The first path, in order of preference, that takes `tokenizer`: the
     /// opt-in v1 pipeline (behind its feature), the direct byte-level
-    /// encoder, else none and `tokenizers` encodes. The choice is logged
+    /// encoder, the direct WordPiece encoder, else none and `tokenizers`
+    /// encodes. The choice is logged
     /// once, with the reasons the paths before it declined, and counted per
     /// path ([`encode_path::encode_path_loads`]).
     fn choose<M: Model + ModelView + Serialize>(tokenizer: &TokenizerOf<M>) -> Self {
@@ -259,14 +262,32 @@ impl DirectEncoders {
                 return Self {
                     v1: Some(v1),
                     native: None,
+                    wordpiece: None,
                 };
             }
             Err(declined) => declined,
         };
-        let (native, path, native_declined) = match NativeEncoder::from_tokenizer(tokenizer) {
-            Ok(native) => (Some(native), EncodePath::Native, None),
-            Err(declined) => (None, EncodePath::Tokenizers, Some(declined.to_string())),
-        };
+        // Each direct encoder declines first a model kind that is not its
+        // own, so a tokenizer both decline is logged with the reason of the
+        // encoder whose kind it is.
+        let (native, wordpiece, path, native_declined) =
+            match NativeEncoder::from_tokenizer(tokenizer) {
+                Ok(native) => (Some(native), None, EncodePath::Native, None),
+                Err(byte_level) => match WordPieceEncoder::from_tokenizer(tokenizer) {
+                    Ok(wordpiece) => (None, Some(wordpiece), EncodePath::Native, None),
+                    Err(wordpiece) => {
+                        let declined = if matches!(
+                            tokenizer.get_model().wrapper(),
+                            ModelWrapper::WordPiece(_)
+                        ) {
+                            wordpiece.to_string()
+                        } else {
+                            byte_level.to_string()
+                        };
+                        (None, None, EncodePath::Tokenizers, Some(declined))
+                    }
+                },
+            };
         encode_path::note_load(path);
         // The opt-in pipeline is for BPE tokenizers: one of those it declines
         // is worth a warning (the opt-in did not take where it could have);
@@ -297,6 +318,7 @@ impl DirectEncoders {
             #[cfg(feature = "tokenizers-v1")]
             v1: None,
             native,
+            wordpiece,
         }
     }
 
@@ -340,6 +362,10 @@ struct EncoderCore {
     /// shape (see `native`), when [`DirectEncoders::choose`] took it;
     /// `None` keeps every encode in `tokenizers`.
     native: Option<NativeEncoder>,
+    /// The crate's direct WordPiece encoder (see `wordpiece`), when
+    /// [`DirectEncoders::choose`] took it for a tokenizer `native` does
+    /// not serve.
+    wordpiece: Option<WordPieceEncoder>,
     /// Every added token, special or not, as one leftmost-longest matcher
     /// over the raw text, built on first use (only a renderer with an
     /// encoder of its own asks; a vocabulary can carry tens of thousands of
@@ -360,10 +386,15 @@ struct EncoderCore {
 }
 
 impl EncoderCore {
-    fn new(tokenizer: HfTokenizer, native: Option<NativeEncoder>) -> Self {
+    fn new(
+        tokenizer: HfTokenizer,
+        native: Option<NativeEncoder>,
+        wordpiece: Option<WordPieceEncoder>,
+    ) -> Self {
         Self {
             tokenizer,
             native,
+            wordpiece,
             added: OnceLock::new(),
             plain: OnceLock::new(),
             plain_after_control: OnceLock::new(),
@@ -506,7 +537,7 @@ impl HuggingFaceTokenizer {
         if self.v1.is_some() {
             return EncodePath::V1;
         }
-        if self.core.native.is_some() {
+        if self.core.native.is_some() || self.core.wordpiece.is_some() {
             EncodePath::Native
         } else {
             EncodePath::Tokenizers
@@ -934,7 +965,11 @@ impl HuggingFaceTokenizer {
             pieces.is_some(),
             token_texts.is_some(),
         );
-        let core = Arc::new(EncoderCore::new(tokenizer, encoders.native));
+        let core = Arc::new(EncoderCore::new(
+            tokenizer,
+            encoders.native,
+            encoders.wordpiece,
+        ));
         let structural_controls = tokenizer_path
             .parent()
             .is_some_and(|dir| dir.join("tekken.json").is_file());
@@ -1269,7 +1304,11 @@ impl HuggingFaceTokenizer {
             token_texts,
             #[cfg(feature = "tokenizers-v1")]
             v1: encoders.v1,
-            core: Arc::new(EncoderCore::new(tokenizer, encoders.native)),
+            core: Arc::new(EncoderCore::new(
+                tokenizer,
+                encoders.native,
+                encoders.wordpiece,
+            )),
             special_tokens,
             chat_template: ChatTemplateState::empty(),
             response_template: None,
@@ -1682,6 +1721,20 @@ impl Encoder for HuggingFaceTokenizer {
                 Err(fallback) => encode_path::note_fallback(fallback),
             }
         }
+        // The direct WordPiece encoder gives the ids alone, as the path
+        // above does, and gives up no input: a tokenizer it does not
+        // reproduce it declined at load. It is made only for a tokenizer
+        // whose model is WordPiece, so the model here is always the one it
+        // reads the pieces from.
+        if let Some(wordpiece) = &self.core.wordpiece {
+            if let ModelWrapper::WordPiece(model) = self.core.tokenizer.get_model().wrapper() {
+                return Ok(Encoding::Plain(wordpiece.encode(
+                    model,
+                    input,
+                    add_special_tokens,
+                )));
+            }
+        }
         self.core
             .tokenizer
             .encode_fast(input, add_special_tokens)
@@ -1701,7 +1754,7 @@ impl Encoder for HuggingFaceTokenizer {
         // the calling thread (the `tokenizers` batch fanned out with rayon):
         // the gateway reaches a batch through `CachedTokenizer::encode_batch`,
         // which fans out over `encode` itself.
-        if self.core.native.is_some() {
+        if self.core.native.is_some() || self.core.wordpiece.is_some() {
             return inputs
                 .iter()
                 .map(|input| self.encode(input, add_special_tokens))
