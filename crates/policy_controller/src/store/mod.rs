@@ -65,6 +65,7 @@
 //!
 //! [`LoadRow`]: crate::view::LoadRow
 
+pub mod encoding;
 pub mod health;
 pub mod index;
 pub mod journal;
@@ -81,6 +82,7 @@ pub mod world;
 #[cfg(test)]
 mod tests;
 
+pub use encoding::{EncodeClasses, EncodeHandoff, EncodeOffer};
 pub use health::{HealthSink, VetoWrite};
 pub use index::{ContentHash, KvEvent, LaneCounts, SequenceHash, StoredBlock, INDEX_WORKERS};
 pub use journal::{Journal, Kinds, Position};

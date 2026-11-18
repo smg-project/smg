@@ -635,6 +635,22 @@ message PairingDescriptor {
   bool ec_producer = 9;
   bool ec_consumer = 10;
   bool vision = 11;
+  // The worker's end of the encode handoff, with its two EC roles: the form
+  // its registration states and, under a push, the connector the role is
+  // stated on. Unspecified is no end, as a registration that names no form
+  // reads; the connector above is the pair's. The store derives from them
+  // which encoders hand an item to which prefills.
+  EncodeHandoff encode_handoff = 12;
+  string ec_connector = 13;
+}
+
+// How an encoder hands an encoded item to a prefill.
+enum EncodeHandoff {
+  ENCODE_HANDOFF_UNSPECIFIED = 0;
+  // The encoder pushes the item to the prefill over an EC connector.
+  ENCODE_HANDOFF_PUSH = 1;
+  // The encoder and the prefill meet at a rendezvous.
+  ENCODE_HANDOFF_RENDEZVOUS = 2;
 }
 
 // Per-worker overrides over the spec's defaults; unset means the spec's value.

@@ -357,5 +357,9 @@ name = "decide_stream"
 harness = false
 required-features = ["controller"]
 
+[[bench]]
+name = "encode_classes"
+harness = false
+
 [lints]
 workspace = true

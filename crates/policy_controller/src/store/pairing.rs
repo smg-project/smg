@@ -111,8 +111,9 @@ impl PairingDescriptor {
     }
 }
 
-/// One value of a descriptor, normalized in place.
-fn normalize(value: &mut Option<String>) {
+/// One stated value, normalized in place: a descriptor's, and the connector
+/// of an encode offer.
+pub(super) fn normalize(value: &mut Option<String>) {
     let Some(text) = value else {
         return;
     };
