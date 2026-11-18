@@ -326,6 +326,19 @@ fn deinterleave_contiguous_by_table(
     }
 }
 
+/// [`deinterleave_rgb_to_planes_by_table`] appended to `out`: the red, green
+/// and blue planes of `rgb` in that order, each plane taken from the bytes in
+/// a pass of its own. For a batch buffer that holds several images' planes
+/// one after another: every float is written once, with no tensor of the
+/// image's own, zero fill or copy in between.
+pub(crate) fn extend_planes_by_table(out: &mut Vec<f32>, rgb: &[u8], table: &[[f32; 256]; 3]) {
+    let [red, green, blue] = table;
+    let (pixels, _) = rgb.as_chunks::<3>();
+    out.extend(pixels.iter().map(|pixel| red[usize::from(pixel[0])]));
+    out.extend(pixels.iter().map(|pixel| green[usize::from(pixel[1])]));
+    out.extend(pixels.iter().map(|pixel| blue[usize::from(pixel[2])]));
+}
+
 /// Build a [C, H, W] f32 tensor from interleaved RGB bytes with per-channel
 /// `scale` and `bias`: `output[c][i] = raw[i*3 + c] * scale[c] + bias[c]`.
 fn build_planar_tensor(
@@ -5771,6 +5784,34 @@ mod tests {
             .all(|(s, b)| s.to_bits() == b.to_bits()));
         assert_eq!(serial[0].to_bits(), table[0][0].to_bits());
         assert_eq!(serial[pixels].to_bits(), table[1][1].to_bits());
+    }
+
+    #[test]
+    fn extend_planes_by_table_appends_each_image_after_the_last() {
+        // Two images of odd pixel counts appended to one buffer; the serial
+        // kernel is the oracle for each one's planes.
+        let table: [[f32; 256]; 3] =
+            std::array::from_fn(|c| std::array::from_fn(|level| (level * 3 + c) as f32 / 7.0));
+        let mut appended = Vec::new();
+        let mut expected = Vec::new();
+        for (pixels, offset) in [(1027_usize, 0_usize), (333, 97)] {
+            let rgb: Vec<u8> = (0..pixels * 3)
+                .map(|i| ((i + offset) % 251) as u8)
+                .collect();
+            let mut planes = vec![0.0_f32; 3 * pixels];
+            {
+                let (r, rest) = planes.split_at_mut(pixels);
+                let (g, b) = rest.split_at_mut(pixels);
+                deinterleave_contiguous_by_table(&rgb, r, g, b, &table);
+            }
+            expected.extend(planes);
+            extend_planes_by_table(&mut appended, &rgb, &table);
+        }
+        assert_eq!(appended.len(), expected.len());
+        assert!(appended
+            .iter()
+            .zip(&expected)
+            .all(|(a, e)| a.to_bits() == e.to_bits()));
     }
 
     #[test]
