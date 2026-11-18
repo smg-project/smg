@@ -44,7 +44,12 @@ use crate::{
     view::{LoadRow, Role, WorkerId},
 };
 
+mod blocks;
 mod turn;
+
+use blocks::Blocks;
+#[cfg(any(test, feature = "controller"))]
+use blocks::Minted;
 
 pub use turn::{AtWork, Hand};
 
@@ -99,6 +104,9 @@ pub struct MemoryStore {
     pins_swept: Mutex<PinsSwept>,
     /// The leases' file behind its turn ([`turn`]).
     file: turn::File,
+    /// The blocks of the leading term's counter and each block's file
+    /// ([`blocks`]): how a lease's id names its file.
+    blocks: Blocks,
     /// What a decision reads, through one load: swapped whole at each
     /// publication.
     world: ArcSwap<World>,
@@ -203,6 +211,7 @@ impl MemoryStore {
             #[cfg(feature = "controller")]
             pins_swept: Mutex::default(),
             file: turn::File::new(leases),
+            blocks: Blocks::default(),
             world,
             origin,
             journal: None,
@@ -376,7 +385,10 @@ impl MemoryStore {
         // is: a later generation's stages never saw the issue and hear
         // nothing of it.
         let mut leases = self.turn();
-        leases.term = leases.term.max(cut.at.term);
+        if cut.at.term > leases.term {
+            leases.term = cut.at.term;
+            self.blocks.rise(cut.at.term);
+        }
         for (record, by) in leases.empty() {
             let said = Said::Released(None, ReleaseReason::WorkerRemoved);
             self.tell(&record, said, by);
@@ -572,7 +584,10 @@ impl MemoryStore {
         if let Some(journal) = &self.journal {
             journal.term_followed(at);
         }
-        leases.term = leases.term.max(at.term);
+        if at.term > leases.term {
+            leases.term = at.term;
+            self.blocks.rise(at.term);
+        }
     }
 
     /// Apply a generation: every world from here on is published under
@@ -2344,10 +2359,10 @@ struct Leases {
     records: FxHashMap<Key, Held>,
     /// The store's counts, a cell a worker: what the leases on file book.
     counts: Arc<Counts>,
-    /// The term of the id last minted and its counter within that term
-    /// ([`MemoryStore::issue_decided`]).
+    /// The block of the term's counter the file mints from, as far as it
+    /// minted into it ([`MemoryStore::issue_decided`]).
     #[cfg(any(test, feature = "controller"))]
-    minted: (u64, u32),
+    minted: Minted,
     /// Every lease filed as issued, by its dispatch deadline, the earliest
     /// first. A lease that left the file or was dispatched keeps its place
     /// until the issues that follow step over it, so no door searches the
@@ -2393,22 +2408,19 @@ impl Held {
 impl Leases {
     /// The next id under the store's term: the term in bits 32 to 62 over a
     /// counter that starts at 1 in each term, as the contract bounds a
-    /// controller's ids. `None` for a term past 31 bits and for a term
-    /// whose counter is spent: an id is never 0, never carries the bit of
-    /// a gateway's own ids and never repeats.
+    /// controller's ids. The counter comes from the block `file` holds of
+    /// `blocks`, or from the next one it claims ([`Minted::mint`]). `None`
+    /// for a term past 31 bits and for a term whose counter is spent: an
+    /// id is never 0, never carries the bit of a gateway's own ids and
+    /// never repeats.
     #[cfg(any(test, feature = "controller"))]
-    fn mint(&mut self) -> Option<LeaseId> {
+    fn mint(&mut self, blocks: &Blocks, file: u8) -> Option<LeaseId> {
         let term = self.term;
         if term >= 1 << 31 {
             return None;
         }
-        if self.minted.0 != term {
-            // The store's term only rises, so a term is minted under once.
-            self.minted = (term, 0);
-        }
-        let next = self.minted.1.checked_add(1)?;
-        self.minted.1 = next;
-        Some(LeaseId(term << 32 | u64::from(next)))
+        let counter = self.minted.mint(blocks, term, file)?;
+        Some(LeaseId(term << 32 | u64::from(counter)))
     }
 
     /// Files `record` under `key`: a record on file under that key gives
@@ -2575,7 +2587,7 @@ impl MemoryStore {
     #[cfg(test)]
     pub(crate) fn spend_ids(&self, left: u32) {
         let mut leases = self.turn();
-        leases.minted = (leases.term, u32::MAX - left);
+        leases.minted = self.blocks.spend(leases.term, left, Self::FILE);
     }
 
     /// The places of the deadline queue: no door tells its length.
@@ -2625,7 +2637,7 @@ impl MemoryStore {
             return Err(unminted);
         }
         let key = loop {
-            record.lease.id = leases.mint().ok_or(unminted)?;
+            record.lease.id = leases.mint(&self.blocks, Self::FILE).ok_or(unminted)?;
             let key = (record.gateway, record.lease.id);
             // An id on file already is a restored lease's: the next one.
             if let Entry::Vacant(place) = leases.records.entry(key) {
@@ -2664,6 +2676,7 @@ impl LeasesStore for MemoryStore {
         let mut leases = self.turn();
         if term > leases.term {
             leases.term = term;
+            self.blocks.rise(term);
             if let Some(journal) = &self.journal {
                 journal.term_rose(term);
             }

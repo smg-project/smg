@@ -251,9 +251,18 @@ impl MemoryStore {
     /// takes the turn and applies before it writes its own.
     pub const HANDOVER: usize = 1_024;
 
-    /// The file a lease's id names: the one file today.
-    fn file_of(&self, _lease: LeaseId) -> &File {
-        &self.file
+    /// The one file's place among the files: the byte its blocks carry.
+    #[cfg(any(test, feature = "controller"))]
+    pub(super) const FILE: u8 = 0;
+
+    /// The file a lease's id names
+    /// ([`Blocks::file_of`](super::blocks::Blocks::file_of)): an id of the
+    /// leading term by its block's byte, any other id by its block modulo
+    /// the files. The file is one today, so every id names it.
+    fn file_of(&self, lease: LeaseId) -> &File {
+        let files = std::slice::from_ref(&self.file);
+        let named = self.blocks.file_of(lease, files.len());
+        files.get(named).unwrap_or(&self.file)
     }
 
     /// Gives the store the controller's word to the engine: what tells it
