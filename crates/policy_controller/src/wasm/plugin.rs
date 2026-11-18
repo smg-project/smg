@@ -918,6 +918,11 @@ pub struct Plugin {
     /// and the time of a lazy `init` the decision paid at its two ends (part
     /// of its sample, not of its own spend).
     decision_opens: ThreadLocal<Cell<(Part, OwnTime)>>,
+    /// Per thread: the decision, by its number on this thread, whose open
+    /// caught the thread's instance up with the membership feed. A decision
+    /// does so once, at the plugin's first open of it that reaches the
+    /// instance. Zero: none yet, and no decision's number.
+    heard_in: ThreadLocal<Cell<u64>>,
 }
 
 impl fmt::Debug for Plugin {
@@ -1044,6 +1049,7 @@ impl Plugin {
             spent: ThreadLocal::new(),
             latency: ThreadLocal::new(),
             decision_opens: ThreadLocal::new(),
+            heard_in: ThreadLocal::new(),
         });
         // The apply's own instance: `init` runs here, and its failure is the
         // apply's. It waits apart for the first decider that needs one.
@@ -1709,17 +1715,19 @@ impl Plugin {
     }
 
     /// One of this plugin's opens of decision `decision` on this thread;
-    /// says whether the plugin already failed that decision, and whether
-    /// this open is the plugin's first of it (the one read of the cell an
-    /// open makes).
-    fn note_open(&self, decision: u64) -> (bool, bool) {
+    /// says whether the plugin already failed that decision (the one read
+    /// of the cell an open makes).
+    fn note_open(&self, decision: u64) -> bool {
         let opens = self.decision_opens.get_or_default();
         let (mut part, init) = opens.get();
-        let first = !part.is_of(decision);
-        let init = if first { OwnTime::default() } else { init };
+        let init = if part.is_of(decision) {
+            init
+        } else {
+            OwnTime::default()
+        };
         let failed = part.open(decision);
         opens.set((part, init));
-        (failed, first)
+        failed
     }
 
     /// The time of a lazy `init` decision `decision` paid on this thread:
@@ -2243,8 +2251,7 @@ impl Bound {
         let mut budget = plugin.runtime.decisions.on_this_thread();
         let decision = budget.open(facts.budget_micros);
         open.decision = decision;
-        let (failed, first) = plugin.note_open(decision);
-        if failed {
+        if plugin.note_open(decision) {
             // The plugin already failed this decision (the other side of a
             // pair, another binding): its part in the decision is over, with
             // no call, no `init` and no second count.
@@ -2367,13 +2374,16 @@ impl Bound {
         }
         // What the membership feed told since this instance last heard comes
         // before the decision reads the instance, as told events: outside
-        // the decision's sums. The plugin's first open of the decision
-        // alone: a later one (a pair's other side, another profile) finds a
-        // resource of the decision live on the instance, so a change handed
-        // between them waits for the decider's next decision or told event.
+        // the decision's sums. Once a decision, at the first of the plugin's
+        // opens that reaches the instance: a later one (a pair's other side,
+        // another profile) finds a resource of the decision live on the
+        // instance, so a change handed between them waits for the decider's
+        // next decision or told event. An open the breaker turned away
+        // above reached no instance and is not that first: the instance the
+        // decision's next open reaches, or makes, still hears.
         // A change that faults the instance ends the plugin's part in the
         // decision, and the close rebuilds the slot.
-        if first {
+        if plugin.feed.is_some() && plugin.heard_in.get_or_default().replace(decision) != decision {
             plugin.catch_up(&mut guard);
             if guard.is_none() {
                 open.bypass = true;

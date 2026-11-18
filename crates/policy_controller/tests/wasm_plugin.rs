@@ -16,7 +16,7 @@ mod support {
 }
 
 use std::sync::{
-    atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering},
+    atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering},
     Arc,
 };
 
@@ -8195,6 +8195,8 @@ enum Inside {
     TellsUnderNoName,
     /// Hands the membership feed one worker that comes.
     HandsAMember(WorkerId),
+    /// Moves the case's own clock to a time, in microseconds.
+    MovesTheClock(&'static AtomicU64, u64),
 }
 
 thread_local! {
@@ -8249,6 +8251,7 @@ impl smg_policy_controller::DecisionScope for ActsInside {
                 self.tells
                     .on_membership(&smg_policy_controller::Membership::Added(worker));
             }
+            Inside::MovesTheClock(clock, to) => clock.store(to, Ordering::Relaxed),
         }
     }
 
@@ -8349,10 +8352,10 @@ fn a_thread_whose_name_ends_gives_the_held_decider_back_before_it_acts_as_itself
     assert_eq!(as_first, Some(102), "its two dispatches and no more");
 }
 
-/// The feed is heard at the plugin's first open of a decision alone. A
-/// change handed between a pair's two opens is not told inside the pair,
-/// where the first side's resource is live on the instance: it is heard at
-/// the next decision's first open.
+/// An instance hears the feed once a decision, at the first open that
+/// reaches it. A change handed between a pair's two opens is not told
+/// inside the pair, where the first side's resource is live on the
+/// instance: it is heard at the next decision's first open.
 #[test]
 fn a_change_handed_between_a_pairs_opens_is_heard_at_the_next_decision() {
     use smg_policy_controller::Membership;
@@ -8383,6 +8386,75 @@ fn a_change_handed_between_a_pairs_opens_is_heard_at_the_next_decision() {
         1,
         "the first pair's change, at the second pair's first open"
     );
+}
+
+/// The open that reaches the instance may be a pair's second. A pair whose
+/// first side meets the open breaker and whose second side opens at the
+/// cool-down's end makes its instance there: that instance hears the list
+/// as it stands before the side reads it.
+#[test]
+fn a_pair_that_straddles_the_cool_down_hears_the_feed_at_the_open_that_reaches_it() {
+    use smg_policy_controller::Membership;
+    const START: u64 = 1_000_000;
+    const COOL_DOWN: u64 = 1_000_000;
+    // The host's clock is the case's own: the cool-down ends when the first
+    // side's scope says so, whatever the runner's clock reads.
+    static CLOCK: AtomicU64 = AtomicU64::new(START);
+    let runtime = Arc::new(
+        Runtime::with_clock(&OpenDecisions::new(), || CLOCK.load(Ordering::Relaxed))
+            .expect("a runtime"),
+    );
+    let mut row = spec(
+        "straddles",
+        guest::record_guest(),
+        mode::TRAP_ON_FIVE_MEMBERS,
+    );
+    row.breaker = BreakerSpec {
+        failures: 1,
+        window_micros: 60_000_000,
+        cooldown_micros: COOL_DOWN,
+    };
+    let plugin = loaded(&runtime, row);
+    let plain = Arc::new(plugin_engine(&plugin));
+    // The first side's profile: the plugin's open, then the host's scope
+    // moves the clock to the cool-down's end. The second side's open follows.
+    let ends = Inside::MovesTheClock(&CLOCK, START + COOL_DOWN);
+    let prefill = profile_that(&plugin, &plain, ends);
+    let decode = plugin_profile(&plugin, None, None, None);
+    let engine = pair_engine(vec![prefill, decode], 1);
+    // The warm-up tells the snapshot of five and this guest traps on it: the
+    // one failure opens the breaker, and the slot is cold.
+    let five: Vec<WorkerId> = (100..105).map(WorkerId).collect();
+    plain.on_membership(&Membership::Snapshot(&five));
+    plugin.warm().expect("the warm-up's own work is done");
+    let warmed = plugin.stats();
+    assert_eq!((warmed.traps, warmed.breaker_opens), (1, 1), "{warmed:?}");
+    // Four go and one stands.
+    for id in [104, 103, 102, 101] {
+        plain.on_membership(&Membership::Removed(WorkerId(id)));
+    }
+    let decision = pair_decide(&engine);
+    let paired = plugin.stats();
+    assert_eq!(
+        (
+            paired.bypassed - warmed.bypassed,
+            paired.lazy_instantiations - warmed.lazy_instantiations
+        ),
+        (1, 1),
+        "the first side met the open breaker, the second made an instance: {paired:?}"
+    );
+    assert_eq!(
+        (paired.observed - warmed.observed, paired.invalid),
+        (1, 0),
+        "the instance made at the second side's open hears one snapshot: {paired:?}"
+    );
+    // The second side's pick is the plugin's own: the row at one member.
+    let decode_id = decision
+        .pick()
+        .and_then(|pick| pick.targets.first())
+        .and_then(|lead| lead.pair)
+        .map(|pair| pair.decode_id);
+    assert_eq!(decode_id, Some(WorkerId(201)), "{decision:?}");
 }
 
 /// The pick of one decision over the pool of four that the plugin itself
