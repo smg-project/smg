@@ -11,12 +11,15 @@
 //! The partition is learned from a window of bookings. Every issued
 //! decision books its tokens on the worker it names
 //! ([`Lifecycle::on_decision_issued`]), and a booking leaves the window once
-//! it is older than `adjust_interval_s`. At each interval the ranges are cut
-//! again from the sizes in the window, so that each worker's range carries
-//! an equal share of the booked tokens. The cut reads the decision's clock
-//! ([`RequestFacts::now_micros`]): a model's first prefill decision starts
-//! the cadence, and the first decision at or past an interval's end makes
-//! the cut before it is placed. No thread and no timer runs.
+//! it is older than `adjust_interval_s`. A cut falls due at each interval
+//! and is made where a worker's share of the booked tokens moved by more
+//! than a factor of two since the last cut, or the listing changed: the
+//! ranges are cut again from the sizes in the window, so that each worker's
+//! range carries an equal share of the booked tokens. The cut reads the
+//! decision's clock ([`RequestFacts::now_micros`]): a model's first prefill
+//! decision starts the cadence, and the first decision at or past an
+//! interval's end makes the cut before it is placed. No thread and no timer
+//! runs.
 //!
 //! The balance rule spills. When the most and the least booked survivors
 //! differ by more than `abs_threshold` tokens and the most booked holds more
@@ -27,9 +30,11 @@
 //! list joins at its first decision, with every other row of that view, and
 //! a changed listing splits [`SPAN`] evenly among all of it until the next
 //! cut. The lifecycle prunes: a removed worker's range goes to the range
-//! below it, and a replaced handle keeps its predecessor's place. All of it
-//! is soft state, which a new process learns again within one window, and
-//! so does a newly applied document, whose generation builds its own scorer.
+//! below it, and a replaced handle keeps its predecessor's place. A handle
+//! a view listed before the word of its replacement keeps its own place,
+//! and its predecessor's leaves as a removed worker's does. All of it is
+//! soft state, which a new process learns again within one window, and so
+//! does a newly applied document, whose generation builds its own scorer.
 //!
 //! A model's partition stands behind its own guard. A decision finds its
 //! model's by the name's hash, in a map replaced whole at a model's first
@@ -352,8 +357,15 @@ impl Pool {
     }
 
     /// The same worker under a new handle keeps its place, range and load.
-    /// Whether the partition lists it.
+    /// Where a view listed the new handle before this word came, the worker
+    /// stands once, at the place that view gave it: the old handle's member
+    /// leaves as a removed worker's does. Whether a member took the new
+    /// handle.
     fn rename(&mut self, old: WorkerId, new: WorkerId) -> bool {
+        if old != new && self.by_id.contains_key(&new) {
+            self.remove(old);
+            return false;
+        }
         let Some(at) = self.by_id.remove(&old) else {
             return false;
         };
@@ -583,6 +595,14 @@ impl Lifecycle for Bucket {
             }
         }
     }
+
+    /// The bookings and the listing are the stage's whole state, and these
+    /// calls alone keep them: under a host that makes none, every size is
+    /// placed by an even split, nothing spills and a worker that left stays
+    /// listed.
+    fn needs_lifecycle(&self) -> bool {
+        true
+    }
 }
 
 impl Scorer for Bucket {
@@ -644,7 +664,7 @@ mod tests {
     use crate::{
         decision::{Pair, Pick, Target, Targets},
         view::Health,
-        Constraints, PolicySpec, PoolFacts, Scratch,
+        Catalog, Constraints, PolicySpec, PoolFacts, Scratch, SpecError,
     };
 
     const SECOND: u64 = 1_000_000;
@@ -1397,5 +1417,144 @@ mod tests {
         // preset's balance rule (64 tokens and 1.5): the first idle worker,
         // then the next.
         assert_eq!(placed, [2, 0, 1]);
+    }
+
+    #[test]
+    fn a_host_that_makes_no_lifecycle_call_refuses_the_stage_and_the_preset() {
+        let served = Catalog::builtin();
+        let unserved = Catalog::builtin().without_lifecycle();
+        let named: PolicySpec = serde_json::from_str(
+            r#"{"apiVersion":"smg.policy/v1","profiles":{"p":{"score":["bucket"],"pick":"best"}}}"#,
+        )
+        .expect("a well-formed document");
+        let preset = PolicySpec::preset("bucket").expect("the preset's form");
+        for (spec, path) in [
+            (&named, "profiles.p.score[0].bucket"),
+            (&preset, "profiles.bucket.score[0].bucket"),
+        ] {
+            let engine = spec
+                .validate_in(&served, &[])
+                .expect("the host makes the calls");
+            assert!(engine.needs_lifecycle(), "{path}");
+            assert_eq!(
+                spec.validate_in(&unserved, &[]).err(),
+                Some(SpecError::NotInBuild {
+                    path: path.to_string(),
+                    what: "the lifecycle this stage needs",
+                }),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_share_exactly_twice_or_half_the_last_cut_s_is_not_cut_again() {
+        // The ranges at twenty seconds, the window's tokens and the share
+        // the ranges were cut for, after the cut for 2,000 a worker at
+        // fifteen and `sizes` booked at `at_micros`.
+        let second_cut = |at_micros: u64, sizes: &[u32]| {
+            let (scorer, pool) = three_classes();
+            led(&scorer, &pool, 0, 15 * SECOND);
+            for &tokens in sizes {
+                book(&scorer, &pool, 0, tokens, at_micros);
+            }
+            led(&scorer, &pool, 0, 20 * SECOND);
+            let cut_for = of(&scorer, "m").lock().cut_for;
+            (ranges(&scorer), loads(&scorer).1, cut_for)
+        };
+        let first = vec![(0, 0, 100), (1, 101, 400), (2, 401, u32::MAX)];
+        // At sixteen seconds the bookings of eleven still count: 6,000 more
+        // make 12,000, and 4,000 a worker is exactly twice 2,000.
+        assert_eq!(
+            second_cut(16 * SECOND, &[1_000; 6]),
+            (first.clone(), 12_000, 2_000)
+        );
+        // Three tokens more make it 4,001.
+        assert_eq!(
+            second_cut(16 * SECOND, &[1_000, 1_000, 1_000, 1_000, 1_000, 1_000, 3]),
+            (
+                vec![(0, 0, 400), (1, 401, 1_000), (2, 1_001, u32::MAX)],
+                12_003,
+                4_001
+            )
+        );
+        // A microsecond later the bookings of eleven are gone: 3,000 in the
+        // window, and 1,000 a worker is exactly half of 2,000.
+        assert_eq!(
+            second_cut(16 * SECOND + 1, &[1_000; 3]),
+            (first, 3_000, 2_000)
+        );
+        // Three tokens fewer make it 999.
+        assert_eq!(
+            second_cut(16 * SECOND + 1, &[1_000, 1_000, 997]),
+            (
+                vec![(0, 0, 997), (1, 998, 1_000), (2, 1_001, u32::MAX)],
+                2_997,
+                999
+            )
+        );
+    }
+
+    #[test]
+    fn a_worker_whose_classes_add_up_to_exactly_its_share_takes_no_class_more() {
+        // Three workers' ranges at the first cut over `sizes`, each one
+        // booking, and the share they were cut for.
+        let first_cut = |sizes: &[u32]| {
+            let scorer = scorer(NEVER, 1.5, 5);
+            let pool = pool(3);
+            led(&scorer, &pool, 0, SECOND);
+            for &tokens in sizes {
+                book(&scorer, &pool, 0, tokens, SECOND);
+            }
+            led(&scorer, &pool, 0, 6 * SECOND);
+            let cut_for = of(&scorer, "m").lock().cut_for;
+            (ranges(&scorer), cut_for)
+        };
+        // Ten bookings of 100 tokens are the first class: 1,000 of the
+        // window's 3,000, exactly a worker's share, and the first range ends
+        // there. The second worker's two classes add up to its share too.
+        let mut sizes = vec![100; 10];
+        sizes.extend([200, 300, 500, 1_000]);
+        assert_eq!(
+            first_cut(&sizes),
+            (vec![(0, 0, 100), (1, 101, 500), (2, 501, u32::MAX)], 1_000)
+        );
+        // Three tokens more in the window make the share 1,001: the first
+        // class is one token short of it, and its worker takes the next.
+        sizes[13] = 1_003;
+        assert_eq!(
+            first_cut(&sizes),
+            (vec![(0, 0, 200), (1, 201, 500), (2, 501, u32::MAX)], 1_001)
+        );
+    }
+
+    #[test]
+    fn a_handle_a_view_listed_before_the_word_of_its_replacement_stands_once() {
+        let (scorer, pool) = booked(NEVER, 1.5, &[100, 40]);
+        // A view shows the second worker under its new handle before the
+        // word of the replacement: the row joins as a third member.
+        let fresh = WorkerId(900);
+        let mut view = pool.clone();
+        view[1].id = fresh;
+        led(&scorer, &view, 0, 2 * SECOND);
+        assert_eq!(loads(&scorer), (vec![100, 40, 0], 140));
+        // The word comes: the worker stands once, at the place the view gave
+        // it, and the handle it replaced leaves as a removed worker's does.
+        scorer.on_membership(&Membership::Replaced {
+            old: pool[1].id,
+            new: fresh,
+        });
+        assert_eq!(loads(&scorer), (vec![100, 0], 140));
+        assert_eq!(ranges(&scorer), [(0, 0, 2_729), (1, 2_730, u32::MAX)]);
+        // One lease of the worker is one booking.
+        book(&scorer, &view, 1, 70, 2 * SECOND);
+        assert_eq!(loads(&scorer), (vec![100, 70], 210));
+        // A replacement by the same handle changes nothing.
+        scorer.on_membership(&Membership::Replaced {
+            old: fresh,
+            new: fresh,
+        });
+        assert_eq!(loads(&scorer), (vec![100, 70], 210));
+        assert_eq!(ranges(&scorer), [(0, 0, 2_729), (1, 2_730, u32::MAX)]);
     }
 }

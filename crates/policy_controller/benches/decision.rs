@@ -8,6 +8,10 @@
 //! `policy_engine/decide/least_load_credited/<n>`,
 //! `policy_engine/decide/all_vetoed/<n>`,
 //! `policy_engine/decide/bucket_prefill/<n>`,
+//! `policy_engine/decide/bucket_prefill_64_models/8`,
+//! `policy_engine/decide/bucket_prefill_64_models_shared/8`,
+//! `policy_engine/decide/bucket_prefill_joined/512`,
+//! `policy_engine/decide/bucket_prefill_two_rows/256`,
 //! `policy_engine/decide/manual_keyed_hit/8`,
 //! `policy_engine/decide/manual_keyed_miss/8` and
 //! `policy_engine/spec/parse_validate`. The view is built from the synthetic
@@ -193,7 +197,9 @@ fn decide(c: &mut Criterion) {
 /// Each iteration decides for one request and issues the decision with the
 /// clock one millisecond on, so the preset's five-second window holds about
 /// five thousand bookings: each decision ages one out, and every
-/// five-thousandth cuts the ranges again from the window. The sizes step
+/// five-thousandth reaches an interval's end, where a cut falls due. The
+/// first is made from the window, and none after it while each worker's
+/// share stays within a factor of two of the last cut's. The sizes step
 /// through the span, so the ranges' owners take turns. The preset's own
 /// rows decide a request that is no prefill placement, which the stage
 /// leaves to the picker. The pull-request gate builds its base side with
@@ -241,44 +247,53 @@ fn bucket_prefill(group: &mut BenchmarkGroup<'_, WallTime>) {
     }
 }
 
-/// The same placement where 64 models take turns, each over 8 workers of its
-/// own: a decision finds its model's partition by the name and a booking
-/// its worker's, so the cell reads what the count of models adds to a
-/// placement. A build before the preset times no cell here.
+/// The same placement where 64 models take turns: each over 8 workers of its
+/// own, then every model over the same 8. A decision finds its model's
+/// partition by the name and a booking its worker's, so the first cell
+/// reads what the count of models adds to a placement. A lease names no
+/// model: where the models list the same workers, the second cell books
+/// each issued decision in the 64 partitions that list its worker, one
+/// guard after the other. A build before the preset times no cell here.
 fn bucket_prefill_models(group: &mut BenchmarkGroup<'_, WallTime>) {
     const MODELS: usize = 64;
     let n = 8;
-    let Ok(spec) = PolicySpec::preset("bucket") else {
-        return;
-    };
-    let engine = spec.validate().expect("the preset validates");
-    let fleet = fleet(MODELS * n);
-    let mut rows = Vec::with_capacity(MODELS * n);
-    build_view(&fleet, &mut rows);
-    // A model's view is its own 8 rows, each at its place in that view.
-    let views: Vec<(String, Vec<_>)> = rows
-        .chunks(n)
-        .enumerate()
-        .map(|(at, own)| {
-            let mut view = own.to_vec();
-            for (position, row) in view.iter_mut().enumerate() {
-                row.position = position as u32;
-            }
-            (format!("model-{at:02}"), view)
-        })
-        .collect();
-    let mut scratch = Scratch::new();
-    let pool = PoolFacts {
-        pool_size: n as u32,
-        generation: 1,
-        ..PoolFacts::default()
-    };
-    let cx = Constraints::default();
-    let mut seed = 0u64;
-    group.bench_with_input(
-        BenchmarkId::new("bucket_prefill_64_models", n),
-        &n,
-        |b, _| {
+    for (name, shared) in [
+        ("bucket_prefill_64_models", false),
+        ("bucket_prefill_64_models_shared", true),
+    ] {
+        let Ok(spec) = PolicySpec::preset("bucket") else {
+            return;
+        };
+        let engine = spec.validate().expect("the preset validates");
+        let fleet = fleet(MODELS * n);
+        let mut rows = Vec::with_capacity(MODELS * n);
+        build_view(&fleet, &mut rows);
+        // A model's view is 8 rows, each at its place in that view: its own
+        // 8, or the fleet's first 8 where the models list the same workers.
+        let views: Vec<(String, Vec<_>)> = rows
+            .chunks(n)
+            .enumerate()
+            .map(|(at, own)| {
+                let mut view = if shared {
+                    rows[..n].to_vec()
+                } else {
+                    own.to_vec()
+                };
+                for (position, row) in view.iter_mut().enumerate() {
+                    row.position = position as u32;
+                }
+                (format!("model-{at:02}"), view)
+            })
+            .collect();
+        let mut scratch = Scratch::new();
+        let pool = PoolFacts {
+            pool_size: n as u32,
+            generation: 1,
+            ..PoolFacts::default()
+        };
+        let cx = Constraints::default();
+        let mut seed = 0u64;
+        group.bench_with_input(BenchmarkId::new(name, n), &n, |b, _| {
             b.iter(|| {
                 seed += 1;
                 let now_micros = 1_000_000 + seed * 1_000;
@@ -301,8 +316,8 @@ fn bucket_prefill_models(group: &mut BenchmarkGroup<'_, WallTime>) {
                 engine.on_decision_issued(&lease, &decision);
                 decision
             });
-        },
-    );
+        });
+    }
 }
 
 /// Two views that part from the listing's order, which a placement must not

@@ -627,7 +627,7 @@
       "additionalProperties": false
     },
     "BucketParams": {
-      "description": "The bucket scorer: prefill placement by request size, over ranges of\nsizes cut again each interval from the tokens booked on the workers.",
+      "description": "The bucket scorer: prefill placement by request size, over ranges of\nsizes. A cut of the ranges falls due each interval and is made, from the\ntokens booked on the workers, where a worker's share of them moved by\nmore than a factor of two since the last cut or the listing changed.",
       "type": "object",
       "properties": {
         "weight": {

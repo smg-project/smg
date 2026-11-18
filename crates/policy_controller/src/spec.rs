@@ -596,7 +596,9 @@ impl Default for WarmupSliceParams {
 }
 
 /// The bucket scorer: prefill placement by request size, over ranges of
-/// sizes cut again each interval from the tokens booked on the workers.
+/// sizes. A cut of the ranges falls due each interval and is made, from the
+/// tokens booked on the workers, where a worker's share of them moved by
+/// more than a factor of two since the last cut or the listing changed.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct BucketParams {

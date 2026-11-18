@@ -8,12 +8,13 @@
 # with a credit held per row (`policy_engine/decide/least_load_credited/<n>`), the steer of a pool over its
 # thresholds on every row (`policy_engine/decide/all_vetoed/<n>`), a prefill placement under the
 # `bucket` preset booked as it is issued (`policy_engine/decide/bucket_prefill/<n>`) and the same where 64
-# models take turns at 8 workers each (`policy_engine/decide/bucket_prefill_64_models/8`), where a worker
+# models take turns at 8 workers each (`policy_engine/decide/bucket_prefill_64_models/8`), where the 64
+# models list the same 8 workers (`policy_engine/decide/bucket_prefill_64_models_shared/8`), where a worker
 # joined mid-view (`policy_engine/decide/bucket_prefill_joined/512`) and at two rows a worker
 # (`policy_engine/decide/bucket_prefill_two_rows/256`), a keyed decision
 # under the manual preset on its pin and off it at 8 workers (`policy_engine/decide/manual_keyed_hit/8`,
 # `policy_engine/decide/manual_keyed_miss/8`) and the spec's parse-and-validate time
-# (`policy_engine/spec/parse_validate`): 48 single-threaded rows, deterministic by construction (a fresh
+# (`policy_engine/spec/parse_validate`): 49 single-threaded rows, deterministic by construction (a fresh
 # seed per iteration), about five minutes a run, so three interleaved runs a side fit the job's budget.
 #
 # From sixteen workers on, a decision under `passthrough`, `random`, `round_robin` or `power_of_two` is made by
