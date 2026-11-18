@@ -70,6 +70,11 @@ impl Object {
         self.done
     }
 
+    /// Whether the object closed as one whole JSON value a strict reader takes.
+    pub(crate) fn whole(&self) -> bool {
+        self.done && !self.fragments.refused() && self.fragments.whole()
+    }
+
     /// [`Self::feed`] without the call's end: the fragments the bytes complete, and at the
     /// object's close the word that says it is no whole value where it is none; how many of the
     /// bytes the object took, up to its closing brace.

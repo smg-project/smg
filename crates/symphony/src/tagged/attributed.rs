@@ -327,6 +327,12 @@ pub struct Assembler {
     /// model's call had something in it the client will not get, so it is no whole call, and
     /// nothing is made up for its close ([`Self::close`]).
     refused: bool,
+    /// Whether the closing brace of arguments written as one JSON object is held back
+    /// ([`Self::json_text`]): the object closed whole, and its brace leaves at the call's end, as
+    /// the arguments' last fragment where nothing was refused after the object, and with the
+    /// refused bytes where something was ([`Self::release`]), so that a call the syntax refused
+    /// bytes in has no whole arguments in this spelling either.
+    close_held: bool,
     done: bool,
     /// The buffer the events of a piece the scanner held fill before they go out owned
     /// (`take_owned`): kept between pieces with its room.
@@ -411,6 +417,7 @@ impl Assembler {
             function: None,
             released: false,
             refused: false,
+            close_held: false,
             done: false,
             scratch: Events::new(),
         }
@@ -943,8 +950,10 @@ impl Assembler {
 
     /// The next bytes of the JSON object, the parameter tags' bytes among them, which are its
     /// text. The bytes after its closing brace are text where the syntax has tags: whitespace,
-    /// the template's before the invoke's close, is carried, anything else refused, its event
-    /// inside the call after the object's fragments, which stay whole as the model closed them.
+    /// the template's before the invoke's close, is carried, anything else refused. The closing
+    /// brace of an object that closed whole is held back ([`take_back_the_brace`]) until the
+    /// call's end says whether the call is whole too: a refusal after the object takes the brace
+    /// with it ([`Self::release`]), and the arguments stay a strict JSON prefix.
     /// Kept out of line: the callers are on the path of every call of parameter tags, which
     /// reads no object.
     #[inline(never)]
@@ -954,6 +963,7 @@ impl Assembler {
         };
         let taken = object.read(text, out);
         if object.closed() {
+            self.close_held = object.whole() && take_back_the_brace(out);
             self.stage = Stage::AfterJson;
             self.text_between(&text[taken..], out);
         }
@@ -983,9 +993,12 @@ impl Assembler {
     /// text. An object the end found open stays as the model wrote it, as the JSON family's
     /// reader leaves one ([`named_arguments::Object::cut`]): the word it held, then one
     /// `Malformed` event of no bytes that says the arguments are no whole value, no brace made up
-    /// for the model. After the object's closing brace the arguments are whole as the model wrote
-    /// them, and the whitespace carried and a tag's start held are the template's, dropped; a
-    /// refusal after the object (a word, a tag) stands inside the call.
+    /// for the model. An object that closed whole, with nothing refused after it, is whole as
+    /// the model wrote it: its closing brace, held back since it arrived, is the last fragment,
+    /// and the whitespace carried and a tag's start held are the template's, dropped. Where the
+    /// syntax refused bytes after the object the brace left with them ([`Self::release`]): the
+    /// arguments stay a strict JSON prefix and no whole value, as those of a call of parameter
+    /// tags the syntax refused bytes in ([`Self::close`]).
     /// Cold and kept out of line: the callers are on the path of every call of parameter tags,
     /// which reads no object.
     #[cold]
@@ -994,6 +1007,9 @@ impl Assembler {
         self.json_held(out);
         if let Some(object) = self.json.take() {
             object.cut(out);
+        }
+        if std::mem::take(&mut self.close_held) {
+            self.object.push_fragment("}", Text::uncounted("}"), out);
         }
         self.stage = Stage::AfterJson;
         let held = self.scanner.set_aside();
@@ -1046,8 +1062,16 @@ impl Assembler {
     /// the model's own). The whitespace carried before the text is the template's after a tag the
     /// syntax read, and is dropped on its own so the refused bytes hold the model's text alone;
     /// after text refused already it is the model's, between two pieces of its text, and leaves
-    /// with this one, so that every byte is accounted for however the bytes were cut.
+    /// with this one, so that every byte is accounted for however the bytes were cut. The closing
+    /// brace of arguments written as one JSON object, held back for the call's end
+    /// ([`Self::json_text`]), is refused with the first text released after the object, the
+    /// whitespace between them included: the call is no whole call, and its arguments stay the
+    /// strict JSON prefix the fragments wrote.
     fn release(&mut self, text: &str, why: MalformedReason, out: &mut Events) {
+        if std::mem::take(&mut self.close_held) {
+            self.object.carried.insert(0, '}');
+            self.released = true;
+        }
         if !self.released {
             self.object.drop_carried(out);
         }
@@ -1386,6 +1410,38 @@ fn typed(tail: &str) -> Option<&str> {
     tail.strip_prefix(" type=\"")
         .and_then(|rest| rest.strip_suffix('"'))
         .filter(|kind| TYPES.contains(kind))
+}
+
+/// Takes the closing brace of a whole JSON object back out of the fragment that carried it, the
+/// last event of `out`: the brace is that fragment's last byte, JSON and source alike, and a
+/// fragment that was the brace alone is taken whole. Whether a brace was taken.
+fn take_back_the_brace(out: &mut Events) -> bool {
+    let Some(Event::ToolCallArguments { json, source, .. }) = out.as_mut_slice().last_mut() else {
+        return false;
+    };
+    if !json.ends_with('}') || !source.text.ends_with('}') {
+        return false;
+    }
+    match (json.len(), source.text.len()) {
+        (1, 1) => {
+            out.pop();
+            return true;
+        }
+        (1, _) | (_, 1) => return false,
+        _ => {}
+    }
+    for text in [json, &mut source.text] {
+        match text {
+            Cow::Borrowed(borrowed) => {
+                let whole = *borrowed;
+                *borrowed = &whole[..whole.len() - 1];
+            }
+            Cow::Owned(owned) => {
+                owned.pop();
+            }
+        }
+    }
+    true
 }
 
 impl TaggedAssembler for Assembler {
@@ -2797,7 +2853,8 @@ mod tests {
 
     /// Around the object the syntax keeps its rules. An object after a parameter is refused, and
     /// the call gets no close, the pairs read before a strict JSON prefix; a word or a tag after
-    /// the object is refused, the object's fragments whole before the refusal's event. An object
+    /// the object is refused, and the object's closing brace with it, so that the arguments stay
+    /// a strict JSON prefix and no whole value, whole and at every cut. An object
     /// a strict reader refuses is the model's bytes as written from one `Malformed
     /// { InvalidArguments }` event. One the invoke's close or the stream cut before its closing
     /// brace is no whole value and says so, no brace made up; one that closed before the stream
@@ -2814,21 +2871,41 @@ mod tests {
         assert_eq!(refused(&events).concat(), "{\"n\": 3}");
         assert_eq!(shown(&events), "");
         for (after, refused_bytes) in [
-            (" and more\n", "and more"),
+            (" and more\n", "} and more"),
             (
                 "\n<｜DSML｜ parameter name=\"s\" string=\"true\">x</｜DSML｜ parameter>\n",
-                "",
+                "}\n<｜DSML｜ parameter name=\"s\" string=\"true\">x</｜DSML｜ parameter>",
             ),
+            ("</｜DSML｜ parameter>", "}</｜DSML｜ parameter>"),
         ] {
             let call = format!("f\">\n{{\"n\": 3}}{after}");
-            let events = run_with(tags, &[&call], false);
-            assert_eq!(arguments(&events), "{\"n\": 3}", "{after:?}");
-            assert!(!malformed(&events).is_empty(), "{after:?}: {events:?}");
-            if !refused_bytes.is_empty() {
-                assert_eq!(refused(&events).concat(), refused_bytes, "{after:?}");
+            let mut cuts: Vec<Vec<&str>> = (1..call.len())
+                .filter(|&cut| call.is_char_boundary(cut))
+                .map(|cut| vec![&call[..cut], &call[cut..]])
+                .collect();
+            cuts.push(vec![&call]);
+            cuts.push(
+                call.char_indices()
+                    .map(|(at, c)| &call[at..at + c.len_utf8()])
+                    .collect(),
+            );
+            for pieces in cuts {
+                let events = run_with(tags, &pieces, false);
+                assert_eq!(arguments(&events), "{\"n\": 3", "{after:?}: {pieces:?}");
+                assert!(!malformed(&events).is_empty(), "{after:?}: {pieces:?}");
+                assert_eq!(
+                    refused(&events).concat(),
+                    refused_bytes,
+                    "{after:?}: {pieces:?}"
+                );
+                assert_eq!(shown(&events), "", "{after:?}: {pieces:?}");
+                assert_eq!(
+                    bytes(&events),
+                    format!("{call}{}", tags.invoke_close),
+                    "{after:?}: {pieces:?}"
+                );
+                nothing_empty(&events);
             }
-            assert_eq!(shown(&events), "", "{after:?}");
-            assert_eq!(bytes(&events), format!("{call}{}", tags.invoke_close));
         }
         let events = run_with(tags, &["f\">\n{\"n\": 3,}\n"], false);
         assert_eq!(arguments(&events), "{\"n\": 3,}");
