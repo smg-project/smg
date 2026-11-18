@@ -4132,6 +4132,80 @@ fn a_piece_that_waits_twice_takes_its_ids_at_both_holes() {
     assert_eq!(cache.packed.len(), 2);
 }
 
+/// A piece the seed holds that is met twice while it waits is learned once:
+/// the later hole's answer takes the vacancy, the earlier hole's copy is
+/// refused on the taken slot, and its insert finds the piece stored.
+#[test]
+fn a_seeded_piece_that_waits_twice_is_learned_once() {
+    let (tokenizer, native) = waiting_fixture();
+    let model = tokenizer.get_model();
+    let id = |token: &str| model.token_to_id(token).expect("a token");
+    let mut cache = native.thread_piece_cache().borrow_mut();
+    let mut ids = vec![7];
+    cache.last_miss = 0;
+    assert!(miss(&native, b"xy", &mut ids, &mut cache));
+    assert!(miss(&native, b"q", &mut ids, &mut cache));
+    assert!(
+        miss(&native, b"xy", &mut ids, &mut cache),
+        "not learned yet"
+    );
+    assert_eq!(ids, [7, 0, 0, 0]);
+    native.answer_waiting(&mut ids, &mut cache);
+    assert_eq!(ids, [7, id("xy"), id("q"), id("xy")]);
+    assert_eq!(cache.packed.len(), 2);
+}
+
+/// The answers of one group that are not one id wait in the scratch list
+/// for the one pass, each with its own ids: a piece merged after the seed
+/// gave the two ids of a later hole is placed and learned with its own.
+#[test]
+fn answers_of_several_ids_in_one_group_keep_their_own_ids() {
+    let (tokenizer, native) = waiting_fixture();
+    let model = tokenizer.get_model();
+    let id = |token: &str| model.token_to_id(token).expect("a token");
+    let mut cache = native.thread_piece_cache().borrow_mut();
+    let mut ids = vec![7];
+    cache.last_miss = 0;
+    assert!(miss(&native, b"xyq", &mut ids, &mut cache));
+    ids.push(8);
+    assert!(miss(&native, b"ab", &mut ids, &mut cache));
+    ids.push(9);
+    assert_eq!(ids, [7, 0, 8, 0, 9]);
+    native.answer_waiting(&mut ids, &mut cache);
+    assert_eq!(ids, [7, id("xy"), id("q"), 8, id("a"), id("b"), 9]);
+    assert_eq!(cache.packed.len(), 2);
+    for (piece, learned) in [
+        (&b"xyq"[..], [id("xy"), id("q")]),
+        (&b"ab"[..], [id("a"), id("b")]),
+    ] {
+        let key = ShortPieceKey::of(piece).expect("key");
+        ids.clear();
+        assert!(cache.packed.ids_into(key, &mut ids));
+        assert_eq!(ids, learned);
+    }
+}
+
+/// An answer of no id closes its hole, and the other pieces take their ids
+/// where they belong. No encoder that waits gives such an answer (its table
+/// has a token for every byte): here the merge table is taken away.
+#[test]
+fn a_waiting_piece_with_no_id_has_its_hole_closed() {
+    let (tokenizer, mut native) = waiting_fixture();
+    let model = tokenizer.get_model();
+    let id = |token: &str| model.token_to_id(token).expect("a token");
+    native.merges = None;
+    let mut cache = native.thread_piece_cache().borrow_mut();
+    let mut ids = vec![7];
+    cache.last_miss = 0;
+    assert!(miss(&native, b"xyq", &mut ids, &mut cache));
+    assert!(miss(&native, b"ab", &mut ids, &mut cache));
+    ids.push(8);
+    assert!(miss(&native, b"xy", &mut ids, &mut cache));
+    assert_eq!(ids, [7, 0, 0, 8, 0]);
+    native.answer_waiting(&mut ids, &mut cache);
+    assert_eq!(ids, [7, id("a"), id("b"), 8, id("xy")]);
+}
+
 /// A thread at its share clears its table when it learns a piece. The
 /// pieces that still wait are answered all the same: each asks the table as
 /// it is at its own answer.

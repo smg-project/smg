@@ -451,8 +451,9 @@ struct PieceCache {
     /// (see `Native::waits`), in the order of their holes; empty between
     /// encode calls.
     waiting: Vec<Waiting>,
-    /// The ids of the waiting piece being answered, when they are not one
-    /// id: a scratch list of the thread.
+    /// The ids of the waiting pieces whose answer is not one id, from their
+    /// answer until one pass places them in the output: a scratch list of
+    /// the thread.
     answer: Vec<u32>,
     /// The length of the output at the packed table's last miss: a miss
     /// close behind it waits.
@@ -3628,12 +3629,12 @@ impl NativeEncoder {
     /// within [`WAITING_GAP`] ids of the last one takes a hole of one id in
     /// the output and waits, and up to [`WAITING_PIECES`] are answered
     /// together ([`Self::answer_waiting`]), their lines read at once
-    /// (measured: a first sight of a word list 16 to 20 % faster, new text
-    /// of 16 and of 256 tokens 5 to 15 %). False for a miss that stands
-    /// alone: the seed answers it where it is met. True for a piece that
-    /// waits; the waiting pieces are answered here, this one the last of
-    /// them, when they are as many as are answered together or the miss is
-    /// not close behind the last one.
+    /// (measured: a first sight of a word list 15 to 17 % faster, new text
+    /// of 16 tokens 5 to 10 %, of 256 tokens 8 to 12 %). False for a miss
+    /// that stands alone: the seed answers it where it is met. True for a
+    /// piece that waits; the waiting pieces are answered here, this one the
+    /// last of them, when they are as many as are answered together or the
+    /// miss is not close behind the last one.
     #[cold]
     #[inline(never)]
     fn waits(&self, vacancy: Vacancy, ids: &mut Vec<u32>, cache: &mut PieceCache) -> bool {
@@ -3662,18 +3663,25 @@ impl NativeEncoder {
     /// through `std::hint::black_box`, which keeps the loop: the hint is a
     /// request, and where it were not honoured the pieces would be answered
     /// one by one, with the same ids (measured: a first loop that does more
-    /// for a piece, a whole walk or one bit kept for the answer, keeps half
-    /// of the gain or less, and no first loop keeps none). Then each piece
-    /// takes its ids at its hole, the last hole first (an answer that is not
-    /// one id moves only the ids behind its own hole, so the holes before it
-    /// stay where they are), and is learned as [`Self::seeded`] and the slow
+    /// for a piece keeps less of the gain: one bit kept for the answer keeps
+    /// half to seven tenths of it on a first sight; a whole walk keeps seven
+    /// tenths to all of it there and half of it or less on new text of 16
+    /// tokens; no first loop keeps none). Then the pieces are answered, the
+    /// last hole first, and each is learned as [`Self::seeded`] and the slow
     /// call learn it: at its vacancy, unless the cache was cleared since the
-    /// miss, when the piece asks the table again. A piece the seed does not
-    /// hold asks the thread's table once more before it is merged: one met
-    /// twice while it waited is merged once. The merge is the table's and
-    /// asks no model, so the answer comes wherever it is due: a piece waits
-    /// only on an encoder whose table merges every short piece
-    /// ([`Self::merges_every_short_piece`]).
+    /// miss, when the piece asks the table again. An answer of one id is
+    /// written into its hole. An answer that is not one id stays in the
+    /// thread's scratch list until the last piece is answered; one pass
+    /// from the last hole down then places them all: the output grows once,
+    /// the ids behind each hole move to their place once, and the holes
+    /// before it stay where they are. (Spliced in one at a time, each such
+    /// answer moved every id behind its hole: with new words in front of a
+    /// long text the thread knows, that text moved once for each word.) A
+    /// piece the seed does not hold asks the thread's table once more
+    /// before it is merged: one met twice while it waited is merged once.
+    /// The merge is the table's and asks no model, so the answer comes
+    /// wherever it is due: a piece waits only on an encoder whose table
+    /// merges every short piece ([`Self::merges_every_short_piece`]).
     #[cold]
     #[inline(never)]
     fn answer_waiting(&self, ids: &mut Vec<u32>, cache: &mut PieceCache) {
@@ -3684,11 +3692,16 @@ impl NativeEncoder {
             touched ^= self.seed.touch(piece.vacancy.key());
         }
         std::hint::black_box(touched);
+        // The answers that are not one id: the hole of each and where its ids
+        // begin in the scratch list, the last hole first.
+        let mut late = [(0usize, 0usize); WAITING_PIECES];
+        let mut lates = 0;
+        answer.clear();
         for piece in waiting.iter().rev() {
             let key = piece.vacancy.key();
             let mut vacancy = Some(piece.vacancy);
             let mut one = None;
-            answer.clear();
+            let from = answer.len();
             if piece.clears != cache.clears {
                 match cache.packed.probe(key) {
                     Ok(entry) => {
@@ -3707,7 +3720,10 @@ impl NativeEncoder {
                         {
                             // Not kept as a copy: remembered from its ids.
                             answer.extend(one);
-                            self.remember_seeded(vacancy, 0, &answer, cache);
+                            self.remember_seeded(vacancy, from, &answer, cache);
+                            if one.is_some() {
+                                answer.truncate(from);
+                            }
                         }
                     }
                     Err(_) => match cache.packed.probe(key) {
@@ -3725,18 +3741,48 @@ impl NativeEncoder {
                                     table.merge(piece, &mut answer);
                                 }
                             }
-                            self.remember_piece(piece, Some(fresh), 0, &answer, cache);
+                            self.remember_piece(piece, Some(fresh), from, &answer, cache);
                         }
                     },
                 }
             }
             match one {
                 Some(id) => ids[piece.at] = id,
-                // The splice is done when its iterator is dropped: one move
-                // of the ids behind the hole, or the hole closed for a piece
-                // with no id.
-                None => drop(ids.splice(piece.at..=piece.at, answer.iter().copied())),
+                None if answer.len() == from => {
+                    // No id (a table that merges every short piece gives no
+                    // such answer): the hole closes, and the holes behind it
+                    // move with the ids.
+                    ids.remove(piece.at);
+                    for (at, _) in &mut late[..lates] {
+                        *at -= 1;
+                    }
+                }
+                None => {
+                    late[lates] = (piece.at, from);
+                    lates += 1;
+                }
             }
+        }
+        // One pass from the last hole down: the output grows once by what
+        // the answers of several ids add, the ids behind each hole move to
+        // their place once, and the answer goes in front of them.
+        let mut rest = ids.len();
+        let mut to = rest + answer.len() - lates;
+        ids.resize(to, 0);
+        for index in 0..lates {
+            let (at, from) = late[index];
+            let end = if index + 1 < lates {
+                late[index + 1].1
+            } else {
+                answer.len()
+            };
+            let behind = rest - at - 1;
+            if to != rest {
+                ids.copy_within(at + 1..rest, to - behind);
+            }
+            to -= behind + (end - from);
+            ids[to..to + end - from].copy_from_slice(&answer[from..end]);
+            rest = at;
         }
         cache.waiting = waiting;
         cache.waiting.clear();
