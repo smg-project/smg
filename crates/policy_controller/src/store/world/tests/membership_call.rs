@@ -86,10 +86,18 @@ mod held {
 
     impl Lifecycle for HeldRing {
         fn on_membership(&self, change: &Membership<'_>) {
-            let shown = self
-                .store
-                .upgrade()
-                .map_or(0, |store| store.world().epoch());
+            let store = self.store.upgrade();
+            if let Some(store) = &store {
+                // The call comes under the membership lock, so the writes
+                // arrive in order, and with the load lock let go, so a load
+                // write waits for no stage.
+                assert!(
+                    !store.workers_lock_free(),
+                    "told outside the membership lock"
+                );
+                assert!(store.load_lock_free(), "told under the load lock");
+            }
+            let shown = store.map_or(0, |store| store.world().epoch());
             self.told.lock().push((shown, format!("{change:?}")));
             self.ring.on_membership(change);
         }

@@ -259,20 +259,82 @@ impl Ring {
     /// Keep the named members only (a snapshot after a resync): the others
     /// leave and are fenced, a named id that was fenced is admitted again,
     /// and a named id the ring does not hold joins from the next view, which
-    /// carries its key.
+    /// carries its key. A ring that holds no member reads the names for no
+    /// leaver, and one that holds no fence admits none.
     pub fn retain_only(&mut self, ids: &[WorkerId], now: Instant) {
-        let keep: FxHashSet<WorkerId> = ids.iter().copied().collect();
+        // A fence a named id holds stood before the pruning, which fences
+        // the ids the snapshot does not name.
+        let fenced = !self.fenced.is_empty();
+        if !self.members.is_empty() {
+            let keep: FxHashSet<WorkerId> = ids.iter().copied().collect();
+            self.prune(&keep, now);
+        }
+        if fenced {
+            for &id in ids {
+                self.admit(id);
+            }
+        }
+    }
+
+    /// Remove at `now` every member `keep` does not hold, fencing each. One
+    /// leaver goes as [`Ring::remove`] takes it. Several go in one pass:
+    /// each entry is read once, dropped with its member or renamed to its
+    /// member's new index, where a removal apiece reads every entry twice
+    /// for each leaver.
+    fn prune(&mut self, keep: &FxHashSet<WorkerId>, now: Instant) {
+        /// The mark of a member that leaves, in place of its new index.
+        const LEFT: u32 = u32::MAX;
         let gone: Vec<WorkerId> = self
             .members
             .iter()
             .copied()
             .filter(|member| !keep.contains(member))
             .collect();
-        for id in gone {
-            self.remove(id, now);
-        }
-        for &id in ids {
-            self.admit(id);
+        match gone.as_slice() {
+            [] => {}
+            &[one] => {
+                self.remove(one, now);
+            }
+            _ => {
+                // Each member's index once the leavers are out, in the
+                // order the members stand in.
+                let mut next = 0;
+                let to: Vec<u32> = self
+                    .members
+                    .iter()
+                    .map(|member| {
+                        if keep.contains(member) {
+                            next += 1;
+                            next - 1
+                        } else {
+                            LEFT
+                        }
+                    })
+                    .collect();
+                // Each kept entry is written once, at its new place and
+                // under its member's new index: renamed where it stands
+                // and then moved, the move would wait on the write.
+                let mut kept = 0;
+                for at in 0..self.entries.len() {
+                    let (position, member) = self.entries[at];
+                    let member = to[member as usize];
+                    self.entries[kept] = (position, member);
+                    kept += usize::from(member != LEFT);
+                }
+                self.entries.truncate(kept);
+                self.index.retain(|_, at| {
+                    *at = to[*at as usize];
+                    *at != LEFT
+                });
+                let mut at = 0;
+                self.members.retain(|_| {
+                    at += 1;
+                    to[at - 1] != LEFT
+                });
+                for &id in &gone {
+                    self.retire(id, now);
+                }
+            }
         }
     }
 
@@ -1055,6 +1117,87 @@ mod tests {
         assert_eq!(ring.learn([(id, key_of(id))], first_lapsed), 0);
         assert!(ring.is_retired(id, first_lapsed));
         assert_eq!(ring.learn([(id, key_of(id))], again + FENCE), 1);
+    }
+
+    /// Two retirements of one id told out of order: the later instant holds
+    /// the fence, whichever the ring heard last.
+    #[test]
+    fn the_later_of_two_retirements_told_out_of_order_holds_the_fence() {
+        let mut ring = ring_of(4);
+        let t0 = Instant::now();
+        let id = WorkerId(1_002);
+        let later = t0 + FENCE / 2;
+        assert!(ring.remove(id, later));
+        // The earlier instant arrives second and takes nothing from the
+        // fence.
+        assert!(!ring.remove(id, t0));
+        assert!(ring.is_retired(id, t0 + FENCE), "the earlier instant won");
+        assert_eq!(ring.learn([(id, key_of(id))], t0 + FENCE), 0);
+        assert_eq!(ring.learn([(id, key_of(id))], later + FENCE), 1);
+    }
+
+    /// A snapshot that drops several members leaves the ring a removal
+    /// apiece leaves: every key's owner, each leaver fenced, the indices
+    /// dense.
+    #[test]
+    fn a_snapshot_prunes_several_members_as_a_removal_apiece_would() {
+        let now = Instant::now();
+        let all = ids(12);
+        let stays = |id: &WorkerId| id.0.is_multiple_of(3);
+        let kept: Vec<WorkerId> = all.iter().copied().filter(stays).collect();
+        let mut apiece = ring_of(12);
+        for &id in all.iter().filter(|&id| !stays(id)) {
+            assert!(apiece.remove(id, now));
+        }
+        let mut at_once = ring_of(12);
+        at_once.retain_only(&kept, now);
+        assert_eq!(at_once.members(), kept, "the members keep their order");
+        for key in 0..2_000 {
+            assert_eq!(owner(&at_once, key), owner(&apiece, key), "key {key}");
+        }
+        for (i, &member) in at_once.members().iter().enumerate() {
+            assert_eq!(at_once.member_index(member), Some(i as u32));
+        }
+        assert_eq!(at_once.index.len(), kept.len());
+        assert_eq!(at_once.entries, {
+            let mut alone = Ring::new();
+            alone.add_many(kept.iter().map(|&id| (id, key_of(id))));
+            alone.entries
+        });
+        for &id in &all {
+            assert_eq!(at_once.contains(id), stays(&id), "{id:?}");
+            assert_eq!(at_once.is_retired(id, now), !stays(&id), "{id:?}");
+        }
+        // Each leaver's fence lapses as a removal's does.
+        let pool = all.iter().map(|&id| (id, key_of(id)));
+        assert_eq!(at_once.learn(pool.clone(), now + FENCE / 2), 0);
+        assert_eq!(at_once.learn(pool, now + FENCE), 8);
+        // One leaver goes as a removal takes it.
+        let mut one = ring_of(3);
+        one.retain_only(&[WorkerId(1_000), WorkerId(1_002)], now);
+        assert_eq!(one.members(), [WorkerId(1_000), WorkerId(1_002)]);
+        assert!(one.is_retired(WorkerId(1_001), now));
+    }
+
+    /// A snapshot told to a ring with no member fences nothing and adds
+    /// nothing: the named join from the view. A ring a removal emptied
+    /// still holds its fence, and naming the id lifts it.
+    #[test]
+    fn a_snapshot_told_to_a_ring_with_no_member_still_lifts_a_fence() {
+        let now = Instant::now();
+        let named = ids(4);
+        let mut ring = Ring::new();
+        ring.retain_only(&named, now);
+        assert!(ring.is_empty());
+        assert!(named.iter().all(|&id| !ring.is_retired(id, now)));
+        assert_eq!(ring.learn(named.iter().map(|&id| (id, key_of(id))), now), 4);
+
+        let mut ring = ring_of(1);
+        assert!(ring.remove(WorkerId(1_000), now));
+        assert!(ring.is_empty() && ring.is_retired(WorkerId(1_000), now));
+        ring.retain_only(&named, now);
+        assert!(!ring.is_retired(WorkerId(1_000), now), "named and fenced");
+        assert_eq!(ring.learn([(WorkerId(1_000), 1_000)], now), 1);
     }
 
     /// Learning many members at once builds the ring one add at a time
