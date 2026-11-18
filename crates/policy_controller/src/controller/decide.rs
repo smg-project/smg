@@ -462,11 +462,8 @@ mod tests {
         future::{poll_fn, Future},
         net::SocketAddr,
         pin::{pin, Pin},
-        sync::{
-            atomic::{AtomicUsize, Ordering},
-            mpsc as std_mpsc, Arc,
-        },
-        task::{Context, Poll, Wake, Waker},
+        sync::{atomic::Ordering, mpsc as std_mpsc, Arc},
+        task::{Context, Poll, Waker},
         thread,
         time::{Duration, Instant},
     };
@@ -509,6 +506,7 @@ mod tests {
             replication::journaled_from,
             service::{Service, Shared},
             session::GRACE_PERIOD,
+            watch_workers::tests::Woken,
             wire::{Checked, MAX_FRAME},
         },
         elector::{Elector, Tick},
@@ -1129,16 +1127,6 @@ mod tests {
         release.send(()).expect("the decider waits for the case");
     }
 
-    /// A waker that counts its wakes.
-    #[derive(Default)]
-    struct Woken(AtomicUsize);
-
-    impl Wake for Woken {
-        fn wake(self: Arc<Self>) {
-            self.0.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
     /// A stream of the gateway `NAME` that a case polls by hand, beside its
     /// inbound side, which the case keeps open.
     fn by_hand(bed: &Bed) -> (Frames, impl Stream<Item = super::Out> + Unpin) {
@@ -1156,13 +1144,12 @@ mod tests {
     /// Polls `stream`, which sleeps, under one waker and then under
     /// another: how often the second was woken is read at `Woken`.
     fn slept_under_two<S: Stream + Unpin>(stream: &mut S) -> Arc<Woken> {
-        let wakers = [Arc::new(Woken::default()), Arc::new(Woken::default())];
-        for woken in &wakers {
-            let waker = Waker::from(Arc::clone(woken));
-            let mut cx = Context::from_waker(&waker);
+        let wakers = [Woken::waker(), Woken::waker()];
+        for (_, waker) in &wakers {
+            let mut cx = Context::from_waker(waker);
             assert!(Pin::new(&mut *stream).poll_next(&mut cx).is_pending());
         }
-        let [_, second] = wakers;
+        let [_, (second, _)] = wakers;
         second
     }
 
@@ -1178,21 +1165,20 @@ mod tests {
         seat.end(bed.now());
         bed.at(GRACE_PERIOD);
         assert_eq!(bed.shared.gateways.sweep(bed.now()), 1);
-        assert_eq!(second.0.load(Ordering::Relaxed), 1);
+        assert_eq!(second.wakes(), 1);
         // The listeners close, under a new presence.
         let _seat = bed.welcomed(NAME, 1);
         let (_frames, mut stream) = by_hand(&bed);
         let second = slept_under_two(&mut stream);
         bed.shared.stop.send_replace(true);
-        assert_eq!(second.0.load(Ordering::Relaxed), 1);
+        assert_eq!(second.wakes(), 1);
     }
 
     /// Polls `stream`, which sleeps, in a poll of the case's task that spent
     /// its budget first, then in the task's next poll under the same
     /// waker, as the runtime polls a task it made yield.
     async fn slept_with_no_budget<S: Stream + Unpin>(stream: &mut S) -> Arc<Woken> {
-        let woken = Arc::new(Woken::default());
-        let waker = Waker::from(Arc::clone(&woken));
+        let (woken, waker) = Woken::waker();
         poll_fn(|_| {
             // More units than a task's budget holds.
             let mut spent = pin!(async {
@@ -1224,18 +1210,18 @@ mod tests {
         let seat = bed.welcomed(NAME, 1);
         let (_frames, mut stream) = by_hand(&bed);
         let woken = slept_with_no_budget(&mut stream).await;
-        let before = woken.0.load(Ordering::Relaxed);
+        let before = woken.wakes();
         seat.end(bed.now());
         bed.at(GRACE_PERIOD);
         assert_eq!(bed.shared.gateways.sweep(bed.now()), 1);
-        assert_eq!(woken.0.load(Ordering::Relaxed), before + 1);
+        assert_eq!(woken.wakes(), before + 1);
         // The listeners close, under a new presence.
         let _seat = bed.welcomed(NAME, 1);
         let (_frames, mut stream) = by_hand(&bed);
         let woken = slept_with_no_budget(&mut stream).await;
-        let before = woken.0.load(Ordering::Relaxed);
+        let before = woken.wakes();
         bed.shared.stop.send_replace(true);
-        assert_eq!(woken.0.load(Ordering::Relaxed), before + 1);
+        assert_eq!(woken.wakes(), before + 1);
     }
 
     /// Under no lead a request spends a credit as any other, and its

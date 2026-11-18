@@ -5,8 +5,10 @@
 //! - `policy_store_journal/load_write/<plain|watched|journaled>/<n>`: one
 //!   load record's write inside the publication window; `watched` is a
 //!   journal of the watched kinds alone, which carries no load row;
-//! - `policy_store_journal/status_write/<plain|journaled>/<n>`: one status
-//!   flip of a member, published at once;
+//! - `policy_store_journal/status_write/<plain|journaled|told>/<n>`: one
+//!   status flip of a member, published at once; `told` is the journaled
+//!   write on a log with a listener of the watched kinds, as a controller
+//!   with a watch open has: the write's telling is in the cell;
 //! - `policy_store_journal/member_write/<plain|journaled>/<n>`: one refresh
 //!   of a member's facts, the pool derived again;
 //! - `policy_store_journal/view_build/<plain|journaled>/<n>`: one
@@ -15,6 +17,9 @@
 //!   clock cannot;
 //! - `policy_store_journal/read/<events>`: one reader's copy of a batch out
 //!   of the log, the longest the log's lock is held;
+//! - `policy_store_journal/read/watched_at_head`: a watch's read of the
+//!   watched kinds at their head, beside the load rows: nothing to copy,
+//!   the lock and the look at the log alone;
 //! - `policy_store_journal/cut/<watched|every>/<n>`: one cut of the tables
 //!   of the watched kinds or of every kind: the copy a writer of those
 //!   tables waits for, and the sort after it;
@@ -100,7 +105,15 @@ struct Pool {
 }
 
 fn pool_of(n: usize, loads: Option<usize>) -> Pool {
-    let log = loads.map(|loads| Arc::new(Log::new(WATCHED, loads)));
+    pool_on(n, loads.map(|loads| Log::new(WATCHED, loads)))
+}
+
+/// How a cell builds its pool of so many members.
+type PoolOf = fn(usize) -> Pool;
+
+/// [`pool_of`] on `log`.
+fn pool_on(n: usize, log: Option<Log>) -> Pool {
+    let log = log.map(Arc::new);
     let store = match &log {
         Some(log) => MemoryStore::journaled(Arc::clone(log) as _),
         None => MemoryStore::new(),
@@ -168,9 +181,18 @@ fn load_write(c: &mut Criterion) {
 
 fn status_write(c: &mut Criterion) {
     let mut group = c.benchmark_group("policy_store_journal/status_write");
-    for (kind, loads) in KINDS {
+    let pools: [(&str, PoolOf); 3] = [
+        ("plain", |n| pool_of(n, None)),
+        ("journaled", |n| pool_of(n, Some(LOADS))),
+        // The listener does nothing: the cell holds what the log's telling
+        // adds to the write, and none of a watch's work.
+        ("told", |n| {
+            pool_on(n, Some(Log::new(WATCHED, LOADS).on_watched(|| {})))
+        }),
+    ];
+    for (kind, pool_of) in pools {
         for n in SIZES {
-            let pool = pool_of(n, loads);
+            let pool = pool_of(n);
             let id = pool.ids[n / 2];
             let mut ready = true;
             group.bench_with_input(BenchmarkId::new(kind, n), &n, |b, _| {
@@ -271,6 +293,18 @@ fn read(c: &mut Criterion) {
             });
         });
     }
+    let head = log.head(Kinds::Watched);
+    let mut out = Vec::with_capacity(16);
+    log.read(Kinds::Watched, head, 16, &mut out)
+        .expect("retained");
+    assert!(out.is_empty(), "the reader is at the head");
+    group.bench_function("watched_at_head", |b| {
+        b.iter(|| {
+            log.read(Kinds::Watched, black_box(head), 16, &mut out)
+                .expect("retained");
+            black_box(out.len())
+        });
+    });
     group.finish();
 }
 
