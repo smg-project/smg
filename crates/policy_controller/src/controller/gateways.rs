@@ -619,6 +619,10 @@ impl Gateways {
             written == VetoWrite::Written
         });
         row.vetoes = listed;
+        // The list replaced the note: the epoch kept for the old note's
+        // last walk says nothing of this one, and the next frame at the
+        // ceiling asks the store whatever the epoch reads by then.
+        row.left_at = None;
         row.held = row.vetoes.values().map(Vec::len).sum();
         row.held
     }
@@ -1689,6 +1693,26 @@ pub(crate) mod tests {
         drop(seat);
     }
 
+    /// A list that fills a note to its ceiling: [`KINDS_MAX`] kinds on each
+    /// of `workers`, every end at sixty seconds.
+    fn full_list(workers: &[WorkerId], t0: Instant) -> Vec<(WorkerId, i32, Instant)> {
+        let kinds = i32::try_from(KINDS_MAX).expect("a small number");
+        workers
+            .iter()
+            .flat_map(|&w| (1..=kinds).map(move |kind| (w, kind, t0 + 60 * S)))
+            .collect()
+    }
+
+    /// Fills the seat's note to its ceiling of [`VETOES_MAX`] ends on newly
+    /// registered workers ([`full_list`]). Returns the workers.
+    fn filled(store: &MemoryStore, seat: &Seat, t0: Instant) -> Vec<WorkerId> {
+        let workers: Vec<WorkerId> = (0..VETOES_MAX / KINDS_MAX)
+            .map(|n| worker(store, &format!("http://w{n}:8000")))
+            .collect();
+        assert_eq!(seat.restore(&full_list(&workers, t0), t0), VETOES_MAX);
+        workers
+    }
+
     /// A gateway's ceiling counts the vetoes the store shows: the ends of
     /// workers whose rows left go before the refusal, and the frame that
     /// would set one more is taken.
@@ -1696,15 +1720,7 @@ pub(crate) mod tests {
     fn a_gateways_ceiling_counts_no_end_of_a_row_that_left() {
         let (_elector, store, gateways, t0) = leading(GRACE);
         let seat = welcomed(&gateways, A, "gateway-a", TERM, t0);
-        let kinds = i32::try_from(KINDS_MAX).expect("a small number");
-        let workers: Vec<WorkerId> = (0..VETOES_MAX / KINDS_MAX)
-            .map(|n| worker(&store, &format!("http://w{n}:8000")))
-            .collect();
-        let list: Vec<(WorkerId, i32, Instant)> = workers
-            .iter()
-            .flat_map(|&w| (1..=kinds).map(move |kind| (w, kind, t0 + 60 * S)))
-            .collect();
-        assert_eq!(seat.restore(&list, t0), VETOES_MAX);
+        let workers = filled(&store, &seat, t0);
         // Every row but the first leaves, and its vetoes with it: the note
         // still holds their ends.
         for &w in &workers[1..] {
@@ -1734,15 +1750,7 @@ pub(crate) mod tests {
     fn a_refusal_at_a_true_ceiling_asks_the_store_once_a_membership_epoch() {
         let (_elector, store, gateways, t0) = leading(GRACE);
         let seat = welcomed(&gateways, A, "gateway-a", TERM, t0);
-        let kinds = i32::try_from(KINDS_MAX).expect("a small number");
-        let workers: Vec<WorkerId> = (0..VETOES_MAX / KINDS_MAX)
-            .map(|n| worker(&store, &format!("http://w{n}:8000")))
-            .collect();
-        let list: Vec<(WorkerId, i32, Instant)> = workers
-            .iter()
-            .flat_map(|&w| (1..=kinds).map(move |kind| (w, kind, t0 + 60 * S)))
-            .collect();
-        assert_eq!(seat.restore(&list, t0), VETOES_MAX);
+        let workers = filled(&store, &seat, t0);
         let one_more = worker(&store, "http://one-more:8000");
         // Every row stands: the frame is refused, and the store was asked.
         assert_eq!(
@@ -1767,6 +1775,53 @@ pub(crate) mod tests {
             Vetoed::Shown
         );
         assert!(store.vetoed(A, one_more, t0 + S));
+        assert_eq!(gateways.kept(A), VETOES_MAX - KINDS_MAX + 1);
+        drop(seat);
+    }
+
+    /// A noted worker removed after a refusal kept the epoch: the store's
+    /// removal is a membership write, so the next frame at the ceiling
+    /// asks the store again, the removed worker's ends go and the veto is
+    /// shown.
+    #[test]
+    fn a_noted_worker_removed_under_a_kept_epoch_has_the_store_asked_again() {
+        let (_elector, store, gateways, t0) = leading(GRACE);
+        let seat = welcomed(&gateways, A, "gateway-a", TERM, t0);
+        let workers = filled(&store, &seat, t0);
+        let one_more = worker(&store, "http://one-more:8000");
+        let frame = || seat.veto(one_more, BREAKER, Some(t0 + 60 * S), t0 + S);
+        // Refused twice, the second time under the epoch the first kept.
+        assert_eq!((frame(), frame()), (Vetoed::Over, Vetoed::Over));
+        let revision = WorkersStore::get(&*store, workers[1])
+            .expect("the row")
+            .revision;
+        WorkersStore::remove(&*store, workers[1], revision).expect("removed");
+        assert_eq!(frame(), Vetoed::Shown);
+        assert!(store.vetoed(A, one_more, t0 + S));
+        assert_eq!(gateways.kept(A), VETOES_MAX - KINDS_MAX + 1);
+        drop(seat);
+    }
+
+    /// A `Hello`'s list replaces the note, and the epoch kept for the old
+    /// note's walk goes with it: the first frame at the ceiling after the
+    /// list asks the store, under the same membership epoch.
+    #[test]
+    fn a_list_that_replaces_the_note_drops_the_epoch_its_walk_kept() {
+        let (_elector, store, gateways, t0) = leading(GRACE);
+        let seat = welcomed(&gateways, A, "gateway-a", TERM, t0);
+        let workers = filled(&store, &seat, t0);
+        let one_more = worker(&store, "http://one-more:8000");
+        let frame = || seat.veto(one_more, BREAKER, Some(t0 + 60 * S), t0 + S);
+        // The refusal walks the note and keeps the epoch.
+        assert_eq!(frame(), Vetoed::Over);
+        // The gateway's list is laid again, whole, with no membership
+        // write between.
+        assert_eq!(seat.restore(&full_list(&workers, t0), t0), VETOES_MAX);
+        // The store loses one worker's veto behind the new note, by no
+        // membership write: the frame asks the store all the same, that
+        // worker's ends go and the veto is shown.
+        HealthSink::gateway_veto(&*store, A, workers[1], None);
+        assert_eq!(frame(), Vetoed::Shown);
         assert_eq!(gateways.kept(A), VETOES_MAX - KINDS_MAX + 1);
         drop(seat);
     }
