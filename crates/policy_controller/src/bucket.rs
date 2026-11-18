@@ -1892,6 +1892,51 @@ mod tests {
         assert_eq!(listed, [wider[0].id, wider[2].id]);
     }
 
+    /// A view older than two leaves places the rows behind the leavers as
+    /// a view taken after the leaves does, whether the filters kept a
+    /// leaver's row or dropped it.
+    #[test]
+    fn a_view_older_than_two_leaves_places_the_rows_behind_them_as_a_new_view_does() {
+        let (scorer, pool) = booked(NEVER, 1.5, &[10, 20, 30, 40, 50, 60]);
+        for row in [1, 3] {
+            scorer.on_membership(&Membership::Removed(pool[row].id));
+        }
+        let mut new: Vec<Candidate> = [0, 2, 4, 5].map(|row: usize| pool[row]).to_vec();
+        for (position, row) in new.iter_mut().enumerate() {
+            row.position = position as u32;
+        }
+        // The old view's first leaver passed the filters and its second did
+        // not.
+        let kept = [0, 1, 2, 4, 5];
+        for tokens in [0, 1_000, 2_000, 3_000, 4_000] {
+            let facts = prefill("m", tokens, 2 * SECOND);
+            let by_new = led(&scorer, &new, tokens, 2 * SECOND).map(|row| new[row as usize].id);
+            let by_old = led_by(&scorer, &facts, &pool, &kept).map(|row| pool[row as usize].id);
+            assert_eq!(by_old, by_new, "{tokens} tokens");
+            assert!(by_old.is_some(), "{tokens} tokens have an owner");
+        }
+        assert_eq!(loads(&scorer), (vec![10, 30, 50, 60], 150));
+    }
+
+    /// The fenced rows a partition keeps are its last listing's alone: the
+    /// next listing starts from none, so the list never outgrows a view.
+    #[test]
+    fn the_fenced_rows_a_partition_keeps_are_its_last_listings_alone() {
+        let (scorer, pool) = booked(NEVER, 1.5, &[10, 20, 30]);
+        let gone = pool[1].id;
+        scorer.on_membership(&Membership::Removed(gone));
+        for _ in 0..3 {
+            led(&scorer, &pool, 0, 2 * SECOND);
+            assert_eq!(of(&scorer, "m").lock().fenced, [(1, gone)]);
+        }
+        // The feed names the worker again: the old view's next decision
+        // lists it, and that listing keeps no fenced row.
+        scorer.on_membership(&Membership::Added(gone));
+        led(&scorer, &pool, 0, 2 * SECOND);
+        assert!(of(&scorer, "m").lock().fenced.is_empty());
+        assert_eq!(loads(&scorer).0.len(), 3);
+    }
+
     #[test]
     fn the_feed_naming_a_worker_again_lifts_its_fence() {
         // Added: the worker joins from the next view that shows it.
