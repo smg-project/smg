@@ -647,11 +647,12 @@ type Read<'a> = (
 /// rows were published under, and those rows as the asking gateway reaches
 /// them at the decision's instant, with the affinity column where the
 /// request's profile declares it. A request that states no wires and no
-/// hint of 0 reads the rows where their publication left them
-/// ([`World::view`]), its gateway's standing vetoes beside them. One that
-/// states wires or a hint of 0, and one whose profile shows its rows to a
-/// plugin, is handed rows written for it ([`World::build`]), less what the
-/// gateway states of itself takes ([`narrow`]). The rows its wires take are
+/// hint of 0 reads its pool by the store's one door ([`World::view`]): the
+/// rows where their publication left them, its gateway's standing vetoes
+/// beside them, or rows the door writes where the request's profile shows
+/// them to a plugin. One that states wires or a hint of 0 is handed rows
+/// written for it ([`World::build`]), less what the gateway states of
+/// itself takes ([`narrow`]). The rows its wires take are
 /// counted in `undialed`, the decider's own part, and the list they leave
 /// takes a name of its own ([`cut_reach`]). The request's block hashes are
 /// cut at what that generation reads of them.
@@ -703,11 +704,12 @@ fn hand<R>(
         generation: spec.generation(),
         ..PoolFacts::default()
     };
-    // Nothing of the request's own is cut out of lent rows, and a plugin is
-    // shown a row's bits and ages as the row's own fields.
-    let lent = wires.is_none() && request.subset() != Some(0) && !shown;
-    let (pool, now_micros, candidates, stalled, affinity): Read<'_> = if lent {
-        match world.view(model, role, &ask, false, view) {
+    // Nothing of the request's own is cut out of the rows the door hands:
+    // the publication's own, or a copy the door writes for a plugin, which
+    // is shown a row's bits and ages as the row's own fields.
+    let uncut = wires.is_none() && request.subset() != Some(0);
+    let (pool, now_micros, candidates, stalled, affinity): Read<'_> = if uncut {
+        match world.view(model, role, &ask, shown, view) {
             Some(read) => (
                 read.built.pool_facts(),
                 read.built.now_micros,
@@ -816,13 +818,15 @@ pub(crate) mod tests {
         Reads, Refused, Taken, PARTS,
     };
     use crate::{
+        catalog::Catalog,
         controller::{
             election::Standing,
             gateways::tests::PATIENT,
             wire::{self, Checked},
         },
         elector::{Elector, Tick},
-        framework::Scratch,
+        framework::{DecisionScope, Filter, Scratch},
+        lease::Lifecycle,
         proto::{self, busy::Reason, decide_answer::Answer, decision::Outcome},
         spec::{AppliedSpec, PolicySpec},
         store::{
@@ -1507,6 +1511,88 @@ pub(crate) mod tests {
         assert_eq!(read(both), (2, 2), "wires that cut none: written");
         let none = constrained(frame_for(SPOKEN, 5, 5), 0, Some(0));
         assert_eq!(read(none), (0, 0), "a hint of 0");
+    }
+
+    /// A profile that shows its rows to a plugin is handed rows the door
+    /// wrote for it, under a veto of its gateway as under none: the vetoed
+    /// row carries its own bit, no mask stands beside the rows, and the
+    /// engine decides where it declines lent rows.
+    #[test]
+    fn a_profile_that_shows_its_rows_is_handed_written_rows_and_decides_under_a_veto() {
+        #[derive(Debug)]
+        struct Shown;
+
+        impl Lifecycle for Shown {}
+
+        impl DecisionScope for Shown {
+            fn open(&self, _: &RequestFacts<'_>, _: &[Candidate], _: &PoolFacts<'_>) {}
+
+            fn close(&self) {}
+        }
+
+        impl Filter for Shown {
+            fn name(&self) -> &'static str {
+                "shown"
+            }
+
+            fn keep(&self, _: &RequestFacts<'_>, _: &Candidate, _: &Constraints<'_>) -> bool {
+                true
+            }
+
+            fn scope(&self) -> Option<&dyn DecisionScope> {
+                Some(self)
+            }
+        }
+
+        let mut catalog = Catalog::builtin();
+        catalog
+            .filter("shown", || Box::new(Shown))
+            .expect("a free name");
+        let mut document = PolicySpec::preset("random").expect("a preset of this build");
+        document.generation = 1;
+        for profile in document.profiles.values_mut() {
+            profile.filter.push("shown".to_string());
+        }
+        let digest = document.digest().expect("the document digests");
+        let spec = AppliedSpec::validate_digested(&document, digest, &catalog)
+            .expect("the catalog holds every stage the document names");
+        let store = MemoryStore::new();
+        let (mut singles, _) = fleet(&store);
+        singles.sort_unstable();
+        store.apply(spec).expect("above the unbound start");
+        let taken = Instant::now();
+        let now = taken + Duration::from_secs(3);
+        // The rows whose own bit says stalled, the mask's length, whether
+        // the engine picked, and the rows written into the decider's
+        // buffers.
+        let decided = || {
+            let request = checked(frame(1, 1));
+            let taken = Taken::at(&request, GATEWAY, now, now).expect("budget is left");
+            let mut buffers = Buffers::default();
+            let (stalled, masked, picked) = store.deciding(|world| {
+                hand(
+                    world,
+                    &taken,
+                    &mut buffers,
+                    &AtomicU64::new(0),
+                    |facts, pool, rows, cx, scratch| {
+                        let stalled: Vec<WorkerId> = rows
+                            .iter()
+                            .filter(|row| row.health.stalled)
+                            .map(|row| row.id)
+                            .collect();
+                        let engine = world.spec().engine();
+                        let decision = engine.decide(facts, pool, rows, cx, scratch);
+                        (stalled, cx.stalled.len(), decision.pick().is_some())
+                    },
+                )
+            });
+            (stalled, masked, picked, buffers.view.candidates.len())
+        };
+        assert_eq!(decided(), (Vec::new(), 0, true, 3), "no veto");
+        let vetoed = singles[1];
+        store.gateway_veto(GATEWAY, vetoed, Some(taken + Duration::from_secs(60)));
+        assert_eq!(decided(), (vec![vetoed], 0, true, 3), "a veto");
     }
 
     /// What the engine is handed for one request, copied out of the
