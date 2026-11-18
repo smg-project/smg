@@ -1389,6 +1389,22 @@ mod tests {
             ..request(schema)
         };
         assert!(validate_interactions_request(&with_mime).is_ok());
+
+        // Through the public path: a request with a typed format reads,
+        // validates, and is written back with the format as sent and no
+        // `response_mime_type`.
+        let image = serde_json::json!({"type": "image", "mime_type": "image/jpeg"});
+        let typed: InteractionsRequest = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "input": "Draw a city.",
+            "store": false,
+            "response_format": image
+        }))
+        .unwrap();
+        assert!(typed.validate().is_ok(), "{:?}", typed.validate());
+        let written = crate::common::to_value_exact(&typed).unwrap();
+        assert_eq!(written["response_format"], image);
+        assert!(written.get("response_mime_type").is_none());
     }
 
     /// The tools the public API declares beside the ones the gateway knew
