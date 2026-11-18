@@ -1508,7 +1508,8 @@ struct ModelArgs {
     /// Parser for reasoning models (e.g., deepseek-r1, qwen3). Under --parser
     /// symphony, a worker's labels decide for its model, else Symphony's
     /// registry for a model it knows, and this flag for the models the
-    /// registry does not know: a Symphony table's name here (and in
+    /// registry does not know (for every model, before the registry, under
+    /// --parser-flags-over-registry): a Symphony table's name here (and in
     /// --tool-call-parser, or there alone) reads them with that table, and
     /// so does a legacy parser's name whose format a table reads (the
     /// table's aliases); `hf` reads each with the table its tokenizer's
@@ -1520,7 +1521,8 @@ struct ModelArgs {
     /// Parser for tool-call interactions (e.g., json, qwen). Under --parser
     /// symphony, a worker's labels decide for its model, else Symphony's
     /// registry for a model it knows, and this flag for the models the
-    /// registry does not know: a Symphony table's name here (and in
+    /// registry does not know (for every model, before the registry, under
+    /// --parser-flags-over-registry): a Symphony table's name here (and in
     /// --reasoning-parser, or here alone) reads them with that table, and
     /// so does a legacy parser's name whose format a table reads (the
     /// table's aliases); `hf` reads each with the table its tokenizer's
@@ -1533,7 +1535,8 @@ struct ModelArgs {
     /// Symphony (the default) or the per-model parsers (legacy). With
     /// Symphony, a model's worker labels decide, else Symphony's registry
     /// for a model it knows, else --tool-call-parser and
-    /// --reasoning-parser: a Symphony table's name reads with that table,
+    /// --reasoning-parser (before the registry under
+    /// --parser-flags-over-registry): a Symphony table's name reads with that table,
     /// and so does a legacy parser's name whose format a table reads (qwen
     /// for qwen3, qwen_xml for qwen3_tagged: the table's aliases, so
     /// existing flags keep a working parser); any other legacy parser's
@@ -1543,6 +1546,19 @@ struct ModelArgs {
     /// flag for that request.
     #[arg(long, default_value = "symphony", value_parser = ["legacy", "symphony"], help_heading = "Parsers")]
     parser: String,
+
+    /// Under --parser symphony, read every model with what --tool-call-parser
+    /// and --reasoning-parser select, before Symphony's registry: a worker's
+    /// labels decide for its model, else the flags, else the registry's table
+    /// for a model it knows, else the legacy parsers. A table the flags name
+    /// that the registry also gives the model keeps the model's own turn
+    /// opener; a legacy tool-call parser's name (pythonic) or passthrough
+    /// keeps the legacy parsers for every model; a reasoning name alone that
+    /// no table answers to selects nothing and leaves the model to the
+    /// registry. Off by default, so a fleet-wide name never reads a family the
+    /// registry has a table for; for a gateway that serves one model.
+    #[arg(long, default_value_t = false, help_heading = "Parsers")]
+    parser_flags_over_registry: bool,
 
     /// Path to MCP server configuration file
     #[arg(long, help_heading = "Parsers")]
@@ -4563,6 +4579,23 @@ mod tests {
             ParserChoice::Symphony
         );
         assert!(Cli::try_parse_from(["smg", "--parser", "fast"]).is_err());
+    }
+
+    /// The registry reads over the parser flags unless `--parser-flags-over-registry` puts them
+    /// first, in both conversions.
+    #[test]
+    fn parser_flags_over_registry_is_off_unless_set() {
+        let cli = cli_args_from(&[]);
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+        assert!(!router_config.parser_flags_over_registry);
+        let server_config = cli.to_server_config(router_config).unwrap();
+        assert!(!server_config.router_config.parser_flags_over_registry);
+
+        let cli = cli_args_from(&["--parser-flags-over-registry"]);
+        let router_config = cli.to_router_config(vec![], vec![]).unwrap();
+        assert!(router_config.parser_flags_over_registry);
+        let server_config = cli.to_server_config(router_config).unwrap();
+        assert!(server_config.router_config.parser_flags_over_registry);
     }
 
     /// clap rejects out-of-range probe ports at parse time (the `u16`

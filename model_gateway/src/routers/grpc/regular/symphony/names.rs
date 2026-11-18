@@ -95,7 +95,7 @@ pub(crate) enum Fallback {
     ReasoningNameOnly,
     /// A legacy tool-call parser's name no table answers to (`pythonic`): the way back
     /// to the legacy parsers for one model (the labels) or for the models the registry does not
-    /// know (the flags).
+    /// know (the flags), every model under `--parser-flags-over-registry`.
     LegacyToolName,
     /// `passthrough`, as the tool-call name or alone as the reasoning name: the choice to leave a
     /// channel as written, which no table does.
@@ -141,32 +141,53 @@ fn nothing_reason(names: &ModelNames<'_>) -> Fallback {
 /// workers' labels), when they select anything; else the registry's table, for a model it knows
 /// (`symphony::formats::for_model`); else the gateway's `--tool-call-parser` and
 /// `--reasoning-parser`, for a model the registry does not know; else the legacy parsers, with
-/// their own detection, the reason named ([`Fallback`]). So a fleet-wide name reads the models
-/// the registry has no table for and never a family it has one for, and a worker's labels read
-/// their model whatever the registry has. A table the labels select reads a model the registry
-/// gives the same table with the model's own turn opener; another model, or one the registry
-/// does not know, replays from the table's own. The registry is asked once per path, as before
-/// the flags came apart.
+/// their own detection, the reason named ([`Fallback`]). So by default a fleet-wide name reads
+/// the models the registry has no table for and never a family it has one for, and a worker's
+/// labels read their model whatever the registry has. Under `--parser-flags-over-registry`
+/// ([`ModelNames::flags_over_registry`]), for a gateway whose flags name the one model it serves,
+/// the flags come before the registry: labels, then the flags when they select anything, then the
+/// registry, then the legacy parsers. The flags' legacy tool-call name or `passthrough` then keeps
+/// the legacy parsers for a model the registry knows too, and a reasoning name alone that no
+/// table answers to still selects nothing, so the registry reads. A table the labels, or the
+/// flags put first, select reads a model the registry gives the same table with the model's own
+/// turn opener; another model, or one the registry does not know, replays from the table's own.
+/// The registry is asked once per path, as before the flags came apart.
 pub(super) fn decision(names: &ModelNames<'_>, model: &str) -> Decision {
-    match selection(&names.labels) {
+    if let Some(decided) = decided_by(&names.labels, model) {
+        return decided;
+    }
+    if names.flags_over_registry {
+        if let Some(decided) = decided_by(names.flags, model) {
+            return decided;
+        }
+    }
+    match for_model_shared(model) {
+        Some(format) => Decision::Table(format),
+        // The registry does not know the model: the flags read it, a table they name from its
+        // own opener.
+        None => match selection(names.flags) {
+            Selection::Template => Decision::Template,
+            Selection::Table(table) => Decision::Table(table.shared()),
+            Selection::Legacy => Decision::Legacy(legacy_reason(names.flags)),
+            Selection::Nothing => Decision::Legacy(nothing_reason(names)),
+        },
+    }
+}
+
+/// What one source's names decide for `model` ahead of the registry ([`decision`]): the response
+/// template, the legacy parsers with the reason, or a table, the registry's own format of it where
+/// the registry gives `model` the same table, so the model keeps its own turn opener; `None` when
+/// they select nothing, which leaves the decision to the next source.
+fn decided_by(names: &Names, model: &str) -> Option<Decision> {
+    Some(match selection(names) {
+        Selection::Nothing => return None,
         Selection::Template => Decision::Template,
-        Selection::Legacy => Decision::Legacy(legacy_reason(&names.labels)),
+        Selection::Legacy => Decision::Legacy(legacy_reason(names)),
         Selection::Table(table) => Decision::Table(match for_model_shared(model) {
             Some(format) if table_for(model) == Some(table) => format,
             _ => table.shared(),
         }),
-        Selection::Nothing => match for_model_shared(model) {
-            Some(format) => Decision::Table(format),
-            // The registry does not know the model: the flags read it, a table they name from
-            // its own opener.
-            None => match selection(names.flags) {
-                Selection::Template => Decision::Template,
-                Selection::Table(table) => Decision::Table(table.shared()),
-                Selection::Legacy => Decision::Legacy(legacy_reason(names.flags)),
-                Selection::Nothing => Decision::Legacy(nothing_reason(names)),
-            },
-        },
-    }
+    })
 }
 
 /// What reads a model's responses under a parser ([`reading`]). Preparation reads it once per
@@ -252,12 +273,13 @@ pub(crate) fn table_label_read(names: &ModelNames<'_>, model: &str) -> Option<&'
     }
 }
 
-/// What the gateway's flags select for `model`, a model the registry knows, that the precedence of
-/// [`decision`] sets aside for a worker labeling no parser: the registry's table, which reads the
-/// model, and the flags' choice spelled for a log line (`the table 'mistral_v13'`, `the model's
-/// response template`, `the legacy parsers`). `None` when the flags select nothing or the
-/// registry's own table, or when the registry does not know the model. Registration warns with it
-/// once per model (`workflow::steps::local::create_worker`).
+/// What the gateway's flags select for `model`, a model the registry knows, that the default
+/// precedence of [`decision`] sets aside for a worker labeling no parser: the registry's table,
+/// which reads the model, and the flags' choice spelled for a log line (`the table 'mistral_v13'`,
+/// `the model's response template`, `the legacy parsers`). `None` when the flags select nothing or
+/// the registry's own table, or when the registry does not know the model. Registration warns with
+/// it once per model (`workflow::steps::local::create_worker`), except under
+/// `--parser-flags-over-registry`, where the flags read the model and nothing is set aside.
 pub(crate) fn set_aside_by_the_registry(
     flags: &Names,
     model: &str,
@@ -1177,7 +1199,11 @@ mod tests {
         let v13 = pair(Some("mistral_v13"), None);
         let no_flags = Names::default();
         fn labeled<'a>(labels: Names, flags: &'a Names) -> ModelNames<'a> {
-            ModelNames { labels, flags }
+            ModelNames {
+                labels,
+                flags,
+                flags_over_registry: false,
+            }
         }
 
         // The labels over the registry: a table they name reads a model the registry reads with
@@ -1269,7 +1295,11 @@ mod tests {
             Decision::Template | Decision::Table(_) => None,
         };
         fn labeled<'a>(labels: Names, flags: &'a Names) -> ModelNames<'a> {
-            ModelNames { labels, flags }
+            ModelNames {
+                labels,
+                flags,
+                flags_over_registry: false,
+            }
         }
 
         // The labels' way back, for a model the registry knows as for one it does not.
@@ -1452,7 +1482,14 @@ mod tests {
         let no_flags = Names::default();
         let flags = pair(Some("mistral_v13"), None);
         let read = |labels: Names, flags: &Names, model: &str| {
-            table_label_read(&ModelNames { labels, flags }, model)
+            table_label_read(
+                &ModelNames {
+                    labels,
+                    flags,
+                    flags_over_registry: false,
+                },
+                model,
+            )
         };
         assert_eq!(
             read(Names::default(), &no_flags, "Qwen/Qwen3-8B"),
@@ -1481,6 +1518,162 @@ mod tests {
         assert_eq!(
             read(pair(Some("passthrough"), None), &no_flags, "Qwen/Qwen3-8B"),
             None
+        );
+        // Under `--parser-flags-over-registry` the flags' table is the one counted for a model
+        // the registry knows.
+        let flags_first = ModelNames {
+            labels: Names::default(),
+            flags: &flags,
+            flags_over_registry: true,
+        };
+        assert_eq!(
+            table_label_read(&flags_first, "Qwen/Qwen3-8B"),
+            Some("mistral_v13")
+        );
+    }
+
+    /// Under `--parser-flags-over-registry` the flags come before the registry: a worker's labels,
+    /// then the flags when they select anything, then the registry's table, then the legacy
+    /// parsers. Off, the default, the registry's table reads a model it knows whatever the flags
+    /// name. Each rule, on the measured cases: Step 3.5 Flash and GLM 4.6, which the registry
+    /// reads with `qwen3_tagged` and `glm4`.
+    #[test]
+    fn the_flags_read_over_the_registry_when_the_gateway_puts_them_first() {
+        let step = "stepfun-ai/Step-3.5-Flash";
+        let glm46 = "zai-org/GLM-4.6";
+        assert_eq!(table_for(step), Some(Table::Qwen3Tagged));
+        assert_eq!(table_for(glm46), Some(Table::Glm4));
+        fn first<'a>(labels: Names, flags: &'a Names) -> ModelNames<'a> {
+            ModelNames {
+                labels,
+                flags,
+                flags_over_registry: true,
+            }
+        }
+        // The table that reads, by the name it counts under: the Qwen3 table's tagged-call
+        // variant, which reads Step 3.5 Flash, is named `qwen3` as a format.
+        let table = |names: &ModelNames<'_>, model: &str| match decision(names, model) {
+            Decision::Table(format) => Some(format.name().to_string()),
+            Decision::Template | Decision::Legacy(_) => None,
+        };
+        let why = |names: &ModelNames<'_>, model: &str| match decision(names, model) {
+            Decision::Legacy(why) => Some(why),
+            Decision::Template | Decision::Table(_) => None,
+        };
+        let step3 = pair(Some("step3"), Some("step3"));
+        let glm47 = pair(Some("glm47_moe"), Some("glm45"));
+
+        // The default is unchanged: the registry's table reads the models it knows over the
+        // flags.
+        assert_eq!(why(&ModelNames::flagged(&step3), step), None);
+        assert_eq!(
+            table(&ModelNames::flagged(&step3), step).as_deref(),
+            Some("qwen3")
+        );
+        assert_eq!(
+            table(&ModelNames::flagged(&glm47), glm46).as_deref(),
+            Some("glm4")
+        );
+
+        // Put first, a table the flags name reads the model; a legacy tool-call name no table
+        // answers to keeps the legacy parsers, as it does for a model the registry does not
+        // know; `passthrough` too.
+        assert_eq!(
+            table(&first(Names::default(), &glm47), glm46).as_deref(),
+            Some("glm")
+        );
+        assert_eq!(
+            why(&first(Names::default(), &step3), step),
+            Some(Fallback::LegacyToolName)
+        );
+        assert_eq!(
+            why(
+                &first(Names::default(), &pair(Some("pythonic"), None)),
+                glm46
+            ),
+            Some(Fallback::LegacyToolName)
+        );
+        assert_eq!(
+            why(
+                &first(Names::default(), &pair(None, Some("passthrough"))),
+                glm46
+            ),
+            Some(Fallback::Passthrough)
+        );
+        assert!(matches!(
+            reading(
+                ParserChoice::Symphony,
+                &first(Names::default(), &step3),
+                step,
+                &templates()
+            ),
+            Ok(Reading::Fallback(Fallback::LegacyToolName))
+        ));
+        // `hf` asks the response template's table, for a model the registry knows too.
+        assert!(matches!(
+            decision(
+                &first(Names::default(), &pair(Some(TEMPLATE_PARSER), None)),
+                glm46
+            ),
+            Decision::Template
+        ));
+
+        // Flags that name the table the registry gives the model read it with the registry's
+        // format of it, the model's own turn opener (Step 3.5 Flash's newline after it), not the
+        // table's own.
+        let qwen_xml = pair(Some("qwen_xml"), None);
+        let Decision::Table(by_flags) = decision(&first(Names::default(), &qwen_xml), step) else {
+            panic!("the flags' table reads Step 3.5 Flash");
+        };
+        let registry = for_model_shared(step).expect("the registry knows Step 3.5 Flash");
+        assert!(Arc::ptr_eq(&by_flags, &registry));
+        assert!(!Arc::ptr_eq(&by_flags, &Table::Qwen3Tagged.shared()));
+        let Decision::Table(other) = decision(&first(Names::default(), &glm47), glm46) else {
+            panic!("the flags' table reads GLM 4.6");
+        };
+        assert!(Arc::ptr_eq(&other, &Table::Glm.shared()));
+
+        // The labels still decide for their model over the flags: a table, or their way back.
+        assert_eq!(
+            table(&first(pair(Some("kimi_k3"), None), &glm47), glm46).as_deref(),
+            Some("kimi_k3")
+        );
+        assert_eq!(
+            why(&first(pair(Some("pythonic"), None), &glm47), glm46),
+            Some(Fallback::LegacyToolName)
+        );
+        assert_eq!(
+            table(&first(pair(Some("qwen_xml"), None), &step3), step).as_deref(),
+            Some("qwen3")
+        );
+
+        // A reasoning name alone that no table answers to selects nothing, so the registry
+        // reads a model it knows, and nothing reads one it does not.
+        let r1 = pair(None, Some("deepseek_r1"));
+        assert_eq!(
+            table(&first(Names::default(), &r1), glm46).as_deref(),
+            Some("glm4")
+        );
+        assert_eq!(
+            why(&first(Names::default(), &r1), "acme/unknown-model"),
+            Some(Fallback::ReasoningNameOnly)
+        );
+        // No flags at all: the registry, as by default.
+        assert_eq!(
+            table(&first(Names::default(), &Names::default()), step).as_deref(),
+            Some("qwen3")
+        );
+        // A model the registry does not know reads as by default.
+        assert_eq!(
+            table(&first(Names::default(), &glm47), "acme/unknown-model").as_deref(),
+            Some("glm")
+        );
+        assert_eq!(
+            why(
+                &first(Names::default(), &Names::default()),
+                "acme/unknown-model"
+            ),
+            Some(Fallback::NoTable)
         );
     }
 }

@@ -654,6 +654,9 @@ struct Router {
     overload_token_usage_threshold: f32,
     /// `symphony` (the default) or `legacy`: which parser reads a chat completion's output.
     parser: String,
+    /// Under `symphony`, the parser flags read every model before Symphony's registry
+    /// (`--parser-flags-over-registry`).
+    parser_flags_over_registry: bool,
     pd_admission_wait_secs: u64,
     pd_disaggregation: bool,
     pd_pairing_mode: String,
@@ -1483,6 +1486,7 @@ impl Router {
             })
             .disable_tokenizer_autoload(self.disable_tokenizer_autoload)
             .parser(parser)
+            .parser_flags_over_registry(self.parser_flags_over_registry)
             .history_backend(history_backend)
             .memory_config(config::MemoryConfig {
                 max_responses: self.history_memory_max_responses,
@@ -1719,6 +1723,7 @@ impl Router {
         overlap_decay = 0.0,
         overload_token_usage_threshold = 1.0,
         parser = String::from("symphony"),
+        parser_flags_over_registry = false,
         pd_admission_wait_secs = 30,
         pd_disaggregation = false,
         pd_pairing_mode = String::from("lenient"),
@@ -1946,6 +1951,7 @@ impl Router {
         overlap_decay: f32,
         overload_token_usage_threshold: f32,
         parser: String,
+        parser_flags_over_registry: bool,
         pd_admission_wait_secs: u64,
         pd_disaggregation: bool,
         pd_pairing_mode: String,
@@ -2224,6 +2230,7 @@ impl Router {
             overlap_decay,
             overload_token_usage_threshold,
             parser,
+            parser_flags_over_registry,
             pd_admission_wait_secs,
             pd_disaggregation,
             pd_pairing_mode,

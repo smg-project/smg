@@ -686,6 +686,13 @@ impl RouterConfigBuilder {
         self
     }
 
+    /// Whether the parser flags read every model under Symphony, before the registry's table
+    /// (`--parser-flags-over-registry`), rather than only the models the registry does not know.
+    pub fn parser_flags_over_registry(mut self, over: bool) -> Self {
+        self.config.parser_flags_over_registry = over;
+        self
+    }
+
     // ==================== History Backend ====================
 
     pub fn history_backend(mut self, backend: HistoryBackend) -> Self {

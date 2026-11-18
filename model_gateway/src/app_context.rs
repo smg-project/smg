@@ -501,16 +501,23 @@ impl AppContextBuilder {
             && names.tool.is_some()
             && named_table(&names).is_none()
         {
+            // Under `--parser-flags-over-registry` the flags read before the registry, so such
+            // a name keeps the legacy parsers for the models the registry knows too.
+            let read_by_the_legacy_parsers = if router_config.parser_flags_over_registry {
+                "every model, the registry's included (--parser-flags-over-registry), is read by \
+                 the legacy parsers (a worker's own labels aside)"
+            } else {
+                "every model the registry does not know is read by the legacy parsers (the \
+                 registry's table reads the models it knows, a worker's own labels aside)"
+            };
             tracing::warn!(
                 tool_call_parser = ?names.tool,
                 reasoning_parser = ?names.reasoning,
                 "The configured tool-call parser name selects no Symphony table, so under \
-                 --parser symphony every model the registry does not know is read by the legacy \
-                 parsers (the registry's table reads the models it knows, a worker's own labels \
-                 aside); a table's name, a legacy name that reads a table's format (qwen, \
-                 qwen_xml, ...), a launcher's name for a family whose table has no older \
-                 parser (muse), or an engine's exact name for a table (llama4_pythonic), reads \
-                 those models with that table"
+                 --parser symphony {read_by_the_legacy_parsers}; a table's name, a legacy name \
+                 that reads a table's format (qwen, qwen_xml, ...), a launcher's name for a \
+                 family whose table has no older parser (muse), or an engine's exact name for a \
+                 table (llama4_pythonic), reads those models with that table"
             );
         }
 

@@ -1269,6 +1269,7 @@ impl CliArgs {
             })
             .disable_tokenizer_autoload(self.model.disable_tokenizer_autoload)
             .parser(ParserChoice::parse(&self.model.parser).unwrap_or_default())
+            .parser_flags_over_registry(self.model.parser_flags_over_registry)
             .history_backend(history_backend)
             .memory_config(MemoryConfig {
                 max_responses: self.model.history_memory_max_responses,

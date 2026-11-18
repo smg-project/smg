@@ -1065,6 +1065,8 @@ pub(crate) struct AutoTag {
     /// resolver, which the stamp outlives).
     pub labels: Names,
     pub flags: Names,
+    /// Whether the flags read before the registry ([`ModelNames::flags_over_registry`]).
+    pub flags_over_registry: bool,
     pub request: AutoRequest,
     /// The prompt leaves the model inside its thought.
     pub reasoning_open: bool,
@@ -1120,6 +1122,7 @@ impl AutoTag {
             &ModelNames {
                 labels: self.labels.clone(),
                 flags: &self.flags,
+                flags_over_registry: self.flags_over_registry,
             },
             asks,
             &tools,
@@ -2813,6 +2816,7 @@ mod tests {
             parser: ParserChoice::Symphony,
             labels: pair(Some("deepseek_v4"), Some("deepseek_v4")),
             flags: Names::default(),
+            flags_over_registry: false,
             request: AutoRequest::Chat(Arc::new(request(json!({"tools": tools()})))),
             reasoning_open: true,
             thought_closed: false,
@@ -2894,6 +2898,7 @@ mod tests {
             parser: ParserChoice::Symphony,
             labels: pair(Some("deepseek_v4"), Some("deepseek_v4")),
             flags: Names::default(),
+            flags_over_registry: false,
             request: AutoRequest::Chat(Arc::new(request(json!({"tools": tools()})))),
             reasoning_open: true,
             thought_closed: false,
@@ -3064,6 +3069,7 @@ mod tests {
                 parser: ParserChoice::Symphony,
                 labels: pair(Some("deepseek_v4"), Some("deepseek_v4")),
                 flags: Names::default(),
+                flags_over_registry: false,
                 request: AutoRequest::Chat(Arc::new(request(json!({})))),
                 reasoning_open: true,
                 thought_closed: false,
@@ -3234,6 +3240,7 @@ mod tests {
                 parser: ParserChoice::Symphony,
                 labels: names.labels.clone(),
                 flags: Names::default(),
+                flags_over_registry: false,
                 request: AutoRequest::Chat(Arc::new(chat.clone())),
                 reasoning_open: true,
                 thought_closed: false,
@@ -3243,6 +3250,7 @@ mod tests {
                 parser: ParserChoice::Symphony,
                 labels: names.labels.clone(),
                 flags: Names::default(),
+                flags_over_registry: false,
                 request: AutoRequest::Messages {
                     request: Arc::new(messages.clone()),
                     tools: tools().into(),
@@ -3308,6 +3316,7 @@ mod tests {
             parser: ParserChoice::Symphony,
             labels: names.labels,
             flags: Names::default(),
+            flags_over_registry: false,
             request: AutoRequest::Chat(Arc::new(request(json!({})))),
             reasoning_open: true,
             thought_closed: false,
