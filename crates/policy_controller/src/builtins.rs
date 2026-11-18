@@ -1558,9 +1558,10 @@ fn push_ranked<const DRAWN: bool>(
 /// For the rows of the engine a picker took ([`Unit::Engine`]): a few rows
 /// in no order of their scores, of which the answer carries fewer than a
 /// ranked push fills. A slot's tie is marked in one word by two passes
-/// over the rows, and it stands for the next slot too while a row that
-/// scores the best itself is left: the level ranks of one engine are read
-/// once. More rows than a word marks are drawn by [`draw_in_band`] itself.
+/// over the rows. Where a later slot follows, a third pass notes the rows
+/// that score the best itself, and the tie stands for that slot too while
+/// one of them is left: the level ranks of one engine are read once. More
+/// rows than a word marks are drawn by [`draw_in_band`] itself.
 pub(crate) fn draw_best(mut draw: Draw, scores: &[f32], band: TieBand, out: &mut [usize]) -> usize {
     let slots = out.len().min(scores.len());
     // A bit a row, set while the row is not taken.
@@ -1582,18 +1583,34 @@ pub(crate) fn draw_best(mut draw: Draw, scores: &[f32], band: TieBand, out: &mut
     // that score it.
     let (mut tied, mut at_best) = (0u64, 0u64);
     let mut filled = 0;
-    for slot in &mut out[..slots] {
+    let all = open;
+    for (n, slot) in out[..slots].iter_mut().enumerate() {
         if at_best & open == 0 {
+            // The best score left: over every row while none is taken.
             let mut top = f32::NEG_INFINITY;
-            for (row, &score) in scores.iter().enumerate() {
-                if (open >> row) & 1 != 0 && score > top {
-                    top = score;
+            if open == all {
+                for &score in scores {
+                    if score > top {
+                        top = score;
+                    }
+                }
+            } else {
+                for (row, &score) in scores.iter().enumerate() {
+                    if (open >> row) & 1 != 0 && score > top {
+                        top = score;
+                    }
                 }
             }
             (tied, at_best) = (0, 0);
             for (row, &score) in scores.iter().enumerate() {
                 tied |= u64::from(!below_band(score, top, band)) << row;
-                at_best |= u64::from(score == top) << row;
+            }
+            // The rows that score the best itself spare a later slot its
+            // passes: the last slot notes none.
+            if n + 1 < slots {
+                for (row, &score) in scores.iter().enumerate() {
+                    at_best |= u64::from(score == top) << row;
+                }
             }
         }
         tied &= open;
