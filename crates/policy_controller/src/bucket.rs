@@ -407,11 +407,13 @@ impl Pool {
 
     /// The same worker under a new handle keeps its place, range and load.
     /// Where a view listed the new handle before this word came, the worker
-    /// stands once, at the place that view gave it: the old handle's member
-    /// leaves as a removed worker's does. Whether a member took the new
-    /// handle.
+    /// stands once, at the place that view gave it and with the load booked
+    /// under both handles: the old handle's bookings move first, then its
+    /// member leaves as a removed worker's does. Whether a member took the
+    /// new handle.
     fn rename(&mut self, old: WorkerId, new: WorkerId) -> bool {
         if old != new && self.by_id.contains_key(&new) {
+            self.rebook(old, new);
             self.remove(old);
             return false;
         }
@@ -421,6 +423,24 @@ impl Pool {
         self.members[at as usize].id = new;
         self.by_id.insert(new, at);
         true
+    }
+
+    /// Move the window's bookings of `from`'s member, and their tokens,
+    /// onto `to`'s: one worker's load, under the handle that stays. Each
+    /// booking then ages off that handle.
+    fn rebook(&mut self, from: WorkerId, to: WorkerId) {
+        let (Some(&from), Some(&to)) = (self.by_id.get(&from), self.by_id.get(&to)) else {
+            return;
+        };
+        let load = self.members[from as usize].load;
+        self.members[from as usize].load = 0;
+        let stays = &mut self.members[to as usize];
+        stays.load = stays.load.saturating_add(load);
+        for booking in &mut self.window {
+            if booking.member == from {
+                booking.member = to;
+            }
+        }
     }
 
     /// The listed workers `ids` does not name.
@@ -1676,23 +1696,28 @@ mod tests {
         led(&scorer, &view, 0, 2 * SECOND);
         assert_eq!(loads(&scorer), (vec![100, 40, 0], 140));
         // The word comes: the worker stands once, at the place the view gave
-        // it, and the handle it replaced leaves as a removed worker's does.
+        // it, with the tokens booked under the handle it replaced, whose
+        // member leaves as a removed worker's does.
         scorer.on_membership(&Membership::Replaced {
             old: pool[1].id,
             new: fresh,
         });
-        assert_eq!(loads(&scorer), (vec![100, 0], 140));
+        assert_eq!(loads(&scorer), (vec![100, 40], 140));
         assert_eq!(ranges(&scorer), [(0, 0, 2_729), (1, 2_730, u32::MAX)]);
         // One lease of the worker is one booking.
         book(&scorer, &view, 1, 70, 2 * SECOND);
-        assert_eq!(loads(&scorer), (vec![100, 70], 210));
+        assert_eq!(loads(&scorer), (vec![100, 110], 210));
         // A replacement by the same handle changes nothing.
         scorer.on_membership(&Membership::Replaced {
             old: fresh,
             new: fresh,
         });
-        assert_eq!(loads(&scorer), (vec![100, 70], 210));
+        assert_eq!(loads(&scorer), (vec![100, 110], 210));
         assert_eq!(ranges(&scorer), [(0, 0, 2_729), (1, 2_730, u32::MAX)]);
+        // The bookings that moved age off the handle that stays: one booked
+        // past the window ends them all.
+        book(&scorer, &view, 0, 1, 20 * SECOND);
+        assert_eq!(loads(&scorer), (vec![1, 0], 1));
     }
 
     #[test]
