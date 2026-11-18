@@ -1214,13 +1214,10 @@ impl ZmqEngineClient {
         } else {
             RankPlacement::RoomResidue
         };
-        // The served DeepSeek-V4.1 model's patch geometry, as the first rank
-        // declared it at its handshake (every rank loads the one model): where
-        // the context window is read.
-        let v41_vision = client
-            .engines()
-            .first()
-            .and_then(|engine| V41Vision::from_handshake(&engine.ready_response));
+        // The served DeepSeek-V4.1 model's patch geometry, as every rank
+        // declared it at its handshake: a request without a pin is placed on
+        // a rank at submit, by load, after this translation.
+        let v41_vision = V41Vision::from_handshakes(client.engines());
         let mut streams = Vec::new();
         // Fan-out clones share identical media; cache only within this request.
         let mut shared_hashes = None;

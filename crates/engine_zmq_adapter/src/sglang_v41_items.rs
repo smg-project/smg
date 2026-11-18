@@ -19,6 +19,7 @@ use engine_zmq_client::{
         handshake::EngineCoreReadyResponse,
         sglang::multimodal::{SglangWireMmItem, SglangWireModality, SglangWireTensor},
     },
+    ConnectedEngine,
 };
 
 pub(crate) const PREFIX: &str = "DeepSeek-V4.1 image batch:";
@@ -50,12 +51,24 @@ impl V41Vision {
     /// each above zero. A scheduler declares none when its model is not a
     /// V4.1 or its config does not hold both, or when its plugin predates the
     /// fields.
-    pub(crate) fn from_handshake(ready: &EngineCoreReadyResponse) -> Option<Self> {
+    fn from_handshake(ready: &EngineCoreReadyResponse) -> Option<Self> {
         let declared = |value: Option<u64>| value.filter(|&value| value > 0);
         Some(Self {
             patch_size: declared(ready.vision_patch_size)?,
             downsample_ratio: declared(ready.vision_downsample_ratio)?,
         })
+    }
+
+    /// The geometry every rank of a connection declared: `None` unless each
+    /// declared the same one. A request without a pin is placed on a rank at
+    /// submit, by load, after its batch is checked, so a batch is checked
+    /// only against a geometry all the ranks share.
+    pub(crate) fn from_handshakes(ranks: &[ConnectedEngine]) -> Option<Self> {
+        let mut declared = ranks
+            .iter()
+            .map(|rank| Self::from_handshake(&rank.ready_response));
+        let first = declared.next()??;
+        declared.all(|rank| rank == Some(first)).then_some(first)
     }
 
     /// The values one patch row holds: three channels of a square patch. The
@@ -261,21 +274,27 @@ fn scalar(value: u64) -> SglangWireTensor {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use engine_zmq_client::{
         codec::decode_msgpack,
-        mock_engine::default_ready_response,
+        mock_engine::{connect_to_frontend, default_ready_response},
         protocol::{
             handshake::EngineCoreReadyResponse,
             sglang::{
                 multimodal::SglangWireMmInputs, request::TokenizedGenerateReqInput as WireRequest,
             },
         },
+        ConnectedEngine, EngineId,
     };
     use openai_protocol::worker::RuntimeType;
     use smg_grpc_client::sglang_proto;
 
     use super::V41Vision;
-    use crate::{sglang::translate_sglang_multimodal, test_support::connected_pair_declaring};
+    use crate::{
+        client::ZmqEngineClient, eos::EosTokenIds, sglang::translate_sglang_multimodal,
+        test_support::connected_pair_declaring,
+    };
 
     /// Two images: a 2x3 and a 1x2 patch grid, 6 + 2 patches of 3x2x2 floats,
     /// filling token spans of 5 and 4 positions in a 12-token prompt. The
@@ -626,6 +645,38 @@ mod tests {
         }
     }
 
+    /// A connection's geometry is the one every rank declared: none when two
+    /// ranks declare different values, or one declares none.
+    #[test]
+    fn the_connections_vision_is_what_every_rank_declared() {
+        let vision_of = |declared: &[Option<(u64, u64)>]| {
+            let ranks: Vec<_> = declared
+                .iter()
+                .zip(0..)
+                .map(|(geometry, index)| ConnectedEngine {
+                    engine_id: EngineId::from_engine_index(index),
+                    ready_response: EngineCoreReadyResponse {
+                        vision_patch_size: geometry.map(|(patch_size, _)| patch_size),
+                        vision_downsample_ratio: geometry.map(|(_, ratio)| ratio),
+                        ..default_ready_response()
+                    },
+                })
+                .collect();
+            V41Vision::from_handshakes(&ranks)
+        };
+        assert_eq!(vision_of(&[Some((2, 2))]), Some(VISION));
+        assert_eq!(vision_of(&[Some((2, 2)), Some((2, 2))]), Some(VISION));
+        for differing in [
+            &[Some((2, 2)), Some((4, 2))][..],
+            &[Some((2, 2)), Some((2, 4))],
+            &[Some((2, 2)), None],
+            &[None, Some((2, 2))],
+            &[],
+        ] {
+            assert_eq!(vision_of(differing), None, "{differing:?}");
+        }
+    }
+
     /// The geometry a batch is checked against is the scheduler's own,
     /// whatever the model id is (here not a local directory): a scheduler
     /// that declared 2x2 patches has a batch of wider rows refused before it
@@ -669,6 +720,50 @@ mod tests {
             assert_eq!(items.len(), 2, "checked={checked}");
             drop(stream);
         }
+    }
+
+    /// Ranks that declare different geometry leave a batch's rows and spans
+    /// unchecked, whichever rank takes it: rows the first rank's patches do
+    /// not take are sent on, here to the second rank, which declared nothing.
+    #[tokio::test]
+    async fn ranks_that_declare_different_geometry_skip_the_geometry_checks() {
+        let dir = tempfile::tempdir().unwrap();
+        let ep = |name: &str| format!("ipc://{}", dir.path().join(name).display());
+        let (handshake, input, output) = (ep("hs.sock"), ep("in.sock"), ep("out.sock"));
+        let declared = EngineCoreReadyResponse {
+            vision_patch_size: Some(2),
+            vision_downsample_ratio: Some(2),
+            ..default_ready_response()
+        };
+        let (client, _first, second) = tokio::join!(
+            ZmqEngineClient::connect(
+                &handshake,
+                &input,
+                &output,
+                2,
+                "m".to_string(),
+                EosTokenIds::default(),
+                RuntimeType::Sglang,
+                Duration::from_secs(10)
+            ),
+            connect_to_frontend(&handshake, EngineId::from_engine_index(0), declared),
+            connect_to_frontend(
+                &handshake,
+                EngineId::from_engine_index(1),
+                default_ready_response()
+            ),
+        );
+        let client = client.expect("adapter connect");
+        let (mut input, _output) = second.expect("mock engine").split();
+        let wide = with_pixel_rows(v41_batch(&GRIDS, &PATCHES, &SPANS), 8, &[3, 2, 3]);
+        let request = sglang_proto::GenerateRequest {
+            data_parallel_rank: Some(1),
+            ..generate_request(wide)
+        };
+        let (stream, frames) = tokio::join!(client.generate_sglang(request), input.recv_frames());
+        let _stream = stream.expect("sent on");
+        let wire: WireRequest = decode_msgpack(frames.unwrap()[1].as_ref()).unwrap();
+        assert_eq!(wire.mm_inputs.expect("the items").mm_items.len(), 2);
     }
 
     /// SGLang pads the image positions only when the request names the image

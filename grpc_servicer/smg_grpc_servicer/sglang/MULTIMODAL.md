@@ -53,8 +53,10 @@ the two values at its handshake for the Rust servicer and for a router
 connected to it directly. The two geometry checks are skipped when the loaded
 config is not a `deepseek_v41` one or does not hold both values as integers
 above zero, and on the Rust side also when the scheduler's plugin predates the
-two handshake fields. The other checks do not need the geometry. Other
-families keep one item per batch.
+two handshake fields, or when the scheduler ranks of a connection do not all
+declare the same two values (a request without a pin is placed on a rank after
+it is checked). The other checks do not need the geometry. Other families keep
+one item per batch.
 
 ## Mixed images and videos
 
