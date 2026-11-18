@@ -63,7 +63,7 @@ use parking_lot::Mutex;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::{
-    decision::Decision,
+    decision::{Decision, Target},
     framework::{Scorer, TieBand},
     lease::{Lease, Lifecycle, Membership, Side},
     ring::Fence,
@@ -480,12 +480,28 @@ impl Pool {
             .collect()
     }
 
+    /// The instant a dispatch's booking takes: `since_micros` after the
+    /// decision of `issued_micros`, as its gateway dates it, and no later
+    /// than the newest booking on file, or than that decision where the
+    /// partition booked nothing since. The date is a gateway's word, and a
+    /// booking dated past every other would age the whole window. With no
+    /// booking on file it stands as said.
+    fn dispatched_at(&self, issued_micros: u64, since_micros: u32) -> u64 {
+        let said = issued_micros.saturating_add(u64::from(since_micros));
+        self.window
+            .back()
+            .map_or(said, |newest| said.min(newest.at_micros.max(issued_micros)))
+    }
+
     /// Book `tokens` on a member at `at_micros`. The bookings older than the
     /// window leave first, each with its tokens off its worker's load, and
     /// so does one dated more than the window after this one: a clock that
     /// went back that far ends what it passed. A booking dated a little
     /// before the window's oldest arrived out of its clock's order, as the
     /// bookings of two deciders can, and nothing leaves on its account.
+    /// Inlined: the issue's booking ran it in line while it was its one
+    /// caller, and a call there costs every decision.
+    #[inline]
     fn book(&mut self, member: u32, tokens: u32, at_micros: u64, window_micros: u64) {
         if let Some(booked) = self.members.get_mut(member as usize) {
             booked.load = booked.load.saturating_add(u64::from(tokens));
@@ -648,6 +664,39 @@ impl Lifecycle for Bucket {
                     lease.issued_micros,
                     self.interval_micros,
                 );
+            }
+        }
+    }
+
+    /// A stage that books at the issue books the worker that serves. A
+    /// lease is issued on its pick's first target, and the lease a host
+    /// tells at its first dispatch names the target that dispatch took:
+    /// where that is the first, the booking of the issue stands and the
+    /// call returns at once. A dispatch on another target books the
+    /// lease's tokens on that worker too, at the dispatch's instant. The
+    /// booking of the issue ages off the first target with its interval:
+    /// nothing is un-booked. A host tells a lease's first dispatch alone.
+    fn on_dispatched(
+        &self,
+        lease: &Lease,
+        target: &Target,
+        _side: Side,
+        since_decision_micros: u32,
+    ) {
+        if lease.target_index == 0 {
+            return;
+        }
+        // The worker and its partitions, as the issue reads them.
+        let (position, id) = match (lease.side, target.pair) {
+            (Side::Decode, Some(pair)) => (pair.decode_position, pair.decode_id),
+            _ => (target.position, target.id),
+        };
+        let listed = self.listed.load();
+        for partition in listed.get(&id).into_iter().flatten() {
+            let mut pool = partition.lock();
+            if let Some(member) = pool.member_of(position, id) {
+                let at_micros = pool.dispatched_at(lease.issued_micros, since_decision_micros);
+                pool.book(member, lease.tokens, at_micros, self.interval_micros);
             }
         }
     }
@@ -1482,6 +1531,86 @@ mod tests {
         ]));
         assert_eq!(ranges(&scorer), [(0, 0, 400), (1, 401, u32::MAX)]);
         assert_eq!(loads(&scorer), (vec![1_000, 3_000], 6_005));
+    }
+
+    /// A lease's first dispatch as a served host tells it: the lease names
+    /// the target the dispatch took by its `index` in the pick, and the
+    /// target names its worker and no position.
+    fn dispatch(
+        scorer: &Bucket,
+        worker: WorkerId,
+        index: u8,
+        tokens: u32,
+        issued_micros: u64,
+        since_micros: u32,
+    ) {
+        let lease = Lease {
+            target_index: index,
+            tokens,
+            issued_micros,
+            ..Lease::default()
+        };
+        let target = Target {
+            id: worker,
+            ..Target::default()
+        };
+        scorer.on_dispatched(&lease, &target, Side::Single, since_micros);
+    }
+
+    /// The date of the booking model `m` took last.
+    fn last_booked_at(scorer: &Bucket) -> Option<u64> {
+        let partition = of(scorer, "m");
+        let pool = partition.lock();
+        pool.window.back().map(|booking| booking.at_micros)
+    }
+
+    #[test]
+    fn a_first_dispatch_on_another_target_books_the_worker_that_serves() {
+        let scorer = scorer(NEVER, 1.5, 5);
+        let pool = pool(3);
+        led(&scorer, &pool, 0, SECOND);
+        // A lease is issued on its pick's first target, the first row here.
+        book(&scorer, &pool, 0, 300, SECOND);
+        // A dispatch on that target finds its booking made.
+        dispatch(&scorer, pool[0].id, 0, 300, SECOND, 250);
+        assert_eq!(loads(&scorer), (vec![300, 0, 0], 300));
+        // Another decision books meanwhile, and the lease's gateway
+        // dispatches on the pick's second target, the third row: that
+        // worker serves and is booked, at the dispatch's instant. The
+        // booking of the issue stands: nothing is un-booked.
+        book(&scorer, &pool, 1, 10, SECOND + 400);
+        dispatch(&scorer, pool[2].id, 1, 300, SECOND, 250);
+        assert_eq!(loads(&scorer), (vec![300, 10, 300], 610));
+        assert_eq!(last_booked_at(&scorer), Some(SECOND + 250));
+        // The booking of the issue ages off the first target with its
+        // interval, and the dispatch's stands on.
+        book(&scorer, &pool, 1, 1, 6 * SECOND + 1);
+        assert_eq!(loads(&scorer), (vec![0, 11, 300], 311));
+        // A worker no partition lists takes no booking.
+        dispatch(&scorer, WorkerId(999), 1, 300, 6 * SECOND, 250);
+        assert_eq!(loads(&scorer), (vec![0, 11, 300], 311));
+    }
+
+    #[test]
+    fn a_dispatch_s_booking_is_dated_no_later_than_the_newest_on_file() {
+        let scorer = scorer(NEVER, 1.5, 5);
+        let pool = pool(2);
+        led(&scorer, &pool, 0, SECOND);
+        // A partition with no booking on file takes the gateway's date.
+        dispatch(&scorer, pool[1].id, 1, 50, SECOND, 250);
+        assert_eq!(last_booked_at(&scorer), Some(SECOND + 250));
+        // A date far past the newest booking is a gateway's word: taken
+        // whole it would age every booking on file. The booking is dated
+        // at the newest.
+        book(&scorer, &pool, 0, 40, 2 * SECOND);
+        dispatch(&scorer, pool[1].id, 1, 7, 2 * SECOND, u32::MAX);
+        assert_eq!(loads(&scorer), (vec![40, 57], 97));
+        assert_eq!(last_booked_at(&scorer), Some(2 * SECOND));
+        // And no earlier than its lease's issue, where the partition
+        // booked nothing since.
+        dispatch(&scorer, pool[1].id, 1, 3, 3 * SECOND, 250);
+        assert_eq!(loads(&scorer), (vec![40, 60], 100));
+        assert_eq!(last_booked_at(&scorer), Some(3 * SECOND));
     }
 
     #[test]

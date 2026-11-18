@@ -370,7 +370,8 @@ pub(crate) mod tests {
             Dispatch, GatewayId, HealthSink, LeaseState, LeasesStore, MemoryStore, Picked,
             SessionsStore, WorkerFacts, WorkersStore,
         },
-        view::{Candidate, RequestFacts, Session, WorkerId},
+        view::{Candidate, Health, Phase, RequestFacts, Session, WorkerId},
+        Constraints, PoolFacts, Scratch,
     };
 
     const A: GatewayId = GatewayId(11);
@@ -620,6 +621,82 @@ pub(crate) mod tests {
         let filed = LeasesStore::get(&store, A, LeaseId(1)).expect("on file");
         assert_eq!((filed.target, filed.lease.target_index), (WorkerId(9), 1));
         assert_eq!(filed.target_at(1), Some((WorkerId(9), 2)));
+    }
+
+    /// A stage that books at the issue books the worker that serves: the
+    /// bucket stage hears a `Dispatched` frame that names its pick's second
+    /// target and books the lease's tokens on that worker too.
+    #[test]
+    fn a_dispatch_on_another_target_is_booked_by_a_stage_that_books_at_the_issue() {
+        let store = MemoryStore::new();
+        let t0 = Instant::now();
+        let mut document = PolicySpec::preset("bucket").expect("a preset of this build");
+        document.generation = 1;
+        let spec = AppliedSpec::validate(&document).expect("the document validates");
+        store.apply(spec).expect("a later generation");
+        // Two workers of one model, as a view shows them, and a prefill
+        // request of 3,000 tokens decided by the standing engine.
+        let view: Vec<Candidate> = [7, 9]
+            .iter()
+            .zip(0..)
+            .map(|(&id, position)| Candidate {
+                position,
+                id: WorkerId(id),
+                health: Health {
+                    healthy: true,
+                    ..Health::default()
+                },
+                ..Candidate::default()
+            })
+            .collect();
+        let mut scratch = Scratch::new();
+        let mut decide = |seed: u64| {
+            let facts = RequestFacts {
+                model: "m",
+                phase: Phase::Prefill,
+                prompt_tokens: 3_000,
+                seed,
+                now_micros: 1_000_000,
+                ..RequestFacts::default()
+            };
+            let pool = PoolFacts {
+                pool_size: 2,
+                generation: 1,
+                ..PoolFacts::default()
+            };
+            store.with_world(|world| {
+                let engine = world.spec().engine();
+                engine.decide(&facts, &pool, &view, &Constraints::default(), &mut scratch)
+            })
+        };
+        let decision = decide(1);
+        let pick = decision.pick().expect("a pick");
+        let [owner, other] = [0, 1].map(|at| pick.targets.as_slice()[at].id);
+        assert_ne!(owner, other);
+        // The lease is issued on the pick's first target, and the engine
+        // that decided is told: the stage books that worker.
+        let mut record = lease(A, 1, t0);
+        record.lease.generation = 1;
+        record.lease.tokens = 3_000;
+        record.lease.issued_micros = 1_000_000;
+        record.target = owner;
+        record.picked = Picked::of(&pick.targets);
+        let issued = record.lease;
+        store.with_world(|world| {
+            let engine = world.spec().engine();
+            engine.on_decision_issued(&issued, &decision);
+        });
+        store.issue(record).expect("a lease");
+        // Its gateway dispatches on the pick's second target.
+        let mut second_target = a_dispatched(1);
+        second_target.target_index = 1;
+        dispatched(&store, &open(&store, A), &second_target, t0).expect("the frame reads");
+        // Both workers carry the lease's tokens: the next request of that
+        // size goes to its range's owner again. With the first target alone
+        // booked, the balance rule would hand it to the other.
+        let next = decide(2);
+        let led = next.pick().expect("a pick").targets.as_slice()[0].id;
+        assert_eq!(led, owner);
     }
 
     #[test]
