@@ -414,6 +414,16 @@ impl EncoderCore {
     /// templates write nowhere as a control, and that the flat encode reads
     /// alone and as they stand (no flag on the entry, as in
     /// [`Self::added_entries`]). `None` when there is none.
+    ///
+    /// A checkpoint with its own vocabulary file keeps none: that file's
+    /// reader encodes every request string as plain text, so the reference
+    /// reads no added token a request types. A template that builds its
+    /// spellings has no such reader beside it. Its reference is the flat
+    /// encode, which reads every added token a request types as its token,
+    /// and a request types some on purpose (the place holder of an image).
+    /// So there only what the templates write and what the vocabulary flags
+    /// special is taken as a control; any other added token reads as the
+    /// flat encode reads it.
     fn kept(&self, written: &[String]) -> Option<Box<[u32]>> {
         let mut kept: Vec<u32> = self
             .tokenizer
