@@ -1088,8 +1088,11 @@ pub struct PoolFacts<'a> {
     /// stage say that it must be asked whole
     /// ([`Front::Whole`](crate::Front::Whole)): the decision is the whole
     /// pass's, and it paid for its ranks' reading. Behind them it is not
-    /// read: each row in front is costed from its own report, and the
-    /// decision is the one by rank. In-process only.
+    /// read where the rows in front decide alone: each is costed from its
+    /// own report, and the decision is the one by rank. Where they cannot,
+    /// their band being wider than the ranks leave room for, every row is
+    /// asked, that row with them, and the decision is the whole pass's.
+    /// In-process only.
     pub rated: bool,
 }
 

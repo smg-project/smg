@@ -1139,6 +1139,13 @@ fn combine_few(
         let (stage_band, said) = weighted
             .scorer
             .score_front(facts, candidates, &tied[..few], out);
+        // Checked ahead of the way out: a band beside `Front::Whole` is
+        // not read, and is none all the same.
+        debug_assert!(
+            bandless(weighted, stage_band),
+            "{} orders nothing and returned a band",
+            weighted.scorer.name()
+        );
         if said == Front::Whole {
             whole = true;
             break;
@@ -1146,11 +1153,6 @@ fn combine_few(
         debug_assert!(
             as_said(weighted.scorer.spread(), said, out),
             "{} said {said:?} of scores that read otherwise",
-            weighted.scorer.name()
-        );
-        debug_assert!(
-            bandless(weighted, stage_band),
-            "{} orders nothing and returned a band",
             weighted.scorer.name()
         );
         band += share * stage_band.0.clamp(0.0, 1.0);
@@ -11747,6 +11749,70 @@ mod tests {
     #[should_panic(expected = "banded orders nothing and returned a band")]
     fn a_band_from_a_stage_that_orders_nothing_fails_a_debug_build_where_every_row_is_asked_on() {
         banded_behind(&[1.0, 0.5, 1.0, 0.0, 1.0, 0.5, 0.0, 0.0, 0.5]);
+    }
+
+    /// A stage of the tests that says it orders nothing and returns no band
+    /// where every row is asked. Handed a front, it returns a band beside
+    /// the word that it must be asked whole.
+    #[derive(Debug)]
+    struct BandedWhole;
+
+    impl Lifecycle for BandedWhole {}
+
+    impl Scorer for BandedWhole {
+        fn name(&self) -> &'static str {
+            "banded-whole"
+        }
+
+        fn score(
+            &self,
+            _: &RequestFacts<'_>,
+            _: &[Candidate],
+            _: &[u32],
+            out: &mut [f32],
+        ) -> TieBand {
+            out.fill(1.0);
+            TieBand(0.0)
+        }
+
+        fn spread(&self) -> Spread {
+            Spread::Alike
+        }
+
+        fn score_front(
+            &self,
+            _: &RequestFacts<'_>,
+            _: &[Candidate],
+            _: &[u32],
+            out: &mut [f32],
+        ) -> (TieBand, Front) {
+            out.fill(1.0);
+            (TieBand(0.5), Front::Whole)
+        }
+    }
+
+    /// The check stands ahead of the way out of the rows in front. A stage
+    /// that says it orders nothing and answers that it must be asked whole
+    /// fails a debug build for the band beside that word, although that
+    /// band is not read and its answer where every row is asked holds none.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "banded-whole orders nothing and returned a band")]
+    fn a_band_beside_the_word_to_be_asked_whole_fails_a_debug_build() {
+        let stages = vec![
+            rank(&[1.0, 0.5, 1.0, 0.0, 1.0, 0.5, 1.0, 0.0, 0.5], 8.0, true),
+            Weighted {
+                scorer: Box::new(Asked(Arc::default())),
+                weight: 1.0,
+            },
+            Weighted {
+                scorer: Box::new(BandedWhole),
+                weight: 1.0,
+            },
+        ];
+        let engine = staged(stages, Box::new(Best));
+        assert_eq!(engine.orders[0].ranks, 1);
+        rated(&engine, &request(7), &ranked_pool(9));
     }
 
     /// A leading rank that says it must be asked whole was handed every
