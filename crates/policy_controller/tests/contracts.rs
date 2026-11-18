@@ -332,6 +332,7 @@ fn lease_record() -> &'static [&'static str] {
             kind,
             side,
             target_index,
+            booked,
             generation,
             session as "session_key",
             session_verdict,
@@ -796,7 +797,7 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
         ProtoMirror {
             message: "Lease",
             record: lease_record(),
-            host_only: &["session_verdict", "issued_micros"],
+            host_only: &["booked", "session_verdict", "issued_micros"],
             wire_only: &["term", "dispatch_ttl_ms", "origin"],
             wire: &[
                 ("id", Type::Fixed64),
@@ -903,7 +904,7 @@ fn wit_mirrors() -> Vec<WitMirror> {
         WitMirror {
             record: "lease",
             crate_record: lease_record(),
-            host_only: &["session_verdict", "issued_micros"],
+            host_only: &["booked", "session_verdict", "issued_micros"],
             before: &[],
             beside: &[],
         },

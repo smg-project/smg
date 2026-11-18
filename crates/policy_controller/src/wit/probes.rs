@@ -220,9 +220,9 @@ pub(crate) fn all() -> Vec<Probe> {
         // spell, `session-key`: the change that first reads a lease from the
         // wire renames the field in both and takes this pair out.
         probe!("lease", before [], Lease {
-            id, kind, side, target_index, generation, session as "session-key", session_verdict,
-            issued_micros, tokens,
-        } host [session_verdict, issued_micros], &lease),
+            id, kind, side, target_index, booked, generation, session as "session-key",
+            session_verdict, issued_micros, tokens,
+        } host [booked, session_verdict, issued_micros], &lease),
         probe!("pair", before [], Pair { decode_position, decode_id, decode_dp_rank } host [decode_position], &pair),
         probe!("target", before [], Target { position, id, dp_rank, pair } host [position], &target),
         probe!("completed", before ["lease": "lease"], Outcome {

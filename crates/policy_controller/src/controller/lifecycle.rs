@@ -623,11 +623,15 @@ pub(crate) mod tests {
         assert_eq!(filed.target_at(1), Some((WorkerId(9), 2)));
     }
 
-    /// A stage that books at the issue books the worker that serves: the
-    /// bucket stage hears a `Dispatched` frame that names its pick's second
-    /// target and books the lease's tokens on that worker too.
-    #[test]
-    fn a_dispatch_on_another_target_is_booked_by_a_stage_that_books_at_the_issue() {
+    /// The worker the bucket stage leads a request of `tokens` with, beside
+    /// the two workers of its view as a first pick ordered them, after a
+    /// lease of that size was issued on that pick's first target and its
+    /// gateway dispatched on the pick's second: the other worker, or
+    /// `another_rank` of the first target's own.
+    fn led_after_a_dispatch_on_the_second_target(
+        tokens: u32,
+        another_rank: bool,
+    ) -> (WorkerId, [WorkerId; 2]) {
         let store = MemoryStore::new();
         let t0 = Instant::now();
         let mut document = PolicySpec::preset("bucket").expect("a preset of this build");
@@ -635,7 +639,7 @@ pub(crate) mod tests {
         let spec = AppliedSpec::validate(&document).expect("the document validates");
         store.apply(spec).expect("a later generation");
         // Two workers of one model, as a view shows them, and a prefill
-        // request of 3,000 tokens decided by the standing engine.
+        // request decided by the standing engine.
         let view: Vec<Candidate> = [7, 9]
             .iter()
             .zip(0..)
@@ -654,7 +658,7 @@ pub(crate) mod tests {
             let facts = RequestFacts {
                 model: "m",
                 phase: Phase::Prefill,
-                prompt_tokens: 3_000,
+                prompt_tokens: tokens,
                 seed,
                 now_micros: 1_000_000,
                 ..RequestFacts::default()
@@ -673,14 +677,30 @@ pub(crate) mod tests {
         let pick = decision.pick().expect("a pick");
         let [owner, other] = [0, 1].map(|at| pick.targets.as_slice()[at].id);
         assert_ne!(owner, other);
-        // The lease is issued on the pick's first target, and the engine
-        // that decided is told: the stage books that worker.
+        // What the record keeps of the pick: its second target as the
+        // engine listed it, or the first target's worker again at its
+        // second rank, as a pick over a worker of two ranks lists it.
+        let mut targets = pick.targets;
+        if another_rank {
+            targets = Targets::new();
+            for dp_rank in 0..2 {
+                targets.push(Target {
+                    id: owner,
+                    dp_rank,
+                    ..Target::default()
+                });
+            }
+        }
+        // The lease is issued on the pick's first target, which it names as
+        // the worker it books, and the engine that decided is told: the
+        // stage books that worker.
         let mut record = lease(A, 1, t0);
         record.lease.generation = 1;
-        record.lease.tokens = 3_000;
+        record.lease.tokens = tokens;
         record.lease.issued_micros = 1_000_000;
+        record.lease.booked = owner;
         record.target = owner;
-        record.picked = Picked::of(&pick.targets);
+        record.picked = Picked::of(&targets);
         let issued = record.lease;
         store.with_world(|world| {
             let engine = world.spec().engine();
@@ -691,11 +711,32 @@ pub(crate) mod tests {
         let mut second_target = a_dispatched(1);
         second_target.target_index = 1;
         dispatched(&store, &open(&store, A), &second_target, t0).expect("the frame reads");
+        let next = decide(2);
+        let led = next.pick().expect("a pick").targets.as_slice()[0].id;
+        (led, [owner, other])
+    }
+
+    /// A stage that books at the issue books the worker that serves: the
+    /// bucket stage hears a `Dispatched` frame that names its pick's second
+    /// target and books the lease's tokens on that worker too.
+    #[test]
+    fn a_dispatch_on_another_target_is_booked_by_a_stage_that_books_at_the_issue() {
         // Both workers carry the lease's tokens: the next request of that
         // size goes to its range's owner again. With the first target alone
         // booked, the balance rule would hand it to the other.
-        let next = decide(2);
-        let led = next.pick().expect("a pick").targets.as_slice()[0].id;
+        let (led, [owner, _]) = led_after_a_dispatch_on_the_second_target(3_000, false);
+        assert_eq!(led, owner);
+    }
+
+    /// A dispatch that names the worker the issue booked books nothing
+    /// more: the frame names another rank of the lease's own worker.
+    #[test]
+    fn a_dispatch_on_another_rank_of_the_leases_worker_is_booked_once() {
+        // Booked once, the worker carries 50 tokens, under the balance
+        // rule's 64: the next request of that size goes to its range's
+        // owner again. Booked twice it would carry 100, and the rule would
+        // hand the request to the other worker.
+        let (led, [owner, _]) = led_after_a_dispatch_on_the_second_target(50, true);
         assert_eq!(led, owner);
     }
 

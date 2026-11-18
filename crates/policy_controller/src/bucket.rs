@@ -10,8 +10,10 @@
 //!
 //! The partition is learned from a window of bookings. Every issued
 //! decision books its tokens on the worker it names
-//! ([`Lifecycle::on_decision_issued`]), and a booking leaves the window once
-//! it is older than `adjust_interval_s`. A cut falls due at each interval
+//! ([`Lifecycle::on_decision_issued`]), and a first dispatch on another
+//! worker books them there too ([`Lifecycle::on_dispatched`]): both
+//! bookings stand until each ages. A booking leaves the window once it is
+//! older than `adjust_interval_s`. A cut falls due at each interval
 //! and is made where a worker's share of the booked tokens moved by more
 //! than a factor of two since the last cut, or the listing changed: the
 //! ranges are cut again from the sizes in the window, so that each worker's
@@ -486,11 +488,23 @@ impl Pool {
     /// partition booked nothing since. The date is a gateway's word, and a
     /// booking dated past every other would age the whole window. With no
     /// booking on file it stands as said.
-    fn dispatched_at(&self, issued_micros: u64, since_micros: u32) -> u64 {
+    ///
+    /// `None` where that instant is more than `window_micros` before the
+    /// booking at the window's front, which [`Pool::book`] ages by: the
+    /// dispatch aged before it was told. Booked there, it would read as a
+    /// clock that went back, and end every booking it passed.
+    fn dispatched_at(
+        &self,
+        issued_micros: u64,
+        since_micros: u32,
+        window_micros: u64,
+    ) -> Option<u64> {
         let said = issued_micros.saturating_add(u64::from(since_micros));
-        self.window
-            .back()
-            .map_or(said, |newest| said.min(newest.at_micros.max(issued_micros)))
+        let (Some(oldest), Some(newest)) = (self.window.front(), self.window.back()) else {
+            return Some(said);
+        };
+        let at_micros = said.min(newest.at_micros.max(issued_micros));
+        (at_micros.saturating_add(window_micros) >= oldest.at_micros).then_some(at_micros)
     }
 
     /// Book `tokens` on a member at `at_micros`. The bookings older than the
@@ -670,10 +684,14 @@ impl Lifecycle for Bucket {
 
     /// A stage that books at the issue books the worker that serves. A
     /// lease is issued on its pick's first target, and the lease a host
-    /// tells at its first dispatch names the target that dispatch took:
-    /// where that is the first, the booking of the issue stands and the
-    /// call returns at once. A dispatch on another target books the
-    /// lease's tokens on that worker too, at the dispatch's instant. The
+    /// tells at its first dispatch names the target that dispatch took and
+    /// the worker its issue booked ([`Lease::booked`]). Where the dispatch
+    /// took the first target, or another target of that worker (another
+    /// rank of it, or the one prefill of a pair pick), the booking of the
+    /// issue stands and the call returns at once. Under a host that names
+    /// no such worker, the first target alone is read as the issue's. A
+    /// dispatch on another worker books the lease's tokens there too, at
+    /// the dispatch's instant, unless it aged before it was told. The
     /// booking of the issue ages off the first target with its interval:
     /// nothing is un-booked. A host tells a lease's first dispatch alone.
     fn on_dispatched(
@@ -691,11 +709,22 @@ impl Lifecycle for Bucket {
             (Side::Decode, Some(pair)) => (pair.decode_position, pair.decode_id),
             _ => (target.position, target.id),
         };
+        // Another target of the worker the issue booked.
+        if id == lease.booked {
+            return;
+        }
         let listed = self.listed.load();
         for partition in listed.get(&id).into_iter().flatten() {
             let mut pool = partition.lock();
-            if let Some(member) = pool.member_of(position, id) {
-                let at_micros = pool.dispatched_at(lease.issued_micros, since_decision_micros);
+            let Some(member) = pool.member_of(position, id) else {
+                continue;
+            };
+            let dated = pool.dispatched_at(
+                lease.issued_micros,
+                since_decision_micros,
+                self.interval_micros,
+            );
+            if let Some(at_micros) = dated {
                 pool.book(member, lease.tokens, at_micros, self.interval_micros);
             }
         }
@@ -1611,6 +1640,163 @@ mod tests {
         dispatch(&scorer, pool[1].id, 1, 3, 3 * SECOND, 250);
         assert_eq!(loads(&scorer), (vec![40, 60], 100));
         assert_eq!(last_booked_at(&scorer), Some(3 * SECOND));
+    }
+
+    #[test]
+    fn a_dispatch_told_past_its_interval_books_nothing() {
+        let scorer = scorer(NEVER, 1.5, 1);
+        let pool = pool(3);
+        led(&scorer, &pool, 0, SECOND);
+        // A lease is issued on the first row. Its booking has aged when
+        // another decision books the second row two seconds later.
+        book(&scorer, &pool, 0, 300, SECOND);
+        book(&scorer, &pool, 1, 10, 3 * SECOND);
+        assert_eq!(loads(&scorer), (vec![0, 10, 0], 10));
+        // The first lease's dispatch on the third row is told then, dated
+        // 250 microseconds behind its decision: more than an interval
+        // before the booking on file. Booked there it would read as a clock
+        // that went back, and end the newer booking.
+        dispatch(&scorer, pool[2].id, 1, 300, SECOND, 250);
+        assert_eq!(loads(&scorer), (vec![0, 10, 0], 10));
+        assert_eq!(last_booked_at(&scorer), Some(3 * SECOND));
+    }
+
+    #[test]
+    fn a_dispatch_s_booking_ends_no_booking_newer_than_itself() {
+        let scorer = scorer(NEVER, 1.5, 1);
+        let pool = pool(3);
+        let tenth = SECOND / 10;
+        led(&scorer, &pool, 0, 10 * SECOND);
+        for (tokens, at_micros) in [(1, 100 * tenth), (2, 105 * tenth), (4, 107 * tenth)] {
+            book(&scorer, &pool, 0, tokens, at_micros);
+        }
+        // A dispatch dated one interval before the oldest booking, to the
+        // microsecond, arrived out of its clock's order: it is booked,
+        // behind the three.
+        dispatch(&scorer, pool[1].id, 1, 8, 90 * tenth, 0);
+        assert_eq!(loads(&scorer), (vec![7, 8, 0], 15));
+        assert_eq!(last_booked_at(&scorer), Some(90 * tenth));
+        // A dispatch dated more than an interval before the oldest booking
+        // is held against that one, not against the last one made: it books
+        // nothing, and the three newer bookings stand.
+        dispatch(&scorer, pool[2].id, 1, 16, 89 * tenth, 0);
+        assert_eq!(loads(&scorer), (vec![7, 8, 0], 15));
+    }
+
+    #[test]
+    fn a_dispatch_books_each_partition_that_lists_its_worker() {
+        let scorer = scorer(NEVER, 1.5, 5);
+        let (pool_a, pool_b) = (pool(2), pool(4));
+        for (model, pool) in [("a", &pool_a), ("b", &pool_b)] {
+            led_by(&scorer, &prefill(model, 0, SECOND), pool, &all(pool));
+        }
+        // Both models list the second row, and one alone the fourth.
+        dispatch(&scorer, pool_a[1].id, 1, 30, SECOND, 250);
+        dispatch(&scorer, pool_b[3].id, 1, 9, SECOND, 250);
+        let booked = |model: &str| {
+            let partition = of(&scorer, model);
+            let held = partition.lock();
+            let loads: Vec<u64> = held.members.iter().map(|member| member.load).collect();
+            (loads, held.total)
+        };
+        assert_eq!(booked("a"), (vec![0, 30], 30));
+        assert_eq!(booked("b"), (vec![0, 30, 0, 9], 39));
+    }
+
+    #[test]
+    fn a_dispatch_on_another_target_of_the_issue_s_worker_books_nothing() {
+        let scorer = scorer(NEVER, 1.5, 5);
+        let pool = pool(3);
+        led(&scorer, &pool, 0, SECOND);
+        book(&scorer, &pool, 0, 300, SECOND);
+        // The lease its host tells names the worker its issue booked.
+        let told = |index: u8, target: Target| {
+            let lease = Lease {
+                target_index: index,
+                booked: pool[0].id,
+                tokens: 300,
+                issued_micros: SECOND,
+                ..Lease::default()
+            };
+            scorer.on_dispatched(&lease, &target, Side::Single, 250);
+        };
+        // The pick's second target is another rank of that worker: the
+        // booking of the issue is the serving worker's own.
+        told(
+            1,
+            Target {
+                id: pool[0].id,
+                dp_rank: 1,
+                ..Target::default()
+            },
+        );
+        assert_eq!(loads(&scorer), (vec![300, 0, 0], 300));
+        // Its third target is another worker, which is booked.
+        told(
+            2,
+            Target {
+                id: pool[2].id,
+                ..Target::default()
+            },
+        );
+        assert_eq!(loads(&scorer), (vec![300, 0, 300], 600));
+    }
+
+    #[test]
+    fn a_pair_pick_s_second_target_books_its_decode_and_not_the_prefill_again() {
+        let scorer = scorer(NEVER, 1.5, 5);
+        let pool = pool(3);
+        led(&scorer, &pool, 0, SECOND);
+        // Each target of a pair pick names the one prefill, the first row,
+        // with another decode: the second row, then the third.
+        let target = |decode: u32| Target {
+            position: 0,
+            id: pool[0].id,
+            dp_rank: 0,
+            pair: Some(Pair {
+                decode_position: decode,
+                decode_id: pool[decode as usize].id,
+                decode_dp_rank: 0,
+            }),
+        };
+        let mut targets = Targets::new();
+        targets.push(target(1));
+        targets.push(target(2));
+        let decision = Decision::Pick(Pick {
+            targets,
+            ..Pick::default()
+        });
+        let lease = |side: Side, booked: WorkerId, index: u8| Lease {
+            side,
+            target_index: index,
+            booked,
+            tokens: 300,
+            issued_micros: SECOND,
+            ..Lease::default()
+        };
+        // The prefill side: its issue books the prefill, and a dispatch on
+        // the second target names that prefill again.
+        let prefill = pool[0].id;
+        scorer.on_decision_issued(&lease(Side::Prefill, prefill, 0), &decision);
+        scorer.on_dispatched(
+            &lease(Side::Prefill, prefill, 1),
+            &target(2),
+            Side::Prefill,
+            250,
+        );
+        assert_eq!(loads(&scorer), (vec![300, 0, 0], 300));
+        // The decode side: its issue books the first target's decode, and
+        // a dispatch on the second target books that target's own.
+        let decode = pool[1].id;
+        scorer.on_decision_issued(&lease(Side::Decode, decode, 0), &decision);
+        assert_eq!(loads(&scorer), (vec![300, 300, 0], 600));
+        scorer.on_dispatched(
+            &lease(Side::Decode, decode, 1),
+            &target(2),
+            Side::Decode,
+            250,
+        );
+        assert_eq!(loads(&scorer), (vec![300, 300, 300], 900));
     }
 
     #[test]

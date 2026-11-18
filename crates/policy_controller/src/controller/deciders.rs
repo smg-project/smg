@@ -1092,6 +1092,7 @@ fn issue(
         kind: LeaseKind::Credit,
         side: Side::Single,
         target_index: 0,
+        booked: booking.target,
         generation: booking.generation,
         session: booking.session,
         session_verdict: booking.verdict,
