@@ -24,7 +24,11 @@
 //! lifecycle, so an event reaches the plugin once per engine); the
 //! engine opens it once per decision over the profile's view (a pair
 //! decision opens one per side) and the stages read one `decision` resource,
-//! dropped at the end. Every call runs under fuel: the plugin's frame budget
+//! dropped at the end. The view carries the request's block hashes only
+//! where the plugin's row declares them (`needs`, either form), the first
+//! [`MAX_BLOCK_HASHES`](crate::spec::MAX_BLOCK_HASHES) of a longer
+//! list, so a prompt's length sizes no view of a module that reads none.
+//! Every call runs under fuel: the plugin's frame budget
 //! clamped to the decision's remaining budget (one remainder per thread per
 //! decision, shared by every plugin and side it opens, of any runtime built
 //! over the same [`OpenDecisions`](crate::plugins::OpenDecisions)), times the

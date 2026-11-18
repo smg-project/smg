@@ -2,10 +2,14 @@
 //! scorer and picker are one plugin, over the record and the packed world,
 //! at 8, 64 and 512 candidates, on a kept instance, on a kept instance with
 //! the affinity column fed (both worlds' fills then read each row's entry
-//! of it) and without an instance (every decision instantiates); the
+//! of it) and without an instance (every decision instantiates); a decision
+//! at 64 candidates whose request carries a prompt's block hashes, for a row
+//! that declares them and for one that does not; the
 //! fuel-exhaustion latency of a guest that spins; one lifecycle event; and
 //! the same profile out of built-in stages as the floor. Ids:
-//! `policy_wasm/decide/<world>/<n>`, `policy_wasm/decide_held/<world>/<n>`,
+//! `policy_wasm/decide/<world>/<n>`,
+//! `policy_wasm/prompt/<declared|undeclared>/<world>/<hashes>`,
+//! `policy_wasm/decide_held/<world>/<n>`,
 //! `policy_wasm/decide_fresh/<world>/<n>`, `policy_wasm/fuel_exhausted/<n>`,
 //! `policy_wasm/observe/<world>` and `policy_wasm/native/<n>`. The guests
 //! are the test guests, assembled at bench start.
@@ -36,6 +40,7 @@ use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criteri
 use smg_policy_controller::{
     builtins::{Best, Healthy, LeastRequests},
     plugins::OpenDecisions,
+    spec::MAX_BLOCK_HASHES,
     wasm::{Plugin, PluginSpec, Runtime, WasmFilter, WasmPicker, WasmScorer},
     Binding, Constraints, Engine, Lease, Lifecycle, Needs, Plan, PoolFacts, Profile, RequestFacts,
     Scratch, Side, Target, Weighted,
@@ -47,6 +52,11 @@ const SIZES: [usize; 3] = [8, 64, 512];
 const FRAME_MICROS: u32 = 10_000;
 
 fn plugin(runtime: &Arc<Runtime>, name: &str, component: Vec<u8>, config: Vec<u8>) -> Arc<Plugin> {
+    Plugin::load(runtime, row(name, component, config)).expect("the guest loads")
+}
+
+/// The row of a bench's plugin.
+fn row(name: &str, component: Vec<u8>, config: Vec<u8>) -> PluginSpec {
     let mut spec = PluginSpec::new(name, component);
     spec.config = config;
     spec.budget_micros = FRAME_MICROS;
@@ -61,7 +71,7 @@ fn plugin(runtime: &Arc<Runtime>, name: &str, component: Vec<u8>, config: Vec<u8
         "observe-session".into(),
         "pick-random".into(),
     ];
-    Plugin::load(runtime, spec).expect("the guest loads")
+    spec
 }
 
 /// One profile whose three stages are the plugin's.
@@ -340,6 +350,50 @@ fn fuel_exhausted(c: &mut Criterion) {
     group.finish();
 }
 
+/// One decision at 64 candidates whose request carries a prompt's block
+/// hashes, 256 and the range's 8,190, for a row that declares them and for
+/// one that does not: the view of the second holds none of them.
+fn prompt(c: &mut Criterion) {
+    const CANDIDATES: usize = 64;
+    let runtime = Arc::new(Runtime::new(&OpenDecisions::new()).expect("a runtime"));
+    let mut group = c.benchmark_group("policy_wasm/prompt");
+    let hashes: Vec<u64> = (1..=u64::from(MAX_BLOCK_HASHES)).collect();
+    let fleet = fleet(CANDIDATES);
+    let mut view = Vec::with_capacity(CANDIDATES);
+    build_view(&fleet, &mut view);
+    let pool = PoolFacts {
+        pool_size: CANDIDATES as u32,
+        generation: 1,
+        ..PoolFacts::default()
+    };
+    let cx = Constraints::default();
+    for (world, component) in worlds() {
+        for (declares, declared) in [("undeclared", false), ("declared", true)] {
+            let mut row = row(world, component.clone(), vec![guest::mode::LEAST_IN_FLIGHT]);
+            row.needs.token_hashes = declared;
+            let plugin = Plugin::load(&runtime, row).expect("the guest loads");
+            let engine = plugin_engine(&plugin);
+            let mut scratch = Scratch::new();
+            for carried in [256, hashes.len()] {
+                let id = BenchmarkId::new(format!("{declares}/{world}"), carried);
+                group.bench_function(id, |b| {
+                    let mut seed = 0u64;
+                    b.iter(|| {
+                        seed += 1;
+                        let facts = RequestFacts {
+                            block_hashes: &hashes[..carried],
+                            ..facts(seed)
+                        };
+                        engine.decide(&facts, &pool, black_box(&view), &cx, &mut scratch)
+                    });
+                });
+            }
+            answered(world, &plugin);
+        }
+    }
+    group.finish();
+}
+
 fn observe(c: &mut Criterion) {
     let runtime = Arc::new(Runtime::new(&OpenDecisions::new()).expect("a runtime"));
     let mut group = c.benchmark_group("policy_wasm/observe");
@@ -393,6 +447,7 @@ fn native(c: &mut Criterion) {
 criterion_group!(
     benches,
     decide,
+    prompt,
     decide_held,
     decide_fresh,
     fuel_exhausted,

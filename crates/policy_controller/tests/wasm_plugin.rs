@@ -1197,6 +1197,54 @@ fn the_memory_cap_is_the_specs_and_a_growth_past_it_traps() {
     );
 }
 
+/// A module's view carries the request's block hashes where its row
+/// declares them, in the token form or the text form, and none where it
+/// declares neither: a guest of each world counts the hashes its decisions
+/// handed it.
+#[test]
+fn a_view_carries_block_hashes_to_a_row_that_declares_them_alone() {
+    let hashes: Vec<u64> = (1..=300).collect();
+    let token = Needs {
+        token_hashes: true,
+        ..Needs::default()
+    };
+    let text = Needs {
+        text_hashes: true,
+        ..Needs::default()
+    };
+    let candidates = pool(4);
+    for (world, component) in guest::hash_counting_guests() {
+        for (needs, handed) in [(Needs::default(), 0), (token, 300), (text, 300)] {
+            let runtime = runtime();
+            let mut row = spec("counting", component.clone(), mode::LEAST_IN_FLIGHT);
+            row.metrics.push("hashes".to_string());
+            row.needs = needs;
+            let plugin = loaded(&runtime, row);
+            let engine = plugin_engine(&plugin);
+            let decision = engine.decide(
+                &RequestFacts {
+                    block_hashes: &hashes,
+                    ..facts(1)
+                },
+                &PoolFacts {
+                    pool_size: 4,
+                    generation: 1,
+                    ..PoolFacts::default()
+                },
+                &candidates,
+                &Constraints::default(),
+                &mut Scratch::new(),
+            );
+            assert!(decision.pick().is_some(), "{world} {needs:?}: {decision:?}");
+            assert_eq!(
+                counter_value(&plugin, counter::HASHES),
+                handed,
+                "the {world} world, {needs:?}"
+            );
+        }
+    }
+}
+
 #[test]
 fn the_lifecycle_reaches_the_plugin_once_per_profile_on_the_hosts_clock() {
     let runtime =

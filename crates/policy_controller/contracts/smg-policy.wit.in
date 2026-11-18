@@ -113,7 +113,9 @@ interface plugin {
 ///   nothing past it. The three counts are bounded by the engine's caps, far
 ///   below u16: hash-count by the spec's `view.max_block_hashes` (default
 ///   256; the view holds the first N hashes in every form, record and packed
-///   alike), header-count by the allow-list (at most 256 names), tried-count
+///   alike, and none for a plugin whose row declares neither token hashes
+///   nor text hashes among its needs), header-count by the allow-list (at
+///   most 256 names), tried-count
 ///   by the attempt counter (u8) times the four targets of a decision; a spec
 ///   whose cap exceeds 65,535 is refused at apply when a packed plugin is
 ///   configured, never a truncated block. The string lengths are u16 as

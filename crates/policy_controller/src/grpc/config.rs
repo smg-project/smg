@@ -71,7 +71,8 @@ pub struct GrpcPluginSpec {
     /// What the host must feed for the plugin's stages to mean anything;
     /// the plugin declares it, the host cannot read it off a server. A frame
     /// carries the request's block hashes where these declare them, in the
-    /// token form or the text form: eight bytes a hash, the first 8,190 of a
+    /// token form or the text form: eight bytes a hash, the first
+    /// [`MAX_BLOCK_HASHES`](crate::spec::MAX_BLOCK_HASHES) of a
     /// longer list. Where they declare neither it carries none, whatever
     /// the other stages of the profile read.
     pub needs: Needs,

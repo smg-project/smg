@@ -24,7 +24,8 @@
 //! the stage bits the profile binds; the answer carries the survivors, one
 //! score per candidate and the pick, each stage's field its own. The
 //! request's block hashes ride the frame only where the plugin's row
-//! declares them (`needs`, either form), the first 8,190 of a longer list,
+//! declares them (`needs`, either form), the first
+//! [`MAX_BLOCK_HASHES`](crate::spec::MAX_BLOCK_HASHES) of a longer list,
 //! so a prompt's length sizes no frame of a plugin that reads none. A plugin
 //! bound as a filter or a scorer is asked at the decision's open, so the
 //! native stages run while it computes; a plugin bound as the picker alone
