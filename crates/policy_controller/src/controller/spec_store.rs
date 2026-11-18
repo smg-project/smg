@@ -1374,7 +1374,11 @@ pub(crate) mod tests {
 
     /// A temporary name whose removal is refused in another way than by
     /// this user's bits or a file system mounted to read alone refuses the
-    /// start: here a directory stands under such a name.
+    /// start: here a directory stands under such a name. The refusal read
+    /// here is Linux's own for that removal. Other systems answer it as a
+    /// permission's refusal, which leaves the name in place, so the case
+    /// runs on Linux alone.
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_temporary_name_whose_removal_fails_otherwise_refuses_the_start() {
         let dir = tempfile::tempdir().expect("a temp dir");
