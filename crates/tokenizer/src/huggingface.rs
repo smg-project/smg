@@ -1866,15 +1866,11 @@ impl Encoder for HuggingFaceTokenizer {
         }
         // The direct Unigram encoder gives the ids alone too. It reads the
         // character map and the pieces from the tokenizer at every encode
-        // and returns nothing when they are not what it was made from: the
-        // encode then runs in `tokenizers`, as before.
+        // and checks the kind of each, not the map or the pieces: the
+        // tokenizer is the one it was made from. It returns nothing when a
+        // kind is another, and the encode then runs in `tokenizers`.
         if let Some(unigram) = &self.core.unigram {
-            if let Some(ids) = unigram.encode(
-                &self.core.tokenizer,
-                self.core.added(),
-                input,
-                add_special_tokens,
-            ) {
+            if let Some(ids) = unigram.encode(&self.core.tokenizer, input, add_special_tokens) {
                 return Ok(Encoding::Plain(ids));
             }
         }

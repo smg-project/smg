@@ -5,9 +5,11 @@
 //! touches, the added tokens, the frame, and the configurations the encoder
 //! declines.
 
+use std::cell::Cell;
+
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde_json::{json, Value};
-use tokenizers::Tokenizer;
+use tokenizers::{models::ModelWrapper, tokenizer::Model, Tokenizer};
 
 use super::UnigramEncoder;
 use crate::{
@@ -428,6 +430,21 @@ fn an_added_token_is_cut_from_the_raw_text_as_it_stands() {
 }
 
 #[test]
+fn the_encoder_cuts_added_tokens_with_its_own_matcher() {
+    let library = library(&definition());
+    let Ok(encoder) = UnigramEncoder::from_tokenizer(&*library) else {
+        panic!("the encoder takes the definition");
+    };
+    for text in ["a</s>b", "<pad></s>", "a <unk> b"] {
+        assert_eq!(
+            encoder.encode(&*library, text, true),
+            Some(library_ids(&library, text, true)),
+            "{text:?}"
+        );
+    }
+}
+
+#[test]
 fn the_frame_is_what_the_post_processor_adds() {
     let template = definition();
     let none = changed("/post_processor", Value::Null);
@@ -453,6 +470,52 @@ fn a_word_longer_than_any_piece_encodes_as_the_library_does() {
         direct_ids(&ours, &text, true),
         library_ids(&library, &text, true)
     );
+}
+
+#[test]
+fn a_long_piece_is_asked_only_where_its_first_byte_stands() {
+    // Pieces of 64, 65 and 300 bytes, all of `b`: the paths over them, and
+    // of two paths of one score the one kept, are the library's.
+    let mut definition = definition();
+    let vocabulary = definition["model"]["vocab"]
+        .as_array_mut()
+        .expect("the vocabulary of the definition");
+    for (len, score) in [(64, -7.0), (65, -8.0), (300, -9.0)] {
+        vocabulary.push(json!(["b".repeat(len), score]));
+    }
+    let (library, ours) = pair(&definition);
+    for len in [63, 64, 65, 66, 129, 299, 300, 301, 365, 664] {
+        for text in ["b".repeat(len), format!("a{}c", "b".repeat(len))] {
+            assert_eq!(
+                direct_ids(&ours, &text, true),
+                library_ids(&library, &text, true),
+                "{len} of `b`"
+            );
+        }
+    }
+    // A word of `a` asks the model for the lengths that pieces with its
+    // first bytes have (three with the marker's, three with `a`), not for
+    // every length up to the longest piece.
+    let Ok(encoder) = UnigramEncoder::from_tokenizer(&*library) else {
+        panic!("the encoder takes the definition");
+    };
+    let ModelWrapper::Unigram(model) = library.get_model() else {
+        panic!("the model of the definition is Unigram");
+    };
+    let word = format!("{MARKER}{}", "a".repeat(2000));
+    let asked = Cell::new(0_usize);
+    let (mut best, mut ids) = (Vec::new(), Vec::new());
+    encoder.best_path(
+        |text| {
+            asked.set(asked.get() + 1);
+            model.token_to_id(text)
+        },
+        &word,
+        &mut best,
+        &mut ids,
+    );
+    assert_eq!(ids, library_ids(&library, &word[MARKER.len()..], false));
+    assert!(asked.get() <= 3 * 2001, "{} texts asked", asked.get());
 }
 
 #[test]

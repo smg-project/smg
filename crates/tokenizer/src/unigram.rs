@@ -25,7 +25,7 @@ use tokenizers::{
 
 use crate::{
     encode_path::Declined,
-    native::AddedTokens,
+    native::{Added, AddedTokens},
     word_cache::{ModelView, TokenizerOf},
     wordpiece::WordPieceEncoder,
 };
@@ -45,20 +45,70 @@ struct Best {
     id: u32,
 }
 
+/// The byte lengths of the pieces, by the first byte of a piece: a text is
+/// a piece only at a length that some piece with its first byte has.
+struct Lengths {
+    /// The lengths of the pieces that start with byte `b` are
+    /// `lengths[starts[b]..starts[b + 1]]`, ascending.
+    lengths: Vec<u32>,
+    starts: [u32; 257],
+}
+
+impl Lengths {
+    /// The lengths of `pieces`, from one pass over them and with no sort of
+    /// the vocabulary: a length up to 64 bytes is a bit in the mask of its
+    /// first byte, and the few longer ones are sorted apart.
+    fn of<'a>(pieces: impl Iterator<Item = &'a str>) -> Self {
+        let mut short = [0u64; 256];
+        let mut long = Vec::new();
+        for piece in pieces {
+            let Some(&first) = piece.as_bytes().first() else {
+                continue;
+            };
+            match piece.len() {
+                len @ ..=64 => short[usize::from(first)] |= 1 << (len - 1),
+                len => long.push((first, len as u32)),
+            }
+        }
+        long.sort_unstable();
+        long.dedup();
+        let mut long = long.into_iter().peekable();
+        let mut lengths = Vec::new();
+        let mut starts = [0; 257];
+        for (first, mut mask) in (0u8..=255).zip(short) {
+            starts[usize::from(first)] = lengths.len() as u32;
+            while mask != 0 {
+                lengths.push(mask.trailing_zeros() + 1);
+                mask &= mask - 1;
+            }
+            while let Some((_, len)) = long.next_if(|(byte, _)| *byte == first) {
+                lengths.push(len);
+            }
+        }
+        starts[256] = lengths.len() as u32;
+        Self { lengths, starts }
+    }
+
+    /// The lengths of the pieces that start with `first`, ascending.
+    fn of_first(&self, first: u8) -> &[u32] {
+        let at = usize::from(first);
+        &self.lengths[self.starts[at] as usize..self.starts[at + 1] as usize]
+    }
+}
+
 /// The direct encoder of one Unigram tokenizer.
 pub(crate) struct UnigramEncoder {
     /// The word marker of the `Metaspace` pre-tokenizer.
     marker: char,
-    /// Whether the tokenizer has added tokens: an encode then needs their
-    /// matcher.
-    has_added: bool,
+    /// The matcher over the added tokens, none when the tokenizer has none.
+    added: Option<AddedTokens>,
     /// The ids the post-processor puts before and after one sequence.
     prefix: Vec<u32>,
     suffix: Vec<u32>,
     /// The score of each piece, by id.
     score: Vec<f64>,
-    /// The longest piece, in bytes: no text longer than it is one.
-    longest: usize,
+    /// The byte lengths of the pieces, by the first byte of a piece.
+    lengths: Lengths,
     /// The id and the score of a character no piece covers.
     unknown: u32,
     unknown_score: f64,
@@ -94,38 +144,39 @@ impl UnigramEncoder {
         }
         let marker = Self::marker(tokenizer)?;
         let (prefix, suffix) = WordPieceEncoder::frame(tokenizer)?;
-        let has_added = Self::added_tokens(tokenizer)?;
+        let added = Self::added_tokens(tokenizer)?;
+        // One pass over the pieces: the score of each, and its length by
+        // its first byte.
         let mut score = Vec::with_capacity(model.get_vocab_size());
-        let mut longest = 0;
-        for (piece, piece_score) in model.iter() {
+        let lengths = Lengths::of(model.iter().map(|(piece, piece_score)| {
             score.push(*piece_score);
-            longest = longest.max(piece.len());
-        }
+            piece.as_str()
+        }));
         Ok(Self {
             marker,
-            has_added,
+            added,
             prefix,
             suffix,
             unknown: Self::unknown(model)?,
             unknown_score: model.min_score - UNKNOWN_PENALTY,
             score,
-            longest,
+            lengths,
             kept: Self::kept(normalizer),
         })
     }
 
-    /// Whether the tokenizer has added tokens. A token the library does not
-    /// cut from the raw text as it stands (one it matches after
-    /// normalization, at word edges only, or with the whitespace beside it)
-    /// declines. The matcher over them is the wrapper's, built at its first
-    /// use.
-    fn added_tokens<M: Model>(tokenizer: &TokenizerOf<M>) -> Result<bool, Declined> {
+    /// The matcher over the added tokens, none when the tokenizer has none.
+    /// A token the library does not cut from the raw text as it stands (one
+    /// it matches after normalization, at word edges only, or with the
+    /// whitespace beside it) declines, and so do tokens no matcher can be
+    /// built over. The encoder holds the matcher: an encode asks its caller
+    /// for none.
+    fn added_tokens<M: Model>(tokenizer: &TokenizerOf<M>) -> Result<Option<AddedTokens>, Declined> {
         let vocabulary = tokenizer.get_added_vocabulary();
         if vocabulary.get_encode_special_tokens() {
             return Err(Declined::from("encode_special_tokens is set"));
         }
-        let tokens = vocabulary.get_added_tokens_decoder();
-        for token in tokens.values() {
+        for token in vocabulary.get_added_tokens_decoder().values() {
             if token.single_word
                 || token.lstrip
                 || token.rstrip
@@ -138,7 +189,12 @@ impl UnigramEncoder {
                 )));
             }
         }
-        Ok(!tokens.is_empty())
+        let tokens: Vec<Added> = vocabulary
+            .get_vocab()
+            .iter()
+            .map(|(content, &id)| Added::plain(content.clone(), id))
+            .collect();
+        AddedTokens::build(&tokens)
     }
 
     /// Which bytes of ASCII the character map leaves as they are: the map
@@ -240,23 +296,19 @@ impl UnigramEncoder {
     }
 
     /// The ids of `text`, framed by the post-processor's tokens on request.
-    /// `added` is the wrapper's matcher over the added tokens of `tokenizer`.
-    /// `None` when `tokenizer` is not the one this encoder was made from or
-    /// the matcher it needs is missing: the caller then encodes in
-    /// `tokenizers`.
+    /// The character map and the pieces are read from `tokenizer`, the one
+    /// this encoder was made from: the kind of its normalizer and of its
+    /// model is checked, not the map or the pieces. `None` when a kind is
+    /// another: the caller then encodes in `tokenizers`.
     pub(crate) fn encode<M: Model + ModelView>(
         &self,
         tokenizer: &TokenizerOf<M>,
-        added: Option<&AddedTokens>,
         text: &str,
         add_special_tokens: bool,
     ) -> Option<Vec<u32>> {
         let Some(NormalizerWrapper::Precompiled(normalizer)) = tokenizer.get_normalizer() else {
             return None;
         };
-        if self.has_added && added.is_none() {
-            return None;
-        }
         let ModelWrapper::Unigram(model) = tokenizer.get_model().wrapper() else {
             return None;
         };
@@ -274,10 +326,10 @@ impl UnigramEncoder {
             self.words(model, normalized, &mut piece, &mut best, ids);
         };
         let mut from = 0;
-        if let Some(added) = added {
-            for range in added.ranges(text) {
+        if let Some(added) = &self.added {
+            for (range, id) in added.tokens(text) {
                 span(&text[from..range.start], &mut ids);
-                ids.push(tokenizer.token_to_id(&text[range.clone()])?);
+                ids.push(id);
                 from = range.end;
             }
         }
@@ -312,7 +364,7 @@ impl UnigramEncoder {
                 let end = rest.find(self.marker).unwrap_or(rest.len());
                 piece.push_str(&rest[..end]);
                 rest = &rest[end..];
-                self.best_path(model, piece, best, ids);
+                self.best_path(|text| model.token_to_id(text), piece, best, ids);
             }
         }
     }
@@ -322,8 +374,15 @@ impl UnigramEncoder {
     /// byte after it a path, and a byte keeps the first path of the highest
     /// score; a character that no piece of its own length covers is offered
     /// as unknown. Unknown pieces in a row are one piece: the piece of that
-    /// text when there is one, the unknown piece otherwise.
-    fn best_path(&self, model: &Unigram, word: &str, best: &mut Vec<Best>, ids: &mut Vec<u32>) {
+    /// text when there is one, the unknown piece otherwise. `piece_id` is
+    /// the model's map: the id of the piece a text is, when it is one.
+    fn best_path(
+        &self,
+        piece_id: impl Fn(&str) -> Option<u32>,
+        word: &str,
+        best: &mut Vec<Best>,
+        ids: &mut Vec<u32>,
+    ) {
         let bytes = word.as_bytes();
         best.clear();
         best.resize(
@@ -355,15 +414,23 @@ impl UnigramEncoder {
             };
             let mut covered = false;
             // Every piece that starts here: the model's own map is asked
-            // for each text that ends between two characters and is no
-            // longer than the longest piece.
-            for end in start + char_len..=bytes.len().min(start + self.longest) {
+            // for each text that is as long as some piece with this first
+            // byte, ends within the word and between two characters. So one
+            // long piece is one more text to ask where its first byte
+            // stands, not a longer scan at every character.
+            let rest = bytes.len() - start;
+            for &len in self.lengths.of_first(bytes[start]) {
+                let len = len as usize;
+                if len > rest {
+                    break;
+                }
+                let end = start + len;
                 if !word.is_char_boundary(end) {
                     continue;
                 }
-                if let Some(id) = model.token_to_id(&word[start..end]) {
+                if let Some(id) = piece_id(&word[start..end]) {
                     offer(end, id, self.score[id as usize] + so_far);
-                    covered |= end == start + char_len;
+                    covered |= len == char_len;
                 }
             }
             if !covered {
@@ -381,18 +448,14 @@ impl UnigramEncoder {
                 unknown_end.get_or_insert(end);
             } else {
                 if let Some(run_end) = unknown_end.take() {
-                    ids.push(
-                        model
-                            .token_to_id(&word[end..run_end])
-                            .unwrap_or(self.unknown),
-                    );
+                    ids.push(piece_id(&word[end..run_end]).unwrap_or(self.unknown));
                 }
                 ids.push(last.id);
             }
             end = last.start as usize;
         }
         if let Some(run_end) = unknown_end {
-            ids.push(model.token_to_id(&word[..run_end]).unwrap_or(self.unknown));
+            ids.push(piece_id(&word[..run_end]).unwrap_or(self.unknown));
         }
         ids[from..].reverse();
     }
