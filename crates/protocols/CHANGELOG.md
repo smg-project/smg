@@ -176,8 +176,10 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   `parameters` is accepted as before, and a self-hosted model's strict member is passed through as
   before.
 - A Responses request with `service_tier: "fast"` or `"ultrafast"`, as the public API offers them
-  (`ServiceTierResponses`), parses and forwards the tier, and a Response served on either parses.
-  The crate refused both as unknown variants. Breaking: `ServiceTier` gains `Fast` and `Ultrafast`.
+  (`ServiceTierResponses`), parses and forwards the tier, and a Response that reports either label
+  parses. The OpenAI API reports `priority` for a `fast` request and `ultrafast` for an
+  `ultrafast` one; the gRPC routers echo the tier the request asked for. The crate refused both
+  as unknown variants. Breaking: `ServiceTier` gains `Fast` and `Ultrafast`.
 - A tool the model calls by name is refused when that name is the empty string (`400`,
   `error.code` `empty_string`, in the public API's words: `Invalid 'tools[1].function.name': empty
   string. Expected a string with minimum length 1, but got an empty string instead.`). On Chat

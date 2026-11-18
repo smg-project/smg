@@ -509,8 +509,8 @@ fn test_require_approval_object_round_trip() {
 }
 
 /// The public API's service tiers include `fast` and `ultrafast`: a request
-/// asking for either parses and forwards it as sent, and a Response that
-/// reports either parses and writes it back.
+/// asking for either parses and is written back with the same tier, and a
+/// Response that reports either parses and writes it back.
 #[test]
 fn a_responses_service_tier_of_fast_or_ultrafast_parses() {
     let mut response = json!({
