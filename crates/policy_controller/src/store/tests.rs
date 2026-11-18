@@ -2524,6 +2524,28 @@ fn a_tell_that_takes_a_door_of_the_leases_is_refused_in_a_debug_build() {
     store.hand(&hand, issued.expect("minted").id, GONE);
 }
 
+/// A line that prints the store from under the turn, a tell's or a panic's,
+/// does not take the turn again: it reads no count of the leases there.
+#[test]
+fn the_store_is_printed_from_under_its_leases_turn() {
+    thread_local!(static PRINTED: RefCell<String> = const { RefCell::new(String::new()) });
+    fn prints(store: &MemoryStore, _: &LeaseRecord, _: Said, _: Option<Decider>) {
+        PRINTED.with(|printed| *printed.borrow_mut() = format!("{store:?}"));
+    }
+    let store = MemoryStore::new();
+    let a = ready(&store, "http://a:1");
+    LeasesStore::set_term(&store, 1);
+    store.tell_through(prints);
+    let record = booking(GatewayId(1), 0, a, Instant::now());
+    let issued = store.issue_decided(record, store.world().booked_of(a), |_| ());
+    let hand = store.handover(GatewayId(1));
+    store.hand(&hand, issued.expect("minted").id, GONE);
+    let under = PRINTED.with(|printed| printed.borrow().clone());
+    assert!(under.contains("leases: under the turn"), "{under}");
+    let free = format!("{store:?}");
+    assert!(free.contains("leases: 0"), "{free}");
+}
+
 #[test]
 fn frames_handed_from_other_threads_are_all_applied_whoever_is_at_work() {
     const STREAMS: usize = 4;

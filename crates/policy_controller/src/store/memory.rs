@@ -142,12 +142,16 @@ impl std::fmt::Debug for MemoryStore {
             let workers = self.workers.lock();
             (workers.rows.len(), workers.epoch)
         };
-        let leases = self.file.take().records.len();
-        f.debug_struct("MemoryStore")
-            .field("workers", &workers)
-            .field("epoch", &epoch)
-            .field("leases", &leases)
-            .finish_non_exhaustive()
+        // The turn is tried, never taken: a line that prints the store from
+        // under the turn (a tell's, a panic's) reads no count there.
+        let leases = self.file.try_take().map(|turn| turn.records.len());
+        let mut form = f.debug_struct("MemoryStore");
+        form.field("workers", &workers).field("epoch", &epoch);
+        match leases {
+            Some(leases) => form.field("leases", &leases),
+            None => form.field("leases", &format_args!("under the turn")),
+        };
+        form.finish_non_exhaustive()
     }
 }
 
