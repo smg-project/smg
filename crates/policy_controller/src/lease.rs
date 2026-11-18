@@ -102,10 +102,12 @@ pub struct Outcome {
 /// Why a lease was released before its completion.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReleaseReason {
-    /// The host gave up before dispatch.
+    /// The lease ended before a dispatch: its host gave up, no dispatch
+    /// was named by its deadline, or its answer was stopped for the fence
+    /// (its controller no longer led the term that minted it).
     Abandoned,
     /// A late decision: it arrived after a fallback dispatch, or was cut
-    /// before it left.
+    /// before it left, for its request's budget or its dispatch span.
     LateDecision,
     /// The client went away.
     ClientGone,
