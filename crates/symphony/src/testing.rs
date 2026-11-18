@@ -507,13 +507,10 @@ pub(crate) fn a_call_terminal_ends_an_invoke_whose_arguments_are_json(
             .map_or(&events[..], |next| &events[..next]);
         let first_end = first_call
             .iter()
-            .position(|event| matches!(event, Event::ToolCallEnd { index: 0, .. }));
-        assert!(
-            first_end.is_some(),
-            "{name}: the first call has no end of its own: {events:?}"
-        );
+            .position(|event| matches!(event, Event::ToolCallEnd { index: 0, .. }))
+            .unwrap_or_else(|| panic!("{name}: the first call has no end of its own: {events:?}"));
         assert_eq!(
-            malformed(&first_call[..first_end.unwrap_or(first_call.len())]).len(),
+            malformed(&first_call[..first_end]).len(),
             1,
             "{name}: {events:?}"
         );

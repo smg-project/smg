@@ -372,7 +372,7 @@ What the syntax says, and what the assembler does with it:
   the invoke's close is the call's end. An object a terminal, the cut or the stop found open stays
   as written, no brace made up, and one `Malformed` event of no bytes says it is no whole value:
   the reader's at the first byte that is no JSON where it refused the object, else the one at
-  the call's end; an object that closed whole before a cut or a stop is whole, as the
+  the call's end; an object that closed whole before a cut or a stop stays whole, as the
   JSON assembler ends one. A word or a tag after the object is text where the syntax has tags,
   refused as below, and the call it stands in is no whole call, as a call of parameter tags the
   syntax refused bytes in is none: the closing brace of an object that closed whole, held back
