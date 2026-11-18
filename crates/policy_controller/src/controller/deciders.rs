@@ -2206,7 +2206,8 @@ pub(crate) mod tests {
         at_issue
             .recv_timeout(PATIENCE)
             .expect("the stage's issue call");
-        assert_eq!(bed.store.live(GATEWAY), 1, "filed before the call");
+        // The call runs under the turn of the leases' file, on the lease
+        // filed ahead of it: no door of the leases answers until it ends.
         // The call took the budget: the next read of the clock, the
         // decision's last, shows the hour past it.
         bed.script.steps.lock().push_back(Step::At(BUDGET));
@@ -2245,8 +2246,10 @@ pub(crate) mod tests {
     }
 
     /// A lease another hand ended while its decision ran is not the
-    /// decision's to tell of: the give-up finds none on file, and the
-    /// engine hears the issue alone.
+    /// decision's to tell of. A release its gateway hands while the stage's
+    /// issue call runs waits for the turn that call runs under: the
+    /// give-up's door applies it first and finds none on file, and the
+    /// engine hears the issue and the gateway's release alone.
     #[tokio::test]
     async fn a_lease_another_hand_ended_is_told_nothing_at_the_give_up() {
         let (mut bed, told, at_issue, word) = waiting();
@@ -2256,13 +2259,15 @@ pub(crate) mod tests {
             .expect("the stage's issue call");
         // Its gateway gives the lease up while the stage's call runs.
         let id = LeaseId(1 << 32 | 1);
-        let store: &dyn LeasesStore = bed.store.as_ref();
-        assert!(store.released(GATEWAY, id, None, ReleaseReason::ClientGone));
+        let hand = lifecycle::open(&bed.store, GATEWAY);
+        let gone = ReleaseReason::ClientGone;
+        bed.store.hand(&hand, id, Said::Released(None, gone));
         bed.script.steps.lock().push_back(Step::At(BUDGET));
         word.send(()).expect("the stage waits for the case");
         let answer = bed.answer().await;
         assert_eq!(busy(&answer), Reason::BudgetGoneOnArrival);
-        assert_eq!(*told.lock(), [(id.0, None)]);
+        assert_eq!(*told.lock(), [(id.0, None), (id.0, Some(gone))]);
+        assert_eq!(bed.store.live(GATEWAY), 0);
     }
 
     /// A lease's dispatch span counts from its decision's first read, and
