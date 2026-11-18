@@ -3445,14 +3445,16 @@ impl Engine {
                     .any(|&i| candidates[i as usize].id == stored)
                 {
                     // The door writes nothing where another request took
-                    // the key since this decision's read. The pins that
-                    // stand are this decision's own only where the
-                    // recorded worker leads them: otherwise the first read
-                    // stands, and the claim below sees the move and
-                    // follows it.
+                    // the key since this decision's read. Where the
+                    // recorded worker leads the pins that stand, this
+                    // decision's sight is that worker alone: a pin behind
+                    // it is another request's claim, and the claim below
+                    // sees it and follows it. Where another worker leads,
+                    // the first read stands, and the claim follows that
+                    // worker.
                     let written = self.sessions.restore(key, facts.now_micros, rule, stored);
                     if written[0] == stored {
-                        pins = written;
+                        pins = [stored, WorkerId(0)];
                     }
                 }
             }

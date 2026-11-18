@@ -1807,8 +1807,9 @@ mod tests {
 
     /// Keeps every row. The first time it is asked under the lifted veto it
     /// runs the request once more, on the same engine and over the staged
-    /// pool: another decision's whole run, in the gap between a decision's
-    /// read of the pins and its own claim.
+    /// pool, lent the pins of record its caller was lent: another
+    /// decision's whole run, in the gap between a decision's read of the
+    /// pins and its own claim.
     #[derive(Debug)]
     struct InTheGap(Arc<Gap>);
 
@@ -1821,7 +1822,18 @@ mod tests {
                 let staged = std::mem::take(&mut *self.0.staged.lock().expect("the staged pool"));
                 if let Some(engine) = self.0.engine.get().and_then(Weak::upgrade) {
                     if !staged.is_empty() {
-                        let _ = decide(&engine, facts, &staged);
+                        let lent = Constraints {
+                            pins: cx.pins,
+                            ..Constraints::default()
+                        };
+                        let mut scratch = Scratch::new();
+                        let _ = engine.decide(
+                            facts,
+                            &PoolFacts::default(),
+                            &staged,
+                            &lent,
+                            &mut scratch,
+                        );
                     }
                 }
             }
@@ -2356,6 +2368,63 @@ mod tests {
             SessionVerdict::Pinned,
             "the claim of record is the other decision's"
         );
+    }
+
+    /// A claim made behind the record is not this decision's own read
+    /// either. Another decision of the key, lent the same record, writes
+    /// it back first and claims the ring's next worker behind it: it sees
+    /// the ring's first worker down. Where the rule recovers the original
+    /// the record still leads the pins that stand. This decision's sight
+    /// is the record alone, so its claim sees the pin behind it and
+    /// follows the other's worker. Taken whole, the pins would let it
+    /// claim a second worker, and the record's pin would be dropped.
+    #[test]
+    fn a_claim_made_behind_the_record_is_followed() {
+        for recovery in [Recovery::Original, Recovery::Latest] {
+            let rule = SessionRule {
+                assignment: Assignment::Delegate,
+                inflight_cap: 0,
+                ttl_micros: None,
+                sweep_micros: 0,
+                recovery,
+            };
+            let (ringed, _) = ring_with_a_gap(None);
+            let (engine, gap) = ring_with_a_gap(Some(rule));
+            let mut pool = [free(0, 4), free(1, 4), free(2, 4), free(3, 4)];
+            let ring = ring_order(&ringed, &keyed("k1"), &pool);
+            let request = keyed("k1");
+            // The record names the ring's third worker, over its thresholds
+            // in both views: each decision's lifted pass keeps it.
+            let recorded = ring[2] as usize;
+            let record = Stored::of(request.session_key.hash, pool[recorded].id);
+            pool[recorded].health.overloaded = true;
+            let mut theirs = pool.to_vec();
+            theirs[ring[0] as usize].health.healthy = false;
+            *gap.staged.lock().expect("the staged pool") = theirs;
+            let lent = Constraints {
+                pins: Some(&record),
+                ..Constraints::default()
+            };
+            let mut scratch = Scratch::new();
+            let decision =
+                engine.decide(&request, &PoolFacts::default(), &pool, &lent, &mut scratch);
+            assert!(
+                gap.staged.lock().expect("the staged pool").is_empty(),
+                "the other decision ran"
+            );
+            assert_eq!(order(&decision)[..2], [ring[1], ring[0]], "{recovery:?}");
+            assert_eq!(
+                decision.pick().expect("a pick").session_verdict,
+                SessionVerdict::Pinned,
+                "{recovery:?}: the claim of record is the other decision's"
+            );
+            let pins = engine.sessions().pins(request.session()).expect("the pins");
+            assert!(pins.contains(&pool[recorded].id), "{recovery:?}: {pins:?}");
+            assert!(
+                pins.contains(&pool[ring[1] as usize].id),
+                "{recovery:?}: {pins:?}"
+            );
+        }
     }
 
     /// A key handed on at the cap reads the veto as it stands, from a pin
