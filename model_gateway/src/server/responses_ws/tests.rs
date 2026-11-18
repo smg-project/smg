@@ -5,8 +5,8 @@ fn user(text: &str) -> Value {
 #[test]
 fn continuation_preserves_order_and_only_appends_new_items() {
     let mut cache = SessionCache::default();
-    cache.remember("resp_1".into(), vec![user("first")], vec![json!({"type":"message","id":"m1","role":"assistant","content":[{"type":"output_text","text":"answer"}]})]);
-    let request = prepare(json!({"type":"response.create","model":"fixture-model","previous_response_id":"resp_1","input":[user("next")],"store":false}), &mut cache).unwrap();
+    cache.remember("resp_1", &[user("first")], &[json!({"type":"message","id":"m1","role":"assistant","content":[{"type":"output_text","text":"answer"}]})]);
+    let request = prepare(json!({"type":"response.create","model":"fixture-model","previous_response_id":"resp_1","input":[user("next")],"store":false}), &mut cache, MAX_PAYLOAD_BYTES).unwrap();
     assert_eq!(request.input.len(), 3);
     assert_eq!(request.input[0], user("first"));
     assert_eq!(request.input[2], user("next"));
@@ -15,19 +15,19 @@ fn continuation_preserves_order_and_only_appends_new_items() {
 #[test]
 fn ids_are_connection_scoped_and_missing_parent_never_generates() {
     let mut a = SessionCache::default();
-    a.remember("resp_1".into(), vec![user("private")], vec![]);
+    a.remember("resp_1", &[user("private")], &[]);
     let mut b = SessionCache::default();
-    let error = prepare(json!({"type":"response.create","model":"fixture-model","previous_response_id":"resp_1","input":"next"}), &mut b).err().unwrap();
+    let error = prepare(json!({"type":"response.create","model":"fixture-model","previous_response_id":"resp_1","input":"next"}), &mut b, MAX_PAYLOAD_BYTES).err().unwrap();
     assert_eq!(error["error"]["code"], "previous_response_not_found");
 }
 #[test]
 fn lru_entries_are_bounded_and_clear_releases_owned_state() {
     let mut cache = SessionCache::default();
     for i in 0..8 {
-        cache.remember(format!("resp_{i}"), vec![user("small")], vec![]);
+        cache.remember(&format!("resp_{i}"), &[user("small")], &[]);
     }
     assert_eq!(cache.entries.len(), MAX_CACHE_ENTRIES);
-    assert!(cache.expand("resp_0", vec![]).is_err());
+    assert!(cache.expand("resp_0", vec![], MAX_PAYLOAD_BYTES).is_err());
     cache.clear();
     assert!(cache.entries.is_empty());
     assert_eq!(cache.bytes, 0);
@@ -35,13 +35,36 @@ fn lru_entries_are_bounded_and_clear_releases_owned_state() {
 #[test]
 fn oversized_history_is_not_retained() {
     let mut cache = SessionCache::default();
-    cache.remember(
-        "large".into(),
-        vec![user(&"x".repeat(MAX_CACHE_BYTES / 3 + 1))],
-        vec![],
-    );
+    cache.remember("large", &[user(&"x".repeat(MAX_CACHE_BYTES / 3 + 1))], &[]);
     assert_eq!(cache.bytes, 0);
     assert!(cache.entries.is_empty());
+}
+#[test]
+fn history_charges_the_id_and_rejects_replay_over_the_payload_limit() {
+    let mut cache = SessionCache::default();
+    cache.remember(&"x".repeat(MAX_CACHE_BYTES / 3), &[], &[]);
+    assert!(cache.entries.is_empty());
+
+    cache.remember("parent", &[user("longer than the replay cap")], &[]);
+    let entry = &cache.entries[0];
+    assert_eq!(cache.bytes, (entry.id.len() + entry.items.len()) * 3);
+    let failure = cache.expand("parent", Vec::new(), 10).unwrap_err();
+    assert_eq!(failure["status"], 413);
+    assert_eq!(failure["error"]["code"], "request_body_too_large");
+    assert!(cache
+        .expand("parent", Vec::new(), MAX_PAYLOAD_BYTES)
+        .is_ok());
+}
+#[test]
+fn a_history_charge_releases_the_gauge_it_reserved() {
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let charge = metrics::with_local_recorder(&recorder, || Charge::reserve(123).unwrap());
+    assert!(handle
+        .render()
+        .contains("smg_responses_ws_cache_bytes 123\n"));
+    drop(charge);
+    assert!(handle.render().contains("smg_responses_ws_cache_bytes 0\n"));
 }
 #[test]
 fn prewarm_and_control_validation() {
@@ -49,20 +72,23 @@ fn prewarm_and_control_validation() {
     assert!(
         !prepare(
             json!({"type":"response.create","model":"fixture-model","generate":false,"input":[]}),
-            &mut cache
+            &mut cache,
+            MAX_PAYLOAD_BYTES,
         )
         .unwrap()
         .generate
     );
-    assert!(prepare(json!({"type":"other"}), &mut cache).is_err());
+    assert!(prepare(json!({"type":"other"}), &mut cache, MAX_PAYLOAD_BYTES).is_err());
     assert!(prepare(
         json!({"type":"response.create","generate":"false"}),
-        &mut cache
+        &mut cache,
+        MAX_PAYLOAD_BYTES,
     )
     .is_err());
     assert!(prepare(
         json!({"type":"response.create","stream_id":"x"}),
-        &mut cache
+        &mut cache,
+        MAX_PAYLOAD_BYTES,
     )
     .is_err());
 }
@@ -157,7 +183,7 @@ async fn heartbeat_keeps_the_transport_alive_without_extending_session_idle_time
 #[test]
 fn background_mode_is_rejected_before_loading_history() {
     let mut cache = SessionCache::default();
-    let failure = prepare(json!({"type":"response.create","background":true,"previous_response_id":"missing","input":[]}), &mut cache).err().unwrap();
+    let failure = prepare(json!({"type":"response.create","background":true,"previous_response_id":"missing","input":[]}), &mut cache, MAX_PAYLOAD_BYTES).err().unwrap();
     assert_eq!(failure["error"]["code"], "unsupported_parameter");
     assert_eq!(failure["error"]["param"], "background");
 }

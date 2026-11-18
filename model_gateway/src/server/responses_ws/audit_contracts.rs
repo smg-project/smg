@@ -95,6 +95,10 @@ impl Fixture {
                 let fail = body["input"].as_array().is_some_and(|items| items.last().is_some_and(|item| item["content"] == "fail"));
                 let response = json!({"id":format!("resp_{number}"),"status":if fail {"failed"} else {"completed"},"output":[]});
                 let event = json!({"type":if fail {"response.failed"} else {"response.completed"},"response":response});
+                if body["input"].as_array().is_some_and(|items| items.last().is_some_and(|item| item["content"] == "trailing-fixture")) {
+                    let trailing = json!({"type":"error","error":{"code":"trailing_fixture"}});
+                    return ([("content-type","text/event-stream")], format!("data: {event}\n\ndata: {trailing}\n\n")).into_response();
+                }
                 ([("content-type","text/event-stream")], format!("data: {event}\n\n")).into_response()
             }
         }));
@@ -481,6 +485,7 @@ fn durable_storage_and_conversation_modes_are_explicitly_unsupported() {
         let error = prepare(
             json!({"type":"response.create","model":"fixture-model","store":store,"input":"seed"}),
             &mut cache,
+            MAX_PAYLOAD_BYTES,
         )
         .err()
         .unwrap();
@@ -489,12 +494,26 @@ fn durable_storage_and_conversation_modes_are_explicitly_unsupported() {
     }
     for generate in [true, false] {
         let mut cache = SessionCache::default();
-        let error = prepare(json!({"type":"response.create","model":"fixture-model","generate":generate,"store":true,"input":"seed"}), &mut cache).err().unwrap();
+        let error = prepare(json!({"type":"response.create","model":"fixture-model","generate":generate,"store":true,"input":"seed"}), &mut cache, MAX_PAYLOAD_BYTES).err().unwrap();
         assert_eq!(error["error"]["code"], "unsupported_parameter");
         assert_eq!(error["error"]["param"], "store");
-        let error = prepare(json!({"type":"response.create","model":"fixture-model","conversation":"conv_fixture","input":"seed"}), &mut cache).err().unwrap();
+        let error = prepare(json!({"type":"response.create","model":"fixture-model","conversation":"conv_fixture","input":"seed"}), &mut cache, MAX_PAYLOAD_BYTES).err().unwrap();
         assert_eq!(error["error"]["param"], "conversation");
     }
+}
+
+#[tokio::test]
+async fn a_terminal_event_ends_its_turn_even_when_another_frame_shares_the_chunk() {
+    let mut fixture = Fixture::new(false).await;
+    let first = fixture
+        .turn(json!({"type":"response.create","model":"fixture-model","input":"trailing-fixture"}))
+        .await;
+    assert_eq!(first["type"], "response.completed");
+    let next = fixture
+        .turn(json!({"type":"response.create","model":"fixture-model","input":"next"}))
+        .await;
+    assert_eq!(next["type"], "response.completed", "{next}");
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]

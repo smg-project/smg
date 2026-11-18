@@ -137,7 +137,8 @@ A listener accepts up to 32 Responses sockets, with up to four per authenticated
 tenant. A frame or expanded request is limited to the smaller of 4 MiB and the
 configured HTTP payload limit. History keeps up to four responses per socket.
 Its accounting limits are 16 MiB per socket and 128 MiB per process. The
-accounting charges three times the serialized JSON size. The gateway sends a
+cache stores compact JSON and charges three times the transcript and response ID
+size. The gateway sends a
 WebSocket ping every 15 seconds, including while a worker is quiet. Set proxy
 idle timeouts above that interval. Control frames do not renew the session's
 15-minute wait for the next turn, and every connection expires after one hour.

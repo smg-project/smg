@@ -29,7 +29,8 @@ use openai_protocol::responses::{
     ResponseStatus, ResponseUsage, ResponsesRequest, ResponsesResponse, ResponsesUsage,
 };
 use parking_lot::Mutex;
-use serde_json::{json, Value};
+use serde::{Serialize, Serializer as _};
+use serde_json::{json, Map, Value};
 use smg_external_router::sse::SseDecoder;
 use tower::ServiceExt;
 
@@ -175,7 +176,10 @@ const MAX_ERROR_BYTES: usize = 1024 * 1024;
 const CONNECTION_LIFETIME: Duration = Duration::from_secs(3600);
 static CACHE_BYTES: AtomicUsize = AtomicUsize::new(0);
 
-struct Charge(usize);
+struct Charge {
+    bytes: usize,
+    gauge: metrics::Gauge,
+}
 impl Charge {
     fn reserve(bytes: usize) -> Option<Self> {
         CACHE_BYTES
@@ -184,22 +188,22 @@ impl Charge {
                     .filter(|total| *total <= GLOBAL_CACHE_BYTES)
             })
             .ok()?;
-        metrics::gauge!("smg_responses_ws_cache_bytes")
-            .set(CACHE_BYTES.load(Ordering::Acquire) as f64);
-        Some(Self(bytes))
+        // Add each charge to the gauge before handing it out. Publishing
+        // absolute snapshots allows concurrent drops to restore older values.
+        let gauge = metrics::gauge!("smg_responses_ws_cache_bytes");
+        gauge.increment(bytes as f64);
+        Some(Self { bytes, gauge })
     }
 }
 impl Drop for Charge {
     fn drop(&mut self) {
-        CACHE_BYTES.fetch_sub(self.0, Ordering::AcqRel);
-        metrics::gauge!("smg_responses_ws_cache_bytes")
-            .set(CACHE_BYTES.load(Ordering::Acquire) as f64);
+        CACHE_BYTES.fetch_sub(self.bytes, Ordering::AcqRel);
+        self.gauge.decrement(self.bytes as f64);
     }
 }
 struct Entry {
-    id: String,
-    input: Vec<Value>,
-    output: Vec<Value>,
+    id: Box<str>,
+    items: Box<[u8]>,
     charge: Charge,
 }
 #[derive(Default)]
@@ -212,27 +216,50 @@ impl SessionCache {
         self.entries.clear();
         self.bytes = 0;
     }
-    fn expand(&mut self, parent: &str, input: Vec<Value>) -> Result<Vec<Value>, Value> {
-        let index = self.entries.iter().position(|entry| entry.id == parent);
-        let Some(entry) = index.and_then(|index| self.entries.remove(index)) else {
+    fn expand(
+        &mut self,
+        parent: &str,
+        input: Vec<Value>,
+        max_payload_bytes: usize,
+    ) -> Result<Vec<Value>, Value> {
+        let Some(index) = self
+            .entries
+            .iter()
+            .position(|entry| entry.id.as_ref() == parent)
+        else {
             metrics::counter!("smg_responses_ws_cache_misses_total").increment(1);
             return Err(error("previous_response_not_found", "Previous response is not cached on this connection. Resend the complete input without previous_response_id.", Some("previous_response_id")));
         };
-        let mut expanded = entry.input.clone();
-        expanded.extend(entry.output.iter().cloned());
+        let entry = &self.entries[index];
+        if entry.items.len() > max_payload_bytes {
+            return Err(payload_limit_error());
+        }
+        let mut expanded: Vec<Value> = serde_json::from_slice(&entry.items).map_err(|_| {
+            error(
+                "previous_response_not_found",
+                "Previous response could not be replayed. Resend the complete input without previous_response_id.",
+                Some("previous_response_id"),
+            )
+        })?;
         expanded.extend(input);
-        self.entries.push_back(entry);
+        self.entries.make_contiguous()[index..].rotate_left(1);
         metrics::counter!("smg_responses_ws_cache_hits_total").increment(1);
         Ok(expanded)
     }
-    fn remember(&mut self, id: String, input: Vec<Value>, output: Vec<Value>) {
-        // Retention is charged in logical bytes (3x serialized JSON), not RSS.
-        // Frame and HTTP body limits bound individual incoming requests.
-        let mut count = JsonLimit::new(io::sink(), MAX_CACHE_BYTES / 3);
-        if serde_json::to_writer(&mut count, &(&input, &output)).is_err() {
+    fn remember(&mut self, id: &str, input: &[Value], output: &[Value]) {
+        // Cache the serialized transcript so small JSON items cannot expand
+        // into an unaccounted tree of allocations for the lifetime of a session.
+        let Some(limit) = (MAX_CACHE_BYTES / 3).checked_sub(id.len()) else {
+            return;
+        };
+        let mut encoded = JsonLimit::new(Vec::new(), limit);
+        if serde_json::Serializer::new(&mut encoded)
+            .collect_seq(input.iter().chain(output))
+            .is_err()
+        {
             return;
         }
-        let bytes = count.written * 3;
+        let bytes = (encoded.written + id.len()) * 3;
         while !self.entries.is_empty()
             && (self.entries.len() >= MAX_CACHE_ENTRIES || self.bytes + bytes > MAX_CACHE_BYTES)
         {
@@ -249,15 +276,14 @@ impl SessionCache {
         };
         self.bytes += bytes;
         self.entries.push_back(Entry {
-            id,
-            input,
-            output,
+            id: id.into(),
+            items: encoded.writer.into_boxed_slice(),
             charge,
         });
     }
     fn evict(&mut self) {
         if let Some(entry) = self.entries.pop_front() {
-            self.bytes -= entry.charge.0;
+            self.bytes -= entry.charge.bytes;
             metrics::counter!("smg_responses_ws_cache_evictions_total").increment(1);
         }
     }
@@ -312,6 +338,16 @@ fn connection_expired_error() -> Value {
     )
 }
 
+fn payload_limit_error() -> Value {
+    let mut refusal = error(
+        "request_body_too_large",
+        "Expanded Responses request exceeds the WebSocket payload limit",
+        None,
+    );
+    refusal["status"] = 413.into();
+    refusal
+}
+
 fn input_items(value: Option<Value>) -> Result<Vec<Value>, Value> {
     match value {
         None => Ok(Vec::new()),
@@ -324,13 +360,21 @@ fn input_items(value: Option<Value>) -> Result<Vec<Value>, Value> {
         )),
     }
 }
+#[derive(Serialize)]
 struct Prepared {
-    body: Value,
+    #[serde(flatten)]
+    body: Map<String, Value>,
     input: Vec<Value>,
+    #[serde(skip)]
     generate: bool,
+    #[serde(skip)]
     full_replacement: bool,
 }
-fn prepare(value: Value, cache: &mut SessionCache) -> Result<Prepared, Value> {
+fn prepare(
+    value: Value,
+    cache: &mut SessionCache,
+    max_payload_bytes: usize,
+) -> Result<Prepared, Value> {
     let Value::Object(mut body) = value else {
         return Err(error(
             "invalid_type",
@@ -403,7 +447,7 @@ fn prepare(value: Value, cache: &mut SessionCache) -> Result<Prepared, Value> {
     let full_replacement = matches!(parent.as_ref(), None | Some(Value::Null));
     let input = input_items(body.remove("input"))?;
     let input = match parent {
-        Some(Value::String(parent)) => cache.expand(&parent, input)?,
+        Some(Value::String(parent)) => cache.expand(&parent, input, max_payload_bytes)?,
         None | Some(Value::Null) => input,
         _ => {
             return Err(error(
@@ -413,13 +457,12 @@ fn prepare(value: Value, cache: &mut SessionCache) -> Result<Prepared, Value> {
             ))
         }
     };
-    body.insert("input".into(), Value::Array(input.clone()));
     body.insert("stream".into(), Value::Bool(true));
     // This pilot supports only socket-scoped history; unstored responses
     // are never promoted to persistent history.
     body.insert("store".into(), Value::Bool(false));
     Ok(Prepared {
-        body: Value::Object(body),
+        body,
         input,
         generate,
         full_replacement,
@@ -674,7 +717,7 @@ async fn serve(
                 continue;
             }
         };
-        let mut prepared = match prepare(value, &mut cache) {
+        let prepared = match prepare(value, &mut cache, dispatch.max_payload_bytes) {
             Ok(prepared) => prepared,
             Err(error) => {
                 if !send(&mut socket, &error).await {
@@ -697,17 +740,8 @@ async fn serve(
             return;
         }
         let mut payload = JsonLimit::new(Vec::new(), dispatch.max_payload_bytes);
-        if serde_json::to_writer(&mut payload, &prepared.body).is_err() {
-            let refusal = json!({
-                "type": "error",
-                "status": 413,
-                "error": {
-                    "type": "invalid_request_error",
-                    "code": "request_body_too_large",
-                    "message": "Expanded Responses request exceeds the WebSocket payload limit",
-                },
-            });
-            if !send(&mut socket, &refusal).await {
+        if serde_json::to_writer(&mut payload, &prepared).is_err() {
+            if !send(&mut socket, &payload_limit_error()).await {
                 return;
             }
             continue;
@@ -809,7 +843,6 @@ async fn serve(
                 .await;
                 return;
             };
-            let id = id.to_owned();
             let mut created = response.clone();
             created["status"] = json!("in_progress");
             created["completed_at"] = Value::Null;
@@ -825,7 +858,8 @@ async fn serve(
             if prepared.full_replacement {
                 cache.clear();
             }
-            cache.remember(id, prepared.input, Vec::new());
+            cache.remember(id, &prepared.input, &[]);
+            drop(prepared.input);
             if !send(
                 &mut socket,
                 &json!({"type":"response.completed","sequence_number":1,"response":response}),
@@ -873,7 +907,7 @@ async fn serve(
                                 }
                                 let response = &event["response"];
                                 if let (Some(id), Some(output)) = (response["id"].as_str(), response["output"].as_array()) {
-                                    cache.remember(id.to_owned(), std::mem::take(&mut prepared.input), output.clone());
+                                    cache.remember(id, &prepared.input, output);
                                 }
                                 complete = true;
                             }
@@ -881,11 +915,13 @@ async fn serve(
                             _ => {}
                         }
                         if !send(&mut socket, &event).await { return; }
+                        if complete { break; }
                     }
                     if complete { break; }
                 }
             }
         }
+        drop(prepared.input);
         if complete {
             // Let the HTTP edge observe EOF and release its permit. The
             // terminal event has already reached the client.
