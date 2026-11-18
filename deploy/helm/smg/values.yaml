@@ -429,7 +429,12 @@ policyController:
   # -- Replicas. With the election off every replica is a controller of its
   #    own and two would each lead alone: the chart refuses more than one,
   #    and an upgrade tells the old pod to stop before it makes the new one.
-  #    With it on, run two or more: one leads and the others stand by.
+  #    With it on, one leads and the others stand by. One replica is a shape
+  #    of its own there: a rollout's surge pod is its standby, and the old
+  #    pod's stop hands over to it. Two or more keep a standby between
+  #    rollouts too: for a pod that is lost, and for a node drain, where no
+  #    surge comes. What a standby holds when it takes over is the
+  #    election's word, below.
   replicas: 1
 
   # -- Leader election among the replicas, over one coordination.k8s.io Lease
@@ -450,6 +455,25 @@ policyController:
   #    A changed leaseName on a running release is such a change as well: a
   #    pod elected over the new Lease may lead while the old Lease's leader
   #    still leads, until its renew deadline, and the term starts again.
+  #    A standby follows its leader only where the standbys' listener takes
+  #    identities as told: identityAsTold names replication. It then dials
+  #    the Lease holder's pod at ports.replication, takes the leader's
+  #    workers and their loads and follows each write of them. Its readiness
+  #    probe fails until it is synced with its leader and passes only while
+  #    it is: a rollout waits for the new pod's sync by itself, and a
+  #    disruption budget counts a synced standby alone. Under the defaults
+  #    none of that holds: a standby follows nobody, reads ready at once and
+  #    takes over with no worker and no load. A standbys' listener that
+  #    serves TLS follows nobody yet.
+  #    Naming replication there on a running elected release does not roll
+  #    out: the old leader's listener takes no stated name and refuses the
+  #    new pod, which stays not ready while the old pods serve as before.
+  #    Roll back, or scale the controller to zero and upgrade. Deleting a
+  #    pod is no way out: another old pod may take the Lease. The first
+  #    leader under the new values starts with no worker and no load either
+  #    way.
+  #    A Lease deleted under standbys that follow turns every pod not ready
+  #    until the release is applied again: the pods cannot make it.
   election:
     enabled: false
     leaseName: ""
@@ -523,6 +547,13 @@ policyController:
   #    verifies its callers, or a network policy that admits them alone: the
   #    Service carries the gateways' and the operators' ports, and a pod's
   #    address reaches all three listeners.
+  #    The standbys' listener is called by the controller's own pods and by
+  #    nobody else. What fences it admits, to ports.replication, the pods
+  #    under the controller's selector labels: app.kubernetes.io/name,
+  #    app.kubernetes.io/instance and app.kubernetes.io/component:
+  #    policy-controller. A fence that keeps them out leaves every standby
+  #    not ready. The chart renders no such policy: one that selects the
+  #    controller's pods isolates their other listeners too.
   identityAsTold: []
 
   # -- The Service <fullname>-policy-controller, three ports on the listeners'
@@ -567,7 +598,9 @@ policyController:
 
   # -- Pod disruption budget. With one replica, minAvailable: 1 lets no pod
   #    be evicted and a node drain waits on it for ever: run two replicas or
-  #    more, or leave the budget off.
+  #    more, or leave the budget off. The budget counts ready pods: a standby
+  #    is ready once it is synced where identityAsTold names replication,
+  #    and at once under the defaults, where it holds nothing.
   podDisruptionBudget:
     enabled: false
     minAvailable: 1
@@ -603,7 +636,8 @@ policyController:
     periodSeconds: 30
 
   # -- Readiness probe tuning. `/readiness` on the admin listener answers 200
-  #    once every listener serves and 503 from SIGTERM on.
+  #    once every listener serves and 503 from SIGTERM on. A standby that
+  #    follows its leader answers 503 while it is not synced with it.
   readinessProbe:
     path: /readiness
     initialDelaySeconds: 2

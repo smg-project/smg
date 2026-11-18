@@ -14,6 +14,7 @@ the job that runs these cases on the image's binary does not install.
 
 from __future__ import annotations
 
+import errno
 import http.server
 import json
 import os
@@ -327,7 +328,7 @@ def test_only_its_own_examples_turn_the_controller_on():
     examples = sorted(EXAMPLES.glob("*.yaml"))
     assert examples, "the chart has examples"
     on = [example.name for example in examples if of_the_controller(render(files=(example,)))]
-    assert on == [STORE_EXAMPLE, "with-policy-controller.yaml"]
+    assert on == [STORE_EXAMPLE, STANDBY_EXAMPLE.name, "with-policy-controller.yaml"]
 
 
 @needs_helm
@@ -1847,12 +1848,18 @@ def test_the_image_job_starts_on_what_these_cases_read():
     assert not starts_the_job("deploy/helm/smg/tests/rules/run.sh", entries)
 
 
-def free_ports(count: int) -> list[int]:
+def free_ports(count: int, *addresses: str) -> list[int]:
+    """``count`` ports free on 127.0.0.1, and on each of ``addresses`` too."""
     sockets = [socket.socket() for _ in range(count)]
     try:
         for sock in sockets:
             sock.bind(("127.0.0.1", 0))
-        return [sock.getsockname()[1] for sock in sockets]
+        ports = [sock.getsockname()[1] for sock in sockets]
+        for address in addresses:
+            for port in ports:
+                sockets.append(socket.socket())
+                sockets[-1].bind((address, port))
+        return ports
     finally:
         for sock in sockets:
             sock.close()
@@ -2244,26 +2251,50 @@ class ElectedPod:
     arguments the Deployment passes, on ports free here and a short grace
     period, with the pod's address written where the kubelet writes it, the
     pod's name in HOSTNAME, the client configuration of its account, and
-    the spec document's ConfigMap mounted: each pod's own mount."""
+    the spec document's ConfigMap mounted: each pod's own mount.
 
-    def __init__(self, binary: str, configuration: Path, name: str):
-        gateway, control, replication, admin = free_ports(4)
+    ``settings`` are laid over the elected block, and ``values`` is a values
+    file in that block's place. A pod given ``ports`` shares them with the
+    Deployment's other pods, as the pods of one template do, and listens on
+    its own ``address`` alone: a pod's network is its own in a cluster, and
+    two pods of one host cannot each take every address of a port."""
+
+    def __init__(
+        self,
+        binary: str,
+        configuration: Path,
+        name: str,
+        *settings: str,
+        values: Path | None = None,
+        address: str = "127.0.0.1",
+        ports: list[int] | None = None,
+    ):
+        gateway, control, replication, admin = ports or free_ports(4)
+        block = (*ELECTED, "policyController.replicas=2") if values is None else ()
         documents = render(
-            *ELECTED,
-            "policyController.replicas=2",
+            *block,
             f"policyController.ports.gateway={gateway}",
             f"policyController.ports.control={control}",
             f"policyController.ports.replication={replication}",
             f"policyController.ports.admin={admin}",
             "policyController.shutdownGracePeriodSeconds=4",
             "policyController.shutdownSettleSeconds=1",
+            *settings,
+            files=() if values is None else (values,),
         )
         found = container(documents)
         _, passed = mounted(documents, configuration.parent / name)
         # The kubelet expands a variable the container itself names.
         assert "POD_IP" in [variable["name"] for variable in found["env"]]
-        arguments = [argument.replace("$(POD_IP)", "127.0.0.1") for argument in passed]
+        arguments = [argument.replace("$(POD_IP)", address) for argument in passed]
         assert arguments != passed, "the arguments name no pod address"
+        if ports is not None:
+            everywhere = [argument for argument in arguments if argument.startswith("0.0.0.0:")]
+            assert len(everywhere) == 4, f"four listeners take every address: {arguments}"
+            arguments = [
+                argument.replace("0.0.0.0", address, 1) if argument in everywhere else argument
+                for argument in arguments
+            ]
         environment = {
             key: value
             for key, value in os.environ.items()
@@ -2271,8 +2302,9 @@ class ElectedPod:
         }
         environment["HOSTNAME"] = name
         environment["KUBECONFIG"] = str(configuration)
-        self.identity = f"{name}@127.0.0.1:{gateway}"
-        self.probe = f"http://127.0.0.1:{admin}/readiness"
+        self.identity = f"{name}@{address}:{gateway}"
+        self.probe = f"http://{address}:{admin}/readiness"
+        self.metrics = f"http://{address}:{admin}/metrics"
         self.process = subprocess.Popen(
             [binary, *arguments],
             env=environment,
@@ -2303,6 +2335,31 @@ class ElectedPod:
             assert time.monotonic() < deadline, f"not ready as {role} in {seconds} s: {answer}"
             time.sleep(0.1)
             answer = self.readiness()
+
+    def holds(self, answer: tuple[int, dict], seconds: float) -> None:
+        """Waits until the probe answers ``answer``, and reads no other
+        answer of it through ``seconds`` from then. A probe a held host did
+        not answer in time is no sample."""
+        deadline = time.monotonic() + 20
+        while (read := self.readiness()) != answer:
+            assert time.monotonic() < deadline, f"no {answer} in 20 s: {read}"
+            time.sleep(0.1)
+        samples = 0
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            read = self.readiness()
+            if read != (0, {}):
+                assert read == answer, f"{read} inside {seconds} s of {answer}"
+                samples += 1
+            time.sleep(0.2)
+        assert samples >= 5, f"the probe answered {samples} times in {seconds} s"
+
+    def series(self, name: str) -> float:
+        """What the pod's /metrics reads for the series ``name``."""
+        with DIRECT.open(self.metrics, timeout=2) as response:
+            rendered = response.read().decode()
+        (value,) = re.findall(rf"^{re.escape(name)} (\S+)$", rendered, flags=re.MULTILINE)
+        return float(value)
 
     def stop(self) -> str:
         """SIGTERM, the exit status checked, and the log."""
@@ -2505,6 +2562,354 @@ def test_a_lease_deleted_under_running_pods_leaves_them_ready_and_nobody_leading
         one_leads_and_one_follows(pods)
         for pod in pods:
             pod.stop()
+    finally:
+        for pod in pods:
+            pod.end()
+        stand_in.close()
+
+
+# The standby. A replica that does not lead follows its leader only where
+# the standbys' listener takes identities as told. The chart says so in its
+# words, in one line of an install's notes and by one example.
+
+STANDBY_EXAMPLE = EXAMPLES / "with-policy-controller-standby.yaml"
+# The standbys' listener named among those that take identities as told.
+REPLICATION_AS_TOLD = "policyController.identityAsTold={replication}"
+# The notes' line of an elected controller whose standby follows nobody, and
+# its two reasons, in the order the controller tells them apart.
+NO_STANDBY_FOLLOWS = "  Standby:  follows no leader and takes over with no worker and no load"
+NOT_TOLD = "policyController.identityAsTold does not name replication"
+SERVES_TLS = "the controller's listeners serve TLS"
+# A server certificate for the controller's gRPC listeners, in the two
+# spellings of an option's value.
+TLS = "policyController.extraArgs={--tls-cert,/tls/tls.crt,--tls-key,/tls/tls.key}"
+TLS_BEHIND_SIGNS = "policyController.extraArgs={--tls-cert=/tls/tls.crt,--tls-key=/tls/tls.key}"
+# What the probe answers on a replica that follows its leader and is not
+# synced with it.
+SYNCING = (503, {"status": "not ready", "reason": "syncing"})
+# The series that reads 1 on a standby synced with its leader, and 0 on
+# every other replica.
+SYNCED = "smg_policy_controller_replication_synced"
+# Two pods' addresses on one host: each loopback address is a pod's own.
+POD_ADDRESSES = ("127.0.0.1", "127.0.0.2")
+
+
+@needs_helm
+def test_the_standby_example_renders_two_elected_replicas_behind_the_fence_it_names(notes):
+    """The standby example renders the election's four objects, two
+    replicas, the standbys' listener named to take identities as told, and
+    a budget over the controller's pods. The fence its words name is what
+    the chart renders: the pods' selector labels and the replication
+    port. Its install's notes say nothing of a standby that follows
+    nobody: its standby follows."""
+    documents = render(files=(STANDBY_EXAMPLE,))
+    assert sorted(document["kind"] for document in of_the_controller(documents)) == [
+        "ConfigMap",
+        "Deployment",
+        "Lease",
+        "PodDisruptionBudget",
+        "Role",
+        "RoleBinding",
+        "Service",
+        "ServiceAccount",
+    ]
+    deployment = one(documents, "Deployment")
+    assert deployment["spec"]["replicas"] == 2
+    found = container(documents)
+    assert found["args"][found["args"].index("--identity-as-told") + 1] == "replication"
+    selector = deployment["spec"]["selector"]["matchLabels"]
+    assert one(documents, "PodDisruptionBudget")["spec"] == {
+        "minAvailable": 1,
+        "selector": {"matchLabels": selector},
+    }
+    words = STANDBY_EXAMPLE.read_text()
+    labels = dict(re.findall(r"^#   (app\.kubernetes\.io/\S+): (\S+)$", words, flags=re.MULTILINE))
+    assert labels == selector
+    ports = {port["name"]: port["containerPort"] for port in found["ports"]}
+    assert f"({ports['replication']} here)" in words
+    assert "Standby" not in notes(files=(STANDBY_EXAMPLE,))
+
+
+@pytest.fixture
+def notes(tmp_path):
+    """What an install prints, by its ``--set`` pairs: the chart's notes,
+    rendered. ``helm template`` renders the notes and prints none of them,
+    and an install's dry run asks a cluster. So a copy of the chart holds
+    the notes' text as a file of its own, and one more template renders
+    that text, as the chart's templates are rendered, into a ConfigMap."""
+    chart = tmp_path / "smg"
+    shutil.copytree(CHART, chart)
+    shutil.copy(chart / "templates" / "NOTES.txt", chart / "notes.txt")
+    (chart / "templates" / "notes-rendered.yaml").write_text(
+        "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: notes\n"
+        'data:\n  notes: {{ tpl (.Files.Get "notes.txt") . | toJson }}\n'
+    )
+
+    def printed(*settings: str, files: tuple[Path, ...] = ()) -> str:
+        documents = render(*settings, files=files, chart=chart)
+        return one(documents, "ConfigMap", "notes")["data"]["notes"]
+
+    return printed
+
+
+@needs_helm
+@pytest.mark.parametrize(
+    ("settings", "why"),
+    [
+        ((), NOT_TOLD),
+        (("policyController.identityAsTold={gateway,control}",), NOT_TOLD),
+        (("policyController.extraArgs={--identity-as-told,gateway}",), NOT_TOLD),
+        ((TLS,), NOT_TOLD),
+        ((REPLICATION_AS_TOLD, TLS), SERVES_TLS),
+        ((REPLICATION_AS_TOLD, TLS_BEHIND_SIGNS), SERVES_TLS),
+    ],
+    ids=[
+        "the defaults",
+        "the other two listeners named",
+        "another listener named by a flag",
+        "a certificate and the listener not named",
+        "the listener named behind a certificate",
+        "the listener named behind a certificate, by equals signs",
+    ],
+)
+def test_the_notes_of_an_elected_controller_say_that_its_standby_follows_nobody(
+    notes, settings, why
+):
+    """An install with the election on says in one line of its notes where a
+    standby follows no leader and takes over with no worker and no load, and
+    why, as the controller tells the two apart: the standbys' listener not
+    named to take identities as told, or named and serving TLS, where a
+    standby's dial has no credential yet."""
+    said = [line for line in notes(*ELECTED, *settings).splitlines() if "Standby" in line]
+    assert len(said) == 1 and said[0].startswith(f"{NO_STANDBY_FOLLOWS}: {why}"), said
+
+
+@needs_helm
+@pytest.mark.parametrize(
+    "settings",
+    [
+        (*ELECTED, REPLICATION_AS_TOLD),
+        (*ELECTED, "policyController.identityAsTold={replication,gateway}"),
+        (*ELECTED, "policyController.extraArgs={--identity-as-told,replication}"),
+        (*ELECTED, "policyController.extraArgs={--identity-as-told,gateway\\,replication}"),
+        (*ELECTED, "policyController.extraArgs={--identity-as-told=control\\,replication}"),
+        (*ELECTED, REPLICATION_AS_TOLD, "policyController.extraArgs={--identity-as-told,gateway}"),
+        ON,
+        (),
+    ],
+    ids=[
+        "the value names it",
+        "the value names it among others",
+        "a flag names it",
+        "a flag names it among others",
+        "a flag names it behind an equals sign",
+        "the value names it and a flag names another",
+        "the election is off",
+        "the controller is off",
+    ],
+)
+def test_the_notes_say_nothing_of_a_standby_that_follows_or_where_none_stands_by(notes, settings):
+    """The line stands for nothing else. Not where the listener is named, by
+    the value or by a flag of extraArgs in either spelling of its value: the
+    notes read the arguments the pod is passed, each flag of them where the
+    option stands twice. And not with the election off, where no replica
+    stands by."""
+    assert "Standby" not in notes(*settings)
+
+
+def test_the_readme_has_the_part_the_notes_name_and_lists_the_standby_example():
+    """The notes' line sends its reader to the chart's README, Standby. The
+    README has a part of that name, and its table of examples names the
+    standby example by its file."""
+    assert "(the chart's README, Standby)" in (CHART / "templates" / "NOTES.txt").read_text()
+    readme = (CHART / "README.md").read_text()
+    assert "\n**Standby.** " in readme
+    assert f"| [`{STANDBY_EXAMPLE.name}`](examples/{STANDBY_EXAMPLE.name}) | " in readme
+
+
+@pytest.fixture
+def shared_ports() -> list[int]:
+    """Four ports free on both pods' addresses, for the pods of one
+    Deployment: they share its ports, a pod an address. Skipped on a host
+    with no second loopback address; Linux answers on one with no set-up."""
+    ports: list[int] = []
+    try:
+        ports = free_ports(4, POD_ADDRESSES[1])
+    except OSError as refused:
+        if refused.errno != errno.EADDRNOTAVAIL:
+            raise
+        pytest.skip(f"this host has no address {POD_ADDRESSES[1]}")
+    return ports
+
+
+def pod_of(
+    binary: str,
+    configuration: Path,
+    place: int,
+    ports: list[int],
+    *settings: str,
+    values: Path | None = None,
+) -> ElectedPod:
+    """Pod ``place`` of a Deployment whose pods share ``ports``, under that
+    place's name and on its address."""
+    return ElectedPod(
+        binary,
+        configuration,
+        POD_NAMES[place],
+        *settings,
+        values=values,
+        address=POD_ADDRESSES[place],
+        ports=ports,
+    )
+
+
+@needs_helm
+def test_the_standby_examples_second_pod_reads_ready_once_synced_and_takes_the_lease_over(
+    binary, tmp_path, shared_ports
+):
+    """Two controllers started as the pods of the standby example, over one
+    Lease. The first leads. The second follows it: it reads ready as a
+    follower, synced with its leader by its own scrape, where a leader's
+    scrape reads not synced, for it follows nobody. The first's stop hands
+    the Lease over and the second leads. No call of the two is one the
+    example's Role refuses."""
+    documents = render(files=(STANDBY_EXAMPLE,))
+    (rule,) = one(documents, "Role")["rules"]
+    stand_in = LeaseStandIn([rule])
+    pods: list[ElectedPod] = []
+    try:
+        stand_in.apply(one(documents, "Lease"))
+        configuration = client_configuration(tmp_path, stand_in.url)
+        leader = pod_of(binary, configuration, 0, shared_ports, values=STANDBY_EXAMPLE)
+        pods.append(leader)
+        leader.reads("leader")
+        standby = pod_of(binary, configuration, 1, shared_ports, values=STANDBY_EXAMPLE)
+        pods.append(standby)
+        standby.reads("follower")
+        assert (leader.series(SYNCED), standby.series(SYNCED)) == (0, 1)
+        assert stand_in.objects[NAME]["spec"]["holderIdentity"] == leader.identity
+
+        assert "the lease is released" in leader.stop()
+        standby.reads("leader")
+        assert standby.series(SYNCED) == 0
+        assert stand_in.objects[NAME]["spec"]["holderIdentity"] == standby.identity
+        output = standby.stop()
+        assert "this replica follows its leader while it does not lead" in output
+        assert "following the leader's log" in output
+        assert [call for call in stand_in.calls if not call[2]] == []
+    finally:
+        for pod in pods:
+            pod.end()
+        stand_in.close()
+
+
+@needs_helm
+def test_under_the_defaults_a_replica_follows_no_leader_and_says_so(binary, tmp_path):
+    """Two elected pods under the chart's defaults, where the standbys'
+    listener takes no stated name. Each says once, at its start, that it
+    follows no leader, and why. The second reads ready as a follower all
+    the same, synced with nobody: it would take over with no worker and no
+    load, as the notes of such an install say."""
+    documents = render(*ELECTED, "policyController.replicas=2")
+    (rule,) = one(documents, "Role")["rules"]
+    stand_in = LeaseStandIn([rule])
+    pods: list[ElectedPod] = []
+    try:
+        stand_in.apply(one(documents, "Lease"))
+        configuration = client_configuration(tmp_path, stand_in.url)
+        pods.append(ElectedPod(binary, configuration, POD_NAMES[0]))
+        pods[0].reads("leader")
+        pods.append(ElectedPod(binary, configuration, POD_NAMES[1]))
+        pods[1].reads("follower")
+        assert pods[1].series(SYNCED) == 0
+        for pod in pods:
+            said = [
+                line for line in pod.stop().splitlines() if "this replica follows no leader" in line
+            ]
+            assert len(said) == 1, said
+            assert 'why="the replication listener places no principal"' in said[0]
+    finally:
+        for pod in pods:
+            pod.end()
+        stand_in.close()
+
+
+@needs_helm
+def test_a_standby_its_leader_refuses_reads_not_ready_for_as_long_as_that_leader_leads(
+    binary, tmp_path, shared_ports
+):
+    """What a rollout that names the standbys' listener makes of a running
+    elected release. The old leader's listener takes no stated name and
+    refuses the new pod, which reads not ready, syncing, for as long as
+    that leader leads, and says the refusal in its log. The rollout stops
+    no pod before the new one is ready, so it waits and nothing is down:
+    the chart's words say the two ways out. With the old leader gone the
+    new pod leads."""
+    documents = render(*ELECTED, "policyController.replicas=2")
+    (rule,) = one(documents, "Role")["rules"]
+    stand_in = LeaseStandIn([rule])
+    pods: list[ElectedPod] = []
+    try:
+        stand_in.apply(one(documents, "Lease"))
+        configuration = client_configuration(tmp_path, stand_in.url)
+        old = pod_of(binary, configuration, 0, shared_ports)
+        pods.append(old)
+        old.reads("leader")
+        new = pod_of(binary, configuration, 1, shared_ports, REPLICATION_AS_TOLD)
+        pods.append(new)
+        # Through three seconds, in which the new pod dials its leader
+        # again and again.
+        new.holds(SYNCING, 3)
+        assert new.series(SYNCED) == 0
+        old.stop()
+        new.reads("leader")
+        refused = [
+            line
+            for line in new.stop().splitlines()
+            if "this standby does not follow its leader" in line
+        ]
+        assert refused and "Unauthenticated" in refused[0], refused
+    finally:
+        for pod in pods:
+            pod.end()
+        stand_in.close()
+
+
+@needs_helm
+def test_a_lease_deleted_under_replicas_that_follow_turns_them_not_ready(
+    binary, tmp_path, shared_ports
+):
+    """The Lease deleted under a leader and its synced standby. Nobody
+    leads, as under the defaults, and here neither stays ready: the old
+    leader reads syncing once it has fenced itself, which its log says, and
+    the standby once its sync lapses, a load poll interval after its
+    leader's last frame. The Lease applied again, as the release renders
+    it, one leads and the other follows it, with no restart."""
+    documents = render(*ELECTED, "policyController.replicas=2")
+    (rule,) = one(documents, "Role")["rules"]
+    lease = one(documents, "Lease")
+    stand_in = LeaseStandIn([rule])
+    # A load poll interval of two seconds: a standby reads synced under one,
+    # so its sync lapses inside the case's wait.
+    settings = (REPLICATION_AS_TOLD, "policyController.extraArgs={--load-monitor-interval,2}")
+    pods: list[ElectedPod] = []
+    try:
+        stand_in.apply(lease)
+        configuration = client_configuration(tmp_path, stand_in.url)
+        pods.append(pod_of(binary, configuration, 0, shared_ports, *settings))
+        pods[0].reads("leader")
+        pods.append(pod_of(binary, configuration, 1, shared_ports, *settings))
+        pods[1].reads("follower")
+
+        stand_in.delete(NAME)
+        for pod in pods:
+            pod.holds(SYNCING, 2)
+        assert stand_in.objects == {}
+
+        stand_in.apply(lease)
+        one_leads_and_one_follows(pods)
+        outputs = [pod.stop() for pod in pods]
+        assert "the lease moved; the fence is closed" in outputs[0]
     finally:
         for pod in pods:
             pod.end()
