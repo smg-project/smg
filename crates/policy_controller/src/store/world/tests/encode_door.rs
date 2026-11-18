@@ -478,3 +478,31 @@ fn a_membership_write_that_moves_an_encoders_end_states_its_facts_again() {
     assert!(after[0].references, "the door reads the end of this write");
     assert_eq!(after[0].class, before[0].class);
 }
+
+#[test]
+fn a_write_that_leaves_a_models_encoders_and_prefills_carries_the_encoders_facts() {
+    let store = MemoryStore::new();
+    store.upsert(encode_facts("grpc://e1:9000", Role::Encode, push_on("c1")));
+    store.upsert(encode_facts("grpc://p1:9000", Role::Prefill, push_on("c1")));
+    let stated = || {
+        let world = store.world();
+        let shape = world.derived.shape(MODEL, Role::Encode);
+        shape
+            .and_then(|shape| shape.encoders.clone())
+            .expect("the encoders' facts")
+    };
+    let before = stated();
+    // A decode joins: the encoders' facts read no decode.
+    store.upsert(facts("grpc://d1:9000", Role::Decode, &[MODEL]));
+    assert!(
+        Arc::ptr_eq(&before, &stated()),
+        "a decode joined: stated again"
+    );
+    // A prefill joins: the classes are derived again and the facts with
+    // them.
+    store.upsert(encode_facts("grpc://p2:9000", Role::Prefill, push_on("c1")));
+    assert!(
+        !Arc::ptr_eq(&before, &stated()),
+        "a prefill joined: carried"
+    );
+}

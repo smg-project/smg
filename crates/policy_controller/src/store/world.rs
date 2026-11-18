@@ -34,8 +34,9 @@
 //! **The encode classes stand beside them.** Where a model's encoders state
 //! an end of the encode handoff, the same write derives which encoders each
 //! prefill's handoff reaches ([`EncodeClasses`]), by the rows of the two
-//! pools. A write that moves no member and no member's offer carries them,
-//! and every other write derives them whole.
+//! pools. A write carries them in every model whose encoders and prefills
+//! it leaves as they stood, a decode's write and another model's among
+//! them, and derives them whole in the models it moves one of.
 //!
 //! A row in a pool is the candidate row itself. Its fixed fields are
 //! written when the membership's first world is built. Its moving facts
@@ -429,10 +430,59 @@ impl Derived {
         self.prefill(model)?.encodes.as_ref()
     }
 
+    /// The shapes of `model`'s encode pool and of its prefill pool, each
+    /// where the model has one, by one read of the model's pools.
+    fn ends(&self, model: &str) -> Option<Ends<'_>> {
+        let pools = self.by_model.get(model)?;
+        let shape =
+            |role: Role| pools[role_slot(role)].and_then(|pool| self.pools.get(pool as usize));
+        Some(Ends {
+            encode: shape(Role::Encode),
+            prefill: shape(Role::Prefill),
+        })
+    }
+
     /// How many members `pool` holds: none where there is no pool.
     fn members(&self, pool: Option<u32>) -> usize {
         pool.and_then(|pool| self.pools.get(pool as usize))
             .map_or(0, |shape| shape.admitted_micros.len())
+    }
+}
+
+/// The two pools of one model that the encode handoff reads, as one write
+/// left them: the shape of its encode pool and of its prefill pool, each
+/// where the model has one.
+#[derive(Clone, Copy)]
+struct Ends<'a> {
+    encode: Option<&'a PoolShape>,
+    prefill: Option<&'a PoolShape>,
+}
+
+impl Ends<'_> {
+    /// Whether a write that asks `classes` left both pools as they stand
+    /// here, `sides` being the model's members after it: no member of
+    /// either joined or left, and the written worker is in neither. One
+    /// worker's write moves that worker's rows alone, so two sides of these
+    /// pools' lengths that do not hold the worker are these pools' sides,
+    /// row for row.
+    fn stand(&self, classes: Classes, sides: &[Vec<Entry<'_>>; ROLES]) -> bool {
+        let joined = match classes {
+            Classes::Carry => return true,
+            Classes::Derive => return false,
+            Classes::Written { joined, .. } => joined,
+        };
+        [(Role::Encode, self.encode), (Role::Prefill, self.prefill)]
+            .into_iter()
+            .all(|(role, shape)| {
+                let entries = &sides[role_slot(role)];
+                let holds = |id: WorkerId| {
+                    entries
+                        .binary_search_by_key(&id, |entry| entry.row.id)
+                        .is_ok()
+                };
+                entries.len() == shape.map_or(0, |shape| shape.admitted_micros.len())
+                    && !joined.is_some_and(holds)
+            })
     }
 }
 
@@ -791,9 +841,10 @@ impl World {
     /// class's encoders by their rows in its encode pool, another gateway's
     /// host-local rows counted ([`EncodeClasses`]). A class's number is read
     /// under this world's borrow and never kept. `None` when the model has
-    /// no prefill or no encoder that states an end. A membership write
-    /// derives them, and so does a generation of another pairing mode at the
-    /// same epoch, as it does the pair classes ([`World::pairs`]).
+    /// no prefill or no encoder that states an end. A membership write that
+    /// moves one of the model's encoders or prefills derives them, and so
+    /// does a generation of another pairing mode at the same epoch, as it
+    /// does the pair classes ([`World::pairs`]).
     pub fn encodes(&self, model: &str) -> Option<&EncodeClasses> {
         self.derived.encodes(model).map(|classes| &**classes)
     }
@@ -1426,7 +1477,9 @@ impl<'a> Pool<'a> for [Entry<'a>] {
 
 /// What a membership write asks of a model's classes. The pair classes
 /// follow each variant's words. The encode classes are carried under
-/// [`Classes::Carry`] and derived whole under the other two.
+/// [`Classes::Carry`], and under [`Classes::Written`] in every model whose
+/// encoders and prefills the write left as they stood ([`Ends::stand`]).
+/// Elsewhere they are derived whole.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Classes {
     /// Every model's classes are derived whole: a generation of another
@@ -1530,26 +1583,27 @@ fn encode_member<'a>(entry: &Entry<'a>) -> EncodeMember<'a> {
 }
 
 /// One model's encode classes, each side in its rows' order: what the last
-/// write left on the model's prefill pool (`kept`), classes or none, where
-/// this write moved no member and no offer ([`Classes::Carry`]), else
-/// derived. `None` when the model has none: no prefill, or no encoder that
-/// states an end. A model with no encoder pays no derivation, and a write
-/// that carries pays none whatever the model holds.
+/// write left on the model's prefill pool (`last_prefill`), classes or
+/// none, where this write left the model's encoders and prefills as they
+/// stood ([`Ends::stand`]), else derived. `None` when the model has none:
+/// no prefill, or no encoder that states an end. A model with no encoder
+/// pays no derivation, and a write that carries pays none whatever the
+/// model holds.
 fn encode_up(
     sides: &[Vec<Entry<'_>>; ROLES],
-    kept: Option<&PoolShape>,
+    last_prefill: Option<&PoolShape>,
 ) -> Option<Arc<EncodeClasses>> {
     let encoders = &sides[role_slot(Role::Encode)];
     let prefills = &sides[role_slot(Role::Prefill)];
-    if let Some(kept) = kept {
+    if let Some(last) = last_prefill {
         debug_assert!(
-            kept.encodes.iter().all(|classes| {
+            last.encodes.iter().all(|classes| {
                 classes.encoders().len() == encoders.len()
                     && classes.prefills().len() == prefills.len()
             }),
             "the classes are these members'"
         );
-        return kept.encodes.clone();
+        return last.encodes.clone();
     }
     if encoders.is_empty() || prefills.is_empty() {
         return None;
@@ -1565,22 +1619,22 @@ fn encode_up(
 /// order: its class among `classes`, `0` where it states no end or the
 /// model has no class; whether its registration states a push, with its
 /// role or without; and whether it takes an item's references. They are
-/// what the last write left on the model's encode pool (`kept`) where this
-/// write moved no member and no offer ([`Classes::Carry`]), and `None`
-/// where the model has no encoder.
+/// what the last write left on the model's encode pool (`last_encode`)
+/// where this write left the model's encoders and prefills as they stood
+/// ([`Ends::stand`]), and `None` where the model has no encoder.
 fn encoder_facts(
     encoders: &[Entry<'_>],
     classes: Option<&EncodeClasses>,
-    kept: Option<&PoolShape>,
+    last_encode: Option<&PoolShape>,
 ) -> Option<Arc<[EncoderFacts]>> {
-    if let Some(kept) = kept {
+    if let Some(last) = last_encode {
         debug_assert!(
-            kept.encoders
+            last.encoders
                 .iter()
                 .all(|stated| stated.len() == encoders.len()),
             "the facts are these members'"
         );
-        return kept.encoders.clone();
+        return last.encoders.clone();
     }
     if encoders.is_empty() {
         return None;
@@ -2523,25 +2577,23 @@ impl Writer {
                 .all(|entries| entries.is_sorted_by(|a, b| a.row.id < b.row.id)));
             // The model's classes go on its prefill pool's shape: a model
             // that has classes has that pool.
-            let carried = last.as_deref().and_then(|last| last.pairs(&model));
+            // One read of the last write's pools of the model serves its
+            // pair classes, its encode classes and its encoders' facts.
+            let ends = last.as_deref().and_then(|last| last.ends(&model));
+            let carried = ends.and_then(|ends| ends.prefill?.pairs.as_ref());
             let (mode, kept) = (self.spec.pairing(), &mut self.derivations);
             let mut pairs = pair_up(&mut sides, mode, classes, carried, kept, &model);
-            // The encode classes are carried where no member and no offer
-            // moved, and derived whole at every other write.
-            let kept = match classes {
-                Classes::Carry => last.as_deref().and_then(|last| last.prefill(&model)),
-                Classes::Derive | Classes::Written { .. } => None,
-            };
-            let mut encodes = encode_up(&sides, kept);
-            // The encoders' facts are carried as the encode classes are.
-            let kept = match classes {
-                Classes::Carry => last
-                    .as_deref()
-                    .and_then(|last| last.shape(&model, Role::Encode)),
-                Classes::Derive | Classes::Written { .. } => None,
-            };
-            let mut stated =
-                encoder_facts(&sides[role_slot(Role::Encode)], encodes.as_deref(), kept);
+            // The encode classes and the encoders' facts are the last
+            // write's in every model whose encoders and prefills this write
+            // left as they stood, and derived whole in the others.
+            let stood = ends.filter(|ends| ends.stand(classes, &sides));
+            let mut encodes = encode_up(&sides, stood.and_then(|ends| ends.prefill));
+            let last_encode = stood.and_then(|ends| ends.encode);
+            let mut stated = encoder_facts(
+                &sides[role_slot(Role::Encode)],
+                encodes.as_deref(),
+                last_encode,
+            );
             let mut indexes = [None; ROLES];
             for (side, entries) in sides.into_iter().enumerate() {
                 if entries.is_empty() {
