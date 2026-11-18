@@ -38,10 +38,13 @@
 //!    build alone behind it: a decision whose budget ended while it was
 //!    made, its lease's filing and the stages' hearing of it included,
 //!    leaves as `Busy` under the reason a late arrival is told, and under
-//!    a count of its own ([`Counts`]). The lease of an answer that does
-//!    not leave is given up at once by the door a `Released` frame takes:
-//!    the store first, then the engine told, of a commit that failed
-//!    under a closed fence and of a late decision past the budget.
+//!    a count of its own ([`Counts`]). So does a pick whose lease has
+//!    under a millisecond of its dispatch span left at that read: the span
+//!    counts from the first read, and the answer's lease carries what is
+//!    left of it. The lease of an answer that does not leave is given up
+//!    at once: the store's release door first, the one a `Released` frame
+//!    takes, then the engine told, as abandoned under a closed fence and
+//!    as a late decision past the budget or the span.
 //!
 //! A lease is what the next decisions read. The store counts the leases on
 //! file by the worker each books, and a decision whose profile declares
@@ -55,9 +58,10 @@
 //! head of the store's deadline queue that no gateway named a dispatch
 //! for in time, two at most, and tells the engine of those its own
 //! generation issued. So a lease whose answer never reached its gateway
-//! (a stream that ended, a full queue, a decision that panicked past its
-//! issue) stands until its deadline and the issues after it, and through
-//! a lull until the next issue: no timer ends one yet.
+//! (a stream that ended, a full queue, the stream's own fence at the
+//! send, a decision that panicked past its issue) stands until its
+//! deadline and the issues after it, and through a lull until the next
+//! issue: no timer ends one yet.
 //!
 //! What a lease does not do yet. It books the pick's first target alone: a
 //! dispatch that names another target moves no count. A request sent twice
@@ -141,10 +145,10 @@ use crate::{
 /// for its scrape to render: each `Busy` by its reason, the requests this
 /// build has no decision for by cause, the requests whose block hashes
 /// were cut, the answers no stream took, the candidates a gateway's wires
-/// took from its decisions, and the decisions whose budget ended while they
-/// were made. A request that is decided inside its budget, with its hashes
-/// inside the cap and every candidate one its gateway can dial, moves none
-/// of them.
+/// took from its decisions, and the decisions whose budget or lease's
+/// dispatch span ended while they were made. A request that is decided
+/// inside both, with its hashes inside the cap and every candidate one its
+/// gateway can dial, moves none of them.
 #[derive(Debug, Default)]
 pub(crate) struct Counts {
     /// `Busy` answers, each at its reason's number on the wire.
@@ -167,9 +171,9 @@ pub(crate) struct Counts {
     /// its own: read whole by [`Counts::undialed`] and
     /// [`Counts::hashes_cut`].
     parts: [Part; PARTS],
-    /// Decisions whose budget ended while they were made. Each leaves as
-    /// `Busy` under the reason a late arrival is told, and this count is
-    /// of them alone.
+    /// Decisions whose budget, or whose lease's dispatch span, ended while
+    /// they were made. Each leaves as `Busy` under the reason a late arrival
+    /// is told, and this count is of them alone.
     pub(crate) outlasted: AtomicU64,
     /// Picks the store minted no lease for, its term's ids being spent or
     /// the term past the width an id carries. Each leaves as `Busy` with
@@ -502,14 +506,14 @@ impl Decider {
     }
 
     /// One request's decision with the term both reads of the fence showed
-    /// and the lease issued for it where it is a pick, or the reason its
-    /// answer is `Busy`.
+    /// and, where it is a pick, the lease issued for it with what is left
+    /// of its dispatch span, or the reason its answer is `Busy`.
     fn decide(
         &mut self,
         request: &Checked,
         gateway: GatewayId,
         received: Instant,
-    ) -> Result<(u64, Decision, Option<Lease>), Reason> {
+    ) -> Result<(u64, Decision, Option<wire::Leased>), Reason> {
         let Reads {
             store,
             fence,
@@ -552,9 +556,17 @@ impl Decider {
             // as `Busy` under the reason a late arrival is told, and under
             // a count of its own.
             let handed = clock();
+            // The decision's length, one difference of its two reads, is
+            // what the budget and a lease's dispatch span are judged by.
+            // The span counts from the first read: the answer tells its
+            // gateway what is left of it, and a lease with under a
+            // millisecond left is none to hand over.
+            let since = taken.since(handed);
+            let left = DISPATCH_TTL.saturating_sub(since);
+            let spent = matches!(filed, Ok(Some(_))) && left < Duration::from_millis(1);
             let failed = if fence.leader_term(handed) != Some(term) {
-                Some((Reason::NotLeader, ReleaseReason::CommitFailed))
-            } else if taken.outlasted(handed) {
+                Some((Reason::NotLeader, ReleaseReason::Abandoned))
+            } else if taken.outlasted(since) || spent {
                 counts.outlasted.fetch_add(1, Ordering::Relaxed);
                 Some((Reason::BudgetGoneOnArrival, ReleaseReason::LateDecision))
             } else {
@@ -562,7 +574,11 @@ impl Decider {
             };
             let Some((busy, ended)) = failed else {
                 return match filed {
-                    Ok(lease) => Ok((term, decision, lease)),
+                    Ok(lease) => Ok((
+                        term,
+                        decision,
+                        lease.map(|lease| wire::Leased { lease, left }),
+                    )),
                     // The term mints no more ids. A pick with no lease is
                     // no answer: its gateway decides it locally.
                     Err(LeaseRefused::Unminted { lease, store }) if lease == store => {
@@ -618,12 +634,17 @@ impl<'a> Taken<'a> {
         })
     }
 
-    /// Whether the budget is gone at `later`, a read of the clock after the
-    /// one the request was taken at: what was left then, less the time
-    /// since, under the same rule. One difference of two instants, where
-    /// taking the request again would read its budget and build it whole.
-    fn outlasted(&self, later: Instant) -> bool {
-        let since = later.saturating_duration_since(self.now);
+    /// The time since the request was taken at `later`, a read of the
+    /// clock after that one. One difference of two instants judges the
+    /// budget and a lease's dispatch span, where taking the request again
+    /// would read its budget and build it whole.
+    fn since(&self, later: Instant) -> Duration {
+        later.saturating_duration_since(self.now)
+    }
+
+    /// Whether the budget is gone `since` the request was taken: what was
+    /// left then, less that time, under the same rule.
+    fn outlasted(&self, since: Duration) -> bool {
         self.left.saturating_sub(since) < Duration::from_micros(1)
     }
 }
@@ -791,11 +812,11 @@ fn issue(
     Ok(lease)
 }
 
-/// Gives up the lease of a decision whose answer does not leave, by the
-/// door a gateway's `Released` frame takes: the store first, and the
-/// engine that heard the issue told once, where the store held the lease.
-/// A lease the store no longer holds was ended by another hand, and
-/// nothing is told of it here.
+/// Gives up the lease of a decision whose answer does not leave: the
+/// store's release door first ([`crate::store::LeasesStore::released`], the
+/// one a gateway's `Released` frame takes), then the engine that heard the
+/// issue, told once where the store held the lease. A lease the store no
+/// longer holds was ended by another hand, and nothing is told of it here.
 fn give_up(
     store: &MemoryStore,
     world: &World,
@@ -1280,6 +1301,13 @@ pub(crate) mod tests {
         frame_for(MODEL, id, seed)
     }
 
+    /// `frame` with `budget` in place of the case's.
+    fn budgeted(mut frame: proto::DecideRequest, budget: Duration) -> proto::DecideRequest {
+        let facts = frame.facts.as_mut().expect("the case's frame has facts");
+        facts.budget_micros = u32::try_from(budget.as_micros()).expect("a budget of seconds");
+        frame
+    }
+
     /// `frame` in `phase`.
     fn phased(mut frame: proto::DecideRequest, phase: proto::Phase) -> proto::DecideRequest {
         frame
@@ -1710,7 +1738,7 @@ pub(crate) mod tests {
 
     /// The fence is judged behind the lease's issue too: a word that closes
     /// it while a stage's issue call runs stops the answer, and the lease
-    /// filed for it is given up as a commit that failed.
+    /// filed for it is given up as abandoned.
     #[tokio::test]
     async fn a_fence_closed_by_a_word_inside_a_stages_issue_call_stops_the_answer_and_its_lease() {
         let (mut bed, told, at_issue, word) = waiting();
@@ -1727,8 +1755,81 @@ pub(crate) mod tests {
         assert_eq!(busy(&answer), Reason::NotLeader);
         assert_eq!(bed.counts.outlasted.load(Ordering::Relaxed), 0);
         assert_eq!(bed.store.live(GATEWAY), 0);
-        let (id, failed) = (1 << 32 | 1, Some(ReleaseReason::CommitFailed));
-        assert_eq!(*told.lock(), [(id, None), (id, failed)]);
+        let (id, abandoned) = (1 << 32 | 1, Some(ReleaseReason::Abandoned));
+        assert_eq!(*told.lock(), [(id, None), (id, abandoned)]);
+    }
+
+    /// A lease another hand ended while its decision ran is not the
+    /// decision's to tell of: the give-up finds none on file, and the
+    /// engine hears the issue alone.
+    #[tokio::test]
+    async fn a_lease_another_hand_ended_is_told_nothing_at_the_give_up() {
+        let (mut bed, told, at_issue, word) = waiting();
+        assert_eq!(bed.submit(frame(1, 1)), None);
+        at_issue
+            .recv_timeout(PATIENCE)
+            .expect("the stage's issue call");
+        // Its gateway gives the lease up while the stage's call runs.
+        let id = LeaseId(1 << 32 | 1);
+        let store: &dyn LeasesStore = bed.store.as_ref();
+        assert!(store.released(GATEWAY, id, None, ReleaseReason::ClientGone));
+        bed.script.steps.lock().push_back(Step::At(BUDGET));
+        word.send(()).expect("the stage waits for the case");
+        let answer = bed.answer().await;
+        assert_eq!(busy(&answer), Reason::BudgetGoneOnArrival);
+        assert_eq!(*told.lock(), [(id.0, None)]);
+    }
+
+    /// A lease's dispatch span counts from its decision's first read, and
+    /// its answer says what is left of the span at the last. A decision
+    /// inside its budget that leaves under a millisecond of the span has no
+    /// lease to hand over: it leaves as `Busy`, late, its lease given up.
+    /// One with no lease has no span to end, and leaves.
+    #[tokio::test]
+    async fn a_slow_decisions_lease_says_what_is_left_of_its_span_and_none_left_is_no_answer() {
+        // A budget of twice the span: the span ends first.
+        let slow = |id: u8| budgeted(frame(id, 1), DISPATCH_TTL * 2);
+        let (mut bed, told, at_issue, word) = waiting();
+        let id = |count: u64| 1 << 32 | count;
+        // The first decision's stage leaves a millisecond of the span.
+        let first = DISPATCH_TTL - Duration::from_millis(1);
+        assert_eq!(bed.submit(slow(1)), None);
+        at_issue
+            .recv_timeout(PATIENCE)
+            .expect("the stage's issue call");
+        bed.script.steps.lock().push_back(Step::At(first));
+        word.send(()).expect("the stage waits for the case");
+        let answer = bed.answer().await;
+        assert_eq!(lease_of(&answer).dispatch_ttl_ms, 1);
+        let store: &dyn LeasesStore = bed.store.as_ref();
+        let filed = store.get(GATEWAY, LeaseId(id(1)));
+        let filed = filed.expect("the lease is on file");
+        assert_eq!(filed.dispatch_deadline, bed.script.taken + DISPATCH_TTL);
+        // The second is taken where the first left the clock, and its
+        // stage leaves under a millisecond of the span, half its budget.
+        let second = first + DISPATCH_TTL - Duration::from_micros(999);
+        assert_eq!(bed.submit_at(slow(2), GATEWAY, first), None);
+        at_issue
+            .recv_timeout(PATIENCE)
+            .expect("the stage's issue call");
+        bed.script.steps.lock().push_back(Step::At(second));
+        word.send(()).expect("the stage waits for the case");
+        let answer = bed.answer().await;
+        assert_eq!(busy(&answer), Reason::BudgetGoneOnArrival);
+        assert_eq!(bed.counts.outlasted.load(Ordering::Relaxed), 1);
+        // A third of the same length, which the wires shed: no lease, so
+        // no span to end, and it leaves as its shed.
+        let third = second + DISPATCH_TTL - Duration::from_micros(999);
+        let reads = [second, third].map(Step::At);
+        bed.script.steps.lock().extend(reads);
+        let wireless = constrained(slow(3), 0b010, None);
+        assert_eq!(bed.submit_at(wireless, GATEWAY, second), None);
+        let shed = declined(proto::ShedReason::NoEndpoints, "wires");
+        assert_eq!(outcome(&bed.answer().await), &shed);
+        assert_eq!(bed.counts.outlasted.load(Ordering::Relaxed), 1);
+        let late = (id(2), Some(ReleaseReason::LateDecision));
+        assert_eq!(*told.lock(), [(id(1), None), (id(2), None), late]);
+        assert_eq!(bed.store.live(GATEWAY), 1, "the first decision's lease");
     }
 
     #[tokio::test]
@@ -3093,35 +3194,38 @@ pub(crate) mod tests {
     /// read the fence takes there and with no clock read more. A decision
     /// with a microsecond left leaves. One whose budget ended while it was
     /// made leaves as `Busy` under the reason a late arrival is told, and
-    /// is counted apart from one.
+    /// is counted apart from one. The case's budget is half the dispatch
+    /// span, so no lease's span ends where its decision's budget does.
     #[tokio::test]
     async fn a_decision_whose_budget_ended_while_it_was_made_leaves_as_busy_and_is_counted_apart() {
-        let short = BUDGET - Duration::from_micros(1);
-        let under = BUDGET - Duration::from_nanos(999);
+        let budget = DISPATCH_TTL / 2;
+        let halved = |id, seed| budgeted(frame(id, seed), budget);
+        let short = budget - Duration::from_micros(1);
+        let under = budget - Duration::from_nanos(999);
         let steps = [
             Duration::ZERO,
             short,
             Duration::ZERO,
             under,
             Duration::ZERO,
-            BUDGET,
-            BUDGET,
+            budget,
+            budget,
         ]
         .map(Step::At);
         let mut bed = leading(steps);
-        let answer = bed.ask(frame(1, 1)).await;
+        let answer = bed.ask(halved(1, 1)).await;
         assert!(bed.workers.contains(&picked(&answer)), "{answer:?}");
         assert_eq!(bed.counts.outlasted.load(Ordering::Relaxed), 0);
         // Under one microsecond left is gone, as where a request is taken.
         for (id, count) in [(2, 1), (3, 2)] {
-            let answer = bed.ask(frame(id, 2)).await;
+            let answer = bed.ask(halved(id, 2)).await;
             assert_eq!(busy(&answer), Reason::BudgetGoneOnArrival);
             assert_eq!((answer.request_id.as_slice(), answer.term), (&[id][..], 1));
             assert_eq!(bed.counts.outlasted.load(Ordering::Relaxed), count);
         }
         // A request that arrived late is told the same reason at its
         // decider's first read, and is none of the count.
-        let answer = bed.ask(frame(4, 4)).await;
+        let answer = bed.ask(halved(4, 4)).await;
         assert_eq!(busy(&answer), Reason::BudgetGoneOnArrival);
         assert_eq!(bed.counts.outlasted.load(Ordering::Relaxed), 2);
         assert_eq!(bed.script.readers.lock().len(), 7);
