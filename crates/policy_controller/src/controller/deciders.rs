@@ -262,7 +262,7 @@ fn past_mark(id: LeaseId) -> bool {
 }
 
 /// What a decider calls once it handed over a term's first answer at or
-/// past the mark: the election's planned hand-over.
+/// past the mark: the election's planned hand-over, handed that term.
 pub(crate) type Leave = Box<dyn Fn(u64) + Send + Sync>;
 
 /// What the deciders share of a term's mark: the word, and the highest term
@@ -395,8 +395,8 @@ impl Deciders {
 
     /// Hands the deciders the word a term's mark says: the decider that
     /// hands over a term's first answer at or past the mark ([`past_mark`])
-    /// calls `leave` once that answer is handed over. Set once, when the
-    /// election runs: a second call changes nothing.
+    /// calls `leave` with that term once that answer is handed over. Set
+    /// once, when the election runs: a second call changes nothing.
     pub(crate) fn leave_through(&self, leave: impl Fn(u64) + Send + Sync + 'static) {
         let _ = self.mark.leave.set(Box::new(leave));
     }
@@ -538,7 +538,7 @@ impl Decider {
         let Some(leave) = self.mark.leave.get() else {
             warn!(
                 term,
-                "a term's lease ids passed their mark and no election listens: no hand-over is said"
+                "a term's lease ids passed their mark and no election listens: no hand-over is said, and picks are answered Busy once the ids end"
             );
             return;
         };

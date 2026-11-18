@@ -24,7 +24,9 @@
 //! duration (a replica alone over a lease in its own process takes it again
 //! at once: its next step follows the word). The thread goes on stepping. A
 //! decider says the planned hand-over itself where its term's lease ids pass
-//! their mark: the next take brings a term whose ids start again.
+//! their mark: the next take brings a term whose ids start again. The
+//! hand-over names that term, and the thread drops one whose term this
+//! replica no longer holds the lease under: that lease is left already.
 
 use std::{
     fmt, io,
@@ -368,8 +370,9 @@ enum Word {
     /// The planned stop: the fence closed, the lease released, the thread
     /// ended.
     Stop,
-    /// Leave and stay in the election: a planned hand-over, or a term a
-    /// caller says it saw.
+    /// Leave and stay in the election: a term a caller says it saw
+    /// ([`Door::saw`]). With no term it is the leave itself, which the
+    /// thread makes of a hand-over of the term held: cases alone send it.
     StepDown(Option<u64>),
     /// The planned hand-over of the lease held under this term: a replica
     /// that no longer holds the lease under it keeps on as it is.
@@ -415,13 +418,13 @@ impl Running {
     }
 }
 
-/// A word to leave on `words`: a planned hand-over, or a term a caller
-/// says it saw, which must leave one to take ([`term_said`]): one that
-/// does not is the term error, and no word is said.
-fn leave(words: &mpsc::Sender<Word>, above: Option<u64>) -> Result<(), ElectError> {
-    term_said(above)?;
+/// A word to leave on `words`: the term `above` a caller says it saw, which
+/// must leave one to take ([`term_said`]): one that does not is the term
+/// error, and no word is said.
+fn leave(words: &mpsc::Sender<Word>, above: u64) -> Result<(), ElectError> {
+    term_said(Some(above))?;
     // A thread that is gone holds no lease.
-    let _ = words.send(Word::StepDown(above));
+    let _ = words.send(Word::StepDown(Some(above)));
     Ok(())
 }
 
@@ -451,7 +454,7 @@ impl Door {
     /// leads: the term is judged the same and said to no one.
     pub(crate) fn saw(&self, above: u64) -> Result<(), ElectError> {
         match self.words.upgrade() {
-            Some(words) => leave(&words, Some(above)),
+            Some(words) => leave(&words, above),
             None => term_said(Some(above)),
         }
     }
@@ -675,7 +678,14 @@ fn run(
                 // Planned under a term this replica no longer holds the lease
                 // under, it asks nothing: that lease is left already, and
                 // the take since stands.
-                Ok(Word::HandOver(_)) => continue,
+                Ok(Word::HandOver(under)) => {
+                    debug!(
+                        identity = elector.identity(),
+                        under,
+                        "a planned hand-over of a term this replica no longer holds the lease under is dropped"
+                    );
+                    continue;
+                }
             };
             // A word the elector refused counts nothing here
             // either.
