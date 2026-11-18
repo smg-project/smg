@@ -2073,3 +2073,34 @@ fn the_dispatch_deadlines_fall_due_in_their_own_order_whatever_order_they_were_f
     assert_eq!(due(9), [3]);
     assert_eq!(leases.live(gateway), 0);
 }
+
+/// The pins of record sit in shards by key. A worker's removal and a sweep
+/// reach every shard, each under that shard's own hold, and the count is
+/// the shards' together.
+#[test]
+fn a_removal_and_a_sweep_reach_the_pins_of_every_shard() {
+    let shards = crate::sessions::SHARDS;
+    let store = MemoryStore::new();
+    let sessions: &dyn SessionsStore = &store;
+    let now = Instant::now();
+    let later = now + Duration::from_secs(1);
+    // Four keys a shard: two of the first worker used now, two of the
+    // second used later.
+    let keys = 4 * shards;
+    let first = |i: usize| (i / shards).is_multiple_of(2);
+    for (i, key) in (1_u64..).take(keys).enumerate() {
+        if first(i) {
+            sessions.pin(key, WorkerId(1), now);
+        } else {
+            sessions.pin(key, WorkerId(2), later);
+        }
+    }
+    assert_eq!(sessions.len(), keys);
+    assert_eq!(sessions.drop_worker(WorkerId(1)), keys / 2);
+    assert_eq!(sessions.len(), keys / 2);
+    for (i, key) in (1_u64..).take(keys).enumerate() {
+        assert_eq!(sessions.lookup(key).is_some(), !first(i), "key {key}");
+    }
+    assert_eq!(sessions.expire(later + Duration::from_secs(1)), keys / 2);
+    assert!(sessions.is_empty());
+}

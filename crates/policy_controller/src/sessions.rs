@@ -129,7 +129,12 @@ impl Entry {
 
 /// Shards of the table, by the key's low bits: keyed decisions on different
 /// keys take different locks.
-const SHARDS: usize = 16;
+pub(crate) const SHARDS: usize = 16;
+
+/// The shard of `key`, in this table and in the store's pins of record.
+pub(crate) fn shard_of(key: u64) -> usize {
+    (key % SHARDS as u64) as usize
+}
 
 /// The session table: every key's pins, swept on the decision clock.
 #[derive(Debug)]
@@ -158,7 +163,7 @@ impl SessionTable {
     }
 
     fn shard(&self, key: u64) -> &Mutex<FxHashMap<u64, Entry>> {
-        &self.shards[(key % SHARDS as u64) as usize]
+        &self.shards[shard_of(key)]
     }
 
     /// The pins of `key` at a decision taken at `now_micros` under `rule`,

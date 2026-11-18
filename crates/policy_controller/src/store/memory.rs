@@ -79,7 +79,11 @@ pub struct MemoryStore {
     /// tables and reads each pool's standing in them.
     kv: Arc<KvTables>,
     reservations: Mutex<Reservations>,
-    sessions: Mutex<FxHashMap<u64, Pin>>,
+    /// The pins of record, in the shards of the engine's own table
+    /// ([`crate::sessions::shard_of`]): a dispatch's write and a lookup
+    /// hold one shard, and a sweep or a worker's removal walks them one
+    /// hold after another.
+    sessions: Vec<Mutex<FxHashMap<u64, Pin>>>,
     /// The instant of the pins' last sweep ([`Self::sweep_pins`]); `None`
     /// before the first.
     #[cfg(feature = "controller")]
@@ -172,7 +176,9 @@ impl MemoryStore {
             }),
             kv,
             reservations: Mutex::default(),
-            sessions: Mutex::default(),
+            sessions: (0..crate::sessions::SHARDS)
+                .map(|_| Mutex::default())
+                .collect(),
             #[cfg(feature = "controller")]
             pins_swept: Mutex::default(),
             leases: Mutex::new(leases),
@@ -1821,12 +1827,19 @@ impl ReservationStore for MemoryStore {
 
 // --------------------------------------------------------------- sessions
 
+impl MemoryStore {
+    /// The shard that holds `key`'s pin of record.
+    fn pins_of(&self, key: u64) -> &Mutex<FxHashMap<u64, Pin>> {
+        &self.sessions[crate::sessions::shard_of(key)]
+    }
+}
+
 impl SessionsStore for MemoryStore {
     fn pin(&self, key: u64, worker: WorkerId, at: Instant) {
         if key == 0 {
             return;
         }
-        self.sessions.lock().insert(
+        self.pins_of(key).lock().insert(
             key,
             Pin {
                 worker,
@@ -1836,40 +1849,50 @@ impl SessionsStore for MemoryStore {
     }
 
     fn lookup(&self, key: u64) -> Option<Pin> {
-        self.sessions.lock().get(&key).copied()
+        self.pins_of(key).lock().get(&key).copied()
     }
 
     fn unpin(&self, key: u64) {
-        self.sessions.lock().remove(&key);
+        self.pins_of(key).lock().remove(&key);
     }
 
     fn drop_worker(&self, worker: WorkerId) -> usize {
-        let mut sessions = self.sessions.lock();
-        let before = sessions.len();
-        sessions.retain(|_, pin| pin.worker != worker);
-        before - sessions.len()
+        self.sessions
+            .iter()
+            .map(|shard| {
+                let mut pins = shard.lock();
+                let before = pins.len();
+                pins.retain(|_, pin| pin.worker != worker);
+                before - pins.len()
+            })
+            .sum()
     }
 
     fn expire(&self, before: Instant) -> usize {
-        let mut sessions = self.sessions.lock();
-        let count = sessions.len();
-        sessions.retain(|_, pin| pin.last_used >= before);
-        count - sessions.len()
+        self.sessions
+            .iter()
+            .map(|shard| {
+                let mut pins = shard.lock();
+                let count = pins.len();
+                pins.retain(|_, pin| pin.last_used >= before);
+                count - pins.len()
+            })
+            .sum()
     }
 
     fn merge(&self, key: u64, pin: Pin) {
         if key == 0 {
             return;
         }
-        let mut sessions = self.sessions.lock();
-        let entry = sessions.entry(key).or_insert(pin);
+        let mut pins = self.pins_of(key).lock();
+        let entry = pins.entry(key).or_insert(pin);
         if pin.last_used > entry.last_used {
             *entry = pin;
         }
     }
 
     fn len(&self) -> usize {
-        self.sessions.lock().len()
+        self.sessions.iter().map(|shard| shard.lock().len()).sum()
     }
 }
 
