@@ -371,10 +371,9 @@ impl<'a> PoolView<'a> {
     /// The pool facts of the decision ([`Built::pool_facts`]) with the
     /// pool's engines beside them.
     pub fn pool_facts(&self) -> PoolFacts<'a> {
-        PoolFacts {
-            engines: self.engines,
-            ..self.built.pool_facts()
-        }
+        let mut facts: PoolFacts<'a> = self.built.pool_facts();
+        facts.engines = self.engines;
+        facts
     }
 }
 

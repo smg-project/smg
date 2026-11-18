@@ -188,7 +188,7 @@ fn by_engines(
     draw: &mut Draw,
     mut keep: impl FnMut(&Candidate) -> bool,
 ) -> Option<Decision> {
-    let engines = pool.engines;
+    let engines = &pool.engines;
     // The list names rows by their place among those handed.
     debug_assert!(candidates
         .iter()
@@ -281,7 +281,7 @@ fn by_engines(
 /// where no engine is left to draw.
 fn stand_in(
     draw: &mut Draw,
-    engines: Engines<'_>,
+    engines: &Engines<'_>,
     candidates: &[Candidate],
     but: Option<u32>,
     keep: &mut impl FnMut(&Candidate) -> bool,
