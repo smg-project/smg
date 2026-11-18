@@ -470,6 +470,12 @@ mod seam {
         HOOK.with(|held| *held.borrow_mut() = Some((point, Box::new(hook))));
     }
 
+    /// Whether a hook is still set. A case holds that none is behind its
+    /// naming: every step it set ran.
+    pub(super) fn pending() -> bool {
+        HOOK.with(|held| held.borrow().is_some())
+    }
+
     /// The hook set for `point` runs. It is taken out first: a naming the
     /// hook itself asks for meets none.
     pub(super) fn at(point: Point) {

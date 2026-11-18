@@ -127,6 +127,10 @@ impl Run {
         // SeqCst against the inserters' `inflight` increment: either they see the odd version and
         // back off, or the writer sees their count and waits (see `wait_inflight`).
         self.version.fetch_add(1, Ordering::SeqCst);
+        // A release fence ahead of every store of the step: a reader that reads one of them
+        // and then passes its acquire fence reads this step in its check of the version, and
+        // tries again. The increment alone orders nothing for that reader.
+        fence(Ordering::Release);
     }
 
     /// Wait for lock-free child inserts to finish; called inside a version step, so no new one
@@ -144,6 +148,8 @@ impl Run {
     /// Start a new life of this header: next generation, fields reset.
     pub(super) fn reincarnate(&self, start: usize, parent: u32, window: Window) {
         self.version.fetch_add((1 << 32) | 1, Ordering::Acquire);
+        // As where a step begins: ahead of the stores of the new life.
+        fence(Ordering::Release);
         self.start.store(start as u32, Ordering::Relaxed);
         self.parent.store(parent, Ordering::Relaxed);
         self.block.store(window.block, Ordering::Relaxed);
