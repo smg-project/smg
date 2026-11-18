@@ -310,36 +310,32 @@ impl WordPieceEncoder {
         if vocabulary.get_encode_special_tokens() {
             return Err(Declined::from("encode_special_tokens is set"));
         }
-        for token in vocabulary.get_added_tokens_decoder().values() {
-            if token.single_word
-                || token.lstrip
-                || token.rstrip
-                || token.normalized
-                || token.content.is_empty()
-            {
-                return Err(Declined::from(format!(
-                    "added token {:?} is not cut from the raw text as it stands",
-                    token.content
-                )));
-            }
-        }
-        let tokens = vocabulary.get_vocab();
+        // The library builds its matcher over the tokens of this map, each
+        // with its key as the id.
+        let tokens = vocabulary.get_added_tokens_decoder();
         if tokens.len() > MAX_ADDED {
             return Err(Declined::from(format!(
                 "there are more than {MAX_ADDED} added tokens"
             )));
         }
         let mut added: Vec<(Box<str>, u32)> = Vec::with_capacity(tokens.len());
-        for (content, &id) in tokens {
-            let kept = content.bytes().next().is_some_and(|first| {
+        for (&id, token) in tokens {
+            if token.single_word || token.lstrip || token.rstrip || token.normalized {
+                return Err(Declined::from(format!(
+                    "added token {:?} is not cut from the raw text as it stands",
+                    token.content
+                )));
+            }
+            let kept = token.content.bytes().next().is_some_and(|first| {
                 first.is_ascii() && ascii_class(rules, first) != Ascii::Removed
             });
             if !kept {
                 return Err(Declined::from(format!(
-                    "added token {content:?} does not start with a byte of ASCII the normalizer keeps"
+                    "added token {:?} does not start with a byte of ASCII the normalizer keeps",
+                    token.content
                 )));
             }
-            added.push((content.as_str().into(), id));
+            added.push((token.content.as_str().into(), id));
         }
         // Longest first. At most one of two tokens of one length stands at
         // a place, so their order is free; their text makes it fixed.
