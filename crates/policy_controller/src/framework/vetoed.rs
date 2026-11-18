@@ -173,6 +173,7 @@ mod tests {
 
     use crate::{
         builtins::{Best, NotOverloaded},
+        counts::tests::Lent,
         decision::{Decision, Lifted, ShedReason},
         framework::{Binding, Engine, Filter, PairPools, Plan, Profile, Scratch, DRAW_FROM},
         lease::{Lease, Lifecycle, Side},
@@ -300,6 +301,24 @@ mod tests {
                 let pick = decision.pick().expect("a pick");
                 assert_eq!(pick.trace.survivors.get(), Some(3), "{preset}");
                 assert_eq!(pick.session_verdict, SessionVerdict::None, "{preset}");
+            }
+        }
+    }
+
+    /// The steer reads the fewest requests through the request's facts: a
+    /// pool whose counts stand in a table lent beside its rows, each row
+    /// reading zero, is steered as the pool that carries them, under
+    /// presets whose own stages read no count.
+    #[test]
+    fn a_steered_pool_goes_to_the_fewest_in_flight_by_a_lent_table() {
+        let mut pool = [over(0, 3), over(1, 1), over(2, 2)];
+        let lent = Lent::take(&mut pool);
+        assert!(pool.iter().all(|row| row.in_flight == 0));
+        for preset in ["random", "round_robin", "passthrough"] {
+            let engine = engine_of(preset, false);
+            for seed in 1..=8 {
+                let decision = decide(&engine, &lent.beside(&facts(seed)), &pool);
+                assert_eq!(order(&decision), vec![1, 2, 0], "{preset}, seed {seed}");
             }
         }
     }

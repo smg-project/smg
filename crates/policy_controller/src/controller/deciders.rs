@@ -47,9 +47,10 @@
 //!    as a late decision past the budget or the span.
 //!
 //! A lease is what the next decisions read. The store counts the leases on
-//! file by the worker each books, and a decision whose profile declares
-//! the count ([`crate::Needs::in_flight`]) reads it on each row as the
-//! row's requests in flight: it is made over what the decisions before it
+//! file by the worker each books, and a decision reads that count as each
+//! row's requests in flight ([`crate::RequestFacts::in_flight`]): beside
+//! the rows where the store lent them, in the row where they were written
+//! for the request. A decision is made over what the decisions before it
 //! left on file. The file is the one thing every decider writes, under
 //! one lock held for one lease's filing or its giving up. A lease leaves
 //! the file where its answer does not leave (step 7), at its gateway's
@@ -956,14 +957,15 @@ fn shed(reason: ShedReason, emptied_by: &'static str, seed: u64, generation: u64
 
 /// What [`hand`] reads of a pool for one request: the pool's facts, the
 /// decision's instant in the rows' clock, the rows, the mask of the asking
-/// gateway's vetoes beside lent rows, the affinity column, and the build
-/// the rows were read by.
+/// gateway's vetoes beside lent rows, the affinity column, the leases'
+/// counts beside lent rows, and the build the rows were read by.
 type Read<'a> = (
     PoolFacts<'a>,
     u64,
     &'a [Candidate],
     &'a [u32],
     &'a [AffinityFacts],
+    Option<crate::LentCounts<'a>>,
     Option<Built>,
 );
 
@@ -973,18 +975,17 @@ type Read<'a> = (
 /// them at the decision's instant, with the affinity column where the
 /// request's profile declares it. A request that states no wires and no
 /// hint of 0 reads its pool by the store's one door ([`World::view`]): the
-/// rows where their publication left them, its gateway's standing vetoes
-/// beside them, or rows the door writes where the request's profile shows
-/// them to a plugin. One that states wires or a hint of 0 and one whose
-/// profile declares a worker's requests in flight are handed rows written
-/// for them ([`World::build`]), the last with what the leases on file book
-/// on each row's worker ([`World::count_in_flight`]), less what the
-/// gateway states of itself takes ([`narrow`]). The rows its wires take
-/// are counted in `undialed`, the decider's own part, and the list they
-/// leave takes a name of its own ([`cut_reach`]). The request's block
-/// hashes are cut at what that generation reads of them. `decide`'s answer
-/// comes back with the build its rows were read by, `None` where no member
-/// serves the model.
+/// rows where their publication left them, with its gateway's standing
+/// vetoes and the leases' counts beside them, or rows the door writes
+/// where the request's profile shows them to a plugin. One that states
+/// wires or a hint of 0 is handed rows written for it ([`World::build`]),
+/// what the leases on file book on each row's worker written over them
+/// ([`World::count_in_flight`]), less what the gateway states of itself
+/// takes ([`narrow`]). The rows its wires take are counted in `undialed`,
+/// the decider's own part, and the list they leave takes a name of its
+/// own ([`cut_reach`]). The request's block hashes are cut at what that
+/// generation reads of them. `decide`'s answer comes back with the build
+/// its rows were read by, `None` where no member serves the model.
 ///
 /// A request whose profile reads the affinity column and takes a sample is
 /// handed no column: the rows the store names for it stand in the column's
@@ -1052,12 +1053,11 @@ fn hand<R>(
         ..PoolFacts::default()
     };
     // Nothing of the request's own is cut out of the rows the door hands:
-    // the publication's own, or a copy the door writes for a plugin, which
-    // is shown a row's bits and ages as the row's own fields. The count of
-    // the leases on file is written over rows built here, so a profile
-    // that declares it reads none of the door's.
-    let by_door = wires.is_none() && request.subset() != Some(0) && !needs.in_flight;
-    let (pool, now_micros, candidates, stalled, affinity, built): Read<'_> = if by_door {
+    // the publication's own, the leases' counts beside them, or a copy the
+    // door writes with the counts on it for a plugin, which is shown a
+    // row's bits and ages as the row's own fields.
+    let by_door = wires.is_none() && request.subset() != Some(0);
+    let (pool, now_micros, candidates, stalled, affinity, counts, built): Read<'_> = if by_door {
         match world.view(model, role, &ask, shown, view) {
             Some(read) => (
                 read.built.pool_facts(),
@@ -1065,20 +1065,19 @@ fn hand<R>(
                 read.candidates,
                 read.stalled,
                 read.affinity,
+                read.in_flight,
                 Some(read.built),
             ),
-            None => (none(), world.micros(now), &[], &[], &[], None),
+            None => (none(), world.micros(now), &[], &[], &[], None, None),
         }
     } else {
         let built = world.build(model, role, &ask, view);
         let (pool, now_micros) = match built {
             Some(built) => {
-                // What the leases on file book on each row's worker, for a
-                // profile that declares the count, written before the
-                // request's own narrowing moves a row.
-                if needs.in_flight {
-                    world.count_in_flight(&built, &ask, &mut view.candidates);
-                }
+                // What the leases on file book on each row's worker,
+                // written before the request's own narrowing moves a row:
+                // rows that are written carry their counts.
+                world.count_in_flight(&built, &ask, &mut view.candidates);
                 // The pool's facts are of the rows before the request's own
                 // narrowing, all but the list's name: the rows the wires
                 // left are another list of the pool.
@@ -1100,6 +1099,7 @@ fn hand<R>(
             &view.candidates,
             &[],
             &view.affinity,
+            None,
             built,
         )
     };
@@ -1124,6 +1124,7 @@ fn hand<R>(
         budget_micros: u32::try_from(left.as_micros()).unwrap_or(u32::MAX),
         affinity,
         stalled,
+        in_flight: counts,
         max_block_hashes: request.hashes_read(spec),
         named: names.then(|| named.affinity()),
     };
@@ -2214,12 +2215,14 @@ pub(crate) mod tests {
         assert_eq!(store.live(GATEWAY), 1);
     }
 
-    /// The `random` picker, keeping each row's requests in flight as every
-    /// decision handed them, under a count it declares or does not.
+    /// What one decision was handed of each row's requests in flight: the
+    /// count the request's facts read, and the row's own field.
+    type SeenRows = Vec<(u32, u32)>;
+
+    /// The `random` picker, keeping the reads of every decision.
     #[derive(Debug)]
     struct Seen {
-        declares: bool,
-        rows: Arc<Mutex<Vec<Vec<u32>>>>,
+        rows: Arc<Mutex<Vec<SeenRows>>>,
     }
 
     impl Lifecycle for Seen {}
@@ -2238,50 +2241,46 @@ pub(crate) mod tests {
             band: TieBand,
             out: &mut Targets,
         ) {
-            let counts = candidates.iter().map(|row| row.in_flight);
+            let counts = candidates
+                .iter()
+                .map(|row| (facts.in_flight(row), row.in_flight));
             self.rows.lock().push(counts.collect());
             Random.pick(facts, candidates, kept, scores, band, out);
         }
-
-        fn needs(&self) -> crate::Needs {
-            crate::Needs {
-                in_flight: self.declares,
-                ..crate::Needs::default()
-            }
-        }
     }
 
-    /// The count is a declared need: a profile with a stage that declares a
-    /// worker's requests in flight is handed rows that read the leases on
-    /// file, and a profile that declares none is handed rows that read the
-    /// publication's zero, whatever stands on file.
+    /// A decision reads what the leases on file book, whatever its profile
+    /// and with nothing declared: its facts read the three leases the
+    /// decisions before it left, beside lent rows, no row of the
+    /// publication carrying a count.
     #[tokio::test]
-    async fn a_decision_reads_the_leases_count_where_its_profile_declares_it_and_nowhere_else() {
-        for declares in [true, false] {
-            let rows = Arc::new(Mutex::new(Vec::new()));
-            let kept = Arc::clone(&rows);
-            let mut catalog = Catalog::builtin();
-            let seen = move || -> Box<dyn Picker> {
-                let rows = Arc::clone(&kept);
-                Box::new(Seen { declares, rows })
-            };
-            catalog.picker("seen", seen).expect("a free name");
-            let mut document = PolicySpec::preset("random").expect("a preset of this build");
-            let profile = document.profiles.get_mut("random");
-            profile.expect("the preset's profile").pick = "seen".into();
-            let digest = document.digest().expect("the document digests");
-            let spec = AppliedSpec::validate_digested(&document, digest, &catalog)
-                .expect("the catalog holds the stage");
-            let mut bed = bed(Some(spec), true, (2, 8), []);
-            // Three decisions and no word from their gateway: three leases
-            // stand on file when the fourth is made.
-            for request in 1..=4u8 {
-                bed.ask(frame(request, u64::from(request))).await;
-            }
-            let rows = rows.lock();
-            let on_file: u32 = rows[3].iter().sum();
-            assert_eq!(on_file, if declares { 3 } else { 0 }, "{rows:?}");
+    async fn a_decision_reads_the_leases_count_beside_the_rows_its_store_lends() {
+        let rows = Arc::new(Mutex::new(Vec::new()));
+        let kept = Arc::clone(&rows);
+        let mut catalog = Catalog::builtin();
+        let seen = move || -> Box<dyn Picker> {
+            let rows = Arc::clone(&kept);
+            Box::new(Seen { rows })
+        };
+        catalog.picker("seen", seen).expect("a free name");
+        let mut document = PolicySpec::preset("random").expect("a preset of this build");
+        let profile = document.profiles.get_mut("random");
+        profile.expect("the preset's profile").pick = "seen".into();
+        let digest = document.digest().expect("the document digests");
+        let spec = AppliedSpec::validate_digested(&document, digest, &catalog)
+            .expect("the catalog holds the stage");
+        let mut bed = bed(Some(spec), true, (2, 8), []);
+        // Three decisions and no word from their gateway: three leases
+        // stand on file when the fourth is made.
+        for request in 1..=4u8 {
+            bed.ask(frame(request, u64::from(request))).await;
         }
+        // What the fourth decision was handed: its facts read the three
+        // leases, beside its rows.
+        let rows = rows.lock();
+        let (read, own): (Vec<u32>, Vec<u32>) = rows[3].iter().copied().unzip();
+        assert_eq!(read.iter().sum::<u32>(), 3, "{rows:?}");
+        assert_eq!(own.iter().sum::<u32>(), 0, "{rows:?}");
     }
 
     #[tokio::test]
@@ -2686,17 +2685,18 @@ pub(crate) mod tests {
         assert_eq!(decided(), (vec![vetoed], 0, true, 3), "a veto");
     }
 
-    /// Rows written for a request that states its wires carry the leases'
-    /// count for a profile that declares it and none for a profile that
-    /// does not: a fact a decision may not read is not written into its
-    /// rows.
+    /// One lease on file reads as its worker's requests in flight on both
+    /// forms of a decision's rows: in the row where the rows were written
+    /// for a request that states its wires, beside the row where they were
+    /// lent. The request's facts read it either way, under a profile that
+    /// reads no count too.
     #[test]
-    fn rows_written_for_a_request_carry_the_count_its_profile_declares_alone() {
+    fn a_lease_on_file_is_read_in_a_written_row_and_beside_a_lent_one() {
         const SPOKEN: &str = "model-http";
-        for (name, declares) in [("random", false), ("least_load", true)] {
+        for (stated, own) in [(true, 1), (false, 0)] {
             let store = MemoryStore::new();
             store
-                .apply(preset(name, 1))
+                .apply(preset("random", 1))
                 .expect("above the unbound start");
             let member = ready(&store, "h0", SPOKEN, Role::Single, WireModes::HTTP);
             let leases: &dyn LeasesStore = &store;
@@ -2718,7 +2718,13 @@ pub(crate) mod tests {
                 state: LeaseState::Issued,
             });
             assert_eq!(filed, Ok(()));
-            let request = checked(constrained(frame_for(SPOKEN, 1, 1), 0b001, None));
+            let frame = frame_for(SPOKEN, 1, 1);
+            let frame = if stated {
+                constrained(frame, 0b001, None)
+            } else {
+                frame
+            };
+            let request = checked(frame);
             let taken = Taken::at(&request, GATEWAY, now, now).expect("budget is left");
             let mut buffers = Buffers::default();
             let counts = store.deciding(|world| {
@@ -2727,11 +2733,209 @@ pub(crate) mod tests {
                     &taken,
                     &mut buffers,
                     &AtomicU64::new(0),
-                    |_, _, rows, _, _| rows.iter().map(|row| row.in_flight).collect::<Vec<_>>(),
+                    |facts, _, rows, _, _| {
+                        let read = |row: &Candidate| (facts.in_flight(row), row.in_flight);
+                        rows.iter().map(read).collect::<Vec<_>>()
+                    },
                 )
                 .0
             });
-            assert_eq!(counts, [u32::from(declares)], "{name}");
+            assert_eq!(counts, [(1, own)], "wires stated: {stated}");
+        }
+    }
+
+    /// The model of the cases that book a fleet's leases themselves.
+    const BOOKED: &str = "model-http";
+
+    /// Files one issued lease of `GATEWAY` on `target`, under `id`.
+    fn file(store: &MemoryStore, id: u64, target: WorkerId, now: Instant) {
+        let leases: &dyn LeasesStore = store;
+        let filed = leases.issue(crate::store::LeaseRecord {
+            lease: Lease {
+                id: LeaseId(1 << 63 | id),
+                ..Lease::default()
+            },
+            gateway: GATEWAY,
+            request: id,
+            target,
+            picked: crate::store::Picked::default(),
+            decode: None,
+            term: 1,
+            issued_at: now,
+            dispatch_deadline: now + DISPATCH_TTL,
+            state: LeaseState::Issued,
+        });
+        assert_eq!(filed, Ok(()));
+    }
+
+    /// A store under `spec` with one member of `BOOKED` a count of `held`,
+    /// each booked by its count of leases on file: the store, the members
+    /// in the counts' order and the instant the leases were issued at.
+    fn booked(spec: AppliedSpec, held: &[u64]) -> (MemoryStore, Vec<WorkerId>, Instant) {
+        let store = MemoryStore::new();
+        store.apply(spec).expect("above the unbound start");
+        let members: Vec<WorkerId> = (0..held.len())
+            .map(|i| {
+                ready(
+                    &store,
+                    &format!("h{i}"),
+                    BOOKED,
+                    Role::Single,
+                    WireModes::HTTP,
+                )
+            })
+            .collect();
+        let leases: &dyn LeasesStore = &store;
+        leases.set_term(1);
+        let now = Instant::now();
+        let targets = members.iter().zip(held);
+        let targets = targets.flat_map(|(&member, &held)| (0..held).map(move |_| member));
+        for (target, id) in targets.zip(1..) {
+            file(&store, id, target, now);
+        }
+        (store, members, now)
+    }
+
+    /// One decision of `frame` over `store` by the decider's own hand: each
+    /// row's requests in flight as the request's facts first read them, by
+    /// worker, and the first target. `late` is filed on its workers after
+    /// those reads and before the engine is asked, and the facts then read
+    /// every row as they first read it.
+    fn decided(
+        store: &MemoryStore,
+        frame: proto::DecideRequest,
+        now: Instant,
+        late: &[WorkerId],
+    ) -> (Vec<(WorkerId, u32)>, Option<WorkerId>) {
+        let request = checked(frame);
+        let taken = Taken::at(&request, GATEWAY, now, now).expect("budget is left");
+        let mut buffers = Buffers::default();
+        store.deciding(|world| {
+            hand(
+                world,
+                &taken,
+                &mut buffers,
+                &AtomicU64::new(0),
+                |facts, pool, rows, cx, scratch| {
+                    let read = || -> Vec<(WorkerId, u32)> {
+                        let rows = rows.iter();
+                        rows.map(|row| (row.id, facts.in_flight(row))).collect()
+                    };
+                    let first = read();
+                    for (&target, id) in late.iter().zip(1_000..) {
+                        file(store, id, target, now);
+                    }
+                    assert_eq!(read(), first, "a decision reads one count a row");
+                    let decision = world.spec().engine().decide(facts, pool, rows, cx, scratch);
+                    let picked = decision.pick();
+                    let target = picked.and_then(|pick| pick.targets.as_slice().first());
+                    (first, target.map(|target| target.id))
+                },
+            )
+            .0
+        })
+    }
+
+    /// `held` by the worker of `members` each count is of, in the rows'
+    /// order: by worker id.
+    fn by_id(members: &[WorkerId], held: &[u32]) -> Vec<(WorkerId, u32)> {
+        let mut held: Vec<(WorkerId, u32)> = members.iter().copied().zip(held.to_vec()).collect();
+        held.sort_unstable();
+        held
+    }
+
+    /// One reader, two feeds, by the decision: under each preset that reads
+    /// a worker's requests in flight, a request that states its wires (rows
+    /// written for it, the count on each) and one that states none (lent
+    /// rows, the leases' table beside them) read the same counts and are
+    /// answered by the same pick.
+    #[test]
+    fn a_count_reading_preset_picks_alike_over_written_and_lent_rows() {
+        for name in ["least_load", "power_of_two", "prefix_hash", "cache_aware"] {
+            // The i-th worker books i leases: the counts part every row.
+            let (store, members, now) = booked(preset(name, 1), &[0, 1, 2, 3, 4, 5]);
+            let held = by_id(&members, &[0, 1, 2, 3, 4, 5]);
+            for seed in 1..=32 {
+                let plain = frame_for(BOOKED, 1, seed);
+                let stated = constrained(plain.clone(), 0b001, None);
+                let lent = decided(&store, plain, now, &[]);
+                assert_eq!(lent.0, held, "{name}, seed {seed}");
+                assert_eq!(
+                    decided(&store, stated, now, &[]),
+                    lent,
+                    "{name}, seed {seed}"
+                );
+            }
+        }
+    }
+
+    /// A decision reads one count a row: a row's first read is kept, and a
+    /// lease filed after it moves nothing the decision's stages read. Two
+    /// leases are filed on the row that held the fewest, after the facts'
+    /// first reads and before the `count-first` picker's narrowing and
+    /// pick: the picker still names that row. The next decision reads the
+    /// two.
+    #[test]
+    fn a_lease_filed_after_a_rows_first_read_moves_nothing_the_decision_reads() {
+        let mut document = PolicySpec::preset("random").expect("a preset of this build");
+        let profile = document.profiles.get_mut("random");
+        profile.expect("the preset's profile").pick = "count-first".into();
+        let (store, members, now) = booked(applied(&document), &[1, 0, 2]);
+        let fewest = members[1];
+        let first = decided(&store, frame_for(BOOKED, 1, 1), now, &[fewest, fewest]);
+        assert_eq!(first, (by_id(&members, &[1, 0, 2]), Some(fewest)));
+        let next = decided(&store, frame_for(BOOKED, 2, 2), now, &[]);
+        assert_eq!(next, (by_id(&members, &[1, 2, 2]), Some(members[0])));
+    }
+
+    /// The engine's own placement by the fewest requests reads the leases
+    /// on file as a stage does, with nothing declared: a profile whose
+    /// picker leaves the placement to its rule, under no rule and under a
+    /// rule that delegates, and a sessions rule that assigns `min_load`.
+    /// Each places a request on the worker that holds the fewest leases,
+    /// whatever the request's seed.
+    #[test]
+    fn a_placement_by_the_fewest_requests_reads_the_leases_on_file() {
+        let ruled = |assignment: crate::Assignment, pick: &str| {
+            let mut document = PolicySpec::preset("manual").expect("a preset of this build");
+            let rule = document.bindings[0].sessions.as_mut();
+            rule.expect("the preset's rule").assignment = assignment;
+            let profile = document.profiles.get_mut("manual");
+            profile.expect("the preset's profile").pick = pick.into();
+            document
+        };
+        let unruled = r#"{"apiVersion":"smg.policy/v1","profiles":{"p":{"pick":"manual"}}}"#;
+        let mut unruled: PolicySpec = serde_json::from_str(unruled).expect("a document");
+        unruled.generation = 1;
+        let (delegate, min_load) = (crate::Assignment::Delegate, crate::Assignment::MinLoad);
+        let cases = [
+            ("no rule", unruled, false),
+            ("a rule that delegates", ruled(delegate, "manual"), false),
+            (
+                "a rule that delegates, a key",
+                ruled(delegate, "manual"),
+                true,
+            ),
+            ("min_load", ruled(min_load, "random"), true),
+            (
+                "min_load, the placement its rule's",
+                ruled(min_load, "manual"),
+                true,
+            ),
+        ];
+        for (name, document, keyed) in cases {
+            let (store, members, now) = booked(applied(&document), &[2, 0, 3]);
+            for seed in 1..=16u8 {
+                let mut frame = frame_for(BOOKED, seed, u64::from(seed));
+                if keyed {
+                    let facts = frame.facts.as_mut().expect("the case's frame has facts");
+                    facts.session_key = Some(proto::Identity {
+                        form: Some(proto::identity::Form::Hash(u64::from(seed))),
+                    });
+                }
+                let (_, placed) = decided(&store, frame, now, &[]);
+                assert_eq!(placed, Some(members[1]), "{name}, seed {seed}");
+            }
         }
     }
 

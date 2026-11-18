@@ -94,12 +94,12 @@ use rustc_hash::FxHashMap;
 
 use crate::{
     affinity::WarmRule,
+    counts::{Counts, KeptCounts, LentCounts, Slot},
     framework::{OverloadThresholds, PairPools, PairTable},
     spec::{AppliedSpec, Listed, Pairing},
     store::{
         encoding::{EncodeClasses, EncodeHandoff, EncodeMember},
         index::{KvTables, Named, PoolIndex, Reading},
-        leases::{Counts, Slot},
         loads::LoadSample,
         pairing::{known, Derivation, Member, PairClasses, Pool},
         workers::{Overload, Reachability, WorkerFacts, WorkerRow, WorkerStatus},
@@ -188,6 +188,11 @@ pub struct ViewBuffers {
     /// view is a publication's own rows ([`World::view`]); empty where the
     /// rows were written for the decision.
     pub stalled: Vec<u32>,
+    /// What the decision read of its rows' requests in flight, where the
+    /// view lent its rows with the leases' counts beside them
+    /// ([`World::view`]): a row's first read is kept here, so a decision
+    /// reads one count a row.
+    pub kept: KeptCounts,
 }
 
 /// The buffers a host keeps across pair decisions: both sides' views and
@@ -330,6 +335,10 @@ pub struct PoolView<'a> {
     /// The affinity column: one entry a row under a profile that declared
     /// it, empty otherwise.
     pub affinity: &'a [AffinityFacts],
+    /// What the leases on file book on each row, by position: what
+    /// [`RequestFacts::lent_in_flight`](crate::RequestFacts::lent_in_flight)
+    /// takes. `None` where the rows carry their counts.
+    pub in_flight: Option<LentCounts<'a>>,
     /// What the view read beside the rows.
     pub built: Built,
 }
@@ -833,10 +842,9 @@ impl World {
     /// Writes over `rows`, the candidates `built` left for `ask` before
     /// anything narrowed them, what the leases on file book on each row's
     /// worker at this call: one load a row, in the build's own walk of the
-    /// rows the asking gateway reaches. For a decision whose profile
-    /// declares the count ([`Needs::in_flight`](crate::Needs::in_flight)):
-    /// a row no decision reads the count of keeps the publication's zero.
-    /// `built` is a build of this world.
+    /// rows the asking gateway reaches. For rows that are written: a
+    /// decision over lent rows reads the table beside them
+    /// ([`World::view`]). `built` is a build of this world.
     pub fn count_in_flight(&self, built: &Built, ask: &Ask, rows: &mut [Candidate]) {
         let Some(shape) = self.derived.pools.get(built.pool as usize) else {
             return;
@@ -1002,11 +1010,13 @@ impl World {
     /// `written` rows. A profile that shows its rows to a plugin
     /// ([`Profile::scoped`](crate::Profile::scoped)) asks for them: a
     /// plugin's view carries each row's bits and ages as the row's fields.
-    /// So does a decision that reads a row's requests in flight: that
-    /// count is the leases' at the decision, written over rows that are
-    /// written ([`World::count_in_flight`]) and into no publication.
-    /// Both forms come back as one shape, so a caller hands the mask and
-    /// the pin on whichever rows it was given.
+    ///
+    /// What the leases on file book on each row goes into no publication:
+    /// the table is lent beside lent rows ([`PoolView::in_flight`]) and
+    /// its counts are written over rows that are written
+    /// ([`World::count_in_flight`]). Both forms come back as one shape, so
+    /// a caller hands the mask, the pin and the counts on whichever rows
+    /// it was given.
     pub fn view<'a>(
         &'a self,
         model: &str,
@@ -1022,11 +1032,13 @@ impl World {
         let (rows, shape) = (self.rows.get(index)?, self.derived.pools.get(index)?);
         if written || !shape.locals.is_empty() {
             let built = self.written(index, rows, shape, ask, out);
+            self.count_in_flight(&built, ask, &mut out.candidates);
             return Some(PoolView {
                 candidates: &out.candidates,
                 stalled: &[],
                 pinned_at: 0,
                 affinity: &out.affinity,
+                in_flight: None,
                 built,
             });
         }
@@ -1064,6 +1076,7 @@ impl World {
             stalled: &out.stalled,
             pinned_at,
             affinity: &out.affinity,
+            in_flight: Some(self.derived.counts.lend(&shape.booked, &mut out.kept)),
             built: Built {
                 pool: index as u32,
                 pool_size: rows.len() as u32,

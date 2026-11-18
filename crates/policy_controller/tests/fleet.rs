@@ -27,6 +27,9 @@
 //! client's answers alone: a load-led pick leaves the engine that holds
 //! requests, a rotation names each row in turn, a routing key returns to its
 //! worker and a retry leaves it, and no decision names the dead engine.
+//! The gateway's own constraints narrow a decision first: a row it
+//! excludes is no pick, and a hint of no candidates or a wire no row
+//! speaks is shed under the constraint's name.
 //! A decision by count follows the leases the decisions before it left on
 //! the store's file: with every lease kept, a round of asks by the fewest
 //! requests names each row once, and once its own leases are given up the
@@ -39,8 +42,10 @@
 //! and the store's pin of record follows the dispatch.
 //! A prompt returns to its worker as a key does: under the prefix preset a
 //! head of 256 tokens names one row whatever follows it, a routing key
-//! leads it, a retry walks to one next worker, and a boundary of the
-//! document's view keys a prompt at its stem.
+//! leads it, a retry walks to one next worker, a worker past its bounded
+//! load is passed over until its leases are given up, and a boundary of
+//! the document's view keys a prompt at its stem, where a prompt past its
+//! loaded worker lands.
 //! Each model decides under the profile its own binding names: a second
 //! pool, on the wire whose load report counts resident tokens, is asked
 //! under the resident form of the two-draw preset while the first turns a
@@ -86,7 +91,7 @@ use smg_policy_controller::{
     },
     spec::{BindingSpec, Match},
     store::{LaneCounts, WorkerStatus},
-    view::{Role, SignalSource},
+    view::{Role, SignalSource, WireModes},
     PolicySpec, PowerOfTwoMetric, SpecError,
 };
 use tokio::sync::oneshot;
@@ -179,6 +184,12 @@ const HEAD: u32 = 256 / BLOCK;
 /// boundary: 64 tokens.
 const STEM: u32 = 64 / BLOCK;
 
+/// The kept leases that carry a head's worker past the prefix preset's
+/// bounded load, in a pool of six rows that books nothing else: with
+/// thirteen kept the next request counts in a mean of 14 over 6, and 13
+/// stands past that mean by more than the margin of ten.
+const LOADED: u64 = 13;
+
 /// A pick's first target: the row of the fleet it names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct Picked {
@@ -261,10 +272,11 @@ fn by_model() -> Result<PolicySpec, SpecError> {
     Ok(document)
 }
 
-/// The prefix preset under a view whose one boundary stands at `tokens`.
-fn bounded_at(tokens: u32) -> Result<PolicySpec, SpecError> {
+/// The prefix preset under a view whose boundaries stand at `tokens`,
+/// ascending.
+fn bounded_at(tokens: &[u32]) -> Result<PolicySpec, SpecError> {
     let mut document = PolicySpec::preset("prefix_hash")?;
-    document.view.boundaries = vec![tokens];
+    document.view.boundaries = tokens.to_vec();
     Ok(document)
 }
 
@@ -683,6 +695,47 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             turns.len() == ranks && turns.values().all(|asks| *asks == 2),
             "two turns of a rotation name each row twice: {turns:?}"
         );
+
+        // The gateway's own word narrows a decision before a stage runs. A
+        // row it just failed to connect to is excluded: four turns of a
+        // rotation name every other row and never that one.
+        let shunned = first;
+        let mut others = HashSet::new();
+        for n in (0u64..).take(4 * ranks) {
+            let mut ask = nth("shun", n);
+            ask.constraints.get_or_insert_default().excluded = vec![shunned.id];
+            let pick = picked(&mut harness, ask)
+                .await
+                .expect("a pick answers an ask over a ready fleet");
+            assert_ne!(pick, shunned, "a row the gateway excludes is no pick");
+            others.insert(pick);
+        }
+        assert_eq!(
+            others.len(),
+            ranks - 1,
+            "a rotation under an exclusion names every other row: {others:?}"
+        );
+        // A hint of no candidates and a wire no row speaks each leave a
+        // pool that has rows with none: the answer is a shed for want of
+        // endpoints, under the constraint's own name and no stage's.
+        let mut hinted = nth("subset-hint", 0);
+        hinted.constraints.get_or_insert_default().subset_hint = Some(0);
+        let mut narrowed = nth("wires", 0);
+        narrowed.constraints.get_or_insert_default().wire_modes = u32::from(WireModes::HTTP.bits());
+        for (name, ask) in [("subset-hint", hinted), ("wires", narrowed)] {
+            let answer = harness.client().decide(ask).await;
+            assert!(
+                matches!(&answer, Ok(Answer::Decision(Decision { outcome: Some(Outcome::Shed(shed)), .. }))
+                    if shed.reason() == ShedReason::NoEndpoints && shed.emptied_by == name),
+                "a constraint that leaves no row sheds under its own name, {name}: {answer:?}"
+            );
+        }
+        // The rows' own wire stated, the rotation goes on as with none.
+        let mut wired = nth("wired", 0);
+        wired.constraints.get_or_insert_default().wire_modes = u32::from(WireModes::GRPC.bits());
+        picked(&mut harness, wired)
+            .await
+            .expect("a pick answers a gateway that states the rows' wire");
 
         // A decision by count reads what the decisions before it left on
         // file. Under the two-draw preset's form by the fewest requests
@@ -1130,6 +1183,41 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             1,
             "past the worker it tried a head walks to one worker: {walked:?}"
         );
+        // A worker past its bounded load is passed over. A kept lease
+        // books the head's worker, and the ring keeps the worker while its
+        // count stands inside both margins over the pool's mean: of six
+        // rows with ten for the absolute margin, through thirteen leases.
+        // The next ask of that head has no owner left and goes where the
+        // fewest requests are in flight; its leases given up, the head
+        // returns.
+        let mut loaded = Vec::new();
+        for n in 0..LOADED {
+            let (row, lease) = kept(&mut harness, prompted(nth("load", n), &[(HEAD, 1)]))
+                .await
+                .expect("a pick answers an ask over a ready fleet");
+            assert_eq!(
+                row, home,
+                "inside its bounded load a head's worker keeps it"
+            );
+            loaded.push(lease);
+        }
+        let over = picked(&mut harness, prompted(nth("over", 0), &[(HEAD, 1)]))
+            .await
+            .expect("a pick answers an ask over a ready fleet");
+        assert_ne!(
+            over, home,
+            "past its bounded load a head's worker is passed over"
+        );
+        given_up(&mut harness, &loaded, 0)
+            .await
+            .expect("the kept leases are given up");
+        let back = picked(&mut harness, prompted(nth("back", 0), &[(HEAD, 1)]))
+            .await
+            .expect("a pick answers an ask over a ready fleet");
+        assert_eq!(
+            back, home,
+            "its load given up, a head returns to its worker"
+        );
         // A boundary of the document's view moves the key. Prompts that
         // share a stem of 64 tokens and nothing past it are 64 heads to the
         // preset; under a view whose boundary stands at the stem's end
@@ -1146,7 +1234,7 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             apart.len() > 1,
             "past one stem {ASKS} heads do not share one worker: {apart:?}"
         );
-        let at_stem = bounded_at(STEM * BLOCK).expect("a document of this build's preset");
+        let at_stem = bounded_at(&[STEM * BLOCK]).expect("a document of this build's preset");
         harness
             .apply_document(at_stem)
             .expect("a document whose view names a boundary applies");
@@ -1163,6 +1251,57 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             1,
             "a boundary of the view keys a prompt at its stem: {together:?}"
         );
+        // A prompt that grew past a loaded worker lands where its stem is
+        // held. Under a view of two boundaries a prompt is keyed at the
+        // deepest it reaches. With its worker there past its bounded load
+        // the ring tries the boundary below, and the stem's worker takes
+        // the request.
+        let two =
+            bounded_at(&[STEM * BLOCK, HEAD * BLOCK]).expect("a document of this build's preset");
+        harness
+            .apply_document(two)
+            .expect("a document whose view names two boundaries applies");
+        let stem = picked(&mut harness, prompted(nth("stem", 0), &[(STEM, 1)]))
+            .await
+            .expect("a pick answers an ask over a ready fleet");
+        let mut found = None;
+        for n in 0..ASKS {
+            let ask = prompted(nth("grown", n), &[(STEM, 1), (HEAD - STEM, n + 2)]);
+            let pick = picked(&mut harness, ask)
+                .await
+                .expect("a pick answers an ask over a ready fleet");
+            if pick != stem {
+                found = Some((n, pick));
+                break;
+            }
+        }
+        let (grown, deep) =
+            found.expect("of 64 prompts on one stem, another worker than the stem's holds one");
+        let mut loaded = Vec::new();
+        for n in 0..LOADED {
+            let ask = prompted(nth("deep", n), &[(STEM, 1), (HEAD - STEM, grown + 2)]);
+            let (row, lease) = kept(&mut harness, ask)
+                .await
+                .expect("a pick answers an ask over a ready fleet");
+            assert_eq!(
+                row, deep,
+                "inside its bounded load a prompt's worker keeps it"
+            );
+            loaded.push(lease);
+        }
+        for n in 0..8 {
+            let ask = prompted(nth("below", n), &[(STEM, 1), (HEAD - STEM, grown + 2)]);
+            let below = picked(&mut harness, ask)
+                .await
+                .expect("a pick answers an ask over a ready fleet");
+            assert_eq!(
+                below, stem,
+                "past its loaded worker a prompt lands where its stem is held"
+            );
+        }
+        given_up(&mut harness, &loaded, 0)
+            .await
+            .expect("the kept leases are given up");
 
         // Each model decides under the profile its binding names. One
         // document binds the counted model to the two-draw preset's

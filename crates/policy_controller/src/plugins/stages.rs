@@ -97,16 +97,11 @@ pub trait BoundPlugin: DecisionScope + 'static {
 }
 
 /// What one adapter needs from the host: its plugin's declared needs and
-/// its fallback's, since either answers the call, and each row's requests
-/// in flight: a plugin's row carries that count whether the plugin reads
-/// it or not, and a plugin's declaration has no word for it. The same for
-/// each stage kind: a plugin that reads the affinity facts as the filter
-/// alone or as the picker alone is a reader as one that scores is.
+/// its fallback's, since either answers the call. The same for each stage
+/// kind: a plugin that reads the affinity facts as the filter alone or as
+/// the picker alone is a reader as one that scores is.
 fn stage_needs<B: BoundPlugin>(bound: &B, fallback: Option<Needs>) -> Needs {
-    let own = Needs {
-        in_flight: true,
-        ..bound.needs()
-    };
+    let own = bound.needs();
     fallback.map_or(own, |fallback| own.or(fallback))
 }
 
@@ -420,7 +415,7 @@ mod tests {
     use crate::{
         catalog::Catalog,
         decision::{Decision, Pick, Target},
-        framework::{DecisionScope, Filter, Picker, Scorer, TieBand},
+        framework::{DecisionScope, Scorer, TieBand},
         lease::{
             EventKind, EventSet, Lease, Lifecycle, Membership, Outcome, ReleaseReason, Side,
             Signal, TransportClass,
@@ -671,24 +666,6 @@ mod tests {
             worker: WorkerId(1),
             health: Health::default(),
         });
-    }
-
-    /// A plugin's row carries its worker's requests in flight, and a
-    /// plugin's declaration has no word for that count: each stage a plugin
-    /// is bound as declares it, beside what the plugin declares.
-    #[test]
-    fn a_plugins_stage_declares_its_rows_requests_in_flight() {
-        let bound = Arc::new(Quiet);
-        let needs = [
-            PluginFilter::new(Arc::clone(&bound), None).needs(),
-            PluginScorer::new(Arc::clone(&bound), None).needs(),
-            PluginPicker::new(bound, None).needs(),
-        ];
-        let counted = Needs {
-            in_flight: true,
-            ..Needs::default()
-        };
-        assert_eq!(needs, [counted; 3]);
     }
 
     /// A host names a decision's rows in the affinity column's place only

@@ -6,6 +6,7 @@
 //! the engine's types as the WIT is are a later step.
 
 use crate::{
+    counts::with_counts,
     decision::{Decision, Lifted, Target, Trace},
     lease::{Lease, LeaseKind, Membership, Outcome, ReleaseReason, Side, Signal, TransportClass},
     plugins::{
@@ -125,8 +126,9 @@ fn load(row: &LoadRow) -> proto::LoadRow {
 
 /// One candidate as the frame carries it: the row, and the affinity facts the
 /// host holds for it beside the row (`held`), which the record carries as
-/// five of its own fields.
-fn candidate(c: &Candidate, held: AffinityFacts) -> proto::Candidate {
+/// five of its own fields. Its requests in flight are what the request's
+/// facts read for it (`in_flight`).
+fn candidate(c: &Candidate, held: AffinityFacts, in_flight: u32) -> proto::Candidate {
     proto::Candidate {
         id: c.id.0,
         role: role(c.role),
@@ -136,7 +138,7 @@ fn candidate(c: &Candidate, held: AffinityFacts) -> proto::Candidate {
         wire_modes: wire_bits(c.wire_modes),
         engine_kind: u32::from(c.engine_kind),
         connector: u32::from(c.connector),
-        in_flight: c.in_flight,
+        in_flight,
         load: c.load.as_ref().map(load),
         overlap_blocks: held.overlap_blocks,
         predicted_blocks: held.predicted_blocks,
@@ -285,10 +287,10 @@ pub(crate) fn decide(
         request: Some(request(facts, exposure, needs)),
         // A candidate's affinity facts ride the request's column, by its
         // index: the same index reads the row and its entry.
-        candidates: (0u32..)
+        candidates: with_counts!(facts, |counts| (0u32..)
             .zip(candidates)
-            .map(|(index, c)| candidate(c, facts.affinity_at(index)))
-            .collect(),
+            .map(|(index, c)| candidate(c, facts.affinity_at(index), counts(c)))
+            .collect()),
         pool: Some(pool(pool_facts)),
         stages: 0,
         scores_in: Vec::new(),
@@ -923,7 +925,6 @@ mod tests {
             ring: true,
             headers: true,
             media: true,
-            in_flight: true,
             active_sessions: true,
             session_in_flight: true,
             affinity: true,
@@ -943,6 +944,40 @@ mod tests {
             held[..most],
             "the first of a longer list"
         );
+    }
+
+    /// The frame carries each candidate's requests in flight as the
+    /// request's facts read them: the lent count where the host lends a
+    /// table, the rows themselves reading zero.
+    #[test]
+    fn the_frame_gives_a_row_the_count_its_request_reads() {
+        use crate::{
+            counts::tests::Lent,
+            plugins::config::Exposure,
+            spec::Needs,
+            view::{Candidate, PoolFacts, RequestFacts},
+        };
+
+        let mut rows: Vec<Candidate> = (0..)
+            .zip([4, 0, 9])
+            .map(|(position, in_flight)| Candidate {
+                position,
+                in_flight,
+                ..Candidate::default()
+            })
+            .collect();
+        let lent = Lent::take(&mut rows);
+        let facts = lent.beside(&RequestFacts::default());
+        let frame = super::decide(
+            1,
+            &facts,
+            &rows,
+            &PoolFacts::default(),
+            &Exposure::default(),
+            Needs::default(),
+        );
+        let read: Vec<u32> = frame.candidates.iter().map(|c| c.in_flight).collect();
+        assert_eq!(read, [4, 0, 9]);
     }
 
     /// The view's trace is the contract's pair. A counted trace leaves with

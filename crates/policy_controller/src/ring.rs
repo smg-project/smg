@@ -49,6 +49,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::{
     affinity::Gates,
+    counts::with_counts,
     decision::MAX_TARGETS,
     framework::{Scorer, TieBand},
     lease::{Lifecycle, Membership},
@@ -496,6 +497,7 @@ impl ConsistentHash {
     /// Whether the key's owner among the survivors holds more requests than
     /// `bound`. `slots` is as [`Self::fill`] left it.
     fn passed_over(
+        facts: &RequestFacts<'_>,
         ring: &Ring,
         key: u64,
         candidates: &[Candidate],
@@ -507,7 +509,7 @@ impl ConsistentHash {
             FREE => Probe::Skip,
             slot => {
                 let owner = &candidates[kept[slot as usize] as usize];
-                Probe::Take(f64::from(owner.in_flight) > bound)
+                Probe::Take(f64::from(facts.in_flight(owner)) > bound)
             }
         })
         .unwrap_or(false)
@@ -641,10 +643,10 @@ impl Scorer for ConsistentHash {
                 // counted in it: the larger of the two is the bound. The
                 // product is taken as written, in 64-bit floats: an owner
                 // at the bound's edge stands or falls by its last bit.
-                let total: u64 = kept
+                let total: u64 = with_counts!(facts, |counts| kept
                     .iter()
-                    .map(|&k| u64::from(candidates[k as usize].in_flight))
-                    .sum();
+                    .map(|&k| u64::from(counts(&candidates[k as usize])))
+                    .sum());
                 let mean = (total as f64 + 1.0) / kept.len() as f64;
                 (mean * factor).max(mean + f64::from(margin))
             });
@@ -652,7 +654,7 @@ impl Scorer for ConsistentHash {
             let mut key = Some(first);
             if let Some(bound) = bound {
                 while let Some(tried) = key {
-                    if !Self::passed_over(&ring, tried, candidates, kept, &slots, bound) {
+                    if !Self::passed_over(facts, &ring, tried, candidates, kept, &slots, bound) {
                         break;
                     }
                     key = keys.as_mut().and_then(Iterator::next);
@@ -670,8 +672,6 @@ impl Scorer for ConsistentHash {
         // host hashes by: over its token ids, or over windows of its text.
         let hashes = self.prefix.is_some();
         Needs {
-            // The bounded-load rule reads each survivor's requests in flight.
-            in_flight: self.bounded.is_some(),
             ring: true,
             token_hashes: hashes,
             text: hashes,
@@ -1225,9 +1225,6 @@ mod tests {
     fn the_scorer_declares_the_ring_need() {
         assert!(ConsistentHash::new(None).needs().ring);
         assert!(!ConsistentHash::new(None).needs().loads);
-        // The bounded-load rule alone reads a worker's requests in flight.
-        assert!(!ConsistentHash::new(None).needs().in_flight);
-        assert!(bounded(1.25, 10).needs().in_flight);
     }
 
     /// A request of these block hashes, sixteen tokens a block, with no
@@ -1332,6 +1329,7 @@ mod tests {
     /// owner passed over leaves the decision scored as a keyless one, and
     /// an owner that keeps its key leaves it scored as with no rule.
     fn keeps(rule: &ConsistentHash, loads: &[u32]) -> bool {
+        use crate::counts::tests::Lent;
         let plain = ConsistentHash::new(None);
         let mut pool: Vec<Candidate> = (0..loads.len() as u32).map(|i| candidate(i, 0)).collect();
         let ranks = scored(&plain, &keyed(5), &pool);
@@ -1340,7 +1338,10 @@ mod tests {
         for (&place, &load) in order.iter().zip(loads) {
             pool[place].in_flight = load;
         }
-        let scores = scored(rule, &keyed(5), &pool);
+        // The loads stand in a table lent beside the rows, each row reading
+        // zero: the rule reads them through the request's facts.
+        let lent = Lent::take(&mut pool);
+        let scores = scored(rule, &lent.beside(&keyed(5)), &pool);
         let kept = scores[order[0]] == 1.0;
         assert!(
             if kept {

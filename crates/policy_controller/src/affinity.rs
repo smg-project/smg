@@ -26,6 +26,7 @@ use parking_lot::Mutex;
 use rustc_hash::FxHashMap;
 
 use crate::{
+    counts::with_counts,
     framework::{Front, Scorer, Spread, TieBand},
     lease::{Lifecycle, Membership},
     spec::{AffinitySource, KvPressureParams, Needs, PrefixAffinityParams, WarmupSliceParams},
@@ -281,6 +282,7 @@ impl Warm<'_> {
 /// they hold, how a warming row is told, the request's deepest index match
 /// and size, and the decision's draw.
 struct Pass<'a> {
+    facts: &'a RequestFacts<'a>,
     candidates: &'a [Candidate],
     kept: &'a [u32],
     feed: Feed<'a>,
@@ -292,29 +294,37 @@ struct Pass<'a> {
 
 impl Pass<'_> {
     /// The slot of the least-loaded kept row `wanted` admits, equal loads
-    /// drawn uniformly from the decision's seed.
-    fn least_loaded(&mut self, mut wanted: impl FnMut(u32, &Candidate) -> bool) -> Option<usize> {
+    /// drawn uniformly from the decision's seed. `wanted` is asked with
+    /// the row's requests in flight, the decision's one number for the
+    /// row.
+    fn least_loaded(
+        &mut self,
+        mut wanted: impl FnMut(u32, &Candidate, u32) -> bool,
+    ) -> Option<usize> {
         let mut pick: Option<(usize, u32)> = None;
         let mut tied = 0usize;
-        for (slot, &i) in self.kept.iter().enumerate() {
-            let c = &self.candidates[i as usize];
-            if !wanted(i, c) {
-                continue;
-            }
-            match pick {
-                Some((_, load)) if c.in_flight > load => {}
-                Some((_, load)) if c.in_flight == load => {
-                    tied += 1;
-                    if self.draw.below(tied + 1) == 0 {
-                        pick = Some((slot, load));
+        with_counts!(self.facts, |counts| {
+            for (slot, &i) in self.kept.iter().enumerate() {
+                let c = &self.candidates[i as usize];
+                let held = counts(c);
+                if !wanted(i, c, held) {
+                    continue;
+                }
+                match pick {
+                    Some((_, load)) if held > load => {}
+                    Some((_, load)) if held == load => {
+                        tied += 1;
+                        if self.draw.below(tied + 1) == 0 {
+                            pick = Some((slot, load));
+                        }
+                    }
+                    _ => {
+                        pick = Some((slot, held));
+                        tied = 0;
                     }
                 }
-                _ => {
-                    pick = Some((slot, c.in_flight));
-                    tied = 0;
-                }
             }
-        }
+        });
         pick.map(|(slot, _)| slot)
     }
 }
@@ -323,8 +333,16 @@ impl Pass<'_> {
 /// engine set it
 /// ([`NamedAffinity::mean_in_flight`]),
 /// else the kept rows'.
-fn spill_mean(drawn: Option<f32>, candidates: &[Candidate], kept: &[u32]) -> f32 {
-    drawn.unwrap_or_else(|| mean_in_flight(candidates, kept))
+// Forced into the stage's passes with the mean it reads
+// ([`mean_in_flight`]): out of line the mean's walk costs a pass a call.
+#[inline(always)]
+fn spill_mean(
+    drawn: Option<f32>,
+    facts: &RequestFacts<'_>,
+    candidates: &[Candidate],
+    kept: &[u32],
+) -> f32 {
+    drawn.unwrap_or_else(|| mean_in_flight(facts, candidates, kept))
 }
 
 /// Every row scores alike: the stage has nothing to say about this request.
@@ -407,7 +425,7 @@ impl PrefixAffinity {
         } else {
             0
         };
-        let avg = spill_mean(feed.drawn_mean(), candidates, kept);
+        let avg = spill_mean(feed.drawn_mean(), facts, candidates, kept);
         // A decode worker prefills nothing again: its held prefix is not
         // priced.
         let priced = self.gates.prefix_margin_tokens > 0 && facts.phase != Phase::Decode;
@@ -417,21 +435,23 @@ impl PrefixAffinity {
             0.0
         };
         let mut entry = reads();
-        for (o, &i) in out.iter_mut().zip(kept) {
-            let c = &candidates[i as usize];
-            let load = c.in_flight as f32;
-            // A match above zero was read from a feed that holds entries.
-            *o = if best > 0
-                && self.matched(entry(i), request_blocks) == best
-                && !self.gates.over(load, avg, held)
-            {
-                1.0
-            } else if !self.gates.over(load, avg, 0.0) {
-                0.5
-            } else {
-                0.0
-            };
-        }
+        with_counts!(facts, |counts| {
+            for (o, &i) in out.iter_mut().zip(kept) {
+                let c = &candidates[i as usize];
+                let load = counts(c) as f32;
+                // A match above zero was read from a feed that holds entries.
+                *o = if best > 0
+                    && self.matched(entry(i), request_blocks) == best
+                    && !self.gates.over(load, avg, held)
+                {
+                    1.0
+                } else if !self.gates.over(load, avg, 0.0) {
+                    0.5
+                } else {
+                    0.0
+                };
+            }
+        });
         TieBand(0.0)
     }
 
@@ -463,7 +483,7 @@ impl PrefixAffinity {
                 best = best.max(matched);
             }
         }
-        let avg = spill_mean(named.mean_in_flight, candidates, kept);
+        let avg = spill_mean(named.mean_in_flight, facts, candidates, kept);
         let priced = self.gates.prefix_margin_tokens > 0 && facts.phase != Phase::Decode;
         let held = if priced {
             self.gates.tokens_of(best, facts)
@@ -471,13 +491,15 @@ impl PrefixAffinity {
             0.0
         };
         let (holder, anyone) = (self.gates.spill(avg, held), self.gates.spill(avg, 0.0));
-        for (o, &i) in out.iter_mut().zip(kept) {
-            let load = candidates[i as usize].in_flight as f32;
-            // A match above zero was read into this slot.
-            let deepest = (best > 0) & (o.to_bits() == best);
-            let own = usize::from(deepest & !holder.over(load));
-            *o = [0.0, 0.5, 1.0, 1.0][own << 1 | usize::from(!anyone.over(load))];
-        }
+        with_counts!(facts, |counts| {
+            for (o, &i) in out.iter_mut().zip(kept) {
+                let load = counts(&candidates[i as usize]) as f32;
+                // A match above zero was read into this slot.
+                let deepest = (best > 0) & (o.to_bits() == best);
+                let own = usize::from(deepest & !holder.over(load));
+                *o = [0.0, 0.5, 1.0, 1.0][own << 1 | usize::from(!anyone.over(load))];
+            }
+        });
         TieBand(0.0)
     }
 
@@ -572,7 +594,6 @@ impl Scorer for PrefixAffinity {
             // predictor's placement are fields of a candidate's entry. What
             // feeds the entry differs by source and is declared beside it.
             affinity: true,
-            in_flight: true,
             token_hashes: true,
             events: self.source != AffinitySource::Predictor,
             text: placements,
@@ -892,6 +913,7 @@ impl WarmupSlice {
         let thin_overlap = best as f32 / request_blocks as f32 <= self.miss_share
             || (best <= WARMUP_MISS_BLOCKS && best * 2 < request_blocks);
         let mut pass = Pass {
+            facts,
             candidates,
             kept,
             feed,
@@ -983,10 +1005,15 @@ impl WarmupSlice {
 
     /// The slot of the kept row the slice sends this miss to, if it is due.
     fn slice<const DRAWN: bool>(&self, pass: &mut Pass<'_>) -> Option<usize> {
-        let avg = spill_mean(pass.feed.drawn_mean(), pass.candidates, pass.kept);
+        let avg = spill_mean(
+            pass.feed.drawn_mean(),
+            pass.facts,
+            pass.candidates,
+            pass.kept,
+        );
         let mut warming = self.warming::<DRAWN>(pass.warm, pass.feed);
         let slot =
-            pass.least_loaded(|i, c| warming(i) && !self.gates.over(c.in_flight as f32, avg, 0.0))?;
+            pass.least_loaded(|i, _, load| warming(i) && !self.gates.over(load as f32, avg, 0.0))?;
         let seen = self.misses.fetch_add(1, Ordering::Relaxed);
         seen.is_multiple_of(self.period()).then_some(slot)
     }
@@ -997,6 +1024,7 @@ impl WarmupSlice {
             return None;
         }
         let Pass {
+            facts,
             candidates,
             kept,
             feed,
@@ -1025,7 +1053,7 @@ impl WarmupSlice {
             let mut reads = feed.reads();
             kept.iter()
                 .filter(|&&i| feed.read::<DRAWN>(&mut reads, i).overlap_blocks == best)
-                .map(|&i| candidates[i as usize].in_flight)
+                .map(|&i| facts.in_flight(&candidates[i as usize]))
                 .min()
         };
         // The eligibility read and the window's reservation on one lock
@@ -1035,10 +1063,10 @@ impl WarmupSlice {
         let slot = {
             let mut until = self.divert_until.lock();
             let (mut warming, mut held) = (self.warming::<DRAWN>(warm, feed), feed.reads());
-            let slot = pass.least_loaded(|i, c| {
+            let slot = pass.least_loaded(|i, c, load| {
                 warming(i)
-                    && !(c.in_flight > 0 && until.get(&c.id).is_some_and(|&t| now < t))
-                    && !(holder_load.is_some_and(|h| c.in_flight >= h)
+                    && !(load > 0 && until.get(&c.id).is_some_and(|&t| now < t))
+                    && !(holder_load.is_some_and(|h| load >= h)
                         && feed.read::<DRAWN>(&mut held, i).overlap_blocks != best)
             })?;
             until.insert(
@@ -1143,7 +1171,6 @@ impl Scorer for WarmupSlice {
             // are all read from a candidate's entry of the column.
             affinity: true,
             events: true,
-            in_flight: true,
             loads: true,
             ..Needs::default()
         }
@@ -1158,6 +1185,7 @@ impl Scorer for WarmupSlice {
 mod tests {
     use super::*;
     use crate::{
+        counts::tests::Lent,
         spec::SpillParams,
         view::{Health, LoadRow, NamedHolder},
     };
@@ -1228,13 +1256,18 @@ mod tests {
         rows: &[Candidate],
         column: &[AffinityFacts],
     ) -> Vec<f32> {
-        let facts = RequestFacts {
+        // The counts a case wrote into its rows stand in a table lent
+        // beside them, each row reading zero: every case that scores
+        // through here holds its stage to the one reader of a row's count.
+        let mut rows = rows.to_vec();
+        let lent = Lent::take(&mut rows);
+        let facts = lent.beside(&RequestFacts {
             affinity: column,
             ..*facts
-        };
+        });
         let kept = kept(rows.len() as u32);
         let mut out = vec![0.0; rows.len()];
-        scorer.score(&facts, rows, &kept, &mut out);
+        scorer.score(&facts, &rows, &kept, &mut out);
         out
     }
 
@@ -1260,7 +1293,7 @@ mod tests {
             rel: Some(1.5),
             ..SpillParams::default()
         }));
-        let mean = mean_in_flight(&rows(&pool), &kept(3));
+        let mean = mean_in_flight(&RequestFacts::default(), &rows(&pool), &kept(3));
         assert!((mean - 40.0 / 3.0).abs() < 1e-6);
         assert_eq!(scores(&gated, &facts(16), &pool), vec![0.0, 0.5, 0.5]);
         // Under a lifted relative part the holder keeps the request.
@@ -1431,6 +1464,37 @@ mod tests {
         assert_eq!(slice.misses.load(Ordering::Relaxed), 8);
     }
 
+    /// Two thin workers part by the counts the request's facts read: beside
+    /// a lent table that the rows' own fields contradict, a sliced miss
+    /// goes to the thin worker the table says is the least loaded.
+    #[test]
+    fn a_thin_miss_goes_to_the_thin_worker_the_lent_counts_say_is_least_loaded() {
+        let slice = warmup(0.25, 0);
+        // Level 64 (the median of 64, 64, 64, 0, 0): rows 3 and 4 are thin,
+        // and row 4 has the fewer requests by the counts lent.
+        let pool = [
+            sized(0, 3, 0, 64),
+            sized(1, 2, 0, 64),
+            sized(2, 4, 0, 64),
+            sized(3, 5, 0, 0),
+            sized(4, 1, 0, 0),
+        ];
+        let column = column(&pool);
+        let mut rows = rows(&pool);
+        let lent = Lent::take(&mut rows);
+        // The rows' own fields say the contrary.
+        rows[3].in_flight = 1;
+        rows[4].in_flight = 5;
+        let facts = lent.beside(&RequestFacts {
+            affinity: &column,
+            ..facts(16)
+        });
+        let kept = kept(rows.len() as u32);
+        let mut out = vec![0.0; rows.len()];
+        slice.score(&facts, &rows, &kept, &mut out);
+        assert_eq!(out, vec![0.0, 0.0, 0.0, 0.0, 1.0]);
+    }
+
     /// A few-block hit on a long request is a miss for the slice: at most
     /// four blocks held that cover less than half the request. A fifth
     /// block, or half the request, is a hit the slice leaves alone.
@@ -1591,6 +1655,10 @@ mod tests {
         }
         let shallow = [sized(0, 0, 7, 64), sized(1, 0, 0, 64), sized(2, 1, 0, 0)];
         assert_eq!(scores(&slice, &now, &shallow), vec![0.0, 0.0, 1.0]);
+        // A holder with more in flight than the thin worker gives its due
+        // deep hit up: the holder's count is read as the thin worker's is.
+        let busier = [sized(0, 4, 12, 64), sized(1, 0, 0, 64), sized(2, 1, 0, 0)];
+        assert_eq!(scores(&warmup(0.25, 1), &now, &busier), vec![0.0, 0.0, 1.0]);
     }
 
     /// A thin worker among a deep hit's deepest holders recomputes nothing:
@@ -1835,7 +1903,6 @@ mod tests {
             let needs =
                 PrefixAffinity::new(&params, Gates::of(Some(&params), None, Some(16))).needs();
             assert!(needs.affinity, "{source:?} reads the column");
-            assert!(needs.in_flight, "{source:?} reads its rows' requests");
             assert_eq!(
                 needs.events,
                 source != AffinitySource::Predictor,
@@ -1843,9 +1910,7 @@ mod tests {
             );
         }
         assert!(warmup(1.0, 0).needs().affinity);
-        assert!(warmup(1.0, 0).needs().in_flight);
         assert!(!KvPressure.needs().affinity);
-        assert!(!KvPressure.needs().in_flight);
     }
 
     /// `row` named as holding `blocks` by the index.
@@ -1875,13 +1940,17 @@ mod tests {
         rows: &[Candidate],
         named: NamedAffinity<'_>,
     ) -> Vec<f32> {
-        let facts = RequestFacts {
+        // The rows' counts are lent beside them, as [`scores_beside`] lends
+        // them.
+        let mut rows = rows.to_vec();
+        let lent = Lent::take(&mut rows);
+        let facts = lent.beside(&RequestFacts {
             named: Some(named),
             ..*facts
-        };
+        });
         let kept = kept(rows.len() as u32);
         let mut out = vec![0.0; rows.len()];
-        scorer.score(&facts, rows, &kept, &mut out);
+        scorer.score(&facts, &rows, &kept, &mut out);
         out
     }
 
@@ -2276,7 +2345,7 @@ mod tests {
             }
             let whole = named(&holders, &[], false);
             let drawn = NamedAffinity {
-                mean_in_flight: Some(mean_in_flight(&pool, &order)),
+                mean_in_flight: Some(mean_in_flight(&RequestFacts::default(), &pool, &order)),
                 ..whole
             };
             let stage = &stages[round as usize % stages.len()];
