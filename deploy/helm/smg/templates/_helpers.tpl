@@ -1083,6 +1083,27 @@ comparer can hold: any other tag takes the default.
 {{- end }}
 
 {{/*
+Policy controller spec document -- policyController.spec as the bytes of the
+file the controller reads, and empty where the values hold no document: a
+null, an empty map, or values with no such key. A value that is no map is
+refused as written, also one that reads as empty (false, 0, an empty text
+or list): it never renders as no document. The chart reads no line of the
+document and writes none: whether it runs is the controller's word, and a
+generation line is the document's own.
+*/}}
+{{- define "smg.policyControllerSpec" -}}
+{{- $spec := (.Values.policyController).spec -}}
+{{- if not (kindIs "invalid" $spec) -}}
+{{- if not (kindIs "map" $spec) -}}
+{{- fail (printf "policyController.spec is %s: the policy spec document as a map" (toJson $spec)) -}}
+{{- end -}}
+{{- with $spec -}}
+{{- toYaml . -}}
+{{- end -}}
+{{- end -}}
+{{- end }}
+
+{{/*
 Policy controller CLI arguments -- every argument is a flag of
 smg-policy-controller, each from a value. The controller's id is not here:
 the flag reads HOSTNAME, the pod's name. What the controller refuses at
@@ -1096,7 +1117,9 @@ text or map): null alone is the value left out. Those listeners are a set,
 said in the listeners' own order however the value was written: a reorder
 rolls no pod. With the election on the Lease is named,
 and the pod's own address, which the kubelet writes in place of $(POD_IP):
-the holder of the Lease is named by an address the others can dial.
+the holder of the Lease is named by an address the others can dial. With a
+spec document the file is named that the Deployment mounts it as: the one
+key of the document's ConfigMap, under the mount's directory.
 */}}
 {{- define "smg.policyControllerArgs" -}}
 {{- $controller := .Values.policyController -}}
@@ -1167,6 +1190,10 @@ the holder of the Lease is named by an address the others can dial.
 - {{ include "smg.policyControllerLeaseName" . | quote }}
 - "--advertise-address"
 - "$(POD_IP)"
+{{- end }}
+{{- if include "smg.policyControllerSpec" . }}
+- "--spec-file"
+- "/etc/smg/policy-spec/spec.yaml"
 {{- end }}
 {{- range $controller.extraArgs }}
 - {{ . | quote }}

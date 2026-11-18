@@ -68,6 +68,24 @@ LONE_STRATEGY = {"type": "RollingUpdate", "rollingUpdate": {"maxSurge": 0, "maxU
 POD_IP = {"name": "POD_IP", "valueFrom": {"fieldRef": {"fieldPath": "status.podIP"}}}
 # The settle window the controller takes when the chart passes none.
 DEFAULT_SETTLE_SECONDS = 5
+# A policy spec document the stock controller runs, another one, and one no
+# build runs: its filter is none the controller knows.
+LEAST_LOAD = {
+    "apiVersion": "smg.policy/v1",
+    "profiles": {"default": {"filter": ["healthy"], "score": ["least-load"], "pick": "best"}},
+}
+RANDOM = {
+    "apiVersion": "smg.policy/v1",
+    "profiles": {"default": {"filter": ["healthy"], "pick": "random"}},
+}
+UNKNOWN_FILTER = {
+    "apiVersion": "smg.policy/v1",
+    "profiles": {"default": {"filter": ["no-such-filter"], "pick": "random"}},
+}
+# Where the pod mounts the document's ConfigMap, and the file under it that
+# the controller is passed.
+SPEC_MOUNT = "/etc/smg/policy-spec"
+SPEC_FILE = f"{SPEC_MOUNT}/spec.yaml"
 # The started controller is read on a loopback port: a proxy named in the
 # environment is not asked for it.
 DIRECT = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -150,6 +168,13 @@ def controller_args(*settings: str) -> list[str]:
     return container(render(*ON, *settings))["args"]
 
 
+def spec_values(directory: Path, document: object, name: str = "spec.yaml") -> Path:
+    """A values file that holds ``document`` as the controller's spec."""
+    values = directory / name
+    values.write_text(yaml.safe_dump({"policyController": {"spec": document}}))
+    return values
+
+
 def selects(selector: dict[str, str], labels: dict[str, str]) -> bool:
     return all(labels.get(key) == value for key, value in selector.items())
 
@@ -178,8 +203,8 @@ def chart_with_no_block(tmp_path) -> Path:
 @needs_helm
 def test_a_controller_that_is_off_asks_nothing_of_the_values(chart_with_no_block):
     """With no block, a null block over the chart's values or over none, the
-    switch alone named off or null, or one value and no switch, the chart
-    renders what its defaults render, byte for byte.
+    switch alone named off or null, or one value or a spec document and no
+    switch, the chart renders what its defaults render, byte for byte.
     Each again with the router's monitor on: the controller's monitor stands
     behind that switch."""
     cells = {
@@ -189,6 +214,10 @@ def test_a_controller_that_is_off_asks_nothing_of_the_values(chart_with_no_block
         "the switch alone, off": (chart_with_no_block, ("policyController.enabled=false",)),
         "the switch alone, null": (chart_with_no_block, ("policyController.enabled=null",)),
         "one value and no switch": (chart_with_no_block, ("policyController.ports.admin=9000",)),
+        "a document and no switch": (
+            chart_with_no_block,
+            ("policyController.spec.apiVersion=smg.policy/v1",),
+        ),
     }
     wrong = {}
     for monitor in ((), ("router.metrics.serviceMonitor.enabled=true",)):
@@ -442,8 +471,8 @@ def test_a_release_older_than_the_first_with_a_controller_image_is_refused():
 
 @needs_helm
 def test_the_block_renders_two_objects_and_the_election_four_more():
-    """No ConfigMap: it arrives with the controller flag that reads it. The
-    election's four objects stand behind the election's switch."""
+    """No ConfigMap without a spec document. The election's four objects
+    stand behind the election's switch."""
     documents = of_the_controller(render(*ON))
     assert sorted(document["kind"] for document in documents) == ["Deployment", "Service"]
     assert {document["metadata"]["name"] for document in documents} == {NAME}
@@ -472,6 +501,121 @@ def test_the_block_renders_two_objects_and_the_election_four_more():
         "Service",
         "ServiceMonitor",
     ]
+
+
+@needs_helm
+def test_a_spec_document_renders_its_configmap_its_mount_and_its_flag(tmp_path):
+    """A document in the values is the one key of one ConfigMap under the
+    controller's name. The pod mounts that ConfigMap whole and read-only,
+    and the controller is passed the key's file under the mount. A null and
+    an empty map are no document: none of the three is rendered."""
+    documents = render(*ON, files=(spec_values(tmp_path, LEAST_LOAD),))
+    assert sorted(document["kind"] for document in of_the_controller(documents)) == [
+        "ConfigMap",
+        "Deployment",
+        "Service",
+    ]
+    config = one(documents, "ConfigMap")
+    assert component(config) == COMPONENT
+    assert list(config["data"]) == [Path(SPEC_FILE).name]
+    assert yaml.safe_load(config["data"]["spec.yaml"]) == LEAST_LOAD
+    pod = one(documents, "Deployment")["spec"]["template"]["spec"]
+    found = container(documents)
+    # The whole ConfigMap, whose updates the kubelet projects (a subPath gets
+    # none), and not optional: the pod waits for it.
+    assert pod["volumes"] == [{"name": "policy-spec", "configMap": {"name": NAME}}]
+    assert found["volumeMounts"] == [
+        {"name": "policy-spec", "mountPath": SPEC_MOUNT, "readOnly": True}
+    ]
+    # The flag once, after the chart's other flags.
+    assert found["args"][-2:] == ["--spec-file", SPEC_FILE]
+    assert found["args"].count("--spec-file") == 1
+    # The read-only root filesystem stands: the mount is a volume of its own.
+    assert found["securityContext"]["readOnlyRootFilesystem"] is True
+    # A null and an empty map are no document: the render is the one of no
+    # spec value, byte for byte.
+    plain = helm_template(ON)
+    assert plain.returncode == 0, plain.stderr
+    assert helm_template((*ON, "policyController.spec=null")).stdout == plain.stdout
+    no_document = spec_values(tmp_path, {}, "empty.yaml")
+    assert helm_template(ON, files=(no_document,)).stdout == plain.stdout
+
+
+def without_the_document(documents: list[dict]) -> list[dict]:
+    """Every rendered object but the spec document's ConfigMap."""
+    config = one(documents, "ConfigMap")
+    return [document for document in documents if document is not config]
+
+
+@needs_helm
+@pytest.mark.parametrize("switches", [ON, ELECTED], ids=["alone", "elected"])
+def test_a_changed_document_changes_its_configmap_and_no_pod(switches, tmp_path):
+    """The pod template holds no checksum of the document. An upgrade to
+    another document renders another ConfigMap and every other object as it
+    was, so it moves no pod: the kubelet turns the mounted file and the
+    running controller reads it. A first document does move the pod: the
+    mount and the flag arrive with it."""
+    first = render(*switches, files=(spec_values(tmp_path, LEAST_LOAD, "first.yaml"),))
+    second = render(*switches, files=(spec_values(tmp_path, RANDOM, "second.yaml"),))
+    assert one(first, "ConfigMap")["data"] != one(second, "ConfigMap")["data"]
+    assert without_the_document(first) == without_the_document(second)
+    assert "annotations" not in one(first, "Deployment")["spec"]["template"]["metadata"]
+    assert one(first, "Deployment") != one(render(*switches), "Deployment")
+
+
+@needs_helm
+def test_the_document_reaches_the_file_as_the_values_hold_it(tmp_path):
+    """The chart reads no line of the document and writes none, so the file
+    reads back as the map the values hold. The map here is no document a
+    controller runs: it asks what the chart carries. Text that reads as a
+    number, a boolean or a null stays text; a list keeps its order; a null,
+    an empty list and an empty map stay what they are; a text of several
+    lines keeps its empty line; braces are no template. No generation line
+    is written, and one the document writes is handed on."""
+    carried = {
+        **LEAST_LOAD,
+        "order": ["c", "a", "b"],
+        "text": {
+            "number": "123",
+            "boolean": "true",
+            "null": "null",
+            "lines": "first\n\nthird\n",
+            "braces": "{{ .Values.none }}",
+        },
+        "numbers": {"whole": 67108864, "ratio": 0.3},
+        "nothing": None,
+        "empty": {"list": [], "map": {}},
+    }
+
+    def file(document: dict) -> str:
+        documents = render(*ON, files=(spec_values(tmp_path, document),))
+        return one(documents, "ConfigMap")["data"]["spec.yaml"]
+
+    written = file(carried)
+    assert yaml.safe_load(written) == carried
+    numbered = file({**carried, "generation": 7})
+    assert yaml.safe_load(numbered) == {**carried, "generation": 7}
+    # By value a whole number equals its float form. The text of its line
+    # holds the form: the controller's reader takes no float there.
+    assert "\n  whole: 67108864\n" in written
+    assert "\ngeneration: 7\n" in numbered
+
+
+@needs_helm
+@pytest.mark.parametrize("written", ["false", "0", '""', "[]", '"apiVersion: smg.policy/v1"'])
+def test_a_document_that_is_no_map_is_refused_though_it_reads_as_empty(
+    written: str, tmp_path: Path
+):
+    """With the schema's check skipped, a document that is no map is refused
+    as it was written. One that reads as empty never renders as no document,
+    and a document handed as one text is not written into the file as a
+    text: null and the empty map alone are no document."""
+    values = tmp_path / "values.yaml"
+    values.write_text(f"policyController:\n  spec: {written}\n")
+    refused = render_error(*ON, files=(values,), skip_schema=True)
+    assert f"policyController.spec is {written}: the policy spec document as a map" in refused
+    # The schema refuses each first, by its type.
+    assert "policyController.spec: Invalid type" in render_error(*ON, files=(values,))
 
 
 @needs_helm
@@ -1226,6 +1370,8 @@ SAME_AS_THE_DEFAULT = {
     "extraEnv",
     "identityAsTold",
     "shutdownSettleSeconds",
+    # No document: the controller runs no spec.
+    "spec",
     # The election off, and the Lease under the controller's own name.
     "election",
     "election.enabled",
@@ -1368,6 +1514,7 @@ ARGUMENT_SETS = {
     "extra-arguments": (
         "policyController.extraArgs={--ingestion-listen,0.0.0.0:30104,--load-monitor-interval,2}",
     ),
+    "a-spec-document": ("policyController.spec.apiVersion=smg.policy/v1",),
     "an-election": ("policyController.election.enabled=true", "policyController.replicas=2"),
     "an-election-over-a-named-lease": (
         "policyController.election.enabled=true",
@@ -2034,6 +2181,190 @@ def test_a_lease_deleted_under_running_pods_leaves_them_ready_and_nobody_leading
         for pod in pods:
             pod.end()
         stand_in.close()
+
+
+# The controller under a spec document, as the Deployment's one pod. No
+# cluster: the document's ConfigMap is laid out here as a kubelet mounts it.
+
+EXAMPLE = EXAMPLES / "with-policy-controller.yaml"
+# The spec's series as /metrics renders them: the generation the controller
+# runs, and its counts of documents applied and rejected.
+SPEC_SERIES = (
+    "smg_policy_spec_generation",
+    'smg_policy_spec_apply_total{result="applied"}',
+    'smg_policy_spec_apply_total{result="rejected"}',
+)
+
+
+def example_values(directory: Path, document: dict, name: str) -> Path:
+    """The controller's example values with ``document`` as the spec, whole:
+    a values file laid over another would join the two documents key by
+    key."""
+    values = yaml.safe_load(EXAMPLE.read_text())
+    values["policyController"]["spec"] = document
+    path = directory / name
+    path.write_text(yaml.safe_dump(values))
+    return path
+
+
+class Mount:
+    """A directory laid out as a kubelet lays a ConfigMap volume: each key's
+    file is a link through ``..data``, itself a link to the directory of the
+    version in use. An update writes a new directory, turns ``..data`` to it
+    by one rename and takes the old directory away: a reader finds one
+    version whole or the other, and a file it holds may go from under it."""
+
+    def __init__(self, directory: Path, config: dict):
+        self.directory = directory
+        self._versions = 0
+        directory.mkdir()
+        self.turn(config)
+        for key in config["data"]:
+            (directory / key).symlink_to(Path("..data") / key)
+
+    def turn(self, config: dict) -> None:
+        """The mount's update to ``config``."""
+        self._versions += 1
+        version = self.directory / f"..version-{self._versions}"
+        version.mkdir()
+        for key, document in config["data"].items():
+            (version / key).write_text(document)
+        staged = self.directory / "..data_tmp"
+        staged.symlink_to(version.name)
+        staged.replace(self.directory / "..data")
+        # The kubelet takes the old version away once the link is turned.
+        if self._versions > 1:
+            shutil.rmtree(self.directory / f"..version-{self._versions - 1}")
+
+
+class DocumentedPod:
+    """The controller as the Deployment's one pod under a spec document:
+    exactly the arguments the Deployment passes, on ports free here and a
+    short grace period, with the pod's name in HOSTNAME and the document's
+    ConfigMap mounted. A directory of the case's stands in for the mount's
+    path, and nothing else of the arguments is another."""
+
+    def __init__(self, binary: str, directory: Path, values: Path):
+        gateway, control, replication, admin = free_ports(4)
+        self._settings = (
+            *ON,
+            f"policyController.ports.gateway={gateway}",
+            f"policyController.ports.control={control}",
+            f"policyController.ports.replication={replication}",
+            f"policyController.ports.admin={admin}",
+            "policyController.shutdownGracePeriodSeconds=4",
+            "policyController.shutdownSettleSeconds=1",
+        )
+        documents = render(*self._settings, files=(values,))
+        self._deployment = one(documents, "Deployment")
+        found = container(documents)
+        (mounted,) = found["volumeMounts"]
+        self._mount = Mount(directory / "mount", one(documents, "ConfigMap"))
+        self.arguments = [
+            argument.replace(mounted["mountPath"], str(self._mount.directory), 1)
+            if argument.startswith(mounted["mountPath"] + "/")
+            else argument
+            for argument in found["args"]
+        ]
+        assert self.arguments != found["args"], "no argument names a file under the mount"
+        self._metrics = f"http://127.0.0.1:{admin}/metrics"
+        environment = {key: value for key, value in os.environ.items() if key not in LOG_VARIABLES}
+        environment["HOSTNAME"] = POD_NAMES[0]
+        self.process = subprocess.Popen(
+            [binary, *self.arguments],
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+
+    def upgrade(self, values: Path) -> None:
+        """An upgrade of the release to ``values``. It renders the Deployment
+        the pod runs under, so it moves no pod and the pod's arguments stand,
+        and the kubelet turns the mount to the upgrade's ConfigMap."""
+        documents = render(*self._settings, files=(values,))
+        assert one(documents, "Deployment") == self._deployment, "the upgrade moves the pod"
+        self._mount.turn(one(documents, "ConfigMap"))
+
+    def spec(self) -> tuple[int, ...] | None:
+        """The spec's series as they read now; none while nothing listens."""
+        if self.process.poll() is not None:
+            output = self.process.stdout.read() if self.process.stdout else ""
+            raise AssertionError(f"the controller exited: {output}")
+        try:
+            with DIRECT.open(self._metrics, timeout=2) as response:
+                rendered = response.read().decode()
+        except (urllib.error.URLError, ConnectionError, TimeoutError):
+            return None
+        series = dict(re.findall(r"^(smg_policy_spec_\S+) (\d+)$", rendered, flags=re.MULTILINE))
+        assert set(SPEC_SERIES) <= set(series), f"/metrics renders {sorted(series)}"
+        return tuple(int(series[name]) for name in SPEC_SERIES)
+
+    def runs(self, generation: int, applied: int, rejected: int, seconds: float = 20) -> None:
+        """Waits until the spec's series read these three."""
+        deadline = time.monotonic() + seconds
+        while (read := self.spec()) != (generation, applied, rejected):
+            assert time.monotonic() < deadline, f"the spec's series read {read} after {seconds} s"
+            time.sleep(0.1)
+
+    def stop(self) -> str:
+        """SIGTERM, the exit status checked, and the log."""
+        self.process.send_signal(signal.SIGTERM)
+        output, _ = self.process.communicate(timeout=15)
+        assert self.process.returncode == 0, output
+        return output
+
+    def end(self) -> None:
+        if self.process.poll() is None:
+            self.process.kill()
+            self.process.wait()
+
+
+@needs_helm
+def test_the_binary_runs_the_mounted_document_and_a_changed_one_in_place(binary, tmp_path):
+    """The controller started as the Deployment's pod on the chart's example,
+    its document mounted as a kubelet mounts a ConfigMap: it runs the
+    document as its first generation. An upgrade to another document moves
+    no pod. The mount turns, and the running controller applies the new
+    document as its next generation and logs each with its digest."""
+    pod = DocumentedPod(binary, tmp_path, EXAMPLE)
+    try:
+        pod.runs(generation=1, applied=1, rejected=0)
+        pod.upgrade(example_values(tmp_path, RANDOM, "random.yaml"))
+        pod.runs(generation=2, applied=2, rejected=0)
+        output = pod.stop()
+    finally:
+        pod.end()
+    applied = [line for line in output.splitlines() if "policy spec applied" in line]
+    assert len(applied) == 2, output
+    for generation, line in enumerate(applied, start=1):
+        assert f"generation={generation} digest=" in line, line
+    assert "policy spec rejected" not in output
+
+
+@needs_helm
+def test_a_mounted_document_that_does_not_run_is_rejected_and_the_running_one_stays(
+    binary, tmp_path
+):
+    """A mounted document turned to one that does not run. The upgrade
+    renders the Deployment as it was, so the pod's arguments stand and no
+    pod is started on the document. The running controller rejects it once,
+    in its log and in its count, and runs the generation it ran. A
+    controller started on those arguments refuses to start and names the
+    document's fault: a pod the upgrade had moved would not come up."""
+    pod = DocumentedPod(binary, tmp_path, EXAMPLE)
+    try:
+        pod.runs(generation=1, applied=1, rejected=0)
+        pod.upgrade(example_values(tmp_path, UNKNOWN_FILTER, "unknown.yaml"))
+        pod.runs(generation=1, applied=1, rejected=1)
+        output = pod.stop()
+    finally:
+        pod.end()
+    (rejected,) = [line for line in output.splitlines() if "policy spec rejected" in line]
+    assert "the running generation stays" in rejected and "generation=1" in rejected
+    assert "no-such-filter" in rejected
+    assert output.count("policy spec applied") == 1
+    assert "no-such-filter" in refusal(binary, pod.arguments)
 
 
 def test_the_image_job_builds_the_example_for_both_platforms_and_pushes_nothing():

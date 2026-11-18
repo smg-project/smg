@@ -1,0 +1,19 @@
+{{- if (.Values.policyController).enabled }}
+{{- /* The policy spec document of policyController.spec as the file the
+     controller reads: the controller's Deployment mounts this ConfigMap
+     whole and passes its one key as --spec-file. It carries the
+     controller's name, as the controller's other objects do. Not rendered
+     without a document. */}}
+{{- with include "smg.policyControllerSpec" . }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "smg.policyControllerName" $ }}
+  labels:
+    {{- include "smg.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: policy-controller
+data:
+  spec.yaml: |
+    {{- . | nindent 4 }}
+{{- end }}
+{{- end }}
