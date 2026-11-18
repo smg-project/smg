@@ -491,7 +491,7 @@ impl<'a> McpToolSession<'a> {
             })
             .filter(|entry| {
                 self.tool_owners
-                    .get(Self::owned_name(entry))
+                    .get(&entry.qualified_name)
                     .is_none_or(|&place| self.all_mcp_servers[place].pool_key == binding.pool_key)
             })
             .collect()
@@ -586,7 +586,7 @@ impl<'a> McpToolSession<'a> {
             let server_key = entry.server_key().to_string();
             let associated_server_key = Self::associated_server_key(entry);
             let binding = owners
-                .get(Self::owned_name(entry))
+                .get(&entry.qualified_name)
                 .map(|&place| &mcp_servers[place])
                 .or_else(|| Self::binding_for_entry(entry, &bindings));
             let server_label = binding
@@ -643,44 +643,6 @@ impl<'a> McpToolSession<'a> {
         mcp_servers: &[McpServerBinding],
         server_keys: &[String],
     ) -> (Vec<ToolEntry>, HashMap<QualifiedToolName, usize>) {
-        // The servers in binding order. A binding with a pool key lists the
-        // tools its own connection listed: under its URL the inventory holds
-        // the last listing of any caller. Of a URL bound more than once each
-        // binding lists what its allowlist admits and no earlier binding
-        // listed, and `owners` keeps its place for the calls of those tools.
-        let mut direct_tools = Vec::new();
-        let mut owners = HashMap::new();
-        for (place, binding) in mcp_servers.iter().enumerate() {
-            let Some(key) = &binding.pool_key else {
-                if !server_keys[..place].contains(&binding.server_key) {
-                    direct_tools
-                        .extend(orchestrator.list_tools_for_servers(&server_keys[place..=place]));
-                }
-                continue;
-            };
-            let shared = server_keys
-                .iter()
-                .filter(|other| **other == binding.server_key)
-                .count()
-                > 1;
-            let allowed = binding
-                .allowed_tools
-                .as_deref()
-                .filter(|_| shared)
-                .map(Self::allowlist);
-            for entry in orchestrator.listed_tools(key) {
-                let admitted = allowed
-                    .as_ref()
-                    .is_none_or(|allowed| Self::matches_allowed_tool_name(&entry, allowed));
-                if !admitted || owners.contains_key(&entry.qualified_name) {
-                    continue;
-                }
-                if shared {
-                    owners.insert(entry.qualified_name.clone(), place);
-                }
-                direct_tools.push(entry);
-            }
-        }
         let server_key_set: HashSet<&str> = server_keys.iter().map(String::as_str).collect();
 
         let mut aliases_by_target: HashMap<QualifiedToolName, Vec<ToolEntry>> = HashMap::new();
@@ -704,46 +666,80 @@ impl<'a> McpToolSession<'a> {
                 .push(alias_entry);
         }
 
-        let mut visible_tools = Vec::with_capacity(
-            direct_tools.len() + aliases_by_target.values().map(Vec::len).sum::<usize>(),
-        );
-
-        // An alias of a bound server's tool shows the tool as the binding's
-        // own connection listed it, and is not offered without it.
-        let bound = |server_key: &str| {
-            mcp_servers
-                .iter()
-                .any(|b| b.pool_key.is_some() && b.server_key == server_key)
-        };
-        for direct_entry in direct_tools {
-            if let Some(mut alias_entries) = aliases_by_target.remove(&direct_entry.qualified_name)
-            {
-                if bound(direct_entry.server_key()) {
-                    for alias in &mut alias_entries {
-                        alias.tool = direct_entry.tool.clone();
+        // The servers in binding order, an alias in the place of its target.
+        // A binding with a pool key lists the tools its own connection
+        // listed: under its URL the inventory holds the last listing of any
+        // caller. An alias of such a tool shows the tool as that connection
+        // listed it, and is not offered without it. Of a URL bound more than
+        // once each binding lists what its allowlist admits and no earlier
+        // binding listed, and `owners` keeps its place for the calls of
+        // those tools.
+        let mut visible_tools = Vec::new();
+        let mut owners = HashMap::new();
+        for (place, binding) in mcp_servers.iter().enumerate() {
+            let Some(key) = &binding.pool_key else {
+                if !server_keys[..place].contains(&binding.server_key) {
+                    for direct_entry in
+                        orchestrator.list_tools_for_servers(&server_keys[place..=place])
+                    {
+                        match aliases_by_target.remove(&direct_entry.qualified_name) {
+                            Some(mut alias_entries) => visible_tools.append(&mut alias_entries),
+                            None => visible_tools.push(direct_entry),
+                        }
                     }
                 }
-                visible_tools.append(&mut alias_entries);
-            } else {
-                visible_tools.push(direct_entry);
+                continue;
+            };
+            let shared = server_keys
+                .iter()
+                .filter(|other| **other == binding.server_key)
+                .count()
+                > 1;
+            let allowed = binding
+                .allowed_tools
+                .as_deref()
+                .filter(|_| shared)
+                .map(Self::allowlist);
+            for direct_entry in orchestrator.listed_tools(key) {
+                let shown: Vec<ToolEntry> =
+                    match aliases_by_target.get(&direct_entry.qualified_name) {
+                        Some(alias_entries) => alias_entries
+                            .iter()
+                            .cloned()
+                            .map(|mut alias| {
+                                alias.tool = direct_entry.tool.clone();
+                                alias
+                            })
+                            .collect(),
+                        None => vec![direct_entry],
+                    };
+                for entry in shown {
+                    let admitted = allowed
+                        .as_ref()
+                        .is_none_or(|allowed| Self::matches_allowed_tool_name(&entry, allowed));
+                    if !admitted || owners.contains_key(&entry.qualified_name) {
+                        continue;
+                    }
+                    if shared {
+                        owners.insert(entry.qualified_name.clone(), place);
+                    }
+                    visible_tools.push(entry);
+                }
             }
         }
 
+        // An alias whose target is not listed: offered for a configured
+        // server, not for a bound one.
         for (target, mut alias_entries) in aliases_by_target {
-            if !bound(target.server_key()) {
+            let bound = mcp_servers
+                .iter()
+                .any(|b| b.pool_key.is_some() && b.server_key == target.server_key());
+            if !bound {
                 visible_tools.append(&mut alias_entries);
             }
         }
 
         (visible_tools, owners)
-    }
-
-    /// The name a tool's owner is kept under: an alias by its target.
-    fn owned_name(entry: &ToolEntry) -> &QualifiedToolName {
-        entry
-            .alias_target
-            .as_ref()
-            .map_or(&entry.qualified_name, |alias| &alias.target)
     }
 
     fn associated_server_key(entry: &ToolEntry) -> &str {

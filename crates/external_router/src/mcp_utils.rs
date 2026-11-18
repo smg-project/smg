@@ -1386,6 +1386,135 @@ mod tests {
         }
     }
 
+    /// Two requests under one key connect at once, and the second
+    /// connection's listing is refused while the first's is still out. The
+    /// first request lists the server's tool and its call runs; the second
+    /// request's item carries the refusal. The server's signals order the
+    /// steps, no timer.
+    #[tokio::test]
+    async fn two_connects_at_once_under_one_key_keep_the_tools_when_the_second_listing_is_refused()
+    {
+        let (orchestrator, format_registry) = create_test_orchestrator_no_builtin().await;
+        let refusing = Arc::new(AtomicBool::new(false));
+        let arrived = Arc::new(Notify::new());
+        let hold = Arc::new(Hold {
+            holding: AtomicBool::new(true),
+            release: Notify::new(),
+        });
+        let later_connects = Arc::new(Hold::default());
+        let url = serve_local_mcp_server(LocalServer {
+            tools: Some(&["echo"]),
+            refusing: Some(Arc::clone(&refusing)),
+            arrived: Some(Arc::clone(&arrived)),
+            hold: Some(Arc::clone(&hold)),
+            later_connects: Some(Arc::clone(&later_connects)),
+            calls: Some(Arc::default()),
+            ..Default::default()
+        })
+        .await;
+        let inputs = [McpServerInput {
+            label: "conf".to_string(),
+            url: Some(url),
+            authorization: Some("one-token".to_string()),
+            headers: HashMap::new(),
+            allowed_tools: None,
+        }];
+        let connect = || {
+            Box::pin(connect_mcp_servers(
+                &orchestrator,
+                &format_registry,
+                &inputs,
+            ))
+        };
+        // Bounded: a listing that never arrives fails here and says so.
+        let listing_arrives = || async {
+            tokio::time::timeout(Duration::from_secs(10), arrived.notified())
+                .await
+                .expect("a tools/list reaches the server");
+        };
+
+        // The first connection is pooled and its listing is held. The second
+        // is then pooled in its place and the server refuses its listing at
+        // once: the second request returns first.
+        let (returned, ()) = tokio::join!(futures::future::select(connect(), connect()), async {
+            listing_arrives().await;
+            hold.holding.store(false, Ordering::SeqCst);
+            refusing.store(true, Ordering::SeqCst);
+            later_connects.release.notify_one();
+            listing_arrives().await;
+        });
+        let (second, first) = returned.factor_first();
+        assert!(
+            list_item_error(&orchestrator, second, "conf").is_some_and(|error| error.is_string()),
+            "the second request's item carries the refusal"
+        );
+        hold.release.notify_one();
+        assert_eq!(
+            lists_and_calls_echo(&orchestrator, first.await).await,
+            (vec!["echo".to_string()], None),
+            "the first request lists the tool and its call runs: its listing returned after the second's was refused"
+        );
+    }
+
+    /// One request binds one URL under two labels with different
+    /// credentials, and a label's allowlist names a tool by its alias. The
+    /// alias is listed once, under the first label whose allowlist names it,
+    /// and its call runs under that label's credentials.
+    #[tokio::test]
+    async fn an_allowlist_admits_a_tool_by_its_alias_for_a_url_bound_twice() {
+        for (first_allows, lister) in [("lookup", "first"), ("other", "second")] {
+            let (orchestrator, format_registry) = create_test_orchestrator_no_builtin().await;
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let url = serve_local_mcp_server(LocalServer {
+                tools: Some(&["echo"]),
+                calls: Some(Arc::clone(&calls)),
+                ..Default::default()
+            })
+            .await;
+            let inputs = [("first", first_allows), ("second", "lookup")].map(|(label, allows)| {
+                McpServerInput {
+                    label: label.to_string(),
+                    url: Some(url.clone()),
+                    authorization: Some(format!("{label}-token")),
+                    headers: HashMap::new(),
+                    allowed_tools: Some(vec![allows.to_string()]),
+                }
+            });
+            let bindings = connect_mcp_servers(&orchestrator, &format_registry, &inputs).await;
+            orchestrator
+                .register_alias("lookup", &url, "echo", None)
+                .expect("the alias registers");
+            let session = McpToolSession::new(&orchestrator, bindings, "test-request");
+            let listers: Vec<&str> = session
+                .mcp_servers()
+                .iter()
+                .filter(|binding| {
+                    let tools = session.list_tools_for_binding(binding);
+                    tools.iter().any(|entry| entry.tool_name() == "lookup")
+                })
+                .map(|binding| binding.label.as_str())
+                .collect();
+            assert_eq!(
+                listers,
+                [lister],
+                "the first label whose allowlist names the alias lists it, and no other"
+            );
+            let output = session
+                .execute_tool(ToolExecutionInput {
+                    call_id: "call-1".to_string(),
+                    tool_name: "lookup".to_string(),
+                    arguments: json!({}),
+                })
+                .await;
+            assert_eq!(output.error_message, None, "the alias call runs");
+            assert_eq!(
+                *calls.lock().expect("the calls lock"),
+                [format!("Bearer {lister}-token")],
+                "the alias call ran under the credentials of the label that lists it"
+            );
+        }
+    }
+
     /// A pooled connection whose listing failed lists again for the next
     /// caller with the same key: the server refuses the first request's
     /// `tools/list` and lists for the second, whose item carries no error.

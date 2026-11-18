@@ -107,10 +107,10 @@ pub(crate) struct CachedConnection {
     pub client: Arc<McpClient>,
     /// The connection's tool listing. It leaves the pool with the connection.
     pub listing: Listing,
-    /// The tools the connection last listed. Before its first listing: the
-    /// tools last listed under its key, if any (those of the connection it
-    /// was pooled in place of, or of a listing that returned for the key
-    /// since).
+    /// The tools the connection last listed. Until a listing of its own
+    /// succeeds: the tools last listed under its key, if any (those of the
+    /// connection it was pooled in place of, or of a listing that returned
+    /// for the key since).
     pub tools: Arc<[ToolEntry]>,
 }
 
@@ -278,7 +278,7 @@ impl McpConnectionPool {
     /// or with the server's message. The record is the listing connection's:
     /// a key the pool no longer holds is left alone, and a connection pooled
     /// under the key since (the lister evicted during its listing) keeps its
-    /// own listing state. While that connection has not listed it takes the
+    /// own listing state. Until a listing of its own succeeds it takes the
     /// returned tools: one key is one server under one set of credentials. A
     /// failed listing leaves the tools of an earlier one in place.
     pub(crate) fn set_listing(
@@ -299,7 +299,8 @@ impl McpConnectionPool {
                 }
                 Err(message) => cached.listing = Listing::Failed(message),
             }
-        } else if let (Listing::Pending, Ok(tools)) = (&cached.listing, listed) {
+        } else if let (Listing::Pending | Listing::Failed(_), Ok(tools)) = (&cached.listing, listed)
+        {
             cached.tools = tools.into();
         }
     }
