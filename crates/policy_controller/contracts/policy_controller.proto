@@ -48,9 +48,13 @@
 // no credit the gateway decides locally, and a DecideRequest sent with none
 // is answered Busy { NO_CREDIT } and spends none; a Decide whose budget is
 // gone on arrival, or ends while it is decided, is answered
-// Busy { BUDGET_GONE_ON_ARRIVAL } without a lease, and the controller counts
-// the second apart; a Decision that arrives after a fallback is answered
-// with Released.
+// Busy { BUDGET_GONE_ON_ARRIVAL } without a lease, and so is a pick whose
+// lease has under a millisecond of its dispatch span left once it is
+// decided, or once it is sent to a gateway that read nothing meanwhile:
+// the span counts from the request's take, and a lease tells what is left
+// of it as it is sent. The controller counts the two that end while they
+// are decided apart from the rest; a Decision that arrives after a
+// fallback is answered with Released.
 // A DecideRequest the controller has no decision for is answered Busy with
 // no reason, and the gateway decides it locally.
 // Where the controller leads, a Decide stream is a present gateway's: one

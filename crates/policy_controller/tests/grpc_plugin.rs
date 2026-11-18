@@ -2588,6 +2588,13 @@ fn a_stream_that_ends_under_a_clock_that_panics_still_reopens() {
     armed.store(true, Ordering::Relaxed);
     // The decision in flight falls back when its stream goes.
     assert_eq!(lead(&decide_short(&engine, &candidates, 2)), Some(103));
+    // The plugin reads its behaviour as it takes a frame, and the short
+    // decision may give up before it took this one: it is told to be
+    // honest again once it took the frame it ends the stream at.
+    assert!(
+        eventually(|| served.frames() == 2),
+        "the plugin took the frame it ends its stream at"
+    );
     served.behave(Behaviour::Honest);
     assert!(
         eventually(|| {

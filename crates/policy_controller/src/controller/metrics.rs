@@ -90,9 +90,11 @@ pub const DECIDE_ANSWERS_DROPPED_TOTAL: &str = "smg_policy_controller_decide_ans
 /// share no wire with the gateway that asked.
 pub const DECIDE_CANDIDATES_UNDIALED_TOTAL: &str =
     "smg_policy_controller_decide_candidates_undialed_total";
-/// Decisions whose budget, or whose lease's dispatch span, ended while they
-/// were made: each is answered `Busy` under `budget_gone_on_arrival`, and
-/// counted here apart from a request that arrived late.
+/// Decisions cut at their last read, with under a microsecond of the budget
+/// or under a millisecond of the lease's dispatch span left: each is
+/// answered `Busy` under `budget_gone_on_arrival`, and counted here apart
+/// from a request that arrived late and from a pick whose span ended while
+/// it waited to be sent.
 pub const DECIDE_BUDGET_OUTLASTED_TOTAL: &str =
     "smg_policy_controller_decide_budget_outlasted_total";
 /// Members whose engine family or zone the standing generation's list does
@@ -250,7 +252,7 @@ impl Metrics {
         recorder.describe_counter(
             KeyName::from_const_str(DECIDE_BUDGET_OUTLASTED_TOTAL),
             None,
-            "Decisions whose budget or lease's dispatch span ended while they were made, of the Busy answers under budget_gone_on_arrival"
+            "Decisions cut at their last read with under a microsecond of budget or under a millisecond of the lease's dispatch span left, of the Busy answers under budget_gone_on_arrival"
                 .into(),
         );
         recorder.describe_gauge(
