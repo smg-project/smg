@@ -98,7 +98,9 @@ about 170 bytes out (a pair with two decode alternates 260); a candidate row
 with its load row is about 90 bytes (up to 6 more with the index's block count
 set), so a gRPC plugin's record view is about 42 KB at 512 candidates, hence
 `plugins[].max_candidates`
-(default 128); a credit grant (a delta: each decide request spends one, no
+(default 128), and its frame carries the request's block hashes only where
+the plugin's row declares them, 8,190 at most (64 KB);
+a credit grant (a delta: each decide request spends one, no
 answer returns one, a new stream starts at the welcome's window) is 6 bytes
 in its envelope (20 on the wire); a
 `HelloPage` of 100 leases and 50 pins is about 9.3 KB, so a 64 KB page holds

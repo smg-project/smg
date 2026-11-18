@@ -4,10 +4,12 @@
 //! and sent, the wait, the answer read. Bound as the three stages (asked at
 //! the open) and as the picker alone (asked at the pick with the combined
 //! scores), at 8, 64 and 512 candidates; a decision the open breaker
-//! bypasses; one lifecycle event; and the same profile out of built-in
-//! stages as the floor. Ids: `policy_grpc/decide/<binding>/<n>`,
-//! `policy_grpc/bypassed/<n>`, `policy_grpc/observe` and
-//! `policy_grpc/native/<n>`.
+//! bypasses; one lifecycle event; the same profile out of built-in stages
+//! as the floor; and a request that carries a prompt's block hashes, to a
+//! plugin whose row declares them and to one whose row does not. Ids:
+//! `policy_grpc/decide/<binding>/<n>`, `policy_grpc/bypassed/<n>`,
+//! `policy_grpc/observe`, `policy_grpc/native/<n>` and
+//! `policy_grpc/prompt/<row>/<hashes>`.
 #![expect(
     clippy::expect_used,
     reason = "a bench's setup has no caller to answer; a plugin that fails to load is a bug the tests catch"
@@ -41,6 +43,9 @@ use smg_policy_controller::{
 };
 
 const SIZES: [usize; 3] = [8, 64, 512];
+
+/// A prompt's block hashes: the view's default cap and the contract's most.
+const HASHES: [usize; 2] = [256, 8_190];
 
 /// A budget of one second per decision: no honest round trip meets it, so
 /// every cell is an answered decision.
@@ -173,20 +178,66 @@ fn decide(c: &mut Criterion) {
                 });
             });
         }
-        let stats = plugin.stats();
-        assert_eq!(
-            (
-                stats.missed,
-                stats.invalid,
-                stats.declined,
-                stats.cold,
-                stats.refused,
-                stats.bypassed
-            ),
-            (0, 0, 0, 0, 0, 0),
-            "{binding}: the plugin answered every frame and no decision was bypassed: {stats:?}"
-        );
-        assert!(stats.answered > 0, "{binding}: {stats:?}");
+        assert_answered(binding, &plugin);
+    }
+    group.finish();
+}
+
+/// The plugin answered every frame of its cells and no decision took a
+/// fallback: a run that timed anything else fails here.
+fn assert_answered(row: &str, plugin: &Plugin) {
+    let stats = plugin.stats();
+    assert_eq!(
+        (
+            stats.missed,
+            stats.invalid,
+            stats.declined,
+            stats.cold,
+            stats.refused,
+            stats.bypassed
+        ),
+        (0, 0, 0, 0, 0, 0),
+        "{row}: the plugin answered every frame and no decision was bypassed: {stats:?}"
+    );
+    assert!(stats.answered > 0, "{row}: {stats:?}");
+}
+
+/// A request that carries a prompt's block hashes, at 64 candidates, bound
+/// as the three stages. A plugin whose row declares the hashes is sent
+/// them; one whose row declares none is sent none, so its cell is the
+/// decision's without a prompt, whatever the prompt's length.
+fn prompt(c: &mut Criterion) {
+    let runtime = Runtime::new(&OpenDecisions::new()).expect("a runtime");
+    let n = 64;
+    let fleet = fleet(n);
+    let mut view = Vec::with_capacity(n);
+    build_view(&fleet, &mut view);
+    let pool = pool_of(n);
+    let cx = Constraints::default();
+    let mut group = c.benchmark_group("policy_grpc/prompt");
+    for (row, declared) in [("declared", true), ("undeclared", false)] {
+        let served = serve();
+        let mut spec = spec(&served, row);
+        spec.breaker.cooldown_micros = 0;
+        spec.needs.token_hashes = declared;
+        let plugin = Plugin::load(&runtime, spec).expect("the plugin loads");
+        let engine = plugin_engine(&plugin, ALL);
+        for &hashes in &HASHES {
+            let held: Vec<u64> = (1..).take(hashes).collect();
+            let mut scratch = Scratch::new();
+            group.bench_with_input(BenchmarkId::new(row, hashes), &hashes, |b, _| {
+                let mut seed = 0u64;
+                b.iter(|| {
+                    seed += 1;
+                    let facts = RequestFacts {
+                        block_hashes: black_box(&held),
+                        ..facts(seed)
+                    };
+                    engine.decide(&facts, &pool, black_box(&view), &cx, &mut scratch)
+                });
+            });
+        }
+        assert_answered(row, &plugin);
     }
     group.finish();
 }
@@ -282,5 +333,5 @@ fn native(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, decide, bypassed, observe, native);
+criterion_group!(benches, decide, bypassed, observe, native, prompt);
 criterion_main!(benches);

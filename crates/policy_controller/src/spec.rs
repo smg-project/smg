@@ -187,6 +187,12 @@ pub struct Needs {
 }
 
 impl Needs {
+    /// Whether these declare a request's block hashes, in the token form or
+    /// the text form. A stage that declares neither reads none of them.
+    pub(crate) fn request_hashes(self) -> bool {
+        self.token_hashes || self.text_hashes
+    }
+
     /// Both sides' needs: what a host feeding either of two stage sets must
     /// feed.
     pub(crate) fn or(self, other: Self) -> Self {
@@ -2300,7 +2306,7 @@ impl HashDepth {
     /// What a stage that declares `needs` reads when it names no depth of
     /// its own: the list whole where it declares the request's hashes.
     fn of(needs: Needs) -> Self {
-        if needs.token_hashes || needs.text_hashes {
+        if needs.request_hashes() {
             Self::Whole
         } else {
             Self::Unread
