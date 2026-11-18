@@ -26,11 +26,11 @@
 //! id order, so two stores that hold one membership number its classes
 //! alike.
 //!
-//! A membership write of one worker derives for that worker alone: the
-//! store's writer keeps each model's offers and the rule's verdicts on
-//! them from one write to the next, moves the written worker in them and
-//! runs the rule again only on an offer no worker of its pool held. The
-//! classes it hands back are the whole derivation's.
+//! A membership build of one worker's writes derives for that worker
+//! alone: the store's writer keeps each model's offers and the rule's
+//! verdicts on them from one build to the next, moves the written worker in
+//! them and runs the rule again only on an offer no worker of its pool
+//! held. The classes it hands back are the whole derivation's.
 //!
 //! Every value here is opaque text: a runtime, a transport and a layout
 //! fact are compared for equality and never interpreted. Deriving a
@@ -818,7 +818,7 @@ struct Work {
 }
 
 /// One model's derivation as the store's writer keeps it from one
-/// membership write to the next: each pool's distinct offers, which worker
+/// membership build to the next: each pool's distinct offers, which worker
 /// holds which, and the rule's verdict on every pair of offers. A write of
 /// one worker moves that worker alone in it ([`Derivation::written`]), and
 /// the rule runs again only on an offer no worker of its pool held. What is

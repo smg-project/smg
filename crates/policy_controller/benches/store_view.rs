@@ -162,6 +162,7 @@ fn pool_of(n: usize) -> (Arc<MemoryStore>, Vec<WorkerId>, Instant) {
                     ..WorkerFacts::default()
                 })
                 .id();
+            store.publish_now();
             let revision = WorkersStore::get(&*store, id).expect("the row").revision;
             store
                 .set_status(id, WorkerStatus::Ready, revision)
@@ -350,18 +351,20 @@ fn vetoed(c: &mut Criterion, fixtures: &mut [Fixture]) {
     }
 }
 
-/// One membership write in turn: the worker joins where it is out and
-/// leaves where it is in. `joined` holds its id and its row's revision
-/// between the two.
+/// One membership write in turn, and the build it leaves owed: the worker
+/// joins where it is out and leaves where it is in. `joined` holds its id
+/// and its row's revision between the two.
 fn join_or_leave(store: &MemoryStore, joining: &WorkerFacts, joined: &mut Option<(WorkerId, u64)>) {
     match joined.take() {
         Some((id, revision)) => {
             store
                 .remove(id, revision)
                 .expect("the joined worker leaves");
+            store.publish_now();
         }
         None => {
             let id = store.upsert(black_box(joining.clone())).id();
+            store.publish_now();
             let revision = WorkersStore::get(store, id).expect("the row").revision;
             *joined = Some((id, revision));
         }
@@ -418,6 +421,7 @@ fn writes_beside_vetoes(c: &mut Criterion, fixtures: &mut [Fixture]) {
         store
             .remove(id, revision)
             .expect("the joined worker leaves");
+        store.publish_now();
     }
     for gateway in others {
         for nth in 0..64 {
@@ -454,6 +458,7 @@ fn member_write_beside_spread_vetoes(c: &mut Criterion) {
             let id = store
                 .upsert(facts(format!("http://s{index}:8000"), index % POOLS))
                 .id();
+            store.publish_now();
             let revision = WorkersStore::get(&store, id).expect("the row").revision;
             store
                 .set_status(id, WorkerStatus::Ready, revision)
@@ -486,8 +491,8 @@ fn member_write_beside_spread_vetoes(c: &mut Criterion) {
 /// generation that declares the view's three lists, in a store of its own:
 /// 512 members of one pool, each stating an engine family, a zone and
 /// twelve labels, under two families, four zones and eight selectors. A
-/// worker joins the pool and leaves it in turn: the write reads that
-/// worker under the lists and carries every other member's fields.
+/// worker joins the pool and leaves it in turn: the write's build reads
+/// that worker under the lists and carries every other member's fields.
 fn member_write_under_lists(c: &mut Criterion) {
     const MEMBERS: usize = 512;
     let store = MemoryStore::new();
@@ -522,6 +527,7 @@ fn member_write_under_lists(c: &mut Criterion) {
         let id = store
             .upsert(facts(format!("http://l{index}:8000"), index))
             .id();
+        store.publish_now();
         let revision = WorkersStore::get(&store, id).expect("the row").revision;
         store
             .set_status(id, WorkerStatus::Ready, revision)
@@ -846,6 +852,7 @@ fn pair_writes(c: &mut Criterion) {
         let opened = Instant::now();
         for index in 0..2 * n {
             let id = store.upsert(facts_of(index)).id();
+            store.publish_now();
             let revision = WorkersStore::get(&store, id).expect("the row").revision;
             store
                 .set_status(id, WorkerStatus::Ready, revision)
@@ -863,7 +870,11 @@ fn pair_writes(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("kept", n), &n, |b, _| {
             b.iter_batched(
                 || written.clone(),
-                |facts| store.upsert(black_box(facts)),
+                |facts| {
+                    let change = store.upsert(black_box(facts));
+                    store.publish_now();
+                    change
+                },
                 BatchSize::SmallInput,
             );
         });
@@ -880,7 +891,11 @@ fn pair_writes(c: &mut Criterion) {
                         written.clone()
                     }
                 },
-                |facts| store.upsert(black_box(facts)),
+                |facts| {
+                    let change = store.upsert(black_box(facts));
+                    store.publish_now();
+                    change
+                },
                 BatchSize::SmallInput,
             );
         });
@@ -914,6 +929,7 @@ fn member_write_beside_many_models(c: &mut Criterion) {
         let opened = Instant::now();
         for (index, facts) in (0..8).map(&small).chain([wide]).enumerate() {
             let id = store.upsert(facts).id();
+            store.publish_now();
             let revision = WorkersStore::get(&store, id).expect("the row").revision;
             store
                 .set_status(id, WorkerStatus::Ready, revision)
@@ -926,7 +942,11 @@ fn member_write_beside_many_models(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("member_write", ids), &ids, |b, _| {
             b.iter_batched(
                 || written.clone(),
-                |facts| store.upsert(black_box(facts)),
+                |facts| {
+                    let change = store.upsert(black_box(facts));
+                    store.publish_now();
+                    change
+                },
                 BatchSize::SmallInput,
             );
         });

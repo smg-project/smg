@@ -282,6 +282,17 @@ pub enum MembershipTail {
 /// store's buffer it is told to snapshot again. The snapshot carries the
 /// facts the gateways' pools derive from (role, wire modes, engine kind,
 /// reachability), never a pool list.
+///
+/// A write is answered once its row is written, told to the journal and
+/// counted in the epoch. What a decision reads follows it. The crate's
+/// store builds its pools from the membership once a publication window
+/// ([`crate::store::PUBLISH_WINDOW`]), however many writes the window
+/// took: a registration, its refresh and a patch are in force for decisions
+/// within one window of their answer, and a caller that needs its own write
+/// in force at once asks for the build
+/// ([`crate::store::MemoryStore::publish_now`]). A removal, the old id of a
+/// replaced incarnation and a status change are in force at their answer:
+/// no decision made after it is handed the worker.
 pub trait WorkersStore: Send + Sync {
     /// A registration or its refresh. A new key is `Registered`; the same key
     /// with another incarnation is `Replaced` (the old id leaves with its

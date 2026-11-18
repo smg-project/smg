@@ -6,7 +6,7 @@
 use std::{
     collections::{HashMap, HashSet},
     sync::{atomic::Ordering, Arc},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use openai_protocol::worker::{RuntimeType, SchedulerLoadSnapshot, WorkerLoadResponse};
@@ -189,6 +189,7 @@ fn ready(
     let id = store
         .upsert(facts(key, engine, rank, size, wires, scrape_ms))
         .id();
+    store.publish_now();
     let revision = store.get(id).expect("the row").revision;
     store.set_status(id, WorkerStatus::Ready, revision);
     id
@@ -461,6 +462,7 @@ async fn a_rank_ready_alone_takes_its_own_figures_from_the_engines_answer() {
             ..WorkerFacts::default()
         })
         .id();
+    store.publish_now();
     let rank1 = ready(
         &store,
         "grpc://b:1@1",
@@ -552,6 +554,7 @@ async fn rows_the_controller_never_dials_are_not_polled() {
             ..WorkerFacts::default()
         })
         .id();
+    store.publish_now();
     let revision = store.get(relayed).expect("the row").revision;
     store.set_status(relayed, WorkerStatus::Ready, revision);
     // An HTTP engine with no scrape interval: nothing to ask it.
@@ -565,6 +568,7 @@ async fn rows_the_controller_never_dials_are_not_polled() {
         dp_size: 1,
         ..WorkerFacts::default()
     });
+    store.publish_now();
     let driver = driver(&store, &probe, TEN);
     let mut schedule = Schedule::default();
 
@@ -919,6 +923,7 @@ async fn an_engine_that_left_is_forgotten_by_the_probe() {
 
     let revision = store.get(id).expect("the row").revision;
     store.remove(id, revision);
+    store.publish_now();
     tokio::time::advance(Duration::from_secs(1)).await;
     tick(&driver, &mut schedule).await;
 
@@ -1019,6 +1024,57 @@ async fn run_shows_a_row_that_landed_inside_the_window_at_the_windows_end() {
     .await;
     assert_eq!(seen(late), Some(4));
     assert_eq!(store.publish_due(), None);
+
+    stop.send_replace(true);
+    tasks
+        .join_next()
+        .await
+        .expect("the run task")
+        .expect("it ended without a panic");
+}
+
+#[tokio::test(start_paused = true)]
+async fn run_pays_the_build_another_tasks_registration_owes_before_any_tick() {
+    let store = Arc::new(MemoryStore::new());
+    let probe = Arc::new(FakeProbe::default());
+    let driver = Arc::new(driver(&store, &probe, TEN));
+    let (stop, stopped) = watch::channel(false);
+    let mut tasks = JoinSet::new();
+    let running = Arc::clone(&driver);
+    tasks.spawn(async move { running.run(stopped).await });
+    // The loop is up: its first tick is behind it and it reads no instant.
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    let started = now();
+    let register = |key: &str| {
+        store.upsert(WorkerFacts {
+            key: key.to_owned(),
+            engine: key.to_owned(),
+            incarnation: 1,
+            role: Role::Single,
+            wire_modes: WireModes::HTTP,
+            models: vec!["m".to_owned()],
+            dp_size: 1,
+            ..WorkerFacts::default()
+        });
+    };
+    let after = |instant: Instant| {
+        tokio::time::sleep_until(tokio::time::Instant::from_std(instant) + Duration::from_millis(1))
+    };
+    // A registration from this task: its answer is back and its build is
+    // owed. The store wakes the loop, which pays the build at the instant
+    // the store names, with no later write.
+    register("http://a:1");
+    assert_eq!(store.membership_builds(), 0);
+    after(store.publish_due().expect("a build is owed")).await;
+    assert_eq!((store.membership_builds(), store.publish_due()), (1, None));
+    // That build opened a window: two registrations inside it are one build
+    // at its end.
+    register("http://b:1");
+    register("http://c:1");
+    after(store.publish_due().expect("a build is owed")).await;
+    assert_eq!((store.membership_builds(), store.publish_due()), (2, None));
+    // Both were paid before the loop's next tick.
+    assert!(now() < started + Duration::from_millis(50));
 
     stop.send_replace(true);
     tasks
@@ -1181,6 +1237,7 @@ async fn a_poll_that_lands_after_its_worker_left_writes_nothing() {
     // The worker leaves with its call out; the engine answers afterwards.
     let revision = store.get(id).expect("the row").revision;
     store.remove(id, revision);
+    store.publish_now();
     probe.release.notify_one();
     while let Some(joined) = schedule.calls.join_next().await {
         driver.land(&mut schedule.due, joined);
@@ -1216,6 +1273,7 @@ async fn a_call_that_lands_after_its_engine_left_leaves_no_connection_behind() {
     // it, which finds nothing to drop yet.
     let revision = store.get(id).expect("the row").revision;
     store.remove(id, revision);
+    store.publish_now();
     driver.tick(&mut schedule);
     assert_eq!(*probe.forgotten.lock(), vec!["grpc://a:1"]);
     assert_eq!(probe.connections(), 0);
@@ -1839,10 +1897,16 @@ async fn a_followers_loop_pays_the_stores_publications_and_polls_no_engine() {
     };
     store.follow(1, MembershipChange::Registered { id }, Some(told));
     store.follow(2, ready, None);
+    // The followed registration left its build owed: the loop pays it at
+    // the instant the store names, with no decision asked.
+    let due = store.publish_due().expect("a build is owed");
+    let paid = tokio::time::Instant::from_std(due) + Duration::from_millis(1);
+    tokio::time::sleep_until(paid).await;
     assert_eq!(seen(id), Some(None), "a followed registration");
-    // Two followed load rows, the leader's polls: the first opens the store's
-    // window and shows by itself, the second lands inside it and waits for
-    // the payer.
+    // The window that build opened ends. Two followed load rows then, the
+    // leader's polls: the first opens the store's window and shows by
+    // itself, the second lands inside it and waits for the payer.
+    tokio::time::sleep(PUBLISH_WINDOW + Duration::from_millis(1)).await;
     let load = |running| LoadRow {
         running,
         ..LoadRow::default()

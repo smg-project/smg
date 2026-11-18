@@ -41,6 +41,7 @@ fn populated() -> (MemoryStore, Vec<WorkerId>) {
     let ids = (0..WORKERS)
         .map(|i| store.upsert(facts(&format!("http://w{i}:8000"), 1)).id())
         .collect();
+    store.publish_now();
     (store, ids)
 }
 
@@ -99,6 +100,7 @@ fn remove(c: &mut Criterion) {
             },
             |(store, id, revision)| {
                 black_box(store.remove(black_box(id), revision).expect("removed"));
+                store.publish_now();
                 // Returned, so criterion drops the store outside the timed section.
                 store
             },

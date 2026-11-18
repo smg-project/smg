@@ -275,14 +275,17 @@ mod tests {
         };
 
         let listed = store.upsert(member("listed", "alpha", "east")).id();
+        store.publish_now();
         let (_, _, body) = get(app.clone(), "/metrics").await;
         assert!(body.contains("smg_policy_controller_members_outside_list{list=\"engines\"} 0"));
         assert!(body.contains("smg_policy_controller_members_outside_list{list=\"zones\"} 0"));
         assert!(body.contains("smg_policy_controller_overload_flips_total 0"));
 
-        // A member the lists do not name is counted at the next scrape.
+        // A member the lists do not name is counted at the scrape after the
+        // build its registration owes.
         store.upsert(member("stray", "beta", "west"));
         store.upsert(member("far", "alpha", "north"));
+        store.publish_now();
         let (_, _, body) = get(app.clone(), "/metrics").await;
         assert!(body.contains("smg_policy_controller_members_outside_list{list=\"engines\"} 1"));
         assert!(body.contains("smg_policy_controller_members_outside_list{list=\"zones\"} 2"));

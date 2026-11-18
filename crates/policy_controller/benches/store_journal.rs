@@ -125,6 +125,7 @@ fn pool_on(n: usize, log: Option<Log>) -> Pool {
     let ids: Vec<WorkerId> = (0..n)
         .map(|index| {
             let id = store.upsert(facts(index, 0)).id();
+            store.publish_now();
             let revision = WorkersStore::get(&store, id).expect("the row").revision;
             store
                 .set_status(id, WorkerStatus::Ready, revision)
@@ -226,6 +227,7 @@ fn member_write(c: &mut Criterion) {
                 b.iter(|| {
                     turn = turn.wrapping_add(1);
                     black_box(pool.store.upsert(facts(n / 2, turn)));
+                    pool.store.publish_now();
                 });
             });
         }

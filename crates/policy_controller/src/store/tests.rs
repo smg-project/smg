@@ -33,6 +33,7 @@ fn facts(key: &str, incarnation: u64) -> WorkerFacts {
 
 fn ready(store: &MemoryStore, key: &str) -> WorkerId {
     let id = store.upsert(facts(key, 1)).id();
+    store.publish_now();
     let revision = WorkersStore::get(store, id).expect("the row").revision;
     store
         .set_status(id, WorkerStatus::Ready, revision)
@@ -1716,6 +1717,7 @@ fn a_count_is_written_on_its_own_workers_row_past_another_gateways_local_row() {
                 ..facts(key, 1)
             })
             .id();
+        store.publish_now();
         let revision = WorkersStore::get(&store, id).expect("the row").revision;
         store
             .set_status(id, WorkerStatus::Ready, revision)

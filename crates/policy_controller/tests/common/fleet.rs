@@ -1018,6 +1018,9 @@ impl Harness {
             let mut ids = Vec::with_capacity(usize::from(shape.ranks));
             for rank in 0..shape.ranks {
                 let id = self.member(&endpoint, shape, rank).await?;
+                // The build this registration owes, asked: the cases read
+                // the row at once.
+                self.store.publish_now();
                 self.members.insert(id, (engine, rank));
                 ids.push(id);
             }

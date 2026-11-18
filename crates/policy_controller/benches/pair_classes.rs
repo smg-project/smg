@@ -260,6 +260,7 @@ fn store_of(fleet: &[WorkerFacts], mode: Pairing) -> MemoryStore {
     for facts in fleet {
         store.upsert(facts.clone());
     }
+    store.publish_now();
     store
 }
 
@@ -365,7 +366,11 @@ fn membership_write(c: &mut Criterion) {
         group.bench_function(name, |b| {
             b.iter_batched(
                 || refreshed.clone(),
-                |facts| store.upsert(black_box(facts)),
+                |facts| {
+                    let change = store.upsert(black_box(facts));
+                    store.publish_now();
+                    change
+                },
                 BatchSize::SmallInput,
             );
         });

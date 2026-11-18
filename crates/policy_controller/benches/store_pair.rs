@@ -70,6 +70,7 @@ fn pair_pool(n: usize) -> (Arc<MemoryStore>, Instant) {
                     ..WorkerFacts::default()
                 })
                 .id();
+            store.publish_now();
             let revision = WorkersStore::get(&*store, id).expect("the row").revision;
             store
                 .set_status(id, WorkerStatus::Ready, revision)

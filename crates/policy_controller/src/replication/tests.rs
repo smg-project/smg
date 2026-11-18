@@ -1695,6 +1695,9 @@ fn a_followed_relabel_carries_the_pair_classes_unless_the_offer_moved() {
                 follows(&standby, &followed, entry);
             }
             told = entries.len();
+            // Each store's build is asked: the case reads at once.
+            leader.publish_now();
+            standby.publish_now();
         };
         for (key, role, transport) in fleet {
             leader.upsert(pair_facts(key, role, transport));
@@ -1740,6 +1743,9 @@ fn a_standbys_pair_classes_follow_each_membership_write_and_a_restore() {
             follows(&standby, &followed, entry);
         }
         told = entries.len();
+        // Each store's build is asked: the case reads at once.
+        leader.publish_now();
+        standby.publish_now();
         assert_eq!(pair_rows(&standby), pair_rows(&leader), "{what}");
         let (ours, theirs) = (standby.world(), leader.world());
         assert_eq!(ours.pairs("m"), theirs.pairs("m"), "{what}");
@@ -1770,6 +1776,7 @@ fn a_standbys_pair_classes_follow_each_membership_write_and_a_restore() {
     let (other, _log) = journaled(64);
     other.upsert(prefill("tx-a"));
     other.upsert(pair_facts("grpc://dz:9000", Role::Decode, Some("tx-a")));
+    other.publish_now();
     assert_ne!(pair_rows(&other), fewer);
     assert!(other.restore_from(leader.cut(Kinds::All)));
     assert_eq!(pair_rows(&other), fewer);

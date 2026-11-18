@@ -1310,6 +1310,9 @@ async fn rss_idle_and_with_a_thousand_workers_in_the_store() {
                 LoadSource::Stream,
             );
         }
+        // The fleet arrived inside one window: its one build, asked here so
+        // the figure holds the world a decision reads.
+        store.publish_now();
         let (_, rows) = store.snapshot();
         assert_eq!(rows.len(), 1_000);
         let fed = vm_rss_kib();

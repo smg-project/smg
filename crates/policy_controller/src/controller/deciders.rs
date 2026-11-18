@@ -1410,6 +1410,7 @@ pub(crate) mod tests {
             ..WorkerFacts::default()
         };
         let id = store.upsert(facts).id();
+        store.publish_now();
         let row = WorkersStore::get(store, id).expect("the row");
         if row.status != WorkerStatus::Ready {
             store
@@ -3227,6 +3228,9 @@ pub(crate) mod tests {
             ..facts
         };
         let id = store.upsert(facts).id();
+        // The build this registration owes, asked: the cases read the row
+        // at once.
+        store.publish_now();
         let mut blocks: Vec<StoredBlock> = Vec::with_capacity(contents.len());
         for &content in contents {
             let seq_hash = match blocks.last() {

@@ -155,6 +155,11 @@ pub trait LoadSink: Send + Sync {
     /// after a write and calls [`LoadSink::publish`] at it. A host that
     /// does neither shows a waiting write with its next one, and the row's
     /// age says so meanwhile.
+    ///
+    /// The crate's store names the instant for one thing more: the build
+    /// its membership writes owe. No later write pays that build and no
+    /// load write is shown before it, so a host with no loop asks for it
+    /// ([`crate::store::MemoryStore::publish_now`]).
     fn publish_due(&self) -> Option<Instant> {
         None
     }
@@ -164,4 +169,19 @@ pub trait LoadSink: Send + Sync {
     fn publish(&self, now: Instant) {
         let _ = now;
     }
+
+    /// Hand the sink the host's wake. The sink calls it, on the writing
+    /// thread, where a write that is no load call leaves an instant for
+    /// [`LoadSink::publish_due`] to name and none stood: in the crate's
+    /// store, the build a membership write owes. The host's loop reads the
+    /// instant again at each call. The last wake handed stands. A sink
+    /// that never names an instant drops it.
+    fn wake_with(&self, wake: Wake) {
+        drop(wake);
+    }
 }
+
+/// The host's wake: what a sink calls to have its host read
+/// [`LoadSink::publish_due`] again. It is called under the writer's locks:
+/// it sets a flag or a notification and returns.
+pub type Wake = Box<dyn Fn() + Send + Sync>;

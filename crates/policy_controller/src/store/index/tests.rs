@@ -37,7 +37,11 @@ fn publisher(key: &str, models: &[&str]) -> WorkerFacts {
 }
 
 fn admitted(store: &MemoryStore, key: &str) -> WorkerId {
-    store.upsert(publisher(key, &[MODEL])).id()
+    let id = store.upsert(publisher(key, &[MODEL])).id();
+    // The build this registration owes, asked: the cases read the row at
+    // once.
+    store.publish_now();
+    id
 }
 
 /// The facts of the row of `engine` at `rank` of `ranks`.
@@ -1089,7 +1093,11 @@ mod named {
 
     /// `facts` registered: the row's id.
     fn registered(store: &MemoryStore, facts: WorkerFacts) -> WorkerId {
-        store.upsert(facts).id()
+        let id = store.upsert(facts).id();
+        // The build this registration owes, asked: the cases read the row
+        // at once.
+        store.publish_now();
+        id
     }
 
     /// What one decision is handed, by worker: its rows, the holders named
@@ -1505,6 +1513,39 @@ mod named {
         assert!(Arc::ptr_eq(&before, &after), "the standing was kept");
         assert_eq!(taken_now, taken + 1, "the other pool's row took an id");
         assert_eq!(whole_at, taken_now);
+    }
+
+    /// A refresh keeps the publication window, and one that moves a row to
+    /// another first model frees its index id with no publication. Where a
+    /// registration takes the id inside that window, the newest world still
+    /// lists the row that moved, and no decision names it a holder by the
+    /// blocks of the row that took its id. A row that stands is named by
+    /// what it holds, and the window's build names the taker.
+    #[test]
+    fn an_index_id_taken_again_inside_a_window_names_no_holder_under_the_row_that_moved() {
+        let store = MemoryStore::new();
+        store.apply(sampled(1)).expect("above the unbound start");
+        let (moves, stays) = (admitted(&store, "moves"), admitted(&store, "stays"));
+        let request = [1, 2, 3];
+        // No build is asked between the two writes: the refresh frees the
+        // id and the registration takes it, both inside one window.
+        let moved = store.upsert(publisher("moves", &["n", MODEL])).id();
+        let taker = store.upsert(publisher("taker", &[MODEL])).id();
+        assert_eq!(moved, moves, "a refresh keeps the worker's number");
+        holds(&store, taker, &request);
+        holds(&store, stays, &[1, 2]);
+        assert!(store.publish_due().is_some(), "the window holds the writes");
+        for cap in [1, 2, 16] {
+            let inside = handed(&store, GatewayId::LOCAL, None, &request, (cap, 7));
+            assert!(inside.rows.contains(&moves) && !inside.rows.contains(&taker));
+            let moved_named = inside.holders.iter().any(|&(id, _)| id == moves);
+            assert!(!moved_named, "under a cap of {cap}: {:?}", inside.holders);
+            assert_eq!(inside.holders, [(stays, 2)], "under a cap of {cap}");
+        }
+        store.publish_now();
+        let now = handed(&store, GatewayId::LOCAL, None, &request, (16, 7));
+        assert_eq!(now.holders.len(), 2, "{:?}", now.holders);
+        assert!(now.holders.contains(&(stays, 2)) && now.holders.contains(&(taker, 3)));
     }
 
     /// The pool's warming rows are named as a publication read them: the
@@ -1943,6 +1984,15 @@ mod named {
         registered(&store, plain(2));
         let readmitted = standings();
         assert!(!Arc::ptr_eq(&joined.0, &readmitted.0) && Arc::ptr_eq(&joined.1, &readmitted.1));
+        // Two workers join the other pool inside one window, and one build
+        // pays both writes: it derives whole, this pool stands as it did
+        // through it, and the other stands again with both rows.
+        store.upsert(publisher("e", &[BESIDE]));
+        store.upsert(publisher("f", &[BESIDE]));
+        store.publish_now();
+        let folded = standings();
+        assert!(Arc::ptr_eq(&readmitted.0, &folded.0) && !Arc::ptr_eq(&readmitted.1, &folded.1));
+        assert_eq!(folded.1.tables.id_of.len(), 4);
     }
 
     /// A pool's standing goes with the pool where a write moves its place:

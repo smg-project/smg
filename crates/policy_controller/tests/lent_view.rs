@@ -332,7 +332,8 @@ fn a_decision_that_straddles_a_write_frees_nothing() {
     };
     let until = Some(opened + Duration::from_secs(7_200));
     let write = |kind: usize, turn: u32| match kind {
-        // A window's publication of a folded record.
+        // A record past the open window: it publishes at its own instant,
+        // and the end of the window it opens has nothing to publish.
         0 => {
             let at = opened + PUBLISH_WINDOW * (2 * turn + 2);
             let row = LoadRow {
@@ -344,17 +345,46 @@ fn a_decision_that_straddles_a_write_frees_nothing() {
         }
         // A veto of the asking gateway.
         1 => store.gateway_veto(ASKER, ids[10 + turn as usize], until),
-        // A membership write.
+        // A membership write, and the build it owes.
         2 => {
             store.upsert(member_facts(format!("http://new{turn}:8000")));
+            store.publish_now();
         }
         // A generation applied.
-        _ => store
+        3 => store
             .apply(generation(u64::from(turn) + 1))
             .expect("above the standing one"),
+        // A record inside the open window: it waits, and the window's end
+        // publishes it and opens the next. The last record of kind 0 opened
+        // the standing window, six windows past `opened`.
+        4 => {
+            let end = opened + PUBLISH_WINDOW * (turn - 5);
+            let row = LoadRow {
+                running: turn,
+                ..LoadRow::default()
+            };
+            store.record(ids[0], 0, row, end - PUBLISH_WINDOW / 2, LoadSource::Stream);
+            assert_eq!(store.publish_due(), Some(end), "the record waits");
+            store.publish(end);
+        }
+        // A leave: its rows are folded as gone at its answer.
+        5 => {
+            let id = ids[40 + turn as usize];
+            let revision = WorkersStore::get(&store, id).expect("the row").revision;
+            store.remove(id, revision).expect("removed");
+        }
+        // A new incarnation: the old one's rows are folded as gone at its
+        // answer.
+        _ => {
+            let key = format!("http://w{:04}:8000", 20 + turn);
+            store.upsert(WorkerFacts {
+                incarnation: 2,
+                ..member_facts(key)
+            });
+        }
     };
     let mut out = ViewBuffers::default();
-    for kind in 0..4usize {
+    for kind in 0..7usize {
         for turn in 0..3u32 {
             // The decision holds its load across the write: it is the last
             // reader of the world the write replaces.
@@ -434,6 +464,8 @@ fn a_period_told_before_any_window_shows_its_judgment_and_frees_nothing() {
         rank(1, vec![MODEL.to_string()]),
     );
     assert_eq!(named, (cool, hot));
+    // The build those registrations left owed, asked: no window opens.
+    store.publish_now();
     let ask = Ask {
         gateway: ASKER,
         now: late,

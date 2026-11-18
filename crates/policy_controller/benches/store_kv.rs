@@ -137,6 +137,7 @@ fn publishers(rows: usize) -> (MemoryStore, Vec<WorkerId>) {
     let ids = (0..rows)
         .map(|row| store.upsert(publisher(row)).id())
         .collect();
+    store.publish_now();
     (store, ids)
 }
 
@@ -412,6 +413,7 @@ fn leaves(c: &mut Criterion) {
             b.iter_batched(
                 || {
                     let change = store.upsert(publisher(rows));
+                    store.publish_now();
                     let id = change.id();
                     if filled {
                         assert_eq!(store.admit(id, 0, batch(1), &held), BatchOutcome::Applied);
@@ -423,7 +425,11 @@ fn leaves(c: &mut Criterion) {
                     let revision = WorkersStore::get(&store, id).expect("the row").revision;
                     (id, revision)
                 },
-                |(id, revision)| store.remove(id, revision).expect("removed"),
+                |(id, revision)| {
+                    let removed = store.remove(id, revision).expect("removed");
+                    store.publish_now();
+                    removed
+                },
                 BatchSize::PerIteration,
             );
         });

@@ -26,6 +26,7 @@ fn a_pair_s_decode_pool_is_judged_under_the_pair_binding_s_block() {
     let alone = store
         .upsert(facts("http://o:8000", Role::Decode, &["n"]))
         .id();
+    store.publish_now();
     // A decode-phase binding for every model with a count of 2, then the
     // pair binding of one model with `pair_block`.
     let document = |generation: u64, pair_block: OverloadSpec| {
