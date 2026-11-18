@@ -151,7 +151,11 @@ impl Fence {
         self.expire(now);
         let last = self.fenced.entry(id).or_insert(now);
         *last = (*last).max(now);
-        self.retired.push_back((id, now));
+        // Two callers can read their clocks in one order and get here in
+        // the other. The list stays oldest first all the same, so a
+        // retirement that lapsed never waits behind a later one.
+        let behind = self.retired.partition_point(|&(_, at)| at <= now);
+        self.retired.insert(behind, (id, now));
     }
 }
 
@@ -1171,6 +1175,35 @@ mod tests {
         assert!(ring.is_retired(id, t0 + FENCE), "the earlier instant won");
         assert_eq!(ring.learn([(id, key_of(id))], t0 + FENCE), 0);
         assert_eq!(ring.learn([(id, key_of(id))], later + FENCE), 1);
+    }
+
+    /// Two ids retired out of their clocks' order: each lapses at its own
+    /// instant, and a listing's read of the fence agrees with the clock's
+    /// on both.
+    #[test]
+    fn a_retirement_told_behind_a_later_one_lapses_at_its_own_instant() {
+        let t0 = Instant::now();
+        let (late, early) = (WorkerId(1), WorkerId(2));
+        let mut fence = Fence::default();
+        fence.retire(late, t0 + FENCE / 2);
+        fence.retire(early, t0);
+        for now in [
+            t0 + FENCE / 2,
+            t0 + FENCE,
+            t0 + FENCE + FENCE / 4,
+            t0 + FENCE + FENCE / 2,
+        ] {
+            fence.expire(now);
+            for id in [late, early] {
+                assert_eq!(
+                    fence.holds(id),
+                    fence.is_retired(id, now),
+                    "{id:?} {:?} after the first clock read",
+                    now - t0
+                );
+            }
+        }
+        assert!(fence.is_empty());
     }
 
     /// A snapshot that drops several members leaves the ring a removal
