@@ -60,14 +60,16 @@
 //!
 //! A start reads the directory: the highest number is the generation to
 //! run, and a file a write left under its temporary name is removed, or
-//! left in place where this user may not remove it. Any other name is left
-//! alone, the lock file's among them. Two files under one number, a
-//! directory another process holds, one renamed under the start's wait, one
-//! with no lock file where none can be made, or a path that leads to no
-//! directory, refuse the start by name. The [`RETAINED`] highest numbers
-//! are kept; an apply removes the files under them. A generation on file is
-//! read by the read call and by a rollback; the read call reads its file
-//! through the directory itself ([`read_at`]), under no lock of the door.
+//! left in place where this user may not remove it. One that is gone by
+//! then is removed, and a directory under such a name refuses the start.
+//! Any other name is left alone, the lock file's among them. Two files
+//! under one number, a directory another process holds, one renamed under
+//! the start's wait, one with no lock file where none can be made, or a
+//! path that leads to no directory, refuse the start by name. The
+//! [`RETAINED`] highest numbers are kept; an apply removes the files under
+//! them. A generation on file is read by the read call and by a rollback;
+//! the read call reads its file through the directory itself ([`read_at`]),
+//! under no lock of the door.
 //!
 //! [`Generations`]: super::generations::Generations
 
@@ -445,11 +447,41 @@ impl SpecStore {
         }
     }
 
+    /// Removes the temporary name `name` from the directory `root`: a
+    /// write that never ended. A name that is gone already is removed: a
+    /// live writer took its own name away after its link, where the file
+    /// system's locks do not hold two apart. A file this user may not
+    /// remove, by its bits or on a file system mounted to read alone, is
+    /// left in place: no start reads it. Any other refusal refuses the
+    /// start, and so does a directory under such a name, however the
+    /// system words the refusal of its removal: by its kind, or as a
+    /// permission's on some systems and behind the store's bits on all.
+    fn clear(root: &fs::File, name: &str) -> io::Result<()> {
+        use rustix::{
+            fs::{AtFlags, FileType},
+            io::Errno,
+        };
+
+        let removed = rustix::fs::unlinkat(root, name, AtFlags::empty());
+        match removed.map_err(io::Error::from) {
+            Err(gone) if gone.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(refused) if Self::read_serves(&refused) => {
+                match rustix::fs::statat(root, name, AtFlags::SYMLINK_NOFOLLOW) {
+                    Ok(left) if FileType::from_raw_mode(left.st_mode) == FileType::Directory => {
+                        Err(Errno::ISDIR.into())
+                    }
+                    Ok(_) | Err(Errno::NOENT) => Ok(()),
+                    Err(errno) => Err(errno.into()),
+                }
+            }
+            removed => removed,
+        }
+    }
+
     /// Reads the directory `root`, whose path is `dir`, under `held`, its
     /// lock file. The names are read through the directory itself. A
-    /// temporary name is removed, its write never ended, and one this user
-    /// may not remove is left in place: the refusals of a write that leave
-    /// the lock file to an open to read leave such a name too.
+    /// temporary name's write never ended: [`Self::clear`] removes it, or
+    /// says what stays in place and what refuses the start.
     fn read_under(dir: PathBuf, root: fs::File, held: fs::File) -> Result<Self, StoreRefused> {
         let unreadable = |error: io::Error| StoreRefused::Unreadable(error.to_string());
         let mut kept = Vec::new();
@@ -460,16 +492,7 @@ impl SpecStore {
                 continue;
             };
             if name.starts_with(WRITING) {
-                // A name this user may not remove, by its bits or on a
-                // file system mounted to read alone, is left in place: its
-                // write never ended, and no start reads it.
-                let removed = rustix::fs::unlinkat(&root, name, rustix::fs::AtFlags::empty());
-                match removed.map_err(io::Error::from) {
-                    Err(refused) if !Self::read_serves(&refused) => {
-                        return Err(unreadable(refused));
-                    }
-                    _ => {}
-                }
+                Self::clear(&root, name).map_err(unreadable)?;
             } else if let Some(persisted) = named(name) {
                 kept.push(persisted);
             }
@@ -1374,11 +1397,8 @@ pub(crate) mod tests {
 
     /// A temporary name whose removal is refused in another way than by
     /// this user's bits or a file system mounted to read alone refuses the
-    /// start: here a directory stands under such a name. The refusal read
-    /// here is Linux's own for that removal. Other systems answer it as a
-    /// permission's refusal, which leaves the name in place, so the case
-    /// runs on Linux alone.
-    #[cfg(target_os = "linux")]
+    /// start: here a directory stands under such a name, which no system
+    /// removes as a file.
     #[test]
     fn a_temporary_name_whose_removal_fails_otherwise_refuses_the_start() {
         let dir = tempfile::tempdir().expect("a temp dir");
@@ -1389,6 +1409,57 @@ pub(crate) mod tests {
             matches!(refused, StoreRefused::Unreadable(_)),
             "{refused:?}"
         );
+    }
+
+    /// A temporary name that is gone when a start comes to remove it is
+    /// removed, which is what the start wanted: a live writer took its own
+    /// name away after its link, where the file system's locks do not
+    /// hold two apart.
+    #[test]
+    fn a_temporary_name_gone_before_its_removal_is_removed() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let (_, root) = SpecStore::rooted(dir.path()).expect("the directory");
+        SpecStore::clear(&root, &format!("{WRITING}gone")).expect("gone is removed");
+    }
+
+    /// A directory under a temporary name refuses the start behind the
+    /// store's bits too. There the system refuses its removal as it
+    /// refuses a file's, by permission, and the name is told from a write
+    /// that never ended by its kind.
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_under_a_temporary_name_refuses_the_start_behind_the_stores_bits() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("a temp dir");
+        drop(SpecStore::open(dir.path().to_owned()).expect("the store"));
+        fs::create_dir(dir.path().join(format!("{WRITING}dir"))).expect("a directory");
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o555)).expect("its bits");
+        let opened = SpecStore::open(dir.path().to_owned());
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).expect("its bits");
+        let refused = opened.expect_err("a directory is no write that never ended");
+        assert!(
+            matches!(&refused, StoreRefused::Unreadable(told) if told.contains("directory")),
+            "{refused:?}"
+        );
+    }
+
+    /// A link under a temporary name is judged as the name it is, not by
+    /// what it leads to: behind the store's bits one that leads to a
+    /// directory refuses no start, where a directory itself does.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_to_a_directory_under_a_temporary_name_refuses_no_start() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("a temp dir");
+        drop(SpecStore::open(dir.path().to_owned()).expect("the store"));
+        let led = tempfile::tempdir().expect("another directory");
+        symlink(led.path(), dir.path().join(format!("{WRITING}link"))).expect("a link");
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o555)).expect("its bits");
+        let opened = SpecStore::open(dir.path().to_owned());
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).expect("its bits");
+        drop(opened.expect("a link is no directory"));
     }
 
     /// A lock the system does not give refuses the start in the system's
