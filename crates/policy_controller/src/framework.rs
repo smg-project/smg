@@ -3528,57 +3528,54 @@ impl Engine {
                 if KEPT && pins.contains(&first) {
                     // The followed pin is put to the rule's cap as the pin
                     // read first is: the lift is of the overload veto alone.
-                    let capped = buf
-                        .kept
-                        .iter()
-                        .find(|&&i| candidates[i as usize].id == first)
-                        .is_some_and(|&i| Self::at_cap(rule, &candidates[i as usize]));
+                    // A rule with no cap asks no walk for the pin's row.
+                    let capped = rule.inflight_cap != 0
+                        && buf
+                            .kept
+                            .iter()
+                            .find(|&&i| candidates[i as usize].id == first)
+                            .is_some_and(|&i| Self::at_cap(rule, &candidates[i as usize]));
                     if capped {
-                        // The hand-on reads the veto as it stands, as the
-                        // pin read first does: that pass's survivors under
-                        // the cap decide.
-                        if !all_vetoed && filter(profile, facts, cx, buf, set).is_none() {
-                            if let Some(respilled) = self.respill(
-                                profile, index, rule, placing, facts, pool, candidates, buf,
-                            ) {
-                                return respilled;
-                            }
-                        }
-                        // It keeps none under the cap: the lifted pass's
-                        // survivors decide, and the trace says the lift.
-                        if vetoed::lifted(profile, index, facts, pool, set, cx, buf).is_none() {
-                            if let Some(mut respilled) = self.respill(
-                                profile, index, rule, placing, facts, pool, candidates, buf,
-                            ) {
-                                if let Decision::Pick(pick) = &mut respilled {
-                                    pick.trace.lifted = Lifted::Overload;
-                                }
-                                return respilled;
-                            }
+                        if let Some(handed) = self.hand_on::<KEPT>(
+                            profile, index, rule, placing, facts, pool, set, cx, buf, all_vetoed,
+                        ) {
+                            return handed;
                         }
                     }
                     return decision;
                 }
-                let owner = match self.sessions.claim(key, pins, first) {
-                    Claim::Made(id) => {
-                        pick.session_verdict = SessionVerdict::Claimed(id);
-                        id
-                    }
-                    Claim::Standing(id) => id,
-                };
-                if owner != first {
-                    if let Some(&i) = buf
-                        .kept
-                        .iter()
-                        .find(|&&i| candidates[i as usize].id == owner)
-                    {
-                        let c = &candidates[i as usize];
-                        pick.targets.lead(Target {
-                            position: c.position,
-                            id: c.id,
-                            dp_rank: c.dp_rank,
-                            pair: None,
-                        });
+                match self.sessions.claim(key, pins, first) {
+                    Claim::Made(id) => pick.session_verdict = SessionVerdict::Claimed(id),
+                    // The table took no claim of this decision's: another
+                    // request's stands, or the pins moved under the
+                    // decision. The worker it names is a pin of the key
+                    // where it is among the survivors: the rule's cap
+                    // holds for it as for the pin read first, and it leads
+                    // where the placement stood elsewhere.
+                    Claim::Standing(owner) => {
+                        if let Some(&i) = buf
+                            .kept
+                            .iter()
+                            .find(|&&i| candidates[i as usize].id == owner)
+                        {
+                            let c = &candidates[i as usize];
+                            if Self::at_cap(rule, c) {
+                                if let Some(handed) = self.hand_on::<KEPT>(
+                                    profile, index, rule, placing, facts, pool, set, cx, buf,
+                                    all_vetoed,
+                                ) {
+                                    return handed;
+                                }
+                            }
+                            if owner != first {
+                                pick.targets.lead(Target {
+                                    position: c.position,
+                                    id: c.id,
+                                    dp_rank: c.dp_rank,
+                                    pair: None,
+                                });
+                            }
+                        }
                     }
                 }
             }
@@ -3625,8 +3622,8 @@ impl Engine {
     /// A pin at its rule's in-flight cap ([`Self::at_cap`]) hands the key
     /// on: the survivors under the cap decide, and this is their placement,
     /// marked [`SessionVerdict::Respill`]. `None` where no survivor is under
-    /// the cap: the key stays on its pin. One home for the pin a decision
-    /// reads first and for the pin a kept key's lifted pass lands on.
+    /// the cap. The pin a decision reads first then keeps the key. A pin
+    /// the decision follows asks in its form's order ([`Self::hand_on`]).
     #[expect(
         clippy::too_many_arguments,
         reason = "the placement's inputs, as place takes them"
@@ -3656,6 +3653,61 @@ impl Engine {
             pick.session_verdict = SessionVerdict::Respill;
         }
         Some(decision)
+    }
+
+    /// A pin the decision follows hands the key on at its rule's cap, in the
+    /// order of the decision's form: the pin a kept key's lifted pass lands
+    /// on, and another request's claim that either form answers with. The
+    /// plain form asks its survivors ([`Self::respill`]). The kept form
+    /// reads the veto as it stands first, as the pin read first does, and
+    /// the lifted pass's survivors after: a placement of theirs says the
+    /// lift in its trace. `None` where neither holds a worker under the cap:
+    /// the key stays on the pin. Out of line: the hand-on is off a
+    /// decision's common path.
+    #[inline(never)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the profile run's inputs, as run_profile takes them"
+    )]
+    fn hand_on<const KEPT: bool>(
+        &self,
+        profile: &Profile,
+        index: u16,
+        rule: &SessionRule,
+        placing: Assignment,
+        facts: &RequestFacts<'_>,
+        pool: &PoolFacts<'_>,
+        set: Set<'_>,
+        cx: &Constraints<'_>,
+        buf: &mut Buffers,
+        all_vetoed: bool,
+    ) -> Option<Decision> {
+        let candidates = set.candidates;
+        if !KEPT {
+            return self.respill(profile, index, rule, placing, facts, pool, candidates, buf);
+        }
+        // The veto as it stands: that pass's survivors under the cap
+        // decide.
+        if !all_vetoed && filter(profile, facts, cx, buf, set).is_none() {
+            if let Some(respilled) =
+                self.respill(profile, index, rule, placing, facts, pool, candidates, buf)
+            {
+                return Some(respilled);
+            }
+        }
+        // It keeps none under the cap: the lifted pass's survivors decide,
+        // and the trace says the lift.
+        if vetoed::lifted(profile, index, facts, pool, set, cx, buf).is_none() {
+            if let Some(mut respilled) =
+                self.respill(profile, index, rule, placing, facts, pool, candidates, buf)
+            {
+                if let Decision::Pick(pick) = &mut respilled {
+                    pick.trace.lifted = Lifted::Overload;
+                }
+                return Some(respilled);
+            }
+        }
+        None
     }
 
     /// The stages of an assignment over the survivors in `buf.kept`: the
