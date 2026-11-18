@@ -700,8 +700,18 @@ impl Credits {
         });
     }
 
-    /// Credits the rank a dispatch landed on.
-    fn dispatched(&self, lease: &Lease, target: &Target, side: Side, since_decision_micros: u32) {
+    /// Credits the rank a dispatch landed on. A lease that states no size
+    /// is credited at `mean_prefill`, the calling stage's own mean: a
+    /// credit of no tokens would read its worker as free until that
+    /// worker's next report.
+    fn dispatched(
+        &self,
+        lease: &Lease,
+        target: &Target,
+        side: Side,
+        since_decision_micros: u32,
+        mean_prefill: u32,
+    ) {
         // The decode side of a pair target is the pair's decode rank; the
         // target itself is the prefill. The credit dates from the dispatch,
         // so a report sampled while a queue held the decision does not
@@ -713,11 +723,15 @@ impl Credits {
             Side::Single | Side::Prefill | Side::Encode => (target.id, target.dp_rank),
         };
         let dispatched_micros = lease.issued_micros + u64::from(since_decision_micros);
+        let tokens = match lease.tokens {
+            0 => mean_prefill,
+            stated => stated,
+        };
         // A rank the tally knows is credited on its own entry; the first
         // dispatch to a rank enters it (another dispatch may have entered it
         // meanwhile: the entry the map holds is the one credited).
         if let Some(since) = self.tally.load().get(&rank) {
-            since.record(dispatched_micros, lease.tokens);
+            since.record(dispatched_micros, tokens);
             return;
         }
         self.tally.rcu(|tally| {
@@ -729,7 +743,7 @@ impl Credits {
             Arc::new(next)
         });
         if let Some(since) = self.tally.load().get(&rank) {
-            since.record(dispatched_micros, lease.tokens);
+            since.record(dispatched_micros, tokens);
         }
     }
 
@@ -902,8 +916,13 @@ impl Lifecycle for LeastLoad {
         side: Side,
         since_decision_micros: u32,
     ) {
-        self.credits
-            .dispatched(lease, target, side, since_decision_micros);
+        self.credits.dispatched(
+            lease,
+            target,
+            side,
+            since_decision_micros,
+            self.mean_prefill_tokens,
+        );
     }
 
     fn on_membership(&self, change: &Membership<'_>) {
@@ -1114,8 +1133,13 @@ impl Lifecycle for ResidentWork {
         side: Side,
         since_decision_micros: u32,
     ) {
-        self.credits
-            .dispatched(lease, target, side, since_decision_micros);
+        self.credits.dispatched(
+            lease,
+            target,
+            side,
+            since_decision_micros,
+            self.mean_prefill_tokens,
+        );
     }
 
     fn on_membership(&self, change: &Membership<'_>) {
@@ -2864,6 +2888,44 @@ mod tests {
         );
     }
 
+    /// A dispatch whose lease states no size is credited at the mean of
+    /// the stage that credits it, whether it enters its rank or finds it,
+    /// and so costs what its request cost in flight. A stated size is
+    /// credited as stated.
+    #[test]
+    fn a_dispatch_that_states_no_size_is_credited_at_the_stages_own_mean() {
+        let mut pool = [candidate(0, 2), candidate(1, 2)];
+        pool[0].load = Some(report(0, 0));
+        pool[1].load = Some(report(0, 0));
+        let unstated = Lease {
+            issued_micros: 2_000,
+            ..Lease::default()
+        };
+        let stated = Lease {
+            tokens: 48,
+            ..unstated
+        };
+        for mean in [512, 2_048] {
+            let ll = LeastLoad::new(0.15, mean, 2000.0);
+            // Two requests in flight that no report and no credit account
+            // for cost the stage's mean each.
+            let in_flight = ll.credit_work(&pool[0], 2, 0, 0);
+            assert_eq!(in_flight, 2.0 * mean as f32);
+            // The first dispatch to a rank enters it and the second finds
+            // it: each is credited at that mean, so the two cost dispatched
+            // what they cost in flight.
+            for _ in 0..2 {
+                ll.on_dispatched(&unstated, &target_of(&pool[0]), Side::Single, 0);
+                ll.on_dispatched(&stated, &target_of(&pool[1]), Side::Single, 0);
+            }
+            let (tokens, requests) = ll.held_word_at(pool[0].id, 0);
+            assert_eq!((tokens, requests), (2 * u64::from(mean), 2));
+            assert_eq!(ll.credit_work(&pool[0], 2, tokens, requests), in_flight);
+            // A stated size is credited as stated.
+            assert_eq!(ll.held_word_at(pool[1].id, 0), (96, 2));
+        }
+    }
+
     #[test]
     fn a_membership_snapshot_keeps_only_the_tallies_of_its_ids() {
         let ll = LeastLoad::new(0.15, 1024, 2000.0);
@@ -3186,6 +3248,31 @@ mod tests {
         rw.on_dispatched(&lease, &target_of(&pool[1]), Side::Single, 0);
         rw.on_membership(&Membership::Removed(pool[1].id));
         assert_eq!(rw.held_at(pool[1].id, 0), 0);
+    }
+
+    /// The resident-work stage credits a dispatch of no stated size at its
+    /// mean prefill, the crate's default: credited at no tokens, the worker
+    /// would still read cheaper than its peer.
+    #[test]
+    fn resident_work_credits_a_dispatch_of_no_stated_size_at_its_mean_prefill() {
+        let rw = ResidentWork::new(1_000);
+        let mut pool = [candidate(0, 0), candidate(1, 0)];
+        pool[0].load = Some(resident(1, 2_000));
+        pool[0].load_sampled_at_micros = 1_000;
+        pool[1].load = Some(resident(1, 4_000));
+        pool[1].load_sampled_at_micros = 1_000;
+        assert_eq!(resident_scores(&rw, &pool), [1.0, 0.0]);
+
+        let unstated = Lease {
+            issued_micros: 2_000,
+            ..Lease::default()
+        };
+        rw.on_dispatched(&unstated, &target_of(&pool[0]), Side::Single, 0);
+        assert_eq!(
+            resident_scores(&rw, &pool),
+            [0.0, 1.0],
+            "2,000 + the crate's default 1,024 + 1,000 for each of two requests, against 5,000"
+        );
     }
 
     /// A report releases the dispatches it reflects whether or not the score

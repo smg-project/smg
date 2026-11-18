@@ -1960,6 +1960,59 @@ pub(crate) mod tests {
         assert_eq!(filed.session.get(), session);
     }
 
+    /// Requests that state no prompt size spread over the members: each
+    /// dispatch is its worker's credit at the load stage's mean until that
+    /// worker's next report, and each lease states no size.
+    #[tokio::test]
+    async fn a_dispatched_request_that_stated_no_size_is_priced_until_its_workers_next_report() {
+        use crate::{
+            store::{LoadSink, LoadSource, PUBLISH_WINDOW},
+            view::LoadRow,
+        };
+        let mut bed = bed(Some(preset("least_load", 1)), true, (2, 8), []);
+        // Each member reports at the take, at one rate: the first holds no
+        // work and the other two a quarter of a mean prompt each. The
+        // window the first record opens ends, and one world shows the
+        // three.
+        let (sink, at): (&dyn LoadSink, _) = (bed.store.as_ref(), bed.script.taken);
+        for (turn, &id) in bed.workers.iter().enumerate() {
+            let row = LoadRow {
+                waiting_uncached_tokens: if turn == 0 { 0 } else { 256 },
+                live_rate: 1_000,
+                ..LoadRow::default()
+            };
+            sink.record(id, 0, row, at, LoadSource::Stream);
+        }
+        sink.publish(at + PUBLISH_WINDOW);
+        // Three requests that state no prompt size, each dispatched before
+        // the next is decided. A dispatch is its worker's credit until that
+        // worker's next report, and the load stage credits one of no stated
+        // size at its mean: at no tokens it would cost nothing there, and
+        // each request would read the first member as free.
+        let mut named = Vec::new();
+        for id in 1..=3u8 {
+            let answer = bed.ask(frame(id, u64::from(id))).await;
+            assert_eq!(
+                lease_of(&answer).tokens,
+                0,
+                "the lease states what the request did"
+            );
+            named.push(picked(&answer));
+            let frame = proto::Dispatched {
+                lease_id: lease_of(&answer).id,
+                target_index: 0,
+                side: proto::Side::Single.into(),
+                since_decision_micros: 250,
+            };
+            let hand = lifecycle::open(&bed.store, GATEWAY);
+            lifecycle::dispatched(&bed.store, &hand, &frame, bed.script.taken)
+                .expect("the frame reads");
+        }
+        assert_eq!(named[0], bed.workers[0], "the member with no work");
+        let members: BTreeSet<WorkerId> = named.iter().copied().collect();
+        assert_eq!(members.len(), 3, "each member took one request: {named:?}");
+    }
+
     #[tokio::test]
     async fn an_answer_that_names_no_worker_or_does_not_leave_files_no_lease() {
         // A shed: no member serves the model.
