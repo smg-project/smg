@@ -136,6 +136,9 @@ pub struct Seen {
     pub engine: usize,
     pub rank: u16,
     pub healthy: bool,
+    /// Whether the row reads overloaded: its engine's reports against the
+    /// thresholds that stand for it.
+    pub overloaded: bool,
     pub load: Option<LoadRow>,
 }
 
@@ -1206,6 +1209,52 @@ impl Harness {
         self.events.snapshots.load(Ordering::SeqCst)
     }
 
+    /// Patches the overload thresholds of every rank of the engine at
+    /// `engine` on the control listener, each under the revision its row
+    /// stands at: an operator's patch. The engine's next overload verdict
+    /// reads the thresholds it left.
+    pub async fn patch_overload(
+        &mut self,
+        engine: usize,
+        overload: proto::OverloadThresholds,
+    ) -> Result<(), String> {
+        let ids: Vec<WorkerId> = self
+            .members
+            .iter()
+            .filter(|(_, (of, _))| *of == engine)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in ids {
+            let row = self
+                .store
+                .get(id)
+                .ok_or("a rank of the engine holds no row")?;
+            let mut request = Request::new(proto::PatchWorkerRequest {
+                worker_id: id.0,
+                overload: Some(overload),
+                revision: row.revision,
+                ..proto::PatchWorkerRequest::default()
+            });
+            request
+                .metadata_mut()
+                .insert(PRINCIPAL, AsciiMetadataValue::from_static(OPERATOR));
+            bounded(
+                "the patch call answers",
+                ROOM,
+                self.operator.patch_worker(request),
+            )
+            .await?
+            .map_err(|status| {
+                format!(
+                    "the patch was refused: {:?}: {}",
+                    status.code(),
+                    status.message()
+                )
+            })?;
+        }
+        Ok(())
+    }
+
     /// The pool serving `model` in `role` as a decision's view reads it at
     /// this instant, each row named by its engine. Until the service
     /// answers decisions this is what a case reads back.
@@ -1234,6 +1283,7 @@ impl Harness {
                     engine,
                     rank,
                     healthy: row.health.healthy,
+                    overloaded: row.health.overloaded,
                     load: row.load,
                 })
             })
