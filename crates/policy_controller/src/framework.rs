@@ -3444,7 +3444,16 @@ impl Engine {
                     .iter()
                     .any(|&i| candidates[i as usize].id == stored)
                 {
-                    pins = self.sessions.restore(key, facts.now_micros, rule, stored);
+                    // The door writes nothing where another request took
+                    // the key since this decision's read. The pins that
+                    // stand are this decision's own only where the
+                    // recorded worker leads them: otherwise the first read
+                    // stands, and the claim below sees the move and
+                    // follows it.
+                    let written = self.sessions.restore(key, facts.now_micros, rule, stored);
+                    if written[0] == stored {
+                        pins = written;
+                    }
                 }
             }
         }
@@ -7392,14 +7401,14 @@ mod tests {
     /// The pins of record a case lends: one key's stored worker, and the
     /// TTL each question was asked under.
     #[derive(Debug)]
-    struct Stored {
+    pub(super) struct Stored {
         key: Session,
         worker: WorkerId,
         asked: Mutex<Vec<Option<u64>>>,
     }
 
     impl Stored {
-        fn of(key: u64, worker: WorkerId) -> Self {
+        pub(super) fn of(key: u64, worker: WorkerId) -> Self {
             Self {
                 key: session(key),
                 worker,

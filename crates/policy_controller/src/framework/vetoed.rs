@@ -345,16 +345,16 @@ mod tests {
         counts::tests::Lent,
         decision::{Decision, Lifted, ShedReason},
         framework::{
-            Binding, DecisionScope, Engine, Filter, Marks, PairPools, Picker, Plan, Profile,
-            Scratch, Weighted, DRAW_FROM, WRITTEN_ROWS,
+            tests::Stored, Binding, DecisionScope, Engine, Filter, Marks, PairPools, Picker, Plan,
+            Profile, Scratch, Weighted, DRAW_FROM, WRITTEN_ROWS,
         },
         lease::{Lease, Lifecycle, Side},
         ring::ConsistentHash,
         sessions::{SessionRule, SessionVerdict},
         spec::{Assignment, Needs, OverloadSpec, PolicySpec, Recovery},
         view::{
-            Candidate, Constraints, Health, Identity, NamedAffinity, NamedHolder, Phase, PinSource,
-            PoolFacts, RequestFacts, Session, WorkerId,
+            Candidate, Constraints, Health, Identity, NamedAffinity, NamedHolder, Phase, PoolFacts,
+            RequestFacts, WorkerId,
         },
     };
 
@@ -2079,16 +2079,6 @@ mod tests {
         assert_eq!(dispatched(&engine, &pool, 3_000), ring[0], "the pin stood");
     }
 
-    /// The pins of record a case lends: one key's worker.
-    #[derive(Debug)]
-    struct Recorded(Session, WorkerId);
-
-    impl PinSource for Recorded {
-        fn pinned(&self, key: Session, _ttl_micros: Option<u64>) -> Option<WorkerId> {
-            (key == self.0).then_some(self.1)
-        }
-    }
-
     /// A kept key the lifted pass puts back on its pin of record follows
     /// that pin as it follows a pin the table holds. The table holds no pin
     /// of the key, the host's record names the key's ring worker, and that
@@ -2109,7 +2099,7 @@ mod tests {
         };
         // The table holds nothing of the key. The record names its worker,
         // over its thresholds beside free workers.
-        let record = Recorded(request.session(), pool[owner].id);
+        let record = Stored::of(request.session_key.hash, pool[owner].id);
         pool[owner].health.overloaded = true;
         let decision = engine.decide(
             &request,
@@ -2211,7 +2201,7 @@ mod tests {
             now_micros: 2_000,
             ..keyed("k1")
         };
-        let record = Recorded(request.session(), pool[owner].id);
+        let record = Stored::of(request.session_key.hash, pool[owner].id);
         pool[owner].health.overloaded = true;
         pool[owner].session_in_flight = 2;
         let decision = engine.decide(
@@ -2248,7 +2238,7 @@ mod tests {
             ..keyed("k1")
         };
         let recorded = pool[ring[1] as usize].id;
-        let record = Recorded(request.session(), recorded);
+        let record = Stored::of(request.session_key.hash, recorded);
         let lent = Constraints {
             pins: Some(&record),
             ..Constraints::default()
@@ -2298,7 +2288,7 @@ mod tests {
             ..keyed("k1")
         };
         let down = ring[1] as usize;
-        let record = Recorded(request.session(), pool[down].id);
+        let record = Stored::of(request.session_key.hash, pool[down].id);
         pool[down].health.healthy = false;
         let lent = Constraints {
             pins: Some(&record),
@@ -2319,6 +2309,52 @@ mod tests {
                 .map(|pins| pins[0]),
             Some(taker),
             "nothing is written back"
+        );
+    }
+
+    /// The write-back does not take another request's claim for this
+    /// decision's own read. Another decision of the key, which sees the
+    /// recorded worker down, claims the ring's next worker in the gap
+    /// between this decision's read of the pins and its write-back. The
+    /// door then writes nothing, and the pins that stand are not this
+    /// decision's: its claim sees the move and follows the other's worker.
+    /// Taken for its own, they would let it claim the recorded worker over
+    /// the standing claim, and the two decisions would part.
+    #[test]
+    fn a_claim_made_ahead_of_the_write_back_is_followed() {
+        let rule = SessionRule {
+            assignment: Assignment::Delegate,
+            inflight_cap: 0,
+            ttl_micros: None,
+            sweep_micros: 0,
+            recovery: Recovery::Original,
+        };
+        let (ringed, _) = ring_with_a_gap(None);
+        let (engine, gap) = ring_with_a_gap(Some(rule));
+        let mut pool = [free(0, 4), free(1, 4), free(2, 4), free(3, 4)];
+        let ring = ring_order(&ringed, &keyed("k1"), &pool);
+        let request = keyed("k1");
+        let recorded = ring[0] as usize;
+        let record = Stored::of(request.session_key.hash, pool[recorded].id);
+        let mut theirs = pool.to_vec();
+        theirs[recorded].health.healthy = false;
+        *gap.staged.lock().expect("the staged pool") = theirs;
+        pool[recorded].health.overloaded = true;
+        let lent = Constraints {
+            pins: Some(&record),
+            ..Constraints::default()
+        };
+        let mut scratch = Scratch::new();
+        let decision = engine.decide(&request, &PoolFacts::default(), &pool, &lent, &mut scratch);
+        assert!(
+            gap.staged.lock().expect("the staged pool").is_empty(),
+            "the other decision ran"
+        );
+        assert_eq!(order(&decision)[..2], [ring[1], ring[0]]);
+        assert_eq!(
+            decision.pick().expect("a pick").session_verdict,
+            SessionVerdict::Pinned,
+            "the claim of record is the other decision's"
         );
     }
 
