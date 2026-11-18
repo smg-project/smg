@@ -923,6 +923,7 @@ mod tests {
             ring: true,
             headers: true,
             media: true,
+            in_flight: true,
             active_sessions: true,
             session_in_flight: true,
             affinity: true,

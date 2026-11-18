@@ -258,7 +258,8 @@ fn bounded_at(tokens: u32) -> Result<PolicySpec, SpecError> {
 }
 
 /// Asks, and reads the pick's first target as the row of the fleet it
-/// names. A pick that carries a lease is refused: the case releases none.
+/// names. The pick's lease is given up on the session and has left the
+/// store's file before the next ask reads the rows.
 async fn picked(harness: &mut Harness, ask: DecideRequest) -> Result<Picked, String> {
     let answer = harness.client().decide(ask).await;
     let Ok(Answer::Decision(Decision {
@@ -269,14 +270,21 @@ async fn picked(harness: &mut Harness, ask: DecideRequest) -> Result<Picked, Str
     else {
         return Err(format!("no pick: {answer:?}"));
     };
-    // The asserts by count lean on a served decision booking nothing: once
-    // a decision carries a lease, a pick releases it here, before the next
-    // ask reads the rows.
-    if !leases.is_empty() {
-        return Err(format!(
-            "a served decision carries a lease, released by no ask of this case: {leases:?}"
-        ));
+    // The asserts by count lean on a decision that books nothing past its
+    // own ask: a lease on file is a request in flight on its worker.
+    for lease in leases {
+        let released = Released {
+            what: Some(released::What::LeaseId(lease.id)),
+            reason: released::Reason::ClientGone.into(),
+            ..Released::default()
+        };
+        let reported = harness.client().released(released).await;
+        reported.map_err(|status| format!("a pick's lease is not given up: {status:?}"))?;
     }
+    within("a pick's lease leaves the store's file", ROOM, || {
+        harness.leases(GATEWAY) == 0
+    })
+    .await?;
     let target = pick.targets.first().ok_or("a pick with no target")?;
     match harness.named(target.id) {
         Some((engine, rank)) if target.dp_rank == u32::from(rank) => Ok(Picked {

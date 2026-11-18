@@ -97,6 +97,7 @@ use crate::{
     spec::{AppliedSpec, Listed, Pairing},
     store::{
         encoding::{EncodeClasses, EncodeMember},
+        leases::{Counts, Slot},
         loads::LoadSample,
         pairing::{known, Derivation, Member, PairClasses, Pool},
         workers::{Overload, Reachability, WorkerFacts, WorkerRow, WorkerStatus},
@@ -223,6 +224,9 @@ pub struct Built {
     /// of that gateway masks a row of its copy, and `0` for a pool every
     /// gateway dials whole and reads alike.
     pub reach: u64,
+    /// The pool the rows were read from, by its place among its world's
+    /// pools: what [`World::booked`] takes, and good for that world alone.
+    pub(crate) pool: u32,
 }
 
 impl Built {
@@ -272,6 +276,10 @@ pub struct PoolView<'a> {
 struct PoolShape {
     /// Each row's admission instant, in the rows' clock.
     admitted_micros: Box<[u64]>,
+    /// Each row's worker's slot in the store's counts of the leases on
+    /// file ([`Counts`]): the slot its member keeps across membership
+    /// writes.
+    booked: Box<[Slot]>,
     /// The host-local rows, by index, each with the gateway that holds its
     /// socket; empty for a pool every gateway dials whole.
     locals: Box<[(u32, GatewayId)]>,
@@ -326,6 +334,9 @@ struct Derived {
     /// status (a status change is a health signal and moves no position).
     by_model: FxHashMap<Box<str>, [Option<u32>; ROLES]>,
     pools: Box<[PoolShape]>,
+    /// The store's counts of the leases on file, which the pools' slots
+    /// name: the one table of the store's life, lent with its shapes.
+    counts: Arc<Counts>,
 }
 
 impl Derived {
@@ -722,6 +733,55 @@ impl World {
         Some(self.derived.by_model.get(model)?[role_slot(role)]? as usize)
     }
 
+    /// The slot of worker `id`'s count of the leases on file, as the pool
+    /// `built` read names it beside the worker's row: what the lease of a
+    /// decision over that build books. `None` for a worker the pool does
+    /// not list. `built` is a build of this world.
+    #[cfg(feature = "controller")]
+    pub(crate) fn booked(&self, built: &Built, id: WorkerId) -> Option<Slot> {
+        let pool = built.pool as usize;
+        let (rows, shape) = (self.rows.get(pool)?, self.derived.pools.get(pool)?);
+        let row = rows.binary_search_by_key(&id, |row| row.id).ok()?;
+        shape.booked.get(row).copied()
+    }
+
+    /// The slot of worker `id`'s count wherever this world lists it: a
+    /// member's rows name one. `None` for a worker in no pool. It searches
+    /// every pool, for a lease written outside a decision.
+    pub(crate) fn booked_of(&self, id: WorkerId) -> Option<Slot> {
+        let mut pools = self.rows.iter().zip(self.derived.pools.iter());
+        pools.find_map(|(rows, shape)| {
+            let row = rows.binary_search_by_key(&id, |row| row.id).ok()?;
+            shape.booked.get(row).copied()
+        })
+    }
+
+    /// Writes over `rows`, the candidates `built` left for `ask` before
+    /// anything narrowed them, what the leases on file book on each row's
+    /// worker at this call: one load a row, in the build's own walk of the
+    /// rows the asking gateway reaches. For a decision whose profile
+    /// declares the count ([`Needs::in_flight`](crate::Needs::in_flight)):
+    /// a row no decision reads the count of keeps the publication's zero.
+    /// `built` is a build of this world.
+    pub fn count_in_flight(&self, built: &Built, ask: &Ask, rows: &mut [Candidate]) {
+        let Some(shape) = self.derived.pools.get(built.pool as usize) else {
+            return;
+        };
+        // The rows as the build left them: a narrowing before this call
+        // would lay a count on another worker's row.
+        debug_assert_eq!(rows.len(), built.pool_size as usize);
+        let counts = &self.derived.counts;
+        let mut at = 0;
+        for (from, to) in Segments::of(&shape.locals, ask.gateway, shape.booked.len()) {
+            let booked = shape.booked.get(from..to).unwrap_or_default();
+            let reached = rows.get_mut(at..).unwrap_or_default();
+            for (row, in_flight) in reached.iter_mut().zip(counts.of(booked)) {
+                row.in_flight = in_flight;
+            }
+            at += booked.len();
+        }
+    }
+
     /// Build one decision's view of the pool serving `model` in `role` into
     /// `out`; `None`, with the buffers cleared, when no member serves it.
     ///
@@ -744,8 +804,13 @@ impl World {
     /// Under `ask.affinity` the column holds one entry per candidate with
     /// the worker's age since admission.
     ///
+    /// A row's in-flight count is not written here: every decision moves
+    /// the count of the leases on file, so no publication carries it, and
+    /// a decision that reads it has it written over these rows
+    /// ([`World::count_in_flight`]).
+    ///
     /// What no fact of the store feeds yet reads as the row's default: the
-    /// in-flight and session counts, the two admission bits, the breaker
+    /// two session counts, the two admission bits, the breaker
     /// bit, the four positions into declared lists, the
     /// vision and encode bits, and the column's four index facts. The
     /// healthy bit is the status alone: the health sink's precedence rule
@@ -826,6 +891,7 @@ impl World {
         let masked =
             own.is_some_and(|run| mask(run, ask.now, shape.locals.is_empty(), &mut out.candidates));
         Built {
+            pool: index as u32,
             pool_size: out.candidates.len() as u32,
             membership_epoch: self.epoch,
             now_micros,
@@ -862,6 +928,9 @@ impl World {
     /// `written` rows. A profile that shows its rows to a plugin
     /// ([`Profile::scoped`](crate::Profile::scoped)) asks for them: a
     /// plugin's view carries each row's bits and ages as the row's fields.
+    /// So does a decision that reads a row's requests in flight: that
+    /// count is the leases' at the decision, written over rows that are
+    /// written ([`World::count_in_flight`]) and into no publication.
     /// Both forms come back as one shape, so a caller hands the mask and
     /// the pin on whichever rows it was given.
     pub fn view<'a>(
@@ -922,6 +991,7 @@ impl World {
             pinned_at,
             affinity: &out.affinity,
             built: Built {
+                pool: index as u32,
                 pool_size: rows.len() as u32,
                 membership_epoch: self.epoch,
                 now_micros,
@@ -1104,6 +1174,8 @@ struct Entry<'a> {
     local: Option<GatewayId>,
     /// The thresholds its registration names.
     own: Overload,
+    /// Its member's slot in the store's counts.
+    booked: Slot,
 }
 
 /// The list a membership write fills for a pool that stood at `standing`
@@ -1406,6 +1478,17 @@ pub(super) struct Writer {
     /// Every member's rows, sorted by worker id: a worker serving several
     /// models has a row in each model's pool.
     places: Vec<Place>,
+    /// The store's counts of the leases on file: the one table of the
+    /// store's life, which the leases' file writes and a world lends.
+    counts: Arc<Counts>,
+    /// Each member's slot in the counts, by worker id, as the last
+    /// membership write left it: a member keeps its slot across writes, a
+    /// member that joins is given the table's next one, and the slot of a
+    /// worker that left is given to no one, so the leases still on file
+    /// for it end on the count they booked.
+    booked: Vec<(WorkerId, Slot)>,
+    /// The list the next membership write fills, kept for its room.
+    booked_spare: Vec<(WorkerId, Slot)>,
     vetoes: Arc<Vetoes>,
     /// The vetoes as the world carries them, by pool and by gateway. A
     /// veto's write builds its own gateway's runs again; a membership write
@@ -1488,6 +1571,9 @@ impl Writer {
             worlds: Vec::new(),
             publications: 0,
             places: Vec::new(),
+            counts: Arc::default(),
+            booked: Vec::new(),
+            booked_spare: Vec::new(),
             vetoes: Arc::default(),
             pool_vetoes: Arc::default(),
             spec: Arc::new(AppliedSpec::unbound()),
@@ -1507,6 +1593,12 @@ impl Writer {
             last_window: None,
             waiting: false,
         }
+    }
+
+    /// The store's counts of the leases on file, for the leases' file to
+    /// write.
+    pub(super) fn counts(&self) -> Arc<Counts> {
+        Arc::clone(&self.counts)
     }
 
     /// A world of everything published so far: one small object, a pointer
@@ -2043,6 +2135,12 @@ impl Writer {
         incoming.clear();
         let mut from = 0;
         let mut outside = OutsideLists::default();
+        // Each member's slot in the counts of the leases on file: its own
+        // where it stood at the last write, the table's next where it
+        // joins. Both lists stand by id, so the last write's is walked once
+        // beside the members and this write's fills in the walk's order.
+        let mut booked = mem::take(&mut self.booked_spare);
+        let mut stood = self.booked.iter().copied().peekable();
         for &(_, member) in &members {
             if standing {
                 ids.push(member.id);
@@ -2089,7 +2187,13 @@ impl Writer {
                     Reachability::Gateway(gateway) => Some(gateway),
                 },
                 own: facts.overload,
+                booked: {
+                    while stood.next_if(|&(id, _)| id < member.id).is_some() {}
+                    let kept = stood.next_if(|&(id, _)| id == member.id);
+                    kept.map_or_else(|| self.counts.claim(), |(_, slot)| slot)
+                },
             };
+            booked.push((member.id, entry.booked));
             let side = role_slot(facts.role);
             for model in &facts.models {
                 match groups.get_mut(model.as_str()) {
@@ -2169,6 +2273,7 @@ impl Writer {
                     }));
                 pools.push(PoolShape {
                     admitted_micros: entries.iter().map(|entry| entry.admitted_micros).collect(),
+                    booked: entries.iter().map(|entry| entry.booked).collect(),
                     locals: entries
                         .iter()
                         .enumerate()
@@ -2218,6 +2323,11 @@ impl Writer {
         self.listed = incoming;
         self.listed_spare = outgoing;
         self.outside = outside;
+        // The slots stand by id, the walk's order, for the next write's
+        // walk. The list of the last write is emptied here, so a worker
+        // that left keeps no slot of the writer's, and kept for its room.
+        self.booked_spare = mem::replace(&mut self.booked, booked);
+        self.booked_spare.clear();
         // The engines, from the places, which stand by member: a member's
         // first place is where its record is read, each is where a verdict
         // is written. The writer's lists are written over in place, so the
@@ -2347,6 +2457,7 @@ impl Writer {
         self.derived = Arc::new(Derived {
             by_model,
             pools: pools.into_boxed_slice(),
+            counts: Arc::clone(&self.counts),
         });
         // A worker's vetoes leave with its row, in this write's own hold:
         // no publication shows the row without them. The ids stand in

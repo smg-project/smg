@@ -4453,16 +4453,20 @@ mod tests {
             }
         }
 
-        let quiet = least_requests_profile();
-        let fed = Profile {
-            filters: vec![Box::new(Fed)],
+        // A profile whose stages read nothing a host feeds.
+        let quiet = || Profile {
+            scorers: Vec::new(),
             ..least_requests_profile()
         };
+        let fed = Profile {
+            filters: vec![Box::new(Fed)],
+            ..quiet()
+        };
         let decode = fed.needs();
-        assert_eq!(quiet.needs(), Needs::default());
+        assert_eq!(quiet().needs(), Needs::default());
         assert!(decode.loads);
         let engine = Engine::new(
-            vec![quiet, fed],
+            vec![quiet(), fed],
             vec![Binding {
                 model: "pd/*".into(),
                 phases: vec![Phase::Prefill],
@@ -4480,10 +4484,10 @@ mod tests {
         // No prefill lookup resolves to a pair bound for another phase.
         let fed = Profile {
             filters: vec![Box::new(Fed)],
-            ..least_requests_profile()
+            ..quiet()
         };
         let engine = Engine::new(
-            vec![least_requests_profile(), fed],
+            vec![quiet(), fed],
             vec![Binding {
                 model: "pd/*".into(),
                 phases: vec![Phase::Encode],

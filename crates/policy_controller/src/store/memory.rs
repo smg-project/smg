@@ -24,7 +24,7 @@ use crate::{
         index::{indexed_under, KvEvent, KvTables, LaneCounts},
         journal::{Journal, Kinds, Position},
         kv_events::{BatchFacts, BatchOutcome, KvCursor, KvEventSink, ResyncReason},
-        leases::{Dispatch, LeaseRecord, LeaseRefused, LeaseState, LeasesStore},
+        leases::{Counts, Dispatch, LeaseRecord, LeaseRefused, LeaseState, LeasesStore, Slot},
         loads::{LoadSample, LoadSink, LoadSource, PollMode},
         reservations::{ReservationKind, ReservationStore},
         sessions::{Pin, SessionsStore},
@@ -143,6 +143,11 @@ impl MemoryStore {
         let origin = now.checked_sub(Duration::from_secs(3_600)).unwrap_or(now);
         let writer = Writer::new(window, origin);
         let world = ArcSwap::new(writer.world());
+        // The leases' file writes the counts the writer's shapes name.
+        let leases = Leases {
+            counts: writer.counts(),
+            ..Leases::default()
+        };
         Self {
             workers: Mutex::default(),
             health: Mutex::default(),
@@ -153,7 +158,7 @@ impl MemoryStore {
             kv: KvTables::default(),
             reservations: Mutex::default(),
             sessions: Mutex::default(),
-            leases: Mutex::default(),
+            leases: Mutex::new(leases),
             world,
             origin,
             journal: None,
@@ -1609,10 +1614,221 @@ impl SessionsStore for MemoryStore {
 
 // ----------------------------------------------------------------- leases
 
+/// The leases on file, the ids the store mints for a decision's, and the
+/// order their dispatch deadlines fall due in.
 #[derive(Default)]
 struct Leases {
     term: u64,
-    records: FxHashMap<(GatewayId, LeaseId), LeaseRecord>,
+    records: FxHashMap<Key, Held>,
+    /// The store's counts, a cell a worker: what the leases on file book.
+    counts: Arc<Counts>,
+    /// The term of the id last minted and its counter within that term
+    /// ([`MemoryStore::issue_decided`]).
+    #[cfg(any(test, feature = "controller"))]
+    minted: (u64, u32),
+    /// Every lease filed as issued, by its dispatch deadline, the earliest
+    /// first. A lease that left the file or was dispatched keeps its place
+    /// until the issues that follow step over it, so no door searches the
+    /// queue: it holds the leases that wait for a dispatch, and behind the
+    /// first of those the places of what one dispatch deadline issued.
+    due: VecDeque<(Instant, Key)>,
+}
+
+/// A lease's key on file: its gateway and its id.
+type Key = (GatewayId, LeaseId);
+
+/// The leases past their dispatch deadline that one issue ends at most.
+#[cfg(any(test, feature = "controller"))]
+pub(crate) const ABANDONED: usize = 2;
+
+/// The places of the deadline queue one issue steps over at most, the
+/// places of leases that were dispatched or left the file among them: four
+/// for the one it adds, so the queue shortens under any run of issues.
+#[cfg(any(test, feature = "controller"))]
+const DUE_STEPS: usize = 4;
+
+/// A lease on file with the slot of the count it books on its worker.
+struct Held {
+    record: LeaseRecord,
+    /// `None` for a lease whose worker stood in no pool when it was
+    /// written: it books no row a decision reads.
+    booked: Option<Slot>,
+}
+
+impl Leases {
+    /// The next id under the store's term: the term in bits 32 to 62 over a
+    /// counter that starts at 1 in each term, as the contract bounds a
+    /// controller's ids. `None` for a term past 31 bits and for a term
+    /// whose counter is spent: an id is never 0, never carries the bit of
+    /// a gateway's own ids and never repeats.
+    #[cfg(any(test, feature = "controller"))]
+    fn mint(&mut self) -> Option<LeaseId> {
+        let term = self.term;
+        if term >= 1 << 31 {
+            return None;
+        }
+        if self.minted.0 != term {
+            // The store's term only rises, so a term is minted under once.
+            self.minted = (term, 0);
+        }
+        let next = self.minted.1.checked_add(1)?;
+        self.minted.1 = next;
+        Some(LeaseId(term << 32 | u64::from(next)))
+    }
+
+    /// Files `record` under `key`: a record on file under that key gives
+    /// its counts back first.
+    fn file(&mut self, key: Key, record: LeaseRecord, booked: Option<Slot>) {
+        self.end(&key);
+        self.records.insert(key, Held { record, booked });
+        self.laid(key, &record, booked);
+    }
+
+    /// What a record just laid on file takes: it books `booked`, its
+    /// worker's count, and its dispatch deadline is queued where it is
+    /// filed as issued.
+    fn laid(&mut self, key: Key, record: &LeaseRecord, booked: Option<Slot>) {
+        if let Some(booked) = booked {
+            self.counts.book(booked);
+        }
+        if record.state == LeaseState::Issued {
+            self.queue(record.dispatch_deadline, key);
+        }
+    }
+
+    /// The keys of `gateway`'s leases on file.
+    fn of(&self, gateway: GatewayId) -> Vec<Key> {
+        let keys = self.records.keys();
+        keys.filter(|(owner, _)| *owner == gateway)
+            .copied()
+            .collect()
+    }
+
+    /// Takes the lease under `key` off the file and gives its counts back:
+    /// the one way a record leaves the file, whichever door ends it.
+    fn end(&mut self, key: &Key) -> Option<LeaseRecord> {
+        let held = self.records.remove(key)?;
+        if let Some(booked) = held.booked {
+            self.counts.free(booked);
+        }
+        Some(held.record)
+    }
+
+    /// Queues `deadline` in its order. The deadlines come in rising order
+    /// but for two deciders whose clock reads lie a moment apart and for a
+    /// record written with a deadline of its own: those are placed by a
+    /// search.
+    fn queue(&mut self, deadline: Instant, key: Key) {
+        if self.due.back().is_none_or(|&(last, _)| last <= deadline) {
+            self.due.push_back((deadline, key));
+        } else {
+            let at = self.due.partition_point(|&(due, _)| due <= deadline);
+            self.due.insert(at, (deadline, key));
+        }
+    }
+
+    /// Ends the first lease of the queue that stands issued past its
+    /// dispatch deadline at `now`: released as abandoned. A place whose
+    /// lease left the file, was dispatched or was written again with
+    /// another deadline is stepped over whatever its own deadline, `steps`
+    /// of them at most over the calls that share the count: while its
+    /// first place moves, the queue holds the leases that wait for a
+    /// dispatch, not every issue of the deadline's span. Behind a first
+    /// lease that waits out its deadline it keeps a place for every issue
+    /// since, the deadline's span of them at most. `None` at a first place
+    /// whose lease waits inside its deadline, at an empty queue and once
+    /// the steps are spent.
+    fn end_due(&mut self, now: Instant, steps: &mut usize) -> Option<LeaseRecord> {
+        while *steps > 0 {
+            let &(due, key) = self.due.front()?;
+            let waits = self.records.get(&key).is_some_and(|held| {
+                held.record.state == LeaseState::Issued && held.record.dispatch_deadline == due
+            });
+            if waits && due > now {
+                return None;
+            }
+            self.due.pop_front();
+            *steps -= 1;
+            if waits {
+                let mut record = self.end(&key)?;
+                record.state = LeaseState::Released(ReleaseReason::Abandoned);
+                return Some(record);
+            }
+        }
+        None
+    }
+}
+
+impl MemoryStore {
+    /// Spends the ids of the store's term but for the last `left`: no door
+    /// reaches a term's last ids in under 2^32 issues, and their cases
+    /// start here.
+    #[cfg(test)]
+    pub(crate) fn spend_ids(&self, left: u32) {
+        let mut leases = self.leases.lock();
+        leases.minted = (leases.term, u32::MAX - left);
+    }
+
+    /// The places of the deadline queue: no door tells its length.
+    #[cfg(test)]
+    pub(crate) fn queued(&self) -> usize {
+        self.leases.lock().due.len()
+    }
+
+    /// Issues the lease of one decision made under `record.term`, the
+    /// store's own term: the store mints its id ([`Leases::mint`]), files
+    /// the record under it and books `booked`, the slot of the record's
+    /// target's count as the decision's own world names it
+    /// ([`World::booked`]). `Ok` is the lease as filed, with its id.
+    ///
+    /// # Errors
+    ///
+    /// The record's term is above the store's, or the store mints no id
+    /// under it: the term is not the store's own any more, is past the
+    /// width an id carries, or its counter is spent.
+    ///
+    /// The same call ends the leases at the head of the deadline queue
+    /// that no gateway named a dispatch for by `record.issued_at`,
+    /// [`ABANDONED`] of them at most, and hands them back released as
+    /// abandoned, for their engine to be told outside the lock. So a lease
+    /// past its deadline stands no longer than the next issues take, and no
+    /// call passes over the file: an issue adds one place to the queue and
+    /// steps over [`DUE_STEPS`] at most.
+    #[cfg(any(test, feature = "controller"))]
+    pub(crate) fn issue_decided(
+        &self,
+        mut record: LeaseRecord,
+        booked: Option<Slot>,
+    ) -> Result<(crate::Lease, [Option<LeaseRecord>; ABANDONED]), LeaseRefused> {
+        use std::collections::hash_map::Entry;
+
+        let mut leases = self.leases.lock();
+        let (lease, store) = (record.term, leases.term);
+        if lease > store {
+            return Err(LeaseRefused::TermAhead { lease, store });
+        }
+        let unminted = LeaseRefused::Unminted { lease, store };
+        if lease < store {
+            return Err(unminted);
+        }
+        let key = loop {
+            record.lease.id = leases.mint().ok_or(unminted)?;
+            let key = (record.gateway, record.lease.id);
+            // An id on file already is a restored lease's: the next one.
+            if let Entry::Vacant(place) = leases.records.entry(key) {
+                place.insert(Held { record, booked });
+                break key;
+            }
+        };
+        leases.laid(key, &record, booked);
+        // A second lease is looked for where a first one was ended: a
+        // call that ends none stopped at a lease that waits, at an empty
+        // queue or at its last step, and so would the next.
+        let (now, mut steps) = (record.issued_at, DUE_STEPS);
+        let first = leases.end_due(now, &mut steps);
+        let second = first.and_then(|_| leases.end_due(now, &mut steps));
+        Ok((record.lease, [first, second]))
+    }
 }
 
 impl LeasesStore for MemoryStore {
@@ -1634,6 +1850,10 @@ impl LeasesStore for MemoryStore {
     }
 
     fn issue(&self, record: LeaseRecord) -> Result<(), LeaseRefused> {
+        // The slot of the record's target's count, where the standing world
+        // lists it: read before the leases' lock, which nests with no other.
+        let world = self.world.load();
+        let booked = world.booked_of(record.target);
         let mut leases = self.leases.lock();
         if record.term > leases.term {
             return Err(LeaseRefused::TermAhead {
@@ -1645,7 +1865,7 @@ impl LeasesStore for MemoryStore {
         if leases.records.contains_key(&key) {
             return Err(LeaseRefused::Duplicate);
         }
-        leases.records.insert(key, record);
+        leases.file(key, record, booked);
         Ok(())
     }
 
@@ -1657,26 +1877,26 @@ impl LeasesStore for MemoryStore {
         at: Instant,
     ) -> bool {
         let mut leases = self.leases.lock();
-        let Some(record) = leases.records.get_mut(&(gateway, lease)) else {
+        let Some(held) = leases.records.get_mut(&(gateway, lease)) else {
             return false;
         };
-        if record.state == LeaseState::Issued {
-            record.state = LeaseState::Dispatched { at };
+        if held.record.state == LeaseState::Issued {
+            held.record.state = LeaseState::Dispatched { at };
         }
         true
     }
 
     fn completed(&self, gateway: GatewayId, lease: LeaseId, outcome: &Outcome) -> bool {
         let mut leases = self.leases.lock();
-        let Some(record) = leases.records.get(&(gateway, lease)) else {
+        let Some(held) = leases.records.get(&(gateway, lease)) else {
             return false;
         };
         // A pair's room lives until its decode side ends: the prefill side's
         // completion leaves the record standing.
-        if record.decode.is_some() && outcome.side == Side::Prefill {
+        if held.record.decode.is_some() && outcome.side == Side::Prefill {
             return true;
         }
-        leases.records.remove(&(gateway, lease));
+        leases.end(&(gateway, lease));
         true
     }
 
@@ -1689,45 +1909,39 @@ impl LeasesStore for MemoryStore {
     ) -> bool {
         // No side is read yet: a release of one side of a pair ends the
         // whole lease. The step that issues a pair's lease reads it.
-        self.leases
-            .lock()
-            .records
-            .remove(&(gateway, lease))
-            .is_some()
+        self.leases.lock().end(&(gateway, lease)).is_some()
     }
 
     fn get(&self, gateway: GatewayId, lease: LeaseId) -> Option<LeaseRecord> {
-        self.leases.lock().records.get(&(gateway, lease)).copied()
+        let leases = self.leases.lock();
+        leases
+            .records
+            .get(&(gateway, lease))
+            .map(|held| held.record)
     }
 
     fn expire(&self, now: Instant) -> Vec<LeaseRecord> {
         let mut leases = self.leases.lock();
-        let gone: Vec<(GatewayId, LeaseId)> = leases
-            .records
-            .iter()
-            .filter(|(_, record)| {
-                record.state == LeaseState::Issued && record.dispatch_deadline <= now
-            })
-            .map(|(key, _)| *key)
-            .collect();
-        gone.into_iter()
-            .filter_map(|key| leases.records.remove(&key))
-            .map(|mut record| {
-                record.state = LeaseState::Released(ReleaseReason::Abandoned);
-                record
-            })
-            .collect()
+        let (mut ended, mut steps) = (Vec::new(), usize::MAX);
+        while let Some(record) = leases.end_due(now, &mut steps) {
+            ended.push(record);
+        }
+        ended
     }
 
     fn restore(&self, gateway: GatewayId, records: &[LeaseRecord]) -> usize {
+        let world = self.world.load();
         let mut leases = self.leases.lock();
         let term = leases.term;
-        leases.records.retain(|(owner, _), _| *owner != gateway);
+        for key in leases.of(gateway) {
+            leases.end(&key);
+        }
         for record in records {
             if record.gateway != gateway || record.term > term {
                 continue;
             }
-            leases.records.insert((gateway, record.lease.id), *record);
+            let booked = world.booked_of(record.target);
+            leases.file((gateway, record.lease.id), *record, booked);
         }
         leases
             .records
@@ -1748,15 +1962,18 @@ impl LeasesStore for MemoryStore {
         let mut released = vec![0_usize; sorted.len()];
         {
             let mut leases = self.leases.lock();
-            leases
+            // One pass names the leases of every gateway that goes. Each
+            // then leaves by the file's one end, which gives back the count
+            // it books.
+            let ended: Vec<(usize, Key)> = leases
                 .records
-                .retain(|(owner, _), _| match sorted.binary_search(owner) {
-                    Ok(at) => {
-                        released[at] += 1;
-                        false
-                    }
-                    Err(_) => true,
-                });
+                .keys()
+                .filter_map(|key| sorted.binary_search(&key.0).ok().map(|at| (at, *key)))
+                .collect();
+            for (at, key) in &ended {
+                released[*at] += 1;
+                leases.end(key);
+            }
         }
         // The leases lock nests with no other, so it is let go first. The
         // gateways' vetoes and completed dispatches leave under the health
@@ -1775,10 +1992,10 @@ impl LeasesStore for MemoryStore {
             .lock()
             .records
             .iter()
-            .filter(|((owner, _), record)| {
+            .filter(|((owner, _), held)| {
                 *owner == gateway
                     && matches!(
-                        record.state,
+                        held.record.state,
                         LeaseState::Issued | LeaseState::Dispatched { .. }
                     )
             })

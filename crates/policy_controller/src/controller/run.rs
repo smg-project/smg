@@ -1115,9 +1115,10 @@ mod tests {
         }
     }
 
-    /// The controller makes the membership call alone: a spec file that
-    /// names a stage in need of the lifecycle's calls refuses the start by
-    /// the stage's field, and the same stage with no such need starts.
+    /// The controller makes the membership call and two of a lease's calls
+    /// and not the rest yet: a spec file that names a stage in need of
+    /// them refuses the start by the stage's field, and the same stage
+    /// with no such need starts.
     #[tokio::test]
     async fn a_spec_file_that_names_a_stage_in_need_of_the_lifecycle_refuses_the_start() {
         let dir = tempfile::tempdir().expect("a directory");

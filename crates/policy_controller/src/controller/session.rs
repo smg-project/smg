@@ -57,11 +57,12 @@ use super::{
     lifecycle,
     principal::Principal,
     service::Shared,
+    wire::millis,
     PROTOCOL_VERSION,
 };
 use crate::{
     proto::{self, controller_frame, gateway_frame::Frame},
-    store::GatewayId,
+    store::{leases::DISPATCH_TTL, GatewayId},
     view::WorkerId,
 };
 
@@ -247,10 +248,6 @@ const fn kind(frame: &Frame) -> &'static str {
     }
 }
 
-fn millis(duration: Duration) -> u32 {
-    u32::try_from(duration.as_millis()).unwrap_or(u32::MAX)
-}
-
 /// One session, from its first frame to its end. `Some` is the status the
 /// stream ends with; `None` is a stream the gateway closed.
 async fn session(
@@ -363,12 +360,11 @@ async fn session(
         }),
         needs,
         hashing,
-        // A decide stream's credit at its open, and the streams a gateway
-        // holds at most. No lease is issued yet: the call that issues one
-        // sets the dispatch TTL.
+        // A decide stream's credit at its open, the streams a gateway holds
+        // at most, and the time it has to name the dispatch of a lease.
         decide_window: decide::WINDOW,
         max_decide_streams: decide::MAX_STREAMS,
-        dispatch_ttl_ms: 0,
+        dispatch_ttl_ms: millis(DISPATCH_TTL),
         grace_period_ms: millis(shared.gateways.grace()),
         leader_poll_ms: millis(LEADER_POLL),
         // The design sends no page: no lease and no pin is restored.
@@ -937,7 +933,7 @@ mod tests {
                     decide_window: 128,
                     max_decide_streams: 256,
                     grace_period_ms: 10_000,
-                    dispatch_ttl_ms: 0,
+                    dispatch_ttl_ms: 5_000,
                     leader_poll_ms: 1_000,
                     leases_restored: 0,
                     pins_restored: 0,

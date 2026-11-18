@@ -325,8 +325,9 @@ impl Controller {
     /// connect. A policy document names the stages `catalog` holds: the
     /// stock build's and the ones the host added. One that needs the
     /// lifecycle's calls ([`crate::Lifecycle::needs_lifecycle`]) is refused
-    /// as not in this build: the controller makes the membership call
-    /// alone.
+    /// as not in this build: the controller makes the membership call and
+    /// tells a stage of a lease's issue and of its end at the dispatch
+    /// deadline, and of no dispatch, completion or release yet.
     pub async fn bind_with(config: Config, catalog: Catalog) -> Result<Self, Error> {
         config.validate()?;
         tls::install_crypto_provider();
@@ -339,9 +340,11 @@ impl Controller {
             pickers = ?catalog.pickers().collect::<Vec<_>>(),
             "stages held"
         );
-        // The store makes the membership call and no served line makes
-        // another: a stage that needs them is refused by name, never run on
-        // state nothing keeps.
+        // The store makes the membership call, and a served decision tells
+        // a stage of its lease and of the lease's end at the dispatch
+        // deadline. No line tells one of a dispatch, a completion or a
+        // release yet: a stage that needs the calls is refused by name,
+        // never run on state half kept.
         let catalog = Arc::new(catalog.without_lifecycle());
         let mut listeners = Vec::with_capacity(config.listeners.len());
         for listener in &config.listeners {

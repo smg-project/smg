@@ -670,6 +670,8 @@ impl Scorer for ConsistentHash {
         // host hashes by: over its token ids, or over windows of its text.
         let hashes = self.prefix.is_some();
         Needs {
+            // The bounded-load rule reads each survivor's requests in flight.
+            in_flight: self.bounded.is_some(),
             ring: true,
             token_hashes: hashes,
             text: hashes,
@@ -1223,6 +1225,9 @@ mod tests {
     fn the_scorer_declares_the_ring_need() {
         assert!(ConsistentHash::new(None).needs().ring);
         assert!(!ConsistentHash::new(None).needs().loads);
+        // The bounded-load rule alone reads a worker's requests in flight.
+        assert!(!ConsistentHash::new(None).needs().in_flight);
+        assert!(bounded(1.25, 10).needs().in_flight);
     }
 
     /// A request of these block hashes, sixteen tokens a block, with no

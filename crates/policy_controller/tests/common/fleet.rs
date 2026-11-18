@@ -1391,6 +1391,14 @@ impl Harness {
         &mut self.client
     }
 
+    /// The leases the store holds for the gateway named `gateway`, issued
+    /// or dispatched: each books a request in flight on its worker.
+    pub fn leases(&self, gateway: &str) -> usize {
+        let gateway = GatewayId(fingerprint(gateway.as_bytes()));
+        // By the trait's path: in scope, its `get` would meet the rows' own.
+        smg_policy_controller::store::LeasesStore::live(self.store.as_ref(), gateway)
+    }
+
     /// Whether the store holds a completion of class ok by the gateway named
     /// `gateway` on the first rank of the engine at `engine`, at or after
     /// `since`: the read a decision's precedence rule makes of one

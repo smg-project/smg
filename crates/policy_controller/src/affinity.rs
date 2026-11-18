@@ -550,6 +550,7 @@ impl Scorer for PrefixAffinity {
             // predictor's placement are fields of a candidate's entry. What
             // feeds the entry differs by source and is declared beside it.
             affinity: true,
+            in_flight: true,
             token_hashes: true,
             events: self.source != AffinitySource::Predictor,
             text: placements,
@@ -964,6 +965,7 @@ impl Scorer for WarmupSlice {
             // are all read from a candidate's entry of the column.
             affinity: true,
             events: true,
+            in_flight: true,
             loads: true,
             ..Needs::default()
         }
@@ -1651,6 +1653,7 @@ mod tests {
             let needs =
                 PrefixAffinity::new(&params, Gates::of(Some(&params), None, Some(16))).needs();
             assert!(needs.affinity, "{source:?} reads the column");
+            assert!(needs.in_flight, "{source:?} reads its rows' requests");
             assert_eq!(
                 needs.events,
                 source != AffinitySource::Predictor,
@@ -1658,7 +1661,9 @@ mod tests {
             );
         }
         assert!(warmup(1.0, 0).needs().affinity);
+        assert!(warmup(1.0, 0).needs().in_flight);
         assert!(!KvPressure.needs().affinity);
+        assert!(!KvPressure.needs().in_flight);
     }
 
     /// `row` named as holding `blocks` by the index.
