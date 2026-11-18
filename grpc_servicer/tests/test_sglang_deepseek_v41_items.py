@@ -96,10 +96,11 @@ def _v41_batch(pb, grids=GRIDS, patches=PATCHES, spans=SPANS, types_per_image=Tr
     )
 
 
-def _convert(servicer, pb, batch):
+def _convert(servicer, pb, batch, extras=()):
     request = pb.GenerateRequest(
         tokenized=pb.TokenizedInput(input_ids=list(range(PROMPT_LEN))),
         mm_inputs=batch,
+        extra_mm_inputs=extras,
     )
     return servicer._convert_generate_request(request).mm_inputs
 
@@ -335,6 +336,26 @@ def test_a_batch_without_patch_counts_is_refused(v41_converter):
         _convert(servicer, pb, batch)
 
 
+def test_a_batch_without_its_image_token_id_is_refused(v41_converter):
+    """SGLang pads the image positions only when the request names the image token
+    id. Without it the model finds no position for the items' embeddings and fails
+    in the scheduler, so the batch is refused here."""
+    servicer, pb = v41_converter
+    batch = _v41_batch(pb)
+    batch.ClearField("im_token_id")
+    with pytest.raises(ValueError, match="DeepSeek-V4.1 image batch: no im_token_id"):
+        _convert(servicer, pb, batch)
+    # Also as the extra batch of a mixed request, after a video batch.
+    video = pb.MultimodalInputs(
+        modalities=["video"],
+        im_token_id=8,
+        pixel_values=_tensor(pb, [0.0, 0.0], (2,), torch.float32),
+        mm_placeholders=[pb.PlaceholderRange(offset=0, length=1)],
+    )
+    with pytest.raises(ValueError, match="DeepSeek-V4.1 image batch: no im_token_id"):
+        _convert(servicer, pb, video, extras=[batch])
+
+
 def test_media_references_without_tensors_still_convert(v41_converter):
     """A request carrying only media references (the encode dispatch's) is not refused."""
     servicer, pb = v41_converter
@@ -364,3 +385,8 @@ def test_other_families_keep_one_item_per_batch(v41_converter, patch_counts):
     assert item.offsets == [(1, 2), (5, 6)]
     assert set(item.model_specific_data) == set(tensors)
     assert item.feature.shape == (8,)
+    # Only a V4.1 batch must name its image token id: this one converts
+    # without it, as before.
+    batch.ClearField("im_token_id")
+    result = _convert(servicer, pb, batch)
+    assert result.im_token_id is None and len(result.mm_items) == 1

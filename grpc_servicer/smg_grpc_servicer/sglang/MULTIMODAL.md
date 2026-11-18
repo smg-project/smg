@@ -37,7 +37,8 @@ is refused with `INVALID_ARGUMENT` before the scheduler when:
 
 - its grids, patch counts, token counts and placeholders disagree (when it
   sends `types_per_image`, each span must be as long as its count);
-- it carries no images, no patch counts or no pixels;
+- it carries no images, no patch counts, no pixels or no `im_token_id` (SGLang
+  pads the image positions only when the request names the id);
 - its placeholders are out of prompt order or overlap (SGLang writes the items'
   embeddings over the placeholders in prompt order);
 - its patch rows or spans do not fit the served model, when that model's

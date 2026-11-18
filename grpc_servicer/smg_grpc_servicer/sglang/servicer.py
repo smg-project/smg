@@ -1214,6 +1214,11 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                 for key, value in batch.model_specific_tensors.items()
             }
             if modality == Modality.IMAGE and V41_MARKER in tensors:
+                if token is None:
+                    # SGLang pads the image positions only when the id is set.
+                    # Without it the model finds no position for the items'
+                    # embeddings and fails in the scheduler.
+                    raise ValueError(f"{V41_PREFIX} no im_token_id")
                 vision = v41_vision(self.model_config.hf_config)
                 mm_items.extend(_deepseek_v41_items(feature, tensors, offsets, vision))
                 continue

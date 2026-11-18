@@ -21,11 +21,11 @@ use engine_zmq_client::{
     },
 };
 
-const PREFIX: &str = "DeepSeek-V4.1 image batch:";
+pub(crate) const PREFIX: &str = "DeepSeek-V4.1 image batch:";
 
 /// The grid only the Router's DeepSeek-V4.1 preprocessor sends with an image
 /// batch; GLM-5.3 Flash sends `patches_per_image` as well.
-const MARKER: &str = "vit_grid";
+pub(crate) const MARKER: &str = "vit_grid";
 
 /// Whether an image batch's model tensors are a V4.1 batch's. Its other
 /// fields are then required, so a batch missing one is refused, not sent on
@@ -366,6 +366,20 @@ mod tests {
         }
     }
 
+    /// A video batch, the primary batch of a mixed request.
+    fn video_batch() -> sglang_proto::MultimodalInputs {
+        sglang_proto::MultimodalInputs {
+            modalities: vec!["video".to_string()],
+            im_token_id: Some(8),
+            pixel_values: Some(tensor("float32", vec![2], vec![0; 8])),
+            mm_placeholders: vec![sglang_proto::PlaceholderRange {
+                offset: 1,
+                length: 3,
+            }],
+            ..Default::default()
+        }
+    }
+
     /// A generate request of `PROMPT_LEN` tokens carrying `batch`.
     fn generate_request(batch: sglang_proto::MultimodalInputs) -> sglang_proto::GenerateRequest {
         sglang_proto::GenerateRequest {
@@ -657,6 +671,27 @@ mod tests {
         }
     }
 
+    /// SGLang pads the image positions only when the request names the image
+    /// token id. Without it the model finds no position for the items'
+    /// embeddings and fails in the scheduler, so the batch is refused. A
+    /// batch without `vit_grid` is sent on without one, as before.
+    #[test]
+    fn a_batch_without_its_image_token_id_is_refused() {
+        let mut batch = v41_batch(&GRIDS, &PATCHES, &SPANS);
+        batch.im_token_id = None;
+        let needle = "DeepSeek-V4.1 image batch: no im_token_id";
+        let error = translate(batch.clone()).unwrap_err();
+        assert!(error.contains(needle), "{error:?}");
+        // Also as the extra batch of a mixed request, after a video batch.
+        let extras = vec![batch.clone()];
+        let error = translate_sglang_multimodal(video_batch(), extras, PROMPT_LEN, Some(VISION))
+            .unwrap_err();
+        assert!(error.contains(needle), "{error:?}");
+        batch.model_specific_tensors.remove("vit_grid");
+        let output = translate(batch).unwrap();
+        assert_eq!((output.mm_items.len(), output.im_token_id), (1, None));
+    }
+
     /// Empty grids make no items. Refused alone, and refused, not a panic,
     /// as the extra batch after a video batch, where the caller reads the
     /// first item of each batch.
@@ -668,18 +703,9 @@ mod tests {
             error.contains("DeepSeek-V4.1 image batch: no images"),
             "{error:?}"
         );
-        let video = sglang_proto::MultimodalInputs {
-            modalities: vec!["video".to_string()],
-            im_token_id: Some(8),
-            pixel_values: Some(tensor("float32", vec![2], vec![0; 8])),
-            mm_placeholders: vec![sglang_proto::PlaceholderRange {
-                offset: 1,
-                length: 3,
-            }],
-            ..Default::default()
-        };
         let error =
-            translate_sglang_multimodal(video, vec![empty], PROMPT_LEN, Some(VISION)).unwrap_err();
+            translate_sglang_multimodal(video_batch(), vec![empty], PROMPT_LEN, Some(VISION))
+                .unwrap_err();
         assert!(error.contains("no images"), "{error:?}");
     }
 

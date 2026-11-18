@@ -29,7 +29,9 @@ use crate::{
     fanout::fan_out_n,
     pin_yield::PinYieldNote,
     sglang_encode::EncodeMediaRefs,
-    sglang_v41_items::{deepseek_v41_items, is_v41_batch, V41Vision},
+    sglang_v41_items::{
+        deepseek_v41_items, is_v41_batch, V41Vision, MARKER as V41_MARKER, PREFIX as V41_PREFIX,
+    },
     stream::{
         finish, map_slim_output, matched_stop_of, poll_mapped, FinishParts, MappedGenerateStream,
         StreamState,
@@ -530,9 +532,13 @@ pub(crate) fn translate_request_sglang(
 /// worker, see [`crate::sglang_encode`]). A payload carrying tensors takes the
 /// processor-output path whatever references ride beside them (the engine's
 /// frontend processes such a request locally); one naming nothing is not a
-/// dispatch. A borrowing test: the translation's guard, free of copies.
+/// dispatch. Nor is a payload that carries `vit_grid`, the DeepSeek-V4.1 grid,
+/// which describes pixels: without them it takes the tensor path, which
+/// refuses it, as the Python servicer does. A borrowing test: the
+/// translation's guard, free of copies.
 pub(crate) fn names_encode_refs(mm: &sglang_proto::MultimodalInputs) -> bool {
     mm.pixel_values.is_none()
+        && !mm.model_specific_tensors.contains_key(V41_MARKER)
         && !(mm.image_urls.is_empty() && mm.video_urls.is_empty() && mm.audio_urls.is_empty())
 }
 
@@ -656,6 +662,12 @@ fn translate_sglang_batch(
         Some(offsets)
     };
     if modality == SglangWireModality::Image && is_v41_batch(&model_specific_data) {
+        // SGLang pads the image positions only when the id is set. Without it
+        // the model finds no position for the items' embeddings and fails in
+        // the scheduler.
+        if mm.im_token_id.is_none() {
+            return Err(format!("{V41_PREFIX} no im_token_id"));
+        }
         let offsets = offsets.as_deref().unwrap_or_default();
         return Ok(SglangWireMmInputs {
             mm_items: deepseek_v41_items(feature, &model_specific_data, offsets, v41_vision)?,
@@ -1082,6 +1094,43 @@ mod tests {
                 length: 3,
             }],
             ..Default::default()
+        }
+    }
+
+    /// A payload that carries `vit_grid`, the DeepSeek-V4.1 grid, is never
+    /// the encoders' input. With a reference of any modality in place of its
+    /// pixels it takes the tensor path, which refuses it; the reference path
+    /// would drop the grid and send the request on. The Python servicer
+    /// refuses the same payload.
+    #[test]
+    fn a_v41_grid_beside_a_reference_is_refused_not_dispatched() {
+        let url = || vec!["http://example.test/a".to_string()];
+        let mut marked = media_payload();
+        marked.pixel_values = None;
+        let grid: Vec<u8> = [1i64, 2].iter().flat_map(|v| v.to_le_bytes()).collect();
+        marked
+            .model_specific_tensors
+            .insert("vit_grid".to_string(), tensor("int64", vec![1, 2], grid));
+        let by_image = sglang_proto::MultimodalInputs {
+            image_urls: url(),
+            ..marked.clone()
+        };
+        let by_video = sglang_proto::MultimodalInputs {
+            video_urls: url(),
+            ..marked.clone()
+        };
+        let by_audio = sglang_proto::MultimodalInputs {
+            audio_urls: url(),
+            ..marked
+        };
+        for payload in [by_image, by_video, by_audio] {
+            assert!(!names_encode_refs(&payload));
+            assert_eq!(encode_media_refs(&payload), None);
+            let error = translate(media_request(payload)).unwrap_err();
+            assert!(
+                error.contains("media references but no preprocessed tensors"),
+                "{error:?}"
+            );
         }
     }
 
