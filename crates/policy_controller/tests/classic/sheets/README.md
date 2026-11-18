@@ -22,6 +22,10 @@ places a request on, over two pools its pair index has paired.
 One sheet records no pick and no policy: `overload.json` holds whether the gateway reads one worker as overloaded
 after each thing its load monitor is handed about the worker.
 
+Two sheets record a rank of one worker and no worker: `minimum_tokens.json` holds the rank the gateway's
+minimum-tokens policy gives each request after each thing its rank cache is handed about the worker, and
+`sticky_rank.json` holds the rank the gateway pins each request of one grouped worker to by its sticky key.
+
 ```
 crates/policy_controller/tests/classic/sheets/
   power_of_two.json        one sheet per policy: its recorded rows
@@ -33,6 +37,8 @@ crates/policy_controller/tests/classic/sheets/
   pair_select.json
   overload.json
   bucket.json
+  minimum_tokens.json
+  sticky_rank.json
 model_gateway/src/         each recorder, a test module beside the code it runs
   policies/classic_rows.rs                                                  power_of_two.json
   policies/classic_manual_rows.rs                                           manual.json
@@ -43,6 +49,8 @@ model_gateway/src/         each recorder, a test module beside the code it runs
   routers/common/classic_pair_select_rows.rs                                pair_select.json
   worker/load/monitor/classic_overload_rows.rs                              overload.json
   policies/bucket/classic_bucket_rows.rs                                    bucket.json
+  worker/load/monitor/classic_minimum_tokens_rows.rs                        minimum_tokens.json
+  routers/grpc/common/stages/request_execution/classic_sticky_rank_rows.rs  sticky_rank.json
 ```
 
 ## A sheet
@@ -177,6 +185,26 @@ pool, which is the pool's order and no rule of the policy.
   the recorder runs each row twice, each time from a fresh monitor and a fresh worker, and stops if the two runs
   differ.
 
+`minimum_tokens.json` and `sticky_rank.json` hold a fifth kind, whose picks are ranks of one worker:
+
+- **rank row of `minimum_tokens.json`:** one worker with its data-parallel ranks (`ranks`), which stands for every
+  rank or for the one rank `pinned` names. A step is what the gateway's rank cache is handed: a poll's answer
+  (`poll`: an entry a rank in rank order, `null` where the answer omits the rank), a poll that failed (`failed`),
+  the worker's loads dropped as it leaves the ready set (`evict`), or a request of `cost` estimated tokens
+  (`pick`), which asks the policy for a rank and books its cost on the rank it takes. An entry carries the tokens
+  the rank's cache uses (`used`), which is the count the gateway reads, the rank's token capacity (`capacity`)
+  and, where the rank reports them, the context tokens of the requests it holds (`resident`). The row records the
+  rank each request took, `null` where it found none. Nothing in a row draws: the recorder runs each row twice,
+  each time from a fresh monitor and a fresh worker, and stops if the two runs differ.
+- **rank row of `sticky_rank.json`:** one grouped worker, several engines behind one connection: the engines the
+  worker names (`ranks`, `null` where it names no count) and the ranks its connection places a pin on (`pinnable`,
+  `null` where the connection does not say). A step is a request with its sticky key (`pick`: `key`, `null` for a
+  request with none). The row records the rank the gateway pins each request to under hash placement, `null`
+  where it sets none and the connection places the request on any engine. A counted row asks `keys.count` keys,
+  `key-0` upward: a pairs row (`pairs` true) asks each twice and counts the keys whose two requests took one rank,
+  then the others, and a spread row counts what each rank took, the largest count first. Nothing in a row draws:
+  a key's rank is its hash, and the recorder runs each row twice and stops if the two runs differ.
+
 ## The sheets
 
 Each sheet is recorded on its own, so the commit is a column of the sheet's row and never one commit for the
@@ -193,6 +221,8 @@ directory. The sha256 is of the file as committed.
 | `pair_select.json` | the placement of a prefill and decode pair: each side under its policy, a side over its overload thresholds or doubted whole, a decode's rooms, the prefill admission's bound, the least-loaded default's own rules, a role with no worker | `4ba2a6431357be5411a2383cdc4916b41471d722` | 40: 23 sequence, 17 drawn | `bd8426316ae7337ede82b5a931c1d00cd9dee1aca22c528278f32b2671846eb8` | `classic_pair_select_rows.rs` |
 | `overload.json` | the overload verdict of one worker: the gateway's thresholds and the worker's own, a poll's answer, a poll with no report, a pushed record, an eviction | `436f0c8c5725b0a408b990003d76eaddc72c4be4` | 25 verdict rows | `29c10ee8876e53d23a824a3b7bd0481efd118e8ac5a0d2822477729f6e21283a` | `classic_overload_rows.rs` |
 | `bucket.json` | bucket: a size's range and its worker, the hand-down when that worker is not offered, the two parts of the balance rule, the window a booking leaves, the adjustment's cut, a worker that joins or leaves, a pool nobody listed | `d92647556e91a3601ef647f12ae5784df2080dc3` | 19: 18 sequence, 1 drawn | `71a533017809566486335bb9f212ea49712a833bbe5ebcbde7c5d6319ee764e4` | `classic_bucket_rows.rs` |
+| `minimum_tokens.json` | the minimum-tokens rank of one worker: a poll's answer, a rank it omits, an answer with no token capacity or no entry, a failed poll, an eviction, a worker that stands for one rank, used tokens beside context tokens | `615542c4c69bb28fb3cb3e9e4ee29a8e2be0a7bc` | 18: 18 sequence, 0 drawn | `1ab41e023fa4f9b507860655a3d917aee68686479d09eaa3b1e9cf8e71d56139` | `classic_minimum_tokens_rows.rs` |
+| `sticky_rank.json` | the rank of a sticky key on one grouped worker under hash placement: a key's rank, a request with no key, a worker of one engine or of no count, the ranks a connection places a pin on, how the keys keep and spread | `615542c4c69bb28fb3cb3e9e4ee29a8e2be0a7bc` | 8: 6 sequence, 2 drawn | `d8663087d143cb6d8f46777b2abf6b38e16153fb738c33240c8c7473c86805af` | `classic_sticky_rank_rows.rs` |
 
 ## Recording
 
@@ -215,6 +245,8 @@ CLASSIC_ROWS_OUT=$PWD/crates/policy_controller/tests/classic/sheets CLASSIC_ROWS
 | `pair_select.json` | `routers::common::classic_pair_select_rows` |
 | `overload.json` | `worker::load::monitor::classic_overload_rows` |
 | `bucket.json` | `policies::bucket::classic_bucket_rows` |
+| `minimum_tokens.json` | `worker::load::monitor::classic_minimum_tokens_rows` |
+| `sticky_rank.json` | `request_execution::classic_sticky_rank_rows` |
 
 The pair sheet's recorder is a child of the module that derives a worker's pairing descriptor, so it records the
 descriptor the gateway derived and never a second reading of the registration. The encode sheet's recorder is a
@@ -225,6 +257,9 @@ own types. The overload sheet's recorder is a child of the gateway's load monito
 through the monitor's own functions and the verdict is read off the worker the monitor wrote it on. The bucket
 sheet's recorder is a child of the policy's own module and stands in that policy's directory: the adjustment and
 the window are the policy's private state, and a module beside the policy's could reach neither.
+The minimum-tokens sheet's recorder is a child of the load monitor too: each step reaches the rank cache as the
+monitor's poll loop hands it over, and each request asks the policy. The sticky rank sheet's recorder is a child of
+the stage that sends a request to its worker, and calls the stage's own pin.
 
 A sheet is never edited by hand. A new recording replaces the whole sheet and its row in the table above, in one
 pull request that names the commit and says which rows moved: a sequence row moves only when the policy's
@@ -277,3 +312,29 @@ fails once the reason no longer holds.
   no key and is placed as one with nothing to hash, on the fewest requests
   (`a-ten-token-prompt-keeps-its-key-s-worker-over-the-fewest-requests`). The other 45 rows replay.
 - `bucket.json`: none. All 19 rows replay.
+- `minimum_tokens.json`: twelve rows are decided apart, each by a rule of the crate's store or scorer that the
+  replay names with the ranks the crate gives. The gateway reads the tokens a rank's cache uses, and only from an
+  entry that carries token capacity. The crate scores a rank by the context tokens of the requests it holds
+  (`the-used-tokens-decide-where-a-rank-holds-fewer-context-tokens`), whatever capacity its entry carries
+  (`a-row-with-no-token-capacity-is-no-rank`, `an-answer-with-no-token-capacity-drops-the-worker-s-ranks`). Where no
+  rank counts its context tokens the requests in flight decide
+  (`a-rank-that-reports-no-context-tokens-is-a-rank-by-its-used-tokens`). The gateway forgets a rank the moment an
+  answer omits it, and a worker's ranks at an answer with no entry. The store keeps what is on file, through as
+  many answers as omit the rank (`a-rank-an-answer-omits-is-no-rank-at-once`,
+  `a-rank-five-answers-omit-is-no-rank-after-any-of-them`, `an-answer-with-no-row-drops-the-worker-s-ranks`): a
+  rank leaves a decision when its host takes its row out. The gateway has no rank for a worker it holds no answer
+  of. The crate hands a decision every rank row of the worker, and one with nothing on file scores beside its
+  peers (`a-worker-never-polled-has-no-rank`, `an-evicted-worker-has-no-rank-until-its-next-answer`), so a worker
+  of one rank row answers with it (`a-worker-of-one-rank-the-answer-omits-has-none`,
+  `an-answer-with-no-row-drops-the-one-rank-of-its-worker`). The gateway takes the lowest of equal ranks, and the
+  crate draws among them (`equal-ranks-go-to-the-lowest-rank`). The other six rows replay.
+- `sticky_rank.json`: four rows are decided apart. The gateway sets no rank on a request with no sticky key, on a
+  worker of one engine or of no count it knows, and on a key whose hash rank its connection places no pin on: the
+  connection then places the request on any engine. The crate gives every request a rank row of the worker, a
+  key's owner on the ring of the ranks its host lists and the picker's draw for a request with no key
+  (`a-request-with-no-key-takes-no-rank`, `a-worker-of-one-engine-takes-no-rank`,
+  `a-worker-that-names-no-count-takes-no-rank-where-its-connection-says-none`,
+  `a-key-whose-rank-the-connection-places-no-pin-on-takes-none`). Two hashes place no key alike, so a key's rank
+  here is not its rank there: a row of steps replays when the requests of one key share one rank and a request
+  with no rank there has none here. The other four rows replay so, the pairs row count for count and the spread
+  row share for share.
