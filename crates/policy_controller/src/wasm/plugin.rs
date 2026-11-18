@@ -800,6 +800,13 @@ impl Rest {
 /// One named decider's place of rest: empty until the decider first acts.
 type Resting = Mutex<Option<Box<Rest>>>;
 
+thread_local! {
+    /// How many plugins' named deciders the thread holds the kept state of,
+    /// from a bring to its give-back: what a thread under no name reads
+    /// before it acts as itself.
+    static HOLDS: Cell<u32> = const { Cell::new(0) };
+}
+
 /// What a thread is to a plugin, beside what stands in its working slots.
 #[derive(Clone, Copy, Default)]
 struct Standing {
@@ -1238,11 +1245,17 @@ impl Plugin {
     /// hold it already, and says whether it did. A decision's first open
     /// brings it and the plugin's last close of the decision gives it back;
     /// a told event holds it for its one call. What the thread never gave
-    /// back (a close that did not return) goes back first, at its next bring
-    /// under a name: until then a decision the thread makes under no name
-    /// runs on what stands in its slots.
+    /// back (a close that did not return) goes back first, under another
+    /// name or under none: a thread decides on no instance but the one of
+    /// the decider it acts as.
     fn lend(&self) -> bool {
         let Some(decider) = Decider::acting() else {
+            // Under no name the thread acts as itself. One count says
+            // whether it holds any named decider's state, so a host that
+            // names none pays one load here.
+            if HOLDS.get() != 0 {
+                self.rest();
+            }
             return false;
         };
         let standing = self.standing.get_or_default();
@@ -1264,6 +1277,7 @@ impl Plugin {
         std::mem::swap(&mut rest.ring, &mut *self.ring().borrow_mut());
         now.lent = Some(decider);
         standing.set(now);
+        HOLDS.set(HOLDS.get() + 1);
         true
     }
 
@@ -1285,6 +1299,7 @@ impl Plugin {
     /// a second thread acting as the decider at the same time, against the
     /// turn's rule: it is dropped here.
     fn give_back(&self, decider: Decider) {
+        HOLDS.set(HOLDS.get().saturating_sub(1));
         let mut rest = self.rest_of(decider).lock();
         let rest = rest.get_or_insert_with(Rest::new);
         let mut slot = self.slot().borrow_mut();

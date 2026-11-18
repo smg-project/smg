@@ -8180,3 +8180,156 @@ fn a_thread_whose_first_instance_the_close_rebuilt_hears_what_it_tells_in_a_try(
             .expect("the thread that did not load")
     })
 }
+
+/// What a host's scope does inside a decision, after the plugin's scope
+/// opened and brought its decider's instance.
+#[derive(Clone, Copy, Debug)]
+enum Inside {
+    /// Acts as another decider and warms the plugin there.
+    WarmsAs(Decider),
+    /// Ends the thread's name and tells a dispatch under none.
+    TellsUnderNoName,
+}
+
+thread_local! {
+    /// The name a case's thread holds, where a scope of the host can end it.
+    static HELD_NAME: std::cell::RefCell<Option<smg_policy_controller::decider::Acting>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// A stage of the host's own whose scope acts on the plugin inside a
+/// decision, on the deciding thread.
+struct ActsInside {
+    plugin: Arc<Plugin>,
+    tells: Arc<Engine>,
+    does: Inside,
+}
+
+impl std::fmt::Debug for ActsInside {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ActsInside")
+            .field("does", &self.does)
+            .finish_non_exhaustive()
+    }
+}
+
+impl smg_policy_controller::Filter for ActsInside {
+    fn name(&self) -> &'static str {
+        "acts-inside"
+    }
+
+    fn keep(&self, _: &RequestFacts<'_>, _: &Candidate, _: &Constraints<'_>) -> bool {
+        true
+    }
+
+    fn scope(&self) -> Option<&dyn smg_policy_controller::DecisionScope> {
+        Some(self)
+    }
+}
+
+impl smg_policy_controller::DecisionScope for ActsInside {
+    fn open(&self, _: &RequestFacts<'_>, _: &[Candidate], _: &PoolFacts<'_>) {
+        match self.does {
+            Inside::WarmsAs(other) => {
+                let _turn = other.enter();
+                self.plugin.warm().expect("the other decider warms");
+            }
+            Inside::TellsUnderNoName => {
+                drop(HELD_NAME.take());
+                self.tells
+                    .on_dispatched(&Lease::default(), &Target::default(), Side::Single, 3);
+            }
+        }
+    }
+
+    fn close(&self) {}
+}
+
+/// An engine over the plugin whose decision, after the plugin's scope
+/// opened, runs a scope of the host that acts inside it.
+fn engine_that(plugin: &Arc<Plugin>, tells: &Arc<Engine>, does: Inside) -> Engine {
+    let mut profile = plugin_profile(plugin, None, None, None);
+    profile.filters.push(Box::new(ActsInside {
+        plugin: Arc::clone(plugin),
+        tells: Arc::clone(tells),
+        does,
+    }));
+    single_engine(profile)
+}
+
+/// What a thread still holds of one named decider goes back to that
+/// decider's rest before the thread acts as another: the first decider's
+/// instance, with what it heard, is there for whoever acts as it next.
+#[test]
+fn a_thread_that_turns_to_another_name_gives_the_held_one_back_first() {
+    let runtime = runtime();
+    let plugin = load(
+        &runtime,
+        "turns",
+        guest::record_guest(),
+        mode::COUNT_DISPATCHES,
+    );
+    let plain = Arc::new(plugin_engine(&plugin));
+    let turning = engine_that(&plugin, &plain, Inside::WarmsAs(Decider::new(6)));
+    let first = Decider::new(5);
+    {
+        let _turn = first.enter();
+        for _ in 0..2 {
+            plain.on_dispatched(&Lease::default(), &Target::default(), Side::Single, 3);
+        }
+        // The plugin's scope brings the first decider's instance, and the
+        // host's scope then acts as the second, inside the decision.
+        let _ = decide(&turning, &pool(4), 1);
+    }
+    let picked = std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                let _turn = first.enter();
+                pick_ids(&decide(&plain, &pool(4), 2)).first().copied()
+            })
+            .join()
+            .expect("the thread that acts as the first decider next")
+    });
+    let stats = plugin.stats();
+    assert_eq!(picked, Some(102), "the instance that heard two: {stats:?}");
+    assert_eq!(stats.instantiations, 2, "one a decider: {stats:?}");
+}
+
+/// A thread that still holds a named decider's instance when its name ends
+/// gives it back before it acts under no name: what it then tells reaches
+/// its own instance and not the decider's.
+#[test]
+fn a_thread_whose_name_ends_gives_the_held_decider_back_before_it_acts_as_itself() {
+    let runtime = runtime();
+    let plugin = load(
+        &runtime,
+        "ends",
+        guest::record_guest(),
+        mode::COUNT_DISPATCHES,
+    );
+    let plain = Arc::new(plugin_engine(&plugin));
+    let ending = engine_that(&plugin, &plain, Inside::TellsUnderNoName);
+    let pick = |seed| pick_ids(&decide(&plain, &pool(4), seed)).first().copied();
+    // The thread is a decider of its own: its instance heard nothing.
+    assert_eq!(pick(1), Some(100));
+    let first = Decider::new(5);
+    HELD_NAME.set(Some(first.enter()));
+    for _ in 0..2 {
+        plain.on_dispatched(&Lease::default(), &Target::default(), Side::Single, 3);
+    }
+    // The plugin's scope brings the first decider's instance. The host's
+    // scope then ends the name and tells a dispatch under none.
+    let _ = decide(&ending, &pool(4), 2);
+    assert_eq!(Decider::acting(), None, "the scope ended the name");
+    assert_eq!(pick(3), Some(101), "the thread's own instance heard it");
+    let as_first = std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                let _turn = first.enter();
+                pick(4)
+            })
+            .join()
+            .expect("the thread that acts as the first decider")
+    });
+    assert_eq!(as_first, Some(102), "its two dispatches and no more");
+}
