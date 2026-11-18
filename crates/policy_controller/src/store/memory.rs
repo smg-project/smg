@@ -1171,9 +1171,15 @@ impl MemoryStore {
 impl WorkersStore for MemoryStore {
     fn upsert(&self, mut facts: WorkerFacts) -> MembershipChange {
         // A blank value of a descriptor or of an encode offer is no report:
-        // the row of record holds what the two rules read.
-        if let Some(descriptor) = facts.pairing.as_deref_mut() {
-            descriptor.normalize();
+        // the row of record holds what the two rules read. A descriptor that
+        // stands so is kept where it is, shared or not: a row written again
+        // copies none.
+        if let Some(descriptor) = facts
+            .pairing
+            .as_mut()
+            .filter(|descriptor| !descriptor.is_normalized())
+        {
+            Arc::make_mut(descriptor).normalize();
         }
         facts.encode = facts.encode.normalized();
         let mut workers = self.writing();

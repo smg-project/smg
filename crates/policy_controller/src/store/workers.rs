@@ -2,7 +2,7 @@
 //! that change it and the watch the gateways' pools derive from (design 5.1,
 //! the workers row; 5.2, `WatchWorkers`).
 
-use std::{collections::BTreeMap, time::Instant};
+use std::{collections::BTreeMap, sync::Arc, time::Instant};
 
 use crate::{
     lease::Membership,
@@ -139,8 +139,9 @@ pub struct WorkerFacts {
     /// member or an offer and where a generation moves the pairing mode
     /// ([`pairing`](super::pairing)): a registration hands no class in. The
     /// door drops a blank value and reads a name past its blanks. Behind a
-    /// pointer: a worker that reports none holds one word for it.
-    pub pairing: Option<Box<PairingDescriptor>>,
+    /// shared pointer: a worker that reports none holds one word for it,
+    /// and every copy of a row shares the one its worker reported.
+    pub pairing: Option<Arc<PairingDescriptor>>,
     /// The worker's end of the encode handoff, as the handshake learned it;
     /// the default states none. The store derives the encode classes from
     /// it, with the engine kind as the runtime, where a membership write

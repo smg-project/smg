@@ -310,7 +310,7 @@ impl Ring {
 /// model, no label, no pairing descriptor and no encode connector, a second
 /// row for a replacement, so 4,096 membership events are about 2.1 MB at
 /// that row. A pairing descriptor stands apart from its row, 168 bytes and
-/// its strings.
+/// its strings, held once for every copy of that row.
 pub struct Log {
     ring: Mutex<Ring>,
     /// The highest term the log has seen: the store's takes, the events it

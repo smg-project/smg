@@ -14,7 +14,10 @@
 
 mod common;
 
-use std::time::{Duration, Instant};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use common::counting_alloc::{calls, Counting};
 use smg_policy_controller::{
@@ -516,7 +519,7 @@ fn a_pair_build_with_its_table_allocates_nothing_after_the_first() {
             models: vec!["m".to_string()],
             dp_size: 1,
             pairing: transport.map(|transport| {
-                Box::new(PairingDescriptor {
+                Arc::new(PairingDescriptor {
                     transport: Some(transport.to_string()),
                     ..PairingDescriptor::default()
                 })

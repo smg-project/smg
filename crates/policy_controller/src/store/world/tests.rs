@@ -2532,7 +2532,7 @@ fn pair_facts(key: &str, role: Role, transport: Option<&str>) -> WorkerFacts {
         wire_modes: WireModes::GRPC,
         engine_kind: "rt-a".to_string(),
         pairing: transport.map(|transport| {
-            Box::new(PairingDescriptor {
+            Arc::new(PairingDescriptor {
                 transport: Some(transport.to_string()),
                 ..PairingDescriptor::default()
             })
@@ -3339,7 +3339,7 @@ fn a_blank_value_of_a_descriptor_is_dropped_at_the_door() {
         .map(|&(key, role, transport)| {
             let transport = transport.map_or_else(|| " ".to_string(), |name| format!(" {name} "));
             let facts = WorkerFacts {
-                pairing: Some(Box::new(PairingDescriptor {
+                pairing: Some(Arc::new(PairingDescriptor {
                     protocol: Some(String::new()),
                     transport: Some(transport),
                     version: Some(String::new()),
@@ -3361,11 +3361,35 @@ fn a_blank_value_of_a_descriptor_is_dropped_at_the_door() {
     let row = WorkersStore::get(&blanked, first).expect("the row");
     assert_eq!(
         row.facts.pairing,
-        Some(Box::new(PairingDescriptor {
+        Some(Arc::new(PairingDescriptor {
             transport: Some("tx-a".to_string()),
             ..PairingDescriptor::default()
         }))
     );
+}
+
+#[test]
+fn a_descriptor_the_rule_reads_is_shared_by_every_copy_of_its_row() {
+    let store = MemoryStore::new();
+    // Handed in as the rule reads it, and kept by the caller too.
+    let handed = Arc::new(PairingDescriptor {
+        transport: Some("tx-a".to_string()),
+        ..PairingDescriptor::default()
+    });
+    let id = admit(
+        &store,
+        WorkerFacts {
+            pairing: Some(Arc::clone(&handed)),
+            ..pair_facts("grpc://pa:9000", Role::Prefill, None)
+        },
+    );
+    // The door kept the descriptor where it stood, and each read by value
+    // copies the row with it: one descriptor behind them all.
+    for _ in 0..2 {
+        let row = WorkersStore::get(&store, id).expect("the row");
+        let held = row.facts.pairing.as_ref().expect("the descriptor");
+        assert!(Arc::ptr_eq(held, &handed));
+    }
 }
 
 // ------------------------------------------------------ the overload verdict

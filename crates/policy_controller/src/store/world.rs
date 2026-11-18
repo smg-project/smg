@@ -1466,7 +1466,7 @@ struct Entry<'a> {
 }
 
 /// The list a membership build fills for a pool that stood at `standing`
-/// members: room for them and one more, the most one write adds a pool, so
+/// members: room for them and one more, the most one write adds to a pool, so
 /// the build of one write allocates the list once. A build that pays a
 /// storm of joins grows the list as it fills, and so does a pool that did
 /// not stand, which takes no room.
@@ -1566,7 +1566,11 @@ impl Classes {
 /// the wires, the runtime and the descriptor are what the pairing rule reads of
 /// it, the runtime as an offer holds it ([`known`]); the runtime and the
 /// stated end are what [`encode_member`] reads. A write from one such
-/// version to the other moves no pair class and no encode class.
+/// version to the other moves no pair class and no encode class. The
+/// models are read as they are listed: a refresh that only reorders them
+/// is answered as a moved offer, for that worker alone, where
+/// [`WorkerFacts::same_models`] reads the reorder as the same worker for
+/// the status a new incarnation takes.
 pub(super) fn same_offer(old: &WorkerFacts, new: &WorkerFacts) -> bool {
     old.role == new.role
         && old.models == new.models

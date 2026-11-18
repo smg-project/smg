@@ -49,6 +49,7 @@
 
 use std::{
     hint::black_box,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -204,7 +205,7 @@ fn fleet(fleet: &str) -> Vec<WorkerFacts> {
             engine_kind: runtime,
             models: vec![MODEL.to_string()],
             dp_size: 1,
-            pairing: pairing.map(Box::new),
+            pairing: pairing.map(Arc::new),
             ..WorkerFacts::default()
         }
     };

@@ -68,7 +68,7 @@ pub const LAYOUT_FACTS: [(&str, &str); 4] = [
 /// its runtime (the row's engine kind). A field left `None` is one the
 /// worker does not report. A blank value is no report either, and the rule
 /// never meets one: the store's door hands it a normalized descriptor
-/// ([`PairingDescriptor::normalized`]), as the gateway's own derive drops a
+/// ([`PairingDescriptor::normalize`]), as the gateway's own derive drops a
 /// blank label where it makes a worker's descriptor.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct PairingDescriptor {
@@ -84,16 +84,9 @@ pub struct PairingDescriptor {
 }
 
 impl PairingDescriptor {
-    /// The descriptor as the rule reads it: every blank value dropped and
-    /// every name read past the blanks around it. The store's door makes a
-    /// worker's descriptor so, once a write.
-    #[must_use]
-    pub fn normalized(mut self) -> Self {
-        self.normalize();
-        self
-    }
-
-    /// [`PairingDescriptor::normalized`], in place.
+    /// Make the descriptor what the rule reads, in place: every blank value
+    /// dropped and every name read past the blanks around it. The store's
+    /// door makes a worker's descriptor so, once a write.
     pub fn normalize(&mut self) {
         normalize(&mut self.protocol);
         normalize(&mut self.transport);
@@ -102,7 +95,7 @@ impl PairingDescriptor {
     }
 
     /// Whether no value is blank or stands between blanks.
-    fn is_normalized(&self) -> bool {
+    pub(super) fn is_normalized(&self) -> bool {
         [&self.protocol, &self.transport, &self.version]
             .into_iter()
             .chain(&self.kv_layout)

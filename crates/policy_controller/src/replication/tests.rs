@@ -1609,7 +1609,7 @@ fn pair_facts(key: &str, role: Role, transport: Option<&str>) -> WorkerFacts {
         wire_modes: WireModes::GRPC,
         engine_kind: "rt-a".to_owned(),
         pairing: transport.map(|transport| {
-            Box::new(PairingDescriptor {
+            Arc::new(PairingDescriptor {
                 transport: Some(transport.to_owned()),
                 ..PairingDescriptor::default()
             })
