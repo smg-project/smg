@@ -722,7 +722,9 @@ mod tests {
     /// The entries read before the kind is known go back in front, in the
     /// file's order, for the crate's reader: a BPE section with its keys
     /// sorted (`byte_fallback`, then a key no Unigram section has),
-    /// `byte_fallback` then `type`, and a map vocabulary before `type`.
+    /// `byte_fallback` then `type`, a map vocabulary before `type`, and
+    /// `byte_fallback` then a map vocabulary, where two entries are held
+    /// and the model needs both.
     #[test]
     fn the_entries_read_before_the_kind_is_known_reach_the_crate_reader() {
         let fields: std::collections::BTreeMap<String, Value> =
@@ -740,6 +742,7 @@ mod tests {
             section(&[]),
             section(&["byte_fallback", "type"]),
             section(&["vocab", "byte_fallback"]),
+            section(&["byte_fallback", "vocab"]),
         ] {
             assert_eq!(loading_reading(&json), crate_reading(&json), "{json}");
         }
