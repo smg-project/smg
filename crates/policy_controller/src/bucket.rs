@@ -1789,6 +1789,21 @@ mod tests {
         assert!(scorer.partitions.load().is_empty());
     }
 
+    /// The removal takes a partition out only where it still stands under
+    /// its model: an entry made since under the same name stays.
+    #[test]
+    fn forgetting_a_partition_leaves_an_entry_made_since_under_its_model() {
+        let scorer = scorer(NEVER, 1.5, 5);
+        let left = scorer.partition("m");
+        scorer.forget("m", &left);
+        assert!(scorer.partitions.load().is_empty());
+        let made = scorer.partition("m");
+        scorer.forget("m", &left);
+        assert!(Arc::ptr_eq(&of(&scorer, "m"), &made));
+        scorer.forget("m", &made);
+        assert!(scorer.partitions.load().is_empty());
+    }
+
     /// The fence takes a leave's word before the leaver's partition forgets
     /// it, and holds no lock across the walk.
     #[test]
