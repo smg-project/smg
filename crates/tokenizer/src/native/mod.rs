@@ -3695,7 +3695,7 @@ impl NativeEncoder {
         // The answers that are not one id: the hole of each and where its ids
         // begin in the scratch list, the last hole first.
         let mut late = [(0usize, 0usize); WAITING_PIECES];
-        let mut lates = 0;
+        let mut late_len = 0;
         answer.clear();
         for piece in waiting.iter().rev() {
             let key = piece.vacancy.key();
@@ -3753,13 +3753,13 @@ impl NativeEncoder {
                     // such answer): the hole closes, and the holes behind it
                     // move with the ids.
                     ids.remove(piece.at);
-                    for (at, _) in &mut late[..lates] {
+                    for (at, _) in &mut late[..late_len] {
                         *at -= 1;
                     }
                 }
                 None => {
-                    late[lates] = (piece.at, from);
-                    lates += 1;
+                    late[late_len] = (piece.at, from);
+                    late_len += 1;
                 }
             }
         }
@@ -3767,11 +3767,11 @@ impl NativeEncoder {
         // the answers of several ids add, the ids behind each hole move to
         // their place once, and the answer goes in front of them.
         let mut rest = ids.len();
-        let mut to = rest + answer.len() - lates;
+        let mut to = rest + answer.len() - late_len;
         ids.resize(to, 0);
-        for index in 0..lates {
+        for index in 0..late_len {
             let (at, from) = late[index];
-            let end = if index + 1 < lates {
+            let end = if index + 1 < late_len {
                 late[index + 1].1
             } else {
                 answer.len()
