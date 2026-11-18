@@ -84,7 +84,8 @@ impl Default for Blocks {
 
 impl Blocks {
     /// The word of `term` with no block claimed and no table kept. A term
-    /// past 32 bits leads no blocks: no id is minted under a term past 31.
+    /// past 32 bits takes the greatest word: the mint refuses a term past
+    /// 31 bits, so no claim is made under it.
     fn word(term: u64) -> u64 {
         u64::from(u32::try_from(term).unwrap_or(u32::MAX)) << u32::BITS
     }
@@ -271,6 +272,7 @@ mod tests {
         collections::BTreeSet,
         sync::atomic::{AtomicBool, AtomicU64, Ordering},
         thread,
+        time::{Duration, Instant},
     };
 
     use super::{Blocks, Minted, BLOCK, BLOCKS, BLOCK_BITS};
@@ -452,10 +454,13 @@ mod tests {
 
     /// A claim is one atomic step of the block count: two files that claim
     /// at once take the 256 blocks of a term between them, each block
-    /// once, whichever of them takes it.
+    /// once, whichever of them takes it. Every wait ends at the case's
+    /// bound and a file claims no more than two terms' blocks: a claim
+    /// that never fails, or a claimer that leaves, fails the case.
     #[test]
     fn two_files_that_claim_at_once_take_each_block_once() {
         const TERMS: u64 = 200;
+        let end = Instant::now() + Duration::from_secs(60);
         let blocks = Blocks::default();
         let (term, taken) = (AtomicU64::new(0), AtomicU64::new(0));
         let mut totals = Vec::new();
@@ -465,9 +470,13 @@ mod tests {
                 scope.spawn(move || {
                     for under in 1..=TERMS {
                         while term.load(Ordering::Acquire) < under {
+                            if Instant::now() > end {
+                                return;
+                            }
                             thread::yield_now();
                         }
                         let claims = std::iter::from_fn(|| blocks.claim(under, file));
+                        let claims = claims.take(2 * BLOCKS as usize);
                         // The claims of this file, and its end of the term.
                         let claimed = (claims.count() as u64) << u32::BITS | 1;
                         taken.fetch_add(claimed, Ordering::AcqRel);
@@ -480,7 +489,7 @@ mod tests {
                 term.store(under, Ordering::Release);
                 let both = loop {
                     let taken = taken.load(Ordering::Acquire);
-                    if taken & u64::from(u32::MAX) == 2 {
+                    if taken & u64::from(u32::MAX) == 2 || Instant::now() > end {
                         break taken >> u32::BITS;
                     }
                     thread::yield_now();
@@ -502,6 +511,14 @@ mod tests {
     /// a rise, and the case never fails a right read.
     #[test]
     fn a_read_beside_a_rise_is_of_one_standing() {
+        /// Ends the reader where the rising thread leaves, by its end or
+        /// by an unwind.
+        struct Ends<'a>(&'a AtomicBool);
+        impl Drop for Ends<'_> {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
         const TERMS: u64 = 200;
         let blocks = Blocks::default();
         let first = |term: u64| {
@@ -519,13 +536,14 @@ mod tests {
                 }
                 wrong
             });
+            let ends = Ends(&done);
             for term in 1..=TERMS {
                 blocks.rise(term, on_file.iter().copied());
                 let lease = first(term);
                 on_file.push(lease);
                 newest.store(lease.0, Ordering::Release);
             }
-            done.store(true, Ordering::Release);
+            drop(ends);
             reader.join().expect("the reader ends")
         });
         assert_eq!(wrong, 0, "an id read by a table that is not its term's");

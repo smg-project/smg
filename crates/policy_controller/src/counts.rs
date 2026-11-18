@@ -91,9 +91,10 @@ impl Counts {
     }
 
     /// One lease more books the worker of `slot`, in one atomic step. The
-    /// turn of a leases' file orders that file's writers alone, and two
-    /// files book one worker where it serves two models: neither write is
-    /// lost under the other. No reader waits on the line.
+    /// turn of a leases' file orders that file's writers alone. The file
+    /// is one today; with a file a decider, two files book one worker
+    /// where it serves two models, and neither write is lost under the
+    /// other. No reader waits on the line.
     pub(crate) fn book(&self, slot: Slot) {
         if let Some(cell) = self.cell(slot) {
             let one_more = |held: u32| held.saturating_add(1);
@@ -111,8 +112,11 @@ impl Counts {
     }
 
     /// A lease's booking moves from the worker of `from` to the worker of
-    /// `to`: added before it is taken, so a reader between the two steps
-    /// counts the request on both workers and never on neither.
+    /// `to`: added before it is taken. Where a thread's writes are seen in
+    /// the order it made them (x86-64), a reader between the two steps
+    /// counts the request on both workers and never on neither. The
+    /// writes and the reads are relaxed: a machine that orders them more
+    /// loosely may show a reader the taking first.
     pub(crate) fn moved(&self, from: Option<Slot>, to: Option<Slot>) {
         if let Some(to) = to {
             self.book(to);
