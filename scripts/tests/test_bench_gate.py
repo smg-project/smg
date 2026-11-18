@@ -9,6 +9,7 @@ import os
 import re
 import shutil
 import stat
+import struct
 import subprocess
 import sys
 import types
@@ -1982,3 +1983,48 @@ def test_a_second_measurement_starts_only_with_room_for_all_its_runs(mod, tmp_pa
     rc, out, _ = count_run(mod, tmp_path, monkeypatch, {}, name="room")
     saved = json.loads((out / "results.json").read_text())
     assert rc == 1 and len(saved["second"]["pr"]["runs"]) == 3
+
+
+# ---------------------------------------------------------------- the same program
+
+
+def elf(image: bytes, build_id: bytes, unloaded: bytes) -> bytes:
+    """A 64-bit little-endian ELF file of one loadable segment (its headers, a build id note
+    and `image`) with `unloaded` bytes behind it, and a section table its header names there."""
+    note = struct.pack("<III", 4, len(build_id), 3) + b"GNU\x00" + build_id
+    loaded = 64 + 2 * 56 + len(note) + len(image)
+    sections = (loaded + len(unloaded), 64, len(unloaded) % 7, 1)
+    header = struct.pack(
+        "<6s10xHHIQQQIHHH", b"\x7fELF\x02\x01", 3, 62, 1, 0x1000, 64, sections[0], 0, 64, 56, 2
+    )
+    header += struct.pack("<HHH", *sections[1:])
+    segments = struct.pack("<IIQQQQQQ", 1, 5, 0, 0, 0, loaded, loaded, 4096)
+    segments += struct.pack("<IIQQQQQQ", 4, 4, 176, 176, 0, len(note), len(note), 4)
+    return header + segments + note + image + unloaded
+
+
+def test_two_files_that_load_the_same_image_are_the_same_program(mod, tmp_path, monkeypatch):
+    # A change outside a bench's code moves its executable's build id and what no run reads.
+    monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
+    base, pr = tmp_path / "base.elf", tmp_path / "pr.elf"
+    base.write_bytes(elf(b"code" * 64, b"A" * 20, b"symbols"))
+    pr.write_bytes(elf(b"code" * 64, b"B" * 20, b"other symbols, longer"))
+    assert base.read_bytes()[0x28:0x30] != pr.read_bytes()[0x28:0x30]
+    assert mod.image_of(base) == mod.image_of(pr) is not None
+    gate_file, out = tmp_path / "gates.toml", tmp_path / "out"
+    gate_file.write_text(GATE_TOML)
+    args = ["run", "--gates", str(gate_file), "--base", str(base), "--pr", str(pr)]
+    assert mod.main([*args, "--out", str(out)]) == 0
+    saved = json.loads((out / "results.json").read_text())
+    assert saved["identical"] is True and saved["base"]["runs"] == []
+    assert saved["binaries"]["base"]["image"] == saved["binaries"]["pr"]["image"]
+    assert "### Benchmark gate: PASS (the same program)" in (out / "gate.md").read_text()
+    # One byte of the image apart they are two programs.
+    pr.write_bytes(elf(b"code" * 63 + b"cade", b"A" * 20, b"symbols"))
+    assert mod.image_of(base) != mod.image_of(pr)
+    # A file that is no such ELF has no image, nor has one whose headers do not add up.
+    script = tmp_path / "bench.py"
+    script.write_text("#!/usr/bin/env python3\n")
+    assert mod.image_of(script) is None
+    base.write_bytes(elf(b"code" * 64, b"A" * 20, b"")[:200])
+    assert mod.image_of(base) is None

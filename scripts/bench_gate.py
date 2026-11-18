@@ -35,7 +35,10 @@ build on the base. The rule for a change: a gated bench binary's sources stay by
 unless the change is to what they measure, and a new row goes to a bench target of its own.
 
 Four controls keep the verdict about the code. Binaries of the same bytes pass without a run:
-no code change can move a row. Each side is measured from a fresh copy of its binary under the
+no code change can move a row. So do two that load the same image, the bytes the loader maps
+with the build id left out: a change outside a bench's code still moves its executable's
+symbol names, debug sections and build id, and such a pair would be timed against itself.
+Each side is measured from a fresh copy of its binary under the
 output directory, through paths and criterion homes of one length: a file's cached pages decide
 its speed on 1 to 6 µs rows (one binary read 9 to 20 % slower than its byte-identical copy on
 whichever side it stood, 2026-11-09), so neither side carries its file's history; the copies go
@@ -135,6 +138,7 @@ import os
 import re
 import shutil
 import statistics
+import struct
 import subprocess
 import sys
 import time
@@ -504,6 +508,49 @@ def sha256_of(path: Path) -> str:
     return digest.hexdigest()
 
 
+# The fields of an ELF header that name its section table (e_shoff; e_shentsize, e_shnum and
+# e_shstrndx): the loader maps them with the first segment, and no run reads them.
+ELF_SECTION_FIELDS = ((0x28, 0x30), (0x3A, 0x40))
+PT_LOAD, PT_NOTE, NT_GNU_BUILD_ID = 1, 4, 3
+
+
+def image_of(path: Path) -> str | None:
+    """The sha256 of what the loader maps of a 64-bit little-endian ELF executable: its
+    program headers and the file bytes of every loadable segment, with the build id and the
+    header's section-table fields left out. Those follow what no run reads: symbol names and
+    debug sections. None for any other file, and for one whose headers do not add up."""
+    data = bytearray(path.read_bytes())
+    if len(data) < 64 or data[:6] != b"\x7fELF\x02\x01":
+        return None
+    (phoff,) = struct.unpack_from("<Q", data, 0x20)
+    phentsize, phnum = struct.unpack_from("<HH", data, 0x36)
+    if phentsize != 56 or phnum in (0, 0xFFFF) or phoff + phnum * 56 > len(data):
+        return None
+    table = bytes(data[phoff : phoff + phnum * 56])
+    for start, end in ELF_SECTION_FIELDS:
+        data[start:end] = bytes(end - start)
+    loads = []
+    for n in range(phnum):
+        kind, _, offset, _, _, filesz, _, _ = struct.unpack_from("<IIQQQQQQ", table, n * 56)
+        if offset + filesz > len(data):
+            return None
+        if kind == PT_LOAD:
+            loads.append((offset, filesz))
+        at, end = offset, offset + filesz
+        while kind == PT_NOTE and at + 12 <= end:
+            namesz, descsz, note = struct.unpack_from("<III", data, at)
+            desc = at + 12 + (namesz + 3) // 4 * 4
+            if desc + descsz > end:
+                return None
+            if note == NT_GNU_BUILD_ID and data[at + 12 : at + 12 + namesz] == b"GNU\x00":
+                data[desc : desc + descsz] = bytes(descsz)
+            at = desc + (descsz + 3) // 4 * 4
+    digest = hashlib.sha256(table)
+    for offset, filesz in loads:
+        digest.update(data[offset : offset + filesz])
+    return digest.hexdigest()
+
+
 def copy_binary(binary: Path, copy: Path) -> Path:
     """`copy`, a fresh copy of `binary`: the side runs from pages this copy caches, through a
     path of the same length as the other side's."""
@@ -557,14 +604,20 @@ def cmd_run(args: argparse.Namespace) -> int:
         record = sources_record_path(binary)
         sources[side] = json.loads(record.read_text()) if record.exists() else None
     hashes = {side: sha256_of(binary) for side, binary in binaries.items()}
+    # Two files of other bytes are one program where the loader maps the same image of both.
+    images = {side: image_of(binary) for side, binary in binaries.items()}
+    same_image = images["base"] is not None and images["base"] == images["pr"]
     results = {
         "gates": str(args.gates),
         "repeats": repeats,
         "filter": gates.filter,
         "bench_args": gates.bench_args + extra_args,
         "sources": sources,
-        "binaries": {side: {"path": str(binaries[side]), "sha256": hashes[side]} for side in SIDES},
-        "identical": hashes["base"] == hashes["pr"],
+        "binaries": {
+            side: {"path": str(binaries[side]), "sha256": hashes[side], "image": images[side]}
+            for side in SIDES
+        },
+        "identical": hashes["base"] == hashes["pr"] or same_image,
         "order": [],
         "base": {"binary": str(binaries["base"]), "runs": [], "seconds": [], "load": []},
         "pr": {"binary": str(binaries["pr"]), "runs": [], "seconds": [], "load": []},
@@ -576,7 +629,8 @@ def cmd_run(args: argparse.Namespace) -> int:
             json.dump(results, handle, indent=1, sort_keys=True)
 
     if results["identical"]:
-        # The same bytes on both sides: no code change can move a row, nothing to measure.
+        # The same bytes on both sides, or the same loaded image: no code change can move a
+        # row, nothing to measure.
         save()
         print(f"results: {results_path}", flush=True)
         return report(results, gates, out / "gate.md", args.summary)
@@ -1568,7 +1622,16 @@ def markdown(results: dict, rows: list[Row]) -> str:
     # names the unit of its values, "" when the id names it. Lower is better either way.
     unit = results.get("unit")
     if results.get("identical"):
-        sha = results["binaries"]["base"]["sha256"]
+        base, pr = (results["binaries"][side] for side in SIDES)
+        if base["sha256"] != pr["sha256"]:
+            return (
+                "### Benchmark gate: PASS (the same program)\n\n"
+                "The base and pull-request bench binaries load the same image (sha256 "
+                f"{base['image'][:16]}... of what the loader maps, the build id left out) and "
+                "differ outside it, in what no run reads: no code change can move a row, so "
+                "nothing was run.\n"
+            )
+        sha = base["sha256"]
         return (
             "### Benchmark gate: PASS (identical binaries)\n\n"
             f"The base and pull-request bench binaries are the same bytes (sha256 {sha[:16]}...): "
