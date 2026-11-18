@@ -292,11 +292,29 @@ mod tests {
         let mut file = Minted::default();
         let first = [(); 3].map(|()| file.mint(&blocks, 0, 0));
         assert_eq!(first, [Some(1), Some(2), Some(3)]);
-        assert_eq!(file.left, BLOCK - 4, "the first block is one id short");
         // From the first block's last id on.
         let mut file = blocks.spend(0, u32::MAX - (BLOCK - 2), 0);
         let across = [(); 3].map(|()| file.mint(&blocks, 0, 0));
         assert_eq!(across, [Some(BLOCK - 1), Some(BLOCK), Some(BLOCK + 1)]);
+        // Two blocks are claimed: another file's first id is the third's.
+        assert_eq!(Minted::default().mint(&blocks, 0, 1), Some(2 * BLOCK));
+    }
+
+    /// One file mints its first block to its end and two ids on: every
+    /// counter once, in its order. The first block is one id short, so
+    /// its last id is the one before the second block's first, and no id
+    /// is minted twice where the second block is claimed.
+    #[test]
+    fn one_file_mints_its_first_block_to_its_end() {
+        let blocks = Blocks::default();
+        let mut file = Minted::default();
+        let mut last = 0_u32;
+        for _ in 0..=BLOCK {
+            let counter = file.mint(&blocks, 0, 0).expect("a block is left");
+            assert_eq!(counter, last + 1, "the id behind {last}");
+            last = counter;
+        }
+        assert_eq!(last, BLOCK + 1);
         // Two blocks are claimed: another file's first id is the third's.
         assert_eq!(Minted::default().mint(&blocks, 0, 1), Some(2 * BLOCK));
     }

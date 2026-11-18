@@ -113,10 +113,12 @@ impl Counts {
 
     /// A lease's booking moves from the worker of `from` to the worker of
     /// `to`: added before it is taken. Where a thread's writes are seen in
-    /// the order it made them (x86-64), a reader between the two steps
-    /// counts the request on both workers and never on neither. The
-    /// writes and the reads are relaxed: a machine that orders them more
-    /// loosely may show a reader the taking first.
+    /// the order it made them (x86-64), a reader that reads the worker
+    /// the booking leaves and then the worker it goes to counts the
+    /// request on one of the two or on both. A reader that meets the two
+    /// in the other order may count it on neither, as before the order.
+    /// The writes and the reads are relaxed: a machine that orders them
+    /// more loosely may show any reader the taking first.
     pub(crate) fn moved(&self, from: Option<Slot>, to: Option<Slot>) {
         if let Some(to) = to {
             self.book(to);
