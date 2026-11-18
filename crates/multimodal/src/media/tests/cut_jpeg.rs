@@ -90,7 +90,7 @@ fn a_single_scan_file_ending_in_a_comment_is_served_as_the_reference_serves_it()
         if turbojpeg_reads_warnings() {
             let served = decoded.expect("served with the library").to_rgb8();
             assert!(
-                served.as_raw() == clean.as_raw(),
+                served == clean,
                 "the clean file's pixels for the tail {tail:02X?}"
             );
         } else {
@@ -219,7 +219,7 @@ fn segments_libjpeg_parses_behind_a_single_scan_are_refused_as_the_reference_ref
             .expect("served through the library")
             .to_rgb8();
         assert!(
-            served.as_raw() == clean.as_raw(),
+            served == clean,
             "the clean file's pixels for the tail {tail:02X?}"
         );
     }
@@ -302,7 +302,7 @@ fn a_table_behind_a_single_scan_frames_scan_is_refused_before_the_fallback_decod
                 // The library returned the warned scan clean: the loader's answer.
                 Ok(served) if turbojpeg_available() => {
                     assert!(
-                        served.to_rgb8().as_raw() == clean.as_raw(),
+                        served.to_rgb8() == clean,
                         "the clean file's pixels behind the table {table:02X?}"
                     );
                     true
@@ -325,7 +325,7 @@ fn a_table_behind_a_single_scan_frames_scan_is_refused_before_the_fallback_decod
     if turbojpeg_available() {
         let served = decoded.expect("served with the library").to_rgb8();
         assert!(
-            served.as_raw() == clean.as_raw(),
+            served == clean,
             "the clean file's pixels behind a clean scan"
         );
     } else {
