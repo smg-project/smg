@@ -2510,6 +2510,17 @@ fn check_profile(
             None
         }
     };
+    // The scores combine by each weight's share of the weights' sum: a sum
+    // that is not finite, or whose reciprocal is not, gives shares that
+    // lose the order of every row.
+    let total: f32 = scorers.iter().map(|weighted| weighted.weight).sum();
+    if !scorers.is_empty() && !(total.is_finite() && total.recip().is_finite()) {
+        return Err(at.bad(
+            "score",
+            total,
+            "weights whose sum, and one over that sum, are finite numbers",
+        ));
+    }
     // The key's mark: the plain ring alone decides the profile's pick. It
     // is the only scorer, with no bound, under `best` named bare, so the
     // key's owner holds the best score and the picker takes it. The engine
@@ -4749,6 +4760,27 @@ mod tests {
                 "{score}"
             );
         }
+    }
+
+    /// The scores combine by each weight's share of the weights' sum. A
+    /// profile whose sum is not finite, or has no finite reciprocal, is
+    /// refused at its score list: its shares would lose the order of every
+    /// row. A weight under the normal range beside one that is not passes.
+    #[test]
+    fn weights_whose_sum_gives_no_finite_share_are_refused_at_the_score_list() {
+        for score in [
+            r#"{"least-load":{"weight":1e-40}}"#,
+            r#"{"least-load":{"weight":3e38}},{"least-requests":{"weight":3e38}}"#,
+        ] {
+            assert_eq!(
+                bad_field(&spec_with_score(score)),
+                "profiles.p.score",
+                "{score}"
+            );
+        }
+        spec_with_score(r#"{"least-load":{"weight":1e-40}},"least-requests""#)
+            .validate()
+            .expect("a sum in the normal range");
     }
 
     #[test]
