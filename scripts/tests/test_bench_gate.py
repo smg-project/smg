@@ -1285,26 +1285,35 @@ def test_the_same_count_keeps_the_failure_unmoved_or_beyond_twice_the_threshold(
     assert "FAIL regression" in text and " 1 placement (" not in text
     assert (
         f"{same}, and `{unit}` starts at 0x3be0c0 in both: where the code sits does not explain "
-        "the time, and the failure stands."
+        "the time, and the second measurement decides. Measured again from a fresh copy of each "
+        "executable: base runs [101, 101, 101] ns, pull request runs [118, 118, 118] ns "
+        "(+16.8%): the failure repeats."
     ) in text
 
 
-def test_an_id_beyond_twice_its_threshold_is_not_counted(mod, tmp_path, monkeypatch):
-    # +29.7 % on a 10 % threshold: no count makes it a placement, so none is taken.
+def test_an_id_beyond_twice_its_threshold_is_counted_for_a_second_measurement(
+    mod, tmp_path, monkeypatch
+):
+    # +29.7 % on a 10 % threshold: no count makes it a placement, and a count that reads level
+    # still asks for the second measurement, which repeats here.
     counts = {"base": {"encode/a": [1, 2]}, "head": {"encode/a": [1, 2]}}
     rc, out, calls = count_run(mod, tmp_path, monkeypatch, counts, slow=OVER)
-    assert rc == 1 and not calls.exists()
+    assert rc == 1 and calls.read_text().splitlines() == ["base encode/a", "head encode/a"]
     saved = json.loads((out / "results.json").read_text())
-    assert saved["count"] == {"encode/a": {"skipped": "beyond"}}
+    assert saved["count"]["encode/a"]["base"]["batches"] == [1, 2]
+    assert saved["second"]["ids"] == ["encode/a"]
     text = (out / "gate.md").read_text()
     assert "### Benchmark gate: FAIL" in text and "FAIL regression" in text
-    assert "Counted before the verdict" not in text
+    assert "Counted before the verdict" in text and "Not counted" not in text
+    assert "pull request runs [133, 133, 133] ns (+31.7%): the failure repeats." in text
+    # Results saved when the count passed such an id carry the reason, and read as they did.
+    saved["count"], saved["second"] = {"encode/a": {"skipped": "beyond"}}, None
+    (out / "results.json").write_text(json.dumps(saved))
+    summary, gate_file = tmp_path / "old.md", str(tmp_path / "gates.toml")
+    args = ["compare", "--gates", gate_file, "--summary", str(summary), str(out / "results.json")]
+    assert mod.main(args) == 1
     said = "a change beyond 2 times the threshold, which no placement excuses."
-    assert f"Not counted, `encode/a`: {said}" in text
-    assert f"pull request 133 ns (+31.7%). Not counted: {said}" in text
-    # the saved results carry the reason: re-evaluated, the verdict is the same
-    gate_file = str(tmp_path / "gates.toml")
-    assert mod.main(["compare", "--gates", gate_file, str(out / "results.json")]) == 1
+    assert f"Not counted, `encode/a`: {said}" in summary.read_text()
 
 
 def test_an_id_whose_base_median_is_zero_is_not_counted_and_says_so(mod, tmp_path, monkeypatch):
@@ -1751,12 +1760,18 @@ def test_a_level_count_does_not_lift_the_ceiling(mod, tmp_path, monkeypatch):
         "(10.0 an iteration). A placement excuses a change up to 2 times the "
         "threshold, 20.0%: the failure stands."
     )
-    # A run counts no such id, marked or not.
-    rc, out, calls = count_run(
-        mod, tmp_path, monkeypatch, {}, gate_text=WHOLE_TOML, name="over", slow=OVER
+    # A run counts such an id, marked or not, and measures it again on its level count: the
+    # ceiling stands for the placement, and the second measurement decides.
+    counts = {"base": {"encode/a": [9, 20, 40]}, "head": {"encode/a": [7, 20, 40]}}
+    rc, out, _ = count_run(
+        mod, tmp_path, monkeypatch, counts, gate_text=WHOLE_TOML, name="over", slow=OVER
     )
-    assert rc == 1 and not calls.exists()
-    assert "Not counted: a change beyond 2 times the threshold" in (out / "gate.md").read_text()
+    assert rc == 1
+    assert (
+        "20.0%: the second measurement decides. Measured again from a fresh copy of each "
+        "executable: base runs [101, 101, 101] ns, pull request runs [133, 133, 133] ns "
+        "(+31.7%): the failure repeats."
+    ) in (out / "gate.md").read_text()
 
 
 def test_a_run_places_a_marked_id_on_a_level_count_and_fails_one_that_moved(
@@ -1820,3 +1835,150 @@ def test_the_repository_gate_files_mark_the_rows_that_time_a_whole_decision(mod)
     assert engine.threshold_for("policy_engine/decide/random/64").threshold == 0.10
     for name in ("policy-engine-power-of-two.toml", "policy-store.toml"):
         assert not any(gate.whole_pass for gate in mod.load_gates(root / name).gates), name
+
+
+# ---------------------------------------------------------------- measured again
+
+# Four jobs failed by time alone on 2026-11-18 and passed when run again: ids of 110 to 270 ns
+# that no line of their pull requests reaches, the same instruction count on both executables
+# at the same address, the re-measured round agreeing. Per id: the base's runs, the pull
+# request's, the re-measured round and the count of the last batch.
+TIME_ONLY = {
+    "policy_engine/decide/random/512": (
+        ([130.705, 130.803, 131.189], [152.681, 153.359, 151.732]),
+        (130.953, 158.896),
+        154_134_765,
+    ),
+    "policy_engine/decide/round_robin/512": (
+        ([240.053, 245.549, 241.447], [273.386, 272.947, 273.457]),
+        (244.616, 274.436),
+        177_145_736,
+    ),
+    "policy_engine/power_of_two/least_requests/8": (
+        ([111.903, 105.382, 107.504], [119.716, 120.697, 119.123]),
+        (107.17, 121.202),
+        303_081_870,
+    ),
+    "policy_engine/decide/random/64": (
+        ([131.147, 129.616, 134.482], [152.831, 154.061, 147.547]),
+        (132.948, 146.643),
+        153_733_589,
+    ),
+}
+
+
+def time_only(mod, bench_id, second=None):
+    runs, recheck, count = TIME_ONLY[bench_id]
+    side = {"batches": [count // 4 + 9, count // 2, count], "unit": "decide", "address": 0x3E5FC0}
+    counts = {"base": dict(side), "pr": dict(side)}
+    gate = mod.Gate("^policy_engine/", 0.10)
+    row = mod.Row(bench_id, *runs, gate, rechecks=[recheck], counts=counts, second=second)
+    row.verdict = mod.judge(row)
+    return row
+
+
+def test_four_jobs_red_by_time_on_the_same_count_ask_for_a_second_measurement(mod):
+    for bench_id in TIME_ONLY:
+        row = time_only(mod, bench_id)
+        # The same count at the same address places nothing, and reads level.
+        assert row.same_count and row.moved is False and not row.placed
+        assert row.reads_level and row.repeated is None
+        # Not measured again, the first measurement decides.
+        assert row.verdict == "regression"
+
+
+def test_a_second_measurement_decides_an_id_on_a_level_count(mod):
+    bench_id = "policy_engine/power_of_two/least_requests/8"
+    # The runs of the job's second attempt: +4.7 %, within the threshold.
+    again = {"base": [150.575, 151.854, 150.691], "pr": [157.623, 157.849, 166.08]}
+    row = time_only(mod, bench_id, again)
+    assert row.repeated is False and row.verdict == "not repeated" and not row.fails
+    # Beyond the threshold with the runs overlapping is not the failure a second time.
+    row = time_only(mod, bench_id, {"base": [100, 100, 120], "pr": [118, 119, 121]})
+    assert row.repeated is False and row.verdict == "not repeated"
+    # Beyond it with every pull-request run worse than every base run: it repeats.
+    row = time_only(mod, bench_id, {"base": [107, 108, 109], "pr": [120, 121, 122]})
+    assert row.repeated is True and row.verdict == "regression" and row.fails
+
+
+def test_a_count_unsteady_on_one_executable_alone_reads_level_within_the_level(mod):
+    # One job's four counts of a failing id: the base's first read 0.023 % over the other three.
+    first, rest = [44_198_696, 88_397_128, 176_793_992], [44_188_328, 88_376_392, 176_752_520]
+    counts = {"base": {"batches": first, "again": rest}, "pr": {"batches": rest, "again": rest}}
+    runs = [240.542, 237.072, 245.485], [271.799, 271.623, 265.3]
+    gate = mod.Gate("^policy_engine/", 0.10)
+    row = mod.Row("policy_engine/decide/round_robin/512", *runs, gate, counts=counts)
+    assert row.counted.state == "unsteady" and not row.level_count and row.reads_level
+    # Further apart than the level, it tells nothing and asks for nothing.
+    counts["base"]["batches"] = [44_198_696, 88_397_128, 178_000_000]
+    assert row.counted.state == "unsteady" and not row.reads_level
+
+
+def test_a_count_that_moved_beyond_the_level_is_not_measured_again(mod, tmp_path, monkeypatch):
+    counts = {"base": {"encode/a": [5, 10, 2000]}, "head": {"encode/a": [5, 10, 2100]}}
+    rc, out, _ = count_run(mod, tmp_path, monkeypatch, counts)
+    assert rc == 1 and "second" not in json.loads((out / "results.json").read_text())
+    assert "Measured again" not in (out / "gate.md").read_text()
+
+
+def test_a_run_measures_an_id_again_from_fresh_copies_and_passes_one_that_does_not_repeat(
+    mod, tmp_path, monkeypatch
+):
+    same = {"encode/a": [5414, 8268, 16270], "address": 0x3BE0C0}
+    counts = {"base": dict(same), "head": dict(same)}
+    # The pull request's runs: four over the threshold (the rounds and the re-measured one),
+    # one the count's directory stands for, and the second measurement's three, level.
+    rc, out, _ = count_run(mod, tmp_path, monkeypatch, counts, slow=(*SLOW, 0, 101, 102, 100))
+    assert rc == 0
+    saved = json.loads((out / "results.json").read_text())
+    second = saved["second"]
+    assert second["ids"] == ["encode/a"] and "skipped" not in second
+    assert [run["encode/a"] for run in second["pr"]["runs"]] == [101, 102, 100]
+    assert second["order"] == ["base-1", "pr-1", "pr-2", "base-2", "base-3", "pr-3"]
+    # The first measurement stands as it was read, and no copy is left behind.
+    assert len(saved["pr"]["runs"]) == 4
+    assert not (out / "head" / "second").exists() and not (out / "head" / "bench").exists()
+    assert f"+ {out / 'head' / 'second'} --bench" in (out / "head" / "second-1.log").read_text()
+    text = (out / "gate.md").read_text()
+    assert "### Benchmark gate: PASS" in text and "| not repeated |" in text
+    assert "Measured again before the verdict, 3 more run(s) per side from a fresh copy" in text
+    assert " 1 not repeated (" in text and "0 failed" in text
+    assert "pull request runs [101, 102, 100] ns (+0.0%): it does not repeat." in text
+    # Saved, the results read the same.
+    gate_file = str(tmp_path / "gates.toml")
+    assert mod.main(["compare", "--gates", gate_file, str(out / "results.json")]) == 0
+
+
+def test_a_second_measurement_starts_only_with_room_for_all_its_runs(mod, tmp_path, monkeypatch):
+    # A clock that moves a second at each read: a run takes one, the second measurement's six
+    # runs ask for six, and the count ends three before the run's budget does.
+    clock = [0.0]
+
+    def monotonic():
+        clock[0] += 1.0
+        return clock[0]
+
+    def count_ids(ids, copies, out, cwd, gates, extra_args, cpu, deadline):
+        clock[0] = deadline - 4.0
+        side = {"batches": [9, 20, 40], "unit": "decide", "address": 0x5000}
+        return {bench_id: {"base": dict(side), "pr": dict(side)} for bench_id in ids}
+
+    stand_in = types.SimpleNamespace(monotonic=monotonic, sleep=lambda seconds: None)
+    monkeypatch.setattr(mod, "time", stand_in)
+    monkeypatch.setattr(mod, "count_ids", count_ids)
+    rc, out, _ = count_run(mod, tmp_path, monkeypatch, {})
+    assert rc == 1
+    saved = json.loads((out / "results.json").read_text())
+    assert saved["second"]["skipped"] == "budget" and saved["second"]["base"]["runs"] == []
+    assert not (out / "head" / "second-1").exists()
+    text = (out / "gate.md").read_text()
+    assert "Not measured again, `encode/a`: the run's budget left no room" in text
+    assert "and the failure stands." in text and "FAIL regression" in text
+    # With room for the six runs it is taken.
+    clock[0] = 0.0
+    monkeypatch.setattr(
+        mod, "count_ids", lambda ids, *rest: count_ids(ids, *rest[:-1], rest[-1] - 96.0)
+    )
+    rc, out, _ = count_run(mod, tmp_path, monkeypatch, {}, name="room")
+    saved = json.loads((out / "results.json").read_text())
+    assert rc == 1 and len(saved["second"]["pr"]["runs"]) == 3

@@ -59,8 +59,9 @@ placement, reported with the count and the two places and not failed, when two m
 hold: the function the harness spent the most in starts at another address in the pull
 request's executable, and the change is within twice the id's threshold. The same count with
 that function where it was leaves the failure, with the count in its line. An id whose change
-is beyond twice its threshold is not counted: no count makes it a placement, and its line
-says so. Two counts that differ are each taken once more, and
+is beyond twice its threshold is counted too, though no count makes it a placement: a count
+that reads level asks for the second measurement below. Two counts that differ are each taken
+once more, and
 the failure stands either way: the count moved, or it differs from itself on one executable
 (an id whose work follows the clock, a seed or the allocator's state) and tells nothing. A
 count that was not read (no valgrind on the host, one batch alone) leaves the failure too. The
@@ -91,6 +92,20 @@ threshold holds as for every id, and a count that moved further leaves the failu
 work inserted into the decision read the same two ids 16.2 and 11.3 % slower on counts 3.1 and
 3.4 % higher. Half a percent of a count carries a twentieth of a 10 % threshold by itself: the
 rest of such a time is not work.
+
+A sixth control asks the clock again where the count is level. The full rounds and the
+re-measured round run from one copy of each executable, and share whatever that copy's pages
+carry: four pull requests failed on ids of 110 to 270 ns that no line of theirs reaches, the
+same instruction count on both executables at the same address, the re-measured round
+agreeing, and each passed when its job ran again (2026-11-18). An id that still fails on a
+count that reads level is therefore measured again before it fails: the gate's N interleaved
+runs a side once more, from a fresh copy of each executable, read within itself. A count reads
+level when it is a level count as above, or when it is unsteady on one executable alone and
+every count is within `LEVEL_COUNT`. The id fails where the second measurement too is beyond
+its threshold with every pull-request run worse than every base run, and is reported as not
+repeated otherwise. No threshold moves. A count that moved beyond the level fails as before,
+and so does an id whose second measurement the run's budget has no room for: it starts only
+with room for all of its runs, by the longest run of the failing ids so far.
 
 Usage:
     bench_gate.py build --out FILE [--name BENCH] [--gates FILE [--sources-from REV]]
@@ -569,7 +584,10 @@ def cmd_run(args: argparse.Namespace) -> int:
     # processes have one shape: paths and criterion homes of one length, the same environment.
     copies = {side: copy_binary(binaries[side], out / SIDE_DIRS[side] / "bench") for side in SIDES}
 
-    def run(i: int, side: str, bench_filter: str | None, label: str) -> None:
+    # The copies of the second measurement: none until an id asks for it.
+    fresh: dict[str, Path] = {}
+
+    def run(i: int, side: str, bench_filter: str | None, label: str, second: bool = False) -> None:
         load = host_load()
         if args.busy_above is not None:
             load, quiet = quiet_host(args.busy_above, args.busy_wait)
@@ -581,22 +599,54 @@ def cmd_run(args: argparse.Namespace) -> int:
                 raise BusyHost(results["not_judged"])
         side_dir = out / SIDE_DIRS[side]
         started = time.monotonic()
+        stem = f"second-{i}" if second else f"run-{i}"
         medians = run_once(
-            copies[side],
-            side_dir / f"run-{i}",
+            (fresh if second else copies)[side],
+            side_dir / stem,
             cwd,
             gates,
             extra_args,
-            side_dir / f"run-{i}.log",
+            side_dir / f"{stem}.log",
             bench_filter=bench_filter,
             cpu=args.cpu,
         )
         seconds = time.monotonic() - started
-        results[side]["runs"].append(medians)
-        results[side]["seconds"].append(round(seconds, 1))
-        results[side]["load"].append(load)
-        results["order"].append(f"{side}-{i}")
+        sink = results["second"] if second else results
+        sink[side]["runs"].append(medians)
+        sink[side]["seconds"].append(round(seconds, 1))
+        sink[side]["load"].append(load)
+        sink["order"].append(f"{side}-{i}")
         print(f"[{label}] {side}: {len(medians)} ids in {seconds:.0f} s", flush=True)
+
+    def measure_again(deadline: float) -> None:
+        """The second measurement: an id that still fails on a count that reads level is
+        measured again before it fails, `repeats` interleaved runs a side from a fresh copy of
+        each executable, kept apart from the first (`results["second"]`). The full rounds and
+        the re-measured round share one copy a side, and what that copy's pages carry. It
+        starts only with room for all of its runs before `deadline`, by the longest run of
+        the failing ids so far; without that room the first measurement decides."""
+        level = sorted(
+            row.bench_id
+            for row in compare(results, gates)
+            if row.verdict == "regression" and row.reads_level
+        )
+        if not level:
+            return
+        second = results["second"] = {"ids": level, "order": []}
+        for side in SIDES:
+            second[side] = {"runs": [], "seconds": [], "load": []}
+        save()
+        timed = [results[side]["seconds"] for side in SIDES]
+        alone = [took for seconds in timed for took in seconds[repeats:]]
+        longest = max(alone or [took for seconds in timed for took in seconds])
+        if time.monotonic() + 2 * repeats * longest > deadline:
+            second["skipped"] = "budget"
+            return
+        for side in SIDES:
+            fresh[side] = copy_binary(binaries[side], out / SIDE_DIRS[side] / "second")
+        exact = "^(" + "|".join(re.escape(bench_id) for bench_id in level) + ")$"
+        for i, side in interleaved_order(repeats):
+            run(i, side, exact, f"second measurement {i}/{repeats}", second=True)
 
     try:
         try:
@@ -619,22 +669,22 @@ def cmd_run(args: argparse.Namespace) -> int:
                         run(i, side, exact, f"recheck {extra}/{args.recheck}")
             # An id that still fails is counted on both executables: on the same instruction
             # count its time can be a placement in the bench executable, not work. A change
-            # beyond twice the threshold is no placement whatever its count reads: not counted.
+            # beyond twice the threshold is no placement whatever its count reads, and it is
+            # counted all the same: a count that reads level asks for a second measurement.
             still = [row for row in compare(results, gates) if row.verdict == "regression"]
             if still and gates.count:
                 # The timed rounds are written first: a count that hangs, or a job cancelled
                 # in it, still leaves them in the output directory.
                 save()
-                within = sorted(row.bench_id for row in still if row.within_ceiling)
+                based = sorted(row.bench_id for row in still if row.change is not None)
                 results["count"] = {
-                    row.bench_id: {"skipped": "no_base" if row.change is None else "beyond"}
-                    for row in still
-                    if not row.within_ceiling
+                    row.bench_id: {"skipped": "no_base"} for row in still if row.change is None
                 }
                 deadline = run_started + (gates.run_budget or math.inf)
                 results["count"].update(
-                    count_ids(within, copies, out, cwd, gates, extra_args, args.cpu, deadline)
+                    count_ids(based, copies, out, cwd, gates, extra_args, args.cpu, deadline)
                 )
+                measure_again(deadline)
         except BusyHost as busy:
             save()
             print(f"run: not judged, {busy}", file=sys.stderr)
@@ -646,7 +696,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     finally:
         # The copies served the runs. The output directory is what the workflows upload,
         # and two bench binaries do not belong in that artifact.
-        for copy in copies.values():
+        for copy in (*copies.values(), *fresh.values()):
             copy.unlink(missing_ok=True)
 
 
@@ -958,6 +1008,9 @@ class Row:
     # The count of an id that failed by time, per side: the batches' instruction counts and
     # the last batch's unit, or why the side was not read.
     counts: dict | None = None
+    # The second measurement of an id that still failed on a count that reads level, per
+    # side: its runs from the fresh copies. None for an id not measured again.
+    second: dict[str, list[float]] | None = None
 
     @property
     def base_median(self) -> float | None:
@@ -1137,6 +1190,40 @@ class Row:
             return self.level_count
         return bool(self.same_count and self.moved)
 
+    @property
+    def reads_level(self) -> bool:
+        """Whether no count read more work on the pull request's executable than the level: a
+        level count, or one that is not steady on one executable alone while the two
+        executables, and that executable's own two counts, read within `LEVEL_COUNT`. Such
+        an id is measured again before it fails."""
+        if self.level_count:
+            return True
+        counted = self.counted
+        if counted is None or counted.state != "unsteady" or self.beyond_once is not None:
+            return False
+        apart = abs(counted.pr - counted.base) <= LEVEL_COUNT * counted.base
+        return apart and abs(counted.own) <= LEVEL_COUNT
+
+    @property
+    def measured_again(self) -> Row | None:
+        """The second measurement as a row of its own, read within itself; None for an id
+        not measured again."""
+        if not self.second or not all(self.second.get(side) for side in SIDES):
+            return None
+        return Row(self.bench_id, self.second["base"], self.second["pr"], self.gate)
+
+    @property
+    def repeated(self) -> bool | None:
+        """Whether the second measurement fails the id as the first did: beyond the threshold
+        with every pull-request run worse than every base run. None for an id not measured
+        again."""
+        again = self.measured_again
+        if again is None:
+            return None
+        change, threshold = again.change, self.gate.threshold if self.gate else 0.0
+        beyond = again.pr_median > 0 if change is None else change > threshold
+        return beyond and min(again.pr) > max(again.base)
+
 
 def judge(row: Row) -> str:
     if not row.pr:
@@ -1175,7 +1262,11 @@ def regression_or_suspect(row: Row) -> str:
         return "suspect (runs overlap)"
     if row.confirmed is False:
         return "suspect (not confirmed by the re-measurement)"
-    return "placement" if row.placed else "regression"
+    if row.placed:
+        return "placement"
+    # A count that reads level asked for a second measurement: the id fails where that one
+    # fails it too, and is reported where it does not.
+    return "not repeated" if row.repeated is False else "regression"
 
 
 def compare(results: dict, gates: Gates) -> list[Row]:
@@ -1193,6 +1284,8 @@ def compare(results: dict, gates: Gates) -> list[Row]:
                     extra[side].setdefault(bench_id, {})[i] = value
     ids = sorted(set(per_side["base"]) | set(per_side["pr"]))
     counts = results.get("count") or {}
+    second = results.get("second") or {}
+    measured = set() if second.get("skipped") else set(second.get("ids", []))
     rows = []
     for bench_id in ids:
         base_extra = extra["base"].get(bench_id, {})
@@ -1206,6 +1299,11 @@ def compare(results: dict, gates: Gates) -> list[Row]:
             rechecks=[(base_extra[i], pr_extra[i]) for i in rounds],
             counts=counts.get(bench_id),
         )
+        if bench_id in measured:
+            row.second = {
+                side: [run[bench_id] for run in second[side]["runs"] if bench_id in run]
+                for side in SIDES
+            }
         row.verdict = judge(row)
         rows.append(row)
     # (3) A run the busy host stopped: the rows it left one-sided are not missing ids.
@@ -1275,6 +1373,25 @@ def fmt_place(address: int) -> str:
 
 
 # Why an id that failed by time was not counted, as its line and the report say it.
+def stands(row: Row) -> str:
+    """How the sentence of a count that places nothing ends: the failure stands, or, for an
+    id measured again on that count, the second measurement decides."""
+    return "the failure stands" if row.second is None else "the second measurement decides"
+
+
+def fmt_second(row: Row, unit_suffix: str) -> str:
+    """The second measurement of a row, read within itself; "" for a row not measured again."""
+    again = row.measured_again
+    if again is None:
+        return ""
+    end = "the failure repeats" if row.repeated else "it does not repeat"
+    return (
+        " Measured again from a fresh copy of each executable: base runs "
+        f"{fmt_runs(again.base)}{unit_suffix}, pull request runs {fmt_runs(again.pr)}"
+        f"{unit_suffix} ({fmt_pct(again.change)}): {end}."
+    )
+
+
 NOT_COUNTED = {
     "beyond": (
         f"a change beyond {PLACEMENT_CEILING:g} times the threshold, which no placement excuses"
@@ -1358,7 +1475,7 @@ def fmt_ceiling(row: Row) -> str:
     ceiling = PLACEMENT_CEILING * (row.gate.threshold if row.gate else 0.0)
     return (
         f" A placement excuses a change up to {PLACEMENT_CEILING:g} times the threshold, "
-        f"{fmt_pct(ceiling, signed=False)}: the failure stands."
+        f"{fmt_pct(ceiling, signed=False)}: {stands(row)}."
     )
 
 
@@ -1383,13 +1500,13 @@ def fmt_same_count(row: Row, counted: Counted) -> str:
     moved = row.moved
     if moved is None:
         return (
-            f"{same}, but the count names no one function with a place on both sides: the "
-            "failure stands."
+            f"{same}, but the count names no one function with a place on both sides: "
+            f"{stands(row)}."
         )
     if not moved:
         return (
             f"{same}, and `{unit}` starts at 0x{places[0]:x} in both: where the code sits does "
-            "not explain the time, and the failure stands."
+            f"not explain the time, and {stands(row)}."
         )
     if places[0] % 4096 == places[1] % 4096:
         where = (
@@ -1460,6 +1577,7 @@ def markdown(results: dict, rows: list[Row]) -> str:
     failed = [row for row in rows if row.fails]
     suspect = [row for row in rows if row.verdict.startswith("suspect")]
     placed = [row for row in rows if row.verdict == "placement"]
+    unrepeated = [row for row in rows if row.verdict == "not repeated"]
     recheck = results.get("recheck") or {}
     rechecked = set(recheck.get("ids", []))
     not_judged = results.get("not_judged")
@@ -1511,6 +1629,25 @@ def markdown(results: dict, rows: list[Row]) -> str:
         if left:
             names = ", ".join(f"`{bench_id}`" for bench_id in left)
             lines += [f"Not counted, {names}: {said}.", ""]
+    second = results.get("second") or {}
+    if second.get("ids"):
+        names = ", ".join(f"`{bench_id}`" for bench_id in second["ids"])
+        if second.get("skipped"):
+            lines += [
+                f"Not measured again, {names}: the run's budget left no room for the second "
+                "measurement a count that reads level asks for, and the first decides.",
+                "",
+            ]
+        else:
+            lines += [
+                f"Measured again before the verdict, {repeats} more run(s) per side from a fresh "
+                f"copy of each executable: {names}. An id that still fails by time on a count "
+                "that reads level (the same on both executables, or every count within "
+                f"{LEVEL_COUNT:.1%}) fails where this second measurement, read within itself, is "
+                "beyond its threshold with every pull-request run worse than every base run "
+                "too. Otherwise it is reported as not repeated, and still a row to read.",
+                "",
+            ]
     if any(results.get(side, {}).get("load") for side in SIDES):
         shown = ", ".join(
             f"{side} {[round(v, 1) for v in results[side]['load'] if v is not None]}"
@@ -1551,6 +1688,12 @@ def markdown(results: dict, rows: list[Row]) -> str:
             if placed
             else ""
         )
+        + (
+            f" {len(unrepeated)} not repeated (beyond the threshold on a count that reads "
+            "level, and not so a second time from fresh copies: not failed)."
+            if unrepeated
+            else ""
+        )
     )
     unit_suffix = " ns" if unit is None else (f" {unit}" if unit else "")
     for row in failed:
@@ -1565,15 +1708,18 @@ def markdown(results: dict, rows: list[Row]) -> str:
                 f"- `{row.bench_id}`: {fmt_pct(row.change)} against a {fmt_pct(row.gate.threshold, signed=False)} "
                 f"threshold; base runs {fmt_runs(row.base)}{unit_suffix}, pull request runs "
                 f"{fmt_runs(row.pr)}{unit_suffix}{fmt_rechecks(row, unit_suffix)}.{fmt_count(row)}"
+                f"{fmt_second(row, unit_suffix)}"
             )
     # The per-run values of every suspect, placed or re-measured row, so a bimodal set is
     # visible here; a placement carries what its count read.
     for row in rows:
-        if row in suspect or row in placed or (row.bench_id in rechecked and not row.fails):
+        listed = row in suspect or row in placed or row in unrepeated
+        if listed or (row.bench_id in rechecked and not row.fails):
             lines.append(
                 f"- `{row.bench_id}`: {row.verdict}, {fmt_pct(row.change)}; base runs "
                 f"{fmt_runs(row.base)}{unit_suffix}, pull request runs "
                 f"{fmt_runs(row.pr)}{unit_suffix}{fmt_rechecks(row, unit_suffix)}.{fmt_count(row)}"
+                f"{fmt_second(row, unit_suffix)}"
             )
     return "\n".join(lines) + "\n"
 
