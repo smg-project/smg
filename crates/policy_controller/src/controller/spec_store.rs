@@ -120,6 +120,13 @@ pub enum StoreRefused {
     /// lock file does not open, or the file system takes no lock.
     #[error("not locked: {0}")]
     Unlocked(String),
+    /// The directory holds no lock file and this start may not make one,
+    /// in the system's words for the making: a store's first start makes
+    /// the file, and needs a directory it may write.
+    #[error(
+        "no lock file, and none can be made: {0}: a store's first start needs a directory it may write"
+    )]
+    Unmade(String),
     /// Two files, one in each form, are named by one number.
     #[error("generation {0} stands under two names")]
     TwoNames(u64),
@@ -342,7 +349,8 @@ impl SpecStore {
     /// write is not given there, and the refusal is the system's for the
     /// lock. Where the file may not be made and the open to read fails
     /// too, the file not there or no regular file, the refusal is the
-    /// system's for the making.
+    /// system's for the making, and where the file is not there it says
+    /// what a first start needs.
     fn lock_file(root: &fs::File) -> Result<fs::File, StoreRefused> {
         use rustix::fs::{Mode, OFlags};
 
@@ -356,13 +364,17 @@ impl SpecStore {
             Ok(file)
         };
         let made = open(OFlags::RDWR | OFlags::CREATE, Mode::from_raw_mode(0o666));
+        let unlocked = |error: io::Error| StoreRefused::Unlocked(error.to_string());
         match made {
             Err(denied) if Self::read_serves(&denied) => {
-                open(OFlags::RDONLY, Mode::empty()).map_err(|_| denied)
+                open(OFlags::RDONLY, Mode::empty()).map_err(|read| match read.kind() {
+                    // No lock file is there, and this start may not make one.
+                    io::ErrorKind::NotFound => StoreRefused::Unmade(denied.to_string()),
+                    _ => unlocked(denied),
+                })
             }
-            opened => opened,
+            opened => opened.map_err(unlocked),
         }
-        .map_err(|error| StoreRefused::Unlocked(error.to_string()))
     }
 
     /// The directory's lock: an exclusive advisory lock on the lock file,
@@ -880,8 +892,13 @@ pub(crate) mod tests {
         fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).expect("its bits");
         let refused = refused.expect_err("no lock");
         assert!(
-            matches!(&refused, StoreRefused::Unlocked(told) if told.contains("denied")),
+            matches!(&refused, StoreRefused::Unmade(told) if told.contains("denied")),
             "{refused:?}"
+        );
+        let said = refused.to_string();
+        assert!(
+            said.ends_with("a store's first start needs a directory it may write"),
+            "{said}"
         );
     }
 
