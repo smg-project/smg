@@ -131,7 +131,7 @@ impl Blocks for Held {
         parent: Option<SequenceHash>,
     ) -> Result<(), ApplyError> {
         // Before the batch's blocks reach the chain: a decision that reads
-        // one of them then reads this row as its id's holder ([`Index`]).
+        // one of them then counts this row's take of its id ([`Index`]).
         fence(Ordering::Release);
         self.index
             .chain
@@ -322,6 +322,12 @@ struct Tables {
     by_wire: [Box<[u64]>; WIRE_BITS],
     /// Each row's admission, in the rows' clock.
     admitted: Box<[u64]>,
+    /// The count of the index's takes the tables are known whole at, each
+    /// id its row's own ([`Index::taken`]): the count they were made at,
+    /// then the count at each membership write that kept them
+    /// ([`KvTables::stands`]), both under the table's lock. A naming reads
+    /// it before its lookup: a count told later covers no earlier read.
+    taken: AtomicU64,
 }
 
 impl Tables {
@@ -365,6 +371,65 @@ impl Tables {
             }
         }
         mask
+    }
+
+    /// `within` less the rows that are no longer their ids' holders in
+    /// `index`: what a read is kept within once an id was taken since the
+    /// tables were known whole. `pool` is the pool's rows as the
+    /// publication holds them.
+    fn own(&self, index: &Index, pool: &[Candidate], within: &[u64]) -> [u64; MASK_WORDS] {
+        let mut own = [0u64; MASK_WORDS];
+        for (word, (own, &ids)) in own.iter_mut().zip(within).enumerate() {
+            let mut left = ids;
+            while left != 0 {
+                let bit = left.trailing_zeros();
+                left &= left - 1;
+                let id = word as u32 * 64 + bit;
+                let row = self.row_of.get(id as usize).copied().unwrap_or(NONE);
+                let member = pool.get(row as usize);
+                if member.is_some_and(|member| index.held_by(id, member.id)) {
+                    *own |= 1 << bit;
+                }
+            }
+        }
+        own
+    }
+
+    /// The lookup again for a decision whose tables are not known whole at
+    /// `taken`, the index's count of takes after the read in `kept`, which
+    /// was kept within `within`. An id was taken since, and a block read
+    /// under it may be another row's, even where the row the tables name
+    /// holds the id again by now. So the rows that hold their ids at that
+    /// count are told apart and the lookup is made again within them,
+    /// until one is made with no take between the count before it and the
+    /// count after. Off a decision's usual path: it runs for the decisions
+    /// that hold tables from before a take.
+    #[cold]
+    #[inline(never)]
+    fn look_again(
+        &self,
+        naming: &Naming<'_>,
+        pool: &[Candidate],
+        within: &[u64],
+        cap: usize,
+        mut taken: u64,
+        kept: &mut Vec<(u32, u32)>,
+    ) {
+        let Some(index) = self.index.as_deref() else {
+            return;
+        };
+        let words = within.len().min(MASK_WORDS);
+        loop {
+            let own = self.own(index, pool, &within[..words]);
+            index.deepest_again(naming, &own[..words], cap, kept);
+            // As in the naming: the read before the fence, the count after.
+            fence(Ordering::Acquire);
+            let now = index.taken();
+            if now == taken {
+                return;
+            }
+            taken = now;
+        }
     }
 }
 
@@ -513,7 +578,11 @@ impl PoolIndex {
     /// deepest while they fit, the depth the cap cuts by a draw from the
     /// decision's seed on a stream of its own; a head the whole pool holds
     /// is never listed. The lookup is kept within the rows the view can
-    /// hold, so the cap is filled from them. The warming rows are the
+    /// hold, so the cap is filled from them. Where an id of the index was
+    /// taken since the pool's tables were known whole, the lookup runs
+    /// again, within the rows that still hold their ids: a row that left is
+    /// named by no block of the row that took its id, and takes no place of
+    /// the cap. The warming rows are the
     /// publication's that the view holds, less the rows whose naming ended
     /// by the decision's instant: whole within the cap, a draw of the cap
     /// past it, on another stream.
@@ -548,6 +617,13 @@ impl PoolIndex {
         if let Some(index) = index.filter(|_| !naming.block_hashes.is_empty()) {
             let mut mask = [0u64; MASK_WORDS];
             let within = tables.within(naming, locals, &mut mask);
+            // The count the tables are whole at, read before the lookup: a
+            // membership write that keeps them tells a later count, and
+            // that count covers only what is read after it.
+            let whole_at = tables.taken.load(Ordering::Acquire);
+            // The naming's own lookup, in its own frame: one instantiation
+            // with a second caller goes out of line for every decision
+            // ([`Index::deepest_again`]).
             let mut draw = Draw::new(naming.seed ^ HOLDERS_STREAM);
             index.chain.deepest_into(
                 naming.block_hashes,
@@ -557,21 +633,16 @@ impl PoolIndex {
                 |under| below(&mut draw, under),
                 &mut named.kept,
             );
-            // Every read of the lookup stands before this fence, and each
-            // question of who holds an id after it ([`Index`]).
+            // Every read of the lookup stands before this fence, and the
+            // question of what was taken since after it ([`Index`]).
             fence(Ordering::Acquire);
+            let taken = index.taken();
+            if taken != whole_at {
+                tables.look_again(naming, pool, within, cap, taken, &mut named.kept);
+            }
             for &(id, blocks) in &named.kept {
                 let row = tables.row_of.get(id as usize).copied().unwrap_or(NONE);
                 debug_assert!(row != NONE, "a read is kept within the pool's rows");
-                // The id may have been taken again since this world was
-                // published: the blocks read under it are the row's only
-                // while the row's own worker holds it.
-                let Some(member) = pool.get(row as usize) else {
-                    continue;
-                };
-                if !index.held_by(id, member.id) {
-                    continue;
-                }
                 let at = place(row);
                 debug_assert!(
                     at.is_some(),
@@ -629,32 +700,42 @@ impl PoolIndex {
     }
 }
 
-/// One model's index: the chain index, and who holds each of its ids.
+/// One model's index: the chain index, who holds each of its ids, and how
+/// many times an id was taken.
 ///
 /// The chain frees an id for the next row once its row leaves, and a pool's
 /// tables of before still map the id to the row that left
-/// ([`Tables::row_of`]). So a decision asks who holds an id after its
-/// lookup read blocks under it ([`Self::held_by`]), and the answer must be
-/// no older than those blocks. The chain writes and reads its coverage
-/// relaxed. Its reader runs an acquire fence after its reads, for its own
-/// snapshot: this file does not rest on where that fence stands. Three
-/// things of this file order the two:
+/// ([`Tables::row_of`]). So a decision asks after its lookup whether the
+/// count of takes stands where its tables were known whole before it
+/// ([`Self::taken`]), and the answer must be no older than the blocks the
+/// lookup read. The chain writes and
+/// reads its coverage relaxed. Its reader runs an acquire fence after its
+/// reads, for its own snapshot: this file does not rest on where that fence
+/// stands. What orders the answer after a block, by who wrote it:
 ///
-/// - the table's lock: the holder is said under it before the row's lane
-///   exists ([`KvTables::member`]), and a batch finds its lane under it;
-/// - a release fence on the lane's thread, before a batch's blocks reach
-///   the chain ([`Held`]);
-/// - an acquire fence in the naming, between its lookup and its questions
-///   ([`PoolIndex::name`]).
+/// - the row's own lane: the take is said under the table's lock before
+///   the row's lane exists ([`KvTables::member`]), a batch finds its lane
+///   under that lock, and the lane passes a release fence before a batch's
+///   blocks reach the chain ([`Held`]);
+/// - another row's lane, at a run's split, which writes the holdings of
+///   every row on the run: the chain passes a release fence of its own
+///   there, under the run's lock. A holding stands on a run by a write
+///   under that lock, or by the write of the lane that made the run,
+///   before another lane could find it;
+/// - the reader: an acquire fence in the naming, between its lookup and
+///   its question ([`PoolIndex::name`]).
 ///
-/// The two fences synchronize where the lookup read what the batch wrote,
-/// so a decision that read a row's block reads that row as the holder, or
-/// a later one. The orderings of the holder's own store and load carry
-/// none of this.
+/// A release fence and the reader's synchronize where the lookup read what
+/// was written behind the first, so a decision that read a row's block
+/// counts that row's take. The count is written after the holder, by a
+/// release, and read by an acquire: a reader of a count reads the holders
+/// said before it. The holders' own orderings carry nothing.
 struct Index {
     chain: ChainIndex,
     /// Index id -> the worker whose row took the id last, by its number.
     holders: [AtomicU64; INDEX_WORKERS],
+    /// How many times a row took an id ([`Self::take`]).
+    taken: AtomicU64,
 }
 
 impl Index {
@@ -662,6 +743,7 @@ impl Index {
         Self {
             chain: ChainIndex::with_max_workers(INDEX_WORKERS),
             holders: std::array::from_fn(|_| AtomicU64::new(0)),
+            taken: AtomicU64::new(0),
         }
     }
 
@@ -670,18 +752,52 @@ impl Index {
     /// the row writes reaches the chain after it, behind the lane's fence.
     fn take(&self, id: u32, worker: WorkerId) {
         if let Some(holder) = self.holders.get(id as usize) {
-            holder.store(worker.0, Ordering::Release);
+            holder.store(worker.0, Ordering::Relaxed);
         }
+        self.taken.fetch_add(1, Ordering::Release);
+    }
+
+    /// How many times a row took an id of this index. A pool's tables keep
+    /// the count they are known whole at, said under the table's lock, and
+    /// a reader asks again after its lookup and its fence: while the count
+    /// stands, every block it read under an id is the row's that the tables
+    /// name.
+    fn taken(&self) -> u64 {
+        self.taken.load(Ordering::Acquire)
+    }
+
+    /// The naming's lookup made again ([`Tables::look_again`]): the
+    /// request's deepest holders within `within` under `cap`, into `kept`
+    /// by index id, the depth the cap cuts by a draw from the decision's
+    /// seed on the holders' stream. A lookup of its own beside the
+    /// naming's: with one instantiation for both, every decision would pay
+    /// a call for the lookup it makes once.
+    fn deepest_again(
+        &self,
+        naming: &Naming<'_>,
+        within: &[u64],
+        cap: usize,
+        kept: &mut Vec<(u32, u32)>,
+    ) {
+        let mut draw = Draw::new(naming.seed ^ HOLDERS_STREAM);
+        self.chain.deepest_into(
+            naming.block_hashes,
+            |hash| *hash,
+            within,
+            cap,
+            |under| below(&mut draw, under),
+            kept,
+        );
     }
 
     /// Whether `worker`'s row is the one that took `id` last. A reader asks
-    /// after its lookup and its fence: where another row took the id since,
-    /// the blocks it read under the id may be that row's. An id nobody took
+    /// after it read a count of takes: where another row took the id by
+    /// then, the blocks under the id may be that row's. An id nobody took
     /// since answers true for the row that left, and the chain holds none
     /// of that row's blocks.
     fn held_by(&self, id: u32, worker: WorkerId) -> bool {
         let holder = self.holders.get(id as usize);
-        holder.is_some_and(|holder| holder.load(Ordering::Acquire) == worker.0)
+        holder.is_some_and(|holder| holder.load(Ordering::Relaxed) == worker.0)
     }
 }
 
@@ -814,9 +930,10 @@ impl KvTables {
         at: u64,
         reading: &mut Reading,
     ) -> PoolIndex {
-        let (index, id_of) = {
+        let (index, id_of, taken) = {
             let table = self.table.lock();
             let index = table.indexes.get(model).map(|held| Arc::clone(&held.index));
+            let taken = index.as_ref().map_or(0, |index| index.taken());
             let id_of: Box<[u32]> = rows
                 .iter()
                 .map(|row| match table.lanes.get(&row.id) {
@@ -824,7 +941,7 @@ impl KvTables {
                     _ => NONE,
                 })
                 .collect();
-            (index, id_of)
+            (index, id_of, taken)
         };
         let ids = id_of
             .iter()
@@ -864,6 +981,7 @@ impl KvTables {
             members: members.into(),
             by_wire: by_wire.map(Vec::into_boxed_slice),
             admitted: admitted.into(),
+            taken: AtomicU64::new(taken),
         });
         let ruled = PoolIndex::warming(&tables, rule, at, reading);
         PoolIndex::read(tables, rule, ruled, &reading.rows)
@@ -892,13 +1010,22 @@ impl KvTables {
             (None, None) => true,
             _ => false,
         };
-        same && rows.iter().zip(tables.id_of.iter()).all(|(row, &then)| {
-            let now = match table.lanes.get(&row.id) {
-                Some(entry) if *entry.model == *model => entry.worker,
-                _ => NONE,
-            };
-            now == then
-        })
+        let stands = same
+            && rows.iter().zip(tables.id_of.iter()).all(|(row, &then)| {
+                let now = match table.lanes.get(&row.id) {
+                    Some(entry) if *entry.model == *model => entry.worker,
+                    _ => NONE,
+                };
+                now == then
+            });
+        // Each row holds the id its tables hold, under the table's lock:
+        // the tables are whole at the count of this instant. By release:
+        // a naming that reads this count before its lookup reads what
+        // this write found.
+        if let (true, Some(index)) = (stands, index) {
+            tables.taken.store(index.taken(), Ordering::Release);
+        }
+        stands
     }
 
     /// Take `id`'s lane out, when it has one: its blocks leave the index,

@@ -1060,7 +1060,7 @@ fn a_row_written_at_another_rank_starts_over_there() {
 /// The rows a decision is handed in the affinity column's place.
 mod named {
     use std::{
-        sync::Arc,
+        sync::{atomic::Ordering, Arc},
         time::{Duration, Instant},
     };
 
@@ -1283,13 +1283,54 @@ mod named {
     }
 
     /// What a decision that holds the world of before is named for
-    /// `request` once `left` has left under it, a row has taken its index
-    /// id, and `then` has said what the taker and the others hold: the
-    /// holders by their workers, and the taker.
+    /// `request` under `cap` once `then` has run under it: the holders by
+    /// their workers, and the workers of that world's rows.
+    fn named_under_a_kept_world(
+        store: &MemoryStore,
+        request: &[u64],
+        cap: u32,
+        then: impl FnOnce(),
+    ) -> (Vec<(WorkerId, u32)>, Vec<WorkerId>) {
+        let mut view = ViewBuffers::default();
+        let mut named = Named::default();
+        let before: Vec<WorkerId> = store.deciding(|world| {
+            let ask = Ask {
+                gateway: GatewayId::LOCAL,
+                now: Instant::now(),
+                pinned: None,
+                affinity: false,
+            };
+            let built = world
+                .build(MODEL, Role::Single, &ask, &mut view)
+                .expect("the pool");
+            then();
+            let naming = Naming {
+                gateway: GatewayId::LOCAL,
+                block_hashes: request,
+                seed: 7,
+                cap,
+                wires: None,
+                now_micros: built.now_micros,
+            };
+            world.name(MODEL, Role::Single, &naming, &view.candidates, &mut named);
+            view.candidates.iter().map(|row| row.id).collect()
+        });
+        let holders = named
+            .holders
+            .iter()
+            .map(|holder| (before[holder.row as usize], holder.overlap_blocks))
+            .collect();
+        (holders, before)
+    }
+
+    /// The same once `left` has left under that world, a row has taken its
+    /// index id, and `then` has said what the taker and the others hold:
+    /// the holders by their workers, and the taker.
     fn named_past_an_id_taken_again(
         store: &MemoryStore,
         left: WorkerId,
         request: &[u64],
+        cap: u32,
         then: impl FnOnce(WorkerId),
     ) -> (Vec<(WorkerId, u32)>, WorkerId) {
         // A row's id in the model's index, as the world of now holds it.
@@ -1301,44 +1342,18 @@ mod named {
                 standing.tables.id_of[row]
             })
         };
-        let mut view = ViewBuffers::default();
-        let mut named = Named::default();
-        let (before, taker): (Vec<WorkerId>, WorkerId) = store.deciding(|world| {
-            let ask = Ask {
-                gateway: GatewayId::LOCAL,
-                now: Instant::now(),
-                pinned: None,
-                affinity: false,
-            };
-            let built = world
-                .build(MODEL, Role::Single, &ask, &mut view)
-                .expect("the pool");
-            // Under the world this decision holds, the row leaves and
-            // another takes its id.
+        let mut taker = None;
+        let (holders, before) = named_under_a_kept_world(store, request, cap, || {
             let freed = index_id(left);
             let revision = WorkersStore::get(store, left).expect("the row").revision;
             store.remove(left, revision).expect("removed");
-            let taker = admitted(store, "taker");
-            assert_eq!(index_id(taker), freed, "the id is taken again");
-            then(taker);
-            let naming = Naming {
-                gateway: GatewayId::LOCAL,
-                block_hashes: request,
-                seed: 7,
-                cap: 16,
-                wires: None,
-                now_micros: built.now_micros,
-            };
-            world.name(MODEL, Role::Single, &naming, &view.candidates, &mut named);
-            (view.candidates.iter().map(|row| row.id).collect(), taker)
+            let row = admitted(store, "taker");
+            assert_eq!(index_id(row), freed, "the id is taken again");
+            then(row);
+            taker = Some(row);
         });
         assert!(before.contains(&left), "the world of before holds the row");
-        let holders = named
-            .holders
-            .iter()
-            .map(|holder| (before[holder.row as usize], holder.overlap_blocks))
-            .collect();
-        (holders, taker)
+        (holders, taker.expect("a taker"))
     }
 
     /// An index id is free for the next row once its row leaves, and a
@@ -1354,7 +1369,7 @@ mod named {
         let request = [1, 2, 3];
         // The taker holds the request whole, and the row that stands comes
         // to hold two of its blocks.
-        let (holders, taker) = named_past_an_id_taken_again(&store, left, &request, |taker| {
+        let (holders, taker) = named_past_an_id_taken_again(&store, left, &request, 16, |taker| {
             holds(&store, taker, &request);
             holds(&store, stays, &[1, 2]);
         });
@@ -1377,13 +1392,88 @@ mod named {
         let left = admitted(&store, "left");
         let deep = admitted(&store, "deep");
         let request = [1, 2, 3];
-        let (holders, _) = named_past_an_id_taken_again(&store, left, &request, |taker| {
+        let (holders, _) = named_past_an_id_taken_again(&store, left, &request, 16, |taker| {
             holds(&store, shallow, &[1]);
             holds(&store, taker, &[1, 2]);
             holds(&store, deep, &request);
         });
         assert_eq!(holders.len(), 2, "{holders:?}");
         assert!(holders.contains(&(shallow, 1)) && holders.contains(&(deep, 3)));
+    }
+
+    /// An id taken again takes no place of the cap: the lookup runs again
+    /// within the rows that still hold their ids, and the cap is filled
+    /// from them. The taker is the deepest of three under a cap of two, so
+    /// one lookup alone would name one row.
+    #[test]
+    fn an_index_id_taken_again_takes_no_place_of_the_cap() {
+        let store = MemoryStore::new();
+        store.apply(sampled(1)).expect("above the unbound start");
+        let left = admitted(&store, "left");
+        let (shallow, deep) = (admitted(&store, "shallow"), admitted(&store, "deep"));
+        let request = [1, 2, 3];
+        let (holders, _) = named_past_an_id_taken_again(&store, left, &request, 2, |taker| {
+            holds(&store, taker, &request);
+            holds(&store, deep, &[1, 2]);
+            holds(&store, shallow, &[1]);
+        });
+        assert_eq!(holders.len(), 2, "{holders:?}");
+        assert!(holders.contains(&(deep, 2)) && holders.contains(&(shallow, 1)));
+    }
+
+    /// A row that joins takes an id of its own, and the index counts that
+    /// take as any: a decision that holds the world of before looks up
+    /// again, within its rows that hold their ids, which is all of them,
+    /// and names them by what they hold. The row that joined is no row of
+    /// that world.
+    #[test]
+    fn a_join_under_a_kept_world_names_that_worlds_rows_as_before() {
+        let store = MemoryStore::new();
+        store.apply(sampled(1)).expect("above the unbound start");
+        let (near, far) = (admitted(&store, "near"), admitted(&store, "far"));
+        let request = [1, 2, 3];
+        holds(&store, near, &request);
+        holds(&store, far, &[1]);
+        let (holders, before) = named_under_a_kept_world(&store, &request, 16, || {
+            let joined = admitted(&store, "joined");
+            holds(&store, joined, &request);
+        });
+        assert_eq!(before.len(), 2, "the world of before holds two rows");
+        assert_eq!(holders.len(), 2, "{holders:?}");
+        assert!(holders.contains(&(near, 3)) && holders.contains(&(far, 1)));
+    }
+
+    /// A row that joins another pool of the model takes an id of the
+    /// model's index, and the write that admits it keeps this pool's
+    /// standing. It tells the standing whole at the index's new count, so a
+    /// decision on it still asks its one question and looks up once.
+    #[test]
+    fn a_standing_kept_through_another_pools_take_is_whole_at_the_new_count() {
+        let store = MemoryStore::new();
+        store.apply(sampled(1)).expect("above the unbound start");
+        admitted(&store, "a");
+        admitted(&store, "b");
+        // The pool's standing, the count its tables are whole at, and the
+        // index's count of takes.
+        let stood = || {
+            store.deciding(|world| {
+                let standing = world.standing(MODEL, Role::Single).expect("the pool's");
+                let whole_at = standing.tables.taken.load(Ordering::Relaxed);
+                let index = standing.tables.index.as_ref().expect("an index");
+                (Arc::clone(&standing), whole_at, index.taken())
+            })
+        };
+        let (before, whole_at, taken) = stood();
+        assert_eq!(whole_at, taken);
+        let other = WorkerFacts {
+            role: Role::Decode,
+            ..publisher("d", &[MODEL])
+        };
+        registered(&store, other);
+        let (after, whole_at, taken_now) = stood();
+        assert!(Arc::ptr_eq(&before, &after), "the standing was kept");
+        assert_eq!(taken_now, taken + 1, "the other pool's row took an id");
+        assert_eq!(whole_at, taken_now);
     }
 
     /// The pool's warming rows are named as a publication read them: the
