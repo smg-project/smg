@@ -320,13 +320,15 @@ impl<'de> Deserialize<'de> for LateBoundModel {
 /// one the crate builds from the same file. A Unigram section is read by
 /// [`unigram_scores::section`], for the scores the reference reads, in any
 /// order of its keys (`type`, `unk_id`, `vocab`, `byte_fallback`): the
-/// entries are read until one tells the kind, which is the value of `type`,
-/// a key of another kind of section (`unk_token`, `dropout`, `merges` and
-/// the like) or a vocabulary that is a list of pieces with their scores.
-/// Any other entry is held until then (`unk_id`, `byte_fallback`, a key no
-/// section has), so the place of such a key does not decide which reader
-/// takes the section. Any other section (another model kind, a BPE section
-/// with `type` later) goes to the crate's own reader, which streams it as
+/// entries are read until one tells the kind, which is the value of `type`
+/// or a vocabulary that is a list of pieces with their scores. Any other
+/// entry is held until then, so a `type` behind any key still tells the
+/// kind. A section that has shown a key of another kind (`unk_token`,
+/// `dropout` and the like) and not yet its `type` goes to the crate's own
+/// reader when its vocabulary or its merges come, that value unread, so an
+/// older file of another kind, written without `type`, loads at the cost
+/// it had. Any other section (another model kind, a BPE section with `type`
+/// later) goes to the crate's own reader as well, which streams it as
 /// before with the entries already read put back in front.
 struct ModelSection;
 
@@ -342,6 +344,8 @@ impl<'de> Visitor<'de> for ModelSection {
         // ended the reading with its value still in the section.
         let mut read = Vec::new();
         let mut pending = None;
+        // Whether a key of another kind of section has been read.
+        let mut another = false;
         while let Some(key) = map.next_key::<String>()? {
             match key.as_str() {
                 "type" => {
@@ -356,6 +360,12 @@ impl<'de> Visitor<'de> for ModelSection {
                     read.push((key, Value::String(kind)));
                     break;
                 }
+                // Behind a key of another kind the crate's reader takes the
+                // section from here, with this value unread.
+                "vocab" | "merges" if another => {
+                    pending = Some(key);
+                    break;
+                }
                 // A list of pieces with their scores is a Unigram section's.
                 "vocab" => match map.next_value_seed(unigram_scores::VocabShape)? {
                     unigram_scores::Vocab::Scored(vocab) => {
@@ -368,9 +378,8 @@ impl<'de> Visitor<'de> for ModelSection {
                     }
                 },
                 // A key of another kind of section, which no Unigram section
-                // has: the crate's reader takes the section from here, the
-                // value of this key unread, so an older file of another
-                // kind, written without `type`, loads at the cost it had.
+                // has. It is held like the rest, so a `type` behind it still
+                // tells the kind; the section's vocabulary is not read here.
                 "dropout"
                 | "unk_token"
                 | "continuing_subword_prefix"
@@ -379,8 +388,8 @@ impl<'de> Visitor<'de> for ModelSection {
                 | "ignore_merges"
                 | "merges"
                 | "max_input_chars_per_word" => {
-                    pending = Some(key);
-                    break;
+                    another = true;
+                    read.push((key, map.next_value()?));
                 }
                 // No other entry tells the kind: `unk_id`, which a section
                 // of another kind may carry (the crate's reader skips it
@@ -861,7 +870,8 @@ mod tests {
     #[test]
     fn a_key_of_another_kind_hands_the_section_to_the_crate_reader() {
         // Each is a key of a BPE, WordPiece or WordLevel section, and no
-        // Unigram section has it. The scores behind it are the tie of
+        // Unigram section has it. The section names no kind, so it is the
+        // crate's when its vocabulary comes. The scores are the tie of
         // `unigram_scores`, which the crate's reader and the section's own
         // read one bit apart: the reading is the crate's.
         for entry in [

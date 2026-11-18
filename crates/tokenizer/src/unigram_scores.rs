@@ -413,6 +413,33 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_key_of_another_kind_leaves_the_scores_of_a_section_that_names_its_kind() {
+        for entry in [
+            r#""dropout":null"#,
+            r#""unk_token":"<unk>""#,
+            r#""continuing_subword_prefix":"""#,
+            r#""end_of_word_suffix":"""#,
+            r#""fuse_unk":false"#,
+            r#""ignore_merges":false"#,
+            r#""merges":[]"#,
+            r#""max_input_chars_per_word":100"#,
+        ] {
+            let in_front = TIED.replacen('{', &format!("{{{entry},"), 1);
+            let behind = TIED.replacen(
+                r#""type":"Unigram","#,
+                &format!(r#""type":"Unigram",{entry},"#),
+                1,
+            );
+            for section in [in_front, behind] {
+                assert!(section.contains(entry), "{section}");
+                let tokenizer = load(&section).expect("the file loads");
+                assert_eq!(ids(&tokenizer, "aa"), [2], "{section}");
+                assert_eq!(ids(&tokenizer, "aaa"), [1, 2], "{section}");
+            }
+        }
+    }
+
     /// The entries of [`TIED`], one by one.
     const ENTRIES: [&str; 4] = [
         r#""type":"Unigram""#,
