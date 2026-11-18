@@ -681,7 +681,17 @@ impl<'a> McpToolSession<'a> {
         let mut visible_tools = Vec::new();
         let mut owners = HashMap::new();
         for (place, binding) in mcp_servers.iter().enumerate() {
-            let Some(key) = &binding.pool_key else {
+            let listed = if let Some(key) = &binding.pool_key {
+                orchestrator.listed_tools(key)
+            } else if mcp_servers
+                .iter()
+                .any(|b| b.pool_key.is_some() && b.server_key == binding.server_key)
+            {
+                // A configured server whose name this request also binds as
+                // a URL is one more binding of that name: it lists its own
+                // tools as a binding of the URL lists its connection's.
+                orchestrator.list_tools_for_servers(&server_keys[place..=place])
+            } else {
                 if !server_keys[..place].contains(&binding.server_key) {
                     for direct_entry in
                         orchestrator.list_tools_for_servers(&server_keys[place..=place])
@@ -708,7 +718,7 @@ impl<'a> McpToolSession<'a> {
                 .as_deref()
                 .filter(|_| shared)
                 .map(Self::allowlist);
-            for direct_entry in orchestrator.listed_tools(key) {
+            for direct_entry in listed {
                 let shown: Vec<ToolEntry> =
                     match aliases_by_target.get(&direct_entry.qualified_name) {
                         Some(alias_entries) => alias_entries

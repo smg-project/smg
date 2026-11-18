@@ -2316,9 +2316,17 @@ mod tests {
             ..Default::default()
         })
         .await;
-        let config = McpConfig {
+        let config = config_holding("conf-static", url);
+        let orchestrator = Arc::new(McpOrchestrator::new(config).await.unwrap());
+        let format_registry = FormatRegistry::new();
+        (orchestrator, format_registry)
+    }
+
+    /// A configuration holding one server, `name`, the MCP server at `url`.
+    fn config_holding(name: &str, url: String) -> McpConfig {
+        McpConfig {
             servers: vec![McpServerConfig {
-                name: "conf-static".to_string(),
+                name: name.to_string(),
                 transport: McpTransport::Streamable {
                     url,
                     token: None,
@@ -2336,10 +2344,7 @@ mod tests {
             warmup: Vec::new(),
             inventory: Default::default(),
             policy: Default::default(),
-        };
-        let orchestrator = Arc::new(McpOrchestrator::new(config).await.unwrap());
-        let format_registry = FormatRegistry::new();
-        (orchestrator, format_registry)
+        }
     }
 
     /// A tool with no `server_url` names a configured server by its label
@@ -2378,6 +2383,107 @@ mod tests {
             bindings.is_empty(),
             "no configured server is named conf: {bindings:?}"
         );
+    }
+
+    /// A configured server is named by the URL of another server, and one
+    /// request binds the name and that URL. Each binding lists its own
+    /// server's tools under its own label. A tool both servers list is
+    /// listed once, from the first binding whose allowlist admits it, and
+    /// each call reaches the server of the binding that lists its tool.
+    #[tokio::test]
+    async fn a_configured_server_and_a_url_of_one_name_each_list_and_call_their_own_tools() {
+        for (first_allows, lists, reaches) in [
+            (
+                None,
+                [vec!["echo", "own"], vec!["other"]],
+                [(1, 0), (2, 0), (2, 1)],
+            ),
+            (
+                Some("own"),
+                [vec!["own"], vec!["echo", "other"]],
+                [(0, 1), (1, 1), (1, 2)],
+            ),
+        ] {
+            let named_calls: Arc<Mutex<Vec<String>>> = Arc::default();
+            let url_calls: Arc<Mutex<Vec<String>>> = Arc::default();
+            let named_at = serve_local_mcp_server(LocalServer {
+                tools: Some(&["echo", "own"]),
+                calls: Some(Arc::clone(&named_calls)),
+                ..Default::default()
+            })
+            .await;
+            let url = serve_local_mcp_server(LocalServer {
+                tools: Some(&["echo", "other"]),
+                calls: Some(Arc::clone(&url_calls)),
+                ..Default::default()
+            })
+            .await;
+            let config = config_holding(&url, named_at);
+            let orchestrator = Arc::new(McpOrchestrator::new(config).await.unwrap());
+            let inputs = [
+                McpServerInput {
+                    label: url.clone(),
+                    url: None,
+                    authorization: None,
+                    headers: HashMap::new(),
+                    allowed_tools: first_allows.map(|tool: &str| vec![tool.to_string()]),
+                },
+                McpServerInput {
+                    label: "by-url".to_string(),
+                    url: Some(url.clone()),
+                    authorization: Some("one-token".to_string()),
+                    headers: HashMap::new(),
+                    allowed_tools: None,
+                },
+            ];
+            let bindings =
+                connect_mcp_servers(&orchestrator, &FormatRegistry::new(), &inputs).await;
+            let session = McpToolSession::new(&orchestrator, bindings, "test-request");
+            let bound: Vec<(&str, bool)> = session
+                .mcp_servers()
+                .iter()
+                .map(|binding| (binding.label.as_str(), binding.pool_key.is_some()))
+                .collect();
+            assert_eq!(
+                bound,
+                [(url.as_str(), false), ("by-url", true)],
+                "the name binds the configured server, the URL a pooled connection"
+            );
+            let listed: Vec<Vec<String>> = session
+                .mcp_servers()
+                .iter()
+                .map(|binding| {
+                    session
+                        .list_tools_for_binding(binding)
+                        .iter()
+                        .map(|entry| entry.tool_name().to_string())
+                        .collect()
+                })
+                .collect();
+            assert_eq!(
+                listed, lists,
+                "each binding lists its own server's tools, a tool of both from the first that admits it"
+            );
+            let mut reached = Vec::new();
+            for tool in ["echo", "own", "other"] {
+                let output = session
+                    .execute_tool(ToolExecutionInput {
+                        call_id: "call-1".to_string(),
+                        tool_name: tool.to_string(),
+                        arguments: json!({}),
+                    })
+                    .await;
+                assert_eq!(output.error_message, None, "the call of `{tool}` runs");
+                reached.push((
+                    named_calls.lock().expect("the calls lock").len(),
+                    url_calls.lock().expect("the calls lock").len(),
+                ));
+            }
+            assert_eq!(
+                reached, reaches,
+                "each call reaches the server of the binding that lists its tool"
+            );
+        }
     }
 
     /// The Responses routes' rule: a request whose only `mcp` tool names no

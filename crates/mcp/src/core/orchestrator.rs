@@ -1915,10 +1915,13 @@ impl McpOrchestrator {
 
         // The tools go to the inventory by URL and stay with this connection
         // (its pool key), beside the listing's outcome; the outcome goes to
-        // the caller's binding.
+        // the caller's binding. Under a configured server's name the
+        // inventory keeps that server's tools alone.
         let listed = tools_of(client.as_ref(), &server_key, ToolCategory::Dynamic).await;
-        for entry in listed.iter().flatten() {
-            inventory_clone.insert_entry(entry.clone());
+        if !self.static_servers.contains_key(&server_key) {
+            for entry in listed.iter().flatten() {
+                inventory_clone.insert_entry(entry.clone());
+            }
         }
         let list_error = listed.as_ref().err().cloned();
         self.connection_pool.set_listing(&pool_key, &client, listed);
