@@ -14,7 +14,7 @@ use parking_lot::Mutex;
 use rmcp::{service::RunningService, RoleClient};
 
 use super::config::{McpProxyConfig, McpServerConfig, McpTransport};
-use crate::error::McpResult;
+use crate::{error::McpResult, inventory::ToolEntry};
 
 type McpClient = RunningService<RoleClient, ()>;
 type EvictionCallback = Arc<dyn Fn(&PoolKey) + Send + Sync>;
@@ -107,6 +107,8 @@ pub(crate) struct CachedConnection {
     pub client: Arc<McpClient>,
     /// The connection's tool listing. It leaves the pool with the connection.
     pub listing: Listing,
+    /// The tools the connection last listed; none before its first listing.
+    pub tools: Arc<[ToolEntry]>,
 }
 
 impl CachedConnection {
@@ -114,6 +116,7 @@ impl CachedConnection {
         Self {
             client,
             listing: Listing::Pending,
+            tools: Arc::default(),
         }
     }
 }
@@ -263,17 +266,30 @@ impl McpConnectionPool {
         }
     }
 
-    /// Record where `client`'s tool listing stands. The record is the listing
-    /// connection's: a key the pool no longer holds, or holds for a connection
-    /// pooled since (the lister evicted during its listing), is left alone.
-    pub(crate) fn set_listing(&self, key: &PoolKey, client: &Arc<McpClient>, listing: Listing) {
+    /// Record how `client`'s tool listing ended: with the tools it returned,
+    /// or with the server's message. The record is the listing connection's:
+    /// a key the pool no longer holds, or holds for a connection pooled since
+    /// (the lister evicted during its listing), is left alone. A failed
+    /// listing leaves the tools of an earlier one in place.
+    pub(crate) fn set_listing(
+        &self,
+        key: &PoolKey,
+        client: &Arc<McpClient>,
+        listed: Result<Vec<ToolEntry>, String>,
+    ) {
         if let Some(cached) = self
             .connections
             .lock()
             .peek_mut(key)
             .filter(|cached| Arc::ptr_eq(&cached.client, client))
         {
-            cached.listing = listing;
+            match listed {
+                Ok(tools) => {
+                    cached.tools = tools.into();
+                    cached.listing = Listing::Listed;
+                }
+                Err(message) => cached.listing = Listing::Failed(message),
+            }
         }
     }
 
@@ -285,6 +301,16 @@ impl McpConnectionPool {
             self.connections.lock().peek(key),
             Some(cached) if cached.listing == Listing::Listed
         )
+    }
+
+    /// The tools the connection under `key` last listed, in its listing's
+    /// order: none before its first listing, `None` for a key the pool does
+    /// not hold. No promotion.
+    pub(crate) fn listed_tools(&self, key: &PoolKey) -> Option<Arc<[ToolEntry]>> {
+        self.connections
+            .lock()
+            .peek(key)
+            .map(|cached| Arc::clone(&cached.tools))
     }
 
     pub fn list_keys(&self) -> Vec<PoolKey> {

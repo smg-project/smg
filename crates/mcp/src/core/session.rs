@@ -124,7 +124,8 @@ impl<'a> McpToolSession<'a> {
         let request_id = request_id.into();
         let tenant_ctx = TenantContext::default();
         let server_keys: Vec<String> = mcp_servers.iter().map(|b| b.server_key.clone()).collect();
-        let mut mcp_tools = Self::collect_visible_mcp_tools(orchestrator, &server_keys);
+        let mut mcp_tools =
+            Self::collect_visible_mcp_tools(orchestrator, &mcp_servers, &server_keys);
 
         // The model's view of a server is the union of its bindings' allowlists
         // (a server bound under several labels lists each label's own set,
@@ -621,9 +622,23 @@ impl<'a> McpToolSession<'a> {
 
     fn collect_visible_mcp_tools(
         orchestrator: &McpOrchestrator,
+        mcp_servers: &[McpServerBinding],
         server_keys: &[String],
     ) -> Vec<ToolEntry> {
-        let direct_tools = orchestrator.list_tools_for_servers(server_keys);
+        // The servers in binding order. A binding with a pool key lists the
+        // tools its own connection listed: under its URL the inventory holds
+        // the last listing of any caller.
+        let mut direct_tools = Vec::new();
+        for (place, binding) in mcp_servers.iter().enumerate() {
+            if server_keys[..place].contains(&binding.server_key) {
+                continue;
+            }
+            match &binding.pool_key {
+                Some(key) => direct_tools.extend(orchestrator.listed_tools(key)),
+                None => direct_tools
+                    .extend(orchestrator.list_tools_for_servers(&server_keys[place..=place])),
+            }
+        }
         let server_key_set: HashSet<&str> = server_keys.iter().map(String::as_str).collect();
 
         let mut aliases_by_target: HashMap<QualifiedToolName, Vec<ToolEntry>> = HashMap::new();

@@ -60,7 +60,7 @@ use super::{
     },
     handler::{HandlerRequestContext, RefreshRequest, SmgClientHandler},
     metrics::McpMetrics,
-    pool::{Listing, McpConnectionPool, PoolKey, UrlLookup},
+    pool::{McpConnectionPool, PoolKey, UrlLookup},
     reconnect::ReconnectionManager,
 };
 use crate::{
@@ -1093,22 +1093,29 @@ impl McpOrchestrator {
 
         let qualified = QualifiedToolName::new(server_key, &input.tool_name);
         // A call bound to a pooled connection answers for that connection
-        // alone: once the pool no longer holds it the server is gone for this
-        // call, whatever is listed under the same URL.
-        let entry = match pool_key {
-            Some(key) if !self.connection_pool.contains(key) => Err(format!(
+        // alone: its tool is the one that connection listed, and once the
+        // pool no longer holds it the server is gone for this call, whatever
+        // is listed under the same URL.
+        let listed = match pool_key {
+            Some(key) => self.connection_pool.listed_tools(key).map(|tools| {
+                tools
+                    .iter()
+                    .find(|entry| entry.tool_name() == input.tool_name)
+                    .cloned()
+            }),
+            None => Some(self.tool_inventory.get_entry(server_key, &input.tool_name)),
+        };
+        let entry = match listed {
+            None => Err(format!(
                 "Tool call failed: {}",
                 McpError::ServerNotFound(server_key.to_string())
             )),
-            _ => self
-                .tool_inventory
-                .get_entry(server_key, &input.tool_name)
-                .ok_or_else(|| {
-                    format!(
-                        "Tool '{}' not found on server '{}'",
-                        input.tool_name, server_key
-                    )
-                }),
+            Some(entry) => entry.ok_or_else(|| {
+                format!(
+                    "Tool '{}' not found on server '{}'",
+                    input.tool_name, server_key
+                )
+            }),
         };
 
         match entry {
@@ -1895,25 +1902,15 @@ impl McpOrchestrator {
             }
         };
 
-        // The tools go to the inventory by URL; the listing's outcome stays
-        // with this connection (its pool key) and goes to the caller's binding.
-        let list_error = match tools_of(client.as_ref(), &server_key, ToolCategory::Dynamic).await {
-            Ok(entries) => {
-                for entry in entries {
-                    inventory_clone.insert_entry(entry);
-                }
-                None
-            }
-            Err(message) => Some(message),
-        };
-        self.connection_pool.set_listing(
-            &pool_key,
-            &client,
-            match &list_error {
-                Some(message) => Listing::Failed(message.clone()),
-                None => Listing::Listed,
-            },
-        );
+        // The tools go to the inventory by URL and stay with this connection
+        // (its pool key), beside the listing's outcome; the outcome goes to
+        // the caller's binding.
+        let listed = tools_of(client.as_ref(), &server_key, ToolCategory::Dynamic).await;
+        for entry in listed.iter().flatten() {
+            inventory_clone.insert_entry(entry.clone());
+        }
+        let list_error = listed.as_ref().err().cloned();
+        self.connection_pool.set_listing(&pool_key, &client, listed);
 
         if opened {
             self.metrics.record_connection_opened();
@@ -1955,6 +1952,16 @@ impl McpOrchestrator {
             ))
         });
         ranked.into_iter().map(|(_, entry)| entry).collect()
+    }
+
+    /// The tools the connection pooled under `key` last listed, for the
+    /// session of a request bound to it; none once the pool no longer holds
+    /// the connection.
+    pub(crate) fn listed_tools(&self, key: &PoolKey) -> Vec<ToolEntry> {
+        self.connection_pool
+            .listed_tools(key)
+            .map(|tools| tools.to_vec())
+            .unwrap_or_default()
     }
 
     /// Get a tool by qualified name.

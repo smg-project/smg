@@ -613,6 +613,11 @@ mod tests {
         /// With it set the server answers `tools/call` and records each
         /// call's `Authorization` here, in arrival order.
         calls: Option<Arc<Mutex<Vec<String>>>>,
+        /// With it set each tool takes an `id`: an integer for the caller
+        /// under this bearer token, a string for any other.
+        integer_id_bearer: Option<&'static str>,
+        /// Each call's arguments, in arrival order.
+        arguments: Option<Arc<Mutex<Vec<Value>>>>,
     }
 
     /// A gate the local server's `tools/list` waits at while `holding` is
@@ -702,13 +707,26 @@ mod tests {
                         Some(moment) => format!("{name}-{moment}"),
                         None => name.to_string(),
                     };
+                    let id_type = server.integer_id_bearer.map(|token| {
+                        let integer = headers
+                            .get(AUTHORIZATION)
+                            .and_then(|value| value.to_str().ok())
+                            .is_some_and(|value| value == format!("Bearer {token}"));
+                        if integer {
+                            "integer"
+                        } else {
+                            "string"
+                        }
+                    });
+                    let properties =
+                        id_type.map_or_else(|| json!({}), |id| json!({"id": {"type": id}}));
                     match server.tools {
                         Some(names) if !refused => Json(json!({
                             "jsonrpc": "2.0", "id": id,
                             "result": {"tools": names.iter().skip(usize::from(relisted)).map(|name| json!({
                                 "name": numbered(name),
                                 "description": format!("the {name} tool{note}"),
-                                "inputSchema": {"type": "object", "properties": {}}
+                                "inputSchema": {"type": "object", "properties": &properties}
                             })).collect::<Vec<_>>()}
                         }))
                         .into_response(),
@@ -727,6 +745,10 @@ mod tests {
                         .to_string();
                     if let Some(calls) = &server.calls {
                         calls.lock().expect("the calls lock").push(caller);
+                    }
+                    if let Some(arguments) = &server.arguments {
+                        let got = message["params"]["arguments"].clone();
+                        arguments.lock().expect("the arguments lock").push(got);
                     }
                     Json(json!({
                         "jsonrpc": "2.0", "id": id,
@@ -1056,6 +1078,74 @@ mod tests {
             ["Bearer first-token", "Bearer second-token"],
             "each call came under the credentials of the request that made it"
         );
+    }
+
+    /// A bound call and its request's tool list use the tools the request's
+    /// own connection listed. A server types a tool's `id` as an integer
+    /// under one credential and as a string under another; two requests
+    /// reach it, one under each, and both connections are pooled. Each
+    /// request lists and calls after both listed, in either order.
+    #[tokio::test]
+    async fn a_bound_call_and_its_tool_list_use_the_tools_its_own_connection_listed() {
+        let (orchestrator, format_registry) = create_test_orchestrator_no_builtin().await;
+        let own = |token: &str| match token {
+            "number-token" => (json!("integer"), json!({"id": 123.0})),
+            _ => (json!("string"), json!({"id": "00123"})),
+        };
+        for order in [
+            ["text-token", "number-token"],
+            ["number-token", "text-token"],
+        ] {
+            let arguments = Arc::new(Mutex::new(Vec::new()));
+            let url = serve_local_mcp_server(LocalServer {
+                tools: Some(&["echo"]),
+                calls: Some(Arc::default()),
+                integer_id_bearer: Some("number-token"),
+                arguments: Some(Arc::clone(&arguments)),
+                ..Default::default()
+            })
+            .await;
+            let mut requests = Vec::new();
+            for token in order {
+                let input = McpServerInput {
+                    label: token.to_string(),
+                    url: Some(url.clone()),
+                    authorization: Some(token.to_string()),
+                    headers: HashMap::new(),
+                    allowed_tools: None,
+                };
+                requests.push(connect_mcp_servers(&orchestrator, &format_registry, &[input]).await);
+            }
+            let mut listed = Vec::new();
+            for bindings in requests {
+                let session = McpToolSession::new(&orchestrator, bindings, "test-request");
+                let tools = session.list_tools_for_binding(&session.mcp_servers()[0]);
+                listed.push(tools[0].tool.input_schema["properties"]["id"]["type"].clone());
+                let output = session
+                    .execute_tool(ToolExecutionInput {
+                        call_id: "call-1".to_string(),
+                        tool_name: "echo".to_string(),
+                        arguments: json!({"id": "00123"}),
+                    })
+                    .await;
+                assert_eq!(output.error_message, None, "the call runs");
+            }
+            let used: Vec<_> = listed
+                .into_iter()
+                .zip(
+                    arguments
+                        .lock()
+                        .expect("the arguments lock")
+                        .iter()
+                        .cloned(),
+                )
+                .collect();
+            assert_eq!(
+                used,
+                order.map(own),
+                "each request's tool list and call use the `id` type its own connection listed"
+            );
+        }
     }
 
     /// A pooled connection whose listing failed lists again for the next
