@@ -5,8 +5,10 @@
 //! policy, so one sheet holds it and a row names its policy.
 //!
 //! A ring row (`ring_key`) is a request placed by its routing key on the
-//! hash ring. This module refuses such a row in the words of [`RING_ROW`]:
-//! the change that keeps a key on its ring worker replays it.
+//! hash ring. Two rings put one key on different workers, so such a row
+//! lists its workers in the key's ring order and every number in it counts
+//! in that order: `0` is the key's own worker and `1` the ring's next
+//! member, on whatever ring replays the row.
 
 use serde::Deserialize;
 use smg_policy_controller::{
@@ -45,9 +47,6 @@ impl State {
     }
 }
 
-/// The words a ring row is refused in.
-pub const RING_ROW: &str = "a row placed by its routing key on the ring";
-
 /// One worker of a row: the requests the host holds on it and its state.
 #[derive(Clone, Copy, Debug, Deserialize)]
 struct WorkerState {
@@ -80,7 +79,8 @@ pub struct Row {
     /// `overload.shed_when_all_vetoed`.
     shed: bool,
     /// A ring row's routing key: the row lists its workers in this key's
-    /// ring order. Such a row is refused here ([`RING_ROW`]).
+    /// ring order, the key's own worker first and then each next member,
+    /// and its loads, states, tried lists and answers count in that order.
     #[serde(default)]
     ring_key: Option<String>,
     workers: Vec<WorkerState>,
@@ -116,6 +116,9 @@ fn id(i: usize) -> WorkerId {
 struct Bed {
     engine: Engine,
     pool: Vec<Candidate>,
+    /// Where each worker of the row stands in the pool: the row's own
+    /// order, or the key's ring order on this crate's ring for a ring row.
+    places: Vec<usize>,
     scratch: Scratch,
     /// The host's clock, microseconds: each request has its own instant.
     clock: u64,
@@ -125,26 +128,27 @@ impl Bed {
     /// The bed, or the validator's words when this crate does not build the
     /// row's policy.
     fn new(row: &Row) -> Result<Self, String> {
-        if row.ring_key.is_some() {
-            return Err(RING_ROW.to_string());
-        }
         let engine = row.spec()?.validate().map_err(|err| err.to_string())?;
-        let pool = row
-            .workers
-            .iter()
-            .enumerate()
-            .map(|(i, worker)| Candidate {
-                position: i as u32,
-                id: id(i),
-                key: 1_000 + i as u32,
-                health: worker.state.health(),
-                in_flight: worker.in_flight,
+        let places = match &row.ring_key {
+            Some(key) => ring_order(row, key)?,
+            None => (0..row.workers.len()).collect(),
+        };
+        let mut pool: Vec<Candidate> = (0..row.workers.len())
+            .map(|place| Candidate {
+                position: place as u32,
+                id: id(place),
+                key: 1_000 + place as u32,
                 ..Candidate::default()
             })
             .collect();
+        for (&place, worker) in places.iter().zip(&row.workers) {
+            pool[place].health = worker.state.health();
+            pool[place].in_flight = worker.in_flight;
+        }
         Ok(Self {
             engine,
             pool,
+            places,
             scratch: Scratch::new(),
             clock: 1_000,
         })
@@ -156,7 +160,7 @@ impl Bed {
     /// workers for a shed as saturated, the count plus one for any other.
     fn pick(&mut self, key: Option<&str>, tried: &[usize], seed: u64) -> usize {
         self.clock += 1_000;
-        let tried: Vec<WorkerId> = tried.iter().map(|&i| id(i)).collect();
+        let tried: Vec<WorkerId> = tried.iter().map(|&i| id(self.places[i])).collect();
         let facts = RequestFacts {
             model: "m",
             session_key: key.map_or(Identity::NONE, Identity::plain),
@@ -191,7 +195,11 @@ impl Bed {
             ..Lease::default()
         };
         self.engine.on_dispatched(&lease, &target, Side::Single, 0);
-        target.position as usize
+        let place = target.position as usize;
+        self.places
+            .iter()
+            .position(|&p| p == place)
+            .expect("a worker of the row")
     }
 
     /// One step of the row; a request answers where it was placed.
@@ -200,19 +208,56 @@ impl Bed {
             Step::Pick { key, tried } => return Some(self.pick(key.as_deref(), tried, seed)),
             Step::Loads(loads) => {
                 assert_eq!(loads.len(), self.pool.len(), "a load of every worker");
-                for (candidate, &load) in self.pool.iter_mut().zip(loads) {
-                    candidate.in_flight = load;
+                for (&place, &load) in self.places.iter().zip(loads) {
+                    self.pool[place].in_flight = load;
                 }
             }
             Step::States(states) => {
                 assert_eq!(states.len(), self.pool.len(), "a state of every worker");
-                for (candidate, state) in self.pool.iter_mut().zip(states) {
-                    candidate.health = state.health();
+                for (&place, state) in self.places.iter().zip(states) {
+                    self.pool[place].health = state.health();
                 }
             }
         }
         None
     }
+}
+
+/// The ring order of `key` over the row's pool on this crate's ring: the
+/// worker the key lands on with every worker free and idle, then with the
+/// members found so far down, as the recorder found it on the gateway's
+/// ring. Each probe runs on a fresh engine of the row's policy.
+fn ring_order(row: &Row, key: &str) -> Result<Vec<usize>, String> {
+    let workers = row.workers.len();
+    let mut order = Vec::with_capacity(workers);
+    while order.len() < workers {
+        let probe = Row {
+            name: String::new(),
+            policy: row.policy.clone(),
+            shed: false,
+            ring_key: None,
+            workers: (0..workers)
+                .map(|place| WorkerState {
+                    in_flight: 0,
+                    state: if order.contains(&place) {
+                        State::Down
+                    } else {
+                        State::Free
+                    },
+                })
+                .collect(),
+            steps: Vec::new(),
+            outcome: Outcome::Sequence(Vec::new()),
+        };
+        let next = Bed::new(&probe)?.pick(Some(key), &[], 1);
+        if next >= workers || order.contains(&next) {
+            return Err(format!(
+                "the ring's order of {key}: the next member is a worker not yet placed, got {next}"
+            ));
+        }
+        order.push(next);
+    }
+    Ok(order)
 }
 
 /// The row run once from a fresh engine: where each request was placed, or

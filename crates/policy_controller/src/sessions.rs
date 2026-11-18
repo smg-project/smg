@@ -174,6 +174,9 @@ impl SessionTable {
     /// table swept when a sweep is due. A key never seen, or one whose TTL
     /// passed, has empty pins: expiry is the key's own compare, the sweep
     /// only reclaims.
+    /// Always inlined: the keyed decision has two forms, and a second caller
+    /// would otherwise move this out of line under the first.
+    #[inline(always)]
     pub(crate) fn lookup(&self, key: Session, now_micros: u64, rule: &SessionRule) -> Pins {
         let key = key.get();
         self.sweep_if_due(now_micros);
@@ -197,6 +200,9 @@ impl SessionTable {
     /// claim is the one pin made before a commit, and it is marked as such:
     /// any dispatch to it confirms it, the claiming decision's own dispatch
     /// elsewhere withdraws it (`dispatched`), the TTL sweeps it otherwise.
+    /// Always inlined: the keyed decision has two forms, and a second caller
+    /// would otherwise move this out of line under the first.
+    #[inline(always)]
     pub(crate) fn claim(&self, key: Session, seen: Pins, target: WorkerId) -> Claim {
         let key = key.get();
         if key == 0 || target == WorkerId(0) {
@@ -316,7 +322,9 @@ impl SessionTable {
 
     /// Forget every key whose TTL passed, once per the table's sweep
     /// interval; a table without one (no rule has a TTL) never walks its
-    /// shards.
+    /// shards. Always inlined with its one caller ([`Self::lookup`]): the
+    /// check is two compares on the pin's path.
+    #[inline(always)]
     fn sweep_if_due(&self, now_micros: u64) {
         if self.sweep_micros == 0 {
             return;

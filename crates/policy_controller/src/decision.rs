@@ -6,6 +6,8 @@
 
 use std::fmt;
 
+#[cfg(feature = "controller")]
+use crate::proto::LiftedVeto;
 use crate::{sessions::SessionVerdict, view::WorkerId};
 
 /// Targets a decision carries at most: the pick and its alternates.
@@ -164,12 +166,14 @@ impl fmt::Debug for Survivors {
     }
 }
 
-/// The soft veto the all-vetoed rule lifted to make a pick, in the order the
-/// rule lifts them: the mark a host counts its steered picks from. A pick
-/// the profile's own stages made reads `None`, the default; the rule's pick
-/// alone writes another word, and one mark is the decision's, since the pick
-/// and its alternates are of the one lifted pool. The mark sits in a byte
-/// the record had spare: the trace is no larger for it.
+/// The soft veto lifted to make a pick in a pool that veto left nobody, in
+/// the order the all-vetoed rule lifts them: the mark a host counts such
+/// picks from. The rule's own pick writes it, and so does the pick of a
+/// session key kept on its worker where the veto as it stands kept no
+/// worker. Every other pick reads `None`, the default. One mark is the
+/// decision's, since the pick and its alternates are of the one lifted
+/// pool. The mark sits in a byte the record had spare: the trace is no
+/// larger for it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Lifted {
@@ -178,6 +182,18 @@ pub enum Lifted {
     None,
     /// The overload veto: every usable worker was over its thresholds.
     Overload,
+}
+
+/// The contract's word for the mark: the one mapper, for every writer of a
+/// trace.
+#[cfg(feature = "controller")]
+impl From<Lifted> for LiftedVeto {
+    fn from(mark: Lifted) -> Self {
+        match mark {
+            Lifted::None => Self::None,
+            Lifted::Overload => Self::Overload,
+        }
+    }
 }
 
 /// The decision's trace: what the trace header and an explain call print.
@@ -204,8 +220,8 @@ pub struct Trace {
     pub top_len: u8,
     pub seed: u64,
     pub generation: u64,
-    /// The soft veto the all-vetoed rule lifted for this pick ([`Lifted`]):
-    /// `None` unless the rule made the pick.
+    /// The soft veto lifted for this pick ([`Lifted`]): `None` unless that
+    /// veto as it stands left the pool nobody.
     pub lifted: Lifted,
 }
 

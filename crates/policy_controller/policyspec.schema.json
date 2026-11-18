@@ -1161,7 +1161,7 @@
           "exclusiveMinimum": 0
         },
         "shed_when_all_vetoed": {
-          "description": "Shed with a 503 when every usable worker is vetoed, instead of\nfalling back to the least-vetoed one.",
+          "description": "Shed with a 503 when every usable worker is vetoed, instead of\nfalling back to the least-vetoed one. The same word decides what a\nsession key does under consistent hashing while its own worker is\nvetoed: set, the key moves to the ring's next worker; unset, the\nkey stays on its worker over the veto.",
           "type": "boolean",
           "default": false
         }

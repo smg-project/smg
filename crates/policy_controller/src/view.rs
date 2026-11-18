@@ -1005,8 +1005,12 @@ pub struct Constraints<'a> {
     pub excluded: &'a [WorkerId],
     /// The wires this host speaks.
     pub wire_modes: WireModes,
-    /// The overload veto does not apply to this decision (a pool whose
-    /// policy balances load against affinity itself, a session owner).
+    /// The overload veto does not apply to this decision: the host's
+    /// override, for a pool whose policy balances load against affinity
+    /// itself. An engine built from a document lifts the veto itself for a
+    /// keyed request of a profile that places by the session key, where the
+    /// binding steers. An engine built by hand does not: its host says so
+    /// here.
     pub overload_lifted: bool,
     /// A subset hint: decide over at most this many candidates.
     pub subset_hint: Option<u32>,

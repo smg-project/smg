@@ -1300,7 +1300,10 @@ pub struct OverloadSpec {
     #[schemars(extend("exclusiveMinimum" = 0), range(max = 1.0))]
     pub token_usage: Option<f32>,
     /// Shed with a 503 when every usable worker is vetoed, instead of
-    /// falling back to the least-vetoed one.
+    /// falling back to the least-vetoed one. The same word decides what a
+    /// session key does under consistent hashing while its own worker is
+    /// vetoed: set, the key moves to the ring's next worker; unset, the
+    /// key stays on its worker over the veto.
     pub shed_when_all_vetoed: bool,
 }
 
@@ -2431,7 +2434,9 @@ impl HashDepth {
     }
 }
 
-/// One profile's stages, built when this build carries every one of them.
+/// One profile's stages, built when this build carries every one of them,
+/// and whether one of them keeps a session key on its worker over the
+/// overload veto: the ring stage in its plain form, not in its prefix form.
 /// `depth` is deepened to what the built stages read of a request's block
 /// hashes.
 fn check_profile(
@@ -2441,7 +2446,7 @@ fn check_profile(
     catalog: &Catalog,
     deferred: &mut Deferred,
     depth: &mut HashDepth,
-) -> Result<Option<Profile>, SpecError> {
+) -> Result<Option<(Profile, bool)>, SpecError> {
     let gates = gates_of(p, view);
     let at = At::new(format!("profiles.{name}"));
     let mut filters = Vec::with_capacity(p.filter.len());
@@ -2457,6 +2462,7 @@ fn check_profile(
     }
     let mut scorers = Vec::with_capacity(p.score.len());
     let mut complete = true;
+    let mut by_key = false;
     for (i, entry) in p.score.iter().enumerate() {
         let entry_at = At::new(format!("{}.score[{i}]", at.0));
         let stage = match scored(entry, name, &entry_at, catalog)? {
@@ -2474,6 +2480,11 @@ fn check_profile(
             Resolved::Built(scorer) => {
                 let read = HashDepth::of_scorer(&stage, &view.boundaries, scorer.needs());
                 depth.deepen(read);
+                // The ring's prefix form takes no mark, though a request's
+                // key leads its prefix there: the gateway's prefix hash
+                // moves a key off a worker over its thresholds.
+                by_key |=
+                    matches!(&stage, ScoreStage::ConsistentHash(p) if p.prefix_tokens.is_none());
                 scorers.push(Weighted {
                     scorer,
                     weight: stage.weight(),
@@ -2529,12 +2540,15 @@ fn check_profile(
             // A filter and a picker name no depth of their own.
             let unkeyed = filters.iter().map(|filter| filter.needs());
             depth.deepen(HashDepth::of(unkeyed.fold(picker.needs(), Needs::or)));
-            Some(Profile {
-                name: name.to_string(),
-                filters,
-                scorers,
-                picker,
-            })
+            Some((
+                Profile {
+                    name: name.to_string(),
+                    filters,
+                    scorers,
+                    picker,
+                },
+                by_key,
+            ))
         }
         _ => None,
     })
@@ -3257,6 +3271,9 @@ impl PolicySpec {
         // Noted by name: the built vector lines up with the document's
         // positions only once nothing is deferred.
         let mut by_assignment = Vec::new();
+        // The built profiles a stage of which places a request by its
+        // session key, by their place in `profiles`.
+        let mut keyed = Vec::new();
         for (name, profile) in &self.profiles {
             let built = check_profile(
                 name,
@@ -3266,9 +3283,12 @@ impl PolicySpec {
                 &mut deferred,
                 &mut depth,
             )?;
-            if let Some(built) = built {
+            if let Some((built, by_key)) = built {
                 if built.picker.by_assignment() {
                     by_assignment.push(name.as_str());
+                }
+                if by_key {
+                    keyed.push(profiles.len());
                 }
                 profiles.push(built);
             }
@@ -3331,6 +3351,9 @@ impl PolicySpec {
         let mut engine = Engine::new(profiles, bindings, self.generation, needs);
         for at in sheds {
             engine.shed_when_all_vetoed(at);
+        }
+        for at in keyed {
+            engine.places_by_key(at);
         }
         Ok((engine, depth))
     }
