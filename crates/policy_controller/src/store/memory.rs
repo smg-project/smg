@@ -242,6 +242,206 @@ impl MemoryStore {
         }
     }
 
+    /// The tables replaced by `cut`, a leader's complete snapshot: what a
+    /// standby starts from, and starts from again when the leader's log no
+    /// longer holds its place. Every row and load row the store held leaves
+    /// with what lives as long as a row (the prober's counts, the gateways'
+    /// completions, their vetoes in the table and in the world), the epoch
+    /// is the cut's, and the journal starts again at the cut's place inside
+    /// the same locks: a reader of the tables sees them before the restore
+    /// or after it, never between. The KV lanes follow the rows: one that
+    /// left gives up its lane, one that stays keeps what this replica heard
+    /// for it. The store's term rises to the cut's, as
+    /// following that term's start leaves it. The engine is told the
+    /// members once, by id, as an apply tells a generation's
+    /// ([`Membership::Snapshot`]), and the journal's listener once the
+    /// restore's locks are let go. `false`, with nothing changed, where the
+    /// journal refuses the place ([`Journal::restart`]).
+    pub fn restore_from(&self, cut: Cut) -> bool {
+        // Taken before the first lock, so dropped after the last: the journal
+        // restarts inside the locks, and its listener is told behind them.
+        let _released = self.released();
+        let mut workers = self.workers.lock();
+        let held: Vec<WorkerId>;
+        {
+            let mut health = self.health.lock();
+            let mut loads = self.loads.lock();
+            if let Some(journal) = &self.journal {
+                if !journal.restart(cut.at) {
+                    return false;
+                }
+            }
+            health.vetoes.clear();
+            health.ok_at.clear();
+            held = workers.rows.keys().copied().collect();
+            workers.rows.clear();
+            workers.by_key.clear();
+            workers.log.clear();
+            workers.epoch = cut.epoch;
+            // A world's vetoes leave with their rows at a membership write:
+            // one over no row takes them all, and its world is shown to
+            // no one. The fields each member was read at under the
+            // generation's lists leave with them: a cut can bring a row at
+            // an id and a revision the world read under other facts.
+            drop(
+                loads
+                    .writer
+                    .rebuild(cut.epoch, std::iter::empty(), |_, _| None, Classes::Derive),
+            );
+            loads.ranks.clear();
+            for row in cut.rows {
+                workers.by_key.insert(row.facts.key.clone(), row.id);
+                loads.ranks.insert(row.id, Ranks::default());
+                workers.rows.insert(
+                    row.id,
+                    Row {
+                        row,
+                        probes: Probes::default(),
+                    },
+                );
+            }
+            for (id, rank, sample) in cut.loads {
+                if let Some(ranks) = loads.ranks.get_mut(&id) {
+                    ranks.samples.insert(rank, sample);
+                }
+            }
+        }
+        // The index is this replica's own: a row that left gives up its
+        // lane, a row that stays keeps what was heard for it, and a row the
+        // cut brings takes the lane its facts ask for.
+        for id in held {
+            if !workers.rows.contains_key(&id) {
+                self.kv.forget(id);
+            }
+        }
+        for row in workers.rows.values() {
+            self.kv.member(&row.row);
+        }
+        self.swap_world(&workers, Classes::Derive);
+        // Every row was replaced: the engine is told the members once, by
+        // id, as an apply tells a generation's.
+        self.tell_members(&workers);
+        drop(workers);
+        let mut leases = self.leases.lock();
+        leases.term = leases.term.max(cut.at.term);
+        true
+    }
+
+    /// One of the leader's membership or status writes, applied as the
+    /// replication stream tells it: a standby's side of a journaled write
+    /// of [`WorkersStore`] or [`HealthSink`]. `row` is the row as the
+    /// leader's write left it, and none for a removal or a status change;
+    /// a resize is told as a relabel and recorded as the leader recorded
+    /// it, by the widths. Nothing is minted and no revision is guarded: the
+    /// leader's log is the order. A row that leaves takes its tables with
+    /// it as the leader's own write does, and a row that stays keeps its
+    /// admission instant.
+    ///
+    /// The change is applied only where it fits the tables: the epoch is
+    /// the next one, a new row's id is free and a registration's key too,
+    /// a row that stays or is replaced keeps its key, and any other change
+    /// names a row the store holds (a status change, in the status it
+    /// leaves). A change that does not fit writes nothing and tells the
+    /// journal nothing, so the guard of its position does not land and the
+    /// caller starts again from a snapshot.
+    ///
+    /// The world's engine is told the change as at the leader's own write
+    /// ([`MembershipChange::as_lifecycle`]): a standby's stages hold what
+    /// its leader's hold, with no step at a take.
+    pub fn follow(&self, epoch: u64, change: MembershipChange, row: Option<WorkerRow>) {
+        let mut workers = self.writing();
+        if epoch != workers.epoch + 1 {
+            return;
+        }
+        // A row told again with the offer it had moves no pair class, here
+        // as in the leader's own write: the classes are carried.
+        let mut classes = Classes::Derive;
+        let (change, left) = match (change, row) {
+            (MembershipChange::Registered { id }, Some(row))
+                if row.id == id
+                    && !workers.rows.contains_key(&id)
+                    && !workers.by_key.contains_key(&row.facts.key) =>
+            {
+                workers.by_key.insert(row.facts.key.clone(), id);
+                let probes = Probes::default();
+                workers.rows.insert(id, Row { row, probes });
+                (change, None)
+            }
+            (
+                MembershipChange::Relabelled { id } | MembershipChange::Resized { id },
+                Some(mut row),
+            ) if row.id == id => {
+                let held = workers.rows.get_mut(&id);
+                let Some(held) = held.filter(|held| held.row.facts.key == row.facts.key) else {
+                    return;
+                };
+                let resized = held.row.facts.dp_size != row.facts.dp_size;
+                if same_offer(&held.row.facts, &row.facts) {
+                    classes = Classes::Carry;
+                }
+                row.admitted_at = held.row.admitted_at;
+                held.row = row;
+                if resized {
+                    (MembershipChange::Resized { id }, None)
+                } else {
+                    (MembershipChange::Relabelled { id }, None)
+                }
+            }
+            (MembershipChange::Replaced { old, new }, Some(row))
+                if row.id == new
+                    && !workers.rows.contains_key(&new)
+                    && workers
+                        .rows
+                        .get(&old)
+                        .is_some_and(|held| held.row.facts.key == row.facts.key) =>
+            {
+                let left = workers.rows.remove(&old).map(|held| held.row);
+                workers.by_key.insert(row.facts.key.clone(), new);
+                let probes = Probes::default();
+                workers.rows.insert(new, Row { row, probes });
+                self.forget_worker(old);
+                (change, left)
+            }
+            (MembershipChange::Removed { id }, None) => {
+                let Some(held) = workers.rows.remove(&id) else {
+                    return;
+                };
+                workers.by_key.remove(&held.row.facts.key);
+                self.forget_worker(id);
+                (change, Some(held.row))
+            }
+            (MembershipChange::StatusChanged { id, from, to }, None) => {
+                let held = workers.rows.get_mut(&id);
+                let Some(held) = held.filter(|held| held.row.status == from) else {
+                    return;
+                };
+                // The revision counts a row's stated facts: a status
+                // change leaves it, here as in the leader's own write.
+                held.row.status = to;
+                (change, None)
+            }
+            _ => return,
+        };
+        workers.record_over(change, left.as_ref());
+        match change {
+            MembershipChange::Registered { id } | MembershipChange::Replaced { new: id, .. } => {
+                // A row's load entry is made after its telling, as a
+                // registration's is.
+                self.loads.lock().ranks.insert(id, Ranks::default());
+                self.index_member(&workers, id);
+                self.rebuild_world(&workers, Classes::Derive, change);
+            }
+            MembershipChange::Relabelled { id } | MembershipChange::Resized { id } => {
+                self.index_member(&workers, id);
+                self.rebuild_world(&workers, classes, change);
+            }
+            MembershipChange::StatusChanged { id, to, .. } => self.show_status(id, to),
+            MembershipChange::Removed { .. } => {
+                self.rebuild_world(&workers, Classes::Derive, change);
+            }
+        }
+    }
+
     /// Apply a generation: every world from here on is published under
     /// `spec`, the first at once, with the standing membership, each row's
     /// engine family, zone and labels read under the generation's own
@@ -285,9 +485,7 @@ impl MemoryStore {
             )?;
             writer.replaced(self.world.swap(world));
             drop(loads);
-            let mut members: Vec<WorkerId> = workers.rows.keys().copied().collect();
-            members.sort_unstable();
-            spec.engine().on_membership(&Membership::Snapshot(&members));
+            self.tell_members(&workers);
             before
         };
         drop(before);
@@ -394,6 +592,16 @@ impl MemoryStore {
     /// still name a worker the call took out: a stage answers that from its
     /// own state, as the ring fences a pruned id ([`crate::ring::FENCE`]).
     fn rebuild_world(&self, workers: &Workers, classes: Classes, change: MembershipChange) {
+        self.swap_world(workers, classes);
+        if let Some(change) = change.as_lifecycle() {
+            self.world.load().spec().engine().on_membership(&change);
+        }
+    }
+
+    /// The swap of [`MemoryStore::rebuild_world`] alone, the load lock let
+    /// go at its return: for a write that tells the engine in other words
+    /// than one change's ([`MemoryStore::restore_from`]).
+    fn swap_world(&self, workers: &Workers, classes: Classes) {
         let mut loads = self.loads.lock();
         let Loads { ranks, writer } = &mut *loads;
         let ranks = &*ranks;
@@ -404,10 +612,18 @@ impl MemoryStore {
             classes,
         );
         writer.replaced(self.world.swap(world));
-        drop(loads);
-        if let Some(change) = change.as_lifecycle() {
-            self.world.load().spec().engine().on_membership(&change);
-        }
+    }
+
+    /// Tell the standing generation's engine every member once, by id
+    /// ([`Membership::Snapshot`]): what an apply tells the generation it
+    /// applied and a restore the one that stands. Called under the workers
+    /// lock, after the world of those members is shown and with the load
+    /// lock let go.
+    fn tell_members(&self, workers: &Workers) {
+        let mut members: Vec<WorkerId> = workers.rows.keys().copied().collect();
+        members.sort_unstable();
+        let told = Membership::Snapshot(&members);
+        self.world.load().spec().engine().on_membership(&told);
     }
 
     /// Show the deciders the world a write made, when it made one. Called

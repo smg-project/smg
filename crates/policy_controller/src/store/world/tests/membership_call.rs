@@ -64,7 +64,8 @@ mod held {
         lease::{Lifecycle, Membership},
         spec::{BindingSpec, Needs},
         store::{
-            world::ViewBuffers, MemoryStore, WorkerFacts, WorkerPatch, WorkerStatus, WorkersStore,
+            world::ViewBuffers, Kinds, MembershipChange, MemoryStore, WorkerFacts, WorkerPatch,
+            WorkerStatus, WorkersStore,
         },
         view::{Candidate, Constraints, Identity, RequestFacts, Role, WorkerId},
         AppliedSpec, Catalog, ConsistentHash, PolicySpec, Scratch,
@@ -323,5 +324,42 @@ mod held {
             ]
         );
         assert_eq!(told.lock().len(), 6, "a generation that left was told");
+    }
+
+    /// A standby's two doors tell the engine as a leader's writes do: a
+    /// restore tells one snapshot, the restored members alone, and a
+    /// followed write the change it applied. The ring keeps no row the
+    /// restore replaced.
+    #[test]
+    fn a_restore_tells_one_snapshot_and_a_followed_write_its_change() {
+        let leader = MemoryStore::new();
+        let mut members = vec![
+            member(&leader, "http://a:8000"),
+            member(&leader, "http://b:8000"),
+        ];
+        members.sort_unstable();
+        let standby = Arc::new(MemoryStore::new());
+        let (ring, told) = (Arc::new(ConsistentHash::new(None)), Told::default());
+        standby
+            .apply(generation(1, &standby, &ring, &told))
+            .expect("applied");
+        // A row of the standby's own joins the ring at a decision.
+        member(&standby, "http://own:8000");
+        let (mut out, mut scratch) = (ViewBuffers::default(), Scratch::new());
+        decided(&standby, 77, &mut out, &mut scratch);
+        assert_eq!(ring.ring().len(), 1);
+        told.lock().clear();
+        assert!(standby.restore_from(leader.cut(Kinds::All)));
+        let snapshot = format!("{:?}", Membership::Snapshot(&members));
+        assert_eq!(*told.lock(), [(2, snapshot)]);
+        let target = decided(&standby, 77, &mut out, &mut scratch);
+        assert!(members.contains(&target), "a row the restore replaced");
+        assert_eq!(ring.ring().len(), 2, "the ring kept a replaced row");
+        // A followed registration is told as the leader's own is.
+        let joined = member(&leader, "http://c:8000");
+        let row = WorkersStore::get(&leader, joined).expect("the row");
+        standby.follow(3, MembershipChange::Registered { id: joined }, Some(row));
+        let added = format!("{:?}", Membership::Added(joined));
+        assert_eq!(told.lock().last(), Some(&(3, added)));
     }
 }

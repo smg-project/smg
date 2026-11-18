@@ -55,7 +55,7 @@ const IDLE: Duration = Duration::from_millis(20);
 /// How long an idle stream stays silent. After it the leader says where its
 /// head stands with an empty batch, so a standby reads its lag from the age
 /// of the stream's last frame.
-const BEAT: Duration = Duration::from_secs(1);
+pub(crate) const BEAT: Duration = Duration::from_secs(1);
 
 /// The most bytes of one message a client reads, by the transport's own
 /// bound: a complete snapshot above it is refused, and a batch stops under
@@ -77,7 +77,8 @@ const MESSAGE_BYTES: usize = 4 * 1024 * 1024;
 /// place of the run before would be held, and never told this run's first
 /// writes. After a draw that place is outside this run's log, and its
 /// reader is told to start again. A standby that applied nothing names no
-/// place of any run: it joins at the drawn start ([`Feed::join`]).
+/// place of any run: the standby's feed joins it at the drawn start
+/// ([`Feed::join`]).
 pub(crate) fn journaled(place: &LeasePlace) -> (Arc<MemoryStore>, watch_workers::Feed) {
     journaled_from(place, RandomState::new().hash_one(0u8) % FIRST_PLACES)
 }
@@ -340,8 +341,8 @@ impl Feed {
     /// A standby's feed from the place its hello names, and how its stream
     /// starts: open where the log holds the place under its term, else
     /// with the word to re-sync. A standby that applied nothing names the
-    /// place before every write: it stands at the log's first place, after
-    /// the number the run drew, while the log retains every write since. A
+    /// place before every write: it stands at the log's first place, the
+    /// number the run drew, while the log retains every write since. A
     /// bound of zero is the log's own, and no bound is above it.
     fn join(
         log: Arc<Log>,
@@ -1180,10 +1181,13 @@ mod tests {
         assert!(matches!(join(named).1, End::Resync(_)));
         // A log that restarted at a snapshot's place is no longer its
         // store's whole history: that standby starts from a snapshot.
-        after.log.restart(Position {
-            seq: head.seq + 9,
-            term: head.term + 1,
-        });
+        after
+            .log
+            .restart(Position {
+                seq: head.seq + 9,
+                term: head.term + 1,
+            })
+            .expect("a place the log takes");
         assert!(matches!(join(START).1, End::Resync(_)));
     }
 
@@ -1382,6 +1386,10 @@ mod tests {
         fn released(&self) {
             self.log.released();
         }
+
+        fn restart(&self, at: Position) -> bool {
+            self.log.restart(at).is_ok()
+        }
     }
 
     #[test]
@@ -1494,7 +1502,10 @@ mod tests {
         // one before the store is told the take and after it: no write of
         // that take starts the term.
         let leader = Leader::elected();
-        leader.log.restart(Position { seq: 9, term: 7 });
+        leader
+            .log
+            .restart(Position { seq: 9, term: 7 })
+            .expect("a place the log takes");
         for told in [false, true] {
             if told {
                 leader.store.set_term(leader.term);
@@ -1515,7 +1526,10 @@ mod tests {
         // that applied that term's start does: a take does not lower it,
         // and the refusal names both terms, never a write still to come.
         let leader = Leader::elected();
-        leader.log.restart(Position { seq: 9, term: 7 });
+        leader
+            .log
+            .restart(Position { seq: 9, term: 7 })
+            .expect("a place the log takes");
         leader.store.set_term(7);
         leader.store.set_term(leader.term);
         assert_eq!(leader.store.term(), 7);

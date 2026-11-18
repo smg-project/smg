@@ -260,8 +260,11 @@ pub struct LoadDriver<S, P> {
     probe: Arc<P>,
     config: LoadDriverConfig,
     stats: Arc<Stats>,
-    /// The membership grouped by engine, kept until the store's epoch moves.
-    grouped: Mutex<Option<Grouped>>,
+    /// The engines the probe was asked about and not told to forget since:
+    /// it may hold a connection for each. The set outlives a run, as the
+    /// probe does, so an engine that leaves the membership between two
+    /// runs is let go at the next run's first tick.
+    asked: Mutex<HashSet<String>>,
 }
 
 /// The engines of one membership epoch.
@@ -290,10 +293,15 @@ struct Engine {
     ranks: Vec<(u16, WorkerId)>,
 }
 
-/// What the loop keeps between ticks: when each engine is next due, and the
-/// calls that are out.
+/// What a run of polls keeps between its ticks: the membership as last
+/// grouped, when each engine is next due, and the calls that are out.
 #[derive(Default)]
 struct Schedule {
+    /// The membership grouped by engine, kept until the store's epoch
+    /// moves. An epoch names one membership within a run of polls alone:
+    /// between two runs a restore may leave the store at the same epoch
+    /// with another, so a run of polls starts with no grouping.
+    grouped: Option<Grouped>,
     due: BTreeMap<String, Due>,
     /// The calls that have not answered yet. A tick starts calls and waits
     /// for none: an answer is written when it lands, and dropping the
@@ -378,6 +386,14 @@ async fn at(instant: Option<Instant>) {
     }
 }
 
+/// The gate's next word; for ever once its teller is gone.
+async fn turned(polls: &mut watch::Receiver<bool>) -> bool {
+    if polls.changed().await.is_err() {
+        std::future::pending::<()>().await;
+    }
+    *polls.borrow_and_update()
+}
+
 /// What a log line calls an engine: the host and port of its address, never
 /// the address whole (a worker URL may carry userinfo, which no log line
 /// gets; the gRPC client names its peers the same way). An address with an
@@ -421,7 +437,7 @@ where
             probe,
             config,
             stats: Arc::new(Stats::default()),
-            grouped: Mutex::new(None),
+            asked: Mutex::new(HashSet::new()),
         }
     }
 
@@ -435,34 +451,65 @@ where
     /// is written when it lands, so an engine that does not answer delays
     /// its own rows alone, never the fleet's or the stop, which cancels the
     /// calls still out.
-    pub async fn run(&self, mut stop: watch::Receiver<bool>) {
+    pub async fn run(&self, stop: watch::Receiver<bool>) {
+        // No role to read: the polls run for the loop's length.
+        let (_always, polls) = watch::channel(true);
+        self.run_while(stop, polls).await;
+    }
+
+    /// [`LoadDriver::run`] on a replica that may follow a leader: the loop
+    /// runs for the process's life and polls only while `polls` reads
+    /// `true`. It pays the store's publications either way, whoever wrote
+    /// the rows: a follower's applier writes them, and the instant the
+    /// store names is read again at each tick. A turn to `false` ends the
+    /// run of polls, with its calls still out and its grouping of the
+    /// membership; a turn to `true` starts the next with a tick at once.
+    pub async fn run_while(
+        &self,
+        mut stop: watch::Receiver<bool>,
+        mut polls: watch::Receiver<bool>,
+    ) {
         let mut ticker = tokio::time::interval(self.config.tick);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut schedule = Schedule::default();
+        let mut polling = *polls.borrow_and_update();
         loop {
             // The instant the store names for the rows its publication
             // window still holds, read after every write of this loop: the
             // last row of a burst is shown within one window of its
-            // receipt, with no later write.
+            // receipt, with no later write. A row another writer brought,
+            // a follower's applier, is read at the next tick.
             let due = self.store.publish_due();
             // The stop first; then the answers before the tick, which finds
             // the engines whose calls landed free to be asked again.
             tokio::select! {
                 biased;
                 _ = stop.wait_for(|stop| *stop) => return,
+                word = turned(&mut polls) => {
+                    if word != polling {
+                        polling = word;
+                        schedule = Schedule::default();
+                        if polling {
+                            self.tick(&mut schedule);
+                        }
+                    }
+                }
                 Some(joined) = schedule.calls.join_next() => self.land(&mut schedule.due, joined),
                 () = at(due) => self.store.publish(now()),
-                _ = ticker.tick() => self.tick(&mut schedule),
+                _ = ticker.tick() => {
+                    if polling {
+                        self.tick(&mut schedule);
+                    }
+                }
             }
         }
     }
 
     /// The membership grouped by engine: the snapshot is read and regrouped
-    /// only when the store's epoch moved since the last tick (every write,
-    /// a status change included, moves it).
-    fn engines(&self) -> Arc<Vec<Engine>> {
+    /// only when the store's epoch moved since the run's last tick (every
+    /// write, a status change included, moves it).
+    fn engines(&self, grouped: &mut Option<Grouped>) -> Arc<Vec<Engine>> {
         let epoch = self.store.epoch();
-        let mut grouped = self.grouped.lock();
         if let Some(kept) = grouped.as_ref() {
             if kept.epoch == epoch {
                 return Arc::clone(&kept.engines);
@@ -480,10 +527,12 @@ where
     /// One tick: the membership read, the engines that left dropped, the due
     /// calls started. Nothing here waits on an engine.
     fn tick(&self, schedule: &mut Schedule) {
-        let engines = self.engines();
+        let engines = self.engines(&mut schedule.grouped);
         let tick_at = tokio::time::Instant::now();
         let live: HashSet<&str> = engines.iter().map(|engine| engine.key.as_str()).collect();
-        schedule.due.retain(|key, _| {
+        schedule.due.retain(|key, _| live.contains(key.as_str()));
+        let mut asked = self.asked.lock();
+        asked.retain(|key| {
             let kept = live.contains(key.as_str());
             if !kept {
                 self.probe.forget(key);
@@ -491,6 +540,9 @@ where
             kept
         });
         for (index, engine) in engines.iter().enumerate() {
+            if !asked.contains(&engine.key) {
+                asked.insert(engine.key.clone());
+            }
             let slot = schedule
                 .due
                 .entry(engine.key.clone())

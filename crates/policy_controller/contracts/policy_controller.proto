@@ -469,8 +469,8 @@ message WatchWorkersRequest {
   // below 2^48. A later run can take a term again, at each start where the
   // lease is not shared and where a shared lease's record was lost, and the
   // draw keeps a position of another run outside the positions this run
-  // holds, under its first or ahead of its head, but for a chance of 4,096
-  // in 2^48 a resume, or of 69,632 where the lease is shared and the log
+  // holds, under its first or ahead of its head, but for a chance of 4,097
+  // in 2^48 a resume, or of 69,634 where the lease is shared and the log
   // holds the load rows' positions too.
   // membership_epoch moves only on a membership change and is no resume point.
   uint64 resume_seq = 2;
@@ -1142,7 +1142,10 @@ message LeaderInfo {
   string address = 2;
   uint64 term = 3;
   bool is_leader = 4;
-  // Synced on replication lag, live ranks and generation (design 5.4).
+  // On a follower: its replication lag is under one load poll interval,
+  // or two of the leader's heartbeats where that is longer. The live
+  // ranks and the generation narrow this bit with their steps (design
+  // 5.4). A leader follows nobody: false.
   bool synced = 5;
   SyncState sync = 6;
   repeated GroupLeader groups = 7;
@@ -1151,6 +1154,7 @@ message LeaderInfo {
 }
 
 message SyncState {
+  // The age of the last frame of its leader's stream a follower applied.
   uint32 replication_lag_ms = 1;
   uint32 ranks_live = 2;
   uint32 ranks_total = 3;

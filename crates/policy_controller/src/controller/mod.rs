@@ -49,12 +49,15 @@ mod service;
 mod session;
 mod spec_file;
 mod spec_store;
+mod standby;
 pub mod tls;
 mod watch_workers;
 mod wire;
 mod worker_wire;
 
-use std::{future::Future, io, net::SocketAddr, path::PathBuf, pin::pin, sync::Arc};
+use std::{
+    convert::Infallible, future::Future, io, net::SocketAddr, path::PathBuf, pin::pin, sync::Arc,
+};
 
 use axum::serve::{ListenerExt as _, TapIo};
 use tokio::{
@@ -89,6 +92,7 @@ use self::{
     service::{Service, Shared},
     spec_file::SpecFile,
     spec_store::SpecStore,
+    standby::{Lag, Standby},
 };
 use crate::{
     catalog::Catalog,
@@ -423,9 +427,9 @@ impl Controller {
             "election"
         );
         let (standing, stood) = watch::channel(Standing::default());
-        let (phase, readiness) = readiness::channel(elector.fence(), stood.clone());
+        let steps = stood.clone();
         let journal = replication::journaled(&config.election.lease);
-        let shared = Shared::new(
+        let mut shared = Shared::new(
             config.controller_id.clone(),
             address.unwrap_or_default(),
             &elector,
@@ -435,6 +439,9 @@ impl Controller {
             config.decide_shards,
         )
         .map_err(Error::Deciders)?;
+        shared.lag = Arc::new(Lag::new(standby::synced_within(config.load_poll_interval)));
+        let (phase, readiness) =
+            readiness::channel(elector.fence(), steps, Arc::clone(&shared.lag));
         let shared = Arc::new(shared);
         let probe = Arc::new(EngineProbe::new().map_err(Error::Probe)?);
         Ok(Self {
@@ -469,6 +476,15 @@ impl Controller {
                 .collect(),
             admin: self.admin_addr,
         }
+    }
+
+    /// Where this replica dials the leader it follows, or why it follows
+    /// none: read once the listeners' layers stand, at the serve's start.
+    fn follows(&self) -> Result<u16, NoFollow> {
+        if !self.config.election.lease.is_shared() {
+            return Err(NoFollow::Lease);
+        }
+        following(&self.listeners)
     }
 
     /// Names `listener` one that takes its callers' identities as told
@@ -621,7 +637,10 @@ impl Controller {
     /// first tick (idle while the store has no rows); the election thread
     /// takes its first look at the lease, and the state turns
     /// [`State::Leader`] or [`State::Follower`] and the health service's
-    /// overall status `SERVING` once that look has landed. At the shutdown
+    /// overall status `SERVING` once that look has landed. A replica that
+    /// runs a standby turns [`State::Syncing`] where it does not lead, and
+    /// is [`State::Follower`] and `SERVING` only while its standby is
+    /// synced with its leader. At the shutdown
     /// the state turns [`State::Draining`] and the overall status
     /// `NOT_SERVING` at once, and a leader closes its fence and releases the
     /// lease before the settle window, so a follower takes it within one
@@ -659,6 +678,7 @@ impl Controller {
         shutdown: impl Future<Output = ()>,
         fault: impl Future<Output = Error>,
     ) -> Result<(), Error> {
+        let follows = self.follows();
         let Self {
             config,
             phase,
@@ -677,6 +697,22 @@ impl Controller {
         // The listeners' close is one word, and an open decide stream hears
         // it too: the word is `Shared`'s.
         let stop = shared.stop.clone();
+        // A replica under a shared lease follows its leader where it can,
+        // and says once why it cannot: it then behaves as before a standby
+        // existed.
+        let follows = match follows {
+            Ok(port) => Some(port),
+            // Nobody else leads under a lease of the replica's own.
+            Err(NoFollow::Lease) => None,
+            Err(why) => {
+                info!(
+                    controller_id = %config.controller_id,
+                    why = why.as_str(),
+                    "this replica follows no leader"
+                );
+                None
+            }
+        };
         let mut tasks: JoinSet<Result<(), Error>> = JoinSet::new();
         let mut reporters = Vec::with_capacity(listeners.len());
         // The reporters of the listeners whose door a caller can pass: the
@@ -730,10 +766,35 @@ impl Controller {
         ));
         let loads = driver.stats();
         let driver_stop = stop.subscribe();
+        // A replica that follows polls no engine: its applier is the load
+        // table's one writer then, and a poll's row between two of the
+        // leader's would take the place of the log the leader's next event
+        // needs. The loop itself runs on every replica: it pays the store's
+        // publications, so a followed row reaches the published world.
+        let polls = follows.map(|_| shared.role.subscribe());
         tasks.spawn(async move {
-            driver.run(driver_stop).await;
+            match polls {
+                Some(polls) => driver.run_while(driver_stop, polls).await,
+                None => driver.run(driver_stop).await,
+            }
             Ok(())
         });
+        if let Some(port) = follows {
+            info!(
+                controller_id = %config.controller_id,
+                port,
+                "this replica follows its leader while it does not lead"
+            );
+            // From here this replica is ready as a follower only while
+            // its standby is synced.
+            shared.lag.follow();
+            let standby = Standby::new(Arc::clone(&shared), port);
+            let standby_stop = stop.subscribe();
+            tasks.spawn(async move {
+                standby.run(standby_stop).await;
+                Ok(())
+            });
+        }
         // The presence sweep: what a gateway held is let go once its grace
         // period ended with no new `Hello`.
         let gateways = Arc::clone(&shared.gateways);
@@ -801,23 +862,34 @@ impl Controller {
         let leave = match starting {
             Some(leave) => leave,
             None => {
-                for reporter in &reporters {
-                    reporter
-                        .set_service_status("", ServingStatus::Serving)
-                        .await;
+                // A replica that runs no standby is ready from here, and
+                // its word is told before the state moves. One that runs a
+                // standby is ready only while it is synced: its word is
+                // told at each turn.
+                let mut told = None;
+                if follows.is_none() {
+                    for reporter in &reporters {
+                        reporter
+                            .set_service_status("", ServingStatus::Serving)
+                            .await;
+                    }
+                    told = Some(true);
                 }
                 phase.send_replace(Phase::Serving);
-                info!(
-                    controller_id = %config.controller_id,
-                    role = readiness.state().as_str(),
-                    membership_epoch = store.epoch(),
-                    "ready"
-                );
+                let mut word = Box::pin(tell_readiness(
+                    readiness.clone(),
+                    &reporters,
+                    told,
+                    follows.is_some(),
+                    &config.controller_id,
+                    &store,
+                ));
                 tokio::select! {
                     () = &mut shutdown => Leave::Signal,
                     joined = tasks.join_next() => Leave::Task(joined),
                     () = election.ended() => Leave::Election,
                     error = &mut fault => Leave::Task(Some(Ok(Err(error)))),
+                    never = &mut word => match never {},
                 }
             }
         };
@@ -958,6 +1030,106 @@ async fn tell_role(
     }
 }
 
+/// Why a replica follows no leader.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NoFollow {
+    /// The lease is the replica's own: nobody else leads under it.
+    Lease,
+    /// No listener serves the replication scope.
+    Listener,
+    /// The replication listener places no principal: a leader's would
+    /// refuse every standby.
+    Principal,
+    /// The replication listener serves TLS: a standby's dial has no
+    /// credential yet.
+    Tls,
+}
+
+impl NoFollow {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Lease => "the lease is this replica's own",
+            Self::Listener => "no listener serves the replication scope",
+            Self::Principal => "the replication listener places no principal",
+            Self::Tls => {
+                "the replication listener serves TLS, and a standby's dial has no credential yet"
+            }
+        }
+    }
+}
+
+/// The port a standby dials its leader at, on the leader's own host: the
+/// port of this replica's listener that serves the replication scope to a
+/// stated principal in the clear, since replicas are configured alike. Or
+/// why the replica follows no leader, by its last replication listener.
+fn following(listeners: &[Bound]) -> Result<u16, NoFollow> {
+    let mut why = NoFollow::Listener;
+    for bound in listeners {
+        if !bound.scopes.contains(&Scope::Replication) {
+            continue;
+        }
+        if bound.layer == Layer::Off {
+            why = NoFollow::Principal;
+        } else if bound.tls {
+            why = NoFollow::Tls;
+        } else {
+            return Ok(bound.addr.port());
+        }
+    }
+    Err(why)
+}
+
+/// Tells every listener's overall word as the readiness turns and says each
+/// turn once in the log: the word's one writer while the controller serves.
+/// `told` is the word the listeners hold at the call. A replica that runs
+/// no standby (`follows` false) is ready from its first look to its drain,
+/// so its word is told once. Never resolves.
+async fn tell_readiness(
+    mut role: Readiness,
+    reporters: &[HealthReporter],
+    mut told: Option<bool>,
+    follows: bool,
+    controller_id: &str,
+    store: &MemoryStore,
+) -> Infallible {
+    let mut said = None;
+    loop {
+        let (state, lapse) = role.read();
+        let ready = state.is_ready();
+        if told != Some(ready) {
+            let word = if ready {
+                ServingStatus::Serving
+            } else {
+                ServingStatus::NotServing
+            };
+            for reporter in reporters {
+                reporter.set_service_status("", word).await;
+            }
+            told = Some(ready);
+        }
+        if said != Some(ready) {
+            if ready {
+                info!(
+                    controller_id,
+                    role = state.as_str(),
+                    membership_epoch = store.epoch(),
+                    "ready"
+                );
+            } else {
+                info!(
+                    controller_id,
+                    role = state.as_str(),
+                    "not ready: the standby is not synced with its leader"
+                );
+            }
+            said = Some(ready);
+        }
+        if !follows || role.moved_by(lapse).await.is_none() {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! What no case outside the module reaches: a serve whose election
@@ -978,14 +1150,20 @@ mod tests {
         task::JoinSet,
         time::timeout,
     };
-    use tonic::codegen::tokio_stream::StreamExt as _;
+    use tonic::{
+        codegen::tokio_stream::StreamExt as _,
+        transport::{server::TcpIncoming, Server},
+    };
 
     use super::{
         config::tests::valid,
         deciders::{tests as bed, TERM_MARK},
-        election::Standing,
-        readiness::{self, Phase},
-        tell_role, Controller, Error,
+        election::{self, Standing},
+        following,
+        principal::Layer,
+        readiness::{self, tests::fenced, Phase},
+        standby::Lag,
+        tell_readiness, tell_role, Bound, Controller, Error, NoFollow, Scope,
     };
     use crate::{
         elector::{
@@ -1355,7 +1533,8 @@ mod tests {
         let mut elector = Elector::alone("controller-0@127.0.0.1:1", ElectionSettings::default())
             .expect("the default settings are in order");
         let (steps, stepped) = watch::channel(Standing::default());
-        let (phase, readiness) = readiness::channel(elector.fence(), stepped);
+        let (phase, readiness) =
+            readiness::channel(elector.fence(), stepped, Arc::new(Lag::new(Duration::ZERO)));
         let (stop, stopped) = watch::channel(false);
         let (told, mut role) = watch::channel(false);
         let mut teller = JoinSet::new();
@@ -1412,7 +1591,8 @@ mod tests {
         let mut elector = Elector::alone("controller-0@127.0.0.1:1", ElectionSettings::default())
             .expect("the default settings are in order");
         let (steps, stepped) = watch::channel(Standing::default());
-        let (phase, readiness) = readiness::channel(elector.fence(), stepped);
+        let (phase, readiness) =
+            readiness::channel(elector.fence(), stepped, Arc::new(Lag::new(Duration::ZERO)));
         let (_stop, stopped) = watch::channel(false);
         let (told, mut role) = watch::channel(false);
         let mut teller = JoinSet::new();
@@ -1472,7 +1652,8 @@ mod tests {
             )
             .expect("the settings are in order");
             let (steps, stepped) = watch::channel(Standing::default());
-            let (phase, readiness) = readiness::channel(elector.fence(), stepped);
+            let (phase, readiness) =
+                readiness::channel(elector.fence(), stepped, Arc::new(Lag::new(Duration::ZERO)));
             let (stop, stopped) = watch::channel(false);
             let (told, role) = watch::channel(false);
             let mut teller = JoinSet::new();
@@ -1542,5 +1723,150 @@ mod tests {
         assert!(serve.elector.release().expect("a release"));
         serve.steps.send_replace(Standing::default());
         serve.hears("the lead's loss").await;
+    }
+
+    /// A listener as the follow rule reads it: its scopes, its layer and
+    /// whether it serves TLS.
+    type Door<'a> = (&'a [Scope], Layer, bool);
+
+    /// The follow rule over these listeners, each bound on a port of its
+    /// own: the ports, and the rule's answer.
+    async fn followed(doors: &[Door<'_>]) -> (Vec<u16>, Result<u16, NoFollow>) {
+        let mut listeners = Vec::new();
+        for &(scopes, layer, tls) in doors {
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("a port");
+            listeners.push(Bound {
+                name: "listener".to_owned(),
+                scopes: scopes.to_vec(),
+                addr: listener.local_addr().expect("its address"),
+                listener: TcpIncoming::from(listener),
+                server: Server::builder(),
+                tls,
+                mutual: false,
+                layer,
+            });
+        }
+        let ports = listeners.iter().map(|bound| bound.addr.port()).collect();
+        (ports, following(&listeners))
+    }
+
+    #[tokio::test]
+    async fn a_replica_follows_at_its_replication_listener_that_takes_a_name_in_the_clear() {
+        let gateway: Door<'_> = (&[Scope::Gateway, Scope::Control], Layer::AsTold, false);
+        let unnamed: Door<'_> = (&[Scope::Replication], Layer::Off, false);
+        let sealed: Door<'_> = (&[Scope::Replication], Layer::AsTold, true);
+        let open: Door<'_> = (&[Scope::Control, Scope::Replication], Layer::AsTold, false);
+        // Each reason, by the replication listener that gives it.
+        assert_eq!(followed(&[]).await.1, Err(NoFollow::Listener));
+        assert_eq!(followed(&[gateway]).await.1, Err(NoFollow::Listener));
+        assert_eq!(
+            followed(&[gateway, unnamed]).await.1,
+            Err(NoFollow::Principal)
+        );
+        assert_eq!(followed(&[gateway, sealed]).await.1, Err(NoFollow::Tls));
+        // The listener a standby can dial, past those it cannot.
+        let (ports, port) = followed(&[gateway, unnamed, sealed, open]).await;
+        assert_eq!(port.ok(), ports.last().copied());
+    }
+
+    #[tokio::test]
+    async fn a_replica_follows_under_a_shared_lease_alone_and_is_synced_within_its_poll_interval() {
+        // A lease of its own: nobody to follow, whatever its listeners.
+        let mut alone = Controller::bind(valid()).await.expect("the listeners bind");
+        alone
+            .identity_as_told("replication")
+            .expect("a listener of the configuration");
+        assert_eq!(alone.follows(), Err(NoFollow::Lease));
+        // A shared lease: the replication listener's port, once it takes
+        // its callers' names.
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let mut config = valid();
+        config.election.lease = election::LeasePlace::File(dir.path().join("lease"));
+        config.load_poll_interval = Duration::from_secs(30);
+        let mut replica = Controller::bind(config).await.expect("the listeners bind");
+        assert_eq!(replica.follows(), Err(NoFollow::Principal));
+        replica
+            .identity_as_told("replication")
+            .expect("a listener of the configuration");
+        let port = replica
+            .addresses()
+            .of(Scope::Replication)
+            .map(|addr| addr.port());
+        assert_eq!(replica.follows().ok(), port);
+        // Synced reads the configured poll interval, not the stock one.
+        assert_eq!(replica.shared.lag.within(), Duration::from_secs(30));
+    }
+
+    #[tokio::test]
+    async fn a_standbys_word_follows_its_sync_with_no_step_of_the_election() {
+        use std::{convert::Infallible, future::Future};
+
+        use tonic_health::{
+            pb::{
+                health_check_response::ServingStatus as Word, health_server::Health as _,
+                HealthCheckRequest,
+            },
+            server::{health_reporter, HealthService},
+        };
+
+        use crate::store::MemoryStore;
+
+        /// Runs the teller until the overall word is `wanted`; fails after
+        /// ten seconds.
+        async fn told(
+            teller: &mut (impl Future<Output = Infallible> + Unpin),
+            service: &HealthService,
+            wanted: Word,
+        ) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let overall = HealthCheckRequest {
+                    service: String::new(),
+                };
+                let answer = service.check(tonic::Request::new(overall)).await;
+                let word = answer.expect("the overall name is known").into_inner();
+                if word.status() == wanted {
+                    return;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "the word is not {wanted:?} after ten seconds"
+                );
+                tokio::select! {
+                    never = &mut *teller => match never {},
+                    () = tokio::time::sleep(Duration::from_millis(5)) => {}
+                }
+            }
+        }
+
+        let (elector, _phase, _steps, _) = fenced();
+        // A standby under a bound short enough to wait out, and long
+        // beside a slow host's pauses.
+        let bound = Duration::from_secs(1);
+        let lag = Arc::new(Lag::new(bound));
+        lag.follow();
+        let (_standing, stepped) = watch::channel(Standing::default());
+        let (phase, role) = readiness::channel(elector.fence(), stepped, Arc::clone(&lag));
+        phase.send_replace(Phase::Serving);
+        let (reporter, _server) = health_reporter();
+        let service = HealthService::from_health_reporter(reporter.clone());
+        let store = MemoryStore::new();
+        let reporters = [reporter];
+        let teller = tell_readiness(role, &reporters, None, true, "controller-0", &store);
+        tokio::pin!(teller);
+
+        // No frame yet: the word is told NOT_SERVING.
+        told(&mut teller, &service, Word::NotServing).await;
+        // A frame: the lag tells the turn and the word follows.
+        let first = Instant::now();
+        lag.applied(first);
+        told(&mut teller, &service, Word::Serving).await;
+        // No further frame: the word lapses with the sync by the clock
+        // alone, with no step of the election and no move of the run loop.
+        told(&mut teller, &service, Word::NotServing).await;
+        // An apply that straddled the lapse: its frame is dated inside the
+        // bound and written after the word turned. The word follows it.
+        lag.applied(first + bound - Duration::from_millis(1));
+        told(&mut teller, &service, Word::Serving).await;
     }
 }
