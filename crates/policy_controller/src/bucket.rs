@@ -1764,6 +1764,71 @@ mod tests {
         assert!(scorer.partitions.load().is_empty());
     }
 
+    /// The fence takes a leave's word before the leaver's partition forgets
+    /// it, and holds no lock across the walk.
+    #[test]
+    fn a_leaver_is_fenced_while_its_partition_still_lists_it() {
+        let scorer = Arc::new(scorer(NEVER, 1.5, 5));
+        let pool = pool(3);
+        led(&scorer, &pool, 0, SECOND);
+        let gone = pool[1].id;
+        let partition = of(&scorer, "m");
+        // A decision holds the leaver's partition while the feed's call
+        // runs: the call fences the leaver and waits for the partition.
+        let held = partition.lock();
+        let feed = {
+            let scorer = Arc::clone(&scorer);
+            std::thread::spawn(move || scorer.on_membership(&Membership::Removed(gone)))
+        };
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        let mut fenced = false;
+        while !fenced && Instant::now() < deadline {
+            fenced = scorer
+                .fence
+                .try_lock_for(std::time::Duration::from_millis(100))
+                .is_some_and(|fence| fence.holds(gone));
+            std::thread::yield_now();
+        }
+        assert!(
+            held.by_id.contains_key(&gone),
+            "the held partition lists it"
+        );
+        assert!(fenced, "no fence on the leaver while the walk waited");
+        // The call holds no fence while it waits for the partition: the
+        // fence stays free for a decision that lists.
+        let free = (0..10).all(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            scorer
+                .fence
+                .try_lock_for(std::time::Duration::from_millis(50))
+                .is_some()
+        });
+        assert!(free, "the fence is held across the walk");
+        drop(held);
+        feed.join().expect("the feed's call");
+        assert!(!partition.lock().by_id.contains_key(&gone));
+        led(&scorer, &pool, 0, 2 * SECOND);
+        assert_eq!(loads(&scorer).0.len(), 2, "an older view lists it nowhere");
+    }
+
+    /// A decision reads the fence for every row of its view: a fenced row
+    /// the filters dropped joins nowhere when another row of the view joins.
+    #[test]
+    fn a_fenced_row_the_filters_dropped_joins_nowhere_beside_a_new_row() {
+        let (scorer, pool) = booked(NEVER, 1.5, &[100, 40]);
+        let gone = pool[1].id;
+        scorer.on_membership(&Membership::Removed(gone));
+        let wider = self::pool(3);
+        let _ = led_by(&scorer, &prefill("m", 0, 2 * SECOND), &wider, &[0, 2]);
+        let listed: Vec<WorkerId> = of(&scorer, "m")
+            .lock()
+            .members
+            .iter()
+            .map(|member| member.id)
+            .collect();
+        assert_eq!(listed, [wider[0].id, wider[2].id]);
+    }
+
     #[test]
     fn the_feed_naming_a_worker_again_lifts_its_fence() {
         // Added: the worker joins from the next view that shows it.
