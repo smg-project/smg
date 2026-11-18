@@ -14,7 +14,10 @@ use rustc_hash::FxBuildHasher;
 use tracing::debug;
 
 use super::{
-    common::{intern_tenant, MatchResult, TenantId, CANCEL_CHECK_EVERY, MATCHED_TENANTS_CAP},
+    common::{
+        evict_in_passes, intern_tenant, BoundedEviction, MatchResult, Pass, TenantId,
+        CANCEL_CHECK_EVERY, MATCHED_TENANTS_CAP,
+    },
     RadixTree,
 };
 use crate::snapshot::{SnapshotNode, TreeSnapshot};
@@ -1403,9 +1406,54 @@ impl Tree {
             return true;
         }
         self.before_eviction();
-        let cancelled = self.evict_pass(max_size, keep_going);
+        let cancelled = self.evict_pass(max_size, None, keep_going).cancelled;
         self.after_eviction(cancelled);
         cancelled
+    }
+
+    /// [`Self::evict_tenant_by_size`] holding at most `max_entries` leaf
+    /// entries at once: each pass walks the tree keeping only the
+    /// `max_entries` least recently used leaves, evicts from them, and the
+    /// tree is walked again while it is over budget and a pass made progress,
+    /// up to a limit the first walk sets. `keep_going` is asked before every
+    /// pass and every [`CANCEL_CHECK_EVERY`] nodes walked or entries taken off
+    /// the heap within one. The order is the same LRU order, up to ties
+    /// between equal timestamps.
+    ///
+    /// A pass's heap holds at most `max_entries` entries instead of the tree's
+    /// (tenant, leaf) count (an entry leaves it as it is evicted, a promoted
+    /// parent taking its place), and its walk's stack the siblings still to
+    /// visit. `max_entries` 0 is taken as 1.
+    /// Each pass is a whole walk, so an eviction costs about the tree's size for
+    /// every `max_entries` entries it evicts: pick `max_entries` near the
+    /// expected eviction count, and bound the time with `keep_going`. This
+    /// path holds no node guard when it asks `keep_going`; the rule of
+    /// [`Self::evict_tenant_by_size_until`] (no writes to this tree) applies
+    /// all the same, so a callback is valid for either.
+    pub fn evict_tenant_by_size_bounded(
+        &self,
+        max_size: usize,
+        max_entries: usize,
+        keep_going: &dyn Fn() -> bool,
+    ) -> BoundedEviction {
+        if self.total_char_size() <= max_size {
+            return BoundedEviction::default();
+        }
+        self.before_eviction();
+        let max_entries = max_entries.max(1);
+        let done = evict_in_passes(
+            max_entries,
+            keep_going,
+            || self.total_char_size() > max_size,
+            || self.evict_pass(max_size, Some(max_entries), keep_going),
+        );
+        // A call stopped before its first pass walked nothing: as with
+        // `_until`'s stop at entry, the sweep and the "After" debug walk are
+        // skipped (`before_eviction` has run already).
+        if done.passes > 0 {
+            self.after_eviction(done.cancelled);
+        }
+        done
     }
 
     /// Once per eviction, before its passes.
@@ -1442,18 +1490,29 @@ impl Tree {
         }
     }
 
-    /// One eviction pass; whether `keep_going` stopped it (asked every
-    /// [`CANCEL_CHECK_EVERY`] nodes walked or entries taken off the heap).
-    fn evict_pass(&self, max_size: usize, keep_going: &dyn Fn() -> bool) -> bool {
+    /// One eviction pass, what it did ([`Pass`]); `keep_going` is asked every
+    /// [`CANCEL_CHECK_EVERY`] nodes walked or entries taken off the heap.
+    fn evict_pass(
+        &self,
+        max_size: usize,
+        max_entries: Option<usize>,
+        keep_going: &dyn Fn() -> bool,
+    ) -> Pass {
+        let mut pass = Pass::default();
         // Collect leaves across all tenants
         let mut stack = vec![Arc::clone(&self.root)];
         let mut walked = 0usize;
         let mut pq = BinaryHeap::new();
+        // A bounded pass keeps the `max_entries` oldest leaves: a max-heap,
+        // the most recently used on top, popped past the bound.
+        let mut oldest = BinaryHeap::new();
+        let mut leaves = 0usize;
 
         while let Some(curr) = stack.pop() {
             walked += 1;
             if walked.is_multiple_of(CANCEL_CHECK_EVERY) && !keep_going() {
-                return true;
+                pass.cancelled = true;
+                return pass;
             }
             for child in &curr.children {
                 stack.push(Arc::clone(child.value()));
@@ -1464,16 +1523,50 @@ impl Tree {
                 continue;
             }
 
+            if max_entries.is_some() {
+                pass.pairs += curr.tenant_last_access_time.len();
+            }
             // Add leaves to priority queue
             for tenant in Tree::leaf_of(&curr) {
                 if let Some(timestamp) = curr.tenant_last_access_time.get(tenant.as_ref()) {
-                    pq.push(Reverse(EvictionEntry {
-                        timestamp: *timestamp,
+                    let timestamp = *timestamp;
+                    leaves += 1;
+                    // A full bounded heap would pop a leaf newer than its
+                    // newest right back off: it is left out unbuilt.
+                    if max_entries.is_some_and(|bound| oldest.len() >= bound)
+                        && oldest
+                            .peek()
+                            .is_some_and(|newest: &EvictionEntry| timestamp > newest.timestamp)
+                    {
+                        continue;
+                    }
+                    let entry = EvictionEntry {
+                        timestamp,
                         tenant: Arc::clone(&tenant),
                         node: Arc::clone(&curr),
-                    }));
+                    };
+                    match max_entries {
+                        None => pq.push(Reverse(entry)),
+                        Some(bound) => {
+                            oldest.push(entry);
+                            if oldest.len() > bound {
+                                oldest.pop();
+                            }
+                        }
+                    }
                 }
             }
+        }
+        pass.truncated = max_entries.is_some_and(|bound| leaves > bound);
+        // A bounded pass that left leaves out evicts nothing newer than the
+        // newest it kept: a parent promoted past that waits for the next
+        // pass, behind the older leaves left out of this one.
+        let cutoff = pass
+            .truncated
+            .then(|| oldest.peek().map(|entry| entry.timestamp))
+            .flatten();
+        if max_entries.is_some() {
+            pq = oldest.into_iter().map(Reverse).collect();
         }
 
         // Process eviction until the tree-wide total obeys the budget
@@ -1484,7 +1577,8 @@ impl Tree {
             };
             popped += 1;
             if popped.is_multiple_of(CANCEL_CHECK_EVERY) && !keep_going() {
-                return true;
+                pass.cancelled = true;
+                break;
             }
             let EvictionEntry { tenant, node, .. } = entry;
 
@@ -1503,15 +1597,32 @@ impl Tree {
                         .contains_key(tenant.as_ref())
                 });
             if !is_still_leaf {
+                pass.stale += 1;
                 continue;
             }
 
-            // Decrement when removing tenant from node
-            let node_len = node.text.read().char_count();
+            // Concurrency: remove the tenant and read the chars it held under
+            // one `text` read guard. A split truncates the node and clones its
+            // tenant map in one `text` write section, and an attach credits
+            // its chars under the read guard (`match_and_insert_dyn`'s replay),
+            // so the chars subtracted are the ones this removal took. The one
+            // exception is pre-existing: `merge_nodes`' split clones the map
+            // before its write section, and the counts can drift either way
+            // there. Only a removal that found the tenant subtracts: one a
+            // concurrent eviction or removal beat to it has been counted
+            // already.
+            let removed_chars = {
+                let text = node.text.read();
+                node.tenant_last_access_time
+                    .remove(tenant.as_ref())
+                    .map(|_| text.char_count())
+            };
+            let Some(node_len) = removed_chars else {
+                pass.stale += 1;
+                continue;
+            };
             self.sub_tenant_chars(&tenant, node_len);
-
-            // Remove tenant from node
-            node.tenant_last_access_time.remove(tenant.as_ref());
+            pass.evicted += 1;
 
             // Get parent reference outside of the borrow scope
             // Use Weak::upgrade() to get a strong reference if the parent still exists
@@ -1538,7 +1649,10 @@ impl Tree {
 
                     if !has_child_with_tenant {
                         // Add parent to priority queue as new leaf
-                        if let Some(timestamp) = parent.tenant_last_access_time.get(tenant.as_ref())
+                        if let Some(timestamp) = parent
+                            .tenant_last_access_time
+                            .get(tenant.as_ref())
+                            .filter(|timestamp| cutoff.is_none_or(|cutoff| **timestamp <= cutoff))
                         {
                             pq.push(Reverse(EvictionEntry {
                                 timestamp: *timestamp,
@@ -1550,8 +1664,7 @@ impl Tree {
                 }
             }
         }
-
-        false
+        pass
     }
 
     pub fn get_tenant_char_count(&self) -> HashMap<String, usize> {

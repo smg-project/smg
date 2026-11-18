@@ -27,7 +27,10 @@ use rustc_hash::FxBuildHasher;
 use tracing::debug;
 
 use super::{
-    common::{intern_tenant, MatchResult, TenantId, CANCEL_CHECK_EVERY, MATCHED_TENANTS_CAP},
+    common::{
+        evict_in_passes, intern_tenant, BoundedEviction, MatchResult, Pass, TenantId,
+        CANCEL_CHECK_EVERY, MATCHED_TENANTS_CAP,
+    },
     RadixTree,
 };
 
@@ -1899,9 +1902,59 @@ impl TokenTree {
         if !keep_going() {
             return true;
         }
-        let cancelled = self.evict_pass(max_size, keep_going);
+        let cancelled = self.evict_pass(max_size, None, keep_going).cancelled;
         self.after_eviction(initial_total, max_size, cancelled);
         cancelled
+    }
+
+    /// [`Self::evict_tenant_by_size`] holding at most `max_entries` leaf
+    /// entries at once: each pass walks the tree keeping only the
+    /// `max_entries` leaves first in eviction order, evicts from them, and the
+    /// tree is walked again while it is over budget and a pass made progress,
+    /// up to a limit the first walk sets. `keep_going` is asked before every
+    /// pass and every [`CANCEL_CHECK_EVERY`] nodes walked or entries taken off
+    /// the heap within one.
+    ///
+    /// The order is the same, up to ties between equal priorities and one
+    /// case: when an evicted node stays for another tenant, its parent, now
+    /// this tenant's leaf, is not taken up in that pass (as in
+    /// [`Self::evict_tenant_by_size`], which leaves it to its next eviction),
+    /// and a bounded eviction takes it up at its next walk.
+    ///
+    /// A pass's heap holds at most `max_entries` entries instead of the tree's
+    /// (tenant, leaf) count (an entry leaves it as it is evicted, a promoted
+    /// parent taking its place), and its walk's stack the siblings still to
+    /// visit. `max_entries` 0 is taken as 1.
+    /// Each pass is a whole walk, so an eviction costs about the tree's size for
+    /// every `max_entries` entries it evicts: pick `max_entries` near the
+    /// expected eviction count, and bound the time with `keep_going`. This
+    /// path holds no node guard when it asks `keep_going`; the rule of
+    /// [`Self::evict_tenant_by_size_until`] (no writes to this tree) applies
+    /// all the same, so a callback is valid for either.
+    pub fn evict_tenant_by_size_bounded(
+        &self,
+        max_size: usize,
+        max_entries: usize,
+        keep_going: &dyn Fn() -> bool,
+    ) -> BoundedEviction {
+        let initial_total = self.total_token_size();
+        if initial_total <= max_size {
+            return BoundedEviction::default();
+        }
+        let max_entries = max_entries.max(1);
+        let done = evict_in_passes(
+            max_entries,
+            keep_going,
+            || self.total_token_size() > max_size,
+            || self.evict_pass(max_size, Some(max_entries), keep_going),
+        );
+        // A call stopped before its first pass walked nothing: as with
+        // `_until`'s stop at entry, the sweep and the closing debug line are
+        // skipped.
+        if done.passes > 0 {
+            self.after_eviction(initial_total, max_size, done.cancelled);
+        }
+        done
     }
 
     /// Once per eviction, after its passes (and their holds on the nodes)
@@ -1929,67 +1982,183 @@ impl TokenTree {
         );
     }
 
-    /// One eviction pass; whether `keep_going` stopped it (asked every
-    /// [`CANCEL_CHECK_EVERY`] nodes walked or entries taken off the heap).
-    fn evict_pass(&self, max_size: usize, keep_going: &dyn Fn() -> bool) -> bool {
+    /// One eviction pass, what it did ([`Pass`]); `keep_going` is asked every
+    /// [`CANCEL_CHECK_EVERY`] nodes walked or entries taken off the heap.
+    fn evict_pass(
+        &self,
+        max_size: usize,
+        max_entries: Option<usize>,
+        keep_going: &dyn Fn() -> bool,
+    ) -> Pass {
         use std::{cmp::Reverse, collections::BinaryHeap};
 
-        // Min-heap by eviction priority (policy-dependent), across all tenants
-        let mut heap: BinaryHeap<Reverse<((i64, u64), usize)>> = BinaryHeap::new();
-        let mut leaf_data: Vec<(NodeRef, TenantId)> = Vec::new();
-        // Every leaf, its priority computed as it enters the heap.
-        let mut leaves: Vec<(NodeRef, TenantId, u64)> = Vec::new();
-        let mut walked = 0usize;
-        if !self.collect_all_tenant_leaves(&self.root, &mut leaves, &mut walked, keep_going) {
-            return true;
-        }
-        leaf_data.reserve(leaves.len());
-        for (node, tenant, ts) in leaves.drain(..) {
-            let priority = self.compute_eviction_priority(&node, ts);
-            heap.push(Reverse((priority, leaf_data.len())));
-            leaf_data.push((node, tenant));
-        }
+        let mut pass = Pass::default();
 
-        let mut cancelled = false;
+        // Min-heap by eviction priority (policy-dependent), across all
+        // tenants; `seq` keeps the order the entries entered in, for ties.
+        let mut heap: BinaryHeap<Reverse<RankedLeaf>> = BinaryHeap::new();
+        let mut seq = 0usize;
+        let mut push = |heap: &mut BinaryHeap<_>, priority, node, tenant| {
+            heap.push(Reverse(RankedLeaf {
+                priority,
+                seq,
+                node,
+                tenant,
+            }));
+            seq += 1;
+        };
+        // A bounded pass that left leaves out evicts nothing later in order
+        // than the last it kept: a parent promoted past that waits for the
+        // next pass, behind the leaves left out of this one.
+        let cutoff = match max_entries {
+            None => {
+                // Every leaf, its priority computed as it enters the heap.
+                let mut leaves: Vec<(NodeRef, TenantId, u64)> = Vec::new();
+                let mut walked = 0usize;
+                if !self.collect_all_tenant_leaves(&self.root, &mut leaves, &mut walked, keep_going)
+                {
+                    pass.cancelled = true;
+                    return pass;
+                }
+                heap.reserve(leaves.len());
+                for (node, tenant, ts) in leaves.drain(..) {
+                    let priority = self.compute_eviction_priority(&node, ts);
+                    push(&mut heap, priority, node, tenant);
+                }
+                None
+            }
+            // The priorities the kept leaves were chosen by: under LFU a hit
+            // count may move during the pass, and the cutoff and the heap
+            // must agree.
+            Some(bound) => {
+                let mut kept: Vec<(NodeRef, TenantId, (i64, u64))> = Vec::new();
+                let Some(cutoff) =
+                    self.collect_first_tenant_leaves(bound, &mut kept, &mut pass, keep_going)
+                else {
+                    pass.cancelled = true;
+                    return pass;
+                };
+                heap.reserve(kept.len());
+                for (node, tenant, priority) in kept.drain(..) {
+                    push(&mut heap, priority, node, tenant);
+                }
+                cutoff
+            }
+        };
         let mut popped = 0usize;
         while self.total_token_size() > max_size {
-            let Some(Reverse((_, idx))) = heap.pop() else {
+            let Some(Reverse(RankedLeaf { node, tenant, .. })) = heap.pop() else {
                 break;
             };
             popped += 1;
             if popped.is_multiple_of(CANCEL_CHECK_EVERY) && !keep_going() {
-                cancelled = true;
+                pass.cancelled = true;
                 break;
             }
 
-            let (node, tenant) = {
-                let (node, tenant) = &leaf_data[idx];
-                (Arc::clone(node), Arc::clone(tenant))
-            };
             // Verify this node is still a leaf for this tenant: a concurrent
             // insert may have attached the tenant to a descendant.
             if !self.is_tenant_leaf(&node, &tenant) {
+                pass.stale += 1;
                 continue;
             }
             let (node_tokens, parent_became_leaf) = self.remove_tenant_and_cleanup(&node, &tenant);
-            if node_tokens > 0 {
+            if node_tokens == 0 {
+                // Nothing freed (a concurrent removal took the tenant first).
+                pass.stale += 1;
+            } else {
+                pass.evicted += 1;
                 self.sub_tenant_tokens(&tenant, node_tokens);
 
                 // Incremental leaf promotion (matching SGLang's approach)
                 if let Some((parent_node, parent_ts)) = parent_became_leaf {
                     let priority = self.compute_eviction_priority(&parent_node, parent_ts);
-                    let new_idx = leaf_data.len();
-                    leaf_data.push((parent_node, tenant));
-                    heap.push(Reverse((priority, new_idx)));
+                    if cutoff.is_none_or(|cutoff| priority <= cutoff) {
+                        push(&mut heap, priority, parent_node, tenant);
+                    }
                 }
             }
         }
 
-        // The pass's own holds on the leaves and the promoted parents go
-        // first, so a node this pass detached counts as gone below.
+        // The pass's own holds on the entries left in the heap go first, so
+        // a node this pass detached counts as gone below.
         drop(heap);
-        drop(leaf_data);
-        cancelled
+        pass
+    }
+
+    /// [`Self::collect_all_tenant_leaves`] keeping only the `bound` leaves
+    /// first in eviction order: a max-heap of them, the last in order on top,
+    /// popped past the bound, so the heap holds `bound` entries at most (the
+    /// walk's stack holds the siblings still to visit).
+    /// Returns the priority of the last kept when leaves were left out, or
+    /// `None` when `keep_going` stopped the walk (asked every
+    /// [`CANCEL_CHECK_EVERY`] nodes); counts the (tenant, node) pairs it saw
+    /// and whether it left leaves out in `pass`.
+    fn collect_first_tenant_leaves(
+        &self,
+        bound: usize,
+        result: &mut Vec<(NodeRef, TenantId, (i64, u64))>,
+        pass: &mut Pass,
+        keep_going: &dyn Fn() -> bool,
+    ) -> Option<Option<(i64, u64)>> {
+        use std::collections::BinaryHeap;
+
+        let mut kept: BinaryHeap<RankedLeaf> = BinaryHeap::new();
+        let mut leaves = 0usize;
+        let mut seq = 0;
+        let mut stack = vec![Arc::clone(&self.root)];
+        let mut walked = 0usize;
+        while let Some(node) = stack.pop() {
+            walked += 1;
+            if walked.is_multiple_of(CANCEL_CHECK_EVERY) && !keep_going() {
+                return None;
+            }
+            for child in &node.children {
+                stack.push(Arc::clone(child.value()));
+            }
+            // Root is never eligible for eviction
+            if Arc::ptr_eq(&node, &self.root) {
+                continue;
+            }
+            for entry in &node.tenant_last_access_time {
+                pass.pairs += 1;
+                let tenant = entry.key();
+                let any_child_has_tenant = node.children.iter().any(|child| {
+                    child
+                        .value()
+                        .tenant_last_access_time
+                        .contains_key(tenant.as_ref())
+                });
+                if any_child_has_tenant {
+                    continue;
+                }
+                leaves += 1;
+                let priority = self.compute_eviction_priority(&node, *entry.value());
+                // A full heap would pop a leaf no earlier than its last right
+                // back off (a later `seq` breaks the tie): left out unbuilt.
+                if kept.len() >= bound && kept.peek().is_some_and(|last| priority >= last.priority)
+                {
+                    continue;
+                }
+                kept.push(RankedLeaf {
+                    priority,
+                    seq,
+                    node: Arc::clone(&node),
+                    tenant: Arc::clone(tenant),
+                });
+                seq += 1;
+                if kept.len() > bound {
+                    kept.pop();
+                }
+            }
+        }
+        pass.truncated = leaves > bound;
+        let cutoff = pass
+            .truncated
+            .then(|| kept.peek().map(|k| k.priority))
+            .flatten();
+        result.extend(kept.into_iter().map(|k| (k.node, k.tenant, k.priority)));
+        Some(cutoff)
     }
 
     /// Collect `(node, tenant, ts)` for every tenant-leaf of every tenant;
@@ -2046,6 +2215,36 @@ impl TokenTree {
     /// for mesh sync (eventual consistency).
     pub fn iter_entries(&self) -> EntriesIter {
         EntriesIter::new(self)
+    }
+}
+
+/// A (tenant, leaf) entry of an eviction heap, ordered by its eviction
+/// priority and then by `seq`, the order it entered in. It owns its node and
+/// tenant, so an entry the eviction takes off the heap lets them go at once.
+struct RankedLeaf {
+    priority: (i64, u64),
+    seq: usize,
+    node: NodeRef,
+    tenant: TenantId,
+}
+
+impl PartialEq for RankedLeaf {
+    fn eq(&self, other: &Self) -> bool {
+        (self.priority, self.seq) == (other.priority, other.seq)
+    }
+}
+
+impl Eq for RankedLeaf {}
+
+impl PartialOrd for RankedLeaf {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for RankedLeaf {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        (self.priority, self.seq).cmp(&(other.priority, other.seq))
     }
 }
 
