@@ -18,6 +18,7 @@ use parking_lot::{Mutex, MutexGuard};
 use rustc_hash::{FxHashMap, FxHasher};
 
 use crate::{
+    counts::with_counts,
     decision::{Target, Targets, MAX_TARGETS},
     framework::{
         top_drawn, top_pass, Filter, Front, Narrowed, Picker, Scorer, TieBand, DRAW_BOUND,
@@ -285,9 +286,11 @@ impl Scorer for LeastRequests {
         kept: &[u32],
         out: &mut [f32],
     ) -> TieBand {
-        for (slot, &i) in out.iter_mut().zip(kept) {
-            *slot = facts.in_flight(&candidates[i as usize]) as f32;
-        }
+        with_counts!(facts, |counts| {
+            for (slot, &i) in out.iter_mut().zip(kept) {
+                *slot = counts(&candidates[i as usize]) as f32;
+            }
+        });
         normalize_costs(out);
         TieBand::NORMALIZED
     }
@@ -949,20 +952,22 @@ impl Scorer for LeastLoad {
         let mut reporting = 0usize;
         {
             let tally = self.credits.tally.load();
-            for (slot, &i) in out.iter_mut().zip(kept) {
-                let c = &candidates[i as usize];
-                *slot = match c.load {
-                    Some(_) => {
-                        let (tokens, requests) =
-                            tally.get(&(c.id, c.dp_rank)).map_or((0, 0), |since| {
-                                since.credit_through(c.load_sampled_at_micros)
-                            });
-                        reporting += 1;
-                        self.credit_work(c, facts.in_flight(c), tokens, requests)
-                    }
-                    None => PENDING,
-                };
-            }
+            with_counts!(facts, |counts| {
+                for (slot, &i) in out.iter_mut().zip(kept) {
+                    let c = &candidates[i as usize];
+                    *slot = match c.load {
+                        Some(_) => {
+                            let (tokens, requests) =
+                                tally.get(&(c.id, c.dp_rank)).map_or((0, 0), |since| {
+                                    since.credit_through(c.load_sampled_at_micros)
+                                });
+                            reporting += 1;
+                            self.credit_work(c, counts(c), tokens, requests)
+                        }
+                        None => PENDING,
+                    };
+                }
+            });
         }
         for (slot, &i) in out.iter_mut().zip(kept) {
             if let Some(r) = candidates[i as usize].load {
@@ -981,16 +986,18 @@ impl Scorer for LeastLoad {
                 peer_baseline = 0.0;
             }
         }
-        for (slot, &i) in out.iter_mut().zip(kept) {
-            if *slot == PENDING {
-                *slot = self.unreported_cost(
-                    facts.in_flight(&candidates[i as usize]),
-                    nominal,
-                    fleet_has_loads,
-                    peer_baseline,
-                );
+        with_counts!(facts, |counts| {
+            for (slot, &i) in out.iter_mut().zip(kept) {
+                if *slot == PENDING {
+                    *slot = self.unreported_cost(
+                        counts(&candidates[i as usize]),
+                        nominal,
+                        fleet_has_loads,
+                        peer_baseline,
+                    );
+                }
             }
-        }
+        });
         // The band of a microsecond of expected wait on the normalized scale:
         // exact for one scorer, additive under several.
         let span = normalize_costs(out);
@@ -1131,25 +1138,27 @@ impl Scorer for ResidentWork {
         let mut reporting = 0usize;
         {
             let tally = self.credits.tally.load();
-            for (slot, &i) in out.iter_mut().zip(kept) {
-                let c = &candidates[i as usize];
-                // A report releases the dispatches it reflects whatever the
-                // score reads of them: a rank whose report counts no
-                // resident tokens would hold its credit at the bound.
-                let reported = c.load.map(|r| {
-                    let credit = tally.get(&(c.id, c.dp_rank)).map_or((0, 0), |since| {
-                        since.credit_through(c.load_sampled_at_micros)
+            with_counts!(facts, |counts| {
+                for (slot, &i) in out.iter_mut().zip(kept) {
+                    let c = &candidates[i as usize];
+                    // A report releases the dispatches it reflects whatever the
+                    // score reads of them: a rank whose report counts no
+                    // resident tokens would hold its credit at the bound.
+                    let reported = c.load.map(|r| {
+                        let credit = tally.get(&(c.id, c.dp_rank)).map_or((0, 0), |since| {
+                            since.credit_through(c.load_sampled_at_micros)
+                        });
+                        (r, credit)
                     });
-                    (r, credit)
-                });
-                *slot = match reported {
-                    Some((r, (tokens, requests))) if r.resident_counted => {
-                        reporting += 1;
-                        self.reported_cost(facts.in_flight(c), r, tokens, requests)
-                    }
-                    _ => PENDING,
-                };
-            }
+                    *slot = match reported {
+                        Some((r, (tokens, requests))) if r.resident_counted => {
+                            reporting += 1;
+                            self.reported_cost(counts(c), r, tokens, requests)
+                        }
+                        _ => PENDING,
+                    };
+                }
+            });
         }
         let fleet_reports = reporting > 0;
         let peer_baseline = if fleet_reports && reporting < kept.len() {
@@ -1161,16 +1170,18 @@ impl Scorer for ResidentWork {
             0.0
         };
         let in_flight_work = self.mean_prefill_tokens as f32 + self.request_tokens as f32;
-        for (slot, &i) in out.iter_mut().zip(kept) {
-            if *slot == PENDING {
-                let in_flight = facts.in_flight(&candidates[i as usize]) as f32;
-                *slot = if fleet_reports {
-                    peer_baseline + in_flight * in_flight_work
-                } else {
-                    in_flight
-                };
+        with_counts!(facts, |counts| {
+            for (slot, &i) in out.iter_mut().zip(kept) {
+                if *slot == PENDING {
+                    let in_flight = counts(&candidates[i as usize]) as f32;
+                    *slot = if fleet_reports {
+                        peer_baseline + in_flight * in_flight_work
+                    } else {
+                        in_flight
+                    };
+                }
             }
-        }
+        });
         // The least-load scorer's band, on a score in tokens: equal work is
         // a tie, drawn by the picker.
         let span = normalize_costs(out);
@@ -2045,50 +2056,52 @@ impl Picker for CountFirst {
         candidates: &[Candidate],
         kept: &mut [u32],
     ) -> Narrowed {
-        let count = |row: u32| facts.in_flight(&candidates[row as usize]);
-        let Some(fewest) = kept.iter().map(|&row| count(row)).min() else {
-            return Narrowed::all(0);
-        };
-        let mut compared = 0usize;
-        for i in 0..kept.len() {
-            if count(kept[i]) == fewest {
-                kept.swap(compared, i);
-                compared += 1;
-            }
-        }
-        // The alternates the target list still has room for once the
-        // compared set is ordered: the next by count, equal counts drawn.
-        let alternates = MAX_TARGETS
-            .saturating_sub(compared)
-            .min(kept.len() - compared);
-        // The order of equal counts is drawn from a stream of its own, so it
-        // says nothing of the tie among the fewest (the seed's stream, which
-        // `pick` reads) nor of the draws a pair plan's decode side makes.
-        let mut draw = Draw::new(facts.seed ^ ALTERNATES_STREAM);
-        for slot in compared..compared + alternates {
-            let mut next = slot;
-            let mut tied = 1usize;
-            for i in slot + 1..kept.len() {
-                match count(kept[i]).cmp(&count(kept[next])) {
-                    std::cmp::Ordering::Less => {
-                        next = i;
-                        tied = 1;
-                    }
-                    std::cmp::Ordering::Equal => {
-                        tied += 1;
-                        if draw.below(tied) == 0 {
-                            next = i;
-                        }
-                    }
-                    std::cmp::Ordering::Greater => {}
+        with_counts!(facts, |counts| {
+            let count = |row: u32| counts(&candidates[row as usize]);
+            let Some(fewest) = kept.iter().map(|&row| count(row)).min() else {
+                return Narrowed::all(0);
+            };
+            let mut compared = 0usize;
+            for i in 0..kept.len() {
+                if count(kept[i]) == fewest {
+                    kept.swap(compared, i);
+                    compared += 1;
                 }
             }
-            kept.swap(slot, next);
-        }
-        Narrowed {
-            compared,
-            alternates,
-        }
+            // The alternates the target list still has room for once the
+            // compared set is ordered: the next by count, equal counts drawn.
+            let alternates = MAX_TARGETS
+                .saturating_sub(compared)
+                .min(kept.len() - compared);
+            // The order of equal counts is drawn from a stream of its own, so it
+            // says nothing of the tie among the fewest (the seed's stream, which
+            // `pick` reads) nor of the draws a pair plan's decode side makes.
+            let mut draw = Draw::new(facts.seed ^ ALTERNATES_STREAM);
+            for slot in compared..compared + alternates {
+                let mut next = slot;
+                let mut tied = 1usize;
+                for i in slot + 1..kept.len() {
+                    match count(kept[i]).cmp(&count(kept[next])) {
+                        std::cmp::Ordering::Less => {
+                            next = i;
+                            tied = 1;
+                        }
+                        std::cmp::Ordering::Equal => {
+                            tied += 1;
+                            if draw.below(tied) == 0 {
+                                next = i;
+                            }
+                        }
+                        std::cmp::Ordering::Greater => {}
+                    }
+                }
+                kept.swap(slot, next);
+            }
+            Narrowed {
+                compared,
+                alternates,
+            }
+        })
     }
 
     fn pick(
@@ -2100,34 +2113,36 @@ impl Picker for CountFirst {
         band: TieBand,
         out: &mut Targets,
     ) {
-        let count = |row: u32| facts.in_flight(&candidates[row as usize]);
-        // The ties are drawn from the seed's own stream, as the best picker
-        // draws them: the alternates' order has a stream of its own.
-        let mut draw = Draw::new(facts.seed);
-        // The narrowing leaves one count, and among equal counts the pick is
-        // the best picker's.
-        if kept.windows(2).all(|pair| count(pair[0]) == count(pair[1])) {
-            return push_ranked::<false>(draw, candidates, kept, scores, band, out);
-        }
-        // Rows that were never narrowed: the same rule a slot, among the
-        // fewest in flight of the rows left. Every row here came with a
-        // score, so equal counts past the fewest go by score too, where the
-        // narrowing draws them unscored.
-        let mut taken = [usize::MAX; MAX_TARGETS];
-        for slot in 0..MAX_TARGETS.min(kept.len()) {
-            let left = |i: usize| !taken[..slot].contains(&i);
-            let rows = kept.iter().enumerate();
-            let fewest = rows
-                .filter(|&(i, _)| left(i))
-                .map(|(_, &row)| count(row))
-                .min();
-            let open = |i: usize| left(i) && Some(count(kept[i])) == fewest;
-            let Some(b) = draw_in_band(scores, band, &mut draw, open) else {
-                break;
-            };
-            taken[slot] = b;
-            out.push(target_of(&candidates[kept[b] as usize]));
-        }
+        with_counts!(facts, |counts| {
+            let count = |row: u32| counts(&candidates[row as usize]);
+            // The ties are drawn from the seed's own stream, as the best picker
+            // draws them: the alternates' order has a stream of its own.
+            let mut draw = Draw::new(facts.seed);
+            // The narrowing leaves one count, and among equal counts the pick is
+            // the best picker's.
+            if kept.windows(2).all(|pair| count(pair[0]) == count(pair[1])) {
+                return push_ranked::<false>(draw, candidates, kept, scores, band, out);
+            }
+            // Rows that were never narrowed: the same rule a slot, among the
+            // fewest in flight of the rows left. Every row here came with a
+            // score, so equal counts past the fewest go by score too, where the
+            // narrowing draws them unscored.
+            let mut taken = [usize::MAX; MAX_TARGETS];
+            for slot in 0..MAX_TARGETS.min(kept.len()) {
+                let left = |i: usize| !taken[..slot].contains(&i);
+                let rows = kept.iter().enumerate();
+                let fewest = rows
+                    .filter(|&(i, _)| left(i))
+                    .map(|(_, &row)| count(row))
+                    .min();
+                let open = |i: usize| left(i) && Some(count(kept[i])) == fewest;
+                let Some(b) = draw_in_band(scores, band, &mut draw, open) else {
+                    break;
+                };
+                taken[slot] = b;
+                out.push(target_of(&candidates[kept[b] as usize]));
+            }
+        });
     }
 }
 

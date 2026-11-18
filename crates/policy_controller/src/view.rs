@@ -623,7 +623,10 @@ pub struct Candidate {
     /// takes one row and no index, so a filter that read the affinity
     /// column there would have to read it at the position; no filter of
     /// this crate does. A debug build asserts that the two agree where a
-    /// decision takes its inputs; a release build does not check.
+    /// decision takes its inputs; a release build does not check. A count
+    /// the host lent beside its rows is read at the position too
+    /// ([`RequestFacts::in_flight`]): the row's place in the host's pool,
+    /// whatever its index.
     pub position: u32,
     pub id: WorkerId,
     pub role: Role,
@@ -724,6 +727,10 @@ pub struct Header<'a> {
 
 /// The mean of the in-flight counts of `rows` of `candidates`; zero over no
 /// row.
+// Forced into its callers: the walk is two small loops, one a kind of rows.
+// Out of line they cost an affinity pass a call and one instruction a row
+// more than the one loop that stood inside the pass.
+#[inline(always)]
 pub(crate) fn mean_in_flight(
     facts: &RequestFacts<'_>,
     candidates: &[Candidate],
@@ -732,10 +739,10 @@ pub(crate) fn mean_in_flight(
     if rows.is_empty() {
         return 0.0;
     }
-    let sum: u64 = rows
+    let sum: u64 = crate::counts::with_counts!(facts, |counts| rows
         .iter()
-        .map(|&i| u64::from(facts.in_flight(&candidates[i as usize])))
-        .sum();
+        .map(|&i| u64::from(counts(&candidates[i as usize])))
+        .sum());
     sum as f32 / rows.len() as f32
 }
 
@@ -801,7 +808,7 @@ pub struct RequestFacts<'a> {
     /// the count itself. A pair takes none: a position is a place in one
     /// pool, and a pair's rows carry what counts their host wrote.
     /// In-process only.
-    pub lent_in_flight: Option<crate::counts::LentCounts<'a>>,
+    pub lent_in_flight: Option<&'a crate::counts::LentCounts<'a>>,
     /// The candidates' affinity facts, by index in the candidate slice the
     /// decision is made over: the one column the affinity stages read, in
     /// the candidates' own order. It is EMPTY or holds exactly one entry a

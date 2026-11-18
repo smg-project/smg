@@ -26,6 +26,7 @@ use parking_lot::Mutex;
 use rustc_hash::FxHashMap;
 
 use crate::{
+    counts::with_counts,
     framework::{Front, Scorer, Spread, TieBand},
     lease::{Lifecycle, Membership},
     spec::{AffinitySource, KvPressureParams, Needs, PrefixAffinityParams, WarmupSliceParams},
@@ -294,34 +295,36 @@ struct Pass<'a> {
 impl Pass<'_> {
     /// The slot of the least-loaded kept row `wanted` admits, equal loads
     /// drawn uniformly from the decision's seed. `wanted` is asked with
-    /// the row's requests in flight, read once a row: a count lent beside
-    /// the rows may move under the pass.
+    /// the row's requests in flight, the decision's one number for the
+    /// row.
     fn least_loaded(
         &mut self,
         mut wanted: impl FnMut(u32, &Candidate, u32) -> bool,
     ) -> Option<usize> {
         let mut pick: Option<(usize, u32)> = None;
         let mut tied = 0usize;
-        for (slot, &i) in self.kept.iter().enumerate() {
-            let c = &self.candidates[i as usize];
-            let held = self.facts.in_flight(c);
-            if !wanted(i, c, held) {
-                continue;
-            }
-            match pick {
-                Some((_, load)) if held > load => {}
-                Some((_, load)) if held == load => {
-                    tied += 1;
-                    if self.draw.below(tied + 1) == 0 {
-                        pick = Some((slot, load));
+        with_counts!(self.facts, |counts| {
+            for (slot, &i) in self.kept.iter().enumerate() {
+                let c = &self.candidates[i as usize];
+                let held = counts(c);
+                if !wanted(i, c, held) {
+                    continue;
+                }
+                match pick {
+                    Some((_, load)) if held > load => {}
+                    Some((_, load)) if held == load => {
+                        tied += 1;
+                        if self.draw.below(tied + 1) == 0 {
+                            pick = Some((slot, load));
+                        }
+                    }
+                    _ => {
+                        pick = Some((slot, held));
+                        tied = 0;
                     }
                 }
-                _ => {
-                    pick = Some((slot, held));
-                    tied = 0;
-                }
             }
-        }
+        });
         pick.map(|(slot, _)| slot)
     }
 }
@@ -330,6 +333,9 @@ impl Pass<'_> {
 /// engine set it
 /// ([`NamedAffinity::mean_in_flight`]),
 /// else the kept rows'.
+// Forced into the stage's passes with the mean it reads
+// ([`mean_in_flight`]): out of line the mean's walk costs a pass a call.
+#[inline(always)]
 fn spill_mean(
     drawn: Option<f32>,
     facts: &RequestFacts<'_>,
@@ -429,21 +435,23 @@ impl PrefixAffinity {
             0.0
         };
         let mut entry = reads();
-        for (o, &i) in out.iter_mut().zip(kept) {
-            let c = &candidates[i as usize];
-            let load = facts.in_flight(c) as f32;
-            // A match above zero was read from a feed that holds entries.
-            *o = if best > 0
-                && self.matched(entry(i), request_blocks) == best
-                && !self.gates.over(load, avg, held)
-            {
-                1.0
-            } else if !self.gates.over(load, avg, 0.0) {
-                0.5
-            } else {
-                0.0
-            };
-        }
+        with_counts!(facts, |counts| {
+            for (o, &i) in out.iter_mut().zip(kept) {
+                let c = &candidates[i as usize];
+                let load = counts(c) as f32;
+                // A match above zero was read from a feed that holds entries.
+                *o = if best > 0
+                    && self.matched(entry(i), request_blocks) == best
+                    && !self.gates.over(load, avg, held)
+                {
+                    1.0
+                } else if !self.gates.over(load, avg, 0.0) {
+                    0.5
+                } else {
+                    0.0
+                };
+            }
+        });
         TieBand(0.0)
     }
 
@@ -483,13 +491,15 @@ impl PrefixAffinity {
             0.0
         };
         let (holder, anyone) = (self.gates.spill(avg, held), self.gates.spill(avg, 0.0));
-        for (o, &i) in out.iter_mut().zip(kept) {
-            let load = facts.in_flight(&candidates[i as usize]) as f32;
-            // A match above zero was read into this slot.
-            let deepest = (best > 0) & (o.to_bits() == best);
-            let own = usize::from(deepest & !holder.over(load));
-            *o = [0.0, 0.5, 1.0, 1.0][own << 1 | usize::from(!anyone.over(load))];
-        }
+        with_counts!(facts, |counts| {
+            for (o, &i) in out.iter_mut().zip(kept) {
+                let load = counts(&candidates[i as usize]) as f32;
+                // A match above zero was read into this slot.
+                let deepest = (best > 0) & (o.to_bits() == best);
+                let own = usize::from(deepest & !holder.over(load));
+                *o = [0.0, 0.5, 1.0, 1.0][own << 1 | usize::from(!anyone.over(load))];
+            }
+        });
         TieBand(0.0)
     }
 

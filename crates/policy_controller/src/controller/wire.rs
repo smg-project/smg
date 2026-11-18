@@ -311,7 +311,7 @@ impl Checked {
                 // No decider asks its view for a pinned worker's row.
                 pinned_at: 0,
                 // What the leases book, beside rows a view lent.
-                lent_in_flight: view.in_flight,
+                lent_in_flight: view.in_flight.as_ref(),
             },
             &Constraints {
                 excluded: &lists.excluded,

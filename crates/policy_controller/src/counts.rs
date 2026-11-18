@@ -13,6 +13,8 @@ use std::sync::{
     OnceLock,
 };
 
+use crate::view::Candidate;
+
 /// The place of one worker's count in the store's counts ([`Counts`]). A
 /// member is given its slot at the membership write that first lists it
 /// and keeps it while it stands, and no other member is given it after.
@@ -122,21 +124,25 @@ impl Counts {
         slots: &'a [Slot],
         kept: &'a mut KeptCounts,
     ) -> LentCounts<'a> {
-        let (kept, stamp) = kept.open(slots.len());
-        self.lent(slots, kept, stamp)
+        kept.open(slots.len());
+        self.lent(slots, kept)
     }
 
-    /// The table beside `slots` with the cells a decision of `stamp` keeps
-    /// its reads in.
-    fn lent<'a>(&'a self, slots: &'a [Slot], kept: &'a [AtomicU64], stamp: u32) -> LentCounts<'a> {
-        let first = self.pieces.first().and_then(OnceLock::get);
+    /// The table beside `slots` with the cells a decision keeps its reads
+    /// in, as they stand.
+    fn lent<'a>(&'a self, slots: &'a [Slot], kept: &'a KeptCounts) -> LentCounts<'a> {
         LentCounts {
-            first: first.map_or(&[], |cells| cells),
             counts: self,
             slots,
             kept,
-            stamp,
         }
+    }
+
+    /// The table's first piece: the cells of the first 1,024 members that
+    /// ever stood, and no cell before the first slot is given.
+    fn first(&self) -> &[AtomicU32] {
+        let first = self.pieces.first().and_then(OnceLock::get);
+        first.map_or(&[], |cells| cells)
     }
 
     fn cell(&self, slot: Slot) -> Option<&AtomicU32> {
@@ -172,23 +178,85 @@ impl Counts {
 /// stage reads costs nothing.
 #[derive(Clone, Copy)]
 pub struct LentCounts<'a> {
-    /// The table's first piece, read with no search: the cells of the
-    /// first 1,024 members that ever stood.
-    first: &'a [AtomicU32],
     counts: &'a Counts,
     /// Each row's slot, by the row's position.
     slots: &'a [Slot],
     /// What the decision read of each row, by the row's position, under
-    /// its stamp ([`KeptCounts`]).
-    kept: &'a [AtomicU64],
-    stamp: u32,
+    /// its stamp.
+    kept: &'a KeptCounts,
 }
 
-impl LentCounts<'_> {
+impl<'a> LentCounts<'a> {
     /// The count of the row at `position`, one number for the decision:
     /// zero past the rows.
     #[inline]
     pub(crate) fn at(&self, position: u32) -> u32 {
+        self.run().at(position)
+    }
+
+    /// The table's first piece, the slots and the decision's cells, each
+    /// found once for the reads of one run.
+    #[inline]
+    pub(crate) fn run(&self) -> LentRun<'a> {
+        LentRun {
+            first: self.counts.first(),
+            counts: self.counts,
+            slots: self.slots,
+            kept: &self.kept.cells,
+            stamp: self.kept.stamp,
+        }
+    }
+}
+
+/// Runs a walk of rows with the reader of the rows' requests in flight, a
+/// function of a row. The walk is written once and compiled for each kind
+/// of rows: over rows that carry their counts the reader returns the row's
+/// field, beside a lent table it asks the table's [`LentRun`]. The
+/// request's facts are asked which once a walk, so no read tests it and
+/// the lent table's parts are found once. A walk reads what the one reader
+/// reads ([`RequestFacts::in_flight`](crate::RequestFacts::in_flight)),
+/// and a stage that reads a row or two asks that.
+macro_rules! with_counts {
+    ($facts:expr, |$counts:ident| $walk:expr) => {
+        match $facts.lent_in_flight {
+            Some(lent) => {
+                let run = lent.run();
+                let $counts = move |row: &$crate::view::Candidate| run.of(row);
+                $walk
+            }
+            None => {
+                let $counts = |row: &$crate::view::Candidate| row.in_flight;
+                $walk
+            }
+        }
+    };
+}
+pub(crate) use with_counts;
+
+/// The reader of a run beside a lent table: each part of the table by
+/// value, so a read loads none of them again.
+#[derive(Clone, Copy)]
+pub(crate) struct LentRun<'a> {
+    /// The table's first piece, read with no search.
+    first: &'a [AtomicU32],
+    counts: &'a Counts,
+    slots: &'a [Slot],
+    /// The decision's cells and the stamp its reads are kept under.
+    kept: &'a [AtomicU64],
+    stamp: u32,
+}
+
+impl LentRun<'_> {
+    /// The requests in flight of `row`, the decision's one number for it.
+    #[inline]
+    pub(crate) fn of(&self, row: &Candidate) -> u32 {
+        self.at(row.position)
+    }
+
+    /// The count of the row at `position`, one number for the decision:
+    /// zero past the rows.
+    #[inline]
+    fn at(&self, position: u32) -> u32 {
         let Some(kept) = self.kept.get(position as usize) else {
             return 0;
         };
@@ -234,7 +302,7 @@ impl KeptCounts {
     /// unread. One add a decision. The stamps come round once in 2^32
     /// decisions, and every cell is cleared then: a count kept under the
     /// first of them would read as this decision's.
-    fn open(&mut self, rows: usize) -> (&[AtomicU64], u32) {
+    fn open(&mut self, rows: usize) {
         if self.cells.len() < rows {
             self.cells.resize_with(rows, AtomicU64::default);
         }
@@ -245,7 +313,6 @@ impl KeptCounts {
             }
             self.stamp = 1;
         }
-        (&self.cells, self.stamp)
     }
 }
 
@@ -259,21 +326,23 @@ impl std::fmt::Debug for LentCounts<'_> {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use std::sync::atomic::AtomicU64;
+    use std::cell::OnceCell;
 
-    use super::{Counts, KeptCounts, Slot};
+    use super::{Counts, KeptCounts, LentCounts, Slot};
     use crate::view::{Candidate, RequestFacts};
 
     /// A pool's counts taken out of its rows into a table of their own: the
     /// lent form of rows a case wrote its counts into.
-    pub(crate) struct Lent {
+    pub(crate) struct Lent<'a> {
         counts: Counts,
         slots: Vec<Slot>,
         /// The cells of the one decision a case's reads stand for.
-        kept: Vec<AtomicU64>,
+        kept: KeptCounts,
+        /// The table as a case's facts name it, lent at the first ask.
+        lent: OnceCell<LentCounts<'a>>,
     }
 
-    impl Lent {
+    impl<'a> Lent<'a> {
         /// Takes each row's count out of `rows` into a table, under the
         /// row's position: the rows read zero after it. A worker a case
         /// lists twice has one count.
@@ -292,19 +361,24 @@ pub(crate) mod tests {
                 }
                 assert_eq!(counts.in_flight(*place), held, "one count a position");
             }
-            let kept = slots.iter().map(|_| AtomicU64::default()).collect();
+            let mut kept = KeptCounts::default();
+            kept.open(slots.len());
             Self {
                 counts,
                 slots,
                 kept,
+                lent: OnceCell::new(),
             }
         }
 
         /// `facts` with the table lent beside the rows: every call lends
         /// the one decision a case's reads stand for.
-        pub(crate) fn beside<'a>(&'a self, facts: &RequestFacts<'a>) -> RequestFacts<'a> {
+        pub(crate) fn beside(&'a self, facts: &RequestFacts<'a>) -> RequestFacts<'a> {
+            let lent = self
+                .lent
+                .get_or_init(|| self.counts.lent(&self.slots, &self.kept));
             RequestFacts {
-                lent_in_flight: Some(self.counts.lent(&self.slots, &self.kept, 1)),
+                lent_in_flight: Some(lent),
                 ..*facts
             }
         }
@@ -347,6 +421,58 @@ pub(crate) mod tests {
         kept.stamp = u32::MAX;
         assert_eq!(counts.lend(&slots, &mut kept).at(0), 1);
         assert_eq!(kept.stamp, 1);
+    }
+
+    /// A walk is handed the reader of the rows its request was given: the
+    /// row's field over rows that carry their counts, the lent count
+    /// beside a lent table.
+    #[test]
+    fn a_walk_reads_by_the_kind_of_rows_its_request_was_given() {
+        let row = |position, in_flight| Candidate {
+            position,
+            in_flight,
+            ..Candidate::default()
+        };
+        let mut rows = [row(0, 4), row(1, 2)];
+        let read = |facts: &RequestFacts<'_>, rows: &[Candidate]| -> Vec<u32> {
+            with_counts!(facts, |counts| rows.iter().map(counts).collect())
+        };
+        let own = RequestFacts::default();
+        assert_eq!(read(&own, &rows), [4, 2]);
+        let lent = Lent::take(&mut rows);
+        // The counts stand in the table: what the rows hold is not read.
+        rows[0].in_flight = 9;
+        assert_eq!(read(&lent.beside(&own), &rows), [4, 2]);
+    }
+
+    /// A run's reader and a single read share the decision's one number
+    /// for a row: the first read by either is kept and the other returns
+    /// it, whatever is booked between the two. A reader taken later in the
+    /// decision reads the same cells.
+    #[test]
+    fn a_runs_reader_and_a_single_read_share_a_decisions_one_number() {
+        let counts = Counts::default();
+        let slots = [counts.claim(), counts.claim()];
+        counts.book(slots[0]);
+        let mut kept = KeptCounts::default();
+        let lent = counts.lend(&slots, &mut kept);
+        let run = lent.run();
+        // A row beside a lent table: no reader returns its own field.
+        let row = |position| Candidate {
+            position,
+            in_flight: 7,
+            ..Candidate::default()
+        };
+        assert_eq!(run.of(&row(0)), 1, "the run reads the row first");
+        counts.book(slots[0]);
+        counts.book(slots[1]);
+        assert_eq!(lent.at(0), 1, "a single read after the run's");
+        assert_eq!(lent.at(1), 1, "a single read first");
+        counts.book(slots[1]);
+        assert_eq!((run.of(&row(0)), run.of(&row(1))), (1, 1));
+        let later = lent.run();
+        let read = [0, 1, 2].map(|position| later.of(&row(position)));
+        assert_eq!(read, [1, 1, 0], "zero past the rows");
     }
 
     /// A lent count is read at its row's position, whichever piece of the

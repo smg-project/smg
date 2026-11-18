@@ -82,7 +82,7 @@ wit! {
     Option<NamedAffinity<'_>> => "host-only",
     // Host-only: a guest reads a candidate's requests in flight as the
     // candidate's own field, whichever feed its host read them from.
-    Option<crate::LentCounts<'_>> => "host-only",
+    Option<&crate::LentCounts<'_>> => "host-only",
 }
 
 // The spellings above that look inside a type, tied to it: an inner width that

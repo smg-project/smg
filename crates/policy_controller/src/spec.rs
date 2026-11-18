@@ -164,7 +164,6 @@ pub struct Needs {
     /// Allow-listed headers in the view.
     pub headers: bool,
     pub media: bool,
-
     /// The count of session keys with a request in flight, per worker (the
     /// `min_group` assignment and the `fewest-sessions` scorer).
     pub active_sessions: bool,
@@ -222,7 +221,6 @@ impl Needs {
             ring: self.ring || other.ring,
             headers: self.headers || other.headers,
             media: self.media || other.media,
-
             active_sessions: self.active_sessions || other.active_sessions,
             session_in_flight: self.session_in_flight || other.session_in_flight,
             affinity: self.affinity || other.affinity,
@@ -4031,7 +4029,6 @@ mod tests {
             assert_eq!(engine.needs().headers, name == "manual", "{name}");
             assert!(!engine.needs().active_sessions, "{name}");
             assert!(!engine.needs().session_in_flight, "{name}");
-
             assert!(engine.profile_for("any", Phase::Single).is_some(), "{name}");
             // One profile bound to every model and phase: the per-phase and
             // per-binding reads are the summary.
@@ -6626,15 +6623,18 @@ mod tests {
         let sessions = r#""score":["fewest-sessions"]"#;
         let scored = |pick: &str| format!(r#"{{{sessions},"pick":{pick}}}"#);
         let alone = |pick: &str| format!(r#"{{"filter":["healthy"],"pick":{pick}}}"#);
-        // The forms that read the count under parameters, then each name
-        // of the lists in the forms it validates in. The scorer and the
-        // picker this build lacks are no readers.
+        // The forms that take parameters, then each other name of the
+        // lists in the forms it validates in. A name this build lacks is
+        // refused by name in each of its forms and is no reader.
         let bounded = r#"{"consistent-hash":{"bounded_load":{"factor":1.0,"abs_margin":0}}}"#;
+        let tempered = r#"{"best-with-temperature":{"temperature":1.0}}"#;
         let mut profiles: Vec<Vec<String>> = vec![
             vec![r#"{"score":[{"resident-work":{"request_tokens":512}}],"pick":"best"}"#.into()],
             vec![format!(r#"{{"score":[{bounded}],"pick":"best"}}"#)],
+            vec![scored(tempered), alone(tempered)],
         ];
-        let apart = ["bucket", "resident-work", "best-with-temperature"];
+        let apart = ["resident-work", "best-with-temperature"];
+
         for name in FILTERS {
             profiles.push(vec![format!(
                 r#"{{"filter":["{name}"],{sessions},"pick":"best"}}"#
@@ -6651,12 +6651,15 @@ mod tests {
                 format!(r#"{{"pick":{pick}}}"#),
             ]);
         }
+        let document = |profile: &String| {
+            doc(&format!(
+                r#"{{"apiVersion":"smg.policy/v1","profiles":{{"p":{profile}}}}}"#
+            ))
+        };
+        let lacked =
+            |form: &String| matches!(document(form).validate(), Err(SpecError::NotInBuild { .. }));
+        profiles.retain(|forms| !forms.iter().all(lacked));
         let build = |forms: &[String]| -> Engine {
-            let document = |profile: &String| {
-                doc(&format!(
-                    r#"{{"apiVersion":"smg.policy/v1","profiles":{{"p":{profile}}}}}"#
-                ))
-            };
             let built = forms.iter().find_map(|form| document(form).validate().ok());
             built.unwrap_or_else(|| panic!("no form validates: {forms:?}"))
         };
@@ -6686,7 +6689,7 @@ mod tests {
         };
         // One engine a feed: a stage that keeps a rotation starts each
         // feed's decisions at the same place.
-        let run = |forms: &[String], rows: &[Candidate], lent: Option<&Lent>| {
+        let run = |forms: &[String], rows: &[Candidate], beside: bool| {
             let engine = build(forms);
             let picks = |seed: u64| {
                 let facts = RequestFacts {
@@ -6695,7 +6698,7 @@ mod tests {
                     seed,
                     ..RequestFacts::default()
                 };
-                let facts = lent.map_or(facts, |lent| lent.beside(&facts));
+                let facts = if beside { lent.beside(&facts) } else { facts };
                 let cx = Constraints::default();
                 let decision = engine.decide(&facts, &pool, rows, &cx, &mut Scratch::new());
                 let picked = decision.pick();
@@ -6710,14 +6713,14 @@ mod tests {
             (0..32).map(picks).collect::<Vec<_>>()
         };
         for forms in &profiles {
-            let written = run(forms, &own, None);
-            let read = run(forms, &other, Some(&lent));
+            let written = run(forms, &own, false);
+            let read = run(forms, &other, true);
             assert_eq!(
                 written, read,
                 "a lent count is not read as a row's own: {forms:?}"
             );
             // The counts part the rows: the fewest requests answer by them.
-            let moved = written != run(forms, &bare, None);
+            let moved = written != run(forms, &bare, false);
             assert!(moved || !forms[0].contains("least-requests"), "{forms:?}");
         }
     }

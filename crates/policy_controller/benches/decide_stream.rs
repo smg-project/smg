@@ -1000,7 +1000,7 @@ fn in_process(store: &MemoryStore, decisions: u64, commit: bool) -> u64 {
                 seed,
                 budget_micros: BUDGET_MICROS,
                 now_micros: world.micros(ask.now),
-                lent_in_flight: read.and_then(|read| read.in_flight),
+                lent_in_flight: read.as_ref().and_then(|read| read.in_flight.as_ref()),
                 ..RequestFacts::default()
             };
             let pool = read.map_or_else(

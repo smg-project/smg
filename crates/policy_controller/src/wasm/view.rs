@@ -9,6 +9,7 @@ use super::{
     config::{Exposure, Reveal},
 };
 use crate::{
+    counts::with_counts,
     decision::{Decision, Target, MAX_TARGETS},
     lease::{Lease, LeaseKind, Membership, Outcome, ReleaseReason, Side, Signal, TransportClass},
     plugins::shown_hashes,
@@ -306,11 +307,12 @@ impl Records {
         // index reads the row and what it holds. The packed fill walks
         // either feed instead; this one keeps the read by index, whose
         // tests are lost in what a record a candidate costs.
-        self.candidates.extend(
-            (0u32..)
+        with_counts!(facts, |counts| {
+            let records = (0u32..)
                 .zip(candidates)
-                .map(|(index, c)| candidate(c, facts.affinity_at(index), facts.in_flight(c))),
-        );
+                .map(|(index, c)| candidate(c, facts.affinity_at(index), counts(c)));
+            self.candidates.extend(records);
+        });
         self.zones.clear();
         self.zones.extend(pool.zones.iter().map(zone));
         self.tried.clear();
@@ -765,26 +767,26 @@ impl Packed {
         // depths, and every row reads its age, growth and index size as
         // zero, so a host fills the column for a profile whose guest reads
         // those.
-        match facts.feed() {
+        with_counts!(facts, |counts| match facts.feed() {
             feed if feed.is_empty() => {
                 let nothing = AffinityFacts::default();
                 for (c, row) in candidates.iter().zip(rows) {
-                    Self::fill_row(row, c, nothing, facts.in_flight(c));
+                    Self::fill_row(row, c, nothing, counts(c));
                 }
             }
             Feed::Column(column) => {
                 let column = &column[..candidates.len()];
                 for ((c, held), row) in candidates.iter().zip(column).zip(rows) {
-                    Self::fill_row(row, c, *held, facts.in_flight(c));
+                    Self::fill_row(row, c, *held, counts(c));
                 }
             }
             Feed::Named(named) => {
                 let mut walk = named.walk();
                 for ((index, c), row) in (0u32..).zip(candidates).zip(rows) {
-                    Self::fill_row(row, c, walk.entry(index), facts.in_flight(c));
+                    Self::fill_row(row, c, walk.entry(index), counts(c));
                 }
             }
-        }
+        });
     }
 
     /// One candidate's row of the table, its affinity facts and the

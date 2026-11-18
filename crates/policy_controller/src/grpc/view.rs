@@ -6,6 +6,7 @@
 //! the engine's types as the WIT is are a later step.
 
 use crate::{
+    counts::with_counts,
     decision::{Decision, Lifted, Target, Trace},
     lease::{Lease, LeaseKind, Membership, Outcome, ReleaseReason, Side, Signal, TransportClass},
     plugins::{
@@ -286,10 +287,10 @@ pub(crate) fn decide(
         request: Some(request(facts, exposure, needs)),
         // A candidate's affinity facts ride the request's column, by its
         // index: the same index reads the row and its entry.
-        candidates: (0u32..)
+        candidates: with_counts!(facts, |counts| (0u32..)
             .zip(candidates)
-            .map(|(index, c)| candidate(c, facts.affinity_at(index), facts.in_flight(c)))
-            .collect(),
+            .map(|(index, c)| candidate(c, facts.affinity_at(index), counts(c)))
+            .collect()),
         pool: Some(pool(pool_facts)),
         stages: 0,
         scores_in: Vec::new(),
@@ -945,9 +946,6 @@ mod tests {
         );
     }
 
-    /// The view's trace is the contract's pair. A counted trace leaves with
-    /// its count and no word of a draw; a drawn one leaves with the count
-    /// unset, which is no zero, and `drew_first` set.
     /// The frame carries each candidate's requests in flight as the
     /// request's facts read them: the lent count where the host lends a
     /// table, the rows themselves reading zero.
@@ -982,6 +980,9 @@ mod tests {
         assert_eq!(read, [4, 0, 9]);
     }
 
+    /// The view's trace is the contract's pair. A counted trace leaves with
+    /// its count and no word of a draw; a drawn one leaves with the count
+    /// unset, which is no zero, and `drew_first` set.
     #[test]
     fn the_views_trace_says_its_count_or_that_the_decision_drew() {
         use crate::decision::{Survivors, Trace};
