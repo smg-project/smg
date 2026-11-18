@@ -3439,11 +3439,12 @@ pub(crate) mod tests {
     /// forms of a decision's rows: in the row where the rows were written
     /// for a request that states its wires, beside the row where they were
     /// lent. The request's facts read it either way, under a profile that
-    /// reads no count too.
+    /// reads no count too. A hint that keeps rows beside the wires leaves
+    /// the written row its count.
     #[test]
     fn a_lease_on_file_is_read_in_a_written_row_and_beside_a_lent_one() {
         const SPOKEN: &str = "model-http";
-        for (stated, own) in [(true, 1), (false, 0)] {
+        for (stated, hint, own) in [(true, None, 1), (true, Some(7), 1), (false, None, 0)] {
             let store = MemoryStore::new();
             store
                 .apply(preset("random", 1))
@@ -3471,7 +3472,7 @@ pub(crate) mod tests {
             assert_eq!(filed, Ok(()));
             let frame = frame_for(SPOKEN, 1, 1);
             let frame = if stated {
-                constrained(frame, 0b001, None)
+                constrained(frame, 0b001, hint)
             } else {
                 frame
             };
@@ -3491,7 +3492,7 @@ pub(crate) mod tests {
                 )
                 .0
             });
-            assert_eq!(counts, [(1, own)], "wires stated: {stated}");
+            assert_eq!(counts, [(1, own)], "wires stated: {stated}, {hint:?}");
         }
     }
 
