@@ -838,7 +838,7 @@ fn step_down(elector: &mut Elector, above: Option<u64>) -> Option<bool> {
             );
             None
         }
-        Err(error) => {
+        Err(error) if elector.is_holder() => {
             warn!(
                 identity = elector.identity(),
                 above,
@@ -846,6 +846,17 @@ fn step_down(elector: &mut Elector, above: Option<u64>) -> Option<bool> {
                 "stepped down; the release failed and is tried again at the next step"
             );
             Some(true)
+        }
+        // No lease is held here: the term was counted, and its write over
+        // a release this replica saw failed.
+        Err(error) => {
+            warn!(
+                identity = elector.identity(),
+                above,
+                %error,
+                "a term said over a released lease was counted and not written; a take below it is left again at its gateway's word"
+            );
+            Some(false)
         }
     }
 }
