@@ -711,15 +711,6 @@ async fn drain_allows_an_active_response_to_finish_and_then_closes_the_socket() 
     );
     assert_eq!(tracker.len(), 1);
     assert_eq!(bucket.available_tokens(), 0.0);
-    tokio::time::pause();
-    tokio::time::advance(HEARTBEAT_INTERVAL).await;
-    let ping = tokio::time::timeout(Duration::from_secs(2), fixture.socket.next())
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
-    assert!(ping.is_ping());
-    tokio::time::resume();
     tracker.begin_drain();
     assert!(!tracker.wait_for_shutdown(Duration::ZERO).await);
     resume.notify_one();

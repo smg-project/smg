@@ -38,6 +38,28 @@ impl<'a> WorkerSelector<'a> {
         Self { registry }
     }
 
+    /// Check the inventory before prewarm. An OpenAI-compatible worker can
+    /// route requests before its model cards are known to the gateway.
+    pub(crate) async fn discover_openai_model(&self, model_id: &str) -> bool {
+        let router = smg_external_router::known::OPENAI;
+        // A lazy refresh updates the worker's cards without changing the
+        // registration's model index. Read those cards directly on a miss.
+        let has_model = || {
+            self.registry.contains_model(model_id)
+                || self.registry.get_routing_workers().iter().any(|worker| {
+                    worker.metadata().spec.runtime_type == RuntimeType::External
+                        && worker.is_healthy()
+                        && router.takes(worker.default_provider())
+                        && worker.any_model(&mut |card| card.matches(model_id))
+                })
+        };
+        if has_model() {
+            return true;
+        }
+        self.refresh_external_models(None, Some(&router)).await;
+        has_model()
+    }
+
     fn matches_worker_filters(worker: &Arc<dyn Worker>, req: &SelectWorkerRequest<'_>) -> bool {
         req.worker_type
             .is_none_or(|worker_type| *worker.worker_type() == worker_type)

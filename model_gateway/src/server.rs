@@ -95,7 +95,7 @@ use crate::{
         metrics_server, otel_trace, runtime_metrics,
     },
     routers::{
-        common::realtime::ws::RealtimeQueryParams,
+        common::{realtime::ws::RealtimeQueryParams, worker_selection::WorkerSelector},
         error as route_error,
         gateway::Gateway,
         grpc::{common::responses::spawn_unstored_sweeper, regular::symphony::telemetry},
@@ -356,10 +356,17 @@ async fn v1_responses(
             );
         }
         if turn.prewarm {
-            if !state.context.worker_registry.contains_model(&body.model) {
-                return route_error::model_not_found(&body.model);
-            }
-            return responses_ws::prewarm_response(body);
+            return cancel
+                .guard(async {
+                    if !WorkerSelector::new(&state.context.worker_registry)
+                        .discover_openai_model(&body.model)
+                        .await
+                    {
+                        return route_error::model_not_found(&body.model);
+                    }
+                    responses_ws::prewarm_response(body)
+                })
+                .await;
         }
     }
     let model = body.model.clone();

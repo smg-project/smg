@@ -250,3 +250,93 @@ async fn responses_get_is_disabled_by_default() {
         .unwrap();
     assert_eq!(response.status(), 405);
 }
+
+#[cfg(feature = "provider-openai")]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "synthetic loopback servers are owned by the fixture"
+)]
+#[tokio::test]
+async fn prewarm_discovers_openai_models_before_the_first_generation() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use axum::{http::HeaderMap, routing::get, Json, Router};
+    use smg_test_harness::test_app::create_test_app_context_with_config;
+
+    const MODEL: &str = "cold-openai-fixture";
+    let discovery_calls = Arc::new(AtomicUsize::new(0));
+    let observed = discovery_calls.clone();
+    // The fixture publishes model inventory but has no generation endpoint.
+    let worker = Router::new().route(
+        "/v1/models",
+        get(move |headers: HeaderMap| async move {
+            assert!(!headers.contains_key("authorization"));
+            observed.fetch_add(1, Ordering::SeqCst);
+            Json(json!({"object": "list", "data": [{"id": MODEL, "object": "model"}]}))
+        }),
+    );
+    let worker_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let worker_url = format!("http://{}", worker_listener.local_addr().unwrap());
+    let worker_server =
+        tokio::spawn(async move { axum::serve(worker_listener, worker).await.unwrap() });
+    let mut servers = Servers(vec![worker_server.abort_handle()]);
+    let mut config = RouterConfig::builder()
+        .openai_mode(vec![])
+        .build_unchecked();
+    config.api_key = Some("fixture-key".into());
+    config.enable_responses_websocket = true;
+    config.health_check.disable_health_check = true;
+    let context = create_test_app_context_with_config(&config).await;
+    context
+        .worker_registry
+        .register(Arc::new(
+            BasicWorkerBuilder::new(worker_url)
+                .worker_type(WorkerType::Regular)
+                .connection_mode(ConnectionMode::Http)
+                .runtime_type(RuntimeType::External)
+                .health_config(HealthCheckConfig {
+                    disable_health_check: true,
+                    ..Default::default()
+                })
+                .build(),
+        ))
+        .unwrap();
+    let registry = context.worker_registry.clone();
+    assert!(!registry.contains_model(MODEL));
+    let router = RouterFactory::create_router(&context).await.unwrap();
+    let app = create_test_app_with_context(router.into(), context);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}/v1/responses", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    servers.0.push(server.abort_handle());
+
+    let mut request = url.into_client_request().unwrap();
+    request
+        .headers_mut()
+        .insert("authorization", "Bearer fixture-key".parse().unwrap());
+    let (mut socket, _) = connect_async(request).await.unwrap();
+    for expected_model in [MODEL, MODEL, "unknown-fixture"] {
+        socket.send(Message::Text(json!({
+            "type": "response.create", "generate": false, "model": expected_model, "input": "fixture"
+        }).to_string().into())).await.unwrap();
+        let result = timeout(Duration::from_secs(6), async {
+            loop {
+                let event = socket.next().await.unwrap().unwrap().into_text().unwrap();
+                let value: Value = serde_json::from_str(&event).unwrap();
+                if value["type"] != "response.created" {
+                    break value;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        if expected_model == MODEL {
+            assert_eq!(result["type"], "response.completed", "{result}");
+            assert_eq!(result["response"]["usage"]["total_tokens"], 0);
+            assert_eq!(discovery_calls.load(Ordering::SeqCst), 1);
+        } else {
+            assert_eq!(result["status"], 404, "{result}");
+            assert_eq!(result["error"]["code"], "model_not_found");
+        }
+    }
+}

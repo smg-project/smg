@@ -128,9 +128,10 @@ gateway or at a trusted proxy.
 A session handles one `response.create` at a time. Set `store: false` or omit
 `store`. `previous_response_id` refers to a recent response on the same socket.
 After reconnecting or losing an entry to eviction, resend the full input.
-`generate: false` accepts context for a registered model and returns a typed
-response without calling a worker. Background responses, conversation-backed
-requests, and multiplexed `stream_id` requests are refused.
+`generate: false` accepts context and returns a typed response without
+dispatching inference. For a model absent from its registry, the gateway first
+checks the model inventory of OpenAI-compatible workers. Background responses,
+conversation-backed requests, and multiplexed `stream_id` requests are refused.
 
 A listener accepts up to 32 Responses sockets, with up to four per authenticated
 tenant. A frame or expanded request is limited to the smaller of 4 MiB and the
