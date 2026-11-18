@@ -384,12 +384,10 @@ impl Tables {
     /// since ([`Index::taken_since`]): a take tells a later count for good,
     /// the same row back on its id included, so the ask is right at any
     /// instant behind the lookup's fence. Where no id kept was taken since,
-    /// the read stands. Else a block may be another row's: the lookup is
-    /// made again within the ids not taken since, by a draw of that round's
-    /// own ([`Index::deepest_again`]), and its rows are asked again. Past
-    /// [`Self::ROUNDS`] lookups no read of the naming stands,
-    /// and it names no holder. Off a decision's usual path: it runs for the
-    /// decisions that hold tables from before a take.
+    /// the read stands. Else a block may be another row's, and the lookup
+    /// is made again ([`Self::again`]). The asks stand in a frame of their
+    /// own: a decision that holds tables from before a take pays them, and
+    /// nothing of a lookup it does not make. Off a decision's usual path.
     #[cold]
     #[inline(never)]
     fn look_again(
@@ -403,18 +401,87 @@ impl Tables {
         let Some(index) = self.index.as_deref() else {
             return;
         };
+        if kept.iter().any(|&(id, _)| index.taken_since(id, whole_at)) {
+            Self::again(index, naming, within, cap, whole_at, kept);
+        }
+    }
+
+    /// The lookup made again for a read that kept an id taken since
+    /// `whole_at`: within the ids not taken since, by a draw of that round's
+    /// own ([`Index::deepest_again`]), and its rows are asked again. Past
+    /// [`Self::ROUNDS`] lookups no read of the naming stands, and it names
+    /// no holder. Out of line: the rounds' frame and their seeds are no
+    /// cost of the asks.
+    #[cold]
+    #[inline(never)]
+    fn again(
+        index: &Index,
+        naming: &Naming<'_>,
+        within: &[u64],
+        cap: usize,
+        whole_at: u64,
+        kept: &mut Vec<(u32, u32)>,
+    ) {
         let words = within.len().min(MASK_WORDS);
-        let mut rounds = 0;
-        while kept.iter().any(|&(id, _)| index.taken_since(id, whole_at)) {
-            if rounds == Self::ROUNDS {
-                kept.clear();
-                return;
-            }
-            rounds += 1;
+        // A round's stream is seeded by the first value of the one before
+        // it, the first round's by the holders' stream.
+        let mut seed = naming.seed ^ HOLDERS_STREAM;
+        for _ in 0..Self::ROUNDS {
+            seed = Draw::new(seed).next_u64();
             let own = index.own(&within[..words], whole_at);
-            index.deepest_again(naming, &own[..words], cap, rounds, kept);
+            #[cfg(test)]
+            seam::at(seam::Point::Again);
+            index.deepest_again(naming, &own[..words], cap, seed, kept);
             // As in the naming: the read before the fence, the asks after.
             fence(Ordering::Acquire);
+            if !kept.iter().any(|&(id, _)| index.taken_since(id, whole_at)) {
+                return;
+            }
+        }
+        kept.clear();
+    }
+}
+
+/// A seam for the cases: a hook the naming thread runs once at a point
+/// inside one naming, where a take or a keep lands between the naming's
+/// reads. No case reaches there from outside. In no build but the cases'.
+#[cfg(test)]
+mod seam {
+    use std::cell::RefCell;
+
+    /// Where inside a naming a hook runs.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum Point {
+        /// Behind the naming's lookup, ahead of its fence and its question.
+        Looked,
+        /// Ahead of a lookup made again, behind the ids it is kept within.
+        Again,
+    }
+
+    type Hook = Box<dyn FnOnce()>;
+
+    thread_local! {
+        static HOOK: RefCell<Option<(Point, Hook)>> = const { RefCell::new(None) };
+    }
+
+    /// `hook` runs once, in the next naming of this thread that reaches
+    /// `point`.
+    pub(super) fn set(point: Point, hook: impl FnOnce() + 'static) {
+        HOOK.with(|held| *held.borrow_mut() = Some((point, Box::new(hook))));
+    }
+
+    /// The hook set for `point` runs. It is taken out first: a naming the
+    /// hook itself asks for meets none.
+    pub(super) fn at(point: Point) {
+        let hook = HOOK.with(|held| {
+            let mut held = held.borrow_mut();
+            match &*held {
+                Some((set, _)) if *set == point => held.take(),
+                _ => None,
+            }
+        });
+        if let Some((_, hook)) = hook {
+            hook();
         }
     }
 }
@@ -458,7 +525,11 @@ impl PoolIndex {
             reading.rows.clear();
             return Warming::default();
         };
-        let size = |&id: &u32| match &tables.index {
+        // The index read once, ahead of the walk: the tables hold a cell (the
+        // count they are whole at), so a shared reference to them does not tell
+        // the compiler this word stands still across the walk's calls.
+        let index = tables.index.as_deref();
+        let size = |&id: &u32| match index {
             Some(index) if id != NONE => {
                 u32::try_from(index.chain.worker_block_count(id)).unwrap_or(u32::MAX)
             }
@@ -620,6 +691,8 @@ impl PoolIndex {
                 |under| below(&mut draw, under),
                 &mut named.kept,
             );
+            #[cfg(test)]
+            seam::at(seam::Point::Looked);
             // Every read of the lookup stands before this fence, and the
             // question of what was taken since after it ([`Index`]).
             fence(Ordering::Acquire);
@@ -709,10 +782,9 @@ impl PoolIndex {
 ///   there, under the run's lock. A holding stands on a run by a write
 ///   under that lock, or by the write of the lane that made the run,
 ///   before another lane could find it;
-/// - another row's lane, where a partial table grows: the growth copies
-///   every row's entry under the run's lock, and the run's version
-///   orders it: the writer steps it at the growth's end, and the reader
-///   loads it at its snapshot;
+/// - another row's lane, where a partial table grows, which copies every
+///   row's entry: the chain passes a release fence of its own there too,
+///   under the run's lock;
 /// - the reader: an acquire fence in the naming, between its lookup and
 ///   its question ([`PoolIndex::name`]).
 ///
@@ -759,28 +831,23 @@ impl Index {
         self.taken.load(Ordering::Acquire)
     }
 
-    /// The naming's lookup made again, for the `round`th time
-    /// ([`Tables::look_again`]): the request's deepest holders within
-    /// `within` under `cap`, into `kept` by index id, the depth the cap
-    /// cuts by a draw of the round's own. A round runs only where the
-    /// lookup before it kept an id taken since, so the stream that lookup
-    /// cut by would cut by the same values again, and favour the rows it
-    /// reaches first. Each round's stream is seeded by the first value of
-    /// the one before it, the first round's by the holders' stream. A
-    /// lookup of its own beside the naming's: with one instantiation for
-    /// both, every decision would pay a call for the lookup it makes once.
+    /// The naming's lookup made again ([`Tables::again`]): the request's
+    /// deepest holders within `within` under `cap`, into `kept` by index
+    /// id, the depth the cap cuts by a draw from `seed`, the round's own. A
+    /// round runs only where the lookup before it kept an id taken since,
+    /// so the stream that lookup cut by would cut by the same values again,
+    /// and favour the rows it reaches first. A lookup of its own beside the
+    /// naming's: with one instantiation for both, every decision would pay
+    /// a call for the lookup it makes once.
     fn deepest_again(
         &self,
         naming: &Naming<'_>,
         within: &[u64],
         cap: usize,
-        round: usize,
+        seed: u64,
         kept: &mut Vec<(u32, u32)>,
     ) {
-        let mut draw = Draw::new(naming.seed ^ HOLDERS_STREAM);
-        for _ in 0..round {
-            draw = Draw::new(draw.next_u64());
-        }
+        let mut draw = Draw::new(seed);
         self.chain.deepest_into(
             naming.block_hashes,
             |hash| *hash,
@@ -803,7 +870,7 @@ impl Index {
     }
 
     /// `within` less the ids taken since `whole_at`: what a lookup made
-    /// again is kept within ([`Tables::look_again`]).
+    /// again is kept within ([`Tables::again`]).
     fn own(&self, within: &[u64], whole_at: u64) -> [u64; MASK_WORDS] {
         let mut own = [0u64; MASK_WORDS];
         for (word, (own, &ids)) in own.iter_mut().zip(within).enumerate() {
