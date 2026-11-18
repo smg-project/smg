@@ -615,10 +615,11 @@ def test_a_spec_store_renders_its_claim_its_mount_and_its_flag(tmp_path):
     assert found["args"][-2:] == ["--spec-store", STORE_MOUNT]
     assert found["args"][:-2] == controller_args()[:-2]
     assert "--spec-file" not in found["args"]
-    # One pod at a time opens the store: the old pod is gone before the new
-    # one is made, where the document's form waits for its stop signal
-    # alone. The rolling update's fields are named as nothing, which takes
-    # them off a live object.
+    # An upgrade makes the store's new pod once the old one is gone, where
+    # the document's form waits for its stop signal alone: the store's own
+    # lock holds one pod at a time, and a pod made beside one that stops
+    # would wait on it. The rolling update's fields are named as nothing,
+    # which takes them off a live object.
     assert deployment["strategy"] == {"type": "Recreate", "rollingUpdate": None}
     assert one(render(*ON), "Deployment")["spec"]["strategy"] == LONE_STRATEGY
     # The read-only root filesystem stands: the store is a volume of its own.
@@ -630,6 +631,10 @@ def test_a_spec_store_renders_its_claim_its_mount_and_its_flag(tmp_path):
     }
     unnamed = render(*STORED, "policyController.securityContext.runAsUser=null")
     assert "securityContext" not in one(unnamed, "Deployment")["spec"]["template"]["spec"]
+    # A user of 0 is a user: its group is written, where a null names none.
+    zero = ("runAsUser=0", "runAsNonRoot=false")
+    root = render(*STORED, *(f"policyController.securityContext.{field}" for field in zero))
+    assert one(root, "Deployment")["spec"]["template"]["spec"]["securityContext"] == {"fsGroup": 0}
     # A number of a values file is a float there: the group is written digit
     # for digit, as the container's user is.
     wide = tmp_path / "wide.yaml"
@@ -664,9 +669,11 @@ def test_a_spec_store_is_refused_beside_what_the_controller_refuses(tmp_path):
         f"policyController.specStoreClaim names {CLAIM} and policyController.spec holds a"
         " document: the controller refuses a start that names two sources of its policy spec"
     ) in both
-    # Over reused values an empty map clears nothing: the refusal says the
-    # null that does.
+    # Over reused values an empty map clears nothing, and under
+    # --reuse-values a null does not either: the refusal says the null and
+    # the two flags under which it clears the document.
     assert "Set policyController.spec to null" in both
+    assert "--reset-then-reuse-values or --reset-values" in both
     document = spec_values(tmp_path, LEAST_LOAD)
     assert "names two sources of its policy spec" in render_error(*STORED, files=(document,))
     for settings in ((ELECTION,), (ELECTION, "policyController.replicas=2")):
@@ -1924,7 +1931,11 @@ def first_ready(process: subprocess.Popen, url: str) -> dict | None:
             with DIRECT.open(url, timeout=2) as response:
                 assert response.status == 200
                 return json.load(response)
-        except (urllib.error.URLError, ConnectionError):
+        except OSError:
+            # Nothing listens yet, the connection is reset, or the answer
+            # does not come inside the probe's two seconds: each is an
+            # OSError on every Python the package supports, where a socket's
+            # timeout is no TimeoutError before 3.10.
             time.sleep(0.1)
     return None
 
@@ -2014,8 +2025,9 @@ def test_the_binary_starts_on_a_spec_stores_rendered_arguments(binary, tmp_path)
     """The controller started with exactly what the Deployment passes on a
     spec store's claim (ports free here, a short grace period, a directory of
     the case's in place of the claim's mount) answers its readiness probe
-    with nothing on file, reads generation 0 on its series, writes nothing
-    before an apply and stops clean on SIGTERM."""
+    with nothing on file, reads generation 0 on its series, writes no
+    generation before an apply, holds the store under its lock file and stops
+    clean on SIGTERM."""
     gateway, control, replication, admin = free_ports(4)
     documents = render(
         *STORED,
@@ -2051,7 +2063,8 @@ def test_the_binary_starts_on_a_spec_stores_rendered_arguments(binary, tmp_path)
         with DIRECT.open(f"http://127.0.0.1:{admin}/metrics", timeout=2) as response:
             series = response.read().decode().splitlines()
         assert "smg_policy_spec_generation 0" in series
-        assert list(store.iterdir()) == []
+        # No generation is on file: the store's own lock file stands alone.
+        assert [entry.name for entry in store.iterdir()] == [".lock"]
         process.send_signal(signal.SIGTERM)
         output, _ = process.communicate(timeout=15)
         assert process.returncode == 0, output

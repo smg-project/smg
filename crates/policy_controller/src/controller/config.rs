@@ -108,7 +108,9 @@ pub struct Config {
     /// out the listeners are closed with their streams. The controller's
     /// streams reconnect on a drain, so the default is far below the
     /// gateway's, which waits for generations to finish. A period the clock
-    /// cannot add to the present is no bound.
+    /// cannot add to the present is no bound. A start on a spec store that
+    /// another controller holds waits this long for that one to stop
+    /// ([`Controller::spec_store`](super::Controller::spec_store)).
     pub shutdown_grace: Duration,
     /// How often the load driver polls an engine whose stream is not
     /// serving it, and the freshness bound a pushed record must meet to
