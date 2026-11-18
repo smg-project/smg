@@ -189,7 +189,12 @@ struct Cli {
     /// rollback runs one of them again as the next generation. One replica
     /// serves it, its lease in the process: beside a lease another
     /// replica can take the start is refused, since a standby does not
-    /// follow an applied generation in this build
+    /// follow an applied generation in this build. One process holds the
+    /// directory, and nothing holds two apart: one that started before
+    /// another's last apply runs the generation it started with, and
+    /// refuses each apply by name until it starts again. The directory
+    /// stands on a file system that links: a generation's file is linked
+    /// under its name
     #[arg(
         long,
         value_name = "DIR",

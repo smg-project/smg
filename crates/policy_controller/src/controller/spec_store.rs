@@ -18,10 +18,13 @@
 //! One process holds a directory, and nothing here holds two apart. Where
 //! a second one writes it too, its apply of a number the first has on file
 //! is refused by name, and from then on it takes no write until it starts
-//! again: a store reads its directory at its start alone. Two that write
-//! one number at one moment in the two forms both land, and the next start
-//! is refused by the two names. A start removes every temporary name, a
-//! live writer's among them: that write is refused.
+//! again: a store reads its directory at its start alone, so that process
+//! runs the generation it started with. Two that write one number at one
+//! moment in the two forms both land, and the next start is refused by the
+//! two names. A start removes every temporary name, a live writer's among
+//! them: that write is refused. The directory stands on a file system that
+//! links: where no link is made, every write is refused at the link in the
+//! system's own words, and nothing of it stays on file.
 //!
 //! A start reads the directory: the highest number is the generation to
 //! run, and a file a write left under its temporary name is removed. Any
