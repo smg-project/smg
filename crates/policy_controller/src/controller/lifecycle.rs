@@ -180,11 +180,12 @@ fn told(store: &MemoryStore, record: &LeaseRecord, said: Said<'_>) {
 /// The pin ends where the engine's table forgets the key, and at no
 /// instant under a rule without a TTL. Where the table holds no such key,
 /// or no engine was told, the key's rule is not known: the longest TTL
-/// among the `standing` generation's rules ends the pin, and where none of
-/// them has a TTL the pin has no end. The end stands on the decision
-/// clock, as the table holds it: a dispatch converts no clock but where
-/// the rule is not known. The table's lock is let go before the store's
-/// pin is written: no lock is held across the two.
+/// among the `standing` generation's rules ends the pin, and the pin has
+/// no end where one of them has no TTL, since the key may be that
+/// rule's. The end stands on the decision clock, as the table holds it:
+/// a dispatch converts no clock but where the rule is not known. The
+/// table's lock is let go before the store's pin is written: no lock is
+/// held across the two.
 fn pinned(
     store: &MemoryStore,
     record: &LeaseRecord,
@@ -758,6 +759,34 @@ pub(crate) mod tests {
         let pin = SessionsStore::lookup(&store, KEY.get()).expect("a pin");
         let ends = store.micros(at) + 3_600_000_000;
         assert_eq!((pin.worker, pin.ends), (WorkerId(7), Some(ends)));
+    }
+
+    /// Beside a standing rule that keeps its keys with no TTL, a pin whose
+    /// rule is not known has no end: the key may be that rule's, and the
+    /// other rule's TTL would end its pin of record early.
+    #[test]
+    fn a_pin_no_engine_was_told_of_has_no_end_beside_a_rule_with_no_ttl() {
+        let store = MemoryStore::new();
+        let t0 = Instant::now();
+        let _first = hearing(&store, 1);
+        keyed(&store, 1, 7, SessionVerdict::Claimed(WorkerId(7)), t0);
+        // Generation 2: one rule keeps its keys for ever, the other an
+        // hour.
+        let mut document = PolicySpec::preset("manual").expect("a preset of this build");
+        document.generation = 2;
+        let mut for_ever = document.bindings[0].clone();
+        for_ever.matcher.model = "kept-for-ever".into();
+        let rule = for_ever.sessions.as_mut().expect("the preset's rule");
+        (rule.ttl_s, rule.sweep_s) = (u32::MAX, u32::MAX);
+        let rule = document.bindings[0].sessions.as_mut();
+        rule.expect("the preset's rule").ttl_s = 3_600;
+        document.bindings.insert(0, for_ever);
+        let spec = AppliedSpec::validate(&document).expect("the document validates");
+        store.apply(spec).expect("a later generation");
+        let at = t0 + Duration::from_millis(3);
+        dispatched(&store, A, &a_dispatched(1), at).expect("the frame reads");
+        let pin = SessionsStore::lookup(&store, KEY.get()).expect("a pin");
+        assert_eq!((pin.worker, pin.ends), (WorkerId(7), None));
     }
 
     #[test]

@@ -2844,12 +2844,16 @@ impl Engine {
     }
 
     /// The longest TTL among this generation's sessions rules, in
-    /// microseconds: what ends a pin whose own rule its host cannot name.
-    /// `None` where no rule has one.
+    /// microseconds: what ends a pin whose own rule its host cannot name,
+    /// so the pin outlasts whichever rule placed its key. `None`, no end,
+    /// where one of the rules keeps its keys with no TTL: the key may be
+    /// that rule's. `None` as well where no rule stands.
     pub fn pins_longest_ttl(&self) -> Option<u64> {
-        self.session_rules()
-            .filter_map(|rule| rule.ttl_micros)
-            .max()
+        let mut longest = None;
+        for rule in self.session_rules() {
+            longest = longest.max(Some(rule.ttl_micros?));
+        }
+        longest
     }
 
     /// What the host must feed before any request exists: every profile's
@@ -7686,10 +7690,13 @@ mod tests {
         assert_eq!(read(&one), (Some(100), Some(1_000)));
         let both = two(rule(Some(1_000), 100), rule(Some(5_000), 40));
         assert_eq!(read(&both), (Some(40), Some(5_000)));
-        // A rule that keeps its keys with no TTL sweeps nothing and ends
-        // nothing: the other rule's interval and TTL stand.
+        // A rule that keeps its keys with no TTL sweeps nothing: the other
+        // rule's interval stands. Its keys never end, so no TTL is the
+        // longest, wherever the rule sits among the bindings.
         let mixed = two(rule(Some(1_000), 100), rule(None, 0));
-        assert_eq!(read(&mixed), (Some(100), Some(1_000)));
+        assert_eq!(read(&mixed), (Some(100), None));
+        let mixed = two(rule(None, 0), rule(Some(1_000), 100));
+        assert_eq!(read(&mixed), (Some(100), None));
         let for_ever = manual_engine(Some(rule(None, 0)));
         assert_eq!(read(&for_ever), (None, None));
     }

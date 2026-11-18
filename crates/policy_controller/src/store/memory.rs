@@ -346,8 +346,9 @@ impl MemoryStore {
     /// a resize is told as a relabel and recorded as the leader recorded
     /// it, by the widths. Nothing is minted and no revision is guarded: the
     /// leader's log is the order. A row that leaves takes its tables with
-    /// it as the leader's own write does, and a row that stays keeps its
-    /// admission instant.
+    /// it as the leader's own write does, but for the sessions' pins of
+    /// record that name it, which the leader's own write alone drops, and
+    /// a row that stays keeps its admission instant.
     ///
     /// The change is applied only where it fits the tables: the epoch is
     /// the next one, a new row's id is free and a registration's key too,
@@ -802,9 +803,14 @@ impl MemoryStore {
     /// worker's KV lane with its blocks in the index. The vetoes a world
     /// carries are not among them: they leave with the row in the
     /// publication of the membership write that calls this. Nor are the
-    /// sessions' pins of record that name the worker: the write drops
-    /// them once it let its lock go ([`Self::forget_pins`]). Called under
-    /// the workers lock:
+    /// sessions' pins of record that name the worker: the leader's own
+    /// removal or replacement drops them once it let its lock go
+    /// ([`Self::forget_pins`]), and a row that leaves by a followed change
+    /// or a restore keeps them. A standby is sent no pin, so those are of
+    /// a term this store led itself: no decision takes one while its
+    /// worker is gone, and a worker that returns under the same key and
+    /// incarnation is pinned by them again. Called under the workers
+    /// lock:
     /// the health writers take it first and a load write goes into its
     /// worker's entry or nowhere, so a write racing the removal finds the
     /// row gone or lands before the tables are cleared.
