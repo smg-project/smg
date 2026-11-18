@@ -2318,7 +2318,8 @@ fn scope_reads_plainly<'a>(
 
 /// Adds to `names` the carriers the statements of one scope bind: the name
 /// of a plain `set` whose value reads a carrier, and a macro whose body
-/// reads one.
+/// reads one. A namespace becomes a holder where a `set` binds one of its
+/// attributes from a value that reads a carrier.
 fn bind_carriers<'a>(body: &'a [Stmt<'a>], names: &mut Names<'a>) {
     for stmt in body {
         match stmt {
@@ -2421,10 +2422,12 @@ fn attribute_of<'a>(expr: &Expr<'a>, names: &Names<'a>, kind: Watched) -> Option
     }
 }
 
-/// Whether `expr`, a written value or the value of a plain `set`, reads
-/// `names` plainly: a carrier alone, as a whole operand of `~` or `+`, or called (a
-/// macro's text) with arguments that read none; a part only in a statement
-/// that `builds`.
+/// Whether `expr`, a written value, the value of a plain `set` or the value
+/// a `set` binds to a holder's attribute, reads `names` plainly: a carrier
+/// or a holder's attribute alone or as a whole operand of `~` or `+`, or a
+/// carrier called (a macro's text) with arguments that read none; a part
+/// only in a statement that `builds`. A holder is read by its attributes,
+/// never by its name alone.
 fn joins<'a>(expr: &'a Expr<'a>, names: &Names<'a>, builds: bool) -> bool {
     match expr {
         Expr::Var(var) => match names.get(var.id) {
@@ -2448,7 +2451,9 @@ fn joins<'a>(expr: &'a Expr<'a>, names: &Names<'a>, builds: bool) -> bool {
 }
 
 /// Whether `expr`, the condition of an `if`, reads `names` only to ask
-/// whether one is empty: a name alone, or under `not`, `and` and `or`.
+/// whether one is empty: a name or a holder's attribute alone, such an
+/// attribute against the empty string (`ns.attr == ''` or `!= ''`), or
+/// under `not`, `and` and `or`.
 fn asks_whether_empty<'a>(expr: &'a Expr<'a>, names: &Names<'a>) -> bool {
     match expr {
         Expr::Var(_) => true,
@@ -2487,7 +2492,8 @@ fn statements_read<'a>(stmts: &'a [Stmt<'a>], names: &Names<'a>, parts: bool) ->
 }
 
 /// Whether one of `read`, the names a piece of a template reads, is watched
-/// among `names`: as a carrier or, where `parts` count, as a part.
+/// among `names`: as a carrier or a holder or, where `parts` count, as a
+/// part.
 fn any_watched(read: &HashSet<&str>, names: &Names, parts: bool) -> bool {
     read.iter().any(|name| match names.get(name) {
         Some(Watched::Carrier | Watched::Holder) => true,
