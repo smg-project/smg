@@ -2524,28 +2524,55 @@ fn contested<'a>(spellings: &[&str], mut added: impl Iterator<Item = (&'a str, b
 }
 
 /// What `source`, a chat template, writes by itself: its raw text and its
-/// string literals, each behind a separator ([`VALUE_SEPARATOR`]). A comment
-/// is not in it, and neither is a literal that `built` names by its byte
-/// offset: one inside an expression the template builds a value from, the
-/// pattern of that value, which it writes only as the value. A template the
-/// lexer refuses is read whole.
+/// string literals, each behind a separator ([`VALUE_SEPARATOR`]), and then
+/// each run of two or more pieces that stand side by side, joined, behind a
+/// separator of its own. Between two pieces of a run nothing lies but a
+/// comment, the marks of an expression or a join, so a render that writes
+/// one writes the next right after it, and a token the pieces spell
+/// together is written whole. Every piece stands in it by itself too: a
+/// token that matches only as a whole word, or after normalization, may
+/// stand in a piece and not in its run. A comment is not in it, and neither
+/// is a literal that `built` names by its byte offset: one inside an
+/// expression the template builds a value from, the pattern of that value,
+/// which it writes only as the value. A template the lexer refuses is read
+/// whole.
 fn written_text(source: &str, built: impl Fn(usize) -> bool) -> String {
     let mut written = String::new();
+    // The runs of pieces that stand side by side, each behind a separator:
+    // where the open run begins, and how many pieces it holds so far.
+    let mut runs = String::new();
+    let (mut start, mut pieces) = (0, 0_usize);
     for item in tokenize(source, false, SyntaxConfig, WhitespaceConfig::default()) {
         let Ok((token, span)) = item else {
             return source.to_owned();
         };
         let text = match &token {
-            Token::TemplateData(text) | Token::Str(text) => *text,
-            Token::String(text) => &**text,
-            _ => continue,
+            Token::TemplateData(text) | Token::Str(text) => Some(*text),
+            Token::String(text) => Some(&**text),
+            Token::VariableStart | Token::VariableEnd | Token::Tilde | Token::Plus => continue,
+            _ => None,
         };
-        if !built(span.start_offset as usize) {
-            written.push(char::from(VALUE_SEPARATOR));
-            written.push_str(text);
+        let Some(text) = text.filter(|_| !built(span.start_offset as usize)) else {
+            // The run ends here; one piece alone is no run.
+            if pieces == 1 {
+                runs.truncate(start);
+            }
+            pieces = 0;
+            continue;
+        };
+        written.push(char::from(VALUE_SEPARATOR));
+        written.push_str(text);
+        if pieces == 0 {
+            start = runs.len();
+            runs.push(char::from(VALUE_SEPARATOR));
         }
+        runs.push_str(text);
+        pieces += 1;
     }
-    written
+    if pieces == 1 {
+        runs.truncate(start);
+    }
+    written + &runs
 }
 
 /// The names a render gives the four special tokens a template reads
@@ -4697,24 +4724,23 @@ impl ChatTemplateState {
         };
         // A template that writes an added token whole by itself is of the
         // other kind: its spellings would want the scan of `mark_controls`,
-        // which is not made here. The whole source is asked first, and what
-        // the template writes only where the source holds an added token
-        // somewhere: in a comment, or in the pattern a bound spelling is
-        // built from, the template writes none. Where the flat encode
-        // matches an added token after normalization it is asked too,
-        // whatever the source holds: the normalizer may make one of a text.
-        if cut_out.is_some() || controls.ranges(source).next().is_some() {
-            let bound = |at| {
-                bindings
-                    .iter()
-                    .any(|binding| (binding.span.0..binding.span.1).contains(&at))
-            };
-            let written = written_text(source, bound);
-            if controls.ranges(&written).next().is_some()
-                || cut_out.is_some_and(|cut_out| !cut_out(&written).is_empty())
-            {
-                return declined("it writes an added token whole by itself");
-            }
+        // which is not made here. What the template writes is asked, not
+        // its source: in a comment, or in the pattern a bound spelling is
+        // built from, the template writes none, and pieces that stand side
+        // by side write one whole, so they are asked joined and each by
+        // itself. Where the flat encode matches an added token after
+        // normalization it is asked too: the normalizer may make one of a
+        // text.
+        let bound = |at| {
+            bindings
+                .iter()
+                .any(|binding| (binding.span.0..binding.span.1).contains(&at))
+        };
+        let written = written_text(source, bound);
+        if controls.ranges(&written).next().is_some()
+            || cut_out.is_some_and(|cut_out| !cut_out(&written).is_empty())
+        {
+            return declined("it writes an added token whole by itself");
         }
         let Some(literals) = with_marked_literals(source, bindings) else {
             return declined("no string literal holds one of the spellings");

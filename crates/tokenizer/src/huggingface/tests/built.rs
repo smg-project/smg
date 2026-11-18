@@ -351,6 +351,37 @@ fn a_text_the_normalizer_turns_into_an_added_token_stays_text() {
     assert_eq!(ids, [2, 13, 19, 14, 3, 13, 14, 1]);
 }
 
+/// A text a template writes in two pieces side by side is asked both ways,
+/// the pieces joined and each by itself. Under a pipeline that lowercases,
+/// an added token that matches only as a whole word stands in the second
+/// piece (`TAG`) and not in the run (`xTAG`): the template is left as it
+/// is, as one that writes that piece alone is.
+#[test]
+fn a_whole_word_token_in_one_of_two_joined_pieces_leaves_the_template_as_it_was() {
+    let conversion = with_added_token("<a>")
+        .replace(
+            r#""special": false}],"#,
+            r#""special": false},
+        {"id": 20, "content": "tag", "single_word": true, "lstrip": false, "rstrip": false, "normalized": true, "special": true}],"#,
+        )
+        .replace(r#""<a>": 19}"#, r#""<a>": 19, "tag": 20}"#)
+        .replace(
+            r#""normalizer": null"#,
+            r#""normalizer": {"type": "Lowercase"}"#,
+        );
+    assert!(conversion.contains(r#""id": 20"#) && conversion.contains("Lowercase"));
+    let marked = |written: &str| {
+        let template = format!("{}{{% if tagged %}}{written}{{% endif %}}", builds());
+        let temp = TempDir::new().unwrap();
+        checkpoint_of(temp.path(), &conversion, &template)
+            .chat_template
+            .marked()
+    };
+    assert!(marked("{{ 'x' }}"));
+    assert!(!marked("{{ 'TAG' }}"));
+    assert!(!marked("{{ ('x' ~ 'TAG')[1:] }}"));
+}
+
 /// A replaced template makes the kept tokens anew: a token that kept its id
 /// is read by its characters once the template writes it as a control.
 #[test]
