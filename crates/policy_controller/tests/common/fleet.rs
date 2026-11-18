@@ -1430,9 +1430,16 @@ impl Harness {
     /// dispatched: no dispatch deadline ends it then, so it books its
     /// worker until its gateway gives it up.
     pub async fn dispatch(&mut self, lease: u64) -> Result<(), String> {
+        self.dispatch_at(lease, 0).await
+    }
+
+    /// As [`Harness::dispatch`], on the target at `target` of the lease's
+    /// pick, best first: a gateway that sent its request past the first
+    /// target names the one it sent to.
+    pub async fn dispatch_at(&mut self, lease: u64, target: u32) -> Result<(), String> {
         let dispatched = Dispatched {
             lease_id: lease,
-            target_index: 0,
+            target_index: target,
             side: Side::Single.into(),
             since_decision_micros: 0,
         };
@@ -1452,6 +1459,16 @@ impl Harness {
         })
         .await
         .map(|_| ())
+    }
+
+    /// The row the store's pin of record names for `session`, the value a
+    /// lease states of its request's session; `None` where the store pins
+    /// the session nowhere.
+    pub fn pinned(&self, session: u64) -> Option<(usize, u16)> {
+        // By the trait's path, as `leases` reads the file.
+        let pin =
+            smg_policy_controller::store::SessionsStore::lookup(self.store.as_ref(), session)?;
+        self.named(pin.worker.0)
     }
 
     /// Whether the store holds a completion of class ok by the gateway named

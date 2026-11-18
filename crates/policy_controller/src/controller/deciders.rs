@@ -53,12 +53,11 @@
 //! past its issue) stands until its deadline and the issues after it, and
 //! through a lull until the next issue: no timer ends one yet.
 //!
-//! What a lease does not do yet. It books the pick's first target alone: a
-//! dispatch that names another target moves no count. A request sent twice
-//! under one id is issued two leases. A stage hears a lease's issue and its
-//! end at the dispatch deadline, and no dispatch, completion or release at
-//! its gateway's word: a document that names a stage in need of those calls
-//! stays refused.
+//! What a lease does not do yet. A request sent twice under one id is
+//! issued two leases. A stage hears a lease's issue here, its dispatch,
+//! completion and release at its gateway's word and its end at the
+//! dispatch deadline, and not the end of a lease whose gateway was let go:
+//! a document that names a stage in need of the calls stays refused.
 //!
 //! A term mints 2^32 - 1 ids, and under every term but the last a leader
 //! leaves before they end. The first answer a term hands over with an id at
@@ -130,7 +129,7 @@ use crate::{
     sessions::SessionVerdict,
     store::{
         leases::DISPATCH_TTL, Ask, Built, GatewayId, LeaseRecord, LeaseRefused, LeaseState,
-        MemoryStore, Named, Naming, ViewBuffers, World,
+        MemoryStore, Named, Naming, Picked, ViewBuffers, World,
     },
     view::{
         fingerprint, AffinityFacts, Candidate, Constraints, Phase, PoolFacts, RequestFacts, Role,
@@ -782,6 +781,7 @@ fn decide_in(
             let booking = decision.pick().and_then(|pick| {
                 Some(Booking {
                     target: pick.targets.first()?.id,
+                    picked: Picked::of(&pick.targets),
                     verdict: pick.session_verdict,
                     generation: pick.trace.generation,
                     session: facts.session(),
@@ -804,6 +804,9 @@ fn decide_in(
 struct Booking {
     /// The pick's first target: the worker the lease books.
     target: WorkerId,
+    /// The pick's other targets and the ranks, for a `Dispatched` that
+    /// names one by its index.
+    picked: Picked,
     /// What the decision did with the request's session key.
     verdict: SessionVerdict,
     /// The generation that decided.
@@ -854,6 +857,7 @@ fn issue(
         gateway: taken.gateway,
         request: fingerprint(taken.request.id()),
         target: booking.target,
+        picked: booking.picked,
         decode: None,
         term,
         issued_at: handed,
@@ -2447,6 +2451,7 @@ pub(crate) mod tests {
                 gateway: GATEWAY,
                 request: 1,
                 target: member,
+                picked: crate::store::Picked::default(),
                 decode: None,
                 term: 1,
                 issued_at: now,
