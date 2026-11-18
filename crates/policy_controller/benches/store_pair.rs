@@ -16,6 +16,9 @@
     reason = "a bench's setup has no caller to answer"
 )]
 
+#[path = "common/filled.rs"]
+mod filled;
+
 use std::{
     hint::black_box,
     sync::Arc,
@@ -81,6 +84,9 @@ fn pair_pool(n: usize) -> (Arc<MemoryStore>, Instant) {
     let opened = opened + PUBLISH_WINDOW;
     store.publish(opened);
     assert_eq!(store.publish_due(), None);
+    for role in [Role::Prefill, Role::Decode] {
+        filled::filled(&store, MODEL, role, n);
+    }
     (store, opened)
 }
 

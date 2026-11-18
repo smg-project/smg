@@ -86,6 +86,8 @@
     reason = "the shared fleet's engine builder belongs to the decision benches"
 )]
 mod common;
+#[path = "common/filled.rs"]
+mod filled;
 #[path = "common/placed.rs"]
 mod placed;
 
@@ -174,6 +176,7 @@ fn pool_of(n: usize) -> (Arc<MemoryStore>, Vec<WorkerId>, Instant) {
     let opened = opened + PUBLISH_WINDOW;
     store.publish(opened);
     assert_eq!(store.publish_due(), None);
+    filled::filled(&store, MODEL, Role::Single, n);
     (store, ids, opened)
 }
 
@@ -470,6 +473,8 @@ fn member_write_beside_spread_vetoes(c: &mut Criterion) {
     let opened = opened + PUBLISH_WINDOW;
     store.publish(opened);
     assert_eq!(store.publish_due(), None);
+    let spread = (0..MEMBERS).step_by(POOLS).count();
+    filled::filled(&store, "spread-0", Role::Single, spread);
     let until = opened + Duration::from_secs(3_600);
     for gateway in (2..14).map(GatewayId) {
         for id in &ids {
@@ -536,6 +541,7 @@ fn member_write_under_lists(c: &mut Criterion) {
     }
     store.publish(opened + PUBLISH_WINDOW);
     assert_eq!(store.publish_due(), None);
+    filled::filled(&store, MODEL, Role::Single, MEMBERS);
     // A fifth of the members state a zone the list does not name: the
     // lists stand, and the store counts those members outside.
     assert!(store.outside_lists().zones > 0);
@@ -861,6 +867,9 @@ fn pair_writes(c: &mut Criterion) {
         }
         store.publish(opened + PUBLISH_WINDOW);
         assert_eq!(store.publish_due(), None);
+        for role in [Role::Prefill, Role::Decode] {
+            filled::filled(&store, MODEL, role, n);
+        }
         let written = facts_of(n / 2);
         let named = WorkerFacts {
             engine_kind: "rt-b".to_string(),
@@ -938,6 +947,8 @@ fn member_write_beside_many_models(c: &mut Criterion) {
         }
         store.publish(opened + PUBLISH_WINDOW);
         assert_eq!(store.publish_due(), None);
+        filled::filled(&store, MODEL, Role::Single, 8);
+        filled::filled(&store, "model-0", Role::Single, 1);
         let written = small(3);
         group.bench_with_input(BenchmarkId::new("member_write", ids), &ids, |b, _| {
             b.iter_batched(

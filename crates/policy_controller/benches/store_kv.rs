@@ -33,6 +33,9 @@
     reason = "a bench's setup has no caller to answer, and the fill's report is its output"
 )]
 
+#[path = "common/filled.rs"]
+mod filled;
+
 use std::{
     fs,
     hint::black_box,
@@ -47,7 +50,7 @@ use smg_policy_controller::{
         BatchFacts, BatchOutcome, ContentHash, KvEvent, KvEventSink, LaneCounts, MemoryStore,
         SequenceHash, Signals, StoredBlock, WorkerFacts, WorkersStore, INDEX_WORKERS,
     },
-    WorkerId,
+    Role, WorkerId,
 };
 
 const MODEL: &str = "m";
@@ -138,6 +141,7 @@ fn publishers(rows: usize) -> (MemoryStore, Vec<WorkerId>) {
         .map(|row| store.upsert(publisher(row)).id())
         .collect();
     store.publish_now();
+    filled::filled(&store, MODEL, Role::Single, rows);
     (store, ids)
 }
 

@@ -47,6 +47,9 @@
     reason = "a bench's setup has no caller to answer"
 )]
 
+#[path = "common/filled.rs"]
+mod filled;
+
 use std::{
     hint::black_box,
     sync::Arc,
@@ -262,6 +265,13 @@ fn store_of(fleet: &[WorkerFacts], mode: Pairing) -> MemoryStore {
         store.upsert(facts.clone());
     }
     store.publish_now();
+    if let Some(first) = fleet.first() {
+        let rows = fleet
+            .iter()
+            .filter(|facts| facts.role == first.role)
+            .count();
+        filled::filled(&store, MODEL, first.role, rows);
+    }
     store
 }
 

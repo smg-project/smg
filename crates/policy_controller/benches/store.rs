@@ -10,6 +10,9 @@
     reason = "a bench's setup has no caller to answer; a store that refuses its own registration is a bug the unit tests catch"
 )]
 
+#[path = "common/filled.rs"]
+mod filled;
+
 use std::{
     hint::black_box,
     time::{Duration, Instant},
@@ -18,7 +21,7 @@ use std::{
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
 use smg_policy_controller::{
     store::{GatewayId, HealthSink, MemoryStore, WorkerFacts, WorkersStore},
-    TransportClass, WorkerId,
+    Role, TransportClass, WorkerId,
 };
 
 const WORKERS: u64 = 64;
@@ -38,10 +41,11 @@ fn facts(key: &str, incarnation: u64) -> WorkerFacts {
 /// A store with `WORKERS` registered workers, and their ids in order.
 fn populated() -> (MemoryStore, Vec<WorkerId>) {
     let store = MemoryStore::new();
-    let ids = (0..WORKERS)
+    let ids: Vec<WorkerId> = (0..WORKERS)
         .map(|i| store.upsert(facts(&format!("http://w{i}:8000"), 1)).id())
         .collect();
     store.publish_now();
+    filled::filled(&store, "m", Role::Single, ids.len());
     (store, ids)
 }
 

@@ -37,6 +37,9 @@
     reason = "a bench's setup has no caller to answer"
 )]
 
+#[path = "common/filled.rs"]
+mod filled;
+
 use std::{
     hint::black_box,
     sync::{
@@ -136,6 +139,7 @@ fn pool_on(n: usize, log: Option<Log>) -> Pool {
         .collect();
     let opened = opened + PUBLISH_WINDOW;
     store.publish(opened);
+    filled::filled(&store, MODEL, Role::Single, n);
     Pool {
         store,
         log,
