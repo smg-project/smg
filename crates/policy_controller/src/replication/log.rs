@@ -155,9 +155,11 @@ struct Ring {
     /// The leader's place for the next write, while a standby applies the
     /// leader's event.
     adopting: Option<Position>,
-    /// How many places a standby has asked for. A guard gives the pending
-    /// place up while its own is the last asked for.
-    adoptions: u64,
+    /// How many places a standby has asked for, wrapping: a guard gives the
+    /// pending place up while its own is the last asked for, and reads the
+    /// count for that alone. Its four bytes stand beside `leads`, so the
+    /// ring keeps its size, and with it the lock's place in [`Log`].
+    adoptions: u32,
     /// Whether the store leads the log's term: from its take until it
     /// follows another history.
     leads: bool,
@@ -650,7 +652,7 @@ impl Log {
             return Err(Lost);
         }
         ring.adopting = Some(at);
-        ring.adoptions += 1;
+        ring.adoptions = ring.adoptions.wrapping_add(1);
         Ok(Adopting {
             log: self,
             at,
@@ -741,7 +743,7 @@ pub struct Adopting<'a> {
     log: &'a Log,
     at: Position,
     /// Which of the log's adoptions this is.
-    nth: u64,
+    nth: u32,
 }
 
 impl Adopting<'_> {
@@ -1794,6 +1796,37 @@ mod tests {
         load(&log, 3);
         assert!(second.landed(), "the first guard's drop took the place");
         assert_eq!(marks(&all(&log)), [1, 2, 3]);
+    }
+
+    #[test]
+    fn the_count_of_adoptions_wraps_and_a_guard_still_reads_its_own() {
+        let log = Log::new(8, 8);
+        // One short of the count's last value: the first guard takes that
+        // value and the second wraps to zero.
+        log.ring.lock().adoptions = u32::MAX - 1;
+        let first = log.adopt(at(1, 3)).expect("the next position");
+        let second = log.adopt(at(1, 3)).expect("the same position");
+        // The first guard's is not the last asked for, on either side of
+        // the wrap: its drop leaves the second's place.
+        drop(first);
+        load(&log, 1);
+        assert!(second.landed(), "the first guard's drop took the place");
+        // The last asked for gives its own place up.
+        drop(log.adopt(at(2, 3)).expect("the next position"));
+        load(&log, 2);
+        assert_ne!(log.head(All), at(2, 3), "a dropped guard's place was taken");
+    }
+
+    /// The lock is the log's first field, as the compiler lays the log out:
+    /// a read then addresses the ring off the log's own pointer. With the
+    /// lock further in, a read keeps the lock's address in a register of
+    /// its own, and its loop runs three instructions more an entry. The
+    /// compiler orders the fields by their sizes, so the ring's size
+    /// decides it: eight bytes more move the lock behind two fields.
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn the_logs_lock_is_its_first_field() {
+        assert_eq!(std::mem::offset_of!(Log, ring), 0);
     }
 
     #[test]
