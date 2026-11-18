@@ -638,9 +638,7 @@ impl Gemma4Processor {
         dtype: EncoderDtype,
         writer: &WireWriter,
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
-        if images.is_empty() {
-            return Err(TransformError::EmptyBatch);
-        }
+        TransformError::if_empty(images)?;
         let params = self.params_for(Modality::Image)?;
         let (max_patches, patch_pixels) = (params.max_patches(), params.patch_pixels());
         let band_bytes = max_patches * patch_pixels * writer.element_size();
@@ -719,9 +717,7 @@ impl VisionPreProcessor for Gemma4Processor {
         &self,
         images: &[&DynamicImage],
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
-        if images.is_empty() {
-            return Err(TransformError::EmptyBatch);
-        }
+        TransformError::if_empty(images)?;
         let params = self.params_for(Modality::Image)?;
         let encoded = images
             .iter()

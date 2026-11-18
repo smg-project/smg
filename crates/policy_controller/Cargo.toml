@@ -167,8 +167,21 @@ kubernetes = ["dep:k8s-openapi", "dep:kube", "dep:tokio"]
 default = ["wasm"]
 # The WebAssembly plugin host over the committed `smg:policy` worlds.
 wasm = ["dep:wasmtime", "dep:thread_local", "dep:tracing", "dep:rustix"]
+# A case's hold of the gRPC plugin runtime's I/O thread, the stand-in for a
+# host that takes the thread's core. The package's own tests and benches
+# turn it on through the dev-dependency on the package itself; no build of
+# a product has it.
+test-util = []
 
 [dev-dependencies]
+# The package itself with `test-util`, for its own tests and benches alone.
+# Without `default-features = false` the default set would reach every test
+# target whatever features a run selected, and a run with no default
+# features would not be one. The key is not the package's name: on a build
+# line cargo reads `smg-policy-controller/<feature>` as a dependency of that
+# name first, and the controller image's line, which names its features so,
+# would turn them on for this test edge alone and build no binary.
+smg-policy-controller-test-util = { package = "smg-policy-controller", path = ".", default-features = false, features = ["test-util"] }
 criterion = "0.8"
 # The Kubernetes elector's tests run its client against a service in the
 # test's process that plays one Lease, and its three-process cell against
@@ -205,6 +218,10 @@ tower = { version = "0.5", default-features = false, features = ["util"] }
 # the same `GetLoads` answers the gateway's tests read.
 mock-worker = { path = "../mock_worker" }
 
+# The spec file's open is read on a terminal pair its test makes (`pty`).
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+rustix = { version = "1", default-features = false, features = ["pty"] }
+
 [[bin]]
 name = "smg-policy-controller"
 path = "src/bin/smg-policy-controller.rs"
@@ -216,6 +233,10 @@ required-features = ["controller"]
 
 [[test]]
 name = "spec_file"
+required-features = ["controller"]
+
+[[test]]
+name = "spec_store"
 required-features = ["controller"]
 
 # Replays recorded rows through the row builder of `ingest`: a bare test run builds no part of it.
@@ -254,6 +275,14 @@ required-features = ["controller"]
 
 [[test]]
 name = "replicas"
+required-features = ["controller"]
+
+[[test]]
+name = "replication"
+required-features = ["controller"]
+
+[[test]]
+name = "watch_workers"
 required-features = ["controller"]
 
 [[bench]]
@@ -309,6 +338,10 @@ name = "store_pair"
 harness = false
 
 [[bench]]
+name = "store_lent"
+harness = false
+
+[[bench]]
 name = "store"
 harness = false
 
@@ -321,7 +354,15 @@ name = "store_journal"
 harness = false
 
 [[bench]]
+name = "store_named"
+harness = false
+
+[[bench]]
 name = "power_of_two"
+harness = false
+
+[[bench]]
+name = "prefix_hash"
 harness = false
 
 [[bench]]
@@ -330,6 +371,15 @@ harness = false
 
 [[bench]]
 name = "pair_classes"
+harness = false
+
+[[bench]]
+name = "decide_stream"
+harness = false
+required-features = ["controller"]
+
+[[bench]]
+name = "encode_classes"
 harness = false
 
 [lints]

@@ -12,12 +12,11 @@
 //! policy controller crate replays the rows through its store
 //! (`crates/policy_controller/tests/classic/overload.rs`).
 //!
-//! This file is not part of the gateway. It is kept beside the recorded rows
-//! with the commit it records from, and run in a checkout of that commit:
-//! copy it to
-//! `model_gateway/src/worker/load/monitor/classic_overload_rows.rs`, add
-//! `#[cfg(test)] mod classic_overload_rows;` at the end of
-//! `model_gateway/src/worker/load/monitor.rs`, then
+//! This file is an ignored test of the gateway crate, kept beside the code
+//! it runs. It records from the checkout it is built in and writes the sheet
+//! under `CLASSIC_ROWS_OUT`, naming `CLASSIC_ROWS_COMMIT` as the commit it
+//! recorded from. The sheets the policy controller crate replays are in
+//! `crates/policy_controller/tests/classic/sheets`; to record this one again:
 //!
 //! ```text
 //! CLASSIC_ROWS_OUT=<dir> CLASSIC_ROWS_COMMIT=<commit> \
@@ -36,10 +35,9 @@ use openai_protocol::{
 use serde::Serialize;
 
 use super::*;
-use crate::{
-    config::types::PolicyConfig,
-    policies::PolicyRegistry,
-    worker::{health::overload::OverloadThresholds, BasicWorkerBuilder, WorkerType},
+use crate::worker::{
+    health::overload::OverloadThresholds, test_support::LoadReaders, BasicWorkerBuilder,
+    WorkerMonitor, WorkerRegistry, WorkerType,
 };
 
 const URL: &str = "http://w0:8000";
@@ -204,10 +202,9 @@ fn answer(ranks: usize, figures: &[Option<Figures>]) -> WorkerLoadResponse {
 /// own.
 fn run(gateway: Thresholds, own: Thresholds, ranks: usize, steps: &[Step]) -> Vec<bool> {
     let registry = Arc::new(WorkerRegistry::new());
-    let policies = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
     let monitor = Arc::new(WorkerMonitor::new(
         Arc::clone(&registry),
-        policies,
+        Arc::new(LoadReaders::Blind),
         1,
         false,
         false,

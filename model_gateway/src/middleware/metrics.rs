@@ -459,7 +459,7 @@ mod tests {
     use tower::{ServiceBuilder, ServiceExt};
 
     use super::*;
-    use crate::observability::metrics::is_interned;
+    use crate::worker::metrics::is_interned;
 
     #[test]
     fn matched_path_label_defaults_to_other_when_absent() {

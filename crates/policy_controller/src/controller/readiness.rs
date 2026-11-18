@@ -94,8 +94,9 @@ impl Readiness {
     /// Resolves with `wanted` once the state is `wanted`, at once when it
     /// already is; `None` when the controller is gone before that. The
     /// state is read again at every move of the run loop and after every
-    /// election step; a fence that closes between two steps is seen at the
-    /// next.
+    /// election step; a fence that closes between two steps, or opens there
+    /// one renew deadline after a take, is seen at the next: a waiter for
+    /// the leader's state learns it up to a renew period late.
     pub async fn wait_for(&mut self, wanted: State) -> Option<State> {
         loop {
             if self.state() == wanted {
@@ -217,23 +218,27 @@ pub(crate) mod tests {
         assert_eq!(readiness.state(), State::Follower);
 
         // The take of a lease that held no record opens no fence: still a
-        // follower, through a renewal inside the wait. The lead opens one
+        // follower, through the renewals inside the wait. The lead opens one
         // renew deadline after the take's write, between two steps: the
         // leader from that instant, with no step taken and no message sent.
-        // The renewal's instant is ahead of the clock and just short of the
-        // opening, so the fence stays open most of a renew deadline past it.
+        // The renewals are a chain ahead of the clock, each just short of
+        // the deadline the one before it stamped: the fence stays open
+        // seconds past the opening, so the read needs no narrow window.
         let taken = Instant::now();
         assert_eq!(
             elector.tick(taken).expect("the take"),
             Tick::Acquired { term: 1 }
         );
         assert_eq!(readiness.state(), State::Follower);
-        let renewed = taken + settings.renew_deadline - Duration::from_millis(10);
-        assert_eq!(
-            elector.tick(renewed).expect("the renewal"),
-            Tick::Renewed { term: 1 }
-        );
-        assert_eq!(readiness.state(), State::Follower);
+        let mut renewed = taken;
+        for _ in 0..10 {
+            renewed += settings.renew_deadline - Duration::from_millis(10);
+            assert_eq!(
+                elector.tick(renewed).expect("the renewal"),
+                Tick::Renewed { term: 1 }
+            );
+            assert_eq!(readiness.state(), State::Follower);
+        }
         thread::sleep(settings.renew_deadline);
         assert_eq!(readiness.state(), State::Leader);
 

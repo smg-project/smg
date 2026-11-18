@@ -1,26 +1,35 @@
 //! What the crate's tests build their workers with: a health-check
 //! configuration that leaves the worker as the test built it, a ready
 //! worker and a worker of a given role built with it, a labelled gRPC
-//! worker and the registry holding a test's workers, the admission attempt
-//! that selects one worker, and the KV cache event that clears a worker's
-//! cache. [`RefusedAddress`] is the loopback address nothing answers at: a
-//! dead worker's port, held for as long as the test needs it.
+//! worker and the registry holding a test's workers, and the KV cache event
+//! that clears a worker's cache. [`RefusedAddress`] is the loopback address
+//! nothing answers at: a dead worker's port, held for as long as the test
+//! needs it. [`NoEngine`] is an engine connection with no engine behind it,
+//! and [`CountingConnector`] the connector that hands those out.
+//! [`LoadReaders`] is the routing side a load monitor's test stands beside
+//! it. A test of a metric renders its scrape with [`render_with_recorder`]
+//! and reads it with [`assert_metric`] and [`sorted_series`].
 
 use std::{
     net::{Ipv4Addr, SocketAddr},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Weak,
+    },
 };
 
+use async_trait::async_trait;
+use metrics_exporter_prometheus::PrometheusBuilder;
 use openai_protocol::{
     model_card::ModelCard,
-    worker::{HealthCheckConfig, RuntimeType, WorkerStatus, WorkerType},
+    worker::{HealthCheckConfig, RuntimeType, WorkerLoadResponse, WorkerStatus, WorkerType},
 };
-use smg_grpc_client::common_proto::{kv_cache_event, KvCacheCleared, KvCacheEvent};
+use smg_grpc_client::common_proto::{self, kv_cache_event, KvCacheCleared, KvCacheEvent};
 use tokio::net::{TcpListener, TcpSocket};
 
-use crate::{
-    routers::common::prefill_admission::{PrefillAdmissionAttempt, PrefillSelectionContext},
-    worker::{BasicWorkerBuilder, ConnectionMode, Worker, WorkerRegistry},
+use crate::worker::{
+    connection::engine::{EngineConnection, EngineConnector, ZmqLink},
+    BasicWorkerBuilder, ConnectionMode, LoadConsumer, Worker, WorkerRegistry,
 };
 
 /// The health checker disabled, everything else default: a test's worker
@@ -54,15 +63,6 @@ pub fn worker_of(url: &str, worker_type: WorkerType) -> Arc<dyn Worker> {
             .health_config(no_health_check())
             .build(),
     )
-}
-
-/// The attempt a test makes when it wants exactly `worker`: it is selected,
-/// with a unit payload, whenever it has capacity.
-pub fn select_worker(
-    worker: &Arc<dyn Worker>,
-) -> impl for<'a> FnMut(&PrefillSelectionContext<'a>) -> PrefillAdmissionAttempt<()> + Send {
-    let worker = Arc::clone(worker);
-    move |capacity| capacity.select(Arc::clone(&worker), ())
 }
 
 /// A regular gRPC worker of `runtime` at `url` serving `model`, with
@@ -237,6 +237,79 @@ impl RefusedAddress {
     }
 }
 
+/// A removed worker nothing holds any more: a dead witness for the series
+/// store's `retire`.
+pub fn gone(url: &str) -> Weak<dyn Worker> {
+    let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new(url).build());
+    Arc::downgrade(&worker)
+}
+
+/// A removed worker a handle still holds: the worker and its witness.
+pub fn held(url: &str) -> (Arc<dyn Worker>, Weak<dyn Worker>) {
+    let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new(url).build());
+    let witness = Arc::downgrade(&worker);
+    (worker, witness)
+}
+
+/// The routing side a test stands beside the load monitor: it says whether
+/// a reader wants worker loads, and reconciles nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadReaders {
+    /// No reader wants loads, as under a policy that reads none.
+    Blind,
+    /// A reader wants loads, as under a load-aware policy.
+    Aware,
+}
+
+impl LoadConsumer for LoadReaders {
+    fn needs_loads(&self) -> bool {
+        matches!(self, Self::Aware)
+    }
+
+    fn reconcile_in_flight(&self, _worker: &dyn Worker) {}
+}
+
+/// Run `f` under a thread-local Prometheus recorder and return the rendered
+/// scrape, the text a metrics endpoint serves.
+pub fn render_with_recorder(f: impl FnOnce()) -> String {
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    metrics::with_local_recorder(&recorder, f);
+    handle.render()
+}
+
+/// Assert the rendered scrape has a line for `name` carrying every label in
+/// `labels` and ending in `value`. Label order is exporter-defined, so this
+/// matches on substrings rather than a fixed label set.
+#[expect(
+    clippy::panic,
+    reason = "a test assertion: a missing series is a test failure"
+)]
+pub fn assert_metric(rendered: &str, name: &str, labels: &[&str], value: &str) {
+    let line = rendered
+        .lines()
+        .find(|l| l.starts_with(&format!("{name}{{")))
+        .unwrap_or_else(|| panic!("metric {name} missing; rendered:\n{rendered}"));
+    for label in labels {
+        assert!(line.contains(label), "{name} missing label {label}: {line}");
+    }
+    assert!(
+        line.ends_with(&format!(" {value}")),
+        "{name} expected value {value}: {line}"
+    );
+}
+
+/// The lines of a scrape that are series (not `# HELP` or `# TYPE`),
+/// sorted, for comparing two recorders' output.
+pub fn sorted_series(rendered: &str) -> Vec<&str> {
+    let mut series: Vec<&str> = rendered
+        .lines()
+        .filter(|line| !line.starts_with('#') && !line.is_empty())
+        .collect();
+    series.sort_unstable();
+    series
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::ErrorKind;
@@ -331,5 +404,102 @@ mod tests {
             reserved.len(),
             "two reservations hold one port"
         );
+    }
+}
+
+/// An engine connection with no engine behind it: alive, without admin
+/// calls, and every call refused as unavailable. What a test hands a worker
+/// whose connection only has to exist.
+#[derive(Debug, Default)]
+pub struct NoEngine;
+
+fn no_engine<T>() -> Result<T, tonic::Status> {
+    Err(tonic::Status::unavailable(
+        "no engine behind the test's connection",
+    ))
+}
+
+#[async_trait]
+impl EngineConnection for NoEngine {
+    fn carries_admin_calls(&self) -> bool {
+        false
+    }
+
+    fn is_alive(&self) -> bool {
+        true
+    }
+
+    async fn health_check(&self) -> Result<bool, tonic::Status> {
+        no_engine()
+    }
+
+    async fn get_loads(&self) -> Result<WorkerLoadResponse, tonic::Status> {
+        no_engine()
+    }
+
+    async fn flush_cache(
+        &self,
+        _timeout_s: f32,
+    ) -> Result<common_proto::FlushCacheResponse, tonic::Status> {
+        no_engine()
+    }
+
+    async fn start_profile(
+        &self,
+        _req: common_proto::StartProfileRequest,
+    ) -> Result<common_proto::ProfileResponse, tonic::Status> {
+        no_engine()
+    }
+
+    async fn stop_profile(&self) -> Result<common_proto::ProfileResponse, tonic::Status> {
+        no_engine()
+    }
+
+    async fn subscribe_kv_events(
+        &self,
+        _start_seq: u64,
+    ) -> Result<tonic::Streaming<common_proto::KvEventBatch>, tonic::Status> {
+        no_engine()
+    }
+
+    async fn subscribe_load_records(
+        &self,
+    ) -> Result<tonic::Streaming<common_proto::KvEventBatch>, tonic::Status> {
+        no_engine()
+    }
+
+    async fn kv_engine_id(&self) -> Result<Option<String>, tonic::Status> {
+        no_engine()
+    }
+}
+
+/// A connector that hands out [`NoEngine`] connections and counts the
+/// connects it was asked for.
+#[derive(Debug, Default)]
+pub struct CountingConnector {
+    connects: AtomicUsize,
+}
+
+impl CountingConnector {
+    /// How many connects it was asked for.
+    pub fn connects(&self) -> usize {
+        self.connects.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl EngineConnector for CountingConnector {
+    async fn connect_grpc(
+        &self,
+        _base_url: &str,
+        _runtime: RuntimeType,
+    ) -> Result<Arc<dyn EngineConnection>, String> {
+        self.connects.fetch_add(1, Ordering::SeqCst);
+        Ok(Arc::new(NoEngine))
+    }
+
+    async fn connect_zmq(&self, _link: ZmqLink) -> Result<Arc<dyn EngineConnection>, String> {
+        self.connects.fetch_add(1, Ordering::SeqCst);
+        Ok(Arc::new(NoEngine))
     }
 }

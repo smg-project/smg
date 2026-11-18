@@ -11,7 +11,7 @@ use wfaas::{
 use crate::{
     app_context::AppContext,
     worker::{ConnectionMode, RuntimeType, SubscriptionKind, Worker},
-    workflow::data::WorkerRegistrationData,
+    workflow::data::{require_app_context, WorkerRegistrationData},
 };
 
 /// Start the worker's stream on the KV event monitor, or restart it for the
@@ -161,11 +161,7 @@ impl UpdatePoliciesStep {
 #[async_trait]
 impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for UpdatePoliciesStep {
     async fn execute(&self, context: &mut WorkflowContext<D>) -> WorkflowResult<StepResult> {
-        let app_context = context
-            .data
-            .get_app_context()
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?
-            .clone();
+        let app_context = require_app_context(context.data.get_app_context())?.clone();
 
         let workers = context
             .data

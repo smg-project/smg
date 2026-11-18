@@ -251,17 +251,14 @@ impl WasmThreadPool {
         );
 
         loop {
-            let task = match receiver.recv().await {
-                Ok(task) => task,
-                Err(_) => {
-                    debug!(
-                        target: "smg::wasm::runtime",
-                        worker_id = worker_id,
-                        "Worker shutting down"
-                    );
-                    epoch_handle.abort(); // Stop the epoch incrementer
-                    break; // channel closed, exit loop
-                }
+            let Ok(task) = receiver.recv().await else {
+                debug!(
+                    target: "smg::wasm::runtime",
+                    worker_id = worker_id,
+                    "Worker shutting down"
+                );
+                epoch_handle.abort(); // Stop the epoch incrementer
+                break; // channel closed, exit loop
             };
 
             match task {

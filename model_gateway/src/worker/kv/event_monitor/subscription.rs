@@ -17,16 +17,14 @@ use super::{
     apply::{WorkerIndexCounters, WorkerIndexState},
     KvBlockSize, KvEventMonitor, SubscriptionKind,
 };
-use crate::{
-    observability::metrics::Metrics,
-    routers::grpc::backend_client::BackendClient,
-    worker::{
-        health::liveness,
-        identity::endpoint::Endpoint,
-        kv::{event_monitor::recovery::ResyncReason, index_backend::KvIndex},
-        load::monitor::WorkerMonitor,
-        Worker,
-    },
+use crate::worker::{
+    connection::engine::EngineConnection,
+    health::liveness,
+    identity::endpoint::Endpoint,
+    kv::{event_monitor::recovery::ResyncReason, index_backend::KvIndex},
+    load::monitor::PushedLoadSink,
+    metrics::Metrics,
+    Worker,
 };
 
 /// Initial reconnection delay after stream failure.
@@ -213,7 +211,7 @@ struct WorkerSubscription<'a> {
     worker_url: &'a str,
     role: Role<'a>,
     model_id: &'a str,
-    load_sink: Option<&'a Weak<WorkerMonitor>>,
+    load_sink: Option<&'a Weak<dyn PushedLoadSink>>,
     wake: Option<&'a Arc<tokio::sync::Notify>>,
 }
 
@@ -247,7 +245,7 @@ async fn sleep_or_shutdown(
 /// removal ends it at once (without this arm a call that never answers,
 /// retried at every contact, would keep the task alive past the removal).
 async fn subscribe_with_deadline(
-    backend_client: &BackendClient,
+    backend_client: &dyn EngineConnection,
     start_seq: u64,
     kind: SubscriptionKind,
     wake: Option<&Arc<tokio::sync::Notify>>,
@@ -390,7 +388,7 @@ impl KvEventMonitor {
         block_sizes: Arc<DashMap<String, KvBlockSize>>,
         model_id: String,
         mut shutdown_rx: oneshot::Receiver<()>,
-        load_sink: Option<Weak<WorkerMonitor>>,
+        load_sink: Option<Weak<dyn PushedLoadSink>>,
     ) {
         let index = match &indexer {
             Some(indexer) => match indexer.intern_worker(&worker_url) {
@@ -472,7 +470,7 @@ impl KvEventMonitor {
         shutdown_rx: &mut oneshot::Receiver<()>,
     ) -> Round {
         let worker_url = sub.worker_url;
-        let backend_client = match sub.worker.get_backend_client().await {
+        let backend_client = match sub.worker.engine_connection().await {
             Ok(Some(client)) => client,
             Ok(None) => {
                 // HTTP workers are filtered in on_worker_added, so this should
@@ -498,7 +496,7 @@ impl KvEventMonitor {
 
         let start_seq = state.resume_sequence();
         let subscribed = subscribe_with_deadline(
-            &backend_client,
+            backend_client.as_ref(),
             start_seq,
             sub.role.kind(),
             sub.wake,
@@ -682,8 +680,8 @@ impl KvEventMonitor {
             return;
         }
         liveness::on_contact(sub.worker);
-        if let Some(monitor) = sub.load_sink.and_then(Weak::upgrade) {
-            monitor.apply_pushed_load(sub.worker, dp_rank, load, Instant::now());
+        if let Some(sink) = sub.load_sink.and_then(Weak::upgrade) {
+            sink.push_load(sub.worker, dp_rank, load, Instant::now());
         }
     }
 
@@ -829,7 +827,8 @@ mod tests {
         policies::PolicyRegistry,
         routers::grpc::test_engine::serve_on_loopback,
         worker::{
-            identity::basic::StallReason, BasicWorkerBuilder, WorkerRegistry, UNKNOWN_MODEL_ID,
+            identity::basic::StallReason, BasicWorkerBuilder, WorkerMonitor, WorkerRegistry,
+            UNKNOWN_MODEL_ID,
         },
     };
 
@@ -1096,10 +1095,10 @@ mod tests {
     }
 
     /// A gRPC worker at `addr` and its backend client.
-    async fn connected(addr: SocketAddr) -> (Arc<dyn Worker>, Arc<BackendClient>) {
+    async fn connected(addr: SocketAddr) -> (Arc<dyn Worker>, Arc<dyn EngineConnection>) {
         let worker = grpc_worker(addr);
         let client = worker
-            .get_backend_client()
+            .engine_connection()
             .await
             .expect("a backend client")
             .expect("a gRPC worker has one");
@@ -1118,7 +1117,7 @@ mod tests {
         let (_keep, mut shutdown_rx) = oneshot::channel::<()>();
 
         let Subscribed::Refused(status) = subscribe_with_deadline(
-            &client,
+            client.as_ref(),
             0,
             SubscriptionKind::Events,
             wake.as_ref(),
@@ -1148,7 +1147,7 @@ mod tests {
         };
         assert!(matches!(
             subscribe_with_deadline(
-                &client,
+                client.as_ref(),
                 0,
                 SubscriptionKind::Events,
                 wake.as_ref(),
@@ -1164,7 +1163,7 @@ mod tests {
         shutdown_tx.send(()).unwrap();
         assert!(matches!(
             subscribe_with_deadline(
-                &client,
+                client.as_ref(),
                 0,
                 SubscriptionKind::Events,
                 wake.as_ref(),
@@ -1180,7 +1179,7 @@ mod tests {
         let (_worker, client) = connected(addr).await;
         let (_keep, mut shutdown_rx) = oneshot::channel::<()>();
         let Subscribed::Refused(status) = subscribe_with_deadline(
-            &client,
+            client.as_ref(),
             0,
             SubscriptionKind::Events,
             None,
@@ -1235,7 +1234,7 @@ mod tests {
             let mut state = WorkerStreamState::default();
             let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
             let Subscribed::Stream(stream) = subscribe_with_deadline(
-                &client,
+                client.as_ref(),
                 0,
                 SubscriptionKind::Events,
                 None,
@@ -1330,7 +1329,7 @@ mod tests {
         let (addr, server) = serve(Subscribe::Stream(script)).await;
         let worker = rank_worker(addr, 0, 2);
         let client = worker
-            .get_backend_client()
+            .engine_connection()
             .await
             .expect("a backend client")
             .expect("a gRPC worker has one");
@@ -1344,6 +1343,7 @@ mod tests {
             false,
         ));
         let sink = Arc::downgrade(&monitor);
+        let sink: Weak<dyn PushedLoadSink> = sink;
         let wake = worker.runtime_state().map(|state| state.contact_wake());
         let sub = WorkerSubscription {
             worker: &worker,
@@ -1356,7 +1356,7 @@ mod tests {
         let mut state = WorkerStreamState::default();
         let (_keep, mut shutdown_rx) = oneshot::channel::<()>();
         let Subscribed::Stream(stream) = subscribe_with_deadline(
-            &client,
+            client.as_ref(),
             0,
             SubscriptionKind::Loads,
             None,
@@ -1500,7 +1500,7 @@ mod tests {
             };
             let (_keep, mut shutdown_rx) = oneshot::channel();
             let Subscribed::Stream(stream) = subscribe_with_deadline(
-                &client,
+                client.as_ref(),
                 0,
                 SubscriptionKind::Events,
                 None,
@@ -1583,7 +1583,7 @@ mod tests {
             };
             let (_keep, mut shutdown_rx) = oneshot::channel();
             let Subscribed::Stream(stream) = subscribe_with_deadline(
-                &client,
+                client.as_ref(),
                 0,
                 SubscriptionKind::Events,
                 None,

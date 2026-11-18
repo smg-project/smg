@@ -335,9 +335,11 @@
           "livenessProbe",
           "readinessProbe",
           "shutdownGracePeriodSeconds",
-          "terminationGraceMarginSeconds"
+          "terminationGraceMarginSeconds",
+          "spec"
         ],
         "properties": {
+          "spec": { "type": "object", "minProperties": 1 },
           "replicas": { "type": "integer" },
           "ports": {
             "type": "object",
@@ -412,6 +414,7 @@
             }
           }
         },
+        "spec": { "type": ["object", "null"] },
         "ports": {
           "type": ["object", "null"],
           "additionalProperties": false,

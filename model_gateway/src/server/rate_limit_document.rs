@@ -277,8 +277,11 @@ mod tests {
 
     use super::*;
     use crate::{
-        app_context::AppContext, config::RouterConfig, health::ProbeState,
-        policies::PolicyRegistry, routers::gateway::Gateway, server::http_client,
+        app_context::AppContext,
+        config::RouterConfig,
+        policies::PolicyRegistry,
+        routers::gateway::Gateway,
+        server::{health::ProbeState, http_client},
         worker::WorkerRegistry,
     };
 

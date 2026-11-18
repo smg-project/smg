@@ -6,7 +6,7 @@
 //! is this binary's, installed once for all its tests (see `recorder()` in
 //! the group's `mod.rs`).
 
-use smg::observability::{metrics::Metrics, metrics_server::start_metrics_server};
+use smg::{observability::metrics_server::start_metrics_server, worker::metrics::Metrics};
 
 use crate::metrics::recorder;
 

@@ -120,16 +120,17 @@ pub mod wit;
 
 pub use catalog::{Catalog, CatalogError, StageKind};
 pub use decision::{
-    Decision, Pair, Pick, Queue, Shed, ShedReason, Survivors, Target, Targets, Trace, MAX_TARGETS,
-    TRACE_TOP,
+    Decision, Lifted, Pair, Pick, Queue, Shed, ShedReason, Survivors, Target, Targets, Trace,
+    MAX_TARGETS, TRACE_TOP,
 };
 pub use framework::{
-    Binding, DecisionScope, Engine, Filter, Narrowed, PairPools, PairTable, PairTableError, Picker,
-    Plan, Profile, Scorer, Scratch, TieBand, Weighted, DRAW_BOUND, DRAW_FROM,
+    Binding, DecisionScope, Engine, Filter, Front, Narrowed, PairPools, PairTable, PairTableError,
+    Picker, Plan, Profile, Scorer, Scratch, Spread, TieBand, Weighted, DRAW_BOUND, DRAW_FROM,
+    RANK_FROM,
 };
 pub use lease::{
-    Lease, LeaseId, LeaseKind, Lifecycle, Membership, Outcome, ReleaseReason, Side, Signal,
-    TransportClass,
+    EventKind, EventSet, Lease, LeaseId, LeaseKind, Lifecycle, Membership, Outcome, ReleaseReason,
+    Side, Signal, TransportClass,
 };
 pub use ring::{ConsistentHash, Ring};
 pub use sessions::{Assignment, Pins, Recovery, SessionRule, SessionTable, SessionVerdict};
@@ -156,7 +157,10 @@ pub use view::{
 /// - the seed under the alternates' mask: the order of equal counts among
 ///   the workers the count-first picker passed over;
 /// - the first value of the seed's stream: the seed a pair plan hands its
-///   decode side, whose stages derive their streams from it as above.
+///   decode side, whose stages derive their streams from it as above;
+/// - the seed under the store's two naming masks: where the store names a
+///   decision's rows and cuts a list at the profile's sample, the holders'
+///   draw and the warming rows' draw.
 #[derive(Clone, Copy, Debug)]
 pub struct Draw(u64);
 

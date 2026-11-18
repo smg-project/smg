@@ -79,23 +79,14 @@ impl Default for TransparentBgConfig {
 }
 
 impl TransparentBgConfig {
-    /// Background grey level for pixel `(x, y)`.
-    fn background_at(self, x: u32, y: u32) -> u8 {
+    /// The grey level of a flat background; `None` for the chessboard, whose
+    /// level depends on the pixel.
+    fn flat_level(self) -> Option<u8> {
         match self.pattern {
-            TransparentBgPattern::White => 255,
-            TransparentBgPattern::Black => 0,
-            TransparentBgPattern::Gray => 128,
-            TransparentBgPattern::Chessboard => {
-                // A square size of 0 would divide by zero here; the reference
-                // raises on the same input, so clamp instead of panicking.
-                let size = self.chessboard_square_size.max(1);
-                let gray_cell = u32::from(self.chessboard_square_on_top_left);
-                if (y / size + x / size) % 2 == gray_cell {
-                    self.chessboard_gray_value
-                } else {
-                    self.chessboard_white_value
-                }
-            }
+            TransparentBgPattern::White => Some(255),
+            TransparentBgPattern::Black => Some(0),
+            TransparentBgPattern::Gray => Some(128),
+            TransparentBgPattern::Chessboard => None,
         }
     }
 }
@@ -128,33 +119,80 @@ pub struct TransparentBg {
 /// reference's early return. Note that dropping alpha (what `to_rgb8` does on
 /// its own) is *not* equivalent: a fully transparent pixel usually stores RGB
 /// `(0,0,0)`, so it would read as solid black instead of as background.
+///
+/// The reference computes `a * img + (1 - a) * bg` in float32 with
+/// `a = alpha / 255`, then truncates. `a` depends on the pixel's alpha alone
+/// and `(1 - a) * bg` on the alpha and the background's level, so each is
+/// computed once per level, 256 values, and a pixel reads the two it needs.
 pub fn fill_transparent_bg(image: &DynamicImage, config: TransparentBgConfig) -> RgbImage {
     if !image.color().has_alpha() {
         return image.to_rgb8();
     }
 
-    let rgba = image.to_rgba8();
+    // An RGBA8 image is read where it is; another layout with alpha converts.
+    let converted;
+    let rgba = match image {
+        DynamicImage::ImageRgba8(rgba) => rgba,
+        other => {
+            converted = other.to_rgba8();
+            &converted
+        }
+    };
     let (width, height) = rgba.dimensions();
-    let mut out = Vec::with_capacity(width as usize * height as usize * 3);
+    let (w, h) = (width as usize, height as usize);
+    // A container may be longer than the image: the fill ends at the image's
+    // own pixels.
+    let pixels = &rgba.as_raw()[..4 * w * h];
+    // Filled run by run in the image's order; nothing is zeroed first.
+    let mut out: Vec<[u8; 3]> = Vec::with_capacity(w * h);
 
-    for (y, row) in rgba.as_raw().chunks_exact(width as usize * 4).enumerate() {
-        for (x, px) in row.as_chunks::<4>().0.iter().enumerate() {
-            let bg = f32::from(config.background_at(x as u32, y as u32));
-            let alpha = f32::from(px[3]) / 255.0;
-            let inv = 1.0 - alpha;
-            // numpy's `.astype(np.uint8)` truncates rather than rounds, and so
-            // does an `as` cast; keep them consistent.
-            out.push((alpha * f32::from(px[0]) + inv * bg) as u8);
-            out.push((alpha * f32::from(px[1]) + inv * bg) as u8);
-            out.push((alpha * f32::from(px[2]) + inv * bg) as u8);
+    let mut alpha = [0f32; 256];
+    for (a, level) in alpha.iter_mut().zip(0u8..=255) {
+        *a = f32::from(level) / 255.0;
+    }
+    let background_share = |level: u8| alpha.map(|a| (1.0 - a) * f32::from(level));
+    // numpy's `.astype(np.uint8)` truncates rather than rounds, and so does an
+    // `as` cast; keep them consistent.
+    let blend = |px: &[u8; 4], share: &[f32; 256]| {
+        let a = usize::from(px[3]);
+        [px[0], px[1], px[2]].map(|value| (alpha[a] * f32::from(value) + share[a]) as u8)
+    };
+
+    match config.flat_level() {
+        Some(level) => {
+            let share = background_share(level);
+            out.extend(pixels.as_chunks::<4>().0.iter().map(|px| blend(px, &share)));
+        }
+        None => {
+            // `bg[y, x] = gray if (y // size + x // size) % 2 == gray_cell
+            // else white`. A square size of 0 would divide by zero; the
+            // reference raises on the same input, so clamp instead of
+            // panicking. A row changes level only at a square's edge, so the
+            // level is found once per run of a square's width.
+            let size = config.chessboard_square_size.max(1) as usize;
+            let gray_cell = usize::from(config.chessboard_square_on_top_left);
+            let shares = [
+                background_share(config.chessboard_white_value),
+                background_share(config.chessboard_gray_value),
+            ];
+            // An image with no width has no rows, and a chunk of no bytes
+            // panics.
+            let stride = w.max(1);
+            for (y, row) in pixels.chunks_exact(4 * stride).enumerate() {
+                for (square, run) in row.chunks(4 * size).enumerate() {
+                    let share = &shares[usize::from((y / size + square) % 2 == gray_cell)];
+                    out.extend(run.as_chunks::<4>().0.iter().map(|px| blend(px, share)));
+                }
+            }
         }
     }
 
     #[expect(
         clippy::expect_used,
-        reason = "out holds exactly width*height*3 bytes by construction"
+        reason = "out holds exactly width*height pixels by construction"
     )]
-    RgbImage::from_raw(width, height, out).expect("buffer matches image dimensions")
+    RgbImage::from_raw(width, height, out.into_flattened())
+        .expect("buffer matches image dimensions")
 }
 
 /// Deinterleave interleaved RGB bytes into separate R, G, B f32 planes with
@@ -3615,9 +3653,7 @@ pub fn pad_to_size_pil_rgb(
 ///
 /// All tensors must have the same shape.
 pub fn stack_batch(tensors: &[Array3<f32>]) -> Result<Array4<f32>> {
-    if tensors.is_empty() {
-        return Err(TransformError::EmptyBatch);
-    }
+    TransformError::if_empty(tensors)?;
 
     let shape = tensors[0].shape();
     let (c, h, w) = (shape[0], shape[1], shape[2]);
@@ -5584,6 +5620,90 @@ mod tests {
             DynamicImage::from(image::RgbaImage::from_pixel(4, 4, Rgba([0, 0, 0, 0])));
         let out = fill_transparent_bg(&transparent, chessboard(0, true));
         assert_eq!(out.dimensions(), (4, 4));
+    }
+
+    /// The reference's blend of one pixel over a background level: float32,
+    /// truncated.
+    fn reference_blend(px: [u8; 4], bg: u8) -> [u8; 3] {
+        let a = f32::from(px[3]) / 255.0;
+        [px[0], px[1], px[2]].map(|c| (a * f32::from(c) + (1.0 - a) * f32::from(bg)) as u8)
+    }
+
+    /// Every channel value at every alpha, 65,536 pixels, over each flat
+    /// level and over three chessboards, one whose squares divide the width
+    /// and two whose squares do not: the fill is the reference's blend over
+    /// the reference's board.
+    #[test]
+    fn fill_transparent_bg_blends_every_value_at_every_alpha() {
+        let rgba = image::RgbaImage::from_fn(256, 256, |value, alpha| {
+            Rgba([value as u8, !(value as u8), value as u8 ^ 0x5a, alpha as u8])
+        });
+        let flat = |pattern| TransparentBgConfig {
+            pattern,
+            ..Default::default()
+        };
+        let patterns = [
+            (flat(TransparentBgPattern::Black), Some(0)),
+            (flat(TransparentBgPattern::Gray), Some(128)),
+            (flat(TransparentBgPattern::White), Some(255)),
+            (chessboard(16, true), None),
+            (chessboard(17, true), None),
+            (chessboard(3, false), None),
+        ];
+        let image = DynamicImage::from(rgba.clone());
+        for (config, level) in patterns {
+            let out = fill_transparent_bg(&image, config);
+            assert_eq!(out.dimensions(), (256, 256));
+            for (x, y, px) in rgba.enumerate_pixels() {
+                let bg = level.unwrap_or_else(|| reference_board(config, x, y));
+                assert_eq!(
+                    out.get_pixel(x, y).0,
+                    reference_blend(px.0, bg),
+                    "{config:?} at ({x},{y})"
+                );
+            }
+        }
+    }
+
+    /// Two pixels in a container two rows and three bytes longer than the
+    /// image: the fill ends at the image's own pixels.
+    #[test]
+    fn fill_transparent_bg_ends_at_the_images_pixels() {
+        let mut container = vec![200, 100, 50, 64, 200, 100, 50, 192];
+        container.extend_from_slice(&[9; 19]);
+        let rgba = image::RgbaImage::from_raw(2, 1, container).expect("2x1 RGBA");
+        let image = DynamicImage::from(rgba.clone());
+        for config in [TransparentBgConfig::default(), chessboard(1, true)] {
+            let out = fill_transparent_bg(&image, config);
+            assert_eq!(out.as_raw().len(), 6, "{config:?}");
+            for (x, y, px) in rgba.enumerate_pixels() {
+                let bg = match config.pattern {
+                    TransparentBgPattern::Chessboard => reference_board(config, x, y),
+                    _ => 0,
+                };
+                assert_eq!(
+                    out.get_pixel(x, y).0,
+                    reference_blend(px.0, bg),
+                    "{config:?}"
+                );
+            }
+        }
+    }
+
+    /// A layout with alpha other than RGBA8 converts first: a grey pixel with
+    /// alpha blends as that grey in three channels.
+    #[test]
+    fn fill_transparent_bg_converts_another_layout_with_alpha() {
+        let grey = image::GrayAlphaImage::from_raw(2, 1, vec![200, 64, 50, 192]).expect("2x1 LA");
+        let config = chessboard(1, false);
+        let out = fill_transparent_bg(&DynamicImage::ImageLumaA8(grey), config);
+        for (x, [luma, alpha]) in [(0u32, [200u8, 64]), (1, [50, 192])] {
+            let bg = reference_board(config, x, 0);
+            assert_eq!(
+                out.get_pixel(x, 0).0,
+                reference_blend([luma, luma, luma, alpha], bg)
+            );
+        }
     }
 
     #[test]

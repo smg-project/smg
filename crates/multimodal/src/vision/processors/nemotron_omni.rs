@@ -257,10 +257,13 @@ impl NemotronOmniProcessor {
         if !image.color().has_alpha() {
             return rgb_bytes(image);
         }
-        let rgba = image.to_rgba8();
+        // An RGBA8 input is read where it stands; another layout with alpha
+        // is converted first.
+        let rgba = image
+            .as_rgba8()
+            .map_or_else(|| Cow::Owned(image.to_rgba8()), Cow::Borrowed);
         let (width, height) = (rgba.width() as usize, rgba.height() as usize);
-        // An RGBA8 input comes back in a clone of its own container, which
-        // may be longer than its pixels.
+        // The container may be longer than its pixels.
         let (pixels, _) = rgba.as_raw()[..4 * width * height].as_chunks::<4>();
         // Whole pixels are collected and the vector is flattened: one exact
         // allocation, and no capacity check per byte in the loop.
@@ -396,9 +399,7 @@ impl VisionPreProcessor for NemotronOmniProcessor {
         images: &[&DynamicImage],
         context: &VisionPreprocessingContext,
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
-        if images.is_empty() {
-            return Err(TransformError::EmptyBatch);
-        }
+        TransformError::if_empty(images)?;
         let sizes: Vec<_> = images
             .iter()
             .map(|image| (image.width(), image.height()))
@@ -627,6 +628,18 @@ mod tests {
         assert_eq!(
             NemotronOmniProcessor::rgb_on_white(&longer),
             NemotronOmniProcessor::rgb_on_white(&exact)
+        );
+    }
+
+    /// An input of another layout with alpha is converted to RGBA8 first and
+    /// composites as that image does.
+    #[test]
+    fn another_alpha_layout_composites_as_its_rgba8_image() {
+        let gray = image::GrayAlphaImage::from_raw(2, 1, vec![200, 128, 9, 0]).unwrap();
+        let rgba = image::RgbaImage::from_raw(2, 1, vec![200, 200, 200, 128, 9, 9, 9, 0]).unwrap();
+        assert_eq!(
+            NemotronOmniProcessor::rgb_on_white(&DynamicImage::from(gray)),
+            NemotronOmniProcessor::rgb_on_white(&DynamicImage::from(rgba))
         );
     }
 

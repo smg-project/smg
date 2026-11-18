@@ -17,14 +17,20 @@
 //! and its ranks have no row until a per-rank source names them: a row
 //! holds a figure measured for its rank, never an aggregate. A failed read
 //! writes no row: the row on file ages, the engine's overload verdict
-//! reads clear until the engine is heard again, and health is the
-//! prober's (a later PR). A read that lands after its worker left writes
-//! nothing: the store keeps a worker's load rows exactly as long as its
-//! row.
+//! reads clear until the engine is heard again unless a rank of it is
+//! still heard on its stream, and health is the prober's (a later PR). A
+//! read that lands after its worker left writes nothing: the store keeps
+//! a worker's load rows exactly as long as its row.
 //! A row reachable only through a gateway is never dialed: its records
 //! arrive relayed. The engines are asked through a [`LoadProbe`], so the
 //! tests drive the arbitration without a socket and the binary dials the
 //! engines.
+//!
+//! Where it is built the driver tells the store the period every ready
+//! rank is heard in, by its stream or by the poll: the longer of the poll
+//! interval and the poll's deadline, plus a tick. The store ends the
+//! sample of a rank that lies three such periods behind its engine's
+//! newest ([`LoadSink::heard_every`]).
 //!
 //! The loop also keeps the instant the store names for its publication
 //! ([`LoadSink::publish_due`]): a row that lands inside the store's window
@@ -60,7 +66,9 @@ use crate::{
 pub struct LoadDriverConfig {
     /// How often an engine is polled while its stream is not serving it;
     /// also the freshness bound of the arbitration (a rank whose newest
-    /// record is older than this is polled). The gateway's
+    /// record is older than this is polled), and with a tick the period
+    /// every ready rank is heard in, unless the poll's deadline is longer
+    /// ([`Self::report_period`]). The gateway's
     /// `--load-monitor-interval`, 10 s. An interval the clock cannot add to
     /// the present polls an engine once.
     pub poll_interval: Duration,
@@ -72,6 +80,26 @@ pub struct LoadDriverConfig {
     pub scrape_timeout: Duration,
     /// The scheduler's tick: the resolution of every interval above.
     pub tick: Duration,
+}
+
+impl LoadDriverConfig {
+    /// The period the driver tells the sink ([`LoadSink::heard_every`]),
+    /// true of the slowest read of a sample that can end by its age: the
+    /// longer of the poll interval and the poll's deadline, plus a tick.
+    /// A poll starts on a tick, so two starts of an engine's polls lie at
+    /// most that far apart, and a poll that takes its whole deadline
+    /// lands inside the period it is counted in. A rank that loses one
+    /// report is so heard again within two periods and a deadline, inside
+    /// the three a sample is kept through. The sum saturates at the
+    /// largest interval or deadline a host can set. A sample is aged
+    /// against its engine's newest, and a scrape reads only an engine of
+    /// one rank, whose sample is its engine's newest at any age: the
+    /// scrape's timeout is not in the period.
+    pub fn report_period(&self) -> Duration {
+        self.poll_interval
+            .max(self.poll_deadline)
+            .saturating_add(self.tick)
+    }
 }
 
 impl Default for LoadDriverConfig {
@@ -376,7 +404,18 @@ where
     S: WorkersStore + LoadSink + 'static,
     P: LoadProbe,
 {
+    /// A driver over `store`. The store is told the report period
+    /// ([`LoadDriverConfig::report_period`]) here, where the driver is built
+    /// and not at its first poll: a store is aged by the period from its
+    /// first judged write.
     pub fn new(store: Arc<S>, probe: Arc<P>, config: LoadDriverConfig) -> Self {
+        let period = config.report_period();
+        if !store.heard_every(period) {
+            warn!(
+                ?period,
+                "the load sink keeps the report period it was told first"
+            );
+        }
         Self {
             store,
             probe,

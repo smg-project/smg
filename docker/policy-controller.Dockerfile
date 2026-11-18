@@ -6,7 +6,13 @@
 #
 # From the repository root:
 #   docker build --file docker/policy-controller.Dockerfile --tag smg-policy-controller .
-#   docker run --rm --publish 30103:30103 smg-policy-controller
+#   docker run --rm --publish 30103:30103 \
+#     --tmpfs /var/lib/smg/spec:uid=65532,gid=65532,mode=0700 \
+#     smg-policy-controller --spec-store /var/lib/smg/spec
+#
+# A start names the source of its policy spec. The directory above is one the
+# controller keeps, empty until the first apply and gone with the container:
+# mount a volume there to keep it, or pass a document's file as --spec-file.
 #
 # An image for another architecture than the builder's (`--platform`) is
 # cross-compiled: the build stage runs on the builder's own architecture, and

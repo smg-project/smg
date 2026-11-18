@@ -21,7 +21,7 @@ use wasmtime::{
 
 use super::{
     bindings::{packed, record, wit, HostState, LogGate, Watch},
-    config::{Abi, Exposure, Failure, FrameBudget, PluginSpec},
+    config::{Abi, EventSet, Exposure, Failure, FrameBudget, PluginSpec},
     view::{self as marshal, Packed, Records, TooLong},
 };
 use crate::{
@@ -741,6 +741,7 @@ pub struct Plugin {
     frame: FrameBudget,
     exposure: Exposure,
     needs: Needs,
+    observes: EventSet,
     failure: Failure,
     log: super::config::LogLimit,
     counters: Counters,
@@ -875,6 +876,7 @@ impl Plugin {
             frame,
             exposure: spec.view,
             needs: spec.needs,
+            observes: spec.observes,
             failure: spec.failure,
             log: spec.log,
             counters: Counters::new(spec.metrics),
@@ -953,6 +955,12 @@ impl Plugin {
     /// ([`crate::Profile::needs`]), and so into the engine's summary.
     pub fn needs(&self) -> Needs {
         self.needs
+    }
+
+    /// The kinds of lifecycle event the plugin hears, as its row lists
+    /// them.
+    pub fn observes(&self) -> EventSet {
+        self.observes
     }
 
     /// The counters the plugin adds to.
@@ -1866,7 +1874,10 @@ impl Bound {
             match &inst.exports {
                 Exports::Record(_) => inst.records.fill(facts, candidates, pool),
                 Exports::Packed(_) => {
-                    if inst.packed.fill(facts, candidates, pool, &plugin.exposure) == Err(TooLong) {
+                    let filled =
+                        inst.packed
+                            .fill(facts, candidates, pool, &plugin.exposure, plugin.needs);
+                    if filled == Err(TooLong) {
                         bump(&plugin.tally.too_long);
                         open.bypass = true;
                         return;
@@ -1876,12 +1887,14 @@ impl Bound {
         }
         let count = open.count;
         let exposure = &plugin.exposure;
+        let needs = plugin.needs;
         let frame = open.frame(&mut budget, frame.fuel_per_micro);
         let constructed = plugin.call(&mut guard, frame, |inst| {
             let result = match &inst.exports {
                 Exports::Record(b) => {
                     let headers = marshal::headers(facts, exposure);
-                    let request = marshal::request(facts, exposure, &inst.records.tried, &headers);
+                    let request =
+                        marshal::request(facts, exposure, needs, &inst.records.tried, &headers);
                     let pool = marshal::pool(pool, &inst.records.zones);
                     b.smg_policy_plugin().decision().call_constructor(
                         &mut inst.store,
@@ -2092,6 +2105,10 @@ impl BoundPlugin for Bound {
 
     fn needs(&self) -> Needs {
         self.plugin.needs()
+    }
+
+    fn observes(&self) -> EventSet {
+        self.plugin.observes()
     }
 
     /// The first scorer or picker adapter made from any bound set of the

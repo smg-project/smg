@@ -8,7 +8,10 @@ use wfaas::{
     WorkflowDefinition, WorkflowError, WorkflowResult,
 };
 
-use super::{data::WasmRemovalWorkflowData, wasm_module_registration::module_manager};
+use super::{
+    data::{require_app_context, WasmRemovalWorkflowData},
+    wasm_module_registration::module_manager,
+};
 use crate::app_context::AppContext;
 
 /// WASM module removal request
@@ -41,11 +44,7 @@ impl StepExecutor<WasmRemovalWorkflowData> for FindModuleToRemoveStep {
         context: &mut WorkflowContext<WasmRemovalWorkflowData>,
     ) -> WorkflowResult<StepResult> {
         let removal_request = &context.data.config;
-        let app_context = context
-            .data
-            .app_context
-            .as_ref()
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
+        let app_context = require_app_context(context.data.app_context.as_ref())?;
 
         debug!("Finding module to remove: {}", removal_request.module_uuid);
 
@@ -93,11 +92,7 @@ impl StepExecutor<WasmRemovalWorkflowData> for RemoveModuleStep {
         context: &mut WorkflowContext<WasmRemovalWorkflowData>,
     ) -> WorkflowResult<StepResult> {
         let removal_request = &context.data.config;
-        let app_context = context
-            .data
-            .app_context
-            .as_ref()
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
+        let app_context = require_app_context(context.data.app_context.as_ref())?;
 
         debug!("Removing WASM module: {}", removal_request.module_uuid);
 

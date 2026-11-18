@@ -168,9 +168,7 @@ impl Qwen3AudioProcessor {
         clips: &[&DecodedAudio],
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
         self.validate_params()?;
-        if clips.is_empty() {
-            return Err(TransformError::EmptyBatch);
-        }
+        TransformError::if_empty(clips)?;
 
         let mut waveforms: Vec<Cow<'_, [f32]>> = Vec::with_capacity(clips.len());
         for (clip_index, clip) in clips.iter().enumerate() {

@@ -1,12 +1,13 @@
 //! The controller's process series: its state, its start time, the load
-//! driver's counts and the decide call's (design 14 names the rest, which
-//! arrive with the scopes, the replication and the election). They live on
-//! a recorder of the controller's own, not the process global, so a gateway
-//! that embeds the controller keeps its recorder and two controllers in one
-//! test process keep theirs; the admin listener renders it in the
-//! Prometheus text form. The driver's counts and the decide call's are read
-//! from their atomics at each render, so neither carries a recorder handle
-//! and a decision writes no series.
+//! driver's counts, the decide call's and the store's two counts (design 14
+//! names the rest, which arrive with the scopes, the replication and the
+//! election). They live on a recorder of the controller's own, not the
+//! process global, so a gateway that embeds the controller keeps its
+//! recorder and two controllers in one test process keep theirs; the admin
+//! listener renders it in the Prometheus text form. The driver's counts and
+//! the decide call's are read from their atomics at each render and the
+//! store's from the store, so none carries a recorder handle and a decision
+//! writes no series.
 
 use std::{
     sync::{
@@ -21,7 +22,10 @@ use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle, Prometheu
 use parking_lot::Mutex;
 
 use super::{deciders::Counts, generations::Generations, readiness::State};
-use crate::ingest::loads::{Failures, Stats};
+use crate::{
+    ingest::loads::{Failures, Stats},
+    store::StoreCounts,
+};
 
 /// `1` for the controller's state (`starting`, `leader`, `follower`,
 /// `draining`), `0` for the other three. The admin listener sets it from the
@@ -55,11 +59,11 @@ pub const SPEC_APPLY_TOTAL: &str = "smg_policy_spec_apply_total";
 /// `not_leader`): each is one the gateway decided locally.
 pub const DECIDE_BUSY_TOTAL: &str = "smg_policy_controller_decide_busy_total";
 /// Decide requests this build had no decision for, by `cause` (`fault`,
-/// `pair_side`, `prompt_text`, `decider_gone`): the `Busy` answers with no
-/// reason, each under what took its decision.
+/// `pair_side`, `prompt_text`, `decider_gone`, `lease_ids_spent`): the
+/// `Busy` answers with no reason, each under what took its decision.
 pub const DECIDE_NO_DECISION_TOTAL: &str = "smg_policy_controller_decide_no_decision_total";
-/// Decide requests that carried more block hashes than their generation's
-/// view reads: decided over the first ones.
+/// Decide requests that carried more block hashes than their generation
+/// reads of them: decided over the first ones, the rest hashed for nothing.
 pub const DECIDE_HASHES_CUT_TOTAL: &str = "smg_policy_controller_decide_hashes_cut_total";
 /// Answers no decide stream took, by `cause`: `stream_gone` for a stream
 /// that had ended, `queue_full` for one whose queue had no place, which a
@@ -74,6 +78,12 @@ pub const DECIDE_CANDIDATES_UNDIALED_TOTAL: &str =
 /// request that arrived late.
 pub const DECIDE_BUDGET_OUTLASTED_TOTAL: &str =
     "smg_policy_controller_decide_budget_outlasted_total";
+/// Members whose engine family or zone the standing generation's list does
+/// not name, by `list` (`engines`, `zones`). Such a member is admitted and
+/// reads position 0 in that field. A generation with no list counts none.
+pub const MEMBERS_OUTSIDE_LIST: &str = "smg_policy_controller_members_outside_list";
+/// Writes to the load table that moved an overload verdict.
+pub const OVERLOAD_FLIPS_TOTAL: &str = "smg_policy_controller_overload_flips_total";
 
 /// The controller's series and the handle that renders them.
 pub(crate) struct Metrics {
@@ -82,6 +92,9 @@ pub(crate) struct Metrics {
     state: [Gauge; 4],
     loads: LoadCounters,
     decides: DecideCounters,
+    /// The members outside a list: `engines`, then `zones`.
+    outside: [Gauge; 2],
+    overload_flips: Counter,
     /// Held from a scrape's sample of the state to the end of its render:
     /// the four gauges are written from one sample and read back whole.
     scrape: Mutex<()>,
@@ -118,8 +131,8 @@ struct LoadCounters {
 struct DecideCounters {
     /// In the order of [`Counts::BUSY`].
     busy: [Counter; 5],
-    /// `fault`, `pair_side`, `prompt_text`, `decider_gone`.
-    no_decision: [Counter; 4],
+    /// `fault`, `pair_side`, `prompt_text`, `decider_gone`, `lease_ids_spent`.
+    no_decision: [Counter; 5],
     hashes_cut: Counter,
     /// `queue_full`, `stream_gone`.
     dropped: [Counter; 2],
@@ -128,7 +141,7 @@ struct DecideCounters {
 }
 
 impl Metrics {
-    /// A recorder with the two series registered and the start time set.
+    /// A recorder with the series registered and the start time set.
     ///
     /// No histogram lives here yet, so the recorder needs no upkeep task;
     /// the first histogram brings one.
@@ -185,8 +198,7 @@ impl Metrics {
         recorder.describe_counter(
             KeyName::from_const_str(DECIDE_HASHES_CUT_TOTAL),
             None,
-            "Decide requests that carried more block hashes than their generation's view reads"
-                .into(),
+            "Decide requests that carried more block hashes than their generation reads".into(),
         );
         recorder.describe_counter(
             KeyName::from_const_str(DECIDE_ANSWERS_DROPPED_TOTAL),
@@ -203,6 +215,16 @@ impl Metrics {
             None,
             "Decisions whose budget ended while they were made, of the Busy answers under budget_gone_on_arrival"
                 .into(),
+        );
+        recorder.describe_gauge(
+            KeyName::from_const_str(MEMBERS_OUTSIDE_LIST),
+            None,
+            "Members whose engine family or zone the policy document's list does not name, by list (engines, zones)".into(),
+        );
+        recorder.describe_counter(
+            KeyName::from_const_str(OVERLOAD_FLIPS_TOTAL),
+            None,
+            "Writes to the load table that moved an overload verdict".into(),
         );
         let state = State::ALL.map(|state| {
             let key = Key::from_parts(STATE, vec![Label::new("state", state.as_str())]);
@@ -231,8 +253,14 @@ impl Metrics {
         };
         let decides = DecideCounters {
             busy: Counts::BUSY.map(|reason| counter(DECIDE_BUSY_TOTAL, "reason", reason)),
-            no_decision: ["fault", "pair_side", "prompt_text", "decider_gone"]
-                .map(|cause| counter(DECIDE_NO_DECISION_TOTAL, "cause", cause)),
+            no_decision: [
+                "fault",
+                "pair_side",
+                "prompt_text",
+                "decider_gone",
+                "lease_ids_spent",
+            ]
+            .map(|cause| counter(DECIDE_NO_DECISION_TOTAL, "cause", cause)),
             hashes_cut: recorder
                 .register_counter(&Key::from_name(DECIDE_HASHES_CUT_TOTAL), &metadata),
             dropped: ["queue_full", "stream_gone"]
@@ -242,6 +270,12 @@ impl Metrics {
             outlasted: recorder
                 .register_counter(&Key::from_name(DECIDE_BUDGET_OUTLASTED_TOTAL), &metadata),
         };
+        let outside = ["engines", "zones"].map(|list| {
+            let key = Key::from_parts(MEMBERS_OUTSIDE_LIST, vec![Label::new("list", list)]);
+            recorder.register_gauge(&key, &metadata)
+        });
+        let overload_flips =
+            recorder.register_counter(&Key::from_name(OVERLOAD_FLIPS_TOTAL), &metadata);
         start.set(
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -253,6 +287,8 @@ impl Metrics {
             state,
             loads,
             decides,
+            outside,
+            overload_flips,
             scrape: Mutex::new(()),
             recorder,
             spec: OnceLock::new(),
@@ -295,15 +331,16 @@ impl Metrics {
     }
 
     /// One scrape's text form: the state sampled once by `state` and its
-    /// gauge written, the load driver's counts and the decide call's read,
-    /// and the render, with no other scrape between the sample and the
-    /// render. Two scrapes across a change of role each render one state,
-    /// their own.
+    /// gauge written, the load driver's counts, the decide call's and the
+    /// store's read, and the render, with no other scrape between the
+    /// sample and the render. Two scrapes across a change of role each
+    /// render one state, their own.
     pub(crate) fn render(
         &self,
         state: impl FnOnce() -> State,
         loads: &Stats,
         decides: &Counts,
+        store: impl FnOnce() -> StoreCounts,
     ) -> String {
         let _one = self.scrape.lock();
         self.set_state(state());
@@ -315,6 +352,7 @@ impl Metrics {
             spec.rejected.absolute(counts.rejected);
         }
         self.observe_decides(decides);
+        self.observe_store(store());
         self.handle.render()
     }
 
@@ -329,6 +367,7 @@ impl Metrics {
             &counts.pair_sides,
             &counts.texts,
             &counts.gone,
+            &counts.unleased,
         ];
         for (counter, count) in self.decides.no_decision.iter().zip(causes) {
             counter.absolute(read(count));
@@ -340,6 +379,14 @@ impl Metrics {
         }
         self.decides.undialed.absolute(counts.undialed());
         self.decides.outlasted.absolute(read(&counts.outlasted));
+    }
+
+    /// Sets the store's series from one read of its counts.
+    fn observe_store(&self, counts: StoreCounts) {
+        let [engines, zones] = &self.outside;
+        engines.set(f64::from(counts.outside.engines));
+        zones.set(f64::from(counts.outside.zones));
+        self.overload_flips.absolute(counts.overload_flips);
     }
 
     /// Sets the load counters from the driver's atomics.
@@ -383,11 +430,13 @@ mod tests {
     use std::{sync::Arc, time::Duration};
 
     use super::{
-        Generations, Metrics, SPEC_APPLY_TOTAL, SPEC_GENERATION, START_TIME_SECONDS, STATE,
+        Generations, Metrics, StoreCounts, MEMBERS_OUTSIDE_LIST, SPEC_APPLY_TOTAL, SPEC_GENERATION,
+        START_TIME_SECONDS, STATE,
     };
     use crate::{
         controller::{deciders::Counts, readiness::State},
         ingest::loads::Stats,
+        store::OutsideLists,
     };
 
     fn line(rendered: &str, series: &str, label: &str) -> Option<String> {
@@ -400,7 +449,12 @@ mod tests {
     #[test]
     fn the_state_gauge_follows_the_transitions_on_the_controllers_own_recorder() {
         let metrics = Metrics::new();
-        let rendered = metrics.render(|| State::Starting, &Stats::default(), &Counts::default());
+        let rendered = metrics.render(
+            || State::Starting,
+            &Stats::default(),
+            &Counts::default(),
+            StoreCounts::default,
+        );
         assert_eq!(
             line(&rendered, STATE, "state=\"starting\"").as_deref(),
             Some("smg_policy_controller_state{state=\"starting\"} 1")
@@ -411,7 +465,12 @@ mod tests {
         );
         assert!(rendered.contains("# HELP smg_policy_controller_state "));
 
-        let rendered = metrics.render(|| State::Leader, &Stats::default(), &Counts::default());
+        let rendered = metrics.render(
+            || State::Leader,
+            &Stats::default(),
+            &Counts::default(),
+            StoreCounts::default,
+        );
         assert_eq!(
             line(&rendered, STATE, "state=\"starting\"").as_deref(),
             Some("smg_policy_controller_state{state=\"starting\"} 0")
@@ -424,7 +483,12 @@ mod tests {
         let other = Metrics::new();
         assert_eq!(
             line(
-                &other.render(|| State::Starting, &Stats::default(), &Counts::default()),
+                &other.render(
+                    || State::Starting,
+                    &Stats::default(),
+                    &Counts::default(),
+                    StoreCounts::default
+                ),
                 STATE,
                 "state=\"leader\""
             )
@@ -469,6 +533,7 @@ mod tests {
                     },
                     &stats,
                     &Counts::default(),
+                    StoreCounts::default,
                 )
             }
         });
@@ -484,6 +549,7 @@ mod tests {
             },
             &stats,
             &Counts::default(),
+            StoreCounts::default,
         );
         let waited = Instant::now();
         while !first.is_finished() {
@@ -517,7 +583,12 @@ mod tests {
 
         let metrics = Metrics::new();
         let stats = Stats::default();
-        let rendered = metrics.render(|| State::Starting, &stats, &Counts::default());
+        let rendered = metrics.render(
+            || State::Starting,
+            &stats,
+            &Counts::default(),
+            StoreCounts::default,
+        );
         assert!(rendered.contains("smg_policy_controller_load_polls_total{mode=\"poll\"} 0"));
         assert!(rendered.contains("smg_policy_controller_load_rows_total 0"));
 
@@ -526,7 +597,12 @@ mod tests {
         stats.rows.fetch_add(7, Ordering::Relaxed);
         stats.scrapes.fetch_add(1, Ordering::Relaxed);
         stats.poll_failures.deadline.fetch_add(1, Ordering::Relaxed);
-        let rendered = metrics.render(|| State::Starting, &stats, &Counts::default());
+        let rendered = metrics.render(
+            || State::Starting,
+            &stats,
+            &Counts::default(),
+            StoreCounts::default,
+        );
         assert!(rendered.contains("smg_policy_controller_load_polls_total{mode=\"poll\"} 3"));
         assert!(rendered.contains("smg_policy_controller_load_polls_total{mode=\"suppressed\"} 2"));
         assert!(rendered
@@ -547,7 +623,12 @@ mod tests {
 
         let metrics = Metrics::new();
         let counts = Counts::default();
-        let rendered = metrics.render(|| State::Starting, &Stats::default(), &counts);
+        let rendered = metrics.render(
+            || State::Starting,
+            &Stats::default(),
+            &counts,
+            StoreCounts::default,
+        );
         // Every series stands at zero from the first scrape, by its labels.
         for (series, labels) in [
             (
@@ -556,8 +637,14 @@ mod tests {
             ),
             (
                 "decide_no_decision_total",
-                &["fault", "pair_side", "prompt_text", "decider_gone"]
-                    .map(|cause| format!("{{cause=\"{cause}\"}}"))[..],
+                &[
+                    "fault",
+                    "pair_side",
+                    "prompt_text",
+                    "decider_gone",
+                    "lease_ids_spent",
+                ]
+                .map(|cause| format!("{{cause=\"{cause}\"}}"))[..],
             ),
             ("decide_hashes_cut_total", &[String::new()][..]),
             (
@@ -582,6 +669,7 @@ mod tests {
             &counts.dropped_full,
             &counts.dropped_gone,
             &counts.outlasted,
+            &counts.unleased,
         ]);
         for (count, value) in all.zip(1..) {
             count.store(value, Ordering::Relaxed);
@@ -593,7 +681,12 @@ mod tests {
         fourth.undialed.store(17, Ordering::Relaxed);
         first.hashes_cut.store(20, Ordering::Relaxed);
         fourth.hashes_cut.store(22, Ordering::Relaxed);
-        let rendered = metrics.render(|| State::Starting, &Stats::default(), &counts);
+        let rendered = metrics.render(
+            || State::Starting,
+            &Stats::default(),
+            &counts,
+            StoreCounts::default,
+        );
         for line in [
             "decide_busy_total{reason=\"unspecified\"} 1",
             "decide_busy_total{reason=\"queue_depth\"} 2",
@@ -607,6 +700,7 @@ mod tests {
             "decide_answers_dropped_total{cause=\"queue_full\"} 10",
             "decide_answers_dropped_total{cause=\"stream_gone\"} 11",
             "decide_budget_outlasted_total 12",
+            "decide_no_decision_total{cause=\"lease_ids_spent\"} 13",
             "decide_candidates_undialed_total 31",
             "decide_hashes_cut_total 42",
         ] {
@@ -616,9 +710,66 @@ mod tests {
     }
 
     #[test]
+    fn the_stores_counts_render_by_list_from_each_scrapes_own_read() {
+        let metrics = Metrics::new();
+        let rendered = metrics.render(
+            || State::Leader,
+            &Stats::default(),
+            &Counts::default(),
+            StoreCounts::default,
+        );
+        assert_eq!(
+            line(&rendered, MEMBERS_OUTSIDE_LIST, "list=\"engines\"").as_deref(),
+            Some("smg_policy_controller_members_outside_list{list=\"engines\"} 0")
+        );
+        assert!(rendered.contains("smg_policy_controller_overload_flips_total 0"));
+        assert!(rendered.contains("# HELP smg_policy_controller_members_outside_list "));
+
+        let counts = StoreCounts {
+            outside: OutsideLists {
+                engines: 2,
+                zones: 5,
+            },
+            overload_flips: 9,
+        };
+        let rendered = metrics.render(
+            || State::Leader,
+            &Stats::default(),
+            &Counts::default(),
+            || counts,
+        );
+        assert_eq!(
+            line(&rendered, MEMBERS_OUTSIDE_LIST, "list=\"engines\"").as_deref(),
+            Some("smg_policy_controller_members_outside_list{list=\"engines\"} 2")
+        );
+        assert_eq!(
+            line(&rendered, MEMBERS_OUTSIDE_LIST, "list=\"zones\"").as_deref(),
+            Some("smg_policy_controller_members_outside_list{list=\"zones\"} 5")
+        );
+        assert!(rendered.contains("smg_policy_controller_overload_flips_total 9"));
+
+        // The count outside a list falls once a generation names the member.
+        let rendered = metrics.render(
+            || State::Leader,
+            &Stats::default(),
+            &Counts::default(),
+            StoreCounts::default,
+        );
+        assert_eq!(
+            line(&rendered, MEMBERS_OUTSIDE_LIST, "list=\"zones\"").as_deref(),
+            Some("smg_policy_controller_members_outside_list{list=\"zones\"} 0")
+        );
+    }
+
+    #[test]
     fn the_start_time_is_set_once_at_construction() {
         let metrics = Metrics::new();
-        let rendered = metrics.render(|| State::Starting, &Stats::default(), &Counts::default());
+        let rendered = metrics.render(
+            || State::Starting,
+            &Stats::default(),
+            &Counts::default(),
+            StoreCounts::default,
+        );
         let start = rendered
             .lines()
             .find(|l| l.starts_with(START_TIME_SECONDS) && !l.starts_with('#'))
@@ -642,7 +793,12 @@ mod tests {
         };
 
         let metrics = Metrics::new();
-        let rendered = metrics.render(|| State::Leader, &Stats::default(), &Counts::default());
+        let rendered = metrics.render(
+            || State::Leader,
+            &Stats::default(),
+            &Counts::default(),
+            StoreCounts::default,
+        );
         assert!(!rendered.contains("smg_policy_spec"), "{rendered}");
 
         let generations = Arc::new(Generations::new(
@@ -651,7 +807,12 @@ mod tests {
         ));
         metrics.spec(Arc::clone(&generations));
         let series = |generation: u64, applied: u64, rejected: u64| {
-            let rendered = metrics.render(|| State::Leader, &Stats::default(), &Counts::default());
+            let rendered = metrics.render(
+                || State::Leader,
+                &Stats::default(),
+                &Counts::default(),
+                StoreCounts::default,
+            );
             for line in [
                 format!("{SPEC_GENERATION} {generation}"),
                 format!("{SPEC_APPLY_TOTAL}{{result=\"applied\"}} {applied}"),

@@ -261,9 +261,7 @@ pub fn preprocess(
     images: &[&DynamicImage],
     transparent_bg: Option<TransparentBg>,
 ) -> Result<PreprocessedEncoderInputs, TransformError> {
-    if images.is_empty() {
-        return Err(TransformError::EmptyBatch);
-    }
+    TransformError::if_empty(images)?;
 
     let item_sizes: Vec<(u32, u32)> = images.iter().map(|img| img.dimensions()).collect();
     let levels = normalized_levels(&params.mean, &params.std);

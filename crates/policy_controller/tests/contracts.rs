@@ -164,6 +164,7 @@ fn request_record() -> &'static [&'static str] {
             seed,
             block_size,
             now_micros,
+            pinned_at,
             affinity,
             named,
             model_fingerprint,
@@ -197,7 +198,8 @@ fn constraints_record() -> &'static [&'static str] {
             excluded,
             wire_modes,
             overload_lifted,
-            subset_hint
+            subset_hint,
+            stalled
         }
     )
 }
@@ -213,6 +215,7 @@ fn pool_record() -> &'static [&'static str] {
             generation,
             zones,
             reach,
+            rated,
         }
     )
 }
@@ -309,7 +312,8 @@ fn trace_record() -> &'static [&'static str] {
             top,
             top_len,
             seed,
-            generation
+            generation,
+            lifted
         }
     )
 }
@@ -629,7 +633,13 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
             record: request_record(),
             // The affinity column rides the request in the crate; the wire
             // carries each entry in its candidate.
-            host_only: &["now_micros", "affinity", "named", "model_fingerprint"],
+            host_only: &[
+                "now_micros",
+                "pinned_at",
+                "affinity",
+                "named",
+                "model_fingerprint",
+            ],
             wire_only: &["prompt_text"],
             wire: &[
                 ("model", Type::String),
@@ -658,7 +668,7 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
         ProtoMirror {
             message: "Constraints",
             record: constraints_record(),
-            host_only: &[],
+            host_only: &["stalled"],
             wire_only: &[],
             wire: &[
                 ("excluded", Type::Fixed64),
@@ -672,7 +682,7 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
         ProtoMirror {
             message: "PoolFacts",
             record: pool_record(),
-            host_only: &["reach"],
+            host_only: &["reach", "rated"],
             wire_only: &[],
             wire: &[
                 ("pool_size", Type::Uint32),
@@ -773,6 +783,7 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
                 ("fallback", Type::Bool),
                 ("affinity_source", Type::Enum),
                 ("drew_first", Type::Bool),
+                ("lifted", Type::Enum),
             ],
             repeated: &["top", "drops"],
             optional: &["survivors"],
@@ -858,7 +869,13 @@ fn wit_mirrors() -> Vec<WitMirror> {
         WitMirror {
             record: "request",
             crate_record: request_record(),
-            host_only: &["now_micros", "affinity", "named", "model_fingerprint"],
+            host_only: &[
+                "now_micros",
+                "pinned_at",
+                "affinity",
+                "named",
+                "model_fingerprint",
+            ],
             before: &[],
             beside: &[],
         },
@@ -872,7 +889,7 @@ fn wit_mirrors() -> Vec<WitMirror> {
         WitMirror {
             record: "pool",
             crate_record: pool_record(),
-            host_only: &["reach"],
+            host_only: &["reach", "rated"],
             before: &[],
             beside: &[],
         },
@@ -1087,6 +1104,7 @@ const ONEOFS: &[(&str, &str, &str, &[&str])] = &[
             "generation",
             "ids",
             "lease_end",
+            "term_start",
         ],
     ),
     (

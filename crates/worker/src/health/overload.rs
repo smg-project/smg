@@ -9,7 +9,7 @@
 //! `routers::common::overload`). Refusing requests with a 503 instead is the
 //! opt-in `--worker-overload-shed`.
 
-use openai_protocol::worker::{OverloadUpdate, WorkerLoadResponse};
+use crate::worker::{OverloadUpdate, WorkerLoadResponse};
 
 /// Default KV token-usage ceiling (mean across DP ranks). On the replay
 /// harness this is the setting that keeps `cache_aware`'s hit rate while
@@ -113,9 +113,8 @@ impl OverloadThresholds {
 
 #[cfg(test)]
 mod tests {
-    use openai_protocol::worker::SchedulerLoadSnapshot;
-
     use super::*;
+    use crate::worker::SchedulerLoadSnapshot;
 
     fn response(waiting: i32, token_usage: f64) -> WorkerLoadResponse {
         WorkerLoadResponse {

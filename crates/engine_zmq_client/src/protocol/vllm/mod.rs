@@ -48,6 +48,7 @@ impl From<SchedulerStats> for EngineLoad {
                 .num_waiting_reqs
                 .saturating_add(stats.num_skipped_waiting_reqs),
             kv_cache_usage: stats.kv_cache_usage,
+            ..Self::default()
         }
     }
 }

@@ -4,13 +4,13 @@ use metrics_exporter_prometheus::PrometheusBuilder;
 use openai_protocol::model_card::ModelCard;
 
 use super::*;
-use crate::{
-    observability::worker_metrics::{self, WorkerSeriesRecorder},
-    worker::{
-        health::circuit_breaker::{CircuitBreakerConfig, CircuitState},
-        test_support::no_health_check,
-        BasicWorker, BasicWorkerBuilder, WorkerLoadGuard,
-    },
+// The cases run over the gateway's registry.
+use crate::worker::WorkerRegistry;
+use crate::worker::{
+    health::circuit_breaker::{CircuitBreakerConfig, CircuitState},
+    metrics::series::{self as worker_series, WorkerSeriesRecorder},
+    test_support::no_health_check,
+    BasicWorker, BasicWorkerBuilder, WorkerLoadGuard,
 };
 
 /// A worker whose breaker opens on one failed request and would stay
@@ -372,15 +372,13 @@ fn origin_tracks_local_and_mesh_registrations() {
     let local_id = registry.register(local).unwrap();
     assert_eq!(registry.origin_of(&local_id), Some(WorkerOrigin::Local));
 
-    registry.on_remote_worker_state(&smg_mesh::WorkerState {
+    registry.on_remote_worker_state(&RemoteWorkerState {
         worker_id: "peer-w1".to_string(),
         model_id: "llama-3".to_string(),
         url: "http://remote:8080".to_string(),
         health: true,
-        load: 0.0,
         version: 1,
         spec: vec![],
-        owner: "peer".to_string(),
     });
     let mesh_id = registry.get_id_by_url("http://remote:8080").unwrap();
     assert_eq!(registry.origin_of(&mesh_id), Some(WorkerOrigin::Mesh));
@@ -552,7 +550,7 @@ fn a_refresh_that_changes_a_card_is_read_by_the_next_kept_answer() {
         )
     };
     let model = registry.model_routing_snapshot("qwen").unwrap();
-    let global = registry.current_global_routing_snapshot();
+    let global = registry.global_generation();
     assert_eq!(floor(&model), Some(a_regular_floor_of(8_192)));
     assert_eq!(floor(&global), Some(a_regular_floor_of(8_192)));
     assert!(!model.harmony(a_worker_names(4_096)));
@@ -569,7 +567,7 @@ fn a_refresh_that_changes_a_card_is_read_by_the_next_kept_answer() {
     let model = registry.model_routing_snapshot("qwen").unwrap();
     assert_eq!(floor(&model), Some(a_regular_floor_of(4_096)));
     assert_eq!(
-        floor(&registry.current_global_routing_snapshot()),
+        floor(&registry.global_generation()),
         Some(a_regular_floor_of(4_096))
     );
     assert!(model.harmony(a_worker_names(4_096)));
@@ -747,13 +745,13 @@ fn a_refresh_that_repeats_the_cards_publishes_nothing() {
     let worker = worker_with_a_window("grpc://127.0.0.1:8401", "qwen", 8_192);
     registry.register(Arc::clone(&worker)).unwrap();
     let model = registry.model_routing_snapshot("qwen").unwrap();
-    let global = registry.current_global_routing_snapshot();
+    let global = registry.global_generation();
 
     // The cards of its registration, then the cards of an earlier refresh.
     for window in [8_192, 4_096, 4_096] {
         let changed = worker.context_length("qwen") != Some(window);
         let model = registry.model_routing_snapshot("qwen").unwrap();
-        let global = registry.current_global_routing_snapshot();
+        let global = registry.global_generation();
         assert_eq!(
             registry.refresh_models(
                 &worker,
@@ -766,7 +764,7 @@ fn a_refresh_that_repeats_the_cards_publishes_nothing() {
             !changed
         );
         assert_eq!(
-            Arc::ptr_eq(&global, &registry.current_global_routing_snapshot()),
+            Arc::ptr_eq(&global, &registry.global_generation()),
             !changed
         );
     }
@@ -774,10 +772,7 @@ fn a_refresh_that_repeats_the_cards_publishes_nothing() {
         &model,
         &registry.model_routing_snapshot("qwen").unwrap()
     ));
-    assert!(!Arc::ptr_eq(
-        &global,
-        &registry.current_global_routing_snapshot()
-    ));
+    assert!(!Arc::ptr_eq(&global, &registry.global_generation()));
 }
 
 #[test]
@@ -835,16 +830,14 @@ fn record(version: u64) -> ImportRecord {
     }
 }
 
-fn remote_state(worker_id: &str, url: &str, health: bool, spec: Vec<u8>) -> smg_mesh::WorkerState {
-    smg_mesh::WorkerState {
+fn remote_state(worker_id: &str, url: &str, health: bool, spec: Vec<u8>) -> RemoteWorkerState {
+    RemoteWorkerState {
         worker_id: worker_id.to_string(),
         model_id: "llama-3".to_string(),
         url: url.to_string(),
         health,
-        load: 0.0,
         version: 1,
         spec,
-        owner: "peer".to_string(),
     }
 }
 
@@ -884,7 +877,7 @@ fn a_mesh_imports_lines_name_the_address_masked() {
     let url = ADDRESS_WITH_A_PASSWORD;
     let spec = |model: &str| spec_bytes(url, model, WorkerType::Regular);
     let undecodable = || b"not a worker spec".to_vec();
-    let state = |version: u64, health: bool, spec: Vec<u8>| smg_mesh::WorkerState {
+    let state = |version: u64, health: bool, spec: Vec<u8>| RemoteWorkerState {
         version,
         ..remote_state("peer-w1", url, health, spec)
     };
@@ -2201,9 +2194,9 @@ fn routing_pools_filter_regular_workers_by_transport() {
         urls(RoutingPool::GrpcPipelineRegular),
         HashSet::from(["grpc://regular".to_string(), "zmq://regular".to_string()])
     );
-    // The disaggregated pools hold gRPC workers and TokenSpeed's direct-ZMQ
-    // engines, whose wire carries the rendezvous and the encode request:
-    // another runtime's ZMQ prefill worker that slipped past registration
+    // The disaggregated pools hold gRPC workers and the direct-ZMQ engines
+    // whose wire carries the rendezvous and the encode request: a ZMQ
+    // prefill worker on another wire that slipped past registration
     // must not appear.
     assert_eq!(
         urls(RoutingPool::GrpcPrefill),
@@ -4050,7 +4043,7 @@ fn clear_all_overload_flags_resets_every_model() {
 /// registry hands the store the removed worker's own witness.
 #[test]
 fn a_removed_workers_address_is_retired_until_its_last_handle_is_gone() {
-    let series = worker_metrics::installed_or_default();
+    let series = worker_series::installed_or_default();
     let registry = WorkerRegistry::new();
     let url = "http://retired-seam:8080";
     let worker: Arc<dyn Worker> = Arc::new(
@@ -4086,7 +4079,7 @@ fn a_removed_workers_address_is_retired_until_its_last_handle_is_gone() {
 /// gone too, and the guard's release lands nowhere.
 #[test]
 fn a_replaced_workers_guard_keeps_the_removed_address_retired_until_it_drops() {
-    let series = worker_metrics::installed_or_default();
+    let series = worker_series::installed_or_default();
     let recorder = WorkerSeriesRecorder::new(
         PrometheusBuilder::new().build_recorder(),
         Arc::clone(series),
