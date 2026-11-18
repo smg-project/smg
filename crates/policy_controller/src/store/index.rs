@@ -46,7 +46,7 @@
 use std::{
     collections::HashMap,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{fence, AtomicU64, Ordering},
         Arc,
     },
 };
@@ -130,6 +130,9 @@ impl Blocks for Held {
         blocks: &[StoredBlock],
         parent: Option<SequenceHash>,
     ) -> Result<(), ApplyError> {
+        // Before the batch's blocks reach the chain: a decision that reads
+        // one of them then reads this row as its id's holder ([`Index`]).
+        fence(Ordering::Release);
         self.index
             .chain
             .apply_stored(self.worker, blocks, parent, &mut self.map)
@@ -554,6 +557,9 @@ impl PoolIndex {
                 |under| below(&mut draw, under),
                 &mut named.kept,
             );
+            // Every read of the lookup stands before this fence, and each
+            // question of who holds an id after it ([`Index`]).
+            fence(Ordering::Acquire);
             for &(id, blocks) in &named.kept {
                 let row = tables.row_of.get(id as usize).copied().unwrap_or(NONE);
                 debug_assert!(row != NONE, "a read is kept within the pool's rows");
@@ -624,12 +630,30 @@ impl PoolIndex {
 }
 
 /// One model's index: the chain index, and who holds each of its ids.
+///
+/// The chain frees an id for the next row once its row leaves, and a pool's
+/// tables of before still map the id to the row that left
+/// ([`Tables::row_of`]). So a decision asks who holds an id after its
+/// lookup read blocks under it ([`Self::held_by`]), and the answer must be
+/// no older than those blocks. The chain writes and reads its coverage
+/// relaxed. Its reader runs an acquire fence after its reads, for its own
+/// snapshot: this file does not rest on where that fence stands. Three
+/// things of this file order the two:
+///
+/// - the table's lock: the holder is said under it before the row's lane
+///   exists ([`KvTables::member`]), and a batch finds its lane under it;
+/// - a release fence on the lane's thread, before a batch's blocks reach
+///   the chain ([`Held`]);
+/// - an acquire fence in the naming, between its lookup and its questions
+///   ([`PoolIndex::name`]).
+///
+/// The two fences synchronize where the lookup read what the batch wrote,
+/// so a decision that read a row's block reads that row as the holder, or
+/// a later one. The orderings of the holder's own store and load carry
+/// none of this.
 struct Index {
     chain: ChainIndex,
     /// Index id -> the worker whose row took the id last, by its number.
-    /// The chain frees an id for the next row once its row leaves, and a
-    /// pool's tables of before still map the id to the row that left
-    /// ([`Tables::row_of`]): a decision asks here after its lookup.
     holders: [AtomicU64; INDEX_WORKERS],
 }
 
@@ -643,7 +667,7 @@ impl Index {
 
     /// `worker`'s row takes `id`, which the chain just handed out. Said
     /// under the table's lock, before the row's lane exists: every block
-    /// the row writes reaches the chain after it.
+    /// the row writes reaches the chain after it, behind the lane's fence.
     fn take(&self, id: u32, worker: WorkerId) {
         if let Some(holder) = self.holders.get(id as usize) {
             holder.store(worker.0, Ordering::Release);
@@ -651,9 +675,10 @@ impl Index {
     }
 
     /// Whether `worker`'s row is the one that took `id` last. A reader asks
-    /// after its lookup: where another row took the id since, the blocks it
-    /// read under the id may be that row's. A row that left and took no
-    /// other answers true, and the chain holds none of its blocks.
+    /// after its lookup and its fence: where another row took the id since,
+    /// the blocks it read under the id may be that row's. An id nobody took
+    /// since answers true for the row that left, and the chain holds none
+    /// of that row's blocks.
     fn held_by(&self, id: u32, worker: WorkerId) -> bool {
         let holder = self.holders.get(id as usize);
         holder.is_some_and(|holder| holder.load(Ordering::Acquire) == worker.0)
