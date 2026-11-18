@@ -292,18 +292,29 @@ impl SpecStore {
         }
     }
 
+    /// Whether an open to read serves where the open to read and write was
+    /// refused as `refused`: the user's bits and a file system mounted to
+    /// read alone refuse the write alone, and the lock asks none.
+    fn read_serves(refused: &io::Error) -> bool {
+        matches!(
+            refused.kind(),
+            io::ErrorKind::PermissionDenied | io::ErrorKind::ReadOnlyFilesystem
+        )
+    }
+
     /// The lock file of `dir`, open: made empty where it is not there, and
     /// never truncated, since what stands in it is no part of the lock. On
     /// a file system that locks as a local one does, the lock asks no write
     /// of the file either: one that stands under bits this user may not
-    /// write, as after a change of the controller's user, is opened to
-    /// read, without waiting and as a regular file alone: a pipe there
-    /// holds no start. Where a lock is made of a byte-range lock, as a
-    /// network file system's client may make it, it asks a file opened to
-    /// write: the lock of a file this user may not write is not given
-    /// there, and the refusal is the system's for the lock. Where the file
-    /// may not be made and that open fails too, the file not there or no
-    /// regular file, the refusal is the system's for the making.
+    /// write, as after a change of the controller's user, or on a file
+    /// system mounted to read alone, is opened to read, without waiting
+    /// and as a regular file alone: a pipe there holds no start. Where a
+    /// lock is made of a byte-range lock, as a network file system's
+    /// client may make it, it asks a file opened to write: the lock of a
+    /// file this user may not write is not given there, and the refusal is
+    /// the system's for the lock. Where the file may not be made and that
+    /// open fails too, the file not there or no regular file, the refusal
+    /// is the system's for the making.
     fn lock_file(dir: &Path) -> Result<fs::File, StoreRefused> {
         let path = dir.join(HELD);
         let made = fs::OpenOptions::new()
@@ -313,9 +324,7 @@ impl SpecStore {
             .truncate(false)
             .open(&path);
         match made {
-            Err(denied) if denied.kind() == io::ErrorKind::PermissionDenied => {
-                open_regular(&path).map_err(|_| denied)
-            }
+            Err(denied) if Self::read_serves(&denied) => open_regular(&path).map_err(|_| denied),
             opened => opened,
         }
         .map_err(|error| StoreRefused::Unlocked(error.to_string()))
@@ -821,6 +830,22 @@ pub(crate) mod tests {
             matches!(&refused, StoreRefused::Unlocked(told) if told.contains("denied")),
             "{refused:?}"
         );
+    }
+
+    /// A write of the lock file the user's bits refuse, and one a file
+    /// system mounted to read alone refuses, leave it to an open to read;
+    /// another refusal stands as it is. The case reads the system's
+    /// refusals by their numbers: it mounts no file system.
+    #[cfg(unix)]
+    #[test]
+    fn a_write_refused_by_bits_or_a_read_only_mount_leaves_an_open_to_read() {
+        use rustix::io::Errno;
+
+        let refused = |errno: Errno| io::Error::from(errno);
+        assert!(SpecStore::read_serves(&refused(Errno::ACCESS)));
+        assert!(SpecStore::read_serves(&refused(Errno::ROFS)));
+        assert!(!SpecStore::read_serves(&refused(Errno::ISDIR)));
+        assert!(!SpecStore::read_serves(&refused(Errno::NOENT)));
     }
 
     /// A lock the system does not give refuses the start in the system's
