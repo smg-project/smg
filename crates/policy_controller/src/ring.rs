@@ -179,7 +179,21 @@ pub struct Ring {
     shown: Vec<(u32, bool)>,
     /// The newest membership epoch a pool was shown under.
     shown_epoch: u64,
+    /// For a member, by its index: the pool that showed it as a row a walk
+    /// may take, by the pool's number, [`MANY_POOLS`] where several did
+    /// and [`NO_POOL`] where none did. A member whose mark is another
+    /// pool's is no row of the pool a walk is taken for. Dropped with the
+    /// notes, and never longer than the members.
+    shown_by: Vec<u32>,
+    /// Whether a member carries the mark of several pools.
+    shown_many: bool,
 }
+
+/// The mark of a member no pool showed since the notes were last dropped.
+const NO_POOL: u32 = u32::MAX;
+
+/// The mark of a member several pools showed: a row of each.
+const MANY_POOLS: u32 = u32::MAX - 1;
 
 impl Ring {
     pub fn new() -> Self {
@@ -280,7 +294,10 @@ impl Ring {
     /// feed names an id ([`Ring::admit`], [`Ring::remove`],
     /// [`Ring::retain_only`]), which drops every note. The pools of an
     /// earlier epoch are dropped at the first of a later one, and a pool
-    /// of an epoch behind the one held is not noted.
+    /// of an epoch behind the one held is not noted. Each row of a pool a
+    /// walk may take is marked with the pool's number, or with the mark of
+    /// several pools where another showed it too: the marks stand and
+    /// fall with the notes.
     pub fn show(
         &mut self,
         epoch: u64,
@@ -290,13 +307,14 @@ impl Ring {
         now: Instant,
     ) {
         self.learn(members.clone(), now);
+        let rows = members.clone();
         let mut members = members;
         let ordered = ordered && members.all(|(id, _)| self.contains(id));
         if epoch < self.shown_epoch {
             return;
         }
         if epoch > self.shown_epoch {
-            self.shown.clear();
+            self.forget_shown();
             self.shown_epoch = epoch;
         }
         match self
@@ -306,6 +324,39 @@ impl Ring {
             Ok(at) => self.shown[at].1 = ordered,
             Err(at) => self.shown.insert(at, (pool, ordered)),
         }
+        if !ordered {
+            return;
+        }
+        // Each row of a pool a walk may take is marked with the pool, so
+        // the walk of another pool passes it by one read.
+        self.shown_by.resize(self.members.len(), NO_POOL);
+        let mark = pool.min(MANY_POOLS);
+        for (id, _) in rows {
+            if let Some(member) = self.member_index(id) {
+                let by = &mut self.shown_by[member as usize];
+                *by = if *by == NO_POOL || *by == mark {
+                    mark
+                } else {
+                    MANY_POOLS
+                };
+                self.shown_many |= *by == MANY_POOLS;
+            }
+        }
+    }
+
+    /// Drops what the ring was shown: every pool's note and every
+    /// member's mark.
+    fn forget_shown(&mut self) {
+        self.shown.clear();
+        self.shown_by.clear();
+        self.shown_many = false;
+    }
+
+    /// The members' marks by member index, no longer than the members,
+    /// and whether one of them is the mark of several pools: where none
+    /// is, a member is a pool's by that pool's number alone.
+    fn marks(&self) -> (&[u32], bool) {
+        (&self.shown_by, self.shown_many)
     }
 
     /// What [`Ring::show`] noted of the pool numbered `pool` under `epoch`:
@@ -334,14 +385,14 @@ impl Ring {
     /// Lift the fence on `id`: the feed named it as a member again.
     pub fn admit(&mut self, id: WorkerId) {
         self.fence.admit(id);
-        self.shown.clear();
+        self.forget_shown();
     }
 
     /// Remove a member at `now`, fencing its id for [`FENCE`]; `false` when
     /// it was none.
     pub fn remove(&mut self, id: WorkerId, now: Instant) -> bool {
         self.fence.retire(id, now);
-        self.shown.clear();
+        self.forget_shown();
         let Some(gone) = self.index.remove(&id) else {
             return false;
         };
@@ -366,7 +417,7 @@ impl Ring {
     /// carries its key. A ring that holds no member reads the names for no
     /// leaver, and one that holds no fence admits none.
     pub fn retain_only(&mut self, ids: &[WorkerId], now: Instant) {
-        self.shown.clear();
+        self.forget_shown();
         // A fence a named id holds stood before the pruning, which fences
         // the ids the snapshot does not name.
         let fenced = !self.fence.is_empty();
@@ -443,13 +494,19 @@ impl Ring {
         }
     }
 
-    /// Walk clockwise from the key's position, showing `visit` each entry's
-    /// member until it takes one or stops; the walk goes once around.
-    pub fn walk<T>(&self, key: u64, mut visit: impl FnMut(u32) -> Probe<T>) -> Option<T> {
+    /// The members at the ring's positions clockwise from the key's, once
+    /// around: the one source of a walk's order.
+    fn around(&self, key: u64) -> impl Iterator<Item = u32> + '_ {
         let at = key_position(key);
         let start = self.entries.partition_point(|&(p, _)| p < at);
         let (before, from) = self.entries.split_at(start);
-        for &(_, member) in from.iter().chain(before) {
+        from.iter().chain(before).map(|&(_, member)| member)
+    }
+
+    /// Walk clockwise from the key's position, showing `visit` each entry's
+    /// member until it takes one or stops; the walk goes once around.
+    pub fn walk<T>(&self, key: u64, mut visit: impl FnMut(u32) -> Probe<T>) -> Option<T> {
+        for member in self.around(key) {
             match visit(member) {
                 Probe::Take(value) => return Some(value),
                 Probe::Skip => {}
@@ -574,12 +631,6 @@ pub struct ConsistentHash {
     ring: RwLock<Ring>,
 }
 
-/// A walk is taken over a pool that holds at least one in so many of the
-/// ring's members. One ring serves every pool of its profile, and a walk
-/// passes the others' positions on its way to its own: over a smaller pool
-/// it would read more than the whole pass does.
-const RING_SHARE: usize = 4;
-
 impl ConsistentHash {
     pub fn new(bounded: Option<&BoundedLoadParams>) -> Self {
         Self {
@@ -698,6 +749,97 @@ impl ConsistentHash {
     }
 }
 
+/// A ring of the pool's rows alone: [`walk_pool`] reads no mark.
+const ALONE: u8 = 0;
+/// No member is a row of several pools: a member is the pool's by its
+/// number alone, in one compare.
+const APART: u8 = 1;
+/// A member may be a row of several pools, under their one mark.
+const SHARED: u8 = 2;
+
+/// The walk of [`ConsistentHash::own`] over a ring whose members `marks`
+/// tells apart as `BY` says: the rows met for the pool `number` are asked
+/// about and the first of them kept are handed out in the ring's order.
+/// One body, built once for each form, so a walk past another pool's
+/// members costs each the compares its ring needs. `false` where the walk
+/// stopped at its bound or came round short of the rows handed.
+fn walk_pool<const BY: u8>(
+    ring: &Ring,
+    marks: &[u32],
+    key: u64,
+    number: u32,
+    candidates: &[Candidate],
+    keep: &mut dyn FnMut(&Candidate) -> bool,
+    kept: &mut Vec<u32>,
+) -> bool {
+    // The members met, kept or refused: a walk meets a member at each
+    // of its positions and asks about it once.
+    let mut met = [FREE; MAX_TARGETS + DRAW_BOUND as usize];
+    let (mut asked, mut refused) = (0, 0);
+    let mut members = ring.around(key);
+    loop {
+        let next = if BY == ALONE {
+            members.next()
+        } else {
+            passed::<BY>(&mut members, marks, number)
+        };
+        // A walk that came round the ring short of the rows handed met no
+        // member for one of them, which the whole pass places.
+        let Some(member) = next else {
+            return false;
+        };
+        if met[..asked].contains(&member) {
+            continue;
+        }
+        let id = ring.members().get(member as usize);
+        // A ring that learned one pool in its rows' order names a member
+        // by its row's position: the row there is read first, its id
+        // compared.
+        let row = id.and_then(|id| match candidates.get(member as usize) {
+            Some(row) if row.id == *id => Some(member as usize),
+            _ => candidates.binary_search_by_key(id, |row| row.id).ok(),
+        });
+        let (Some(row), Some(slot)) = (row, met.get_mut(asked)) else {
+            continue;
+        };
+        *slot = member;
+        asked += 1;
+        if keep(&candidates[row]) {
+            kept.push(row as u32);
+            if kept.len() == MAX_TARGETS {
+                return true;
+            }
+        } else {
+            refused += 1;
+            if refused == DRAW_BOUND {
+                return false;
+            }
+        }
+        // Every row handed was asked: no position further on holds
+        // another.
+        if asked == candidates.len() {
+            return !kept.is_empty();
+        }
+    }
+}
+
+/// The next of `members` that may be a row of the pool `number`: its mark
+/// is the pool's, or the mark of several pools where `BY` says a ring
+/// holds one. A member no pool showed, or another did, is passed. Out of
+/// line, a loop of its own: it holds nothing of the walk across a member
+/// it passes, so each costs one read and one compare.
+#[inline(never)]
+fn passed<const BY: u8>(
+    members: &mut impl Iterator<Item = u32>,
+    marks: &[u32],
+    number: u32,
+) -> Option<u32> {
+    members.find(|&member| {
+        let by = marks.get(member as usize);
+        by.is_some_and(|&by| by == number || (BY == SHARED && by == MANY_POOLS))
+    })
+}
+
 impl Lifecycle for ConsistentHash {
     fn on_membership(&self, change: &Membership<'_>) {
         let now = Instant::now();
@@ -749,8 +891,12 @@ impl Scorer for ConsistentHash {
     /// with a row the ring does not hold, once [`DRAW_BOUND`] rows were
     /// refused, which says nothing of the rows behind them, where the walk
     /// came round the ring short of the rows handed, one of which the ring
-    /// does not hold, and for a pool that holds under a quarter of the
-    /// ring's members: the whole pass decides.
+    /// does not hold: the whole pass decides.
+    ///
+    /// One ring serves every pool of its profile. The walk passes a member
+    /// that another pool showed by one read of its mark, as the whole pass
+    /// passes it by one slot, so a pool is walked whatever its share of
+    /// the ring.
     fn own(
         &self,
         facts: &RequestFacts<'_>,
@@ -771,55 +917,20 @@ impl Scorer for ConsistentHash {
             RwLockReadGuard::unlocked(&mut ring, || self.learn(epoch, number, candidates));
             ring.shown(epoch, number)
         });
-        // A walk passes the positions of the ring's other members on its
-        // way: a pool that is a small share of them is read whole.
-        let small = candidates.len().saturating_mul(RING_SHARE) < ring.len();
-        if ordered != Some(true) || small {
+        if ordered != Some(true) {
             return false;
         }
-        // The members met, kept or refused: a walk meets a member at each
-        // of its positions and asks about it once.
-        let mut met = [FREE; MAX_TARGETS + DRAW_BOUND as usize];
-        let (mut asked, mut refused) = (0, 0);
-        let ended = ring.walk(key, |member| {
-            if met[..asked].contains(&member) {
-                return Probe::Skip;
-            }
-            // A member of another pool is no row of this one.
-            let id = ring.members().get(member as usize);
-            // A ring that learned one pool in its rows' order names a
-            // member by its row's position: the row there is read first,
-            // its id compared.
-            let row = id.and_then(|id| match candidates.get(member as usize) {
-                Some(row) if row.id == *id => Some(member as usize),
-                _ => candidates.binary_search_by_key(id, |row| row.id).ok(),
-            });
-            let (Some(row), Some(slot)) = (row, met.get_mut(asked)) else {
-                return Probe::Skip;
-            };
-            *slot = member;
-            asked += 1;
-            if keep(&candidates[row]) {
-                kept.push(row as u32);
-                if kept.len() == MAX_TARGETS {
-                    return Probe::Take(());
-                }
-            } else {
-                refused += 1;
-                if refused == DRAW_BOUND {
-                    return Probe::Stop;
-                }
-            }
-            // Every row handed was asked: no position further on holds
-            // another.
-            if asked == candidates.len() {
-                return Probe::Take(());
-            }
-            Probe::Skip
-        });
-        // A walk that came round the ring short of the rows handed met no
-        // member for one of them, which the whole pass places.
-        ended.is_some() && !kept.is_empty()
+        // One ring serves every pool of its profile, and a walk passes the
+        // other pools' members on its way, each by one read of its mark. A
+        // ring of this pool's rows alone holds no other to pass.
+        let (marks, many) = ring.marks();
+        if candidates.len() == ring.len() {
+            walk_pool::<ALONE>(&ring, marks, key, number, candidates, keep, kept)
+        } else if many {
+            walk_pool::<SHARED>(&ring, marks, key, number, candidates, keep, kept)
+        } else {
+            walk_pool::<APART>(&ring, marks, key, number, candidates, keep, kept)
+        }
     }
 
     fn score(
@@ -1936,5 +2047,47 @@ mod tests {
         assert_eq!(ring.shown(4, 0), Some(true));
         ring.retain_only(&[WorkerId(1)], now);
         assert_eq!(ring.shown(4, 0), None, "a snapshot drops the notes");
+    }
+
+    #[test]
+    fn a_ring_marks_each_member_with_the_pool_that_showed_it_while_its_notes_stand() {
+        let now = Instant::now();
+        let rows = |ids: std::ops::Range<u64>| ids.map(|n| (WorkerId(n), n as u32));
+        let by = |ring: &Ring, n: u64| {
+            let member = ring.member_index(WorkerId(n)).expect("a member");
+            let mark = ring.marks().0.get(member as usize);
+            mark.copied().unwrap_or(NO_POOL)
+        };
+        let mut ring = Ring::new();
+        ring.show(1, 0, true, rows(0..4), now);
+        assert!(!ring.marks().1, "no member of two pools yet");
+        ring.show(1, 3, true, rows(2..6), now);
+        assert!(ring.marks().1, "two members of two pools");
+        assert_eq!([by(&ring, 0), by(&ring, 1)], [0, 0]);
+        assert_eq!([by(&ring, 2), by(&ring, 3)], [MANY_POOLS; 2], "of both");
+        assert_eq!([by(&ring, 4), by(&ring, 5)], [3, 3]);
+        // A pool no walk may take marks nothing, and one shown again
+        // keeps its mark.
+        ring.show(1, 7, false, rows(6..8), now);
+        ring.show(1, 0, true, rows(0..4), now);
+        assert_eq!([by(&ring, 6), by(&ring, 0)], [NO_POOL, 0]);
+        // Each word that drops the notes drops the marks: a later epoch,
+        // and the three tells of the feed that name an id.
+        let drops: [fn(&mut Ring, Instant); 4] = [
+            |ring, now| ring.show(2, 9, true, [(WorkerId(8), 8)].into_iter(), now),
+            |ring, _| ring.admit(WorkerId(100)),
+            |ring, now| {
+                ring.remove(WorkerId(5), now);
+            },
+            |ring, now| ring.retain_only(&[WorkerId(0), WorkerId(8)], now),
+        ];
+        for (epoch, dropped) in (1..).zip(drops) {
+            ring.show(epoch, 0, true, rows(0..1), now);
+            assert_eq!(by(&ring, 0), 0);
+            dropped(&mut ring, now);
+            assert_eq!(by(&ring, 0), NO_POOL, "drop {epoch}");
+            assert!(!ring.marks().1, "drop {epoch}");
+        }
+        assert_eq!(by(&ring, 8), NO_POOL, "a member the snapshot kept");
     }
 }

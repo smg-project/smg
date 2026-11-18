@@ -2461,8 +2461,7 @@ impl Marks {
     /// whether the scorer places a request by itself. A profile that asks
     /// none of it pays the one compare it paid for the draw and the ranks.
     const fn first(self) -> u16 {
-        self.0
-            & (Self::DRAWS_FIRST | Self::JOINED | Self::RANKED | Self::ENGINES | Self::OWNS)
+        self.0 & (Self::DRAWS_FIRST | Self::JOINED | Self::RANKED | Self::ENGINES | Self::OWNS)
     }
 
     const fn by_assignment(self) -> bool {

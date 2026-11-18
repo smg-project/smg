@@ -825,13 +825,16 @@ fn a_ring_that_holds_another_pools_members_passes_them_by() {
         row.id = WorkerId(row.id.0 + 500_000);
         row.key += 500_000;
     }
-    // One ring decides for both pools, turn about; each pool's answers
-    // are those of a ring that never saw the other.
+    // One ring decides for both pools, turn about, each under its own
+    // number; each pool's answers are those of a ring that never saw the
+    // other.
     let ring = ring_engine();
     for _ in 0..2 {
         let alone = (ring_engine(), ring_engine());
-        let of_first = walked(&ring, &alone.0, &first, &first_listed, &first_ends);
-        let of_second = walked(&ring, &alone.1, &second, &second_listed, &second_ends);
+        let engines = Engines::new(0, &first_listed, &first_ends);
+        let of_first = walked_as(&ring, &alone.0, &first, engines);
+        let engines = Engines::new(1, &second_listed, &second_ends);
+        let of_second = walked_as(&ring, &alone.1, &second, engines);
         assert!(of_first >= 48 && of_second >= 48, "{of_first} {of_second}");
     }
 }
@@ -940,29 +943,78 @@ fn nine_pools_on_one_ring_are_each_walked_turn_about() {
     }
 }
 
+/// `rows` as a pool of its own: ids and ring keys `by` further on, and
+/// every row kept.
+fn apart(rows: &mut [Candidate], by: u64) {
+    for row in rows {
+        row.id = WorkerId(row.id.0 + by);
+        row.key += by as u32;
+        row.health.healthy = true;
+    }
+}
+
 #[test]
-fn a_pool_that_is_a_small_share_of_its_ring_is_read_whole() {
-    // Eight rows beside 64 of another pool on one ring: a walk for the
-    // small pool would pass eight positions of the other for each of its
-    // own.
+fn a_pool_that_is_a_small_share_of_its_ring_is_walked_past_the_others_members() {
+    // Eight rows and two rows beside 64 of another pool on one ring: a
+    // walk for a small pool passes the others' members, each by its mark,
+    // and hands the rows a ring of its own gives it.
     let (large, large_listed, large_ends) = fleet(&[8; 8], 1);
     let (mut small, small_listed, small_ends) = fleet(&[8], 2);
-    for row in &mut small {
-        row.id = WorkerId(row.id.0 + 500_000);
-        row.key += 500_000;
-        row.health.healthy = true;
+    let (mut pair, pair_listed, pair_ends) = fleet(&[2], 3);
+    apart(&mut small, 500_000);
+    apart(&mut pair, 900_000);
+    let ring = ring_engine();
+    let alone = (ring_engine(), ring_engine(), ring_engine());
+    for turn in 0..2 {
+        let engines = Engines::new(0, &large_listed, &large_ends);
+        let of_large = walked_as(&ring, &alone.0, &large, engines);
+        assert!(of_large >= 48, "{of_large} of 64 keys, turn {turn}");
+        let engines = Engines::new(1, &small_listed, &small_ends);
+        let of_small = walked_as(&ring, &alone.1, &small, engines);
+        let engines = Engines::new(2, &pair_listed, &pair_ends);
+        let of_pair = walked_as(&ring, &alone.2, &pair, engines);
+        assert_eq!((of_small, of_pair), (64, 64), "turn {turn}");
+    }
+}
+
+#[test]
+fn a_member_two_pools_showed_is_a_row_of_each_to_their_walks() {
+    // Two models on fleets that overlap: 16 rows a pool, eight of them
+    // the other's too, each pool's rows numbered from its own first.
+    let (mut rows, ..) = fleet(&[8; 3], 1);
+    apart(&mut rows, 0);
+    let (_, listed, ends) = fleet(&[8; 2], 1);
+    let one = rows[..16].to_vec();
+    let mut two = rows[8..].to_vec();
+    for row in &mut two {
+        row.position -= 8;
     }
     let ring = ring_engine();
     let alone = (ring_engine(), ring_engine());
-    let engines = Engines::new(0, &large_listed, &large_ends);
-    let of_large = walked_as(&ring, &alone.0, &large, engines);
-    let engines = Engines::new(1, &small_listed, &small_ends);
-    let of_small = walked_as(&ring, &alone.1, &small, engines);
-    assert!(of_large >= 48, "{of_large} of 64 keys by the walk alone");
-    assert_eq!(of_small, 0, "the small pool by the whole pass");
-    // Alone on a ring it is walked.
-    let of_small = walked_as(&ring_engine(), &ring_engine(), &small, engines);
-    assert_eq!(of_small, 64);
+    for turn in 0..2 {
+        let of_one = walked_as(&ring, &alone.0, &one, Engines::new(0, &listed, &ends));
+        let of_two = walked_as(&ring, &alone.1, &two, Engines::new(1, &listed, &ends));
+        assert_eq!((of_one, of_two), (64, 64), "turn {turn}");
+    }
+}
+
+#[test]
+fn a_member_no_pool_showed_is_passed_by_a_walk() {
+    // A pool whose host lists no engine is read whole, and the ring
+    // learns its rows from the pass: members no pool showed, at places
+    // past the marks of the pool shown before them.
+    let (rows, listed, ends) = fleet(&[8; 2], 1);
+    let (mut bare, ..) = fleet(&[8; 2], 2);
+    apart(&mut bare, 500_000);
+    let ring = ring_engine();
+    let alone = (ring_engine(), ring_engine());
+    for turn in 0..2 {
+        let engines = Engines::new(0, &listed, &ends);
+        let of_listed = walked_as(&ring, &alone.0, &rows, engines);
+        assert!(of_listed >= 48, "{of_listed} of 64 keys, turn {turn}");
+        let of_bare = walked_as(&ring, &alone.1, &bare, Engines::default());
+        assert_eq!(of_bare, 0, "turn {turn}: no list, no walk");
+    }
 }
 
 #[test]
