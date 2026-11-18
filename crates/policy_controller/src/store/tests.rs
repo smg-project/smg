@@ -2322,18 +2322,27 @@ fn a_rise_keeps_the_table_of_a_term_whose_lease_is_on_file() {
 }
 
 /// A restore that raises the store's term tells the blocks, as the term's
-/// own door does: the first lease decided behind it is that term's first
-/// id.
+/// own door does, with the ids on file: the table of a term that holds a
+/// lease is kept, and the first lease decided behind the restore is the
+/// new term's first id.
 #[test]
 fn a_restore_that_raises_the_term_starts_the_blocks_under_it() {
     let standby = MemoryStore::new();
+    let term: &dyn LeasesStore = &standby;
+    term.set_term(3);
+    let (gateway, now) = (GatewayId(1), Instant::now());
+    let held = standby.issue_decided(lease(gateway, 0, 3, now), None, |_| ());
+    held.expect("minted under the term the standby stood at");
     let mut cut = MemoryStore::new().cut(super::Kinds::All);
     cut.at.term = 7;
     assert!(standby.restore_from(cut));
-    let term: &dyn LeasesStore = &standby;
     assert_eq!(term.term(), 7);
-    let (gateway, now) = (GatewayId(1), Instant::now());
-    let issued = standby.issue_decided(lease(gateway, 0, 7, now), None, |_| ());
+    assert_eq!(
+        standby.kept_terms(),
+        [3],
+        "the rise is told the ids on file"
+    );
+    let issued = standby.issue_decided(lease(gateway, 1, 7, now), None, |_| ());
     assert_eq!(issued.map(|lease| lease.id.0), Ok(7 << 32 | 1));
 }
 

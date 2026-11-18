@@ -25,6 +25,14 @@
 //! id names its file by one rule ([`Blocks::file_of`]): an id of the
 //! leading term by the leading table, an id of a kept term by that term's
 //! table, any other id by its block modulo the files.
+//!
+//! The law covers the ids this replica mints and the ids of terms that
+//! led. An id of the leading term that some other door filed stands in a
+//! block no file here claimed: it goes by that block's cleared byte, and
+//! the claim of the block would name it another file. A gateway's replay
+//! brings ids of older terms, so a served controller files none; with one
+//! file nothing can tell, and the door that files a lease holds the law
+//! once the files are several.
 
 use std::sync::{
     atomic::{AtomicU64, AtomicU8, Ordering},

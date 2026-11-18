@@ -103,8 +103,9 @@ pub struct MemoryStore {
     pins_swept: Mutex<PinsSwept>,
     /// The leases' file behind its turn ([`turn`]).
     file: turn::File,
-    /// The blocks of the leading term's counter and each block's file
-    /// ([`blocks`]): how a lease's id names its file.
+    /// The blocks of the leading term's counter, each block's file and the
+    /// tables kept for terms that led ([`blocks`]): how a lease's id names
+    /// its file.
     blocks: Blocks,
     /// What a decision reads, through one load: swapped whole at each
     /// publication.
