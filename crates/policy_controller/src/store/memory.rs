@@ -785,15 +785,14 @@ impl MemoryStore {
     /// paid its leave's, and with the load lock let go: the engine hears the
     /// writes in their order, a load write under the load lock alone waits
     /// for no stage, and an apply, which takes the workers lock, moves no
-    /// generation in between. A leave
-    /// is told after the build that takes its rows out of their pools: the
-    /// worker is in no pool when its write returns, whoever wrote. A join is
-    /// told when the store takes it, and the world that lists its row
-    /// follows within one publication window. A decision takes neither lock
-    /// and meets the call at a stage's own lock alone. One that built its
-    /// view before a leave's swap may still name the worker: a stage answers
-    /// that from its own state, as the ring fences a pruned id
-    /// ([`crate::ring::FENCE`]).
+    /// generation in between. A leave is told after the build that takes its
+    /// rows out of their pools: the worker is in no pool when its write
+    /// returns, whoever wrote. A join is told when the store takes it, and
+    /// the world that lists its row follows at its window's build. A
+    /// decision takes neither lock and meets the call at a stage's own lock
+    /// alone. One that built its view before a leave's swap may still name
+    /// the worker: a stage answers that from its own state, as the ring
+    /// fences a pruned id ([`crate::ring::FENCE`]).
     fn tell_membership(&self, change: MembershipChange) {
         if let Some(change) = change.as_lifecycle() {
             self.world.load().spec().engine().on_membership(&change);

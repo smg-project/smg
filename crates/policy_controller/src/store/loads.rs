@@ -164,9 +164,9 @@ pub trait LoadSink: Send + Sync {
     ///
     /// The crate's store names the instant for one thing more: the build
     /// its membership writes owe. The store pays that build ahead of the
-    /// instant for one write alone, a poll's answer for a rank that has no
-    /// row yet, and no load write is shown before it, so a host with no
-    /// loop asks for it ([`crate::store::MemoryStore::publish_now`]).
+    /// instant for one load write alone, a poll's answer for a rank that
+    /// has no row yet, and no load write is shown before it, so a host with
+    /// no loop asks for it ([`crate::store::MemoryStore::publish_now`]).
     fn publish_due(&self) -> Option<Instant> {
         None
     }

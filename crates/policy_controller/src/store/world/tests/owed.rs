@@ -966,7 +966,7 @@ fn the_writes_one_build_pays_ask_the_pair_classes_once() {
 /// The contract names the window by its figure, for a caller that reads no
 /// source: the sentence and the store's constant move together.
 #[test]
-fn the_contract_names_the_window_a_registration_is_in_force_within() {
+fn the_contract_names_the_window_a_registrations_build_starts_within() {
     const CONTRACT: &str = include_str!("../../../../contracts/policy_controller.proto");
     let figure = format!(
         "publication window ({} ms) of their answer",
