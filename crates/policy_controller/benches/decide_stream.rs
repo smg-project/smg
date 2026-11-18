@@ -21,16 +21,25 @@
 //!   with a fixed count in flight and no pause reads the stream's ceiling;
 //!   this one reads a latency at a rate, and the share that went local.
 //! - `policy_decide_stream/rate/<members>/<deciders>`: decisions a second
-//!   over 8, 64 and 512 members with four streams of 32 in flight each: on
-//!   one decider (one model) and on eight (64 models). The rate is the
-//!   streams' measured answers together over the one interval they share,
-//!   from the first of them to the last: a stream that ends early idles
-//!   in it, so the row reads no higher than the streams did together.
+//!   over 8, 64 and 512 members with 128 decisions in flight. On one
+//!   decider one model is asked over four streams and two runtime threads.
+//!   On eight, 64 models are asked over eight streams and eight runtime
+//!   threads, so as many threads feed the deciders as decide: the row
+//!   reads its deciders where its rate stands above the one-decider row's
+//!   (`rate_over_one`), and its feed where it does not. An eight-decider
+//!   row runs over a shared fleet, where every member serves every model
+//!   and every decider books its leases on the same members (over 8 and
+//!   64 of them on the one member of the least band), and over 64 members
+//!   as `/own` too: fleets of their own, 64 members a model, where no two
+//!   deciders book on one member. The rate is the streams' measured
+//!   answers together over the one interval they share, from the first of
+//!   them to the last: a stream that ends early idles in it, so the row
+//!   reads no higher than the streams did together.
 //! - `policy_decide_stream/gateway/64/<deciders>`: the rate rows over 64
-//!   members, on one decider and on eight, with each answered request told
-//!   on the gateway's `Session` as a gateway tells one served to its end: a
-//!   `Dispatched` and a `Completed`, sent by the thread that holds the
-//!   session. The frames name the lease the answer carried; where it
+//!   members, both fleets on eight deciders, with each answered request
+//!   told on the gateway's `Session` as a gateway tells one served to its
+//!   end: a `Dispatched` and a `Completed`, sent by the thread that holds
+//!   the session. The frames name the lease the answer carried; where it
 //!   carried none they name no lease, which a session takes. A stream
 //!   hands the session its reports sixteen at a time: a hand-over wakes
 //!   the session's thread, and one a request would time the wake.
@@ -51,6 +60,33 @@
 //!   counted run keeps no round trip and
 //!   sorts none: a sort grows faster than its length, and the difference
 //!   of two runs would keep part of it.
+//!
+//! A rate or a gateway row is a bar's cell. It runs `DECIDE_STREAM_PASSES`
+//! passes (one by default), each over a controller of its own, and prints
+//! the pass of the middle rate among the clean ones (no `Busy` answer and
+//! every answer timed; `passes` counts them) with their least and most
+//! rate. Beside the process's CPU a decision it prints its user and system
+//! parts and, as `<user>+<system>` microseconds a decision, the deciders',
+//! the controller's runtime threads' and the gateway's threads'
+//! (`clients_us`: the streams' clients and the session), then the switches
+//! a decision each of the three asked for (`switches`): all by the
+//! kernel's books of each thread, the time split as its ticks fell. A
+//! one-decider cell runs one pass more with the deciding thread's cycles
+//! and instructions counted in user space (`decider_cycles` and
+//! `decider_instructions`, a decision; `n/a` where the kernel gives no
+//! counter): a pass apart, whose rate is not read, since a counted thread
+//! pays for its counters at every switch. An eight-decider cell prints its
+//! rate and its CPU a decision over those of the one-decider cell of its
+//! members (`rate_over_one`, `cpu_over_one`).
+//!
+//! A measured run pins a cell's busy threads to a core each, over the
+//! cores the process was given, in their order: the deciders, the
+//! controller's runtime threads, the streams' clients, the session, the
+//! serving thread, and one core for the allocator's background thread and
+//! the election's (`cores`: the six in that order, a slash between them).
+//! An eight-decider cell takes 27 cores and a one-decider cell 10. A
+//! process given fewer, a test and a target without the call print
+//! `cores=none`: such a row is not a pinned cell's, whatever it reads.
 //!
 //! Every wire row prints the `Busy` answers it met (none is expected: the
 //! rows stay inside a stream's window and a decider's queue) and the
@@ -85,9 +121,14 @@
 //! make the least loaded rows tie: over 8 and 64 members one row alone, a
 //! band of two and the next band's row; over 512 members from one band.
 //! Every member reports 2,097,152 requests beneath its band, more than a
-//! row has decisions, so no count of leases on file reaches it and a
-//! lease on file moves no row's cost: a build that files leases and one
-//! that files none pick over the same costs. Every wire row prints how the three best rows of
+//! row has decisions, and a request names no prompt size, so its lease
+//! books no token-work and a dispatch told on the session credits its
+//! member none: a lease on file moves no row's cost, and a
+//! build that files leases and one that files none pick over the same
+//! costs. The bands stand in for the ties a fleet's leases make: here the
+//! reports fix them, and a row whose decisions fall under more than one
+//! count of the tally stops the bench, its pool having moved. Every wire
+//! row prints how the three best rows of
 //! its measured decisions scored (`ties`, four counts): each alone, the
 //! best alone and the next two alike, the best two alike, all three
 //! alike. Two builds are compared where they print one tally.
@@ -113,7 +154,7 @@
 )]
 #![expect(
     unsafe_code,
-    reason = "a counting global allocator is the only way to see what a decision allocated, and the allocator reads its settings from an exported symbol and answers for them through its control call"
+    reason = "a counting global allocator is the only way to see what a decision allocated, and the allocator reads its settings from an exported symbol and answers for them through its control call; a thread's core and its counters are asked of the kernel through calls the standard library wraps none of"
 )]
 
 #[path = "common/filled.rs"]
@@ -128,7 +169,7 @@ use std::{
     net::{Ipv4Addr, SocketAddr},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        mpsc as std_mpsc, Arc,
+        mpsc as std_mpsc, Arc, OnceLock,
     },
     thread,
     time::{Duration, Instant},
@@ -342,10 +383,165 @@ unsafe impl GlobalAlloc for Counted {
 #[global_allocator]
 static GLOBAL: Counted = Counted;
 
+/// The kernel's calls a row asks for itself: a thread's core, and the
+/// deciding thread's counters.
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+mod kernel {
+    use std::ffi::{c_int, c_long, c_ulong, c_void};
+
+    extern "C" {
+        fn sched_getaffinity(thread: c_int, size: usize, mask: *mut u64) -> c_int;
+        fn sched_setaffinity(thread: c_int, size: usize, mask: *const u64) -> c_int;
+        fn syscall(number: c_long, ...) -> c_long;
+        fn read(file: c_int, buffer: *mut c_void, count: usize) -> isize;
+        fn close(file: c_int) -> c_int;
+    }
+
+    /// A core mask as the kernel reads one: 1,024 cores.
+    type Mask = [u64; 16];
+
+    /// The cores the calling thread may run on, in their order.
+    pub(super) fn given() -> Vec<usize> {
+        let mut mask: Mask = [0; 16];
+        // SAFETY: the mask is `size_of_val(&mask)` writable bytes, and thread 0 is the caller.
+        let refused = unsafe { sched_getaffinity(0, size_of_val(&mask), mask.as_mut_ptr()) };
+        if refused != 0 {
+            return Vec::new();
+        }
+        let cores = mask.iter().enumerate().flat_map(|(word, bits)| {
+            (0..64).filter_map(move |bit| ((bits >> bit) & 1 == 1).then_some(word * 64 + bit))
+        });
+        cores.collect()
+    }
+
+    /// Pins `thread` to `core` alone, the caller for thread 0; whether the
+    /// kernel took it.
+    pub(super) fn pin(thread: c_int, core: usize) -> bool {
+        let mut mask: Mask = [0; 16];
+        let Some(word) = mask.get_mut(core / 64) else {
+            return false;
+        };
+        *word = 1 << (core % 64);
+        // SAFETY: the mask is `size_of_val(&mask)` readable bytes; the kernel refuses a thread that ended.
+        unsafe { sched_setaffinity(thread, size_of_val(&mask), mask.as_ptr()) == 0 }
+    }
+
+    /// The number of `perf_event_open`, which the C library wraps in no call.
+    #[cfg(target_arch = "x86_64")]
+    const PERF_EVENT_OPEN: c_long = 298;
+    #[cfg(target_arch = "aarch64")]
+    const PERF_EVENT_OPEN: c_long = 241;
+
+    /// The first version of the kernel's `perf_event_attr`: 64 bytes.
+    #[repr(C)]
+    #[derive(Default)]
+    struct Attr {
+        kind: u32,
+        size: u32,
+        config: u64,
+        sample: u64,
+        sample_type: u64,
+        read_format: u64,
+        flags: u64,
+        wakeup: u32,
+        breakpoint: u32,
+        config1: u64,
+    }
+
+    /// One hardware counter over one thread's own work: user space, no
+    /// kernel and no hypervisor.
+    pub(super) struct Counter(c_int);
+
+    impl Counter {
+        /// A counter of `thread`'s cycles (`event` 0) or instructions (1),
+        /// counting from now; none where the kernel or the host has none
+        /// to give.
+        pub(super) fn open(thread: c_int, event: u64) -> Option<Self> {
+            let attr = Attr {
+                size: 64,
+                config: event,
+                // exclude_kernel and exclude_hv.
+                flags: (1 << 5) | (1 << 6),
+                ..Attr::default()
+            };
+            let (every_core, no_group): (c_int, c_int) = (-1, -1);
+            let no_flags: c_ulong = 0;
+            // SAFETY: the kernel reads `size` bytes of the attribute, which outlives the call.
+            let file = unsafe {
+                syscall(
+                    PERF_EVENT_OPEN,
+                    &raw const attr,
+                    thread,
+                    every_core,
+                    no_group,
+                    no_flags,
+                )
+            };
+            c_int::try_from(file)
+                .ok()
+                .filter(|file| *file >= 0)
+                .map(Self)
+        }
+
+        /// The count so far.
+        pub(super) fn count(&self) -> Option<u64> {
+            let mut count = 0_u64;
+            // SAFETY: the buffer is the eight bytes of `count`.
+            let read = unsafe { read(self.0, (&raw mut count).cast(), size_of::<u64>()) };
+            (read == 8).then_some(count)
+        }
+    }
+
+    impl Drop for Counter {
+        fn drop(&mut self) {
+            // SAFETY: the file is this counter's own, closed once.
+            unsafe { close(self.0) };
+        }
+    }
+}
+
+/// A target with none of those calls: no thread is pinned and no counter
+/// counts.
+#[cfg(not(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+)))]
+mod kernel {
+    pub(super) fn given() -> Vec<usize> {
+        Vec::new()
+    }
+
+    pub(super) fn pin(_: i32, _: usize) -> bool {
+        false
+    }
+
+    /// No counter: the type has no value.
+    pub(super) enum Counter {}
+
+    impl Counter {
+        pub(super) fn open(_: i32, _: u64) -> Option<Self> {
+            None
+        }
+
+        pub(super) fn count(&self) -> Option<u64> {
+            match *self {}
+        }
+    }
+}
+
 const GATEWAY: &str = "bench-gateway";
 const PRESET: &str = "least_load";
-/// The controller's runtime threads.
-const SERVER_THREADS: usize = 2;
+/// The names a row finds its threads by: the controller's runtime threads,
+/// the thread that serves it, and the gateway's session.
+const RUNTIME: &str = "runtime";
+const SERVING: &str = "controller";
+const SESSION: &str = "session";
+/// The cores the process was given, read once as a measured run starts.
+/// Unset in a test, which pins no thread.
+static GIVEN: OnceLock<Vec<usize>> = OnceLock::new();
 /// The slots a stream keeps its requests' send instants in, each beside
 /// its request's id: above every row's count in flight. An answer whose
 /// slot a later request took is counted, not timed.
@@ -369,14 +565,118 @@ const REPORTS: usize = 16;
 /// The seed of the order the members are dealt to their bands in.
 const DEAL: u64 = 0x0B_A4D5;
 
+/// What a row's members serve.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Fleet {
+    /// Every member serves every model of the row: every decider books its
+    /// leases on the same members, and over 8 and 64 of them on the one
+    /// member of the least band.
+    Shared,
+    /// Each model has the row's count of members to itself, as fleets that
+    /// serve one model each: no two deciders book on one member.
+    Own,
+}
+
+impl Fleet {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Shared => "shared",
+            Self::Own => "own",
+        }
+    }
+}
+
+/// A thread's CPU and switches so far, by the kernel's books: its time on
+/// a core in nanoseconds, its user and system ticks, and the switches it
+/// asked for.
+#[derive(Clone, Copy, Default)]
+struct Spent {
+    nanos: u64,
+    user: u64,
+    system: u64,
+    asked: u64,
+}
+
+impl Spent {
+    /// Thread `task` of this process, the caller for `thread-self`; none
+    /// where the kernel's files do not read.
+    fn of(task: &str) -> Option<Self> {
+        let read = |file: &str| fs::read_to_string(format!("/proc/{task}/{file}")).ok();
+        let nanos = read("schedstat")?.split_whitespace().next()?.parse().ok()?;
+        let stat = read("stat")?;
+        // Past the command's closing parenthesis, as the process's own file
+        // reads: the user time the twelfth field, the system time the next.
+        let (_, fields) = stat.rsplit_once(')')?;
+        let mut times = fields.split_whitespace().skip(11).map(str::parse::<u64>);
+        let (Some(Ok(user)), Some(Ok(system))) = (times.next(), times.next()) else {
+            return None;
+        };
+        let asked = read("status")?
+            .lines()
+            .find_map(|line| line.strip_prefix("voluntary_ctxt_switches:"))
+            .and_then(|count| count.trim().parse().ok())?;
+        Some(Self {
+            nanos,
+            user,
+            system,
+            asked,
+        })
+    }
+
+    /// This sum with `other` in it.
+    fn with(self, other: Self) -> Self {
+        Self {
+            nanos: self.nanos + other.nanos,
+            user: self.user + other.user,
+            system: self.system + other.system,
+            asked: self.asked + other.asked,
+        }
+    }
+
+    /// What was spent since `earlier`.
+    fn since(self, earlier: Self) -> Self {
+        Self {
+            nanos: self.nanos.saturating_sub(earlier.nanos),
+            user: self.user.saturating_sub(earlier.user),
+            system: self.system.saturating_sub(earlier.system),
+            asked: self.asked.saturating_sub(earlier.asked),
+        }
+    }
+
+    /// The user and the system microseconds a decision, as a row prints
+    /// them: the time on a core, split as the kernel's ticks fell. `n/a`
+    /// for a time under one tick.
+    fn apart(self, decisions: u64) -> String {
+        let micros = self.nanos / 1_000;
+        match (micros * self.user).checked_div(self.user + self.system) {
+            Some(user) => format!(
+                "{}+{}",
+                each(user, decisions),
+                each(micros.saturating_sub(user), decisions)
+            ),
+            None => "n/a".to_owned(),
+        }
+    }
+}
+
+/// A count a decision as a row prints it, to the hundredth.
+fn each(count: u64, decisions: u64) -> String {
+    let hundredths = (count * 100).checked_div(decisions).unwrap_or(0);
+    format!("{}.{:02}", hundredths / 100, hundredths % 100)
+}
+
 /// One row's shape.
 #[derive(Clone, Copy)]
 struct Shape {
     members: u32,
     deciders: usize,
     models: u32,
+    /// What the members serve.
+    fleet: Fleet,
     streams: u32,
     in_flight: u32,
+    /// The controller's runtime threads.
+    threads: usize,
     /// The decisions a second an open loop offers each stream; zero keeps
     /// `in_flight` requests in flight instead.
     offered: u64,
@@ -388,6 +688,183 @@ struct Shape {
     /// The streams tell each answered request on the gateway's session, as
     /// a gateway does; otherwise they end its lease at the store's door.
     frames: bool,
+    /// The row's busy threads sit on a core each, where the process was
+    /// given the cores ([`Cores`]).
+    pinned: bool,
+    /// The deciding thread's cycles and instructions are counted
+    /// ([`Counters`]).
+    cycles: bool,
+}
+
+/// The process's live threads: each one's id and name, in the order of
+/// their ids. Empty where the kernel's directory does not read.
+fn threads() -> Vec<(i32, String)> {
+    let Ok(tasks) = fs::read_dir("/proc/self/task") else {
+        return Vec::new();
+    };
+    let mut threads: Vec<(i32, String)> = tasks
+        .filter_map(|task| {
+            let id = task.ok()?.file_name().to_str()?.parse().ok()?;
+            let name = fs::read_to_string(format!("/proc/self/task/{id}/comm")).ok()?;
+            Some((id, name.trim().to_owned()))
+        })
+        .collect();
+    threads.sort_unstable();
+    threads
+}
+
+/// What the controller's deciders and its runtime threads have spent so
+/// far, over the process's live threads by their names; none where the
+/// kernel's files do not read.
+fn controller_spent() -> Option<(Spent, Spent)> {
+    let (mut deciders, mut runtime) = (Spent::default(), Spent::default());
+    let threads = threads();
+    if threads.is_empty() {
+        return None;
+    }
+    for (id, name) in threads {
+        let class = if name.starts_with("decide-") {
+            &mut deciders
+        } else if name == RUNTIME {
+            &mut runtime
+        } else {
+            continue;
+        };
+        *class = class.with(Spent::of(&format!("self/task/{id}"))?);
+    }
+    Some((deciders, runtime))
+}
+
+/// The cores a row's busy threads sit on, each alone.
+struct Cores {
+    deciders: Vec<usize>,
+    runtime: Vec<usize>,
+    clients: Vec<usize>,
+    session: usize,
+    serving: usize,
+    /// The allocator's background thread and the election's share one.
+    rest: usize,
+}
+
+impl Cores {
+    /// The row's cores, taken from those the process was given in their
+    /// order: the deciders', the runtime threads', the streams' clients',
+    /// the session's, the serving thread's and the rest's. None where the
+    /// process was given fewer cores than the row has busy threads, or
+    /// reads none ([`GIVEN`]).
+    fn of(shape: Shape) -> Option<Self> {
+        let mut cores = GIVEN.get()?.iter().copied();
+        let mut take = |count: usize| {
+            let taken: Vec<usize> = cores.by_ref().take(count).collect();
+            (taken.len() == count).then_some(taken)
+        };
+        let deciders = take(shape.deciders)?;
+        let runtime = take(shape.threads)?;
+        let clients = take(usize::try_from(shape.streams).ok()?)?;
+        let [session, serving, rest] = take(3)?.try_into().ok()?;
+        Some(Self {
+            deciders,
+            runtime,
+            clients,
+            session,
+            serving,
+            rest,
+        })
+    }
+
+    /// Pins the controller's threads, found by their names: a decider on
+    /// the core of its number, the runtime threads in the order of their
+    /// ids, the serving thread, and the allocator's and the election's
+    /// together. The streams' clients and the session pin themselves as
+    /// they start. A row that found fewer deciders or runtime threads than
+    /// it has cores for them stops the bench.
+    fn controller(&self) {
+        let mut runtime = self.runtime.iter();
+        let (mut deciders, mut workers) = (0, 0);
+        for (id, name) in threads() {
+            let core = if let Some(number) = name.strip_prefix("decide-") {
+                deciders += 1;
+                number
+                    .parse::<usize>()
+                    .ok()
+                    .and_then(|number| self.deciders.get(number))
+            } else if name == RUNTIME {
+                runtime.next().inspect(|_| workers += 1)
+            } else if name == SERVING {
+                Some(&self.serving)
+            } else if name == "election" || name.starts_with("jemalloc") {
+                Some(&self.rest)
+            } else {
+                None
+            };
+            if let Some(core) = core {
+                assert!(kernel::pin(id, *core), "{name} sits on core {core}");
+            }
+        }
+        assert_eq!(
+            (deciders, workers),
+            (self.deciders.len(), self.runtime.len()),
+            "every decider and every runtime thread of the row is pinned"
+        );
+    }
+
+    /// The cores as a row prints them: the six classes in their order, a
+    /// slash between them.
+    fn print(&self) -> String {
+        [
+            runs(&self.deciders),
+            runs(&self.runtime),
+            runs(&self.clients),
+            self.session.to_string(),
+            self.serving.to_string(),
+            self.rest.to_string(),
+        ]
+        .join("/")
+    }
+}
+
+/// A list of cores as a row prints it: a run of neighbours as its first and
+/// its last, a comma between runs.
+fn runs(cores: &[usize]) -> String {
+    let mut runs = Vec::new();
+    let mut cores = cores.iter().copied().peekable();
+    while let Some(first) = cores.next() {
+        let mut last = first;
+        while let Some(next) = cores.next_if_eq(&(last + 1)) {
+            last = next;
+        }
+        runs.push(if last == first {
+            first.to_string()
+        } else {
+            format!("{first}-{last}")
+        });
+    }
+    runs.join(",")
+}
+
+/// The cycles and the instructions of a row's one deciding thread, in user
+/// space.
+struct Counters {
+    cycles: kernel::Counter,
+    instructions: kernel::Counter,
+}
+
+impl Counters {
+    /// Counters over the row's first deciding thread, from now; none where
+    /// the kernel gives none: a host without counters, or one that keeps
+    /// them from its users.
+    fn open() -> Option<Self> {
+        let (decider, _) = threads().into_iter().find(|(_, name)| name == "decide-0")?;
+        Some(Self {
+            cycles: kernel::Counter::open(decider, 0)?,
+            instructions: kernel::Counter::open(decider, 1)?,
+        })
+    }
+
+    /// The cycles and the instructions counted so far.
+    fn read(&self) -> Option<(u64, u64)> {
+        self.cycles.count().zip(self.instructions.count())
+    }
 }
 
 /// A controller served on its own thread and runtime.
@@ -478,46 +955,59 @@ fn bands(members: u32) -> Vec<u32> {
     band_of
 }
 
-/// `members` ready members that serve every one of `models` models, each
-/// with a load report in its band ([`bands`]), under the row's preset as
-/// generation 1, their rows built.
-fn fill(store: &MemoryStore, members: u32, models: u32) {
-    let models: Vec<String> = (0..models).map(model).collect();
+/// The shape's fleet: ready members, each with a load report in its band
+/// ([`bands`]), under the row's preset as generation 1, their rows built.
+/// A shared fleet is one deal of the bands over members that serve every
+/// model; fleets of their own are the same deal a model, over members
+/// that serve it alone.
+fn fill(store: &MemoryStore, shape: Shape) {
+    let models: Vec<String> = (0..shape.models).map(model).collect();
+    let fleets: Vec<(String, Vec<String>)> = match shape.fleet {
+        Fleet::Shared => vec![(String::new(), models)],
+        Fleet::Own => models
+            .into_iter()
+            .enumerate()
+            .map(|(fleet, model)| (format!("{fleet}-"), vec![model]))
+            .collect(),
+    };
+    let bands = bands(shape.members);
     let now = Instant::now();
-    for (index, band) in (0..members).zip(bands(members)) {
-        let key = format!("http://worker-{index}.fleet:8000");
-        let id = store
-            .upsert(WorkerFacts {
-                key: key.clone(),
-                engine: key,
-                incarnation: 1,
-                role: Role::Single,
-                models: models.clone(),
-                dp_size: 1,
-                max_running: Some(2 * HELD),
-                ..WorkerFacts::default()
-            })
-            .id();
-        let revision = WorkersStore::get(store, id).expect("the row").revision;
-        store.set_status(id, WorkerStatus::Ready, revision);
-        store.record(
-            id,
-            0,
-            LoadRow {
-                running: HELD + band,
-                max_running: 2 * HELD,
-                ..LoadRow::default()
-            },
-            now,
-            LoadSource::Stream,
-        );
+    for (fleet, models) in &fleets {
+        for (index, band) in (0..shape.members).zip(&bands) {
+            let key = format!("http://worker-{fleet}{index}.fleet:8000");
+            let id = store
+                .upsert(WorkerFacts {
+                    key: key.clone(),
+                    engine: key,
+                    incarnation: 1,
+                    role: Role::Single,
+                    models: models.clone(),
+                    dp_size: 1,
+                    max_running: Some(2 * HELD),
+                    ..WorkerFacts::default()
+                })
+                .id();
+            let revision = WorkersStore::get(store, id).expect("the row").revision;
+            store.set_status(id, WorkerStatus::Ready, revision);
+            store.record(
+                id,
+                0,
+                LoadRow {
+                    running: HELD + band,
+                    max_running: 2 * HELD,
+                    ..LoadRow::default()
+                },
+                now,
+                LoadSource::Stream,
+            );
+        }
     }
     let mut document = PolicySpec::preset(PRESET).expect("a preset of this build");
     document.generation = 1;
     let spec = AppliedSpec::validate(&document).expect("the preset validates");
     store.apply(spec).expect("above the unbound start");
     store.publish_now();
-    filled::filled(store, &model(0), Role::Single, members as usize);
+    filled::filled(store, &model(0), Role::Single, shape.members as usize);
 }
 
 /// Serves a controller over the shape's fleet; returns once it leads.
@@ -527,7 +1017,8 @@ fn serve(shape: Shape) -> Served {
         .name("controller".to_owned())
         .spawn(move || {
             let runtime = runtime::Builder::new_multi_thread()
-                .worker_threads(SERVER_THREADS)
+                .worker_threads(shape.threads)
+                .thread_name(RUNTIME)
                 .enable_all()
                 .build()
                 .expect("the controller's runtime");
@@ -539,7 +1030,7 @@ fn serve(shape: Shape) -> Served {
                     .identity_as_told("gateway")
                     .expect("a listener of the configuration");
                 let store = controller.store();
-                fill(&store, shape.members, shape.models);
+                fill(&store, shape);
                 let addr = controller
                     .addresses()
                     .of(Scope::Gateway)
@@ -659,7 +1150,7 @@ struct Tally {
 impl Tally {
     /// Counts a measured pick: under its place of [`Self::ties`], and its
     /// lease where its answer carried one.
-    fn picked(&mut self, pick: Option<&Answered>) {
+    fn count(&mut self, pick: Option<&Answered>) {
         let Some(pick) = pick else {
             return;
         };
@@ -769,7 +1260,7 @@ impl Ends {
 /// Reads the decision's place in a stream's tally of ties, by its trace's
 /// three best rows (two score alike where their scores are one value, bit
 /// for bit), the lease its answer carried and its first target.
-fn picked(decision: &Decision) -> Answered {
+fn answered(decision: &Decision) -> Answered {
     let first = match &decision.outcome {
         Some(Outcome::Pick(pick)) => pick.targets.first(),
         _ => None,
@@ -882,7 +1373,7 @@ async fn ask(addr: SocketAddr, shape: Shape, ends: &mut Ends) -> Tally {
             .expect("an answer, not the stream's end");
         let received = Instant::now();
         let pick = match &answer.answer {
-            Some(Answer::Decision(decision)) => Some(picked(decision)),
+            Some(Answer::Decision(decision)) => Some(answered(decision)),
             Some(Answer::Busy(_)) => {
                 tally.busy += 1;
                 None
@@ -897,7 +1388,7 @@ async fn ask(addr: SocketAddr, shape: Shape, ends: &mut Ends) -> Tally {
         }
         if done >= shape.warm {
             tally.answered += 1;
-            tally.picked(pick.as_ref());
+            tally.count(pick.as_ref());
         }
         // A counted run keeps no round trip: a sort of them would stay in
         // the difference of two runs.
@@ -1009,7 +1500,7 @@ async fn offer(addr: SocketAddr, shape: Shape, ends: &mut Ends) -> Tally {
             .expect("an answer, not the stream's end");
         let received = Instant::now();
         let pick = match &answer.answer {
-            Some(Answer::Decision(decision)) => Some(picked(decision)),
+            Some(Answer::Decision(decision)) => Some(answered(decision)),
             Some(Answer::Busy(_)) => {
                 tally.busy += 1;
                 None
@@ -1034,7 +1525,7 @@ async fn offer(addr: SocketAddr, shape: Shape, ends: &mut Ends) -> Tally {
                 tally.opened = received;
             }
             tally.answered += 1;
-            tally.picked(pick.as_ref());
+            tally.count(pick.as_ref());
             let took = received.saturating_duration_since(due(id));
             tally
                 .nanos
@@ -1047,18 +1538,28 @@ async fn offer(addr: SocketAddr, shape: Shape, ends: &mut Ends) -> Tally {
     tally
 }
 
+/// What the session's thread returns: the frames it sent and what it
+/// spent.
+type Told = (u64, Option<Spent>);
+
 /// The gateway's session on a thread of its own: its `Hello` is welcomed,
 /// then each request a stream reports as over is told as a gateway tells
 /// one served to its end, a `Dispatched` and a `Completed`. Once every
 /// reporting end is dropped the thread ends its side of the stream and
 /// reads the controller's to its end: every frame was applied by then.
-/// Returns the frames it sent.
-fn session(addr: SocketAddr) -> (mpsc::Sender<Vec<Over>>, thread::JoinHandle<u64>) {
+/// Returns the frames it sent and what its thread spent.
+fn session(
+    addr: SocketAddr,
+    core: Option<usize>,
+) -> (mpsc::Sender<Vec<Over>>, thread::JoinHandle<Told>) {
     let (ready, opened) = std_mpsc::channel();
     let thread = thread::Builder::new()
-        .name("session".to_owned())
+        .name(SESSION.to_owned())
         .spawn(move || {
-            current_thread().block_on(async move {
+            if let Some(core) = core {
+                assert!(kernel::pin(0, core), "the session sits on core {core}");
+            }
+            let sent = current_thread().block_on(async move {
                 let (frames, mut answers) = hello(addr).await;
                 let (reports, mut over) = mpsc::channel::<Vec<Over>>(64);
                 ready.send(reports).expect("the row waits for the session");
@@ -1102,7 +1603,8 @@ fn session(addr: SocketAddr) -> (mpsc::Sender<Vec<Over>>, thread::JoinHandle<u64
                 drop(frames);
                 while let Ok(Some(_)) = answers.message().await {}
                 seq
-            })
+            });
+            (sent, Spent::of("thread-self"))
         })
         .expect("the session's thread");
     (opened.recv().expect("the session opens"), thread)
@@ -1115,9 +1617,9 @@ fn current_thread() -> runtime::Runtime {
         .expect("a client's runtime")
 }
 
-/// The process's CPU time so far, in the kernel's ticks of ten
-/// milliseconds; none where the kernel's file does not read.
-fn cpu_ticks() -> Option<u64> {
+/// The process's user and system CPU time so far, in the kernel's ticks of
+/// ten milliseconds; none where the kernel's file does not read.
+fn cpu_ticks() -> Option<(u64, u64)> {
     let stat = fs::read_to_string("/proc/self/stat").ok()?;
     // Past the command's closing parenthesis the state is the first field,
     // the user time the twelfth and the system time the thirteenth.
@@ -1126,7 +1628,7 @@ fn cpu_ticks() -> Option<u64> {
     let (Some(Ok(user)), Some(Ok(system))) = (times.next(), times.next()) else {
         return None;
     };
-    Some(user + system)
+    Some((user, system))
 }
 
 /// The process's resident size in MiB; none where the kernel's file does
@@ -1150,6 +1652,22 @@ struct Row {
     /// CPU milliseconds of the whole process per million decisions, and
     /// its resident size: none where the kernel's file did not read.
     cpu_millis_per_million: Option<u64>,
+    /// The process's user and system ticks over the row.
+    ticks: Option<(u64, u64)>,
+    /// What the deciders, the controller's runtime threads and the
+    /// gateway's threads (its streams' clients and its session) spent over
+    /// the row; none where the kernel's files did not read.
+    deciders: Option<Spent>,
+    runtime: Option<Spent>,
+    gateway: Option<Spent>,
+    /// The cores the row's busy threads sat on, as it prints them; none
+    /// for a row that is not pinned.
+    cores: Option<String>,
+    /// The deciding thread's cycles and instructions in user space, where
+    /// the row counted them.
+    counted: Option<(u64, u64)>,
+    /// The row's decisions, warm and measured, over all its streams.
+    decisions: u64,
     rss_mib: Option<u64>,
     calls: u64,
     late: u64,
@@ -1176,7 +1694,8 @@ fn wire(shape: Shape) -> Row {
     );
     let served = serve(shape);
     let addr = served.addr;
-    let (reports, session) = session(addr);
+    let cores = if shape.pinned { Cores::of(shape) } else { None };
+    let (reports, session) = session(addr, cores.as_ref().map(|cores| cores.session));
     let ends = if shape.frames {
         Ends::Session {
             reports: reports.clone(),
@@ -1185,28 +1704,40 @@ fn wire(shape: Shape) -> Row {
     } else {
         Ends::Door(Arc::clone(&served.store), None)
     };
-    let before = cpu_ticks();
+    if let Some(cores) = &cores {
+        cores.controller();
+    }
+    let counters = if shape.cycles { Counters::open() } else { None };
+    let before = (cpu_ticks(), controller_spent());
     let streams: Vec<_> = (0..shape.streams)
-        .map(|index| {
+        .zip(0..)
+        .map(|(index, place)| {
             let mut ends = ends.clone();
+            let core = cores
+                .as_ref()
+                .and_then(|cores| cores.clients.get(place).copied());
             thread::Builder::new()
                 .name(format!("client-{index}"))
                 .spawn(move || {
-                    current_thread().block_on(async move {
+                    if let Some(core) = core {
+                        assert!(kernel::pin(0, core), "a client sits on core {core}");
+                    }
+                    let tally = current_thread().block_on(async move {
                         if shape.offered == 0 {
                             ask(addr, shape, &mut ends).await
                         } else {
                             offer(addr, shape, &mut ends).await
                         }
-                    })
+                    });
+                    (tally, Spent::of("thread-self"))
                 })
                 .expect("a client's thread")
         })
         .collect();
-    let tallies: Vec<Tally> = streams
+    let (tallies, mut gateway): (Vec<Tally>, Vec<Option<Spent>>) = streams
         .into_iter()
         .map(|stream| stream.join().expect("a client's thread ends cleanly"))
-        .collect();
+        .unzip();
     // The row's own reporting end kept the session standing for the whole
     // row, whoever reported on it: a gateway whose session ended is let go
     // after its grace period, its streams and its leases with it. With the
@@ -1214,10 +1745,18 @@ fn wire(shape: Shape) -> Row {
     // is read to its end, so the row's CPU holds every frame.
     drop(ends);
     drop(reports);
-    let frames = session.join().expect("the session's thread ends cleanly");
-    let ticks = cpu_ticks()
-        .zip(before)
-        .map(|(after, before)| after.saturating_sub(before));
+    let (frames, told) = session.join().expect("the session's thread ends cleanly");
+    gateway.push(told);
+    let ticks = cpu_ticks().zip(before.0).map(|(after, before)| {
+        (
+            after.0.saturating_sub(before.0),
+            after.1.saturating_sub(before.1),
+        )
+    });
+    let controller = controller_spent()
+        .zip(before.1)
+        .map(|(after, before)| (after.0.since(before.0), after.1.since(before.1)));
+    let counted = counters.and_then(|counters| counters.read());
     let rss_mib = rss_mib();
     served.stop();
 
@@ -1226,7 +1765,16 @@ fn wire(shape: Shape) -> Row {
         busy: 0,
         per_second: 0,
         cpu_millis_per_million: ticks
-            .and_then(|ticks| (ticks * 10 * 1_000_000).checked_div(decisions)),
+            .and_then(|(user, system)| ((user + system) * 10 * 1_000_000).checked_div(decisions)),
+        ticks,
+        deciders: controller.map(|(deciders, _)| deciders),
+        runtime: controller.map(|(_, runtime)| runtime),
+        gateway: gateway
+            .into_iter()
+            .try_fold(Spent::default(), |sum, spent| Some(sum.with(spent?))),
+        cores: cores.as_ref().map(Cores::print),
+        counted,
+        decisions,
         rss_mib,
         calls: 0,
         late: 0,
@@ -1269,8 +1817,129 @@ fn wire(shape: Shape) -> Row {
         "{} of the row's {picks} measured picks carried a lease",
         row.leases
     );
+    // The reports fix the pool, so every decision of a row scores its
+    // three best rows one way. A tally under two counts means a cost
+    // moved, by a lease on file or by a dispatch told: the row would read
+    // one pool on a build that files leases and another on one that
+    // files none.
+    assert!(
+        row.ties.iter().filter(|count| **count > 0).count() <= 1,
+        "the row's pool moved: its decisions' three best rows scored {}",
+        ties(row.ties)
+    );
     row.nanos.sort_unstable();
     row
+}
+
+impl Row {
+    /// Whether the row met no `Busy` answer and timed every answer.
+    fn clean(&self) -> bool {
+        self.busy == 0 && self.overtaken == 0
+    }
+}
+
+/// The rate rows' cells, each by its members, its deciders and its fleet:
+/// a one-decider cell stands ahead of the eight-decider cells over its
+/// members, which are read against it.
+const RATE: [(u32, usize, Fleet); 7] = [
+    (8, 1, Fleet::Shared),
+    (64, 1, Fleet::Shared),
+    (512, 1, Fleet::Shared),
+    (8, 8, Fleet::Shared),
+    (64, 8, Fleet::Shared),
+    (64, 8, Fleet::Own),
+    (512, 8, Fleet::Shared),
+];
+/// The gateway rows' cells, in the same form.
+const TOLD: [(u32, usize, Fleet); 3] = [
+    (64, 1, Fleet::Shared),
+    (64, 8, Fleet::Shared),
+    (64, 8, Fleet::Own),
+];
+
+impl Shape {
+    /// A bar's cell over `members`, with 128 decisions in flight: on one
+    /// decider, one model asked over four streams and two runtime threads;
+    /// on more, 64 models with a stream and a runtime thread a decider,
+    /// so the deciders are fed by as many threads as decide.
+    fn bar(
+        members: u32,
+        deciders: usize,
+        fleet: Fleet,
+        frames: bool,
+        warm: u64,
+        measured: u64,
+    ) -> Self {
+        let (models, streams, threads) = if deciders == 1 { (1, 4, 2) } else { (64, 8, 8) };
+        Self {
+            members,
+            deciders,
+            models,
+            fleet,
+            streams,
+            in_flight: 128 / streams,
+            threads,
+            offered: 0,
+            warm,
+            measured,
+            counted: false,
+            frames,
+            pinned: true,
+            cycles: false,
+        }
+    }
+}
+
+/// A bar's cell: the shape's passes, each a row over a controller of its
+/// own.
+struct Cell {
+    /// The pass of the middle rate among the clean ones ([`Row::clean`]),
+    /// or among all of them where none is clean.
+    middle: Row,
+    /// The clean passes, and the least and the most rate among the passes
+    /// the middle is of.
+    clean: usize,
+    least: u64,
+    most: u64,
+    /// The deciding thread's cycles and instructions a decision, where a
+    /// one-decider cell counted them in a pass of their own.
+    counted: Option<(u64, u64)>,
+}
+
+/// Runs a bar's cell: `passes` passes of the shape and, on one decider, one
+/// more with the deciding thread's counters open, whose rate is not read:
+/// a counted thread pays for its counters at every switch.
+fn cell(shape: Shape, passes: usize) -> Cell {
+    let mut rows: Vec<Row> = (0..passes.max(1)).map(|_| wire(shape)).collect();
+    let clean = rows.iter().filter(|row| row.clean()).count();
+    if clean > 0 {
+        rows.retain(Row::clean);
+    }
+    rows.sort_unstable_by_key(|row| row.per_second);
+    let least = rows.first().map_or(0, |row| row.per_second);
+    let most = rows.last().map_or(0, |row| row.per_second);
+    let middle = rows.len().saturating_sub(1) / 2;
+    let middle = rows.into_iter().nth(middle).expect("a cell runs a pass");
+    let counted = (shape.deciders == 1)
+        .then(|| {
+            wire(Shape {
+                cycles: true,
+                ..shape
+            })
+        })
+        .and_then(|row| {
+            let (cycles, instructions) = row.counted?;
+            cycles
+                .checked_div(row.decisions)
+                .zip(instructions.checked_div(row.decisions))
+        });
+    Cell {
+        middle,
+        clean,
+        least,
+        most,
+        counted,
+    }
 }
 
 /// The value `numerator` in `denominator` of the sorted values are at or
@@ -1406,13 +2075,17 @@ fn count(cell: &str, out: &mut impl Write) -> io::Result<()> {
         members: u32::try_from(members).expect("a fleet that fits"),
         deciders: 1,
         models: 1,
+        fleet: Fleet::Shared,
         streams: 1,
         in_flight: 1,
+        threads: 2,
         offered: 0,
         warm: 2_000,
         measured: decisions,
         counted: true,
         frames: false,
+        pinned: false,
+        cycles: false,
     };
     let (calls, busy) = match mode {
         "in_process" | "commit" => {
@@ -1435,6 +2108,87 @@ fn count(cell: &str, out: &mut impl Write) -> io::Result<()> {
     )
 }
 
+/// Prints a bar's cell: the pass of its middle rate with the passes' least
+/// and most, the CPU a decision by thread class, and on one decider the
+/// deciding thread's counts, on more the cell over the one-decider cell of
+/// its members (`ones`: each one's members, rate and CPU a decision).
+fn bar(
+    out: &mut impl Write,
+    kind: &str,
+    shape: Shape,
+    passes: usize,
+    cell: &Cell,
+    ones: &[(u32, u64, Option<u64>)],
+) -> io::Result<()> {
+    let row = &cell.middle;
+    let own = if shape.fleet == Fleet::Own {
+        "/own"
+    } else {
+        ""
+    };
+    let part = |ticks: Option<u64>| read(ticks, |ticks| each(ticks * 10_000, row.decisions));
+    let class = |spent: Option<Spent>| read(spent, |spent| spent.apart(row.decisions));
+    let asked = |spent: Option<Spent>| read(spent, |spent| each(spent.asked, row.decisions));
+    write!(
+        out,
+        "policy_decide_stream/{kind}/{}/{}{own} models={} fleet={} streams={} in_flight={} threads={} cores={} passes={}/{passes} decisions={} per_s={} least_per_s={} most_per_s={} p50_us={} p99_us={} busy={} cpu_s_per_million={} user_us={} system_us={} deciders_us={} runtime_us={} clients_us={} switches={}/{}/{} rss_mib={} overtaken={} ties={} leases={}",
+        shape.members,
+        shape.deciders,
+        shape.models,
+        shape.fleet.name(),
+        shape.streams,
+        shape.in_flight,
+        shape.threads,
+        row.cores.as_deref().unwrap_or("none"),
+        cell.clean,
+        row.nanos.len(),
+        row.per_second,
+        cell.least,
+        cell.most,
+        percentile(&row.nanos, 1, 2),
+        percentile(&row.nanos, 99, 100),
+        row.busy,
+        read(row.cpu_millis_per_million, seconds),
+        part(row.ticks.map(|(user, _)| user)),
+        part(row.ticks.map(|(_, system)| system)),
+        class(row.deciders),
+        class(row.runtime),
+        class(row.gateway),
+        asked(row.deciders),
+        asked(row.runtime),
+        asked(row.gateway),
+        read(row.rss_mib, |mib| mib.to_string()),
+        row.overtaken,
+        ties(row.ties),
+        row.leases,
+    )?;
+    if shape.frames {
+        write!(out, " frames={}", row.frames)?;
+    }
+    if shape.deciders == 1 {
+        writeln!(
+            out,
+            " decider_cycles={} decider_instructions={}",
+            read(cell.counted, |(cycles, _)| cycles.to_string()),
+            read(cell.counted, |(_, instructions)| instructions.to_string()),
+        )?;
+    } else {
+        let one = ones
+            .iter()
+            .find(|(members, _, _)| *members == shape.members);
+        writeln!(
+            out,
+            " rate_over_one={} cpu_over_one={}",
+            read(one, |(_, rate, _)| each(row.per_second, *rate)),
+            read(
+                one.and_then(|(_, _, cpu)| cpu.zip(row.cpu_millis_per_million)),
+                |(one, eight)| each(eight, one)
+            ),
+        )?;
+    }
+    out.flush()
+}
+
 fn main() -> io::Result<()> {
     // A run on another allocator, or under other settings, is refused
     // before a row starts: its rows would pass for the binary's.
@@ -1451,6 +2205,10 @@ fn main() -> io::Result<()> {
     // As criterion reads a run: `cargo bench` passes `--bench`, and a test
     // of every target passes neither flag.
     let quick = env::args().any(|arg| arg == "--test") || !env::args().any(|arg| arg == "--bench");
+    if !quick {
+        // A measured run pins its bars' threads to these.
+        GIVEN.get_or_init(kernel::given);
+    }
     let mut out = io::stdout().lock();
     if let Ok(cell) = env::var("DECIDE_STREAM_COUNT") {
         return count(&cell, &mut out);
@@ -1468,13 +2226,17 @@ fn main() -> io::Result<()> {
                 members: 64,
                 deciders: 2,
                 models: 1,
+                fleet: Fleet::Shared,
                 streams: 1,
                 in_flight,
+                threads: 2,
                 offered: 0,
                 warm,
                 measured,
                 counted: false,
                 frames: false,
+                pinned: false,
+                cycles: false,
             });
             writeln!(
                 out,
@@ -1504,13 +2266,17 @@ fn main() -> io::Result<()> {
                 members: 64,
                 deciders: 2,
                 models: 1,
+                fleet: Fleet::Shared,
                 streams,
                 in_flight: 0,
+                threads: 2,
                 offered: offered / u64::from(streams),
                 warm: warm / u64::from(streams),
                 measured: measured / u64::from(streams),
                 counted: false,
                 frames: false,
+                pinned: false,
+                cycles: false,
             });
             writeln!(
                 out,
@@ -1531,69 +2297,23 @@ fn main() -> io::Result<()> {
             out.flush()?;
         }
     }
-    if all || rows == "rate" {
-        for (deciders, models) in [(1, 1), (8, 64)] {
-            for members in [8, 64, 512] {
-                let row = wire(Shape {
-                    members,
-                    deciders,
-                    models,
-                    streams: 4,
-                    in_flight: 32,
-                    offered: 0,
-                    warm,
-                    measured,
-                    counted: false,
-                    frames: false,
-                });
-                writeln!(
-                    out,
-                    "policy_decide_stream/rate/{members}/{deciders} models={models} streams=4 in_flight=32 decisions={} per_s={} p50_us={} p99_us={} busy={} cpu_s_per_million={} rss_mib={} overtaken={} ties={} leases={}",
-                    row.nanos.len(),
-                    row.per_second,
-                    percentile(&row.nanos, 1, 2),
-                    percentile(&row.nanos, 99, 100),
-                    row.busy,
-                    read(row.cpu_millis_per_million, seconds),
-                    read(row.rss_mib, |mib| mib.to_string()),
-                    row.overtaken,
-                    ties(row.ties),
-                    row.leases,
-                )?;
-                out.flush()?;
-            }
+    let passes = env::var("DECIDE_STREAM_PASSES")
+        .ok()
+        .and_then(|passes| passes.parse().ok())
+        .unwrap_or(1);
+    for (kind, frames, cells) in [("rate", false, &RATE[..]), ("gateway", true, &TOLD[..])] {
+        if !all && rows != kind {
+            continue;
         }
-    }
-    if all || rows == "gateway" {
-        for (deciders, models) in [(1, 1), (8, 64)] {
-            let row = wire(Shape {
-                members: 64,
-                deciders,
-                models,
-                streams: 4,
-                in_flight: 32,
-                offered: 0,
-                warm,
-                measured,
-                counted: false,
-                frames: true,
-            });
-            writeln!(
-                out,
-                "policy_decide_stream/gateway/64/{deciders} models={models} streams=4 in_flight=32 decisions={} per_s={} p50_us={} p99_us={} busy={} cpu_s_per_million={} rss_mib={} overtaken={} ties={} leases={} frames={}",
-                row.nanos.len(),
-                row.per_second,
-                percentile(&row.nanos, 1, 2),
-                percentile(&row.nanos, 99, 100),
-                row.busy,
-                read(row.cpu_millis_per_million, seconds),
-                read(row.rss_mib, |mib| mib.to_string()),
-                row.overtaken,
-                ties(row.ties),
-                row.leases,
-                row.frames,
-            )?;
-            out.flush()?;
+        let mut ones = Vec::new();
+        for &(members, deciders, fleet) in cells {
+            let shape = Shape::bar(members, deciders, fleet, frames, warm, measured);
+            let cell = cell(shape, passes);
+            bar(&mut out, kind, shape, passes, &cell, &ones)?;
+            if deciders == 1 {
+                let row = &cell.middle;
+                ones.push((members, row.per_second, row.cpu_millis_per_million));
+            }
         }
     }
     Ok(())
