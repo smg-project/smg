@@ -20,12 +20,15 @@ use engine_zmq_client::{
 
 const PREFIX: &str = "DeepSeek-V4.1 image batch:";
 
-/// The grids the Router's DeepSeek-V4.1 preprocessor sends with an image batch.
-const GRID_KEYS: [&str; 2] = ["vit_grid", "patches_per_image"];
+/// The grid only the Router's DeepSeek-V4.1 preprocessor sends with an image
+/// batch; GLM-5.3 Flash sends `patches_per_image` as well.
+const MARKER: &str = "vit_grid";
 
-/// Whether an image batch's model tensors are the V4.1 grids.
+/// Whether an image batch's model tensors are a V4.1 batch's. Its other
+/// fields are then required, so a batch missing one is refused, not sent on
+/// as one item.
 pub(crate) fn is_v41_batch(tensors: &BTreeMap<String, SglangWireTensor>) -> bool {
-    GRID_KEYS.iter().all(|key| tensors.contains_key(*key))
+    tensors.contains_key(MARKER)
 }
 
 /// One item per image: its rows of the feature (viewed, not copied), its
@@ -334,7 +337,19 @@ mod tests {
         let mut pixel_less = v41_batch(&GRIDS, &PATCHES, &SPANS);
         pixel_less.pixel_values = None;
         pixel_less.feature_hash = Some(7);
+        refused(pixel_less.clone(), "no pixel_values");
+        pixel_less
+            .model_specific_tensors
+            .remove("patches_per_image");
         refused(pixel_less, "no pixel_values");
+        let mut no_patch_counts = v41_batch(&GRIDS, &PATCHES, &SPANS);
+        no_patch_counts
+            .model_specific_tensors
+            .remove("patches_per_image");
+        refused(
+            no_patch_counts,
+            "DeepSeek-V4.1 image batch: no patches_per_image",
+        );
         let mut flat_pixels = v41_batch(&GRIDS, &PATCHES, &SPANS);
         let floats: Vec<u8> = (0..8).flat_map(|row| (row as f32).to_le_bytes()).collect();
         flat_pixels.pixel_values = Some(tensor("float32", vec![8], floats));
@@ -381,22 +396,26 @@ mod tests {
         assert!(output.mm_items.iter().all(|item| item.hash.is_none()));
     }
 
-    /// A batch without the V4.1 grids (a Qwen-style `image_grid_thw`) stays
-    /// one item.
+    /// A batch without `vit_grid` stays one item: a Qwen-style
+    /// `image_grid_thw`, or GLM-5.3 Flash's, which carries `patches_per_image`
+    /// as well.
     #[test]
     fn other_families_keep_one_item_per_batch() {
-        let mut batch = v41_batch(&GRIDS, &PATCHES, &SPANS);
-        batch.model_specific_tensors = [(
+        let qwen = [(
             "image_grid_thw".to_string(),
             int64(&[1, 2, 2, 1, 2, 2], vec![2, 3]),
-        )]
-        .into_iter()
-        .collect();
-        let output = translate_sglang_multimodal(batch, Vec::new(), PROMPT_LEN).unwrap();
-        assert_eq!(output.mm_items.len(), 1);
-        assert_eq!(output.mm_items[0].offsets, Some(vec![(1, 5), (7, 10)]));
-        assert!(output.mm_items[0]
-            .model_specific_data
-            .contains_key("image_grid_thw"));
+        )];
+        let mut glm53_flash = qwen.to_vec();
+        glm53_flash.push(("patches_per_image".to_string(), int64(&[4, 4], vec![2])));
+        for tensors in [qwen.to_vec(), glm53_flash] {
+            let mut batch = v41_batch(&GRIDS, &PATCHES, &SPANS);
+            batch.model_specific_tensors = tensors.iter().cloned().collect();
+            let output = translate_sglang_multimodal(batch, Vec::new(), PROMPT_LEN).unwrap();
+            assert_eq!(output.mm_items.len(), 1);
+            assert_eq!(output.mm_items[0].offsets, Some(vec![(1, 5), (7, 10)]));
+            assert!(tensors
+                .iter()
+                .all(|(key, _)| output.mm_items[0].model_specific_data.contains_key(key)));
+        }
     }
 }

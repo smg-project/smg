@@ -31,8 +31,10 @@ of every image's patches, with each image's grid (`vit_grid`), patch count
 model encodes one image per item and reads that image's grid as `n_vit_h` /
 `n_vit_w`, so both SGLang servicers cut the batch into one item per image, the
 shape SGLang's own processor builds: the image's patch rows, its placeholder
-range and its grid. A batch whose grids, patch counts, token counts and
-placeholders disagree, or that carries no images or no pixels, is refused with
+range and its grid. A batch is a V4.1 batch when it carries `vit_grid`, which no
+other family sends (GLM-5.3 Flash sends `patches_per_image` too). A V4.1 batch
+whose grids, patch counts, token counts and placeholders disagree, or that
+carries no images, no patch counts or no pixels, is refused with
 `INVALID_ARGUMENT` before the scheduler.
 Other families keep one item per batch.
 

@@ -222,12 +222,26 @@ def test_a_batch_without_images_is_refused(v41_converter):
         _convert(servicer, pb, batch)
 
 
-def test_grids_without_pixels_are_refused(v41_converter):
-    """V4.1 grids with no pixel_values are refused, not dropped with the images."""
+@pytest.mark.parametrize("missing", [(), ("patches_per_image",)])
+def test_grids_without_pixels_are_refused(v41_converter, missing):
+    """V4.1 grids with no pixel_values are refused, not dropped with the images,
+    also when the patch counts are missing as well."""
     servicer, pb = v41_converter
     batch = _v41_batch(pb)
     batch.ClearField("pixel_values")
+    for name in missing:
+        del batch.model_specific_tensors[name]
     with pytest.raises(ValueError, match="no pixel_values to cut its per-image items from"):
+        _convert(servicer, pb, batch)
+
+
+def test_a_batch_without_patch_counts_is_refused(v41_converter):
+    """``vit_grid`` marks a V4.1 batch: without its patch counts it is refused, not sent
+    to the scheduler as one item."""
+    servicer, pb = v41_converter
+    batch = _v41_batch(pb)
+    del batch.model_specific_tensors["patches_per_image"]
+    with pytest.raises(ValueError, match="DeepSeek-V4.1 image batch: no patches_per_image"):
         _convert(servicer, pb, batch)
 
 
@@ -238,16 +252,19 @@ def test_media_references_without_tensors_still_convert(v41_converter):
     assert _convert(servicer, pb, batch) is None
 
 
-def test_other_families_keep_one_item_per_batch(v41_converter):
-    """A batch without the V4.1 grids (a Qwen-style ``image_grid_thw``) is not cut."""
+@pytest.mark.parametrize("patch_counts", [False, True], ids=["qwen", "glm53-flash"])
+def test_other_families_keep_one_item_per_batch(v41_converter, patch_counts):
+    """A batch without ``vit_grid`` is not cut: a Qwen-style ``image_grid_thw``, or
+    GLM-5.3 Flash's, which carries ``patches_per_image`` as well."""
     servicer, pb = v41_converter
+    tensors = {"image_grid_thw": _tensor(pb, [[1, 2, 2], [1, 2, 2]], (2, 3), torch.int64)}
+    if patch_counts:
+        tensors["patches_per_image"] = _tensor(pb, [4, 4], (2,), torch.int64)
     batch = pb.MultimodalInputs(
         modalities=["image"],
         im_token_id=9,
         pixel_values=_tensor(pb, [0.0] * 8, (8,), torch.float32),
-        model_specific_tensors={
-            "image_grid_thw": _tensor(pb, [[1, 2, 2], [1, 2, 2]], (2, 3), torch.int64),
-        },
+        model_specific_tensors=tensors,
         mm_placeholders=[
             pb.PlaceholderRange(offset=1, length=2),
             pb.PlaceholderRange(offset=5, length=2),
@@ -255,5 +272,5 @@ def test_other_families_keep_one_item_per_batch(v41_converter):
     )
     (item,) = _convert(servicer, pb, batch).mm_items
     assert item.offsets == [(1, 2), (5, 6)]
-    assert set(item.model_specific_data) == {"image_grid_thw"}
+    assert set(item.model_specific_data) == set(tensors)
     assert item.feature.shape == (8,)

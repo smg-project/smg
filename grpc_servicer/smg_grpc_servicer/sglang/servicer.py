@@ -92,8 +92,9 @@ HEALTH_CHECK_TIMEOUT = int(os.getenv("SGLANG_HEALTH_CHECK_TIMEOUT", 20))
 PROFILE_COMM_TIMEOUT = 600.0
 
 
-# The grids the Router's DeepSeek-V4.1 preprocessor sends with an image batch.
-V41_GRID_KEYS = ("vit_grid", "patches_per_image")
+# The grid only the Router's DeepSeek-V4.1 preprocessor sends with an image
+# batch; GLM-5.3 Flash sends ``patches_per_image`` as well.
+V41_MARKER = "vit_grid"
 V41_PREFIX = "DeepSeek-V4.1 image batch:"
 
 
@@ -107,6 +108,8 @@ def _deepseek_v41_items(feature, tensors: dict, offsets: list) -> list:
     scheduler, where it would stop the engine.
     """
     prefix = V41_PREFIX
+    if "patches_per_image" not in tensors:
+        raise ValueError(f"{prefix} no patches_per_image")
     counts = {}
     for name in ("vit_grid", "patches_per_image", "types_per_image"):
         tensor = tensors.get(name)
@@ -1082,7 +1085,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         if (
             grpc_req.HasField("mm_inputs")
             and not grpc_req.mm_inputs.HasField("pixel_values")
-            and all(key in grpc_req.mm_inputs.model_specific_tensors for key in V41_GRID_KEYS)
+            and V41_MARKER in grpc_req.mm_inputs.model_specific_tensors
         ):
             # Grids without the pixels they describe would drop the images unseen.
             raise ValueError(f"{V41_PREFIX} no pixel_values to cut its per-image items from")
@@ -1172,7 +1175,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                 key: self._decode_tensor_data(value)
                 for key, value in batch.model_specific_tensors.items()
             }
-            if modality == Modality.IMAGE and all(key in tensors for key in V41_GRID_KEYS):
+            if modality == Modality.IMAGE and V41_MARKER in tensors:
                 mm_items.extend(_deepseek_v41_items(feature, tensors, offsets))
                 continue
             mm_items.append(
