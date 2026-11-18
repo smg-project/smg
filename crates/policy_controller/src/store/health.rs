@@ -61,9 +61,10 @@ pub trait HealthSink: Send + Sync {
     /// gone past its grace period takes its vetoes with it
     /// ([`LeasesStore::drop_gateways`](super::LeasesStore::drop_gateways)).
     /// The controller's presence table alone writes a gateway's vetoes,
-    /// through the note it keeps of them: a write that goes around the
-    /// table is not seen by the gateway's ceiling of vetoes until the next
-    /// membership write.
+    /// through the note it keeps of them. A veto set around the table never
+    /// counts against the gateway's ceiling of vetoes. One lifted around it
+    /// still counts until its own instant, the gateway's next frame for
+    /// that worker, the next membership write or the gateway's next list.
     fn gateway_veto(&self, gateway: GatewayId, id: WorkerId, until: Option<Instant>);
 
     /// [`gateway_veto`](Self::gateway_veto) for a caller that keeps a note

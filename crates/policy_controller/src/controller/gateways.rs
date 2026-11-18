@@ -182,6 +182,11 @@ struct Row {
     vetoes: FxHashMap<WorkerId, Ends>,
     /// How many ends the note holds, over every worker.
     held: usize,
+    /// No end the note holds is earlier than this instant: a write of an
+    /// end lowers it, an end that leaves does not raise it, and a walk for
+    /// ends past their instants ([`Row::prune`]) sets it to the earliest
+    /// end left. `None` only while the note holds no end.
+    next_end: Option<Instant>,
     /// The membership epoch at the note's last walk for rows that left
     /// ([`Row::left`]), `None` before the first: a row leaves by a
     /// membership write alone, so one walk an epoch finds every one.
@@ -210,13 +215,22 @@ pub(crate) struct Seat {
 
 impl Row {
     /// An end past its instant is no veto: the note keeps none, and the
-    /// count is the note's.
+    /// count is the note's. The note is walked only once the earliest end
+    /// it may hold is past: until then no end left it by its instant.
     fn prune(&mut self, now: Instant) {
+        if self.next_end.is_none_or(|next| next > now) {
+            return;
+        }
+        let mut held = 0;
+        let mut next_end = None;
         self.vetoes.retain(|_, ends| {
             ends.retain(|&(_, end)| end > now);
+            held += ends.len();
+            next_end = ends.iter().map(|&(_, end)| end).chain(next_end).min();
             !ends.is_empty()
         });
-        self.held = self.vetoes.values().map(Vec::len).sum();
+        self.held = held;
+        self.next_end = next_end;
     }
 
     /// The ends of workers whose rows left since they were noted go: the
@@ -408,6 +422,7 @@ impl Gateways {
             replaced: Vec::new(),
             vetoes: FxHashMap::default(),
             held: 0,
+            next_end: None,
             left_at: None,
             ended: watch::channel(()).0,
         });
@@ -540,7 +555,7 @@ impl Gateways {
                         // each moves the epoch, read here before the walk:
                         // the store is asked once an epoch, and a frame
                         // refused again under it asks nothing. The prune
-                        // above still walks the note at each such frame.
+                        // above walks the note only past its earliest end.
                         let epoch = WorkersStore::epoch(&*self.store);
                         if row.left_at != Some(epoch) {
                             row.left(&self.store, gateway, now);
@@ -576,6 +591,10 @@ impl Gateways {
         };
         if !ends.is_empty() {
             row.held += ends.len();
+            // The worker's ends were out of the note while a walk may have
+            // set its earliest end: each of them lowers it again.
+            let first = ends.iter().map(|&(_, end)| end).min();
+            row.next_end = first.into_iter().chain(row.next_end).min();
             row.vetoes.insert(worker, ends);
         }
         vetoed
@@ -628,6 +647,7 @@ impl Gateways {
         // ceiling asks the store whatever the epoch reads by then.
         row.left_at = None;
         row.held = row.vetoes.values().map(Vec::len).sum();
+        row.next_end = row.vetoes.values().flatten().map(|&(_, end)| end).min();
         row.held
     }
 
@@ -639,6 +659,11 @@ impl Gateways {
         table.rows.get(&gateway).map_or(0, |row| {
             let noted: usize = row.vetoes.values().map(Vec::len).sum();
             assert_eq!(row.held, noted, "the count follows the note");
+            let earliest = row.vetoes.values().flatten().map(|&(_, end)| end).min();
+            assert!(
+                earliest.is_none_or(|end| row.next_end.is_some_and(|next| next <= end)),
+                "no end is earlier than the note says"
+            );
             row.held
         })
     }
@@ -1829,6 +1854,41 @@ pub(crate) mod tests {
         HealthSink::gateway_veto(&*store, A, workers[1], None);
         assert_eq!(frame(), Vetoed::Shown);
         assert_eq!(gateways.kept(A), VETOES_MAX - KINDS_MAX + 1);
+        drop(seat);
+    }
+
+    /// A frame's end nearer than every end the note holds is the note's
+    /// earliest from then on, and a walk keeps the earliest end left: each
+    /// such end frees its place at the ceiling once past, with no pass of
+    /// the sweep between, and the ceiling stands until then.
+    #[test]
+    fn an_end_a_frame_sets_nearest_frees_its_place_at_the_ceiling_once_past() {
+        let (_elector, store, gateways, t0) = leading(GRACE);
+        let seat = welcomed(&gateways, A, "gateway-a", TERM, t0);
+        let workers = filled(&store, &seat, t0);
+        // Two frames move one kind's end each, to five and to seven
+        // seconds: the list's ends stand at sixty.
+        assert_eq!(
+            seat.veto(workers[0], 1, Some(t0 + 5 * S), t0),
+            Vetoed::Shown
+        );
+        assert_eq!(
+            seat.veto(workers[1], 1, Some(t0 + 7 * S), t0),
+            Vetoed::Shown
+        );
+        assert_eq!(gateways.kept(A), VETOES_MAX);
+        let first = worker(&store, "http://one-more:8000");
+        let second = worker(&store, "http://two-more:8000");
+        let frame = |w, at| seat.veto(w, BREAKER, Some(t0 + 60 * S), t0 + at);
+        // Before the nearest end the ceiling stands; at it one place is
+        // free.
+        assert_eq!(frame(first, S), Vetoed::Over);
+        assert_eq!(frame(first, 5 * S), Vetoed::Shown);
+        // The walk kept the earliest end left: the ceiling stands again
+        // until that one passes.
+        assert_eq!(frame(second, 6 * S), Vetoed::Over);
+        assert_eq!(frame(second, 7 * S), Vetoed::Shown);
+        assert_eq!(gateways.kept(A), VETOES_MAX);
         drop(seat);
     }
 
