@@ -55,13 +55,18 @@ pub use turn::{AtWork, Hand};
 /// again (the registry's broadcast is sized the same today).
 const CHANGE_LOG: usize = 1_024;
 
-/// The store's counts one scrape reports, both of one state of the store.
+/// The store's counts one scrape reports: the first two of one state of
+/// the store.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct StoreCounts {
     /// The members outside the standing generation's lists.
     pub outside: OutsideLists,
     /// The load writes that moved an overload verdict.
     pub overload_flips: u64,
+    /// The lifecycle calls of a lease that panicked and were held
+    /// ([`MemoryStore::lifecycle_faults`]): a count of its own, read
+    /// beside the two.
+    pub lifecycle_faults: u64,
 }
 
 /// The store. `Default` is empty with term `0`.
@@ -913,13 +918,14 @@ impl MemoryStore {
         health.vetoes.len() + completions.sum::<usize>()
     }
 
-    /// The counts one scrape reports, read under one hold of the load lock:
-    /// the two are of one state of the store.
+    /// The counts one scrape reports. The load table's two are read under
+    /// one hold of the load lock, so they are of one state of the store.
     pub fn counts(&self) -> StoreCounts {
         let loads = self.loads.lock();
         StoreCounts {
             outside: loads.writer.outside(),
             overload_flips: loads.writer.flips(),
+            lifecycle_faults: self.lifecycle_faults(),
         }
     }
 

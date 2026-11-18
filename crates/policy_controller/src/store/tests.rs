@@ -3464,3 +3464,16 @@ fn a_lease_of_the_term_before_is_found_in_its_file_behind_a_rise() {
     drop(names);
     assert_eq!(LeasesStore::live(&store, gateway), 0);
 }
+
+/// A streak of lifecycle calls that panicked says its first alone: each is
+/// counted, and a call that returns ends the streak.
+#[test]
+fn a_streak_of_lifecycle_faults_says_its_first_alone() {
+    let store = MemoryStore::new();
+    assert!(store.call_faulted());
+    assert!(!store.call_faulted());
+    store.call_returned();
+    assert_eq!(store.lifecycle_faults(), 2);
+    assert!(store.call_faulted());
+    assert_eq!(store.lifecycle_faults(), 3);
+}

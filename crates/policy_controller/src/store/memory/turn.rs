@@ -304,12 +304,20 @@ impl Hand {
     }
 }
 
+/// The bit of the files' fault count that says the last lifecycle call
+/// panicked: a streak of faults writes one line.
+const STREAK: u64 = 1 << (u64::BITS - 1);
+
 /// The store's files of leases, one a decider, and the word their events
 /// are told through.
 pub(super) struct Files {
     files: Box<[File]>,
     /// The controller's word to the engine, given once.
     teller: OnceLock<Teller>,
+    /// The lifecycle calls that panicked, below a bit that says the last
+    /// call did ([`MemoryStore::lifecycle_faults`]): read beside the word
+    /// at each tell, written at a fault and at the first return behind one.
+    faults: AtomicU64,
 }
 
 impl Files {
@@ -319,6 +327,7 @@ impl Files {
         Self {
             files: Box::new([File::new(leases, None)]),
             teller: OnceLock::new(),
+            faults: AtomicU64::new(0),
         }
     }
 
@@ -333,6 +342,7 @@ impl Files {
         Self {
             files,
             teller: OnceLock::new(),
+            faults: AtomicU64::new(0),
         }
     }
 }
@@ -380,6 +390,34 @@ impl MemoryStore {
     #[cfg(any(test, feature = "controller"))]
     pub(crate) fn tell_through(&self, teller: Teller) {
         self.files.teller.get_or_init(|| teller);
+    }
+
+    /// A lifecycle call the controller made for a lease panicked and was
+    /// held: counted. `true` for the first of a streak, the one its caller
+    /// writes a line for.
+    #[cfg(any(test, feature = "controller"))]
+    pub(crate) fn call_faulted(&self) -> bool {
+        let faults = &self.files.faults;
+        let first = faults.fetch_or(STREAK, Relaxed) & STREAK == 0;
+        faults.fetch_add(1, Relaxed);
+        first
+    }
+
+    /// A lifecycle call the controller made for a lease returned: a
+    /// streak of faults ends. One load where none stands, so a call that
+    /// returns writes nothing the deciders share.
+    #[cfg(any(test, feature = "controller"))]
+    pub(crate) fn call_returned(&self) {
+        let faults = &self.files.faults;
+        if faults.load(Relaxed) & STREAK != 0 {
+            faults.fetch_and(!STREAK, Relaxed);
+        }
+    }
+
+    /// How many lifecycle calls of a lease panicked and were held: each
+    /// cost no request its decision and ended no thread.
+    pub fn lifecycle_faults(&self) -> u64 {
+        self.files.faults.load(Relaxed) & !STREAK
     }
 
     /// Tells the engine what `said` did to the lease `record` stood as,

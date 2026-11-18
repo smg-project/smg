@@ -119,7 +119,9 @@
 //! the panic's payload under a catch of its own, since a payload's drop
 //! can panic too, takes the next request on new buffers, so that one reads
 //! nothing the fault left, and writes one line for a streak of faults,
-//! never one a request.
+//! never one a request. A lease's lifecycle call that panics is held
+//! where the engine is told ([`lifecycle`]), whoever applies the lease's
+//! event: it costs no request its decision and ends no decider.
 //! A decider's thread that unwinds anywhere else leaves its models with no
 //! decider: the deciders tell it ([`Deciders::ended`]), for the controller
 //! to stop, since a leader that cannot decide for a model must not keep
@@ -178,8 +180,7 @@ use crate::{
 pub(crate) struct Counts {
     /// `Busy` answers, each at its reason's number on the wire.
     pub(crate) busy: [AtomicU64; 5],
-    /// Decisions that panicked, and the lifecycle calls that did as a
-    /// decider left its work or gave up an answer its stream refused.
+    /// Decisions that panicked.
     pub(crate) faults: AtomicU64,
     /// Requests for a side of a pair plan: prefill or decode under either
     /// pair plan, encode under the plan that has an encode side.
@@ -594,16 +595,13 @@ impl Deciding {
 
     /// Leaves the decider's work at the leases' file. What was handed
     /// behind its last take is applied here, and the engine's lifecycle
-    /// calls run with it, outside any decision ([`Self::held`]).
+    /// calls run with it, outside any decision. A call that panics is
+    /// held where it is made ([`lifecycle::tells`]'s word to the engine):
+    /// it costs no request and ends no decider.
     fn rest(&mut self) {
-        let Some(mut seat) = self.working.take() else {
-            return;
-        };
-        self.held(
-            "a lease's lifecycle call panicked as its decider left its work: what it left is applied at the decider's next take",
-            |_| seat.rest(),
-        );
-        self.working = Some(seat);
+        if let Some(seat) = &mut self.working {
+            seat.rest();
+        }
     }
 
     /// Gives up the lease of an answer its stream did not take: the queue
@@ -612,13 +610,12 @@ impl Deciding {
     /// decider hands its release to its own file as abandoned, as a
     /// stream does for a decision it stops at the send, and applies it at
     /// its next take: before its next decision reads a count, or as it
-    /// rests. A full ring makes the hand apply in place, outside
-    /// any decision ([`Self::held`]). A call that panics there unwinds the
-    /// hand before its frame is in the ring, and that call's own frame is
-    /// out of it: the release is handed once more. A second panic there
-    /// leaves the lease to its dispatch deadline.
+    /// rests. A full ring makes the hand apply in place, outside any
+    /// decision. A stage's call that panics at either is held where the
+    /// engine is told, as every call of a lease's event is: the hand is
+    /// through, and the lease is off its file.
     #[cold]
-    fn unsent(&mut self, gateway: GatewayId, answer: wire::Decided) {
+    fn unsent(&self, gateway: GatewayId, answer: wire::Decided) {
         let wire::Decided::Decision {
             lease: Some(leased),
             ..
@@ -626,39 +623,9 @@ impl Deciding {
         else {
             return;
         };
-        let give_up = |reads: &Reads| {
-            let hand = lifecycle::open(&reads.store, gateway);
-            let abandoned = Said::Released(None, ReleaseReason::Abandoned);
-            reads.store.hand(&hand, leased.lease.id, abandoned);
-        };
-        let line = "a lease's lifecycle call panicked as its decider gave up an answer its stream refused: the give-up is handed again, and what the call left is applied at the decider's next take";
-        if self.held(line, give_up) {
-            self.held(line, give_up);
-        }
-    }
-
-    /// Runs what applies handed frames outside a decision. A lifecycle
-    /// call that panics there is held as a decision's is: counted with the
-    /// faults and written once a streak, as `line`. What it left in the
-    /// ring is the next take's; a frame its caller had not written yet is
-    /// the caller's to hand again. True where a call panicked.
-    fn held(&mut self, line: &'static str, apply: impl FnOnce(&Reads)) -> bool {
-        let reads = &self.reads;
-        let Err(payload) = catch_unwind(AssertUnwindSafe(|| apply(reads))) else {
-            return false;
-        };
-        // A payload's own drop can panic: the engine's helper frees it
-        // under a catch of its own.
-        release(payload);
-        self.reads.counts.faults.fetch_add(1, Ordering::Relaxed);
-        if !self.faulted {
-            error!(
-                decider = thread::current().name().unwrap_or_default(),
-                "{line}"
-            );
-        }
-        self.faulted = true;
-        true
+        let hand = lifecycle::open(&self.reads.store, gateway);
+        let abandoned = Said::Released(None, ReleaseReason::Abandoned);
+        self.reads.store.hand(&hand, leased.lease.id, abandoned);
     }
 
     /// The word of `term`'s mark: the planned hand-over, so the next take
@@ -2464,8 +2431,8 @@ pub(crate) mod tests {
     /// A decider that leaves its work on an empty queue applies what was
     /// handed behind its last take, and the engine's lifecycle calls run
     /// with it, outside any decision. A stage's call that panics there is
-    /// a fault as a decision's is: counted, and the decider stands for its
-    /// next request.
+    /// held as a decision's fault is, counted apart from the decisions',
+    /// and the decider stands for its next request.
     #[tokio::test]
     async fn a_stages_call_that_panics_as_a_decider_leaves_its_work_is_a_fault_it_outlives() {
         let (mut bed, told, at_issue, word) = waits(true);
@@ -2483,8 +2450,8 @@ pub(crate) mod tests {
         bed.store.hand(&hand, id, gone);
         word.send(()).expect("the stage waits for the case");
         picked(&bed.answer().await);
-        let (faults, waited) = (&bed.counts.faults, Instant::now());
-        while faults.load(Ordering::Relaxed) == 0 && !*ended.borrow() {
+        let (faults, waited) = (|| bed.store.lifecycle_faults(), Instant::now());
+        while faults() == 0 && !*ended.borrow() {
             assert!(
                 waited.elapsed() < PATIENCE,
                 "the decider never left its work"
@@ -2492,7 +2459,9 @@ pub(crate) mod tests {
             thread::sleep(Duration::from_millis(1));
         }
         assert!(!*ended.borrow(), "the decider's thread unwound");
-        assert_eq!(faults.load(Ordering::Relaxed), 1);
+        // The call's fault is its own count: no request went unanswered.
+        assert_eq!(faults(), 1);
+        assert_eq!(bed.counts.faults.load(Ordering::Relaxed), 0);
         // The lease left the file ahead of the call that panicked.
         assert_eq!(bed.store.live(GATEWAY), 0);
         assert_eq!(*told.lock(), [(id.0, None)]);
@@ -2563,9 +2532,9 @@ pub(crate) mod tests {
     }
 
     /// The hand of an unsent answer applies in place where the ring is
-    /// full, outside any decision. A stage's call that panics there is a
-    /// fault as a decision's is: counted, and the decider stands for its
-    /// next request.
+    /// full, outside any decision. A stage's call that panics there is
+    /// held as a decision's fault is, counted apart from the decisions',
+    /// and the decider stands for its next request.
     #[tokio::test]
     async fn a_stages_panic_at_an_unsent_answers_give_up_is_a_fault_its_decider_outlives() {
         let (mut bed, told, at_issue, word) = waits(true);
@@ -2595,8 +2564,8 @@ pub(crate) mod tests {
             bed.store.hand(&hand, LeaseId(0), gone());
         }
         word.send(()).expect("the stage waits for the case");
-        let (faults, waited) = (&bed.counts.faults, Instant::now());
-        while faults.load(Ordering::Relaxed) == 0 && !*ended.borrow() {
+        let (faults, waited) = (|| bed.store.lifecycle_faults(), Instant::now());
+        while faults() == 0 && !*ended.borrow() {
             assert!(
                 waited.elapsed() < PATIENCE,
                 "the decider never gave the lease up"
@@ -2604,7 +2573,9 @@ pub(crate) mod tests {
             thread::sleep(Duration::from_millis(1));
         }
         assert!(!*ended.borrow(), "the decider's thread unwound");
-        assert_eq!(faults.load(Ordering::Relaxed), 1);
+        // The call's fault is its own count: no decision panicked.
+        assert_eq!(faults(), 1);
+        assert_eq!(bed.counts.faults.load(Ordering::Relaxed), 0);
         // The lease left the file ahead of the call that panicked.
         assert_eq!(bed.store.live(GATEWAY), 0);
         assert_eq!(*told.lock(), [(id.0, None)]);
@@ -2618,11 +2589,11 @@ pub(crate) mod tests {
     }
 
     /// A give-up whose hand applies in place and meets another lease's
-    /// panicking call there is handed once more: that call unwound the hand
-    /// before its frame was in the ring. The unsent answer's lease leaves
-    /// the file at the decider's next take.
+    /// panicking call there is through: the call is held where the engine
+    /// is told, and the hand writes its frame behind it. The unsent
+    /// answer's lease leaves the file at the decider's next take.
     #[tokio::test]
-    async fn a_give_up_behind_another_leases_panic_at_a_full_ring_is_handed_again() {
+    async fn a_give_up_behind_another_leases_panic_at_a_full_ring_is_still_handed() {
         let (mut bed, told, at_issue, word) = waits(true);
         let ended = bed.deciders.ended();
         // The first lease: its answer is taken and the lease stays on file.
@@ -2657,18 +2628,20 @@ pub(crate) mod tests {
             bed.store.hand(&hand, LeaseId(0), gone());
         }
         word.send(()).expect("the stage waits for the case");
-        // Two faults: the first lease's release call, where the give-up's
+        // Two held calls: the first lease's release, where the give-up's
         // hand applied in place, and the second lease's own, where the
-        // decider leaves its work and applies the frame handed again.
-        let (faults, waited) = (&bed.counts.faults, Instant::now());
-        while faults.load(Ordering::Relaxed) < 2 && !*ended.borrow() {
+        // decider leaves its work and applies the frame its hand wrote.
+        let (faults, waited) = (|| bed.store.lifecycle_faults(), Instant::now());
+        while faults() < 2 && !*ended.borrow() {
             assert!(
                 waited.elapsed() < PATIENCE,
-                "the give-up was not handed again"
+                "the give-up was not handed behind the call that panicked"
             );
             thread::sleep(Duration::from_millis(1));
         }
         assert!(!*ended.borrow(), "the decider's thread unwound");
+        // No decision panicked: the calls' faults are their own count.
+        assert_eq!(bed.counts.faults.load(Ordering::Relaxed), 0);
         assert_eq!(bed.store.live(GATEWAY), 0);
         assert_eq!(*told.lock(), [(first.0, None), (first.0 + 1, None)]);
     }
