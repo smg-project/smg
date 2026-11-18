@@ -615,8 +615,10 @@ impl McpOrchestrator {
         let configured = Arc::clone(&static_servers);
         connection_pool.set_eviction_callback(move |key: &PoolKey| {
             // Under a configured server's name the inventory keeps that
-            // server's tools.
-            if configured.contains_key(&key.url) {
+            // server's tools: the name is tested and the listing cleared
+            // under the name's guard.
+            let name = configured.entry(key.url.clone());
+            if matches!(name, dashmap::Entry::Occupied(_)) {
                 return;
             }
             debug!(
@@ -1923,11 +1925,16 @@ impl McpOrchestrator {
         // The tools go to the inventory by URL and stay with this connection
         // (its pool key), beside the listing's outcome; the outcome goes to
         // the caller's binding. Under a configured server's name the
-        // inventory keeps that server's tools alone.
+        // inventory keeps that server's tools alone: the name is tested and
+        // the listing written under the name's guard, the guard a configured
+        // server's own listing is written under.
         let listed = tools_of(client.as_ref(), &server_key, ToolCategory::Dynamic).await;
-        if !self.static_servers.contains_key(&server_key) {
-            for entry in listed.iter().flatten() {
-                inventory_clone.insert_entry(entry.clone());
+        {
+            let name = self.static_servers.entry(server_key.clone());
+            if matches!(name, dashmap::Entry::Vacant(_)) {
+                for entry in listed.iter().flatten() {
+                    inventory_clone.insert_entry(entry.clone());
+                }
             }
         }
         let list_error = listed.as_ref().err().cloned();
