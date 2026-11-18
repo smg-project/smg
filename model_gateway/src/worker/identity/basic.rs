@@ -55,18 +55,17 @@ pub use crate::worker::{
 /// host's connector ([`EngineConnector::connect_zmq`]); the worker layer
 /// keeps the connection in its slot and maps the error.
 async fn connect_zmq_backend(
-    connector: Option<Arc<dyn EngineConnector>>,
+    connector: Arc<dyn EngineConnector>,
     link: ZmqLink,
 ) -> WorkerResult<Arc<dyn EngineConnection>> {
     let base_url = link.base_url.clone();
-    let connected = match connector {
-        Some(connector) => connector.connect_zmq(link).await,
-        None => Err(NO_ENGINE_CONNECTOR.to_string()),
-    };
-    connected.map_err(|reason| WorkerError::ConnectionFailed {
-        url: base_url,
-        reason,
-    })
+    connector
+        .connect_zmq(link)
+        .await
+        .map_err(|reason| WorkerError::ConnectionFailed {
+            url: base_url,
+            reason,
+        })
 }
 
 /// Default bootstrap port for PD disaggregation (a bootstrap server's, and the Mooncake connector's)
@@ -1105,13 +1104,18 @@ impl BasicWorker {
     /// load, so any caller awaiting it (request pipeline, load monitor, health
     /// probe) would block far past its own deadline. Callers peek the cell and
     /// report unavailable until the driver lands.
+    ///
+    /// A worker built without a connector has no handshake to drive, and
+    /// none starts: its acquisition refuses and its probe reads not ready.
     fn spawn_zmq_connect_driver(&self, cell: &Arc<OnceCell<Arc<dyn EngineConnection>>>) {
+        let Some(connector) = self.engine_connector.clone() else {
+            return;
+        };
         if self.zmq_connect_started.swap(true, Ordering::SeqCst) {
             return;
         }
         let cell = Arc::clone(cell);
         let started = Arc::clone(&self.zmq_connect_started);
-        let connector = self.engine_connector.clone();
         let link = ZmqLink {
             base_url: self.metadata.base_url().to_string(),
             model_id: self.metadata.model_id().to_string(),
@@ -1912,6 +1916,14 @@ impl Worker for BasicWorker {
                 let cell = self.engine_connection.load_full();
                 if let Some(client) = cell.get() {
                     return Ok(Some(Arc::clone(client)));
+                }
+                if self.engine_connector.is_none() {
+                    // No handshake will complete: refuse now, as the gRPC
+                    // arm does.
+                    return Err(WorkerError::ConnectionFailed {
+                        url: self.metadata.spec.url.clone(),
+                        reason: NO_ENGINE_CONNECTOR.to_string(),
+                    });
                 }
                 self.spawn_zmq_connect_driver(&cell);
                 Err(WorkerError::ConnectionFailed {
