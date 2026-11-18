@@ -191,7 +191,8 @@ pool, which is the pool's order and no rule of the policy.
   rank or for the one rank `pinned` names. A step is what the gateway's rank cache is handed: a poll's answer
   (`poll`: an entry a rank in rank order, `null` where the answer omits the rank), a poll that failed (`failed`),
   the worker's loads dropped as it leaves the ready set (`evict`), or a request of `cost` estimated tokens
-  (`pick`), which asks the policy for a rank and books its cost on the rank it takes. An entry carries the tokens
+  (`pick`), which asks the cache's select for a rank and books its cost on the rank it takes. The gateway's
+  policy forwards a request to that select and adds nothing. An entry carries the tokens
   the rank's cache uses (`used`), which is the count the gateway reads, the rank's token capacity (`capacity`)
   and, where the rank reports them, the context tokens of the requests it holds (`resident`). The row records the
   rank each request took, `null` where it found none. Nothing in a row draws: the recorder runs each row twice,
@@ -258,8 +259,9 @@ through the monitor's own functions and the verdict is read off the worker the m
 sheet's recorder is a child of the policy's own module and stands in that policy's directory: the adjustment and
 the window are the policy's private state, and a module beside the policy's could reach neither.
 The minimum-tokens sheet's recorder is a child of the load monitor too: each step reaches the rank cache as the
-monitor's poll loop hands it over, and each request asks the policy. The sticky rank sheet's recorder is a child of
-the stage that sends a request to its worker, and calls the stage's own pin.
+monitor's poll loop hands it over, and each request asks the cache's select, which the policy forwards to. The
+sticky rank sheet's recorder is a child of the stage that sends a request to its worker, and calls the stage's own
+pin.
 
 A sheet is never edited by hand. A new recording replaces the whole sheet and its row in the table above, in one
 pull request that names the commit and says which rows moved: a sequence row moves only when the policy's
