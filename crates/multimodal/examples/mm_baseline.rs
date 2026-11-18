@@ -33,12 +33,14 @@
 //! its averaged columns and its p90 carry each thread's first cold take (the median
 //! only at `--repeats 1`).
 //! The move of the wire bytes runs on a thread of its own, one beside each worker, as
-//! the gateway runs it on a runtime worker that never preprocesses: a float tensor's
-//! storage is dropped there and does not return to the scratch pool of the thread that
-//! made it. `--write-thread same` runs the move on the worker itself, where the storage
-//! returns to that pool and the next iteration takes it warm: a reuse the gateway does
-//! not have, kept for comparison. In the default mode the serialize stage includes the
-//! hand-over to that thread and back.
+//! the gateway runs it where a backend's wire is assembled on a runtime worker, a
+//! thread that never preprocesses: a float tensor's storage is dropped there and does
+//! not return to the scratch pool of the thread that made it. Where a backend's wire is
+//! assembled on the blocking pool, the write can land on a thread that also
+//! preprocesses, and that thread's pool keeps the storage: such a backend lies between
+//! the two modes. `--write-thread same` runs the move on the worker itself, where the
+//! storage always returns to that pool and the next iteration takes it warm. In the
+//! default mode the serialize stage includes the hand-over to that thread and back.
 //! Video decodes through the media connector under the family's own sampling rule;
 //! audio through the in-process decoder.
 //!
@@ -345,8 +347,12 @@ impl Writer {
     }
 
     fn write(&self, input: EncoderInput, wire: EncoderDtype) -> Result<Vec<u8>, String> {
-        self.inputs.send((input, wire)).map_err(|e| e.to_string())?;
-        self.written.recv().map_err(|e| e.to_string())?
+        // The channels close under a live worker only when the writing thread has died.
+        const DIED: &str = "the writing thread panicked";
+        self.inputs
+            .send((input, wire))
+            .map_err(|_| DIED.to_string())?;
+        self.written.recv().map_err(|_| DIED.to_string())?
     }
 }
 
