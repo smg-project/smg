@@ -19,9 +19,11 @@ mod net;
 
 use std::{
     collections::BTreeMap,
+    convert::Infallible,
     future::Future,
     io::{ErrorKind, Write as _},
     net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener},
+    path::Path,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
@@ -1308,6 +1310,19 @@ async fn a_standby_that_closes_its_half_ends_the_stream() {
     .await;
 }
 
+/// Removes the lease file at `lease` again and again. A holder's renewal
+/// reads the file, then renames a new one over its path: a removal that
+/// lands between the two is undone, and the holder never sees its lease
+/// gone. A removal that lands outside a renewal stands, and the holder's
+/// next look finds no lease.
+async fn removed_again(lease: &Path) -> Infallible {
+    loop {
+        // Gone already, where the holder has not written since.
+        let _ = std::fs::remove_file(lease);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 /// The fence at the wire. A leader whose lease is gone ends an open stream
 /// `ABORTED` at its next look of the lease. A hello it still waited for is
 /// refused the same way, though it names a place the log does not hold: a
@@ -1345,7 +1360,13 @@ async fn a_leader_that_loses_its_lease_ends_its_stream_and_joins_no_other() {
             .await
             .expect("the leader's word while it leads");
         std::fs::remove_file(&lease).expect("the lease file");
-        assert_eq!(open.ended().await, Some(Code::Aborted));
+        // One removal can be undone by the holder's renewal: the file is
+        // removed again until the stream ends.
+        let ended = tokio::select! {
+            ended = open.ended() => ended,
+            never = removed_again(&lease) => match never {},
+        };
+        assert_eq!(ended, Some(Code::Aborted));
         // The fence is closed, and the hello names a place past the head.
         let lost = place(base.replication_seq + 1_000, base.replication_term);
         late.send(proto::ReplicaFrame {
