@@ -319,6 +319,8 @@ pub(crate) const TYPES: &[Item] = &[
             " into the spec's `view.headers` list with the value (unlike the one-based",
             " `zone`, `engine-kind` and `connector`); `budget-micros` is relative to",
             " the host's receipt; `seed` is the only randomness (see `host`).",
+            " `block-hashes` is empty unless the plugin's row declares `token_hashes` or",
+            " `text_hashes` among its needs.",
         ],
         fields: &[
             Field {

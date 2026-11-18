@@ -21,7 +21,7 @@ use wasmtime::{
 
 use super::{
     bindings::{packed, record, wit, HostState, LogGate, Watch},
-    config::{Abi, Exposure, Failure, FrameBudget, PluginSpec},
+    config::{Abi, EventSet, Exposure, Failure, FrameBudget, PluginSpec},
     view::{self as marshal, Packed, Records, TooLong},
 };
 use crate::{
@@ -741,6 +741,7 @@ pub struct Plugin {
     frame: FrameBudget,
     exposure: Exposure,
     needs: Needs,
+    observes: EventSet,
     failure: Failure,
     log: super::config::LogLimit,
     counters: Counters,
@@ -875,6 +876,7 @@ impl Plugin {
             frame,
             exposure: spec.view,
             needs: spec.needs,
+            observes: spec.observes,
             failure: spec.failure,
             log: spec.log,
             counters: Counters::new(spec.metrics),
@@ -953,6 +955,12 @@ impl Plugin {
     /// ([`crate::Profile::needs`]), and so into the engine's summary.
     pub fn needs(&self) -> Needs {
         self.needs
+    }
+
+    /// The kinds of lifecycle event the plugin hears, as its row lists
+    /// them.
+    pub fn observes(&self) -> EventSet {
+        self.observes
     }
 
     /// The counters the plugin adds to.
@@ -2097,6 +2105,10 @@ impl BoundPlugin for Bound {
 
     fn needs(&self) -> Needs {
         self.plugin.needs()
+    }
+
+    fn observes(&self) -> EventSet {
+        self.plugin.observes()
     }
 
     /// The first scorer or picker adapter made from any bound set of the

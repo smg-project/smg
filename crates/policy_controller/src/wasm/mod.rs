@@ -116,6 +116,15 @@
 //! never forwarded: the stages fall back and the breaker counts a budget
 //! hit, the instance standing.
 //!
+//! What a module hears: `observe` is called with the kinds of lifecycle
+//! event the plugin's row lists ([`PluginSpec::observes`]), none by default,
+//! on the thread that tells the event and on that thread's instance. A row
+//! that lists none is never told: no call is made, and a thread that only
+//! tells makes no instance. A row that lists any has its plugin's scorer
+//! and picker say they need the lifecycle's calls
+//! ([`crate::Lifecycle::needs_lifecycle`]), so a host that makes none
+//! refuses them.
+//!
 //! What a failure does: a `decline` falls back to the stage's configured
 //! fallback and keeps the instance; a trap, an exhausted budget or an answer
 //! that breaks a validity rule (a duplicate or out-of-range filter position,
@@ -166,7 +175,10 @@ pub mod config;
 mod plugin;
 mod view;
 
-pub use config::{Abi, BreakerSpec, Exposure, Failure, HeaderSet, LogLimit, PluginSpec, Reveal};
+pub use config::{
+    Abi, BreakerSpec, EventKind, EventSet, Exposure, Failure, HeaderSet, LogLimit, PluginSpec,
+    Reveal,
+};
 pub use plugin::{Binder, Bound, LoadError, Plugin, Runtime, Stats, World};
 /// The packed form's layout, as the WIT's table names it.
 pub use view::layout;

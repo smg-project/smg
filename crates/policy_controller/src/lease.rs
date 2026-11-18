@@ -153,6 +153,62 @@ pub enum Signal {
     },
 }
 
+/// One kind of lifecycle event: one of the six calls of [`Lifecycle`], as
+/// both plugin contracts name them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EventKind {
+    Issued,
+    Dispatched,
+    Completed,
+    Released,
+    Membership,
+    Signal,
+}
+
+impl EventKind {
+    const fn bit(self) -> u8 {
+        1 << self as u8
+    }
+}
+
+/// A set of kinds of lifecycle event, as bits over [`EventKind`]. Empty by
+/// default. A plugin's row lists in one the kinds its plugin hears, and a
+/// plugin whose row lists nothing is told nothing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EventSet(u8);
+
+impl EventSet {
+    /// No event.
+    pub const NONE: Self = Self(0);
+
+    /// Every kind.
+    pub const ALL: Self = Self(
+        EventKind::Issued.bit()
+            | EventKind::Dispatched.bit()
+            | EventKind::Completed.bit()
+            | EventKind::Released.bit()
+            | EventKind::Membership.bit()
+            | EventKind::Signal.bit(),
+    );
+
+    /// The set of these kinds.
+    pub fn of(kinds: impl IntoIterator<Item = EventKind>) -> Self {
+        let mut set = Self::NONE;
+        for kind in kinds {
+            set.0 |= kind.bit();
+        }
+        set
+    }
+
+    pub const fn contains(self, kind: EventKind) -> bool {
+        self.0 & kind.bit() != 0
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+}
+
 /// The lifecycle a stateful stage implements. Every hook defaults to a
 /// no-op, so a stateless stage implements nothing.
 pub trait Lifecycle: Send + Sync {
@@ -246,6 +302,48 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
+
+    /// Every kind, in the order of its bit. The match names each, so a new
+    /// kind does not compile until it is placed here, and the case below
+    /// then holds [`EventSet::ALL`] to it.
+    fn kinds() -> [EventKind; 6] {
+        let kinds = [
+            EventKind::Issued,
+            EventKind::Dispatched,
+            EventKind::Completed,
+            EventKind::Released,
+            EventKind::Membership,
+            EventKind::Signal,
+        ];
+        for (at, kind) in kinds.into_iter().enumerate() {
+            let place = match kind {
+                EventKind::Issued => 0,
+                EventKind::Dispatched => 1,
+                EventKind::Completed => 2,
+                EventKind::Released => 3,
+                EventKind::Membership => 4,
+                EventKind::Signal => 5,
+            };
+            // Its place in the list is its bit.
+            assert_eq!((place, EventSet::of([kind]).0), (at, 1 << at), "{kind:?}");
+        }
+        kinds
+    }
+
+    #[test]
+    fn an_event_set_holds_the_kinds_it_was_made_of_and_no_other() {
+        let kinds = kinds();
+        assert_eq!(EventSet::default(), EventSet::NONE);
+        assert!(EventSet::NONE.is_empty() && !EventSet::ALL.is_empty());
+        assert_eq!(EventSet::of(kinds), EventSet::ALL);
+        for kind in kinds {
+            let alone = EventSet::of([kind]);
+            assert!(EventSet::ALL.contains(kind) && !EventSet::NONE.contains(kind));
+            for other in kinds {
+                assert_eq!(alone.contains(other), other == kind, "{kind:?} {other:?}");
+            }
+        }
+    }
 
     /// A stage that counts what reached it, to prove the box forwards every
     /// hook and a stateless stage needs none.

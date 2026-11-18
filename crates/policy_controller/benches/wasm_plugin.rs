@@ -11,7 +11,8 @@
 //! `policy_wasm/prompt/<declared|undeclared>/<world>/<hashes>`,
 //! `policy_wasm/decide_held/<world>/<n>`,
 //! `policy_wasm/decide_fresh/<world>/<n>`, `policy_wasm/fuel_exhausted/<n>`,
-//! `policy_wasm/observe/<world>` and `policy_wasm/native/<n>`. The guests
+//! `policy_wasm/observe/<world>`, `policy_wasm/unheard/<world>` (an event of a
+//! kind the row does not list) and `policy_wasm/native/<n>`. The guests
 //! are the test guests, assembled at bench start.
 #![expect(
     clippy::expect_used,
@@ -41,7 +42,7 @@ use smg_policy_controller::{
     builtins::{Best, Healthy, LeastRequests},
     plugins::OpenDecisions,
     spec::MAX_BLOCK_HASHES,
-    wasm::{Plugin, PluginSpec, Runtime, WasmFilter, WasmPicker, WasmScorer},
+    wasm::{EventSet, Plugin, PluginSpec, Runtime, WasmFilter, WasmPicker, WasmScorer},
     Binding, Constraints, Engine, Lease, Lifecycle, Needs, Plan, PoolFacts, Profile, RequestFacts,
     Scratch, Side, Target, Weighted,
 };
@@ -63,6 +64,8 @@ fn row(name: &str, component: Vec<u8>, config: Vec<u8>) -> PluginSpec {
     // A cool-down of zero: an opening then ends at its own instant, so the
     // breaker bypasses no measured decision, whatever opened it.
     spec.breaker.cooldown_micros = 0;
+    // Every kind of event, as the `observe` cells tell one.
+    spec.observes = EventSet::ALL;
     spec.metrics = vec![
         "observed".into(),
         "now".into(),
@@ -418,6 +421,30 @@ fn observe(c: &mut Criterion) {
     group.finish();
 }
 
+/// One lifecycle event of a kind the plugin's row does not list: no call is
+/// made.
+fn unheard(c: &mut Criterion) {
+    let runtime = Arc::new(Runtime::new(&OpenDecisions::new()).expect("a runtime"));
+    let mut group = c.benchmark_group("policy_wasm/unheard");
+    for (world, component) in worlds() {
+        let mut row = row(world, component, vec![guest::mode::LEAST_IN_FLIGHT]);
+        row.observes = EventSet::NONE;
+        let plugin = Plugin::load(&runtime, row).expect("the guest loads");
+        let engine = plugin_engine(&plugin);
+        let lease = Lease {
+            issued_micros: 1_000_000,
+            tokens: 512,
+            ..Lease::default()
+        };
+        let target = Target::default();
+        group.bench_function(world, |b| {
+            b.iter(|| engine.on_dispatched(black_box(&lease), &target, Side::Single, 0));
+        });
+        assert_eq!(plugin.stats().observed, 0, "{world}: nothing was told");
+    }
+    group.finish();
+}
+
 fn native(c: &mut Criterion) {
     let mut group = c.benchmark_group("policy_wasm/native");
     let engine = native_engine();
@@ -452,6 +479,7 @@ criterion_group!(
     decide_fresh,
     fuel_exhausted,
     observe,
+    unheard,
     native
 );
 criterion_main!(benches);

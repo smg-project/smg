@@ -128,8 +128,8 @@ pub use framework::{
     Plan, Profile, Scorer, Scratch, TieBand, Weighted, DRAW_BOUND, DRAW_FROM,
 };
 pub use lease::{
-    Lease, LeaseId, LeaseKind, Lifecycle, Membership, Outcome, ReleaseReason, Side, Signal,
-    TransportClass,
+    EventKind, EventSet, Lease, LeaseId, LeaseKind, Lifecycle, Membership, Outcome, ReleaseReason,
+    Side, Signal, TransportClass,
 };
 pub use ring::{ConsistentHash, Ring};
 pub use sessions::{Assignment, Pins, Recovery, SessionRule, SessionTable, SessionVerdict};

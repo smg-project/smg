@@ -63,7 +63,9 @@ clock, a lease's issue instant), and each file's comments name them.
   guest builds without `std` and exports its own `cabi_realloc`. The host
   imports are `log`, `now-micros`, `counter` and `random-u64`; the exports are
   `init`, the `decision` resource (constructor, `filter`, `score`, `pick`) and
-  `observe`. A `policy-packed` guest reads its three blocks in place: the
+  `observe`, which the host calls with the kinds of lifecycle event the
+  plugin's row lists, none by default (a gRPC plugin's `Observe` stream
+  carries those). A `policy-packed` guest reads its three blocks in place: the
   offsets are in the WIT comments, the model name is padded so the u64
   sections stay 8-byte aligned for any name length, and the guest's
   `cabi_realloc` returns 8-aligned memory for the blocks (or it reads with
