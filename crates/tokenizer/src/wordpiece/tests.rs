@@ -9,7 +9,7 @@ use tokenizers::{
     Normalizer, OffsetReferential, OffsetType, PreTokenizedString, PreTokenizer, Tokenizer,
 };
 
-use super::WordPieceEncoder;
+use super::{WordPieceEncoder, MAX_ADDED};
 use crate::{
     encode_path::EncodePath,
     huggingface::HuggingFaceTokenizer,
@@ -222,6 +222,28 @@ fn definition(flags: Flags) -> Value {
     })
 }
 
+/// `definition(flags)` with more added tokens behind the special ones, at
+/// the ids that follow the vocabulary.
+fn with_added(flags: Flags, contents: &[&str]) -> Value {
+    let mut definition = definition(flags);
+    let first = vocabulary().len();
+    let added = definition["added_tokens"]
+        .as_array_mut()
+        .expect("the added tokens are a list");
+    for (at, content) in contents.iter().enumerate() {
+        added.push(json!({
+            "id": first + at,
+            "content": content,
+            "single_word": false,
+            "lstrip": false,
+            "rstrip": false,
+            "normalized": false,
+            "special": true,
+        }));
+    }
+    definition
+}
+
 /// The library's tokenizer of `definition`.
 fn library(definition: &Value) -> Tokenizer {
     definition
@@ -390,6 +412,145 @@ fn an_added_token_is_cut_from_the_raw_text_as_it_stands() {
         direct_ids(&ours, "[mask]", false),
         [id("["), id("m"), id("##a"), id("##s"), id("##k"), id("]")]
     );
+    // A token at each end of the text, two in a row, a start that no token
+    // finishes, and a token behind a run beyond ASCII, between two marks
+    // and between two removed characters.
+    let texts = [
+        "[CLS]",
+        "[CLS][SEP]",
+        "[PAD]hello[PAD]",
+        "[",
+        "[[CLS]",
+        "[CLS",
+        "[CLS][",
+        "x[SE[SEP]y",
+        "[SEP ]",
+        "a[b]c",
+        "h\u{e9}[SEP]\u{e9}",
+        "e\u{301}[MASK]\u{327}",
+        "\u{4e2d}[UNK]\u{6587}",
+        "a\u{1}[PAD]\u{1}b",
+    ];
+    for flags in [UNCASED, CASED] {
+        let (library, ours) = pair(&definition(flags));
+        for text in texts {
+            for special in [false, true] {
+                assert_eq!(
+                    direct_ids(&ours, text, special),
+                    library_ids(&library, text, special),
+                    "{text:?} under {flags:?}, special tokens {special}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn added_tokens_are_cut_leftmost_first_and_longest_first() {
+    // Two tokens that start alike, one of them the start of the other; one
+    // that starts inside them; one that starts with a letter and is a piece
+    // too; one that starts with a space.
+    let (library, ours) = pair(&with_added(UNCASED, &["<a", "<ab", "b>", "hello", " ."]));
+    assert_eq!(ours.encode_path(), EncodePath::Native);
+    let id = |token: &str| {
+        library
+            .token_to_id(token)
+            .expect("a token of the tokenizer")
+    };
+    // The longest of the tokens that stand at one place.
+    assert_eq!(direct_ids(&ours, "<abc", false), [id("<ab"), id("c")]);
+    // The leftmost token: the one that starts inside it is text.
+    assert_eq!(direct_ids(&ours, "<ab>", false), [id("<ab"), id("[UNK]")]);
+    // A start no token finishes is a character of its class, and the next
+    // byte is asked in its turn.
+    assert_eq!(direct_ids(&ours, "<b>", false), [id("[UNK]"), id("b>")]);
+    // A token is cut inside a word.
+    assert_eq!(direct_ids(&ours, "ahello", false), [id("a"), id("hello")]);
+    assert_eq!(
+        direct_ids(&ours, "hellohello", false),
+        [id("hello"), id("hello")]
+    );
+    let texts = [
+        "<a",
+        "<ab",
+        "<abc",
+        "<ab>",
+        "<abb>",
+        "<b>",
+        "<a<ab<abb>",
+        "a<ab>b",
+        "<",
+        "b",
+        "b>b>",
+        "hello",
+        "Hello",
+        "hell",
+        "hellos",
+        "ahello",
+        "hellohello",
+        "x .",
+        " . .",
+        ". .",
+        "a .b>",
+        "h\u{e9}<ab\u{e9}",
+    ];
+    for text in texts {
+        for special in [false, true] {
+            assert_eq!(
+                direct_ids(&ours, text, special),
+                library_ids(&library, text, special),
+                "{text:?}, special tokens {special}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_set_of_added_tokens_the_pass_does_not_cut_is_declined() {
+    // A token that starts beyond ASCII, one that starts with a byte the
+    // normalizer removes, and one token more than the encoder tries.
+    let many: Vec<String> = (SPECIAL.len()..=MAX_ADDED)
+        .map(|n| format!("<{n}>"))
+        .collect();
+    let many: Vec<&str> = many.iter().map(String::as_str).collect();
+    for (contents, reason) in [
+        (&["\u{e9}t\u{e9}"][..], "does not start"),
+        (&["\u{1}x"][..], "does not start"),
+        (&many[..], "more than"),
+    ] {
+        let declined = declined(&with_added(UNCASED, contents));
+        assert!(
+            declined
+                .as_deref()
+                .is_some_and(|text| text.contains(reason)),
+            "the added tokens {contents:?}: {declined:?}"
+        );
+    }
+    // As many tokens as the encoder tries are taken.
+    let (library, ours) = pair(&with_added(UNCASED, &many[1..]));
+    assert_eq!(ours.encode_path(), EncodePath::Native);
+    for text in ["<5><32>x<6", "<31><32", "a<10>b<6>"] {
+        assert_eq!(
+            direct_ids(&ours, text, true),
+            library_ids(&library, text, true),
+            "{text:?}"
+        );
+    }
+    // Where the normalizer keeps the control characters, a token that
+    // starts with one is taken.
+    let kept = Flags {
+        clean_text: false,
+        ..UNCASED
+    };
+    let (library, ours) = pair(&with_added(kept, &["\u{1}x"]));
+    assert_eq!(ours.encode_path(), EncodePath::Native);
+    for text in ["a\u{1}xb", "\u{1}", "\u{1}y \u{1}x"] {
+        assert_eq!(
+            direct_ids(&ours, text, true),
+            library_ids(&library, text, true),
+            "{text:?}"
+        );
+    }
 }
 
 #[test]

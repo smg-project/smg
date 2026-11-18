@@ -1722,16 +1722,18 @@ impl Encoder for HuggingFaceTokenizer {
             }
         }
         // The direct WordPiece encoder gives the ids alone, as the path
-        // above does; a tokenizer it does not reproduce it declined at load.
-        if let Some(ids) = self.core.wordpiece.as_ref().and_then(|wordpiece| {
-            wordpiece.encode(
-                &self.core.tokenizer,
-                self.core.added(),
-                input,
-                add_special_tokens,
-            )
-        }) {
-            return Ok(Encoding::Plain(ids));
+        // above does, and gives up no input: a tokenizer it does not
+        // reproduce it declined at load. It is made only for a tokenizer
+        // whose model is WordPiece, so the model here is always the one it
+        // reads the pieces from.
+        if let Some(wordpiece) = &self.core.wordpiece {
+            if let ModelWrapper::WordPiece(model) = self.core.tokenizer.get_model().wrapper() {
+                return Ok(Encoding::Plain(wordpiece.encode(
+                    model,
+                    input,
+                    add_special_tokens,
+                )));
+            }
         }
         self.core
             .tokenizer

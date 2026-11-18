@@ -8,15 +8,20 @@
 //! encoder reads the text once. A byte of ASCII is answered by one table; a
 //! character beyond ASCII runs the same rules in the same order on its own
 //! run of characters; a finished word is matched greedily, longest piece
-//! first, in the model's own vocabulary. The encoder holds no table of the
-//! pieces, so a tokenizer loads as fast and as small as before.
+//! first, in the model's own vocabulary. An added token is cut in the same
+//! pass: a byte that starts one is a class of the table, and the tokens are
+//! tried where it stands. The encoder holds no table of the pieces and
+//! builds no matcher, so a tokenizer loads as fast and as small as before,
+//! and no input leaves it for `tokenizers`.
 //!
 //! It takes the configuration it reproduces (a `BertNormalizer` with any
 //! flags, a `BertPreTokenizer`, a `WordPiece` model, a template
-//! post-processor or none, added tokens cut from the raw text as they stand)
-//! and declines every other with a reason; a declined tokenizer encodes in
-//! `tokenizers` as before. The character classes are the library's own (see
-//! `classes`), and the decomposition is the crate the library calls.
+//! post-processor or none, at most `MAX_ADDED` added tokens, each cut from
+//! the raw text as it stands and starting with a byte of ASCII the
+//! normalizer keeps) and declines every other with a reason; a declined
+//! tokenizer encodes in `tokenizers` as before. The character classes are
+//! the library's own (see `classes`), and the decomposition is the crate
+//! the library calls.
 
 mod classes;
 
@@ -33,7 +38,6 @@ use unicode_normalization_alignments::UnicodeNormalization;
 
 use crate::{
     encode_path::Declined,
-    native::AddedTokens,
     word_cache::{ModelView, TokenizerOf},
 };
 
@@ -61,6 +65,9 @@ enum Ascii {
     Punctuation,
     /// The normalizer removes it.
     Removed,
+    /// An added token starts with it: the tokens are tried where it stands,
+    /// and where none does the byte is what the rules alone make of it.
+    Added,
 }
 
 /// Whether `c` is in `class`, a sorted list of inclusive ranges.
@@ -106,26 +113,52 @@ fn is_punctuation(c: char) -> bool {
     in_class(classes::PUNCTUATION, c)
 }
 
-/// The table of the ASCII bytes under `rules`: each byte through the rules
-/// a character beyond ASCII runs through, once, at load.
-fn ascii_table(rules: Rules) -> [Ascii; 128] {
+/// What `rules` make of one byte of ASCII: the rules a character beyond
+/// ASCII runs through.
+fn ascii_class(rules: Rules, byte: u8) -> Ascii {
+    if rules.clean_text && removed(char::from(byte)) {
+        Ascii::Removed
+    } else {
+        kept_class(rules, byte)
+    }
+}
+
+/// What `rules` make of a byte of ASCII the normalizer keeps.
+fn kept_class(rules: Rules, byte: u8) -> Ascii {
+    let c = char::from(byte);
+    if c.is_whitespace() {
+        Ascii::Space
+    } else if c.is_ascii_punctuation() {
+        Ascii::Punctuation
+    } else if rules.lowercase {
+        Ascii::Letter(byte.to_ascii_lowercase())
+    } else {
+        Ascii::Letter(byte)
+    }
+}
+
+/// The table of the ASCII bytes under `rules`, made once, at load: each
+/// byte by its class, and the bytes that start a token of `added` set
+/// apart.
+fn ascii_table(rules: Rules, added: &[(Box<str>, u32)]) -> [Ascii; 128] {
     let mut table = [Ascii::Removed; 128];
     for (byte, entry) in (0u8..).zip(table.iter_mut()) {
-        let c = char::from(byte);
-        *entry = if rules.clean_text && removed(c) {
-            Ascii::Removed
-        } else if c.is_whitespace() {
-            Ascii::Space
-        } else if c.is_ascii_punctuation() {
-            Ascii::Punctuation
-        } else if rules.lowercase {
-            Ascii::Letter(byte.to_ascii_lowercase())
-        } else {
-            Ascii::Letter(byte)
-        };
+        *entry = ascii_class(rules, byte);
+    }
+    for (token, _) in added {
+        let first = token.as_bytes().first().map(|&first| usize::from(first));
+        if let Some(entry) = first.and_then(|first| table.get_mut(first)) {
+            *entry = Ascii::Added;
+        }
     }
     table
 }
+
+/// The most added tokens the encoder takes. They are tried in turn where a
+/// byte that starts one stands, so the set is kept to what a tokenizer of
+/// this shape carries (its special tokens); a larger set stays with
+/// `tokenizers`, whose matcher is built for any number.
+const MAX_ADDED: usize = 32;
 
 /// The word under construction: its normalized text and its length in
 /// characters. Past the model's bound only the count grows (such a word is
@@ -177,9 +210,9 @@ pub(crate) struct WordPieceEncoder {
     marker: Box<str>,
     unknown: u32,
     max_chars: usize,
-    /// Whether the tokenizer has added tokens: an encode then needs their
-    /// matcher.
-    has_added: bool,
+    /// The added tokens with their ids, longest first: the first of them
+    /// that stands at a place is the longest there.
+    added: Vec<(Box<str>, u32)>,
     /// The ids the post-processor puts before and after one sequence.
     prefix: Vec<u32>,
     suffix: Vec<u32>,
@@ -214,17 +247,17 @@ impl WordPieceEncoder {
             lowercase: normalizer.lowercase,
         };
         let (prefix, suffix) = Self::frame(tokenizer)?;
-        let has_added = Self::added_tokens(tokenizer)?;
+        let added = Self::added_tokens(tokenizer, rules)?;
         let Some(unknown) = model.token_to_id(&model.unk_token) else {
             return Err(Declined::from("the unknown token is not in the vocabulary"));
         };
         Ok(Self {
             rules,
-            ascii: ascii_table(rules),
+            ascii: ascii_table(rules, &added),
             marker: model.continuing_subword_prefix.as_str().into(),
             unknown,
             max_chars: model.max_input_chars_per_word,
-            has_added,
+            added,
             prefix,
             suffix,
         })
@@ -262,18 +295,22 @@ impl WordPieceEncoder {
         }
     }
 
-    /// Whether the tokenizer has added tokens. A token the library does not
-    /// cut from the raw text as it stands (one it matches after
+    /// The added tokens with their ids, longest first. A token the library
+    /// does not cut from the raw text as it stands (one it matches after
     /// normalization, at word edges only, or with the whitespace beside it)
-    /// declines. The matcher over them is the wrapper's, built at its first
-    /// use.
-    fn added_tokens<M: Model>(tokenizer: &TokenizerOf<M>) -> Result<bool, Declined> {
+    /// declines. So does a set the pass does not cut: a token that starts
+    /// beyond ASCII or with a byte the normalizer removes (the pass tries
+    /// the tokens at the bytes of ASCII it keeps), or more than
+    /// [`MAX_ADDED`] tokens.
+    fn added_tokens<M: Model>(
+        tokenizer: &TokenizerOf<M>,
+        rules: Rules,
+    ) -> Result<Vec<(Box<str>, u32)>, Declined> {
         let vocabulary = tokenizer.get_added_vocabulary();
         if vocabulary.get_encode_special_tokens() {
             return Err(Declined::from("encode_special_tokens is set"));
         }
-        let tokens = vocabulary.get_added_tokens_decoder();
-        for token in tokens.values() {
+        for token in vocabulary.get_added_tokens_decoder().values() {
             if token.single_word
                 || token.lstrip
                 || token.rstrip
@@ -286,27 +323,39 @@ impl WordPieceEncoder {
                 )));
             }
         }
-        Ok(!tokens.is_empty())
+        let tokens = vocabulary.get_vocab();
+        if tokens.len() > MAX_ADDED {
+            return Err(Declined::from(format!(
+                "there are more than {MAX_ADDED} added tokens"
+            )));
+        }
+        let mut added: Vec<(Box<str>, u32)> = Vec::with_capacity(tokens.len());
+        for (content, &id) in tokens {
+            let kept = content.bytes().next().is_some_and(|first| {
+                first.is_ascii() && ascii_class(rules, first) != Ascii::Removed
+            });
+            if !kept {
+                return Err(Declined::from(format!(
+                    "added token {content:?} does not start with a byte of ASCII the normalizer keeps"
+                )));
+            }
+            added.push((content.as_str().into(), id));
+        }
+        // Longest first. At most one of two tokens of one length stands at
+        // a place, so their order is free; their text makes it fixed.
+        added.sort_unstable_by(|(a, _), (b, _)| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+        Ok(added)
     }
 
     /// The ids of `text`, framed by the post-processor's tokens on request.
-    /// `added` is the wrapper's matcher over the added tokens of `tokenizer`
-    /// (built at its first use, one for every caller). `None` when
-    /// `tokenizer` is not the one this encoder was made from or the matcher
-    /// it needs is missing: the caller then encodes in `tokenizers`.
-    pub(crate) fn encode<M: Model + ModelView>(
+    /// `model` is the model of the tokenizer this encoder was made from: its
+    /// vocabulary answers the pieces.
+    pub(crate) fn encode(
         &self,
-        tokenizer: &TokenizerOf<M>,
-        added: Option<&AddedTokens>,
+        model: &WordPiece,
         text: &str,
         add_special_tokens: bool,
-    ) -> Option<Vec<u32>> {
-        let ModelWrapper::WordPiece(model) = tokenizer.get_model().wrapper() else {
-            return None;
-        };
-        if self.has_added && added.is_none() {
-            return None;
-        }
+    ) -> Vec<u32> {
         let mut ids =
             Vec::with_capacity(self.prefix.len() + text.len() / 4 + self.suffix.len() + 4);
         if add_special_tokens {
@@ -320,48 +369,86 @@ impl WordPieceEncoder {
             probe,
             ids,
         };
-        // A run of characters beyond ASCII, as the decomposition reads it.
-        let mut segment = String::new();
-        match added {
-            None => self.span(text, &mut segment, &mut run),
-            Some(added) => {
-                let mut from = 0;
-                for range in added.ranges(text) {
-                    self.span(&text[from..range.start], &mut segment, &mut run);
-                    run.ids.push(tokenizer.token_to_id(&text[range.clone()])?);
-                    from = range.end;
-                }
-                self.span(&text[from..], &mut segment, &mut run);
-            }
-        }
+        self.pass(text, &mut run);
         if add_special_tokens {
             run.ids.extend_from_slice(&self.suffix);
         }
-        Some(run.ids)
+        run.ids
     }
 
-    /// The ids of a span between added tokens. A word ends with the span.
-    fn span(&self, text: &str, segment: &mut String, run: &mut Run<'_>) {
+    /// The one pass over `text`: a byte of ASCII by its class, a run beyond
+    /// ASCII by the rules, an added token as its id. A word ends at an added
+    /// token and with the text: the library cuts the text at the tokens
+    /// before it reads what stands between them.
+    fn pass(&self, text: &str, run: &mut Run<'_>) {
+        // A run of characters beyond ASCII, as the decomposition reads it.
+        let mut segment = String::new();
         let bytes = text.as_bytes();
         let mut at = 0;
         while let Some(&byte) = bytes.get(at) {
-            if byte < 0x80 {
-                match self.ascii[usize::from(byte)] {
-                    Ascii::Letter(letter) => run.word.push(char::from(letter)),
-                    Ascii::Space => self.end_word(run),
-                    Ascii::Punctuation => {
-                        self.end_word(run);
-                        run.word.push(char::from(byte));
-                        self.end_word(run);
-                    }
-                    Ascii::Removed => {}
-                }
-                at += 1;
-            } else {
-                at = self.beyond_ascii(text, at, segment, run);
+            if byte >= 0x80 {
+                at = self.beyond_ascii(text, at, &mut segment, run);
+                continue;
             }
+            match self.ascii[usize::from(byte)] {
+                Ascii::Letter(letter) => run.word.push(char::from(letter)),
+                Ascii::Space => self.end_word(run),
+                Ascii::Punctuation => self.punctuation(byte, run),
+                Ascii::Removed => {}
+                Ascii::Added => {
+                    at = self.added_or_byte(bytes, at, run);
+                    continue;
+                }
+            }
+            at += 1;
         }
         self.end_word(run);
+    }
+
+    /// A punctuation character of ASCII: a word of its own.
+    fn punctuation(&self, byte: u8, run: &mut Run<'_>) {
+        self.end_word(run);
+        run.word.push(char::from(byte));
+        self.end_word(run);
+    }
+
+    /// At `at`, a byte that starts an added token: the token that stands
+    /// there as its id, a word ending before it, or else the byte as what
+    /// the rules alone make of it. Returns where the next read starts. Kept
+    /// out of the pass: such a byte is rare in text.
+    #[cold]
+    fn added_or_byte(&self, bytes: &[u8], at: usize, run: &mut Run<'_>) -> usize {
+        let rest = bytes.get(at..).unwrap_or_default();
+        if let Some((len, id)) = self.added_at(rest) {
+            self.end_word(run);
+            run.ids.push(id);
+            return at + len;
+        }
+        if let Some(&byte) = rest.first() {
+            // A byte that starts a token is one the normalizer keeps (the
+            // load declined any other).
+            match kept_class(self.rules, byte) {
+                Ascii::Letter(letter) => run.word.push(char::from(letter)),
+                Ascii::Space => self.end_word(run),
+                Ascii::Punctuation => self.punctuation(byte, run),
+                Ascii::Removed | Ascii::Added => {}
+            }
+        }
+        at + 1
+    }
+
+    /// The added token that stands at the start of `rest`, the longest one:
+    /// its length and its id. The library matches the tokens leftmost first
+    /// and longest first; the pass asks at every byte that starts one, from
+    /// the left, and the list is longest first.
+    fn added_at(&self, rest: &[u8]) -> Option<(usize, u32)> {
+        // Compared byte by byte: a start that no token finishes differs at
+        // its second byte, sooner than a call to compare would return.
+        self.added.iter().find_map(|(token, id)| {
+            let token = token.as_bytes();
+            let stands = token.len() <= rest.len() && token.iter().zip(rest).all(|(a, b)| a == b);
+            stands.then_some((token.len(), *id))
+        })
     }
 
     /// Reads from `at`, where a character beyond ASCII starts, what the
