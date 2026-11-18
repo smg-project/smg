@@ -6,7 +6,7 @@ use std::{
     collections::{vec_deque, VecDeque},
     fmt,
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicU64, Ordering},
         Arc,
     },
 };
@@ -226,13 +226,13 @@ pub struct Log {
     loads: usize,
     /// Told that the watched kinds moved, once a write of them is released.
     told: Option<Box<dyn Fn() + Send + Sync>>,
-    /// Whether a write of the watched kinds landed that `told` has not
-    /// heard of: set under the log's lock, taken where the telling is made.
-    untold: AtomicBool,
     /// How often the watched kinds moved: a write of them, a mark, a
     /// restart. It moves under the log's lock, and a reader that keeps a
     /// [`Stamp`] loads it under none.
     moves: AtomicU64,
+    /// The highest count of moves told: `told` is owed a telling while
+    /// `moves` is past it, and is told under no lock.
+    told_at: AtomicU64,
 }
 
 impl fmt::Debug for Log {
@@ -271,8 +271,8 @@ impl Log {
             watched,
             loads,
             told: None,
-            untold: AtomicBool::new(false),
             moves: AtomicU64::new(0),
+            told_at: AtomicU64::new(0),
         }
     }
 
@@ -468,9 +468,9 @@ impl Log {
         Ok(())
     }
 
-    /// One batch for [`Log::read`]. Where it reached the end of what the
-    /// log holds of `kinds`, it says how often the watched kinds had moved
-    /// by then: a [`Stamp`] of the state it read.
+    /// One batch for [`Log::read`] and [`Log::read_if_moved`]. Where it
+    /// reached the end of what the log holds of `kinds`, it says how often
+    /// the watched kinds had moved by then: a [`Stamp`] of the state it read.
     fn batch(
         &self,
         kinds: Kinds,
@@ -578,24 +578,29 @@ impl Log {
 
     /// Notes that the watched kinds moved: a write of them, a mark, a
     /// restart. `_held` is the log's lock, held: the count moves under it,
-    /// so a batch read under that lock names the state it read. The count
-    /// moves before the flag: the telling the flag owes is made after it,
-    /// and the reader that telling wakes finds the log past its [`Stamp`].
+    /// so a batch read under that lock names the state it read. The move
+    /// is told under no lock, and the count alone owes it ([`Log::tell`]).
     fn moved(&self, _held: &Ring) {
         self.moves.fetch_add(1, Ordering::Release);
-        // Held back: the listener is told under no lock.
-        self.untold.store(true, Ordering::Release);
     }
 
     /// Tells the listener that the watched kinds moved since its last
     /// telling, if they did. Called under no lock of the log or of the
     /// store: once a store has let a write's locks go, and at the end of a
     /// restart and of a mark.
+    ///
+    /// A telling is owed while the count of moves is past the highest
+    /// count told. The count is loaded before the kept one is raised to
+    /// it, so a move is told after its count moved, and the reader that
+    /// telling wakes finds the log past its [`Stamp`]. Of the releases
+    /// that race, each that raises the kept count tells: no move goes
+    /// untold, and a release that raises nothing tells nothing.
     fn tell(&self) {
         let Some(told) = &self.told else {
             return;
         };
-        if self.untold.swap(false, Ordering::AcqRel) {
+        let moves = self.moves.load(Ordering::Acquire);
+        if self.told_at.fetch_max(moves, Ordering::AcqRel) < moves {
             told();
         }
     }
