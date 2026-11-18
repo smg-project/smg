@@ -100,7 +100,7 @@
 // cannot serve yet (WatchWorkers until its replica follows the leader's log,
 // a NotLeader in the status details), a leader whose store does not lead its
 // term, on a membership write, a spec write, its dry run and a rollback,
-// GetSnapshot, Replicate and the open of a WatchWorkers (the moment after
+// Replicate and the open of a WatchWorkers (the moment after
 // its take, until its store is told the term, and a call admitted under a
 // take its store has since passed: retry; or its whole lead, until a later
 // take, where its log followed a term at or above the one it took), or a
