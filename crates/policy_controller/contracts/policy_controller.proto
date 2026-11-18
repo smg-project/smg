@@ -143,7 +143,12 @@ service PolicyController {
   // Ingestion scope (relays only), client streams answered once at the end.
   rpc PushLoad(stream LoadReport) returns (Ack);
   rpc PushKvEvents(stream RelayKvFrame) returns (Ack);
-  // Control scope, unary.
+  // Control scope, unary. An answer says the row as written. A registration,
+  // its refresh and a patch owe a build of the pools: it starts within one
+  // publication window (20 ms) of their answer, and they are in force for
+  // decisions when it ends. A deregistration and a new incarnation's
+  // replacing of the old are in force at their answer: no decision made
+  // after it names the worker that left.
   rpc RegisterWorker(RegisterWorkerRequest) returns (WorkerEvent);
   rpc PatchWorker(PatchWorkerRequest) returns (WorkerEvent);
   rpc DeregisterWorker(DeregisterWorkerRequest) returns (WorkerEvent);

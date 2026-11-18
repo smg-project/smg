@@ -113,7 +113,9 @@ pub trait LoadSink: Send + Sync {
     /// answer names that rank or not. Whether a stream still serves a
     /// rank the poll was not for is the caller's to know, by the
     /// freshness it chose the poll's ranks with: it says the word only
-    /// for a poll that left out no such rank.
+    /// for a poll that left out no such rank. The crate's store pays the
+    /// build a rank the answer names still waits for before it writes the
+    /// answer, so an answer is read over the rows of every rank it names.
     fn report(
         &self,
         answer: &[(WorkerId, u16, Option<LoadRow>)],
@@ -155,6 +157,12 @@ pub trait LoadSink: Send + Sync {
     /// after a write and calls [`LoadSink::publish`] at it. A host that
     /// does neither shows a waiting write with its next one, and the row's
     /// age says so meanwhile.
+    ///
+    /// The crate's store names the instant for one thing more: the build
+    /// its membership writes owe. The store pays that build ahead of the
+    /// instant for one write alone, a poll's answer for a rank that has no
+    /// row yet, and no load write is shown before it, so a host with no
+    /// loop asks for it ([`crate::store::MemoryStore::publish_now`]).
     fn publish_due(&self) -> Option<Instant> {
         None
     }
@@ -164,4 +172,19 @@ pub trait LoadSink: Send + Sync {
     fn publish(&self, now: Instant) {
         let _ = now;
     }
+
+    /// Hand the sink the host's wake. The sink calls it, on the writing
+    /// thread, where a write that is no load call leaves an instant for
+    /// [`LoadSink::publish_due`] to name and none stood: in the crate's
+    /// store, the build a membership write owes. The host's loop reads the
+    /// instant again at each call. The last wake handed stands. A sink
+    /// that never names an instant drops it.
+    fn wake_with(&self, wake: Wake) {
+        drop(wake);
+    }
 }
+
+/// The host's wake: what a sink calls to have its host read
+/// [`LoadSink::publish_due`] again. It is called under the writer's locks:
+/// it sets a flag or a notification and returns.
+pub type Wake = Box<dyn Fn() + Send + Sync>;

@@ -107,6 +107,9 @@
     reason = "a counting global allocator is the only way to see what a decision allocated, and the allocator reads its settings from an exported symbol and answers for them through its control call"
 )]
 
+#[path = "common/filled.rs"]
+mod filled;
+
 use std::{
     alloc::{GlobalAlloc, Layout},
     env, fs,
@@ -460,7 +463,7 @@ fn bands(members: u32) -> Vec<u32> {
 
 /// `members` ready members that serve every one of `models` models, each
 /// with a load report in its band ([`bands`]), under the row's preset as
-/// generation 1.
+/// generation 1, their rows built.
 fn fill(store: &MemoryStore, members: u32, models: u32) {
     let models: Vec<String> = (0..models).map(model).collect();
     let now = Instant::now();
@@ -496,6 +499,8 @@ fn fill(store: &MemoryStore, members: u32, models: u32) {
     document.generation = 1;
     let spec = AppliedSpec::validate(&document).expect("the preset validates");
     store.apply(spec).expect("above the unbound start");
+    store.publish_now();
+    filled::filled(store, &model(0), Role::Single, members as usize);
 }
 
 /// Serves a controller over the shape's fleet; returns once it leads.

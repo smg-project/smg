@@ -25,6 +25,9 @@
     reason = "a bench's setup has no caller to answer"
 )]
 
+#[path = "common/filled.rs"]
+mod filled;
+
 use std::{
     hint::black_box,
     time::{Duration, Instant},
@@ -115,6 +118,8 @@ fn pool_of(n: usize, beside: Beside) -> (MemoryStore, Vec<WorkerId>, Instant) {
     let opened = opened + PUBLISH_WINDOW;
     store.publish(opened);
     assert_eq!(store.publish_due(), None);
+    let rows = n + usize::from(beside == Beside::Local);
+    filled::filled(&store, MODEL, Role::Single, rows);
     (store, ids, opened)
 }
 

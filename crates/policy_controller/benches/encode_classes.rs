@@ -39,6 +39,9 @@
     reason = "a bench's setup has no caller to answer"
 )]
 
+#[path = "common/filled.rs"]
+mod filled;
+
 use std::{hint::black_box, time::Instant};
 
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
@@ -117,6 +120,16 @@ fn store_of(fleet: &[WorkerFacts]) -> MemoryStore {
     for facts in fleet {
         store.upsert(facts.clone());
     }
+    store.publish_now();
+    // The first row's pool: its own model's, where a fleet holds several.
+    if let Some(first) = fleet.first() {
+        let model = first.models.first().map_or(MODEL, String::as_str);
+        let rows = fleet
+            .iter()
+            .filter(|facts| facts.role == first.role && facts.models == first.models)
+            .count();
+        filled::filled(&store, model, first.role, rows);
+    }
     store
 }
 
@@ -168,7 +181,11 @@ fn membership_write(c: &mut Criterion) {
             group.bench_function(BenchmarkId::new(name, n), |b| {
                 b.iter_batched(
                     || refreshed.clone(),
-                    |facts| store.upsert(black_box(facts)),
+                    |facts| {
+                        let change = store.upsert(black_box(facts));
+                        store.publish_now();
+                        change
+                    },
                     BatchSize::SmallInput,
                 );
             });
@@ -201,7 +218,11 @@ fn moved_write(c: &mut Criterion) {
                             first.clone()
                         }
                     },
-                    |facts| store.upsert(black_box(facts)),
+                    |facts| {
+                        let change = store.upsert(black_box(facts));
+                        store.publish_now();
+                        change
+                    },
                     BatchSize::SmallInput,
                 );
             });
@@ -275,7 +296,11 @@ fn decode_write(c: &mut Criterion) {
                             first.clone()
                         }
                     },
-                    |facts| store.upsert(black_box(facts)),
+                    |facts| {
+                        let change = store.upsert(black_box(facts));
+                        store.publish_now();
+                        change
+                    },
                     BatchSize::SmallInput,
                 );
             });
@@ -320,7 +345,11 @@ fn models_write(c: &mut Criterion) {
                         first.clone()
                     }
                 },
-                |facts| store.upsert(black_box(facts)),
+                |facts| {
+                    let change = store.upsert(black_box(facts));
+                    store.publish_now();
+                    change
+                },
                 BatchSize::SmallInput,
             );
         });

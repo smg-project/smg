@@ -14,7 +14,10 @@
 
 mod common;
 
-use std::time::{Duration, Instant};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use common::counting_alloc::{calls, Counting};
 use smg_policy_controller::{
@@ -467,6 +470,7 @@ fn store_of(n: usize) -> (MemoryStore, Vec<WorkerId>, Instant) {
                 ..WorkerFacts::default()
             })
             .id();
+        store.publish_now();
         let revision = WorkersStore::get(&store, id).expect("the row").revision;
         store
             .set_status(id, WorkerStatus::Ready, revision)
@@ -529,13 +533,14 @@ fn a_pair_build_with_its_table_allocates_nothing_after_the_first() {
             models: vec!["m".to_string()],
             dp_size: 1,
             pairing: transport.map(|transport| {
-                Box::new(PairingDescriptor {
+                Arc::new(PairingDescriptor {
                     transport: Some(transport.to_string()),
                     ..PairingDescriptor::default()
                 })
             }),
             ..WorkerFacts::default()
         });
+        store.publish_now();
     };
     for (index, transport) in ["tx-a", "tx-b"].into_iter().enumerate() {
         register(
@@ -602,13 +607,19 @@ fn a_write_that_moves_an_offer_allocates_what_a_write_that_moves_none_does() {
         };
         for index in 0..2 * n {
             store.upsert(facts_of(index, ""));
+            store.publish_now();
         }
-        // The fewest allocation calls of one write among a few: the store's
-        // change log grows by doubling, and one write in many pays for it.
+        // The fewest allocation calls of one write and the build it owes
+        // among a few: the store's change log grows by doubling, and one
+        // write in many pays for it.
         let fewest = |runtimes: [&str; 2]| {
             let one = |turn: usize| {
                 let facts = facts_of(n / 2, runtimes[turn % 2]);
-                allocations_during(|| store.upsert(facts)).1
+                allocations_during(|| {
+                    store.upsert(facts);
+                    store.publish_now();
+                })
+                .1
             };
             (0..8).map(one).min()
         };
@@ -630,9 +641,9 @@ fn a_registrations_allocations_do_not_follow_the_fleet() {
     // 512 workers makes the allocator calls of one into 8.
     let fewest = |n: usize| {
         let (store, _, _) = store_of(n);
-        // The fewest allocation calls of one registration among a few: the
-        // store's tables and the writer's kept lists grow by doubling, and
-        // one write in many pays for it.
+        // The fewest allocation calls of one registration and the build it
+        // owes among a few: the store's tables and the writer's kept lists
+        // grow by doubling, and one write in many pays for it.
         let one = |turn: usize| {
             let key = format!("http://new{turn}:8000");
             let facts = WorkerFacts {
@@ -643,7 +654,11 @@ fn a_registrations_allocations_do_not_follow_the_fleet() {
                 dp_size: 1,
                 ..WorkerFacts::default()
             };
-            allocations_during(|| store.upsert(facts)).1
+            allocations_during(|| {
+                store.upsert(facts);
+                store.publish_now();
+            })
+            .1
         };
         (0..8).map(one).min()
     };

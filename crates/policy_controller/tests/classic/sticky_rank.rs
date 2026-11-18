@@ -132,6 +132,9 @@ impl Bed {
                 .set_status(id, WorkerStatus::Ready, revision)
                 .expect("ready");
         }
+        // The bed's host runs no loop: it asks the build its registrations
+        // owe, so the rows stand before the first request.
+        store.publish_now();
         store.apply(applied).expect("the first generation applies");
         Ok(Self {
             store,

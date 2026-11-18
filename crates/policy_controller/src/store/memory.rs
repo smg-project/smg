@@ -28,7 +28,7 @@ use crate::{
         journal::{Journal, Kinds, Position},
         kv_events::{BatchFacts, BatchOutcome, KvCursor, KvEventSink, ResyncReason},
         leases::{Counts, Dispatch, LeaseRecord, LeaseRefused, LeaseState, LeasesStore, Slot},
-        loads::{LoadSample, LoadSink, LoadSource, PollMode},
+        loads::{LoadSample, LoadSink, LoadSource, PollMode, Wake},
         reservations::{ReservationKind, ReservationStore},
         sessions::{Pin, SessionsStore},
         workers::{
@@ -73,12 +73,14 @@ pub struct MemoryStore {
     /// first, as the health writers take it). A load write goes into its
     /// worker's entry or is dropped, under this lock alone: the entry is the
     /// membership test, so a read that lands after a removal re-creates
-    /// nothing and a replaced incarnation starts empty. The world's write
-    /// side sits behind the same lock: a record is on file and folded into
-    /// the working rows in one step, and every world is made and shown
-    /// under it, so the deciders see the worlds in the order they were
-    /// made. It is the last lock a writer takes: the workers lock, then the
-    /// health lock, then this one.
+    /// nothing and a replaced incarnation starts empty. One load write takes
+    /// the workers lock first: a poll's answer for a rank that waits for its
+    /// build, which it pays ([`LoadSink::report`]). The world's write side
+    /// sits behind the same lock: a record is on file and folded into the
+    /// working rows in one step, and every world is made and shown under
+    /// it, so the deciders see the worlds in the order they were made. It
+    /// is the last lock a writer takes: the workers lock, then the health
+    /// lock, then this one.
     loads: Mutex<Loads>,
     /// The KV lanes and the indexes they write, behind locks of their own
     /// ([`KvTables`]): a membership write takes the table's after the
@@ -109,6 +111,11 @@ pub struct MemoryStore {
     /// The same journal where it carries load rows: where the load writes
     /// are told.
     load_journal: Option<Arc<dyn Journal>>,
+    /// The host's wake, once its loop handed one ([`LoadSink::wake_with`]):
+    /// called where a membership write leaves a build owed and none was,
+    /// the one instant the host's loop cannot have read. A lock of its own,
+    /// the last taken and held for the call alone.
+    wake: Mutex<Option<Wake>>,
 }
 
 /// The store's replicated tables at one place of its history
@@ -162,9 +169,11 @@ impl MemoryStore {
 
     /// A store whose folded load records wait at most `window` for their
     /// publication, where [`MemoryStore::new`] takes [`PUBLISH_WINDOW`]:
-    /// for a test of the window itself. A window the clock cannot add to
-    /// an instant never ends: a waiting record is then shown by the next
-    /// status or membership write.
+    /// for a test of the window itself. The build a membership write owes
+    /// waits for the same window. A window the clock cannot add to an
+    /// instant never ends: a waiting record is then shown by the next
+    /// status write or the next build, and a build is paid by the ask
+    /// alone ([`MemoryStore::publish_now`]).
     pub fn with_publish_window(window: Duration) -> Self {
         let now = Instant::now();
         // An hour before the store was made, where the host's clock reaches
@@ -198,6 +207,7 @@ impl MemoryStore {
             origin,
             journal: None,
             load_journal: None,
+            wake: Mutex::new(None),
         }
     }
 
@@ -281,6 +291,10 @@ impl MemoryStore {
     /// ([`Membership::Snapshot`]), and the journal's listener once the
     /// restore's locks are let go. `false`, with nothing changed, where the
     /// journal refuses the place ([`Journal::restart`]).
+    ///
+    /// The pools are built from the cut's rows at once, whatever the
+    /// publication window, and no build is left owed: a decision after the
+    /// restore reads its rows.
     pub fn restore_from(&self, cut: Cut) -> bool {
         // Taken before the first lock, so dropped after the last: the journal
         // restarts inside the locks, and its listener is told behind them.
@@ -362,6 +376,10 @@ impl MemoryStore {
     /// record that name it, which the leader's own write alone drops, and
     /// a row that stays keeps its admission instant.
     ///
+    /// The pools follow as at the leader's own write: a join, a refresh and
+    /// a patch leave their build owed, which the replica's loop pays at the
+    /// window's end, and a leave pays its own before it is told.
+    ///
     /// The change is applied only where it fits the tables: the epoch is
     /// the next one, a new row's id is free and a registration's key too,
     /// a row that stays or is replaced keeps its key, and any other change
@@ -380,7 +398,7 @@ impl MemoryStore {
         }
         // A row told again with the offer it had moves no pair class, here
         // as in the leader's own write: the classes are carried.
-        let mut classes = Classes::Derive;
+        let mut carried = false;
         let (change, left) = match (change, row) {
             (MembershipChange::Registered { id }, Some(row))
                 if row.id == id
@@ -401,9 +419,7 @@ impl MemoryStore {
                     return;
                 };
                 let resized = held.row.facts.dp_size != row.facts.dp_size;
-                if same_offer(&held.row.facts, &row.facts) {
-                    classes = Classes::Carry;
-                }
+                carried = same_offer(&held.row.facts, &row.facts);
                 row.admitted_at = held.row.admitted_at;
                 held.row = row;
                 if resized {
@@ -448,21 +464,54 @@ impl MemoryStore {
             _ => return,
         };
         workers.record_over(change, left.as_ref());
+        // The build each write leaves, as the leader's own: a join, a
+        // refresh and a patch owe it, and a leave pays its own before it is
+        // told. What is owed, the replica's loop pays at the window's end.
+        let now = Instant::now();
         match change {
-            MembershipChange::Registered { id } | MembershipChange::Replaced { new: id, .. } => {
+            MembershipChange::Registered { id } => {
                 // A row's load entry is made after its telling, as a
                 // registration's is.
                 self.loads.lock().ranks.insert(id, Ranks::default());
                 self.index_member(&workers, id);
-                self.rebuild_world(&workers, Classes::Derive, change);
+                let classes = Classes::Written {
+                    left: None,
+                    joined: Some(id),
+                };
+                self.owe(classes, now);
+                self.tell_membership(change);
+            }
+            MembershipChange::Replaced { old, new } => {
+                self.loads.lock().ranks.insert(new, Ranks::default());
+                self.index_member(&workers, new);
+                let classes = Classes::Written {
+                    left: Some(old),
+                    joined: Some(new),
+                };
+                self.pay_leave(&workers, classes, now);
+                self.tell_membership(change);
             }
             MembershipChange::Relabelled { id } | MembershipChange::Resized { id } => {
                 self.index_member(&workers, id);
-                self.rebuild_world(&workers, classes, change);
+                let classes = if carried {
+                    Classes::Carry
+                } else {
+                    Classes::Written {
+                        left: Some(id),
+                        joined: Some(id),
+                    }
+                };
+                self.owe(classes, now);
+                self.tell_membership(change);
             }
             MembershipChange::StatusChanged { id, to, .. } => self.show_status(id, to),
-            MembershipChange::Removed { .. } => {
-                self.rebuild_world(&workers, Classes::Derive, change);
+            MembershipChange::Removed { id } => {
+                let classes = Classes::Written {
+                    left: Some(id),
+                    joined: None,
+                };
+                self.pay_leave(&workers, classes, now);
+                self.tell_membership(change);
             }
         }
     }
@@ -505,6 +554,7 @@ impl MemoryStore {
             let ranks = &*ranks;
             let (world, before) = writer.apply(
                 Arc::clone(&spec),
+                workers.epoch,
                 workers.rows.values().map(|row| &row.row),
                 |id, rank| ranks.get(&id)?.samples.get(&rank).copied(),
             )?;
@@ -625,34 +675,11 @@ impl MemoryStore {
         micros(self.origin, at)
     }
 
-    /// Derive the pools of the membership as this write left it and publish
-    /// them in one world. Called under the workers lock by every membership
-    /// write; it takes the load lock, as those writes do, so each row
-    /// carries the load record on file and no record is lost across the
-    /// swap. `classes` names the worker whose write moved a member or a
-    /// member's offer: the pair classes are derived for it alone, or carried
-    /// where the write moved none.
-    ///
-    /// The write then tells that world's engine what `change` is to it
-    /// ([`MembershipChange::as_lifecycle`]): the swap first and the call
-    /// after it, with the load lock let go, so a load write waits for no
-    /// stage. The workers lock is still held, so the engine hears the
-    /// writes in their order, and an apply, which takes that lock, moves no
-    /// generation in between: the engine told is the one the world was
-    /// published under. A decision takes neither lock and meets the call at
-    /// a stage's own lock alone. One that built its view before the swap may
-    /// still name a worker the call took out: a stage answers that from its
-    /// own state, as the ring fences a pruned id ([`crate::ring::FENCE`]).
-    fn rebuild_world(&self, workers: &Workers, classes: Classes, change: MembershipChange) {
-        self.swap_world(workers, classes);
-        if let Some(change) = change.as_lifecycle() {
-            self.world.load().spec().engine().on_membership(&change);
-        }
-    }
-
-    /// The swap of [`MemoryStore::rebuild_world`] alone, the load lock let
-    /// go at its return: for a write that tells the engine in other words
-    /// than one change's ([`MemoryStore::restore_from`]).
+    /// Build the pools of the membership as it stands and show them in one
+    /// world, now, whatever the window: nothing is left owed. What a write
+    /// that replaces every row does, which tells the engine in other words
+    /// than one change's ([`MemoryStore::restore_from`]). Called under the
+    /// workers lock; it takes the load lock and lets it go at its return.
     fn swap_world(&self, workers: &Workers, classes: Classes) {
         let mut loads = self.loads.lock();
         let Loads { ranks, writer } = &mut *loads;
@@ -676,6 +703,101 @@ impl MemoryStore {
         members.sort_unstable();
         let told = Membership::Snapshot(&members);
         self.world.load().spec().engine().on_membership(&told);
+    }
+
+    /// Tell the standing generation's engine what `change` is to it
+    /// ([`MembershipChange::as_lifecycle`]). Called by every membership
+    /// write under the workers lock, after the write left its build owed or
+    /// paid its leave's, and with the load lock let go: the engine hears the
+    /// writes in their order, a load write under the load lock alone waits
+    /// for no stage, and an apply, which takes the workers lock, moves no
+    /// generation in between. A leave
+    /// is told after the build that takes its rows out of their pools: the
+    /// worker is in no pool when its write returns, whoever wrote. A join is
+    /// told when the store takes it, and the world that lists its row
+    /// follows within one publication window. A decision takes neither lock
+    /// and meets the call at a stage's own lock alone. One that built its
+    /// view before a leave's swap may still name the worker: a stage answers
+    /// that from its own state, as the ring fences a pruned id
+    /// ([`crate::ring::FENCE`]).
+    fn tell_membership(&self, change: MembershipChange) {
+        if let Some(change) = change.as_lifecycle() {
+            self.world.load().spec().engine().on_membership(&change);
+        }
+    }
+
+    /// A membership write left the pools to be built again. Called under
+    /// the workers lock by every membership write, with what the write asks
+    /// of the pair classes. The build is owed until the store's window ends
+    /// and takes in every write since the last: a storm of registrations
+    /// builds once a window, never once a write.
+    fn owe(&self, classes: Classes, at: Instant) {
+        let first = self.loads.lock().writer.owe(classes, at);
+        self.wake_host(first);
+    }
+
+    /// Have the host read the due instant again where a write left the
+    /// `first` build owed: its loop sleeps to an instant it read before.
+    /// Called with the load lock released, so the host's read does not wait
+    /// for this writer.
+    fn wake_host(&self, first: bool) {
+        if first {
+            if let Some(wake) = &*self.wake.lock() {
+                wake();
+            }
+        }
+    }
+
+    /// Pay the build the membership writes left owed: the pools of the
+    /// membership as it stands, each row with its load record on file, in
+    /// one world. Called under the workers lock; it takes the load lock, as
+    /// a membership write does, so no record is lost across the swap. The
+    /// host's call names its instant, and a build is paid when it is due at
+    /// it; where none is, what waits for the window is published by the
+    /// window's own rule. The ask names no instant and is paid at once.
+    fn pay(&self, workers: &Workers, at: Option<Instant>) {
+        let mut loads = self.loads.lock();
+        let Loads { ranks, writer } = &mut *loads;
+        let ranks = &*ranks;
+        let world = match at {
+            Some(now) if !writer.build_due(now) => writer.publish_if_due(now),
+            _ => writer.build_owed(
+                at,
+                workers.epoch,
+                workers.rows.values().map(|row| &row.row),
+                |id, rank| ranks.get(&id)?.samples.get(&rank).copied(),
+            ),
+        };
+        self.show(writer, world);
+    }
+
+    /// A leave pays its own build. A removal and a replaced incarnation owe
+    /// the build as every membership write does and pay it in the same
+    /// write, as the ask pays it, with every write the window held. Called
+    /// under the workers lock, before the leave is told: the worker is in no
+    /// pool when its write returns, under every profile and stage and
+    /// whoever wrote, a served call or a followed change. A storm of
+    /// removals so builds once a removal. The window stands as it was, and
+    /// the host is not woken: nothing is left owed.
+    fn pay_leave(&self, workers: &Workers, classes: Classes, at: Instant) {
+        self.loads.lock().writer.owe(classes, at);
+        self.pay(workers, None);
+    }
+
+    /// Build what the membership writes left owed, now, whatever the
+    /// window. Where nothing is owed, nothing is done.
+    ///
+    /// The build of a registration, a refresh and a patch starts within one
+    /// publication window of their answer, when the store's host pays the
+    /// due instant ([`LoadSink::publish_due`]), and they are in force for
+    /// decisions when it ends. A caller that needs its own write in force
+    /// at once asks here: a test, a bench's fill, a host with no loop. The
+    /// store asks for itself before it writes a poll's answer for a rank
+    /// that has no row yet. The ask builds the whole membership under the
+    /// workers lock and the load lock: a writer's wait, never a decision's.
+    pub fn publish_now(&self) {
+        let workers = self.workers.lock();
+        self.pay(&workers, None);
     }
 
     /// Show the deciders the world a write made, when it made one. Called
@@ -734,7 +856,7 @@ impl MemoryStore {
 
     /// How many writes to the load table moved an overload verdict: a
     /// record, a report, the word that no report came, an eviction. A
-    /// membership write and an applied generation judge again and count
+    /// membership build and an applied generation judge again and count
     /// nothing.
     pub fn overload_flips(&self) -> u64 {
         self.counts().overload_flips
@@ -864,10 +986,10 @@ impl MemoryStore {
     /// was made. A publication writes a pool's rows over rows no world
     /// lists any more: the ones the pool published before its last, else
     /// any of its length that left a pool. It allocates when it finds
-    /// none: at a pool's first publication after a membership write,
-    /// unless rows that write retired fit it, and past that only while a
+    /// none: at a pool's first publication after a membership build,
+    /// unless rows that build retired fit it, and past that only while a
     /// reader holds a world from before the pool's last publication. A
-    /// membership write's own rows are not counted.
+    /// membership build's own rows are not counted.
     pub fn publication_allocations(&self) -> u64 {
         self.loads.lock().writer.allocations()
     }
@@ -877,6 +999,13 @@ impl MemoryStore {
     /// leave in one.
     pub fn publications(&self) -> u64 {
         self.loads.lock().writer.publications()
+    }
+
+    /// How many times the pools were built from the membership since the
+    /// store was made. A storm of membership writes builds once a window,
+    /// never once a write: the count says so by run.
+    pub fn membership_builds(&self) -> u64 {
+        self.loads.lock().writer.builds()
     }
 
     /// Give the row of `id` its KV lane as its facts ask
@@ -1058,9 +1187,15 @@ impl MemoryStore {
 impl WorkersStore for MemoryStore {
     fn upsert(&self, mut facts: WorkerFacts) -> MembershipChange {
         // A blank value of a descriptor or of an encode offer is no report:
-        // the row of record holds what the two rules read.
-        if let Some(descriptor) = facts.pairing.as_deref_mut() {
-            descriptor.normalize();
+        // the row of record holds what the two rules read. A descriptor that
+        // stands so is kept where it is, shared or not: a row written again
+        // copies none.
+        if let Some(descriptor) = facts
+            .pairing
+            .as_mut()
+            .filter(|descriptor| !descriptor.is_normalized())
+        {
+            Arc::make_mut(descriptor).normalize();
         }
         facts.encode = facts.encode.normalized();
         let mut workers = self.writing();
@@ -1093,7 +1228,8 @@ impl WorkersStore for MemoryStore {
                     MembershipChange::Relabelled { id: old_id }
                 });
                 self.index_member(&workers, old_id);
-                self.rebuild_world(&workers, classes, change);
+                self.owe(classes, now);
+                self.tell_membership(change);
                 return change;
             }
             // A new incarnation under the key: the old id leaves with its
@@ -1149,7 +1285,8 @@ impl WorkersStore for MemoryStore {
                 left: Some(old_id),
                 joined: Some(new_id),
             };
-            self.rebuild_world(&workers, classes, change);
+            self.pay_leave(&workers, classes, now);
+            self.tell_membership(change);
             drop(workers);
             self.forget_pins(old_id);
             return change;
@@ -1174,13 +1311,18 @@ impl WorkersStore for MemoryStore {
         let change = workers.record(MembershipChange::Registered { id });
         // The row's load entry, created with it: what a member's load
         // writes go into.
-        self.loads.lock().ranks.insert(id, Ranks::default());
-        self.index_member(&workers, id);
-        let classes = Classes::Written {
-            left: None,
-            joined: Some(id),
+        let first = {
+            let mut loads = self.loads.lock();
+            loads.ranks.insert(id, Ranks::default());
+            let classes = Classes::Written {
+                left: None,
+                joined: Some(id),
+            };
+            loads.writer.owe(classes, now)
         };
-        self.rebuild_world(&workers, classes, change);
+        self.wake_host(first);
+        self.index_member(&workers, id);
+        self.tell_membership(change);
         change
     }
 
@@ -1206,7 +1348,8 @@ impl WorkersStore for MemoryStore {
         row.row.revision += 1;
         let change = workers.record(MembershipChange::Relabelled { id });
         // Labels, a priority and an overload are no part of an offer.
-        self.rebuild_world(&workers, Classes::Carry, change);
+        self.owe(Classes::Carry, Instant::now());
+        self.tell_membership(change);
         Some(change)
     }
 
@@ -1227,7 +1370,8 @@ impl WorkersStore for MemoryStore {
             left: Some(id),
             joined: None,
         };
-        self.rebuild_world(&workers, classes, change);
+        self.pay_leave(&workers, classes, Instant::now());
+        self.tell_membership(change);
         drop(workers);
         self.forget_pins(id);
         Some(change)
@@ -1539,6 +1683,18 @@ struct Loads {
     writer: Writer,
 }
 
+impl Loads {
+    /// Whether a rank `answer` names waits for a build ([`Writer::waits`]):
+    /// a member's rank with no row for the answer's words to be written
+    /// on. A worker with no entry here is no member and waits for none.
+    fn waits(&mut self, answer: &[(WorkerId, u16, Option<LoadRow>)]) -> bool {
+        let Self { ranks, writer } = self;
+        answer
+            .iter()
+            .any(|&(id, rank, _)| writer.waits(id, rank) && ranks.contains_key(&id))
+    }
+}
+
 impl LoadSink for MemoryStore {
     fn record(
         &self,
@@ -1586,6 +1742,23 @@ impl LoadSink for MemoryStore {
         source: LoadSource,
     ) {
         let mut loads = self.loads.lock();
+        // A rank the answer names may have no row yet, inside the window of
+        // its registration or of a refresh that moved it. Written now, its
+        // row would be heard for no engine, the word that no report came
+        // would be said of none, and a rank left out beside it would take
+        // no mark. The build the window owes is paid first, as an ask pays
+        // it, with the load lock let go for it: one build an answer at the
+        // most, none where every rank the answer names has its row, and
+        // none for a record, whose rank the build reads by what it
+        // reported. The workers lock stays held to the answer's own write:
+        // no membership write stands between the build and the answer.
+        let _membership = loads.waits(answer).then(|| {
+            MutexGuard::unlocked(&mut loads, || {
+                let workers = self.workers.lock();
+                self.pay(&workers, None);
+                workers
+            })
+        });
         let Loads {
             ranks: table,
             writer,
@@ -1688,13 +1861,17 @@ impl LoadSink for MemoryStore {
                 // No row came for the engine: the word that none came,
                 // unless a rank of it pushed since the poll began, whether
                 // the answer names that rank or not. The word is shown
-                // where it moves a verdict.
+                // where it moves a verdict. A rank the answer does not name
+                // may stand inside the window of its registration, or of a
+                // refresh that moved it, with no row at its rank here: the
+                // build reads what it reported against the word and the
+                // instant this poll began.
                 let pushed = writer.ranks_of(engine).any(|(id, rank)| {
                     table
                         .get(&id)
                         .is_some_and(|ranks| ranks.pushed_since(rank, polled_at))
                 });
-                !pushed && writer.silence(engine)
+                !pushed && writer.silence(engine, polled_at)
             };
         }
         if changed {
@@ -1792,9 +1969,23 @@ impl LoadSink for MemoryStore {
     }
 
     fn publish(&self, now: Instant) {
-        let mut loads = self.loads.lock();
-        let world = loads.writer.publish_if_due(now);
-        self.show(&mut loads.writer, world);
+        {
+            let mut loads = self.loads.lock();
+            if !loads.writer.build_due(now) {
+                let world = loads.writer.publish_if_due(now);
+                self.show(&mut loads.writer, world);
+                return;
+            }
+        }
+        // A build is owed and due. The workers lock comes first, as every
+        // membership write takes it, and the build is asked again under
+        // both: another call may have paid it meanwhile.
+        let workers = self.workers.lock();
+        self.pay(&workers, Some(now));
+    }
+
+    fn wake_with(&self, wake: Wake) {
+        *self.wake.lock() = Some(wake);
     }
 }
 

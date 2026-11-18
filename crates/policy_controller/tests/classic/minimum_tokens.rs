@@ -257,6 +257,9 @@ impl Bed {
                 (id, rank)
             })
             .collect();
+        // The bed's host runs no loop: it asks the build its registrations
+        // owe, so the rows stand before the first request.
+        store.publish_now();
         store.apply(applied).expect("the first generation applies");
         // The driver tells its poll interval where it is built.
         assert!(store.heard_every(PERIOD), "the first period told");

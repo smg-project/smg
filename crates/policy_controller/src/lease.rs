@@ -119,7 +119,9 @@ pub enum ReleaseReason {
     WorkerRemoved,
 }
 
-/// A membership change the host reports.
+/// A membership change the host reports. A host tells a join when it takes
+/// it, and a view that lists the row may follow: a stage that lists by the
+/// feed treats a member its candidates do not hold as one a filter took.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Membership<'a> {
     Added(WorkerId),

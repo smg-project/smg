@@ -57,7 +57,7 @@
 # to two cores. The three `policy_store_held/` rows time a publication beside a reader that holds the rows it
 # would write over. The four `policy_store_pairs/` rows at 8 and at 64 a side are the two membership writes
 # of smaller fleets of pairs. The two other `policy_store_models/` rows read the same write beside a list of
-# 128 and of 4,096 models: the scan is a tenth of the first, and six rounds of one build read the second at 3.4
+# 128 and of 4,096 models: the scan is a sixth of the first, and six rounds of one build read the second at 3.4
 # to 8.9 ms.
 #
 # Threshold (the method is described in tokenizer.toml). The identical-build spread, (max - min) / median of the

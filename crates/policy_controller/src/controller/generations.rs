@@ -1753,6 +1753,9 @@ pub(crate) mod tests {
                 dp_size: 1,
                 ..WorkerFacts::default()
             });
+            // The members are read under the lists at the build the join
+            // owes.
+            store.publish_now();
         };
         join("http://a:8000", "alpha");
         assert_eq!(store.outside_lists(), OutsideLists::default());
