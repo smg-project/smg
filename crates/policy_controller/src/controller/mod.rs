@@ -557,8 +557,9 @@ impl Controller {
     /// file by its number. A directory with no generation on file starts
     /// the controller with no document, until the first apply.
     ///
-    /// Refused here, before anything serves: a path that leads to no
-    /// directory, a newest generation that does not run, a spec source
+    /// Refused here, before anything serves ([`StoreRefused`]): a path that
+    /// leads to no directory, a directory that is not read, two files under
+    /// one number, a newest generation that does not run, a spec source
     /// taken before this one, and a lease another replica can take
     /// ([`LeasePlace`]). A standby does not follow an applied generation in
     /// this build, so a promoted one would run without it.

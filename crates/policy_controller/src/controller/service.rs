@@ -635,8 +635,9 @@ fn verdict(
 }
 
 /// The status of a spec call that gave no answer of its own: a guard's by
-/// the standing generation, a full wait's as one to ask again, and a
-/// generation no document is held for as not found.
+/// the standing generation, a full wait's as one to ask again, a generation
+/// no document is held for as not found, and a call's thread that did not
+/// end or a file that was not read as internal.
 fn unanswered(unanswered: Unanswered) -> Status {
     match unanswered {
         Unanswered::Guarded(standing, digest) => {

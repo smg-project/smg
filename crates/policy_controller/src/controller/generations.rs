@@ -41,8 +41,9 @@
 //! file's name states ([`Generations::bind_store`]). A call's document
 //! writes the next number or none ([`Line::Next`]): another line is
 //! refused by naming the standing one. The write calls take the door one
-//! at a time, off the runtime's workers ([`Generations::enforce_in_turn`]),
-//! and no more wait than [`WRITES_WAITING`]. A controller has one source:
+//! at a time, in the order they came, off the runtime's workers
+//! ([`Generations::enforce_in_turn`]), and no more wait than
+//! [`WRITES_WAITING`]. A controller has one source:
 //! a store is bound where no file's document was applied
 //! ([`StoreRefused::SecondSource`]), and a file's document is refused
 //! where a store is bound ([`SpecRejected::SecondSource`]).
@@ -74,9 +75,12 @@
 //! the file writes one. Under a spec store the numbers are the directory's,
 //! and no standby follows an applied generation in this build: a store is
 //! bound only beside a lease in the process
-//! ([`Controller::spec_store`](super::Controller::spec_store)). A file in
-//! the store that is no document of this build is listed nowhere: the read
-//! call does not answer it. A digest is the applier's ([`Digest`]): it travels
+//! ([`Controller::spec_store`](super::Controller::spec_store)). One process
+//! holds a store's directory, and nothing holds two apart: a second one's
+//! write of a number on file is refused by name, and it takes no write
+//! until it starts again ([`SpecStore`]). A file in the store that is no
+//! document of this build is listed nowhere: the read call does not answer
+//! it. A digest is the applier's ([`Digest`]): it travels
 //! with its bytes, and a reader of another build does not recompute it to
 //! compare.
 
@@ -896,6 +900,15 @@ fn check(
     })
 }
 
+/// The rule of the store's entry in its own words: a number at or under
+/// the standing one is refused by naming it.
+fn above(standing: u64, offered: u64) -> Result<(), StaleGeneration> {
+    if offered <= standing {
+        return Err(StaleGeneration { standing, offered });
+    }
+    Ok(())
+}
+
 /// A panic's message, where it has one.
 fn fault_text(fault: &(dyn Any + Send)) -> String {
     fault
@@ -944,8 +957,12 @@ pub(crate) struct Generations {
     /// each write; a reader copies one entry out.
     on_file: Mutex<Vec<Retained>>,
     /// The write calls let in: the one that applies and the ones that wait
-    /// for the door.
+    /// their turn.
     writing: Arc<Semaphore>,
+    /// One write call at a time, in the order the calls came: a call awaits
+    /// this turn before its thread starts, and its thread holds it. The
+    /// door's lock is then taken by one write, with no other waiting on it.
+    write_turn: Arc<tokio::sync::Mutex<()>>,
     /// One dry run at a time. A dry run takes neither lock of the door, and
     /// its pass holds what an apply's does: the pass holds this turn.
     dry_turn: Arc<tokio::sync::Mutex<()>>,
@@ -981,6 +998,7 @@ impl Generations {
             dir: OnceLock::new(),
             on_file: Mutex::new(Vec::new()),
             writing: Arc::new(Semaphore::new(WRITES_WAITING + 1)),
+            write_turn: Arc::default(),
             dry_turn: Arc::default(),
             dry_runs: Arc::new(Semaphore::new(DRY_RUNS_WAITING + 1)),
             held: Mutex::new(None),
@@ -1096,12 +1114,7 @@ impl Generations {
                     return Ok((standing.0, digest));
                 };
                 let offered = next.generation();
-                if offered <= standing.0 {
-                    return Err(SpecRejected::Stale(StaleGeneration {
-                        standing: standing.0,
-                        offered,
-                    }));
-                }
+                above(standing.0, offered)?;
                 needs = Some(proto::NeedsDiff {
                     before: Some(before),
                     after: Some(needs_summary(next.engine())),
@@ -1318,7 +1331,9 @@ impl Generations {
     }
 
     /// One write under the door's lock: the pass, the persist, the entry,
-    /// then the read call's list. It answers the number the document runs
+    /// then the read call's list. A number that is not above the standing
+    /// one is refused in the entry's words before a file is written, as a
+    /// dry run refuses it. It answers the number the document runs
     /// under with its digest, and what a host must feed under it: `None`
     /// where it is the standing document again, which is no change.
     fn write(
@@ -1334,6 +1349,7 @@ impl Generations {
             return Ok((standing.0, digest, None));
         };
         let generation = next.generation();
+        above(standing.0, generation)?;
         let after = needs_summary(next.engine());
         let persisted = Persisted { generation, format };
         dir.persist(persisted, &document)
@@ -1410,8 +1426,13 @@ impl Generations {
     }
 
     /// Runs `write` off the runtime's workers, behind the write calls that
-    /// came first. No more calls wait than [`WRITES_WAITING`]: one past
-    /// them is refused.
+    /// came first: a call awaits its turn, in the order the calls came,
+    /// and its thread starts once the turn is its own, so no thread waits
+    /// for the door. No more calls wait than [`WRITES_WAITING`]: one past
+    /// them is refused. A caller that leaves while its call waits writes
+    /// nothing and frees its place. Once its thread started, the write
+    /// runs to its end whoever left, and holds the turn and the place
+    /// until then.
     async fn in_turn(
         self: &Arc<Self>,
         write: impl FnOnce(&Self) -> Result<Enforced, Unanswered> + Send + 'static,
@@ -1419,9 +1440,10 @@ impl Generations {
         let Ok(place) = Arc::clone(&self.writing).try_acquire_owned() else {
             return Err(Unanswered::Waiting);
         };
+        let turn = Arc::clone(&self.write_turn).lock_owned().await;
         let door = Arc::clone(self);
         let written = tokio::task::spawn_blocking(move || {
-            let _place = place;
+            let _held = (turn, place);
             write(&door)
         });
         written
@@ -1498,11 +1520,10 @@ impl Generations {
     /// file, read from its file off the runtime's workers and answered with
     /// the digest and the time it is listed under. It takes no lock an
     /// apply holds: the read waits on no validation and on no file's sync.
-    /// A file an apply removed since the list was read is not held.
-    pub(crate) async fn read(
-        self: &Arc<Self>,
-        wanted: u64,
-    ) -> Result<proto::PolicySpecDocument, Unanswered> {
+    /// A file an apply removed since the list was read is not held. No turn
+    /// bounds the reads: one holds a file's bytes, the size bound at most,
+    /// and the runtime's blocking threads are their bound.
+    pub(crate) async fn read(&self, wanted: u64) -> Result<proto::PolicySpecDocument, Unanswered> {
         let not_held = match self.document(wanted) {
             Ok(document) => return Ok(document),
             Err(not_held) => not_held,
@@ -4468,6 +4489,205 @@ pub(crate) mod tests {
         assert_eq!(names(dir.path()), on_file);
         // The number the flag's help states.
         assert_eq!(names(dir.path()).len(), 8);
+    }
+
+    /// Two doors on one directory, as two processes hold one, each enforce
+    /// a document of their own at one moment: one runs it as generation 1,
+    /// and the other is refused by name with nothing applied. The directory
+    /// holds the document that runs, and a start on it runs that one.
+    #[test]
+    fn two_doors_on_one_directory_do_not_both_run_one_number() {
+        for round in 0..20 {
+            let dir = tempfile::tempdir().expect("a temp dir");
+            let doors = [LEAST_LOAD, RANDOM].map(|document| {
+                let (store, generations) = generations();
+                bind(&generations, dir.path());
+                (store, generations, document)
+            });
+            let barrier = std::sync::Barrier::new(2);
+            let [first, second] = thread::scope(|scope| {
+                let calls = doors.each_ref().map(|(_, generations, document)| {
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        barrier.wait();
+                        enforce(generations, *document)
+                    })
+                });
+                calls.map(|call| call.join().expect("no panic"))
+            });
+            let taken = SpecRejected::Unpersisted("generation 1 is on file already".to_owned());
+            let ((won, ran), (lost, refused)) = match (first, second) {
+                (Ok(ran), Err(refused)) => ((&doors[0], ran), (&doors[1], refused)),
+                (Err(refused), Ok(ran)) => ((&doors[1], ran), (&doors[0], refused)),
+                both => panic!("round {round}: one door runs generation 1: {both:?}"),
+            };
+            assert_eq!(refused, taken);
+            let (number, digest) = ran;
+            assert_eq!(number, 1);
+            assert_eq!(standing(&won.0), (1, Some(digest)));
+            assert_eq!(standing(&lost.0), (0, None));
+            let on_file = std::fs::read(dir.path().join(name_of(1, "yaml"))).expect("the file");
+            assert_eq!(on_file, won.2.as_bytes());
+
+            let (store, again) = generations();
+            bind(&again, dir.path());
+            assert_eq!(standing(&store), (1, Some(digest)));
+        }
+    }
+
+    /// Write calls take the door one at a time, in the order they came: a
+    /// call awaits its turn before its thread starts, so while the turn is
+    /// held none runs, and then each runs as the next number in its order.
+    #[tokio::test]
+    async fn write_calls_take_their_turn_in_the_order_they_came() {
+        let (_dir, store, generations) = stored();
+        let held = Arc::clone(&generations.write_turn).lock_owned().await;
+        let mut calls = JoinSet::new();
+        for n in 1..=4_u64 {
+            let door = Arc::clone(&generations);
+            calls.spawn(async move {
+                let document = bound_to(n).into_bytes();
+                let call = door.enforce_in_turn(String::new(), document, Format::Yaml);
+                (n, call.await)
+            });
+            // The call reaches its wait before the next one is made.
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(standing(&store).0, 0, "a write ran beside the turn held");
+        drop(held);
+        while let Some(call) = calls.join_next().await {
+            let (n, answer) = call.expect("the call ends");
+            let ran = answer.expect("a place").ran;
+            assert_eq!(ran.map(|(number, _)| number), Ok(n));
+        }
+    }
+
+    /// Waits until `free` of the write calls' places are free.
+    async fn places_free(door: &Generations, free: usize) {
+        let started = Instant::now();
+        while door.writing.available_permits() != free {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "the write calls' places did not come to {free} free"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
+    /// A call holds its place until its write ends. With the door's lock
+    /// held, as a write in flight holds it, the calls that fill the places
+    /// stay in them and one more is refused; once the door is free each of
+    /// them runs and gives its place back.
+    #[tokio::test]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "the case holds the door's lock, as a write in flight does, while the calls take their places"
+    )]
+    async fn a_write_call_holds_its_place_until_its_write_ends() {
+        let (_dir, store, generations) = stored();
+        let enforce = |door: Arc<Generations>, n: usize| async move {
+            let n = u64::try_from(n).expect("a small count");
+            let document = bound_to(n).into_bytes();
+            door.enforce_in_turn(String::new(), document, Format::Yaml)
+                .await
+        };
+        let applying = generations.applying.lock();
+        let mut calls = JoinSet::new();
+        for n in 0..=WRITES_WAITING {
+            calls.spawn(enforce(Arc::clone(&generations), n));
+        }
+        places_free(&generations, 0).await;
+        let past = enforce(Arc::clone(&generations), 0).await;
+        assert!(matches!(past, Err(Unanswered::Waiting)), "{past:?}");
+        assert_eq!(standing(&store).0, 0);
+        drop(applying);
+        while let Some(call) = calls.join_next().await {
+            let answer = call.expect("the call ends").expect("a place");
+            answer.ran.expect("it runs");
+        }
+        let all = u64::try_from(WRITES_WAITING).expect("a small count") + 1;
+        assert_eq!(standing(&store).0, all);
+        assert_eq!(generations.writing.available_permits(), WRITES_WAITING + 1);
+    }
+
+    /// A generation whose file is gone under the list, as an apply's prune
+    /// takes one between a read's look and its open, is not held: the read
+    /// answers so, and no internal fault.
+    #[tokio::test]
+    async fn a_generation_whose_file_is_gone_under_the_list_is_not_held() {
+        let (dir, _store, generations) = stored();
+        enforce(&generations, LEAST_LOAD).expect("it runs");
+        enforce(&generations, RANDOM).expect("it runs");
+        std::fs::remove_file(dir.path().join(name_of(1, "yaml"))).expect("the file goes");
+
+        let gone = generations.read(1).await;
+        let Err(Unanswered::NotHeld(not_held)) = gone else {
+            panic!("generation 1 has no file: {gone:?}");
+        };
+        assert_eq!((not_held.asked, not_held.standing), (1, 2));
+    }
+
+    /// A caller that leaves while its call waits for the turn writes
+    /// nothing and frees its place: the next call runs as the first
+    /// generation, and its document alone is on file.
+    #[tokio::test]
+    async fn a_write_call_whose_caller_left_while_it_waited_writes_nothing() {
+        let (dir, store, generations) = stored();
+        let held = Arc::clone(&generations.write_turn).lock_owned().await;
+        let mut calls = JoinSet::new();
+        let door = Arc::clone(&generations);
+        let left = calls.spawn(async move {
+            door.enforce_in_turn(String::new(), RANDOM.into(), Format::Yaml)
+                .await
+        });
+        places_free(&generations, WRITES_WAITING).await;
+        left.abort();
+        let gone = calls.join_next().await.expect("the one call");
+        let gone = gone.expect_err("its caller left");
+        assert!(gone.is_cancelled(), "{gone}");
+        drop(held);
+        places_free(&generations, WRITES_WAITING + 1).await;
+        assert_eq!((standing(&store).0, names(dir.path()).len()), (0, 0));
+
+        let ran = generations
+            .enforce_in_turn(String::new(), LEAST_LOAD.into(), Format::Yaml)
+            .await
+            .expect("a place")
+            .ran;
+        assert_eq!(ran.map(|(number, _)| number), Ok(1));
+        let on_file = std::fs::read(dir.path().join(name_of(1, "yaml"))).expect("the file");
+        assert_eq!(on_file, LEAST_LOAD.as_bytes());
+    }
+
+    /// At the last number none is left: an enforce and a rollback are
+    /// refused in the entry's words, as their dry run is, before a file is
+    /// written.
+    #[test]
+    fn a_write_at_the_last_number_is_refused_as_its_dry_run_is() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let last = u64::MAX;
+        std::fs::write(dir.path().join(name_of(last - 1, "yaml")), RANDOM).expect("the file");
+        std::fs::write(dir.path().join(name_of(last, "yaml")), LEAST_LOAD).expect("the file");
+        let (store, generations) = generations();
+        bind(&generations, dir.path());
+        assert_eq!(standing(&store).0, last);
+        let on_file = names(dir.path());
+        let stale = || {
+            SpecRejected::Stale(StaleGeneration {
+                standing: last,
+                offered: last,
+            })
+        };
+
+        let dry = generations
+            .dry_run("", RANDOM.as_bytes(), Format::Yaml)
+            .expect("no guard");
+        assert_eq!(dry.would_run, Err(stale()));
+        assert_eq!(enforce(&generations, RANDOM), Err(stale()));
+        assert_eq!(roll_back(&generations, last - 1), Err(stale()));
+        assert_eq!(names(dir.path()), on_file);
+        assert_eq!(generations.counts(), applied(1, 2));
     }
 
     /// What a rollback to generation `wanted`, one on file, ran.

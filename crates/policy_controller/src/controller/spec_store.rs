@@ -5,14 +5,23 @@
 //! A generation is one file, named by its number and its form
 //! (`00000000000000000042.yaml`). The bytes are the document as its caller
 //! sent it: the number lives in the name, never inside those bytes. A file
-//! is written whole under another name, synced, renamed into place and the
-//! directory synced, in that order, so a name of that shape holds a whole
-//! document or does not exist. A number on file is not written over: an
-//! apply whose number is on file already, in either form, is refused, so a
-//! second process on the directory replaces no generation of the first.
-//! The door ([`Generations`]) persists a
-//! document here and only then calls the store's entry, one apply at a
-//! time: the directory is written under the door's lock alone.
+//! is written whole under another name and synced, then linked under its
+//! generation's name, the other name removed and the directory synced, in
+//! that order: a name of that shape holds a whole document or does not
+//! exist. A link takes a name once and replaces none, so no write puts a
+//! file over a generation on file, whoever wrote it; a number on file in
+//! the other form is refused where the write finds it. The door
+//! ([`Generations`]) persists a document here and only then calls the
+//! store's entry, one apply at a time: one process writes the directory,
+//! under the door's lock alone.
+//!
+//! One process holds a directory, and nothing here holds two apart. Where
+//! a second one writes it too, its apply of a number the first has on file
+//! is refused by name, and from then on it takes no write until it starts
+//! again: a store reads its directory at its start alone. Two that write
+//! one number at one moment in the two forms both land, and the next start
+//! is refused by the two names. A start removes every temporary name, a
+//! live writer's among them: that write is refused.
 //!
 //! A start reads the directory: the highest number is the generation to
 //! run, and a file a write left under its temporary name is removed. Any
@@ -30,7 +39,7 @@ use std::{
     io::{self, Read as _, Write as _},
     path::{Path, PathBuf},
     process,
-    time::SystemTime,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use super::generations::{Format, SpecRejected, MAX_DOCUMENT_BYTES};
@@ -132,6 +141,10 @@ pub(crate) struct SpecStore {
     dir: PathBuf,
     /// The generations on file, ascending.
     kept: Vec<Persisted>,
+    /// When this store was opened, in nanoseconds: with the process's id it
+    /// tells this store's temporary names from another's on the directory.
+    /// A process id alone does not: it is 1 in each of two containers.
+    opened: u128,
     /// The writes this store began: a temporary name's own number.
     writes: u64,
 }
@@ -166,9 +179,13 @@ impl SpecStore {
         {
             return Err(StoreRefused::TwoNames(pair[0].generation));
         }
+        let opened = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |since| since.as_nanos());
         Ok(Self {
             dir,
             kept,
+            opened,
             writes: 0,
         })
     }
@@ -199,25 +216,40 @@ impl SpecStore {
     }
 
     /// Persists `document` as `persisted`: written whole under a temporary
-    /// name, synced, renamed into place, then the directory synced. A write
-    /// that fails leaves no file under the generation's name, and a number
-    /// on file already takes no write.
+    /// name and synced, linked under the generation's name, the temporary
+    /// name removed, then the directory synced. A link replaces no name: a
+    /// number on file already takes no write, in this form at the link and
+    /// in the other where the write finds it first. A write that fails
+    /// leaves no file of its own behind and removes no other's.
     pub(crate) fn persist(&mut self, persisted: Persisted, document: &[u8]) -> io::Result<()> {
+        self.persist_synced(persisted, document, sync_dir)
+    }
+
+    /// [`SpecStore::persist`] with the directory's sync as its argument: a
+    /// case hands in one that fails.
+    fn persist_synced(
+        &mut self,
+        persisted: Persisted,
+        document: &[u8],
+        sync: fn(&Path) -> io::Result<()>,
+    ) -> io::Result<()> {
         let Persisted { generation, .. } = persisted;
+        let taken = || {
+            let text = format!("generation {generation} is on file already");
+            io::Error::new(io::ErrorKind::AlreadyExists, text)
+        };
         for format in [Format::Yaml, Format::Json] {
             if self.path(Persisted { generation, format }).try_exists()? {
                 // Another process wrote the directory, or a refused
                 // generation stayed on file.
-                return Err(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    format!("generation {generation} is on file already"),
-                ));
+                return Err(taken());
             }
         }
         self.writes += 1;
-        let writing = self
-            .dir
-            .join(format!("{WRITING}{}-{}", process::id(), self.writes));
+        let (id, opened, write) = (process::id(), self.opened, self.writes);
+        let writing = self.dir.join(format!("{WRITING}{id}-{opened}-{write}"));
+        let name = self.path(persisted);
+        let mut linked = false;
         let written = (|| {
             let mut file = fs::OpenOptions::new()
                 .write(true)
@@ -226,14 +258,22 @@ impl SpecStore {
             file.write_all(document)?;
             file.sync_all()?;
             drop(file);
-            fs::rename(&writing, self.path(persisted))?;
-            sync_dir(&self.dir)
+            fs::hard_link(&writing, &name).map_err(|error| match error.kind() {
+                // The name appeared since the look above: its file stays.
+                io::ErrorKind::AlreadyExists => taken(),
+                _ => error,
+            })?;
+            linked = true;
+            fs::remove_file(&writing)?;
+            sync(&self.dir)
         })();
         if written.is_err() {
-            // Whichever step failed, neither name stays: the rename may
-            // have happened where the directory's sync failed.
+            // No name of this write stays, whichever step failed. A
+            // generation's name this write did not link is another's.
             let _ = fs::remove_file(&writing);
-            let _ = fs::remove_file(self.path(persisted));
+            if linked {
+                let _ = fs::remove_file(&name);
+            }
             return written;
         }
         self.kept.push(persisted);
@@ -416,6 +456,64 @@ pub(crate) mod tests {
         assert_eq!(names(dir.path()), BTreeSet::from([name_of(1, "yaml")]));
         assert_eq!(store.read(at(1, YAML)).expect("it reads"), b"one");
         assert_eq!(store.kept(), [at(1, YAML)]);
+    }
+
+    /// Two stores on one directory, as two processes hold one, write one
+    /// number at one moment: one write lands and the other is refused by
+    /// name, whichever looked first. The file is the winner's, whole, and
+    /// the refused write's own cleanup leaves it there.
+    #[test]
+    fn two_stores_that_write_one_number_at_one_moment_land_one_file() {
+        const ROUNDS: u64 = 100;
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let open = || SpecStore::open(dir.path().to_owned()).expect("it opens");
+        let (mut first, mut second) = (open(), open());
+        // Two processes' temporary names differ, whatever the clock read.
+        second.writes = 1 << 32;
+        let barrier = std::sync::Barrier::new(2);
+        for generation in 1..=ROUNDS {
+            let write = |store: &mut SpecStore, bytes: &'static [u8]| {
+                barrier.wait();
+                store.persist(at(generation, YAML), bytes)
+            };
+            let (one, two) = std::thread::scope(|scope| {
+                let one = scope.spawn(|| write(&mut first, b"first"));
+                let two = scope.spawn(|| write(&mut second, b"second"));
+                (one.join().expect("no panic"), two.join().expect("no panic"))
+            });
+            let (landed, refused) = match (one, two) {
+                (Ok(()), Err(refused)) => (b"first".as_slice(), refused),
+                (Err(refused), Ok(())) => (b"second".as_slice(), refused),
+                both => panic!("round {generation}: one write lands: {both:?}"),
+            };
+            assert_eq!(refused.kind(), io::ErrorKind::AlreadyExists);
+            let taken = format!("generation {generation} is on file already");
+            assert_eq!(refused.to_string(), taken);
+            let on_file = fs::read(dir.path().join(name_of(generation, "yaml")));
+            assert_eq!(on_file.expect("the winner's file"), landed);
+        }
+        // A generation's name a round, and no temporary one.
+        let all = (1..=ROUNDS).map(|number| name_of(number, "yaml")).collect();
+        assert_eq!(names(dir.path()), all);
+    }
+
+    /// A write whose directory does not sync after the link is refused, and
+    /// its generation's name goes with its temporary one: nothing of it is
+    /// on file, and the number takes a write again.
+    #[test]
+    fn a_write_the_directory_does_not_sync_leaves_no_name_behind() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let mut store = SpecStore::open(dir.path().to_owned()).expect("an empty directory");
+        let unsynced = |_: &Path| Err(io::Error::other("the directory did not sync"));
+        let refused = store
+            .persist_synced(at(1, YAML), b"one", unsynced)
+            .expect_err("no sync");
+        assert_eq!(refused.to_string(), "the directory did not sync");
+        assert_eq!(names(dir.path()), BTreeSet::new());
+        assert_eq!(store.kept(), []);
+        store
+            .persist(at(1, YAML), b"one")
+            .expect("the number is free");
     }
 
     #[test]
