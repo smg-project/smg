@@ -21,15 +21,18 @@
 //! to them, so the file's lines stay with the threads that read them: a
 //! handed frame waits for the next take of a thread at work, a
 //! decision's try or its issue. With none at work the session takes the
-//! turn and applies. So no handed frame waits on a lull.
+//! turn and applies. So no handed frame waits on a lull, but behind a
+//! thread that left its work by an unwind: what it left is the next
+//! take's.
 //!
 //! The lock order, written here once: the turn is taken first or not at
 //! all. Under it come the world's load (no lock), a stage's own lock, the
 //! engine's sessions table, the store's pins and the journal's word of a
 //! term. No path takes one of those and then the turn. A lifecycle call
-//! of a served controller therefore runs under the turn: it is bounded
-//! and calls no door of the leases. A debug build marks the thread that
-//! holds the turn and refuses a second take by it.
+//! of a served controller therefore runs under the turn, or after it
+//! where a decision gives its own lease up: it is bounded and calls no
+//! door of the leases. A debug build marks the thread that holds the turn
+//! and refuses a second take by it.
 //!
 //! The file is one today, shared by the deciders: the turn is held for an
 //! apply, for an issue and for a lease's giving up, never across a

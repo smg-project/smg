@@ -90,9 +90,9 @@ impl Counts {
         })
     }
 
-    /// One lease more books the worker of `slot`. The leases' lock orders
-    /// the writers, so a write is a load and a store: no reader waits on
-    /// the line and no writer locks it.
+    /// One lease more books the worker of `slot`. The turn of the leases'
+    /// file orders the writers, so a write is a load and a store: no reader
+    /// waits on the line and no writer locks it.
     pub(crate) fn book(&self, slot: Slot) {
         if let Some(cell) = self.cell(slot) {
             let held = cell.load(Ordering::Relaxed);

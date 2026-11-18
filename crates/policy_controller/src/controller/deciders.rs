@@ -538,8 +538,8 @@ impl Deciding {
             if self.working.is_none() {
                 self.working = Some(self.reads.store.at_work());
             }
-            // The thread acts as its decider for the turn: a local, so the
-            // name is let go where the turn ends.
+            // The thread acts as its decider for this job: a local, so the
+            // name is let go where the job ends.
             let _acting = self.name.map(Decider::enter);
             let Job {
                 request,

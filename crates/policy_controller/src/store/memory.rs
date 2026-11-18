@@ -777,7 +777,8 @@ impl MemoryStore {
     }
 
     /// Whether no lock a journaled write takes is held at this instant:
-    /// the membership lock, the lease lock and the load lock, each tried.
+    /// the membership lock, the turn of the leases' file and the load lock,
+    /// each tried.
     #[cfg(test)]
     pub(crate) fn unlocked(&self) -> bool {
         self.workers.try_lock().is_some() && self.file.free() && self.loads.try_lock().is_some()
@@ -2350,8 +2351,8 @@ impl LeasesStore for MemoryStore {
     }
 
     fn set_term(&self, term: u64) {
-        // Taken before the lock, so dropped after it: a rise is told to the
-        // journal under the lease lock, and released once that is let go.
+        // Taken before the turn, so dropped after it: a rise is told to the
+        // journal under the turn, and released once that is let go.
         let _released = self.released();
         let mut leases = self.turn();
         if term > leases.term {
