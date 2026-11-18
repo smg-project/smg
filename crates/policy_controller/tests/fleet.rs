@@ -26,6 +26,10 @@
 //! client's answers alone: a load-led pick leaves the engine that holds
 //! requests, a rotation names each row in turn, a routing key returns to its
 //! worker and a retry leaves it, and no decision names the dead engine.
+//! A prompt returns to its worker as a key does: under the prefix preset a
+//! head of 256 tokens names one row whatever follows it, a routing key
+//! leads it, a retry walks to one next worker, and a boundary of the
+//! document's view keys a prompt at its stem.
 //! Each model decides under the profile its own binding names: a second
 //! pool, on the wire whose load report counts resident tokens, is asked
 //! under the resident form of the two-draw preset while the first turns a
@@ -153,6 +157,17 @@ fn ask(id: &[u8]) -> DecideRequest {
 /// The asks an assertion makes where one draw could hide what it reads.
 const ASKS: u64 = 64;
 
+/// Tokens a block: the view's, where a document names no size.
+const BLOCK: u32 = 16;
+
+/// The blocks of a prompt's head, what the prefix preset keys a request
+/// within: 256 tokens.
+const HEAD: u32 = 256 / BLOCK;
+
+/// The blocks of a prompt's stem, where the case's own view sets its
+/// boundary: 64 tokens.
+const STEM: u32 = 64 / BLOCK;
+
 /// A pick's first target: the row of the fleet it names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct Picked {
@@ -177,6 +192,26 @@ fn keyed(mut ask: DecideRequest, key: u64) -> DecideRequest {
         facts.session_key = Some(Identity {
             form: Some(Form::Hash(key)),
         });
+    }
+    ask
+}
+
+/// `ask` with the prefix block hashes of a prompt of `runs`, each so many
+/// blocks of one text. A block's hash names the prompt through its block:
+/// two prompts share the hashes of the blocks they share from the start and
+/// none past them.
+fn prompted(mut ask: DecideRequest, runs: &[(u32, u64)]) -> DecideRequest {
+    if let Some(facts) = &mut ask.facts {
+        let mut through = 0u64;
+        for &(blocks, text) in runs {
+            for _ in 0..blocks {
+                through = (through ^ text)
+                    .wrapping_mul(0x0100_0000_01b3)
+                    .rotate_left(29)
+                    | 1;
+                facts.block_hashes.push(through);
+            }
+        }
     }
     ask
 }
@@ -212,6 +247,13 @@ fn by_model() -> Result<PolicySpec, SpecError> {
         );
         document.profiles.insert(name, profile);
     }
+    Ok(document)
+}
+
+/// The prefix preset under a view whose one boundary stands at `tokens`.
+fn bounded_at(tokens: u32) -> Result<PolicySpec, SpecError> {
+    let mut document = PolicySpec::preset("prefix_hash")?;
+    document.view.boundaries = vec![tokens];
     Ok(document)
 }
 
@@ -634,6 +676,96 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             .await
             .expect("a pick answers an ask over a ready fleet");
         assert_ne!(next, owner, "a retry leaves the worker it names as tried");
+
+        // A prompt returns to its worker. Under the prefix preset an ask
+        // with no routing key is keyed by its prompt's head, the last whole
+        // block within 256 tokens: prompts that share a head name one row
+        // whatever follows it, and 64 heads do not all share that row.
+        harness
+            .apply("prefix_hash")
+            .expect("a preset of this build applies");
+        let home = picked(&mut harness, prompted(nth("head", 0), &[(HEAD, 1)]))
+            .await
+            .expect("a pick answers an ask over a ready fleet");
+        for n in 1..8 {
+            let longer = prompted(nth("head", n), &[(HEAD, 1), (HEAD, ASKS + n)]);
+            let again = picked(&mut harness, longer)
+                .await
+                .expect("a pick answers an ask over a ready fleet");
+            assert_eq!(again, home, "one head returns to one worker");
+        }
+        let mut homes = HashSet::from([home]);
+        for n in 1..ASKS {
+            let other = picked(&mut harness, prompted(nth("heads", n), &[(HEAD, n + 1)]))
+                .await
+                .expect("a pick answers an ask over a ready fleet");
+            homes.insert(other);
+        }
+        assert!(
+            homes.len() > 1,
+            "{ASKS} heads do not share one worker: {homes:?}"
+        );
+        // A routing key leads the prefix: whatever its head, a keyed ask
+        // names the worker the plain ring named for its key.
+        for n in 0..8 {
+            let led = keyed(prompted(nth("led", n), &[(HEAD, n + 1)]), 1);
+            let led = picked(&mut harness, led)
+                .await
+                .expect("a pick answers an ask over a ready fleet");
+            assert_eq!(led, owner, "a routing key leads the prefix");
+        }
+        // A retry that names its head's worker as tried walks to the ring's
+        // next one, the same worker at each retry.
+        let mut walked = HashSet::new();
+        for n in 0..8 {
+            let mut retry = prompted(nth("walk", n), &[(HEAD, 1), (HEAD, ASKS + n)]);
+            let facts = retry.facts.as_mut().expect("the ask states facts");
+            facts.tried = vec![home.id];
+            facts.attempt = 1;
+            let next = picked(&mut harness, retry)
+                .await
+                .expect("a pick answers an ask over a ready fleet");
+            assert_ne!(next, home, "a head's retry leaves the worker it tried");
+            walked.insert(next);
+        }
+        assert_eq!(
+            walked.len(),
+            1,
+            "past the worker it tried a head walks to one worker: {walked:?}"
+        );
+        // A boundary of the document's view moves the key. Prompts that
+        // share a stem of 64 tokens and nothing past it are 64 heads to the
+        // preset; under a view whose boundary stands at the stem's end
+        // they are keyed there, and name one row.
+        let mut apart = HashSet::new();
+        for n in 0..ASKS {
+            let ask = prompted(nth("stems", n), &[(STEM, 1), (HEAD - STEM, n + 2)]);
+            let pick = picked(&mut harness, ask)
+                .await
+                .expect("a pick answers an ask over a ready fleet");
+            apart.insert(pick);
+        }
+        assert!(
+            apart.len() > 1,
+            "past one stem {ASKS} heads do not share one worker: {apart:?}"
+        );
+        let at_stem = bounded_at(STEM * BLOCK).expect("a document of this build's preset");
+        harness
+            .apply_document(at_stem)
+            .expect("a document whose view names a boundary applies");
+        let mut together = HashSet::new();
+        for n in 0..ASKS {
+            let ask = prompted(nth("bounded", n), &[(STEM, 1), (HEAD - STEM, n + 2)]);
+            let pick = picked(&mut harness, ask)
+                .await
+                .expect("a pick answers an ask over a ready fleet");
+            together.insert(pick);
+        }
+        assert_eq!(
+            together.len(),
+            1,
+            "a boundary of the view keys a prompt at its stem: {together:?}"
+        );
 
         // Each model decides under the profile its binding names. One
         // document binds the counted model to the two-draw preset's
