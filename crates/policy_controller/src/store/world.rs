@@ -2927,7 +2927,8 @@ impl Writer {
         // A record no row took was heard for no engine, and no write before
         // this build knew the engine it is for: the word is carried to that
         // engine over no such record that came at or after the word's poll
-        // began, in that poll's answer or since.
+        // began. A record's write leaves one, for a rank that waits for
+        // this build; a poll's answer asks for the build first.
         if !fresh.is_empty() {
             silent.retain(|&(id, said)| {
                 let at = ranked.binary_search_by_key(&id, |&(of, ..)| of).ok();
@@ -3342,6 +3343,17 @@ impl Writer {
     /// membership in hand ([`Writer::build_owed`]).
     pub(super) fn build_due(&self, now: Instant) -> bool {
         self.owed.is_some() && self.due().is_some_and(|due| now >= due)
+    }
+
+    /// Whether the member `id` waits at `rank` for a build: a membership
+    /// write left one owed and no row of the member stands at the rank, by
+    /// the walk a load write folds a rank's record with ([`rows_at`]). A
+    /// rank inside the window of its registration reads so, and one a
+    /// refresh moved under its id. So does a worker that left while
+    /// another's build is owed: the caller knows its members.
+    pub(super) fn waits(&mut self, id: WorkerId, rank: u16) -> bool {
+        self.owed.is_some()
+            && rows_at(&self.places, &mut self.working, id, rank, |_| false).is_none()
     }
 
     /// Pay the build the membership writes left owed: the pools of

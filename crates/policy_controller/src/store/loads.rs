@@ -113,7 +113,9 @@ pub trait LoadSink: Send + Sync {
     /// answer names that rank or not. Whether a stream still serves a
     /// rank the poll was not for is the caller's to know, by the
     /// freshness it chose the poll's ranks with: it says the word only
-    /// for a poll that left out no such rank.
+    /// for a poll that left out no such rank. The crate's store pays the
+    /// build a rank the answer names still waits for before it writes the
+    /// answer, so an answer is read over the rows of every rank it names.
     fn report(
         &self,
         answer: &[(WorkerId, u16, Option<LoadRow>)],
@@ -157,9 +159,10 @@ pub trait LoadSink: Send + Sync {
     /// age says so meanwhile.
     ///
     /// The crate's store names the instant for one thing more: the build
-    /// its membership writes owe. No later write pays that build and no
-    /// load write is shown before it, so a host with no loop asks for it
-    /// ([`crate::store::MemoryStore::publish_now`]).
+    /// its membership writes owe. The store pays that build ahead of the
+    /// instant for one write alone, a poll's answer for a rank that has no
+    /// row yet, and no load write is shown before it, so a host with no
+    /// loop asks for it ([`crate::store::MemoryStore::publish_now`]).
     fn publish_due(&self) -> Option<Instant> {
         None
     }

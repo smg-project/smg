@@ -115,6 +115,30 @@ fn a_record_waits_while_a_build_is_owed_and_is_read_with_it() {
 }
 
 #[test]
+fn a_polls_answer_asks_for_the_build_a_worker_it_names_waits_for() {
+    let store = MemoryStore::new();
+    let t0 = Instant::now();
+    let [a, b, c] = [0, 1, 2].map(|index| store.upsert(worker(index)).id());
+    assert_eq!(store.membership_builds(), 0);
+    // The first answer names a worker with no row yet: it asks for the
+    // build, which takes in every write the window held. The answers after
+    // it find their workers' rows and ask for none.
+    for id in [a, b, c] {
+        store.report(&[(id, 0, Some(load(1, 0)))], t0, LoadSource::Poll);
+        assert_eq!(store.membership_builds(), 1);
+    }
+    assert_eq!(view(&store, &ask(t0)).0.len(), 3);
+    // Another worker's build is owed. An answer for a worker that has its
+    // row leaves it to the window, and so does one for a worker that left.
+    store.remove(c, revision(&store, c)).expect("removed");
+    store.upsert(worker(3));
+    store.report(&[(a, 0, Some(load(2, 0)))], t0, LoadSource::Poll);
+    store.report(&[(c, 0, None)], t0, LoadSource::Poll);
+    assert_eq!(store.membership_builds(), 2);
+    assert!(store.publish_due().is_some());
+}
+
+#[test]
 fn a_status_and_a_veto_are_read_at_their_answer_while_a_build_is_owed() {
     let store = MemoryStore::new();
     let t0 = Instant::now();
@@ -385,7 +409,7 @@ fn the_word_that_no_report_came_leaves_with_the_worker_it_was_said_of() {
 }
 
 #[test]
-fn a_poll_with_no_report_for_a_worker_that_returned_moves_no_verdict_before_its_build() {
+fn a_poll_with_no_report_for_a_worker_that_returned_moves_no_verdict_of_the_one_that_left() {
     let store = MemoryStore::with_publish_window(Duration::ZERO);
     let t0 = Instant::now();
     let id = member(&store, "http://a:8000");
@@ -401,10 +425,32 @@ fn a_poll_with_no_report_for_a_worker_that_returned_moves_no_verdict_before_its_
     let back = store
         .upsert(facts("http://a:8000", Role::Single, &[MODEL]))
         .id();
-    // The poll's word is the new registration's, whose engine is not built
-    // yet: it does not reach the engine of the one that left.
+    // The poll's word is the new registration's: the answer asks for its
+    // build and says the word of its engine, which has nothing on file. No
+    // verdict moves, and nothing of the one that left is read.
     store.report(&[(back, 0, None)], t0, LoadSource::Poll);
     assert_eq!(store.overload_flips(), 1);
+}
+
+#[test]
+fn the_word_that_no_report_came_is_said_of_a_worker_inside_its_window() {
+    let store = MemoryStore::with_publish_window(Duration::ZERO);
+    let t0 = Instant::now();
+    store
+        .apply(generation_with(1, block(8, 1.0)))
+        .expect("applied");
+    let id = store
+        .upsert(facts("http://a:8000", Role::Single, &[MODEL]))
+        .id();
+    // Its stream brings a queue past the threshold, and a poll that began
+    // after that record brings no report, both before the window's build.
+    // The answer asks for the build, which judges the worker from its
+    // record, and says the word of its engine: the verdict reads clear.
+    store.record(id, 0, pressure(9, 0), t0, LoadSource::Stream);
+    let (later, builds) = (t0 + Duration::from_millis(1), store.membership_builds());
+    store.report(&[(id, 0, None)], later, LoadSource::Poll);
+    assert_eq!(store.membership_builds(), builds + 1);
+    assert_eq!(overloaded(&store, later), []);
 }
 
 /// A rank of the two-rank engine, as its registration names it.
@@ -461,28 +507,26 @@ fn partial_poll_after(change: fn(&MemoryStore, WorkerId) -> WorkerId) {
     assert_eq!(overloaded(&store, t0), []);
     let again = change(&store, a);
     // The same poll after the change. A rank that returned has no row
-    // before its build: none takes its sample, and the word that no report
-    // came is said of the rank that stands. The build carries no word over
-    // a row the word's own poll brought, and judges the engine. A rank's
-    // new life stands in its rows and is heard at the poll's write.
+    // before its build: the answer asks for that build, and its row is
+    // heard for the engine at the poll's write. A rank's new life stands
+    // in its rows from its registration's answer, and is heard there too.
     let partial = [(again, 0, Some(pressure(9, 0))), (b, 1, None)];
     store.report(&partial, t0, LoadSource::Poll);
-    store.publish_now();
     assert_eq!(overloaded(&store, t0).len(), 2);
 }
 
 #[test]
-fn the_build_carries_no_word_over_the_row_a_poll_brought_a_returned_rank() {
+fn a_partial_poll_is_judged_the_same_after_a_rank_returned() {
     partial_poll_after(returns);
 }
 
 #[test]
-fn the_build_carries_no_word_over_the_row_a_poll_brought_a_restarted_rank() {
+fn a_partial_poll_is_judged_the_same_after_a_rank_restarted() {
     partial_poll_after(restarts);
 }
 
 #[test]
-fn the_build_carries_no_word_over_the_row_a_poll_brought_a_rank_new_to_its_engine() {
+fn a_polls_row_for_a_rank_new_to_its_engine_is_heard_for_the_engine() {
     let store = MemoryStore::with_publish_window(Duration::ZERO);
     let t0 = Instant::now();
     let a = rank_of(&store, "http://e:8000", 0);
@@ -490,12 +534,40 @@ fn the_build_carries_no_word_over_the_row_a_poll_brought_a_rank_new_to_its_engin
         .apply(generation_with(1, block(8, 1.0)))
         .expect("applied");
     // The second rank registers after the first was built, and the poll's
-    // answer comes inside its window.
+    // answer comes inside its window: the answer asks for the build, and
+    // the row is heard for the engine the two ranks share.
     let b = store.upsert(rank_facts(1)).id();
     let partial = [(a, 0, None), (b, 1, Some(pressure(9, 0)))];
     store.report(&partial, t0, LoadSource::Poll);
-    store.publish_now();
     assert_eq!(overloaded(&store, t0).len(), 2);
+}
+
+#[test]
+fn an_answer_that_names_a_rank_inside_its_window_marks_the_rank_it_leaves_out() {
+    let store = MemoryStore::with_publish_window(Duration::ZERO);
+    let t0 = Instant::now();
+    let a = rank_of(&store, "http://e:8000", 0);
+    let b = store.upsert(rank_facts(1)).id();
+    // No threshold stands. The answer names the rank that just registered
+    // and leaves out the one that was built: that rank is avoided from this
+    // write on, as beside a named rank that has its row.
+    let partial = [(a, 0, None), (b, 1, Some(load(2, 0)))];
+    store.report(&partial, t0, LoadSource::Poll);
+    assert_eq!(overloaded(&store, t0), [a]);
+}
+
+#[test]
+fn an_answer_that_leaves_out_a_rank_inside_its_window_marks_that_rank() {
+    let store = MemoryStore::with_publish_window(Duration::ZERO);
+    let t0 = Instant::now();
+    let a = rank_of(&store, "http://e:8000", 0);
+    let b = store.upsert(rank_facts(1)).id();
+    // The answer names the rank that was built and leaves out the one that
+    // just registered: the build the answer asks for lists it, and it is
+    // avoided from this write on.
+    let partial = [(a, 0, Some(load(1, 0))), (b, 1, None)];
+    store.report(&partial, t0, LoadSource::Poll);
+    assert_eq!(overloaded(&store, t0), [b]);
 }
 
 /// The engine's word that no report came stands, with a record past the
@@ -575,10 +647,10 @@ fn a_poll_with_no_report_for_either_rank_says_the_word_after_one_returned() {
     assert_eq!(overloaded(&store, t0).len(), 2);
     let back = returns(&store, a);
     // No row for the rank that returned and none for the one that stayed:
-    // the word that no report came is the engine's, and the build carries
-    // it over the record still on file.
+    // the answer asks for the build, which judges the engine from the
+    // record still on file, and the word that no report came is said of
+    // the engine both ranks stand in.
     store.report(&[(back, 0, None), (b, 1, None)], t0, LoadSource::Poll);
-    store.publish_now();
     assert_eq!(overloaded(&store, t0), []);
 }
 
@@ -686,7 +758,7 @@ fn moves(store: &MemoryStore, id: WorkerId) -> WorkerId {
 }
 
 #[test]
-fn the_build_carries_no_word_over_the_row_a_poll_brought_a_rank_moved_under_its_id() {
+fn a_polls_row_for_a_rank_moved_under_its_id_is_heard_at_its_new_rank() {
     let store = MemoryStore::with_publish_window(Duration::ZERO);
     let t0 = Instant::now();
     let [a, b] = two_ranks(&store);
@@ -695,12 +767,11 @@ fn the_build_carries_no_word_over_the_row_a_poll_brought_a_rank_moved_under_its_
     assert_eq!(overloaded(&store, t0), []);
     let moved = moves(&store, b);
     // The poll omits rank 0 and brings the moved rank a row at its new rank
-    // before the build. The member's row stands at the rank it left and
-    // takes none, and the word that no report came is said of the engine.
-    // The build asks what the load write asked and carries no word over it.
+    // before the build, with the member's row still at the rank it left.
+    // The answer asks for the build, and the row is heard where the member
+    // now stands.
     let partial = [(a, 0, None), (moved, 2, Some(pressure(9, 0)))];
     store.report(&partial, t0, LoadSource::Poll);
-    store.publish_now();
     assert_eq!(overloaded(&store, t0).len(), 2);
 }
 

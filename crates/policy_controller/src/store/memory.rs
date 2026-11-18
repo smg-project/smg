@@ -66,12 +66,14 @@ pub struct MemoryStore {
     /// first, as the health writers take it). A load write goes into its
     /// worker's entry or is dropped, under this lock alone: the entry is the
     /// membership test, so a read that lands after a removal re-creates
-    /// nothing and a replaced incarnation starts empty. The world's write
-    /// side sits behind the same lock: a record is on file and folded into
-    /// the working rows in one step, and every world is made and shown
-    /// under it, so the deciders see the worlds in the order they were
-    /// made. It is the last lock a writer takes: the workers lock, then the
-    /// health lock, then this one.
+    /// nothing and a replaced incarnation starts empty. One load write takes
+    /// the workers lock first: a poll's answer for a rank that waits for its
+    /// build, which it pays ([`LoadSink::report`]). The world's write side
+    /// sits behind the same lock: a record is on file and folded into the
+    /// working rows in one step, and every world is made and shown under
+    /// it, so the deciders see the worlds in the order they were made. It
+    /// is the last lock a writer takes: the workers lock, then the health
+    /// lock, then this one.
     loads: Mutex<Loads>,
     /// The KV lanes and the indexes they write, behind locks of their own
     /// ([`KvTables`]): a membership write takes the table's after the
@@ -695,8 +697,9 @@ impl MemoryStore {
     /// ([`MembershipChange::as_lifecycle`]). Called by every membership
     /// write under the workers lock, after the write left its build owed or
     /// paid its leave's, and with the load lock let go: the engine hears the
-    /// writes in their order, a load write waits for no stage, and an apply,
-    /// which takes the workers lock, moves no generation in between. A leave
+    /// writes in their order, a load write under the load lock alone waits
+    /// for no stage, and an apply, which takes the workers lock, moves no
+    /// generation in between. A leave
     /// is told after the build that takes its rows out of their pools: the
     /// worker is in no pool when its write returns, whoever wrote. A join is
     /// told when the store takes it, and the world that lists its row
@@ -777,8 +780,9 @@ impl MemoryStore {
     /// due instant ([`LoadSink::publish_due`]), and they are in force for
     /// decisions when it ends. A caller that needs its own write in force
     /// at once asks here: a test, a bench's fill, a host with no loop. The
-    /// ask builds the whole membership under the workers lock and the load
-    /// lock: a writer's wait, never a decision's.
+    /// store asks for itself before it writes a poll's answer for a rank
+    /// that has no row yet. The ask builds the whole membership under the
+    /// workers lock and the load lock: a writer's wait, never a decision's.
     pub fn publish_now(&self) {
         let workers = self.workers.lock();
         self.pay(&workers, None);
@@ -1668,6 +1672,18 @@ struct Loads {
     writer: Writer,
 }
 
+impl Loads {
+    /// Whether a rank `answer` names waits for a build ([`Writer::waits`]):
+    /// a member's rank with no row for the answer's words to be written
+    /// on. A worker with no entry here is no member and waits for none.
+    fn waits(&mut self, answer: &[(WorkerId, u16, Option<LoadRow>)]) -> bool {
+        let Self { ranks, writer } = self;
+        answer
+            .iter()
+            .any(|&(id, rank, _)| writer.waits(id, rank) && ranks.contains_key(&id))
+    }
+}
+
 impl LoadSink for MemoryStore {
     fn record(
         &self,
@@ -1715,6 +1731,23 @@ impl LoadSink for MemoryStore {
         source: LoadSource,
     ) {
         let mut loads = self.loads.lock();
+        // A rank the answer names may have no row yet, inside the window of
+        // its registration or of a refresh that moved it. Written now, its
+        // row would be heard for no engine, the word that no report came
+        // would be said of none, and a rank left out beside it would take
+        // no mark. The build the window owes is paid first, as an ask pays
+        // it, with the load lock let go for it: one build an answer at the
+        // most, none where every rank the answer names has its row, and
+        // none for a record, whose rank the build reads by what it
+        // reported. The workers lock stays held to the answer's own write:
+        // no membership write stands between the build and the answer.
+        let _membership = loads.waits(answer).then(|| {
+            MutexGuard::unlocked(&mut loads, || {
+                let workers = self.workers.lock();
+                self.pay(&workers, None);
+                workers
+            })
+        });
         let Loads {
             ranks: table,
             writer,
@@ -1817,10 +1850,11 @@ impl LoadSink for MemoryStore {
                 // No row came for the engine: the word that none came,
                 // unless a rank of it pushed since the poll began, whether
                 // the answer names that rank or not. The word is shown
-                // where it moves a verdict. A rank inside the window of its
-                // registration, or of a refresh that moved it, has no row
-                // at its rank here: the build reads what it reported against
-                // the word and the instant this poll began.
+                // where it moves a verdict. A rank the answer does not name
+                // may stand inside the window of its registration, or of a
+                // refresh that moved it, with no row at its rank here: the
+                // build reads what it reported against the word and the
+                // instant this poll began.
                 let pushed = writer.ranks_of(engine).any(|(id, rank)| {
                     table
                         .get(&id)
