@@ -1,8 +1,9 @@
 pub(crate) mod bootstrap_probe;
-pub mod circuit_breaker;
-pub(crate) mod liveness;
 pub mod manager;
-pub mod resilience;
 
-// The worker crate's, at the path it had here.
-pub use smg_worker::health::overload;
+#[cfg(test)]
+mod gateway_tests;
+
+pub(crate) use smg_worker::health::liveness;
+// The worker crate's, at the paths they had here.
+pub use smg_worker::health::{circuit_breaker, overload, resilience};
