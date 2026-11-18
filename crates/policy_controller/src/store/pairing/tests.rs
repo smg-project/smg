@@ -356,7 +356,8 @@ fn a_normalized_descriptor_holds_no_blank_value() {
         ],
     };
     assert!(!written.is_normalized());
-    let read = written.normalized();
+    let mut read = written;
+    read.normalize();
     assert_eq!(
         read,
         PairingDescriptor {
@@ -367,8 +368,10 @@ fn a_normalized_descriptor_holds_no_blank_value() {
         }
     );
     assert!(read.is_normalized());
-    // A descriptor that holds no blank comes back as it is.
-    assert_eq!(read.clone().normalized(), read);
+    // A descriptor that holds no blank stays as it is.
+    let mut again = read.clone();
+    again.normalize();
+    assert_eq!(again, read);
     assert!(PairingDescriptor::default().is_normalized());
 }
 

@@ -48,19 +48,21 @@ use std::{
 
 use tokio::sync::mpsc;
 use tonic::{codegen::tokio_stream::Stream, Code, Status, Streaming};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use super::{
     decide,
+    floor::{unbelieved, Told, FLOORS_SPENT_MAX, FLOOR_REACH},
     gateways::{over_kinds, Refused, Seat, Vetoed, KINDS_MAX, VETOES_MAX},
     lifecycle,
     principal::Principal,
     service::Shared,
+    wire::millis,
     PROTOCOL_VERSION,
 };
 use crate::{
     proto::{self, controller_frame, gateway_frame::Frame},
-    store::GatewayId,
+    store::{leases::DISPATCH_TTL, Hand},
     view::WorkerId,
 };
 
@@ -246,10 +248,6 @@ const fn kind(frame: &Frame) -> &'static str {
     }
 }
 
-fn millis(duration: Duration) -> u32 {
-    u32::try_from(duration.as_millis()).unwrap_or(u32::MAX)
-}
-
 /// One session, from its first frame to its end. `Some` is the status the
 /// stream ends with; `None` is a stream the gateway closed.
 async fn session(
@@ -324,7 +322,7 @@ async fn session(
     let Some(term) = shared.fence.leader_term(now) else {
         return Some(not_leading(shared, answers).await);
     };
-    if let Some(status) = floor(first.term_floor, term) {
+    if let Some(status) = floor(shared, &principal.subject, first.term_floor, term) {
         return Some(status);
     }
     let gateway = principal.gateway();
@@ -362,12 +360,11 @@ async fn session(
         }),
         needs,
         hashing,
-        // A decide stream's credit at its open, and the streams a gateway
-        // holds at most. No lease is issued yet: the call that issues one
-        // sets the dispatch TTL.
+        // A decide stream's credit at its open, the streams a gateway holds
+        // at most, and the time it has to name the dispatch of a lease.
         decide_window: decide::WINDOW,
         max_decide_streams: decide::MAX_STREAMS,
-        dispatch_ttl_ms: 0,
+        dispatch_ttl_ms: millis(DISPATCH_TTL),
         grace_period_ms: millis(shared.gateways.grace()),
         leader_poll_ms: millis(LEADER_POLL),
         // The design sends no page: no lease and no pin is restored.
@@ -387,6 +384,9 @@ async fn session(
         "a gateway is welcomed"
     );
 
+    // The session's hand-over at the leases' file: what its frames say of
+    // a lease is handed there, and applied before the session leaves.
+    let hand = lifecycle::open(&shared.store, gateway);
     let status = loop {
         tokio::select! {
             frame = inbound.message() => {
@@ -395,7 +395,7 @@ async fn session(
                     Ok(None) => break None,
                     Err(status) => break Some(unread("a Session frame", status)),
                 };
-                if let Some(status) = judge(shared, gateway, term, &seat, &frame, answers).await {
+                if let Some(status) = judge(shared, &principal.subject, &hand, term, &seat, &frame, answers).await {
                     break Some(status);
                 }
             }
@@ -412,6 +412,7 @@ async fn session(
         }
     };
     debug!(gateway = %principal.subject, term, ended = ?status.as_ref().map(Status::code), "a gateway's session ended");
+    shared.store.hand_back(hand);
     // The seat's drop starts the gateway's grace period.
     drop(seat);
     status
@@ -435,13 +436,47 @@ async fn fenced(shared: &Shared, term: u64, now: Instant, answers: &mut Answers)
 }
 
 /// A floor above the term this replica leads under: it has not noticed it
-/// lost.
-fn floor(floor: u64, term: u64) -> Option<Status> {
-    (floor > term).then(|| {
-        Status::failed_precondition(format!(
-            "the gateway's term floor {floor} is above this controller's term {term}"
-        ))
-    })
+/// lost, or its lease was wiped beside a gateway that remembers. The frame
+/// is refused, and the floor is said to the election once a rising floor
+/// (the shared state's `floors`): the leader gives the lease up and the
+/// next take is above the floor. A floor that is not believed
+/// ([`unbelieved`]) is refused by its field's name and says nothing. Past
+/// the budget of terms one process moves on such floors the frame is
+/// refused in the same words and nothing is said, and so is a floor whose
+/// take would land past the reach of every process's floors.
+fn floor(shared: &Shared, subject: &str, floor: u64, term: u64) -> Option<Status> {
+    if floor <= term {
+        return None;
+    }
+    if let Some(why) = unbelieved(floor, term) {
+        return Some(Status::invalid_argument(why));
+    }
+    match shared.floors.say(floor, term) {
+        Told::Said => warn!(
+            gateway = %subject,
+            floor,
+            term,
+            "a gateway's term floor is above this controller's term; the election is told to leave the lease"
+        ),
+        Told::Spent { first: true } => warn!(
+            gateway = %subject,
+            floor,
+            term,
+            budget = FLOORS_SPENT_MAX,
+            "this process has too few terms left for a gateway's floor; a floor past what is left is refused and moves nothing until the process starts again"
+        ),
+        Told::Past { first: true } => warn!(
+            gateway = %subject,
+            floor,
+            term,
+            reach = FLOOR_REACH,
+            "a gateway's term floor is past the terms a floor may move the lease to; it is refused and moves nothing, also after a restart"
+        ),
+        Told::Kept | Told::Spent { first: false } | Told::Past { first: false } => {}
+    }
+    Some(Status::failed_precondition(format!(
+        "the gateway's term floor {floor} is above this controller's term {term}"
+    )))
 }
 
 /// The end of a session a newer one of its gateway replaced.
@@ -526,7 +561,8 @@ fn vetoed(seat: &Seat, veto: &proto::GatewayVeto, now: Instant) -> Option<Status
 /// kind's arm. `Some` ends the session; the frame is then not applied.
 async fn judge(
     shared: &Shared,
-    gateway: GatewayId,
+    subject: &str,
+    hand: &Hand,
     term: u64,
     seat: &Seat,
     frame: &proto::GatewayFrame,
@@ -543,7 +579,7 @@ async fn judge(
     if let Some(status) = fenced(shared, term, now, answers).await {
         return Some(status);
     }
-    if let Some(status) = floor(frame.term_floor, term) {
+    if let Some(status) = floor(shared, subject, frame.term_floor, term) {
         return Some(status);
     }
     match &frame.frame {
@@ -553,14 +589,12 @@ async fn judge(
             "a session stands on this stream: a second Hello needs a new stream",
         )),
         Some(Frame::Dispatched(dispatched)) => {
-            lifecycle::dispatched(&shared.store, gateway, dispatched, now).err()
+            lifecycle::dispatched(&shared.store, hand, dispatched, now).err()
         }
         Some(Frame::Completed(completed)) => {
-            lifecycle::completed(&shared.store, gateway, completed, now).err()
+            lifecycle::completed(&shared.store, hand, completed, now).err()
         }
-        Some(Frame::Released(released)) => {
-            lifecycle::released(&shared.store, gateway, released).err()
-        }
+        Some(Frame::Released(released)) => lifecycle::released(&shared.store, hand, released).err(),
         Some(Frame::Veto(veto)) => vetoed(seat, veto, now),
         Some(unserved @ (Frame::HelloPage(_) | Frame::SpecAck(_))) => Some(Status::unimplemented(
             format!("{} is not served by this build", kind(unserved)),
@@ -593,13 +627,14 @@ mod tests {
     use tonic_prost::ProstCodec;
 
     use super::{
-        judge, refusal, release, Answers, GRACE_PERIOD, HELLO_DEADLINE, LEADER_POLL, LISTED_MAX,
-        OUT_QUEUE, PRESENT_MAX, RELEASE_MAX,
+        floor, judge, refusal, release, Answers, GRACE_PERIOD, HELLO_DEADLINE, LEADER_POLL,
+        LISTED_MAX, OUT_QUEUE, PRESENT_MAX, RELEASE_MAX,
     };
     use crate::{
         controller::{
             config::Scope,
-            election::{LeasePlace, Standing},
+            election::{LeasePlace, Said, Standing},
+            floor::{FLOORS_SPENT_MAX, FLOOR_BELIEVED, FLOOR_REACH},
             gateways::{
                 tests::{lease, PATIENT},
                 Gateways, Refused, KINDS_MAX, VETOES_MAX,
@@ -900,7 +935,7 @@ mod tests {
                     decide_window: 128,
                     max_decide_streams: 256,
                     grace_period_ms: 10_000,
-                    dispatch_ttl_ms: 0,
+                    dispatch_ttl_ms: 5_000,
                     leader_poll_ms: 1_000,
                     leases_restored: 0,
                     pins_restored: 0,
@@ -1008,6 +1043,190 @@ mod tests {
         session.send(frame(1, None)).await;
         session.send(frame(2, None)).await;
         assert_eq!(session.status().await, refusal);
+    }
+
+    /// The floor's word. A believed floor above the term is said to the
+    /// election once a rising floor, at a later frame or at a `Hello`, and
+    /// the refusal reads as before. A floor at the term says nothing. One
+    /// past the believed range is refused by its field's name and says
+    /// nothing.
+    #[tokio::test]
+    async fn a_floor_above_the_term_is_said_to_the_election_once_a_rising_floor() {
+        let mut bed = bed(PATIENT).await;
+        bed.leads(1);
+        let (door, said) = Said::door();
+        bed.shared.floors.open(door);
+        let refused = |floor: u64| {
+            (
+                Code::FailedPrecondition,
+                format!("the gateway's term floor {floor} is above this controller's term 1"),
+            )
+        };
+        let hello_under = |floor: u64| {
+            let mut hello = hello(GATEWAY);
+            hello.term_floor = floor;
+            hello
+        };
+
+        // At a frame after the Welcome. The frame before it, at the term,
+        // says nothing.
+        let mut session = open(bed.addr).await;
+        session.welcomed(1).await;
+        session.send(frame(1, None)).await;
+        session.send(frame(3, None)).await;
+        assert_eq!(session.status().await, refused(3));
+        assert_eq!(said.terms(), [3]);
+
+        // At a Hello: the same floor is said no second time, a higher one
+        // is, and a lower one after it is refused and not said.
+        let mut session = open(bed.addr).await;
+        session.send(hello_under(3)).await;
+        assert_eq!(session.status().await, refused(3));
+        assert!(said.terms().is_empty());
+        let mut session = open(bed.addr).await;
+        session.send(hello_under(5)).await;
+        assert_eq!(session.status().await, refused(5));
+        let mut session = open(bed.addr).await;
+        session.send(hello_under(4)).await;
+        assert_eq!(session.status().await, refused(4));
+        assert_eq!(said.terms(), [5]);
+
+        // Past the believed range, at a Hello and at a later frame: the
+        // field's name, and no word.
+        let far = 2 + FLOOR_BELIEVED;
+        let unbelieved = (
+            Code::InvalidArgument,
+            format!(
+                "term_floor is {far}: a floor is believed up to {FLOOR_BELIEVED} above this controller's term 1"
+            ),
+        );
+        let mut session = open(bed.addr).await;
+        session.send(hello_under(far)).await;
+        assert_eq!(session.status().await, unbelieved);
+        let mut session = open(bed.addr).await;
+        session.welcomed(1).await;
+        session.send(frame(far, None)).await;
+        assert_eq!(session.status().await, unbelieved);
+        assert!(said.terms().is_empty());
+    }
+
+    /// The word's log line: one a rising floor, with the gateway, the floor
+    /// and the term.
+    #[tokio::test]
+    async fn the_floors_word_logs_one_line_a_rising_floor() {
+        // The subscriber of the Welcome's log case, for the same reason.
+        let lines = Logged::default();
+        let writer = lines.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _beside = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+        let _kept = tracing::subscriber::set_default(subscriber);
+
+        let mut bed = bed(PATIENT).await;
+        bed.leads(1);
+        let (door, said) = Said::door();
+        bed.shared.floors.open(door);
+        for _ in 0..2 {
+            let mut session = open(bed.addr).await;
+            let mut high = hello(GATEWAY);
+            high.term_floor = 3;
+            session.send(high).await;
+            assert_eq!(session.status().await.0, Code::FailedPrecondition);
+        }
+        assert_eq!(said.terms(), [3]);
+
+        let logged = String::from_utf8(lines.0.lock().clone()).expect("the lines are text");
+        let line = "a gateway's term floor is above this controller's term";
+        assert_eq!(logged.matches(line).count(), 1, "{logged}");
+        assert!(
+            logged.contains("gateway=gateway-a floor=3 term=1"),
+            "{logged}"
+        );
+    }
+
+    /// The floors one process says spend a budget of terms. Fifteen of
+    /// the whole believed range fit, each above the term the one before it
+    /// left and each with its take's term. The sixteenth is past the
+    /// budget: refused in the same words, it says nothing, and the log
+    /// says so once.
+    #[tokio::test]
+    async fn a_floor_past_the_budget_of_terms_is_refused_as_before_and_says_nothing() {
+        // The subscriber of the Welcome's log case, for the same reason.
+        let lines = Logged::default();
+        let writer = lines.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _beside = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+        let _kept = tracing::subscriber::set_default(subscriber);
+
+        let bed = bed(PATIENT).await;
+        let (door, said) = Said::door();
+        bed.shared.floors.open(door);
+        let mut term = 1;
+        for _ in 1..FLOORS_SPENT_MAX / FLOOR_BELIEVED {
+            let high = term + FLOOR_BELIEVED;
+            let status = floor(&bed.shared, GATEWAY, high, term).expect("refused");
+            assert_eq!(status.code(), Code::FailedPrecondition);
+            assert_eq!(said.terms(), [high]);
+            term = high + 1;
+        }
+        let high = term + FLOOR_BELIEVED;
+        for _ in 0..2 {
+            let status = floor(&bed.shared, GATEWAY, high, term).expect("refused");
+            assert_eq!(status.code(), Code::FailedPrecondition);
+            assert_eq!(
+                status.message(),
+                format!("the gateway's term floor {high} is above this controller's term {term}")
+            );
+        }
+        assert!(said.terms().is_empty());
+
+        let logged = String::from_utf8(lines.0.lock().clone()).expect("the lines are text");
+        let line = "this process has too few terms left for a gateway's floor";
+        assert_eq!(logged.matches(line).count(), 1, "{logged}");
+    }
+
+    /// The floors of every process move the lease to the reach and no
+    /// further: a floor whose take would land past it is refused in the
+    /// same words, it says nothing, and the log says so once.
+    #[tokio::test]
+    async fn a_floor_past_the_reach_is_refused_as_before_and_says_nothing() {
+        // The subscriber of the Welcome's log case, for the same reason.
+        let lines = Logged::default();
+        let writer = lines.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _beside = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+        let _kept = tracing::subscriber::set_default(subscriber);
+
+        let bed = bed(PATIENT).await;
+        let (door, said) = Said::door();
+        bed.shared.floors.open(door);
+        // The last floor a word moves the lease for: its take is the reach.
+        let term = FLOOR_REACH - 2;
+        let status = floor(&bed.shared, GATEWAY, FLOOR_REACH - 1, term).expect("refused");
+        assert_eq!(status.code(), Code::FailedPrecondition);
+        assert_eq!(said.terms(), [FLOOR_REACH - 1]);
+        let term = FLOOR_REACH;
+        for high in [term + 1, term + 2] {
+            let status = floor(&bed.shared, GATEWAY, high, term).expect("refused");
+            assert_eq!(status.code(), Code::FailedPrecondition);
+            assert_eq!(
+                status.message(),
+                format!("the gateway's term floor {high} is above this controller's term {term}")
+            );
+        }
+        assert!(said.terms().is_empty());
+
+        let logged = String::from_utf8(lines.0.lock().clone()).expect("the lines are text");
+        let line = "a gateway's term floor is past the terms a floor may move the lease to";
+        assert_eq!(logged.matches(line).count(), 1, "{logged}");
     }
 
     #[tokio::test]
@@ -1317,9 +1536,17 @@ mod tests {
 
         // While its seat stands the session's frame is applied.
         let report = frame(1, Some(Frame::Completed(a_completed(1, first))));
-        assert!(judge(&bed.shared, gateway, 1, &seat, &report, &mut answers)
-            .await
-            .is_none());
+        assert!(judge(
+            &bed.shared,
+            GATEWAY,
+            &super::lifecycle::open(&bed.shared.store, gateway),
+            1,
+            &seat,
+            &report,
+            &mut answers
+        )
+        .await
+        .is_none());
         assert!(store.completed_ok_since(gateway, first, now));
 
         let newer = bed
@@ -1328,9 +1555,17 @@ mod tests {
             .welcome(gateway, GATEWAY, 1, now)
             .expect("a seat");
         let late = frame(1, Some(Frame::Completed(a_completed(1, second))));
-        let status = judge(&bed.shared, gateway, 1, &seat, &late, &mut answers)
-            .await
-            .expect("the replaced session ends");
+        let status = judge(
+            &bed.shared,
+            GATEWAY,
+            &super::lifecycle::open(&bed.shared.store, gateway),
+            1,
+            &seat,
+            &late,
+            &mut answers,
+        )
+        .await
+        .expect("the replaced session ends");
         assert_eq!(
             (status.code(), status.message()),
             (
@@ -1346,11 +1581,17 @@ mod tests {
         // The session that replaced it was never told: its frame is applied.
         let third = worker(&store, "http://c:8000");
         let report = frame(1, Some(Frame::Completed(a_completed(1, third))));
-        assert!(
-            judge(&bed.shared, gateway, 1, &newer, &report, &mut answers)
-                .await
-                .is_none()
-        );
+        assert!(judge(
+            &bed.shared,
+            GATEWAY,
+            &super::lifecycle::open(&bed.shared.store, gateway),
+            1,
+            &newer,
+            &report,
+            &mut answers
+        )
+        .await
+        .is_none());
         assert!(store.completed_ok_since(gateway, third, now));
     }
 

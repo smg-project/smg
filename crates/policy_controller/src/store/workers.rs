@@ -2,11 +2,11 @@
 //! that change it and the watch the gateways' pools derive from (design 5.1,
 //! the workers row; 5.2, `WatchWorkers`).
 
-use std::{collections::BTreeMap, time::Instant};
+use std::{collections::BTreeMap, sync::Arc, time::Instant};
 
 use crate::{
     lease::Membership,
-    store::{pairing::PairingDescriptor, GatewayId},
+    store::{encoding::EncodeOffer, pairing::PairingDescriptor, GatewayId},
     view::{fingerprint, Role, WireModes, WorkerId},
 };
 
@@ -139,8 +139,19 @@ pub struct WorkerFacts {
     /// member or an offer and where a generation moves the pairing mode
     /// ([`pairing`](super::pairing)): a registration hands no class in. The
     /// door drops a blank value and reads a name past its blanks. Behind a
-    /// pointer: a worker that reports none holds one word for it.
-    pub pairing: Option<Box<PairingDescriptor>>,
+    /// shared pointer: a worker that reports none holds one word for it,
+    /// and every copy of a row shares the one its worker reported.
+    pub pairing: Option<Arc<PairingDescriptor>>,
+    /// The worker's end of the encode handoff, as the handshake learned it;
+    /// the default states none. The store derives the encode classes from
+    /// it, with the engine kind as the runtime, where a membership write
+    /// moves a member or an offer and where a generation moves the pairing
+    /// mode ([`encoding`](super::encoding)). The door drops a blank
+    /// connector and reads its name past its blanks.
+    pub encode: EncodeOffer,
+    /// The worker takes images, as its registration states: an encoder
+    /// encodes them and a decode attends to them.
+    pub vision: bool,
     /// The engine's admission window (maximum running requests); `None`
     /// when it reports none.
     pub max_running: Option<u32>,
@@ -177,7 +188,9 @@ pub struct WorkerRow {
     pub status: WorkerStatus,
     /// Counts the row's stated facts: it moves on every write of them (a
     /// registration's refresh, a patch) and on no status change. The guard
-    /// a racing write names.
+    /// a racing write names. The world's writer carries a member's fields
+    /// under the view's lists while it stands, so a write of the facts must
+    /// move it.
     pub revision: u64,
     /// When the row was created on the host's clock.
     pub admitted_at: Instant,
@@ -270,6 +283,20 @@ pub enum MembershipTail {
 /// store's buffer it is told to snapshot again. The snapshot carries the
 /// facts the gateways' pools derive from (role, wire modes, engine kind,
 /// reachability), never a pool list.
+///
+/// A write is answered once its row is written, told to the journal and
+/// counted in the epoch. What a decision reads follows it. The crate's
+/// store builds its pools from the membership once a publication window
+/// ([`crate::store::PUBLISH_WINDOW`]), however many writes the window
+/// took. The build of a registration, its refresh and a patch starts
+/// within one window of their answer, where the store's host pays the due
+/// instant ([`crate::store::LoadSink::publish_due`]), and they are in force
+/// for decisions when it ends. A caller that needs its own write in force
+/// at once, or whose host runs no loop, asks for the build
+/// ([`crate::store::MemoryStore::publish_now`]). A removal and a replaced
+/// incarnation pay the build before they answer, and a status change is
+/// published with its answer: no decision made after it is handed the
+/// worker.
 pub trait WorkersStore: Send + Sync {
     /// A registration or its refresh. A new key is `Registered`; the same key
     /// with another incarnation is `Replaced` (the old id leaves with its

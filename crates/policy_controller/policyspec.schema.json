@@ -53,7 +53,7 @@
   ],
   "$defs": {
     "ViewSpec": {
-      "description": "What the host builds into every decision's view beyond the facts it\nderives itself: the request headers a stage may read, and the hashing\ninputs a host keeps until it learns them from its engines.",
+      "description": "What the host builds into every decision's view beyond the facts it\nderives itself: the request headers a stage may read, the hashing\ninputs a host keeps until it learns them from its engines, and the\nlists a worker's row names its labels, its zone and its engine family\nby.",
       "type": "object",
       "properties": {
         "headers": {
@@ -91,6 +91,30 @@
           "minimum": 1,
           "maximum": 8190,
           "default": 256
+        },
+        "labels": {
+          "description": "The worker labels a stage may read, each a selector of one label\nkey: `key` (the worker carries the label, whatever its value) or\n`key=value` (it carries the label with that value), split at the\nfirst `=`. A worker's row holds one bit for each selector it meets,\nin this order. At most 64; empty for none.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 64
+        },
+        "zones": {
+          "description": "The zones a stage may tell apart. A worker's row names its zone by\nits position in this list, from 1; a worker with no zone reads 0,\nand so does one whose zone this list does not name. At most 256;\nempty for none, where every row reads 0.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 256
+        },
+        "engines": {
+          "description": "The engine families a stage may tell apart, spelled as a worker's\nregistration spells its own. A worker's row names its family by its\nposition in this list, from 1; a worker whose family this list does\nnot name reads 0. At most 64; empty for none, where every row reads\n0.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 64
         }
       },
       "additionalProperties": false
@@ -147,7 +171,7 @@
       "type": "object",
       "properties": {
         "filter": {
-          "description": "The hard filters, in order.",
+          "description": "The hard filters, in order. Which workers the hard filters keep does\nnot turn on their order; a shed's reason does: a shed names the\nfirst filter, in this order, that left nobody.",
           "type": "array",
           "items": {
             "type": "string"
@@ -603,7 +627,7 @@
       "additionalProperties": false
     },
     "BucketParams": {
-      "description": "The bucket scorer: prefill placement by request-size buckets whose\nboundaries a periodic task adjusts.",
+      "description": "The bucket scorer: prefill placement by request size, over ranges of\nsizes. A cut of the ranges falls due each interval and is made, from the\ntokens booked on the workers, where a worker's share of them moved by\nmore than a factor of two since the last cut or the listing changed.",
       "type": "object",
       "properties": {
         "weight": {
@@ -614,7 +638,7 @@
           "exclusiveMinimum": 0
         },
         "abs_threshold": {
-          "description": "The absolute part of the balance rule, in requests (default 64).",
+          "description": "The absolute part of the balance rule, in booked tokens (default 64).",
           "type": [
             "integer",
             "null"
@@ -632,7 +656,7 @@
           "minimum": 1.0
         },
         "adjust_interval_s": {
-          "description": "The boundary task's cadence, in seconds; above zero (default 5).",
+          "description": "The bookings' window and the cut's cadence, in seconds; above zero\n(default 5).",
           "type": [
             "integer",
             "null"
@@ -1137,7 +1161,7 @@
           "exclusiveMinimum": 0
         },
         "shed_when_all_vetoed": {
-          "description": "Shed with a 503 when every usable worker is vetoed, instead of\nfalling back to the least-vetoed one.",
+          "description": "Shed with a 503 when every usable worker is vetoed, instead of\nfalling back to the least-vetoed one. The same word decides what a\nsession key does while its own worker is vetoed, where the ring\nalone places the request: under the single plan, in a profile whose\nonly scorer is `consistent-hash` with no `prefix_tokens` and no\n`bounded_load`, picked by `best` with no parameters, under no\nsessions rule or one that delegates. Set, the key moves to the\nring's next worker; unset, the key stays on its worker over the\nveto. Everywhere else a keyed request keeps the veto.",
           "type": "boolean",
           "default": false
         }

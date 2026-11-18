@@ -69,17 +69,12 @@ where
     let secs = (*timestamp / 1_000_000_000) as i64;
     let nanos = (*timestamp % 1_000_000_000) as u32;
 
-    match DateTime::<Utc>::from_timestamp(secs, nanos) {
-        Some(dt) => {
-            let s = dt.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
-            serializer.serialize_str(&s)
-        }
-        None => {
-            // Fallback: format manually if timestamp is out of range
-            let s = format!("{timestamp}");
-            serializer.serialize_str(&s)
-        }
-    }
+    let s = match DateTime::<Utc>::from_timestamp(secs, nanos) {
+        Some(dt) => dt.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+        // Fallback: format manually if timestamp is out of range
+        None => format!("{timestamp}"),
+    };
+    serializer.serialize_str(&s)
 }
 
 /// Deserialize ISO 8601 string to u64 timestamp (nanoseconds since epoch)

@@ -39,8 +39,8 @@ use rcgen::{
 use smg_policy_controller::{
     builtins::{Best, Healthy, LeastRequests},
     grpc::{
-        Bound, BreakerSpec, Exposure, Failure, GrpcFilter, GrpcPicker, GrpcPluginSpec, GrpcScorer,
-        HeaderSet, LoadError, Plugin, Reveal, Runtime, Tls, Transport,
+        Bound, BreakerSpec, EventKind, EventSet, Exposure, Failure, GrpcFilter, GrpcPicker,
+        GrpcPluginSpec, GrpcScorer, HeaderSet, LoadError, Plugin, Reveal, Runtime, Tls, Transport,
     },
     plugins::OpenDecisions,
     proto, Binding, Candidate, Constraints, Decision, Engine, Filter, Header, Health, Identity,
@@ -73,6 +73,9 @@ fn unix(served: &TestPlugin) -> Transport {
 fn spec(served: &TestPlugin, name: &str) -> GrpcPluginSpec {
     let mut spec = GrpcPluginSpec::new(name, unix(served));
     spec.connect_micros = BUDGET_MICROS;
+    // Every kind of event: the lifecycle's cases tell them, and a decision
+    // reads none of it.
+    spec.observes = EventSet::ALL;
     spec
 }
 
@@ -2585,6 +2588,13 @@ fn a_stream_that_ends_under_a_clock_that_panics_still_reopens() {
     armed.store(true, Ordering::Relaxed);
     // The decision in flight falls back when its stream goes.
     assert_eq!(lead(&decide_short(&engine, &candidates, 2)), Some(103));
+    // The plugin reads its behaviour as it takes a frame, and the short
+    // decision may give up before it took this one: it is told to be
+    // honest again once it took the frame it ends the stream at.
+    assert!(
+        eventually(|| served.frames() == 2),
+        "the plugin took the frame it ends its stream at"
+    );
     served.behave(Behaviour::Honest);
     assert!(
         eventually(|| {
@@ -2994,13 +3004,17 @@ impl Scorer for Kept {
     }
 }
 
-/// A plugin declares no need of the lifecycle's calls: an adapter needs
-/// them where its fallback does, and an engine built in code says so.
+/// A plugin whose row lists no event declares no need of the lifecycle's
+/// calls: an adapter needs them where its fallback does, and an engine built
+/// in code says so. A plugin whose row lists an event needs them, whatever
+/// its fallback and whichever adapter forwards.
 #[test]
-fn an_adapter_needs_the_lifecycle_where_its_fallback_does() {
+fn an_adapter_needs_the_lifecycle_where_its_row_or_its_fallback_does() {
     let served = TestPlugin::serve();
     let runtime = runtime();
-    let plugin = load(&runtime, &served, "kept");
+    let mut unlisted = spec(&served, "kept");
+    unlisted.observes = EventSet::NONE;
+    let plugin = Plugin::load(&runtime, unlisted).expect("the plugin loads");
     let binder = plugin.binder();
     let adapter = |fallback: Option<Box<dyn Scorer>>| GrpcScorer::new(binder.bind(), fallback);
     assert!(adapter(Some(Box::new(Kept))).needs_lifecycle());
@@ -3020,6 +3034,14 @@ fn an_adapter_needs_the_lifecycle_where_its_fallback_does() {
     };
     assert!(engine_of(Some(Box::new(Kept))).needs_lifecycle());
     assert!(!engine_of(None).needs_lifecycle());
+
+    let mut listed = spec(&served, "hearing");
+    listed.observes = EventSet::of([EventKind::Completed]);
+    let hearing = Plugin::load(&runtime, listed).expect("the plugin loads");
+    let binder = hearing.binder();
+    // The build's observer and the adapter that is not: each says so.
+    assert!(GrpcScorer::new(binder.bind(), None).needs_lifecycle());
+    assert!(GrpcPicker::new(binder.bind(), None).needs_lifecycle());
 }
 
 #[test]
@@ -3066,6 +3088,95 @@ fn the_lifecycle_reaches_the_plugin_once_in_order() {
             "what the veto has left on the runtime's clock"
         ),
         other => panic!("a signal, not {other:?}"),
+    }
+}
+
+/// A row lists the kinds of event its plugin hears, none by default. A
+/// plugin whose row lists none is told nothing, and no `Observe` stream is
+/// opened for it. One whose row lists some is sent those kinds alone,
+/// numbered with no gap for the kinds it does not hear. A loaded plugin
+/// says the kinds its row lists.
+#[test]
+fn a_plugin_hears_the_kinds_of_event_its_row_lists_and_no_other() {
+    let served = TestPlugin::serve();
+    let runtime = runtime();
+    let tell = |engine: &Engine| {
+        let lease = Lease::default();
+        engine.on_dispatched(&lease, &Target::default(), Side::Single, 3);
+        engine.on_released(&lease, ReleaseReason::ClientGone);
+        engine.on_membership(&Membership::Snapshot(&[WorkerId(1), WorkerId(2)]));
+        engine.on_signal(&Signal::GatewayVeto {
+            worker: WorkerId(1),
+            until_micros: 500_000,
+        });
+    };
+    // The default row lists nothing.
+    let mut unlisted = GrpcPluginSpec::new("unlisted", unix(&served));
+    unlisted.connect_micros = BUDGET_MICROS;
+    assert_eq!(unlisted.observes, EventSet::NONE);
+    let deaf = Plugin::load(&runtime, unlisted).expect("the plugin loads");
+    assert_eq!(deaf.observes(), EventSet::NONE);
+    let deaf_engine = single_engine(profile(&deaf, ALL));
+    assert!(!deaf_engine.needs_lifecycle());
+    assert_eq!(lead(&decide(&deaf_engine, &pool(4), 1)), Some(103));
+    tell(&deaf_engine);
+    let stats = deaf.stats();
+    assert_eq!((stats.observed, stats.observe_dropped), (0, 0), "{stats:?}");
+
+    let mut listed = spec(&served, "listed");
+    listed.observes = EventSet::of([EventKind::Released, EventKind::Membership]);
+    let hearing = Plugin::load(&runtime, listed).expect("the plugin loads");
+    assert_eq!(
+        hearing.observes(),
+        EventSet::of([EventKind::Released, EventKind::Membership])
+    );
+    let hearing_engine = single_engine(profile(&hearing, ALL));
+    assert!(hearing_engine.needs_lifecycle());
+    tell(&hearing_engine);
+    assert_eq!(hearing.stats().observed, 2);
+    assert!(eventually(|| served.seen().events.len() == 2));
+    let seen = served.seen();
+    // One stream, the hearing plugin's: the other plugin's `Decide` stream
+    // settled first, answered a decision and opened none.
+    let hellos: Vec<&str> = seen
+        .observe_hellos
+        .iter()
+        .map(|hello| hello.plugin.as_str())
+        .collect();
+    assert_eq!(hellos, ["listed"]);
+    let seqs: Vec<u64> = seen.events.iter().map(|e| e.seq).collect();
+    assert_eq!(seqs, [1, 2], "no gap for the kinds it does not hear");
+    use proto::lifecycle_event::Event;
+    assert!(
+        matches!(seen.events[0].event, Some(Event::Released(_))),
+        "{:?}",
+        seen.events[0]
+    );
+    assert!(
+        matches!(seen.events[1].event, Some(Event::Membership(_))),
+        "{:?}",
+        seen.events[1]
+    );
+}
+
+/// A dispatch on another target of its pick is told with a lease that names
+/// that target's index, and the event's index is the lease's.
+#[test]
+fn a_dispatch_tells_the_plugin_the_index_its_lease_names() {
+    let served = TestPlugin::serve();
+    let runtime = runtime();
+    let plugin = load(&runtime, &served, "second-target");
+    let engine = single_engine(profile(&plugin, ALL));
+    let lease = Lease {
+        target_index: 1,
+        ..Lease::default()
+    };
+    engine.on_dispatched(&lease, &Target::default(), Side::Single, 3);
+    assert!(eventually(|| served.seen().events.len() == 1));
+    let seen = served.seen();
+    match &seen.events[0].event {
+        Some(proto::lifecycle_event::Event::Dispatched(d)) => assert_eq!(d.target_index, 1),
+        other => panic!("dispatched, not {other:?}"),
     }
 }
 

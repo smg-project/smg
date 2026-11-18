@@ -11,6 +11,7 @@ mod llava;
 mod minimax_m3;
 mod muse_spark;
 mod nemotron_omni;
+mod nemotron_transcribe;
 mod phi3_v;
 pub mod qwen3_asr;
 mod qwen3_omni;
@@ -33,6 +34,7 @@ use llava::{LlavaNextSpec, LlavaSpec};
 use minimax_m3::MiniMaxM3VisionSpec;
 use muse_spark::MuseSparkSpec;
 use nemotron_omni::NemotronOmniSpec;
+use nemotron_transcribe::NemotronTranscribeSpec;
 use once_cell::sync::Lazy;
 use phi3_v::Phi3VisionSpec;
 use qwen3_asr::Qwen3AsrSpec;
@@ -72,6 +74,7 @@ impl ModelRegistry {
                 LazySpec::new(|| Box::new(MuseSparkSpec)),
                 // Nemotron-H Omni matches its own model_type only.
                 LazySpec::new(|| Box::new(NemotronOmniSpec)),
+                LazySpec::new(|| Box::new(NemotronTranscribeSpec)),
                 // LlavaNext must be registered before Llava so "llava_next" model_type matches first.
                 LazySpec::new(|| Box::new(LlavaNextSpec)),
                 LazySpec::new(|| Box::new(LlavaSpec)),

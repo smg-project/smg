@@ -53,29 +53,44 @@ pub enum Kinds {
 /// What a store tells at each replicated write.
 ///
 /// Every call but [`Journal::released`] arrives under a lock of the store
-/// (the membership lock, the load lock or the lease lock), so an
-/// implementation returns at once: it takes no lock a reader may hold for
-/// long, it never waits on a standby and it calls nothing of the store.
+/// (the membership lock, the load lock or the turn of the leases' file),
+/// so an implementation returns at once: it takes no lock a reader may
+/// hold for long, it never waits on a standby and it calls nothing of the
+/// store.
 pub trait Journal: Send + Sync {
     /// A membership or status write: the epoch it made, the change, the
     /// row it is about as the write left it in the table (`None` for a
     /// removal) and the row the write took out of the table (a removal's
-    /// row, a replacement's old incarnation).
+    /// row, a replacement's old incarnation). `at` is the place of the
+    /// leader's event the write applies, on a store that follows
+    /// ([`crate::store::MemoryStore::follow`]), and none for a write of the
+    /// store's own: a journal keeps that place for the applier's write
+    /// alone. A write whose place was given up before it came is the
+    /// store's own where the store took a term since, and is journaled
+    /// nowhere otherwise.
     fn member(
         &self,
+        at: Option<Position>,
         epoch: u64,
         change: MembershipChange,
         row: Option<&WorkerRow>,
         left: Option<&WorkerRow>,
     );
 
-    /// One rank's load row, as the store put it on file. Never told to a
-    /// journal that carries no load rows.
-    fn load(&self, id: WorkerId, rank: u16, sample: &LoadSample);
+    /// One rank's load row, as the store put it on file, with the place of
+    /// the leader's event it applies as [`Journal::member`] has it. Never
+    /// told to a journal that carries no load rows.
+    fn load(&self, at: Option<Position>, id: WorkerId, rank: u16, sample: &LoadSample);
 
     /// The store's term rose, told once a rise: the store took `term`, and
     /// its later writes are made under it while it leads.
     fn term_rose(&self, term: u64);
+
+    /// The store follows the start of a leader's term, the event at `at`
+    /// ([`crate::store::MemoryStore::follow_term`]): it writes no row, and
+    /// the journal keeps the place. The store took nothing by it, and
+    /// leads no term.
+    fn term_followed(&self, at: Position);
 
     /// Whether the journal carries load rows, asked once when the store is
     /// built: where it does not, a load write tells nothing.
@@ -94,6 +109,13 @@ pub trait Journal: Send + Sync {
     /// each such write, and a call that wrote nothing may be followed by
     /// it too. What a journal wakes at its writes it wakes here, so no
     /// writer and no reservation waits behind the wake; a journal that
-    /// wakes nobody leaves it empty.
+    /// wakes nobody leaves it empty. A journal that hands its writes on to
+    /// another hands this call on too, or the other's wake is never made.
     fn released(&self) {}
+
+    /// The store restores a snapshot that stands at `at`: the journal starts
+    /// again there, inside the restore's own locks, and wakes nobody there:
+    /// the restore's release follows ([`Journal::released`]). `false` where
+    /// the journal refuses the place, and the store then restores nothing.
+    fn restart(&self, at: Position) -> bool;
 }

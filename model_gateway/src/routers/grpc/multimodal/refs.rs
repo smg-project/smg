@@ -1861,10 +1861,9 @@ mod tests {
             "{err}"
         );
 
-        // Audio is the worker's alone on this runtime: a hinted request that
-        // also carries it keeps the cheap refusal instead of a fetch and a
-        // decode that worker selection would refuse, while the same audio
-        // without a hint still forwards.
+        // vLLM also accepts the router's audio tensors. A hinted request
+        // carrying audio is processed locally so its image hint takes effect;
+        // the same audio without a hint still forwards.
         let audio = MediaContentPart::AudioUrl {
             url: "https://a/x.wav".to_string().into(),
             uuid: None,
@@ -1872,15 +1871,17 @@ mod tests {
         let mut with_audio = expandable_placeholders();
         with_audio.insert(Modality::Audio, "<|audio_pad|>".to_string());
         with_audio.set_worker_expandable(Modality::Audio, true);
-        let err = resolve_mm_processing(
-            &components,
-            &registry,
-            MODEL,
-            &plan(vec![hinted_image("https://a/1.png", 504), audio.clone()]),
-            &with_audio,
-        )
-        .expect_err("the router cannot serve audio to this worker");
-        assert_eq!(err.code(), "multimodal_hint_unsupported_in_worker_mode");
+        assert_eq!(
+            resolve_mm_processing(
+                &components,
+                &registry,
+                MODEL,
+                &plan(vec![hinted_image("https://a/1.png", 504), audio.clone()]),
+                &with_audio,
+            )
+            .expect("the router can apply the hint and serve audio"),
+            MmProcessing::Router
+        );
         assert_eq!(
             resolve_mm_processing(
                 &components,

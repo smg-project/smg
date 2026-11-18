@@ -6,6 +6,8 @@
 
 use std::fmt;
 
+#[cfg(feature = "controller")]
+use crate::proto::LiftedVeto;
 use crate::{sessions::SessionVerdict, view::WorkerId};
 
 /// Targets a decision carries at most: the pick and its alternates.
@@ -164,6 +166,36 @@ impl fmt::Debug for Survivors {
     }
 }
 
+/// The soft veto lifted to make a pick in a pool that veto left nobody, in
+/// the order the all-vetoed rule lifts them: the mark a host counts such
+/// picks from. The rule's own pick writes it, and so does the pick of a
+/// session key kept on its worker where the veto as it stands kept no
+/// worker. Every other pick reads `None`, the default. One mark is the
+/// decision's, since the pick and its alternates are of the one lifted
+/// pool. The mark sits in a byte the record had spare: the trace is no
+/// larger for it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Lifted {
+    /// No veto was lifted.
+    #[default]
+    None,
+    /// The overload veto: every usable worker was over its thresholds.
+    Overload,
+}
+
+/// The contract's word for the mark: the one mapper, for every writer of a
+/// trace.
+#[cfg(feature = "controller")]
+impl From<Lifted> for LiftedVeto {
+    fn from(mark: Lifted) -> Self {
+        match mark {
+            Lifted::None => Self::None,
+            Lifted::Overload => Self::Overload,
+        }
+    }
+}
+
 /// The decision's trace: what the trace header and an explain call print.
 /// This is the first step's subset of the record; per-filter drops,
 /// per-scorer contributions, the plan, the picker and the shadow pick join it
@@ -177,11 +209,22 @@ pub struct Trace {
     pub survivors: Survivors,
     /// The top candidates and their combined scores, best first: of the set
     /// the picker compared, which is every candidate the filters left unless
-    /// the picker narrows them.
+    /// the picker narrows them. Where a profile's ranks put rows in front
+    /// ([`Scorer::score_front`](crate::Scorer::score_front)) the scores are
+    /// those rows' sums among themselves: a stage asked of them alone
+    /// normalizes over them, so a score need not be the one the whole pass
+    /// gives its row. The rows are the whole pass's, and their order too
+    /// wherever its sums tell them apart: rows it rounds to one sum it
+    /// draws among, and the front's scores order them. Where a tie of its
+    /// sums runs past the trace's last row, the rows listed can differ
+    /// too: each is a row of that tie.
     pub top: [(WorkerId, f32); TRACE_TOP],
     pub top_len: u8,
     pub seed: u64,
     pub generation: u64,
+    /// The soft veto lifted for this pick ([`Lifted`]): `None` unless that
+    /// veto as it stands left the pool nobody.
+    pub lifted: Lifted,
 }
 
 impl Trace {
@@ -261,6 +304,15 @@ impl Decision {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The mark of a lifted veto costs the trace no byte: it sits in one the
+    /// record had spare, and a trace no rule wrote reads none.
+    #[test]
+    fn the_mark_of_a_lifted_veto_costs_the_trace_no_byte() {
+        assert_eq!(size_of::<Lifted>(), 1);
+        assert_eq!(size_of::<Trace>(), 72);
+        assert_eq!(Trace::default().lifted, Lifted::None);
+    }
 
     #[test]
     fn targets_keep_order_and_refuse_a_fifth() {

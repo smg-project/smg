@@ -2947,6 +2947,9 @@ mod tests {
             "tools": [{"type": "mcp", "server_label": "wiki"}]
         });
 
+        // UUID's fast-rng feature can warm rand's thread-local generator during
+        // session setup. Exclude that one-time setup under either feature set.
+        let _ = rand::rng();
         let before = counting_alloc::calls();
         super::prepare_mcp_tools_as_functions(&mut payload, &session);
         let item = crate::openai_bridge::mcp_list_tools_json(&session, "wiki", "wiki-server");
@@ -3060,8 +3063,8 @@ mod tests {
         );
     }
 
-    /// Allocation calls of the tool descriptors above, today.
-    const PINNED_DESCRIPTOR_CALLS: usize = 4643;
+    /// Steady-state allocation calls of the tool descriptors, excluding RNG setup.
+    const PINNED_DESCRIPTOR_CALLS: usize = 4642;
 
     /// The JSON list-tools item is the typed item serialised, byte for byte
     /// (its id aside: each build draws one).

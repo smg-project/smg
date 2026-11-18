@@ -1,0 +1,973 @@
+{
+  "recorded_from": "615542c4c69bb28fb3cb3e9e4ee29a8e2be0a7bc",
+  "policy": "minimum_tokens",
+  "rows": [
+    {
+      "name": "the-rank-with-the-fewest-used-tokens-takes-the-request",
+      "ranks": 3,
+      "pinned": null,
+      "steps": [
+        {
+          "poll": [
+            {
+              "used": 300,
+              "capacity": 8192,
+              "resident": 300
+            },
+            {
+              "used": 100,
+              "capacity": 8192,
+              "resident": 100
+            },
+            {
+              "used": 200,
+              "capacity": 8192,
+              "resident": 200
+            }
+          ]
+        },
+        {
+          "pick": {
+            "cost": 10
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          1
+        ]
+      }
+    },
+    {
+      "name": "a-pick-books-its-cost-on-its-rank",
+      "ranks": 2,
+      "pinned": null,
+      "steps": [
+        {
+          "poll": [
+            {
+              "used": 100,
+              "capacity": 8192,
+              "resident": 100
+            },
+            {
+              "used": 150,
+              "capacity": 8192,
+              "resident": 150
+            }
+          ]
+        },
+        {
+          "pick": {
+            "cost": 60
+          }
+        },
+        {
+          "pick": {
+            "cost": 60
+          }
+        },
+        {
+          "pick": {
+            "cost": 60
+          }
+        },
+        {
+          "pick": {
+            "cost": 60
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          0,
+          1,
+          0,
+          1
+        ]
+      }
+    },
+    {
+      "name": "eight-ranks-take-one-large-request-each-from-the-least-used-up",
+      "ranks": 8,
+      "pinned": null,
+      "steps": [
+        {
+          "poll": [
+            {
+              "used": 800,
+              "capacity": 8192,
+              "resident": 800
+            },
+            {
+              "used": 100,
+              "capacity": 8192,
+              "resident": 100
+            },
+            {
+              "used": 700,
+              "capacity": 8192,
+              "resident": 700
+            },
+            {
+              "used": 200,
+              "capacity": 8192,
+              "resident": 200
+            },
+            {
+              "used": 600,
+              "capacity": 8192,
+              "resident": 600
+            },
+            {
+              "used": 300,
+              "capacity": 8192,
+              "resident": 300
+            },
+            {
+              "used": 500,
+              "capacity": 8192,
+              "resident": 500
+            },
+            {
+              "used": 400,
+              "capacity": 8192,
+              "resident": 400
+            }
+          ]
+        },
+        {
+          "pick": {
+            "cost": 1000
+          }
+        },
+        {
+          "pick": {
+            "cost": 1000
+          }
+        },
+        {
+          "pick": {
+            "cost": 1000
+          }
+        },
+        {
+          "pick": {
+            "cost": 1000
+          }
+        },
+        {
+          "pick": {
+            "cost": 1000
+          }
+        },
+        {
+          "pick": {
+            "cost": 1000
+          }
+        },
+        {
+          "pick": {
+            "cost": 1000
+          }
+        },
+        {
+          "pick": {
+            "cost": 1000
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          1,
+          3,
+          5,
+          7,
+          6,
+          4,
+          2,
+          0
+        ]
+      }
+    },
+    {
+      "name": "equal-ranks-go-to-the-lowest-rank",
+      "ranks": 3,
+      "pinned": null,
+      "steps": [
+        {
+          "poll": [
+            {
+              "used": 100,
+              "capacity": 8192,
+              "resident": 100
+            },
+            {
+              "used": 100,
+              "capacity": 8192,
+              "resident": 100
+            },
+            {
+              "used": 100,
+              "capacity": 8192,
+              "resident": 100
+            }
+          ]
+        },
+        {
+          "pick": {
+            "cost": 10
+          }
+        },
+        {
+          "pick": {
+            "cost": 10
+          }
+        },
+        {
+          "pick": {
+            "cost": 10
+          }
+        },
+        {
+          "pick": {
+            "cost": 10
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          0,
+          1,
+          2,
+          0
+        ]
+      }
+    },
+    {
+      "name": "a-taken-answer-replaces-the-ranks-and-their-bookings",
+      "ranks": 2,
+      "pinned": null,
+      "steps": [
+        {
+          "poll": [
+            {
+              "used": 100,
+              "capacity": 8192,
+              "resident": 100
+            },
+            {
+              "used": 200,
+              "capacity": 8192,
+              "resident": 200
+            }
+          ]
+        },
+        {
+          "pick": {
+            "cost": 500
+          }
+        },
+        {
+          "poll": [
+            {
+              "used": 100,
+              "capacity": 8192,
+              "resident": 100
+            },
+            {
+              "used": 200,
+              "capacity": 8192,
+              "resident": 200
+            }
+          ]
+        },
+        {
+          "pick": {
+            "cost": 500
+          }
+        },
+        {
+          "pick": {
+            "cost": 1
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          0,
+          0,
+          1
+        ]
+      }
+    },
+    {
+      "name": "a-rank-an-answer-omits-is-no-rank-at-once",
+      "ranks": 3,
+      "pinned": null,
+      "steps": [
+        {
+          "poll": [
+            {
+              "used": 100,
+              "capacity": 8192,
+              "resident": 100
+            },
+            {
+              "used": 200,
+              "capacity": 8192,
+              "resident": 200
+            },
+            {
+              "used": 300,
+              "capacity": 8192,
+              "resident": 300
+            }
+          ]
+        },
+        {
+          "pick": {
+            "cost": 1
+          }
+        },
+        {
+          "poll": [
+            null,
+            {
+              "used": 200,
+              "capacity": 8192,
+              "resident": 200
+            },
+            {
+              "used": 300,
+              "capacity": 8192,
+              "resident": 300
+            }
+          ]
+        },
+        {
+          "pick": {
+            "cost": 1
+          }
+        },
+        {
+          "pick": {
+            "cost": 1
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          0,
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "name": "a-rank-five-answers-omit-is-no-rank-after-any-of-them",
+      "ranks": 3,
+      "pinned": null,
+      "steps": [
+        {
+          "poll": [
+            {
+              "used": 100,
+              "capacity": 8192,
+              "resident": 100
+            },
+            {
+              "used": 200,
+              "capacity": 8192,
+              "resident": 200
+            },
+            {
+              "used": 300,
+              "capacity": 8192,
+              "resident": 300
+            }
+          ]
+        },
+        {
+          "pick": {
+            "cost": 1
+          }
+        },
+        {
+          "poll": [
+            null,
+            {
+              "used": 200,
+              "capacity": 8192,
+              "resident": 200
+            },
+            {
+              "used": 300,
+              "capacity": 8192,
+              "resident": 300
+            }
+          ]
+        },
+        {
+          "pick": {
+            "cost": 1
+          }
+        },
+        {
+          "poll": [
+            null,
+            {
+              "used": 200,
+              "capacity": 8192,
+              "resident": 200
+            },
+            {
+              "used": 300,
+              "capacity": 8192,
+              "resident": 300
+            }
+          ]
+        },
+        {
+          "pick": {
+            "cost": 1
+          }
+        },
+        {
+          "poll": [
+            null,
+            {
+              "used": 200,
+              "capacity": 8192,
+              "resident": 200
+            },
+            {
+              "used": 300,
+              "capacity": 8192,
+              "resident": 300
+            }
+          ]
+        },
+        {
+          "pick": {
+            "cost": 1
+          }
+        },
+        {
+          "poll": [
+            null,
+            {
+              "used": 200,
+              "capacity": 8192,
+              "resident": 200
+            },
+            {
+              "used": 300,
+              "capacity": 8192,
+              "resident": 300
+            }
+          ]
+        },
+        {
+          "pick": {
+            "cost": 1
+          }
+        },
+        {
+          "poll": [
+            null,
+            {
+              "used": 200,
+              "capacity": 8192,
+              "resident": 200
+            },
+            {
+              "used": 300,
+              "capacity": 8192,
+              "resident": 300
+            }
+          ]
+        },
+        {
+          "pick": {
+            "cost": 1
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          0,
+          1,
+          1,
+          1,
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "name": "a-row-with-no-token-capacity-is-no-rank",
+      "ranks": 2,
+      "pinned": null,
+      "steps": [
+        {
+          "poll": [
+            {
+              "used": 10,
+              "capacity": 0,
+              "resident": 10
+            },
+            {
+              "used": 500,
+              "capacity": 8192,
+              "resident": 500
+            }
+          ]
+        },
+        {
+          "pick": {
+            "cost": 1
+          }
+        },
+        {
+          "pick": {
+            "cost": 1
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "name": "an-answer-with-no-token-capacity-drops-the-worker-s-ranks",
+      "ranks": 2,
+      "pinned": null,
+      "steps": [
+        {
+          "poll": [
+            {
+              "used": 100,
+              "capacity": 8192,
+              "resident": 100
+            },
+            {
+              "used": 200,
+              "capacity": 8192,
+              "resident": 200
+            }
+          ]
+        },
+        {
+          "pick": {
+            "cost": 1
+          }
+        },
+        {
+          "poll": [
+            {
+              "used": 100,
+              "capacity": 0,
+              "resident": 100
+            },
+            {
+              "used": 200,
+              "capacity": 0,
+              "resident": 200
+            }
+          ]
+        },
+        {
+          "pick": {
+            "cost": 1
+          }
+        },
+        {
+          "poll": [
+            {
+              "used": 100,
+              "capacity": 8192,
+              "resident": 100
+            },
+            {
+              "used": 200,
+              "capacity": 8192,
+              "resident": 200
+            }
+          ]
+        },
+        {
+          "pick": {
+            "cost": 1
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          0,
+          null,
+          0
+        ]
+      }
+    },
+    {
+      "name": "an-answer-with-no-row-drops-the-worker-s-ranks",
+      "ranks": 2,
+      "pinned": null,
+      "steps": [
+        {
+          "poll": [
+            {
+              "used": 100,
+              "capacity": 8192,
+              "resident": 100
+            },
+            {
+              "used": 200,
+              "capacity": 8192,
+              "resident": 200
+            }
+          ]
+        },
+        {
+          "pick": {
+            "cost": 1
+          }
+        },
+        {
+          "poll": [
+            null,
+            null
+          ]
+        },
+        {
+          "pick": {
+            "cost": 1
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          0,
+          null
+        ]
+      }
+    },
+    {
+      "name": "a-failed-poll-keeps-the-last-answer-and-its-bookings",
+      "ranks": 2,
+      "pinned": null,
+      "steps": [
+        {
+          "poll": [
+            {
+              "used": 100,
+              "capacity": 8192,
+              "resident": 100
+            },
+            {
+              "used": 200,
+              "capacity": 8192,
+              "resident": 200
+            }
+          ]
+        },
+        {
+          "pick": {
+            "cost": 150
+          }
+        },
+        "failed",
+        {
+          "pick": {
+            "cost": 1
+          }
+        },
+        {
+          "pick": {
+            "cost": 1
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          0,
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "name": "a-worker-never-polled-has-no-rank",
+      "ranks": 2,
+      "pinned": null,
+      "steps": [
+        {
+          "pick": {
+            "cost": 1
+          }
+        },
+        "failed",
+        {
+          "pick": {
+            "cost": 1
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          null,
+          null
+        ]
+      }
+    },
+    {
+      "name": "an-evicted-worker-has-no-rank-until-its-next-answer",
+      "ranks": 2,
+      "pinned": null,
+      "steps": [
+        {
+          "poll": [
+            {
+              "used": 100,
+              "capacity": 8192,
+              "resident": 100
+            },
+            {
+              "used": 200,
+              "capacity": 8192,
+              "resident": 200
+            }
+          ]
+        },
+        {
+          "pick": {
+            "cost": 1
+          }
+        },
+        "evict",
+        {
+          "pick": {
+            "cost": 1
+          }
+        },
+        {
+          "poll": [
+            {
+              "used": 100,
+              "capacity": 8192,
+              "resident": 100
+            },
+            {
+              "used": 200,
+              "capacity": 8192,
+              "resident": 200
+            }
+          ]
+        },
+        {
+          "pick": {
+            "cost": 1
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          0,
+          null,
+          0
+        ]
+      }
+    },
+    {
+      "name": "a-worker-of-one-rank-takes-its-own-rank-alone",
+      "ranks": 2,
+      "pinned": 1,
+      "steps": [
+        {
+          "poll": [
+            {
+              "used": 10,
+              "capacity": 8192,
+              "resident": 10
+            },
+            {
+              "used": 500,
+              "capacity": 8192,
+              "resident": 500
+            }
+          ]
+        },
+        {
+          "pick": {
+            "cost": 1
+          }
+        },
+        {
+          "pick": {
+            "cost": 1
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "name": "a-worker-of-one-rank-the-answer-omits-has-none",
+      "ranks": 2,
+      "pinned": 1,
+      "steps": [
+        {
+          "poll": [
+            {
+              "used": 10,
+              "capacity": 8192,
+              "resident": 10
+            },
+            null
+          ]
+        },
+        {
+          "pick": {
+            "cost": 1
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          null
+        ]
+      }
+    },
+    {
+      "name": "an-answer-with-no-row-drops-the-one-rank-of-its-worker",
+      "ranks": 2,
+      "pinned": 1,
+      "steps": [
+        {
+          "poll": [
+            {
+              "used": 10,
+              "capacity": 8192,
+              "resident": 10
+            },
+            {
+              "used": 500,
+              "capacity": 8192,
+              "resident": 500
+            }
+          ]
+        },
+        {
+          "pick": {
+            "cost": 1
+          }
+        },
+        {
+          "poll": [
+            null,
+            null
+          ]
+        },
+        {
+          "pick": {
+            "cost": 1
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          1,
+          null
+        ]
+      }
+    },
+    {
+      "name": "the-used-tokens-decide-where-a-rank-holds-fewer-context-tokens",
+      "ranks": 2,
+      "pinned": null,
+      "steps": [
+        {
+          "poll": [
+            {
+              "used": 100,
+              "capacity": 8192,
+              "resident": 900
+            },
+            {
+              "used": 200,
+              "capacity": 8192,
+              "resident": 50
+            }
+          ]
+        },
+        {
+          "pick": {
+            "cost": 1
+          }
+        },
+        {
+          "pick": {
+            "cost": 1
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          0,
+          0
+        ]
+      }
+    },
+    {
+      "name": "a-rank-that-reports-no-context-tokens-is-a-rank-by-its-used-tokens",
+      "ranks": 2,
+      "pinned": null,
+      "steps": [
+        {
+          "poll": [
+            {
+              "used": 100,
+              "capacity": 8192,
+              "resident": null
+            },
+            {
+              "used": 200,
+              "capacity": 8192,
+              "resident": null
+            }
+          ]
+        },
+        {
+          "pick": {
+            "cost": 1
+          }
+        },
+        {
+          "pick": {
+            "cost": 200
+          }
+        },
+        {
+          "pick": {
+            "cost": 1
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          0,
+          0,
+          1
+        ]
+      }
+    }
+  ]
+}

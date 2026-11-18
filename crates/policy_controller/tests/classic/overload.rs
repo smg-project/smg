@@ -11,7 +11,10 @@
 //! The store judges an engine by rules of its own, and [`APART`] names each
 //! recorded row they decide apart from the gateway, with the verdicts here.
 
-use std::time::{Duration, Instant};
+use std::{
+    cell::RefCell,
+    time::{Duration, Instant},
+};
 
 use openai_protocol::worker::{SchedulerLoadSnapshot, WorkerLoadResponse};
 use serde::Deserialize;
@@ -210,6 +213,9 @@ struct Bed {
     store: MemoryStore,
     /// The member row of each rank, by rank.
     ids: Vec<WorkerId>,
+    /// The ranks the engine's last answer left out beside a rank it named,
+    /// by rank: the ranks the store marks, kept here by the same rule.
+    left_out: RefCell<Vec<bool>>,
 }
 
 impl Bed {
@@ -255,7 +261,11 @@ impl Bed {
         store.apply(applied).expect("the first generation applies");
         // The driver tells its poll interval where it is built.
         assert!(store.heard_every(PERIOD), "the first period told");
-        Ok(Self { store, ids })
+        Ok(Self {
+            store,
+            ids,
+            left_out: RefCell::new(vec![false; usize::from(row.ranks)]),
+        })
     }
 
     /// One step written through the load sink at `now`, each as the crate's
@@ -267,6 +277,11 @@ impl Bed {
         match step {
             Step::Poll(figures) => {
                 assert_eq!(figures.len(), self.ids.len(), "an entry a rank");
+                // An answer that names a rank leaves out each rank it has
+                // no row for. One that names none says nothing of any.
+                if figures.iter().any(Option::is_some) {
+                    *self.left_out.borrow_mut() = figures.iter().map(Option::is_none).collect();
+                }
                 let answer: Vec<_> = ranks
                     .zip(figures)
                     .map(|((id, rank), figures)| {
@@ -287,11 +302,16 @@ impl Bed {
                     .expect("a rank of the worker");
                 let row = load_row(*figures, now, SignalSource::Events);
                 self.store.record(id, *rank, row, now, LoadSource::Stream);
+                // A record names its rank again.
+                if let Some(out) = self.left_out.borrow_mut().get_mut(usize::from(*rank)) {
+                    *out = false;
+                }
             }
             Step::Evict => {
                 for (id, _) in ranks {
                     self.store.evict(id);
                 }
+                self.left_out.borrow_mut().fill(false);
             }
         }
         if let Some(due) = self.store.publish_due() {
@@ -300,8 +320,8 @@ impl Bed {
     }
 
     /// Whether the worker reads as overloaded to a decision at `now`: the
-    /// verdict every rank's row carries, or `None` when the rows of the one
-    /// engine carry two.
+    /// verdict of its rank rows as [`one_verdict`] takes it, each with whether the
+    /// engine's last answer left the rank out.
     fn verdict(&self, now: Instant) -> Option<bool> {
         let mut out = ViewBuffers::default();
         let ask = Ask {
@@ -313,15 +333,52 @@ impl Bed {
         self.store
             .build_view(MODEL, Role::Single, &ask, &mut out)
             .expect("the pool");
-        let mut rows = out.candidates.iter().map(|row| row.health.overloaded);
-        let first = rows.next()?;
-        rows.all(|row| row == first).then_some(first)
+        let left_out = self.left_out.borrow();
+        one_verdict(out.candidates.iter().map(|row| {
+            let rank = self.ids.iter().position(|&id| id == row.id);
+            let left_out = rank.and_then(|rank| left_out.get(rank).copied());
+            (left_out.unwrap_or(false), row.health.overloaded)
+        }))
     }
+}
+
+/// A worker's verdict off its rank rows, each as whether the engine's last
+/// answer left the rank out and whether the row carries the overload bit:
+/// the bit the named ranks' rows share. A rank left out carries the bit
+/// alone: that is the store's avoidance of the rank and no verdict of the
+/// engine. `None` where the named ranks' rows carry two verdicts, where a
+/// rank left out carries no bit, and where no rank is named.
+fn one_verdict(rows: impl IntoIterator<Item = (bool, bool)>) -> Option<bool> {
+    let mut named = None;
+    for (left_out, bit) in rows {
+        if left_out {
+            if !bit {
+                return None;
+            }
+        } else if *named.get_or_insert(bit) != bit {
+            return None;
+        }
+    }
+    named
+}
+
+#[test]
+fn a_verdict_is_the_named_ranks_own_and_a_rank_left_out_carries_the_bit() {
+    assert_eq!(one_verdict([(false, true), (false, true)]), Some(true));
+    assert_eq!(one_verdict([(false, false), (true, true)]), Some(false));
+    assert_eq!(
+        one_verdict([(false, true), (false, false)]),
+        None,
+        "two verdicts"
+    );
+    assert_eq!(one_verdict([(false, false), (true, false)]), None, "no bit");
+    assert_eq!(one_verdict([(true, true)]), None, "no rank named");
+    assert_eq!(one_verdict([]), None, "no row");
 }
 
 /// This crate's verdict after each step of the row, or why the row has
 /// none: the validator's words for a form this crate does not build, or
-/// the step after which the rows of the one engine carried two verdicts.
+/// the step after which the rank rows gave no one verdict ([`one_verdict`]).
 fn replay(row: &Row) -> Result<Vec<bool>, String> {
     let bed = Bed::new(row)?;
     let start = Instant::now();
@@ -335,7 +392,7 @@ fn replay(row: &Row) -> Result<Vec<bool>, String> {
             let now = start + PERIOD * (at as u32 + 1);
             bed.step(step, now);
             bed.verdict(now)
-                .ok_or_else(|| format!("after step {at} the rows of one engine carry two verdicts"))
+                .ok_or_else(|| format!("after step {at} the rank rows give no one verdict"))
         })
         .collect()
 }

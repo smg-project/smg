@@ -6,11 +6,15 @@
 //! the engine's types as the WIT is are a later step.
 
 use crate::{
+    counts::with_counts,
     decision::{Decision, Target, Trace},
     lease::{Lease, LeaseKind, Membership, Outcome, ReleaseReason, Side, Signal, TransportClass},
-    plugins::config::{Exposure, Reveal},
+    plugins::{
+        config::{Exposure, Reveal},
+        shown_hashes,
+    },
     proto,
-    spec::{Needs, MAX_BLOCK_HASHES},
+    spec::Needs,
     view::{
         AffinityFacts, Candidate, HashKind, Health, Identity, LoadRow, OverloadRegime, Phase,
         PoolFacts, RequestFacts, Role, SignalSource, WireModes, ZoneCapacity,
@@ -122,8 +126,9 @@ fn load(row: &LoadRow) -> proto::LoadRow {
 
 /// One candidate as the frame carries it: the row, and the affinity facts the
 /// host holds for it beside the row (`held`), which the record carries as
-/// five of its own fields.
-fn candidate(c: &Candidate, held: AffinityFacts) -> proto::Candidate {
+/// five of its own fields. Its requests in flight are what the request's
+/// facts read for it (`in_flight`).
+fn candidate(c: &Candidate, held: AffinityFacts, in_flight: u32) -> proto::Candidate {
     proto::Candidate {
         id: c.id.0,
         role: role(c.role),
@@ -133,7 +138,7 @@ fn candidate(c: &Candidate, held: AffinityFacts) -> proto::Candidate {
         wire_modes: wire_bits(c.wire_modes),
         engine_kind: u32::from(c.engine_kind),
         connector: u32::from(c.connector),
-        in_flight: c.in_flight,
+        in_flight,
         load: c.load.as_ref().map(load),
         overlap_blocks: held.overlap_blocks,
         predicted_blocks: held.predicted_blocks,
@@ -207,20 +212,6 @@ pub(crate) fn exposure(e: &Exposure) -> proto::Exposure {
     }
 }
 
-/// The block hashes a frame carries: the request's where the plugin's row
-/// declares a request's hashes, the first [`MAX_BLOCK_HASHES`] of a longer
-/// list (the contract's range), and none where the row declares neither
-/// form, whatever the other stages of the generation read. So the row and
-/// the contract bound a frame, and a prompt's length sizes no frame of a
-/// plugin that reads none of it.
-fn block_hashes<'a>(facts: &RequestFacts<'a>, needs: Needs) -> &'a [u64] {
-    if !needs.request_hashes() {
-        return &[];
-    }
-    let most = usize::try_from(MAX_BLOCK_HASHES).unwrap_or(usize::MAX);
-    facts.block_hashes.get(..most).unwrap_or(facts.block_hashes)
-}
-
 /// The request under the plugin's exposure and its declared needs. The
 /// budget is written when the frame is sent: what the decision has left at
 /// that instant.
@@ -233,7 +224,7 @@ fn request(facts: &RequestFacts<'_>, exposure: &Exposure, needs: Needs) -> proto
         streaming: facts.streaming,
         max_output_tokens: facts.max_output_tokens,
         prompt_tokens: facts.prompt_tokens,
-        block_hashes: block_hashes(facts, needs).to_vec(),
+        block_hashes: shown_hashes(facts, needs).to_vec(),
         hash_kind: hash_kind(facts.hash_kind),
         session_key: session_identity(facts, exposure.session_key),
         phase: phase(facts.phase),
@@ -296,10 +287,10 @@ pub(crate) fn decide(
         request: Some(request(facts, exposure, needs)),
         // A candidate's affinity facts ride the request's column, by its
         // index: the same index reads the row and its entry.
-        candidates: (0u32..)
+        candidates: with_counts!(facts, |counts| (0u32..)
             .zip(candidates)
-            .map(|(index, c)| candidate(c, facts.affinity_at(index)))
-            .collect(),
+            .map(|(index, c)| candidate(c, facts.affinity_at(index), counts(c)))
+            .collect()),
         pool: Some(pool(pool_facts)),
         stages: 0,
         scores_in: Vec::new(),
@@ -384,6 +375,7 @@ fn trace(t: &Trace) -> proto::Trace {
         fallback: false,
         affinity_source: 0,
         drew_first: t.drew_first(),
+        lifted: proto::LiftedVeto::from(t.lifted) as i32,
     }
 }
 
@@ -946,6 +938,40 @@ mod tests {
         );
     }
 
+    /// The frame carries each candidate's requests in flight as the
+    /// request's facts read them: the lent count where the host lends a
+    /// table, the rows themselves reading zero.
+    #[test]
+    fn the_frame_gives_a_row_the_count_its_request_reads() {
+        use crate::{
+            counts::tests::Lent,
+            plugins::config::Exposure,
+            spec::Needs,
+            view::{Candidate, PoolFacts, RequestFacts},
+        };
+
+        let mut rows: Vec<Candidate> = (0..)
+            .zip([4, 0, 9])
+            .map(|(position, in_flight)| Candidate {
+                position,
+                in_flight,
+                ..Candidate::default()
+            })
+            .collect();
+        let lent = Lent::take(&mut rows);
+        let facts = lent.beside(&RequestFacts::default());
+        let frame = super::decide(
+            1,
+            &facts,
+            &rows,
+            &PoolFacts::default(),
+            &Exposure::default(),
+            Needs::default(),
+        );
+        let read: Vec<u32> = frame.candidates.iter().map(|c| c.in_flight).collect();
+        assert_eq!(read, [4, 0, 9]);
+    }
+
     /// The view's trace is the contract's pair. A counted trace leaves with
     /// its count and no word of a draw; a drawn one leaves with the count
     /// unset, which is no zero, and `drew_first` set.
@@ -968,6 +994,25 @@ mod tests {
         };
         let wire = super::trace(&drawn);
         assert_eq!((wire.survivors, wire.drew_first), (None, true));
+    }
+
+    /// The trace a plugin is shown carries the veto the all-vetoed rule
+    /// lifted, and none for a pick no rule made.
+    #[test]
+    fn the_views_trace_carries_the_lifted_veto() {
+        use crate::decision::{Lifted, Trace};
+        let steered = Trace {
+            lifted: Lifted::Overload,
+            ..Trace::default()
+        };
+        assert_eq!(
+            super::trace(&steered).lifted,
+            proto::LiftedVeto::Overload as i32
+        );
+        assert_eq!(
+            super::trace(&Trace::default()).lifted,
+            proto::LiftedVeto::None as i32
+        );
     }
 
     /// A measurement for the Numbers table, not a check: run in release

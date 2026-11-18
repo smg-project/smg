@@ -67,13 +67,22 @@ pub(super) fn calls(
 /// Keyed arguments in the compact spelling (GLM 4.7 and later, IQuest): each call is the call
 /// opener and the tool's name, the schema written in the engines' `glm_xml` style (`<arg_key>`
 /// and `<arg_value>` pairs with nothing between them), and the call's close; the shape
-/// xgrammar's built-in GLM tag has and the gateway writes today. Ling's and Hy4's spellings
-/// are not this one, and are written from their own tags instead ([`calls()`]).
+/// xgrammar's built-in GLM tag has and the gateway's older parser writes. The style ends a value
+/// at `</arg_value>` alone, so the schema excludes what else ends one ([`Ends`]): the terminals
+/// the table has a row for out of the arguments state, which the engine takes inside a value too.
+/// Without them a value the tag let hold `</tool_call>` was read as a call cut there, and a quoted
+/// `<tool_call>` after it as a call the tag never allowed. Ling's and Hy4's spellings are not this
+/// one, and are written from their own tags instead ([`calls()`]).
 pub(super) fn compact_calls(
     markers: &CallMarkers<'_>,
     tools: &[&Tool],
     count: Count<'_>,
 ) -> Grammar {
+    let excludes: Vec<String> = markers
+        .call_exits
+        .iter()
+        .map(|exit| exit.to_string())
+        .collect();
     let tags = tools
         .iter()
         .map(|tool| {
@@ -82,7 +91,7 @@ pub(super) fn compact_calls(
                 Grammar::JsonSchema {
                     schema: Arc::new(tool.function.parameters_schema().clone()),
                     style: Some("glm_xml".to_string()),
-                    excludes: Vec::new(),
+                    excludes: excludes.clone(),
                     whitespace: Whitespace::Free,
                 },
                 markers.call_close,
@@ -564,6 +573,38 @@ mod tests {
                 "{}",
                 format.name()
             );
+        }
+    }
+
+    #[test]
+    fn a_compact_value_holds_nothing_that_ends_the_call() {
+        // The engine ends a call at the table's call terminals wherever they stand, a value
+        // included (`docs/engine.md`), so every value's text excludes them, as the tags written
+        // from the table's own tags exclude them (`Ends`): the call's close, and its opener, which
+        // ends the call open and starts the next. A value the tag let hold `</tool_call>` was read
+        // as the call cut there, and a quoted `<tool_call>` after it as a second call.
+        let tools = weather_tools();
+        for (format, exits) in [
+            (formats::glm(), ["</tool_call>", "<tool_call>"]),
+            (
+                formats::iquest(),
+                ["</iquest_tool_call>", "<iquest_tool_call>"],
+            ),
+        ] {
+            let payload = format
+                .grammar(&tools, true, false)
+                .expect("a grammar")
+                .payload();
+            let tags = payload["format"]["tags"].as_array().expect("the tags");
+            assert!(!tags.is_empty(), "{}", format.name());
+            for tag in tags {
+                assert_eq!(
+                    tag["content"]["excludes"],
+                    value!(exits),
+                    "{}",
+                    format.name()
+                );
+            }
         }
     }
 }

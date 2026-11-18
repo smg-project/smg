@@ -24,7 +24,8 @@
 //! the stage bits the profile binds; the answer carries the survivors, one
 //! score per candidate and the pick, each stage's field its own. The
 //! request's block hashes ride the frame only where the plugin's row
-//! declares them (`needs`, either form), the first 8,190 of a longer list,
+//! declares them (`needs`, either form), the first
+//! [`MAX_BLOCK_HASHES`](crate::spec::MAX_BLOCK_HASHES) of a longer list,
 //! so a prompt's length sizes no frame of a plugin that reads none. A plugin
 //! bound as a filter or a scorer is asked at the decision's open, so the
 //! native stages run while it computes; a plugin bound as the picker alone
@@ -75,8 +76,13 @@
 //! rule and the cool-down. Without a fallback stage, `failure: open` steps
 //! aside and `failure: closed` sheds, as for every kind.
 //!
-//! The lifecycle: one `Observe` stream per plugin, opened once a `Decide`
-//! stream has settled, carries the events the engine forwards (issued,
+//! The lifecycle: a plugin hears the kinds of event its row lists
+//! ([`GrpcPluginSpec::observes`]), none by default. A row that lists none is
+//! told nothing and has no `Observe` stream. A row that lists any has its
+//! plugin's scorer and picker say they need the lifecycle's calls
+//! ([`crate::Lifecycle::needs_lifecycle`]), so a host that makes none
+//! refuses them. One `Observe` stream per such plugin, opened once a
+//! `Decide` stream has settled, carries the events it hears (among issued,
 //! dispatched, completed, released, membership, signals) in order, each
 //! numbered by the I/O thread where it enters the stream, so the numbers
 //! never go down whichever threads raise the events; an event the queue
@@ -98,8 +104,10 @@
 //! such turns. One edge starts an outage and a streak anew: the end of a
 //! call that stood a minute, which only the plugin makes. An event sent
 //! does not, and two outages with less than a minute of standing between
-//! them are one line. The process's panic hook writes its own line to
-//! stderr at every panicked turn. Each profile
+//! them are one line. So a plugin whose calls all end inside a minute is
+//! one outage for its life, and a server that ends every call by age past
+//! a minute says one line an age. The process's panic hook writes its own
+//! line to stderr at every panicked turn. Each profile
 //! that binds the plugin holds one [`Bound`] set, taken from its engine
 //! build's [`Binder`]: one adapter of a build forwards, so an event reaches
 //! the plugin once per engine.
@@ -135,7 +143,8 @@ mod unit;
 mod view;
 
 pub use config::{
-    BreakerSpec, Exposure, Failure, GrpcPluginSpec, HeaderSet, Reveal, Tls, Transport,
+    BreakerSpec, EventKind, EventSet, Exposure, Failure, GrpcPluginSpec, HeaderSet, Reveal, Tls,
+    Transport,
 };
 pub use plugin::{Binder, Bound, LoadError, Plugin, Stats};
 pub use runtime::Runtime;

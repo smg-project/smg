@@ -59,7 +59,7 @@ const START_READS: usize = 3;
 const RESTLESS_LOOKS: u32 = 5;
 
 /// What a look or a read says of a path that leads to no regular file.
-const NOT_A_FILE: &str = "the path leads to no regular file";
+pub(super) const NOT_A_FILE: &str = "the path leads to no regular file";
 
 /// What one look at the path found.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -133,6 +133,17 @@ fn open(path: &Path) -> io::Result<fs::File> {
     Ok(opened.into())
 }
 
+/// Opens a regular file for a read without waiting ([`open`]) and refuses
+/// what is none by its kind, unread: a read of a pipe or of a terminal's
+/// device waits on a writer. The opened file states the kind, not its path.
+pub(super) fn open_regular(path: &Path) -> io::Result<fs::File> {
+    let file = open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::other(NOT_A_FILE));
+    }
+    Ok(file)
+}
+
 /// The file's bytes, whole. A file over the bound is refused by its size,
 /// unread, and one that is no regular file by its kind, unread: a read of a
 /// pipe or of a terminal's device waits on a writer.
@@ -141,12 +152,9 @@ fn read(identity: &Identity) -> Result<Vec<u8>, SpecRejected> {
         return Err(SpecRejected::TooLarge(identity.len));
     }
     let unreadable = |error: io::Error| SpecRejected::Unreadable(error.to_string());
-    let file = open(&identity.resolved).map_err(unreadable)?;
     // The opened file has the word, not the path a look found: the name may
     // have turned between the two.
-    if !file.metadata().map_err(unreadable)?.is_file() {
-        return Err(SpecRejected::Unreadable(NOT_A_FILE.to_owned()));
-    }
+    let file = open_regular(&identity.resolved).map_err(unreadable)?;
     let mut bytes = Vec::with_capacity(usize::try_from(identity.len).unwrap_or(0));
     // One byte past the bound and no more. A file that grew since the look
     // is another file at the look after the read. A file whose size a look
@@ -333,7 +341,7 @@ impl SpecFile {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::{
         process::Command,
         sync::{
@@ -553,7 +561,7 @@ mod tests {
     /// system-call crate has no call for one on every system the crate
     /// builds on.
     #[cfg(unix)]
-    fn pipe_at(path: &Path) {
+    pub(crate) fn pipe_at(path: &Path) {
         let made = Command::new("mkfifo")
             .arg(path)
             .status()

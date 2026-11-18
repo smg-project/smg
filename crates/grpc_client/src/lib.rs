@@ -4,15 +4,9 @@
 //! the vLLM engine, TensorRT-LLM engine, MLX engine, TokenSpeed scheduler,
 //! and SGLang scheduler backends.
 
-pub mod common_proto {
-    #![allow(
-        clippy::all,
-        clippy::absolute_paths,
-        clippy::trivially_copy_pass_by_ref,
-        unused_qualifications
-    )]
-    tonic::include_proto!("smg.grpc.common");
-}
+/// The messages every engine's service shares (`common.proto`). The worker
+/// crate generates them; this is its module, at the path it had here.
+pub use smg_worker::common_proto;
 pub mod abort_on_drop;
 pub mod channel;
 pub mod codec;

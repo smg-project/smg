@@ -162,6 +162,16 @@ impl ShortPieceKey {
         }
     }
 
+    /// The bytes of the piece the key stands for, in the low fifteen of the
+    /// sixteen, and its length: the piece itself, for a caller that kept
+    /// the key and no longer has the text.
+    pub(super) fn bytes(self) -> ([u8; 16], usize) {
+        (
+            self.0.to_le_bytes(),
+            (self.0 >> LENGTH_SHIFT) as usize & 0xF,
+        )
+    }
+
     /// The length of the piece the key stands for.
     #[cfg(test)]
     fn len(self) -> usize {
@@ -316,6 +326,28 @@ impl ShortPieceTable {
             }
             slot = (slot + 1) & self.mask;
         }
+    }
+
+    /// The id of `entry`, an entry of this table, when it stands for exactly
+    /// one, as a vocabulary word's does; else `None`, with the entry's ids
+    /// appended to `out` ([`Self::append`]).
+    #[inline(always)]
+    pub(super) fn one_or_append(&self, entry: &Entry, out: &mut Vec<u32>) -> Option<u32> {
+        if entry.key >> COUNT_SHIFT == 1 {
+            return Some(entry.ids[0]);
+        }
+        self.append(entry, out);
+        None
+    }
+
+    /// One byte of the tag and of the entry a probe of `key` begins on,
+    /// folded. A caller that asks this of several keys one after the other
+    /// has their far lines read together, where whole probes read them one
+    /// by one (see `Native::answer_waiting`).
+    #[inline(always)]
+    pub(super) fn touch(&self, key: ShortPieceKey) -> u8 {
+        let (slot, _) = self.first_slot(key);
+        self.tags[slot] ^ (self.entries[slot].key as u8)
     }
 
     /// Appends the ids of `entry`, an entry of this table, to `out`: all
@@ -634,6 +666,33 @@ mod tests {
         assert_eq!(ids_of(&table, b"b"), None);
         assert_eq!(ids_of(&table, &[b'z'; 14]), None);
         assert_eq!(ids_of(&table, b"a\0"), None);
+    }
+
+    /// An entry of one id answers the id and appends nothing; an entry of
+    /// more appends its ids.
+    #[test]
+    fn an_entry_of_one_id_answers_it_and_one_of_more_appends_its_ids() {
+        let mut table = ShortPieceTable::new();
+        assert!(table.insert(key(b"a"), &[7], 3));
+        assert!(table.insert(key(b"b"), &[1, 2], 3));
+        let mut out = vec![9];
+        let entry = table.probe(key(b"a")).ok().expect("stored");
+        assert_eq!(table.one_or_append(entry, &mut out), Some(7));
+        assert_eq!(out, [9]);
+        let entry = table.probe(key(b"b")).ok().expect("stored");
+        assert_eq!(table.one_or_append(entry, &mut out), None);
+        assert_eq!(out, [9, 1, 2]);
+    }
+
+    /// A key gives back the bytes and the length of its piece, for every
+    /// length.
+    #[test]
+    fn a_key_gives_back_the_bytes_of_its_piece() {
+        let piece: Vec<u8> = (1..=15u8).map(|b| b.wrapping_mul(37)).collect();
+        for len in 1..=15 {
+            let (bytes, length) = key(&piece[..len]).bytes();
+            assert_eq!(&bytes[..length], &piece[..len], "{len}");
+        }
     }
 
     #[test]

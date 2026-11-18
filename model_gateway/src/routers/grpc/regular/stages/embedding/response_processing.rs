@@ -15,7 +15,7 @@ use crate::routers::{
     error,
     grpc::{
         common::stages::ProcessStage,
-        context::{DispatchContext, ExecutionResult, FinalResponse},
+        context::{wrong_response_spec, DispatchContext, ExecutionResult, FinalResponse},
         proto_wrapper::ProtoEmbedComplete,
         spec::{EmbeddingResponseSpec, ResponseSpec},
     },
@@ -30,12 +30,6 @@ impl EmbeddingResponseProcessingStage {
     }
 }
 
-impl Default for EmbeddingResponseProcessingStage {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[async_trait]
 impl ProcessStage for EmbeddingResponseProcessingStage {
     async fn process(
@@ -44,13 +38,8 @@ impl ProcessStage for EmbeddingResponseProcessingStage {
         spec: ResponseSpec,
     ) -> Result<Option<Response>, Response> {
         let ResponseSpec::Embedding(EmbeddingResponseSpec { base64 }) = spec else {
-            error!(
-                function = "EmbeddingResponseProcessingStage::process",
-                "Wrong response spec"
-            );
-            return Err(error::internal_error(
-                "wrong_response_spec",
-                "Wrong response spec",
+            return Err(wrong_response_spec(
+                "EmbeddingResponseProcessingStage::process",
             ));
         };
 

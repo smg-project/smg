@@ -53,4 +53,4 @@ mod log;
 mod tests;
 
 pub use entries::{Fate, ENTRIES};
-pub use log::{Adopting, Entry, Event, Log, Lost, Unled};
+pub use log::{Adopting, Entry, Event, Log, Lost, Stamp, Unled};

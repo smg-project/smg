@@ -96,7 +96,8 @@ use crate::{
     },
     worker::{
         identity::endpoint::Endpoint, metrics::Metrics as WorkerMetrics, PdPairIndex, PdWire,
-        RoutingPool, RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry, UNKNOWN_MODEL_ID,
+        RoutingPool, RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry, WorkerRegistryExt,
+        UNKNOWN_MODEL_ID,
     },
 };
 
@@ -1919,7 +1920,14 @@ impl PDRouter {
                 let id = transfer_id.as_deref().unwrap_or_default();
                 RawValue::from_string(mooncake_decode_params(id, engine_id, host, *port)).ok()
             }
-            (KvConnectorMode::Mooncake { .. }, _) => {
+            // No engine id to mint under. A fan-out to a discovered pair is not
+            // this case: it falls through, and the debug line above names it.
+            (
+                KvConnectorMode::Mooncake {
+                    engine_id: None, ..
+                },
+                _,
+            ) => {
                 // Legacy typed host/port injection is a sidecar-proto shape
                 // with no HTTP equivalent; decode recomputes the prompt.
                 warn!(
@@ -5588,11 +5596,11 @@ mod tests {
         assert_eq!(body.get("bootstrap_room"), None, "no bootstrap on vLLM PD");
     }
 
-    /// What a Mooncake pair's two sides are sent for one chat request, the
-    /// prefill body first. The prefill engine's id was discovered
+    /// Every request a Mooncake pair's two sides are sent for `chat`, the
+    /// prefill side's first. The prefill engine's id was discovered
     /// (`engine_id`) or was not, and its server answers with handoff params
     /// of its own, which neither Mooncake form relays.
-    async fn sent_to_a_mooncake_pair(engine_id: Option<&str>) -> [Value; 2] {
+    async fn mooncake_pair_sees(engine_id: Option<&str>, chat: Value) -> [Vec<(String, Value)>; 2] {
         let (prefill_url, prefill_seen) =
             spawn_recording_stub(r#"{"kv_transfer_params":{"remote_engine_id":"its-own"}}"#).await;
         let (decode_url, decode_seen) =
@@ -5615,19 +5623,24 @@ mod tests {
         }
         let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
 
-        let chat: ChatCompletionRequest = serde_json::from_value(json!({
-            "model": "m",
-            "max_tokens": 50,
-            "messages": [{"role": "user", "content": "hi"}],
-        }))
-        .expect("valid chat request");
+        let chat: ChatCompletionRequest = serde_json::from_value(chat).expect("valid chat request");
         let response = router
             .route_chat(None, &tenant, Arc::new(chat), UNKNOWN_MODEL_ID)
             .await;
         assert_eq!(response.status(), StatusCode::OK);
+        [taken(&prefill_seen), taken(&decode_seen)]
+    }
 
-        [(prefill_seen, "prefill"), (decode_seen, "decode")].map(|(seen, side)| {
-            let mut requests = taken(&seen);
+    /// What a Mooncake pair's two sides are sent for one chat request of one
+    /// choice, the prefill body first.
+    async fn sent_to_a_mooncake_pair(engine_id: Option<&str>) -> [Value; 2] {
+        let chat = json!({
+            "model": "m",
+            "max_tokens": 50,
+            "messages": [{"role": "user", "content": "hi"}],
+        });
+        let [prefill, decode] = mooncake_pair_sees(engine_id, chat).await;
+        [(prefill, "prefill"), (decode, "decode")].map(|(mut requests, side)| {
             assert_eq!(requests.len(), 1, "exactly one {side} request");
             let (path, body) = requests.remove(0);
             assert_eq!(path, "/v1/chat/completions", "{side}");
@@ -5679,6 +5692,32 @@ mod tests {
         assert!(logs_contain(
             "Mooncake without a discovered kv_engine_id cannot be minted for"
         ));
+    }
+
+    /// A fan-out request skips the prefill side, so nothing is minted for it
+    /// whatever the pair. Only a pair whose engine id was not discovered is
+    /// warned about: the other pair's id is there.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn vllm_pd_mooncake_fanout_warns_only_without_an_engine_id() {
+        // The discovered pair goes first: a test's log only grows.
+        for (engine_id, warned) in [(Some("eng0"), false), (None, true)] {
+            let chat = json!({
+                "model": "m",
+                "n": 2,
+                "max_tokens": 50,
+                "messages": [{"role": "user", "content": "hi"}],
+            });
+            let [prefill, decode] = mooncake_pair_sees(engine_id, chat).await;
+            assert!(prefill.is_empty(), "{engine_id:?}: no prefill side");
+            assert_eq!(decode.len(), 1, "{engine_id:?}: one decode request");
+            assert_eq!(decode[0].1.get("kv_transfer_params"), None, "{engine_id:?}");
+            assert_eq!(
+                logs_contain("Mooncake without a discovered kv_engine_id cannot be minted for"),
+                warned,
+                "{engine_id:?}: the warning that names a missing engine id"
+            );
+        }
     }
 
     #[tokio::test]

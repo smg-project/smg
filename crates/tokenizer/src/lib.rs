@@ -24,6 +24,7 @@ mod unigram_scores;
 #[cfg(feature = "tokenizers-v1")]
 mod v1;
 mod word_cache;
+mod wordpiece;
 
 pub mod chat_template;
 pub mod huggingface;

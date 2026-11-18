@@ -18,16 +18,21 @@
 //! lease at once, or after the wait this thread's own take still owed; it
 //! then stops and never takes again.
 //!
-//! A word to leave (`Running::step_down`: a planned hand-over, or a term a
-//! caller says it saw) is taken by the same thread between two steps: the
-//! fence closed, the lease released, no take for one lease duration. The
-//! thread goes on stepping.
+//! A word to leave (`Door::hand_over` for a planned hand-over, `Door::saw`
+//! for a term a caller says it saw) is taken by the same thread between two
+//! steps: the fence closed, the lease released, no take for one lease
+//! duration (a replica alone over a lease in its own process takes it again
+//! at once: its next step follows the word). The thread goes on stepping. A
+//! decider says the planned hand-over itself where its term's lease ids pass
+//! their mark: the next take brings a term whose ids start again. The
+//! hand-over names that term, and the thread drops one whose term this
+//! replica no longer holds the lease under: that lease is left already.
 
 use std::{
     fmt, io,
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
-    sync::{mpsc, Arc},
+    sync::{mpsc, Arc, Weak},
     thread,
     time::Instant,
 };
@@ -365,14 +370,20 @@ enum Word {
     /// The planned stop: the fence closed, the lease released, the thread
     /// ended.
     Stop,
-    /// Leave and stay in the election: a planned hand-over, or a term a
-    /// caller says it saw.
+    /// Leave and stay in the election: a term a caller says it saw
+    /// ([`Door::saw`]). With no term it is the leave itself, which the
+    /// thread makes of a hand-over of the term held: cases alone send it.
     StepDown(Option<u64>),
+    /// The planned hand-over of the lease held under this term: a replica
+    /// that no longer holds the lease under it keeps on as it is.
+    HandOver(u64),
 }
 
 /// The running election: its words and its end.
 pub(crate) struct Running {
-    words: mpsc::Sender<Word>,
+    /// The one strong holder of the words: a door holds them weakly, so
+    /// the thread hears its channel close when this handle is dropped.
+    words: Arc<mpsc::Sender<Word>>,
     /// Taken once the thread's end was seen.
     end: Option<oneshot::Receiver<()>>,
 }
@@ -385,25 +396,14 @@ impl Running {
         let _ = self.words.send(Word::Stop);
     }
 
-    /// A word to leave: a planned hand-over (`None`), or a term `above`
-    /// that a caller says it saw, a gateway's floor or a standby's. The
-    /// thread counts the term among the terms this replica saw. Where it
-    /// leads under a lower term, or no term is said, it closes the fence,
-    /// releases the lease under the highest term it saw and takes nothing
-    /// for one lease duration; a replica that holds no lease, or leads at
-    /// or above the term said, keeps on as it is. A word may not spend the
-    /// last term: a term whose next is not below the ceiling
-    /// ([`crate::elector::TERM_CEILING`]) is the term error, and no word is
-    /// said.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "its callers land with the session's term floor")
-    )]
-    pub(crate) fn step_down(&self, above: Option<u64>) -> Result<(), ElectError> {
-        term_said(above)?;
-        // A thread that is gone holds no lease.
-        let _ = self.words.send(Word::StepDown(above));
-        Ok(())
+    /// The door for a word from outside the run loop: what the service's
+    /// shared state holds, so a session says a gateway's term floor and a
+    /// decider the planned hand-over. The door keeps nothing alive: this
+    /// handle dropped, the election ends as before.
+    pub(crate) fn door(&self) -> Door {
+        Door {
+            words: Arc::downgrade(&self.words),
+        }
     }
 
     /// Resolves when the thread is gone, after a stop or on its own; at
@@ -415,6 +415,98 @@ impl Running {
             let _ = end.await;
             self.end = None;
         }
+    }
+}
+
+/// A word to leave on `words`: the term `above` a caller says it saw, which
+/// must leave one to take ([`term_said`]): one that does not is the term
+/// error, and no word is said.
+fn leave(words: &mpsc::Sender<Word>, above: u64) -> Result<(), ElectError> {
+    term_said(Some(above))?;
+    // A thread that is gone holds no lease.
+    let _ = words.send(Word::StepDown(Some(above)));
+    Ok(())
+}
+
+/// The door for a word from outside the run loop, a term a caller saw or
+/// the planned hand-over, apart from the handle the run loop keeps: the
+/// election's words, held weakly. The handle alone keeps the channel open,
+/// so a host that drops the election without a stop ends it while the
+/// service's shared state still holds this door.
+///
+/// The thread counts a term said among the terms this replica saw. Where it
+/// leads under a lower term, or no term is said, it closes the fence,
+/// releases the lease under the highest term it saw and takes nothing for
+/// one lease duration: but a replica alone over its lease takes it again at
+/// once. A replica that leads at or above the term said keeps on as it is.
+/// So does one that holds no lease: where it saw the lease released under a
+/// lower term, it writes that release again under the highest term it saw.
+#[derive(Clone)]
+pub(crate) struct Door {
+    words: Weak<mpsc::Sender<Word>>,
+}
+
+impl Door {
+    /// A term `above` that a caller says it saw, a gateway's floor or a
+    /// standby's. A word may not spend the last term: a term whose next is
+    /// not below the ceiling ([`crate::elector::TERM_CEILING`]) is the term
+    /// error, and no word is said. Behind a handle that is gone nobody
+    /// leads: the term is judged the same and said to no one.
+    pub(crate) fn saw(&self, above: u64) -> Result<(), ElectError> {
+        match self.words.upgrade() {
+            Some(words) => leave(&words, above),
+            None => term_said(Some(above)),
+        }
+    }
+
+    /// The planned hand-over of the lease held under the term `under`: its
+    /// holder leaves, as at a word with no term. A replica that no longer
+    /// holds the lease under that term keeps on as it is: a hand-over made
+    /// under one term and taken after a later take leaves that take alone.
+    /// Behind a handle that is gone nobody leads, and the word is said to
+    /// no one.
+    pub(crate) fn hand_over(&self, under: u64) {
+        if let Some(words) = self.words.upgrade() {
+            // A thread that is gone holds no lease.
+            let _ = words.send(Word::HandOver(under));
+        }
+    }
+}
+
+/// A door no thread listens behind, for a case of the door's caller. It
+/// stands in for the handle too: the door says while this lives.
+#[cfg(test)]
+pub(crate) struct Said {
+    /// The handle's part: the door holds these weakly.
+    _words: Arc<mpsc::Sender<Word>>,
+    heard: mpsc::Receiver<Word>,
+}
+
+#[cfg(test)]
+impl Said {
+    /// The door, and what is said through it.
+    pub(crate) fn door() -> (Door, Self) {
+        let (words, heard) = mpsc::channel();
+        let words = Arc::new(words);
+        let door = Door {
+            words: Arc::downgrade(&words),
+        };
+        let said = Self {
+            _words: words,
+            heard,
+        };
+        (door, said)
+    }
+
+    /// The terms said since the last call, in order.
+    pub(crate) fn terms(&self) -> Vec<u64> {
+        self.heard
+            .try_iter()
+            .filter_map(|word| match word {
+                Word::StepDown(above) => above,
+                Word::HandOver(_) | Word::Stop => None,
+            })
+            .collect()
     }
 }
 
@@ -436,7 +528,7 @@ pub(crate) fn start(
             let _ = end.send(());
         })?;
     Ok(Running {
-        words,
+        words: Arc::new(words),
         end: Some(ended),
     })
 }
@@ -572,33 +664,52 @@ fn run(
         standing.send_replace(seen.clone());
         // A step that took the period or more is followed at once, never
         // sooner. A word to leave is taken when it comes, and the wait for
-        // the next step goes on.
+        // the next step goes on: but for a replica alone over its lease
+        // that the word left with no leader, whose next step comes now.
         let next = began + period;
         let stop = loop {
-            match words.recv_timeout(next.saturating_duration_since(Instant::now())) {
+            let above = match words.recv_timeout(next.saturating_duration_since(Instant::now())) {
                 Err(mpsc::RecvTimeoutError::Timeout) => break false,
                 Ok(Word::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => break true,
-                Ok(Word::StepDown(above)) => {
-                    // A word the elector refused counts nothing here
-                    // either.
-                    let Some(left) = step_down(&mut elector, above) else {
-                        continue;
-                    };
-                    // The fence closed at the word: the take that opens it
-                    // again says so, as the first take did.
-                    if left {
-                        leading = false;
-                    }
-                    // A lease this replica left names nobody, and so does a
-                    // term above the one the holder is named under: the
-                    // elector counted the term said.
-                    let highest = elector.highest_term();
-                    if left || highest > seen.term {
-                        seen.holder.clear();
-                        seen.term = seen.term.max(highest);
-                        standing.send_replace(seen.clone());
-                    }
+                Ok(Word::StepDown(above)) => above,
+                // The planned hand-over leaves the lease of its own term, as
+                // a word with no term does.
+                Ok(Word::HandOver(under)) if holds_under(&elector, under) => None,
+                // Planned under a term this replica no longer holds the lease
+                // under, it asks nothing: that lease is left already, and
+                // the take since stands.
+                Ok(Word::HandOver(under)) => {
+                    debug!(
+                        identity = elector.identity(),
+                        under,
+                        "a planned hand-over of a term this replica no longer holds the lease under is dropped"
+                    );
+                    continue;
                 }
+            };
+            // A word the elector refused counts nothing here
+            // either.
+            let Some(left) = step_down(&mut elector, above) else {
+                continue;
+            };
+            // The fence closed at the word: the take that opens it
+            // again says so, as the first take did.
+            if left {
+                leading = false;
+            }
+            // A lease this replica left names nobody, and so does a
+            // term above the one the holder is named under: the
+            // elector counted the term said.
+            let highest = elector.highest_term();
+            if left || highest > seen.term {
+                seen.holder.clear();
+                seen.term = seen.term.max(highest);
+                standing.send_replace(seen.clone());
+            }
+            // No other candidate can take the lease this replica left: the
+            // time with no leader ends at its own take.
+            if left && elector.is_alone() {
+                break false;
             }
         };
         if stop {
@@ -725,11 +836,20 @@ fn report(
     }
 }
 
+/// Whether this replica holds the lease under the term `under`, the term a
+/// planned hand-over was made under.
+fn holds_under(elector: &Elector, under: u64) -> bool {
+    elector.is_holder() && elector.fence().term() == under
+}
+
 /// A word to leave, taken by the election thread. The elector counts the
 /// term; a holder under a lower term, or one told no term, closes its fence,
 /// releases the lease and holds its takes back. `Some(true)` when this
 /// replica held the lease and left it: a release that failed is tried again
-/// at every step, in place of a renewal. `None` when the elector refused
+/// at every step, in place of a renewal. `Some(false)` when it left none: a
+/// replica that saw the lease released under a term below the highest its
+/// run saw writes that release again under that highest, and a write that
+/// failed is logged and not tried again. `None` when the elector refused
 /// the word, a term that leaves none to take: nothing was counted.
 fn step_down(elector: &mut Elector, above: Option<u64>) -> Option<bool> {
     match elector.step_down(above, Instant::now()) {
@@ -738,7 +858,7 @@ fn step_down(elector: &mut Elector, above: Option<u64>) -> Option<bool> {
                 info!(
                     identity = elector.identity(),
                     above,
-                    "stepped down; the lease is released and this replica, alone over its lease, takes it again at its next step"
+                    "stepped down; the lease is released and this replica, alone over its lease, takes it again at once"
                 );
             } else {
                 info!(
@@ -760,7 +880,7 @@ fn step_down(elector: &mut Elector, above: Option<u64>) -> Option<bool> {
             );
             None
         }
-        Err(error) => {
+        Err(error) if elector.is_holder() => {
             warn!(
                 identity = elector.identity(),
                 above,
@@ -768,6 +888,17 @@ fn step_down(elector: &mut Elector, above: Option<u64>) -> Option<bool> {
                 "stepped down; the release failed and is tried again at the next step"
             );
             Some(true)
+        }
+        // No lease is held here: the term was counted, and its write over
+        // a release this replica saw failed.
+        Err(error) => {
+            warn!(
+                identity = elector.identity(),
+                above,
+                %error,
+                "a term said over a released lease was counted and not written; a take below it is left again at its gateway's word"
+            );
+            Some(false)
         }
     }
 }
@@ -834,7 +965,7 @@ mod tests {
 
     use super::{
         dialable, elector, identity, run, split_identity, start, Election, LeaseError, LeasePlace,
-        Running, Standing, Word,
+        Running, Said, Standing, Word,
     };
     use crate::{
         controller::{config::ConfigError, replication::journaled_from},
@@ -1122,6 +1253,46 @@ mod tests {
         assert!(
             stored.is_some_and(|record| record.holder.is_empty()),
             "the lease is free"
+        );
+    }
+
+    /// A door given out keeps no election alive: the handle alone holds the
+    /// words. Dropped while the service's shared state still holds the
+    /// door, the election ends as it does with no door, and the door then
+    /// judges a term and says it to no one.
+    #[test]
+    fn an_election_dropped_while_a_door_is_held_gives_the_lease_up_and_ends() {
+        let mut lease = MemoryLease::new();
+        let settings = ElectionSettings {
+            duration: Duration::from_millis(600),
+            renew_period: Duration::from_millis(50),
+            renew_deadline: Duration::from_millis(400),
+        };
+        let candidate = Elector::new(Box::new(lease.clone()), "a@127.0.0.1:1", settings)
+            .expect("the settings are in order");
+        let fence = candidate.fence();
+        let (standing, _stood) = watch::channel(Standing::default());
+        let mut running =
+            start(candidate, Arc::new(MemoryStore::new()), standing).expect("a thread");
+        until("the take", || fence.leader_term(Instant::now()) == Some(1));
+
+        let door = running.door();
+        let mut end = running.end.take().expect("the end was not seen yet");
+        drop(running);
+        until("the thread's end", || end.try_recv().is_ok());
+        assert_eq!(fence.leader_term(Instant::now()), None);
+        let stored = lease.read().expect("a read");
+        assert!(
+            stored.is_some_and(|record| record.holder.is_empty()),
+            "the lease is free"
+        );
+        door.saw(7).expect("a term that leaves one to take");
+        let refused = door
+            .saw(TERM_CEILING - 1)
+            .expect_err("no term is left to take");
+        assert!(
+            matches!(refused, ElectError::Term(next) if next == TERM_CEILING),
+            "{refused}"
         );
     }
 
@@ -1610,7 +1781,9 @@ mod tests {
             };
             let (store, feed) = journaled_from(&LeasePlace::Process, 0);
             if followed {
-                feed.log.restart(Position { seq: 9, term: 5 });
+                feed.log
+                    .restart(Position { seq: 9, term: 5 })
+                    .expect("a place the log takes");
             }
             let candidate = Elector::new(Box::new(MemoryLease::new()), name, settings)
                 .expect("the settings are in order");
@@ -2101,7 +2274,8 @@ mod tests {
         }
 
         /// Every write fails from here as a store that is away, and stores
-        /// nothing, until a case says otherwise.
+        /// nothing, until a case says otherwise: but a write the script
+        /// names ([`Ahead::Write`]) is answered by the store it left.
         fn fail_writes(&self, fail: bool) {
             self.fails.store(fail, Ordering::SeqCst);
         }
@@ -2131,12 +2305,6 @@ mod tests {
             expected: Option<&LeaseRecord>,
             record: &LeaseRecord,
         ) -> Result<Written, ElectError> {
-            if self.fails.load(Ordering::SeqCst) {
-                return Err(ElectError::Io {
-                    place: self.place(),
-                    source: std::io::Error::other("the store is away"),
-                });
-            }
             let next = {
                 let mut ahead = self.ahead.lock();
                 match ahead.front() {
@@ -2144,8 +2312,15 @@ mod tests {
                     _ => None,
                 }
             };
+            // A write the script names is answered by the store it left,
+            // whatever the failing mode: a case scripts a step in one call.
             if let Some(Ahead::Write(rival)) = next {
                 self.put(&rival);
+            } else if self.fails.load(Ordering::SeqCst) {
+                return Err(ElectError::Io {
+                    place: self.place(),
+                    source: std::io::Error::other("the store is away"),
+                });
             }
             let written = self.lease.write(expected, record)?;
             if written == Written::Done {
@@ -2577,12 +2752,13 @@ mod tests {
             looping.said("the release failed and is tried again")
         });
         // The next step's read finds the holder under term nine, and its
-        // release's write the holder restored under term seven.
+        // release's write the holder restored under term seven. The script
+        // is one call and its write lands under the failing mode: no step
+        // of the loop reads the first with its own write still failing.
         store.ahead([
             Ahead::Read(Some(held("z@127.0.0.1:9", 9))),
             Ahead::Write(held("y@127.0.0.1:7", 7)),
         ]);
-        store.fail_writes(false);
         until("the step that read both", || stood.borrow().term == 9);
         assert_eq!(
             *stood.borrow(),
@@ -2999,7 +3175,8 @@ mod tests {
         // look, above the term the leader was told. No instant has two open
         // fences: every wait here asks both.
         first_running
-            .step_down(Some(7))
+            .door()
+            .saw(7)
             .expect("a term that leaves one to take");
         wait_for("the standby's take above the term said", fences, || {
             second_fence.leader_term(Instant::now()) == Some(8) && second_store.term() == 8
@@ -3020,10 +3197,13 @@ mod tests {
     }
 
     #[test]
-    fn a_replica_alone_over_its_own_lease_that_is_told_to_leave_leads_again_at_its_next_step() {
+    fn a_replica_alone_over_its_own_lease_that_is_told_to_leave_leads_again_at_the_word() {
         // No other candidate can take a lease the elector made itself: a
-        // word holds nothing back, and the line at the word says so.
-        let elector = Elector::alone("a@127.0.0.1:1", brisk()).expect("the settings are in order");
+        // word holds nothing back and the take follows it at once, a renew
+        // period of a minute ahead of the next step by the clock. The line
+        // at the word says so.
+        let elector =
+            Elector::alone("a@127.0.0.1:1", unhurried()).expect("the settings are in order");
         let fence = elector.fence();
         let (standing, stood) = watch::channel(Standing::default());
         let looping = looping(elector, standing);
@@ -3041,8 +3221,7 @@ mod tests {
             stood.borrow().holder == "a@127.0.0.1:1"
         });
         assert_eq!(stood.borrow().term, 8);
-        let (said, text) =
-            looping.stopped_with("alone over its lease, takes it again at its next step");
+        let (said, text) = looping.stopped_with("alone over its lease, takes it again at once");
         assert_eq!(said, 1, "{text}");
         // The fence closed at the word, and the retake says it leads again.
         assert_eq!(text.matches(": leading").count(), 2, "{text}");
@@ -3051,6 +3230,34 @@ mod tests {
             !text.contains("takes nothing for one lease duration"),
             "{text}"
         );
+    }
+
+    /// A replica another candidate can follow takes no step at the word: a
+    /// standby's next look takes what it left, and its own next step comes
+    /// with the renew period, a minute away here. A step would write the
+    /// line of the turn it waits or of the record with no holder.
+    #[test]
+    fn a_replica_another_can_follow_takes_no_step_at_the_word_to_leave() {
+        let elector = Elector::new(Box::new(MemoryLease::new()), "a@127.0.0.1:1", unhurried())
+            .expect("the settings are in order");
+        let (standing, stood) = watch::channel(Standing::default());
+        let looping = looping(elector, standing);
+        until("the first take", || {
+            stood.borrow().holder == "a@127.0.0.1:1"
+        });
+        looping
+            .stop
+            .send(Word::StepDown(None))
+            .expect("the loop runs");
+        until("the leave", || {
+            looping.said("takes nothing for one lease duration")
+        });
+        // The loop is past the word: a step that followed it is written
+        // by now, and the stop writes none.
+        thread::sleep(Duration::from_millis(200));
+        let (_, text) = looping.stopped_with("stepped down");
+        assert!(!text.contains("waits its turn"), "{text}");
+        assert!(!text.contains("names no holder"), "{text}");
     }
 
     #[test]
@@ -3074,6 +3281,36 @@ mod tests {
         assert_eq!(fence.leader_term(Instant::now()), Some(1));
         let (leading, text) = looping.stopped_with(": leading");
         assert_eq!(leading, 1, "{text}");
+    }
+
+    /// A planned hand-over is of one term's lease. Made under term one and
+    /// taken after a gateway's floor moved this replica to term three, it
+    /// leaves that take alone; made under the term held, it is taken.
+    #[test]
+    fn a_hand_over_planned_under_a_term_the_replica_left_releases_nothing() {
+        let elector = Elector::alone("a@127.0.0.1:1", brisk()).expect("the settings are in order");
+        let fence = elector.fence();
+        let (standing, mut stood) = watch::channel(Standing::default());
+        let running = start(elector, Arc::new(MemoryStore::new()), standing).expect("a thread");
+        until("the first lead", || {
+            fence.leader_term(Instant::now()) == Some(1)
+        });
+        let door = running.door();
+        door.saw(2).expect("a term that leaves one to take");
+        until("the take above the floor", || {
+            fence.leader_term(Instant::now()) == Some(3)
+        });
+        // The hand-over of term one comes late: three steps on, the lease
+        // of term three is still held.
+        door.hand_over(1);
+        looks(&mut stood, 3);
+        assert_eq!(fence.leader_term(Instant::now()), Some(3));
+        door.hand_over(3);
+        until("the take after the hand-over of the term held", || {
+            fence.leader_term(Instant::now()) == Some(4)
+        });
+        running.stop();
+        ended(running);
     }
 
     #[test]
@@ -3538,13 +3775,49 @@ mod tests {
         // The replica leaves under the term said, and the last term under
         // the ceiling is its next take.
         running
-            .step_down(Some(TERM_CEILING - 2))
+            .door()
+            .saw(TERM_CEILING - 2)
             .expect("the last term a word may say");
         until("the retake", || {
             fence.leader_term(Instant::now()) == Some(TERM_CEILING - 1)
         });
         running.stop();
         ended(running);
+    }
+
+    #[test]
+    fn a_term_said_at_the_door_is_the_handles_word() {
+        let elector = Elector::alone("a@127.0.0.1:1", brisk()).expect("the settings are in order");
+        let fence = elector.fence();
+        let (standing, _stood) = watch::channel(Standing::default());
+        let running = start(elector, Arc::new(MemoryStore::new()), standing).expect("a thread");
+        until("the first lead", || {
+            fence.leader_term(Instant::now()) == Some(1)
+        });
+        // The door says through the handle's words: a term said through it
+        // is a word to leave that the thread takes.
+        running
+            .door()
+            .saw(7)
+            .expect("a term that leaves one to take");
+        until("the retake above the term said", || {
+            fence.leader_term(Instant::now()) == Some(8)
+        });
+        running.stop();
+        ended(running);
+    }
+
+    #[test]
+    fn the_door_refuses_a_term_that_leaves_none_to_take() {
+        let (door, said) = Said::door();
+        let refused = door
+            .saw(TERM_CEILING - 1)
+            .expect_err("no term is left to take");
+        assert!(
+            matches!(refused, ElectError::Term(next) if next == TERM_CEILING),
+            "{refused}"
+        );
+        assert!(said.terms().is_empty(), "no word is said");
     }
 
     #[test]
@@ -3558,7 +3831,8 @@ mod tests {
         let (standing, _stood) = watch::channel(Standing::default());
         let running = start(elector, Arc::new(MemoryStore::new()), standing).expect("a thread");
         let refused = running
-            .step_down(Some(TERM_CEILING - 1))
+            .door()
+            .saw(TERM_CEILING - 1)
             .expect_err("no term is left to take");
         assert!(
             matches!(refused, ElectError::Term(next) if next == TERM_CEILING),

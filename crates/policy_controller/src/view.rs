@@ -135,7 +135,13 @@ pub struct Health {
     pub stalled: bool,
     /// Being drained; nothing new goes there.
     pub draining: bool,
-    /// The latched overload verdict of the last load report.
+    /// The latched overload verdict of the last load report: the engine
+    /// is at a threshold, or an answer of it named another of its ranks
+    /// and not this one. That mark ends when an answer or a record names
+    /// the rank again, when its member's rows go, or with the build that
+    /// follows its member's registration under another rank number. The
+    /// bit reads the mark only while a rank the answer named has a record
+    /// on file.
     pub overloaded: bool,
 }
 
@@ -623,7 +629,10 @@ pub struct Candidate {
     /// takes one row and no index, so a filter that read the affinity
     /// column there would have to read it at the position; no filter of
     /// this crate does. A debug build asserts that the two agree where a
-    /// decision takes its inputs; a release build does not check.
+    /// decision takes its inputs; a release build does not check. A count
+    /// the host lent beside its rows is read at the position too
+    /// ([`RequestFacts::in_flight`]): the row's place in the host's pool,
+    /// whatever its index.
     pub position: u32,
     pub id: WorkerId,
     pub role: Role,
@@ -638,7 +647,10 @@ pub struct Candidate {
     /// The pairing descriptor's connector, as a position into the spec's
     /// declared list; `0` when none.
     pub connector: u16,
-    /// Requests the deciding host holds on the worker right now.
+    /// Requests the deciding host holds on the worker right now. A host
+    /// that lends its counts beside the rows
+    /// ([`RequestFacts::lent_in_flight`]) leaves this zero, so a reader
+    /// asks [`RequestFacts::in_flight`].
     pub in_flight: u32,
     /// The latest load row, when the host has a report for the worker.
     pub load: Option<LoadRow>,
@@ -721,14 +733,22 @@ pub struct Header<'a> {
 
 /// The mean of the in-flight counts of `rows` of `candidates`; zero over no
 /// row.
-pub(crate) fn mean_in_flight(candidates: &[Candidate], rows: &[u32]) -> f32 {
+// Forced into its callers: the walk is two small loops, one a kind of rows.
+// Out of line they cost an affinity pass a call and one instruction a row
+// more than the one loop that stood inside the pass.
+#[inline(always)]
+pub(crate) fn mean_in_flight(
+    facts: &RequestFacts<'_>,
+    candidates: &[Candidate],
+    rows: &[u32],
+) -> f32 {
     if rows.is_empty() {
         return 0.0;
     }
-    let sum: u64 = rows
+    let sum: u64 = crate::counts::with_counts!(facts, |counts| rows
         .iter()
-        .map(|&i| u64::from(candidates[i as usize].in_flight))
-        .sum();
+        .map(|&i| u64::from(counts(&candidates[i as usize])))
+        .sum());
     sum as f32 / rows.len() as f32
 }
 
@@ -786,6 +806,22 @@ pub struct RequestFacts<'a> {
     /// for the decision. A pair takes none: a pin is a position in one
     /// pool, and neither side reads it. In-process only.
     pub pinned_at: u32,
+    /// What the leases on file book on each row, where the host did not
+    /// write the count into the row: a view of a publication's own rows
+    /// lends the table here. A reader of a row's requests in flight asks
+    /// both ([`RequestFacts::in_flight`]). `None` where the rows carry
+    /// their counts: rows written for the decision, and a host that keeps
+    /// the count itself. A pair takes none: a position is a place in one
+    /// pool, and a pair's rows carry what counts their host wrote.
+    /// In-process only.
+    pub lent_in_flight: Option<&'a crate::counts::LentCounts<'a>>,
+    /// The host wrote each row's count of this request's session key
+    /// ([`Candidate::session_in_flight`]). A sessions rule's in-flight cap
+    /// reads the count either way. A key kept on its worker over the
+    /// overload veto is kept under a capped rule only where this is set:
+    /// with the count unwritten the cap could not hand the key on, so the
+    /// veto stands for it as for any request. In-process only.
+    pub session_counted: bool,
     /// The candidates' affinity facts, by index in the candidate slice the
     /// decision is made over: the one column the affinity stages read, in
     /// the candidates' own order. It is EMPTY or holds exactly one entry a
@@ -890,6 +926,20 @@ impl<'a> RequestFacts<'a> {
         self.pinned_at != 0 && self.pinned_at - 1 == position
     }
 
+    /// The requests in flight of `row`: what the host lent for the row's
+    /// position where it lent a table ([`RequestFacts::lent_in_flight`]),
+    /// the row's own count otherwise. Every reader of a row's count asks
+    /// here, and none learns which rows it was given. A decision reads one
+    /// count a row: beside lent rows the first read is kept, and every
+    /// later read returns it.
+    #[inline]
+    pub fn in_flight(&self, row: &Candidate) -> u32 {
+        match self.lent_in_flight {
+            Some(lent) => lent.at(row.position),
+            None => row.in_flight,
+        }
+    }
+
     /// The affinity facts of the candidate at `index` of the slice the
     /// decision is made over. An empty column reads as nothing held for
     /// every candidate. Any other column holds the candidate's own entry,
@@ -945,6 +995,18 @@ impl<'a> RequestFacts<'a> {
     }
 }
 
+/// A table of session pins that outlives an engine's own (design 5.1, the
+/// sessions row), lent by the deciding host among a decision's
+/// [`Constraints`]. A sessions rule asks it once a decision, for a key its
+/// engine's table holds no pin of: the table goes with its generation, the
+/// pins of record do not.
+pub trait PinSource: std::fmt::Debug + Sync {
+    /// The worker `key` is pinned to, where that pin has not ended by the
+    /// host's record and was last used less than `ttl_micros` ago (`None`:
+    /// a pin of any age). The host answers by its own clock.
+    fn pinned(&self, key: Session, ttl_micros: Option<u64>) -> Option<WorkerId>;
+}
+
 /// What only the deciding host knows now: its standing vetoes, the wires it
 /// speaks and the request-level lifts around the profile. The admission bits
 /// of a prefill window and a decode room ride the candidate rows.
@@ -954,8 +1016,12 @@ pub struct Constraints<'a> {
     pub excluded: &'a [WorkerId],
     /// The wires this host speaks.
     pub wire_modes: WireModes,
-    /// The overload veto does not apply to this decision (a pool whose
-    /// policy balances load against affinity itself, a session owner).
+    /// The overload veto does not apply to this decision: the host's
+    /// override, for a pool whose policy balances load against affinity
+    /// itself. An engine built from a document lifts the veto itself for a
+    /// keyed request of a profile that places by the session key, where the
+    /// binding steers. An engine built by hand does not: its host says so
+    /// here.
     pub overload_lifted: bool,
     /// A subset hint: decide over at most this many candidates.
     pub subset_hint: Option<u32>,
@@ -965,6 +1031,12 @@ pub struct Constraints<'a> {
     /// stalled bit asks both ([`Constraints::masks`]). Empty where the rows
     /// were written for the decision. In-process only.
     pub stalled: &'a [u32],
+    /// The pins of record, where the host keeps a table that outlives the
+    /// engine's ([`PinSource`]): a sessions rule asks it for a key its own
+    /// table holds no pin of, and no other stage reads it. `None` where
+    /// the engine's table is the only one, as in a host that embeds the
+    /// engine. In-process only.
+    pub pins: Option<&'a dyn PinSource>,
 }
 
 impl Constraints<'_> {
@@ -1006,11 +1078,55 @@ pub struct PoolFacts<'a> {
     /// rotation does, keys it by this too. In-process only: a plugin reads
     /// the rows it is handed.
     pub reach: u64,
+    /// Whether every row of the pool holds a rate: a report whose
+    /// `live_rate` is above zero. A host says so where it knows it of the
+    /// rows it wrote, and a decision reads it once: a profile decided by
+    /// rank ([`Scorer::spread`](crate::Scorer::spread)) is asked by rank
+    /// only where it is on, since the load stage reads every row to cost a
+    /// row without a rate. By rank the targets are the whole pass's
+    /// wherever its sums tell the rows in front apart: rows it rounds to
+    /// one sum it draws among, and by rank they are ordered. Off by
+    /// default: a host that does not say it gets the whole pass. A host
+    /// that says it of a pool that holds a row without a rate is answered
+    /// in one of two ways. Among the rows in front such a row makes the
+    /// stage say that it must be asked whole
+    /// ([`Front::Whole`](crate::Front::Whole)): the decision is the whole
+    /// pass's, and it paid for its ranks' reading. Behind them it is not
+    /// read where the rows in front decide alone: each is costed from its
+    /// own report, and the decision is the one by rank. Where they cannot,
+    /// their band being wider than the ranks leave room for, every row is
+    /// asked, that row with them, and the decision is the whole pass's.
+    /// In-process only.
+    pub rated: bool,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::counts::tests::Lent;
+
+    /// One reader, two feeds: a row's requests in flight are the lent count
+    /// at the row's position where the host lends a table, whatever the
+    /// row's own field holds, and the row's own field where it lends none.
+    #[test]
+    fn a_rows_requests_in_flight_are_the_lent_count_or_the_rows_own() {
+        let row = |position, in_flight| Candidate {
+            position,
+            in_flight,
+            ..Candidate::default()
+        };
+        let mut rows = [row(0, 5), row(1, 2)];
+        let own = RequestFacts::default();
+        let read = |facts: &RequestFacts<'_>, rows: &[Candidate]| -> Vec<u32> {
+            rows.iter().map(|row| facts.in_flight(row)).collect()
+        };
+        assert_eq!(read(&own, &rows), [5, 2]);
+        let lent = Lent::take(&mut rows);
+        assert_eq!(read(&own, &rows), [0, 0]);
+        // A count a host left on a row does not speak over its table.
+        rows[0].in_flight = 9;
+        assert_eq!(read(&lent.beside(&own), &rows), [5, 2]);
+    }
 
     #[test]
     fn health_flags_compose_into_the_two_routability_reads() {

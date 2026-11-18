@@ -26,9 +26,11 @@ use std::{
 use hyper_util::rt::TokioIo;
 use parking_lot::{Condvar, Mutex};
 use rustls::crypto::ring;
+#[cfg(feature = "test-util")]
+use tokio::sync::oneshot;
 use tokio::{
     net::UnixStream,
-    sync::{mpsc, oneshot, Notify},
+    sync::{mpsc, Notify},
     task::JoinSet,
 };
 use tokio_stream::wrappers::ReceiverStream;
@@ -686,6 +688,7 @@ pub(crate) enum Command {
     Observe(Arc<ObserveLane>),
     /// A case's aimed hold: the thread says it took the command, then
     /// stays off its work this long.
+    #[cfg(feature = "test-util")]
     Hold(Duration, oneshot::Sender<()>),
 }
 
@@ -798,7 +801,9 @@ impl Runtime {
 
     /// Holds the I/O thread off its work for `hold` and returns once the
     /// hold began: a case's stand-in for a host that takes the thread's
-    /// core.
+    /// core. The package's own tests build it (`test-util`); no build of a
+    /// product has it.
+    #[cfg(feature = "test-util")]
     #[doc(hidden)]
     pub fn hold_io(&self, hold: Duration) {
         let (held, began) = oneshot::channel();
@@ -843,6 +848,7 @@ async fn run_commands(
                 Some(Command::Observe(lane)) => {
                     streams.spawn(run_observe(lane));
                 }
+                #[cfg(feature = "test-util")]
                 Some(Command::Hold(hold, held)) => {
                     let _ = held.send(());
                     thread::sleep(hold);
@@ -2010,6 +2016,8 @@ mod tests {
         let opens = ran.opens.borrow();
         let told = events.told.lock();
         assert_eq!(told.len(), 2, "{told:?}");
+        // A refused open is asked for again one frame later, never at once.
+        assert_eq!(opens[2].duration_since(opens[1]), lane.peer.connect);
         assert_eq!(told[0].0.duration_since(opens[0]), quick);
         assert_eq!(told[1].0.duration_since(opens[3]), STAND);
     }
@@ -2020,6 +2028,10 @@ mod tests {
     /// outage: told again only where a call that stood has ended.
     #[tokio::test(start_paused = true)]
     async fn a_telling_that_panics_is_told_once_an_outage() {
+        // A subscriber of the case's own counts this thread's error lines.
+        // A second one stays registered beside it: with one alone a line is
+        // on or off by the thread that reaches it first, and a case beside
+        // this one reaches it under none.
         let errors = Errors::default();
         let _beside = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
         let _kept = tracing::subscriber::set_default(errors.clone());
@@ -2043,6 +2055,10 @@ mod tests {
     /// ends, and the opener panics twice more: two streaks, two lines.
     #[tokio::test(start_paused = true)]
     async fn a_streak_of_panicked_turns_says_one_line_until_a_call_stood() {
+        // A subscriber of the case's own counts this thread's error lines.
+        // A second one stays registered beside it: with one alone a line is
+        // on or off by the thread that reaches it first, and a case beside
+        // this one reaches it under none.
         let errors = Errors::default();
         let _beside = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
         let _kept = tracing::subscriber::set_default(errors.clone());

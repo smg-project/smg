@@ -62,7 +62,7 @@ use crate::{
     },
     server::ServerConfig,
     tenant::storage_tenant,
-    worker::{ConnectionMode, ProviderType, RoutingPool, WorkerRegistry},
+    worker::{ConnectionMode, ProviderType, RoutingPool, WorkerRegistry, WorkerRegistryExt},
 };
 
 /// A router family the weighted selection chooses among: its router and the

@@ -1915,9 +1915,9 @@ mod tests {
     use smg_grpc_client::VllmEngineClient;
 
     use super::*;
-    use crate::{
-        routers::grpc::{client::GrpcClient, test_engine::mock_engine},
-        worker::test_support::select_worker,
+    use crate::routers::{
+        common::prefill_admission::test_support::select_worker,
+        grpc::{client::GrpcClient, test_engine::mock_engine},
     };
 
     /// Only multimodal vLLM EPD owns EC state absent from its retained plan.

@@ -20,12 +20,15 @@ use image::DynamicImage;
 use serde_json::Value;
 
 use super::moonvit::{self, MoonVitParams};
-use crate::vision::{
-    preprocessor_config::PreProcessorConfig,
-    processor::{PreprocessedEncoderInputs, VisionPreProcessor},
-    transforms::{
-        TransformError, TransparentBg, TransparentBgConfig, TransparentBgFillStage,
-        TransparentBgPattern,
+use crate::{
+    encoder_inputs::EncoderDtype,
+    vision::{
+        preprocessor_config::PreProcessorConfig,
+        processor::{PreprocessedEncoderInputs, VisionPreProcessor},
+        transforms::{
+            TransformError, TransparentBg, TransparentBgConfig, TransparentBgFillStage,
+            TransparentBgPattern,
+        },
     },
 };
 
@@ -149,6 +152,14 @@ impl VisionPreProcessor for KimiK3Processor {
         images: &[&DynamicImage],
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
         moonvit::preprocess(self.params, images, self.transparent_bg)
+    }
+
+    fn preprocess_wire(
+        &self,
+        images: &[&DynamicImage],
+        dtype: EncoderDtype,
+    ) -> Option<Result<PreprocessedEncoderInputs, TransformError>> {
+        moonvit::preprocess_wire(self.params, images, self.transparent_bg, dtype)
     }
 
     fn calculate_num_tokens(&self, width: u32, height: u32) -> Result<usize, TransformError> {

@@ -1,6 +1,7 @@
-//! The replication scope's two calls on the leader (design 5.4):
-//! `Replicate`, the log served to a standby from the place it stands at,
-//! and the complete snapshot a standby is restored from.
+//! The replication scope's call on the leader (design 5.4): `Replicate`,
+//! the log served to a standby from the place it stands at and, where the
+//! log does not continue the standby, the snapshot it is restored from, in
+//! parts on the same stream, then the log from the snapshot's place.
 //!
 //! One invariant: a standby is sent only the history it stands in, by the
 //! replica the fence calls leader, and a write never waits for a standby.
@@ -10,32 +11,38 @@
 //! second, at the hello and at every poll. The stream's shape gives the
 //! third: no task and no channel stand between the log and the socket, so a
 //! write of the store waits for the copy of one batch under the log's lock
-//! and for nothing else.
+//! and for nothing else. A snapshot is one cut of the store, taken under
+//! the store's locks for the copy of its rows and held by the stream while
+//! it sends ([`Parts`]): no lock is held across a send.
 //!
 //! The load rows are journaled where the lease is shared, and nowhere else
 //! ([`journaled`]): a controller that leads itself over a lease in its own
 //! process can have no standby, so its log carries the watched kinds alone
-//! and both calls are refused by that state of its configuration.
+//! and the call is refused by that state of its configuration.
 
 use std::{
     collections::hash_map::RandomState,
+    fmt,
     hash::BuildHasher,
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, Weak},
     task::{Context, Poll},
     time::{Duration, Instant},
 };
 
-use prost::Message as _;
+use parking_lot::Mutex;
+use prost::{encoding::message, Message as _};
 use tokio::time::{interval, Interval, MissedTickBehavior};
 use tonic::{codegen::tokio_stream::Stream, Code, Status, Streaming};
+use tracing::info;
 
 use super::{election::LeasePlace, service::not_leader, watch_workers, worker_wire};
 use crate::{
     elector::Fence,
     proto::{self, replica_frame::Frame},
     replication::{Entry, Log, Unled},
-    store::{Journal, Kinds, MemoryStore, Position},
+    store::{Cut, Journal, Kinds, LoadSample, MemoryStore, Position},
+    view::WorkerId,
 };
 
 /// The watched kinds' ring: the membership and status events a watcher or a
@@ -55,11 +62,11 @@ const IDLE: Duration = Duration::from_millis(20);
 /// How long an idle stream stays silent. After it the leader says where its
 /// head stands with an empty batch, so a standby reads its lag from the age
 /// of the stream's last frame.
-const BEAT: Duration = Duration::from_secs(1);
+pub(crate) const BEAT: Duration = Duration::from_secs(1);
 
 /// The most bytes of one message a client reads, by the transport's own
-/// bound: a complete snapshot above it is refused, and a batch stops under
-/// it.
+/// bound: a batch of events stops under it, and a snapshot's part under half
+/// of it ([`watch_workers::PAGE_BYTES`]).
 const MESSAGE_BYTES: usize = 4 * 1024 * 1024;
 
 /// A store and the feed of the log it journals to, for a lease at `place`:
@@ -77,7 +84,8 @@ const MESSAGE_BYTES: usize = 4 * 1024 * 1024;
 /// place of the run before would be held, and never told this run's first
 /// writes. After a draw that place is outside this run's log, and its
 /// reader is told to start again. A standby that applied nothing names no
-/// place of any run: it joins at the drawn start ([`Feed::join`]).
+/// place of any run: the standby's feed joins it at the drawn start
+/// ([`Feed::join`]).
 pub(crate) fn journaled(place: &LeasePlace) -> (Arc<MemoryStore>, watch_workers::Feed) {
     journaled_from(place, RandomState::new().hash_one(0u8) % FIRST_PLACES)
 }
@@ -98,16 +106,24 @@ pub(crate) fn journaled_from(
 /// The places a run's log may start after: below 2^48, drawn once a run.
 pub(super) const FIRST_PLACES: u64 = 1 << 48;
 
-/// The replication scope's calls over one store and its log.
+/// The replication scope's call over one store and its log. A clone is the
+/// same store, log and kept cut: a stream holds one to cut its snapshots.
+#[derive(Clone)]
 pub(crate) struct Replication {
     store: Arc<MemoryStore>,
     log: Arc<Log>,
     fence: Arc<Fence>,
+    cuts: Arc<Kept>,
 }
 
 impl Replication {
     pub(crate) fn new(store: Arc<MemoryStore>, log: Arc<Log>, fence: Arc<Fence>) -> Self {
-        Self { store, log, fence }
+        Self {
+            store,
+            log,
+            fence,
+            cuts: Arc::default(),
+        }
     }
 
     /// Refuses a controller no standby can follow, and a leader whose store
@@ -142,10 +158,10 @@ impl Replication {
     /// field a peer fills in. The wait for the hello has no bound, so the
     /// fence is read again once it is in: a replica deposed meanwhile is
     /// `ABORTED`. A hello whose place the log does not hold under its term
-    /// is answered one `resync_required` batch and `FAILED_PRECONDITION`.
-    /// A frame out of the stream's order (a first frame that is not the
-    /// hello, a second hello) is `FAILED_PRECONDITION` as well; a frame of
-    /// no kind is `INVALID_ARGUMENT`.
+    /// is answered one `resync_required` batch, then the snapshot in parts
+    /// and the log from its place, on the same stream. A frame out of the
+    /// stream's order (a first frame that is not the hello, a second hello)
+    /// is `FAILED_PRECONDITION`; a frame of no kind is `INVALID_ARGUMENT`.
     pub(crate) async fn replicate(
         &self,
         term: u64,
@@ -162,26 +178,26 @@ impl Replication {
                 ));
             }
         };
-        let (feed, end) = self.joins(term, standby, &hello, Instant::now())?;
+        let feed = self.joins(term, standby, &hello, Instant::now())?;
         let mut idle = interval(IDLE);
         idle.set_missed_tick_behavior(MissedTickBehavior::Delay);
         Ok(Batches {
             feed,
             inbound,
             idle,
-            end,
+            closed: false,
         })
     }
 
     /// The feed `hello` opens at `now`, on a call admitted under `term`
-    /// from the principal `standby`, and how its stream starts.
+    /// from the principal `standby`.
     fn joins(
         &self,
         term: u64,
         standby: &str,
         hello: &proto::ReplicaHello,
         now: Instant,
-    ) -> Result<(Feed, End), Status> {
+    ) -> Result<Feed, Status> {
         if hello.replica_id != standby {
             return Err(Status::unauthenticated(
                 "the hello's replica_id is not the principal the call is from",
@@ -208,8 +224,8 @@ impl Replication {
             term: hello.last_applied_term,
         };
         Ok(Feed::join(
-            Arc::clone(&self.log),
-            Arc::clone(&self.fence),
+            self,
+            standby,
             term,
             place,
             hello.max_backlog,
@@ -217,21 +233,14 @@ impl Replication {
         ))
     }
 
-    /// The complete snapshot, admitted under `term`: the rows, the load
-    /// rows and the log's place, read as one, which a standby is restored
-    /// from and rejoins at. The place is `term`'s own: where the term moved
-    /// between the admission and the read, the call is `UNAVAILABLE`. One
-    /// message; a fleet whose snapshot passes the transport's bound is
-    /// refused `RESOURCE_EXHAUSTED`. A row's admission crosses as its age
-    /// at `now`, as a load row's sample does.
-    pub(crate) fn snapshot(
-        &self,
-        term: u64,
-        controller_id: &str,
-        now: Instant,
-    ) -> Result<proto::Snapshot, Status> {
+    /// The cut a standby is restored from, admitted under `term`: the rows,
+    /// the load rows and the log's place, read as one, shared with every
+    /// stream restored at that place ([`Kept`]). The place is `term`'s own:
+    /// where the term moved between the admission and the read, the stream
+    /// ends `UNAVAILABLE`.
+    pub(super) fn cut(&self, term: u64) -> Result<Arc<Cut>, Status> {
         self.serves(term)?;
-        let cut = self.store.cut(Kinds::All);
+        let cut = self.cuts.at_head(&self.store, &self.log);
         // A take, or another leader's event, can land between the admission
         // and the cut, whose place is then that write's.
         if cut.at.term != term {
@@ -240,40 +249,126 @@ impl Replication {
                 cut.at.term
             )));
         }
-        let snapshot = proto::Snapshot {
-            term,
-            controller_id: controller_id.to_owned(),
-            workers: cut
-                .rows
-                .iter()
-                .map(|row| proto::WorkerRow {
-                    admitted_age_ms: age_ms(now, row.admitted_at),
-                    ..worker_wire::row(row)
-                })
-                .collect(),
-            loads: cut
-                .loads
-                .iter()
-                .map(|(id, rank, sample)| worker_wire::load(*id, *rank, sample, now))
-                .collect(),
-            replication_seq: cut.at.seq,
-            replication_term: cut.at.term,
-            membership_epoch: cut.epoch,
-            ..proto::Snapshot::default()
-        };
-        within(snapshot, MESSAGE_BYTES)
+        Ok(cut)
     }
 }
 
-/// A snapshot that fits one message of `most` bytes, or its refusal.
-fn within(snapshot: proto::Snapshot, most: usize) -> Result<proto::Snapshot, Status> {
-    let bytes = snapshot.encoded_len();
-    if bytes > most {
-        return Err(Status::resource_exhausted(format!(
-            "the complete snapshot is {bytes} bytes, above one message of {most}"
-        )));
+/// The cut of every kind at one place of the log: taken by the first stream
+/// that is restored there, under the store's locks for the copy of its
+/// rows, and shared by every stream restored at that place while one still
+/// sends it. A cut is a place's, never a standby's, as a watch's is
+/// ([`watch_workers::Source`]): standbys that lose their place together
+/// hold the store's writers once. Nothing is kept past the last stream that
+/// holds it.
+#[derive(Debug, Default)]
+struct Kept(Mutex<Weak<Cut>>);
+
+impl Kept {
+    fn at_head(&self, store: &MemoryStore, log: &Log) -> Arc<Cut> {
+        let mut kept = self.0.lock();
+        let head = log.head(Kinds::All);
+        if let Some(cut) = kept.upgrade().filter(|cut| cut.at == head) {
+            return cut;
+        }
+        let cut = Arc::new(store.cut(Kinds::All));
+        *kept = Arc::downgrade(&cut);
+        cut
     }
-    Ok(snapshot)
+}
+
+/// A snapshot on its way to one standby: the cut it is restored from, and
+/// how much of it the parts sent so far hold. The rows' parts come first,
+/// paged as a watch's snapshot is ([`watch_workers::fill`]), then the load
+/// rows' within the same bytes. The part that ends both is marked the last,
+/// and an empty store is one empty part. The stream holds the cut while it
+/// sends, and no lock.
+#[derive(Debug)]
+struct Parts {
+    cut: Arc<Cut>,
+    /// The rows and the load rows sent.
+    rows: usize,
+    loads: usize,
+    /// The next part's number.
+    part: u32,
+}
+
+impl Parts {
+    const fn of(cut: Arc<Cut>) -> Self {
+        Self {
+            cut,
+            rows: 0,
+            loads: 0,
+            part: 0,
+        }
+    }
+
+    /// The next part as sent at `now`, and whether it is the last. Every
+    /// part says the snapshot's place as a heartbeat says the head: the
+    /// position after it, under its term. A row's admission crosses as its
+    /// age at `now`, as a load row's sample does.
+    fn next(&mut self, now: Instant) -> (proto::ReplicationBatch, bool) {
+        let cut = &*self.cut;
+        let mut part = proto::ReplicationSnapshot {
+            part: self.part,
+            membership_epoch: cut.epoch,
+            ..proto::ReplicationSnapshot::default()
+        };
+        if self.rows < cut.rows.len() {
+            part.workers = watch_workers::fill(&cut.rows[self.rows..], |row| proto::WorkerRow {
+                admitted_age_ms: age_ms(now, row.admitted_at),
+                ..worker_wire::row(row)
+            });
+            self.rows += part.workers.len();
+        } else {
+            part.loads = load_rows(&cut.loads[self.loads..], now);
+            self.loads += part.loads.len();
+        }
+        let last = self.rows == cut.rows.len() && self.loads == cut.loads.len();
+        part.last = last;
+        self.part += 1;
+        let batch = proto::ReplicationBatch {
+            first_seq: cut.at.seq + 1,
+            term: cut.at.term,
+            snapshot: Some(part),
+            ..proto::ReplicationBatch::default()
+        };
+        (batch, last)
+    }
+}
+
+/// The load rows one part holds of `loads`, as sent at `now`: each in order
+/// while they stay within a page's bytes on the wire, the first whatever it
+/// weighs.
+fn load_rows(loads: &[(WorkerId, u16, LoadSample)], now: Instant) -> Vec<proto::LoadSample> {
+    let mut part = Vec::new();
+    let mut bytes = 0;
+    for (id, rank, sample) in loads {
+        let told = worker_wire::load(*id, *rank, sample, now);
+        // A load row in a part: its bytes under the part's tag and a length
+        // (`ReplicationSnapshot.loads`).
+        let framed = message::encoded_len(5, &told);
+        if !part.is_empty() && bytes + framed > watch_workers::PAGE_BYTES {
+            break;
+        }
+        bytes += framed;
+        part.push(told);
+    }
+    part
+}
+
+/// Every part of the snapshot of `cut`, as sent at `now`: the cases'
+/// leader.
+#[cfg(test)]
+pub(super) fn parts(cut: Arc<Cut>, now: Instant) -> Vec<proto::ReplicationBatch> {
+    let mut parts = Parts::of(cut);
+    let mut sent = Vec::new();
+    loop {
+        let (batch, last) = parts.next(now);
+        sent.push(batch);
+        if last {
+            return sent;
+        }
+    }
 }
 
 /// An instant's age at `now`, in milliseconds: what crosses in its place.
@@ -292,33 +387,66 @@ fn leads(fence: &Fence, term: u64, now: Instant) -> Result<(), Status> {
     )))
 }
 
-fn not_held(place: Position) -> Status {
-    Status::failed_precondition(format!(
-        "position {} is not held under term {}: re-sync from a snapshot",
-        place.seq, place.term
-    ))
+/// Why a standby starts again from a snapshot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Why {
+    /// The log does not hold the standby's place under its term: the place
+    /// its hello named, or one the ring let go since.
+    Place(Position),
+    /// The standby held its whole backlog unacknowledged for a second.
+    Backlog(u64),
+    /// The events after the standby's place were written under no term: no
+    /// standby adopts them.
+    NoTerm,
+}
+
+impl fmt::Display for Why {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Place(place) => write!(
+                f,
+                "position {} is not held under term {}",
+                place.seq, place.term
+            ),
+            Self::Backlog(events) => write!(
+                f,
+                "the standby held {events} events unacknowledged for a second"
+            ),
+            Self::NoTerm => f.write_str("the next events were written under no term"),
+        }
+    }
 }
 
 /// What the feed found at one look.
 #[derive(Debug)]
 enum Step {
-    /// The standby's next batch, or the heartbeat: a batch of no events.
+    /// The stream's next batch: the standby's next events, the heartbeat (a
+    /// batch of no events), the word to re-sync or a part of a snapshot.
     Batch(proto::ReplicationBatch),
     /// Nothing follows the standby's place yet.
     Idle,
-    /// The standby starts again from a snapshot: one `resync_required`
-    /// batch, then the status.
-    Resync(Status),
     /// The stream ends with the status.
     Close(Status),
 }
 
+/// Where a feed stands in a restore of its standby.
+#[derive(Debug)]
+enum Restore {
+    /// The standby follows the log.
+    No,
+    /// The log does not continue the standby: the word to re-sync is owed.
+    Word(Why),
+    /// The word was said: the snapshot's cut is owed.
+    Cut(Why),
+    /// The snapshot's next part is owed.
+    Parts(Parts),
+}
+
 /// One standby's place in the leader's log, and what a poll of its stream
 /// reads there. Between two looks it holds the place and the standby's last
-/// acknowledgement, nothing of the log.
+/// acknowledgement, nothing of the log; inside a restore, the snapshot's
+/// cut as well.
 struct Feed {
-    log: Arc<Log>,
-    fence: Arc<Fence>,
     /// The term this replica led under at the hello.
     term: u64,
     /// The standby's place: the last event sent, or where its hello stood.
@@ -334,40 +462,46 @@ struct Feed {
     /// each batch's and each heartbeat's.
     beat: Instant,
     entries: Vec<Entry>,
+    /// The log the feed reads and the fence it reads before every frame,
+    /// with what a snapshot of the standby is cut from.
+    source: Replication,
+    /// The standby's name as its hello said it.
+    standby: String,
+    /// Where the feed stands in a restore of its standby.
+    restore: Restore,
 }
 
 impl Feed {
-    /// A standby's feed from the place its hello names, and how its stream
-    /// starts: open where the log holds the place under its term, else
-    /// with the word to re-sync. A standby that applied nothing names the
-    /// place before every write: it stands at the log's first place, after
-    /// the number the run drew, while the log retains every write since. A
+    /// A standby's feed from the place its hello names: it follows the log
+    /// where the log holds the place under its term, else its first look
+    /// says the word to re-sync. A standby that applied nothing names the
+    /// place before every write: it stands at the log's first place, the
+    /// number the run drew, while the log retains every write since. A
     /// bound of zero is the log's own, and no bound is above it.
     fn join(
-        log: Arc<Log>,
-        fence: Arc<Fence>,
+        source: &Replication,
+        standby: &str,
         term: u64,
         place: Position,
         max_backlog: u32,
         now: Instant,
-    ) -> (Self, End) {
+    ) -> Self {
         let ring = LOAD_EVENTS as u64;
         let backlog = match max_backlog {
             0 => ring,
             most => u64::from(most).min(ring),
         };
+        let log = &source.log;
         let (place, held) = match log.first(Kinds::All) {
             Some(first) if place == Position::default() => (first, true),
             _ => (place, log.holds(Kinds::All, place)),
         };
-        let end = if held {
-            End::Open
+        let restore = if held {
+            Restore::No
         } else {
-            End::Resync(not_held(place))
+            Restore::Word(Why::Place(place))
         };
-        let feed = Self {
-            log,
-            fence,
+        Self {
             term,
             place,
             acked: place.seq,
@@ -375,24 +509,90 @@ impl Feed {
             full: None,
             beat: now,
             entries: Vec::with_capacity(Log::BATCH),
-        };
-        (feed, end)
+            source: source.clone(),
+            standby: standby.to_owned(),
+            restore,
+        }
     }
 
     fn ack(&mut self, seq: u64) {
         self.acked = self.acked.max(seq.min(self.place.seq));
     }
 
+    /// The word to re-sync, for `why`: a batch that says it and nothing
+    /// else. The standby starts again from a snapshot, whose cut the next
+    /// look takes.
+    fn resync(&mut self, why: Why) -> Step {
+        self.restore = Restore::Cut(why);
+        Step::Batch(proto::ReplicationBatch {
+            resync_required: true,
+            head_seq: self.head(),
+            ..proto::ReplicationBatch::default()
+        })
+    }
+
+    /// The log's head as a frame states it: one read of the log, after
+    /// whatever events the frame carries were read.
+    fn head(&self) -> u64 {
+        self.source.log.head(Kinds::All).seq
+    }
+
+    /// The snapshot's cut and its first part at `now`, or the stream's end
+    /// where this replica cuts nothing under the feed's term.
+    fn cut(&mut self, why: Why, now: Instant) -> Step {
+        match self.source.cut(self.term) {
+            Ok(cut) => {
+                info!(
+                    standby = %self.standby,
+                    seq = cut.at.seq,
+                    term = cut.at.term,
+                    rows = cut.rows.len(),
+                    loads = cut.loads.len(),
+                    why = %why,
+                    "restoring a standby from a snapshot"
+                );
+                self.part(Parts::of(cut), now)
+            }
+            Err(status) => Step::Close(status),
+        }
+    }
+
+    /// The snapshot's next part at `now`. After the last the standby stands
+    /// at the snapshot's place and owes no acknowledgement: the next look
+    /// reads the log from there.
+    fn part(&mut self, mut parts: Parts, now: Instant) -> Step {
+        let (mut batch, last) = parts.next(now);
+        batch.head_seq = self.head();
+        if last {
+            self.place = parts.cut.at;
+            self.acked = self.place.seq;
+        } else {
+            self.restore = Restore::Parts(parts);
+        }
+        self.beat = now;
+        Step::Batch(batch)
+    }
+
     /// One look at `now`: the fence, the room the standby's backlog leaves,
     /// then the log from the standby's place, no further than that room. A
     /// look that found events moves the place past the ones its batch
     /// holds, so the next look reads on with no wait between. A backlog
-    /// left full for a second ends the stream with the word to re-sync. A
-    /// stream silent for a second is sent the heartbeat: an empty batch at
-    /// the position after the head.
+    /// left full for a second is answered the word to re-sync, as a place
+    /// the log no longer holds is. The looks after the word send the
+    /// snapshot: the cut's first part, then a part each, the fence read
+    /// before every one. A stream silent for a second is sent the
+    /// heartbeat: an empty batch at the position after the head. Every
+    /// frame states the log's head as its look found it: the standby reads
+    /// there whether the frame left it at the head.
     fn look(&mut self, now: Instant) -> Step {
-        if let Err(status) = leads(&self.fence, self.term, now) {
+        if let Err(status) = leads(&self.source.fence, self.term, now) {
             return Step::Close(status);
+        }
+        match std::mem::replace(&mut self.restore, Restore::No) {
+            Restore::No => {}
+            Restore::Word(why) => return self.resync(why),
+            Restore::Cut(why) => return self.cut(why, now),
+            Restore::Parts(parts) => return self.part(parts, now),
         }
         // The room the backlog leaves: the look reads no further. A backlog
         // left full waits one beat for an acknowledgement.
@@ -403,48 +603,51 @@ impl Feed {
             if now.saturating_duration_since(since) < BEAT {
                 return Step::Idle;
             }
-            return Step::Resync(Status::resource_exhausted(format!(
-                "the standby held {} events unacknowledged for a second",
-                self.backlog
-            )));
+            return self.resync(Why::Backlog(self.backlog));
         }
         self.full = None;
         let most = usize::try_from(room).map_or(Log::BATCH, |room| room.min(Log::BATCH));
         if self
+            .source
             .log
             .read(Kinds::All, self.place, most, &mut self.entries)
             .is_err()
         {
-            return Step::Resync(not_held(self.place));
+            return self.resync(Why::Place(self.place));
         }
         let Some(first) = self.entries.first().map(|entry| entry.at) else {
             if now.saturating_duration_since(self.beat) < BEAT {
                 return Step::Idle;
             }
-            // Nothing follows the place: it is the head, and the standby is
-            // told so.
+            // Nothing followed the place at the read. The head is read
+            // after it, as for every frame: the standby's place unless a
+            // write came since.
             self.beat = now;
             return Step::Batch(proto::ReplicationBatch {
                 first_seq: self.place.seq + 1,
                 term: self.place.term,
                 events: Vec::new(),
                 resync_required: false,
+                snapshot: None,
+                head_seq: self.head(),
             });
         };
         if first.term == 0 {
             // Written before any term: no standby adopts it. The standby
             // re-syncs from a snapshot, which stands under a term.
-            return Step::Resync(Status::failed_precondition(
-                "the next events were written under no term: re-sync from a snapshot",
-            ));
+            return self.resync(Why::NoTerm);
         }
         // A batch on the wire names its first position alone: its events
         // stand at the positions after the place, one each, or the place is
         // no longer the log's.
         if !follows(self.place, &self.entries) {
-            return Step::Resync(not_held(self.place));
+            return self.resync(Why::Place(self.place));
         }
-        let (events, last) = fitting(first, &self.entries, now, MESSAGE_BYTES);
+        // The head is read after the batch, by the log's own door: it is
+        // never short of the batch's end, and a write between the two
+        // only leaves this frame short of the head it states.
+        let head = self.head();
+        let (events, last) = fitting(first, head, &self.entries, now, MESSAGE_BYTES);
         self.place = last;
         self.beat = now;
         Step::Batch(proto::ReplicationBatch {
@@ -452,6 +655,8 @@ impl Feed {
             term: first.term,
             events,
             resync_required: false,
+            snapshot: None,
+            head_seq: head,
         })
     }
 }
@@ -473,14 +678,17 @@ fn follows(place: Position, entries: &[Entry]) -> bool {
 /// place.
 fn fitting(
     first: Position,
+    head: u64,
     entries: &[Entry],
     now: Instant,
     bound: usize,
 ) -> (Vec<proto::ReplicationEvent>, Position) {
-    // The batch's own fields: its position and its term.
+    // The batch's own fields: its position, its term and the head it
+    // states.
     let mut bytes = proto::ReplicationBatch {
         first_seq: first.seq,
         term: first.term,
+        head_seq: head,
         ..proto::ReplicationBatch::default()
     }
     .encoded_len();
@@ -500,45 +708,31 @@ fn fitting(
     (events, last)
 }
 
-/// How a stream stands.
-enum End {
-    /// Batches flow.
-    Open,
-    /// One `resync_required` batch is owed, then the status.
-    Resync(Status),
-    /// The status is owed.
-    Status(Status),
-    /// Nothing more.
-    Closed,
-}
-
 /// One standby's stream of batches, polled by the transport: each poll
 /// looks at the log from the standby's place and returns what it found, so
 /// the stream is as fast as the socket takes it. Only an idle stream waits,
 /// for the tick that makes it look again.
+///
+/// A standby the log does not continue is told so in one batch and then
+/// restored on the same stream: the looks that follow send one cut of the
+/// store a part each, then the log from the cut's place, so no gap stands
+/// between a snapshot and what follows it ([`Feed::look`]).
 pub(crate) struct Batches {
     feed: Feed,
     inbound: Streaming<proto::ReplicaFrame>,
     /// Wakes an idle stream to look at the log.
     idle: Interval,
-    end: End,
+    /// Whether the stream ended: nothing follows a status, nor the end of
+    /// the standby's half.
+    closed: bool,
 }
 
 type Item = Result<proto::ReplicationBatch, Status>;
 
 impl Batches {
-    /// One `resync_required` batch now, `status` at the next poll.
-    fn resync(&mut self, status: Status) -> Poll<Option<Item>> {
-        self.end = End::Status(status);
-        Poll::Ready(Some(Ok(proto::ReplicationBatch {
-            resync_required: true,
-            ..proto::ReplicationBatch::default()
-        })))
-    }
-
     /// `status` now, and nothing after it.
     fn close(&mut self, status: Status) -> Poll<Option<Item>> {
-        self.end = End::Closed;
+        self.closed = true;
         Poll::Ready(Some(Err(status)))
     }
 }
@@ -553,11 +747,8 @@ impl Stream for Batches {
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Item>> {
         let this = &mut *self;
-        match std::mem::replace(&mut this.end, End::Closed) {
-            End::Open => this.end = End::Open,
-            End::Resync(status) => return this.resync(status),
-            End::Status(status) => return Poll::Ready(Some(Err(status))),
-            End::Closed => return Poll::Ready(None),
+        if this.closed {
+            return Poll::Ready(None);
         }
         // The standby's frames: an ack moves its backlog, and the end of its
         // half ends the stream.
@@ -577,7 +768,7 @@ impl Stream for Batches {
                 Poll::Ready(Some(Err(status))) => return this.close(status),
                 // The standby closed its half.
                 Poll::Ready(None) => {
-                    this.end = End::Closed;
+                    this.closed = true;
                     return Poll::Ready(None);
                 }
                 Poll::Pending => break,
@@ -591,7 +782,6 @@ impl Stream for Batches {
                 while this.idle.poll_tick(cx).is_ready() {}
                 Poll::Pending
             }
-            Step::Resync(status) => this.resync(status),
             Step::Close(status) => this.close(status),
         }
     }
@@ -599,6 +789,8 @@ impl Stream for Batches {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use parking_lot::Mutex;
     use tonic::Code;
 
@@ -614,6 +806,9 @@ mod tests {
     };
 
     const IDENTITY: &str = "controller-0@10.0.0.7:30100";
+
+    /// The standby the cases' feeds name.
+    const STANDBY: &str = "controller-1";
 
     /// A replica that took a free lease of its own at `at`, and a store
     /// that journals every kind.
@@ -667,8 +862,6 @@ mod tests {
         /// A standby's feed from `place`.
         fn feed(&self, place: Position, backlog: u64) -> Feed {
             Feed {
-                log: Arc::clone(&self.log),
-                fence: self.elector.fence(),
                 term: self.term,
                 place,
                 acked: place.seq,
@@ -676,6 +869,9 @@ mod tests {
                 full: None,
                 beat: self.at,
                 entries: Vec::new(),
+                source: self.replication(),
+                standby: STANDBY.to_owned(),
+                restore: Restore::No,
             }
         }
 
@@ -713,10 +909,17 @@ mod tests {
         }
     }
 
-    fn resync(step: Step) -> Code {
-        match step {
-            Step::Resync(status) => status.code(),
-            other => panic!("a resync, not {other:?}"),
+    /// Why the look at `at` says the word to re-sync: a batch that says
+    /// it, the log's head and nothing else.
+    fn resync(feed: &mut Feed, at: Instant) -> Why {
+        let word = proto::ReplicationBatch {
+            resync_required: true,
+            head_seq: feed.source.log.head(Kinds::All).seq,
+            ..proto::ReplicationBatch::default()
+        };
+        match (feed.look(at), &feed.restore) {
+            (Step::Batch(said), Restore::Cut(why)) if said == word => *why,
+            other => panic!("the word to re-sync and its reason, not {other:?}"),
         }
     }
 
@@ -774,7 +977,7 @@ mod tests {
                     sizes.push(batch.events.len());
                 }
                 Step::Idle => break,
-                other => panic!("a batch or the end of the burst, not {other:?}"),
+                other @ Step::Close(_) => panic!("a batch or the end of the burst, not {other:?}"),
             }
         }
         assert_eq!(sizes, [256, 256, 256, 234]);
@@ -844,7 +1047,6 @@ mod tests {
 
     #[test]
     fn a_replica_deposed_while_it_awaited_the_hello_joins_no_feed() {
-        const STANDBY: &str = "controller-1";
         let leader = Leader::leading();
         leader.writes(4);
         let replication = leader.replication();
@@ -863,7 +1065,7 @@ mod tests {
         let joins = |hello: &proto::ReplicaHello, now| {
             replication
                 .joins(leader.term, STANDBY, hello, now)
-                .map(|(_, end)| end)
+                .map(|feed| feed.restore)
                 .map_err(|status| status.code())
         };
         // While the fence stands each hello meets its own rule.
@@ -871,11 +1073,11 @@ mod tests {
         let stands = leader.at;
         assert!(matches!(
             joins(&says(STANDBY, held, term), stands),
-            Ok(End::Open)
+            Ok(Restore::No)
         ));
         assert!(matches!(
             joins(&says(STANDBY, lost, term), stands),
-            Ok(End::Resync(_))
+            Ok(Restore::Word(_))
         ));
         assert!(matches!(
             joins(&says(STANDBY, held, term + 1), stands),
@@ -915,7 +1117,10 @@ mod tests {
         let short = leader.at + BEAT - Duration::from_millis(1);
         assert!(matches!(feed.look(short), Step::Idle));
         assert_eq!(feed.place.seq, 300);
-        assert_eq!(resync(feed.look(leader.at + BEAT)), Code::ResourceExhausted);
+        assert!(matches!(
+            resync(&mut feed, leader.at + BEAT),
+            Why::Backlog(_)
+        ));
 
         // An acknowledgement makes room, and the wait starts again at the
         // look that finds the backlog full.
@@ -930,7 +1135,7 @@ mod tests {
         assert!(matches!(feed.look(later), Step::Idle));
         let short = later + BEAT - Duration::from_millis(1);
         assert!(matches!(feed.look(short), Step::Idle));
-        assert_eq!(resync(feed.look(later + BEAT)), Code::ResourceExhausted);
+        assert!(matches!(resync(&mut feed, later + BEAT), Why::Backlog(_)));
 
         // One event acknowledged is room for one.
         let mut feed = leader.feed(START, 300);
@@ -969,7 +1174,7 @@ mod tests {
                     feed.ack(sent);
                 }
                 Step::Idle => break,
-                other => panic!("a batch or the head, not {other:?}"),
+                other @ Step::Close(_) => panic!("a batch or the head, not {other:?}"),
             }
         }
         assert_eq!(sent, 1_002);
@@ -1005,7 +1210,7 @@ mod tests {
                     sizes.push(batch.encoded_len());
                 }
                 Step::Idle => break,
-                other => panic!("a batch or the head, not {other:?}"),
+                other @ Step::Close(_) => panic!("a batch or the head, not {other:?}"),
             }
         }
         // Every event was sent. Together they weigh more than one message
@@ -1029,8 +1234,9 @@ mod tests {
         let read = leader.log.read(Kinds::All, START, Log::BATCH, &mut entries);
         assert!(read.is_ok());
         let first = entries.first().expect("the take's event").at;
-        let (all, last) = fitting(first, &entries, leader.at, usize::MAX);
-        assert_eq!((all.len(), last), (5, leader.log.head(Kinds::All)));
+        let head = leader.log.head(Kinds::All);
+        let (all, last) = fitting(first, head.seq, &entries, leader.at, usize::MAX);
+        assert_eq!((all.len(), last), (5, head));
         // What a batch of the first `count` events weighs on the wire.
         let weighs = |count: usize| {
             proto::ReplicationBatch {
@@ -1038,18 +1244,20 @@ mod tests {
                 term: first.term,
                 events: all.iter().take(count).cloned().collect(),
                 resync_required: false,
+                snapshot: None,
+                head_seq: head.seq,
             }
             .encoded_len()
         };
         for count in 2..=5 {
-            let (fits, last) = fitting(first, &entries, leader.at, weighs(count));
+            let (fits, last) = fitting(first, head.seq, &entries, leader.at, weighs(count));
             assert_eq!(fits.len(), count);
             assert_eq!(last.seq, first.seq + count as u64 - 1);
-            let (short, _) = fitting(first, &entries, leader.at, weighs(count) - 1);
+            let (short, _) = fitting(first, head.seq, &entries, leader.at, weighs(count) - 1);
             assert_eq!(short.len(), count - 1, "one byte under {count} events");
         }
         // No bound is under the first event: a batch always moves the place.
-        let (alone, last) = fitting(first, &entries, leader.at, 0);
+        let (alone, last) = fitting(first, head.seq, &entries, leader.at, 0);
         assert_eq!((alone.len(), last), (1, first));
     }
 
@@ -1063,15 +1271,15 @@ mod tests {
             seq: 900,
             term: leader.term,
         };
-        let (mut feed, end) = Feed::join(
-            Arc::clone(&leader.log),
-            leader.elector.fence(),
+        let mut feed = Feed::join(
+            &leader.replication(),
+            STANDBY,
             leader.term,
             place,
             64,
             leader.at,
         );
-        assert!(matches!(end, End::Open));
+        assert!(matches!(feed.restore, Restore::No));
         assert_eq!(feed.acked, 900);
         // The room is the bound's own: 64 events, not the batch's 256.
         let first = batch(feed.look(leader.at));
@@ -1088,17 +1296,16 @@ mod tests {
         let head = leader.log.head(Kinds::All);
         let join = |place| {
             Feed::join(
-                Arc::clone(&leader.log),
-                leader.elector.fence(),
+                &leader.replication(),
+                STANDBY,
                 leader.term,
                 place,
                 0,
                 leader.at,
             )
-            .1
         };
-        assert!(matches!(join(head), End::Open));
-        assert!(matches!(join(START), End::Open));
+        assert!(matches!(join(head).restore, Restore::No));
+        assert!(matches!(join(START).restore, Restore::No));
         for place in [
             Position { seq: 1, term: 0 },
             Position {
@@ -1110,12 +1317,13 @@ mod tests {
                 ..head
             },
         ] {
-            match join(place) {
-                End::Resync(status) => {
-                    assert_eq!(status.code(), Code::FailedPrecondition, "{place:?}");
-                }
-                _ => panic!("{place:?} is no place to join at"),
-            }
+            // The word is owed, and the feed's first look says it.
+            let mut feed = join(place);
+            assert!(
+                matches!(feed.restore, Restore::Word(why) if why == Why::Place(place)),
+                "{place:?} is no place to join at"
+            );
+            assert_eq!(resync(&mut feed, leader.at), Why::Place(place));
         }
     }
 
@@ -1138,19 +1346,19 @@ mod tests {
         assert_eq!(held.term, head.term, "one term, two runs");
         let join = |place| {
             Feed::join(
-                Arc::clone(&after.log),
-                after.elector.fence(),
+                &after.replication(),
+                STANDBY,
                 after.term,
                 place,
                 0,
                 after.at,
             )
         };
-        match join(held).1 {
-            End::Resync(status) => assert_eq!(status.code(), Code::FailedPrecondition),
+        match join(held).restore {
+            Restore::Word(why) => assert_eq!(why, Why::Place(held)),
             _ => panic!("{held:?} is a place of the run before, this run's head is {head:?}"),
         }
-        assert!(matches!(join(head).1, End::Open));
+        assert!(matches!(join(head).restore, Restore::No));
         // The log is a watcher's judge as well, and a load row's place is
         // one it holds: this run's head, and no place of the run before.
         assert!(after.log.holds(Kinds::Watched, head), "{head:?}");
@@ -1163,8 +1371,8 @@ mod tests {
             .first(Kinds::All)
             .expect("every write is retained");
         assert_eq!(first.term, 0, "{first:?}");
-        let (mut feed, end) = join(START);
-        assert!(matches!(end, End::Open));
+        let mut feed = join(START);
+        assert!(matches!(feed.restore, Restore::No));
         assert_eq!(feed.place, first);
         let sent = batch(feed.look(after.at));
         assert_eq!((sent.first_seq, sent.term), (first.seq + 1, after.term));
@@ -1175,14 +1383,17 @@ mod tests {
             seq: 0,
             term: head.term,
         };
-        assert!(matches!(join(named).1, End::Resync(_)));
+        assert!(matches!(join(named).restore, Restore::Word(_)));
         // A log that restarted at a snapshot's place is no longer its
         // store's whole history: that standby starts from a snapshot.
-        after.log.restart(Position {
-            seq: head.seq + 9,
-            term: head.term + 1,
-        });
-        assert!(matches!(join(START).1, End::Resync(_)));
+        after
+            .log
+            .restart(Position {
+                seq: head.seq + 9,
+                term: head.term + 1,
+            })
+            .expect("a place the log takes");
+        assert!(matches!(join(START).restore, Restore::Word(_)));
     }
 
     #[test]
@@ -1190,14 +1401,13 @@ mod tests {
         let leader = Leader::leading();
         let bound = |asked| {
             Feed::join(
-                Arc::clone(&leader.log),
-                leader.elector.fence(),
+                &leader.replication(),
+                STANDBY,
                 leader.term,
                 START,
                 asked,
                 leader.at,
             )
-            .0
             .backlog
         };
         assert_eq!(bound(0), RING);
@@ -1223,6 +1433,43 @@ mod tests {
     }
 
     #[test]
+    fn every_frame_states_the_logs_head_as_its_look_found_it() {
+        let leader = Leader::leading();
+        // The take, the registration and 300 load rows: more than a batch.
+        leader.writes(300);
+        let head = leader.log.head(Kinds::All);
+        let ends =
+            |batch: &proto::ReplicationBatch| batch.first_seq + batch.events.len() as u64 - 1;
+        let mut feed = leader.feed(START, RING);
+        // A batch short of the head states a head past its last event: a
+        // standby that applied it is not there yet.
+        let first = batch(feed.look(leader.at));
+        assert_eq!(first.events.len(), Log::BATCH);
+        assert!(ends(&first) < head.seq);
+        assert_eq!(first.head_seq, head.seq);
+        // The batch that ends at the head states its own last position,
+        let second = batch(feed.look(leader.at));
+        assert_eq!((ends(&second), second.head_seq), (head.seq, head.seq));
+        // and the heartbeat the position before its own.
+        let beat = batch(feed.look(leader.at + BEAT));
+        assert!(beat.events.is_empty());
+        assert_eq!((beat.first_seq - 1, beat.head_seq), (head.seq, head.seq));
+        // The word to re-sync and a snapshot's part read no event of the
+        // log: each states the head of its own instant.
+        let nowhere = Position {
+            seq: head.seq + 9,
+            term: head.term,
+        };
+        let mut lost = leader.feed(nowhere, RING);
+        let word = batch(lost.look(leader.at));
+        assert!(word.resync_required);
+        assert_eq!(word.head_seq, head.seq);
+        let part = batch(lost.look(leader.at));
+        assert!(part.snapshot.is_some());
+        assert_eq!(part.head_seq, head.seq);
+    }
+
+    #[test]
     fn a_batch_puts_the_heartbeat_off_a_second() {
         let leader = Leader::leading();
         let mut feed = leader.feed(START, RING);
@@ -1238,17 +1485,142 @@ mod tests {
     }
 
     #[test]
-    fn a_snapshot_above_one_message_is_refused() {
+    fn a_store_above_one_message_is_sent_in_parts_of_a_page_each() {
         let leader = Leader::leading();
-        leader.writes(3);
-        let snapshot = leader
-            .replication()
-            .snapshot(leader.term, "controller-0", leader.at)
-            .expect("a snapshot");
-        let bytes = snapshot.encoded_len();
-        assert!(within(snapshot.clone(), bytes).is_ok());
-        let refused = within(snapshot, bytes - 1).expect_err("one byte over");
-        assert_eq!(refused.code(), Code::ResourceExhausted);
+        // 400 workers whose rows hold three labels at a value's bound, and
+        // one load row each: more rows than one message holds.
+        for n in 0..400 {
+            let key = format!("http://w{n:03}:8000");
+            let facts = WorkerFacts {
+                key: key.clone(),
+                engine: key,
+                incarnation: 1,
+                models: vec!["m".to_owned()],
+                dp_size: 1,
+                labels: ["a", "b", "c"]
+                    .map(|key| (key.to_owned(), "v".repeat(4_096)))
+                    .into(),
+                ..WorkerFacts::default()
+            };
+            let id = leader.store.upsert(facts).id();
+            let row = LoadRow::default();
+            leader
+                .store
+                .record(id, 0, row, leader.at, LoadSource::Stream);
+        }
+        let cut = leader.replication().cut(leader.term).expect("a cut");
+        let sent = parts(Arc::clone(&cut), leader.at);
+        let sizes: Vec<usize> = sent.iter().map(|part| part.encoded_len()).collect();
+        let whole_bytes: usize = sizes.iter().sum();
+        assert!(whole_bytes > MESSAGE_BYTES, "{whole_bytes}");
+        // Each part is a page of rows at most, under the batch's own fields:
+        // half of what the transport reads.
+        let page = watch_workers::PAGE_BYTES + 64;
+        assert!(sizes.iter().all(|size| *size <= page), "{sizes:?}");
+        for (number, batch) in sent.iter().enumerate() {
+            let part = batch.snapshot.as_ref().expect("a part");
+            assert_eq!(part.part as usize, number);
+            assert_eq!(part.last, number + 1 == sent.len(), "part {number}");
+        }
+        // The parts are the cut whole, in its order: the rows, then the
+        // load rows.
+        let (rows, loads) = whole(&sent);
+        let told: Vec<u64> = rows.iter().map(|row| row.id).collect();
+        let held: Vec<u64> = cut.rows.iter().map(|row| row.id.0).collect();
+        assert_eq!(told, held);
+        assert_eq!((rows.len(), loads.len()), (400, 400));
+        let first_load = sent.iter().position(|batch| {
+            let part = batch.snapshot.as_ref().expect("a part");
+            !part.loads.is_empty()
+        });
+        assert_eq!(first_load, Some(sent.len() - 1), "{sizes:?}");
+    }
+
+    #[test]
+    fn a_store_that_holds_nothing_is_one_empty_part() {
+        let leader = Leader::leading();
+        let cut = leader.replication().cut(leader.term).expect("a cut");
+        let sent = parts(cut, leader.at);
+        assert_eq!(sent.len(), 1);
+        let part = sent[0].snapshot.as_ref().expect("a part");
+        assert!(part.last && part.workers.is_empty() && part.loads.is_empty());
+        let head = leader.log.head(Kinds::All);
+        assert_eq!((sent[0].first_seq, sent[0].term), (head.seq + 1, head.term));
+    }
+
+    #[test]
+    fn load_rows_past_a_page_are_sent_in_parts_each_full_to_the_row() {
+        let now = Instant::now();
+        let sample = LoadSample {
+            row: LoadRow {
+                running: u32::MAX,
+                queued: u32::MAX,
+                ..LoadRow::default()
+            },
+            received_at: now,
+            sampled_at: now,
+            source: LoadSource::Stream,
+        };
+        // A cut of load rows alone, a worker each: above two pages of them.
+        let cut = Arc::new(Cut {
+            at: Position { seq: 7, term: 3 },
+            epoch: 2,
+            rows: Vec::new(),
+            loads: (0..250_000).map(|n| (WorkerId(n), 0, sample)).collect(),
+        });
+        let sent = parts(Arc::clone(&cut), now);
+        assert!(sent.len() > 2, "{} parts", sent.len());
+        let framed = |told: &[proto::LoadSample]| -> usize {
+            told.iter().map(|told| message::encoded_len(5, told)).sum()
+        };
+        let told: Vec<&[proto::LoadSample]> = sent
+            .iter()
+            .map(|batch| batch.snapshot.as_ref().expect("a part").loads.as_slice())
+            .collect();
+        // Each part is within a page and full to the row: the first row of
+        // the next would pass it.
+        for pair in told.windows(2) {
+            let bytes = framed(pair[0]);
+            let next = framed(&pair[1][..1]);
+            assert!(bytes <= watch_workers::PAGE_BYTES, "{bytes}");
+            assert!(bytes + next > watch_workers::PAGE_BYTES, "{bytes}");
+        }
+        // Every part says the cut's place and its epoch, in order, and the
+        // one that ends the load rows is the last.
+        for (number, batch) in sent.iter().enumerate() {
+            let part = batch.snapshot.as_ref().expect("a part");
+            assert_eq!((batch.first_seq, batch.term), (8, 3));
+            assert_eq!((part.part as usize, part.membership_epoch), (number, 2));
+            assert_eq!(part.last, number + 1 == sent.len(), "part {number}");
+        }
+        // The parts are the cut's load rows, each once, in its order.
+        let ids = told.concat().into_iter().map(|told| told.worker_id);
+        assert!(ids.eq(0..250_000));
+    }
+
+    #[test]
+    fn a_cut_is_shared_by_the_streams_restored_at_its_place_and_kept_by_none() {
+        let leader = Leader::leading();
+        leader.writes(1);
+        let replication = leader.replication();
+        let first = replication.cut(leader.term).expect("a cut");
+        let second = replication.cut(leader.term).expect("a cut");
+        assert!(Arc::ptr_eq(&first, &second), "one copy at one place");
+        // A stream holds a clone of the call: the same kept cut.
+        let third = replication.clone().cut(leader.term).expect("a cut");
+        assert!(Arc::ptr_eq(&first, &third));
+        // A write moves the head: the next stream takes its own cut there.
+        leader.writes(1);
+        let later = replication.cut(leader.term).expect("a cut");
+        assert!(!Arc::ptr_eq(&first, &later));
+        assert_eq!(later.at, leader.log.head(Kinds::All));
+        // Nothing is kept past the last stream that holds a cut: the next
+        // at the same place copies the rows again.
+        let held = Arc::downgrade(&later);
+        drop(later);
+        assert!(held.upgrade().is_none(), "the rows are let go");
+        let again = replication.cut(leader.term).expect("a cut");
+        assert_eq!(again.at, leader.log.head(Kinds::All));
     }
 
     #[test]
@@ -1267,16 +1639,114 @@ mod tests {
             },
         ] {
             let mut feed = leader.feed(place, RING);
-            assert_eq!(
-                resync(feed.look(leader.at)),
-                Code::FailedPrecondition,
-                "{place:?}"
-            );
+            assert_eq!(resync(&mut feed, leader.at), Why::Place(place));
         }
         assert!(matches!(
             leader.feed(held, RING).look(leader.at),
             Step::Idle
         ));
+    }
+
+    /// A place past the head of `leader`'s log: one its log does not hold.
+    fn past_the_head(leader: &Leader) -> Position {
+        let head = leader.log.head(Kinds::All);
+        Position {
+            seq: head.seq + 9,
+            ..head
+        }
+    }
+
+    #[test]
+    fn a_standby_the_log_does_not_continue_is_restored_by_the_looks_after_the_word() {
+        let leader = Leader::leading();
+        let id = leader.writes(3);
+        let head = leader.log.head(Kinds::All);
+        let lost = past_the_head(&leader);
+        let mut feed = leader.feed(lost, RING);
+        assert_eq!(resync(&mut feed, leader.at), Why::Place(lost));
+        // The snapshot, a part a look: the row's, then the load row's.
+        let rows = batch(feed.look(leader.at));
+        let part = rows.snapshot.as_ref().expect("the rows' part");
+        assert_eq!((rows.first_seq, rows.term), (head.seq + 1, head.term));
+        assert_eq!((part.part, part.last, part.workers.len()), (0, false, 1));
+        assert_eq!(feed.place, lost, "the place moves at the last part");
+        let loads = batch(feed.look(leader.at));
+        let part = loads.snapshot.as_ref().expect("the load rows' part");
+        assert_eq!((part.part, part.last, part.loads.len()), (1, true, 1));
+        // The standby stands at the snapshot's place and owes nothing: the
+        // log follows from there.
+        assert_eq!((feed.place, feed.acked), (head, head.seq));
+        assert!(matches!(feed.look(leader.at), Step::Idle));
+        let row = LoadRow::default();
+        leader
+            .store
+            .record(id, 0, row, leader.at, LoadSource::Stream);
+        let next = batch(feed.look(leader.at));
+        assert_eq!((next.first_seq, next.events.len()), (head.seq + 1, 1));
+        assert!(next.snapshot.is_none());
+    }
+
+    #[test]
+    fn a_replica_deposed_inside_a_restore_cuts_and_sends_no_further() {
+        let leader = Leader::leading();
+        leader.writes(3);
+        let lost = past_the_head(&leader);
+        let past =
+            leader.at + ElectionSettings::default().renew_deadline + Duration::from_millis(1);
+        let closed = |step: Step| match step {
+            Step::Close(status) => assert_eq!(status.code(), Code::Aborted),
+            other => panic!("the stream's end, not {other:?}"),
+        };
+        // Deposed between the word and the cut.
+        let mut feed = leader.feed(lost, RING);
+        assert_eq!(resync(&mut feed, leader.at), Why::Place(lost));
+        closed(feed.look(past));
+        // Deposed between two parts.
+        let mut feed = leader.feed(lost, RING);
+        assert_eq!(resync(&mut feed, leader.at), Why::Place(lost));
+        assert!(batch(feed.look(leader.at)).snapshot.is_some());
+        closed(feed.look(past));
+        assert_eq!(feed.place, lost, "no standby is told it stands there");
+    }
+
+    #[test]
+    fn a_standby_cut_at_its_backlog_owes_nothing_after_its_restore() {
+        let leader = Leader::leading();
+        leader.writes(8);
+        let mut feed = leader.feed(START, 4);
+        // Four events sent and none acknowledged: the word a beat later.
+        assert_eq!(batch(feed.look(leader.at)).events.len(), 4);
+        assert!(matches!(feed.look(leader.at), Step::Idle));
+        let later = leader.at + BEAT;
+        assert_eq!(resync(&mut feed, later), Why::Backlog(4));
+        // The snapshot, then the head: the backlog is empty again.
+        let mut parts = 0;
+        while batch(feed.look(later))
+            .snapshot
+            .is_some_and(|part| !part.last)
+        {
+            parts += 1;
+        }
+        assert_eq!(parts, 1, "the rows' part, then the last");
+        let head = leader.log.head(Kinds::All);
+        assert_eq!((feed.place, feed.acked), (head, head.seq));
+        assert!(matches!(feed.look(later), Step::Idle));
+    }
+
+    #[test]
+    fn a_restore_this_replica_cuts_nothing_for_ends_the_stream() {
+        // The store took a later term after the word: a cut would stand
+        // under that term, not the feed's.
+        let leader = Leader::leading();
+        leader.writes(1);
+        let lost = past_the_head(&leader);
+        let mut feed = leader.feed(lost, RING);
+        assert_eq!(resync(&mut feed, leader.at), Why::Place(lost));
+        leader.store.set_term(leader.term + 1);
+        match feed.look(leader.at) {
+            Step::Close(status) => assert_eq!(status.code(), Code::Unavailable),
+            other => panic!("the stream's end, not {other:?}"),
+        }
     }
 
     #[test]
@@ -1286,51 +1756,45 @@ mod tests {
         leader.writes(1);
         leader.store.set_term(leader.term);
         let mut feed = leader.feed(START, RING);
-        assert_eq!(resync(feed.look(leader.at)), Code::FailedPrecondition);
+        assert_eq!(resync(&mut feed, leader.at), Why::NoTerm);
+    }
+
+    /// The rows and the load rows the parts hold together, in their order.
+    fn whole(sent: &[proto::ReplicationBatch]) -> (Vec<proto::WorkerRow>, Vec<proto::LoadSample>) {
+        let parts = sent.iter().filter_map(|batch| batch.snapshot.as_ref());
+        let rows = parts.clone().flat_map(|part| part.workers.clone());
+        let loads = parts.flat_map(|part| part.loads.clone());
+        (rows.collect(), loads.collect())
     }
 
     #[test]
-    fn the_snapshot_is_the_stores_cut_with_its_place() {
+    fn a_snapshots_parts_are_the_stores_cut_at_its_place() {
         let leader = Leader::leading();
         let id = leader.writes(3);
-        let snapshot = leader
-            .replication()
-            .snapshot(leader.term, "controller-0", leader.at)
-            .expect("a snapshot");
+        let cut = leader.replication().cut(leader.term).expect("a cut");
         let head = leader.log.head(Kinds::All);
-        assert_eq!(
-            (snapshot.replication_seq, snapshot.replication_term),
-            (head.seq, head.term)
-        );
-        assert_eq!(
-            (snapshot.term, snapshot.controller_id.as_str()),
-            (leader.term, "controller-0")
-        );
-        assert_eq!(snapshot.membership_epoch, leader.store.epoch());
-        assert_eq!(
-            snapshot
-                .workers
-                .iter()
-                .map(|row| row.id)
-                .collect::<Vec<_>>(),
-            [id.0]
-        );
+        assert_eq!((cut.at, cut.epoch), (head, leader.store.epoch()));
+        // The row's part, then the load row's, the last. Each says the
+        // place as a heartbeat says the head, and the epoch.
+        let sent = parts(Arc::clone(&cut), leader.at);
+        assert_eq!(sent.len(), 2);
+        for (number, batch) in sent.iter().enumerate() {
+            assert_eq!((batch.first_seq, batch.term), (head.seq + 1, head.term));
+            assert!(batch.events.is_empty() && !batch.resync_required);
+            let part = batch.snapshot.as_ref().expect("a part");
+            assert_eq!((part.part as usize, part.last), (number, number == 1));
+            assert_eq!(part.membership_epoch, leader.store.epoch());
+        }
+        let (rows, loads) = whole(&sent);
+        assert_eq!(rows.iter().map(|row| row.id).collect::<Vec<_>>(), [id.0]);
         // One rank's row: the last of the three records.
-        assert_eq!(snapshot.loads.len(), 1);
-        let load = &snapshot.loads[0];
-        assert_eq!((load.worker_id, load.dp_rank), (id.0, 0));
-        assert_eq!(load.load.as_ref().map(|row| row.running), Some(2));
+        assert_eq!(loads.len(), 1);
+        assert_eq!((loads[0].worker_id, loads[0].dp_rank), (id.0, 0));
+        assert_eq!(loads[0].load.as_ref().map(|row| row.running), Some(2));
 
-        // A row's admission crosses as its age at the send.
-        let later = leader
-            .replication()
-            .snapshot(
-                leader.term,
-                "controller-0",
-                Instant::now() + Duration::from_secs(5),
-            )
-            .expect("a snapshot");
-        let age = later.workers[0].admitted_age_ms;
+        // A row's admission crosses as its age at the part's send.
+        let later = parts(cut, Instant::now() + Duration::from_secs(5));
+        let age = whole(&later).0[0].admitted_age_ms;
         assert!((5_000..65_000).contains(&age), "{age} ms");
     }
 
@@ -1344,20 +1808,25 @@ mod tests {
     impl Journal for AtTheCut {
         fn member(
             &self,
+            at: Option<Position>,
             epoch: u64,
             change: MembershipChange,
             row: Option<&WorkerRow>,
             left: Option<&WorkerRow>,
         ) {
-            self.log.member(epoch, change, row, left);
+            self.log.member(at, epoch, change, row, left);
         }
 
-        fn load(&self, id: WorkerId, rank: u16, sample: &LoadSample) {
-            self.log.load(id, rank, sample);
+        fn load(&self, at: Option<Position>, id: WorkerId, rank: u16, sample: &LoadSample) {
+            self.log.load(at, id, rank, sample);
         }
 
         fn term_rose(&self, term: u64) {
             self.log.term_rose(term);
+        }
+
+        fn term_followed(&self, at: Position) {
+            self.log.term_followed(at);
         }
 
         fn carries_loads(&self) -> bool {
@@ -1376,23 +1845,44 @@ mod tests {
         fn followed(&self) -> Option<u64> {
             self.log.followed()
         }
+
+        fn released(&self) {
+            self.log.released();
+        }
+
+        fn restart(&self, at: Position) -> bool {
+            self.log.restart(at).is_ok()
+        }
     }
 
     #[test]
     fn a_snapshot_a_take_landed_inside_is_refused() {
         let leader = Leader::elected();
-        let log = Arc::new(Log::new(WATCHED_EVENTS, LOAD_EVENTS));
+        let told = Arc::new(AtomicUsize::new(0));
+        let log = {
+            let told = Arc::clone(&told);
+            Arc::new(Log::new(WATCHED_EVENTS, LOAD_EVENTS).on_watched(move || {
+                told.fetch_add(1, Ordering::Relaxed);
+            }))
+        };
         let journal = Arc::new(AtTheCut {
             log: Arc::clone(&log),
             lands: Mutex::default(),
         });
         let store = Arc::new(MemoryStore::journaled(Arc::clone(&journal) as _));
         store.set_term(leader.term);
+        // The journal hands the store's release on to its log, or the
+        // log's listener hears of no write: the term's start is told.
+        assert_eq!(
+            told.load(Ordering::Relaxed),
+            1,
+            "the release was not handed on"
+        );
         let replication = Replication::new(Arc::clone(&store), log, leader.elector.fence());
-        let served = replication
-            .snapshot(leader.term, "controller-0", leader.at)
-            .expect("a snapshot");
-        assert_eq!(served.replication_term, leader.term);
+        // No stream holds the cut past this line: the next call takes its
+        // own.
+        let served = replication.cut(leader.term).expect("a cut").at;
+        assert_eq!(served.term, leader.term);
 
         // The store takes the next term after the call's admission, as the
         // cut reads its place: the place is that take's.
@@ -1402,15 +1892,13 @@ mod tests {
             move || store.set_term(later)
         }));
         let refused = replication
-            .snapshot(leader.term, "controller-0", leader.at)
+            .cut(leader.term)
             .expect_err("a term beside a later term's place");
         assert_eq!(refused.code(), Code::Unavailable);
         assert_eq!(store.term(), later, "the take landed inside the call");
         // The later term's call is served at that place.
-        let served = replication
-            .snapshot(later, "controller-0", leader.at)
-            .expect("the later term's snapshot");
-        assert_eq!((served.term, served.replication_term), (later, later));
+        let served = replication.cut(later).expect("the later term's snapshot");
+        assert_eq!(served.at.term, later);
     }
 
     #[test]
@@ -1446,7 +1934,7 @@ mod tests {
         let leader = Leader::elected();
         let refused = leader
             .replication()
-            .snapshot(leader.term, "controller-0", leader.at)
+            .cut(leader.term)
             .expect_err("the take has not reached the store");
         assert_eq!(refused.code(), Code::Unavailable);
         assert!(
@@ -1459,7 +1947,7 @@ mod tests {
         leader.store.set_term(leader.term);
         let refused = leader
             .replication()
-            .snapshot(leader.term + 1, "controller-0", leader.at)
+            .cut(leader.term + 1)
             .expect_err("the later take has not reached the store");
         assert_eq!(refused.code(), Code::Unavailable);
         assert!(
@@ -1475,14 +1963,17 @@ mod tests {
         // one before the store is told the take and after it: no write of
         // that take starts the term.
         let leader = Leader::elected();
-        leader.log.restart(Position { seq: 9, term: 7 });
+        leader
+            .log
+            .restart(Position { seq: 9, term: 7 })
+            .expect("a place the log takes");
         for told in [false, true] {
             if told {
                 leader.store.set_term(leader.term);
             }
             let refused = leader
                 .replication()
-                .snapshot(leader.term, "controller-0", leader.at)
+                .cut(leader.term)
                 .expect_err("its writes stand under no term");
             assert_eq!(refused.code(), Code::Unavailable);
             let said = refused.message();
@@ -1496,13 +1987,16 @@ mod tests {
         // that applied that term's start does: a take does not lower it,
         // and the refusal names both terms, never a write still to come.
         let leader = Leader::elected();
-        leader.log.restart(Position { seq: 9, term: 7 });
+        leader
+            .log
+            .restart(Position { seq: 9, term: 7 })
+            .expect("a place the log takes");
         leader.store.set_term(7);
         leader.store.set_term(leader.term);
         assert_eq!(leader.store.term(), 7);
         let refused = leader
             .replication()
-            .snapshot(leader.term, "controller-0", leader.at)
+            .cut(leader.term)
             .expect_err("its writes stand under no term");
         assert_eq!(refused.code(), Code::Unavailable);
         let said = refused.message();
@@ -1527,15 +2021,11 @@ mod tests {
             said.contains("under term 7") && said.contains("a later take than term 1"),
             "{said}"
         );
-        let refused = replication
-            .snapshot(leader.term, "controller-0", leader.at)
-            .expect_err("a later take");
+        let refused = replication.cut(leader.term).expect_err("a later take");
         assert_eq!(refused.code(), Code::Unavailable);
         // The later term's own call is served, at that take's place.
-        let served = replication
-            .snapshot(7, "controller-0", leader.at)
-            .expect("the later term's snapshot");
-        assert_eq!((served.term, served.replication_term), (7, 7));
+        let served = replication.cut(7).expect("the later term's snapshot");
+        assert_eq!(served.at.term, 7);
     }
 
     #[test]
@@ -1545,7 +2035,7 @@ mod tests {
         store.set_term(leader.term);
         assert!(!feed.log.carries_loads());
         let refused = Replication::new(store, feed.log, leader.elector.fence())
-            .snapshot(leader.term, "controller-0", leader.at)
+            .cut(leader.term)
             .expect_err("no standby follows it");
         assert_eq!(refused.code(), Code::FailedPrecondition);
     }

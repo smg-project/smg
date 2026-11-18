@@ -65,6 +65,7 @@
 //!
 //! [`LoadRow`]: crate::view::LoadRow
 
+pub mod encoding;
 pub mod health;
 pub mod index;
 pub mod journal;
@@ -81,16 +82,19 @@ pub mod world;
 #[cfg(test)]
 mod tests;
 
+pub use encoding::{EncodeClasses, EncodeHandoff, EncodeOffer};
 pub use health::{HealthSink, VetoWrite};
-pub use index::{ContentHash, KvEvent, LaneCounts, SequenceHash, StoredBlock, INDEX_WORKERS};
+pub use index::{
+    ContentHash, KvEvent, LaneCounts, Named, SequenceHash, StoredBlock, INDEX_WORKERS,
+};
 pub use journal::{Journal, Kinds, Position};
 pub use kv_events::{
     Admission, BatchFacts, BatchOutcome, KvCursor, KvEventSink, RankCursor, ResyncReason,
     SnapshotChunk,
 };
-pub use leases::{Dispatch, LeaseRecord, LeaseRefused, LeaseState, LeasesStore};
+pub use leases::{Dispatch, LeaseRecord, LeaseRefused, LeaseState, LeasesStore, Picked, Said};
 pub use loads::{LoadSample, LoadSink, LoadSource, PollMode};
-pub use memory::{Cut, MemoryStore};
+pub use memory::{AtWork, Cut, Hand, MemoryStore, StoreCounts};
 pub use pairing::{PairClasses, PairingDescriptor};
 pub use reservations::{ReservationKind, ReservationStore};
 pub use sessions::{Pin, SessionsStore};
@@ -99,7 +103,8 @@ pub use workers::{
     Signals, WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus, WorkersStore,
 };
 pub use world::{
-    Ask, Built, PairBuffers, PoolView, StaleGeneration, ViewBuffers, World, PUBLISH_WINDOW,
+    Ask, Built, EncodePairBuffers, Naming, OutsideLists, PairBuffers, PoolView, StaleGeneration,
+    ViewBuffers, World, PUBLISH_WINDOW,
 };
 
 /// The verified identity of a gateway: the fingerprint of the subject its

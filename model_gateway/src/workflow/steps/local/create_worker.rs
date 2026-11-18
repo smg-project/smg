@@ -13,6 +13,7 @@ use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, Wo
 
 use super::discover_dp::DpInfo;
 use crate::{
+    admin::worker_service::{control_character_refusal, logged_strings},
     config::ParserChoice,
     routers::grpc::{
         multimodal::{
@@ -32,7 +33,6 @@ use crate::{
             endpoint::Endpoint,
             metadata::join_base,
         },
-        registry::service::{control_character_refusal, logged_strings},
         BasicWorkerBuilder, ConnectionMode, Worker, WorkerRegistry, UNKNOWN_MODEL_ID,
     },
     workflow::data::{WorkerKind, WorkerRegistrationMode, WorkerWorkflowData},

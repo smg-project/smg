@@ -1634,10 +1634,12 @@ pub(crate) mod tests {
         }
         // The store follows another leader's history at the admitted term:
         // a number under it could be one that leader gave another worker.
-        door.log.restart(Position {
-            seq: 40,
-            term: TERM + 1,
-        });
+        door.log
+            .restart(Position {
+                seq: 40,
+                term: TERM + 1,
+            })
+            .expect("a place the log takes");
         let told = door.register(&operator(), under(TERM + 1), &ask(spec(URL), Mode::Add));
         refused(told);
         assert_eq!(store.epoch(), 0, "a refused registration writes nothing");

@@ -28,7 +28,7 @@ use crate::{
         context::WorkerSelection,
         proto_wrapper::mm_shm_dev_writable,
     },
-    worker::{RoutingPool, Worker, WorkerRegistry},
+    worker::{RoutingPool, Worker, WorkerRegistry, WorkerRegistryExt},
 };
 
 const DEFAULT_SHM_MIN_BYTES: usize = 64 * 1024;

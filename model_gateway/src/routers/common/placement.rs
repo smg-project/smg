@@ -45,7 +45,7 @@ use crate::{
             BRANCH_ALL_OVERLOADED_FALLBACK, BRANCH_ALL_STALLED_FALLBACK, STAGE_SELECTION,
         },
         ConnectionMode, ConnectionModeExt, PdPairIndex, RoutingPool, RuntimeType, Worker,
-        WorkerRegistry, WorkerType,
+        WorkerRegistry, WorkerRegistryExt, WorkerType,
     },
 };
 
