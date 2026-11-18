@@ -719,11 +719,17 @@ pub fn available_cpus() -> usize {
 
 /// Configuration validator
 pub(crate) struct ConfigValidator;
+
+#[cfg(test)]
+#[path = "prefill_cost_tests.rs"]
+mod prefill_cost_tests;
+
 impl ConfigValidator {
     pub(crate) fn validate(config: &RouterConfig) -> ConfigResult<()> {
         Self::validate_mode(&config.mode)?;
         bounds::validate(config)?;
         Self::validate_policy(&config.policy)?;
+        Self::validate_prefill_cost_mode(config)?;
         Self::validate_routing_key_headers(config)?;
         Self::validate_cache_boundaries(&config.cache_boundaries)?;
         Self::validate_server_settings(config)?;
@@ -796,6 +802,50 @@ impl ConfigValidator {
         Self::validate_tokenizer_sources(config)?;
 
         Ok(())
+    }
+
+    fn validate_prefill_cost_mode(config: &RouterConfig) -> ConfigResult<()> {
+        let is_cost = |policy: &PolicyConfig| matches!(policy, PolicyConfig::PrefillCost { .. });
+        let nested = match &config.mode {
+            RoutingMode::PrefillDecode {
+                prefill_policy,
+                decode_policy,
+                ..
+            } => {
+                prefill_policy.as_ref().is_some_and(is_cost)
+                    || decode_policy.as_ref().is_some_and(is_cost)
+            }
+            RoutingMode::EncodePrefillDecode {
+                encode_policy,
+                prefill_policy,
+                decode_policy,
+                ..
+            } => {
+                encode_policy.as_ref().is_some_and(is_cost)
+                    || prefill_policy.as_ref().is_some_and(is_cost)
+                    || decode_policy.as_ref().is_some_and(is_cost)
+            }
+            _ => false,
+        };
+        if !is_cost(&config.policy) && !nested {
+            return Ok(());
+        }
+        let supported = match &config.mode {
+            RoutingMode::Regular { worker_urls } => {
+                !config.enable_igw
+                    && config.connection_mode == ConnectionMode::Grpc
+                    && worker_urls
+                        .iter()
+                        .all(|url| url.starts_with("grpc://") || url.starts_with("grpcs://"))
+            }
+            _ => false,
+        };
+        if supported {
+            Ok(())
+        } else {
+            Err(ConfigError::invalid_value("policy", "prefill_cost",
+                "prefill_cost requires regular native gRPC workers; IGW, HTTP, ZMQ and PD/EPD are not supported"))
+        }
     }
 
     fn validate_prefill_admission(config: &RouterConfig) -> ConfigResult<()> {
@@ -1364,7 +1414,16 @@ impl ConfigValidator {
                 kv_pressure_weight,
                 mean_prefill_tokens,
                 default_throughput,
+            }
+            | PolicyConfig::PrefillCost {
+                kv_pressure_weight,
+                mean_prefill_tokens,
+                default_throughput,
+                block_size: _,
             } => {
+                if let PolicyConfig::PrefillCost { block_size, .. } = policy {
+                    require_positive("block_size", *block_size)?;
+                }
                 if !kv_pressure_weight.is_finite() || *kv_pressure_weight < 0.0 {
                     return Err(ConfigError::invalid_value(
                         "kv_pressure_weight",

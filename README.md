@@ -91,7 +91,7 @@ That's it. SMG is now load-balancing requests across your workers.
 
 | Feature | Description |
 |---------|-------------|
-| **[10 Routing Policies](https://lightseek.org/smg/concepts/routing/load-balancing)** | cache_aware, least_load, power_of_two, consistent_hashing, prefix_hash, bucket, round_robin, random, manual, passthrough |
+| **[11 Routing Policies](https://lightseek.org/smg/concepts/routing/load-balancing)** | cache_aware, [prefill_cost](docs/prefill_cost.md) (regular gRPC), least_load, power_of_two, consistent_hashing, prefix_hash, bucket, round_robin, random, manual, passthrough |
 | **[gRPC Pipeline](https://lightseek.org/smg/concepts/architecture/grpc-pipeline)** | Native streaming gRPC to the engines with prefill/decode and encode disaggregation and DP-aware routing |
 | **[Kubernetes Discovery](https://lightseek.org/smg/getting-started/service-discovery)** | Native pod watchers with label selectors, per-role prefill/decode/encode selectors, and router peer discovery |
 | **[Model Parsers](https://lightseek.org/smg/getting-started/tokenization-and-parsing-apis)** | 21 tool-call parsers and 16 reasoning parsers with automatic model detection — DeepSeek, Qwen, Kimi, GLM, Llama, Mistral, Command, Nemotron, and more |

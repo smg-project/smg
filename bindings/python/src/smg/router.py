@@ -134,6 +134,7 @@ def policy_from_str(policy_str: str | None) -> PolicyType:
         "round_robin": PolicyType.RoundRobin,
         "passthrough": PolicyType.Passthrough,
         "cache_aware": PolicyType.CacheAware,
+        "prefill_cost": PolicyType.PrefillCost,
         "power_of_two": PolicyType.PowerOfTwo,
         "least_load": PolicyType.LeastLoad,
         "bucket": PolicyType.Bucket,
@@ -275,6 +276,7 @@ class Router:
             - PolicyType.PowerOfTwo: Sample two random workers and route to the
               one with the lower expected wait (least-load scoring over the pair)
             - PolicyType.LeastLoad: Route to the worker with the lowest load score
+            - PolicyType.PrefillCost: Native gRPC KV reuse versus reserved prefill/decode work
               (in-flight requests plus KV-cache pressure)
             Default: PolicyType.CacheAware
         host: Host address to bind the router server. Supports IPv4, IPv6 (e.g., ::,

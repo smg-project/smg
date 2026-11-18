@@ -324,7 +324,7 @@ struct RoutingArgs {
 
     // ==================== Routing Policy ====================
     /// Load balancing policy to use
-    #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "passthrough", "cache_aware", "power_of_two", "least_load", "prefix_hash", "consistent_hashing", "manual", "bucket"], help_heading = "Routing Policy")]
+    #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "passthrough", "cache_aware", "prefill_cost", "power_of_two", "least_load", "prefix_hash", "consistent_hashing", "manual", "bucket"], help_heading = "Routing Policy")]
     policy: String,
 
     /// Minimum matched-prefix share (0.0-1.0) before cache-aware routing
@@ -569,6 +569,18 @@ struct RoutingArgs {
     /// token count is unknown at routing
     #[arg(long, default_value_t = 1024, help_heading = "Routing Policy")]
     least_load_mean_prefill_tokens: u32,
+
+    /// KV-pressure time weight for prefill_cost (regular gRPC only).
+    #[arg(long, default_value_t = 0.15, help_heading = "Routing Policy")]
+    prefill_cost_kv_pressure_weight: f64,
+
+    /// Fallback input throughput in tokens/s; never a generation rate.
+    #[arg(long, default_value_t = 2000.0, help_heading = "Routing Policy")]
+    prefill_cost_default_throughput: f64,
+
+    /// Estimated tokens for a reported running request without progress telemetry.
+    #[arg(long, default_value_t = 1024, help_heading = "Routing Policy")]
+    prefill_cost_mean_prefill_tokens: u32,
 
     /// What power_of_two compares: expected_wait (default), requests, least_requests or
     /// resident_tokens:<request_tokens> (resident context tokens plus that many per request)
@@ -2073,6 +2085,50 @@ mod tests {
             .chain(args.iter().map(|s| (*s).to_string()))
             .collect();
         Cli::parse_from(argv).router_args
+    }
+
+    #[test]
+    fn prefill_cost_cli_is_independent_and_preserves_its_own_tuning() {
+        let config = cli_args_from(&[
+            "--policy",
+            "prefill_cost",
+            "--worker-urls",
+            "grpc://worker:8080",
+            "--block-size",
+            "32",
+            "--prefill-cost-default-throughput",
+            "8000",
+            "--prefill-cost-kv-pressure-weight",
+            "0.25",
+            "--prefill-cost-mean-prefill-tokens",
+            "2048",
+        ])
+        .to_router_config(vec![], vec![])
+        .unwrap();
+        assert!(matches!(
+            config.policy,
+            PolicyConfig::PrefillCost {
+                block_size: 32,
+                default_throughput: 8000.0,
+                kv_pressure_weight: 0.25,
+                mean_prefill_tokens: 2048,
+            }
+        ));
+        let default = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(default.policy.name(), "cache_aware");
+    }
+
+    #[test]
+    fn prefill_cost_cli_rejects_http_instead_of_silently_disabling_reservations() {
+        let error = cli_args_from(&[
+            "--policy",
+            "prefill_cost",
+            "--worker-urls",
+            "http://worker:8080",
+        ])
+        .to_router_config(vec![], vec![])
+        .unwrap_err();
+        assert!(error.to_string().contains("regular native gRPC"));
     }
 
     /// The CLI preserves independent role thresholds and rounds percentages up.

@@ -802,6 +802,7 @@ impl RequestPipeline {
                 // This releases its PD admission claim too, so the retry is not
                 // queued behind its own predecessor's bootstrap rooms.
                 dctx.load_guards = None;
+                dctx.cost_reservation = None;
                 dctx.pd_prefill_guard = None;
                 // A worker's definitive answer closes the retry window on that
                 // worker: the next attempt goes to another available worker, or

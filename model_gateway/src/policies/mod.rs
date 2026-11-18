@@ -37,6 +37,7 @@ mod least_load;
 mod manual;
 mod passthrough;
 mod power_of_two;
+pub mod prefill_cost;
 mod prefix_hash;
 mod random;
 mod registry;
@@ -56,6 +57,7 @@ pub use least_load::LeastLoadPolicy;
 pub use manual::{ManualConfig, ManualPolicy};
 pub use passthrough::PassthroughPolicy;
 pub use power_of_two::PowerOfTwoPolicy;
+pub use prefill_cost::PrefillCostPolicy;
 pub use prefix_hash::{PrefixHashConfig, PrefixHashPolicy};
 pub use random::RandomPolicy;
 pub use registry::PolicyRegistry;
@@ -81,6 +83,16 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
     /// * `workers` - Available workers to select from
     /// * `info` - Additional information for routing decisions
     fn select_worker(&self, workers: &[Arc<dyn Worker>], info: &SelectWorkerInfo) -> Option<usize>;
+
+    /// Whether final placement must carry a per-attempt resource reservation.
+    fn needs_reservation(&self) -> bool {
+        self.reservation_active_tokens().is_some()
+    }
+
+    /// Per-running-request input-work estimate, also used for fixed-target fallback leases.
+    fn reservation_active_tokens(&self) -> Option<u64> {
+        None
+    }
 
     /// Update policy state when a request ends.
     ///
@@ -219,6 +231,7 @@ pub(crate) fn policy_filters_unavailable_workers(policy: &dyn LoadBalancingPolic
         || policy.is::<LeastLoadPolicy>()
         || policy.is::<PowerOfTwoPolicy>()
         || policy.is::<CacheAwarePolicy>()
+        || policy.is::<PrefillCostPolicy>()
         || policy.is::<ManualPolicy>()
         || policy.is::<PassthroughPolicy>()
 }
@@ -463,6 +476,8 @@ impl WorkerRole {
 /// Information passed to policy for worker selection
 #[derive(Debug, Clone, Default)]
 pub struct SelectWorkerInfo<'a> {
+    /// Synchronous handoff of a stateful choice to its owning transport attempt.
+    pub reservation: Option<&'a prefill_cost::reservation::ReservationSlot>,
     /// Request text for cache-aware routing
     pub request_text: Option<&'a str>,
     /// Tokenized request for prefix-hash routing

@@ -16,6 +16,17 @@ impl PolicyFactory {
     /// Create a policy from configuration
     pub fn create_from_config(config: &PolicyConfig) -> Arc<dyn LoadBalancingPolicy> {
         match config {
+            PolicyConfig::PrefillCost {
+                block_size,
+                kv_pressure_weight,
+                mean_prefill_tokens,
+                default_throughput,
+            } => Arc::new(super::PrefillCostPolicy::with_params(
+                *block_size,
+                *kv_pressure_weight,
+                *mean_prefill_tokens,
+                *default_throughput,
+            )),
             PolicyConfig::Random => Arc::new(RandomPolicy::new()),
             PolicyConfig::RoundRobin => Arc::new(RoundRobinPolicy::new()),
             PolicyConfig::Passthrough => Arc::new(PassthroughPolicy::new()),
@@ -114,7 +125,9 @@ impl PolicyFactory {
         }
     }
 
-    /// Create a policy by name (for dynamic loading)
+    /// Create a policy by name (for dynamic loading).
+    /// `prefill_cost` requires the validated gateway config: an arbitrary worker
+    /// label cannot opt an HTTP or disaggregated route into lease accounting.
     pub fn create_by_name(name: &str) -> Option<Arc<dyn LoadBalancingPolicy>> {
         match name.to_lowercase().as_str() {
             "random" => Some(Arc::new(RandomPolicy::new())),

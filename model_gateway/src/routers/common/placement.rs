@@ -29,8 +29,8 @@ use crate::{
     },
     policies::{
         as_consistent_hashing, policy_filters_unavailable_workers, policy_reads_hash_ring,
-        CacheNamespace, LoadBalancingPolicy, NamedList, PolicyRegistry, SelectWorkerInfo,
-        WorkerRole,
+        prefill_cost::reservation::ReservationSlot, CacheNamespace, LoadBalancingPolicy, NamedList,
+        PolicyRegistry, SelectWorkerInfo, WorkerRole,
     },
     routers::{
         common::{
@@ -117,6 +117,7 @@ pub(crate) type CandidateFilter<'a> = &'a (dyn Fn(&dyn Worker) -> bool + Sync);
 /// Everything a single-worker placement reads from the request.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct PlacementInputs<'a> {
+    pub reservation: Option<&'a ReservationSlot>,
     /// Request text for cache-aware routing.
     pub text: Option<&'a str>,
     /// Tokenized request, or a valid routing-tokens hint, for prefix hashing.
@@ -486,6 +487,7 @@ fn select_pass(
     };
 
     let mut info = SelectWorkerInfo {
+        reservation: inputs.reservation,
         request_text: inputs.text,
         tokens: inputs.tokens,
         headers: inputs.headers,
@@ -1354,6 +1356,7 @@ pub(crate) fn select_pair(
     let prefill = Narrowed::at(&pairs.prefill, open);
     let hash_ring = registry.get_hash_ring(model_id);
     let mut info = SelectWorkerInfo {
+        reservation: None,
         request_text: inputs.text,
         tokens: inputs.tokens,
         headers: inputs.headers,

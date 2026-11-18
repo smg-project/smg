@@ -1392,6 +1392,18 @@ impl PowerOfTwoLoadMetric {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", remote = "Self")]
 pub enum PolicyConfig {
+    /// Price native KV reuse against pending prefill work; regular gRPC only.
+    #[serde(rename = "prefill_cost")]
+    PrefillCost {
+        #[serde(default = "default_block_size")]
+        block_size: usize,
+        #[serde(default = "default_least_load_kv_pressure_weight")]
+        kv_pressure_weight: f64,
+        #[serde(default = "default_least_load_mean_prefill")]
+        mean_prefill_tokens: u32,
+        #[serde(default = "default_least_load_throughput")]
+        default_throughput: f64,
+    },
     #[serde(rename = "random")]
     Random,
 
@@ -1749,6 +1761,7 @@ impl PolicyConfig {
 
     pub fn name(&self) -> &'static str {
         match self {
+            PolicyConfig::PrefillCost { .. } => "prefill_cost",
             PolicyConfig::Random => "random",
             PolicyConfig::RoundRobin => "round_robin",
             PolicyConfig::Passthrough => "passthrough",

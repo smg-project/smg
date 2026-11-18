@@ -403,6 +403,12 @@ impl CliArgs {
     /// Build a routing policy with the same per-policy defaults as the CLI flags.
     fn parse_policy(&self, policy_str: &str) -> PolicyConfig {
         match policy_str {
+            "prefill_cost" => PolicyConfig::PrefillCost {
+                block_size: self.routing.block_size,
+                kv_pressure_weight: self.routing.prefill_cost_kv_pressure_weight,
+                mean_prefill_tokens: self.routing.prefill_cost_mean_prefill_tokens,
+                default_throughput: self.routing.prefill_cost_default_throughput,
+            },
             "random" => PolicyConfig::Random,
             "round_robin" => PolicyConfig::RoundRobin,
             "passthrough" => PolicyConfig::Passthrough,

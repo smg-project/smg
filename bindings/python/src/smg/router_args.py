@@ -43,6 +43,7 @@ COMMON_POLICY_CHOICES = [
 ]
 
 PREFILL_POLICY_CHOICES = [*COMMON_POLICY_CHOICES, "bucket"]
+REGULAR_POLICY_CHOICES = [*COMMON_POLICY_CHOICES, "prefill_cost"]
 ENCODE_POLICY_CHOICES = ["random", "round_robin", "consistent_hashing"]
 # Worker discovery providers --discovery-provider accepts.
 DISCOVERY_PROVIDER_CHOICES = ["kubernetes", "file", "slurm", "consul"]
@@ -549,6 +550,9 @@ class RouterArgs:
     postgres_op_timeout_secs: int = 5
     postgres_pool_max: int = 16
     power_of_two_load_metric: str = "expected_wait"
+    prefill_cost_default_throughput: float = 2000.0
+    prefill_cost_kv_pressure_weight: float = 0.15
+    prefill_cost_mean_prefill_tokens: int = 1024
     prefill_expected_workers: int | None = None
     prefill_max_inflight_requests_per_worker: int = -1
     prefill_min_ready_percent: int | None = None
@@ -947,7 +951,7 @@ class RouterArgs:
             f"--{prefix}policy",
             type=str,
             default=RouterArgs.policy,
-            choices=COMMON_POLICY_CHOICES,
+            choices=REGULAR_POLICY_CHOICES,
             help=(
                 "Load balancing policy to use. In PD mode, this is used for both prefill and decode"
                 " unless overridden"
@@ -1025,6 +1029,24 @@ class RouterArgs:
             type=float,
             default=RouterArgs.least_load_kv_pressure_weight,
             help="KV-pressure weight (seconds) for the least_load policy",
+        )
+        routing_group.add_argument(
+            f"--{prefix}prefill-cost-kv-pressure-weight",
+            type=float,
+            default=RouterArgs.prefill_cost_kv_pressure_weight,
+            help="KV-pressure time weight for prefill_cost (regular gRPC only)",
+        )
+        routing_group.add_argument(
+            f"--{prefix}prefill-cost-default-throughput",
+            type=float,
+            default=RouterArgs.prefill_cost_default_throughput,
+            help="Fallback input tokens/s for prefill_cost; not a generation rate",
+        )
+        routing_group.add_argument(
+            f"--{prefix}prefill-cost-mean-prefill-tokens",
+            type=int,
+            default=RouterArgs.prefill_cost_mean_prefill_tokens,
+            help="Token estimate for running requests without prefill progress telemetry",
         )
         routing_group.add_argument(
             f"--{prefix}least-load-default-throughput",

@@ -26,8 +26,9 @@ use crate::{
     middleware::{tenant_resolution::AcceptedAt, SHED_RETRY_AFTER_SECS},
     observability::metrics::{metrics_labels, Metrics},
     policies::{
-        hash_ring::HashRing, CacheNamespace, LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo,
-        WorkerRole,
+        hash_ring::HashRing,
+        prefill_cost::reservation::{Reservation, ReservationSlot},
+        CacheNamespace, LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo, WorkerRole,
     },
     routers::{
         common::{
@@ -489,6 +490,7 @@ impl<'a> SelectionInputs<'a> {
         candidate_filter: Option<CandidateFilter<'b>>,
     ) -> PlacementInputs<'b> {
         PlacementInputs {
+            reservation: None,
             text: self.text,
             tokens: self.tokens(),
             headers: self.headers,
@@ -530,7 +532,8 @@ impl WorkerSelectionStage {
             .map(str::to_string);
         ctx.state.routing_snapshot = Some(inputs.snapshot());
 
-        let (workers, prefill_guard) = self.pick(ctx, accepted, &inputs).await?;
+        let (workers, prefill_guard, reservation) = self.pick(ctx, accepted, &inputs).await?;
+        ctx.state.cost_reservation = reservation;
         if let Some(guard) = prefill_guard {
             ctx.state.pd_prefill_guard = Some(guard);
         }
@@ -586,7 +589,14 @@ impl WorkerSelectionStage {
         ctx: &RequestContext,
         accepted: Option<Instant>,
         inputs: &SelectionInputs<'_>,
-    ) -> Result<(WorkerSelection, Option<PrefillLoadGuard>), Response> {
+    ) -> Result<
+        (
+            WorkerSelection,
+            Option<PrefillLoadGuard>,
+            Option<Reservation>,
+        ),
+        Response,
+    > {
         let model_id = inputs.model_id;
         let media = inputs.media;
         let context_requirements = inputs.context_requirements;
@@ -594,6 +604,21 @@ impl WorkerSelectionStage {
         let accepts_refs = |worker: &dyn Worker| media.accepts_refs(worker);
         let placement = inputs.placement(inputs.media_refs.then_some(&accepts_refs));
         let sticky_key = ctx.state.sticky_key.as_deref();
+        let total_tokens = ctx
+            .state
+            .preparation
+            .as_ref()
+            .map_or(0, |prep| prep.total_input_token_count());
+        let reservation = self
+            .policy_registry
+            .reservation_slot()
+            .with_total_tokens(total_tokens)
+            .with_request_count(
+                ctx.state
+                    .preparation
+                    .as_ref()
+                    .map_or(1, |prep| prep.input_count()),
+            );
         match self.mode {
             WorkerSelectionMode::Regular => {
                 match self.select_regular(
@@ -608,8 +633,12 @@ impl WorkerSelectionStage {
                     inputs.cache_namespace,
                     wire,
                     &[],
+                    Some(&reservation),
                 ) {
-                    Some(w) => Ok((WorkerSelection::Single { worker: w }, None)),
+                    Some(w) => {
+                        let lease = reservation.take_for(w.url());
+                        Ok((WorkerSelection::Single { worker: w }, None, lease))
+                    }
                     None => Err(self.context_selection_failure(
                         model_id,
                         wire,
@@ -633,7 +662,7 @@ impl WorkerSelectionStage {
                         ),
                     )
                     .await?;
-                Ok((disaggregated(pair), Some(guard)))
+                Ok((disaggregated(pair), Some(guard), None))
             }
             WorkerSelectionMode::EncodePrefillDecode => {
                 let hashes = if let Some(plan) = ctx.state.multimodal_refs.as_ref() {
@@ -696,6 +725,7 @@ impl WorkerSelectionStage {
                         runtime_type,
                     },
                     Some(guard),
+                    None,
                 ))
             }
         }
@@ -771,6 +801,11 @@ impl WorkerSelectionStage {
         // that decision.
         let ledger = &ctx.ledger;
         let decided_on = ctx.constraint_decided_on;
+        let reservation = self
+            .policy_registry
+            .reservation_slot()
+            .with_total_tokens(plan.total_input_tokens())
+            .with_request_count(plan.input_count());
         let admits = |worker: &dyn Worker| {
             ledger.admits(worker)
                 && decided_on.is_none_or(|decoding| decoding.decides_alike(worker))
@@ -790,6 +825,7 @@ impl WorkerSelectionStage {
                     cache_namespace,
                     wire,
                     &ctx.tried,
+                    Some(&reservation),
                 ) {
                     Some(w) => WorkerSelection::Single { worker: w },
                     None => {
@@ -805,6 +841,7 @@ impl WorkerSelectionStage {
             WorkerSelectionMode::PrefillDecode | WorkerSelectionMode::EncodePrefillDecode => {
                 let pinned = |worker: &dyn Worker| media.accepts_refs(worker) && admits(worker);
                 let inputs = PlacementInputs {
+                    reservation: None,
                     text,
                     tokens,
                     headers,
@@ -839,6 +876,9 @@ impl WorkerSelectionStage {
             }
         };
 
+        ctx.cost_reservation = workers
+            .single()
+            .and_then(|worker| reservation.take_for(worker.url()));
         ctx.workers = Some(workers);
         Ok(())
     }
@@ -1728,6 +1768,7 @@ impl WorkerSelectionStage {
         cache_namespace: Option<CacheNamespace>,
         wire: Option<WireConstraint>,
         tried: &[String],
+        reservation: Option<&ReservationSlot>,
     ) -> Option<Arc<dyn Worker>> {
         let snapshot = self.worker_registry.get_routing_snapshot(model_id);
         let context = context.left_by(&snapshot, &[RoutingPool::GrpcPipelineRegular], model_id);
@@ -1753,6 +1794,7 @@ impl WorkerSelectionStage {
             wire,
             candidate_filter,
             tried,
+            reservation,
         )
     }
 
@@ -1785,6 +1827,7 @@ impl WorkerSelectionStage {
             wire,
             candidate_filter,
             &[],
+            None,
         )
     }
 
@@ -1809,6 +1852,7 @@ impl WorkerSelectionStage {
         wire: Option<WireConstraint>,
         candidate_filter: Option<CandidateFilter<'_>>,
         tried: &[String],
+        reservation: Option<&ReservationSlot>,
     ) -> Option<Arc<dyn Worker>> {
         // A retry pins the retained wire, and with it the media pin and the
         // pipeline pin, on top of whatever the caller excludes.
@@ -1835,6 +1879,7 @@ impl WorkerSelectionStage {
             Arc::clone(snapshot.pool(RoutingPool::GrpcPipelineRegular)),
             wire,
             PlacementInputs {
+                reservation,
                 text,
                 tokens,
                 headers,
@@ -2273,6 +2318,7 @@ fn assign_encode_workers(
         .map(|(item_index, content_hash)| {
             let routing_headers = encode_routing_headers(content_hash);
             let info = SelectWorkerInfo {
+                reservation: None,
                 request_text: None,
                 tokens: None,
                 headers: Some(&routing_headers),
@@ -2398,6 +2444,7 @@ impl SelectionBench {
             None,
             None,
             &[],
+            None,
         )
     }
 
@@ -3639,6 +3686,7 @@ mod tests {
     /// A retry context with a retained wire and no extra request constraints.
     fn dispatch_ctx(model_id: &str, wire: WireConstraint) -> DispatchContext {
         DispatchContext {
+            cost_reservation: None,
             root_request_id: None,
             request_id: None,
             cache_trace: None,

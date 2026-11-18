@@ -126,6 +126,8 @@ impl TextNeeds {
 /// Registry for managing model-to-policy mappings
 #[derive(Clone)]
 pub struct PolicyRegistry {
+    /// One physical-worker ledger across per-model/alias selection policies.
+    reservation_ledger: Arc<super::prefill_cost::reservation::ReservationLedger>,
     /// Model ID -> Policy instance mapping (lock-free reads via DashMap; the
     /// Fx hasher over the operator's model ids, read on every request)
     model_policies: Arc<DashMap<String, Arc<dyn LoadBalancingPolicy>, FxBuildHasher>>,
@@ -251,6 +253,9 @@ impl PolicyRegistry {
             .collect();
         let text_needs = TextNeeds::of(default_policy.as_ref());
         Self {
+            reservation_ledger: Arc::new(
+                super::prefill_cost::reservation::ReservationLedger::default(),
+            ),
             model_policies: Arc::new(DashMap::with_hasher(FxBuildHasher)),
             text_needs: Arc::new(AtomicU8::new(text_needs.0)),
             text_needs_refresh: Arc::new(Mutex::new(())),
@@ -395,12 +400,25 @@ impl PolicyRegistry {
         info: &SelectWorkerInfo,
     ) -> Option<usize> {
         cache_trace::begin_selection(workers);
+        if policy.needs_reservation() {
+            if let Some(slot) = info.reservation {
+                slot.set_active_tokens(policy.reservation_active_tokens().unwrap_or(0));
+                slot.require(info.tokens.map_or(
+                    super::least_load::DEFAULT_MEAN_PREFILL_TOKENS as u64,
+                    |tokens| tokens.len() as u64,
+                ));
+            }
+        }
         if let Some((sticky, key, source)) = self.sticky_for(policy.as_ref(), info) {
             return Self::select_sticky(sticky, policy, model_id, workers, info, key, source);
         }
         let selected = policy.select_worker(workers, info);
         cache_trace::selection(policy.name(), "policy", workers, selected);
         selected
+    }
+
+    pub(crate) fn reservation_slot(&self) -> super::prefill_cost::reservation::ReservationSlot {
+        super::prefill_cost::reservation::ReservationSlot::new(Arc::clone(&self.reservation_ledger))
     }
 
     #[cfg(test)]
@@ -560,6 +578,9 @@ impl PolicyRegistry {
     ) {
         if let Some(cache_aware) = as_cache_aware(policy.as_ref()) {
             cache_aware.set_kv_event_monitor(monitor.cloned());
+        }
+        if let Some(prefill_cost) = policy.as_any().downcast_ref::<super::PrefillCostPolicy>() {
+            prefill_cost.set_kv_event_monitor(monitor.cloned());
         }
     }
 

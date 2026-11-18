@@ -347,6 +347,7 @@ impl Router {
             RoutingPool::HttpRegular,
             None,
             PlacementInputs {
+                reservation: None,
                 text,
                 tokens,
                 headers,
@@ -1248,6 +1249,7 @@ impl Router {
             model_id,
             &non_dp_workers,
             PlacementInputs {
+                reservation: None,
                 text: routing.text.as_deref(),
                 tokens: routing.tokens.as_deref(),
                 headers,

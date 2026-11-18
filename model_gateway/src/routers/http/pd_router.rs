@@ -889,6 +889,7 @@ impl PDRouter {
             .select_pd_pair_with_admission(
                 model_id,
                 PlacementInputs {
+                    reservation: None,
                     text: text.as_deref(),
                     tokens: tokens.as_deref(),
                     headers: context.headers.as_ref(),
@@ -3045,6 +3046,7 @@ impl RouterTrait for PDRouter {
                 RoutingPool::HttpPrefill,
                 None,
                 PlacementInputs {
+                    reservation: None,
                     text: request_text.as_deref(),
                     tokens: None,
                     headers,

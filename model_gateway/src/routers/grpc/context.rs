@@ -57,7 +57,7 @@ use crate::{
     config::ParserChoice,
     middleware::TenantRequestMeta,
     observability::{cache_trace, metrics::Metrics},
-    policies::CacheNamespace,
+    policies::{prefill_cost::reservation::Reservation, CacheNamespace},
     routers::{
         common::{
             attempt_ledger::AttemptLedger, pd_admission::PdAdmissionGuard,
@@ -251,6 +251,8 @@ pub(crate) struct SharedComponents {
 /// client acquisition, encode, and request building).
 #[derive(Default)]
 pub(crate) struct ProcessingState {
+    /// Optional resource lease selected before dispatch; dropped on any ingress refusal.
+    pub cost_reservation: Option<Reservation>,
     // Stage 1: Preparation outputs
     pub preparation: Option<PreparationOutput>,
 
@@ -430,6 +432,8 @@ impl WireConstraint {
 /// [`RequestContext::into_dispatch`]. `ResponseSpec` is the only
 /// request-derived input past this point.
 pub(crate) struct DispatchContext {
+    /// Per-attempt cost accounting, moved into the raw generation stream at dispatch.
+    pub cost_reservation: Option<Reservation>,
     pub root_request_id: Option<String>,
     /// The id the request-id middleware gave the request, for a line written
     /// about it outside its span (a retry's re-selection); always present,
@@ -818,6 +822,30 @@ impl ExecutionPlan {
         }
     }
 
+    /// Resource accounting prices the whole retained plan, not its affinity proxy.
+    pub(crate) fn total_input_tokens(&self) -> usize {
+        match self {
+            Self::Batch { requests, .. } => requests
+                .iter()
+                .map(|request| request.token_ids().len())
+                .sum(),
+            Self::EmbedBatch { requests, .. } => requests
+                .iter()
+                .map(|request| request.token_ids().len())
+                .sum(),
+            _ => self.routing_token_ids().len(),
+        }
+    }
+
+    pub(crate) fn input_count(&self) -> usize {
+        match self {
+            Self::Batch { requests, .. } => requests.len(),
+            Self::EmbedBatch { requests, .. } => requests.len(),
+            _ => 1,
+        }
+        .max(1)
+    }
+
     /// Every generate request in the plan, for per-attempt re-stamping.
     pub(crate) fn generate_requests_mut(
         &mut self,
@@ -940,6 +968,16 @@ impl PreparationOutput {
             Self::Embedding { inputs } => inputs.iter().map(|input| input.token_ids.len()).sum(),
             other => other.token_ids().len(),
         }
+    }
+
+    pub(crate) fn input_count(&self) -> usize {
+        match self {
+            Self::Decisions { items, .. } => items.len(),
+            Self::Completion { items, .. } => items.len(),
+            Self::Embedding { inputs } => inputs.len(),
+            _ => 1,
+        }
+        .max(1)
     }
 
     /// Longest single input in tokens -- what the engine's context window
@@ -1293,6 +1331,7 @@ impl RequestContext {
         let (created, _) =
             super::common::stages::helpers::request_wall_clock(tenant_request_meta.as_ref());
         Ok(Box::new(DispatchContext {
+            cost_reservation: self.state.cost_reservation,
             root_request_id: if cache_trace::enabled() {
                 request_id.clone()
             } else {

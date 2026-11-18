@@ -34,6 +34,7 @@ use smg_grpc_client::{
 use tokio::time::error::Elapsed;
 
 use crate::{
+    policies::prefill_cost::reservation::Reservation,
     routers::{
         common::sse::SseSender,
         grpc::{
@@ -271,6 +272,28 @@ impl ProtoGenerateResponse {
                 }
                 None => false,
             },
+        }
+    }
+
+    /// Empty chunk/control frames do not finish prefill. A terminal response does.
+    fn ends_prefill(&self) -> bool {
+        macro_rules! done {
+            ($response:expr, $wire:ident) => {
+                match &$response.response {
+                    Some($wire::generate_response::Response::Chunk(chunk)) => {
+                        !chunk.token_ids.is_empty()
+                    }
+                    Some($wire::generate_response::Response::Complete(_)) => true,
+                    None => false,
+                }
+            };
+        }
+        match self {
+            Self::Sglang(response) => done!(response, sglang),
+            Self::Vllm(response) => done!(response, vllm),
+            Self::Trtllm(response) => done!(response, trtllm),
+            Self::Mlx(response) => done!(response, mlx),
+            Self::TokenSpeed(response) => done!(response, tokenspeed),
         }
     }
 
@@ -832,6 +855,7 @@ impl PrefillCachedTokens {
 /// yields counts as token progress for that worker, and its prompt counts as
 /// pending prefill on the worker until the first response.
 pub struct TrackedStream {
+    cost_reservation: Option<Reservation>,
     inner: ProtoStream,
     worker: Arc<dyn Worker>,
     /// The worker's state, captured at the stream's start (see
@@ -1725,9 +1749,19 @@ impl ProtoStream {
     /// response, and the request has been in the pile since the dispatch.
     #[must_use]
     pub(crate) fn tracked_booked(self, worker: Arc<dyn Worker>, booking: DispatchBooking) -> Self {
+        self.tracked_booked_with_cost(worker, booking, None)
+    }
+
+    pub(crate) fn tracked_booked_with_cost(
+        self,
+        worker: Arc<dyn Worker>,
+        booking: DispatchBooking,
+        cost_reservation: Option<Reservation>,
+    ) -> Self {
         let DispatchBooking { prefill, progress } = booking;
         let runtime = worker.runtime_state();
         Self::Tracked(Box::new(TrackedStream {
+            cost_reservation,
             inner: self,
             worker,
             runtime,
@@ -1756,6 +1790,7 @@ impl ProtoStream {
     ) -> Self {
         let runtime = worker.runtime_state();
         Self::Tracked(Box::new(TrackedStream {
+            cost_reservation: None,
             inner: self,
             worker,
             runtime,
@@ -2034,6 +2069,11 @@ impl ProtoStream {
         };
         match &item {
             Some(Ok(response)) => {
+                if let Some(lease) = &mut tracked.cost_reservation {
+                    if response.ends_prefill() {
+                        lease.prefill_complete();
+                    }
+                }
                 // One stamp for the message: the worker's progress note and,
                 // on the first response, the end of the prompt's prefill.
                 let now_ms = liveness::now_ms();
@@ -2058,7 +2098,10 @@ impl ProtoStream {
             }
             // The stream ended, or failed: what the worker was producing for
             // it is over, whenever its reader lets go of it.
-            Some(Err(_)) | None => tracked.output = None,
+            Some(Err(_)) | None => {
+                tracked.output = None;
+                tracked.cost_reservation = None;
+            }
         }
         item
     }
@@ -2202,6 +2245,7 @@ impl ProtoStream {
             Self::Fanout(stream) => Self::Fanout(stream.defer_abort_within(bound)),
             Self::Tracked(stream) => {
                 let TrackedStream {
+                    cost_reservation,
                     inner,
                     worker,
                     runtime,
@@ -2212,6 +2256,7 @@ impl ProtoStream {
                     replay,
                 } = *stream;
                 Self::Tracked(Box::new(TrackedStream {
+                    cost_reservation,
                     inner: inner.defer_abort_within(bound),
                     worker,
                     runtime,

@@ -29,6 +29,7 @@ use crate::{
         cache_trace,
         metrics::{metrics_labels, Metrics},
     },
+    policies::prefill_cost::reservation::Reservation,
     routers::{
         common::{
             attempt_ledger::{
@@ -335,6 +336,7 @@ pub(crate) async fn execute_plan(
     // The Prefill admission slot worker selection took for this attempt. It
     // is released when the Prefill phase ends, not with the load guards.
     let prefill_guard = ctx.pd_prefill_guard.take();
+    let cost_reservation = ctx.cost_reservation.take();
 
     // Extract dispatch metadata for the tracing span and PD metric labels.
     let dispatch = stage_output(ctx.dispatch.as_ref(), "execute_plan")?;
@@ -379,7 +381,15 @@ pub(crate) async fn execute_plan(
         match execution_plan {
             ExecutionPlan::Single(request) => match request {
                 ProtoRequest::Generate(req) => {
-                    execute_single(req, clients, workers, ledger, dispatched_at.into_std()).await
+                    execute_single(
+                        req,
+                        clients,
+                        workers,
+                        ledger,
+                        dispatched_at.into_std(),
+                        cost_reservation,
+                    )
+                    .await
                 }
                 ProtoRequest::Embed(req) => {
                     execute_embed(vec![req], clients, workers, ledger).await
@@ -440,6 +450,7 @@ pub(crate) async fn execute_plan(
                     workers,
                     model,
                     prefill_guard,
+                    cost_reservation,
                     ledger,
                     dispatched_at.into_std(),
                 )
@@ -948,9 +959,14 @@ async fn execute_batch_dispatch(
     workers: &WorkerSelection,
     model: &str,
     prefill_guard: Option<PrefillLoadGuard>,
+    cost_reservation: Option<Reservation>,
     ledger: &AttemptLedger,
     dispatched_at: Instant,
 ) -> Result<ExecutionResult, Response> {
+    let reservations: Vec<_> = match cost_reservation {
+        Some(lease) => lease.split(requests.len()).into_iter().map(Some).collect(),
+        None => requests.iter().map(|_| None).collect(),
+    };
     // One Prefill handle per PD sub-request, all on the one admission slot.
     let prefill_guards: Vec<Option<PrefillLoadGuard>> = match kind {
         ExecutionPlanKind::Single => requests.iter().map(|_| None).collect(),
@@ -965,12 +981,21 @@ async fn execute_batch_dispatch(
     let dispatches = requests
         .into_iter()
         .zip(prefill_guards)
-        .map(|(request, prefill_guard)| {
+        .zip(reservations)
+        .map(|((request, prefill_guard), reservation)| {
             let mut clients = clients.clone();
             async move {
                 match kind {
                     ExecutionPlanKind::Single => {
-                        execute_single(request, &mut clients, workers, ledger, dispatched_at).await
+                        execute_single(
+                            request,
+                            &mut clients,
+                            workers,
+                            ledger,
+                            dispatched_at,
+                            reservation,
+                        )
+                        .await
                     }
                     // Completion EPD carries no encode jobs; sub-requests dispatch as PD,
                     // each with the room it was minted (no sticky prefill rank).
@@ -1149,12 +1174,17 @@ fn note_unpinned_prefill_room(prefill: &dyn Worker, request: &'static str) {
     });
 }
 
+#[cfg(test)]
+#[path = "request_execution/cost_tests.rs"]
+mod cost_tests;
+
 async fn execute_single(
     mut proto_request: ProtoGenerateRequest,
     clients: &mut ClientSelection,
     workers: &WorkerSelection,
     ledger: &AttemptLedger,
     dispatched_at: Instant,
+    cost_reservation: Option<Reservation>,
 ) -> Result<ExecutionResult, Response> {
     let client = clients.single_or_mismatch("execute_single")?;
 
@@ -1177,6 +1207,7 @@ async fn execute_single(
         prompt_tokens,
         streaming,
         dispatched_at,
+        cost_reservation,
     )
     .await;
     if let Some(status) = result.breaker_status() {
@@ -1224,13 +1255,17 @@ async fn dispatch_single_booked(
     prompt_tokens: u64,
     streaming: bool,
     dispatched_at: Instant,
+    mut cost_reservation: Option<Reservation>,
 ) -> StreamResult {
     let Some(worker) = worker else {
         return call.await;
     };
     let booking = DispatchBooking::book_at(worker, prompt_tokens, streaming, dispatched_at);
+    if let Some(lease) = &mut cost_reservation {
+        lease.dispatched();
+    }
     let stream = call.await?;
-    Ok(stream.tracked_booked(Arc::clone(worker), booking))
+    Ok(stream.tracked_booked_with_cost(Arc::clone(worker), booking, cost_reservation))
 }
 
 /// Client answer for a request the worker did not start; an engine rejection (4xx) is not a fault.
@@ -5466,7 +5501,7 @@ pub(crate) mod tests {
                 }
             };
             let stream =
-                dispatch_single_booked(call, Some(&worker), 4_096, streaming, Instant::now())
+                dispatch_single_booked(call, Some(&worker), 4_096, streaming, Instant::now(), None)
                     .await
                     .expect("the call answered");
             assert_eq!(
@@ -5488,6 +5523,7 @@ pub(crate) mod tests {
             4_096,
             true,
             Instant::now(),
+            None,
         )
         .await;
         assert!(failed.is_err(), "the call's failure is the dispatch's");
