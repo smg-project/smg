@@ -9,9 +9,46 @@
 
 use std::{any::Any, fmt, sync::Arc, time::Duration};
 
+use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use openai_protocol::worker::{RuntimeType, WorkerLoadResponse, WorkerType};
 use smg_grpc_client::common_proto;
+use tokio::sync::OnceCell;
+
+type ConnectionCell = OnceCell<Arc<dyn EngineConnection>>;
+
+/// A worker's connection generation. Compatible replacements adopt the slot
+/// itself so a probe from either worker can retire its observed generation.
+pub struct EngineConnectionCache {
+    slot: ArcSwap<ArcSwap<ConnectionCell>>,
+}
+
+impl EngineConnectionCache {
+    /// Start with the cell the builder prepared, possibly already connected.
+    pub(crate) fn new(cell: ConnectionCell) -> Self {
+        Self {
+            slot: ArcSwap::from_pointee(ArcSwap::from_pointee(cell)),
+        }
+    }
+
+    /// Pin the generation for one acquisition, probe or handshake.
+    pub fn load_full(&self) -> Arc<ConnectionCell> {
+        self.slot.load().load_full()
+    }
+
+    /// Follow future reconnects as well as the connection established now.
+    pub(crate) fn adopt(&self, previous: &Self) {
+        self.slot.store(previous.slot.load_full());
+    }
+
+    /// Retire only the cell the probe found dead. A later generation may
+    /// already be serving requests by the time this probe resumes.
+    pub(crate) fn evict(&self, observed: &Arc<ConnectionCell>) {
+        self.slot
+            .load()
+            .compare_and_swap(observed, Arc::new(OnceCell::new()));
+    }
+}
 
 /// The reason a gRPC or ZMQ worker built without an [`EngineConnector`]
 /// reports when it is asked to connect, with the two ways out.
