@@ -203,7 +203,11 @@ pub trait LeasesStore: Send + Sync {
     fn get(&self, gateway: GatewayId, lease: LeaseId) -> Option<LeaseRecord>;
 
     /// Release the issued leases whose dispatch deadline passed at `now` as
-    /// abandoned; returns them.
+    /// abandoned; returns them. A store that keeps a file of leases a
+    /// decider ends them where its caller may act: it passes a file whose
+    /// decider is at work, which ends its own at its issues, so what is
+    /// returned can be a part of the leases that are due. Such a store
+    /// tells its engine of each end itself: a caller tells none again.
     fn expire(&self, now: Instant) -> Vec<LeaseRecord>;
 
     /// Restore what a gateway's `Hello` pages list, releasing what they

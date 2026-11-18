@@ -2646,23 +2646,31 @@ impl MemoryStore {
 
 impl MemoryStore {
     /// The store with a file of leases a decider, for a host that decides
-    /// on `deciders` threads and names them ([`crate::decider::Decider`]): each
-    /// decider
-    /// issues into its own file under its own turn, and a lease's events
-    /// are told under the name of the decider whose file it is on. For a
-    /// store no lease was filed in: the files start empty, under the
-    /// store's term.
+    /// on `deciders` threads and names them
+    /// ([`crate::decider::Decider`]): each decider issues into its own
+    /// file under its own turn, and a lease's events are told under the
+    /// name of the decider whose file it is on. The files start empty,
+    /// under the store's term, and keep the word to the engine and the
+    /// fault count the store had.
+    ///
+    /// # Panics
+    ///
+    /// Where a lease is on file: its file would go with it, and the count
+    /// it books would stand for good.
     #[must_use]
     pub fn with_deciders(mut self, deciders: usize) -> Self {
         let (term, counts) = {
             let leases = self.files[0].take();
+            let empty = leases.records.is_empty();
+            assert!(empty, "a store's files are laid before a lease is filed");
             (leases.term, Arc::clone(&leases.counts))
         };
-        self.files = turn::Files::of(deciders, || Leases {
+        let files = turn::Files::of(deciders, &self.files, || Leases {
             term,
             counts: Arc::clone(&counts),
             ..Leases::default()
         });
+        self.files = files;
         self
     }
 

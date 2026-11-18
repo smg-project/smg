@@ -3545,3 +3545,38 @@ fn the_first_leases_of_the_most_deciders_are_far_below_the_terms_mark() {
     assert_eq!(LeasesStore::live(&store, gateway), 256);
     assert_eq!(in_flight(&store), [(a, 256)]);
 }
+
+/// The files laid for a host's deciders keep the store's word to the
+/// engine and its fault count.
+#[test]
+fn the_files_laid_for_deciders_keep_the_word_and_the_fault_count() {
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    static HEARD: AtomicUsize = AtomicUsize::new(0);
+    fn counted(_: &MemoryStore, _: &LeaseRecord, _: Said, _: Option<Decider>) {
+        HEARD.fetch_add(1, SeqCst);
+    }
+    let store = MemoryStore::new();
+    store.tell_through(counted);
+    assert!(store.call_faulted());
+    let store = store.with_deciders(2);
+    assert_eq!((store.deciders(), store.lifecycle_faults()), (2, 1));
+    let a = ready(&store, "http://a:1");
+    LeasesStore::set_term(&store, 1);
+    let (gateway, now) = (GatewayId(1), Instant::now());
+    let record = booking(gateway, 0, a, now);
+    let lease = store.issue_decided(record, store.world().booked_of(a), |_| ());
+    let lease = lease.expect("minted under the store's term").id;
+    store.hand(&Hand::new(gateway), lease, GONE);
+    assert_eq!(HEARD.load(SeqCst), 1, "told through the word given before");
+}
+
+/// A store with a lease on file is not laid for deciders: the lease's
+/// file would go from under it.
+#[test]
+#[should_panic(expected = "a store's files are laid before a lease is filed")]
+fn a_store_with_a_lease_on_file_is_not_laid_for_deciders() {
+    let store = MemoryStore::new();
+    let filed = LeasesStore::issue(&store, lease(GatewayId(1), 1, 0, Instant::now()));
+    filed.expect("a lease");
+    drop(store.with_deciders(2));
+}

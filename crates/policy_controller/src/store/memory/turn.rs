@@ -63,6 +63,7 @@ use std::{
         Arc, OnceLock,
     },
     thread,
+    time::Duration,
 };
 
 use parking_lot::{Mutex, MutexGuard};
@@ -304,6 +305,14 @@ impl Hand {
     }
 }
 
+/// The looks a hand at a full ring yields between before it sleeps
+/// between them ([`MemoryStore::hand`]).
+const FULL_RING_YIELDS: u32 = 64;
+
+/// How long a hand at a full ring sleeps between its looks once it has
+/// yielded [`FULL_RING_YIELDS`] times: well under a decision's budget.
+const FULL_RING_SLEEP: Duration = Duration::from_micros(50);
+
 /// The bit of the files' fault count that says the last lifecycle call
 /// panicked: a streak of faults writes one line.
 const STREAK: u64 = 1 << (u64::BITS - 1);
@@ -332,8 +341,9 @@ impl Files {
     }
 
     /// A file a decider, each over the leases `leases` makes: a host
-    /// names [`Decider::COUNT`] deciders at most.
-    pub(super) fn of(deciders: usize, leases: impl Fn() -> Leases) -> Self {
+    /// names [`Decider::COUNT`] deciders at most. The word to the engine
+    /// and the fault count of the files `before` stay.
+    pub(super) fn of(deciders: usize, before: &Self, leases: impl Fn() -> Leases) -> Self {
         let names = 0..=u8::MAX;
         let files = names
             .take(deciders.max(1))
@@ -341,8 +351,8 @@ impl Files {
             .collect();
         Self {
             files,
-            teller: OnceLock::new(),
-            faults: AtomicU64::new(0),
+            teller: before.teller.clone(),
+            faults: AtomicU64::new(before.faults.load(Relaxed)),
         }
     }
 }
@@ -433,13 +443,15 @@ impl MemoryStore {
     /// decider the thread acts as ([`Decider::acting`]), and one thread
     /// works at a file.
     pub fn at_work(self: &Arc<Self>) -> AtWork {
-        let file = self.acting();
-        self.begin(file);
-        AtWork {
+        // The seat stands before its thread's mark does: a first take
+        // that unwinds drops the seat, which clears the mark.
+        let mut seat = AtWork {
             store: Arc::clone(self),
-            file,
-            working: true,
-        }
+            file: self.acting(),
+            working: false,
+        };
+        seat.work();
+        seat
     }
 
     /// The calling thread says it works at the file at `at`, then takes
@@ -539,19 +551,29 @@ impl MemoryStore {
     /// applied by whoever may act at the file next: its decider at work,
     /// or this caller where none is. A full ring stops its caller until a
     /// holder applied, so no frame is dropped: the caller applies where
-    /// no thread is at work, and yields to the one that is, which looks
-    /// at its ring ahead of each decision.
+    /// no thread is at work, and waits for the one that is, which looks
+    /// at its ring ahead of each decision. The caller's thread is held
+    /// for that wait, one decision of the file's decider at most: it
+    /// yields 64 times, then sleeps 50 microseconds between its looks, so
+    /// a slow decision costs its waiting hands no core.
     pub fn hand(&self, hand: &Hand, lease: LeaseId, said: Said) {
         let at = self.file_of(lease);
         let file = &self.files[at];
         let mut frame = (hand.gateway, lease, said);
+        let mut looks = 0_u32;
         loop {
             match file.shown.hands.try_send(frame) {
                 Ok(()) => break,
                 Err(TrySendError::Full(back)) => {
                     frame = back;
-                    if !self.settle(at) {
+                    if self.settle(at) {
+                        continue;
+                    }
+                    looks = looks.saturating_add(1);
+                    if looks <= FULL_RING_YIELDS {
                         thread::yield_now();
+                    } else {
+                        thread::sleep(FULL_RING_SLEEP);
                     }
                 }
                 // The ring's reading end stands behind the file's turn
