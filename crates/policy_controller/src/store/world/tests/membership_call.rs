@@ -128,6 +128,13 @@ mod held {
         }
     }
 
+    /// The word for the models a worker left, as the telling stage writes
+    /// a word down.
+    fn left(id: WorkerId, models: &[&str]) -> String {
+        let names: Vec<String> = models.iter().copied().map(String::from).collect();
+        format!("{:?}", Membership::Left { id, models: &names })
+    }
+
     /// Generation `number` of one profile for every model: the held ring
     /// scores and the best row is picked.
     fn generation(
@@ -444,5 +451,101 @@ mod held {
         let after = owners(&mut out);
         assert_eq!((out.candidates.len(), ring.ring().len()), (5, 5));
         assert!(after.contains(&fifth), "no key of 64 went to the fifth");
+    }
+
+    /// A registration that takes a worker off a model under its
+    /// incarnation, or moves its role, names the models the worker left to
+    /// the stages: once, ahead of the write's own word, when the store
+    /// shows the world that write made. A refresh, a model more and a patch
+    /// say no such word, and a moved role names every model of the old
+    /// list. Such a write pays its own build, as a leave does, so its two
+    /// words come with the world it made; a join, a refresh and a patch
+    /// are told ahead of the world their writes owe.
+    #[test]
+    fn a_registration_that_takes_a_worker_off_a_model_names_the_models_it_left() {
+        let store = Arc::new(MemoryStore::new());
+        let (ring, told) = (Arc::new(ConsistentHash::new(None)), Told::default());
+        store
+            .apply(generation(1, &store, &ring, &told))
+            .expect("applied");
+        let at = WorkersStore::epoch(&*store);
+        let write = |role, models: &[&str], dp_size| {
+            let facts = facts("http://w:8000", role, models);
+            store.upsert(WorkerFacts { dp_size, ..facts }).id()
+        };
+        let id = write(Role::Single, &[MODEL, "second"], 1);
+        // A refresh, a model more and a patch: the worker left no pool.
+        write(Role::Single, &[MODEL, "second"], 1);
+        write(Role::Single, &[MODEL, "second", "third"], 1);
+        let priority = WorkerPatch {
+            priority: Some(3),
+            ..WorkerPatch::default()
+        };
+        store
+            .patch(id, priority, revision(&store, id))
+            .expect("patched");
+        // A model less, one less under another width, another role.
+        write(Role::Single, &[MODEL, "third"], 1);
+        write(Role::Single, &[MODEL], 2);
+        write(Role::Prefill, &[MODEL], 2);
+        let relabelled = format!("{:?}", Membership::Relabelled(id));
+        assert_eq!(
+            *told.lock(),
+            [
+                (at, format!("{:?}", Membership::Snapshot(&[]))),
+                (at, format!("{:?}", Membership::Added(id))),
+                (at, relabelled.clone()),
+                (at, relabelled.clone()),
+                (at, relabelled.clone()),
+                (at + 5, left(id, &["second"])),
+                (at + 5, relabelled.clone()),
+                (at + 6, left(id, &["third"])),
+                (at + 6, format!("{:?}", Membership::Resized(id))),
+                (at + 7, left(id, &[MODEL])),
+                (at + 7, relabelled),
+            ]
+        );
+    }
+
+    /// A standby that follows such a registration says the same words to
+    /// its own stages: the models the worker left, ahead of the change it
+    /// applied, and no such word for a refresh. A followed write that
+    /// takes the worker off a model pays its build as the leader's does.
+    #[test]
+    fn a_followed_registration_names_the_models_the_worker_left() {
+        let leader = MemoryStore::new();
+        let write = |role, models: &[&str], dp_size| {
+            let facts = facts("http://w:8000", role, models);
+            leader.upsert(WorkerFacts { dp_size, ..facts })
+        };
+        let id = write(Role::Single, &[MODEL, "second"], 1).id();
+        let standby = Arc::new(MemoryStore::new());
+        let (ring, told) = (Arc::new(ConsistentHash::new(None)), Told::default());
+        standby
+            .apply(generation(1, &standby, &ring, &told))
+            .expect("applied");
+        assert!(standby.restore_from(leader.cut(Kinds::All)));
+        told.lock().clear();
+        let at = WorkersStore::epoch(&leader);
+        let unjournaled = Position::default();
+        let follow = |epoch, change| {
+            let row = WorkersStore::get(&leader, id).expect("the row");
+            standby.follow(unjournaled, epoch, change, Some(row));
+        };
+        // A model less, a refresh, then another role under another width.
+        follow(at + 1, write(Role::Single, &[MODEL], 1));
+        follow(at + 2, write(Role::Single, &[MODEL], 1));
+        follow(at + 3, write(Role::Prefill, &[MODEL], 2));
+        let relabelled = format!("{:?}", Membership::Relabelled(id));
+        assert_eq!(
+            *told.lock(),
+            [
+                (at + 1, left(id, &["second"])),
+                (at + 1, relabelled.clone()),
+                (at + 1, relabelled),
+                (at + 3, left(id, &[MODEL])),
+                (at + 3, format!("{:?}", Membership::Resized(id))),
+            ]
+        );
     }
 }

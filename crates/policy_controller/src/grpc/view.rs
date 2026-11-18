@@ -480,9 +480,13 @@ pub(crate) fn released(l: &Lease, r: ReleaseReason) -> proto::lifecycle_event::E
     })
 }
 
-pub(crate) fn membership(m: &Membership<'_>) -> proto::lifecycle_event::Event {
+/// A membership word as the plugin contract carries it. `None` for
+/// [`Membership::Left`]: the contract has no kind for it, and a plugin
+/// hears the `Relabelled` or `Resized` that follows it.
+pub(crate) fn membership(m: &Membership<'_>) -> Option<proto::lifecycle_event::Event> {
     use proto::membership_change::Kind;
     let (kind, worker_id, old_worker_id, ids) = match m {
+        Membership::Left { .. } => return None,
         Membership::Added(w) => (Kind::Added, w.0, 0, Vec::new()),
         Membership::Removed(w) => (Kind::Removed, w.0, 0, Vec::new()),
         Membership::Replaced { old, new } => (Kind::Replaced, new.0, old.0, Vec::new()),
@@ -492,12 +496,14 @@ pub(crate) fn membership(m: &Membership<'_>) -> proto::lifecycle_event::Event {
             (Kind::Snapshot, 0, 0, workers.iter().map(|w| w.0).collect())
         }
     };
-    proto::lifecycle_event::Event::Membership(proto::MembershipChange {
-        kind: kind as i32,
-        worker_id,
-        old_worker_id,
-        ids,
-    })
+    Some(proto::lifecycle_event::Event::Membership(
+        proto::MembershipChange {
+            kind: kind as i32,
+            worker_id,
+            old_worker_id,
+            ids,
+        },
+    ))
 }
 
 /// A signal; a veto's instant on the host's clock becomes the microseconds

@@ -7,6 +7,7 @@
 
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
+    mem,
     ops::{Deref, DerefMut},
     sync::Arc,
     time::{Duration, Instant},
@@ -36,8 +37,8 @@ use crate::{
             WorkerStatus, WorkersStore,
         },
         world::{
-            micros, same_offer, Ask, Built, Classes, EncodePairBuffers, OutsideLists, PairBuffers,
-            StaleGeneration, ViewBuffers, World, Writer, PUBLISH_WINDOW,
+            left_models, micros, same_offer, Ask, Built, Classes, EncodePairBuffers, OutsideLists,
+            PairBuffers, StaleGeneration, ViewBuffers, World, Writer, PUBLISH_WINDOW,
         },
         GatewayId,
     },
@@ -411,8 +412,10 @@ impl MemoryStore {
     /// caller starts again from a snapshot.
     ///
     /// The world's engine is told the change as at the leader's own write
-    /// ([`MembershipChange::as_lifecycle`]): a standby's stages hold what
-    /// its leader's hold, with no step at a take.
+    /// ([`MembershipChange::as_lifecycle`]), and ahead of it the models a
+    /// registration took its worker off ([`Membership::Left`]): a
+    /// standby's stages hold what its leader's hold, with no step at a
+    /// take.
     pub fn follow(
         &self,
         at: Position,
@@ -427,6 +430,9 @@ impl MemoryStore {
         // A row told again with the offer it had moves no pair class, here
         // as in the leader's own write: the classes are carried.
         let mut carried = false;
+        // The models a registration that stays under its id takes its
+        // worker off, for the stages: here as in the leader's own write.
+        let mut off = Vec::new();
         let (change, left) = match (change, row) {
             (MembershipChange::Registered { id }, Some(row))
                 if row.id == id
@@ -449,7 +455,11 @@ impl MemoryStore {
                 let resized = held.row.facts.dp_size != row.facts.dp_size;
                 carried = same_offer(&held.row.facts, &row.facts);
                 row.admitted_at = held.row.admitted_at;
-                held.row = row;
+                let old = mem::replace(&mut held.row, row);
+                // A row that carries its offer left no model.
+                if !carried {
+                    off = left_models(old.facts, &held.row.facts);
+                }
                 if resized {
                     (MembershipChange::Resized { id }, None)
                 } else {
@@ -529,8 +539,7 @@ impl MemoryStore {
                         joined: Some(id),
                     }
                 };
-                self.owe(classes, now);
-                self.tell_membership(change);
+                self.tell_leaving(&workers, classes, change, &off, now);
             }
             MembershipChange::StatusChanged { id, to, .. } => self.show_status(id, to),
             MembershipChange::Removed { id } => {
@@ -761,7 +770,13 @@ impl MemoryStore {
         let mut members: Vec<WorkerId> = workers.rows.keys().copied().collect();
         members.sort_unstable();
         let told = Membership::Snapshot(&members);
-        self.world.load().spec().engine().on_membership(&told);
+        self.tell_engine(&told);
+    }
+
+    /// Tell the engine of the world the store shows one membership word:
+    /// under the workers lock, with the load lock let go.
+    fn tell_engine(&self, word: &Membership<'_>) {
+        self.world.load().spec().engine().on_membership(word);
     }
 
     /// Tell the standing generation's engine what `change` is to it
@@ -781,8 +796,34 @@ impl MemoryStore {
     /// ([`crate::ring::FENCE`]).
     fn tell_membership(&self, change: MembershipChange) {
         if let Some(change) = change.as_lifecycle() {
-            self.world.load().spec().engine().on_membership(&change);
+            self.tell_engine(&change);
         }
+    }
+
+    /// [`MemoryStore::tell_membership`] for a registration that stays under
+    /// its id, with `left`, the models it takes its worker off
+    /// ([`left_models`]). Where it takes the worker off none, the build is
+    /// owed to the window as a join's is. Where it does, the write is a
+    /// leave from those models' pools and pays its own build first, as a
+    /// removal does ([`MemoryStore::pay_leave`]): the worker is in none of
+    /// them when the engine hears [`Membership::Left`], said ahead of the
+    /// write's own word.
+    fn tell_leaving(
+        &self,
+        workers: &Workers,
+        classes: Classes,
+        change: MembershipChange,
+        left: &[String],
+        now: Instant,
+    ) {
+        if left.is_empty() {
+            self.owe(classes, now);
+        } else {
+            self.pay_leave(workers, classes, now);
+            let id = change.id();
+            self.tell_engine(&Membership::Left { id, models: left });
+        }
+        self.tell_membership(change);
     }
 
     /// A membership write left the pools to be built again. Called under
@@ -1280,16 +1321,22 @@ impl WorkersStore for MemoryStore {
                 };
                 let resized = row.row.facts.dp_size != facts.dp_size;
                 // A registration refreshed with the offer it had moves no
-                // pair class.
-                let classes = if same_offer(&row.row.facts, &facts) {
-                    Classes::Carry
+                // pair class and takes its worker off no model: the role and
+                // the models are the offer's. Another names the models it
+                // took the worker off, for the stages to hear ahead of the
+                // write's own word. The facts it replaces end here either
+                // way, ahead of the write's world.
+                let (classes, left) = if same_offer(&row.row.facts, &facts) {
+                    row.row.facts = facts;
+                    (Classes::Carry, Vec::new())
                 } else {
-                    Classes::Written {
+                    let old = mem::replace(&mut row.row.facts, facts);
+                    let classes = Classes::Written {
                         left: Some(old_id),
                         joined: Some(old_id),
-                    }
+                    };
+                    (classes, left_models(old, &row.row.facts))
                 };
-                row.row.facts = facts;
                 row.row.revision += 1;
                 let change = workers.record(if resized {
                     MembershipChange::Resized { id: old_id }
@@ -1297,8 +1344,7 @@ impl WorkersStore for MemoryStore {
                     MembershipChange::Relabelled { id: old_id }
                 });
                 self.index_member(&workers, old_id);
-                self.owe(classes, now);
-                self.tell_membership(change);
+                self.tell_leaving(&workers, classes, change, &left, now);
                 return change;
             }
             // A new incarnation under the key: the old id leaves with its

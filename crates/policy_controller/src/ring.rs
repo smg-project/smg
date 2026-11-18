@@ -628,7 +628,7 @@ impl Lifecycle for ConsistentHash {
                 ring.admit(new);
             }
             Membership::Snapshot(ids) => ring.retain_only(ids, now),
-            Membership::Relabelled(_) | Membership::Resized(_) => {}
+            Membership::Relabelled(_) | Membership::Resized(_) | Membership::Left { .. } => {}
         }
     }
 }
