@@ -672,11 +672,11 @@ impl Log {
     /// A telling is owed while the count of moves is past the highest
     /// count told. The count is loaded before the kept one is raised to
     /// it, so a move is told after its count moved, and the reader that
-    /// telling wakes finds the log past its [`Stamp`], unless an earlier
-    /// telling woke it past that move already: its stamp stands then, and
-    /// it reads nothing. Of the releases that race, each that raises the
-    /// kept count tells: no move goes untold, and a release that raises
-    /// nothing tells nothing.
+    /// telling wakes finds the log past its [`Stamp`], unless it read
+    /// past that move already, whatever brought it to read: its stamp
+    /// stands then, and it reads nothing. Of the releases that race, each
+    /// that raises the kept count tells: no move goes untold, and a
+    /// release that raises nothing tells nothing.
     fn tell(&self) {
         let Some(told) = &self.told else {
             return;
