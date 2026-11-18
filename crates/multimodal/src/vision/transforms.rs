@@ -326,11 +326,13 @@ fn deinterleave_contiguous_by_table(
     }
 }
 
-/// [`deinterleave_rgb_to_planes_by_table`] appended to `out`: the red, green
-/// and blue planes of `rgb` in that order, each plane taken from the bytes in
-/// a pass of its own. For a batch buffer that holds several images' planes
-/// one after another: every float is written once, with no tensor of the
-/// image's own, zero fill or copy in between.
+/// [`deinterleave_rgb_to_planes_by_table`] appended to `out`, on the caller's
+/// thread: the red, green and blue planes of `rgb` in that order, each plane
+/// taken from the bytes in a pass of its own. For a batch buffer that holds
+/// several images' planes one after another: every float is written once,
+/// with no tensor of the image's own, zero fill or copy in between. It stays
+/// on the caller's thread on purpose: banding a patch across the
+/// preprocessing pool measured more CPU a request under concurrent requests.
 pub(crate) fn extend_planes_by_table(out: &mut Vec<f32>, rgb: &[u8], table: &[[f32; 256]; 3]) {
     let [red, green, blue] = table;
     let (pixels, _) = rgb.as_chunks::<3>();
