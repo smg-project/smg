@@ -1212,7 +1212,7 @@ mod tests {
         false
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_slotless_replacement_releases_its_claim_when_its_key_stops_being_importable() {
         for (empty_payload_id, cleanup) in [false, true].into_iter().flat_map(|empty| {
             ["tombstone", "owner-down", "retired"].map(|cleanup| (empty, cleanup))
@@ -1278,7 +1278,11 @@ mod tests {
             // legacy values with no publisher ID in the payload.
             match cleanup {
                 "tombstone" => ns.delete("worker:w1"),
-                "owner-down" => set_status(&cluster, "node-b", NodeStatus::Down),
+                "owner-down" => {
+                    set_status(&cluster, "node-b", NodeStatus::Down);
+                    adapter.refresh_membership();
+                    tokio::time::advance(DEAD_OWNER_GRACE).await;
+                }
                 _ => adapter.retire(url, None),
             }
             adapter.reconcile_once();

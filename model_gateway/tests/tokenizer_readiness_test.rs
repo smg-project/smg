@@ -46,6 +46,10 @@ struct BundleGate {
 }
 
 impl BundleGate {
+    #[expect(
+        clippy::unwrap_used,
+        reason = "fixture ZIP and tokenizer JSON must be valid or the test fails"
+    )]
     fn new(held: &[usize]) -> Arc<Self> {
         let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
         let mut vocab = serde_json::Map::new();
@@ -99,6 +103,10 @@ struct BundleProxy {
     gate: Arc<BundleGate>,
 }
 
+#[expect(
+    clippy::unwrap_used,
+    reason = "mock response constants must form valid gRPC headers and frames"
+)]
 fn grpc_body(message: Option<Vec<u8>>, status: &'static str) -> Response<Body> {
     let mut frames = Vec::new();
     if let Some(message) = message {
@@ -161,6 +169,10 @@ impl Service<Request<Body>> for BundleProxy {
     }
 }
 
+#[expect(
+    clippy::unwrap_used,
+    reason = "loopback backend and proxy startup failures must fail the test"
+)]
 async fn worker(model: &'static str, held: &[usize]) -> (String, Arc<BundleGate>) {
     let port = serve_mock_worker_with(|port| mock_worker::config::Config {
         http_count: 0,
@@ -224,6 +236,10 @@ impl Gateway {
         Self::start_mode(name, peer, mesh, true).await
     }
 
+    #[expect(
+        clippy::unwrap_used,
+        reason = "loopback gateway fixture startup failures must fail the test"
+    )]
     async fn start_mode(
         name: &str,
         peer: Option<u16>,
@@ -327,6 +343,10 @@ impl Gateway {
         std::fs::read_to_string(&self.log).unwrap_or_default()
     }
 
+    #[expect(
+        clippy::unwrap_used,
+        reason = "fixture request or response failures must fail the test"
+    )]
     async fn json(&self, path: &str) -> (StatusCode, Value) {
         let response = self
             .client
@@ -339,6 +359,10 @@ impl Gateway {
         (status, response.json().await.unwrap())
     }
 
+    #[expect(
+        clippy::unwrap_used,
+        reason = "fixture worker registration failures must fail the test"
+    )]
     async fn create(&self, url: &str, model: &str) -> String {
         let response = self
             .client
@@ -370,6 +394,10 @@ impl Gateway {
         }
     }
 
+    #[expect(
+        clippy::unwrap_used,
+        reason = "fixture inference transport failures must fail the test"
+    )]
     async fn infer(&self, model: &str) -> StatusCode {
         self.client.post(format!("{}/v1/chat/completions", self.http))
             .json(&json!({"model":model,"messages":[{"role":"user","content":"hello"}],"max_tokens":3,"temperature":0}))
