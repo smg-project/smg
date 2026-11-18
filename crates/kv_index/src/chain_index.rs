@@ -1017,6 +1017,11 @@ impl ChainIndex {
         if self.arena.partial_put(table, worker, cutoff) {
             return;
         }
+        // The growth copies, from this thread, the entry of every worker on the table. A
+        // release fence first, under the run's lock, as at a split: a reader that loads the
+        // grown table and then passes an acquire fence is ordered after what each of those
+        // workers' own writers did before its entry stood here.
+        fence(Ordering::Release);
         let grown = if table == NONE {
             self.arena.alloc_partials(MIN_TABLE_SLOTS)
         } else {
