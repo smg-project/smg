@@ -3,6 +3,7 @@
 //! allocates per decision.
 
 use std::{
+    any::Any,
     cell::Cell,
     collections::VecDeque,
     hash::Hasher,
@@ -172,6 +173,73 @@ impl Filter for NotTried {
 
     fn soft(&self) -> bool {
         true
+    }
+}
+
+/// The filters of this file as one test of a row: the set of them a
+/// profile holds. The engine folds a profile made of these filters alone
+/// into one at its build ([`RowTests::of`]), and a decision that draws first
+/// asks it about each row drawn: one call a row, where the filters' own
+/// `keep`s are a call a filter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RowTests(u8);
+
+impl RowTests {
+    const HEALTHY: u8 = 1;
+    const NOT_OVERLOADED: u8 = 1 << 1;
+    const HAS_CAPACITY: u8 = 1 << 2;
+    const HAS_ROOM: u8 = 1 << 3;
+    const NOT_TRIED: u8 = 1 << 4;
+
+    /// `filters` as one set, where each is a filter of this file, known by
+    /// its type. A host's own filter is no test the engine holds, one that
+    /// wraps a filter of this file too: a profile with one folds into
+    /// nothing, and is asked through each filter's `keep`.
+    pub(crate) fn of(filters: &[Box<dyn Filter>]) -> Option<Self> {
+        let mut tests = 0;
+        for filter in filters {
+            let filter: &dyn Any = filter.as_ref();
+            tests |= if filter.is::<Healthy>() {
+                Self::HEALTHY
+            } else if filter.is::<NotOverloaded>() {
+                Self::NOT_OVERLOADED
+            } else if filter.is::<HasCapacity>() {
+                Self::HAS_CAPACITY
+            } else if filter.is::<HasRoom>() {
+                Self::HAS_ROOM
+            } else if filter.is::<NotTried>() {
+                Self::NOT_TRIED
+            } else {
+                return None;
+            };
+        }
+        Some(Self(tests))
+    }
+
+    /// Whether a decision under `cx` asks the host's mask about a row
+    /// beside [`RowTests::keeps`]: the health filter is in the set and a
+    /// veto stands.
+    pub(crate) fn masked(self, cx: &Constraints<'_>) -> bool {
+        self.0 & Self::HEALTHY != 0 && !cx.stalled.is_empty()
+    }
+
+    /// Whether every filter of the set keeps the row, each by its own
+    /// `keep`. The health filter answers here for the row's own bits: the
+    /// host's mask, its other half, is the caller's to ask where
+    /// [`RowTests::masked`] says a veto stands.
+    #[inline(always)]
+    pub(crate) fn keeps(
+        self,
+        facts: &RequestFacts<'_>,
+        c: &Candidate,
+        cx: &Constraints<'_>,
+    ) -> bool {
+        let holds = |test: u8| self.0 & test != 0;
+        (!holds(Self::HEALTHY) || OwnBits.keep(facts, c, cx))
+            && (!holds(Self::NOT_OVERLOADED) || NotOverloaded.keep(facts, c, cx))
+            && (!holds(Self::HAS_CAPACITY) || HasCapacity.keep(facts, c, cx))
+            && (!holds(Self::HAS_ROOM) || HasRoom.keep(facts, c, cx))
+            && (!holds(Self::NOT_TRIED) || NotTried.keep(facts, c, cx))
     }
 }
 
@@ -4222,6 +4290,117 @@ mod tests {
         };
         assert!(!NotTried.keep(&facts, &c, &excluded));
         assert!(NotTried.soft() && HasRoom.soft() && !Healthy.soft() && !HasCapacity.soft());
+    }
+
+    /// The five filters of this file a set names, by bit.
+    fn filters_of(set: u8) -> Vec<Box<dyn Filter>> {
+        let all: [fn() -> Box<dyn Filter>; 5] = [
+            || Box::new(Healthy),
+            || Box::new(NotOverloaded),
+            || Box::new(HasCapacity),
+            || Box::new(HasRoom),
+            || Box::new(NotTried),
+        ];
+        (0..all.len())
+            .filter(|bit| set & (1 << bit) != 0)
+            .map(|bit| all[bit]())
+            .collect()
+    }
+
+    #[test]
+    fn a_profiles_filters_as_one_row_test_answer_as_each_filter_asked() {
+        // One row every filter keeps, then a row each refusal takes alone:
+        // the four health bits, the overload bit, the capacity bit, the
+        // room bit, a row the request tried, one the host excluded and one
+        // the host's mask names.
+        let mut pool: Vec<Candidate> = (0..11)
+            .map(|position| Candidate {
+                has_capacity: true,
+                has_room: true,
+                ..candidate(position, 0)
+            })
+            .collect();
+        pool[1].health.healthy = false;
+        pool[2].health.breaker_open = true;
+        pool[3].health.stalled = true;
+        pool[4].health.draining = true;
+        pool[5].health.overloaded = true;
+        pool[6].has_capacity = false;
+        pool[7].has_room = false;
+        let (tried, excluded, mask) = ([pool[8].id], [pool[9].id], [10u32]);
+        let facts = RequestFacts {
+            tried: &tried,
+            ..RequestFacts::default()
+        };
+        let plain = Constraints {
+            excluded: &excluded,
+            ..Constraints::default()
+        };
+        let lifted = Constraints {
+            overload_lifted: true,
+            ..plain
+        };
+        let scopes = [
+            plain,
+            lifted,
+            Constraints {
+                stalled: &mask,
+                ..plain
+            },
+            Constraints {
+                stalled: &mask,
+                ..lifted
+            },
+        ];
+        let mut refused = [0u32; 11];
+        for set in 0..32u8 {
+            let filters = filters_of(set);
+            let tests = RowTests::of(&filters).expect("the filters of this file fold");
+            for cx in &scopes {
+                let masked = tests.masked(cx);
+                assert_eq!(
+                    masked,
+                    set & 1 != 0 && !cx.stalled.is_empty(),
+                    "set {set:#07b}"
+                );
+                for c in &pool {
+                    let each = filters.iter().all(|f| f.keep(&facts, c, cx));
+                    let folded = tests.keeps(&facts, c, cx) && !(masked && cx.masks(c.position));
+                    assert_eq!(folded, each, "set {set:#07b}, row {}, {cx:?}", c.position);
+                    refused[c.position as usize] += u32::from(!each);
+                }
+            }
+        }
+        // The ready row is kept under every set and scope, and each other
+        // row is refused under some.
+        assert_eq!(refused[0], 0);
+        assert!(refused[1..].iter().all(|&times| times > 0), "{refused:?}");
+    }
+
+    #[test]
+    fn a_filter_of_a_hosts_folds_its_profile_into_no_row_test() {
+        /// A host's filter around the health filter: the same word on every
+        /// row, and a type the engine does not hold.
+        #[derive(Debug)]
+        struct Hosted(Healthy);
+        impl Filter for Hosted {
+            fn name(&self) -> &'static str {
+                self.0.name()
+            }
+
+            fn row_wise(&self) -> bool {
+                true
+            }
+
+            fn keep(&self, facts: &RequestFacts<'_>, c: &Candidate, cx: &Constraints<'_>) -> bool {
+                self.0.keep(facts, c, cx)
+            }
+        }
+        assert!(RowTests::of(&[]).is_some(), "no filter keeps every row");
+        let mut filters = filters_of(0b10011);
+        assert!(RowTests::of(&filters).is_some());
+        filters.insert(1, Box::new(Hosted(Healthy)));
+        assert_eq!(RowTests::of(&filters), None);
     }
 
     #[test]

@@ -3,10 +3,10 @@
 //! to its binding and decides. A scorer or picker allocates nothing per
 //! decision: scratch lives in the per-thread [`Scratch`] the host keeps.
 
-use std::{collections::HashMap, fmt::Debug};
+use std::{any::Any, collections::HashMap, fmt::Debug};
 
 use crate::{
-    builtins::{target_of, Best, FewestSessions, LeastRequests, Random},
+    builtins::{target_of, Best, FewestSessions, LeastRequests, Random, RowTests},
     decision::{
         Decision, Pair, Pick, Shed, ShedReason, Survivors, Target, Targets, Trace, MAX_TARGETS,
         TRACE_TOP,
@@ -24,7 +24,11 @@ use crate::{
 /// Drops candidates before scoring. A `soft` filter steps aside when it would
 /// leave nothing: the engines a retry already tried step aside while another
 /// candidate remains, and a pool with nothing else is used whole.
-pub trait Filter: Send + Sync + Debug {
+///
+/// `Any`: the engine's build knows its own filters by their type, and a
+/// decision that draws first asks a profile made of them alone about a row
+/// in one test, with no call a filter.
+pub trait Filter: Any + Send + Sync + Debug {
     fn name(&self) -> &'static str;
 
     fn keep(&self, facts: &RequestFacts<'_>, candidate: &Candidate, cx: &Constraints<'_>) -> bool;
@@ -496,7 +500,7 @@ const RELEASE_DEPTH: usize = 4;
 /// forgotten, since its drop could panic in turn.
 #[cold]
 #[inline(never)]
-pub(crate) fn release(payload: Box<dyn std::any::Any + Send>) {
+pub(crate) fn release(payload: Box<dyn Any + Send>) {
     let mut next = Some(payload);
     for _ in 0..RELEASE_DEPTH {
         let Some(payload) = next.take() else { return };
@@ -1173,6 +1177,11 @@ fn order_joined(
 /// nothing of the pool: the decision widens to the whole pass
 /// ([`run_single`]), which alone sheds and names a stage.
 ///
+/// Where the build folded the profile's filters into one test of a row
+/// (`row_tests`), a row is asked about in that one test, and about the host's
+/// mask only where a veto stands. A profile with a filter of a host's is
+/// asked a call a filter.
+///
 /// Whatever follows the draw reads the seed's stream past the values the
 /// draw read. The stream is continued, never restarted: a pass behind
 /// refused draws that read those values again would decide by the values
@@ -1183,7 +1192,7 @@ fn order_joined(
 /// path as it was.
 #[inline(never)]
 fn run_drawn(
-    profile: &Profile,
+    engine: &Engine,
     index: u16,
     facts: &RequestFacts<'_>,
     pool: &PoolFacts<'_>,
@@ -1191,15 +1200,26 @@ fn run_drawn(
     cx: &Constraints<'_>,
     buf: &mut Buffers,
 ) -> Decision {
+    // The profile and its fold are read here, by the index: the call takes
+    // the engine where a whole pass takes the profile, and no argument more.
+    let at = usize::from(index);
+    let (profile, rows) = (&engine.profiles[at], engine.row_tests[at]);
     let candidates = set.candidates;
     buf.reserve(candidates.len());
     buf.kept.clear();
     let mut draw = Draw::new(facts.seed);
-    let mut keep = |c: &Candidate| profile.filters.iter().all(|f| f.keep(facts, c, cx));
-    let drew =
+    let mut draw_by = |ask: &mut dyn FnMut(&Candidate) -> bool| {
         profile
             .picker
-            .draw_first(facts, pool, candidates, &mut keep, &mut buf.kept, &mut draw);
+            .draw_first(facts, pool, candidates, ask, &mut buf.kept, &mut draw)
+    };
+    let drew = match rows {
+        Some(tests) if tests.masked(cx) => {
+            draw_by(&mut |c| tests.keeps(facts, c, cx) && !cx.masks(c.position))
+        }
+        Some(tests) => draw_by(&mut |c| tests.keeps(facts, c, cx)),
+        None => draw_by(&mut |c| profile.filters.iter().all(|f| f.keep(facts, c, cx))),
+    };
     // The host caps both lists at the picker's sample: past it a decision
     // reads dearer, never wrong, so a debug build alone asserts it.
     debug_assert!(
@@ -1227,6 +1247,9 @@ fn run_drawn(
             // takes them: out of line, so a draw nothing joins keeps the
             // code it had.
             Some(named) if profile.picker.joined_by_named() => {
+                // The rows named are few: each is asked a call a filter,
+                // which answers as the folded test does.
+                let mut keep = |c: &Candidate| profile.filters.iter().all(|f| f.keep(facts, c, cx));
                 order_joined(
                     profile,
                     after,
@@ -1380,6 +1403,11 @@ pub struct Engine {
     /// Per profile, what its stages ask of a decision beyond the profile's
     /// own run ([`Marks`]).
     marks: Vec<Marks>,
+    /// Per profile, its filters as one test of a row, where the engine
+    /// holds every one itself ([`RowTests::of`]). A decision that draws
+    /// first asks it about a row in place of a call a filter, and no other
+    /// decision reads it.
+    row_tests: Vec<Option<RowTests>>,
 }
 
 /// What a profile's stages ask of a decision beyond the profile's own run,
@@ -1948,6 +1976,10 @@ impl Engine {
         }
         let sessions = SessionTable::new(shortest_sweep(&bindings));
         let marks: Vec<Marks> = profiles.iter().map(Marks::of).collect();
+        let row_tests = profiles
+            .iter()
+            .map(|profile| RowTests::of(&profile.filters))
+            .collect();
         // A picker that leaves the placement to its rule has no stages to
         // delegate to: the assignment that places is written beside each
         // binding here, once, so no decision asks. The binding itself keeps
@@ -1977,6 +2009,7 @@ impl Engine {
             sessions,
             assignment: AssignmentStages::default(),
             marks,
+            row_tests,
         }
     }
 
@@ -2254,7 +2287,7 @@ impl Engine {
             && candidates.len() >= DRAW_FROM
             && (draw == Marks::DRAWS_FIRST || facts.named.is_some())
         {
-            return run_drawn(profile, index, facts, pool, set, cx, buf);
+            return run_drawn(self, index, facts, pool, set, cx, buf);
         }
         run_single(profile, index, facts, pool, set, cx, buf)
     }
@@ -2804,8 +2837,8 @@ mod tests {
     use super::*;
     use crate::{
         builtins::{
-            Best, CountFirst, Healthy, LeastRequests, Manual, NotOverloaded, NotTried, Passthrough,
-            PowerOfTwo, PowerOfTwoCountFirst, Random, RoundRobin,
+            Best, CountFirst, HasCapacity, HasRoom, Healthy, LeastRequests, Manual, NotOverloaded,
+            NotTried, Passthrough, PowerOfTwo, PowerOfTwoCountFirst, Random, RoundRobin,
         },
         sessions::Recovery,
         spec::{PolicySpec, PowerOfTwoMetric},
@@ -7617,6 +7650,205 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_profile_of_the_engines_own_filters_draws_as_one_asked_a_call_a_filter() {
+        /// A host's filter around one of the engine's: the same word on
+        /// every row, and no filter the build knows.
+        #[derive(Debug)]
+        struct Hosted(Box<dyn Filter>);
+        impl Filter for Hosted {
+            fn name(&self) -> &'static str {
+                self.0.name()
+            }
+
+            fn soft(&self) -> bool {
+                self.0.soft()
+            }
+
+            fn row_wise(&self) -> bool {
+                self.0.row_wise()
+            }
+
+            fn keep(&self, facts: &RequestFacts<'_>, c: &Candidate, cx: &Constraints<'_>) -> bool {
+                self.0.keep(facts, c, cx)
+            }
+        }
+        /// The engine's five filters a set names, by bit.
+        fn filters_of(set: u8) -> Vec<Box<dyn Filter>> {
+            let all: [fn() -> Box<dyn Filter>; 5] = [
+                || Box::new(Healthy),
+                || Box::new(NotOverloaded),
+                || Box::new(HasCapacity),
+                || Box::new(HasRoom),
+                || Box::new(NotTried),
+            ];
+            (0..all.len())
+                .filter(|bit| set & (1 << bit) != 0)
+                .map(|bit| all[bit]())
+                .collect()
+        }
+        fn engine_of(filters: Vec<Box<dyn Filter>>, picker: Box<dyn Picker>) -> Engine {
+            Engine::new(
+                vec![Profile {
+                    name: "p".into(),
+                    filters,
+                    scorers: Vec::new(),
+                    picker,
+                }],
+                vec![single_binding()],
+                1,
+                Needs::default(),
+            )
+        }
+        const PICKERS: [fn() -> Box<dyn Picker>; 4] = [
+            || Box::new(Passthrough),
+            || Box::new(Random),
+            || Box::new(RoundRobin::new()),
+            || Box::new(PowerOfTwo),
+        ];
+        // By position modulo eight: a row each of four bits refuses and four
+        // the rows' own bits keep, of which the host's mask names one. A
+        // request names one row tried, and the host one excluded.
+        let pool: Vec<Candidate> = (0..64u32)
+            .map(|i| {
+                let mut c = Candidate {
+                    has_capacity: true,
+                    has_room: true,
+                    ..candidate(i, i % 5)
+                };
+                match i % 8 {
+                    1 => c.health.healthy = false,
+                    2 => c.health.overloaded = true,
+                    3 => c.has_capacity = false,
+                    4 => c.has_room = false,
+                    _ => {}
+                }
+                c
+            })
+            .collect();
+        let mask: Vec<u32> = (0..64).filter(|i| i % 8 == 7).collect();
+        let (mut drew, mut masked) = (0u32, 0u32);
+        for set in 0..32u8 {
+            for (which, picker) in PICKERS.into_iter().enumerate() {
+                let folded = engine_of(filters_of(set), picker());
+                let hosted = filters_of(set)
+                    .into_iter()
+                    .map(|filter| Box::new(Hosted(filter)) as Box<dyn Filter>)
+                    .collect();
+                let each = engine_of(hosted, picker());
+                assert!(folded.row_tests[0].is_some(), "set {set:#07b}: folded");
+                // A profile of no filter folds into the empty test whoever built it.
+                assert_eq!(
+                    each.row_tests[0].is_none(),
+                    set != 0,
+                    "set {set:#07b}: a host's"
+                );
+                for seed in 0..24u64 {
+                    let tried = [pool[(seed as usize * 8 + 5) % pool.len()].id];
+                    let excluded = [pool[(seed as usize * 8 + 6) % pool.len()].id];
+                    let facts = RequestFacts {
+                        tried: if seed % 2 == 0 { &tried } else { &[] },
+                        ..request(seed ^ u64::from(set) << 32)
+                    };
+                    let cx = Constraints {
+                        excluded: if seed % 3 == 0 { &excluded } else { &[] },
+                        stalled: if seed % 4 < 2 { mask.as_slice() } else { &[] },
+                        overload_lifted: seed % 5 == 0,
+                        ..Constraints::default()
+                    };
+                    let decide = |engine: &Engine| {
+                        engine.decide(
+                            &facts,
+                            &PoolFacts::default(),
+                            &pool,
+                            &cx,
+                            &mut Scratch::new(),
+                        )
+                    };
+                    let (got, want) = (decide(&folded), decide(&each));
+                    let at = format!("set {set:#07b}, picker {which}, seed {seed}");
+                    assert_eq!(got, want, "{at}");
+                    if got.trace().drew_first() {
+                        drew += 1;
+                        masked += u32::from(set & 1 != 0 && !cx.stalled.is_empty());
+                    }
+                    if set & 1 != 0 {
+                        assert!(
+                            positions(&got).iter().all(|&row| !cx.masks(row)),
+                            "{at}: a row the host's mask names"
+                        );
+                    }
+                }
+            }
+        }
+        // Most decisions drew, some of them under the health filter and a
+        // standing veto, where the mask is asked beside the folded test.
+        assert!(drew > 1_000 && masked > 200, "{drew} drew, {masked} masked");
+    }
+
+    #[test]
+    fn a_draw_asks_the_folded_test_of_its_own_profile() {
+        // Two profiles of one engine, each folded: the first keeps a row
+        // over its ceiling and the second refuses it. A draw under either
+        // asks that profile's own test.
+        let profile = |name: &str, filters: Vec<Box<dyn Filter>>| Profile {
+            name: name.into(),
+            filters,
+            scorers: Vec::new(),
+            picker: Box::new(Random),
+        };
+        let binding = |model: &str, profile: u16| Binding {
+            model: model.into(),
+            profile,
+            ..single_binding()
+        };
+        let engine = Engine::new(
+            vec![
+                profile("lenient", vec![Box::new(Healthy)]),
+                profile("strict", vec![Box::new(Healthy), Box::new(NotOverloaded)]),
+            ],
+            vec![binding("lenient", 0), binding("strict", 1)],
+            1,
+            Needs::default(),
+        );
+        assert!(engine.row_tests[0].is_some() && engine.row_tests[1].is_some());
+        assert_ne!(engine.row_tests[0], engine.row_tests[1]);
+        // Every second row is over its ceiling.
+        let pool: Vec<Candidate> = (0..64u32)
+            .map(|i| {
+                let mut c = candidate(i, 0);
+                c.health.overloaded = i % 2 == 0;
+                c
+            })
+            .collect();
+        let (mut drew, mut over) = ([0u32; 2], [0usize; 2]);
+        for (at, model) in ["lenient", "strict"].into_iter().enumerate() {
+            for seed in 0..64u64 {
+                let facts = RequestFacts {
+                    model,
+                    ..request(seed)
+                };
+                let decision = engine.decide(
+                    &facts,
+                    &PoolFacts::default(),
+                    &pool,
+                    &Constraints::default(),
+                    &mut Scratch::new(),
+                );
+                drew[at] += u32::from(decision.trace().drew_first());
+                let handed = positions(&decision);
+                over[at] += handed.iter().filter(|&&row| row % 2 == 0).count();
+            }
+        }
+        assert!(drew[0] == 64 && drew[1] > 48, "{drew:?} drew");
+        // The first profile hands such rows out and the second none.
+        assert!(over[0] > 0, "the lenient profile handed none");
+        assert_eq!(
+            over[1], 0,
+            "the strict profile handed a row over its ceiling"
+        );
     }
 
     #[test]
