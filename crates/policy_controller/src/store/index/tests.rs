@@ -1402,9 +1402,9 @@ mod named {
     }
 
     /// An id taken again takes no place of the cap: the lookup runs again
-    /// within the rows that still hold their ids, and the cap is filled
-    /// from them. The taker is the deepest of three under a cap of two, so
-    /// one lookup alone would name one row.
+    /// within the ids not taken since, and the cap is filled from them.
+    /// The taker is the deepest of three under a cap of two, so one lookup
+    /// alone would name one row.
     #[test]
     fn an_index_id_taken_again_takes_no_place_of_the_cap() {
         let store = MemoryStore::new();
@@ -1422,10 +1422,9 @@ mod named {
     }
 
     /// A row that joins takes an id of its own, and the index counts that
-    /// take as any: a decision that holds the world of before looks up
-    /// again, within its rows that hold their ids, which is all of them,
-    /// and names them by what they hold. The row that joined is no row of
-    /// that world.
+    /// take as any: a decision that holds the world of before asks the rows
+    /// it kept, finds no id of theirs taken since, and names them by its
+    /// one lookup. The row that joined is no row of that world.
     #[test]
     fn a_join_under_a_kept_world_names_that_worlds_rows_as_before() {
         let store = MemoryStore::new();
