@@ -182,8 +182,9 @@ pub trait Lifecycle: Send + Sync {
     fn on_released(&self, _lease: &Lease, _reason: ReleaseReason) {}
 
     /// The host's membership changed. A host may call this under its own
-    /// membership lock, as the policy store does, so a stage that calls
-    /// back into the host from here waits on itself.
+    /// membership lock, as the policy store does: a stage that calls from
+    /// here a door of the host that takes that lock waits on itself. A read
+    /// that takes no lock does not.
     fn on_membership(&self, _change: &Membership<'_>) {}
 
     fn on_signal(&self, _signal: &Signal) {}
