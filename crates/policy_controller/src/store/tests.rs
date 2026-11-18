@@ -1153,6 +1153,51 @@ fn two_gateways_sharing_a_lease_number_hold_separate_reservations() {
     assert_eq!(rooms.held(id, ReservationKind::Room), 0);
 }
 
+#[cfg(feature = "controller")]
+#[test]
+fn the_pins_sweep_drops_the_pins_past_the_rules_ttl_once_an_interval() {
+    use crate::spec::{AppliedSpec, PolicySpec};
+
+    let store = MemoryStore::new();
+    let now = Instant::now();
+    let t = |seconds: u64| now + Duration::from_secs(seconds);
+    let sessions: &dyn SessionsStore = &store;
+    // No sessions rule stands: no pass runs, whatever the age of a pin.
+    sessions.pin(1, WorkerId(1), now);
+    assert_eq!(store.sweep_pins(t(1_000_000)), 0);
+    // The manual preset, its keys pinned for `ttl_s` and swept every
+    // `sweep_s`.
+    let ruled = |generation: u64, ttl_s: u32, sweep_s: u32| {
+        let mut document = PolicySpec::preset("manual").expect("a preset of this build");
+        document.generation = generation;
+        let rule = document.bindings[0].sessions.as_mut();
+        let rule = rule.expect("the preset's rule");
+        (rule.ttl_s, rule.sweep_s) = (ttl_s, sweep_s);
+        AppliedSpec::validate(&document).expect("the document validates")
+    };
+    store.apply(ruled(1, 60, 30)).expect("a first generation");
+    for key in 2..=1_001 {
+        sessions.pin(key, WorkerId(1), t(10));
+    }
+    assert_eq!(sessions.len(), 1_001);
+    // The first pass: the pin of second 0 is past the TTL at second 61.
+    assert_eq!(store.sweep_pins(t(61)), 1);
+    // A tick inside the interval walks nothing, though every pin is old.
+    assert_eq!(store.sweep_pins(t(80)), 0);
+    assert_eq!(sessions.len(), 1_000);
+    // The next pass due: the thousand pins of second 10 leave together,
+    // so the table holds the keys of one TTL and one interval at most.
+    assert_eq!(store.sweep_pins(t(91)), 1_000);
+    assert!(sessions.is_empty());
+    // A rule that keeps its keys for ever: no pass runs.
+    store
+        .apply(ruled(2, u32::MAX, u32::MAX))
+        .expect("a later generation");
+    sessions.pin(1, WorkerId(1), now);
+    assert_eq!(store.sweep_pins(t(1_000_000)), 0);
+    assert_eq!(sessions.len(), 1);
+}
+
 #[test]
 fn a_pin_is_written_at_the_commit_and_leaves_with_its_worker_or_its_age() {
     let store = MemoryStore::new();

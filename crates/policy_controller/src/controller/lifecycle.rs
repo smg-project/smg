@@ -28,14 +28,19 @@ use tonic::Status;
 
 use crate::{
     decision::Target,
+    framework::Engine,
     lease::{LeaseId, Lifecycle, Outcome, ReleaseReason, Side, TransportClass},
     proto::{
         self,
         completed::Class,
         released::{Reason, What},
     },
-    store::{Dispatch, GatewayId, HealthSink, LeaseRecord, LeaseState, LeasesStore, MemoryStore},
-    view::WorkerId,
+    sessions::SessionVerdict,
+    store::{
+        Dispatch, GatewayId, HealthSink, LeaseRecord, LeaseState, LeasesStore, MemoryStore,
+        SessionsStore,
+    },
+    view::{Session, WorkerId},
 };
 
 /// A `Dispatched` frame: the gateway's lease moves to dispatched at `now`.
@@ -56,7 +61,7 @@ pub(crate) fn dispatched(
     let found = LeasesStore::get(store, gateway, lease);
     let on_file = LeasesStore::dispatched(store, gateway, lease, dispatch, now);
     if let Some(record) = found.filter(|record| on_file && record.state == LeaseState::Issued) {
-        told(store, &record, Said::Dispatched(dispatch));
+        told(store, &record, Said::Dispatched(dispatch, now));
     }
     Ok(())
 }
@@ -112,7 +117,8 @@ pub(crate) fn released(
 /// What a frame says of a lease on file.
 #[derive(Clone, Copy)]
 enum Said<'a> {
-    Dispatched(Dispatch),
+    /// The dispatch, and the instant its frame was read.
+    Dispatched(Dispatch, Instant),
     Completed(&'a Outcome),
     Released(ReleaseReason),
 }
@@ -128,12 +134,9 @@ enum Said<'a> {
 fn told(store: &MemoryStore, record: &LeaseRecord, said: Said<'_>) {
     store.with_world(|world| {
         let spec = world.spec();
-        if spec.generation() != record.lease.generation {
-            return;
-        }
-        let engine = spec.engine();
-        match said {
-            Said::Dispatched(dispatch) => {
+        let engine = (spec.generation() == record.lease.generation).then(|| spec.engine());
+        match (said, engine) {
+            (Said::Dispatched(dispatch, at), engine) => {
                 let Some((id, dp_rank)) = record.target_at(dispatch.target_index) else {
                     return;
                 };
@@ -142,17 +145,51 @@ fn told(store: &MemoryStore, record: &LeaseRecord, said: Said<'_>) {
                     dp_rank,
                     ..Target::default()
                 };
-                engine.on_dispatched(
-                    &record.lease,
-                    &target,
-                    dispatch.side,
-                    dispatch.since_decision_micros,
-                );
+                if let Some(engine) = engine {
+                    engine.on_dispatched(
+                        &record.lease,
+                        &target,
+                        dispatch.side,
+                        dispatch.since_decision_micros,
+                    );
+                }
+                pinned(store, record, engine, id, at);
             }
-            Said::Completed(outcome) => engine.on_completed(&record.lease, outcome),
-            Said::Released(reason) => engine.on_released(&record.lease, reason),
+            (Said::Completed(outcome), Some(engine)) => engine.on_completed(&record.lease, outcome),
+            (Said::Released(reason), Some(engine)) => engine.on_released(&record.lease, reason),
+            (Said::Completed(_) | Said::Released(_), None) => {}
         }
     });
+}
+
+/// Writes a keyed lease's pin of record at its dispatch (design 5.1, the
+/// sessions row: written at the commit, never at selection). The pin names
+/// the worker the key's rule prefers once the engine was told, as its
+/// table holds it: a dispatch on the failover leaves the preferred worker
+/// pinned. Where no engine was told it names the dispatched worker. A
+/// lease no sessions rule governed pins nothing. The table's lock is let
+/// go before the store's pin is written: no lock is held across the two.
+fn pinned(
+    store: &MemoryStore,
+    record: &LeaseRecord,
+    engine: Option<&Engine>,
+    dispatched: WorkerId,
+    at: Instant,
+) {
+    let lease = &record.lease;
+    if lease.session == Session::NONE || lease.session_verdict == SessionVerdict::None {
+        return;
+    }
+    let preferred = engine
+        .and_then(|engine| engine.sessions().pins(lease.session))
+        .map(|pins| pins[0])
+        .filter(|pin| *pin != WorkerId(0));
+    SessionsStore::pin(
+        store,
+        lease.session.get(),
+        preferred.unwrap_or(dispatched),
+        at,
+    );
 }
 
 /// What a `Dispatched` frame says, read whole.
@@ -291,13 +328,15 @@ pub(crate) mod tests {
         spec::{AppliedSpec, PolicySpec},
         store::{
             Dispatch, GatewayId, HealthSink, LeaseState, LeasesStore, MemoryStore, Picked,
-            WorkerFacts, WorkersStore,
+            SessionsStore, WorkerFacts, WorkersStore,
         },
         view::{Candidate, RequestFacts, Session, WorkerId},
     };
 
     const A: GatewayId = GatewayId(11);
     const B: GatewayId = GatewayId(12);
+    /// The session of the keyed leases.
+    const KEY: Session = Session::from_raw(41);
 
     /// A worker the store holds a row for.
     pub(crate) fn worker(store: &MemoryStore, key: &str) -> WorkerId {
@@ -540,6 +579,75 @@ pub(crate) mod tests {
         assert_eq!(pins(), None, "an issue books no pin");
         dispatched(&store, A, &a_dispatched(1), t0).expect("the frame reads");
         assert_eq!(pins(), Some([WorkerId(7), WorkerId(0)]));
+    }
+
+    /// Files the keyed lease `id` of [`A`] on `target`, as generation 1
+    /// issued it under `verdict`.
+    fn keyed(store: &MemoryStore, id: u64, target: u64, verdict: SessionVerdict, now: Instant) {
+        let mut record = lease(A, id, now);
+        record.lease.generation = 1;
+        record.lease.session = KEY;
+        record.lease.session_verdict = verdict;
+        record.target = WorkerId(target);
+        store.issue(record).expect("a lease");
+    }
+
+    /// The worker the pin of record of [`KEY`] names.
+    fn pin_of_record(store: &MemoryStore) -> Option<WorkerId> {
+        SessionsStore::lookup(store, KEY.get()).map(|pin| pin.worker)
+    }
+
+    #[test]
+    fn a_dispatched_frame_writes_a_keyed_leases_pin_of_record() {
+        let store = MemoryStore::new();
+        let t0 = Instant::now();
+        let _heard = hearing(&store, 1);
+        keyed(&store, 1, 7, SessionVerdict::Claimed(WorkerId(7)), t0);
+        assert_eq!(pin_of_record(&store), None, "an issue pins nothing");
+        let at = t0 + Duration::from_millis(3);
+        dispatched(&store, A, &a_dispatched(1), at).expect("the frame reads");
+        let pin = SessionsStore::lookup(&store, KEY.get()).expect("a pin");
+        assert_eq!((pin.worker, pin.last_used), (WorkerId(7), at));
+        // A lease no sessions rule governed, and one with no key: no pin.
+        keyed(&store, 2, 8, SessionVerdict::None, t0);
+        issued(&store, 3, 1, t0);
+        for id in 2..=3 {
+            dispatched(&store, A, &a_dispatched(id), at).expect("the frame reads");
+        }
+        assert_eq!(pin_of_record(&store), Some(WorkerId(7)));
+        assert_eq!(SessionsStore::len(&store), 1);
+    }
+
+    #[test]
+    fn a_dispatch_on_the_failover_leaves_the_preferred_worker_pinned() {
+        let store = MemoryStore::new();
+        let t0 = Instant::now();
+        let _heard = hearing(&store, 1);
+        // The key is claimed on 1, respills to 2 and is then sent to 1
+        // again as its failover: 2 stays the worker the rule prefers.
+        let sent = [
+            (1, SessionVerdict::Claimed(WorkerId(1)), 1),
+            (2, SessionVerdict::Respill, 2),
+            (1, SessionVerdict::Pinned, 2),
+        ];
+        for (id, (target, verdict, preferred)) in (1..).zip(sent) {
+            keyed(&store, id, target, verdict, t0);
+            dispatched(&store, A, &a_dispatched(id), t0).expect("the frame reads");
+            assert_eq!(pin_of_record(&store), Some(WorkerId(preferred)), "{id}");
+        }
+    }
+
+    #[test]
+    fn a_lease_of_a_generation_that_left_still_writes_its_pin() {
+        let store = MemoryStore::new();
+        let t0 = Instant::now();
+        let _first = hearing(&store, 1);
+        keyed(&store, 1, 7, SessionVerdict::Claimed(WorkerId(7)), t0);
+        let _second = hearing(&store, 2);
+        dispatched(&store, A, &a_dispatched(1), t0).expect("the frame reads");
+        // No engine is told, and the pin names the dispatched worker.
+        let table = store.with_world(|world| world.spec().engine().sessions().len());
+        assert_eq!((table, pin_of_record(&store)), (0, Some(WorkerId(7))));
     }
 
     #[test]
