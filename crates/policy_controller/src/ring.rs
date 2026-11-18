@@ -39,6 +39,7 @@
 
 use std::{
     cell::RefCell,
+    cmp::Ordering,
     collections::VecDeque,
     mem,
     time::{Duration, Instant},
@@ -171,6 +172,12 @@ pub struct Ring {
     entries: Vec<(u64, u32)>,
     /// The ids pruned within [`FENCE`].
     fence: Fence,
+    /// The pools shown whole ([`Ring::show`]) under `shown_epoch`, by their
+    /// host's number in rising order, each with whether its rows stood in
+    /// the order of their ids.
+    shown: Vec<(u32, bool)>,
+    /// The newest membership epoch a pool was shown under.
+    shown_epoch: u64,
 }
 
 impl Ring {
@@ -261,6 +268,53 @@ impl Ring {
             .filter(|&(id, _)| !fence.holds(id))
             .collect();
         self.add_many(fresh)
+    }
+
+    /// [`Ring::learn`] for every row of the pool its host numbers `pool`
+    /// under the membership epoch `epoch`, and the note that the pool was
+    /// shown whole, with whether its rows stood in the order of their ids.
+    /// The pools of an earlier epoch are dropped at the first of a later
+    /// one, and a pool of an epoch behind the one held is not noted.
+    pub fn show(
+        &mut self,
+        epoch: u64,
+        pool: u32,
+        ordered: bool,
+        members: impl IntoIterator<Item = (WorkerId, u32)>,
+        now: Instant,
+    ) {
+        self.learn(members, now);
+        if epoch < self.shown_epoch {
+            return;
+        }
+        if epoch > self.shown_epoch {
+            self.shown.clear();
+            self.shown_epoch = epoch;
+        }
+        match self
+            .shown
+            .binary_search_by_key(&pool, |&(number, _)| number)
+        {
+            Ok(at) => self.shown[at].1 = ordered,
+            Err(at) => self.shown.insert(at, (pool, ordered)),
+        }
+    }
+
+    /// What [`Ring::show`] noted of the pool numbered `pool` under `epoch`:
+    /// whether a walk may find its rows by their ids. `None` for a pool
+    /// not shown yet, and `Some(false)` under an epoch behind the one held,
+    /// whose pools are shown no more.
+    pub fn shown(&self, epoch: u64, pool: u32) -> Option<bool> {
+        match epoch.cmp(&self.shown_epoch) {
+            Ordering::Less => Some(false),
+            Ordering::Greater => None,
+            Ordering::Equal => {
+                let at = self
+                    .shown
+                    .binary_search_by_key(&pool, |&(number, _)| number);
+                at.ok().map(|at| self.shown[at].1)
+            }
+        }
     }
 
     /// Whether `id` was pruned within [`FENCE`] of `now` and is fenced
@@ -507,22 +561,13 @@ pub struct ConsistentHash {
     /// The prefix form, for a request with no routing key.
     prefix: Option<Prefix>,
     ring: RwLock<Ring>,
-    /// The pools every row of which the ring was shown, the newest last,
-    /// [`LEARNED`] at the most: what a walk that reads no pool whole
-    /// ([`Scorer::own`]) asks before it takes the ring to hold a key's
-    /// owner.
-    learned: RwLock<Vec<Learned>>,
 }
 
-/// A pool the ring was shown whole: the membership epoch its rows came
-/// under, the place of its list of engines
-/// ([`Engines::place`](crate::view::Engines::place)), and whether its rows
-/// stood in the order of their ids, as the list's host says they do.
-type Learned = (u64, (usize, usize), bool);
-
-/// The pools the ring remembers it was shown: a pool a model and role, and
-/// a fleet's few at one membership epoch.
-const LEARNED: usize = 8;
+/// A walk is taken over a pool that holds at least one in so many of the
+/// ring's members. One ring serves every pool of its profile, and a walk
+/// passes the others' positions on its way to its own: over a smaller pool
+/// it would read more than the whole pass does.
+const RING_SHARE: usize = 4;
 
 impl ConsistentHash {
     pub fn new(bounded: Option<&BoundedLoadParams>) -> Self {
@@ -531,30 +576,23 @@ impl ConsistentHash {
                 .map(|rule| (rule.factor.unwrap_or(1.25), rule.abs_margin.unwrap_or(10))),
             prefix: None,
             ring: RwLock::new(Ring::new()),
-            learned: RwLock::default(),
         }
     }
 
-    /// Shows the ring every row of the pool at `place` under `epoch`, as a
-    /// whole pass shows it the survivors the feed never named, and
-    /// remembers the pool with whether its rows stand in the order of
-    /// their ids: a walk finds a member's row by that order, and the pool
-    /// of a host that hands another is left to the whole pass. Once a pool
-    /// and membership epoch: out of line, a decision that finds its pool
-    /// remembered walks the ring under the shared lock.
+    /// Shows the ring every row of the pool its host numbers `pool` under
+    /// `epoch` ([`Ring::show`]), as a whole pass shows it the survivors the
+    /// feed never named, with whether the rows stand in the order of their
+    /// ids: a walk finds a member's row by that order, and the pool of a
+    /// host that hands another is left to the whole pass. Once a pool and
+    /// membership epoch: out of line, a decision that finds its pool shown
+    /// walks the ring under the one shared lock.
     #[cold]
     #[inline(never)]
-    fn learn(&self, epoch: u64, place: (usize, usize), candidates: &[Candidate]) -> bool {
-        let rows = candidates.iter().map(|row| (row.id, row.key));
-        self.ring.write().learn(rows, Instant::now());
+    fn learn(&self, epoch: u64, pool: u32, candidates: &[Candidate]) {
         let ordered = candidates.windows(2).all(|pair| pair[0].id < pair[1].id);
-        let mut learned = self.learned.write();
-        learned.retain(|&(at, of, _)| (at, of) != (epoch, place));
-        if learned.len() == LEARNED {
-            learned.remove(0);
-        }
-        learned.push((epoch, place, ordered));
-        ordered
+        let rows = candidates.iter().map(|row| (row.id, row.key));
+        let now = Instant::now();
+        self.ring.write().show(epoch, pool, ordered, rows, now);
     }
 
     /// The prefix form: a request with no routing key is keyed by its
@@ -689,14 +727,18 @@ impl Scorer for ConsistentHash {
     /// routing key over the ring's members, each member's row found by its
     /// id among the rows, the filters asked about the rows met and no
     /// others, and the first [`MAX_TARGETS`] of them kept handed out in the
-    /// ring's order. The targets are the whole pass's, row for row.
+    /// ring's order. The walk ends there, or once every row handed was
+    /// asked. The targets are the whole pass's, row for row.
     ///
     /// The pool's list of engines is the host's word for what the walk
     /// takes on trust: the rows are a pool's own under a membership epoch,
-    /// in the order of their ids. `false`, with what `kept` holds to be
-    /// dropped, where the host does not say so, where the request has no
-    /// routing key, and once [`DRAW_BOUND`] rows were refused, which says
-    /// nothing of the rows behind them: the whole pass decides.
+    /// in the order of their ids, and the pool is numbered. `false`, with
+    /// what `kept` holds to be dropped, where the host does not say so,
+    /// where the request has no routing key, once [`DRAW_BOUND`] rows were
+    /// refused, which says nothing of the rows behind them, where the walk
+    /// came round the ring short of the rows handed, one of which the ring
+    /// does not hold, and for a pool that holds under a quarter of the
+    /// ring's members: the whole pass decides.
     fn own(
         &self,
         facts: &RequestFacts<'_>,
@@ -710,18 +752,24 @@ impl Scorer for ConsistentHash {
         if key == 0 || unsaid || !self.owns() {
             return false;
         }
-        let (epoch, place) = (pool.membership_epoch, pool.engines.place());
-        let known = |&&(at, of, _): &&Learned| (at, of) == (epoch, place);
-        let ordered = self.learned.read().iter().find(known).map(|pool| pool.2);
-        if !ordered.unwrap_or_else(|| self.learn(epoch, place, candidates)) {
+        let (epoch, number) = (pool.membership_epoch, pool.engines.pool());
+        let mut ring = self.ring.read();
+        let ordered = ring.shown(epoch, number).or_else(|| {
+            // No lock is held across the two.
+            RwLockReadGuard::unlocked(&mut ring, || self.learn(epoch, number, candidates));
+            ring.shown(epoch, number)
+        });
+        // A walk passes the positions of the ring's other members on its
+        // way: a pool that is a small share of them is read whole.
+        let small = candidates.len().saturating_mul(RING_SHARE) < ring.len();
+        if ordered != Some(true) || small {
             return false;
         }
-        let ring = self.ring.read();
         // The members met, kept or refused: a walk meets a member at each
         // of its positions and asks about it once.
         let mut met = [FREE; MAX_TARGETS + DRAW_BOUND as usize];
         let (mut asked, mut refused) = (0, 0);
-        ring.walk(key, |member| {
+        let ended = ring.walk(key, |member| {
             if met[..asked].contains(&member) {
                 return Probe::Skip;
             }
@@ -750,9 +798,16 @@ impl Scorer for ConsistentHash {
                     return Probe::Stop;
                 }
             }
+            // Every row handed was asked: no position further on holds
+            // another.
+            if asked == candidates.len() {
+                return Probe::Take(());
+            }
             Probe::Skip
         });
-        refused < DRAW_BOUND && !kept.is_empty()
+        // A walk that came round the ring short of the rows handed met no
+        // member for one of them, which the whole pass places.
+        ended.is_some() && !kept.is_empty()
     }
 
     fn score(
@@ -1825,5 +1880,34 @@ mod tests {
         // With no rule the deeper boundary's owner keeps the key whatever
         // it holds.
         assert_eq!(under(&levelled(None), 30, 30), ranks(deep));
+    }
+
+    #[test]
+    fn a_ring_keeps_the_pools_it_was_shown_by_number_while_their_epoch_stands() {
+        let mut ring = Ring::new();
+        let now = Instant::now();
+        assert_eq!(ring.shown(3, 0), None);
+        for pool in 0..9 {
+            let member = (WorkerId(u64::from(pool) + 1), pool);
+            ring.show(3, pool, pool != 4, [member], now);
+        }
+        // Nine pools under one epoch: none forgotten, each with its word.
+        for pool in 0..9 {
+            assert_eq!(ring.shown(3, pool), Some(pool != 4), "pool {pool}");
+        }
+        assert_eq!(ring.shown(3, 9), None, "a pool not shown");
+        assert_eq!(ring.len(), 9);
+        // A later epoch: its pools are shown anew, and the earlier one's
+        // are shown no more.
+        assert_eq!(ring.shown(4, 0), None);
+        ring.show(4, 0, true, [], now);
+        assert_eq!(ring.shown(4, 0), Some(true));
+        assert_eq!(ring.shown(4, 1), None);
+        assert_eq!(ring.shown(3, 1), Some(false), "an epoch behind");
+        // A pool of a passed epoch is learned and not noted.
+        ring.show(3, 7, true, [(WorkerId(77), 77)], now);
+        assert!(ring.contains(WorkerId(77)));
+        assert_eq!(ring.shown(3, 7), Some(false));
+        assert_eq!(ring.shown(4, 7), None);
     }
 }

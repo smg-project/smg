@@ -148,3 +148,38 @@ fn an_engine_is_listed_in_each_pool_by_that_pools_rows() {
         assert!(view.engines.is_empty(), "one row of the engine serves it");
     });
 }
+
+#[test]
+fn each_pools_list_carries_the_pools_number() {
+    let store = MemoryStore::new();
+    // Two models, an engine of two ranks each: two pools that list one.
+    let other = "n";
+    for (engine, model) in [(E, MODEL), (F, other)] {
+        for rank in 0..2 {
+            store.upsert(crate::store::WorkerFacts {
+                engine: engine.to_string(),
+                dp_rank: rank,
+                dp_size: 2,
+                ..facts(&format!("{engine}#{rank}"), Role::Single, &[model])
+            });
+        }
+    }
+    store.publish_now();
+    let ask = ask(Instant::now());
+    let (mut lent, mut built) = (ViewBuffers::default(), ViewBuffers::default());
+    store.with_world(|world| {
+        let numbers = [MODEL, other].map(|model| {
+            let view = world
+                .view(model, Role::Single, &ask, false, &mut lent)
+                .expect("the pool");
+            assert_eq!(view.engines.len(), 1);
+            assert_eq!(view.engines.pool(), view.built.pool, "the pool's index");
+            let read = world
+                .build(model, Role::Single, &ask, &mut built)
+                .expect("the pool");
+            assert_eq!(world.engines(&read).pool(), read.pool);
+            view.engines.pool()
+        });
+        assert_ne!(numbers[0], numbers[1], "a number a pool");
+    });
+}

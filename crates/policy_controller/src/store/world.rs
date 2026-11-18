@@ -426,10 +426,11 @@ impl PoolShape {
     /// The pool's engines as a decision reads them, for rows that stand at
     /// the pool's own positions: a pool that holds a host-local row hands
     /// each gateway a list of its own, whose positions are not these, and
-    /// no engines with it.
-    fn engines(&self) -> Engines<'_> {
+    /// no engines with it. `pool` is the pool's index, its number while the
+    /// membership epoch stands.
+    fn engines(&self, pool: u32) -> Engines<'_> {
         if self.locals.is_empty() {
-            Engines::new(&self.engines.rows, &self.engines.ends)
+            Engines::new(pool, &self.engines.rows, &self.engines.ends)
         } else {
             Engines::default()
         }
@@ -998,7 +999,7 @@ impl World {
         self.derived
             .pools
             .get(built.pool as usize)
-            .map_or_else(Engines::default, PoolShape::engines)
+            .map_or_else(Engines::default, |shape| shape.engines(built.pool))
     }
 
     /// Build one decision's view of the pool serving `model` in `role` into
@@ -1177,7 +1178,7 @@ impl World {
                 pinned_at: 0,
                 affinity: &out.affinity,
                 in_flight: None,
-                engines: shape.engines(),
+                engines: shape.engines(index as u32),
                 built,
             });
         }
@@ -1216,7 +1217,7 @@ impl World {
             pinned_at,
             affinity: &out.affinity,
             in_flight: Some(self.derived.counts.lend(&shape.booked, &mut out.kept)),
-            engines: shape.engines(),
+            engines: shape.engines(index as u32),
             built: Built {
                 pool: index as u32,
                 pool_size: rows.len() as u32,

@@ -297,7 +297,7 @@ fn a_decision_by_engines_is_the_rule_row_for_row_over_drawn_pools() {
     for (shape, ranks) in (0_u64..).zip(SHAPES) {
         for seed in 0..400_u64 {
             let (rows, listed, ends) = pool_of(ranks, shape * 1_000 + seed / 20);
-            let engines = Engines::new(&listed, &ends);
+            let engines = Engines::new(0, &listed, &ends);
             let seed = Draw::new(seed).next_u64();
             let decision = decide(&engine, seed, &rows, engines);
             let (asked, handed) = read();
@@ -346,7 +346,7 @@ fn a_decision_by_engines_reads_no_more_rows_in_a_larger_fleet() {
                 row.health.healthy = true;
             }
             let seed = Draw::new(seed).next_u64();
-            decide(&engine, seed, &rows, Engines::new(&listed, &ends));
+            decide(&engine, seed, &rows, Engines::new(0, &listed, &ends));
             let (asked, handed) = read();
             // The two rows that stand for the engines drawn, then the other
             // rows of the one taken; two sets handed, of two rows and of
@@ -367,7 +367,7 @@ fn a_pool_of_one_engine_hands_its_least_rank_and_its_next_and_draws_no_engine() 
         row.in_flight = in_flight;
     }
     rows[3].health.healthy = false;
-    let decision = decide(&engine, 11, &rows, Engines::new(&listed, &ends));
+    let decision = decide(&engine, 11, &rows, Engines::new(0, &listed, &ends));
     let pick = decision.pick().expect("a pick");
     assert_eq!(
         positions(&pick.targets),
@@ -398,7 +398,7 @@ fn the_alternate_of_a_pick_by_engines_is_another_engines_row() {
     }
     for seed in 0..50 {
         let seed = Draw::new(seed).next_u64();
-        let decision = decide(&engine, seed, &rows, Engines::new(&listed, &ends));
+        let decision = decide(&engine, seed, &rows, Engines::new(0, &listed, &ends));
         let targets = positions(&decision.pick().expect("a pick").targets);
         assert_eq!(targets.len(), 2, "{targets:?}");
         assert_eq!(targets[0], 0, "the taken engine's least rank");
@@ -416,7 +416,7 @@ fn the_alternate_of_a_pick_by_engines_is_another_engines_row() {
         for row in &mut rows {
             row.health.healthy = true;
         }
-        let engines = Engines::new(&listed, &ends);
+        let engines = Engines::new(0, &listed, &ends);
         let of = |position: u32| {
             (0..engines.len()).find(|&engine| engines.rows(engine).contains(&position))
         };
@@ -438,7 +438,7 @@ fn a_pool_no_row_of_which_is_kept_is_the_whole_passes_to_shed() {
         for row in &mut rows {
             row.health.healthy = false;
         }
-        let decision = decide(&engine, 7, &rows, Engines::new(&listed, &ends));
+        let decision = decide(&engine, 7, &rows, Engines::new(0, &listed, &ends));
         let Decision::Shed(shed) = decision else {
             panic!("{ranks:?}: {decision:?}");
         };
@@ -460,7 +460,7 @@ fn a_pick_the_whole_pass_makes_behind_the_unit_keeps_the_requests_seed() {
     let mut widened = 0;
     for seed in 1..=40 {
         read();
-        let decision = decide(&engine, seed, &rows, Engines::new(&listed, &ends));
+        let decision = decide(&engine, seed, &rows, Engines::new(0, &listed, &ends));
         let pick = decision.pick().expect("the one row kept");
         assert_eq!(positions(&pick.targets), [37], "seed {seed}");
         assert_eq!(pick.trace.seed, seed);
@@ -479,7 +479,7 @@ fn a_pool_that_lists_no_engine_and_a_picker_of_rows_keep_their_paths() {
         // Under a picker whose unit is a row the list changes nothing.
         for seed in 0..100_u64 {
             let seed = Draw::new(seed).next_u64();
-            let with = decide(&by_rows, seed, &rows, Engines::new(&listed, &ends));
+            let with = decide(&by_rows, seed, &rows, Engines::new(0, &listed, &ends));
             assert_eq!(with, decide(&by_rows, seed, &rows, Engines::default()));
         }
         // Under the picker of engines a pool with no list draws rows: two
@@ -491,9 +491,9 @@ fn a_pool_that_lists_no_engine_and_a_picker_of_rows_keep_their_paths() {
 
 #[test]
 fn a_list_whose_ends_do_not_cover_its_rows_reads_as_none() {
-    assert!(Engines::new(&[0, 1, 2], &[2]).is_empty());
-    assert!(Engines::new(&[0, 1, 2], &[]).is_empty());
-    let engines = Engines::new(&[2, 0, 1], &[1, 3]);
+    assert!(Engines::new(0, &[0, 1, 2], &[2]).is_empty());
+    assert!(Engines::new(0, &[0, 1, 2], &[]).is_empty());
+    let engines = Engines::new(0, &[2, 0, 1], &[1, 3]);
     assert_eq!(engines.len(), 2);
     assert_eq!((engines.rows(0), engines.rows(1)), (&[2][..], &[0, 1][..]));
     assert_eq!(engines.rows(2), &[] as &[u32], "a place past the list");
@@ -508,7 +508,7 @@ fn an_engine_is_compared_by_one_of_its_rows() {
     let first = |rows: &[Candidate]| {
         let lighter = |&seed: &u64| {
             let seed = Draw::new(seed).next_u64();
-            let decision = decide(&engine, seed, rows, Engines::new(&listed, &ends));
+            let decision = decide(&engine, seed, rows, Engines::new(0, &listed, &ends));
             let pick = positions(&decision.pick().expect("a pick").targets)[0];
             assert!(
                 pick == 0 || pick >= 8,
@@ -590,6 +590,18 @@ fn keyed(
     engines: Engines<'_>,
     epoch: u64,
 ) -> Vec<u32> {
+    keyed_by(engine, key, rows, engines, epoch).0
+}
+
+/// [`keyed`], with whether the walk alone decided: its trace counts no
+/// survivors, and a whole pass counts them.
+fn keyed_by(
+    engine: &Engine,
+    key: &str,
+    rows: &[Candidate],
+    engines: Engines<'_>,
+    epoch: u64,
+) -> (Vec<u32>, bool) {
     let facts = RequestFacts {
         model: "m",
         session_key: Identity::plain(key),
@@ -606,32 +618,42 @@ fn keyed(
     let cx = Constraints::default();
     let decision = engine.decide(&facts, &pool, rows, &cx, &mut Scratch::new());
     let pick = decision.pick();
-    pick.map(|pick| positions(&pick.targets))
-        .unwrap_or_default()
+    pick.map(|pick| {
+        (
+            positions(&pick.targets),
+            pick.trace.survivors.get().is_none(),
+        )
+    })
+    .unwrap_or_default()
 }
 
 /// How many of 64 keys a ring decided by its walk alone over `rows` and
 /// their list, each key's targets held to the ones `whole`, a ring of its
 /// own that is handed no list, gives over the pool read whole.
 fn walked(ring: &Engine, whole: &Engine, rows: &[Candidate], listed: &[u32], ends: &[u32]) -> u32 {
-    let engines = Engines::new(listed, ends);
+    walked_as(ring, whole, rows, Engines::new(0, listed, ends))
+}
+
+/// [`walked`] over a list its caller numbered.
+fn walked_as(ring: &Engine, whole: &Engine, rows: &[Candidate], engines: Engines<'_>) -> u32 {
     let mut walked = 0;
     for i in 0..64 {
         let key = format!("conv-{i}");
         read();
         let by_pass = keyed(whole, &key, rows, Engines::default(), 1);
         assert!(read().0.len() >= rows.len(), "a pass asks about every row");
-        let targets = keyed(ring, &key, rows, engines, 1);
+        let (targets, by_walk) = keyed_by(ring, &key, rows, engines, 1);
         assert_eq!(targets, by_pass, "{key} over {} rows", rows.len());
         // A walk asks about the rows it hands out and the rows refused on
         // its way, each once and under the bound; past the bound the whole
         // pass asks about every row behind it.
         let asked = read().0.len();
-        let by_walk = MAX_TARGETS + DRAW_BOUND as usize - 1;
-        if asked < targets.len() + DRAW_BOUND as usize {
+        let bound = MAX_TARGETS + DRAW_BOUND as usize - 1;
+        if by_walk {
+            assert!(asked <= bound.min(rows.len()), "{asked} rows asked about");
             walked += 1;
         } else {
-            let whole = rows.len()..=rows.len() + by_walk;
+            let whole = rows.len()..=rows.len() + bound;
             assert!(whole.contains(&asked), "{asked} rows asked about");
         }
     }
@@ -670,7 +692,7 @@ fn a_walk_that_meets_refused_rows_to_its_bound_leaves_the_pool_to_the_whole_pass
     for row in &mut rows {
         row.health.healthy = false;
     }
-    let engines = Engines::new(&listed, &ends);
+    let engines = Engines::new(0, &listed, &ends);
     let shed = keyed(&ring_engine(), "conv-0", &rows, engines, 1);
     assert_eq!(shed, Vec::<u32>::new());
 }
@@ -682,7 +704,7 @@ fn a_walk_that_meets_refused_rows_to_its_bound_leaves_the_pool_to_the_whole_pass
 #[test]
 fn a_routing_key_is_placed_alike_under_every_form_of_the_ring() {
     let (rows, listed, ends) = fleet(&[8, 1, 4, 2, 8, 1], 2);
-    let engines = Engines::new(&listed, &ends);
+    let engines = Engines::new(0, &listed, &ends);
     let plain = ring_engine();
     let prefixed = ConsistentHash::new(None).keyed_by_prefix(64, Gates::default(), &[]);
     let prefixed = ring_engine_of(prefixed);
@@ -708,7 +730,7 @@ fn a_routing_key_is_placed_alike_under_every_form_of_the_ring() {
 #[test]
 fn a_pool_whose_host_gives_the_walk_no_word_is_read_whole() {
     let (rows, listed, ends) = fleet(&[8; 8], 1);
-    let engines = Engines::new(&listed, &ends);
+    let engines = Engines::new(0, &listed, &ends);
     let (ring, whole) = (ring_engine(), ring_engine());
     let by_pass = keyed(&whole, "conv-3", &rows, Engines::default(), 1);
     // No membership epoch, and no list.
@@ -740,7 +762,7 @@ fn a_pool_whose_host_gives_the_walk_no_word_is_read_whole() {
 #[test]
 fn a_row_refused_when_its_pool_was_first_read_owns_its_keys_once_it_is_kept() {
     let (mut rows, listed, ends) = fleet(&[8; 8], 3);
-    let engines = Engines::new(&listed, &ends);
+    let engines = Engines::new(0, &listed, &ends);
     for row in &mut rows {
         row.health.healthy = row.position % 4 != 1;
     }
@@ -784,7 +806,7 @@ fn a_ring_that_holds_another_pools_members_passes_them_by() {
 #[test]
 fn a_member_the_feed_takes_away_is_handed_no_key_while_its_row_still_stands() {
     let (rows, listed, ends) = fleet(&[8; 8], 4);
-    let engines = Engines::new(&listed, &ends);
+    let engines = Engines::new(0, &listed, &ends);
     let (ring, whole) = (ring_engine(), ring_engine());
     let owner = keyed(&ring, "conv-9", &rows, engines, 1)[0];
     keyed(&whole, "conv-9", &rows, Engines::default(), 1);
@@ -796,4 +818,113 @@ fn a_member_the_feed_takes_away_is_handed_no_key_while_its_row_still_stands() {
     assert!(!targets.contains(&owner), "{targets:?}");
     let by_pass = keyed(&whole, "conv-9", &rows, Engines::default(), 1);
     assert_eq!(targets, by_pass);
+}
+
+#[test]
+fn a_walk_ends_once_every_row_of_a_small_pool_was_asked() {
+    // Fewer rows than the answer has room for: the walk asks about each
+    // once and ends by itself, with no turn round the ring.
+    for ranks in [2, 3] {
+        for refused in [None, Some(1)] {
+            let (mut rows, listed, ends) = fleet(&[ranks], 7);
+            for row in &mut rows {
+                row.health.healthy = Some(row.position) != refused;
+            }
+            let walked = walked(&ring_engine(), &ring_engine(), &rows, &listed, &ends);
+            assert_eq!(walked, 64, "{ranks} rows, {refused:?} refused");
+        }
+    }
+}
+
+#[test]
+fn a_row_the_ring_does_not_hold_is_the_whole_passes_to_place() {
+    let (mut rows, listed, ends) = fleet(&[3], 4);
+    for row in &mut rows {
+        row.health.healthy = true;
+    }
+    let engines = Engines::new(0, &listed, &ends);
+    let (ring, whole) = (ring_engine(), ring_engine());
+    let owner = keyed(&ring, "conv-9", &rows, engines, 1)[0];
+    keyed(&whole, "conv-9", &rows, Engines::default(), 1);
+    // The feed names the owner as gone before a publication drops its row:
+    // two members are left for three slots, and the whole pass hands the
+    // row the ring lost the last of them.
+    let gone = Membership::Removed(rows[owner as usize].id);
+    ring.on_membership(&gone);
+    whole.on_membership(&gone);
+    let (targets, by_walk) = keyed_by(&ring, "conv-9", &rows, engines, 1);
+    let by_pass = keyed(&whole, "conv-9", &rows, Engines::default(), 1);
+    assert_eq!(targets, by_pass);
+    assert_eq!(targets.len(), 3, "{targets:?}");
+    assert_eq!(targets[2], owner, "the row the ring lost, last");
+    assert!(!by_walk, "a walk that came round short leaves the pool");
+}
+
+#[test]
+fn pools_whose_lists_stand_in_one_buffer_are_each_shown_to_the_ring() {
+    // A host that builds every pool's list in one buffer: one place in
+    // memory under one epoch, and a number a pool.
+    let (first, listed, ends) = fleet(&[8; 8], 1);
+    let (mut second, ..) = fleet(&[8; 8], 2);
+    for row in &mut second {
+        row.id = WorkerId(row.id.0 + 500_000);
+        row.key += 500_000;
+        // A row in four is refused while the ring first reads the pool.
+        row.health.healthy = row.position % 4 != 1;
+    }
+    let ring = ring_engine();
+    let alone = (ring_engine(), ring_engine());
+    let of_first = walked_as(&ring, &alone.0, &first, Engines::new(0, &listed, &ends));
+    let of_second = walked_as(&ring, &alone.1, &second, Engines::new(1, &listed, &ends));
+    assert!(of_first >= 48 && of_second >= 32, "{of_first} {of_second}");
+    // Kept under the same epoch, each row of the second pool owns the keys
+    // a ring of its own gives it.
+    for row in &mut second {
+        row.health.healthy = true;
+    }
+    let of_second = walked_as(&ring, &alone.1, &second, Engines::new(1, &listed, &ends));
+    assert_eq!(of_second, 64, "every key by the walk alone");
+}
+
+#[test]
+fn nine_pools_on_one_ring_are_each_walked_turn_about() {
+    // Nine models that one fleet serves: nine pools of the same rows, a
+    // number each, under one epoch.
+    let (mut rows, listed, ends) = fleet(&[4; 4], 1);
+    for row in &mut rows {
+        row.health.healthy = true;
+    }
+    let ring = ring_engine();
+    for _ in 0..2 {
+        for pool in 0..9 {
+            let engines = Engines::new(pool, &listed, &ends);
+            let walked = walked_as(&ring, &ring_engine(), &rows, engines);
+            assert_eq!(walked, 64, "pool {pool}");
+        }
+    }
+}
+
+#[test]
+fn a_pool_that_is_a_small_share_of_its_ring_is_read_whole() {
+    // Eight rows beside 64 of another pool on one ring: a walk for the
+    // small pool would pass eight positions of the other for each of its
+    // own.
+    let (large, large_listed, large_ends) = fleet(&[8; 8], 1);
+    let (mut small, small_listed, small_ends) = fleet(&[8], 2);
+    for row in &mut small {
+        row.id = WorkerId(row.id.0 + 500_000);
+        row.key += 500_000;
+        row.health.healthy = true;
+    }
+    let ring = ring_engine();
+    let alone = (ring_engine(), ring_engine());
+    let engines = Engines::new(0, &large_listed, &large_ends);
+    let of_large = walked_as(&ring, &alone.0, &large, engines);
+    let engines = Engines::new(1, &small_listed, &small_ends);
+    let of_small = walked_as(&ring, &alone.1, &small, engines);
+    assert!(of_large >= 48, "{of_large} of 64 keys by the walk alone");
+    assert_eq!(of_small, 0, "the small pool by the whole pass");
+    // Alone on a ring it is walked.
+    let of_small = walked_as(&ring_engine(), &ring_engine(), &small, engines);
+    assert_eq!(of_small, 64);
 }

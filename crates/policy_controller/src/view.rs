@@ -1073,33 +1073,35 @@ pub struct ZoneCapacity {
 ///
 /// A host that lists a pool's engines hands the pool's own rows with the
 /// list, in the order of their ids and under a membership epoch
-/// ([`PoolFacts::membership_epoch`]). A stage that finds a member's row by
-/// its id, with no pool read whole
-/// ([`Scorer::own`](crate::Scorer::own)), takes the list as that word.
+/// ([`PoolFacts::membership_epoch`]), and numbers the pool
+/// ([`Engines::pool`]). A stage that finds a member's row by its id, with
+/// no pool read whole ([`Scorer::own`](crate::Scorer::own)), takes the
+/// list as that word.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Engines<'a> {
+    pool: u32,
     rows: &'a [u32],
     ends: &'a [u32],
 }
 
 impl<'a> Engines<'a> {
-    /// The list over `rows`, the positions engine after engine, and `ends`,
-    /// each engine's end in `rows` in rising order. A list whose last end
-    /// is not the count of its rows is no list, and reads as empty.
-    pub fn new(rows: &'a [u32], ends: &'a [u32]) -> Self {
+    /// The list of the pool its host numbers `pool`, over `rows`, the
+    /// positions engine after engine, and `ends`, each engine's end in
+    /// `rows` in rising order. A list whose last end is not the count of
+    /// its rows is no list, and reads as empty.
+    pub fn new(pool: u32, rows: &'a [u32], ends: &'a [u32]) -> Self {
         if ends.last().is_some_and(|&end| end as usize == rows.len()) {
-            Self { rows, ends }
+            Self { pool, rows, ends }
         } else {
             Self::default()
         }
     }
 
-    /// What tells this list from another of one host under one membership
-    /// epoch: where its rows stand in memory and how many engines it holds.
-    /// A stage that keeps what it derived of a list keys it by this and the
-    /// epoch.
-    pub fn place(&self) -> (usize, usize) {
-        (self.rows.as_ptr() as usize, self.ends.len())
+    /// The host's number for the pool: one pool's while a membership epoch
+    /// stands, and no other pool's under that epoch. A stage that keeps
+    /// what it learned of a pool keeps it by this number and the epoch.
+    pub const fn pool(&self) -> u32 {
+        self.pool
     }
 
     /// How many engines the pool holds.
