@@ -22,7 +22,7 @@
 //! completion or its release. A generation that no longer stands is told
 //! nothing: the stages of a later one never saw the issue.
 
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use tonic::Status;
 
@@ -181,8 +181,10 @@ fn told(store: &MemoryStore, record: &LeaseRecord, said: Said<'_>) {
 /// instant under a rule without a TTL. Where the table holds no such key,
 /// or no engine was told, the key's rule is not known: the longest TTL
 /// among the `standing` generation's rules ends the pin, and where none of
-/// them has a TTL the pin has no end. The table's lock is let go before
-/// the store's pin is written: no lock is held across the two.
+/// them has a TTL the pin has no end. The end stands on the decision
+/// clock, as the table holds it: a dispatch converts no clock but where
+/// the rule is not known. The table's lock is let go before the store's
+/// pin is written: no lock is held across the two.
 fn pinned(
     store: &MemoryStore,
     record: &LeaseRecord,
@@ -200,12 +202,10 @@ fn pinned(
         .map(|(pins, _)| pins[0])
         .filter(|pin| *pin != WorkerId(0));
     let ends = match held {
-        Some((_, forgotten)) => forgotten.map(|forgotten| {
-            at + Duration::from_micros(forgotten.saturating_sub(store.micros(at)))
-        }),
+        Some((_, forgotten)) => forgotten,
         None => standing
             .pins_longest_ttl()
-            .map(|ttl| at + Duration::from_micros(ttl)),
+            .map(|ttl| store.micros(at).saturating_add(ttl)),
     };
     SessionsStore::pin(
         store,
@@ -725,8 +725,8 @@ pub(crate) mod tests {
         let at = t0 + Duration::from_millis(3);
         dispatched(&store, A, &a_dispatched(1), at).expect("the frame reads");
         let pin = SessionsStore::lookup(&store, KEY.get()).expect("a pin");
-        let minute = Duration::from_secs(60);
-        assert_eq!((pin.worker, pin.ends), (WorkerId(7), Some(t0 + minute)));
+        let forgotten = store.micros(t0) + 60_000_000;
+        assert_eq!((pin.worker, pin.ends), (WorkerId(7), Some(forgotten)));
         // The key read again under a rule without a TTL: its next dispatch
         // moves the pin's end with it.
         read(&rule(None));
@@ -756,8 +756,8 @@ pub(crate) mod tests {
         let at = t0 + Duration::from_millis(3);
         dispatched(&store, A, &a_dispatched(1), at).expect("the frame reads");
         let pin = SessionsStore::lookup(&store, KEY.get()).expect("a pin");
-        let hour = Duration::from_secs(3_600);
-        assert_eq!((pin.worker, pin.ends), (WorkerId(7), Some(at + hour)));
+        let ends = store.micros(at) + 3_600_000_000;
+        assert_eq!((pin.worker, pin.ends), (WorkerId(7), Some(ends)));
     }
 
     #[test]

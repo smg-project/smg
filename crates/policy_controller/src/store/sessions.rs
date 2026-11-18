@@ -14,11 +14,14 @@ pub struct Pin {
     pub last_used: Instant,
     /// The instant the pin ends, by the TTL of the rule that placed its
     /// key: at or past it the sweep drops the pin and a decision's read
-    /// takes none. `None` for a key its rule keeps with no TTL, and for a
-    /// key whose rule the writer could not name where no standing rule had
-    /// a TTL: such a pin stays until the key's next dispatch writes it
+    /// takes none. It stands on the decision clock, in microseconds since
+    /// the store's origin, as the engine's table holds the instant it
+    /// forgets the key: a dispatch writes it as read and converts no
+    /// clock. `None` for a key its rule keeps with no TTL, and for a key
+    /// whose rule the writer could not name where no standing rule had a
+    /// TTL: such a pin stays until the key's next dispatch writes it
     /// anew, or its worker's row goes.
-    pub ends: Option<Instant>,
+    pub ends: Option<u64>,
 }
 
 /// Where session pins are written: at the commit of a keyed decision, never
@@ -26,9 +29,9 @@ pub struct Pin {
 /// pins with it; the gateways keep a bounded table of the pins they received
 /// and replay it in `Hello`, merged here by last use.
 pub trait SessionsStore: Send + Sync {
-    /// Pin `key` to `worker` at `at`, to end at `ends` (`None`: at no
-    /// instant); a re-pin moves it and its end.
-    fn pin(&self, key: u64, worker: WorkerId, at: Instant, ends: Option<Instant>);
+    /// Pin `key` to `worker` at `at`, to end at `ends` on the decision
+    /// clock (`None`: at no instant); a re-pin moves it and its end.
+    fn pin(&self, key: u64, worker: WorkerId, at: Instant, ends: Option<u64>);
 
     fn lookup(&self, key: u64) -> Option<Pin>;
 
@@ -37,9 +40,9 @@ pub trait SessionsStore: Send + Sync {
     /// A worker left: its pins go with it. Returns how many.
     fn drop_worker(&self, worker: WorkerId) -> usize;
 
-    /// Drop the pins whose own end is at or before `now`. Returns how
-    /// many.
-    fn expire(&self, now: Instant) -> usize;
+    /// Drop the pins whose own end is at or before `now`, an instant of
+    /// the decision clock. Returns how many.
+    fn expire(&self, now: u64) -> usize;
 
     /// Merge a pin a gateway replayed: a key already pinned keeps the later
     /// use.

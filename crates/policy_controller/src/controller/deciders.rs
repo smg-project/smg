@@ -792,8 +792,11 @@ impl PinSource for StorePins<'_> {
         // A pin at or past its own end is no pin, whether or not the sweep
         // has run: its end is the instant the engine's table forgot the
         // key. A TTL counted from the dispatch ends later than that, and
-        // so may the TTL of a rule applied since.
-        if pin.ends.is_some_and(|ends| ends <= self.now) {
+        // so may the TTL of a rule applied since. The end stands on the
+        // decision clock: the ask's instant is turned into it here, at a
+        // miss that finds a pin with an end and nowhere else.
+        let ended = |ends: u64| ends <= self.store.micros(self.now);
+        if pin.ends.is_some_and(ended) {
             return None;
         }
         // The asking rule's TTL holds as well, against the pin's last use:
@@ -4218,7 +4221,7 @@ pub(crate) mod tests {
         // A pin at its own end is no pin, whatever TTL the asking rule
         // has: the engine's table forgot the key at that instant.
         let ended = Session::from_raw(43);
-        let end = t0 + Duration::from_micros(500);
+        let end = store.micros(t0) + 500;
         SessionsStore::pin(&store, ended.get(), WorkerId(8), t0, Some(end));
         assert_eq!(at(499).pinned(ended, Some(1_000)), Some(WorkerId(8)));
         assert_eq!(at(500).pinned(ended, Some(1_000)), None);

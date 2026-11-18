@@ -821,7 +821,11 @@ impl MemoryStore {
     /// walk is as long as the pins of record, and no writer of the
     /// membership or of a worker's health waits on it. A pin a dispatch
     /// writes past the walk names a row that is gone and is taken by no
-    /// decision; where its rule has a TTL, the pins' sweep ends it.
+    /// decision; where its rule has a TTL, the pins' sweep ends it. A
+    /// worker's id is its key and incarnation: where the same incarnation
+    /// registers again before the walk ends, a pin a dispatch writes for
+    /// it in a shard the walk has not reached leaves though its row
+    /// stands, until the key's next dispatch writes it again.
     fn forget_pins(&self, id: WorkerId) {
         SessionsStore::drop_worker(self, id);
     }
@@ -1860,7 +1864,7 @@ impl MemoryStore {
 }
 
 impl SessionsStore for MemoryStore {
-    fn pin(&self, key: u64, worker: WorkerId, at: Instant, ends: Option<Instant>) {
+    fn pin(&self, key: u64, worker: WorkerId, at: Instant, ends: Option<u64>) {
         if key == 0 {
             return;
         }
@@ -1894,7 +1898,7 @@ impl SessionsStore for MemoryStore {
             .sum()
     }
 
-    fn expire(&self, now: Instant) -> usize {
+    fn expire(&self, now: u64) -> usize {
         self.sessions
             .iter()
             .map(|shard| {
@@ -1962,7 +1966,9 @@ impl MemoryStore {
             }
             swept.last = Some(now);
         }
-        SessionsStore::expire(self, now)
+        // The pins' ends stand on the decision clock: the pass's instant
+        // is turned into it once.
+        SessionsStore::expire(self, self.micros(now))
     }
 }
 

@@ -1176,13 +1176,13 @@ fn the_pins_sweep_drops_each_pin_past_its_own_end_once_an_interval() {
     let sessions: &dyn SessionsStore = &store;
     // No sessions rule ever stood: no pass runs, whatever the end of a
     // pin.
-    sessions.pin(1, WorkerId(1), now, Some(t(60)));
+    sessions.pin(1, WorkerId(1), now, Some(store.micros(t(60))));
     assert_eq!(store.sweep_pins(t(1_000_000)), 0);
     store
         .apply(manual_ruled(1, 60, 30))
         .expect("a first generation");
     for key in 2..=1_001 {
-        sessions.pin(key, WorkerId(1), t(10), Some(t(70)));
+        sessions.pin(key, WorkerId(1), t(10), Some(store.micros(t(70))));
     }
     // One key its rule keeps with no TTL.
     sessions.pin(1_002, WorkerId(1), t(10), None);
@@ -1203,7 +1203,7 @@ fn the_pins_sweep_drops_each_pin_past_its_own_end_once_an_interval() {
     store
         .apply(manual_ruled(2, u32::MAX, u32::MAX))
         .expect("a later generation");
-    sessions.pin(1, WorkerId(1), t(100), Some(t(110)));
+    sessions.pin(1, WorkerId(1), t(100), Some(store.micros(t(110))));
     assert_eq!(store.sweep_pins(t(121)), 1);
     assert_eq!(sessions.len(), 1);
 }
@@ -1221,7 +1221,7 @@ fn a_shorter_sweep_applied_waits_out_no_earlier_interval() {
     store
         .apply(manual_ruled(1, 7_200, 3_600))
         .expect("a first generation");
-    sessions.pin(1, WorkerId(1), now, Some(t(60)));
+    sessions.pin(1, WorkerId(1), now, Some(store.micros(t(60))));
     // The first pass runs at once and finds no pin past its end.
     assert_eq!(store.sweep_pins(t(1)), 0);
     // A generation that sweeps every thirty seconds: its pass is due
@@ -1247,7 +1247,7 @@ fn a_generation_replaced_before_any_pass_still_leaves_its_interval() {
     store
         .apply(manual_ruled(1, 60, 30))
         .expect("a first generation");
-    sessions.pin(1, WorkerId(1), now, Some(t(60)));
+    sessions.pin(1, WorkerId(1), now, Some(store.micros(t(60))));
     store
         .apply(manual_ruled(2, u32::MAX, u32::MAX))
         .expect("a later generation");
@@ -1278,7 +1278,7 @@ fn a_pin_past_its_own_end_leaves_where_another_rule_keeps_its_keys_for_ever() {
     document.bindings.insert(0, for_ever);
     let spec = AppliedSpec::validate(&document).expect("the document validates");
     store.apply(spec).expect("a first generation");
-    sessions.pin(1, WorkerId(1), now, Some(t(60)));
+    sessions.pin(1, WorkerId(1), now, Some(store.micros(t(60))));
     sessions.pin(2, WorkerId(1), now, None);
     assert_eq!(store.sweep_pins(t(61)), 1);
     assert_eq!(sessions.lookup(1), None);
@@ -1315,7 +1315,7 @@ fn a_pin_is_written_at_the_commit_and_leaves_with_its_worker_or_at_its_end() {
     let store = MemoryStore::new();
     let sessions: &dyn SessionsStore = &store;
     let now = Instant::now();
-    let ends = |seconds: u64| Some(now + Duration::from_secs(seconds));
+    let ends = |seconds: u64| Some(store.micros(now + Duration::from_secs(seconds)));
     sessions.pin(0, WorkerId(1), now, ends(1));
     assert!(sessions.is_empty(), "the absent key is never pinned");
     sessions.pin(11, WorkerId(1), now, ends(1));
@@ -1349,7 +1349,8 @@ fn a_pin_is_written_at_the_commit_and_leaves_with_its_worker_or_at_its_end() {
     );
     assert_eq!(sessions.len(), 3);
     assert_eq!(sessions.drop_worker(WorkerId(9)), 1);
-    assert_eq!(sessions.expire(now + Duration::from_secs(2)), 1);
+    let two = store.micros(now + Duration::from_secs(2));
+    assert_eq!(sessions.expire(two), 1);
     assert_eq!(sessions.lookup(11), None);
     sessions.unpin(12);
     assert!(sessions.is_empty());
@@ -2261,9 +2262,9 @@ fn a_removal_and_a_sweep_reach_the_pins_of_every_shard() {
     let first = |i: usize| (i / shards).is_multiple_of(2);
     for (i, key) in (1_u64..).take(keys).enumerate() {
         if first(i) {
-            sessions.pin(key, WorkerId(1), now, Some(now));
+            sessions.pin(key, WorkerId(1), now, Some(store.micros(now)));
         } else {
-            sessions.pin(key, WorkerId(2), later, Some(later));
+            sessions.pin(key, WorkerId(2), later, Some(store.micros(later)));
         }
     }
     assert_eq!(sessions.len(), keys);
@@ -2272,6 +2273,6 @@ fn a_removal_and_a_sweep_reach_the_pins_of_every_shard() {
     for (i, key) in (1_u64..).take(keys).enumerate() {
         assert_eq!(sessions.lookup(key).is_some(), !first(i), "key {key}");
     }
-    assert_eq!(sessions.expire(later + Duration::from_secs(1)), keys / 2);
+    assert_eq!(sessions.expire(store.micros(later) + 1_000_000), keys / 2);
     assert!(sessions.is_empty());
 }

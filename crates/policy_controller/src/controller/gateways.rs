@@ -1373,7 +1373,7 @@ pub(crate) mod tests {
         document.generation = 1;
         let spec = AppliedSpec::validate(&document).expect("the document validates");
         store.apply(spec).expect("a first generation");
-        SessionsStore::pin(&*store, 7, WorkerId(1), t0, Some(t0));
+        SessionsStore::pin(&*store, 7, WorkerId(1), t0, Some(store.micros(t0)));
         assert_eq!(SessionsStore::len(&*store), 1);
         let (stop, stopped) = watch::channel(false);
         let mut task = JoinSet::new();
