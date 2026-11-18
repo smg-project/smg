@@ -1,13 +1,15 @@
 //! The recorder of the gateway's minimum-tokens rank: each row is one worker
 //! with its data-parallel ranks, a list of steps and the rank each request
-//! took. A step is what the gateway's rank cache is handed: a poll's answer
+//! took. A step is what the rank cache is handed: a poll's answer
 //! (a row a rank), a poll that failed, the worker's loads dropped as it
-//! leaves the ready set, or a request, which asks the policy for a rank and
-//! books its estimated tokens on the rank it takes. A request that finds no
-//! rank records `null`. The policy controller crate replays the rows
-//! through its store (`crates/policy_controller/tests/classic/minimum_tokens.rs`).
+//! leaves the ready set, or a request, which asks the rank cache's select
+//! for a rank and books its estimated tokens on the rank it takes. The
+//! gateway's minimum-tokens policy forwards a request to that select and
+//! adds nothing. A request that finds no rank records `null`. The policy
+//! controller crate replays the rows through its store
+//! (`crates/policy_controller/tests/classic/minimum_tokens.rs`).
 //!
-//! This file is an ignored test of the gateway crate, kept beside the code
+//! This file is an ignored test of the worker crate, kept beside the code
 //! it runs. It records from the checkout it is built in and writes the sheet
 //! under `CLASSIC_ROWS_OUT`, naming `CLASSIC_ROWS_COMMIT` as the commit it
 //! recorded from. The sheets the policy controller crate replays are in
@@ -15,7 +17,7 @@
 //!
 //! ```text
 //! CLASSIC_ROWS_OUT=<dir> CLASSIC_ROWS_COMMIT=<commit> \
-//!   cargo test -p smg --lib worker::load::monitor::classic_minimum_tokens_rows -- --ignored --nocapture
+//!   cargo test -p smg-worker --all-features --lib load::monitor::classic_minimum_tokens_rows -- --ignored --nocapture
 //! ```
 //!
 //! Nothing in a row draws. The recorder runs each row twice, each time from
@@ -23,24 +25,21 @@
 
 use std::{fs, path::PathBuf};
 
-use openai_protocol::{
-    model_card::ModelCard,
-    worker::{HealthCheckConfig, WorkerStatus},
-};
 use serde::Serialize;
 
 use super::*;
 use crate::{
-    config::types::PolicyConfig,
-    policies::{DPRankLoadPolicy, MinimumTokensPolicy, PolicyRegistry},
-    worker::{BasicWorkerBuilder, WorkerRegistry, WorkerType},
+    identity::basic::WorkerType,
+    model_card::ModelCard,
+    test_support::{BasicWorkerBuilder, LoadReaders, WorkerRegistry},
+    worker::{HealthCheckConfig, WorkerStatus},
 };
 
 const URL: &str = "http://w0:8000";
 const MODEL: &str = "m";
 
 /// One rank's row in a poll's answer: the tokens its cache uses, which is
-/// the count the gateway's rank cache reads, its token capacity, and the
+/// the count the rank cache reads, its token capacity, and the
 /// context tokens of the requests it holds where the rank reports them.
 #[derive(Clone, Copy, Serialize)]
 struct Figures {
@@ -163,19 +162,18 @@ fn answer(ranks: usize, figures: &[Option<Figures>]) -> WorkerLoadResponse {
 }
 
 /// One run of a row from a fresh monitor and a fresh worker: the rank each
-/// request took. Each step reaches the rank cache as the gateway's poll loop
+/// request took. Each step reaches the rank cache as the monitor's poll loop
 /// hands it over, under the worker's own URL, which names its rank where it
 /// stands for one: an answer with no row drops the worker's ranks, or its own
 /// rank where the worker stands for one; an answer with absolute token data
 /// whose rows are ranks replaces the worker's ranks whole; any other answer
 /// drops them; a failed poll changes nothing; the eviction goes through the
-/// monitor's own; a request goes through the policy.
+/// monitor's own; a request goes through the rank cache's select.
 fn run(ranks: usize, pinned: Option<usize>, steps: &[Step]) -> Vec<Option<usize>> {
     let registry = Arc::new(WorkerRegistry::new());
-    let policies = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
     let monitor = Arc::new(WorkerMonitor::new(
         Arc::clone(&registry),
-        policies,
+        Arc::new(LoadReaders::Blind),
         1,
         false,
         false,
@@ -198,7 +196,6 @@ fn run(ranks: usize, pinned: Option<usize>, steps: &[Step]) -> Vec<Option<usize>
         .expect("the worker registers");
     let cache = &monitor.worker_load_manager;
     let url = worker.url().to_string();
-    let policy = MinimumTokensPolicy::new(Some(Arc::clone(cache)));
     steps
         .iter()
         .filter_map(|step| {
@@ -222,8 +219,8 @@ fn run(ranks: usize, pinned: Option<usize>, steps: &[Step]) -> Vec<Option<usize>
                 Step::Failed => {}
                 Step::Evict => monitor.evict_worker_loads(&worker),
                 Step::Pick { cost } => {
-                    let cost = isize::try_from(*cost).expect("a cost fits the policy's count");
-                    let rank = policy.select_dp_rank(worker.as_ref(), cost);
+                    let cost = isize::try_from(*cost).expect("a cost fits the select's count");
+                    let rank = cache.select_and_increment_lowest_dp_load(worker.as_ref(), cost);
                     return Some(
                         rank.map(|rank| {
                             usize::try_from(rank).expect("a rank is no negative number")

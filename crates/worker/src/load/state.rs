@@ -38,15 +38,15 @@ use std::{
     time::Instant,
 };
 
-use openai_protocol::worker::{WorkerLoadResponse, WorkerStatus};
 use parking_lot::Mutex;
 use tokio::sync::{watch, Notify};
 
 #[cfg(any(test, feature = "test-util"))]
-use crate::worker::BasicWorker;
-use crate::worker::{
+use crate::identity::basic::BasicWorker;
+use crate::{
+    identity::basic::Worker,
     registry::{Generation, WorkerRegistry},
-    Worker,
+    worker::{WorkerLoadResponse, WorkerStatus},
 };
 
 /// Subscription handle to the published load snapshots. `borrow().clone()`
@@ -112,7 +112,7 @@ impl LoadSnapshot {
     /// Test-only: a snapshot with the given loads and no live sources, each
     /// report sampled now unless it says otherwise.
     #[cfg(any(test, feature = "test-util"))]
-    pub(crate) fn from_loads_for_test(loads: Vec<(String, WorkerLoadResponse)>) -> Arc<Self> {
+    pub fn from_loads_for_test(loads: Vec<(String, WorkerLoadResponse)>) -> Arc<Self> {
         let published_at = Instant::now();
         let entries = loads
             .into_iter()
@@ -167,7 +167,7 @@ pub fn one_rank_load(
     WorkerLoadResponse {
         timestamp: String::new(),
         dp_rank_count: 1,
-        loads: vec![openai_protocol::worker::SchedulerLoadSnapshot {
+        loads: vec![crate::worker::SchedulerLoadSnapshot {
             dp_rank: 0,
             num_running_reqs: 1,
             num_waiting_uncached_tokens,
@@ -182,8 +182,8 @@ pub fn one_rank_load(
 /// One DP rank reporting a queue depth with no token count for it: the shape
 /// of a backend scored from Prometheus gauges, which have no waiting-token
 /// equivalent.
-#[cfg(test)]
-pub(crate) fn one_rank_load_reqs_only(
+#[cfg(any(test, feature = "test-util"))]
+pub fn one_rank_load_reqs_only(
     num_waiting_reqs: i32,
     token_usage: f64,
     gen_throughput: f64,
@@ -362,13 +362,14 @@ impl<G: Generation> LoadState<G> {
 mod tests {
     use std::sync::Barrier;
 
-    use openai_protocol::worker::SchedulerLoadSnapshot;
-
     use super::*;
-    use crate::worker::{test_support::ready_worker, ModelWorkerSnapshot, WorkerRegistry};
+    use crate::{
+        test_support::{ready_worker, Members, WorkerRegistry},
+        worker::SchedulerLoadSnapshot,
+    };
 
     /// The load state over the gateway's registry.
-    type LoadState = super::LoadState<ModelWorkerSnapshot>;
+    type LoadState = super::LoadState<Members>;
 
     /// A load report distinguishable by its waiting-token count.
     fn load(waiting: i32) -> Arc<WorkerLoadResponse> {

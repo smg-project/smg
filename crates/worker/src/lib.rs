@@ -26,7 +26,9 @@
 //! The `runtime` feature adds the worker's runtime, for the process that
 //! hosts the workers: the worker itself with its builder and its metadata
 //! (`identity`), its runtime state (`runtime`), its liveness, its circuit
-//! breaker and its resilience (`health`), its requests in flight (`load`),
+//! breaker, its resilience, the fleet's lifecycle and the probe of a
+//! bootstrap port (`health`), its requests in flight, the load monitor, the
+//! load snapshots it publishes and the fleet's capacity (`load`),
 //! its pairing descriptor (`pd`), the registry with its events (`registry`),
 //! the metric writers with their series store (`metrics`), and `connection`:
 //! the engine handle a host implements, the HTTP client factory and the cache

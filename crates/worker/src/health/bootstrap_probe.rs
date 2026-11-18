@@ -15,15 +15,17 @@
 
 use std::time::Duration;
 
-use openai_protocol::worker::{RuntimeType, WorkerType};
 use tokio::net::TcpStream;
 use tracing::{debug, info, warn};
 
-use crate::worker::{
-    identity::{basic::WorkerTypeExt, endpoint::Endpoint},
-    metrics::Metrics,
+use crate::{
+    identity::{
+        basic::{Worker, WorkerTypeExt, DEFAULT_BOOTSTRAP_PORT, MOONCAKE_CONNECTOR},
+        endpoint::Endpoint,
+    },
+    metrics::writers::Metrics,
     pd::pairing::KvTransferProfile,
-    Worker, DEFAULT_BOOTSTRAP_PORT, MOONCAKE_CONNECTOR,
+    worker::{RuntimeType, WorkerType},
 };
 
 /// How long the probe waits for the connection: long enough for a far host,
@@ -37,22 +39,22 @@ pub(crate) const PROBE_PHASE: &str = "probe";
 /// The `phase` label the same probe counts under when the request path runs
 /// it: a decode side's engine failed the request without a reason, and the
 /// port that side had to reach, its prefill partner's, did not accept a
-/// connection (see `routers::grpc::utils::pd_bootstrap`).
-pub(crate) const REQUEST_PHASE: &str = "request";
+/// connection (see the gateway's `routers::grpc::utils::pd_bootstrap`).
+pub const REQUEST_PHASE: &str = "request";
 
 /// A bootstrap port that did not accept the probe's connection: the port,
 /// where it came from, and why, for the line and the message that name it.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct DeadBootstrapPort {
-    pub(crate) host: String,
-    pub(crate) port: u16,
-    pub(crate) source: BootstrapPortSource,
-    pub(crate) error: String,
+pub struct DeadBootstrapPort {
+    pub host: String,
+    pub port: u16,
+    pub source: BootstrapPortSource,
+    pub error: String,
 }
 
 /// Where the port a probe connects to came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum BootstrapPortSource {
+pub enum BootstrapPortSource {
     /// The port the worker was registered with: the worker API's
     /// `bootstrap_port`, the CLI's `--prefill <url> <port>`, or the
     /// discovery annotation.
@@ -64,7 +66,7 @@ pub(crate) enum BootstrapPortSource {
 
 impl BootstrapPortSource {
     /// The value of the `bootstrap_port_source` log field.
-    pub(crate) fn label(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
             Self::Registered => "registered",
             Self::Default => "default",
@@ -121,8 +123,17 @@ fn effective_bootstrap_port(worker: &dyn Worker) -> Option<(u16, BootstrapPortSo
     default_applies.then_some((DEFAULT_BOOTSTRAP_PORT, BootstrapPortSource::Default))
 }
 
+/// `effective_bootstrap_port` for a host's tests: the decision beside the
+/// connector mode the host's request path mints.
+#[cfg(any(test, feature = "test-util"))]
+pub fn effective_bootstrap_port_for_test(
+    worker: &dyn Worker,
+) -> Option<(u16, BootstrapPortSource)> {
+    effective_bootstrap_port(worker)
+}
+
 /// The address the probes check for `worker`: the host the side was
-/// registered under and the port of [`effective_bootstrap_port`] (the one it
+/// registered under and the port of `effective_bootstrap_port` (the one it
 /// was registered with, or the default its partners are handed), with where
 /// the port came from. `None` for a worker no partner is handed a port for,
 /// or whose transport carries no host.
@@ -132,7 +143,7 @@ fn partners_bootstrap_address(worker: &dyn Worker) -> Option<(String, u16, Boots
     (!host.is_empty()).then(|| (host.to_string(), port, source))
 }
 
-/// Whether the port of [`effective_bootstrap_port`] is one the request path
+/// Whether the port of `effective_bootstrap_port` is one the request path
 /// hands the decode partner of `worker`. Where the runtime
 /// names a KV connector, a prefill side's is on the
 /// Mooncake connector alone, whose decode-side `remote_bootstrap_addr` is
@@ -152,10 +163,10 @@ fn handed_on_the_request_path(worker: &dyn Worker) -> bool {
 /// registration probe's connection and bound, run by the request path once a
 /// side has failed, on a port the request path really hands the decode
 /// partner. `None` for a worker that is not probed (see
-/// [`partners_bootstrap_address`]) or whose port is not handed on the request
-/// path (see [`handed_on_the_request_path`]); otherwise whether the port
+/// `partners_bootstrap_address`) or whose port is not handed on the request
+/// path (see `handed_on_the_request_path`); otherwise whether the port
 /// accepted the connection, with the port and the error when it did not.
-pub(crate) async fn probe_partners_bootstrap_port(
+pub async fn probe_partners_bootstrap_port(
     worker: &dyn Worker,
 ) -> Option<Result<(), DeadBootstrapPort>> {
     if !handed_on_the_request_path(worker) {
@@ -183,11 +194,11 @@ async fn probe_bootstrap_port(host: &str, port: u16, timeout: Duration) -> Resul
 }
 
 /// Probe the bootstrap port the partners of `worker` are handed (see
-/// [`effective_bootstrap_port`]), off the registration path. Nothing happens
+/// `effective_bootstrap_port`), off the registration path. Nothing happens
 /// for a worker no partner is handed one for, or for a transport that
 /// carries no host; a port registered on a prefill worker whose partners meet
 /// it in a KV store is said to be unused instead of probed.
-pub(crate) fn spawn_bootstrap_port_probe(worker: &dyn Worker) {
+pub fn spawn_bootstrap_port_probe(worker: &dyn Worker) {
     if is_store_prefill_worker(worker) {
         if let Some(port) = worker.bootstrap_port() {
             info!(
@@ -264,10 +275,7 @@ mod tests {
     use metrics_exporter_prometheus::PrometheusBuilder;
 
     use super::*;
-    use crate::{
-        routers::common::kv_transfer::{kv_connector_mode, KvConnectorMode},
-        worker::{test_support::RefusedAddress, BasicWorkerBuilder},
-    };
+    use crate::test_support::{BasicWorkerBuilder, RefusedAddress};
 
     /// A worker of one type and runtime, with the connector and the
     /// bootstrap port it was registered with.
@@ -413,32 +421,6 @@ mod tests {
             effective_bootstrap_port(&rendezvous),
             Some((8998, BootstrapPortSource::Registered))
         );
-    }
-
-    /// For a prefill worker of the runtime that names a KV
-    /// connector the probe's decision is the request path's: the
-    /// default is probed exactly when the connector mode minted for the worker
-    /// hands the decode worker a bootstrap address on that port.
-    #[test]
-    fn the_default_port_decision_follows_the_connector_mode_the_request_path_mints() {
-        for connector in [
-            None,
-            Some(MOONCAKE_CONNECTOR),
-            Some("NixlConnector"),
-            Some("MoRIIOConnector"),
-            Some("LMCacheConnector"),
-        ] {
-            let worker = worker_of(WorkerType::Prefill, RuntimeType::Vllm, connector, None);
-            let minted = matches!(
-                kv_connector_mode(connector, worker.bootstrap_host(), None, None),
-                KvConnectorMode::Mooncake { port, .. } if port == u32::from(DEFAULT_BOOTSTRAP_PORT)
-            );
-            assert_eq!(
-                effective_bootstrap_port(&worker).is_some(),
-                minted,
-                "{connector:?}"
-            );
-        }
     }
 
     #[tokio::test]

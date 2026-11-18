@@ -3,18 +3,17 @@ mod worker_load_manager;
 
 use std::collections::HashMap;
 
-use openai_protocol::{
-    model_card::ModelCard,
-    worker::{HealthCheckConfig, WorkerStatus},
-};
-use smg_grpc_client::common_proto::EngineLoad;
-
 use super::*;
-use crate::worker::{
+use crate::{
     health::overload::OverloadThresholds,
+    identity::basic::{ConnectionMode, WorkerType},
+    model_card::ModelCard,
     runtime::StallReason,
-    test_support::{ready_worker, render_with_recorder, LoadReaders},
-    BasicWorkerBuilder, ConnectionMode, WorkerMonitor, WorkerRegistry, WorkerType,
+    test_support::{
+        ready_worker, render_with_recorder, BasicWorkerBuilder, LoadReaders, WorkerMonitor,
+        WorkerRegistry,
+    },
+    worker::{EngineMemoryMetricsSnapshot, HealthCheckConfig, WorkerStatus},
 };
 
 /// Build an isolated monitor and registry beside a routing side that reads
@@ -60,6 +59,131 @@ impl LoadRecord for Unread {
     }
 }
 
+/// A pushed record as plain data: the six readings the monitor takes of a
+/// [`LoadRecord`], so a case states what the monitor is told and names no
+/// wire message. The setters keep the entry's own relations: its total is
+/// the running and the waiting summed, its utilization is its token usage,
+/// and a figure the record carries sets that figure's flag. The wire
+/// message's reader holds the same relations, by its own cases in the gRPC
+/// client crate (`crates/grpc_client/src/engine_load.rs`).
+#[derive(Clone)]
+pub(super) struct PushedRecord {
+    pub(super) age: Duration,
+    pub(super) telemetry: LoadTelemetry,
+    pub(super) snapshot: SchedulerLoadSnapshot,
+    pub(super) engine_silence: Option<Duration>,
+    pub(super) reports_every_step: bool,
+    pub(super) prefill_pending: Option<u64>,
+}
+
+impl Default for PushedRecord {
+    fn default() -> Self {
+        Self {
+            age: Duration::ZERO,
+            telemetry: LoadTelemetry::empty(),
+            snapshot: SchedulerLoadSnapshot::default(),
+            engine_silence: None,
+            reports_every_step: false,
+            prefill_pending: None,
+        }
+    }
+}
+
+impl PushedRecord {
+    /// A record whose core reports `running` and `waiting` requests.
+    pub(super) fn requests(running: i32, waiting: i32) -> Self {
+        Self::default().with_requests(running, waiting)
+    }
+
+    /// The record with another count of running and waiting requests.
+    pub(super) fn with_requests(mut self, running: i32, waiting: i32) -> Self {
+        self.snapshot.num_running_reqs = running;
+        self.snapshot.num_waiting_reqs = waiting;
+        self.snapshot.num_total_reqs = running + waiting;
+        self
+    }
+
+    /// The record with `usage` as its KV usage.
+    pub(super) fn token_usage(mut self, usage: f64) -> Self {
+        self.snapshot.token_usage = usage;
+        self.snapshot.utilization = usage;
+        self
+    }
+
+    /// The record carrying `rate` as its cache hit rate.
+    pub(super) fn cache_hit_rate(mut self, rate: f64) -> Self {
+        self.snapshot.cache_hit_rate = rate;
+        self.telemetry |= LoadTelemetry::CACHE_HIT_RATE;
+        self
+    }
+
+    /// The record carrying `used` as its count of used tokens.
+    pub(super) fn used_tokens(mut self, used: i32) -> Self {
+        self.snapshot.num_used_tokens = used;
+        self.telemetry |= LoadTelemetry::USED_TOKENS;
+        self
+    }
+
+    /// The record carrying `total` as its token capacity.
+    pub(super) fn total_tokens(mut self, total: i32) -> Self {
+        self.snapshot.max_total_num_tokens = total;
+        self.telemetry |= LoadTelemetry::TOTAL_TOKENS;
+        self
+    }
+
+    /// The record carrying `memory` as its memory section.
+    pub(super) fn memory(mut self, memory: EngineMemoryMetricsSnapshot) -> Self {
+        self.snapshot.memory = Some(memory);
+        self.telemetry |= LoadTelemetry::MEMORY;
+        self
+    }
+
+    /// The record carrying a disaggregation section: the KV transfer's
+    /// latency and speed, the prefill and decode queue depths and the mode.
+    pub(super) fn disaggregation(
+        mut self,
+        latency_ms: f64,
+        speed_gb_s: f64,
+        prefill_queue: i32,
+        decode_queue: i32,
+        mode: &str,
+    ) -> Self {
+        self.snapshot.kv_transfer_latency_ms = Some(latency_ms);
+        self.snapshot.kv_transfer_speed_gb_s = Some(speed_gb_s);
+        self.snapshot.prefill_queue_reqs = Some(prefill_queue);
+        self.snapshot.decode_queue_reqs = Some(decode_queue);
+        self.snapshot.disagg_mode = Some(mode.to_string());
+        self.telemetry |= LoadTelemetry::DISAGGREGATION;
+        self
+    }
+}
+
+impl LoadRecord for PushedRecord {
+    fn age(&self) -> Duration {
+        self.age
+    }
+
+    fn telemetry(&self) -> LoadTelemetry {
+        self.telemetry
+    }
+
+    fn snapshot(&self) -> SchedulerLoadSnapshot {
+        self.snapshot.clone()
+    }
+
+    fn engine_silence(&self) -> Option<Duration> {
+        self.engine_silence
+    }
+
+    fn reports_every_step(&self) -> bool {
+        self.reports_every_step
+    }
+
+    fn prefill_pending(&self) -> Option<u64> {
+        self.prefill_pending
+    }
+}
+
 /// A record of a negative rank, or of a rank that is another virtual
 /// worker's, is dropped before any reader of it is called: the monitor
 /// builds no snapshot for a record it ignores.
@@ -87,12 +211,8 @@ async fn dp8_pushes_cannot_redirect_virtual_workers_to_active_ranks() {
     let (registry, monitor) = build_monitor();
     let now = Instant::now();
     let interval = Duration::from_secs(10);
-    let active = EngineLoad {
-        num_used_tokens: Some(2048),
-        max_total_num_tokens: Some(8192),
-        max_running_requests: 64,
-        ..pushed(7)
-    };
+    let mut active = pushed(7).used_tokens(2048).total_tokens(8192);
+    active.snapshot.max_running_requests = 64;
     for rank in 0..8 {
         let worker: Arc<dyn Worker> = Arc::new(
             BasicWorkerBuilder::new("grpc://decode:9000")
@@ -177,18 +297,18 @@ async fn a_pushed_load_record_becomes_the_workers_report_at_the_next_publish() {
     let worker = ready_worker("grpc://w1:9000", "llama-3");
     registry.register(Arc::clone(&worker)).unwrap();
     let received = Instant::now();
-    let record = EngineLoad {
-        running_requests: 7,
-        waiting_requests: 2,
-        waiting_uncached_tokens: Some(3_000),
-        token_usage: 0.4,
-        gen_throughput: 900.0,
-        max_running_requests: 64,
-        age_ms: 30,
-        sample: 1,
-        load_only: false,
+    let record = PushedRecord {
+        age: Duration::from_millis(30),
+        snapshot: SchedulerLoadSnapshot {
+            num_waiting_uncached_tokens: 3_000,
+            gen_throughput: 900.0,
+            max_running_requests: 64,
+            ..Default::default()
+        },
         ..Default::default()
-    };
+    }
+    .with_requests(7, 2)
+    .token_usage(0.4);
     monitor.apply_pushed_load(&worker, 0, &record, received);
     assert_eq!(monitor.pending_pushed_len(), 1);
     assert!(
@@ -226,23 +346,13 @@ async fn a_pushed_load_record_becomes_the_workers_report_at_the_next_publish() {
     assert_eq!(monitor.pending_pushed_len(), 0);
 
     // A second rank joins the report; a later record replaces only its rank.
-    monitor.apply_pushed_load(
-        &worker,
-        1,
-        &EngineLoad {
-            running_requests: 1,
-            waiting_uncached_tokens: None,
-            ..record.clone()
-        },
-        Instant::now(),
-    );
+    let mut second = record.clone().with_requests(1, 2);
+    second.snapshot.num_waiting_uncached_tokens = 0;
+    monitor.apply_pushed_load(&worker, 1, &second, Instant::now());
     monitor.apply_pushed_load(
         &worker,
         0,
-        &EngineLoad {
-            running_requests: 8,
-            ..record.clone()
-        },
+        &record.clone().with_requests(8, 2),
         Instant::now(),
     );
     monitor.flush_pushed();
@@ -271,7 +381,7 @@ async fn a_pushed_record_from_a_replaced_worker_is_fenced_at_publish() {
     let worker = ready_worker("grpc://w1:9000", "llama-3");
     registry.register(Arc::clone(&worker)).unwrap();
     registry.remove_by_url("grpc://w1:9000");
-    monitor.apply_pushed_load(&worker, 0, &EngineLoad::default(), Instant::now());
+    monitor.apply_pushed_load(&worker, 0, &PushedRecord::default(), Instant::now());
     monitor.flush_pushed();
     assert!(monitor
         .load_state
@@ -500,16 +610,17 @@ async fn spawned_tasks_use_weak_references() {
     );
 }
 
-fn pushed(running: u32) -> EngineLoad {
-    EngineLoad {
-        running_requests: running,
-        waiting_requests: 1,
-        token_usage: 0.2,
-        gen_throughput: 10.0,
-        max_running_requests: 32,
-        sample: 1,
+fn pushed(running: i32) -> PushedRecord {
+    PushedRecord {
+        snapshot: SchedulerLoadSnapshot {
+            gen_throughput: 10.0,
+            max_running_requests: 32,
+            ..Default::default()
+        },
         ..Default::default()
     }
+    .with_requests(running, 1)
+    .token_usage(0.2)
 }
 
 /// A pushed record that carries the engine's own silence past the wedge
@@ -523,12 +634,12 @@ async fn a_pushed_record_with_the_engines_silence_vetoes_the_worker() {
     let mut record = pushed(1);
     monitor.apply_pushed_load(&worker, 0, &record, Instant::now());
     assert!(worker.stall_reason().is_none(), "no silence reported");
-    record.engine_silence_ms = Some(5_000);
-    record.engine_reports_steps = Some(true);
+    record.engine_silence = Some(Duration::from_millis(5_000));
+    record.reports_every_step = true;
     monitor.apply_pushed_load(&worker, 0, &record, Instant::now());
     assert_eq!(worker.stall_reason(), Some(StallReason::Wedged));
     assert!(!worker.is_healthy_and_eligible());
-    record.engine_silence_ms = None;
+    record.engine_silence = None;
     monitor.apply_pushed_load(&worker, 0, &record, Instant::now());
     assert!(worker.stall_reason().is_none(), "the engine produces again");
 }
@@ -544,29 +655,29 @@ async fn a_pushed_record_with_a_long_pending_prefill_behind_the_engines_silence_
     let worker = ready_worker("grpc://w1:9000", "llama-3");
     registry.register(Arc::clone(&worker)).unwrap();
     let mut record = pushed(1);
-    record.engine_reports_steps = Some(true);
-    record.prefill_pending_tokens = Some(156_752);
+    record.reports_every_step = true;
+    record.prefill_pending = Some(156_752);
     for silence in [3_000, 10_000, 31_000] {
-        record.engine_silence_ms = Some(silence);
+        record.engine_silence = Some(Duration::from_millis(silence));
         monitor.apply_pushed_load(&worker, 0, &record, Instant::now());
         assert!(
             worker.stall_reason().is_none(),
             "{silence} ms of silence inside the prefill's allowance"
         );
     }
-    record.engine_silence_ms = Some(32_000);
+    record.engine_silence = Some(Duration::from_millis(32_000));
     monitor.apply_pushed_load(&worker, 0, &record, Instant::now());
     assert_eq!(
         worker.stall_reason(),
         Some(StallReason::Wedged),
         "silent past twice the prefill at the cold prior"
     );
-    record.engine_silence_ms = None;
-    record.prefill_pending_tokens = Some(0);
+    record.engine_silence = None;
+    record.prefill_pending = Some(0);
     monitor.apply_pushed_load(&worker, 0, &record, Instant::now());
     assert!(worker.stall_reason().is_none(), "the engine produces again");
     // Nothing pending: the threshold, as before.
-    record.engine_silence_ms = Some(3_000);
+    record.engine_silence = Some(Duration::from_millis(3_000));
     monitor.apply_pushed_load(&worker, 0, &record, Instant::now());
     assert_eq!(
         worker.stall_reason(),
@@ -601,15 +712,13 @@ async fn the_overload_vetos_edges_are_logged_with_their_figures() {
         Arc::new(worker)
     };
     registry.register(Arc::clone(&worker)).unwrap();
-    let mut record = pushed(1);
-    record.waiting_requests = 8;
+    let mut record = pushed(1).with_requests(1, 8);
     monitor.apply_pushed_load(&worker, 0, &record, Instant::now());
     assert!(worker.is_overloaded(), "eight waiting is the threshold");
     assert!(logs_contain("Worker overload veto set"));
     assert!(logs_contain("waiting_requests=8"));
     assert!(logs_contain("pushed record"));
     assert!(!logs_contain("Worker overload veto cleared"));
-    record.sample = 2;
     monitor.apply_pushed_load(&worker, 0, &record, Instant::now());
     logs_assert(|lines: &[&str]| {
         let edges = lines
@@ -622,8 +731,7 @@ async fn the_overload_vetos_edges_are_logged_with_their_figures() {
             Err(format!("{edges} edge lines for one edge"))
         }
     });
-    record.waiting_requests = 0;
-    record.sample = 3;
+    record = record.with_requests(1, 0);
     monitor.apply_pushed_load(&worker, 0, &record, Instant::now());
     assert!(!worker.is_overloaded(), "the queue drained");
     assert!(logs_contain("Worker overload veto cleared"));
@@ -640,12 +748,10 @@ async fn the_first_record_a_worker_pushes_is_judged_before_any_event_batch() {
     let (registry, monitor) = build_monitor();
     let worker = ready_worker("grpc://w1:9000", "llama-3");
     registry.register(Arc::clone(&worker)).unwrap();
-    let record = EngineLoad {
-        engine_silence_ms: Some(5_000),
-        engine_reports_steps: Some(true),
-        prefill_pending_tokens: Some(47),
-        load_only: true,
-        sample: 1,
+    let record = PushedRecord {
+        engine_silence: Some(Duration::from_millis(5_000)),
+        reports_every_step: true,
+        prefill_pending: Some(47),
         ..Default::default()
     };
     monitor.apply_pushed_load(&worker, 0, &record, Instant::now());
@@ -663,25 +769,19 @@ async fn a_pushed_records_telemetry_feeds_the_gauges_and_outlives_core_only_reco
     let (registry, monitor) = build_monitor();
     let worker = ready_worker("grpc://w1:9000", "llama-3");
     registry.register(Arc::clone(&worker)).unwrap();
-    let full = EngineLoad {
-        cache_hit_rate: Some(0.75),
-        num_used_tokens: Some(2_048),
-        max_total_num_tokens: Some(8_192),
-        memory: Some(smg_grpc_client::common_proto::EngineMemory {
+    // The memory section and the disaggregation section, each whole: what a
+    // section leaves at zero reads as zero.
+    let full = pushed(7)
+        .cache_hit_rate(0.75)
+        .used_tokens(2_048)
+        .total_tokens(8_192)
+        .memory(EngineMemoryMetricsSnapshot {
             weight_gb: 15.0,
             kv_cache_gb: 40.0,
             graph_gb: 1.5,
             token_capacity: 8_192,
-        }),
-        disaggregation: Some(smg_grpc_client::common_proto::EngineDisaggregation {
-            mode: "prefill".to_string(),
-            prefill_prealloc_queue_reqs: 4,
-            prefill_inflight_queue_reqs: 5,
-            kv_transfer_latency_ms: 3.5,
-            ..Default::default()
-        }),
-        ..pushed(7)
-    };
+        })
+        .disaggregation(3.5, 0.0, 9, 0, "prefill");
     let rendered = render_with_recorder(|| {
         monitor.apply_pushed_load(&worker, 0, &full, Instant::now());
     });
@@ -753,8 +853,8 @@ async fn the_poll_decision_follows_the_receipt_of_pushed_records() {
     monitor.apply_pushed_load(
         &worker,
         0,
-        &EngineLoad {
-            age_ms: 60_000,
+        &PushedRecord {
+            age: Duration::from_millis(60_000),
             ..pushed(6)
         },
         late,
@@ -786,10 +886,7 @@ async fn a_quiet_ranks_figures_follow_the_poll_rather_than_its_last_pushed_recor
     let url = "grpc://w1:9000";
     let interval = Duration::from_secs(10);
     let t0 = Instant::now();
-    let record = |running: u32, hit_rate: f64| EngineLoad {
-        cache_hit_rate: Some(hit_rate),
-        ..pushed(running)
-    };
+    let record = |running: i32, hit_rate: f64| pushed(running).cache_hit_rate(hit_rate);
     let poll = |rank1_hit_rate: f64| WorkerLoadResponse {
         dp_rank_count: 2,
         loads: vec![

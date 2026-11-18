@@ -13,7 +13,7 @@
 
 use std::collections::HashMap;
 
-use openai_protocol::worker::{SchedulerLoadSnapshot, WorkerLoadResponse};
+use crate::worker::{SchedulerLoadSnapshot, WorkerLoadResponse};
 
 /// Minimal Prometheus text-format scraper: metric name -> sample values
 /// (one per label-set). Only the flat `name{labels} value` / `name value`

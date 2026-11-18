@@ -2,8 +2,7 @@
 //! test support is re-exported at the paths it had here; what stands here
 //! names the gateway's own builder and registry: a worker of a given role, a
 //! labelled gRPC worker, the registry holding a test's workers, and the KV
-//! cache event that clears a worker's cache. [`LoadReaders`] is the routing
-//! side a load monitor's test stands beside it.
+//! cache event that clears a worker's cache.
 
 use std::sync::Arc;
 
@@ -14,10 +13,10 @@ use openai_protocol::{
 use smg_grpc_client::common_proto::{kv_cache_event, KvCacheCleared, KvCacheEvent};
 pub use smg_worker::test_support::{
     assert_metric, gone, held, no_health_check, ready_worker, render_with_recorder, sorted_series,
-    worker_with_model_aliases, CountingConnector, NoEngine, RefusedAddress,
+    worker_with_model_aliases, CountingConnector, LoadReaders, NoEngine, RefusedAddress,
 };
 
-use crate::worker::{BasicWorkerBuilder, ConnectionMode, LoadConsumer, Worker, WorkerRegistry};
+use crate::worker::{BasicWorkerBuilder, ConnectionMode, Worker, WorkerRegistry};
 
 /// A worker of `worker_type` at `url` with no health checker behind it: what
 /// a test fills a pool with when no health checker may run.
@@ -71,22 +70,4 @@ pub fn kv_cache_cleared() -> KvCacheEvent {
         event_id: 0,
         data: Some(kv_cache_event::Data::Cleared(KvCacheCleared::default())),
     }
-}
-
-/// The routing side a test stands beside the load monitor: it says whether
-/// a reader wants worker loads, and reconciles nothing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LoadReaders {
-    /// No reader wants loads, as under a policy that reads none.
-    Blind,
-    /// A reader wants loads, as under a load-aware policy.
-    Aware,
-}
-
-impl LoadConsumer for LoadReaders {
-    fn needs_loads(&self) -> bool {
-        matches!(self, Self::Aware)
-    }
-
-    fn reconcile_in_flight(&self, _worker: &dyn Worker) {}
 }

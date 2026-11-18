@@ -39,7 +39,7 @@ crates/policy_controller/tests/classic/sheets/
   bucket.json
   minimum_tokens.json
   sticky_rank.json
-model_gateway/src/         each recorder, a test module beside the code it runs
+model_gateway/src/         the gateway's recorders, each a test module beside the code it runs
   policies/classic_rows.rs                                                  power_of_two.json
   policies/classic_manual_rows.rs                                           manual.json
   policies/classic_prefix_hash_rows.rs                                      prefix_hash.json
@@ -47,10 +47,11 @@ model_gateway/src/         each recorder, a test module beside the code it runs
   worker/pd/pair_index/classic_pair_rows.rs                                 pair_index.json
   routers/grpc/common/stages/worker_selection/classic_encode_pair_rows.rs   encode_pair.json
   routers/common/classic_pair_select_rows.rs                                pair_select.json
-  worker/load/monitor/classic_overload_rows.rs                              overload.json
   policies/bucket/classic_bucket_rows.rs                                    bucket.json
-  worker/load/monitor/classic_minimum_tokens_rows.rs                        minimum_tokens.json
   routers/grpc/common/stages/request_execution/classic_sticky_rank_rows.rs  sticky_rank.json
+crates/worker/src/         the worker crate's recorders, test modules beside the load monitor
+  load/monitor/classic_overload_rows.rs                                     overload.json
+  load/monitor/classic_minimum_tokens_rows.rs                               minimum_tokens.json
 ```
 
 ## A sheet
@@ -191,7 +192,8 @@ pool, which is the pool's order and no rule of the policy.
   rank or for the one rank `pinned` names. A step is what the gateway's rank cache is handed: a poll's answer
   (`poll`: an entry a rank in rank order, `null` where the answer omits the rank), a poll that failed (`failed`),
   the worker's loads dropped as it leaves the ready set (`evict`), or a request of `cost` estimated tokens
-  (`pick`), which asks the policy for a rank and books its cost on the rank it takes. An entry carries the tokens
+  (`pick`), which asks the cache's select for a rank and books its cost on the rank it takes. The gateway's
+  policy forwards a request to that select and adds nothing. An entry carries the tokens
   the rank's cache uses (`used`), which is the count the gateway reads, the rank's token capacity (`capacity`)
   and, where the rank reports them, the context tokens of the requests it holds (`resident`). The row records the
   rank each request took, `null` where it found none. Nothing in a row draws: the recorder runs each row twice,
@@ -226,13 +228,17 @@ directory. The sha256 is of the file as committed.
 
 ## Recording
 
-A recorder is an ignored test of the gateway crate: a test module beside the code it runs, so it reads that code by
-the code's own functions. Run one with the output directory and the commit it runs at, from the repository's root:
+A recorder is an ignored test of the crate that holds the code it runs: a test module beside that code, so it reads
+the code by the code's own functions. Run one with the output directory and the commit it runs at, from the
+repository's root:
 
 ```bash
 CLASSIC_ROWS_OUT=$PWD/crates/policy_controller/tests/classic/sheets CLASSIC_ROWS_COMMIT=<commit> \
   cargo test -p smg --lib policies::classic_rows -- --ignored --nocapture
 ```
+
+The overload and minimum-tokens sheets' recorders are tests of the worker crate: their commands name
+`-p smg-worker --all-features` where the others name `-p smg`.
 
 | sheet | test path |
 |---|---|
@@ -243,9 +249,9 @@ CLASSIC_ROWS_OUT=$PWD/crates/policy_controller/tests/classic/sheets CLASSIC_ROWS
 | `pair_index.json` | `worker::pd::pair_index::classic_pair_rows` |
 | `encode_pair.json` | `worker_selection::classic_encode_pair_rows` |
 | `pair_select.json` | `routers::common::classic_pair_select_rows` |
-| `overload.json` | `worker::load::monitor::classic_overload_rows` |
+| `overload.json` | `load::monitor::classic_overload_rows` |
 | `bucket.json` | `policies::bucket::classic_bucket_rows` |
-| `minimum_tokens.json` | `worker::load::monitor::classic_minimum_tokens_rows` |
+| `minimum_tokens.json` | `load::monitor::classic_minimum_tokens_rows` |
 | `sticky_rank.json` | `request_execution::classic_sticky_rank_rows` |
 
 The pair sheet's recorder is a child of the pair index and reads a pairing descriptor by its readers, so it records the
@@ -253,13 +259,14 @@ descriptor the gateway derived and never a second reading of the registration. T
 child of the gateway's worker selection stage: it runs the stage's own selection, and it wraps the encode policy to
 write down each call (the encoders offered and the key) and passes every call on unchanged. The pair placement
 sheet's recorder sits beside the placement it calls and builds its pools, policies and pair index with the gateway's
-own types. The overload sheet's recorder is a child of the gateway's load monitor, so each step enters the monitor
+own types. The overload sheet's recorder is a child of the load monitor's module, so each step enters the monitor
 through the monitor's own functions and the verdict is read off the worker the monitor wrote it on. The bucket
 sheet's recorder is a child of the policy's own module and stands in that policy's directory: the adjustment and
 the window are the policy's private state, and a module beside the policy's could reach neither.
 The minimum-tokens sheet's recorder is a child of the load monitor too: each step reaches the rank cache as the
-monitor's poll loop hands it over, and each request asks the policy. The sticky rank sheet's recorder is a child of
-the stage that sends a request to its worker, and calls the stage's own pin.
+monitor's poll loop hands it over, and each request asks the cache's select, which the policy forwards to. The
+sticky rank sheet's recorder is a child of the stage that sends a request to its worker, and calls the stage's own
+pin.
 
 A sheet is never edited by hand. A new recording replaces the whole sheet and its row in the table above, in one
 pull request that names the commit and says which rows moved: a sequence row moves only when the policy's

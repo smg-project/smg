@@ -56,10 +56,6 @@ use std::{
 
 use dashmap::DashMap;
 use futures::future;
-use openai_protocol::worker::{
-    LoadRecord, LoadTelemetry, RuntimeType, SchedulerLoadSnapshot, WorkerGroupKey,
-    WorkerLoadResponse, WorkerStatus,
-};
 use parking_lot::{Mutex, RwLock};
 use reqwest::StatusCode;
 use rustc_hash::FxHashMap;
@@ -69,13 +65,19 @@ use tokio::{
 };
 use tracing::{debug, info, warn};
 
-use crate::worker::{
+use crate::{
     health::liveness,
-    identity::endpoint::Endpoint,
+    identity::{
+        basic::{ConnectionMode, Worker},
+        endpoint::Endpoint,
+    },
     load::state::{LoadReceiver, LoadSnapshot, LoadState},
-    metrics::Metrics,
+    metrics::writers::Metrics,
     registry::{event::WorkerEvent, worker_model_ids, Generation, WorkerRegistry},
-    ConnectionMode, Worker,
+    worker::{
+        LoadRecord, LoadTelemetry, RuntimeType, SchedulerLoadSnapshot, WorkerGroupKey,
+        WorkerLoadResponse, WorkerStatus,
+    },
 };
 
 mod scrape;
@@ -124,7 +126,7 @@ impl WorkerLoadManager {
     }
 
     /// Replace cached rank loads for the supplied workers, preserving other workers.
-    pub fn update_dp_loads(&self, loads: &HashMap<String, HashMap<isize, isize>>) {
+    pub(crate) fn update_dp_loads(&self, loads: &HashMap<String, HashMap<isize, isize>>) {
         debug!(
             "WorkerLoadManager update_dp_loads map:{:?}",
             MaskedLoads(loads)
@@ -156,7 +158,7 @@ impl WorkerLoadManager {
         Some(dp_rank)
     }
 
-    pub fn remove_workers(&self, urls: &[String]) {
+    pub(crate) fn remove_workers(&self, urls: &[String]) {
         let mut cached = self.dp_cached_loads.write();
         for url in urls {
             cached.remove(url);
@@ -659,7 +661,7 @@ impl<G: Generation> WorkerMonitor<G> {
     /// a load-aware or dp-rank policy, the engine-metrics export or overload
     /// protection on a member needs it. The poll tick and the decision to
     /// open a worker's load stream read the same answer.
-    pub(crate) fn loads_wanted(&self, workers: &[Arc<dyn Worker>]) -> bool {
+    pub fn loads_wanted(&self, workers: &[Arc<dyn Worker>]) -> bool {
         if !self.conditional_polling {
             return true;
         }
@@ -890,6 +892,13 @@ impl<G: Generation> WorkerMonitor<G> {
         }
     }
 
+    /// `flush_pushed` for a host's tests: the publish of the pushed reports
+    /// without the window's wait.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn flush_pushed_for_test(&self) {
+        self.flush_pushed();
+    }
+
     /// Pushed reports waiting to be published (tests).
     #[cfg(test)]
     pub(crate) fn pending_pushed_len(&self) -> usize {
@@ -898,7 +907,7 @@ impl<G: Generation> WorkerMonitor<G> {
 
     /// The current published load snapshot — what routing is acting on, and
     /// what `GET /loads` serves.
-    pub(crate) fn load_snapshot(&self) -> Arc<LoadSnapshot> {
+    pub fn load_snapshot(&self) -> Arc<LoadSnapshot> {
         self.load_state.snapshot()
     }
 
@@ -908,7 +917,7 @@ impl<G: Generation> WorkerMonitor<G> {
     /// `Arc` out of `borrow()` and scan without holding the watch guard.
     /// Stale entries are pruned on each tick of the relevant group and by
     /// the batched eviction flusher.
-    pub(crate) fn subscribe(&self) -> LoadReceiver {
+    pub fn subscribe(&self) -> LoadReceiver {
         self.load_state.subscribe()
     }
 
@@ -964,7 +973,7 @@ impl<G: Generation> WorkerMonitor<G> {
         *self.eviction_flush_task.lock() = Some(flush_handle);
 
         // The liveness sweep: vetoes a worker that stayed silent for the stall
-        // threshold after a transport failure (see `worker::health::liveness::sweep`).
+        // threshold after a transport failure (see `health::liveness::sweep`).
         let monitor = Arc::downgrade(self);
         #[expect(
             clippy::disallowed_methods,
@@ -984,7 +993,7 @@ impl<G: Generation> WorkerMonitor<G> {
     /// when no groups were running, so a lag-recovery rebuild cannot
     /// inherit stale per-rank loads from a previous incarnation.
     /// Idempotent.
-    pub fn stop_all_groups(&self) {
+    pub(crate) fn stop_all_groups(&self) {
         let drained: Vec<(WorkerGroupKey, GroupState)> = {
             let mut handles = self.group_handles.lock();
             handles.drain().collect()
@@ -1582,7 +1591,7 @@ fn group_interval(workers: &[Arc<dyn Worker>], default_interval: Duration) -> Du
 /// strong reference has been dropped. Each iteration upgrades the
 /// `Weak` only for the duration of the work and drops the temporary
 /// `Arc` before the next `recv().await`, so the monitor's `Drop` can
-/// fire as soon as the owning `AppContext` goes away.
+/// fire as soon as its owner, the gateway's `AppContext`, goes away.
 async fn run_event_loop<G: Generation>(
     monitor: Weak<WorkerMonitor<G>>,
     mut events_rx: broadcast::Receiver<WorkerEvent>,
@@ -1964,6 +1973,18 @@ async fn poll_group_once<G: Generation>(
     monitor.load_state.publish_group(&polled_urls, fresh);
 }
 
+/// `poll_group_once` for a host's tests: one tick over engines the host's own
+/// connector reaches.
+#[cfg(any(test, feature = "test-util"))]
+pub async fn poll_group_once_for_test<G: Generation>(
+    monitor: &Arc<WorkerMonitor<G>>,
+    group_key: &WorkerGroupKey,
+    interval: Duration,
+    now: Instant,
+) {
+    poll_group_once(monitor, group_key, interval, now).await;
+}
+
 #[cfg(test)]
 mod tests;
 
@@ -1971,16 +1992,12 @@ mod tests;
 mod native_loads_tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use openai_protocol::{
+    use super::{tests::PushedRecord, *};
+    use crate::{
+        identity::basic::{ConnectionMode, WorkerLoadGuard, WorkerType},
         model_card::ModelCard,
+        test_support::{BasicWorkerBuilder, LoadReaders, WorkerMonitor, WorkerRegistry},
         worker::{HealthCheckConfig, OverloadUpdate},
-    };
-    use smg_grpc_client::common_proto::EngineLoad;
-
-    use super::*;
-    use crate::worker::{
-        test_support::LoadReaders, BasicWorkerBuilder, ConnectionMode, WorkerLoadGuard,
-        WorkerMonitor, WorkerRegistry, WorkerType,
     };
 
     const ENGINE_METRICS: &str = "vllm:num_requests_running{m=\"a\"} 7.0\n\
@@ -2807,7 +2824,7 @@ mod native_loads_tests {
             let t0 = Instant::now();
             let polled_at = t0 + interval;
             for rank in 0..2 {
-                monitor.apply_pushed_load(&worker, rank, &EngineLoad::default(), t0);
+                monitor.apply_pushed_load(&worker, rank, &PushedRecord::default(), t0);
             }
             let absolute = WorkerLoadResponse {
                 loads: (0..2)
@@ -2822,7 +2839,7 @@ mod native_loads_tests {
             };
             monitor.apply_polled_load(worker.url(), &absolute, t0 + Duration::from_secs(1));
             if let Some(offset) = fresh_offset {
-                monitor.apply_pushed_load(&worker, 1, &EngineLoad::default(), polled_at + offset);
+                monitor.apply_pushed_load(&worker, 1, &PushedRecord::default(), polled_at + offset);
             }
             let key = WorkerGroupKey {
                 model_id: "a".to_string(),
@@ -2844,7 +2861,7 @@ mod native_loads_tests {
             monitor.apply_pushed_load(
                 &worker,
                 0,
-                &EngineLoad::default(),
+                &PushedRecord::default(),
                 polled_at + Duration::from_secs(1),
             );
             monitor.flush_pushed();
@@ -2932,89 +2949,6 @@ mod native_loads_tests {
         );
     }
 
-    /// The rank workers of one gRPC engine share one `GetLoads` per tick: the
-    /// engine answers once, and every rank worker gets its contact and its
-    /// own rank's part of the answer, as its own poll would have had it (the
-    /// canned engine names rank 0 only, so rank 1 has no report).
-    #[tokio::test]
-    async fn the_rank_workers_of_one_grpc_engine_share_one_poll() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let cfg = Arc::new(mock_worker::config::Config {
-            http_count: 0,
-            grpc_base_port: port,
-            grpc_count: 1,
-            model_id: "a".to_string(),
-            tokenizer_path: "a".to_string(),
-            gen_delay: Duration::ZERO,
-            output_tokens: 3,
-            realistic: false,
-            ..mock_worker::config::Config::default()
-        });
-        // A port an earlier test's engine served on keeps that engine's
-        // overrides; this engine starts from fresh ones.
-        mock_worker::overrides::fresh_for_port(port);
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "test engine: the server task lives for the test process"
-        )]
-        let _engine = tokio::spawn(mock_worker::grpc::serve_with_listener(cfg, listener));
-        let (registry, monitor) = monitor_with_readers(LoadReaders::Blind);
-        let rank_worker = |rank: usize| -> Arc<dyn Worker> {
-            Arc::new(
-                BasicWorkerBuilder::new(format!("grpc://127.0.0.1:{port}"))
-                    .worker_type(WorkerType::Regular)
-                    .connection_mode(ConnectionMode::Grpc)
-                    .runtime_type(RuntimeType::TokenSpeed)
-                    .model(ModelCard::new("a"))
-                    .dp_config(rank, 2)
-                    .health_config(HealthCheckConfig {
-                        disable_health_check: true,
-                        ..Default::default()
-                    })
-                    .build(),
-            )
-        };
-        let workers = [rank_worker(0), rank_worker(1)];
-        for worker in &workers {
-            registry.register(Arc::clone(worker)).unwrap();
-        }
-        let key = WorkerGroupKey {
-            model_id: "a".to_string(),
-            worker_type: WorkerType::Regular,
-            connection_mode: ConnectionMode::Grpc,
-        };
-        let polls_before = mock_worker::overrides::for_port(port).loads_polls();
-        // A transport failure noted on each rank worker: the one GetLoads'
-        // contact must clear it on both.
-        for worker in &workers {
-            worker.runtime_state().unwrap().note_transport_failure();
-        }
-        poll_group_once(&monitor, &key, Duration::from_secs(10), Instant::now()).await;
-        assert_eq!(
-            mock_worker::overrides::for_port(port).loads_polls() - polls_before,
-            1,
-            "one GetLoads for the engine's two rank workers"
-        );
-
-        let snapshot = monitor.load_state.snapshot();
-        let report = snapshot
-            .get(workers[0].url())
-            .expect("the rank the answer names has its report");
-        assert_eq!((report.loads.len(), report.loads[0].dp_rank), (1, 0));
-        assert!(
-            snapshot.get(workers[1].url()).is_none(),
-            "a rank the answer does not name has no report, as its own poll would have had it"
-        );
-        for worker in &workers {
-            assert!(
-                !worker.runtime_state().unwrap().transport_failure_pending(),
-                "the contact is every member's: {}",
-                worker.url()
-            );
-        }
-    }
-
     /// The tick's fallback poll of a worker whose stream went quiet on one
     /// rank refreshes that rank's entry in the pushed report: the report
     /// the next record publishes carries the poll's figure for it, not
@@ -3036,14 +2970,11 @@ mod native_loads_tests {
         };
         let interval = Duration::from_secs(10);
         let t0 = Instant::now();
-        let record = |running: u32, hit_rate: f64, sample: u64| EngineLoad {
-            running_requests: running,
-            cache_hit_rate: Some(hit_rate),
-            sample,
-            ..Default::default()
+        let record = |running: i32, hit_rate: f64| {
+            PushedRecord::requests(running, 0).cache_hit_rate(hit_rate)
         };
-        monitor.apply_pushed_load(&worker, 0, &record(2, 0.5, 1), t0);
-        monitor.apply_pushed_load(&worker, 1, &record(8, 0.65, 2), t0);
+        monitor.apply_pushed_load(&worker, 0, &record(2, 0.5), t0);
+        monitor.apply_pushed_load(&worker, 1, &record(8, 0.65), t0);
 
         // One interval later rank 1's record is older than the interval:
         // the tick polls the worker.
@@ -3054,7 +2985,7 @@ mod native_loads_tests {
         monitor.apply_pushed_load(
             &worker,
             0,
-            &record(4, 0.5, 3),
+            &record(4, 0.5),
             t0 + interval + Duration::from_millis(1),
         );
         monitor.flush_pushed();
@@ -3081,14 +3012,10 @@ mod native_loads_tests {
         worker.set_status(WorkerStatus::Ready);
         registry.register(Arc::clone(&worker)).unwrap();
         let t0 = Instant::now();
-        let record = |running: u32, sample: u64| EngineLoad {
-            running_requests: running,
-            sample,
-            ..Default::default()
-        };
-        monitor.apply_pushed_load(&worker, 1, &record(8, 1), t0);
+        let record = |running: i32| PushedRecord::requests(running, 0);
+        monitor.apply_pushed_load(&worker, 1, &record(8), t0);
         let last = t0 + Duration::from_millis(5);
-        monitor.apply_pushed_load(&worker, 0, &record(2, 2), last);
+        monitor.apply_pushed_load(&worker, 0, &record(2), last);
         assert_eq!(monitor.pending_pushed_len(), 1, "one publish per worker");
         monitor.flush_pushed();
         let snapshot = monitor.load_state.snapshot();
@@ -3115,6 +3042,31 @@ mod native_loads_tests {
         );
     }
 
+    /// A record's age is the engine's word. One the one-way margin overflows,
+    /// or one older than the clock, keeps its record and reads as sampled at
+    /// the receipt. No wire message carries such an age, so the case states
+    /// both on a plain record.
+    #[tokio::test]
+    async fn an_age_past_the_clock_reads_as_sampled_at_the_receipt() {
+        for age in [Duration::MAX, Duration::MAX - PUSHED_ONE_WAY_MARGIN] {
+            let (registry, monitor) = monitor_with_readers(LoadReaders::Blind);
+            let worker = gauge_worker("http://w1:8000");
+            worker.set_status(WorkerStatus::Ready);
+            registry.register(Arc::clone(&worker)).unwrap();
+            let received = Instant::now();
+            let record = PushedRecord {
+                age,
+                ..PushedRecord::requests(3, 0)
+            };
+            monitor.apply_pushed_load(&worker, 0, &record, received);
+            monitor.flush_pushed();
+            let snapshot = monitor.load_state.snapshot();
+            let (report, sampled_at) = snapshot.report(worker.url()).expect("published");
+            assert_eq!(report.loads[0].num_running_reqs, 3, "the record is kept");
+            assert_eq!(sampled_at, received, "an age of {age:?}");
+        }
+    }
+
     /// A record for a rank on file replaces the rank's entry in place: the
     /// figures are the record's, the telemetry it left out stays what the
     /// last record that carried it said, and the report keeps one entry per
@@ -3126,21 +3078,12 @@ mod native_loads_tests {
         worker.set_status(WorkerStatus::Ready);
         registry.register(Arc::clone(&worker)).unwrap();
         let t0 = Instant::now();
-        let heartbeat = EngineLoad {
-            running_requests: 2,
-            cache_hit_rate: Some(0.75),
-            num_used_tokens: Some(1024),
-            max_total_num_tokens: Some(4096),
-            sample: 1,
-            ..Default::default()
-        };
+        let heartbeat = PushedRecord::requests(2, 0)
+            .cache_hit_rate(0.75)
+            .used_tokens(1024)
+            .total_tokens(4096);
         monitor.apply_pushed_load(&worker, 0, &heartbeat, t0);
-        let core = EngineLoad {
-            running_requests: 5,
-            num_used_tokens: Some(2048),
-            sample: 2,
-            ..Default::default()
-        };
+        let core = PushedRecord::requests(5, 0).used_tokens(2048);
         monitor.apply_pushed_load(&worker, 0, &core, t0 + Duration::from_millis(1));
         monitor.flush_pushed();
         let snapshot = monitor.load_state.snapshot();
@@ -3208,13 +3151,10 @@ mod native_loads_tests {
         let t0 = tick
             .checked_sub(interval)
             .expect("the clock is older than the interval");
-        let record = |running: u32, waiting: u32, used: i32, sample: u64| EngineLoad {
-            running_requests: running,
-            waiting_requests: waiting,
-            num_used_tokens: Some(used),
-            max_total_num_tokens: Some(1000),
-            sample,
-            ..Default::default()
+        let record = |running: i32, waiting: i32, used: i32| {
+            PushedRecord::requests(running, waiting)
+                .used_tokens(used)
+                .total_tokens(1000)
         };
         // What an earlier poll left in the rank cache. No record writes
         // there, so the tick's poll is what replaces this entry or takes it
@@ -3225,11 +3165,11 @@ mod native_loads_tests {
                 stub.url.clone(),
                 HashMap::from([(0, 150), (1, 250)]),
             )]));
-        monitor.apply_pushed_load(&worker, 0, &record(2, 0, 200, 1), t0);
-        monitor.apply_pushed_load(&worker, 1, &record(8, 0, 500, 2), t0);
+        monitor.apply_pushed_load(&worker, 0, &record(2, 0, 200), t0);
+        monitor.apply_pushed_load(&worker, 1, &record(8, 0, 500), t0);
 
         let pushed_at = tick + Duration::from_millis(1);
-        monitor.apply_pushed_load(&worker, 0, &record(10, 8, 900, 3), pushed_at);
+        monitor.apply_pushed_load(&worker, 0, &record(10, 8, 900), pushed_at);
         monitor.flush_pushed();
         let published = |monitor: &WorkerMonitor| {
             let snapshot = monitor.load_state.snapshot();
@@ -3260,7 +3200,7 @@ mod native_loads_tests {
         };
         // The worker's next record publishes the report on file.
         let next = pushed_at + Duration::from_millis(1);
-        monitor.apply_pushed_load(&worker, 1, &record(8, 0, 500, 4), next);
+        monitor.apply_pushed_load(&worker, 1, &record(8, 0, 500), next);
         monitor.flush_pushed();
         AfterFallbackPoll {
             rows,
@@ -3440,13 +3380,10 @@ mod native_loads_tests {
         let t0 = tick
             .checked_sub(interval)
             .expect("the clock is older than the interval");
-        let record = |running: u32, waiting: u32, used: i32, sample: u64| EngineLoad {
-            running_requests: running,
-            waiting_requests: waiting,
-            num_used_tokens: Some(used),
-            max_total_num_tokens: Some(1000),
-            sample,
-            ..Default::default()
+        let record = |running: i32, waiting: i32, used: i32| {
+            PushedRecord::requests(running, waiting)
+                .used_tokens(used)
+                .total_tokens(1000)
         };
         // What an earlier poll left in the rank cache: a count of its own
         // for every rank on file, none of them a record's.
@@ -3461,10 +3398,10 @@ mod native_loads_tests {
                 stub.url.clone(),
                 earlier_poll.iter().copied().collect(),
             )]));
-        monitor.apply_pushed_load(&worker, 0, &record(10, 8, 900, 1), t0);
-        monitor.apply_pushed_load(&worker, 1, &record(8, 0, 500, 2), t0);
+        monitor.apply_pushed_load(&worker, 0, &record(10, 8, 900), t0);
+        monitor.apply_pushed_load(&worker, 1, &record(8, 0, 500), t0);
         for &rank in also_quiet {
-            monitor.apply_pushed_load(&worker, rank, &record(3, 0, 300, 3), t0);
+            monitor.apply_pushed_load(&worker, rank, &record(3, 0, 300), t0);
         }
         monitor.flush_pushed();
         assert!(
@@ -3499,7 +3436,7 @@ mod native_loads_tests {
             .and_then(|report| report.sampled_at);
 
         let next = tick + Duration::from_secs(2);
-        monitor.apply_pushed_load(&worker, 1, &record(8, 0, 500, 4), next);
+        monitor.apply_pushed_load(&worker, 1, &record(8, 0, 500), next);
         monitor.flush_pushed();
         let snapshot = monitor.load_state.snapshot();
         let report = snapshot.get(stub.url.as_str()).expect("published");
@@ -3734,18 +3671,10 @@ mod native_loads_tests {
 
         // A core-only record, then one that carries a token count and its
         // capacity for a rank the entry names.
-        let core_only = EngineLoad {
-            running_requests: 3,
-            sample: 1,
-            ..Default::default()
-        };
-        let with_tokens = EngineLoad {
-            running_requests: 4,
-            num_used_tokens: Some(2048),
-            max_total_num_tokens: Some(4096),
-            sample: 2,
-            ..Default::default()
-        };
+        let core_only = PushedRecord::requests(3, 0);
+        let with_tokens = PushedRecord::requests(4, 0)
+            .used_tokens(2048)
+            .total_tokens(4096);
         for record in [&core_only, &with_tokens] {
             monitor.apply_pushed_load(&worker, 0, record, Instant::now());
             assert_eq!(

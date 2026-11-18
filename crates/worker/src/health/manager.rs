@@ -22,41 +22,42 @@ use std::{
 };
 
 use async_trait::async_trait;
+#[cfg(feature = "axum")]
 use axum::response::{IntoResponse, Response};
 use chrono::Utc;
 use futures::stream::{self, FuturesUnordered, StreamExt};
-use http::StatusCode;
-use openai_protocol::worker::{
-    EngineAggregateMetricsSnapshot, FlushCacheResult, HealthCheckConfig, ProfileOptions,
-    ProfileResult, SchedulerLoadSnapshot, WorkerLoadResponse, WorkerStatus,
-};
-use smg_worker::{
-    labels::DISCOVERY_PROVIDER_LABEL, metrics_labels, settings::UnhealthyRemovalScope,
-};
+use reqwest::StatusCode;
 use tokio::{
     sync::{broadcast, mpsc, Notify},
     task::JoinHandle,
 };
 use tracing::{debug, error, info, warn};
 
-use crate::worker::{
+use crate::{
     connection::engine::NO_ENGINE_CONNECTOR,
     health::liveness,
     identity::{
-        basic::WorkerTypeExt,
+        basic::{ConnectionMode, RuntimeType, Worker, WorkerType, WorkerTypeExt},
         endpoint::{grpc_base_url, Endpoint},
+        error::WorkerResult,
     },
+    labels::DISCOVERY_PROVIDER_LABEL,
     load::{
         metrics_aggregator::{self, MetricPack},
         state::LoadSnapshot,
     },
-    metrics::Metrics,
+    metrics::writers::Metrics,
+    metrics_labels,
     registry::{
         event::{WorkerConnected, WorkerEvent},
-        Generation, WorkerId, WorkerRegistry,
+        Generation, WorkerId, WorkerOrigin, WorkerRegistry,
     },
     runtime::WorkerRuntime,
-    ConnectionMode, RuntimeType, Worker, WorkerOrigin, WorkerResult, WorkerType,
+    settings::UnhealthyRemovalScope,
+    worker::{
+        EngineAggregateMetricsSnapshot, FlushCacheResult, HealthCheckConfig, ProfileOptions,
+        ProfileResult, SchedulerLoadSnapshot, WorkerLoadResponse, WorkerStatus,
+    },
 };
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
@@ -67,7 +68,7 @@ const MAX_CONCURRENT_HEALTH_PROBES: usize = 128;
 /// probe timeout the worker API takes: thirty years, which no process
 /// outlives. The schedule adds a delay to its clock, and the clock cannot
 /// hold every sum a caller's number makes.
-pub(crate) const MAX_PROBE_DELAY: Duration = Duration::from_secs(30 * 365 * 24 * 60 * 60);
+pub const MAX_PROBE_DELAY: Duration = Duration::from_secs(30 * 365 * 24 * 60 * 60);
 
 /// Result of a fan-out request to a single worker
 struct WorkerResponse {
@@ -128,6 +129,7 @@ pub enum EngineMetricsResult {
     Err(String),
 }
 
+#[cfg(feature = "axum")]
 impl IntoResponse for EngineMetricsResult {
     fn into_response(self) -> Response {
         match self {
@@ -283,7 +285,7 @@ impl WorkerManager {
         // so the initial schedule is captured deterministically — not
         // whenever the spawned task happens to be scheduled. A worker
         // registered between WorkerManager::start() returning and the task
-        // running (e.g. the mesh replay loop in server.rs, which runs
+        // running (e.g. the gateway's mesh replay loop, which runs
         // synchronously right after start()) would otherwise race the
         // task's own reconcile call.
         let mut next_check: HashMap<WorkerId, tokio::time::Instant> = HashMap::new();
@@ -923,7 +925,7 @@ async fn apply_connect_signal_and_refresh<G: Generation>(
 
 /// Act on a connect signal: a backend handshake that just completed, or a
 /// contact from a worker the health checker demoted while its transport was
-/// gone (see `worker::health::liveness::on_contact`). Resolves the URL to a live
+/// gone (see `health::liveness::on_contact`). Resolves the URL to a live
 /// worker id; a signal that lost a race with a same-URL replacement, or
 /// names a worker already removed, is discarded.
 ///
@@ -1049,6 +1051,13 @@ async fn read_kv_engine_id(worker: &dyn Worker) -> Result<Option<String>, String
         .kv_engine_id()
         .await
         .map_err(|e| format!("Failed to fetch gRPC server info: {e}"))
+}
+
+/// `read_kv_engine_id` for a host's tests: the read through the host's own
+/// connector, over an engine on the wire.
+#[cfg(any(test, feature = "test-util"))]
+pub async fn read_kv_engine_id_for_test(worker: &dyn Worker) -> Result<Option<String>, String> {
+    read_kv_engine_id(worker).await
 }
 
 /// A PD worker that answers its probe again may be a new engine process on
@@ -1593,10 +1602,15 @@ impl WorkerManager {
     ///
     /// A rank names its worker by the masked address: the route is public,
     /// and a registered address may carry a password or a token.
-    pub(crate) fn fleet_loads<G: Generation>(
+    ///
+    /// `version` is the serving host's own name and version, as the body
+    /// reports it. The host hands it in: this crate's version is not the
+    /// server's.
+    pub fn fleet_loads<G: Generation>(
         worker_registry: &WorkerRegistry<G>,
         snapshot: &LoadSnapshot,
         model_id: Option<&str>,
+        version: &str,
     ) -> WorkerLoadResponse {
         let mut workers = worker_registry.get_all();
         workers.sort_by(|a, b| a.url().cmp(b.url()));
@@ -1619,7 +1633,7 @@ impl WorkerManager {
 
         WorkerLoadResponse {
             timestamp: Utc::now().to_rfc3339(),
-            version: format!("smg-{}", env!("CARGO_PKG_VERSION")),
+            version: version.to_string(),
             dp_rank_count: loads.len() as i32,
             aggregate: EngineAggregateMetricsSnapshot::from_ranks(&loads),
             loads,

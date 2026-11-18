@@ -173,67 +173,21 @@ async fn the_engine_id_read_dials_the_base_address_of_a_rank_row() {
     );
 }
 
-/// The read end to end, through the gateway's own connector, over a mock
-/// engine that reports an id: a plain row, a rank row and a worker registered
-/// under an HTTP scheme each read the reported id, and an id reported empty
-/// reads as none.
-#[tokio::test]
-async fn the_engine_id_read_answers_the_id_an_engine_reports() {
-    let (url, engine) = mock_engine_on_wire("m", mock_worker::config::SchedulerWire::Vllm).await;
-    let port: u16 = url
-        .rsplit(':')
-        .next()
-        .and_then(|port| port.parse().ok())
-        .expect("the mock engine's port");
-    let report = |id: &str| {
-        let mut patch = serde_json::Map::new();
-        patch.insert("kv_engine_id".to_string(), id.into());
-        mock_worker::overrides::for_port(port).patch_info(&patch);
-    };
-    let row = |address: &str, rank: Option<(usize, usize)>| {
-        let mut builder = BasicWorkerBuilder::new(address)
-            .worker_type(WorkerType::Prefill)
-            .connection_mode(ConnectionMode::Grpc)
-            .runtime_type(RuntimeType::Vllm);
-        if let Some((rank, size)) = rank {
-            builder = builder.dp_config(rank, size);
-        }
-        builder.build()
-    };
-    let grpc = url.replacen("http://", "grpc://", 1);
-    let reported = || Ok::<_, String>(Some("eng".to_string()));
-
-    report("eng");
-    assert_eq!(read_kv_engine_id(&row(&grpc, None)).await, reported());
-    assert_eq!(
-        read_kv_engine_id(&row(&grpc, Some((1, 2)))).await,
-        reported()
-    );
-    assert_eq!(read_kv_engine_id(&row(&url, None)).await, reported());
-
-    report("");
-    assert_eq!(read_kv_engine_id(&row(&grpc, None)).await, Ok(None));
-    engine.abort();
-}
-
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use http::{header::AUTHORIZATION, HeaderMap};
-use openai_protocol::{
-    model_card::ModelCard,
-    worker::{HealthCheckConfig, WorkerStatus},
-};
 
 use super::*;
 use crate::{
-    routers::grpc::test_engine::mock_engine_on_wire,
-    worker::{
-        connection::engine::{EngineConnection, EngineConnector, ZmqLink},
-        health::circuit_breaker::CircuitState,
-        identity::builder,
-        test_support::{CountingConnector, RefusedAddress},
-        BasicWorkerBuilder, ConnectionMode, RuntimeType, Worker, WorkerError, WorkerRegistry,
-        WorkerType,
+    connection::engine::{EngineConnection, EngineConnector, ZmqLink},
+    health::circuit_breaker::CircuitState,
+    identity::{
+        basic::{ConnectionMode, RuntimeType, Worker, WorkerType},
+        builder,
+        error::WorkerError,
     },
+    model_card::ModelCard,
+    test_support::{BasicWorkerBuilder, CountingConnector, RefusedAddress, WorkerRegistry},
+    worker::{HealthCheckConfig, WorkerStatus},
 };
 
 fn make_worker(url: &str, success_threshold: u32, failure_threshold: u32) -> Arc<dyn Worker> {
@@ -407,7 +361,7 @@ fn labels_follow_the_engine_for_local_self_hosted_workers_only() {
     let zmq_id = registry.register(zmq.clone()).unwrap();
     assert!(labels_follow_the_engine(&registry, &zmq_id, &zmq));
 
-    registry.on_remote_worker_state(&crate::worker::RemoteWorkerState {
+    registry.on_remote_worker_state(&crate::registry::RemoteWorkerState {
         worker_id: "peer-w1".to_string(),
         model_id: "m".to_string(),
         url: "http://remote:1".to_string(),
@@ -849,7 +803,7 @@ async fn manager_loop_promotes_zmq_worker_on_connect_signal() {
 }
 
 fn make_dp_worker(base: &str, rank: usize, size: usize) -> Arc<dyn Worker> {
-    let spec: openai_protocol::worker::WorkerSpec = serde_json::from_value(serde_json::json!({
+    let spec: crate::worker::WorkerSpec = serde_json::from_value(serde_json::json!({
         "url": format!("{base}@{rank}"),
         "dp_base_url": base,
         "dp_rank": rank,
@@ -900,7 +854,7 @@ fn the_probe_slot_follows_the_status_and_the_health_settings() {
 #[tokio::test]
 async fn a_failed_mesh_import_under_removal_keeps_its_probe_slot() {
     let registry = Arc::new(WorkerRegistry::new());
-    registry.on_remote_worker_state(&crate::worker::RemoteWorkerState {
+    registry.on_remote_worker_state(&crate::registry::RemoteWorkerState {
         worker_id: "peer-w1".to_string(),
         model_id: "m".to_string(),
         url: "http://remote:1".to_string(),
@@ -2098,7 +2052,7 @@ fn a_failed_workers_removal_follows_the_scope() {
             .build(),
     );
     let discovered_id = registry.register(discovered).unwrap();
-    registry.on_remote_worker_state(&crate::worker::RemoteWorkerState {
+    registry.on_remote_worker_state(&crate::registry::RemoteWorkerState {
         worker_id: "peer-w1".to_string(),
         model_id: "m".to_string(),
         url: "http://remote:1".to_string(),
@@ -2884,11 +2838,11 @@ fn fleet_loads_tags_ranks_and_aggregates() {
         ("http://w:2".to_string(), load_report(&[(0, 2, 0, 0.5)])),
     ]);
 
-    let body = WorkerManager::fleet_loads(&registry, &snapshot, None);
+    let body = WorkerManager::fleet_loads(&registry, &snapshot, None, "smg-1.2.3");
 
     assert_eq!(body.dp_rank_count, 3);
     assert_eq!(body.loads.len(), 3);
-    assert!(body.version.starts_with("smg-"));
+    assert_eq!(body.version, "smg-1.2.3");
     assert!(!body.timestamp.is_empty());
 
     let tagged: Vec<(&str, &str, i32)> = body
@@ -2933,7 +2887,7 @@ fn fleet_loads_filters_by_model() {
         ("http://b:1".to_string(), load_report(&[(0, 9, 0, 0.9)])),
     ]);
 
-    let body = WorkerManager::fleet_loads(&registry, &snapshot, Some("gpt-4o"));
+    let body = WorkerManager::fleet_loads(&registry, &snapshot, Some("gpt-4o"), "smg-1.2.3");
 
     assert_eq!(body.dp_rank_count, 1);
     assert_eq!(body.loads[0].worker.as_deref(), Some("http://a:1"));
@@ -2953,7 +2907,7 @@ fn fleet_loads_omits_workers_without_a_report() {
         load_report(&[(0, 7, 2, 0.4)]),
     )]);
 
-    let body = WorkerManager::fleet_loads(&registry, &snapshot, None);
+    let body = WorkerManager::fleet_loads(&registry, &snapshot, None, "smg-1.2.3");
 
     assert_eq!(body.dp_rank_count, 1);
     assert_eq!(body.loads[0].worker.as_deref(), Some("http://w:2"));
@@ -2964,7 +2918,7 @@ fn fleet_loads_with_no_polled_workers_has_no_aggregate() {
     let registry = WorkerRegistry::new();
     registry.register(make_worker("http://w:1", 1, 1)).unwrap();
 
-    let body = WorkerManager::fleet_loads(&registry, &LoadSnapshot::default(), None);
+    let body = WorkerManager::fleet_loads(&registry, &LoadSnapshot::default(), None, "smg-1.2.3");
 
     assert_eq!(body.dp_rank_count, 0);
     assert!(body.loads.is_empty());
@@ -2987,7 +2941,7 @@ fn fleet_loads_names_a_worker_by_its_masked_address() {
         (plain.to_string(), load_report(&[(0, 2, 0, 0.5)])),
     ]);
 
-    let body = WorkerManager::fleet_loads(&registry, &snapshot, None);
+    let body = WorkerManager::fleet_loads(&registry, &snapshot, None, "smg-1.2.3");
 
     let answered = serde_json::to_string(&body).expect("the answer as JSON");
     assert!(

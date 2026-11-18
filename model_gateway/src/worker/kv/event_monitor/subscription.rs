@@ -1420,7 +1420,7 @@ mod tests {
             ),
             "a loads-only stream that delivered is the stream working"
         );
-        monitor.flush_pushed();
+        monitor.flush_pushed_for_test();
         let snapshot = monitor.load_snapshot();
         let report = snapshot
             .get(worker.url())

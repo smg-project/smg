@@ -1506,9 +1506,9 @@ fn test_model_index_fast_lookup() {
     assert_eq!(llama_workers_after[0].url(), "http://worker2:8080");
 }
 
-// Health-checker integration tests moved to worker/health/manager.rs along with
+// Health-checker integration tests moved to health/manager.rs along with
 // the loop itself. The registry is now a pure collection — see
-// `worker::health::manager::WorkerManager` tests.
+// `health::manager::WorkerManager` tests.
 
 #[test]
 fn test_transition_status_emits_event_and_changes_status() {

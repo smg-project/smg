@@ -2,7 +2,7 @@
 //! with its data-parallel ranks, the thresholds the gateway holds for every
 //! worker and the ones the worker names for itself, a list of steps and
 //! whether the worker reads as overloaded after each. A step is what the
-//! gateway's load monitor is handed: a poll's answer (a row a rank), a poll
+//! load monitor is handed: a poll's answer (a row a rank), a poll
 //! that brought no report, a load record one rank pushed on its event
 //! stream, or the worker's loads dropped as it leaves the ready set. The
 //! monitor judges a poll's answer by the answer, and a pushed record by the
@@ -12,7 +12,7 @@
 //! policy controller crate replays the rows through its store
 //! (`crates/policy_controller/tests/classic/overload.rs`).
 //!
-//! This file is an ignored test of the gateway crate, kept beside the code
+//! This file is an ignored test of the worker crate, kept beside the code
 //! it runs. It records from the checkout it is built in and writes the sheet
 //! under `CLASSIC_ROWS_OUT`, naming `CLASSIC_ROWS_COMMIT` as the commit it
 //! recorded from. The sheets the policy controller crate replays are in
@@ -20,7 +20,7 @@
 //!
 //! ```text
 //! CLASSIC_ROWS_OUT=<dir> CLASSIC_ROWS_COMMIT=<commit> \
-//!   cargo test -p smg --lib worker::load::monitor::classic_overload_rows -- --ignored --nocapture
+//!   cargo test -p smg-worker --all-features --lib load::monitor::classic_overload_rows -- --ignored --nocapture
 //! ```
 //!
 //! Nothing in a row draws. The recorder runs each row twice, each time from
@@ -28,17 +28,15 @@
 
 use std::{fs, path::PathBuf};
 
-use openai_protocol::{
-    model_card::ModelCard,
-    worker::{HealthCheckConfig, OverloadUpdate, WorkerStatus},
-};
 use serde::Serialize;
-use smg_grpc_client::common_proto::EngineLoad;
 
-use super::*;
-use crate::worker::{
-    health::overload::OverloadThresholds, test_support::LoadReaders, BasicWorkerBuilder,
-    WorkerMonitor, WorkerRegistry, WorkerType,
+use super::{tests::PushedRecord, *};
+use crate::{
+    health::overload::OverloadThresholds,
+    identity::basic::WorkerType,
+    model_card::ModelCard,
+    test_support::{BasicWorkerBuilder, LoadReaders, WorkerMonitor, WorkerRegistry},
+    worker::{HealthCheckConfig, OverloadUpdate, WorkerStatus},
 };
 
 const URL: &str = "http://w0:8000";
@@ -256,17 +254,17 @@ fn run(gateway: Thresholds, own: Thresholds, ranks: usize, steps: &[Step]) -> Ve
                     }
                 }
                 Step::NoReport => monitor.apply_overload_verdict(&worker, None, "poll"),
-                Step::Record { rank, figures } => monitor.apply_pushed_load(
-                    &worker,
-                    i32::try_from(*rank).expect("a rank fits the record's field"),
-                    &EngineLoad {
-                        waiting_requests: figures.waiting,
-                        token_usage: figures.usage,
-                        active_token_usage: figures.active,
-                        ..EngineLoad::default()
-                    },
-                    now,
-                ),
+                Step::Record { rank, figures } => {
+                    let mut record = PushedRecord::requests(0, count(figures.waiting))
+                        .token_usage(figures.usage);
+                    record.snapshot.active_token_usage = figures.active;
+                    monitor.apply_pushed_load(
+                        &worker,
+                        i32::try_from(*rank).expect("a rank fits the record's field"),
+                        &record,
+                        now,
+                    );
+                }
                 Step::Evict => monitor.evict_worker_loads(&worker),
             }
             worker.is_overloaded()
