@@ -2475,19 +2475,16 @@ impl Leases {
         held.record.state = LeaseState::Dispatched { at };
         // A dispatch on another target of the pick: the record names that
         // target's index from here on. Where the target is another worker
-        // the lease books it and the count of the first one is free;
-        // another rank of the lease's own worker moves no count.
+        // the lease books it and the count of the first one is free, the
+        // new count added before the first is taken; another rank of the
+        // lease's own worker moves no count.
         let Some((target, _)) = held.record.target_at(dispatch.target_index) else {
             return true;
         };
         if target != held.record.target {
-            if let Some(booked) = held.booked {
-                self.counts.free(booked);
-            }
+            let first = held.booked;
             held.booked = world.load().booked_of(target);
-            if let Some(booked) = held.booked {
-                self.counts.book(booked);
-            }
+            self.counts.moved(first, held.booked);
             held.record.target = target;
         }
         held.record.lease.target_index = dispatch.target_index;
