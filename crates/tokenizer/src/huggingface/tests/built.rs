@@ -1332,6 +1332,18 @@ fn a_join_that_is_no_plain_join_leaves_the_template_as_it_was() {
             "",
             "{{ ''.join([open ~ close]) }}",
         ),
+        (
+            "by `+`, under a filter",
+            "",
+            "",
+            "{{ (open + close) | length }}",
+        ),
+        (
+            "by `+`, under a comparison",
+            "",
+            "",
+            "{% if (open + close) == messages[0]['content'] %}{{ end }}{% endif %}",
+        ),
     ]);
     assert!(on.is_empty(), "switched on: {on:?}");
 }
@@ -1757,6 +1769,13 @@ fn a_join_of_constants_is_marked() {
             "",
             "{% set whole = '' ~ wrap(message['content']) %}{{ whole }}",
         ),
+        // `+` joins two strings as `~` does.
+        ("", "", "{{ open + message['content'] + close }}"),
+        (
+            "",
+            "{% set whole = open + message['content'] + close %}",
+            "{{ whole + '' }}",
+        ),
     ] {
         let temp = TempDir::new().unwrap();
         let tok = checkpoint(temp.path(), &shaped(at_top, in_loop, user));
@@ -1765,6 +1784,27 @@ fn a_join_of_constants_is_marked() {
         assert!(!from_text);
         assert_eq!(text, "[INST:x]a[/INST:x]b[/INST:x]ab</s:x>");
         assert_eq!(ids, TYPED_AS_TEXT, "{at_top}{in_loop}{user}");
+    }
+}
+
+#[test]
+fn a_join_by_plus_fails_with_the_marks_as_without_them() {
+    // `+` joins two strings and reads no character of either; on a string
+    // and a number it fails. A constant between marks is a string still, so
+    // the marked template refuses the request that the plain one refuses.
+    let adds = "{% if flat %}{{ close + 1 }}{% endif %}";
+    let kwargs = HashMap::from([("flat".to_owned(), json!(true))]);
+    for (spelled_whole, marked) in [("", true), ("{% if flat %}</s:x>{% endif %}", false)] {
+        let temp = TempDir::new().unwrap();
+        let template = shaped("", "", WRITTEN) + adds + spelled_whole;
+        let tok = checkpoint(temp.path(), &template);
+        assert_eq!(tok.chat_template.marked(), marked);
+        let flat = ChatTemplateParams {
+            template_kwargs: Some(&kwargs),
+            ..ChatTemplateParams::default()
+        };
+        let messages = [json!({"role": "user", "content": "ab"})];
+        assert!(tok.apply_chat_template(&messages, flat).is_err());
     }
 }
 

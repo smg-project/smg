@@ -2174,7 +2174,9 @@ type Names<'a> = HashMap<&'a str, Watched>;
 /// ([`ChatTemplateState::control_bindings`]). A carrier may stand in three
 /// places:
 ///
-/// - as a written value, alone or as a whole operand of `~`;
+/// - as a written value, alone or as a whole operand of a join: `~`, or
+///   `+`, which joins two strings and fails on anything else, with the marks
+///   as without them;
 /// - the same way as the value of a plain `set` of one name;
 /// - alone, or under `not`, `and` and `or`, in the condition of an `if`,
 ///   which asks only whether it is empty: the marks stand around a control
@@ -2316,13 +2318,13 @@ fn statements_read_plainly<'a>(
 }
 
 /// Whether `expr`, a written value or the value of a plain `set`, reads
-/// `names` plainly: a carrier alone, as a whole operand of `~`, or called (a
+/// `names` plainly: a carrier alone, as a whole operand of `~` or `+`, or called (a
 /// macro's text) with arguments that read none; a part only in a statement
 /// that `builds`.
 fn joins<'a>(expr: &'a Expr<'a>, names: &Names<'a>, builds: bool) -> bool {
     match expr {
         Expr::Var(var) => builds || names.get(var.id) != Some(&Watched::Part),
-        Expr::BinOp(op) if matches!(op.op, BinOpKind::Concat) => {
+        Expr::BinOp(op) if matches!(op.op, BinOpKind::Concat | BinOpKind::Add) => {
             joins(&op.left, names, builds) && joins(&op.right, names, builds)
         }
         Expr::Call(call) if matches!(&call.expr, Expr::Var(var) if names.get(var.id) == Some(&Watched::Carrier)) =>
