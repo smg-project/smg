@@ -60,6 +60,10 @@ pub trait HealthSink: Send + Sync {
     /// removed) writes nothing; the clear needs no such guard. A gateway
     /// gone past its grace period takes its vetoes with it
     /// ([`LeasesStore::drop_gateways`](super::LeasesStore::drop_gateways)).
+    /// The controller's presence table alone writes a gateway's vetoes,
+    /// through the note it keeps of them: a write that goes around the
+    /// table is not seen by the gateway's ceiling of vetoes until the next
+    /// membership write.
     fn gateway_veto(&self, gateway: GatewayId, id: WorkerId, until: Option<Instant>);
 
     /// [`gateway_veto`](Self::gateway_veto) for a caller that keeps a note
