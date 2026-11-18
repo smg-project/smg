@@ -1963,8 +1963,9 @@ mod tests {
         assert_eq!(loads(&scorer).0.len(), 2, "an older view lists it nowhere");
     }
 
-    /// A decision reads the fence for every row of its view: a fenced row
-    /// the filters dropped joins nowhere when another row of the view joins.
+    /// A decision asks the fence of every row of its view the partition does
+    /// not list, the filters' dropped rows too: a fenced row the filters
+    /// dropped joins nowhere when another row of the view joins.
     #[test]
     fn a_fenced_row_the_filters_dropped_joins_nowhere_beside_a_new_row() {
         let (scorer, pool) = booked(NEVER, 1.5, &[100, 40]);
