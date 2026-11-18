@@ -180,14 +180,33 @@ mod tests {
         assert_eq!(Decider::acting(), None, "no guard is left");
     }
 
+    /// A drop that leaves two guards: the thread acts as the newer of the
+    /// two, whichever of three went.
+    #[test]
+    fn a_drop_that_leaves_two_guards_leaves_the_newer_name() {
+        for gone in 0..3 {
+            let mut guards: Vec<_> = (1..=3)
+                .map(|name| Some(Decider::new(name).enter()))
+                .collect();
+            guards[gone] = None;
+            let newer = if gone == 2 { 2 } else { 3 };
+            assert_eq!(
+                Decider::acting(),
+                Some(Decider::new(newer)),
+                "the guard at {gone} of three went"
+            );
+            drop(guards);
+            assert_eq!(Decider::acting(), None, "no guard is left");
+        }
+    }
+
     /// A guard kept in a field and renewed by assignment: the new guard
     /// enters before the old one drops, and the name holds at each renewal.
     #[test]
     fn a_guard_renewed_by_assignment_keeps_its_name() {
         let mut held = Decider::new(4).enter();
         for _ in 0..3 {
-            // What an assignment does: the new guard enters, the old drops.
-            drop(std::mem::replace(&mut held, Decider::new(4).enter()));
+            held = Decider::new(4).enter();
             assert_eq!(Decider::acting(), Some(Decider::new(4)));
         }
         drop(held);
