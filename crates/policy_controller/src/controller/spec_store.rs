@@ -397,7 +397,10 @@ impl SpecStore {
     }
 
     /// Reads the directory `root`, whose path is `dir`, under `held`, its
-    /// lock file. The names are read through the directory itself.
+    /// lock file. The names are read through the directory itself. A
+    /// temporary name is removed, its write never ended, and one this user
+    /// may not remove is left in place: the refusals of a write that leave
+    /// the lock file to an open to read leave such a name too.
     fn read_under(dir: PathBuf, root: fs::File, held: fs::File) -> Result<Self, StoreRefused> {
         let unreadable = |error: io::Error| StoreRefused::Unreadable(error.to_string());
         let mut kept = Vec::new();
@@ -408,8 +411,16 @@ impl SpecStore {
                 continue;
             };
             if name.starts_with(WRITING) {
-                rustix::fs::unlinkat(&root, name, rustix::fs::AtFlags::empty())
-                    .map_err(|errno| unreadable(errno.into()))?;
+                // A name this user may not remove, by its bits or on a
+                // file system mounted to read alone, is left in place: its
+                // write never ended, and no start reads it.
+                let removed = rustix::fs::unlinkat(&root, name, rustix::fs::AtFlags::empty());
+                match removed.map_err(io::Error::from) {
+                    Err(refused) if !Self::read_serves(&refused) => {
+                        return Err(unreadable(refused));
+                    }
+                    _ => {}
+                }
             } else if let Some(persisted) = named(name) {
                 kept.push(persisted);
             }
@@ -1015,6 +1026,41 @@ pub(crate) mod tests {
         let refused = SpecStore::open_within(dir.path().to_owned(), Duration::ZERO)
             .expect_err("no lock on a pipe");
         assert_eq!(refused, StoreRefused::Unlocked(NOT_A_FILE.to_owned()));
+    }
+
+    /// A write that never ended leaves a temporary name, and a start
+    /// removes it. Where this user may not, by the directory's bits, the
+    /// name is left in place and the start goes on: no start reads it.
+    #[cfg(unix)]
+    #[test]
+    #[expect(
+        clippy::print_stdout,
+        reason = "a run the bits do not hold in reports it on stdout under --nocapture"
+    )]
+    fn a_temporary_name_a_start_may_not_remove_is_left_in_place() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let mut store = SpecStore::open(dir.path().to_owned()).expect("the store");
+        store.persist(at(1, YAML), b"one").expect("a write");
+        drop(store);
+        let left = dir.path().join(format!("{WRITING}left"));
+        fs::write(&left, "half").expect("a write that never ended");
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o555)).expect("its bits");
+        if fs::File::create(dir.path().join("made")).is_ok() {
+            // The bits do not hold for this user (the superuser): the name
+            // is removed, and there is nothing left in place to read here.
+            println!(
+                "a temporary name a start may not remove: this run asserted another lawful \
+                 world: the directory's bits do not hold for this user"
+            );
+            return;
+        }
+        let opened = SpecStore::open_within(dir.path().to_owned(), Duration::ZERO);
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).expect("its bits");
+        let store = opened.expect("the start goes on");
+        assert_eq!(store.kept(), [at(1, YAML)]);
+        assert!(left.is_file(), "the name is left in place");
     }
 
     /// A lock the system does not give refuses the start in the system's
