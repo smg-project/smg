@@ -1301,17 +1301,146 @@ fn draw_flat(
     fills
 }
 
-/// Push the kept positions in descending score order, ties by draw: per slot
-/// the rows within the band of the best remaining score are one tie, drawn
-/// from uniformly with the values of `draw`. One pass keeps the five best
-/// scores (equal scores in scan order); while the next best is below the
-/// band of the best remaining, that row stands alone in its band and is the
-/// slot's pick with no draw spent. From the first band that holds several
-/// rows on, a slot costs the passes of [`draw_in_band`] and one value of the
-/// draw; where that band's rows score alike, its slots are drawn by rank in
-/// one count ([`draw_flat`]). The taken slots
-/// live in a fixed array: nothing is allocated. `DRAWN` is the order of a
-/// draw: the five best are read with no branch on a score ([`top_drawn`]).
+/// Whether the entry at `at` of the five best stands alone in its band: no
+/// entry stands behind it, or the next one lies below its band.
+fn alone(
+    best_five: &[(usize, f32); MAX_TARGETS + 1],
+    len: usize,
+    at: usize,
+    band: TieBand,
+) -> bool {
+    at + 1 >= len || below_band(best_five[at + 1].1, best_five[at].1, band)
+}
+
+/// The rows of a ranked pick, by their places in `scores`, handed to `pick`
+/// in slot order: `slots` of them at most, and `slots` no more than a
+/// target list holds. Per slot the rows within the band of the best
+/// remaining score are one tie, drawn from uniformly with the values of
+/// `draw`: one value a slot while two rows of its band are left, none for a
+/// row alone, the pick counted from the band's last row in scan order
+/// ([`draw_in_band`]).
+///
+/// One pass keeps the five best scores (equal scores in scan order), and a
+/// band that ends among them is read off them: an entry below the band
+/// stands behind its rows, or the five are every row. A row alone in its
+/// band is its slot's pick. A band of several rows that score alike is
+/// drawn slot by slot among its rows left, and once it is spent the entry
+/// behind it is the best score left. So a pool whose bands end among the
+/// five costs that pass and, at its first band of several rows, the read
+/// below: no slot costs a pass of its own.
+///
+/// The five stand for the pool only where no score is a NaN (one ties in
+/// every band, and the pass may have dropped it) and the band is a width of
+/// zero or more (under a band below zero a row lies below its own band): one
+/// read of the scores, made at the first band of several rows. Where that
+/// fails, where a band reaches the fifth entry (rows behind the five may
+/// stand in it) and where a band's rows differ within it, the slots left
+/// are read over the pool: a flat band is counted once and drawn by rank
+/// ([`draw_flat`]), and each slot it leaves costs the passes of
+/// [`draw_in_band`].
+///
+/// `DRAWN` is the order of a draw: the five best are read with no branch on
+/// a score ([`top_drawn`]). Inlined into the ranked push's two bodies, where
+/// `pick` pushes a row's target: the rows drawn live in a fixed array and
+/// nothing is allocated.
+#[inline(always)]
+fn draw_ranked<const DRAWN: bool>(
+    draw: &mut Draw,
+    scores: &[f32],
+    band: TieBand,
+    slots: usize,
+    mut pick: impl FnMut(usize),
+) {
+    let mut best_five = [(usize::MAX, f32::NEG_INFINITY); MAX_TARGETS + 1];
+    let len = if DRAWN {
+        top_drawn(scores, &mut best_five)
+    } else {
+        top_pass(scores, &mut best_five)
+    };
+    let mut taken = [usize::MAX; MAX_TARGETS];
+    let mut filled = 0usize;
+    while filled < slots && alone(&best_five, len, filled, band) {
+        let (row, _) = best_five[filled];
+        taken[filled] = row;
+        pick(row);
+        filled += 1;
+    }
+    // Whether the five stand for the pool: unread until a band asks.
+    let mut sound = false;
+    // Several rows share the band of the best score left, the next entry
+    // among them.
+    while filled < slots {
+        let top = best_five[filled].1;
+        // Rows behind the five may stand in a band that reaches the fifth
+        // entry.
+        if len > MAX_TARGETS && !below_band(best_five[MAX_TARGETS].1, top, band) {
+            break;
+        }
+        let mut end = filled + 2;
+        while end < len && !below_band(best_five[end].1, top, band) {
+            end += 1;
+        }
+        // A row that differs within the band moves the band as it is taken.
+        if best_five[filled + 1..end]
+            .iter()
+            .any(|&(_, score)| score != top)
+        {
+            break;
+        }
+        if !sound {
+            sound = band.0 >= 0.0 && !scores.iter().fold(false, |nan, s| nan | s.is_nan());
+            if !sound {
+                break;
+            }
+        }
+        // The band's rows left, in scan order: a slot's draw counts from
+        // the last of them.
+        let mut rows = [usize::MAX; MAX_TARGETS];
+        for (row, &(i, _)) in rows.iter_mut().zip(&best_five[filled..end]) {
+            *row = i;
+        }
+        let mut left = end - filled;
+        while left > 0 && filled < slots {
+            let back = if left > 1 { draw.below(left) } else { 0 };
+            let at = left - 1 - back;
+            taken[filled] = rows[at];
+            pick(rows[at]);
+            // The rows behind it close the gap.
+            for gap in at..MAX_TARGETS - 1 {
+                rows[gap] = rows[gap + 1];
+            }
+            filled += 1;
+            left -= 1;
+        }
+        // The rows alone behind the band.
+        while filled < slots && alone(&best_five, len, filled, band) {
+            let (row, _) = best_five[filled];
+            taken[filled] = row;
+            pick(row);
+            filled += 1;
+        }
+    }
+    if filled < slots {
+        let top = best_five[filled].1;
+        let fills = draw_flat(draw, scores, top, band, &mut taken[filled..slots]);
+        for &row in &taken[filled..filled + fills] {
+            pick(row);
+        }
+        filled += fills;
+    }
+    for slot in filled..slots {
+        let open = |i: usize| !taken[..slot].contains(&i);
+        let Some(row) = draw_in_band(scores, band, draw, open) else {
+            break;
+        };
+        taken[slot] = row;
+        pick(row);
+    }
+}
+
+/// Push the kept positions in descending score order, ties by draw
+/// ([`draw_ranked`]). The rows drawn live in a fixed array: nothing is
+/// allocated.
 fn push_ranked<const DRAWN: bool>(
     mut draw: Draw,
     candidates: &[Candidate],
@@ -1321,40 +1450,9 @@ fn push_ranked<const DRAWN: bool>(
     out: &mut Targets,
 ) {
     let slots = MAX_TARGETS.min(kept.len());
-    let mut best_five = [(usize::MAX, f32::NEG_INFINITY); MAX_TARGETS + 1];
-    let len = if DRAWN {
-        top_drawn(scores, &mut best_five)
-    } else {
-        top_pass(scores, &mut best_five)
-    };
-    let mut taken = [usize::MAX; MAX_TARGETS];
-    let mut filled = 0usize;
-    while filled < slots
-        && (filled + 1 >= len || below_band(best_five[filled + 1].1, best_five[filled].1, band))
-    {
-        let (i, _) = best_five[filled];
-        taken[filled] = i;
-        out.push(target_of(&candidates[kept[i] as usize]));
-        filled += 1;
-    }
-    if filled < slots {
-        let mut picks = [usize::MAX; MAX_TARGETS];
-        let top = best_five[filled].1;
-        let fills = draw_flat(&mut draw, scores, top, band, &mut picks[..slots - filled]);
-        for &i in &picks[..fills] {
-            taken[filled] = i;
-            out.push(target_of(&candidates[kept[i] as usize]));
-            filled += 1;
-        }
-    }
-    for slot in filled..slots {
-        let left = |i: usize| !taken[..slot].contains(&i);
-        let Some(b) = draw_in_band(scores, band, &mut draw, left) else {
-            break;
-        };
-        taken[slot] = b;
-        out.push(target_of(&candidates[kept[b] as usize]));
-    }
+    draw_ranked::<DRAWN>(&mut draw, scores, band, slots, |row| {
+        out.push(target_of(&candidates[kept[row] as usize]));
+    });
 }
 
 /// The target that names `c`, on no pair.
@@ -3609,6 +3707,123 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// A band that ends among the five best is read off them, and the rows
+    /// and the draws are the ones the passes over the pool give. The pick
+    /// kept in this case reads by passes: single bands off the five, one
+    /// flat band by its count, then each slot left by passes of its own.
+    /// The pools tie whole, differ row by row or tie in bands of every
+    /// length around the five, some with rows that differ inside a band and
+    /// some with values no score should be; the bands are narrow, none,
+    /// wide, below zero and no number; the slots are the list's room or
+    /// fewer; the five are read by a pass and behind a draw.
+    #[test]
+    fn a_band_that_ends_among_the_five_best_is_drawn_as_the_passes_over_the_pool_draw_it() {
+        fn by_passes<const DRAWN: bool>(
+            draw: &mut Draw,
+            scores: &[f32],
+            band: TieBand,
+            slots: usize,
+        ) -> Vec<usize> {
+            let mut picked = Vec::new();
+            let mut best_five = [(usize::MAX, f32::NEG_INFINITY); MAX_TARGETS + 1];
+            let len = if DRAWN {
+                top_drawn(scores, &mut best_five)
+            } else {
+                top_pass(scores, &mut best_five)
+            };
+            let mut taken = [usize::MAX; MAX_TARGETS];
+            let mut filled = 0usize;
+            while filled < slots
+                && (filled + 1 >= len
+                    || below_band(best_five[filled + 1].1, best_five[filled].1, band))
+            {
+                let (i, _) = best_five[filled];
+                taken[filled] = i;
+                picked.push(i);
+                filled += 1;
+            }
+            if filled < slots {
+                let mut picks = [usize::MAX; MAX_TARGETS];
+                let top = best_five[filled].1;
+                let fills = draw_flat(draw, scores, top, band, &mut picks[..slots - filled]);
+                for &i in &picks[..fills] {
+                    taken[filled] = i;
+                    picked.push(i);
+                    filled += 1;
+                }
+            }
+            for slot in filled..slots {
+                let left = |i: usize| !taken[..slot].contains(&i);
+                let Some(b) = draw_in_band(scores, band, draw, left) else {
+                    break;
+                };
+                taken[slot] = b;
+                picked.push(b);
+            }
+            picked
+        }
+        // Both readings from one seed: the rows, and where the stream
+        // stands behind them.
+        fn held<const DRAWN: bool>(
+            case: u32,
+            scores: &[f32],
+            band: TieBand,
+            slots: usize,
+            seed: u64,
+        ) {
+            let (mut read, mut passed) = (Draw::new(seed), Draw::new(seed));
+            let mut rows = Vec::new();
+            draw_ranked::<DRAWN>(&mut read, scores, band, slots, |row| rows.push(row));
+            let by = by_passes::<DRAWN>(&mut passed, scores, band, slots);
+            assert_eq!(
+                (rows, read.state()),
+                (by, passed.state()),
+                "case {case}: {slots} of {scores:?} under {band:?}, seed {seed}, drawn {DRAWN}"
+            );
+        }
+        // Under the last of the two bands below zero a score of one lies in
+        // its own band and a lower score lies under its own.
+        let bands = [1e-6, 0.0, 0.2, -0.2, -3e-8, f32::NAN, f32::INFINITY];
+        let odd = [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -0.0];
+        let mut pools = Draw::new(0x5eed);
+        for case in 0..60_000u32 {
+            let rows = pools.below(40);
+            // The levels the rows fall on: one ties the pool whole, and
+            // sixty-four leave few rows a level.
+            let levels = 1usize << pools.below(7);
+            let apart = pools.below(8) == 0;
+            let (near, wild) = (pools.below(4) == 0, pools.below(4) == 0);
+            let scores: Vec<f32> = (0..rows)
+                .map(|row| {
+                    let level = if apart {
+                        (row * 37 + case as usize) % 64
+                    } else {
+                        pools.below(levels) * (64 / levels)
+                    };
+                    let score = 1.0 - level as f32 / 64.0;
+                    if wild && pools.below(8) == 0 {
+                        odd[pools.below(odd.len())]
+                    } else if near && pools.below(4) == 0 {
+                        score - 4e-7
+                    } else {
+                        score
+                    }
+                })
+                .collect();
+            let band = TieBand(bands[pools.below(bands.len())]);
+            // The list's room, and now and then less of it.
+            let room = MAX_TARGETS.min(rows);
+            let slots = if pools.below(4) == 0 {
+                pools.below(room + 1)
+            } else {
+                room
+            };
+            let seed = pools.next_u64();
+            held::<false>(case, &scores, band, slots, seed);
+            held::<true>(case, &scores, band, slots, seed);
         }
     }
 
