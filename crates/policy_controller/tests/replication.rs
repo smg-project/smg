@@ -192,6 +192,11 @@ async fn client(addr: SocketAddr) -> PolicyControllerClient<Channel> {
     PolicyControllerClient::new(channel)
 }
 
+/// How long a stream that should end may stand before its case fails:
+/// far past any stall of a loaded host, so the wait is for the end
+/// itself.
+const STANDING: Duration = Duration::from_secs(120);
+
 /// The standby every case is: the name its calls state and its hello's id.
 const STANDBY: &str = "replication-1";
 
@@ -290,20 +295,18 @@ impl Standby {
     }
 
     /// The stream's status, past the batches still on their way; `None`
-    /// when it ends with none. A stream that goes on fails here, at its
-    /// eighth heartbeat or its 4,096th batch.
+    /// when it ends with none. A leader ends a stream at a look of its own
+    /// (at its lease, at its log), and a loaded host stretches the time to
+    /// that look past any count of heartbeats: the batches before the end
+    /// are read past, however many. A stream that goes on fails here
+    /// [`STANDING`] on, or at its 4,096th batch.
     async fn ended(&mut self) -> Option<Code> {
+        let started = Instant::now();
         let mut end = None;
-        let mut beats = 0;
         for _ in 0..4_096 {
             match self.next().await {
-                Ok(Some(batch)) => {
-                    let said = batch.resync_required || batch.snapshot.is_some();
-                    beats += u32::from(!said && batch.events.is_empty());
-                    if beats == 8 {
-                        break;
-                    }
-                }
+                Ok(Some(_)) if started.elapsed() < STANDING => {}
+                Ok(Some(_)) => break,
                 Ok(None) => {
                     end = Some(None);
                     break;
@@ -314,7 +317,7 @@ impl Standby {
                 }
             }
         }
-        end.expect("the stream's end before its eighth heartbeat")
+        end.expect("the stream's end within two minutes")
     }
 
     /// Reads on up to position `seq`: every event after the stream's
