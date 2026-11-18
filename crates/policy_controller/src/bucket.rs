@@ -31,13 +31,14 @@
 //! a changed listing splits [`SPAN`] evenly among all of it until the next
 //! cut. The lifecycle prunes: a removed worker's range goes to the range
 //! below it, and a replaced handle keeps its predecessor's place. A handle
-//! a view listed before the word of its replacement keeps its own place,
-//! and its predecessor's leaves as a removed worker's does. A pruned worker
-//! is fenced for a while ([`FENCE`](crate::ring::FENCE)): a view captured
-//! before its leave still shows it, and a decision over such a view lists
-//! it nowhere, seats it nowhere and places the others. The feed naming the
-//! worker again lifts the fence at once. All of it is soft state, which a
-//! new process learns again within one window, and so does a newly applied
+//! a view listed before the word of its replacement keeps its own place
+//! and takes its predecessor's load and bookings, and the predecessor's
+//! place leaves as a removed worker's does. A pruned worker is fenced for
+//! a while ([`FENCE`](crate::ring::FENCE)): a view captured before its
+//! leave still shows it, and a decision over such a view lists it nowhere,
+//! seats it nowhere and places the others. The feed naming the worker
+//! again lifts the fence at once. All of it is soft state, which a new
+//! process learns again within one window, and so does a newly applied
 //! document, whose generation builds its own scorer.
 //!
 //! A model's partition stands behind its own guard. A decision finds its
@@ -453,13 +454,14 @@ impl Pool {
 
     /// Move the window's bookings of `from`'s member, and their tokens,
     /// onto `to`'s: one worker's load, under the handle that stays. Each
-    /// booking then ages off that handle.
+    /// booking then ages off that handle. `from`'s member keeps its count
+    /// of the load: the caller removes the member next, and the count with
+    /// it.
     fn rebook(&mut self, from: WorkerId, to: WorkerId) {
         let (Some(&from), Some(&to)) = (self.by_id.get(&from), self.by_id.get(&to)) else {
             return;
         };
         let load = self.members[from as usize].load;
-        self.members[from as usize].load = 0;
         let stays = &mut self.members[to as usize];
         stays.load = stays.load.saturating_add(load);
         for booking in &mut self.window {
