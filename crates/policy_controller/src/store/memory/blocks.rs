@@ -34,9 +34,12 @@
 //! file nothing can tell, and the door that files a lease holds the law
 //! once the files are several.
 
-use std::sync::{
-    atomic::{AtomicU64, AtomicU8, Ordering},
-    Arc,
+use std::{
+    cmp,
+    sync::{
+        atomic::{AtomicU64, AtomicU8, Ordering},
+        Arc,
+    },
 };
 
 use arc_swap::ArcSwap;
@@ -215,6 +218,31 @@ impl Blocks {
         let table = kept.iter().find(|table| table.term == term);
         let named = table.and_then(|table| table.files.get(usize::from(block)));
         Self::among(named.copied().unwrap_or(block), files)
+    }
+
+    /// Whether the file `lease` names among `files` of them is settled:
+    /// the one it names for as long as a lease can be on file under it. An
+    /// id of the leading term is settled from a block a file claimed, and
+    /// an id of a term below it wherever it reads its file: no claim and
+    /// no rise writes either anew while its lease is on file. An id of the
+    /// leading term from a block no file claimed is not, since the block's
+    /// claim names its file anew, and neither is an id of a term that can
+    /// still lead. No block is claimed under a term past 31 bits, and with
+    /// one file every id names it: both are settled. Asked under the turn
+    /// of the file the id names, which no rise passes.
+    pub(super) fn settled(&self, lease: LeaseId, files: usize) -> bool {
+        let term = Self::term_of(lease);
+        if files <= 1 || term >= 1 << 31 {
+            return true;
+        }
+        let word = self.claimed.load(Ordering::Acquire);
+        match term.cmp(&(word >> u32::BITS)) {
+            cmp::Ordering::Less => true,
+            // The blocks claimed under the leading term: the word below
+            // the kept bit.
+            cmp::Ordering::Equal => u64::from(Self::block_of(lease)) < word & (KEPT - 1),
+            cmp::Ordering::Greater => false,
+        }
     }
 
     /// The terms whose tables are kept, the newest first.
@@ -486,6 +514,35 @@ mod tests {
         for lease in [led, own, id(9, 1)] {
             assert_eq!(blocks.file_of(lease, 1), 0, "{lease:?}");
         }
+    }
+
+    /// An id's file is settled where no claim and no rise can name it
+    /// anew: an id of the leading term from a claimed block, an id of a
+    /// term below it, a gateway's own id. An id of the leading term from
+    /// a block no file claimed is not, and neither is one of a term that
+    /// can still lead. With one file every id is settled.
+    #[test]
+    fn an_ids_file_is_settled_from_a_claimed_block_or_under_a_term_that_led() {
+        let blocks = Blocks::default();
+        blocks.rise(9, std::iter::empty());
+        let mut file = Minted::default();
+        assert_eq!(file.mint(&blocks, 9, 3), Some(1));
+        let own = LeaseId(1 << 63 | u64::from(6 * BLOCK));
+        for settled in [id(9, 1), id(9, BLOCK - 1), id(3, 5 * BLOCK), own] {
+            assert!(blocks.settled(settled, 4), "{settled:?}");
+        }
+        for open in [id(9, BLOCK), id(9, 5 * BLOCK + 17), id(10, 1)] {
+            assert!(!blocks.settled(open, 4), "{open:?}");
+            assert!(blocks.settled(open, 1), "one file: {open:?}");
+        }
+        // The claim of the second block settles its ids, and a rise leaves
+        // the term below the leading one.
+        let mut other = Minted::default();
+        assert_eq!(other.mint(&blocks, 9, 2), Some(BLOCK));
+        assert!(blocks.settled(id(9, BLOCK), 4));
+        blocks.rise(10, std::iter::empty());
+        assert!(blocks.settled(id(9, 5 * BLOCK + 17), 4));
+        assert!(!blocks.settled(id(10, 1), 4));
     }
 
     /// A claim is one atomic step of the block count: two files that claim

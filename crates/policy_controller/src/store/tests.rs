@@ -3477,3 +3477,49 @@ fn a_streak_of_lifecycle_faults_says_its_first_alone() {
     assert!(store.call_faulted());
     assert_eq!(store.lifecycle_faults(), 3);
 }
+
+/// An id names its file for as long as its lease can be on file, so the
+/// doors that take an id from their caller file none whose file a later
+/// claim would name anew: an id of the store's term from a block no
+/// decider claimed, or of a term the store can still take. An id of a
+/// term before is filed by its block, and one of a claimed block in the
+/// file that claimed it. A store of one file takes every id, as it did.
+#[test]
+fn a_door_files_no_id_whose_file_a_claim_would_name_anew() {
+    let (gateway, now) = (GatewayId(1), Instant::now());
+    let by_hand = |term: u64, counter: u64| lease(gateway, term << 32 | counter, term.min(3), now);
+    let store = MemoryStore::new().with_deciders(2);
+    let a = ready(&store, "http://a:1");
+    LeasesStore::set_term(&store, 3);
+    let doors: &dyn LeasesStore = &store;
+    // No decider minted under term 3 yet: its first block is no file's.
+    assert_eq!(doors.issue(by_hand(3, 9)), Err(LeaseRefused::Unclaimed));
+    assert_eq!(doors.issue(by_hand(4, 9)), Err(LeaseRefused::Unclaimed));
+    assert_eq!(doors.restore(gateway, &[by_hand(3, 9), by_hand(4, 9)]), 0);
+    // An id of a term before names its file by its block: for good.
+    assert_eq!(doors.issue(by_hand(2, 9)), Ok(()));
+    assert!(doors.get(gateway, LeaseId(2 << 32 | 9)).is_some());
+    // The second decider claims the first block of term 3: an id of that
+    // block names its file, and the doors file it there.
+    let minted = {
+        let _acting = Decider::new(1).enter();
+        let record = LeaseRecord {
+            target: a,
+            ..lease(gateway, 0, 3, now)
+        };
+        let issued = store.issue_decided(record, store.world().booked_of(a), |_| ());
+        issued.expect("minted under the store's term").id
+    };
+    assert_eq!(minted, LeaseId(3 << 32 | 1));
+    assert_eq!(doors.issue(by_hand(3, 9)), Ok(()));
+    assert_eq!(doors.restore(gateway, &[by_hand(3, 9), by_hand(2, 9)]), 2);
+    let hand = Hand::new(gateway);
+    store.hand(&hand, LeaseId(3 << 32 | 9), GONE);
+    assert_eq!(doors.get(gateway, LeaseId(3 << 32 | 9)), None);
+    assert_eq!(doors.live(gateway), 1);
+    // One file: every id names it.
+    let one = MemoryStore::new();
+    LeasesStore::set_term(&one, 3);
+    assert_eq!(LeasesStore::issue(&one, by_hand(3, 9)), Ok(()));
+    assert_eq!(LeasesStore::restore(&one, gateway, &[by_hand(4, 9)]), 1);
+}

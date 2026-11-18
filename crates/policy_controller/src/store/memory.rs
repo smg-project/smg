@@ -2753,12 +2753,25 @@ impl LeasesStore for MemoryStore {
         // lists it: read before the turn is taken.
         let world = self.world.load();
         let booked = world.booked_of(record.target);
-        let mut leases = self.turn_of(self.file_of(record.lease.id));
+        // The file the id names, read again under that file's turn: a rise
+        // of the term holds every turn, so the name stands while this one
+        // is held.
+        let id = record.lease.id;
+        let mut leases = loop {
+            let at = self.file_of(id);
+            let leases = self.turn_of(at);
+            if self.file_of(id) == at {
+                break leases;
+            }
+        };
         if record.term > leases.term {
             return Err(LeaseRefused::TermAhead {
                 lease: record.term,
                 store: leases.term,
             });
+        }
+        if !self.blocks.settled(id, self.files.len()) {
+            return Err(LeaseRefused::Unclaimed);
         }
         let key = (record.gateway, record.lease.id);
         if leases.records.contains_key(&key) {
@@ -2835,7 +2848,9 @@ impl LeasesStore for MemoryStore {
         let world = self.world.load();
         // Each file's turn in the files' order, one at a time: the
         // gateway's leases there go, and the records its ids name are
-        // filed.
+        // filed. A record whose id names no file for good is filed in
+        // none ([`LeaseRefused::Unclaimed`]).
+        let files = self.files.len();
         let mut held = 0;
         for at in 0..self.files.len() {
             let mut leases = self.turn_of(at);
@@ -2844,7 +2859,8 @@ impl LeasesStore for MemoryStore {
                 leases.end(&key);
             }
             for record in records {
-                let here = self.file_of(record.lease.id) == at;
+                let id = record.lease.id;
+                let here = self.file_of(id) == at && self.blocks.settled(id, files);
                 if record.gateway != gateway || record.term > term || !here {
                     continue;
                 }
