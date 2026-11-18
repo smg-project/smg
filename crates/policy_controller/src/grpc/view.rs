@@ -125,8 +125,9 @@ fn load(row: &LoadRow) -> proto::LoadRow {
 
 /// One candidate as the frame carries it: the row, and the affinity facts the
 /// host holds for it beside the row (`held`), which the record carries as
-/// five of its own fields.
-fn candidate(c: &Candidate, held: AffinityFacts) -> proto::Candidate {
+/// five of its own fields. Its requests in flight are what the request's
+/// facts read for it (`in_flight`).
+fn candidate(c: &Candidate, held: AffinityFacts, in_flight: u32) -> proto::Candidate {
     proto::Candidate {
         id: c.id.0,
         role: role(c.role),
@@ -136,7 +137,7 @@ fn candidate(c: &Candidate, held: AffinityFacts) -> proto::Candidate {
         wire_modes: wire_bits(c.wire_modes),
         engine_kind: u32::from(c.engine_kind),
         connector: u32::from(c.connector),
-        in_flight: c.in_flight,
+        in_flight,
         load: c.load.as_ref().map(load),
         overlap_blocks: held.overlap_blocks,
         predicted_blocks: held.predicted_blocks,
@@ -287,7 +288,7 @@ pub(crate) fn decide(
         // index: the same index reads the row and its entry.
         candidates: (0u32..)
             .zip(candidates)
-            .map(|(index, c)| candidate(c, facts.affinity_at(index)))
+            .map(|(index, c)| candidate(c, facts.affinity_at(index), facts.in_flight(c)))
             .collect(),
         pool: Some(pool(pool_facts)),
         stages: 0,
@@ -923,7 +924,6 @@ mod tests {
             ring: true,
             headers: true,
             media: true,
-            in_flight: true,
             active_sessions: true,
             session_in_flight: true,
             affinity: true,
@@ -948,6 +948,40 @@ mod tests {
     /// The view's trace is the contract's pair. A counted trace leaves with
     /// its count and no word of a draw; a drawn one leaves with the count
     /// unset, which is no zero, and `drew_first` set.
+    /// The frame carries each candidate's requests in flight as the
+    /// request's facts read them: the lent count where the host lends a
+    /// table, the rows themselves reading zero.
+    #[test]
+    fn the_frame_gives_a_row_the_count_its_request_reads() {
+        use crate::{
+            counts::tests::Lent,
+            plugins::config::Exposure,
+            spec::Needs,
+            view::{Candidate, PoolFacts, RequestFacts},
+        };
+
+        let mut rows: Vec<Candidate> = (0..)
+            .zip([4, 0, 9])
+            .map(|(position, in_flight)| Candidate {
+                position,
+                in_flight,
+                ..Candidate::default()
+            })
+            .collect();
+        let lent = Lent::take(&mut rows);
+        let facts = lent.beside(&RequestFacts::default());
+        let frame = super::decide(
+            1,
+            &facts,
+            &rows,
+            &PoolFacts::default(),
+            &Exposure::default(),
+            Needs::default(),
+        );
+        let read: Vec<u32> = frame.candidates.iter().map(|c| c.in_flight).collect();
+        assert_eq!(read, [4, 0, 9]);
+    }
+
     #[test]
     fn the_views_trace_says_its_count_or_that_the_decision_drew() {
         use crate::decision::{Survivors, Trace};

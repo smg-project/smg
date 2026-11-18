@@ -158,8 +158,9 @@ pub(crate) fn load(row: &LoadRow) -> wit::Load {
 
 /// One candidate as the record form carries it: the row, and the affinity
 /// facts the host holds for it beside the row (`held`), which the record
-/// keeps as fields of its own.
-pub(crate) fn candidate(c: &Candidate, held: AffinityFacts) -> wit::Candidate {
+/// keeps as fields of its own. Its requests in flight are what the
+/// request's facts read for it (`in_flight`).
+pub(crate) fn candidate(c: &Candidate, held: AffinityFacts, in_flight: u32) -> wit::Candidate {
     wit::Candidate {
         id: c.id.0,
         role: role(c.role),
@@ -169,7 +170,7 @@ pub(crate) fn candidate(c: &Candidate, held: AffinityFacts) -> wit::Candidate {
         wire_modes: wire_modes(c.wire_modes),
         engine_kind: c.engine_kind,
         connector: c.connector,
-        in_flight: c.in_flight,
+        in_flight,
         load: c.load.as_ref().map(load),
         overlap_blocks: held.overlap_blocks,
         predicted_blocks: held.predicted_blocks,
@@ -308,7 +309,7 @@ impl Records {
         self.candidates.extend(
             (0u32..)
                 .zip(candidates)
-                .map(|(index, c)| candidate(c, facts.affinity_at(index))),
+                .map(|(index, c)| candidate(c, facts.affinity_at(index), facts.in_flight(c))),
         );
         self.zones.clear();
         self.zones.extend(pool.zones.iter().map(zone));
@@ -768,29 +769,30 @@ impl Packed {
             feed if feed.is_empty() => {
                 let nothing = AffinityFacts::default();
                 for (c, row) in candidates.iter().zip(rows) {
-                    Self::fill_row(row, c, nothing);
+                    Self::fill_row(row, c, nothing, facts.in_flight(c));
                 }
             }
             Feed::Column(column) => {
                 let column = &column[..candidates.len()];
                 for ((c, held), row) in candidates.iter().zip(column).zip(rows) {
-                    Self::fill_row(row, c, *held);
+                    Self::fill_row(row, c, *held, facts.in_flight(c));
                 }
             }
             Feed::Named(named) => {
                 let mut walk = named.walk();
                 for ((index, c), row) in (0u32..).zip(candidates).zip(rows) {
-                    Self::fill_row(row, c, walk.entry(index));
+                    Self::fill_row(row, c, walk.entry(index), facts.in_flight(c));
                 }
             }
         }
     }
 
-    /// One candidate's row of the table, its affinity facts in it.
-    fn fill_row(row: &mut [u8; layout::ROW], c: &Candidate, held: AffinityFacts) {
+    /// One candidate's row of the table, its affinity facts and the
+    /// requests in flight the request's facts read for it in the row.
+    fn fill_row(row: &mut [u8; layout::ROW], c: &Candidate, held: AffinityFacts, in_flight: u32) {
         use layout::*;
         put(row, ROW_ID, &c.id.0.to_le_bytes());
-        put(row, ROW_IN_FLIGHT, &c.in_flight.to_le_bytes());
+        put(row, ROW_IN_FLIGHT, &in_flight.to_le_bytes());
         let load = c.load.unwrap_or_default();
         put(row, ROW_RUNNING, &load.running.to_le_bytes());
         put(row, ROW_QUEUED, &load.queued.to_le_bytes());
@@ -1085,7 +1087,7 @@ mod tests {
     #[test]
     fn the_record_row_carries_every_field_and_the_flags_by_name() {
         let c = candidate_row();
-        let r = candidate(&c, candidate_held());
+        let r = candidate(&c, candidate_held(), c.in_flight);
         assert_eq!(r.id, c.id.0);
         assert_eq!(r.role, wit::Role::Decode);
         assert!(r
@@ -1180,6 +1182,35 @@ mod tests {
             .map(|row| le_u32(row, ROW_OVERLAP))
             .collect();
         assert_eq!(packed, vec![0, 17, 0]);
+    }
+
+    /// Both fills carry each candidate's requests in flight as the
+    /// request's facts read them: the lent count where the host lends a
+    /// table, the rows themselves reading zero.
+    #[test]
+    fn both_fills_give_a_row_the_count_its_request_reads() {
+        use crate::counts::tests::Lent;
+        let mut rows = [Candidate::default(), candidate_row(), Candidate::default()];
+        for (row, position) in rows.iter_mut().zip(0..) {
+            row.position = position;
+        }
+        rows[2].in_flight = 3;
+        let lent = Lent::take(&mut rows);
+        let facts = lent.beside(&RequestFacts::default());
+        let mut records = Records::default();
+        records.fill(&facts, &rows, &PoolFacts::default());
+        let record: Vec<u32> = records.candidates.iter().map(|r| r.in_flight).collect();
+        assert_eq!(record, vec![0, 7, 3]);
+        let mut packed = Packed::default();
+        packed.fill_candidates(&facts, &rows);
+        let packed: Vec<u32> = packed
+            .candidates
+            .as_chunks::<ROW>()
+            .0
+            .iter()
+            .map(|row| le_u32(row, ROW_IN_FLIGHT))
+            .collect();
+        assert_eq!(packed, vec![0, 7, 3]);
     }
 
     #[test]
@@ -1425,6 +1456,7 @@ mod tests {
             block_size: 16,
             now_micros: 0,
             pinned_at: 0,
+            lent_in_flight: None,
             // Host-only: the request block carries no affinity column and
             // no rows named in its place.
             affinity: &[],

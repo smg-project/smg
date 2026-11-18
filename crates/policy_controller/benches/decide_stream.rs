@@ -112,7 +112,7 @@ use smg_policy_controller::{
         Ask, GatewayId, LeaseRecord, LeaseState, LeasesStore, LoadSink, LoadSource, MemoryStore,
         Picked, ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore,
     },
-    AppliedSpec, Constraints, Lease, LeaseId, LoadRow, Phase, PolicySpec, PoolFacts, ReleaseReason,
+    AppliedSpec, Constraints, Lease, LeaseId, LoadRow, PolicySpec, PoolFacts, ReleaseReason,
     RequestFacts, Role, Scratch,
 };
 use tokio::{
@@ -983,12 +983,6 @@ fn in_process(store: &MemoryStore, decisions: u64, commit: bool) -> u64 {
     let mut scratch = Scratch::new();
     let gateway = GatewayId(1);
     let term = store.term();
-    // Whether the row's profile declares the count, as its decider reads
-    // the engine's needs: read once, the preset stands for the whole row.
-    let counted = store.deciding(|world| {
-        let needs = world.spec().engine().needs_for(&name, Phase::Single);
-        needs.in_flight
-    });
     let mut decide = |seed: u64| {
         let ask = Ask {
             gateway,
@@ -997,36 +991,28 @@ fn in_process(store: &MemoryStore, decisions: u64, commit: bool) -> u64 {
             affinity: false,
         };
         let decision = store.deciding(|world| {
+            // The door a decider reads a plain request's pool by: the
+            // publication's own rows, the asking gateway's vetoes and the
+            // leases' counts beside them.
+            let read = world.view(&name, Role::Single, &ask, false, &mut view);
             let facts = RequestFacts {
                 model: &name,
                 seed,
                 budget_micros: BUDGET_MICROS,
                 now_micros: world.micros(ask.now),
+                lent_in_flight: read.and_then(|read| read.in_flight),
                 ..RequestFacts::default()
             };
-            // The doors a decider reads a plain request's pool by. For a
-            // profile that declares a worker's requests in flight: rows
-            // written for the decision, the leases' count over them. For
-            // any other: the publication's own rows, the asking gateway's
-            // vetoes beside them.
-            let none = || PoolFacts {
-                generation: world.spec().generation(),
-                ..PoolFacts::default()
-            };
-            let (pool, candidates, stalled): (PoolFacts<'_>, &[_], &[u32]) = if counted {
-                match world.build(&name, Role::Single, &ask, &mut view) {
-                    Some(built) => {
-                        world.count_in_flight(&built, &ask, &mut view.candidates);
-                        (built.pool_facts(), &view.candidates, &[])
-                    }
-                    None => (none(), &[], &[]),
-                }
-            } else {
-                match world.view(&name, Role::Single, &ask, false, &mut view) {
-                    Some(read) => (read.built.pool_facts(), read.candidates, read.stalled),
-                    None => (none(), &[], &[]),
-                }
-            };
+            let pool = read.map_or_else(
+                || PoolFacts {
+                    generation: world.spec().generation(),
+                    ..PoolFacts::default()
+                },
+                |read| read.built.pool_facts(),
+            );
+            let (candidates, stalled) = read
+                .map(|read| (read.candidates, read.stalled))
+                .unwrap_or_default();
             world.spec().engine().decide(
                 &facts,
                 &pool,

@@ -280,23 +280,16 @@ impl Scorer for LeastRequests {
 
     fn score(
         &self,
-        _: &RequestFacts<'_>,
+        facts: &RequestFacts<'_>,
         candidates: &[Candidate],
         kept: &[u32],
         out: &mut [f32],
     ) -> TieBand {
         for (slot, &i) in out.iter_mut().zip(kept) {
-            *slot = candidates[i as usize].in_flight as f32;
+            *slot = facts.in_flight(&candidates[i as usize]) as f32;
         }
         normalize_costs(out);
         TieBand::NORMALIZED
-    }
-
-    fn needs(&self) -> Needs {
-        Needs {
-            in_flight: true,
-            ..Needs::default()
-        }
     }
 }
 
@@ -838,11 +831,17 @@ impl LeastLoad {
     /// A reporting candidate's dispatch credit as token-work: the since-report
     /// tokens plus the host's in-flight requests no report or credit accounts
     /// for, at the mean prefill. Read under one tally load; no division here.
-    fn credit_work(&self, c: &Candidate, credit_tokens: u64, credit_requests: u64) -> f32 {
+    fn credit_work(
+        &self,
+        c: &Candidate,
+        in_flight: u32,
+        credit_tokens: u64,
+        credit_requests: u64,
+    ) -> f32 {
         let reported = c
             .load
             .map_or(0, |r| u64::from(r.running) + u64::from(r.queued));
-        let unaccounted = u64::from(c.in_flight).saturating_sub(reported + credit_requests);
+        let unaccounted = u64::from(in_flight).saturating_sub(reported + credit_requests);
         unaccounted as f32 * self.mean_prefill_tokens as f32 + credit_tokens as f32
     }
 
@@ -875,15 +874,15 @@ impl LeastLoad {
     /// reports.
     fn unreported_cost(
         &self,
-        c: &Candidate,
+        in_flight: u32,
         nominal: f32,
         fleet_has_loads: bool,
         peer_baseline: f32,
     ) -> f32 {
         if fleet_has_loads {
-            peer_baseline + c.in_flight as f32 * self.mean_prefill_tokens as f32 / nominal
+            peer_baseline + in_flight as f32 * self.mean_prefill_tokens as f32 / nominal
         } else {
-            c.in_flight as f32
+            in_flight as f32
         }
     }
 }
@@ -927,7 +926,7 @@ impl Scorer for LeastLoad {
 
     fn score(
         &self,
-        _: &RequestFacts<'_>,
+        facts: &RequestFacts<'_>,
         candidates: &[Candidate],
         kept: &[u32],
         out: &mut [f32],
@@ -959,7 +958,7 @@ impl Scorer for LeastLoad {
                                 since.credit_through(c.load_sampled_at_micros)
                             });
                         reporting += 1;
-                        self.credit_work(c, tokens, requests)
+                        self.credit_work(c, facts.in_flight(c), tokens, requests)
                     }
                     None => PENDING,
                 };
@@ -985,7 +984,7 @@ impl Scorer for LeastLoad {
         for (slot, &i) in out.iter_mut().zip(kept) {
             if *slot == PENDING {
                 *slot = self.unreported_cost(
-                    &candidates[i as usize],
+                    facts.in_flight(&candidates[i as usize]),
                     nominal,
                     fleet_has_loads,
                     peer_baseline,
@@ -1034,7 +1033,6 @@ impl Scorer for LeastLoad {
 
     fn needs(&self) -> Needs {
         Needs {
-            in_flight: true,
             loads: true,
             ..Needs::default()
         }
@@ -1077,13 +1075,13 @@ impl ResidentWork {
     /// with its since-report credit.
     fn reported_cost(
         &self,
-        c: &Candidate,
+        in_flight: u32,
         r: LoadRow,
         credit_tokens: u64,
         credit_requests: u64,
     ) -> f32 {
         let reported = u64::from(r.running) + u64::from(r.queued);
-        let unaccounted = u64::from(c.in_flight).saturating_sub(reported + credit_requests);
+        let unaccounted = u64::from(in_flight).saturating_sub(reported + credit_requests);
         let resident = r.resident_tokens as f32;
         let mean_context = if reported > 0 {
             resident / reported as f32
@@ -1122,7 +1120,7 @@ impl Scorer for ResidentWork {
 
     fn score(
         &self,
-        _: &RequestFacts<'_>,
+        facts: &RequestFacts<'_>,
         candidates: &[Candidate],
         kept: &[u32],
         out: &mut [f32],
@@ -1147,7 +1145,7 @@ impl Scorer for ResidentWork {
                 *slot = match reported {
                     Some((r, (tokens, requests))) if r.resident_counted => {
                         reporting += 1;
-                        self.reported_cost(c, r, tokens, requests)
+                        self.reported_cost(facts.in_flight(c), r, tokens, requests)
                     }
                     _ => PENDING,
                 };
@@ -1165,7 +1163,7 @@ impl Scorer for ResidentWork {
         let in_flight_work = self.mean_prefill_tokens as f32 + self.request_tokens as f32;
         for (slot, &i) in out.iter_mut().zip(kept) {
             if *slot == PENDING {
-                let in_flight = candidates[i as usize].in_flight as f32;
+                let in_flight = facts.in_flight(&candidates[i as usize]) as f32;
                 *slot = if fleet_reports {
                     peer_baseline + in_flight * in_flight_work
                 } else {
@@ -1185,7 +1183,6 @@ impl Scorer for ResidentWork {
 
     fn needs(&self) -> Needs {
         Needs {
-            in_flight: true,
             loads: true,
             ..Needs::default()
         }
@@ -2048,7 +2045,7 @@ impl Picker for CountFirst {
         candidates: &[Candidate],
         kept: &mut [u32],
     ) -> Narrowed {
-        let count = |row: u32| candidates[row as usize].in_flight;
+        let count = |row: u32| facts.in_flight(&candidates[row as usize]);
         let Some(fewest) = kept.iter().map(|&row| count(row)).min() else {
             return Narrowed::all(0);
         };
@@ -2103,7 +2100,7 @@ impl Picker for CountFirst {
         band: TieBand,
         out: &mut Targets,
     ) {
-        let count = |row: u32| candidates[row as usize].in_flight;
+        let count = |row: u32| facts.in_flight(&candidates[row as usize]);
         // The ties are drawn from the seed's own stream, as the best picker
         // draws them: the alternates' order has a stream of its own.
         let mut draw = Draw::new(facts.seed);
@@ -2130,13 +2127,6 @@ impl Picker for CountFirst {
             };
             taken[slot] = b;
             out.push(target_of(&candidates[kept[b] as usize]));
-        }
-    }
-
-    fn needs(&self) -> Needs {
-        Needs {
-            in_flight: true,
-            ..Needs::default()
         }
     }
 }
@@ -2188,20 +2178,13 @@ impl Picker for PowerOfTwoCountFirst {
         band: TieBand,
         out: &mut Targets,
     ) {
-        let count = |i: usize| candidates[kept[i] as usize].in_flight;
+        let count = |i: usize| facts.in_flight(&candidates[kept[i] as usize]);
         let by_count = |a: usize, b: usize| {
             count(a)
                 .cmp(&count(b))
                 .then_with(|| score_order(scores, band, a, b))
         };
         push_two(facts.seed, candidates, kept, by_count, out);
-    }
-
-    fn needs(&self) -> Needs {
-        Needs {
-            in_flight: true,
-            ..Needs::default()
-        }
     }
 }
 
@@ -2488,6 +2471,7 @@ mod tests {
 
     use super::*;
     use crate::{
+        counts::tests::Lent,
         decision::Pair,
         view::{Health, LoadRow},
     };
@@ -3119,11 +3103,11 @@ mod tests {
         pool[1].load = Some(resident(1, 9_000));
         let cheap = ResidentWork::new(1_000);
         assert_eq!(
-            cheap.reported_cost(&pool[0], resident(2, 6_000), 0, 0),
+            cheap.reported_cost(pool[0].in_flight, resident(2, 6_000), 0, 0),
             8_000.0
         );
         assert_eq!(
-            cheap.reported_cost(&pool[1], resident(1, 9_000), 0, 0),
+            cheap.reported_cost(pool[1].in_flight, resident(1, 9_000), 0, 0),
             10_000.0
         );
         assert_eq!(resident_scores(&cheap, &pool), [1.0, 0.0]);
@@ -3138,7 +3122,10 @@ mod tests {
             queued: 1,
             ..resident(1, 6_000)
         };
-        assert_eq!(cheap.reported_cost(&pool[0], queued, 0, 0), 8_000.0);
+        assert_eq!(
+            cheap.reported_cost(pool[0].in_flight, queued, 0, 0),
+            8_000.0
+        );
     }
 
     /// A dispatch the report does not reflect yet adds its prompt and one
@@ -3253,7 +3240,7 @@ mod tests {
             ..resident(2, 8_000)
         };
         assert_eq!(
-            rw.reported_cost(&busy, row, 0, 0),
+            rw.reported_cost(busy.in_flight, row, 0, 0),
             8_000.0 + 2_000.0 + 5.0 * 1_000.0
         );
     }
@@ -3293,17 +3280,17 @@ mod tests {
         // Two reported requests hold 8,000 tokens, a mean context of 4,000;
         // three more are in transit.
         assert_eq!(
-            rw.reported_cost(&busy, resident(2, 8_000), 0, 0),
+            rw.reported_cost(busy.in_flight, resident(2, 8_000), 0, 0),
             8_000.0 + 3.0 * 4_000.0 + 5.0 * 1_000.0
         );
         // One of the three is a credited dispatch of 1,500 tokens.
         assert_eq!(
-            rw.reported_cost(&busy, resident(2, 8_000), 1_500, 1),
+            rw.reported_cost(busy.in_flight, resident(2, 8_000), 1_500, 1),
             8_000.0 + 1_500.0 + 2.0 * 4_000.0 + 5.0 * 1_000.0
         );
         let idle = candidate(1, 2);
         assert_eq!(
-            rw.reported_cost(&idle, resident(0, 0), 0, 0),
+            rw.reported_cost(idle.in_flight, resident(0, 0), 0, 0),
             2.0 * DEFAULT_MEAN_PREFILL_TOKENS as f32 + 2.0 * 1_000.0
         );
     }
@@ -4802,17 +4789,6 @@ mod tests {
         assert_eq!(scores, [0.0, 1.0]);
         assert!(SessionAffinity.needs().headers);
         assert!(LeastLoad::new(0.15, 1024, 2000.0).needs().loads);
-        // A stage that reads a worker's requests in flight declares the
-        // count, and a stage that reads none of it does not.
-        assert!(LeastRequests.needs().in_flight);
-        assert!(LeastLoad::new(0.15, 1024, 2000.0).needs().in_flight);
-        assert!(ResidentWork::new(512).needs().in_flight);
-        assert!(CountFirst.needs().in_flight);
-        assert!(PowerOfTwoCountFirst.needs().in_flight);
-        assert!(!SessionAffinity.needs().in_flight);
-        assert!(!FewestSessions.needs().in_flight);
-        assert!(!PowerOfTwo.needs().in_flight);
-        assert!(!Random.needs().in_flight);
     }
 
     /// A sampled `best` draws over a pool of more than twice its sample and
@@ -4955,5 +4931,54 @@ mod tests {
             }
         }
         assert!(short > 0, "no seed spent its draws on one row");
+    }
+
+    /// Every built-in that reads a row's requests in flight reads them
+    /// through the request's facts: over rows whose counts stand in a lent
+    /// table, the rows themselves reading zero, each scores and picks as it
+    /// does over rows that carry the counts.
+    #[test]
+    fn a_built_in_reads_a_lent_count_as_it_reads_a_rows_own() {
+        // Counts that part the rows, and reports on four of them: both
+        // load scorers take their reporting and their unreporting terms,
+        // and two rows that count resident tokens part by their costs.
+        let counts = [5, 1, 3, 0, 4, 2, 6, 1];
+        let mut pool: Vec<Candidate> = (0..)
+            .zip(counts)
+            .map(|(at, held)| candidate(at, held))
+            .collect();
+        pool[0].load = Some(resident(2, 9_000));
+        pool[1].load = Some(report(2, 4_000));
+        pool[4].load = Some(resident(1, 6_000));
+        pool[6].load = Some(report(0, 0));
+        let mut bare = pool.clone();
+        let lent = Lent::take(&mut bare);
+        assert!(bare.iter().all(|row| row.in_flight == 0));
+        let rows = kept(pool.len() as u32);
+        let flat = |rows: &[u32]| vec![0.0; rows.len()];
+        for seed in 0..16 {
+            let own = RequestFacts {
+                seed,
+                ..RequestFacts::default()
+            };
+            let beside = lent.beside(&own);
+            let scorers: [&dyn Scorer; 3] = [
+                &LeastRequests,
+                &LeastLoad::new(0.15, 1024, 2000.0),
+                &ResidentWork::new(512),
+            ];
+            for scorer in scorers {
+                let (mut written, mut read) = (vec![0.0; pool.len()], vec![0.0; pool.len()]);
+                scorer.score(&own, &pool, &rows, &mut written);
+                scorer.score(&beside, &bare, &rows, &mut read);
+                assert_eq!(written, read, "{} at seed {seed}", scorer.name());
+            }
+            let pickers: [&dyn Picker; 2] = [&CountFirst, &PowerOfTwoCountFirst];
+            for picker in pickers {
+                let written = picked(picker, &own, &pool, &flat);
+                let read = picked(picker, &beside, &bare, &flat);
+                assert_eq!(written, read, "{} at seed {seed}", picker.name());
+            }
+        }
     }
 }

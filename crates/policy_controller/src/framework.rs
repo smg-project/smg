@@ -1748,12 +1748,13 @@ fn draws_first(profile: &Profile) -> bool {
 /// in place of the mean of the rows handed. A named row past the pool names
 /// no candidate and is passed over.
 fn join_named(
+    facts: &RequestFacts<'_>,
     named: &NamedAffinity<'_>,
     candidates: &[Candidate],
     keep: &mut dyn FnMut(&Candidate) -> bool,
     kept: &mut Vec<u32>,
 ) -> f32 {
-    let mean = mean_in_flight(candidates, kept);
+    let mean = mean_in_flight(facts, candidates, kept);
     let holders = named.holders.iter().map(|holder| holder.row);
     for row in holders.chain(named.warming.iter().copied()) {
         if !kept.contains(&row) && candidates.get(row as usize).is_some_and(&mut *keep) {
@@ -1777,7 +1778,7 @@ fn order_joined(
     buf: &mut Buffers,
     out: &mut Targets,
 ) {
-    let mean = join_named(&named, candidates, keep, &mut buf.kept);
+    let mean = join_named(after, &named, candidates, keep, &mut buf.kept);
     let joined = RequestFacts {
         named: Some(NamedAffinity {
             mean_in_flight: Some(mean),
@@ -2643,8 +2644,10 @@ impl<'a> PairPools<'a> {
                 seed,
                 affinity,
                 named: None,
-                // A pin is a position in one pool: neither side takes it.
+                // A pin and lent counts are positions in one pool: neither
+                // side takes them.
                 pinned_at: 0,
+                lent_in_flight: None,
                 ..*facts
             };
             (pool, facts)
@@ -3717,6 +3720,7 @@ mod tests {
             Best, CountFirst, Healthy, LeastRequests, Manual, NotOverloaded, NotTried, Passthrough,
             PowerOfTwo, PowerOfTwoCountFirst, Random, RoundRobin,
         },
+        counts::tests::Lent,
         sessions::Recovery,
         spec::{PolicySpec, PowerOfTwoMetric},
         view::{Health, Identity, MediaCounts, Role, Session, WorkerId},
@@ -4415,6 +4419,13 @@ mod tests {
             pinned_at: 2,
             ..RequestFacts::default()
         };
+        // Nor the counts a host lent: they are read by a position too.
+        let mut counted = [0, 1].map(|position| Candidate {
+            position,
+            ..Candidate::default()
+        });
+        let lent = Lent::take(&mut counted);
+        let facts = lent.beside(&facts);
         let pools = PairPools {
             prefills: &prefills,
             decodes: &decodes,
@@ -4424,6 +4435,7 @@ mod tests {
             let (_, read) = pools.side(side, &facts).expect("an empty column fits");
             assert!(read.named.is_none(), "the {name} side");
             assert_eq!(read.pinned_at, 0, "the {name} side");
+            assert!(read.lent_in_flight.is_none(), "the {name} side");
         }
     }
 
@@ -5251,20 +5263,16 @@ mod tests {
             }
         }
 
-        // A profile whose stages read nothing a host feeds.
-        let quiet = || Profile {
-            scorers: Vec::new(),
-            ..least_requests_profile()
-        };
+        let quiet = least_requests_profile();
         let fed = Profile {
             filters: vec![Box::new(Fed)],
-            ..quiet()
+            ..least_requests_profile()
         };
         let decode = fed.needs();
-        assert_eq!(quiet().needs(), Needs::default());
+        assert_eq!(quiet.needs(), Needs::default());
         assert!(decode.loads);
         let engine = Engine::new(
-            vec![quiet(), fed],
+            vec![quiet, fed],
             vec![Binding {
                 model: "pd/*".into(),
                 phases: vec![Phase::Prefill],
@@ -5282,10 +5290,10 @@ mod tests {
         // No prefill lookup resolves to a pair bound for another phase.
         let fed = Profile {
             filters: vec![Box::new(Fed)],
-            ..quiet()
+            ..least_requests_profile()
         };
         let engine = Engine::new(
-            vec![quiet(), fed],
+            vec![least_requests_profile(), fed],
             vec![Binding {
                 model: "pd/*".into(),
                 phases: vec![Phase::Encode],
@@ -9185,6 +9193,31 @@ mod tests {
         assert!(led < 20, "{led} of 200 decisions were led by a busy holder");
     }
 
+    /// The mean the join hands on is of the drawn rows' counts as the
+    /// request's facts read them: the lent count where a table is lent.
+    #[test]
+    fn the_join_hands_on_the_mean_of_the_drawn_rows_lent_counts() {
+        let mut pool: Vec<Candidate> = (0..)
+            .zip([6, 2, 9, 9])
+            .map(|(position, in_flight)| Candidate {
+                position,
+                in_flight,
+                ..Candidate::default()
+            })
+            .collect();
+        let lent = Lent::take(&mut pool);
+        let facts = lent.beside(&RequestFacts::default());
+        let mut kept = vec![0, 1];
+        let mean = join_named(
+            &facts,
+            &NamedAffinity::default(),
+            &pool,
+            &mut |_: &Candidate| true,
+            &mut kept,
+        );
+        assert_eq!(mean, 4.0);
+    }
+
     /// A named row past the pool names no candidate: the join passes over
     /// it in every build and asks no filter about it. A decision of a debug
     /// build stops before the join ([`debug_assert_named`]).
@@ -9203,7 +9236,13 @@ mod tests {
             row.health.healthy
         };
         let mut kept = vec![0];
-        join_named(&named, &pool, &mut keep, &mut kept);
+        join_named(
+            &RequestFacts::default(),
+            &named,
+            &pool,
+            &mut keep,
+            &mut kept,
+        );
         assert_eq!(kept, [0, 1, 3], "the pool's rows a filter keeps join");
         assert_eq!(
             asked,

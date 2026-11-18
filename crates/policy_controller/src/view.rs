@@ -638,7 +638,10 @@ pub struct Candidate {
     /// The pairing descriptor's connector, as a position into the spec's
     /// declared list; `0` when none.
     pub connector: u16,
-    /// Requests the deciding host holds on the worker right now.
+    /// Requests the deciding host holds on the worker right now. A host
+    /// that lends its counts beside the rows
+    /// ([`RequestFacts::lent_in_flight`]) leaves this zero, so a reader
+    /// asks [`RequestFacts::in_flight`].
     pub in_flight: u32,
     /// The latest load row, when the host has a report for the worker.
     pub load: Option<LoadRow>,
@@ -721,13 +724,17 @@ pub struct Header<'a> {
 
 /// The mean of the in-flight counts of `rows` of `candidates`; zero over no
 /// row.
-pub(crate) fn mean_in_flight(candidates: &[Candidate], rows: &[u32]) -> f32 {
+pub(crate) fn mean_in_flight(
+    facts: &RequestFacts<'_>,
+    candidates: &[Candidate],
+    rows: &[u32],
+) -> f32 {
     if rows.is_empty() {
         return 0.0;
     }
     let sum: u64 = rows
         .iter()
-        .map(|&i| u64::from(candidates[i as usize].in_flight))
+        .map(|&i| u64::from(facts.in_flight(&candidates[i as usize])))
         .sum();
     sum as f32 / rows.len() as f32
 }
@@ -786,6 +793,15 @@ pub struct RequestFacts<'a> {
     /// for the decision. A pair takes none: a pin is a position in one
     /// pool, and neither side reads it. In-process only.
     pub pinned_at: u32,
+    /// What the leases on file book on each row, where the host did not
+    /// write the count into the row: a view of a publication's own rows
+    /// lends the table here. A reader of a row's requests in flight asks
+    /// both ([`RequestFacts::in_flight`]). `None` where the rows carry
+    /// their counts: rows written for the decision, and a host that keeps
+    /// the count itself. A pair takes none: a position is a place in one
+    /// pool, and a pair's rows carry what counts their host wrote.
+    /// In-process only.
+    pub lent_in_flight: Option<crate::counts::LentCounts<'a>>,
     /// The candidates' affinity facts, by index in the candidate slice the
     /// decision is made over: the one column the affinity stages read, in
     /// the candidates' own order. It is EMPTY or holds exactly one entry a
@@ -888,6 +904,20 @@ impl<'a> RequestFacts<'a> {
     #[inline]
     pub fn pins(&self, position: u32) -> bool {
         self.pinned_at != 0 && self.pinned_at - 1 == position
+    }
+
+    /// The requests in flight of `row`: what the host lent for the row's
+    /// position where it lent a table ([`RequestFacts::lent_in_flight`]),
+    /// the row's own count otherwise. Every reader of a row's count asks
+    /// here, and none learns which rows it was given. A decision reads one
+    /// count a row: beside lent rows the first read is kept, and every
+    /// later read returns it.
+    #[inline]
+    pub fn in_flight(&self, row: &Candidate) -> u32 {
+        match self.lent_in_flight {
+            Some(lent) => lent.at(row.position),
+            None => row.in_flight,
+        }
     }
 
     /// The affinity facts of the candidate at `index` of the slice the
@@ -1028,6 +1058,30 @@ pub struct PoolFacts<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::counts::tests::Lent;
+
+    /// One reader, two feeds: a row's requests in flight are the lent count
+    /// at the row's position where the host lends a table, whatever the
+    /// row's own field holds, and the row's own field where it lends none.
+    #[test]
+    fn a_rows_requests_in_flight_are_the_lent_count_or_the_rows_own() {
+        let row = |position, in_flight| Candidate {
+            position,
+            in_flight,
+            ..Candidate::default()
+        };
+        let mut rows = [row(0, 5), row(1, 2)];
+        let own = RequestFacts::default();
+        let read = |facts: &RequestFacts<'_>, rows: &[Candidate]| -> Vec<u32> {
+            rows.iter().map(|row| facts.in_flight(row)).collect()
+        };
+        assert_eq!(read(&own, &rows), [5, 2]);
+        let lent = Lent::take(&mut rows);
+        assert_eq!(read(&own, &rows), [0, 0]);
+        // A count a host left on a row does not speak over its table.
+        rows[0].in_flight = 9;
+        assert_eq!(read(&lent.beside(&own), &rows), [5, 2]);
+    }
 
     #[test]
     fn health_flags_compose_into_the_two_routability_reads() {

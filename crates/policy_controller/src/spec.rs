@@ -164,15 +164,7 @@ pub struct Needs {
     /// Allow-listed headers in the view.
     pub headers: bool,
     pub media: bool,
-    /// The count of requests in flight, per worker
-    /// ([`Candidate::in_flight`](crate::Candidate::in_flight)): the
-    /// `least-requests` scorer, the load scorers' unreported term, the
-    /// count pickers, the ring's bounded-load rule and the affinity stages'
-    /// spill. A host that books its own dispatches holds it on every row;
-    /// a host that counts leases writes it for a decision whose profile
-    /// declares it, and a row reads zero elsewhere. A stage that shows its
-    /// rows to a plugin declares it for the guest.
-    pub in_flight: bool,
+
     /// The count of session keys with a request in flight, per worker (the
     /// `min_group` assignment and the `fewest-sessions` scorer).
     pub active_sessions: bool,
@@ -230,7 +222,7 @@ impl Needs {
             ring: self.ring || other.ring,
             headers: self.headers || other.headers,
             media: self.media || other.media,
-            in_flight: self.in_flight || other.in_flight,
+
             active_sessions: self.active_sessions || other.active_sessions,
             session_in_flight: self.session_in_flight || other.session_in_flight,
             affinity: self.affinity || other.affinity,
@@ -4039,11 +4031,7 @@ mod tests {
             assert_eq!(engine.needs().headers, name == "manual", "{name}");
             assert!(!engine.needs().active_sessions, "{name}");
             assert!(!engine.needs().session_in_flight, "{name}");
-            // A worker's requests in flight are declared where a stage
-            // reads them: the load scorer, the ring's bounded-load rule
-            // beside the fewest requests, the affinity stages.
-            let counted = ["power_of_two", "least_load", "prefix_hash", "cache_aware"];
-            assert_eq!(engine.needs().in_flight, counted.contains(&name), "{name}");
+
             assert!(engine.profile_for("any", Phase::Single).is_some(), "{name}");
             // One profile bound to every model and phase: the per-phase and
             // per-binding reads are the summary.
@@ -4077,10 +4065,7 @@ mod tests {
           ]
         }"#;
         let engine = doc(text).validate().expect("validates");
-        // What the `least-load` scorer reads: a worker's reports and its
-        // requests in flight.
         let loads = Needs {
-            in_flight: true,
             loads: true,
             ..Needs::default()
         };
@@ -4177,10 +4162,7 @@ mod tests {
                 })
                 .fold(Needs::default(), |fed, (_, _, needs)| fed.or(needs))
         }
-        // What the `least-load` scorer reads: a worker's reports and its
-        // requests in flight.
         let loads = Needs {
-            in_flight: true,
             loads: true,
             ..Needs::default()
         };
@@ -6631,5 +6613,112 @@ mod tests {
         assert!(err.contains("unknown field `draws`"), "{err}");
         let preset = PolicySpec::preset("cache_aware").expect("a preset");
         assert_eq!(preset.validate().expect("validates").needs().sample, 16);
+    }
+
+    /// The guard of the count's one reader, over the catalog's own lists: a
+    /// profile of each stock stage decides alike over rows that carry their
+    /// requests in flight and over rows that read otherwise with the counts
+    /// in a table lent beside them. A stage that reads a row's own field
+    /// reads another count beside lent rows, and parts here.
+    #[test]
+    fn every_catalog_stage_reads_a_lent_count_as_a_rows_own() {
+        use crate::{counts::tests::Lent, view::Identity, Health, PoolFacts, Scratch, WorkerId};
+        let sessions = r#""score":["fewest-sessions"]"#;
+        let scored = |pick: &str| format!(r#"{{{sessions},"pick":{pick}}}"#);
+        let alone = |pick: &str| format!(r#"{{"filter":["healthy"],"pick":{pick}}}"#);
+        // The forms that read the count under parameters, then each name
+        // of the lists in the forms it validates in. The scorer and the
+        // picker this build lacks are no readers.
+        let bounded = r#"{"consistent-hash":{"bounded_load":{"factor":1.0,"abs_margin":0}}}"#;
+        let mut profiles: Vec<Vec<String>> = vec![
+            vec![r#"{"score":[{"resident-work":{"request_tokens":512}}],"pick":"best"}"#.into()],
+            vec![format!(r#"{{"score":[{bounded}],"pick":"best"}}"#)],
+        ];
+        let apart = ["bucket", "resident-work", "best-with-temperature"];
+        for name in FILTERS {
+            profiles.push(vec![format!(
+                r#"{{"filter":["{name}"],{sessions},"pick":"best"}}"#
+            )]);
+        }
+        for name in SCORERS.iter().filter(|name| !apart.contains(name)) {
+            profiles.push(vec![format!(r#"{{"score":["{name}"],"pick":"best"}}"#)]);
+        }
+        for name in PICKERS.iter().filter(|name| !apart.contains(name)) {
+            let pick = format!("{name:?}");
+            profiles.push(vec![
+                scored(&pick),
+                alone(&pick),
+                format!(r#"{{"pick":{pick}}}"#),
+            ]);
+        }
+        let build = |forms: &[String]| -> Engine {
+            let document = |profile: &String| {
+                doc(&format!(
+                    r#"{{"apiVersion":"smg.policy/v1","profiles":{{"p":{profile}}}}}"#
+                ))
+            };
+            let built = forms.iter().find_map(|form| document(form).validate().ok());
+            built.unwrap_or_else(|| panic!("no form validates: {forms:?}"))
+        };
+        // Counts that part the rows, the same rows reading otherwise with
+        // the counts in a lent table, and rows that read none.
+        let counts = [5, 1, 3, 0, 4, 2, 6, 1];
+        let row = |(position, in_flight): (u32, u32)| Candidate {
+            position,
+            id: WorkerId(100 + u64::from(position)),
+            in_flight,
+            health: Health {
+                healthy: true,
+                ..Health::default()
+            },
+            ..Candidate::default()
+        };
+        let rows = |held: [u32; 8]| -> Vec<Candidate> { (0..).zip(held).map(row).collect() };
+        let (own, mut other, bare) = (rows(counts), rows(counts), rows([0; 8]));
+        let lent = Lent::take(&mut other);
+        for (row, held) in other.iter_mut().zip([1, 6, 2, 4, 0, 3, 1, 5]) {
+            row.in_flight = held;
+        }
+        let pool = PoolFacts {
+            pool_size: 8,
+            generation: 1,
+            ..PoolFacts::default()
+        };
+        // One engine a feed: a stage that keeps a rotation starts each
+        // feed's decisions at the same place.
+        let run = |forms: &[String], rows: &[Candidate], lent: Option<&Lent>| {
+            let engine = build(forms);
+            let picks = |seed: u64| {
+                let facts = RequestFacts {
+                    model: "m",
+                    session_key: Identity::hashed(seed),
+                    seed,
+                    ..RequestFacts::default()
+                };
+                let facts = lent.map_or(facts, |lent| lent.beside(&facts));
+                let cx = Constraints::default();
+                let decision = engine.decide(&facts, &pool, rows, &cx, &mut Scratch::new());
+                let picked = decision.pick();
+                picked.map(|pick| {
+                    pick.targets
+                        .as_slice()
+                        .iter()
+                        .map(|t| t.id)
+                        .collect::<Vec<_>>()
+                })
+            };
+            (0..32).map(picks).collect::<Vec<_>>()
+        };
+        for forms in &profiles {
+            let written = run(forms, &own, None);
+            let read = run(forms, &other, Some(&lent));
+            assert_eq!(
+                written, read,
+                "a lent count is not read as a row's own: {forms:?}"
+            );
+            // The counts part the rows: the fewest requests answer by them.
+            let moved = written != run(forms, &bare, None);
+            assert!(moved || !forms[0].contains("least-requests"), "{forms:?}");
+        }
     }
 }
