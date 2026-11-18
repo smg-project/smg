@@ -949,6 +949,8 @@ impl ServerInfo {
 
 /// Keys worth extracting from SGLang gRPC `server_args` (which contains the full config).
 const SGLANG_GRPC_KEYS: &[&str] = &[
+    "sglang_prepared",
+    "sglang_prepared_key",
     "multimodal_encoder_dtype",
     media_contract::LABEL,
     "mm_processor",

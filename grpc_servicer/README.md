@@ -28,6 +28,22 @@ For SGLang:
 pip install smg-grpc-servicer[sglang]
 ```
 
+For prepared-input SGLang EPD, first install a compatible, pinned SGLang
+engine and the SMG Rust wheel from the same SMG build. The extension must
+provide `ManagedEncoderProcessor` and `ManagedEncoderServer`;
+`smg-grpc-proto` must include
+`sglang_managed_pb2` and the prepared-input fields. The published proto
+0.5.0 package lacks these additions. From the matching source checkout,
+install the protocol package and bridge together:
+
+```bash
+pip install ./crates/grpc_client/python "./grpc_servicer[sglang-managed]"
+```
+
+The extra supplies bridge dependencies, not SGLang or the SMG Rust extension.
+Engine startup checks the native image identity/layout and encoder ownership
+APIs. Set `SMG_SGLANG_EPD=1` when launching these workers.
+
 ## Usage
 
 ### vLLM

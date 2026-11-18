@@ -36,6 +36,21 @@ const MIN_GRACE: Duration = Duration::from_millis(100);
 /// shutdown and time the forced close off it.
 pub(crate) type Shutdown = Shared<Pin<Box<dyn Future<Output = Duration> + Send>>>;
 
+/// Close remaining listener connections once the lifecycle owner's drain grace expires.
+pub(crate) async fn serve_with_grace<E: std::fmt::Display>(
+    serving: impl Future<Output = Result<(), E>>,
+    shutdown: Shutdown,
+) -> Result<(), String> {
+    let forced = async { tokio::time::sleep(shutdown.await).await };
+    tokio::select! {
+        result = serving => result.map_err(|error| error.to_string()),
+        () = forced => {
+            tracing::warn!("servicer closed remaining connections after the drain grace");
+            Ok(())
+        }
+    }
+}
+
 /// The last fatal error a running server recorded, readable after `start`
 /// returned: the only post-start error channel the lifecycle owner has.
 pub(crate) type SharedError = Arc<Mutex<Option<String>>>;

@@ -21,6 +21,7 @@ import asyncio
 import contextlib
 import dataclasses
 import faulthandler
+import fnmatch
 import functools
 import glob
 import importlib
@@ -141,29 +142,75 @@ def resolve_tokenizer_dir(tokenizer: str, revision: str | None = None) -> str | 
     downloads the same repo in parallel, and a snapshot it has started to
     populate (its ``config.json`` is there, its ``tokenizer.json`` not yet)
     satisfies a local-only lookup while loading nothing."""
-    if os.path.isdir(tokenizer):
-        return tokenizer
+    return _resolve_metadata_snapshot(
+        tokenizer, revision, TOKENIZER_DOWNLOAD_PATTERNS, holds_tokenizer, (True, False)
+    )
+
+
+def resolve_model_metadata_dir(
+    source: str, revision: str | None, *, require_tokenizer: bool = False
+) -> str | None:
+    """Resolve Hub metadata against its file list and commit; never download weights.
+
+    Missing optional processor configs are legal only when absent from that commit's
+    file list. Hub IDs require a reachable listing; offline deployments can supply
+    their existing local or object-storage metadata directory instead.
+    """
+    if os.path.isdir(source):
+        return source
+    patterns = TOKENIZER_DOWNLOAD_PATTERNS + ["*.py"]
+    try:
+        from huggingface_hub import HfApi
+
+        info = HfApi().model_info(source, revision=revision)
+        if not info.sha or info.siblings is None:
+            raise ValueError("Hub response lacks metadata commit or file list")
+        expected = [
+            entry.rfilename
+            for entry in info.siblings
+            if any(fnmatch.fnmatch(entry.rfilename, pattern) for pattern in patterns)
+        ]
+    except Exception as error:
+        logger.warning("Could not list metadata %r at revision %r: %s", source, revision, error)
+        return None
+
+    def complete(directory):
+        """Reject partial cache fallback without requiring nonexistent optional configs."""
+        required = (
+            holds_tokenizer(directory)
+            if require_tokenizer
+            else os.path.isfile(os.path.join(directory, "config.json"))
+        )
+        return required and all(os.path.isfile(os.path.join(directory, name)) for name in expected)
+
+    return _resolve_metadata_snapshot(source, info.sha, patterns, complete, (False,))
+
+
+def _resolve_metadata_snapshot(source, revision, patterns, accepts, attempts):
+    """Share bounded file selection while retaining each caller's cache validation policy."""
+    if os.path.isdir(source):
+        return source
     try:
         from huggingface_hub import snapshot_download
     except ImportError:
-        logger.warning("huggingface_hub is not installed; cannot resolve tokenizer %r", tokenizer)
+        logger.warning("huggingface_hub is not installed; cannot resolve metadata %r", source)
         return None
     last_error: Exception | None = None
-    for local_files_only in (True, False):
+    for local_files_only in attempts:
         try:
             directory = snapshot_download(
-                tokenizer,
+                source,
                 revision=revision,
-                allow_patterns=TOKENIZER_DOWNLOAD_PATTERNS,
+                allow_patterns=patterns,
                 local_files_only=local_files_only,
             )
-        except Exception as error:  # cache miss, offline, or an unknown repo
+        except Exception as error:
             last_error = error
             continue
-        if holds_tokenizer(directory):
+        if accepts(directory):
             return directory
-        last_error = FileNotFoundError(f"{directory} holds no tokenizer file")
-    logger.warning("Could not resolve tokenizer %r to a local directory: %s", tokenizer, last_error)
+        last_error = FileNotFoundError(f"{directory} lacks required metadata files")
+    logger.warning("Could not resolve metadata %r to a local directory: %s", source, last_error)
     return None
 
 

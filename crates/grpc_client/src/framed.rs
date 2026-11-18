@@ -541,6 +541,8 @@ pub(crate) fn sglang_frames(req: sg::GenerateRequest) -> Result<Vec<Bytes>, Stat
         return_media_identity,
         media_identity,
         extra_mm_inputs,
+        prepared_control,
+        prepared_input,
     } = req;
     // Fields 1-2, moved.
     sg::GenerateRequest {
@@ -576,11 +578,17 @@ pub(crate) fn sglang_frames(req: sg::GenerateRequest) -> Result<Vec<Bytes>, Stat
         ..Default::default()
     }
     .encode_raw(&mut out.scratch);
-    // Field 21, every element in order; the message's last field.
+    // Field 21, every element in order; prepared metadata follows.
     for inputs in extra_mm_inputs {
         out.length_delimited(21, inputs.encoded_len());
         sglang_inputs_frames(inputs, &mut out);
     }
+    sg::GenerateRequest {
+        prepared_control,
+        prepared_input,
+        ..Default::default()
+    }
+    .encode_raw(&mut out.scratch);
     Ok(out.finish())
 }
 
@@ -1554,6 +1562,8 @@ mod tests {
                     ..Default::default()
                 })),
                 extra_mm_inputs: vec![inputs_with_every_field(2), sg::MultimodalInputs::default()],
+                prepared_control: vec![7, 8],
+                prepared_input: vec![9, 10],
             }
         }
 

@@ -16,7 +16,7 @@ use tonic::{metadata::MetadataMap, Code, Request, Status};
 use tracing::warn;
 
 use super::State;
-use crate::admin::flush_timeout;
+use crate::{admin::flush_timeout, rpc::grpc_timeout};
 
 /// Bounds the single attempt of `timeout_s == 0`, so an engine that never
 /// answers cannot hang the RPC.
@@ -172,50 +172,4 @@ fn timed_out() -> Status {
     Status::deadline_exceeded(
         "Flush cache timed out; the engine may still complete an issued reset",
     )
-}
-
-/// The client's `grpc-timeout` header (`<1-8 digits><H|M|S|m|u|n>`), if any.
-fn grpc_timeout(metadata: &MetadataMap) -> Option<Duration> {
-    let value = metadata.get("grpc-timeout")?.to_str().ok()?;
-    let unit = value.chars().last()?;
-    let digits = &value[..value.len() - unit.len_utf8()];
-    if digits.is_empty() || digits.len() > 8 || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
-    }
-    let amount: u64 = digits.parse().ok()?;
-    Some(match unit {
-        'H' => Duration::from_secs(amount * 3600),
-        'M' => Duration::from_secs(amount * 60),
-        'S' => Duration::from_secs(amount),
-        'm' => Duration::from_millis(amount),
-        'u' => Duration::from_micros(amount),
-        'n' => Duration::from_nanos(amount),
-        _ => return None,
-    })
-}
-
-#[cfg(test)]
-mod tests {
-    use tonic::metadata::MetadataValue;
-
-    use super::*;
-
-    #[test]
-    fn grpc_timeout_follows_the_header_grammar() {
-        let parse = |value: &str| {
-            let mut metadata = MetadataMap::new();
-            metadata.insert("grpc-timeout", MetadataValue::try_from(value).unwrap());
-            grpc_timeout(&metadata)
-        };
-        assert_eq!(parse("2H"), Some(Duration::from_secs(7200)));
-        assert_eq!(parse("3M"), Some(Duration::from_secs(180)));
-        assert_eq!(parse("30S"), Some(Duration::from_secs(30)));
-        assert_eq!(parse("250m"), Some(Duration::from_millis(250)));
-        assert_eq!(parse("7u"), Some(Duration::from_micros(7)));
-        assert_eq!(parse("9n"), Some(Duration::from_nanos(9)));
-        for malformed in ["", "S", "5", "123456789S", "+5S", "5x"] {
-            assert_eq!(parse(malformed), None, "{malformed:?}");
-        }
-        assert_eq!(grpc_timeout(&MetadataMap::new()), None);
-    }
 }

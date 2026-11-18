@@ -175,6 +175,11 @@ message GenerateRequest {
   // Additional modality batches, matching vLLM's mm_inputs + extra_mm_inputs.
   // Each batch owns its tensors, token ID and placeholders.
   repeated MultimodalInputs extra_mm_inputs = 21;
+
+  // SMG prepared-input v1 metadata only. P exports the final native layout;
+  // D requires that layout and never falls back to preprocessing references.
+  bytes prepared_control = 22;
+  bytes prepared_input = 23;
 }
 
 // The gateway codec writes this message by hand around its field numbers and
@@ -246,6 +251,7 @@ message GenerateResponse {
   // Control-only first item (response unset), never a generated token.
   // An empty identity explicitly declines reuse.
   MediaIdentity media_identity = 5;
+  bytes prepared_input = 6;
 
   oneof response {
     GenerateStreamChunk chunk = 2;

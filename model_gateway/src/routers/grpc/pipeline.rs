@@ -116,6 +116,7 @@ pub(crate) enum Endpoint {
 /// embeddings/classify build none.
 #[derive(Clone)]
 pub(crate) struct PipelineDeps {
+    prepared_input: bool,
     worker_registry: Arc<WorkerRegistry>,
     policy_registry: Arc<PolicyRegistry>,
     prefill_admission: Option<Arc<PrefillAdmission>>,
@@ -157,6 +158,7 @@ impl PipelineDeps {
         queue_timeout: Duration,
     ) -> Self {
         Self {
+            prepared_input: false,
             worker_registry,
             policy_registry,
             prefill_admission,
@@ -181,6 +183,7 @@ impl PipelineDeps {
         queue_timeout: Duration,
     ) -> Self {
         Self {
+            prepared_input: false,
             worker_registry,
             policy_registry,
             prefill_admission,
@@ -193,6 +196,12 @@ impl PipelineDeps {
             request_timeout: None,
             grouped_dp_sticky: GroupedDpSticky::Off,
         }
+    }
+
+    /// Use the prepared-input handoff without replacing shared P/D routing.
+    pub(crate) fn with_prepared_input(mut self, enabled: bool) -> Self {
+        self.prepared_input = enabled;
+        self
     }
 
     /// Bound each attempt's calls to its workers, and the streams they open,
@@ -270,6 +279,7 @@ impl PipelineDeps {
     fn test_default() -> Self {
         use crate::config::types::PolicyConfig;
         Self {
+            prepared_input: false,
             worker_registry: Arc::new(WorkerRegistry::new()),
             policy_registry: Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
             prefill_admission: None,
@@ -303,6 +313,7 @@ struct PipelineStages {
 /// Generic request pipeline for all request types.
 #[derive(Clone)]
 pub(crate) struct RequestPipeline {
+    prepared_input: bool,
     stages: Arc<PipelineStages>,
     /// Backend type for metrics labeling
     backend_type: &'static str,
@@ -353,8 +364,12 @@ impl RequestPipeline {
             deps.prefill_admission.clone(),
         )
         .with_queue_timeout(deps.queue_timeout);
-        let plan_settings = mode.plan_settings();
-        let encode = matches!(mode, Mode::EncodePrefillDecode).then(EncodeStage::new);
+        let mut plan_settings = mode.plan_settings();
+        // Text-only requests on a prepared-input pool use ordinary PD dispatch.
+        // Media requests keep their instance-bound bootstrap in the adapter.
+        plan_settings.inject_pd_metadata |= deps.prepared_input;
+        let encode = (matches!(mode, Mode::EncodePrefillDecode) && !deps.prepared_input)
+            .then(EncodeStage::new);
         let rate_limit = RateLimitReserveStage::new(deps.rate_limit_manager.clone());
 
         let stages = match endpoint {
@@ -488,6 +503,7 @@ impl RequestPipeline {
         };
 
         Some(Self {
+            prepared_input: deps.prepared_input,
             stages: Arc::new(stages),
             backend_type: backend,
             mode,
@@ -546,6 +562,17 @@ impl RequestPipeline {
             };
         }
 
+        if self.prepared_input {
+            use super::utils::tonic_ext::TonicStatusExt;
+            let prepared = super::sglang_epd::router::prepare(ctx).map_err(|status| {
+                status.to_http_error("sglang_epd_capability", status.message().to_owned())
+            })?;
+            // Text-only requests use the existing PD dispatch, admission and cleanup.
+            // The prepared-input protocol is needed only for encoder output.
+            if let Some(prepared) = prepared {
+                ctx.state.encode_outputs = Some(EncodeOutputs::PreparedInput(Box::new(prepared)));
+            }
+        }
         let stages = &self.stages;
         step!(
             stages.preparation.name(),
@@ -753,8 +780,12 @@ impl RequestPipeline {
             // retry that cannot safely replay an encoder's replica-bound
             // handoff (the selected runtime's encode handoff decides).
             let encode_handoff = PdProtocol::encode_handoff(dctx.wire.runtime);
-            let retry_config =
-                retry_config.filter(|_| !plan.replays_replica_bound_handoff(encode_handoff));
+            let retry_config = retry_config.filter(|_| {
+                // Only this request's prepared operation is not replayable;
+                // installing the adapter must not change ordinary text retries.
+                !matches!(dctx.encode_outputs, Some(EncodeOutputs::PreparedInput(_)))
+                    && !plan.replays_replica_bound_handoff(encode_handoff)
+            });
             let max_attempts = retry_config.map_or(1, |config| config.max_retries.max(1));
             let mut plan = Some(plan);
             let mut spec = Some(spec);

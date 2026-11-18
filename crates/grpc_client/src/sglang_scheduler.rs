@@ -3,16 +3,19 @@ use openai_protocol::{
     messages::CreateMessageRequest, responses::ResponsesRequest,
     sampling_params::SamplingParams as GenerateSamplingParams,
 };
-use tonic::Request;
+use tokio::sync::mpsc;
+use tonic::{codegen::http::uri::PathAndQuery, Request};
 use tracing::{debug, warn};
 
 use crate::{
-    channel::Channel,
+    channel::{Channel, IndependentRequestWrite},
     framed::{call_with_frames, sglang_frames},
     request_fields::{
         body_format, completion_constraint, logit_bias_by_token_text, plain_constraint,
         stop_strings, ConstraintKind, FormatSetAside, OutputConstraint, PlainSampling,
     },
+    sglang_encoder_proto::sglang_encoder_client::SglangEncoderClient,
+    sglang_managed::proto::{decode_command::Command, DecodeCommand},
     BoxedTraceInjector,
 };
 
@@ -77,6 +80,57 @@ impl SglangSchedulerClient {
     );
 
     crate::impl_embed!(proto);
+
+    /// Reuse the registered encoder's connection for native SGLang control.
+    pub async fn encode_native(
+        &self,
+        request: crate::sglang_encoder_proto::EncodeRequest,
+        timeout: std::time::Duration,
+    ) -> Result<(), tonic::Status> {
+        let mut request = Request::new(request);
+        request.set_timeout(timeout);
+        let mut client = SglangEncoderClient::new(self.channel.clone());
+        tokio::time::timeout(timeout, client.encode(request))
+            .await
+            .map_err(|_| tonic::Status::deadline_exceeded("encoder deadline expired"))??;
+        Ok(())
+    }
+
+    /// Start D before P exports metadata, then bind it on the same request stream.
+    pub async fn start_prepared(
+        &self,
+        start: proto::GenerateRequest,
+        remaining: std::time::Duration,
+    ) -> Result<(mpsc::Sender<DecodeCommand>, AbortOnDropStream), tonic::Status> {
+        let rid = start.request_id.clone();
+        let (sender, receiver) = mpsc::channel(2);
+        sender
+            .try_send(DecodeCommand {
+                command: Some(Command::Start(start)),
+            })
+            .map_err(|_| tonic::Status::internal("cannot enqueue decode Start"))?;
+        let mut request = Request::new(futures::stream::unfold(receiver, |mut rx| async move {
+            rx.recv().await.map(|message| (message, rx))
+        }));
+        request.set_timeout(remaining);
+        request.extensions_mut().insert(IndependentRequestWrite);
+        if let Err(error) = self.trace_injector.inject(request.metadata_mut()) {
+            warn!(%error, "Failed to inject trace context");
+        }
+        let mut grpc = tonic::client::Grpc::new(self.channel.clone());
+        grpc.ready()
+            .await
+            .map_err(|error| tonic::Status::unavailable(error.to_string()))?;
+        let response = grpc.streaming(
+            request,
+            PathAndQuery::from_static("/smg.sglang.managed.v1.ManagedDecode/Generate"),
+            crate::codec::SizedProstCodec::<DecodeCommand, Box<proto::GenerateResponse>>::default(),
+        ).await?;
+        Ok((
+            sender,
+            AbortOnDropStream::new(response.into_inner(), rid, self.clone()),
+        ))
+    }
 
     /// Abort a request
     pub async fn abort_request(

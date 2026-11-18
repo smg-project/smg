@@ -538,3 +538,16 @@ class TestLaunchValidation:
 
             # Should create router instance via from_args
             router_mod.from_args.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "backend,epd,expected_igw",
+    [("sglang", True, False), ("vllm", True, True), ("sglang", False, True)],
+)
+def test_discovery_keeps_sglang_epd_on_grpc(backend, epd, expected_igw):
+    """Python discovery mirrors the Rust native-EPD exemption without changing other backends."""
+    args = RouterArgs(backend=backend, epd_disaggregation=epd, service_discovery=True)
+    with patch("smg.launch_router.Router") as router, patch.object(args, "_validate_router_args"):
+        launch_router(args)
+        router.from_args.assert_called_once_with(args)
+    assert args.enable_igw is expected_igw

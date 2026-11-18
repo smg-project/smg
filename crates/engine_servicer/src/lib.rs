@@ -40,6 +40,7 @@ pub mod kv_wire;
 mod load_report;
 mod load_stream;
 mod load_tracker;
+pub mod managed;
 mod metrics;
 mod proto_json;
 mod requests;

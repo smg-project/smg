@@ -886,6 +886,7 @@ mod tests {
     fn chunk_at(index: u32, text: &str) -> proto::GenerateResponse {
         proto::GenerateResponse {
             media_identity: None,
+            prepared_input: Vec::new(),
             request_id: String::new(),
             response: Some(proto::generate_response::Response::Chunk(
                 proto::GenerateStreamChunk {
@@ -901,6 +902,7 @@ mod tests {
     fn complete_at(index: u32, finish_reason: &str) -> proto::GenerateResponse {
         proto::GenerateResponse {
             media_identity: None,
+            prepared_input: Vec::new(),
             request_id: String::new(),
             response: Some(proto::generate_response::Response::Complete(
                 proto::GenerateComplete {

@@ -556,6 +556,62 @@ impl WorkerJobs for RecordedJobs {
     }
 }
 
+/// A healthy prepared process can restart between probes. Retrying a failed
+/// refresh uses that cadence, without changing readiness or adding a timer.
+#[tokio::test]
+async fn ready_prepared_probes_retry_label_refresh_without_health_transitions() {
+    struct FlakyRefresh(AtomicUsize);
+    #[async_trait]
+    impl WorkerJobs for FlakyRefresh {
+        async fn remove_worker(&self, _: String, _: &WorkerId, _: u64) -> Result<(), String> {
+            panic!("a healthy worker must not be removed")
+        }
+        async fn refresh_worker_labels(&self, _: String) -> Result<bool, String> {
+            if self.0.fetch_add(1, Ordering::Relaxed) == 0 {
+                Err("queue temporarily full".into())
+            } else {
+                Ok(true)
+            }
+        }
+    }
+    for prepared in [false, true] {
+        let registry = Arc::new(WorkerRegistry::new());
+        let mut builder =
+            BasicWorkerBuilder::new("grpc://prepared:8000").health_config(HealthCheckConfig {
+                success_threshold: 1,
+                ..HealthCheckConfig::default()
+            });
+        if prepared {
+            builder = builder.label("sglang_prepared", "instance-bound");
+        }
+        let worker: Arc<dyn Worker> = Arc::new(builder.build());
+        let id = registry.register(Arc::clone(&worker)).unwrap();
+        worker.set_status(WorkerStatus::Ready);
+        let jobs = FlakyRefresh(AtomicUsize::new(0));
+        for _ in 0..2 {
+            let mut completion = passing_probe(id.clone(), &worker);
+            completion.launched_status = WorkerStatus::Ready;
+            assert!(matches!(
+                apply_probe_completion(&registry, completion, None, Some(&jobs)).await,
+                ProbeApplyResult::Applied(None)
+            ));
+            assert_eq!(worker.status(), WorkerStatus::Ready);
+        }
+        assert_eq!(jobs.0.load(Ordering::Relaxed), if prepared { 2 } else { 0 });
+        // A probe launched before same-address replacement cannot refresh or
+        // promote the new generation; the existing revision fence still applies.
+        let stale = passing_probe(id.clone(), &worker);
+        let replacement = make_worker(worker.url(), 1, 1);
+        assert!(registry.replace(&id, Arc::clone(&replacement)));
+        let before = jobs.0.load(Ordering::Relaxed);
+        assert!(matches!(
+            apply_probe_completion(&registry, stale, None, Some(&jobs)).await,
+            ProbeApplyResult::Stale
+        ));
+        assert_eq!(jobs.0.load(Ordering::Relaxed), before);
+    }
+}
+
 /// A worker that fails under a removal scope is handed over for removal
 /// once: at its address, named by its own id at the revision its probe saw.
 #[tokio::test]
@@ -1444,6 +1500,31 @@ fn apply_connect_signal_reschedules_a_promoted_worker() {
 /// The signal's promotion is reported for what follows a transition into
 /// service (the label refresh): the worker it moved, and nothing when the
 /// signal moved nothing (already Ready, or an unknown URL).
+#[test]
+fn ready_prepared_instance_recovery_requests_label_refresh() {
+    let registry = Arc::new(WorkerRegistry::new());
+    let worker: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new("grpc://encoder:8000")
+            .label("sglang_prepared", "instance-bound")
+            .build(),
+    );
+    worker.set_status(WorkerStatus::Ready);
+    let revision = worker.revision();
+    registry.register(worker.clone()).unwrap();
+    let mut next_check = HashMap::new();
+    assert!(apply_connect_signal(
+        &registry,
+        WorkerConnected {
+            url: worker.url().to_string(),
+            revision
+        },
+        &mut next_check,
+        &test_config(),
+    )
+    .is_some());
+    assert_eq!(worker.status(), WorkerStatus::Ready);
+}
+
 #[test]
 fn apply_connect_signal_reports_the_promoted_worker() {
     let registry = Arc::new(WorkerRegistry::new());
@@ -3043,4 +3124,131 @@ async fn test_profile_all_url_filter_without_match() {
     assert!(result.successful.is_empty());
     assert!(result.failed.is_empty());
     assert!(result.message.contains("No worker matching"));
+}
+
+/// Label refresh is an effect of a probe, not a reason to run another probe.
+/// Repeated metadata replacements preserve the schedule; a new instance does not.
+#[tokio::test(start_paused = true)]
+async fn prepared_refresh_replacement_does_not_self_trigger_probes() {
+    use smg_grpc_client::sglang_managed::proto::{Capabilities, Instance};
+    let registry = Arc::new(WorkerRegistry::new());
+    let make = |label: Option<&str>| -> Arc<dyn Worker> {
+        let mut builder = BasicWorkerBuilder::new("grpc://prepared:8000");
+        if let Some(label) = label {
+            builder = builder.label("sglang_prepared", label);
+        }
+        let worker: Arc<dyn Worker> = Arc::new(builder.build());
+        worker.set_status(WorkerStatus::Ready);
+        worker
+    };
+    let capability = |generation: &str, wall: u64| {
+        serde_json::to_string(&Capabilities {
+            version: 1,
+            instance: Some(Instance {
+                worker_id: "encoder".into(),
+                generation: generation.into(),
+            }),
+            role: "encoder".into(),
+            model_revision: "weights".into(),
+            wall_time_unix_ms: wall,
+            ready: true,
+            ..Default::default()
+        })
+        .unwrap()
+    };
+    let mut old = make(Some(&capability("generation-1", 1)));
+    let id = registry.register(Arc::clone(&old)).unwrap();
+    let due = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut next_check = HashMap::from([(id.clone(), due)]);
+    assert!(apply_registry_event(
+        Ok(WorkerEvent::Registered {
+            worker_id: id.clone(),
+            worker: Arc::clone(&old),
+        }),
+        &registry,
+        &mut next_check,
+        &test_config()
+    )
+    .is_continue());
+    assert_eq!(next_check[&id], tokio::time::Instant::now());
+    next_check.insert(id.clone(), due);
+    for wall in 2..6 {
+        let new = make(Some(&capability("generation-1", wall)));
+        assert!(registry.replace(&id, Arc::clone(&new)));
+        assert!(apply_registry_event(
+            Ok(WorkerEvent::Replaced {
+                worker_id: id.clone(),
+                old,
+                new: Arc::clone(&new),
+            }),
+            &registry,
+            &mut next_check,
+            &test_config()
+        )
+        .is_continue());
+        assert_eq!(next_check[&id], due);
+        let mut in_flight = HashSet::new();
+        let mut probes = ProbeFutures::new();
+        assert!(queue_due_probes(
+            &registry,
+            &test_config(),
+            &mut next_check,
+            &mut in_flight,
+            &mut probes,
+            tokio::time::Instant::now()
+        )
+        .is_empty());
+        assert!(
+            probes.is_empty(),
+            "refresh must not generate the next refresh"
+        );
+        old = new;
+        tokio::time::advance(Duration::from_millis(100)).await;
+    }
+    let valid = capability("generation-1", 10);
+    let mutate = |field: &str, value: serde_json::Value| {
+        let mut cap: serde_json::Value = serde_json::from_str(&valid).unwrap();
+        cap[field] = value;
+        cap.to_string()
+    };
+    for label in [
+        Some(capability("generation-2", 10)),
+        Some(mutate("ready", serde_json::json!(false))),
+        Some(mutate(
+            "instance",
+            serde_json::json!({"worker_id":"other", "generation":"generation-1"}),
+        )),
+        Some(mutate(
+            "instance",
+            serde_json::json!({"generation":"generation-1"}),
+        )),
+        Some(mutate("model_revision", serde_json::json!("new-weights"))),
+        Some(mutate("kv_backend", serde_json::json!("different"))),
+        Some(mutate("instance", serde_json::Value::Null)),
+        Some(mutate(
+            "instance",
+            serde_json::json!({"worker_id":"encoder", "generation":""}),
+        )),
+        Some("{}".into()),
+        Some("not json".into()),
+        None,
+    ] {
+        // Each change is judged against the same complete, valid generation.
+        old = make(Some(&valid));
+        next_check.insert(id.clone(), due);
+        let new = make(label.as_deref());
+        assert!(registry.replace(&id, Arc::clone(&new)));
+        assert!(apply_registry_event(
+            Ok(WorkerEvent::Replaced {
+                worker_id: id.clone(),
+                old,
+                new: Arc::clone(&new),
+            }),
+            &registry,
+            &mut next_check,
+            &test_config()
+        )
+        .is_continue());
+        assert_eq!(next_check[&id], tokio::time::Instant::now());
+    }
 }

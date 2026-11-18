@@ -152,6 +152,7 @@ enum Unreported {
 pub struct PdPairing {
     runtime: RuntimeType,
     explicit: Option<String>,
+    prepared: Option<String>,
     transport: Option<String>,
     profile: Option<KvTransferProfile>,
     version: Option<String>,
@@ -175,6 +176,7 @@ impl PdPairing {
         Self {
             runtime: spec.runtime_type,
             explicit,
+            prepared: non_empty(labels.get("sglang_prepared_key")),
             transport,
             profile,
             version: non_empty(labels.get("version")),
@@ -261,6 +263,9 @@ impl PdPairing {
     /// rolling upgrade legitimately mixes versions, so it counts only under
     /// `Strict`, and only when both sides report one.
     pub fn mismatch(&self, other: &Self, mode: PdPairingMode) -> Option<PairingMismatch> {
+        if self.prepared != other.prepared {
+            return Some(PairingMismatch::KvLayout("prepared_input"));
+        }
         if mode == PdPairingMode::Off {
             return None;
         }

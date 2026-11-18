@@ -13,9 +13,11 @@ use futures::{
     stream::{FuturesUnordered, Stream, StreamExt},
 };
 use smg_grpc_client::{
-    is_transport_failure, media_identity::sglang as media_contract, RequestDeadline,
+    is_transport_failure, media_identity::sglang as media_contract,
+    sglang_managed::proto::Instance, RequestDeadline,
 };
 use tokio::sync::{oneshot, watch};
+use tokio_util::task::AbortOnDropHandle;
 use tracing::{debug, error, info_span, warn, Instrument};
 
 use super::{
@@ -42,6 +44,7 @@ use crate::{
         error,
         grpc::{
             backend_client::BackendClient,
+            client::GrpcClient,
             common::stages::encode::EncodeDispatchPlan,
             context::{
                 stage_output, ClientSelection, DispatchContext, EncodeOutputs, ExecutionPlan,
@@ -53,6 +56,7 @@ use crate::{
                 ProtoGenerateRequest, ProtoGenerateResponse, ProtoRequest, ProtoStream,
             },
             sequential_pd::execute_sequential_pd,
+            sglang_epd::router as prepared_input,
             utils::{
                 account_pd_side_failure,
                 stream_failure::UpstreamClass,
@@ -64,7 +68,7 @@ use crate::{
         health::liveness::{self, SideReprieve},
         identity::basic::WorkerTypeExt,
         metrics::Metrics as WorkerMetrics,
-        ConnectionModeExt, Worker,
+        ConnectionModeExt, Worker, WorkerRegistry,
     },
 };
 
@@ -403,6 +407,7 @@ pub(crate) async fn execute_plan(
                     ledger,
                     room_residue,
                     None,
+                    None,
                 ))
                 .await
             }
@@ -421,6 +426,7 @@ pub(crate) async fn execute_plan(
                     encode_watch,
                     prefill_guard,
                     ledger,
+                    Arc::clone(&ctx.worker_registry),
                 ))
                 .await
                 .map_err(|mut response| {
@@ -564,6 +570,7 @@ async fn execute_pd_dispatch(
     ledger: &AttemptLedger,
     room_residue: Option<RoomResidue>,
     encode: Option<EncodeWatch>,
+    registry: Option<Arc<WorkerRegistry>>,
 ) -> Result<ExecutionResult, Response> {
     let Some(runtime_type) = workers.disaggregated_runtime_type() else {
         error!(
@@ -624,6 +631,7 @@ async fn execute_pd_dispatch(
                     prefill_guard,
                     ledger,
                     encode,
+                    registry,
                 )
                 .await
             }
@@ -703,11 +711,14 @@ async fn execute_fanout_pd(
     // The samples share the one admission slot; each pair's Prefill phase
     // ends on its own, so each carries its own handle.
     let guards = prefill_guard.replicate_to(subs.len());
-    let dispatches = subs.into_iter().zip(guards).map(|(sub, guard)| {
-        let mut clients = clients.clone();
-        let encode = encode.clone();
-        async move { execute_parallel_pd(sub, &mut clients, workers, guard, ledger, encode).await }
-    });
+    let dispatches =
+        subs.into_iter().zip(guards).map(|(sub, guard)| {
+            let mut clients = clients.clone();
+            let encode = encode.clone();
+            async move {
+                execute_parallel_pd(sub, &mut clients, workers, guard, ledger, encode, None).await
+            }
+        });
     let results = try_join_all(dispatches).await?;
 
     let mut prefills = Vec::with_capacity(results.len());
@@ -774,8 +785,10 @@ async fn execute_epd_dispatch(
     encode_watch: &mut Option<EncodeWatch>,
     prefill_guard: PrefillLoadGuard,
     ledger: &AttemptLedger,
+    registry: Arc<WorkerRegistry>,
 ) -> Result<ExecutionResult, Response> {
-    let mut cleanup = prepare_epd_attempt(&mut proto_request, encode, encode_watch).await?;
+    let mut cleanup =
+        prepare_epd_attempt(&mut proto_request, workers, encode, encode_watch).await?;
     // An EPD request's room is left as minted: no sticky prefill rank.
     let result = execute_pd_dispatch(
         proto_request,
@@ -786,6 +799,7 @@ async fn execute_epd_dispatch(
         ledger,
         None,
         encode_watch.clone(),
+        Some(registry),
     )
     .await;
     if result.is_ok() {
@@ -812,10 +826,24 @@ async fn execute_epd_dispatch(
 /// Text-only leaves nothing.
 async fn prepare_epd_attempt(
     proto_request: &mut ProtoGenerateRequest,
+    workers: &WorkerSelection,
     encode: Option<EncodeOutputs>,
     carried: &mut Option<EncodeWatch>,
 ) -> Result<Option<Vec<PushCleanup>>, Response> {
     match encode {
+        Some(EncodeOutputs::PreparedInput(input)) => {
+            let ProtoGenerateRequest::Sglang(request) = proto_request else {
+                return Err(error::internal_error(
+                    "prepared_input",
+                    "expected SGLang request",
+                ));
+            };
+            let job = input
+                .build(request, workers)
+                .map_err(|s| s.to_http_error("prepared_input", s.message().to_owned()))?;
+            *carried = Some(launch_prepared_encode(job.dispatch()));
+            Ok(None)
+        }
         Some(EncodeOutputs::Push(plan)) => Ok(Some(plan.encode(proto_request).await?)),
         Some(EncodeOutputs::Rendezvous { dispatch, .. }) => {
             *carried = launch_encode_dispatch(dispatch);
@@ -890,6 +918,27 @@ fn launch_encode_dispatch(encode_dispatch: EncodeDispatchPlan) -> Option<EncodeW
     let (failed_tx, failed_rx) = watch::channel(None);
     tokio::spawn(supervise_encode_sends(outcomes, failed_tx));
     Some(failed_rx)
+}
+
+/// Observe the single native encoder RPC until it answers or the last request
+/// watch leaves. Its native owner retains the transfer through cleanup.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the request watches own the encoder RPC"
+)]
+fn launch_prepared_encode(
+    send: impl Future<Output = Result<(), String>> + Send + 'static,
+) -> EncodeWatch {
+    let (failed, watch) = watch::channel(None);
+    let task = AbortOnDropHandle::new(tokio::spawn(send));
+    tokio::spawn(async move {
+        let outcome = async move { task.await.unwrap_or_else(|error| Err(error.to_string())) };
+        tokio::select! {
+            () = failed.closed() => {},
+            () = supervise_encode_sends(Box::pin(futures::stream::once(outcome)), failed.clone()) => {},
+        }
+    });
+    watch
 }
 
 /// Supervise an EPD request's encode sends: the first failure among
@@ -985,6 +1034,7 @@ async fn execute_batch_dispatch(
                             ledger,
                             None, // the room as minted: no sticky prefill rank
                             None, // no encode dispatch on this path
+                            None,
                         )
                         .await
                     }
@@ -1469,6 +1519,7 @@ async fn execute_parallel_pd(
     prefill_guard: PrefillLoadGuard,
     ledger: &AttemptLedger,
     encode: Option<EncodeWatch>,
+    registry: Option<Arc<WorkerRegistry>>,
 ) -> Result<ExecutionResult, Response> {
     let streaming = proto_request.stream();
     let runtime = workers
@@ -1479,6 +1530,21 @@ async fn execute_parallel_pd(
         clients.disaggregated_or_mismatch("execute_parallel_pd")?;
 
     let (mut prefill_request, mut decode_request) = parallel_pd_requests(proto_request, workers);
+    let prepared = if let (ProtoGenerateRequest::Sglang(p), ProtoGenerateRequest::Sglang(d)) =
+        (&mut prefill_request, &mut decode_request)
+    {
+        prepared_input::split_requests(p, d)
+            .map_err(|s| s.to_http_error("prepared_input", s.message().to_owned()))?
+    } else {
+        None
+    };
+    let (prepared_prefill, prepared_decode) = prepared
+        .map(|(binding, remaining)| {
+            let deadline = tokio::time::Instant::now() + remaining;
+            let (tx, rx) = oneshot::channel();
+            ((deadline, tx), (binding, deadline, rx))
+        })
+        .unzip();
     let reuse_key = sglang_media_reuse_key(&prefill_request, workers);
     if reuse_key.is_some() {
         if let ProtoGenerateRequest::Sglang(req) = &mut prefill_request {
@@ -1525,13 +1591,44 @@ async fn execute_parallel_pd(
     // read before the booking, so the side's own prompt is not counted twice.
     let prefill_ticket =
         prefill_worker.and_then(|worker| PrefillTicket::book(worker, sides.prompt_tokens));
+    let (prefill_guard, dispatch_guard) = if prepared_prefill.is_some() {
+        let (guard, retained) = prefill_guard.share();
+        (guard, Some(retained))
+    } else {
+        (prefill_guard, None)
+    };
+    let fence = prepared_decode.as_ref().and_then(|(binding, _, _)| {
+        registry
+            .zip(prefill_worker.cloned())
+            .map(|(registry, worker)| {
+                PreparedDispatchFence::new(registry, worker, binding.prefill.clone())
+            })
+    });
     let prefill_dispatch: SideDispatch = Box::pin(dispatch_prefill_within(
         PrefillWait {
             bound: bound.clone(),
             encode: encode.clone(),
         },
         Box::pin(async move {
-            let mut stream = prefill_client.generate(prefill_request).await?;
+            let dispatch = async move { prefill_client.generate(prefill_request).await };
+            let mut stream = if let Some((deadline, tx)) = prepared_prefill {
+                let mut stream =
+                    owned_prepared_dispatch(dispatch, dispatch_guard, fence, deadline).await?;
+                let item = prepared_layout_before(deadline, stream.next()).await?;
+                let input = match item {
+                    Some(Ok(ProtoGenerateResponse::Sglang(response)))
+                        if response.response.is_none() && !response.prepared_input.is_empty() =>
+                    {
+                        response.prepared_input
+                    }
+                    Some(Err(error)) => return Err(error),
+                    _ => return Err(tonic::Status::data_loss("P did not export prepared input")),
+                };
+                let _ = tx.send(input);
+                stream
+            } else {
+                dispatch.await?
+            };
             if await_identity {
                 // This is a preprocessing control item, not a token or proof
                 // that KV transfer completed. Consume it before tracking TTFT.
@@ -1561,6 +1658,35 @@ async fn execute_parallel_pd(
         sides.prompt_tokens,
     ));
     let decode_dispatch: SideDispatch = Box::pin(async move {
+        if let Some((binding, deadline, prepared_rx)) = prepared_decode {
+            use smg_grpc_client::sglang_managed::proto::{decode_command::Command, DecodeCommand};
+            let (
+                BackendClient::Grpc(GrpcClient::Sglang(client)),
+                ProtoGenerateRequest::Sglang(req),
+            ) = (&decode_client, decode_request)
+            else {
+                return Err(tonic::Status::failed_precondition(
+                    "prepared D requires SGLang gRPC",
+                ));
+            };
+            let (sender, stream) = client
+                .start_prepared(
+                    *req,
+                    deadline.saturating_duration_since(tokio::time::Instant::now()),
+                )
+                .await?;
+            let bytes = prepared_layout_before(deadline, prepared_rx)
+                .await?
+                .map_err(|_| tonic::Status::cancelled("P layout export failed"))?;
+            let input = prepared_input::decode_input(&binding, bytes)?;
+            sender
+                .send(DecodeCommand {
+                    command: Some(Command::BindPreparedInput(input)),
+                })
+                .await
+                .map_err(|_| tonic::Status::cancelled("D closed before input binding"))?;
+            return Ok(ProtoStream::Sglang(stream));
+        }
         if let Some(key) = reuse_key {
             // Bound the optimization, not just inference. Stale capability
             // metadata or a legacy worker must not deadlock the PD rendezvous.
@@ -1617,12 +1743,137 @@ async fn execute_parallel_pd(
     }
 }
 
+/// Submission and both layout observers share the original remaining budget.
+async fn prepared_layout_before<T>(
+    deadline: tokio::time::Instant,
+    layout: impl Future<Output = T>,
+) -> Result<T, tonic::Status> {
+    tokio::time::timeout_at(deadline, layout)
+        .await
+        .map_err(|_| tonic::Status::deadline_exceeded("prepared layout expired"))
+}
+
+/// Preserve an accepted send across HTTP cancellation until its ordinary stream
+/// owner can abort and observe release. Unknown transport failure still fences.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "prepared submission must outlive HTTP cancellation until its existing deadline"
+)]
+async fn owned_prepared_dispatch(
+    dispatch: impl Future<Output = StreamResult> + Send + 'static,
+    guard: Option<Arc<PrefillLoadGuard>>,
+    fence: Option<PreparedDispatchFence>,
+    deadline: tokio::time::Instant,
+) -> StreamResult {
+    tokio::spawn(
+        retain_prefill_dispatch(
+            async move {
+                tokio::time::timeout_at(deadline, dispatch)
+                    .await
+                    .map_err(|_| tonic::Status::deadline_exceeded("prepared submission expired"))?
+            },
+            guard,
+            fence,
+        )
+        .in_current_span(),
+    )
+    .await
+    .map_err(|_| tonic::Status::internal("prepared submission task failed"))?
+}
+
+// Keep the prepared request's one reservation from dispatch creation through
+// transport cleanup, including failures while waiting for prepared metadata.
+/// Keep prefill load ownership alive until an in-flight transport send has retired.
+async fn retain_prefill_dispatch(
+    dispatch: impl Future<Output = StreamResult>,
+    guard: Option<Arc<PrefillLoadGuard>>,
+    mut fence: Option<PreparedDispatchFence>,
+) -> StreamResult {
+    // This body runs only when polled. An unpolled send never fences its worker.
+    if let Some(fence) = &mut fence {
+        fence.guard.clone_from(&guard);
+        fence.armed = true;
+    }
+    let mut stream = match dispatch.await {
+        Ok(stream) => stream,
+        Err(status) => {
+            if smg_grpc_client::sglang_managed::is_not_submitted(&status) {
+                if let Some(fence) = &mut fence {
+                    fence.armed = false;
+                }
+            }
+            // Fence before releasing the reservation, including on cancellation.
+            drop(fence);
+            return Err(status);
+        }
+    };
+    if let (Some(guard), ProtoStream::Sglang(native)) = (guard, &mut stream) {
+        native.retain_until_released(guard);
+        if let Some(fence) = &mut fence {
+            fence.armed = false;
+        }
+    }
+    Ok(stream)
+}
+
+/// An ambiguous prepared submission makes this instance unavailable for reuse.
+/// Instance identity is checked under the registry's mutation lock: a metadata
+/// refresh retains the native owner, but a new generation must not be fenced.
+struct PreparedDispatchFence {
+    registry: Arc<WorkerRegistry>,
+    worker: Arc<dyn Worker>,
+    instance: Option<Instance>,
+    armed: bool,
+    guard: Option<Arc<PrefillLoadGuard>>,
+}
+
+impl PreparedDispatchFence {
+    fn new(
+        registry: Arc<WorkerRegistry>,
+        worker: Arc<dyn Worker>,
+        instance: Option<Instance>,
+    ) -> Self {
+        Self {
+            instance,
+            registry,
+            worker,
+            armed: false,
+            guard: None,
+        }
+    }
+}
+
+impl Drop for PreparedDispatchFence {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let Some(id) = self.registry.get_id_by_url(self.worker.url()) else {
+            return;
+        };
+        let transition = self.registry.transition_status_if(
+            &id,
+            openai_protocol::worker::WorkerStatus::Draining,
+            |current| {
+                Arc::ptr_eq(current, &self.worker)
+                    || (self.instance.is_some()
+                        && prepared_input::capability(current.as_ref()).and_then(|c| c.instance)
+                            == self.instance)
+            },
+        );
+        if let Some((old, new)) = transition {
+            warn!(worker = %self.worker.redacted_url(), instance = ?self.instance,
+                ?old, ?new, "Prepared submission outcome is ambiguous; fencing instance");
+        }
+    }
+}
+
 /// Both sides explicitly advertise the same supported processor contract.
 fn sglang_media_reuse_key(req: &ProtoGenerateRequest, workers: &WorkerSelection) -> Option<String> {
     let ProtoGenerateRequest::Sglang(req) = req else {
         return None;
     };
-    if !media_contract::reusable_request(req) {
+    if !req.prepared_control.is_empty() || !media_contract::reusable_request(req) {
         return None;
     }
     let prefill = workers.prefill_worker()?;
@@ -3517,6 +3768,304 @@ pub(crate) mod tests {
         ));
     }
 
+    fn prepared_fence_worker(generation: &str) -> Arc<dyn Worker> {
+        use smg_grpc_client::sglang_managed::proto;
+        let capability = proto::Capabilities {
+            instance: Some(Instance {
+                worker_id: "p".into(),
+                generation: generation.into(),
+            }),
+            ..Default::default()
+        };
+        Arc::new(
+            BasicWorkerBuilder::new("grpc://prepared-p:30001")
+                .worker_type(WorkerType::Prefill)
+                .health_config(no_health_check())
+                .label(
+                    prepared_input::CAPABILITY,
+                    serde_json::to_string(&capability).unwrap(),
+                )
+                .build(),
+        )
+    }
+
+    fn prepared_fence_guard(worker: &Arc<dyn Worker>) -> Arc<PrefillLoadGuard> {
+        Arc::new(PrefillLoadGuard::Unbounded {
+            _guard: crate::worker::WorkerLoadGuard::with_key(Arc::clone(worker), None),
+        })
+    }
+
+    /// A ready instance and the exact fence a request to it would carry.
+    fn ready_prefill_fence() -> (Arc<dyn Worker>, PreparedDispatchFence) {
+        let registry = Arc::new(WorkerRegistry::new());
+        let worker = prepared_fence_worker("first");
+        let id = registry.register(Arc::clone(&worker)).unwrap();
+        registry.transition_status(&id, openai_protocol::worker::WorkerStatus::Ready);
+        let instance = prepared_input::capability(worker.as_ref())
+            .unwrap()
+            .instance;
+        let fence = PreparedDispatchFence::new(registry, Arc::clone(&worker), instance);
+        (worker, fence)
+    }
+
+    #[tokio::test]
+    async fn prepared_submission_error_fences_only_when_acceptance_is_ambiguous() {
+        use openai_protocol::worker::WorkerStatus;
+        for rejected in [false, true] {
+            let (worker, fence) = ready_prefill_fence();
+            let status = tonic::Status::resource_exhausted("native owner may already exist");
+            let status = if rejected {
+                smg_grpc_client::sglang_managed::not_submitted(status)
+            } else {
+                status
+            };
+            let result = retain_prefill_dispatch(
+                async { Err(status) },
+                Some(prepared_fence_guard(&worker)),
+                Some(fence),
+            )
+            .await;
+            assert!(result.is_err());
+            assert_eq!(worker.load(), 0);
+            assert_eq!(
+                worker.status(),
+                if rejected {
+                    WorkerStatus::Ready
+                } else {
+                    WorkerStatus::Draining
+                }
+            );
+        }
+    }
+
+    /// Client cancellation does not discard the RPC observer: the late response
+    /// decides whether admission was rejected or the instance must be fenced.
+    #[tokio::test]
+    async fn prepared_cancel_retains_dispatch_until_its_real_verdict() {
+        use openai_protocol::worker::WorkerStatus;
+        for rejected in [false, true] {
+            let (worker, fence) = ready_prefill_fence();
+            let (started_tx, started_rx) = oneshot::channel();
+            let (result_tx, result_rx) = oneshot::channel();
+            let mut dispatch = Box::pin(owned_prepared_dispatch(
+                async move {
+                    started_tx.send(()).unwrap();
+                    Err(result_rx.await.unwrap())
+                },
+                Some(prepared_fence_guard(&worker)),
+                Some(fence),
+                tokio::time::Instant::now() + Duration::from_secs(1),
+            ));
+            assert!(futures::poll!(&mut dispatch).is_pending());
+            started_rx.await.unwrap();
+            drop(dispatch);
+            assert_eq!(worker.load(), 1);
+            assert_eq!(worker.status(), WorkerStatus::Ready);
+            let status = tonic::Status::cancelled("late dispatch verdict");
+            result_tx
+                .send(if rejected {
+                    smg_grpc_client::sglang_managed::not_submitted(status)
+                } else {
+                    status
+                })
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while worker.load() != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                worker.status(),
+                if rejected {
+                    WorkerStatus::Ready
+                } else {
+                    WorkerStatus::Draining
+                }
+            );
+        }
+    }
+
+    /// Slow headers consume the layout budget instead of starting a new one.
+    #[tokio::test(start_paused = true)]
+    async fn prepared_headers_and_layout_share_one_deadline() {
+        let start = tokio::time::Instant::now();
+        let deadline = start + Duration::from_secs(1);
+        let stream = owned_prepared_dispatch(
+            async {
+                tokio::time::sleep(Duration::from_millis(900)).await;
+                Ok(ProtoStream::Fanout(FanoutStream::new(Vec::new())))
+            },
+            None,
+            None,
+            deadline,
+        )
+        .await
+        .unwrap();
+        assert!(tokio::time::Instant::now() < deadline);
+        let error = prepared_layout_before(deadline, std::future::pending::<()>())
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::DeadlineExceeded);
+        assert!(tokio::time::Instant::now() <= deadline + Duration::from_millis(1));
+        drop(stream);
+    }
+
+    /// Detaching never extends the request budget or makes uncertain submission
+    /// reusable when the peer never answers.
+    #[tokio::test(start_paused = true)]
+    async fn prepared_detached_dispatch_still_fences_at_its_deadline() {
+        use openai_protocol::worker::WorkerStatus;
+        let (worker, fence) = ready_prefill_fence();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        // Earlier dispatch work consumes the same budget; starting this stage
+        // later must not grant it another full timeout.
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let mut dispatch = Box::pin(owned_prepared_dispatch(
+            std::future::pending(),
+            Some(prepared_fence_guard(&worker)),
+            Some(fence),
+            deadline,
+        ));
+        assert!(futures::poll!(&mut dispatch).is_pending());
+        tokio::task::yield_now().await;
+        drop(dispatch);
+        assert_eq!(worker.load(), 1);
+        tokio::time::advance(Duration::from_millis(1001)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(worker.load(), 0);
+        assert_eq!(worker.status(), WorkerStatus::Draining);
+    }
+
+    #[tokio::test]
+    async fn prepared_submission_drop_fences_only_after_first_poll() {
+        use openai_protocol::worker::WorkerStatus;
+        for polled in [false, true] {
+            let (worker, fence) = ready_prefill_fence();
+            let registry = Arc::clone(&fence.registry);
+            let mut dispatch = Box::pin(retain_prefill_dispatch(
+                std::future::pending(),
+                Some(prepared_fence_guard(&worker)),
+                Some(fence),
+            ));
+            if polled {
+                assert!(futures::poll!(&mut dispatch).is_pending());
+            }
+            assert_eq!(worker.load(), 1);
+            if polled {
+                // Pause precisely before the registry transition, not on a timer:
+                // the CPU cancellation cannot release its charge ahead of fencing.
+                registry.with_another_write_before_the_lock(
+                    |_| drop(dispatch),
+                    |_| {
+                        assert_eq!(worker.load(), 1);
+                        assert_eq!(worker.status(), WorkerStatus::Ready);
+                    },
+                );
+            } else {
+                drop(dispatch);
+            }
+            assert_eq!(worker.load(), 0);
+            assert_eq!(
+                worker.status(),
+                if polled {
+                    WorkerStatus::Draining
+                } else {
+                    WorkerStatus::Ready
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn prepared_submission_fence_survives_refresh_but_not_a_new_instance() {
+        use openai_protocol::worker::WorkerStatus;
+        for same_generation in [false, true] {
+            let (old, fence) = ready_prefill_fence();
+            let registry = Arc::clone(&fence.registry);
+            let id = registry.get_id_by_url(old.url()).unwrap();
+            let replacement =
+                prepared_fence_worker(if same_generation { "first" } else { "second" });
+            let mut dispatch = Box::pin(retain_prefill_dispatch(
+                std::future::pending(),
+                Some(prepared_fence_guard(&old)),
+                Some(fence),
+            ));
+            assert!(futures::poll!(&mut dispatch).is_pending());
+            registry.with_another_write_before_the_lock(
+                |_| drop(dispatch),
+                |registry| {
+                    assert_eq!(old.load(), 1);
+                    assert!(registry.replace(&id, Arc::clone(&replacement)));
+                },
+            );
+            assert_eq!(
+                replacement.status(),
+                if same_generation {
+                    WorkerStatus::Draining
+                } else {
+                    WorkerStatus::Ready
+                }
+            );
+            assert_eq!(old.load(), 0);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    /// Encode failure cannot free the reservation while prefill submission is still pending.
+    async fn encode_failure_retains_pending_prefill_load_until_dispatch_retires() {
+        use crate::worker::WorkerLoadGuard;
+
+        for decode_ready in [false, true] {
+            let workers = tokenspeed_pair();
+            let prefill = Arc::clone(workers.prefill_worker().unwrap());
+            let (guard, retained) = PrefillLoadGuard::Unbounded {
+                _guard: WorkerLoadGuard::with_key(Arc::clone(&prefill), None),
+            }
+            .share();
+            let (release, pending) = oneshot::channel();
+            let dispatch = Box::pin(retain_prefill_dispatch(
+                async move {
+                    let _ = pending.await;
+                    Err(tonic::Status::cancelled("retired dispatch ended"))
+                },
+                Some(retained),
+                None,
+            ));
+            let decode: SideDispatch = if decode_ready {
+                Box::pin(async { Ok(ProtoStream::Fanout(FanoutStream::new(Vec::new()))) })
+            } else {
+                never_answers()
+            };
+            let (failed_tx, failed_rx) = watch::channel(None);
+            let (outcome, ()) = tokio::join!(
+                dispatch_pd_sides(
+                    dispatch,
+                    decode,
+                    None,
+                    Some(encode_race(&prefill, failed_rx))
+                ),
+                encode_fails_after(Duration::from_millis(1), failed_tx),
+            );
+            drop(outcome);
+            drop(guard);
+            assert_eq!(
+                prefill.load(),
+                1,
+                "pending retirement still owns the reservation"
+            );
+            release.send(()).unwrap();
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while prefill.load() != 0 {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+    }
+
     /// The request's encode dispatch fails while both sides still dispatch,
     /// no bound on either (the silence rule off): the prefill side is given
     /// up on the moment the failure is known, the decode dispatch comes
@@ -3653,6 +4202,28 @@ pub(crate) mod tests {
             }
             _ => panic!("the prefill's encode verdict beside the decode's answer"),
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    /// Prepared encode observers must terminate after their final request owner disappears.
+    async fn prepared_encode_observers_end_when_the_last_request_watch_leaves() {
+        let (owner, mut released) = oneshot::channel::<()>();
+        let watch = launch_prepared_encode(async move {
+            let _owner = owner;
+            std::future::pending().await
+        });
+        let retry_watch = watch.clone();
+        drop(watch);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1), &mut released)
+                .await
+                .is_err()
+        );
+        drop(retry_watch);
+        assert!(tokio::time::timeout(Duration::from_millis(1), released)
+            .await
+            .unwrap()
+            .is_err());
     }
 
     /// One refused send is published while a sibling send is still in
@@ -3873,7 +4444,7 @@ pub(crate) mod tests {
         let (first_attempts_watch, failed_tx) = encode_watch();
         let mut carried = Some(first_attempts_watch);
         let mut request = tokenspeed_request(1, None);
-        let cleanups = prepare_epd_attempt(&mut request, None, &mut carried)
+        let cleanups = prepare_epd_attempt(&mut request, &tokenspeed_pair(), None, &mut carried)
             .await
             .expect("nothing to encode");
         assert!(cleanups.is_none(), "no push plan, nothing to disarm");
@@ -3900,9 +4471,10 @@ pub(crate) mod tests {
         let mut carried = None;
         let mut request = tokenspeed_request(1, None);
         for _attempt in 0..2 {
-            let cleanups = prepare_epd_attempt(&mut request, None, &mut carried)
-                .await
-                .expect("nothing to encode");
+            let cleanups =
+                prepare_epd_attempt(&mut request, &tokenspeed_pair(), None, &mut carried)
+                    .await
+                    .expect("nothing to encode");
             assert!(cleanups.is_none());
             assert!(carried.is_none());
         }

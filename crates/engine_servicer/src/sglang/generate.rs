@@ -37,6 +37,11 @@ pub(super) async fn generate(
 ) -> Result<BoxStream<sg::GenerateResponse>, Status> {
     // The request's arrival, the instant its latencies are measured from.
     let arrival = Instant::now();
+    // Quarantine applies to the entire prepared worker, including ordinary
+    // text requests arriving through a direct caller or stale router health.
+    if state.prepared.get().is_some_and(|runtime| !runtime.ready()) {
+        return Err(Status::unavailable("prepared runtime is unhealthy"));
+    }
     let client = state.shared.engine()?;
     if req.request_id.is_empty() {
         return Err(Status::invalid_argument("request_id is required"));
@@ -115,6 +120,7 @@ pub(super) async fn generate(
         early_identity = Some(sg::GenerateResponse {
             request_id: req.request_id.clone(),
             media_identity: Some(identity),
+            prepared_input: Vec::new(),
             response: None,
         });
     }

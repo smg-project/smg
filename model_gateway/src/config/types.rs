@@ -81,8 +81,8 @@ pub struct RouterConfig {
     /// Explicit runtime for the startup workers (`--worker-urls`), set from
     /// `--backend` when the connection mode is ZMQ. The ZMQ handshake is shared
     /// across engine runtimes, so the wire protocol cannot be probed and must
-    /// be declared up front; HTTP/gRPC workers keep auto-detection and ignore
-    /// this field.
+    /// be declared up front. Explicit SGLang EPD also retains the backend here
+    /// to select its control protocol; other HTTP/gRPC workers auto-detect.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub startup_worker_runtime_type: Option<RuntimeType>,
     /// DP engines per startup ZMQ worker: each `--worker-urls` ZMQ worker
@@ -2303,6 +2303,12 @@ impl Default for RouterConfig {
 }
 
 impl RouterConfig {
+    /// SGLang's explicit EPD routing mode selects the managed protocol, without a second switch.
+    pub fn is_sglang_epd(&self) -> bool {
+        matches!(self.mode, RoutingMode::EncodePrefillDecode { .. })
+            && self.startup_worker_runtime_type == Some(RuntimeType::Sglang)
+    }
+
     /// Create a new configuration with mode and policy
     pub fn new(mode: RoutingMode, policy: PolicyConfig) -> Self {
         Self {

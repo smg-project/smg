@@ -498,17 +498,7 @@ impl Server {
                         }),
                         shutdown.clone().map(|_| ()),
                     );
-                let forced = async move {
-                    let grace = shutdown.await;
-                    tokio::time::sleep(grace).await;
-                };
-                let result = tokio::select! {
-                    result = graceful => result.map_err(|error| error.to_string()),
-                    () = forced => {
-                        warn!("gRPC servicer closed its remaining connections after the drain grace");
-                        Ok(())
-                    }
-                };
+                let result = crate::server::serve_with_grace(graceful, shutdown).await;
                 // The handshake endpoint goes with the server, not with the
                 // runtime: a connect still waiting for its engine is ended
                 // here, so its socket drops while the runtime can still run

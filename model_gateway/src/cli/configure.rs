@@ -233,10 +233,13 @@ impl CliArgs {
         }
     }
 
-    /// Selecting a discovery provider, by either spelling, turns IGW mode on.
+    /// Discovery turns IGW on unless the operator selected the native SGLang EPD pipeline.
     /// Returns whether this call turned it on.
     pub(crate) fn enable_igw_for_discovery(&mut self) -> bool {
-        let enable = self.selected_discovery_provider().is_some() && !self.routing.enable_igw;
+        let native_epd =
+            self.workers.epd_disaggregation && matches!(self.model.backend, Some(Backend::Sglang));
+        let enable =
+            self.selected_discovery_provider().is_some() && !self.routing.enable_igw && !native_epd;
         self.routing.enable_igw |= enable;
         enable
     }
@@ -1125,8 +1128,18 @@ impl CliArgs {
             enable_trace: self.integrations.enable_trace,
             otlp_traces_endpoint: self.integrations.otlp_traces_endpoint.clone(),
         });
-        let connection_mode = Self::determine_connection_mode(&Self::startup_worker_urls(&mode));
-        let startup_worker_runtime_type = self.startup_worker_runtime_type(connection_mode);
+        let sglang_epd =
+            self.workers.epd_disaggregation && matches!(self.model.backend, Some(Backend::Sglang));
+        let connection_mode = if sglang_epd {
+            ConnectionMode::Grpc
+        } else {
+            Self::determine_connection_mode(&Self::startup_worker_urls(&mode))
+        };
+        let startup_worker_runtime_type = if sglang_epd {
+            Some(RuntimeType::Sglang)
+        } else {
+            self.startup_worker_runtime_type(connection_mode)
+        };
         let history_backend = match self.model.history_backend.as_str() {
             "none" => HistoryBackend::None,
             "oracle" => HistoryBackend::Oracle,
