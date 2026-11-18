@@ -25,8 +25,9 @@ anyhow.workspace = true
 blake3.workspace = true
 dashmap.workspace = true
 serde = { workspace = true, features = ["derive"] }
-# Native tool arguments must preserve the reference's parsed f64 values.
-serde_json = { workspace = true, features = ["float_roundtrip"] }
+# Native tool arguments must preserve the reference's parsed f64 values (`float_roundtrip`). The Unigram
+# loader takes a score as its text (`raw_value`) and reads it by the parser's plain rule.
+serde_json = { workspace = true, features = ["float_roundtrip", "raw_value"] }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["sync", "rt-multi-thread", "macros"] }
 tracing.workspace = true
