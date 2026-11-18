@@ -49,9 +49,10 @@ pub struct InteractionsRequest {
     #[serde(alias = "responseFormat")]
     pub response_format: Option<Value>,
 
-    /// MIME type for the response, which the legacy `response_format` (a raw
-    /// JSON schema) requires. A typed format (`text`, `image`, `audio`,
-    /// `video`, or a list of them) carries its own `mime_type`.
+    /// MIME type for the response, which the gateway requires beside the
+    /// legacy `response_format` (a raw JSON schema). A typed format (`text`,
+    /// `image`, `audio`, `video`, or a list of them) does not need it, and
+    /// may name its own `mime_type`.
     #[serde(alias = "responseMimeType")]
     pub response_mime_type: Option<String>,
 
@@ -1183,7 +1184,8 @@ fn validate_interactions_request(req: &InteractionsRequest) -> Result<(), Valida
     }
 
     // The legacy response_format, a raw JSON schema, needs a response_mime_type.
-    // A typed format, or a list of them, names its own mime_type.
+    // A typed format, or a list of them, does not: it may name its own
+    // mime_type, which is not checked here.
     if req
         .response_format
         .as_ref()
@@ -1340,10 +1342,10 @@ fn validate_stop_sequences(seqs: &[String]) -> Result<(), ValidationError> {
 mod tests {
     use super::*;
 
-    /// A typed `response_format`, which names its own `mime_type`, needs no
-    /// `response_mime_type`, nor does a list of them, as the public API's
+    /// A typed `response_format`, with or without its own `mime_type`, needs
+    /// no `response_mime_type`, nor does a list of them, as the public API's
     /// polymorphic field takes them. The legacy form, a raw JSON schema,
-    /// still does.
+    /// still does, wherever it sits in a list.
     #[test]
     fn a_typed_response_format_needs_no_response_mime_type() {
         let request = |response_format: Value| InteractionsRequest {
@@ -1358,14 +1360,18 @@ mod tests {
             "schema": {"type": "object", "properties": {"city": {"type": "string"}}}
         });
         assert!(validate_interactions_request(&request(text.clone())).is_ok());
-        let formats = serde_json::json!([text, {"type": "image", "mime_type": "image/png"}]);
+        let formats =
+            serde_json::json!([text.clone(), {"type": "image", "mime_type": "image/png"}]);
         assert!(validate_interactions_request(&request(formats)).is_ok());
+        let without_mime = serde_json::json!({"type": "audio"});
+        assert!(validate_interactions_request(&request(without_mime)).is_ok());
 
         let schema = serde_json::json!({"type": "object", "properties": {}});
         let (code, _) = refusal(validate_interactions_request(&request(schema.clone())));
         assert_eq!(code, "response_mime_type_required");
         for legacy in [
             serde_json::json!([schema.clone()]),
+            serde_json::json!([text.clone(), schema.clone()]),
             serde_json::json!({"properties": {"city": {"type": "string"}}}),
         ] {
             let (code, _) = refusal(validate_interactions_request(&request(legacy)));
