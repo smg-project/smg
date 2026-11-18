@@ -495,6 +495,22 @@ impl Controller {
         following(&self.listeners)
     }
 
+    /// Refuses a replica that follows a leader ([`Controller::follows`])
+    /// with its replication listener configured on port `0`: asked first
+    /// at the serve's start, before anything is served. Replicas are
+    /// configured alike, so a standby dials its leader at the port of its
+    /// own replication listener, and a number the host drew for this
+    /// replica is no other's. A replica that follows nobody keeps port
+    /// `0`.
+    fn names_its_port(&self) -> Result<(), ConfigError> {
+        match unnamed_port(&self.config.listeners) {
+            Some(name) if self.follows().is_ok() => {
+                Err(ConfigError::ReplicationPortUnnamed(name.to_owned()))
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// Names `listener` one that takes its callers' identities as told
     /// (the contract's `METHOD_AS_TOLD`): a caller states its name in the
     /// `x-smg-principal` metadata entry of every call and nothing is
@@ -702,6 +718,10 @@ impl Controller {
     /// A listener, an election thread or a deciding thread that ends before
     /// the shutdown ends the serve with its error, the other listeners
     /// closed.
+    ///
+    /// A replica that follows a leader with its replication listener
+    /// configured on port `0` is refused before anything is served
+    /// ([`ConfigError::ReplicationPortUnnamed`]).
     pub async fn serve(self, shutdown: impl Future<Output = ()>) -> Result<(), Error> {
         self.serve_until(shutdown, std::future::pending()).await
     }
@@ -714,6 +734,7 @@ impl Controller {
         shutdown: impl Future<Output = ()>,
         fault: impl Future<Output = Error>,
     ) -> Result<(), Error> {
+        self.names_its_port()?;
         let follows = self.follows();
         let Self {
             config,
@@ -1109,6 +1130,15 @@ impl NoFollow {
     }
 }
 
+/// The listener configured to serve the replication scope on port `0`, by
+/// its name.
+fn unnamed_port(listeners: &[Listener]) -> Option<&str> {
+    listeners
+        .iter()
+        .find(|listener| listener.scopes.contains(&Scope::Replication) && listener.addr.port() == 0)
+        .map(|listener| listener.name.as_str())
+}
+
 /// The port a standby dials its leader at, on the leader's own host: the
 /// port of this replica's listener that serves the replication scope to a
 /// stated principal in the clear, since replicas are configured alike. Or
@@ -1214,7 +1244,8 @@ mod tests {
         principal::Layer,
         readiness::{self, tests::fenced, Phase},
         standby::Lag,
-        tell_readiness, tell_role, Bound, Controller, Error, NoFollow, Scope,
+        tell_readiness, tell_role, unnamed_port, Bound, ConfigError, Controller, Error, NoFollow,
+        Scope,
     };
     use crate::{
         elector::{
@@ -1852,6 +1883,42 @@ mod tests {
         assert_eq!(replica.follows().ok(), port);
         // Synced reads the configured poll interval, not the stock one.
         assert_eq!(replica.shared.lag.within(), Duration::from_secs(30));
+    }
+
+    #[tokio::test]
+    async fn a_replica_that_follows_is_refused_port_zero_before_it_serves() {
+        // The replication listener on port 0, by its name.
+        let mut config = valid();
+        assert_eq!(unnamed_port(&config.listeners), Some("replication"));
+        // A lease of its own: nobody dials this replica as a leader.
+        let mut alone = Controller::bind(valid()).await.expect("the listeners bind");
+        alone
+            .identity_as_told("replication")
+            .expect("a listener of the configuration");
+        assert_eq!(alone.names_its_port(), Ok(()));
+        // A shared lease: the replica follows once the listener takes its
+        // callers' names, and is refused there.
+        let dir = tempfile::tempdir().expect("a temp dir");
+        config.election.lease = election::LeasePlace::File(dir.path().join("lease"));
+        let mut replica = Controller::bind(config.clone())
+            .await
+            .expect("the listeners bind");
+        assert_eq!(replica.names_its_port(), Ok(()));
+        replica
+            .identity_as_told("replication")
+            .expect("a listener of the configuration");
+        let refused = ConfigError::ReplicationPortUnnamed("replication".to_owned());
+        assert_eq!(replica.names_its_port(), Err(refused.clone()));
+        // Its serve ends by that refusal, though no shutdown came.
+        match timeout(Duration::from_secs(10), replica.serve(pending())).await {
+            Ok(Err(Error::Config(told))) => assert_eq!(told, refused),
+            other => panic!("the refusal, not {other:?}"),
+        }
+        // A named port is kept.
+        for listener in &mut config.listeners {
+            listener.addr.set_port(30_100);
+        }
+        assert_eq!(unnamed_port(&config.listeners), None);
     }
 
     #[tokio::test]

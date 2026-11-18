@@ -87,18 +87,49 @@ struct Leader {
     store: Arc<MemoryStore>,
 }
 
+/// Binds the controller `config` makes of a replication port, at a number
+/// of the pairs' own ([`pair::ports`]): the next one free on `ip`, and on
+/// `standby` too where the replica leads a pair ([`pair::free`]).
+async fn bind_drawn(
+    ip: IpAddr,
+    standby: Option<IpAddr>,
+    config: impl Fn(u16) -> Config,
+) -> Controller {
+    let mut bound = None;
+    for drawn in pair::ports(ip) {
+        match Controller::bind(config(drawn)).await {
+            // In use on this address: the next number.
+            Err(Error::Bind { source, .. }) if source.kind() == ErrorKind::AddrInUse => {}
+            // Held on the standby's address by a standby that outlived its
+            // leader: the next number, and this bind is let go.
+            Ok(_) if standby.is_some_and(|ip| !pair::free(ip, drawn).expect("the look's bind")) => {
+            }
+            other => {
+                bound = Some(other.expect("bind"));
+                break;
+            }
+        }
+    }
+    bound.expect("a free port among the pairs' own")
+}
+
 /// Serves a controller over a lease at `place` in the case's process, and
 /// runs `case` against it once it leads.
 async fn with_leader<Run>(place: LeasePlace, case: impl FnOnce(Leader) -> Run)
 where
     Run: Future<Output = ()>,
 {
-    let mut controller = Controller::bind(Config {
+    // A replica under a shared lease follows, and one that follows names
+    // its replication port: a number of the pairs' own.
+    let config = |port| Config {
         controller_id: "replication-0".to_owned(),
         listeners: vec![
             listener("gateway", &[Scope::Gateway, Scope::Ingestion]),
             listener("control", &[Scope::Control]),
-            listener("replication", &[Scope::Replication]),
+            Listener {
+                addr: SocketAddr::new(LEADER, port),
+                ..listener("replication", &[Scope::Replication])
+            },
         ],
         admin: loopback(),
         shutdown_settle: Duration::from_millis(50),
@@ -106,13 +137,12 @@ where
         load_poll_interval: Config::DEFAULT_LOAD_POLL_INTERVAL,
         decide_shards: 2,
         election: Election {
-            lease: place,
+            lease: place.clone(),
             settings: settings(),
             advertise: None,
         },
-    })
-    .await
-    .expect("bind");
+    };
+    let mut controller = bind_drawn(LEADER, None, config).await;
     // The control and the replication listeners take an identity as told.
     for name in ["control", "replication"] {
         controller
@@ -1665,24 +1695,7 @@ impl Replica {
             },
         };
         let mut controller = if port == 0 {
-            let mut bound = None;
-            for drawn in pair::ports(ip) {
-                match Controller::bind(config(drawn)).await {
-                    // In use on this address: the next number.
-                    Err(Error::Bind { source, .. }) if source.kind() == ErrorKind::AddrInUse => {}
-                    // Held on the standby's address by a standby that
-                    // outlived its leader: the next number, and this bind
-                    // is let go.
-                    Ok(_)
-                        if ip == LEADER
-                            && !pair::free(FOLLOWER, drawn).expect("the look's bind") => {}
-                    other => {
-                        bound = Some(other.expect("bind"));
-                        break;
-                    }
-                }
-            }
-            bound.expect("a free port among the pairs' own")
+            bind_drawn(ip, (ip == LEADER).then_some(FOLLOWER), config).await
         } else {
             Controller::bind(config(port)).await.expect("bind")
         };

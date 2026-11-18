@@ -63,7 +63,7 @@ struct Cli {
     /// a shared lease a replica that does not lead follows its leader: it
     /// dials the leader's advertised host at this port, so every replica
     /// listens on the same one, and the listener takes identities as told
-    /// in the clear
+    /// in the clear. A replica that follows is refused port 0
     #[arg(long, default_value = DEFAULT_REPLICATION_LISTEN, help_heading = "Listeners")]
     replication_listen: SocketAddr,
 
