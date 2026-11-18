@@ -153,12 +153,11 @@ impl Door {
     /// call's admission, a number under it could be one another leader gave
     /// another worker. The call is refused then, and no life is made.
     ///
-    /// The lead is read first. The call was admitted where the log stood at
-    /// that term, and the log's term never falls: a store that leads at the
-    /// first read and stands at the admitted term at the second led that
-    /// term at the first.
+    /// The call was admitted by the same read of the log
+    /// ([`Log::leads`]), made again here in the door's turn: the log may
+    /// have moved since.
     fn next_life(&self, admitted: u64) -> Result<u64, Status> {
-        if self.log.followed().is_some() || self.log.term() != admitted {
+        if self.log.leads(admitted).is_err() {
             return Err(Status::unavailable(LEADS_NO_TERM));
         }
         Ok(life(admitted, self.base, self.store.epoch()))

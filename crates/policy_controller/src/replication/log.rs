@@ -58,6 +58,22 @@ pub struct Entry {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Lost;
 
+/// Why a store does not lead a term its replica took ([`Log::leads`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Unled {
+    /// The log has seen no term that high: the store is told the term next
+    /// and leads it from there. A moment.
+    NotYet,
+    /// The store follows the term given, at or above the one asked: its
+    /// take started no term in the log, or the store followed another
+    /// history since. No write of its own stands under the asked term from
+    /// here.
+    Follows(u64),
+    /// The store leads the later term given: the take that was asked about
+    /// is over.
+    Past(u64),
+}
+
 /// One ring: the retained events of its kinds, oldest first.
 struct Kept {
     events: VecDeque<Entry>,
@@ -338,6 +354,26 @@ impl Log {
     pub fn followed(&self) -> Option<u64> {
         let ring = self.ring.lock();
         (!ring.leads).then(|| self.term.load(Ordering::Relaxed))
+    }
+
+    /// Whether the store leads `term`, in one read under the log's lock:
+    /// the log's term is `term` and the store's own writes stand under it.
+    /// A refusal carries the term the log stands at, so no caller reads the
+    /// log again for its words. Three callers read it, each in its own
+    /// turn: the service's guard, the door's mint of a worker's life and
+    /// the replication's check.
+    pub fn leads(&self, term: u64) -> Result<(), Unled> {
+        let ring = self.ring.lock();
+        let seen = self.term.load(Ordering::Relaxed);
+        if seen < term {
+            Err(Unled::NotYet)
+        } else if !ring.leads {
+            Err(Unled::Follows(seen))
+        } else if seen == term {
+            Ok(())
+        } else {
+            Err(Unled::Past(seen))
+        }
     }
 
     /// Whether a reader of `kinds` that another store's history left at
@@ -1497,6 +1533,33 @@ mod tests {
         load(&log, 2);
         assert_eq!(places(&all(&log)), [at(1, 3), at(2, 4), at(3, 4)]);
         assert_eq!(marks(&all(&log)), [1, TERM, 2]);
+    }
+
+    #[test]
+    fn a_store_leads_the_term_its_take_started_and_the_log_says_why_it_leads_no_other() {
+        let log = Log::new(8, 8);
+        assert_eq!(log.leads(3), Err(Unled::NotYet), "before a take");
+        log.term_rose(3);
+        assert_eq!(log.leads(3), Ok(()));
+        assert_eq!(
+            log.leads(4),
+            Err(Unled::NotYet),
+            "a term the log has not seen"
+        );
+        assert_eq!(log.leads(2), Err(Unled::Past(3)), "a term below its own");
+        // The store follows term 5: it leads neither that term nor its old one.
+        apply(&log, at(2, 5), 1);
+        assert_eq!(log.leads(3), Err(Unled::Follows(5)), "the term it led");
+        assert_eq!(log.leads(5), Err(Unled::Follows(5)), "the term it follows");
+        // A take of the very term it followed starts no lead. A later one does.
+        log.term_rose(5);
+        assert_eq!(
+            log.leads(5),
+            Err(Unled::Follows(5)),
+            "a take that started no term"
+        );
+        log.term_rose(6);
+        assert_eq!(log.leads(6), Ok(()));
     }
 
     #[test]
