@@ -782,11 +782,9 @@ impl Controller {
                 .map_err(Error::Admin)
         });
         let mut looks = shared.standing.clone();
-        let mut election = election::start(elector, Arc::clone(&store), standing)
+        let mut election = shared
+            .elect(elector, standing)
             .map_err(Error::ElectionThread)?;
-        // A gateway's term floor above this replica's term reaches the
-        // election through its door.
-        shared.floors.open(election.door());
 
         let mut shutdown = pin!(shutdown);
         let mut fault = pin!(fault);
@@ -976,7 +974,7 @@ mod tests {
     use axum::serve::Listener as _;
     use tokio::{
         net::{TcpListener, TcpStream},
-        sync::{oneshot, watch},
+        sync::{mpsc, oneshot, watch},
         task::JoinSet,
         time::timeout,
     };
@@ -984,6 +982,7 @@ mod tests {
 
     use super::{
         config::tests::valid,
+        deciders::{tests as bed, TERM_MARK},
         election::Standing,
         readiness::{self, Phase},
         tell_role, Controller, Error,
@@ -1120,6 +1119,45 @@ mod tests {
                 "a lease that gave way after {writes} writes: {served:?}"
             );
         }
+    }
+
+    /// The serve hands its deciders the planned hand-over: a controller
+    /// alone over its lease leaves at its term's mark, takes its next term
+    /// at the election's next step and decides under it.
+    #[tokio::test]
+    async fn a_served_controller_decides_under_its_next_term_past_a_terms_mark() {
+        let controller = Controller::bind(valid()).await.expect("the listeners bind");
+        let (shared, store) = (Arc::clone(&controller.shared), controller.store());
+        let (stop, stopped) = oneshot::channel::<()>();
+        let serve = controller.serve(async {
+            let _ = stopped.await;
+        });
+        let case = async {
+            let (wait, begun) = (Duration::from_secs(20), Instant::now());
+            while shared.fence.leader_term(Instant::now()).is_none() {
+                assert!(begun.elapsed() < wait, "no first take");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            bed::fleet(&store);
+            let applied = store.apply(bed::preset("random", 1));
+            applied.expect("above the unbound start");
+            store.spend_ids(u32::MAX - TERM_MARK + 4);
+            let (sender, mut answers) = mpsc::channel(64);
+            let mut terms = Vec::new();
+            while !terms.contains(&2) {
+                assert!(begun.elapsed() < wait, "no pick under the next term");
+                let read = bed::burst(&shared.deciders, &sender, &mut answers).await;
+                terms.extend(read.into_iter().flatten().map(|id| id >> 32));
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            terms.dedup();
+            assert_eq!(terms, [1, 2], "the term of the mark, then the next");
+            stop.send(()).expect("the serve waits for its stop");
+        };
+        let (served, ()) = timeout(Duration::from_secs(60), async { tokio::join!(serve, case) })
+            .await
+            .expect("the serve ends at its stop");
+        served.expect("a serve that leaves by its signal");
     }
 
     /// A deciding thread that unwound leaves its models with no decider:

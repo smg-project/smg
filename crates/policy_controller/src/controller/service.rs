@@ -49,7 +49,7 @@ use super::{
     config::Scope,
     decide::{self, Streams},
     deciders::{self, Deciders, Reads},
-    election::{split_identity, Standing},
+    election::{self, split_identity, Running, Standing},
     floor::Floors,
     gateways::Gateways,
     generations::{
@@ -259,6 +259,27 @@ impl Shared {
             watchers: Arc::new(Watchers::new(session::PRESENT_MAX)),
             floors: Floors::default(),
         })
+    }
+
+    /// Starts the election thread over `elector` for this state: the term
+    /// goes to its store at every take, each step's sight of the lease to
+    /// `standing`, and the election's door to the two that say a word
+    /// through it: the floors, a term a gateway saw, and the deciders, the
+    /// planned hand-over at a term's mark.
+    ///
+    /// # Errors
+    ///
+    /// The election's thread could not be started.
+    pub(crate) fn elect(
+        &self,
+        elector: Elector,
+        standing: watch::Sender<Standing>,
+    ) -> io::Result<Running> {
+        let election = election::start(elector, Arc::clone(&self.store), standing)?;
+        let door = election.door();
+        self.floors.open(door.clone());
+        self.deciders.leave_through(move || door.hand_over());
+        Ok(election)
     }
 
     /// Who leads, given `leading`, one read of the fence: the term this
@@ -965,14 +986,19 @@ impl PolicyController for Service {
 #[cfg(test)]
 mod tests {
     use std::{
-        sync::Arc,
+        collections::BTreeSet,
+        sync::{atomic::Ordering, Arc},
         thread,
         time::{Duration, Instant},
     };
 
     use http::uri::PathAndQuery;
     use prost::Message as _;
-    use tokio::{net::TcpListener, sync::watch, task::JoinSet};
+    use tokio::{
+        net::TcpListener,
+        sync::{mpsc, watch},
+        task::JoinSet,
+    };
     use tonic::{
         client::Grpc,
         codegen::tokio_stream::StreamExt as _,
@@ -986,6 +1012,7 @@ mod tests {
         catalog::Catalog,
         controller::{
             config::Scope,
+            deciders::{tests as bed, TERM_MARK},
             election::{self, LeasePlace, Standing},
             gateways::tests::PATIENT,
             generations::{tests::LEAST_LOAD, Format, Unanswered},
@@ -1001,7 +1028,8 @@ mod tests {
             ElectError, ElectionSettings, Elector, FileLease, LeaseBackend, LeaseRecord,
             MemoryLease, Tick, Written,
         },
-        proto::{self, policy_controller_server::PolicyController},
+        lease::{LeaseId, ReleaseReason},
+        proto::{self, busy::Reason, policy_controller_server::PolicyController},
         store::{Kinds, LeasesStore, Position, WorkersStore},
     };
 
@@ -1072,6 +1100,277 @@ mod tests {
                 "{what} did not happen in 20 s: {info:?}"
             );
             thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    /// A leader whose term's lease ids pass their mark leaves and decides on
+    /// under the next term, over the election's own thread as the controller
+    /// starts it. Every request sent across the hand-over is answered, by a
+    /// pick or by `Busy` for no leader; no lease id is minted twice; the
+    /// leases of the term before stay on file for their frames.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_leader_at_its_terms_mark_leaves_and_decides_on_under_the_next_term() {
+        let settings = ElectionSettings {
+            duration: Duration::from_millis(600),
+            renew_period: Duration::from_millis(20),
+            renew_deadline: Duration::from_millis(400),
+        };
+        let elector = Elector::alone(IDENTITY, settings).expect("the settings are in order");
+        let (standing, stood) = watch::channel(Standing::default());
+        let (store, feed) = journaled_from(&LeasePlace::Process, 0);
+        let shared = Shared::new(
+            ID.to_owned(),
+            ADDRESS.to_owned(),
+            &elector,
+            stood,
+            (Arc::clone(&store), feed),
+            Arc::new(Catalog::builtin()),
+            1,
+        )
+        .expect("the decider starts");
+        let mut running = shared.elect(elector, standing).expect("a thread");
+        let wait = Duration::from_secs(5);
+
+        // The first take, then a fleet, a profile and the ids just under
+        // the term's mark.
+        let begun = Instant::now();
+        while shared.fence.leader_term(Instant::now()).is_none() {
+            assert!(begun.elapsed() < wait, "no first take");
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        bed::fleet(&store);
+        let applied = store.apply(bed::preset("random", 1));
+        applied.expect("above the unbound start");
+        store.spend_ids(u32::MAX - TERM_MARK + 4);
+
+        let (sender, mut answers) = mpsc::channel(64);
+        let (mut picks, mut busies, mut sent) = (Vec::<u64>::new(), Vec::new(), 0);
+        let begun = Instant::now();
+        while picks.iter().filter(|id| **id >> 32 == 2).count() < 32 {
+            assert!(
+                begun.elapsed() < wait,
+                "no pick under the next term: {} picks, {} Busy",
+                picks.len(),
+                busies.len()
+            );
+            sent += 16;
+            for answer in bed::burst(&shared.deciders, &sender, &mut answers).await {
+                match answer {
+                    Ok(id) => picks.push(id),
+                    Err(reason) => busies.push(reason),
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+
+        // Every request sent was answered, a `Busy` for no leader alone,
+        // and the counter never reached its end.
+        assert_eq!(picks.len() + busies.len(), sent);
+        assert!(
+            busies.iter().all(|reason| *reason == Reason::NotLeader),
+            "{busies:?}"
+        );
+        let unleased = &shared.deciders.counts().unleased;
+        assert_eq!(unleased.load(Ordering::Relaxed), 0);
+        // The term before decided up to its mark and past it, the next one
+        // from its first id on, and no id came twice.
+        let old = picks.iter().take_while(|id| **id >> 32 == 1).count();
+        let (old, new) = picks.split_at(old);
+        assert!(old.contains(&(1 << 32 | u64::from(TERM_MARK))));
+        assert_eq!(new.first(), Some(&(2 << 32 | 1)));
+        assert!(new.iter().all(|id| id >> 32 == 2), "{new:?}");
+        assert_eq!(picks.iter().collect::<BTreeSet<_>>().len(), picks.len());
+        // A lease of the term before stays on file, and its frame is taken.
+        let last = LeaseId(*old.last().expect("a pick under the first term"));
+        let leases: &dyn LeasesStore = store.as_ref();
+        assert!(leases.get(bed::GATEWAY, last).is_some());
+        assert!(leases.released(bed::GATEWAY, last, None, ReleaseReason::ClientGone));
+
+        running.stop();
+        tokio::time::timeout(Duration::from_secs(20), running.ended())
+            .await
+            .expect("the election thread ends within 20 s of its stop");
+    }
+
+    /// The deciders hold the election's door, and the door holds its words
+    /// weakly: an election started for this state and dropped with no stop
+    /// ends and leads no more, while the state and its deciders live on.
+    #[tokio::test]
+    async fn an_election_dropped_without_a_stop_ends_while_the_deciders_hold_its_door() {
+        let settings = ElectionSettings {
+            duration: Duration::from_millis(600),
+            renew_period: Duration::from_millis(20),
+            renew_deadline: Duration::from_millis(400),
+        };
+        let elector = Elector::alone(IDENTITY, settings).expect("the settings are in order");
+        let (standing, stood) = watch::channel(Standing::default());
+        let (store, feed) = journaled_from(&LeasePlace::Process, 0);
+        let shared = Shared::new(
+            ID.to_owned(),
+            ADDRESS.to_owned(),
+            &elector,
+            stood,
+            (store, feed),
+            Arc::new(Catalog::builtin()),
+            1,
+        )
+        .expect("the decider starts");
+        let running = shared.elect(elector, standing).expect("a thread");
+        let patience = Duration::from_secs(20);
+        let mut looks = shared.standing.clone();
+        {
+            let led = looks.wait_for(|standing| standing.holder == IDENTITY);
+            let led = tokio::time::timeout(patience, led).await;
+            assert!(matches!(led, Ok(Ok(_))), "the first take");
+        }
+
+        // The thread's end drops the standing's sender: no look follows it.
+        drop(running);
+        let ended = async { while looks.changed().await.is_ok() {} };
+        tokio::time::timeout(patience, ended)
+            .await
+            .expect("the election thread ends within 20 s of its handle's drop");
+        assert_eq!(shared.fence.leader_term(Instant::now()), None);
+        assert!(looks.borrow().holder.is_empty(), "the lease is given up");
+    }
+
+    /// Who may take the lease a leader hands over at its term's mark.
+    #[derive(Clone, Copy, Debug)]
+    enum Place {
+        /// The leader is alone over a lease of its own.
+        Alone,
+        /// One replica over a shared lease, and no standby.
+        Shared,
+        /// A shared lease a standby looks at.
+        Standby,
+    }
+
+    /// What a term's mark costs, by the clock: how long the leader decides
+    /// on under the term it leaves, past the burst that carried the mark's
+    /// pick; then the time with no leader, to the next leader's open fence,
+    /// this replica's under its next term or the standby's; and the `Busy`
+    /// answers this replica gave from the mark on.
+    async fn left_with_no_leader(
+        place: Place,
+        settings: ElectionSettings,
+    ) -> (Duration, Duration, usize) {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let lease = dir.path().join("lease");
+        let elector = match place {
+            Place::Alone => Elector::alone(IDENTITY, settings),
+            Place::Shared | Place::Standby => {
+                Elector::new(Box::new(FileLease::new(&lease)), IDENTITY, settings)
+            }
+        }
+        .expect("the settings are in order");
+        let (standing, stood) = watch::channel(Standing::default());
+        let (store, feed) = journaled_from(&LeasePlace::Process, 0);
+        let shared = Shared::new(
+            ID.to_owned(),
+            ADDRESS.to_owned(),
+            &elector,
+            stood,
+            (Arc::clone(&store), feed),
+            Arc::new(Catalog::builtin()),
+            1,
+        )
+        .expect("the decider starts");
+        let mut running = shared.elect(elector, standing).expect("a thread");
+        let (wait, begun) = (Duration::from_secs(60), Instant::now());
+        while shared.fence.leader_term(Instant::now()).is_none() {
+            assert!(begun.elapsed() < wait, "no first take");
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        // The standby starts under a leader and has read its record: it
+        // follows.
+        let mut standby = None;
+        if matches!(place, Place::Standby) {
+            let other = "controller-1@10.0.0.8:30100";
+            let other = Elector::new(Box::new(FileLease::new(&lease)), other, settings)
+                .expect("the settings are in order");
+            let fence = other.fence();
+            let (standing, mut stood) = watch::channel(Standing::default());
+            let store = journaled_from(&LeasePlace::Process, 0).0;
+            let running = election::start(other, store, standing).expect("a thread");
+            let follows = stood.wait_for(|standing| standing.holder == IDENTITY);
+            let followed = tokio::time::timeout(wait, follows).await;
+            assert!(
+                matches!(followed, Ok(Ok(_))),
+                "the standby reads the leader's record"
+            );
+            standby = Some((fence, running));
+        }
+        bed::fleet(&store);
+        let applied = store.apply(bed::preset("random", 1));
+        applied.expect("above the unbound start");
+        store.spend_ids(u32::MAX - TERM_MARK + 4);
+
+        let (sender, mut answers) = mpsc::channel(64);
+        let mark = Ok(1 << 32 | u64::from(TERM_MARK));
+        // The burst of the mark's pick, then the last burst a pick of the
+        // term it leaves came in: the time with no leader starts there.
+        let (mut marked, mut last, mut busy) = (None, begun, 0);
+        let led = loop {
+            assert!(begun.elapsed() < wait, "no leader after the mark");
+            let read = bed::burst(&shared.deciders, &sender, &mut answers).await;
+            let now = Instant::now();
+            if marked.is_some() {
+                busy += read.iter().filter(|answer| answer.is_err()).count();
+                let led = match &standby {
+                    Some((fence, _)) => fence.leader_term(now).is_some(),
+                    None => read
+                        .iter()
+                        .any(|answer| matches!(answer, Ok(id) if id >> 32 == 2)),
+                };
+                if led {
+                    break now;
+                }
+            } else if read.contains(&mark) {
+                marked = Some(now);
+            }
+            if read
+                .iter()
+                .any(|answer| matches!(answer, Ok(id) if id >> 32 == 1))
+            {
+                last = now;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        };
+        let marked = marked.expect("the mark's pick came before the next leader");
+
+        let patience = Duration::from_secs(20);
+        running.stop();
+        tokio::time::timeout(patience, running.ended())
+            .await
+            .expect("the election thread ends within 20 s of its stop");
+        if let Some((_, other)) = standby.as_mut() {
+            other.stop();
+            tokio::time::timeout(patience, other.ended())
+                .await
+                .expect("the standby's thread ends within 20 s of its stop");
+        }
+        (last.duration_since(marked), led.duration_since(last), busy)
+    }
+
+    /// What the page's Numbers say of a hand-over at a term's mark under
+    /// the default settings, by who may take the lease: the time the leader
+    /// still decides past the mark, the time with no leader and the `Busy`
+    /// answers. A measurement, run by name with `--ignored`: it prints, and
+    /// asserts only that a leader follows.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "a measurement for the Numbers table, run by name"]
+    async fn the_time_a_terms_mark_leaves_with_no_leader() {
+        use std::io::Write as _;
+
+        let mut out = std::io::stdout();
+        for place in [Place::Alone, Place::Shared, Place::Standby] {
+            let (decided, none, busy) =
+                left_with_no_leader(place, ElectionSettings::default()).await;
+            writeln!(
+                out,
+                "MARK {place:?}: decided on for {decided:?}, no leader for {none:?}, {busy} Busy"
+            )
+            .expect("stdout");
         }
     }
 
@@ -1148,7 +1447,12 @@ mod tests {
             |info| !info.is_leader,
         );
         assert_eq!(fenced, answer("", "", 2, false));
-        let third = answers_until(&service, &mut last, "the take above", |info| info.is_leader);
+        // A renewal that landed before the restore can open the fence once
+        // more under term two, where the host held the election thread: the
+        // take above is the first leader's answer past that term.
+        let third = answers_until(&service, &mut last, "the take above", |info| {
+            info.is_leader && info.term > 2
+        });
         assert_eq!(third, answer(ID, ADDRESS, 3, true));
 
         running.stop();

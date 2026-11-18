@@ -18,11 +18,13 @@
 //! lease at once, or after the wait this thread's own take still owed; it
 //! then stops and never takes again.
 //!
-//! A word to leave (`Running::step_down` for a planned hand-over,
-//! `Door::saw` for a term a caller says it saw) is taken by the same thread
-//! between two steps: the fence closed, the lease released, no take for one
-//! lease duration (a replica alone over a lease in its own process takes it
-//! again at its next step). The thread goes on stepping.
+//! A word to leave (`Door::hand_over` for a planned hand-over, `Door::saw`
+//! for a term a caller says it saw) is taken by the same thread between two
+//! steps: the fence closed, the lease released, no take for one lease
+//! duration (a replica alone over a lease in its own process takes it again
+//! at its next step). The thread goes on stepping. A decider says the
+//! planned hand-over itself where its term's lease ids pass their mark: the
+//! next take brings a term whose ids start again.
 
 use std::{
     fmt, io,
@@ -402,15 +404,16 @@ impl Running {
     /// said.
     #[cfg_attr(
         not(test),
-        expect(dead_code, reason = "a planned hand-over has no caller yet")
+        expect(dead_code, reason = "the product says its words through the door")
     )]
     pub(crate) fn step_down(&self, above: Option<u64>) -> Result<(), ElectError> {
         leave(&self.words, above)
     }
 
-    /// The door for a term a caller saw: what the service's shared state
-    /// holds, so a session says a gateway's term floor. The door keeps
-    /// nothing alive: this handle dropped, the election ends as before.
+    /// The door for a word from outside the run loop: what the service's
+    /// shared state holds, so a session says a gateway's term floor and a
+    /// decider the planned hand-over. The door keeps nothing alive: this
+    /// handle dropped, the election ends as before.
     pub(crate) fn door(&self) -> Door {
         Door {
             words: Arc::downgrade(&self.words),
@@ -439,10 +442,11 @@ fn leave(words: &mpsc::Sender<Word>, above: Option<u64>) -> Result<(), ElectErro
     Ok(())
 }
 
-/// The door for a term a caller saw, apart from the handle the run loop
-/// keeps: the election's words, held weakly. The handle alone keeps the
-/// channel open, so a host that drops the election without a stop ends it
-/// while the service's shared state still holds this door.
+/// The door for a word from outside the run loop, a term a caller saw or
+/// the planned hand-over, apart from the handle the run loop keeps: the
+/// election's words, held weakly. The handle alone keeps the channel open,
+/// so a host that drops the election without a stop ends it while the
+/// service's shared state still holds this door.
 #[derive(Clone)]
 pub(crate) struct Door {
     words: Weak<mpsc::Sender<Word>>,
@@ -457,6 +461,18 @@ impl Door {
         match self.words.upgrade() {
             Some(words) => leave(&words, Some(above)),
             None => term_said(Some(above)),
+        }
+    }
+
+    /// The planned hand-over, the word of [`Running::step_down`] with no
+    /// term: a holder closes its fence, releases the lease and takes
+    /// nothing for one lease duration, and a replica that holds no lease
+    /// keeps on as it is. Behind a handle that is gone nobody leads, and
+    /// the word is said to no one.
+    pub(crate) fn hand_over(&self) {
+        if let Some(words) = self.words.upgrade() {
+            // No term is said, so no term error comes back.
+            let _ = leave(&words, None);
         }
     }
 }
