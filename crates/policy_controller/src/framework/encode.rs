@@ -34,8 +34,8 @@ mod tests;
 
 /// The stage named when no encoder is open for the request though one that
 /// takes it is registered, or when none is registered at all: a retry may
-/// find one. Where the overload veto left none open, the veto's own stage is
-/// named in its stead (`saturation`).
+/// find one. Where the overload veto left none open, the veto's own stage,
+/// `not-overloaded`, is named in its stead ([`saturation`]).
 const ENCODERS: &str = "encoders";
 /// The stage named when the request carries images and the registered
 /// encoders that would take it otherwise take none.
@@ -272,14 +272,15 @@ fn encode_gap(
 }
 
 /// Whether an encoder takes the request's media: references when its items
-/// are references, an image when it carries one.
+/// are references, an image when it carries one. Inlined by force: each
+/// pass asks it once an encoder, and its two tests cost less than a call.
 #[inline(always)]
 fn takes_media(items: &EncodeItems<'_>, images: bool, row: &Candidate, of: &EncoderFacts) -> bool {
     (!items.references || of.references) && (!images || row.vision)
 }
 
-/// The stage that left no encoder open and its reason, when the reason is
-/// saturation: the overload veto's stage. The encoders that take the
+/// The stage that left no encoder open, when its reason is saturation:
+/// the overload veto's stage. The encoders that take the
 /// request are put to the profile's hard filters in their order, as a
 /// pair's side puts its rows: the stage that refuses the last of them left
 /// none. A stage ahead of the veto that leaves none is no saturation, and
@@ -295,7 +296,7 @@ fn saturation(
     encode: &EncodePool<'_>,
     items: &EncodeItems<'_>,
     images: bool,
-) -> Option<(ShedReason, &'static str)> {
+) -> Option<&'static str> {
     let hard = || profile.filters.iter().filter(|f| !f.soft());
     // Where each of them is refused, counted over the hard filters: the
     // farthest of those places is the stage that left none.
@@ -307,8 +308,7 @@ fn saturation(
         .filter_map(|(row, _)| hard().position(|f| !f.keep(facts, row, cx)))
         .max()?;
     let stage = hard().nth(last)?.name();
-    let reason = reason_of(stage);
-    (reason == ShedReason::Saturated).then_some((reason, stage))
+    (reason_of(stage) == ShedReason::Saturated).then_some(stage)
 }
 
 /// Whether a set holds `class`: by its bit, or by `far`, the ascending list
@@ -534,10 +534,10 @@ impl Engine {
                 // Encoders the overload veto left none of are a saturated
                 // fleet, and the shed says so as a pair's side says it of
                 // its own rows.
-                if let Some((reason, stage)) =
+                if let Some(stage) =
                     saturation(profile, &encode_facts, encode_cx, &encode, &items, images)
                 {
-                    return turned_away(reason, stage, bare);
+                    return turned_away(ShedReason::Saturated, stage, bare);
                 }
                 return gap(encode_gap(&encode, &items, images, any_member));
             }
