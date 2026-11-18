@@ -1602,10 +1602,15 @@ impl WorkerManager {
     ///
     /// A rank names its worker by the masked address: the route is public,
     /// and a registered address may carry a password or a token.
+    ///
+    /// `version` is the serving host's own name and version, as the body
+    /// reports it. The host hands it in: this crate's version is not the
+    /// server's.
     pub fn fleet_loads<G: Generation>(
         worker_registry: &WorkerRegistry<G>,
         snapshot: &LoadSnapshot,
         model_id: Option<&str>,
+        version: &str,
     ) -> WorkerLoadResponse {
         let mut workers = worker_registry.get_all();
         workers.sort_by(|a, b| a.url().cmp(b.url()));
@@ -1628,7 +1633,7 @@ impl WorkerManager {
 
         WorkerLoadResponse {
             timestamp: Utc::now().to_rfc3339(),
-            version: format!("smg-{}", env!("CARGO_PKG_VERSION")),
+            version: version.to_string(),
             dp_rank_count: loads.len() as i32,
             aggregate: EngineAggregateMetricsSnapshot::from_ranks(&loads),
             loads,

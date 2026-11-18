@@ -824,6 +824,7 @@ async fn get_loads(
         &state.context.worker_registry,
         &snapshot,
         query.model.as_deref(),
+        concat!("smg-", env!("CARGO_PKG_VERSION")),
     ))
     .into_response()
 }

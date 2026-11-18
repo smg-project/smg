@@ -2838,11 +2838,11 @@ fn fleet_loads_tags_ranks_and_aggregates() {
         ("http://w:2".to_string(), load_report(&[(0, 2, 0, 0.5)])),
     ]);
 
-    let body = WorkerManager::fleet_loads(&registry, &snapshot, None);
+    let body = WorkerManager::fleet_loads(&registry, &snapshot, None, "smg-1.2.3");
 
     assert_eq!(body.dp_rank_count, 3);
     assert_eq!(body.loads.len(), 3);
-    assert!(body.version.starts_with("smg-"));
+    assert_eq!(body.version, "smg-1.2.3");
     assert!(!body.timestamp.is_empty());
 
     let tagged: Vec<(&str, &str, i32)> = body
@@ -2887,7 +2887,7 @@ fn fleet_loads_filters_by_model() {
         ("http://b:1".to_string(), load_report(&[(0, 9, 0, 0.9)])),
     ]);
 
-    let body = WorkerManager::fleet_loads(&registry, &snapshot, Some("gpt-4o"));
+    let body = WorkerManager::fleet_loads(&registry, &snapshot, Some("gpt-4o"), "smg-1.2.3");
 
     assert_eq!(body.dp_rank_count, 1);
     assert_eq!(body.loads[0].worker.as_deref(), Some("http://a:1"));
@@ -2907,7 +2907,7 @@ fn fleet_loads_omits_workers_without_a_report() {
         load_report(&[(0, 7, 2, 0.4)]),
     )]);
 
-    let body = WorkerManager::fleet_loads(&registry, &snapshot, None);
+    let body = WorkerManager::fleet_loads(&registry, &snapshot, None, "smg-1.2.3");
 
     assert_eq!(body.dp_rank_count, 1);
     assert_eq!(body.loads[0].worker.as_deref(), Some("http://w:2"));
@@ -2918,7 +2918,7 @@ fn fleet_loads_with_no_polled_workers_has_no_aggregate() {
     let registry = WorkerRegistry::new();
     registry.register(make_worker("http://w:1", 1, 1)).unwrap();
 
-    let body = WorkerManager::fleet_loads(&registry, &LoadSnapshot::default(), None);
+    let body = WorkerManager::fleet_loads(&registry, &LoadSnapshot::default(), None, "smg-1.2.3");
 
     assert_eq!(body.dp_rank_count, 0);
     assert!(body.loads.is_empty());
@@ -2941,7 +2941,7 @@ fn fleet_loads_names_a_worker_by_its_masked_address() {
         (plain.to_string(), load_report(&[(0, 2, 0, 0.5)])),
     ]);
 
-    let body = WorkerManager::fleet_loads(&registry, &snapshot, None);
+    let body = WorkerManager::fleet_loads(&registry, &snapshot, None, "smg-1.2.3");
 
     let answered = serde_json::to_string(&body).expect("the answer as JSON");
     assert!(
