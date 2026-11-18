@@ -1026,12 +1026,16 @@ it off every replica is a controller of its own, and two would each lead
 alone: the render refuses them. The count is compared as a reader of the
 rendered manifest takes it: a text that reads there as a number above one
 (2e0, or a 2 after a blank) is refused as that number is. It is written as
-the values hold it: a null stays the API's default.
+the values hold it: a null stays the API's default. Beside a spec store the
+refusal says one way out, not two: a store takes no election.
 */}}
 {{- define "smg.policyControllerReplicas" -}}
 {{- $replicas := .Values.policyController.replicas -}}
 {{- $read := include "smg.policyControllerReplicaCount" . -}}
 {{- if and (gt (int $read) 1) (not (include "smg.policyControllerElection" .)) -}}
+{{- if include "smg.policyControllerSpecStore" . -}}
+{{- fail (printf "policyController.replicas is %v beside policyController.specStoreClaim: each replica would lead alone, and a spec store holds one controller's generations. Keep one replica" $replicas) -}}
+{{- end -}}
 {{- fail (printf "policyController.replicas is %v with policyController.election.enabled off: each replica would lead alone. Turn the election on, or keep one replica" $replicas) -}}
 {{- end -}}
 {{- $replicas -}}
@@ -1105,6 +1109,37 @@ line is the document's own.
 {{- end }}
 
 {{/*
+Policy controller spec store -- the claim named in
+policyController.specStoreClaim, and empty when none is named: the
+controller then runs the document of policyController.spec from its file. A
+store is the other source of the controller's spec. The controller is
+passed --spec-store on the claim's mount: it starts on the newest
+generation on file, and writes each generation an operator applies there.
+What the controller refuses at start beside a store is refused here, in
+its reasons: a document in policyController.spec, since a start names one
+source of its spec, and the election, since a standby does not follow an
+applied generation yet and the controller takes no store beside a lease
+another replica can take. More than one replica is refused where the count
+is judged. A value that is no text is refused as written, where the
+schema's check is skipped.
+*/}}
+{{- define "smg.policyControllerSpecStore" -}}
+{{- $claim := (.Values.policyController).specStoreClaim -}}
+{{- if not (or (kindIs "invalid" $claim) (kindIs "string" $claim)) -}}
+{{- fail (printf "policyController.specStoreClaim is %s: the name of a PersistentVolumeClaim, as text" (toJson $claim)) -}}
+{{- end -}}
+{{- if $claim -}}
+{{- if (.Values.policyController).spec -}}
+{{- fail (printf "policyController.specStoreClaim names %s and policyController.spec holds a document: the controller refuses a start that names two sources of its policy spec. Set policyController.spec to null (an empty map does not clear a reused document), or leave the claim unnamed" $claim) -}}
+{{- end -}}
+{{- if include "smg.policyControllerElection" . -}}
+{{- fail (printf "policyController.specStoreClaim names %s with policyController.election.enabled on: another replica can take the controller's lease, and a standby does not follow an applied generation in this build. Turn the election off, or keep the spec document" $claim) -}}
+{{- end -}}
+{{- $claim -}}
+{{- end -}}
+{{- end }}
+
+{{/*
 Policy controller CLI arguments -- every argument is a flag of
 smg-policy-controller, each from a value. The controller's id is not here:
 the flag reads HOSTNAME, the pod's name. What the controller refuses at
@@ -1120,7 +1155,9 @@ rolls no pod. With the election on the Lease is named,
 and the pod's own address, which the kubelet writes in place of $(POD_IP):
 the holder of the Lease is named by an address the others can dial. The
 spec file named is the one the Deployment mounts the document as: the one
-key of the document's ConfigMap, under the mount's directory.
+key of the document's ConfigMap, under the mount's directory. Where a spec
+store's claim is named the store's directory is passed in the file's
+place: the claim's mount.
 */}}
 {{- define "smg.policyControllerArgs" -}}
 {{- $controller := .Values.policyController -}}
@@ -1192,8 +1229,13 @@ key of the document's ConfigMap, under the mount's directory.
 - "--advertise-address"
 - "$(POD_IP)"
 {{- end }}
+{{- if include "smg.policyControllerSpecStore" . }}
+- "--spec-store"
+- "/var/lib/smg/spec"
+{{- else }}
 - "--spec-file"
 - "/etc/smg/policy-spec/spec.yaml"
+{{- end }}
 {{- range $controller.extraArgs }}
 - {{ . | quote }}
 {{- end }}

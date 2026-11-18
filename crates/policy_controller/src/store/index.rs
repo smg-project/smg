@@ -30,7 +30,10 @@
 //! write last read them. The lookup itself is live, as the index is: the
 //! request's blocks are looked up once a decision, under the cap of its
 //! profile's sample, and the holders are named by their place in the
-//! decision's rows.
+//! decision's rows. An index id is free for the next row once its row
+//! leaves, and a decision may read a world published before that: the
+//! index keeps who took each id last (`Index`), and a row is named a holder
+//! only while its own worker holds the id its blocks were read under.
 //!
 //! Locks: the table's, taken under the workers lock by a membership write
 //! and alone by a batch, each for as long as it takes to find or to change
@@ -43,7 +46,7 @@
 use std::{
     collections::HashMap,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{fence, AtomicU64, Ordering},
         Arc,
     },
 };
@@ -113,7 +116,7 @@ trait Blocks {
 
 /// A lane's place in its model's index.
 struct Held {
-    index: Arc<ChainIndex>,
+    index: Arc<Index>,
     /// The row's id in `index`.
     worker: u32,
     /// The worker's blocks by the engine's hash: the index asks each writer
@@ -127,16 +130,22 @@ impl Blocks for Held {
         blocks: &[StoredBlock],
         parent: Option<SequenceHash>,
     ) -> Result<(), ApplyError> {
+        // Before the batch's blocks reach the chain: a decision that reads
+        // one of them then reads this row as its id's holder ([`Index`]).
+        fence(Ordering::Release);
         self.index
+            .chain
             .apply_stored(self.worker, blocks, parent, &mut self.map)
     }
 
     fn removed(&mut self, hashes: &[SequenceHash]) {
-        self.index.apply_removed(self.worker, hashes, &mut self.map);
+        self.index
+            .chain
+            .apply_removed(self.worker, hashes, &mut self.map);
     }
 
     fn cleared(&mut self) {
-        self.index.apply_cleared(self.worker, &mut self.map);
+        self.index.chain.apply_cleared(self.worker, &mut self.map);
     }
 }
 
@@ -300,7 +309,7 @@ struct Tables {
     model: Box<str>,
     role: Option<Role>,
     /// The model's index; `None` while no row of the model is indexed.
-    index: Option<Arc<ChainIndex>>,
+    index: Option<Arc<Index>>,
     /// Index id -> row of the pool; [`NONE`] for an id no row of it holds.
     row_of: Box<[u32]>,
     /// Row -> index id; [`NONE`] for a row the index does not hold.
@@ -400,7 +409,7 @@ impl PoolIndex {
         };
         let size = |&id: &u32| match &tables.index {
             Some(index) if id != NONE => {
-                u32::try_from(index.worker_block_count(id)).unwrap_or(u32::MAX)
+                u32::try_from(index.chain.worker_block_count(id)).unwrap_or(u32::MAX)
             }
             _ => 0,
         };
@@ -540,7 +549,7 @@ impl PoolIndex {
             let mut mask = [0u64; MASK_WORDS];
             let within = tables.within(naming, locals, &mut mask);
             let mut draw = Draw::new(naming.seed ^ HOLDERS_STREAM);
-            index.deepest_into(
+            index.chain.deepest_into(
                 naming.block_hashes,
                 |hash| *hash,
                 within,
@@ -548,9 +557,22 @@ impl PoolIndex {
                 |under| below(&mut draw, under),
                 &mut named.kept,
             );
+            // Every read of the lookup stands before this fence, and each
+            // question of who holds an id after it ([`Index`]).
+            fence(Ordering::Acquire);
             for &(id, blocks) in &named.kept {
                 let row = tables.row_of.get(id as usize).copied().unwrap_or(NONE);
-                let at = (row != NONE).then(|| place(row)).flatten();
+                debug_assert!(row != NONE, "a read is kept within the pool's rows");
+                // The id may have been taken again since this world was
+                // published: the blocks read under it are the row's only
+                // while the row's own worker holds it.
+                let Some(member) = pool.get(row as usize) else {
+                    continue;
+                };
+                if !index.held_by(id, member.id) {
+                    continue;
+                }
+                let at = place(row);
                 debug_assert!(
                     at.is_some(),
                     "a holder the read was kept within is in the view"
@@ -607,9 +629,65 @@ impl PoolIndex {
     }
 }
 
+/// One model's index: the chain index, and who holds each of its ids.
+///
+/// The chain frees an id for the next row once its row leaves, and a pool's
+/// tables of before still map the id to the row that left
+/// ([`Tables::row_of`]). So a decision asks who holds an id after its
+/// lookup read blocks under it ([`Self::held_by`]), and the answer must be
+/// no older than those blocks. The chain writes and reads its coverage
+/// relaxed. Its reader runs an acquire fence after its reads, for its own
+/// snapshot: this file does not rest on where that fence stands. Three
+/// things of this file order the two:
+///
+/// - the table's lock: the holder is said under it before the row's lane
+///   exists ([`KvTables::member`]), and a batch finds its lane under it;
+/// - a release fence on the lane's thread, before a batch's blocks reach
+///   the chain ([`Held`]);
+/// - an acquire fence in the naming, between its lookup and its questions
+///   ([`PoolIndex::name`]).
+///
+/// The two fences synchronize where the lookup read what the batch wrote,
+/// so a decision that read a row's block reads that row as the holder, or
+/// a later one. The orderings of the holder's own store and load carry
+/// none of this.
+struct Index {
+    chain: ChainIndex,
+    /// Index id -> the worker whose row took the id last, by its number.
+    holders: [AtomicU64; INDEX_WORKERS],
+}
+
+impl Index {
+    fn new() -> Self {
+        Self {
+            chain: ChainIndex::with_max_workers(INDEX_WORKERS),
+            holders: std::array::from_fn(|_| AtomicU64::new(0)),
+        }
+    }
+
+    /// `worker`'s row takes `id`, which the chain just handed out. Said
+    /// under the table's lock, before the row's lane exists: every block
+    /// the row writes reaches the chain after it, behind the lane's fence.
+    fn take(&self, id: u32, worker: WorkerId) {
+        if let Some(holder) = self.holders.get(id as usize) {
+            holder.store(worker.0, Ordering::Release);
+        }
+    }
+
+    /// Whether `worker`'s row is the one that took `id` last. A reader asks
+    /// after its lookup and its fence: where another row took the id since,
+    /// the blocks it read under the id may be that row's. An id nobody took
+    /// since answers true for the row that left, and the chain holds none
+    /// of that row's blocks.
+    fn held_by(&self, id: u32, worker: WorkerId) -> bool {
+        let holder = self.holders.get(id as usize);
+        holder.is_some_and(|holder| holder.load(Ordering::Acquire) == worker.0)
+    }
+}
+
 /// One model's index, and how many lanes write it.
 struct ModelIndex {
-    index: Arc<ChainIndex>,
+    index: Arc<Index>,
     lanes: usize,
 }
 
@@ -688,12 +766,13 @@ impl KvTables {
             .indexes
             .entry(model.as_str().into())
             .or_insert_with(|| ModelIndex {
-                index: Arc::new(ChainIndex::with_max_workers(INDEX_WORKERS)),
+                index: Arc::new(Index::new()),
                 lanes: 0,
             });
         // An index at its ceiling: the row holds no lane, and stands in the
         // store's count, until one of its own later writes finds a place.
-        let worker = held.index.intern_worker(&name_of(row.id)).ok()?;
+        let worker = held.index.chain.intern_worker(&name_of(row.id)).ok()?;
+        held.index.take(worker, row.id);
         held.lanes += 1;
         let index = Arc::clone(&held.index);
         let lane = Lane {
@@ -833,7 +912,7 @@ impl KvTables {
             return;
         };
         if let Some(Held { index, worker, map }) = entry.lane.lock().held.take() {
-            index.remove_worker(worker, map);
+            index.chain.remove_worker(worker, map);
         }
         let mut table = self.table.lock();
         table.moves += 1;
@@ -952,7 +1031,7 @@ impl KvTables {
         let lane = lane.lock();
         lane.held
             .as_ref()
-            .map_or(0, |held| held.index.worker_block_count(held.worker))
+            .map_or(0, |held| held.index.chain.worker_block_count(held.worker))
     }
 
     pub(super) fn counts(&self, id: WorkerId, rank: u16) -> Option<LaneCounts> {
@@ -978,7 +1057,7 @@ impl KvTables {
             (Arc::clone(index), rows)
         };
         let mut held = Vec::new();
-        index.score_into(
+        index.chain.score_into(
             hashes,
             |hash| *hash,
             false,
@@ -1006,6 +1085,6 @@ impl KvTables {
         table
             .indexes
             .get(model)
-            .map_or(0, |held| held.index.current_size())
+            .map_or(0, |held| held.index.chain.current_size())
     }
 }

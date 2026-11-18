@@ -10,6 +10,7 @@ use std::{
 };
 
 use crate::{
+    decision::{Targets, MAX_TARGETS},
     lease::{Lease, LeaseId, Outcome, ReleaseReason, Side},
     store::GatewayId,
     view::WorkerId,
@@ -150,6 +151,34 @@ pub enum LeaseState {
     Released(ReleaseReason),
 }
 
+/// What a lease's record keeps of its pick beside the target it books: the
+/// pick's other targets and every target's rank, so a `Dispatched` that
+/// names a target by its index finds the worker. Kept inline: a record is
+/// filed inside a decision's clock. The default is a pick of one target at
+/// rank 0.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Picked {
+    /// The pick's targets behind its first, in the pick's order;
+    /// `WorkerId(0)` is no target.
+    rest: [WorkerId; MAX_TARGETS - 1],
+    /// Each target's rank, by its index in the pick.
+    ranks: [u16; MAX_TARGETS],
+}
+
+impl Picked {
+    /// What a record keeps of the pick `targets`.
+    pub fn of(targets: &Targets) -> Self {
+        let mut picked = Self::default();
+        for (target, rank) in targets.iter().zip(picked.ranks.iter_mut()) {
+            *rank = target.dp_rank;
+        }
+        for (target, id) in targets.iter().skip(1).zip(picked.rest.iter_mut()) {
+            *id = target.id;
+        }
+        picked
+    }
+}
+
 /// One lease as the store holds it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LeaseRecord {
@@ -159,7 +188,11 @@ pub struct LeaseRecord {
     pub gateway: GatewayId,
     /// The request id's fingerprint, for `Explain`.
     pub request: u64,
+    /// The worker the lease books: the pick's first target, until a
+    /// `Dispatched` names another one ([`LeaseRecord::target_at`]).
     pub target: WorkerId,
+    /// The pick's other targets and the ranks, for that `Dispatched`.
+    pub picked: Picked,
     /// The decode side of a pair.
     pub decode: Option<WorkerId>,
     /// The term of the leader that issued the lease.
@@ -168,6 +201,24 @@ pub struct LeaseRecord {
     /// Past it, an undispatched lease is released as abandoned.
     pub dispatch_deadline: Instant,
     pub state: LeaseState,
+}
+
+impl LeaseRecord {
+    /// The worker and the rank a `Dispatched` names by its target `index`:
+    /// the target the lease books at the lease's own index, else the
+    /// pick's target at that index. `None` for an index the pick holds no
+    /// target at.
+    pub fn target_at(&self, index: u8) -> Option<(WorkerId, u16)> {
+        let place = usize::from(index);
+        let rank = *self.picked.ranks.get(place)?;
+        if index == self.lease.target_index {
+            return Some((self.target, rank));
+        }
+        // A lease books the pick's first target at its issue: the others
+        // stand behind it.
+        let id = *self.picked.rest.get(place.checked_sub(1)?)?;
+        (id != WorkerId(0)).then_some((id, rank))
+    }
 }
 
 /// What a gateway's `Dispatched` report says beside its lease.
@@ -215,7 +266,9 @@ pub trait LeasesStore: Send + Sync {
     fn issue(&self, record: LeaseRecord) -> Result<(), LeaseRefused>;
 
     /// The gateway dispatched the lease as `dispatch` says, at `at`;
-    /// `false` when the lease is unknown.
+    /// `false` when the lease is unknown. A first dispatch that names
+    /// another target of the pick moves the lease to it: the record's
+    /// target and index, and the count the lease books.
     fn dispatched(
         &self,
         gateway: GatewayId,

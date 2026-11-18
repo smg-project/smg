@@ -193,7 +193,13 @@ pub struct Trace {
     pub survivors: Survivors,
     /// The top candidates and their combined scores, best first: of the set
     /// the picker compared, which is every candidate the filters left unless
-    /// the picker narrows them.
+    /// the picker narrows them. Where a profile's ranks put rows in front
+    /// ([`Scorer::score_front`](crate::Scorer::score_front)) the scores are
+    /// those rows' sums among themselves: a stage asked of them alone
+    /// normalizes over them, so a score need not be the one the whole pass
+    /// gives its row. The rows are the whole pass's, and their order too
+    /// wherever its sums tell them apart: rows it rounds to one sum it
+    /// draws among, and the front's scores order them.
     pub top: [(WorkerId, f32); TRACE_TOP],
     pub top_len: u8,
     pub seed: u64,

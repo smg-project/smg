@@ -3152,6 +3152,27 @@ fn a_plugin_hears_the_kinds_of_event_its_row_lists_and_no_other() {
     );
 }
 
+/// A dispatch on another target of its pick is told with a lease that names
+/// that target's index, and the event's index is the lease's.
+#[test]
+fn a_dispatch_tells_the_plugin_the_index_its_lease_names() {
+    let served = TestPlugin::serve();
+    let runtime = runtime();
+    let plugin = load(&runtime, &served, "second-target");
+    let engine = single_engine(profile(&plugin, ALL));
+    let lease = Lease {
+        target_index: 1,
+        ..Lease::default()
+    };
+    engine.on_dispatched(&lease, &Target::default(), Side::Single, 3);
+    assert!(eventually(|| served.seen().events.len() == 1));
+    let seen = served.seen();
+    match &seen.events[0].event {
+        Some(proto::lifecycle_event::Event::Dispatched(d)) => assert_eq!(d.target_index, 1),
+        other => panic!("dispatched, not {other:?}"),
+    }
+}
+
 /// The events' numbers are the stream's: an event is numbered where it
 /// enters the stream, on the I/O thread, so threads that raise events at
 /// once cannot put a later number ahead of an earlier one.

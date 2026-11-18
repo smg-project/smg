@@ -148,6 +148,9 @@ pub struct WorkerFacts {
     /// mode ([`encoding`](super::encoding)). The door drops a blank
     /// connector and reads its name past its blanks.
     pub encode: EncodeOffer,
+    /// The worker takes images, as its registration states: an encoder
+    /// encodes them and a decode attends to them.
+    pub vision: bool,
     /// The engine's admission window (maximum running requests); `None`
     /// when it reports none.
     pub max_running: Option<u32>,

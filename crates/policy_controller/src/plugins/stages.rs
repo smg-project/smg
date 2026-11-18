@@ -427,7 +427,7 @@ mod tests {
         },
         plugins::config::Failure,
         spec::{Needs, PolicySpec, SpecError},
-        view::{Candidate, Health, PoolFacts, RequestFacts, WorkerId},
+        view::{Candidate, Health, Phase, PoolFacts, RequestFacts, WorkerId},
     };
 
     /// A plugin that declares nothing and answers no call.
@@ -689,6 +689,50 @@ mod tests {
             ..Needs::default()
         };
         assert_eq!(needs, [counted; 3]);
+    }
+
+    /// A host names a decision's rows in the affinity column's place only
+    /// for a profile whose every stage answers row by row, and a plugin's
+    /// stage does not. A profile that holds one, as a filter or as a scorer
+    /// beside the affinity stage, takes no sample and is named no rows: its
+    /// plugin reads the column whole.
+    #[test]
+    fn a_profile_that_holds_a_plugins_stage_is_named_no_rows() {
+        // The sample of the profile that decides, and the cap a host names
+        // its rows under.
+        let named = |catalog: &Catalog, stages: &str| {
+            let document: PolicySpec = serde_json::from_str(&format!(
+                r#"{{"apiVersion":"smg.policy/v1","profiles":{{"p":{{{stages},"pick":{{"best":{{"sample":16}}}}}}}}}}"#
+            ))
+            .expect("a well-formed document");
+            let engine = document
+                .validate_in(catalog, &[])
+                .expect("a document of this build");
+            (
+                engine.sample_for("m", Phase::Single),
+                engine.named_for("m", Phase::Single),
+            )
+        };
+        let stock = Catalog::builtin();
+        assert_eq!(named(&stock, r#""score":["prefix-affinity"]"#), (16, 16));
+        // A catalog holds a name once, whatever the stage's kind: one a
+        // shape.
+        let mut filtering = Catalog::builtin();
+        filtering
+            .filter("quiet", || {
+                Box::new(PluginFilter::new(Arc::new(Quiet), None))
+            })
+            .expect("a free name, the stage's own");
+        let filtered = r#""filter":["quiet"],"score":["prefix-affinity"]"#;
+        assert_eq!(named(&filtering, filtered), (0, 0));
+        let mut scoring = Catalog::builtin();
+        scoring
+            .scorer("quiet", || {
+                Box::new(PluginScorer::new(Arc::new(Quiet), None))
+            })
+            .expect("a free name, the stage's own");
+        let scored = r#""score":["prefix-affinity","quiet"]"#;
+        assert_eq!(named(&scoring, scored), (0, 0));
     }
 
     /// The forwarding adapter hands the plugin the kinds its row lists and

@@ -45,7 +45,7 @@ use std::{
 
 use replicas::{Lease, Replica, ROOM};
 use smg_policy_controller::{elector::ElectionSettings, proto::ApplyMode};
-use spec::{answers, apply, page, read, until, LEAST_LOAD, PACE, RANDOM};
+use spec::{answers, apply, as_operator, control, page, read, until, LEAST_LOAD, PACE, RANDOM};
 use tempfile::TempDir;
 use tokio::time;
 use tonic::Code;
@@ -311,4 +311,56 @@ fn a_start_on_a_document_the_validator_refuses_exits_naming_the_field() {
         log.contains("profiles.default.score[0]"),
         "the field is named by its path: {log}"
     );
+}
+
+/// A running replica's scrape reads its store's counts: a worker whose
+/// engine family the document's list does not name is counted at the scrape
+/// after its registration, and no load write has moved a verdict.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_replica_on_a_listing_file_counts_the_member_its_list_does_not_name() {
+    use openai_protocol::worker::RuntimeType;
+    use smg_policy_controller::proto::{
+        register_worker_request::Mode, HealthPolicy, RegisterWorkerRequest, Role, WireMode,
+        WorkerSpec,
+    };
+
+    let lease = tempfile::tempdir().expect("a directory");
+    let listing = format!("{LEAST_LOAD}view:\n  engines: [other]\n");
+    let mount = Mount::new(&listing);
+    let replica = start("spec-listing", &lease, &mount.file());
+    let none = "smg_policy_controller_members_outside_list{list=\"engines\"} 0";
+    let one = "smg_policy_controller_members_outside_list{list=\"engines\"} 1";
+    page(&replica, "/metrics", Some(none)).await;
+
+    // Its checks off, the worker is ready from its registration.
+    let spec = WorkerSpec {
+        url: "http://127.0.0.1:9/outside".to_owned(),
+        wire: WireMode::Grpc as i32,
+        role: Role::Single as i32,
+        runtime: RuntimeType::Vllm.as_str().to_owned(),
+        models: vec!["model-a".to_owned()],
+        health_policy: Some(HealthPolicy {
+            disabled: true,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let ask = RegisterWorkerRequest {
+        spec: Some(spec),
+        mode: Mode::Add as i32,
+        wait_ready: false,
+    };
+    // A replica that does not lead yet refuses the registration and writes
+    // nothing, so the ask is made until the leader takes it.
+    let registered = until(
+        || async {
+            let mut operator = control(&replica).await?;
+            operator.register_worker(as_operator(ask.clone())).await
+        },
+        Result::is_ok,
+    );
+    registered.await.expect("an answer").expect("registered");
+    let scrape = page(&replica, "/metrics", Some(one)).await;
+    let flips = "smg_policy_controller_overload_flips_total 0";
+    assert!(scrape.lines().any(|line| line == flips), "{scrape}");
 }

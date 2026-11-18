@@ -18,7 +18,9 @@ use super::{
 };
 use crate::worker::{
     connection::{
-        engine::{ConnectorDefault, EngineConnection, EngineConnector, NoConnector},
+        engine::{
+            ConnectorDefault, EngineConnection, EngineConnectionCache, EngineConnector, NoConnector,
+        },
         http_client::LazyHttpClient,
     },
     health::{
@@ -441,7 +443,7 @@ impl<D: ConnectorDefault> BasicWorkerBuilder<D> {
                 // Pre-set the connection if provided (set on a fresh cell cannot fail)
                 cell.set(connection).ok();
             }
-            Arc::new(ArcSwap::from_pointee(cell))
+            Arc::new(EngineConnectionCache::new(cell))
         };
 
         // Caller can override the initial status (e.g. when replacing an

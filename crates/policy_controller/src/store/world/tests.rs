@@ -28,6 +28,7 @@ use crate::{
 };
 
 mod encode_classes;
+mod encode_door;
 mod list_room;
 mod membership_call;
 mod mode_and_overload;
@@ -4593,6 +4594,83 @@ fn a_worker_of_two_models_reads_the_lists_in_each_of_its_rows() {
     let world = store.world();
     assert_eq!(read(&world, MODEL), (1, 1, 0b1));
     assert_eq!(read(&world, "second"), (1, 1, 0b1));
+    assert_eq!(store.outside_lists(), OutsideLists::default());
+    // An apply whose lists name neither of its fields counts the member once
+    // a list, not once a row.
+    store
+        .apply(generation_listing(3, &["tier=gold"], &["east"], &["alpha"]))
+        .expect("applied");
+    let world = store.world();
+    assert_eq!(read(&world, MODEL), (0, 0, 0b1));
+    assert_eq!(read(&world, "second"), (0, 0, 0b1));
+    let outside = OutsideLists {
+        engines: 1,
+        zones: 1,
+    };
+    assert_eq!(store.outside_lists(), outside);
+    // A membership write counts at its own read of the members: the worker
+    // is counted once there too, beside a worker both lists name.
+    let inside = WorkerFacts {
+        engine_kind: "alpha".to_string(),
+        zone: Some("east".to_string()),
+        ..facts("inside", Role::Single, &[MODEL])
+    };
+    store.upsert(inside);
+    assert_eq!(store.outside_lists(), outside);
+}
+
+/// The one door's pair is of one moment. Each member joins outside the
+/// engines' list and then reports over its bound, so at every moment the
+/// flips trail the members outside by one at most, and a second thread reads
+/// the pair while the walk runs. Two holds of the lock would hand a reader a
+/// pair no moment held.
+#[test]
+fn a_pair_read_beside_a_walk_of_joins_and_reports_is_of_one_moment() {
+    const MEMBERS: u64 = 1_500;
+    let store = Arc::new(MemoryStore::new());
+    let mut document = PolicySpec::preset("round_robin").expect("a preset of this build");
+    document.generation = 1;
+    document.view.engines = vec!["alpha".to_string()];
+    let profile = document
+        .profiles
+        .keys()
+        .next()
+        .expect("the preset's profile");
+    document.bindings = vec![BindingSpec {
+        profile: Some(profile.clone()),
+        overload: Some(block(8, 1.0)),
+        ..BindingSpec::default()
+    }];
+    let listing = AppliedSpec::validate(&document).expect("the document validates");
+    store.apply(listing).expect("applied");
+    let walk = {
+        let store = Arc::clone(&store);
+        std::thread::spawn(move || {
+            for at in 0..MEMBERS {
+                let joins = WorkerFacts {
+                    engine_kind: "beta".to_string(),
+                    ..facts(&format!("w{at}"), Role::Single, &[MODEL])
+                };
+                let id = store.upsert(joins).id();
+                let over = [(id, 0, Some(pressure(9, 0)))];
+                store.report(&over, Instant::now(), LoadSource::Poll);
+            }
+        })
+    };
+    while !walk.is_finished() {
+        let counts = store.counts();
+        let (outside, flips) = (u64::from(counts.outside.engines), counts.overload_flips);
+        assert!(
+            flips <= outside && outside <= flips + 1,
+            "a pair of no moment: {outside} outside beside {flips} flips"
+        );
+    }
+    walk.join().expect("the walk");
+    let end = store.counts();
+    assert_eq!(
+        (u64::from(end.outside.engines), end.overload_flips),
+        (MEMBERS, MEMBERS)
+    );
 }
 
 #[test]

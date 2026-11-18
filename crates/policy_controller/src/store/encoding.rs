@@ -70,6 +70,8 @@ pub struct EncodeOffer {
     pub consumer: bool,
     /// The connector the role is stated on.
     pub connector: Option<String>,
+    /// The worker, an encoder, processes an item's references itself.
+    pub references: bool,
 }
 
 impl EncodeOffer {

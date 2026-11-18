@@ -17,7 +17,6 @@ use openai_protocol::{
     model_card::ModelCard,
     worker::{ProviderType, WorkerInfo, WorkerModels, WorkerStatus},
 };
-use smg_grpc_client::common_proto;
 use tokio::{
     sync::{mpsc, Notify, OnceCell},
     task::AbortHandle,
@@ -28,7 +27,9 @@ pub use super::metadata::WorkerMetadata;
 pub(crate) use crate::worker::runtime::COLD_PREFILL_TOKENS_PER_SEC;
 use crate::worker::{
     connection::{
-        engine::{EngineConnection, EngineConnector, ZmqLink, NO_ENGINE_CONNECTOR},
+        engine::{
+            EngineConnection, EngineConnectionCache, EngineConnector, ZmqLink, NO_ENGINE_CONNECTOR,
+        },
         engine_admin::{
             admin_backend_client, admin_grpc_result, admin_http_post, failed, FLUSH_HTTP_TIMEOUT,
             PROFILE_HTTP_TIMEOUT,
@@ -862,11 +863,7 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
                     self.engine_connection().await?,
                 )?;
                 let result = client.flush_cache(0.0).await;
-                admin_grpc_result(
-                    self.url(),
-                    "flush_cache",
-                    result.map(|r| (r.success, r.message)),
-                )
+                admin_grpc_result(self.url(), "flush_cache", result)
             }
         }
     }
@@ -898,21 +895,8 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
                     "start_profile",
                     self.engine_connection().await?,
                 )?;
-                let req = common_proto::StartProfileRequest {
-                    output_dir: options.output_dir.clone(),
-                    start_step: options.start_step,
-                    num_steps: options.num_steps,
-                    activities: options.activities.clone().unwrap_or_default(),
-                    with_stack: options.with_stack,
-                    record_shapes: options.record_shapes,
-                    profile_by_stage: options.profile_by_stage,
-                };
-                let result = client.start_profile(req).await;
-                admin_grpc_result(
-                    self.url(),
-                    "start_profile",
-                    result.map(|r| (r.success, r.message)),
-                )
+                let result = client.start_profile(options).await;
+                admin_grpc_result(self.url(), "start_profile", result)
             }
         }
     }
@@ -939,11 +923,7 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
                     self.engine_connection().await?,
                 )?;
                 let result = client.stop_profile().await;
-                admin_grpc_result(
-                    self.url(),
-                    "stop_profile",
-                    result.map(|r| (r.success, r.message)),
-                )
+                admin_grpc_result(self.url(), "stop_profile", result)
             }
         }
     }
@@ -987,16 +967,15 @@ pub struct BasicWorker {
     pub runtime: ArcSwap<WorkerRuntime>,
     pub circuit_breaker: ArcSwap<CircuitBreaker>,
     /// Lazily initialized engine connection (gRPC or ZMQ) for local workers.
-    /// The inner `OnceCell` keeps reads lock-free after initialization and
-    /// dedupes concurrent connects; the outer `ArcSwap` lets the ZMQ health
-    /// probe evict a dead client by swapping in a fresh cell (gRPC never
-    /// swaps — a failed gRPC worker is removed and re-added instead).
-    pub engine_connection: Arc<ArcSwap<OnceCell<Arc<dyn EngineConnection>>>>,
+    /// Compatible replacements share the slot in [`EngineConnectionCache`].
+    /// Its current cell deduplicates handshakes; a ZMQ probe on either
+    /// worker can evict that cell when the connection dies.
+    pub engine_connection: Arc<EngineConnectionCache>,
     /// What makes the engine connection: the host's connector, as the
     /// builder resolved it. Without one a gRPC or ZMQ connect is refused.
     pub engine_connector: Option<Arc<dyn EngineConnector>>,
     /// Guards the one-shot background ZMQ handshake driver so the health probe
-    /// never cancels a long (model-load) handshake. Self-clears on failure to
+    /// never cancels a long (model-load) handshake. Clears at completion to
     /// allow a retry. Unused for HTTP/gRPC.
     pub zmq_connect_started: Arc<AtomicBool>,
     /// Abort handle for that driver, so removing or replacing the worker
@@ -1108,6 +1087,9 @@ impl BasicWorker {
     /// A worker built without a connector has no handshake to drive, and
     /// none starts: its acquisition refuses and its probe reads not ready.
     fn spawn_zmq_connect_driver(&self, cell: &Arc<OnceCell<Arc<dyn EngineConnection>>>) {
+        if self.superseded.load(Ordering::Acquire) {
+            return;
+        }
         let Some(connector) = self.engine_connector.clone() else {
             return;
         };
@@ -1134,7 +1116,7 @@ impl BasicWorker {
         let revision = self.revision();
         #[expect(
             clippy::disallowed_methods,
-            reason = "detached one-shot handshake driver; the OnceCell dedupes with the request path and the guard self-clears on failure to allow a retry"
+            reason = "detached one-shot handshake driver; the OnceCell dedupes with the request path and the guard clears when the handshake completes"
         )]
         // Detached: only the AbortHandle is kept, so the task keeps running
         // until it completes or the worker leaves the registry.
@@ -1144,6 +1126,9 @@ impl BasicWorker {
                 .await
             {
                 Ok(_) => {
+                    // Only an in-flight handshake needs this guard. A probe
+                    // holding another worker can evict the shared connection.
+                    started.store(false, Ordering::SeqCst);
                     // Handshake landed: wake the manager to promote now
                     // rather than on the next poll. A dropped signal (no
                     // manager, or receiver gone) is harmless — polling
@@ -1161,8 +1146,14 @@ impl BasicWorker {
                 }
             }
         });
-        self.zmq_connect_abort
-            .store(Some(Arc::new(handle.abort_handle())));
+        let published = Some(Arc::new(handle.abort_handle()));
+        self.zmq_connect_abort.store(published.clone());
+        // Retirement can take the previous handle between the entry check
+        // and publication. Cancel this task even if retirement missed it.
+        if self.superseded.load(Ordering::Acquire) {
+            handle.abort();
+            self.zmq_connect_abort.compare_and_swap(&published, None);
+        }
     }
 
     /// Whether the breaker permits execution. A breaker that moves from open
@@ -1256,12 +1247,11 @@ impl BasicWorker {
         // replacement that arrived with its own client keeps it.
         if self.metadata.spec.connection_mode != other.metadata.spec.connection_mode
             || self.metadata.spec.runtime_type != other.metadata.spec.runtime_type
-            || self.engine_connection.load().get().is_some()
+            || self.engine_connection.load_full().get().is_some()
         {
             return;
         }
-        self.engine_connection
-            .store(other.engine_connection.load_full());
+        self.engine_connection.adopt(&other.engine_connection);
     }
 }
 
@@ -1355,8 +1345,7 @@ impl BasicWorker {
                 "ZMQ engine for {} is no longer alive; evicting the dead client and rebinding on a later probe",
                 self.metadata.redacted_url
             );
-            self.engine_connection
-                .compare_and_swap(&cell, Arc::new(OnceCell::new()));
+            self.engine_connection.evict(&cell);
             self.zmq_connect_started.store(false, Ordering::SeqCst);
             return false;
         }

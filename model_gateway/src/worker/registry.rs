@@ -1763,9 +1763,8 @@ impl<G: Generation> WorkerRegistry<G> {
         // the URL drops those writes until the old instance is gone too.
         Metrics::worker_replaced(old_worker.url(), Arc::downgrade(&old_worker));
 
-        // The replacement carries its own backend-client slot, so the old
-        // instance's ZMQ handshake driver can now only hold its socket binds
-        // against the new worker's connect.
+        // The replacement owns its handshake driver. Release any binds the
+        // retired instance still holds while waiting for the engine.
         old_worker.abort_background_tasks();
 
         // Diff model indexes: remove stale, add new.
@@ -3375,21 +3374,6 @@ impl<G: Generation> WorkerRegistry<G> {
             WorkerStatus::NotReady
         });
         worker
-    }
-}
-
-/// The registry as a peer that asks one thing of it holds it: the worker
-/// registered under a URL. Such a holder reads no generation, so it names
-/// no value of the registry's host.
-pub(crate) trait WorkerLookup: Send + Sync {
-    /// The worker registered under `url`, as [`WorkerRegistry::get_by_url`]
-    /// reads it.
-    fn get_by_url(&self, url: &str) -> Option<Arc<dyn Worker>>;
-}
-
-impl<G: Generation> WorkerLookup for WorkerRegistry<G> {
-    fn get_by_url(&self, url: &str) -> Option<Arc<dyn Worker>> {
-        Self::get_by_url(self, url)
     }
 }
 

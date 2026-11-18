@@ -33,6 +33,7 @@ use openai_protocol::{
     worker::{HealthCheckConfig, OverloadUpdate, WorkerStatus},
 };
 use serde::Serialize;
+use smg_grpc_client::common_proto::EngineLoad;
 
 use super::*;
 use crate::worker::{

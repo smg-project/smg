@@ -326,6 +326,10 @@ name = "epd"
 harness = false
 
 [[bench]]
+name = "encode_pair"
+harness = false
+
+[[bench]]
 name = "contention"
 harness = false
 
@@ -363,6 +367,12 @@ harness = false
 
 [[bench]]
 name = "prefix_hash"
+harness = false
+
+# The `bucket` preset's rows. Apart from `decision`, as `spec_index` is:
+# that binary runs at its gate's bound.
+[[bench]]
+name = "bucket"
 harness = false
 
 [[bench]]

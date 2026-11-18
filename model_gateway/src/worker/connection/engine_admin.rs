@@ -5,7 +5,7 @@
 
 use std::{sync::Arc, time::Duration};
 
-use super::engine::EngineConnection;
+use super::engine::{AdminAnswer, EngineConnection};
 use crate::worker::{WorkerError, WorkerResult};
 
 /// Timeout for worker HTTP `flush_cache` requests. Matches the gRPC
@@ -90,11 +90,11 @@ pub(in crate::worker) fn admin_backend_client(
 pub(in crate::worker) fn admin_grpc_result(
     url: &str,
     operation: &str,
-    result: Result<(bool, String), tonic::Status>,
+    result: Result<AdminAnswer, tonic::Status>,
 ) -> WorkerResult<()> {
     match result {
-        Ok((true, _)) => Ok(()),
-        Ok((false, message)) => Err(failed(
+        Ok(AdminAnswer { success: true, .. }) => Ok(()),
+        Ok(AdminAnswer { message, .. }) => Err(failed(
             url,
             operation,
             if message.is_empty() {
