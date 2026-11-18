@@ -1909,6 +1909,54 @@ fn a_dispatch_on_another_target_of_the_pick_moves_the_leases_count() {
     );
 }
 
+/// A lease moves at its first dispatch alone: a second one that names a
+/// third target of the pick, at a later instant, leaves the instant, the
+/// target and the counts as the first set them.
+#[test]
+fn a_second_dispatch_on_a_third_target_of_the_pick_moves_nothing() {
+    let store = MemoryStore::new();
+    let workers = ["http://a:1", "http://b:1", "http://c:1"].map(|key| ready(&store, key));
+    let [a, b, c] = workers;
+    let (gateway, now) = (GatewayId(1), Instant::now());
+    store.set_term(1);
+    let of = |held: [u32; 3]| {
+        let mut rows = [(a, held[0]), (b, held[1]), (c, held[2])];
+        rows.sort_unstable();
+        rows
+    };
+    let mut targets = Targets::new();
+    for id in workers {
+        targets.push(Target {
+            id,
+            ..Target::default()
+        });
+    }
+    let record = LeaseRecord {
+        picked: Picked::of(&targets),
+        ..booking(gateway, 1, a, now)
+    };
+    let leases: &dyn LeasesStore = &store;
+    leases.issue(record).expect("filed");
+    let on = |target_index| Dispatch {
+        target_index,
+        ..Dispatch::default()
+    };
+    assert!(leases.dispatched(gateway, LeaseId(1), on(1), now));
+    assert_eq!(in_flight(&store), of([0, 1, 0]));
+    let later = now + Duration::from_secs(1);
+    assert!(leases.dispatched(gateway, LeaseId(1), on(2), later));
+    assert_eq!(
+        in_flight(&store),
+        of([0, 1, 0]),
+        "the second target's count"
+    );
+    let filed = leases.get(gateway, LeaseId(1)).expect("on file");
+    assert_eq!(
+        (filed.target, filed.lease.target_index, filed.state),
+        (b, 1, LeaseState::Dispatched { at: now })
+    );
+}
+
 /// One worker at two ranks of a pick: a dispatch on the second names the
 /// lease's own worker, so no count moves, and the record's index follows
 /// the dispatch all the same.

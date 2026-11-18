@@ -417,9 +417,9 @@ pub(crate) mod tests {
     /// the worker the call named.
     type Heard = Vec<(&'static str, u64, WorkerId)>;
 
-    /// The index each dispatch's lease named, as a stage reads it off the
-    /// lease it is handed.
-    type Indexes = Arc<Mutex<Vec<u8>>>;
+    /// The index each dispatch's lease named and the rank of the target it
+    /// was told on, as a stage reads them off what it is handed.
+    type Indexes = Arc<Mutex<Vec<(u8, u16)>>>;
 
     /// The `random` picker, keeping what the engine tells it of leases.
     #[derive(Debug)]
@@ -428,7 +428,7 @@ pub(crate) mod tests {
     impl Lifecycle for Hears {
         fn on_dispatched(&self, lease: &Lease, target: &Target, _: Side, _: u32) {
             self.0.lock().push(("dispatched", lease.id.0, target.id));
-            self.1.lock().push(lease.target_index);
+            self.1.lock().push((lease.target_index, target.dp_rank));
         }
 
         fn on_completed(&self, lease: &Lease, outcome: &Outcome) {
@@ -466,7 +466,8 @@ pub(crate) mod tests {
         hearing_indexes(store, generation).0
     }
 
-    /// [`hearing`], with the index each dispatch's lease named.
+    /// [`hearing`], with the index each dispatch's lease named and the rank
+    /// it was told.
     fn hearing_indexes(store: &MemoryStore, generation: u64) -> (Arc<Mutex<Heard>>, Indexes) {
         let heard = Arc::new(Mutex::new(Vec::new()));
         let indexes = Indexes::default();
@@ -595,8 +596,8 @@ pub(crate) mod tests {
         assert_eq!(*heard.lock(), [("dispatched", 1, WorkerId(9))]);
         // The lease told names the dispatched index, which the door wrote
         // after the record was read: a stage that reads the index off the
-        // lease is told the second target.
-        assert_eq!(*indexes.lock(), [1]);
+        // lease is told the second target, at that target's rank.
+        assert_eq!(*indexes.lock(), [(1, 2)]);
         // The key's pin follows the dispatch, and so does the lease.
         let pins = store.with_world(|world| world.spec().engine().sessions().pins(session));
         assert_eq!(pins, Some([WorkerId(9), WorkerId(0)]));
@@ -650,7 +651,13 @@ pub(crate) mod tests {
         let pin = SessionsStore::lookup(&store, KEY.get()).expect("a pin");
         assert_eq!((pin.worker, pin.last_used), (WorkerId(7), at));
         // A lease no sessions rule governed, and one with no key: no pin.
-        keyed(&store, 2, 8, SessionVerdict::None, t0);
+        // The first has a key of its own: under the first lease's key the
+        // worker its rule prefers would be written again and hide a write.
+        let mut ungoverned = lease(A, 2, t0);
+        ungoverned.lease.generation = 1;
+        ungoverned.lease.session = Session::from_raw(77);
+        ungoverned.lease.session_verdict = SessionVerdict::None;
+        store.issue(ungoverned).expect("a lease");
         issued(&store, 3, 1, t0);
         for id in 2..=3 {
             dispatched(&store, A, &a_dispatched(id), at).expect("the frame reads");
