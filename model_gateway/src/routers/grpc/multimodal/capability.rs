@@ -210,7 +210,7 @@ fn unsupported_modality_message(runtimes: &[RuntimeType], modality: Modality) ->
 /// - Image: SGLang, vLLM, TRT-LLM, TokenSpeed
 /// - ImageEmbeds: TokenSpeed only (pre-computed embeddings are an EPD feature)
 /// - Video: vLLM, TokenSpeed
-/// - Audio: TokenSpeed
+/// - Audio: vLLM, TokenSpeed
 /// - MLX: none
 ///
 /// `Modality::ImageEmbeds` cannot actually reach either check today because a
@@ -225,7 +225,7 @@ pub(crate) fn runtime_supports_modality(runtime: RuntimeType, modality: Modality
         ),
         Modality::ImageEmbeds => matches!(runtime, RuntimeType::TokenSpeed),
         Modality::Video => matches!(runtime, RuntimeType::Vllm | RuntimeType::TokenSpeed),
-        Modality::Audio => matches!(runtime, RuntimeType::TokenSpeed),
+        Modality::Audio => matches!(runtime, RuntimeType::Vllm | RuntimeType::TokenSpeed),
     }
 }
 
@@ -324,7 +324,7 @@ mod tests {
             (Sglang, Audio, false),
             (Vllm, Image, true),
             (Vllm, Video, true),
-            (Vllm, Audio, false),
+            (Vllm, Audio, true),
             (Trtllm, Image, true),
             (Trtllm, Video, false),
             (Trtllm, Audio, false),
@@ -631,10 +631,15 @@ mod tests {
 
             let audio = MediaPlan::new([audio_part()]);
             let vllm = registry_with(vec![engine_worker("grpc://10.0.0.1:1", RuntimeType::Vllm)]);
-            let response = ensure_model_accepts_media(&vllm, MODEL, &audio, false).unwrap_err();
+            assert!(ensure_model_accepts_media(&vllm, MODEL, &audio, false).is_ok());
+            let sglang = registry_with(vec![engine_worker(
+                "grpc://10.0.0.1:1",
+                RuntimeType::Sglang,
+            )]);
+            let response = ensure_model_accepts_media(&sglang, MODEL, &audio, false).unwrap_err();
             let (code, message) = refusal(response).await;
             assert_eq!(code, "multimodal_not_supported");
-            assert_eq!(message, "backend vllm does not support audio inputs");
+            assert_eq!(message, "backend sglang does not support audio inputs");
 
             let tokenspeed = registry_with(vec![engine_worker(
                 "grpc://10.0.0.1:1",
@@ -654,11 +659,10 @@ mod tests {
 
         /// Where the gateway processes every item itself it hands a worker
         /// no reference, so the worker's own media processor takes nothing
-        /// off the matrix: the audio is refused in preparation, with the
-        /// sentence selection gave it after the fetch and the decode. What
-        /// the engine takes by the matrix goes on.
-        #[tokio::test]
-        async fn a_workers_own_processor_takes_nothing_off_the_matrix_where_the_router_processes() {
+        /// off the matrix. vLLM accepts preprocessed audio as well as images,
+        /// whether the worker also advertises its own processor or not.
+        #[test]
+        fn a_workers_own_processor_takes_nothing_off_the_matrix_where_the_router_processes() {
             use crate::routers::grpc::multimodal::refs::MM_PROCESSOR_LABEL;
 
             let audio = MediaPlan::new([audio_part()]);
@@ -666,10 +670,7 @@ mod tests {
                 "grpc://10.0.0.1:1",
                 &[(MM_PROCESSOR_LABEL, "inprocess")],
             )]);
-            let response = ensure_model_accepts_media(&refs, MODEL, &audio, true).unwrap_err();
-            let (code, message) = refusal(response).await;
-            assert_eq!(code, "multimodal_not_supported");
-            assert_eq!(message, "backend vllm does not support audio inputs");
+            assert!(ensure_model_accepts_media(&refs, MODEL, &audio, true).is_ok());
             assert!(ensure_model_accepts_media(&refs, MODEL, &image_plan(), true).is_ok());
         }
 
@@ -851,10 +852,7 @@ mod tests {
                 "grpc://10.0.0.1:1",
                 &[(SUPPORTS_VISION_LABEL, "false")],
             )]);
-            let response = ensure_model_accepts_media(&all_lmo, MODEL, &audio, false).unwrap_err();
-            let (code, message) = refusal(response).await;
-            assert_eq!(code, "multimodal_not_supported");
-            assert_eq!(message, "backend vllm does not support audio inputs");
+            assert!(ensure_model_accepts_media(&all_lmo, MODEL, &audio, false).is_ok());
 
             let mixed = MediaPlan::new([audio_part(), image_part()]);
             assert_eq!(pixel_modalities(&mixed), vec![Modality::Image]);
