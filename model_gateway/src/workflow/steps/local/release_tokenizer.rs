@@ -9,7 +9,7 @@ use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowRe
 
 use crate::{
     app_context::AppContext,
-    worker::Worker,
+    worker::{registry::worker_model_ids, Worker},
     workflow::data::{require_app_context, WorkerRemovalWorkflowData},
 };
 
@@ -19,11 +19,11 @@ use crate::{
 /// (`SubmitTokenizerJobStep`) and nothing unloaded it: every retired model
 /// id kept its tokenizer resident, tens of megabytes each, so model-id churn
 /// grew the registry and the process without bound. Once the removed workers
-/// have left the worker registry, the primary model of every removed worker
-/// is asked after, whatever its wire: the registration step loads under the
-/// primary alone and for the gRPC pipeline alone, but a model served over
-/// both wires keeps its tokenizer until its last worker of either wire
-/// leaves (with autoload off the gateway manages none and the step skips).
+/// have left the worker registry, their primary models are asked after.
+/// Opt-in preparation loads every canonical model of a mesh import, so its
+/// removal asks after all those models too. A model served over both wires
+/// keeps its tokenizer until its last worker of either wire leaves (with
+/// autoload off the gateway manages none and the step skips).
 /// A model no worker serves any more loses the tokenizer registered under
 /// its id, with the multimodal config that came with it, when a worker's
 /// registration loaded that entry (the registration workflow's loader records
@@ -32,8 +32,8 @@ use crate::{
 /// that published after the model's last worker left releases its own entry,
 /// see `release_if_unserved`): the startup entry and an operator's
 /// registration under a model's name stay. The model's next registration
-/// loads the tokenizer again. A model a removed worker only lists keeps its
-/// entry until a worker whose primary it is leaves.
+/// loads the tokenizer again. With default autoload, a model a removed worker
+/// only lists keeps its entry until a worker whose primary it is leaves.
 pub struct ReleaseTokenizerStep;
 
 #[async_trait]
@@ -77,34 +77,37 @@ impl StepExecutor<WorkerRemovalWorkflowData> for ReleaseTokenizerStep {
 }
 
 impl ReleaseTokenizerStep {
-    /// The models whose tokenizer is to leave: the primary model of a removed
-    /// worker of either wire (the registration step loads under the primary
-    /// alone; a model served over both wires keeps its entry until its last
-    /// worker of either leaves), served by no worker any more, whose entry a
-    /// worker's registration loaded; with that entry's id, the one the
-    /// release takes (an entry that replaces it under the name is not).
+    /// Worker-owned entries of unserved models, selected by the same model
+    /// scope as autoload: primary only by default, all cards with preparation.
+    /// The inspected entry ID protects a concurrent operator replacement.
     fn candidates(app_context: &AppContext, removed: &[&Arc<dyn Worker>]) -> Vec<(String, String)> {
         let mut asked: HashSet<String> = HashSet::new();
         let mut candidates = Vec::new();
         for worker in removed {
-            let model_id = worker.model_id().to_string();
-            if !asked.insert(model_id.clone())
-                || app_context.worker_registry.contains_model(&model_id)
-            {
-                continue;
-            }
-            let Some(entry) = app_context.tokenizer_registry.get_by_name(&model_id) else {
-                continue;
+            let models = if app_context.router_config.wait_for_tokenizer {
+                worker_model_ids(worker)
+            } else {
+                vec![worker.model_id().to_string()]
             };
-            if !app_context.worker_loaded_tokenizers.contains(&entry.id) {
-                debug!(
-                    model = %model_id,
-                    tokenizer_id = %entry.id,
-                    "Tokenizer of a model no worker serves kept: no worker's registration loaded it"
-                );
-                continue;
+            for model_id in models {
+                if !asked.insert(model_id.clone())
+                    || app_context.worker_registry.contains_model(&model_id)
+                {
+                    continue;
+                }
+                let Some(entry) = app_context.tokenizer_registry.get_by_name(&model_id) else {
+                    continue;
+                };
+                if !app_context.worker_loaded_tokenizers.contains(&entry.id) {
+                    debug!(
+                        model = %model_id,
+                        tokenizer_id = %entry.id,
+                        "Tokenizer of a model no worker serves kept: no worker's registration loaded it"
+                    );
+                    continue;
+                }
+                candidates.push((model_id, entry.id));
             }
-            candidates.push((model_id, entry.id));
         }
         candidates
     }
@@ -237,7 +240,10 @@ mod tests {
         app_context::{testing::app_context_for_tests, AppContext},
         config::RouterConfig,
         routers::grpc::multimodal::MultimodalModelConfig,
-        worker::{BasicWorkerBuilder, ConnectionMode, ModelCard, Worker, WorkerRegistry},
+        worker::{
+            registry::RemoteWorkerState, BasicWorkerBuilder, ConnectionMode, ModelCard, Worker,
+            WorkerRegistry,
+        },
         workflow::{
             data::WorkerRemovalWorkflowData,
             steps::local::{
@@ -437,33 +443,55 @@ mod tests {
         );
     }
 
-    /// The registration step loads under a worker's primary model alone, so
-    /// the release asks after the primary alone: an endpoint that lists a
-    /// second model takes its primary's tokenizer with it and leaves the
-    /// listed model's entry.
+    /// REST removal of a full mesh import follows the same ownership scope
+    /// as its autoload, while default autoload keeps primary-only cleanup.
     #[tokio::test]
-    async fn a_model_a_worker_only_lists_keeps_its_entry() {
-        let app_context = app_context();
-        let endpoint: Arc<dyn Worker> = Arc::new(
-            BasicWorkerBuilder::new("http://e:8000")
-                .models(vec![ModelCard::new("a"), ModelCard::new("b")])
-                .label("tokenizer_path", "/tok/shared")
-                .connection_mode(ConnectionMode::Grpc)
-                .build(),
-        );
-        app_context.worker_registry.register(Arc::clone(&endpoint));
-        worker_tokenizer(&app_context, "a", "/tok/shared").await;
-        worker_tokenizer(&app_context, "b", "/tok/shared").await;
+    async fn a_listed_models_tokenizer_is_released_when_preparation_owns_it() {
+        for wait_for_tokenizer in [false, true] {
+            let app_context = app_context_for_tests(
+                RouterConfig::builder()
+                    .round_robin_policy()
+                    .wait_for_tokenizer(wait_for_tokenizer)
+                    .build_unchecked(),
+                Arc::new(WorkerRegistry::new()),
+                None,
+            );
+            let url = "http://e:8000";
+            let spec = serde_json::json!({
+                "url": url, "connection_mode":"grpc",
+                "models":[{"id":"a"},{"id":"b"}],
+                "labels":{"tokenizer_path":"/tok/shared"}
+            });
+            app_context
+                .worker_registry
+                .on_remote_worker_state(&RemoteWorkerState {
+                    worker_id: uuid::Uuid::now_v7().to_string(),
+                    model_id: "a".into(),
+                    url: url.into(),
+                    health: true,
+                    version: 1,
+                    spec: serde_json::to_vec(&spec).unwrap(),
+                });
+            let endpoint = app_context.worker_registry.get_by_url(url).unwrap();
+            assert_eq!(
+                endpoint.models().len(),
+                2,
+                "full mesh spec preserves every card"
+            );
+            worker_tokenizer(&app_context, "a", "/tok/shared").await;
+            worker_tokenizer(&app_context, "b", "/tok/shared").await;
 
-        remove(&app_context, endpoint).await;
-        assert!(
-            !app_context.tokenizer_registry.contains("a"),
-            "no worker serves the primary any more"
-        );
-        assert!(
-            app_context.tokenizer_registry.contains("b"),
-            "a listed model's entry is not the endpoint's to release"
-        );
+            remove(&app_context, endpoint).await;
+            assert!(
+                !app_context.tokenizer_registry.contains("a"),
+                "no worker serves the primary any more"
+            );
+            assert_eq!(
+                app_context.tokenizer_registry.contains("b"),
+                !wait_for_tokenizer,
+                "preparation owns listed models; default autoload owns the primary only"
+            );
+        }
     }
 
     /// With autoload off the gateway manages no tokenizer: every entry is the
