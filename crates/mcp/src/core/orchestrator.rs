@@ -413,6 +413,9 @@ struct ServerEntry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConnectedServer {
     pub server_key: String,
+    /// The key the connection is pooled under. The caller's binding keeps it
+    /// and its calls run on this connection.
+    pub pool_key: PoolKey,
     pub list_error: Option<String>,
 }
 
@@ -1058,14 +1061,20 @@ impl McpOrchestrator {
     ///
     /// This path does not perform tool-name reverse lookup. Callers must provide
     /// the exact `server_key` and tool name to execute.
+    ///
+    /// `pool_key` binds the call to a pooled connection, the one the caller's
+    /// request opened: the call runs on that connection, and answers that the
+    /// server is not found once the pool no longer holds it. `None` for a
+    /// server found by its name.
     pub async fn execute_tool_resolved(
         &self,
         input: ToolExecutionInput,
         server_key: &str,
         server_label: &str,
+        pool_key: Option<&PoolKey>,
         request_ctx: &McpRequestContext<'_>,
     ) -> ToolExecutionOutput {
-        self.execute_tool_resolved_result(input, server_key, server_label, request_ctx)
+        self.execute_tool_resolved_result(input, server_key, server_label, pool_key, request_ctx)
             .await
             .into_output()
     }
@@ -1076,21 +1085,40 @@ impl McpOrchestrator {
         input: ToolExecutionInput,
         server_key: &str,
         server_label: &str,
+        pool_key: Option<&PoolKey>,
         request_ctx: &McpRequestContext<'_>,
     ) -> ToolExecutionResult {
         let start = Instant::now();
         let arguments_str = input.arguments.to_string();
 
         let qualified = QualifiedToolName::new(server_key, &input.tool_name);
-        let entry = self.tool_inventory.get_entry(server_key, &input.tool_name);
+        // A call bound to a pooled connection answers for that connection
+        // alone: once the pool no longer holds it the server is gone for this
+        // call, whatever is listed under the same URL.
+        let entry = match pool_key {
+            Some(key) if !self.connection_pool.contains(key) => Err(format!(
+                "Tool call failed: {}",
+                McpError::ServerNotFound(server_key.to_string())
+            )),
+            _ => self
+                .tool_inventory
+                .get_entry(server_key, &input.tool_name)
+                .ok_or_else(|| {
+                    format!(
+                        "Tool '{}' not found on server '{}'",
+                        input.tool_name, server_key
+                    )
+                }),
+        };
 
         match entry {
-            Some(entry) => match self
+            Ok(entry) => match self
                 .execute_tool_entry_result(
                     &entry,
                     qualified,
                     &input.call_id,
                     input.arguments,
+                    pool_key,
                     request_ctx,
                 )
                 .await
@@ -1112,23 +1140,17 @@ impl McpOrchestrator {
                     ToolExecutionResult::PendingApproval(pending)
                 }
             },
-            None => {
-                let err = format!(
-                    "Tool '{}' not found on server '{}'",
-                    input.tool_name, server_key
-                );
-                ToolExecutionResult::Executed(ToolExecutionOutput {
-                    call_id: input.call_id,
-                    tool_name: input.tool_name,
-                    server_key: server_key.to_string(),
-                    server_label: server_label.to_string(),
-                    arguments_str,
-                    output: serde_json::json!({ "error": &err }),
-                    is_error: true,
-                    error_message: Some(err),
-                    duration: start.elapsed(),
-                })
-            }
+            Err(err) => ToolExecutionResult::Executed(ToolExecutionOutput {
+                call_id: input.call_id,
+                tool_name: input.tool_name,
+                server_key: server_key.to_string(),
+                server_label: server_label.to_string(),
+                arguments_str,
+                output: serde_json::json!({ "error": &err }),
+                is_error: true,
+                error_message: Some(err),
+                duration: start.elapsed(),
+            }),
         }
     }
 
@@ -1138,6 +1160,7 @@ impl McpOrchestrator {
         qualified: QualifiedToolName,
         call_id: &str,
         arguments: Value,
+        pool_key: Option<&PoolKey>,
         request_ctx: &McpRequestContext<'_>,
     ) -> ToolExecutionResult {
         self.active_executions.fetch_add(1, Ordering::SeqCst);
@@ -1148,7 +1171,13 @@ impl McpOrchestrator {
         let call_start_time = Instant::now();
 
         let result = match self
-            .execute_tool_with_approval_raw_internal(entry, call_id, arguments, request_ctx)
+            .execute_tool_with_approval_raw_internal(
+                entry,
+                call_id,
+                arguments,
+                pool_key,
+                request_ctx,
+            )
             .await
         {
             Ok(ApprovalExecutionResult::Success(raw_result)) => {
@@ -1206,6 +1235,7 @@ impl McpOrchestrator {
         entry: &ToolEntry,
         call_id: &str,
         arguments: Value,
+        pool_key: Option<&PoolKey>,
         request_ctx: &McpRequestContext<'_>,
     ) -> McpResult<ApprovalExecutionResult> {
         let elicitation_id = Self::approval_elicitation_id(entry.tool_name(), call_id);
@@ -1231,7 +1261,9 @@ impl McpOrchestrator {
                     return Err(McpError::ToolDenied(entry.tool_name().to_string()));
                 }
                 self.metrics.record_approval_granted();
-                let result = self.execute_tool_with_reconnect(entry, arguments).await?;
+                let result = self
+                    .execute_tool_with_reconnect(entry, arguments, pool_key)
+                    .await?;
                 Ok(ApprovalExecutionResult::Success(result))
             }
             ApprovalOutcome::Pending {
@@ -1250,7 +1282,9 @@ impl McpOrchestrator {
                 match rx.await {
                     Ok(ApprovalDecision::Approved) => {
                         self.metrics.record_approval_granted();
-                        let result = self.execute_tool_with_reconnect(entry, arguments).await?;
+                        let result = self
+                            .execute_tool_with_reconnect(entry, arguments, pool_key)
+                            .await?;
                         Ok(ApprovalExecutionResult::Success(result))
                     }
                     Ok(ApprovalDecision::Denied { reason }) => {
@@ -1266,6 +1300,7 @@ impl McpOrchestrator {
         &self,
         entry: &ToolEntry,
         arguments: Value,
+        pool_key: Option<&PoolKey>,
     ) -> McpResult<CallToolResult> {
         // One deadline for the whole call: the first attempt and a replay
         // after reconnection share the configured bound instead of each
@@ -1284,7 +1319,12 @@ impl McpOrchestrator {
             .map(|e| Arc::clone(&e.client));
 
         match self
-            .execute_tool_impl(entry, arguments.clone(), Self::remaining(deadline))
+            .execute_tool_impl(
+                entry,
+                arguments.clone(),
+                Self::remaining(deadline),
+                pool_key,
+            )
             .await
         {
             Ok(result) => Ok(result),
@@ -1295,7 +1335,7 @@ impl McpOrchestrator {
                 let replayable = Self::replayable(entry);
                 let recovery = self.recover_after_disconnect(&name, initial_client).await;
                 Self::after_recovery(replayable, recovery, &name, entry.tool_name())?;
-                self.execute_tool_impl(entry, arguments, Self::remaining(deadline))
+                self.execute_tool_impl(entry, arguments, Self::remaining(deadline), pool_key)
                     .await
             }
             Err(e) => Err(e),
@@ -1514,6 +1554,7 @@ impl McpOrchestrator {
         entry: &ToolEntry,
         mut arguments: Value,
         bound: Option<Duration>,
+        pool_key: Option<&PoolKey>,
     ) -> McpResult<CallToolResult> {
         // The server the call reaches is the one the recovery is keyed by;
         // the tool and the argument mapping come from the alias's target or
@@ -1539,7 +1580,8 @@ impl McpOrchestrator {
         }
 
         // Execute on server
-        self.execute_on_server(target_server, request, bound).await
+        self.execute_on_server(target_server, request, bound, pool_key)
+            .await
     }
 
     /// Coerce argument types based on tool schema.
@@ -1613,6 +1655,7 @@ impl McpOrchestrator {
         server_key: &str,
         request: CallToolRequestParams,
         bound: Option<Duration>,
+        pool_key: Option<&PoolKey>,
     ) -> McpResult<CallToolResult> {
         // Every call is bounded: a hung server must not hold a tool loop open
         // forever, and a call that outlives the bound is reported as unknown
@@ -1620,6 +1663,16 @@ impl McpOrchestrator {
         // budget; the message reports the configured value.
         let configured_secs = self.config.pool.call_timeout;
         let tool = request.name.to_string();
+
+        // A call bound to a pooled connection runs on that connection or not
+        // at all: the URL names every caller's connection to the server.
+        if let Some(key) = pool_key {
+            let Some(client) = self.connection_pool.get(key) else {
+                return Err(McpError::ServerNotFound(server_key.to_string()));
+            };
+            let result = Self::bounded(bound, client.call_tool(request)).await;
+            return Self::map_call_result(server_key, &tool, configured_secs, result);
+        }
 
         // Clone the client out of the map so no shard guard is held across
         // the call: reconnection removes entries from the same map.
@@ -1792,6 +1845,7 @@ impl McpOrchestrator {
         if pooled.is_some() && self.connection_pool.is_listed(&pool_key) {
             return Ok(ConnectedServer {
                 server_key,
+                pool_key,
                 list_error: None,
             });
         }
@@ -1866,6 +1920,7 @@ impl McpOrchestrator {
         }
         Ok(ConnectedServer {
             server_key,
+            pool_key,
             list_error,
         })
     }

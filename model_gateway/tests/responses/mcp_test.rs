@@ -250,6 +250,7 @@ async fn test_tool_execution_with_mock() {
         vec![McpServerBinding {
             label: "mock_server".to_string(),
             server_key: "mock_server".to_string(),
+            pool_key: None,
             allowed_tools: None,
             list_error: None,
         }],
@@ -322,6 +323,7 @@ async fn test_web_search_transform_handles_openai_search_response_with_mock() {
         vec![McpServerBinding {
             label: "openai_search_server".to_string(),
             server_key: "openai_search_server".to_string(),
+            pool_key: None,
             allowed_tools: None,
             list_error: None,
         }],
@@ -398,6 +400,7 @@ async fn test_web_search_transform_sets_action_query_for_brave_search_with_mock(
         vec![McpServerBinding {
             label: "brave_response_server".to_string(),
             server_key: "brave_response_server".to_string(),
+            pool_key: None,
             allowed_tools: None,
             list_error: None,
         }],
@@ -464,6 +467,7 @@ async fn test_concurrent_tool_execution() {
         vec![McpServerBinding {
             label: "mock_server".to_string(),
             server_key: "mock_server".to_string(),
+            pool_key: None,
             allowed_tools: None,
             list_error: None,
         }],
@@ -528,6 +532,7 @@ async fn test_tool_execution_errors() {
         vec![McpServerBinding {
             label: "mock_server".to_string(),
             server_key: "mock_server".to_string(),
+            pool_key: None,
             allowed_tools: None,
             list_error: None,
         }],
@@ -783,6 +788,7 @@ async fn test_complete_workflow() {
         vec![McpServerBinding {
             label: "integration_test".to_string(),
             server_key: "integration_test".to_string(),
+            pool_key: None,
             allowed_tools: None,
             list_error: None,
         }],
@@ -854,6 +860,7 @@ async fn internal_mcp_visibility_preserves_namespaced_client_function() {
         vec![McpServerBinding {
             label: "internal".into(),
             server_key: "internal".into(),
+            pool_key: None,
             allowed_tools: None,
             list_error: None,
         }],

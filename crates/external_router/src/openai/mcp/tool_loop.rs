@@ -1777,12 +1777,14 @@ mod tests {
             McpServerBinding {
                 label: "deepwiki_ask".to_string(),
                 server_key: "server-ask".to_string(),
+                pool_key: None,
                 allowed_tools: Some(vec!["ask_question".to_string()]),
                 list_error: None,
             },
             McpServerBinding {
                 label: "deepwiki_read".to_string(),
                 server_key: "server-read".to_string(),
+                pool_key: None,
                 allowed_tools: Some(vec!["read_wiki_structure".to_string()]),
                 list_error: None,
             },
@@ -1802,6 +1804,7 @@ mod tests {
         let bindings = vec![McpServerBinding {
             label: "deepwiki_ask".to_string(),
             server_key: "server-ask".to_string(),
+            pool_key: None,
             allowed_tools: Some(vec!["ask_question".to_string()]),
             list_error: None,
         }];
@@ -2261,6 +2264,7 @@ mod tests {
         let bindings = vec![McpServerBinding {
             label: "wiki".to_string(),
             server_key: "wiki-server".to_string(),
+            pool_key: None,
             allowed_tools: None,
             list_error: None,
         }];
@@ -2750,6 +2754,7 @@ mod tests {
         let binding = |label: &str, server_key: &str| McpServerBinding {
             label: label.to_string(),
             server_key: server_key.to_string(),
+            pool_key: None,
             allowed_tools: None,
             list_error: None,
         };
@@ -2982,6 +2987,7 @@ mod tests {
         let bindings = vec![McpServerBinding {
             label: "a-label".to_string(),
             server_key: "a-server".to_string(),
+            pool_key: None,
             allowed_tools: None,
             list_error: None,
         }];
@@ -3045,6 +3051,7 @@ mod tests {
         let bindings = vec![McpServerBinding {
             label: "search".to_string(),
             server_key: "search-server".to_string(),
+            pool_key: None,
             allowed_tools: None,
             list_error: None,
         }];

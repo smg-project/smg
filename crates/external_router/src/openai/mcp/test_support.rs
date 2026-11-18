@@ -48,6 +48,7 @@ fn internal_binding() -> McpServerBinding {
     McpServerBinding {
         label: "internal-label".to_string(),
         server_key: INTERNAL_SERVER.to_string(),
+        pool_key: None,
         allowed_tools: None,
         list_error: None,
     }

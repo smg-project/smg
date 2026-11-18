@@ -309,8 +309,8 @@ impl McpConnectionPool {
 
     /// Look up a connection by URL, failing closed when the URL is ambiguous.
     ///
-    /// The tool-execution path holds only the server URL, not the full
-    /// [`PoolKey`]. If exactly one pooled connection matches the URL it is
+    /// A call that is not bound to a [`PoolKey`] holds only the server URL.
+    /// If exactly one pooled connection matches the URL it is
     /// returned; if several do (same server, different credentials or tenants)
     /// the result is [`UrlLookup::Ambiguous`] so the caller never reuses another
     /// caller's authenticated connection. Callers that hold the full key should

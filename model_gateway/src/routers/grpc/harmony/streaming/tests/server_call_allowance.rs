@@ -97,6 +97,7 @@ fn binding() -> Vec<McpServerBinding> {
     vec![McpServerBinding {
         label: "weather".to_string(),
         server_key: "weather".to_string(),
+        pool_key: None,
         allowed_tools: None,
         list_error: None,
     }]

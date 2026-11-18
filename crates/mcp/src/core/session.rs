@@ -16,6 +16,7 @@ use super::{
         McpOrchestrator, McpRequestContext, ToolExecutionInput, ToolExecutionOutput,
         ToolExecutionResult,
     },
+    pool::PoolKey,
     UNKNOWN_SERVER_KEY,
 };
 use crate::{
@@ -37,6 +38,10 @@ pub struct McpServerBinding {
     pub label: String,
     /// Internal key used to look up the server in the orchestrator.
     pub server_key: String,
+    /// The pooled connection this binding's calls run on: the key the server
+    /// was connected under for this request. `None` for a server the gateway
+    /// is configured with, which is found by its name.
+    pub pool_key: Option<PoolKey>,
     /// Optional per-server tool allowlist.
     ///
     /// When `Some`, only the listed tool names are exposed for this server.
@@ -58,6 +63,8 @@ struct ExposedToolBinding {
     server_key: String,
     associated_server_key: String,
     server_label: String,
+    /// The pooled connection the tool's calls run on, from its binding.
+    pool_key: Option<PoolKey>,
     resolved_tool_name: String,
     is_builtin_routed: bool,
     approval_mode: ApprovalMode,
@@ -292,6 +299,7 @@ impl<'a> McpToolSession<'a> {
                     },
                     &binding.server_key,
                     &binding.server_label,
+                    binding.pool_key.as_ref(),
                     &request_ctx,
                 )
                 .await;
@@ -561,9 +569,11 @@ impl<'a> McpToolSession<'a> {
         for entry in tools {
             let server_key = entry.server_key().to_string();
             let associated_server_key = Self::associated_server_key(entry);
-            let server_label = Self::label_for_entry(entry, &bindings)
-                .unwrap_or(associated_server_key)
+            let binding = Self::binding_for_entry(entry, &bindings);
+            let server_label = binding
+                .map_or(associated_server_key, |b| b.label.as_str())
                 .to_string();
+            let pool_key = binding.and_then(|b| b.pool_key.clone());
             let resolved_tool_name = entry.tool_name().to_string();
             let is_builtin_routed = Self::builtin_binding_for_entry(entry, builtin_tool_bindings);
 
@@ -598,6 +608,7 @@ impl<'a> McpToolSession<'a> {
                     server_key,
                     associated_server_key: associated_server_key.to_string(),
                     server_label,
+                    pool_key,
                     resolved_tool_name,
                     is_builtin_routed,
                     approval_mode: ApprovalMode::PolicyOnly,
@@ -664,27 +675,27 @@ impl<'a> McpToolSession<'a> {
             .unwrap_or_else(|| entry.server_key())
     }
 
-    /// The label a tool is attributed to: the first binding of its server
+    /// The binding a tool is attributed to: the first binding of its server
     /// whose allowlist admits it (a server bound under several labels lists
     /// each label's own tools); failing that, the server's first binding.
     /// `bindings` pairs each binding with its allowlist, built once.
-    fn label_for_entry<'b>(
+    fn binding_for_entry<'b>(
         entry: &ToolEntry,
         bindings: &'b [LabelledAllowlist<'b>],
-    ) -> Option<&'b str> {
+    ) -> Option<&'b McpServerBinding> {
         let key = Self::associated_server_key(entry);
         let mut of_server = bindings
             .iter()
             .filter(|(b, _)| b.server_key == key)
             .peekable();
-        let first = of_server.peek().map(|(b, _)| b.label.as_str());
+        let first = of_server.peek().map(|(b, _)| *b);
         of_server
             .find(|(_, allowed)| {
                 allowed
                     .as_ref()
                     .is_none_or(|allowed| Self::matches_allowed_tool_name(entry, allowed))
             })
-            .map(|(b, _)| b.label.as_str())
+            .map(|(b, _)| *b)
             .or(first)
     }
 
@@ -771,12 +782,14 @@ mod tests {
             McpServerBinding {
                 label: "label1".to_string(),
                 server_key: "key1".to_string(),
+                pool_key: None,
                 allowed_tools: None,
                 list_error: None,
             },
             McpServerBinding {
                 label: "label2".to_string(),
                 server_key: "key2".to_string(),
+                pool_key: None,
                 allowed_tools: None,
                 list_error: None,
             },
@@ -812,6 +825,7 @@ mod tests {
         let mcp_servers = vec![McpServerBinding {
             label: "my_label".to_string(),
             server_key: "my_key".to_string(),
+            pool_key: None,
             allowed_tools: None,
             list_error: None,
         }];
@@ -858,6 +872,7 @@ mod tests {
         let mcp_servers = vec![McpServerBinding {
             label: "label1".to_string(),
             server_key: "server1".to_string(),
+            pool_key: None,
             allowed_tools: None,
             list_error: None,
         }];
@@ -878,6 +893,7 @@ mod tests {
             vec![McpServerBinding {
                 label: "label1".to_string(),
                 server_key: "server1".to_string(),
+                pool_key: None,
                 allowed_tools: None,
                 list_error: None,
             }],
@@ -919,6 +935,7 @@ mod tests {
         let open = McpServerBinding {
             label: "conf".to_string(),
             server_key: "server1".to_string(),
+            pool_key: None,
             allowed_tools: None,
             list_error: None,
         };
@@ -971,6 +988,7 @@ mod tests {
             vec![McpServerBinding {
                 label: "brave".to_string(),
                 server_key: "server1".to_string(),
+                pool_key: None,
                 allowed_tools: Some(listed.clone()),
                 list_error: None,
             }],
@@ -995,6 +1013,7 @@ mod tests {
         let mcp_servers = vec![McpServerBinding {
             label: "my_server".to_string(),
             server_key: "server1".to_string(),
+            pool_key: None,
             allowed_tools: None,
             list_error: None,
         }];
@@ -1017,12 +1036,14 @@ mod tests {
                 McpServerBinding {
                     label: "alpha".to_string(),
                     server_key: "server1".to_string(),
+                    pool_key: None,
                     allowed_tools: None,
                     list_error: None,
                 },
                 McpServerBinding {
                     label: "beta".to_string(),
                     server_key: "server2".to_string(),
+                    pool_key: None,
                     allowed_tools: None,
                     list_error: None,
                 },
@@ -1062,18 +1083,21 @@ mod tests {
                 McpServerBinding {
                     label: "a".to_string(),
                     server_key: "s1".to_string(),
+                    pool_key: None,
                     allowed_tools: None,
                     list_error: None,
                 },
                 McpServerBinding {
                     label: "b".to_string(),
                     server_key: "s2".to_string(),
+                    pool_key: None,
                     allowed_tools: None,
                     list_error: None,
                 },
                 McpServerBinding {
                     label: "c".to_string(),
                     server_key: "s3".to_string(),
+                    pool_key: None,
                     allowed_tools: None,
                     list_error: None,
                 },
@@ -1116,12 +1140,14 @@ mod tests {
             McpServerBinding {
                 label: "brave".to_string(),
                 server_key: "brave-builtin".to_string(),
+                pool_key: None,
                 allowed_tools: None,
                 list_error: None,
             },
             McpServerBinding {
                 label: "regular".to_string(),
                 server_key: "regular-server".to_string(),
+                pool_key: None,
                 allowed_tools: None,
                 list_error: None,
             },
@@ -1165,6 +1191,7 @@ mod tests {
             vec![McpServerBinding {
                 label: "internal-label".to_string(),
                 server_key: "internal-server".to_string(),
+                pool_key: None,
                 allowed_tools: None,
                 list_error: None,
             }],
@@ -1196,6 +1223,7 @@ mod tests {
             vec![McpServerBinding {
                 label: "image".to_string(),
                 server_key: "image-server".to_string(),
+                pool_key: None,
                 allowed_tools: None,
                 list_error: None,
             }],
@@ -1218,6 +1246,7 @@ mod tests {
             vec![McpServerBinding {
                 label: "mock".to_string(),
                 server_key: "server1".to_string(),
+                pool_key: None,
                 allowed_tools: Some(vec!["brave_web_search".to_string()]),
                 list_error: None,
             }],
@@ -1249,12 +1278,14 @@ mod tests {
         let open = McpServerBinding {
             label: "conf".to_string(),
             server_key: "server1".to_string(),
+            pool_key: None,
             allowed_tools: None,
             list_error: None,
         };
         let narrow = McpServerBinding {
             label: "conf-b".to_string(),
             server_key: "server1".to_string(),
+            pool_key: None,
             allowed_tools: Some(vec!["echo".to_string()]),
             list_error: None,
         };
@@ -1324,6 +1355,7 @@ mod tests {
             vec![McpServerBinding {
                 label: "brave".to_string(),
                 server_key: "server1".to_string(),
+                pool_key: None,
                 allowed_tools: None,
                 list_error: None,
             }],
@@ -1356,6 +1388,7 @@ mod tests {
             vec![McpServerBinding {
                 label: "brave".to_string(),
                 server_key: "server1".to_string(),
+                pool_key: None,
                 allowed_tools: Some(vec!["web_search".to_string()]),
                 list_error: None,
             }],
@@ -1387,6 +1420,7 @@ mod tests {
             vec![McpServerBinding {
                 label: "internal-label".to_string(),
                 server_key: "internal-server".to_string(),
+                pool_key: None,
                 allowed_tools: None,
                 list_error: None,
             }],
@@ -1422,6 +1456,7 @@ mod tests {
             vec![McpServerBinding {
                 label: "internal-label".to_string(),
                 server_key: "internal-server".to_string(),
+                pool_key: None,
                 allowed_tools: None,
                 list_error: None,
             }],
@@ -1454,12 +1489,14 @@ mod tests {
                 McpServerBinding {
                     label: "shared-label".to_string(),
                     server_key: "public-server".to_string(),
+                    pool_key: None,
                     allowed_tools: None,
                     list_error: None,
                 },
                 McpServerBinding {
                     label: "shared-label".to_string(),
                     server_key: "internal-server".to_string(),
+                    pool_key: None,
                     allowed_tools: None,
                     list_error: None,
                 },
@@ -1491,12 +1528,14 @@ mod tests {
                 McpServerBinding {
                     label: "brave".to_string(),
                     server_key: "server1".to_string(),
+                    pool_key: None,
                     allowed_tools: Some(vec!["brave_web_search".to_string()]),
                     list_error: None,
                 },
                 McpServerBinding {
                     label: "deepwiki".to_string(),
                     server_key: "server2".to_string(),
+                    pool_key: None,
                     allowed_tools: None,
                     list_error: None,
                 },
@@ -1558,6 +1597,7 @@ mod tests {
             vec![McpServerBinding {
                 label: "aliases".to_string(),
                 server_key: crate::inventory::ALIAS_SERVER_KEY.to_string(),
+                pool_key: None,
                 allowed_tools: None,
                 list_error: None,
             }],

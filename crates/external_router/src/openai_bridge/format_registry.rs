@@ -365,6 +365,7 @@ mod tests {
         vec![McpServerBinding {
             label: server_name.to_string(),
             server_key: server_name.to_string(),
+            pool_key: None,
             allowed_tools: None,
             list_error: None,
         }]

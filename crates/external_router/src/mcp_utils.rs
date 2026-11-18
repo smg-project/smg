@@ -144,6 +144,7 @@ pub async fn connect_mcp_servers(
                         mcp_servers.push(McpServerBinding {
                             label: input.label.clone(),
                             server_key,
+                            pool_key: Some(connected.pool_key),
                             allowed_tools: input.allowed_tools.clone(),
                             list_error: connected.list_error,
                         });
@@ -168,6 +169,7 @@ pub async fn connect_mcp_servers(
             mcp_servers.push(McpServerBinding {
                 label: input.label.clone(),
                 server_key: input.label.clone(),
+                pool_key: None,
                 allowed_tools: input.allowed_tools.clone(),
                 list_error: mcp_orchestrator.list_error_for_server(&input.label),
             });
@@ -326,6 +328,7 @@ pub async fn ensure_mcp_servers(
                 mcp_servers.push(McpServerBinding {
                     label: server_name.clone(),
                     server_key: server_name,
+                    pool_key: None,
                     allowed_tools: None,
                     list_error,
                 });
@@ -493,7 +496,7 @@ mod tests {
         collections::{HashMap, HashSet},
         sync::{
             atomic::{AtomicBool, AtomicUsize, Ordering},
-            Arc,
+            Arc, Mutex,
         },
         time::Duration,
     };
@@ -607,6 +610,9 @@ mod tests {
         numbered: Option<Arc<AtomicUsize>>,
         prompts_gate: Option<Arc<Gate>>,
         drops_calls: bool,
+        /// With it set the server answers `tools/call` and records each
+        /// call's `Authorization` here, in arrival order.
+        calls: Option<Arc<Mutex<Vec<String>>>>,
     }
 
     /// A gate the local server's `tools/list` waits at while `holding` is
@@ -712,6 +718,21 @@ mod tests {
                         }))
                         .into_response(),
                     }
+                }
+                Some("tools/call") if server.calls.is_some() => {
+                    let caller = headers
+                        .get(AUTHORIZATION)
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or_default()
+                        .to_string();
+                    if let Some(calls) = &server.calls {
+                        calls.lock().expect("the calls lock").push(caller);
+                    }
+                    Json(json!({
+                        "jsonrpc": "2.0", "id": id,
+                        "result": {"content": [{"type": "text", "text": "called"}]}
+                    }))
+                    .into_response()
                 }
                 Some("tools/call") if server.drops_calls => {
                     StatusCode::INTERNAL_SERVER_ERROR.into_response()
@@ -922,6 +943,118 @@ mod tests {
             item_error(listed),
             None,
             "a refusal another caller met is not this caller's error"
+        );
+    }
+
+    /// A tool call runs on the connection its own request opened. Two callers
+    /// reach one URL under different credentials and the pool holds one
+    /// connection, so the second caller's connect takes the first one's place
+    /// while the first request is in its tool loop. The first request's next
+    /// call answers that its server is not found, and every call the server
+    /// gets comes under the credentials of the request that made it.
+    #[tokio::test]
+    async fn a_call_runs_on_the_connection_its_own_request_opened() {
+        let mut config = McpConfig::default();
+        config.pool.max_connections = 1;
+        let orchestrator = Arc::new(McpOrchestrator::new(config).await.unwrap());
+        let format_registry = FormatRegistry::new();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let url = serve_local_mcp_server(LocalServer {
+            tools: Some(&["echo"]),
+            calls: Some(Arc::clone(&calls)),
+            ..Default::default()
+        })
+        .await;
+        let input = |label: &str, token: &str| McpServerInput {
+            label: label.to_string(),
+            url: Some(url.clone()),
+            authorization: Some(token.to_string()),
+            headers: HashMap::new(),
+            allowed_tools: None,
+        };
+        let echo = || ToolExecutionInput {
+            call_id: "call-1".to_string(),
+            tool_name: "echo".to_string(),
+            arguments: json!({}),
+        };
+
+        let first = connect_mcp_servers(
+            &orchestrator,
+            &format_registry,
+            &[input("first", "first-token")],
+        )
+        .await;
+        let first_request = McpToolSession::new(&orchestrator, first, "first-request");
+        let own = first_request.execute_tool(echo()).await;
+        assert!(
+            !own.is_error,
+            "the request's call runs while its connection is pooled"
+        );
+
+        let second = connect_mcp_servers(
+            &orchestrator,
+            &format_registry,
+            &[input("second", "second-token")],
+        )
+        .await;
+        let after = first_request.execute_tool(echo()).await;
+        assert_eq!(
+            after.error_message,
+            Some(format!("Tool call failed: Server not found: {url}")),
+            "the request's connection left the pool: its next call finds no server"
+        );
+        let theirs = McpToolSession::new(&orchestrator, second, "second-request")
+            .execute_tool(echo())
+            .await;
+        assert!(
+            !theirs.is_error,
+            "the second request's call runs on its own connection"
+        );
+        assert_eq!(
+            *calls.lock().expect("the calls lock"),
+            ["Bearer first-token", "Bearer second-token"],
+            "each call came under the credentials of the request that made it"
+        );
+    }
+
+    /// Two requests reach one URL under different credentials and both
+    /// connections are pooled: each request's call runs on its own
+    /// connection, under its own credentials.
+    #[tokio::test]
+    async fn two_requests_at_one_url_each_call_on_their_own_connection() {
+        let (orchestrator, format_registry) = create_test_orchestrator_no_builtin().await;
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let url = serve_local_mcp_server(LocalServer {
+            tools: Some(&["echo"]),
+            calls: Some(Arc::clone(&calls)),
+            ..Default::default()
+        })
+        .await;
+        for token in ["first-token", "second-token"] {
+            let input = McpServerInput {
+                label: token.to_string(),
+                url: Some(url.clone()),
+                authorization: Some(token.to_string()),
+                headers: HashMap::new(),
+                allowed_tools: None,
+            };
+            let bindings = connect_mcp_servers(&orchestrator, &format_registry, &[input]).await;
+            let output = McpToolSession::new(&orchestrator, bindings, "test-request")
+                .execute_tool(ToolExecutionInput {
+                    call_id: "call-1".to_string(),
+                    tool_name: "echo".to_string(),
+                    arguments: json!({}),
+                })
+                .await;
+            assert_eq!(
+                output.error_message, None,
+                "the call of the request under {token} runs"
+            );
+        }
+        assert_eq!(
+            *calls.lock().expect("the calls lock"),
+            ["Bearer first-token", "Bearer second-token"],
+            "each call came under the credentials of the request that made it"
         );
     }
 
@@ -1543,6 +1676,7 @@ mod tests {
         let conf = McpServerBinding {
             label: "conf".to_string(),
             server_key: "conf".to_string(),
+            pool_key: None,
             allowed_tools: None,
             list_error: None,
         };
