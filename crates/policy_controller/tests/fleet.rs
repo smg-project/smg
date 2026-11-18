@@ -207,6 +207,50 @@ fn keyed(mut ask: DecideRequest, key: u64) -> DecideRequest {
     ask
 }
 
+/// A key's fingerprint by the contract: FNV-1a over its bytes, a result of
+/// zero carried as one.
+fn print_of(key: &str) -> u64 {
+    let print = key.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |print, byte| {
+        (print ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    });
+    print.max(1)
+}
+
+/// The session a key names within a model under the single phase, by the
+/// contract's formula over the key's and the model's fingerprints.
+fn session_of(key: &str, model: &str) -> u64 {
+    const MIX: u64 = 0x9e37_79b9_7f4a_7c15;
+    let scope = print_of(model) ^ MIX;
+    let mut value = print_of(key) ^ scope.wrapping_mul(MIX);
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^= value >> 31;
+    value.max(1)
+}
+
+/// Asks under a session key, and reads the first target's id with the
+/// session the answer's one lease names; the lease is given up.
+async fn sessioned(harness: &mut Harness, ask: DecideRequest) -> Result<(u64, u64), String> {
+    let before = harness.leases(GATEWAY);
+    let answer = harness.client().decide(ask).await;
+    let Ok(Answer::Decision(Decision {
+        leases,
+        outcome: Some(Outcome::Pick(pick)),
+        ..
+    })) = &answer
+    else {
+        return Err(format!("no pick: {answer:?}"));
+    };
+    let ([lease], Some(target)) = (leases.as_slice(), pick.targets.first()) else {
+        return Err(format!(
+            "a keyed pick carries one lease and a target: {answer:?}"
+        ));
+    };
+    let read = (target.id, lease.session_key);
+    given_up(harness, &[lease.id], before).await?;
+    Ok(read)
+}
+
 /// `ask` with the prefix block hashes of a prompt of `runs`, each so many
 /// blocks of one text. A block's hash names the prompt through its block:
 /// two prompts share the hashes of the blocks they share from the start and
@@ -1073,6 +1117,87 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             .await
             .expect("a pick answers an ask over a ready fleet");
         assert_ne!(next, owner, "a retry leaves the worker it names as tried");
+
+        // A key in either form names one session. A gateway states a
+        // routing key plain or by its session's value, the key within the
+        // model and the phase by the contract's formula. The lease of a
+        // plain key carries that value, and an ask that states the value
+        // carries it too and returns to the plain key's worker.
+        assert_eq!(
+            (
+                print_of("conversation-7"),
+                session_of("conversation-7", "model-a")
+            ),
+            (0xd449_9ecc_c740_2a12, 0x6e88_ff71_cc98_2a42),
+            "this case's formulas give the contract's own example"
+        );
+        let value = session_of("conversation-7", MODEL);
+        let mut plain = nth("plain", 0);
+        let facts = plain.facts.as_mut().expect("the ask states facts");
+        facts.session_key = Some(Identity {
+            form: Some(Form::Plain("conversation-7".to_owned())),
+        });
+        let (by_text, text_session) = sessioned(&mut harness, plain)
+            .await
+            .expect("a pick answers an ask over a ready fleet");
+        assert_eq!(
+            text_session, value,
+            "a plain key's lease carries the session the contract's formula gives"
+        );
+        let (by_value, value_session) = sessioned(&mut harness, keyed(nth("value", 0), value))
+            .await
+            .expect("a pick answers an ask over a ready fleet");
+        assert_eq!(
+            value_session, value,
+            "a key stated by its session's value carries that value on its lease"
+        );
+        assert_eq!(
+            by_value, by_text,
+            "a key returns to one worker in either form"
+        );
+
+        // A key names a rank of a data-parallel group. The engine of two
+        // ranks is two rows of the ring, each at the positions of its own
+        // registration key: with every other engine excluded by the
+        // gateway, 64 routing keys are placed on that engine and not all
+        // on one rank of it, and each key asked again names its rank.
+        let apart: Vec<u64> = engines
+            .iter()
+            .filter(|engine| **engine != dead)
+            .map(|engine| harness.worker(*engine).map(|id| id.0))
+            .collect::<Result<_, _>>()
+            .expect("every engine registered its first rank");
+        let grouped = |run: &str, n: u64| {
+            let mut ask = keyed(nth(run, n), n + 1);
+            ask.constraints.get_or_insert_default().excluded = apart.clone();
+            ask
+        };
+        let mut placed = Vec::new();
+        for n in 0..ASKS {
+            let row = picked(&mut harness, grouped("group", n))
+                .await
+                .expect("a pick answers an ask over a ready fleet");
+            assert_eq!(
+                row.engine, dead,
+                "with every other engine excluded a key names the group: {row:?}"
+            );
+            placed.push(row);
+        }
+        let shares: HashSet<u16> = placed.iter().map(|row| row.rank).collect();
+        assert_eq!(
+            shares.len(),
+            2,
+            "{ASKS} routing keys do not share one rank of a data-parallel group: {shares:?}"
+        );
+        for (n, row) in (0..ASKS).zip(&placed) {
+            let again = picked(&mut harness, grouped("regroup", n))
+                .await
+                .expect("a pick answers an ask over a ready fleet");
+            assert_eq!(
+                again, *row,
+                "a routing key returns to its rank of a data-parallel group"
+            );
+        }
 
         // A prompt returns to its worker. Under the prefix preset an ask
         // with no routing key is keyed by its prompt's head, the last whole
