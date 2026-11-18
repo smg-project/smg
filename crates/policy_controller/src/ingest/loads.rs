@@ -456,7 +456,7 @@ where
     pub async fn run(&self, stop: watch::Receiver<bool>) {
         // No role to read: the polls run for the loop's length.
         let (_always, polls) = watch::channel(true);
-        self.run_while(stop, polls).await;
+        self.run_while(stop, polls, || 0).await;
     }
 
     /// [`LoadDriver::run`] on a replica that may follow a leader: the loop
@@ -466,15 +466,23 @@ where
     /// store names is read again at each tick. A turn to `false` ends the
     /// run of polls, with its calls still out and its grouping of the
     /// membership; a turn to `true` starts the next with a tick at once.
+    ///
+    /// `led` says the term the replica last took, read beside each word.
+    /// The watch keeps its last word alone: a loss and the take after it,
+    /// told before the loop looked, read as one `true`. Under another
+    /// term that word ends the run of polls and starts the next all the
+    /// same, so no call of the last lead lands on a store restored since.
     pub async fn run_while(
         &self,
         mut stop: watch::Receiver<bool>,
         mut polls: watch::Receiver<bool>,
+        led: impl Fn() -> u64,
     ) {
         let mut ticker = tokio::time::interval(self.config.tick);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut schedule = Schedule::default();
-        let mut polling = *polls.borrow_and_update();
+        // The word, and the term it was read under: one run of polls.
+        let (mut polling, mut under) = (*polls.borrow_and_update(), led());
         // A write of another task can leave the store an instant this loop
         // read none of (a registration's build): the store wakes the loop,
         // which reads the instant again.
@@ -496,8 +504,11 @@ where
                 biased;
                 _ = stop.wait_for(|stop| *stop) => return,
                 word = turned(&mut polls) => {
-                    if word != polling {
-                        polling = word;
+                    // The term is read after the word: a take sets it
+                    // before its word is told.
+                    let led = led();
+                    if (word, led) != (polling, under) {
+                        (polling, under) = (word, led);
                         schedule = Schedule::default();
                         if polling {
                             self.tick(&mut schedule);

@@ -808,9 +808,15 @@ impl Controller {
         // needs. The loop itself runs on every replica: it pays the store's
         // publications, so a followed row reaches the published world.
         let polls = follows.map(|_| shared.role.subscribe());
+        let fence = Arc::clone(&shared.fence);
         tasks.spawn(async move {
             match polls {
-                Some(polls) => driver.run_while(driver_stop, polls).await,
+                // The fence's term moves at a take alone: a word that
+                // reads `true` again under another term is another lead.
+                Some(polls) => {
+                    let led = move || fence.term();
+                    driver.run_while(driver_stop, polls, led).await;
+                }
                 None => driver.run(driver_stop).await,
             }
             Ok(())
