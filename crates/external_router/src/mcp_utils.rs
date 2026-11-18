@@ -618,6 +618,12 @@ mod tests {
         integer_id_bearer: Option<&'static str>,
         /// Each call's arguments, in arrival order.
         arguments: Option<Arc<Mutex<Vec<Value>>>>,
+        /// A tool named here is listed only for the caller under the bearer
+        /// token beside it.
+        only_for: &'static [(&'static str, &'static str)],
+        /// The first `initialize` sets `holding` here and is answered; each
+        /// later one waits for a release first.
+        later_connects: Option<Arc<Hold>>,
     }
 
     /// A gate the local server's `tools/list` waits at while `holding` is
@@ -653,6 +659,12 @@ mod tests {
         ) -> Response {
             use axum::response::IntoResponse;
             let id = message.get("id").cloned().unwrap_or(Value::Null);
+            if message["method"] == "initialize" {
+                let gate = server.later_connects.as_ref();
+                if let Some(gate) = gate.filter(|gate| gate.holding.swap(true, Ordering::SeqCst)) {
+                    gate.release.notified().await;
+                }
+            }
             if message["method"] == "prompts/list" {
                 let gate = server.prompts_gate.as_ref();
                 if let Some(gate) = gate.filter(|gate| gate.hold.holding.load(Ordering::SeqCst)) {
@@ -720,10 +732,19 @@ mod tests {
                     });
                     let properties =
                         id_type.map_or_else(|| json!({}), |id| json!({"id": {"type": id}}));
+                    let listed_for_caller = |name: &str| {
+                        server.only_for.iter().all(|(tool, token)| {
+                            *tool != name
+                                || headers
+                                    .get(AUTHORIZATION)
+                                    .and_then(|value| value.to_str().ok())
+                                    .is_some_and(|value| value == format!("Bearer {token}"))
+                        })
+                    };
                     match server.tools {
                         Some(names) if !refused => Json(json!({
                             "jsonrpc": "2.0", "id": id,
-                            "result": {"tools": names.iter().skip(usize::from(relisted)).map(|name| json!({
+                            "result": {"tools": names.iter().skip(usize::from(relisted)).filter(|name| listed_for_caller(name)).map(|name| json!({
                                 "name": numbered(name),
                                 "description": format!("the {name} tool{note}"),
                                 "inputSchema": {"type": "object", "properties": &properties}
@@ -1144,6 +1165,223 @@ mod tests {
                 used,
                 order.map(own),
                 "each request's tool list and call use the `id` type its own connection listed"
+            );
+        }
+    }
+
+    /// One request binds one URL under two labels with different
+    /// credentials, and the server lists one tool for each credential alone.
+    /// The request lists both tools, each under the label whose connection
+    /// listed it, and each call runs under that label's credentials.
+    #[tokio::test]
+    async fn a_url_bound_twice_lists_each_tool_from_the_binding_whose_connection_lists_it() {
+        let (orchestrator, format_registry) = create_test_orchestrator_no_builtin().await;
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let url = serve_local_mcp_server(LocalServer {
+            tools: Some(&["read", "write"]),
+            only_for: &[("read", "reader-token"), ("write", "writer-token")],
+            calls: Some(Arc::clone(&calls)),
+            ..Default::default()
+        })
+        .await;
+        let inputs = ["reader", "writer"].map(|label| McpServerInput {
+            label: label.to_string(),
+            url: Some(url.clone()),
+            authorization: Some(format!("{label}-token")),
+            headers: HashMap::new(),
+            allowed_tools: None,
+        });
+        let bindings = connect_mcp_servers(&orchestrator, &format_registry, &inputs).await;
+        let session = McpToolSession::new(&orchestrator, bindings, "test-request");
+        let listed: Vec<Vec<String>> = session
+            .mcp_servers()
+            .iter()
+            .map(|binding| {
+                let tools = session.list_tools_for_binding(binding);
+                tools
+                    .iter()
+                    .map(|entry| entry.tool_name().to_string())
+                    .collect()
+            })
+            .collect();
+        assert_eq!(
+            listed,
+            [["read"], ["write"]],
+            "each label lists the tool its own connection listed"
+        );
+        for tool in ["write", "read"] {
+            let output = session
+                .execute_tool(ToolExecutionInput {
+                    call_id: "call-1".to_string(),
+                    tool_name: tool.to_string(),
+                    arguments: json!({}),
+                })
+                .await;
+            assert_eq!(output.error_message, None, "the call of {tool} runs");
+        }
+        assert_eq!(
+            *calls.lock().expect("the calls lock"),
+            ["Bearer writer-token", "Bearer reader-token"],
+            "each call ran under the credentials of the label that lists its tool"
+        );
+    }
+
+    /// An alias of a tool of a request-connected server keeps its mapping
+    /// and resolves to its target on the connection of the request's
+    /// binding: the alias's renamed argument arrives under the target's
+    /// name, typed as that connection listed it.
+    #[tokio::test]
+    async fn an_alias_call_reaches_its_target_on_the_connection_of_its_binding() {
+        let (orchestrator, format_registry) = create_test_orchestrator_no_builtin().await;
+        let arguments = Arc::new(Mutex::new(Vec::new()));
+        let url = serve_local_mcp_server(LocalServer {
+            tools: Some(&["echo"]),
+            calls: Some(Arc::default()),
+            integer_id_bearer: Some("number-token"),
+            arguments: Some(Arc::clone(&arguments)),
+            ..Default::default()
+        })
+        .await;
+        let input = |token: &str| McpServerInput {
+            label: token.to_string(),
+            url: Some(url.clone()),
+            authorization: Some(token.to_string()),
+            headers: HashMap::new(),
+            allowed_tools: None,
+        };
+        let text =
+            connect_mcp_servers(&orchestrator, &format_registry, &[input("text-token")]).await;
+        connect_mcp_servers(&orchestrator, &format_registry, &[input("number-token")]).await;
+        let mapping = smg_mcp::ArgMapping {
+            renames: vec![("number".to_string(), "id".to_string())],
+            defaults: Vec::new(),
+            overrides: Vec::new(),
+        };
+        orchestrator
+            .register_alias("lookup", &url, "echo", Some(mapping))
+            .expect("the alias registers");
+        let output = McpToolSession::new(&orchestrator, text, "test-request")
+            .execute_tool(ToolExecutionInput {
+                call_id: "call-1".to_string(),
+                tool_name: "lookup".to_string(),
+                arguments: json!({"number": "00123"}),
+            })
+            .await;
+        assert_eq!(output.error_message, None, "the alias call runs");
+        assert_eq!(
+            *arguments.lock().expect("the arguments lock"),
+            [json!({"id": "00123"})],
+            "the alias call reached its target with its mapping and its own connection's `id` type"
+        );
+    }
+
+    /// The tools a session over `bindings` lists, by name, and the error of
+    /// its call of `echo`.
+    async fn lists_and_calls_echo(
+        orchestrator: &McpOrchestrator,
+        bindings: Vec<McpServerBinding>,
+    ) -> (Vec<String>, Option<String>) {
+        let session = McpToolSession::new(orchestrator, bindings, "test-request");
+        let listed = session
+            .mcp_servers()
+            .iter()
+            .flat_map(|binding| session.list_tools_for_binding(binding))
+            .map(|entry| entry.tool_name().to_string())
+            .collect();
+        let output = session
+            .execute_tool(ToolExecutionInput {
+                call_id: "call-1".to_string(),
+                tool_name: "echo".to_string(),
+                arguments: json!({}),
+            })
+            .await;
+        (listed, output.error_message)
+    }
+
+    /// Two requests under one key connect at once: neither finds a pooled
+    /// connection, both open one, and the second is pooled in place of the
+    /// first. Each request lists the server's tool and its call runs, the
+    /// first while the second's listing still waits, whether its own
+    /// listing returned after the second connection was pooled or before.
+    /// The server's signals order the steps, no timer.
+    #[tokio::test]
+    async fn two_connects_at_once_under_one_key_each_list_and_call_the_servers_tool() {
+        for (first_listed, late) in [("after", true), ("before", false)] {
+            let (orchestrator, format_registry) = create_test_orchestrator_no_builtin().await;
+            let arrived = Arc::new(Notify::new());
+            let hold = Arc::new(Hold {
+                holding: AtomicBool::new(late),
+                release: Notify::new(),
+            });
+            let later_connects = Arc::new(Hold::default());
+            let url = serve_local_mcp_server(LocalServer {
+                tools: Some(&["echo"]),
+                arrived: Some(Arc::clone(&arrived)),
+                hold: Some(Arc::clone(&hold)),
+                later_connects: Some(Arc::clone(&later_connects)),
+                calls: Some(Arc::default()),
+                ..Default::default()
+            })
+            .await;
+            let inputs = [McpServerInput {
+                label: "conf".to_string(),
+                url: Some(url),
+                authorization: Some("one-token".to_string()),
+                headers: HashMap::new(),
+                allowed_tools: None,
+            }];
+            let connect = || {
+                Box::pin(connect_mcp_servers(
+                    &orchestrator,
+                    &format_registry,
+                    &inputs,
+                ))
+            };
+            // Bounded: a listing that never arrives fails here and says so.
+            let listing_arrives = || async {
+                tokio::time::timeout(Duration::from_secs(10), arrived.notified())
+                    .await
+                    .expect("a tools/list reaches the server");
+            };
+            let listed_and_called = (vec!["echo".to_string()], None);
+
+            // Both connects start before either is pooled; the server
+            // answers one `initialize` and holds the other. The first
+            // connection is pooled and lists. With `late` its listing is
+            // held until the second connection is pooled in its place and
+            // lists too, then it is released alone.
+            let (returned, ()) =
+                tokio::join!(futures::future::select(connect(), connect()), async {
+                    listing_arrives().await;
+                    if late {
+                        later_connects.release.notify_one();
+                        listing_arrives().await;
+                        hold.release.notify_one();
+                    }
+                });
+            let (first, second) = returned.factor_first();
+            // Without `late` the first listing has returned: the second
+            // connection is pooled now, and its listing is held.
+            let ((), second) = tokio::join!(
+                async {
+                    if !late {
+                        hold.holding.store(true, Ordering::SeqCst);
+                        later_connects.release.notify_one();
+                        listing_arrives().await;
+                    }
+                    assert_eq!(
+                        lists_and_calls_echo(&orchestrator, first).await,
+                        listed_and_called,
+                        "the first request lists the tool and its call runs: its listing returned {first_listed} the second connection was pooled"
+                    );
+                    hold.release.notify_one();
+                },
+                second
+            );
+            assert_eq!(
+                lists_and_calls_echo(&orchestrator, second).await,
+                listed_and_called,
+                "the second request lists the tool and its call runs"
             );
         }
     }

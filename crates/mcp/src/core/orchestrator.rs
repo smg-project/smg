@@ -1098,10 +1098,21 @@ impl McpOrchestrator {
         // is listed under the same URL.
         let listed = match pool_key {
             Some(key) => self.connection_pool.listed_tools(key).map(|tools| {
-                tools
-                    .iter()
-                    .find(|entry| entry.tool_name() == input.tool_name)
-                    .cloned()
+                let own = |name: &str| tools.iter().find(|entry| entry.tool_name() == name);
+                if server_key == key.url {
+                    return own(&input.tool_name).cloned();
+                }
+                // An alias keeps its mapping; its target is the tool this
+                // connection listed.
+                let mut alias = self
+                    .tool_inventory
+                    .get_entry(server_key, &input.tool_name)?;
+                let target = alias
+                    .alias_target
+                    .as_ref()
+                    .filter(|alias| alias.target.server_key() == key.url)?;
+                alias.tool = own(target.target.tool_name())?.tool.clone();
+                Some(alias)
             }),
             None => Some(self.tool_inventory.get_entry(server_key, &input.tool_name)),
         };

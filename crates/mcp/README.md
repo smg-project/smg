@@ -436,6 +436,7 @@ let session = McpToolSession::new(
     vec![McpServerBinding {
         label: "my-server".to_string(),
         server_key: "my-server".to_string(),
+        pool_key: None,
         allowed_tools: None,
         list_error: None,
     }],
@@ -473,6 +474,7 @@ use smg_mcp::{McpServerBinding, McpToolSession};
 let binding = McpServerBinding {
     label: "my-server".to_string(),
     server_key: "my-server".to_string(),
+    pool_key: None,
     allowed_tools: None,
     list_error: None,
 };
@@ -481,6 +483,7 @@ let binding = McpServerBinding {
 let binding = McpServerBinding {
     label: "my-server".to_string(),
     server_key: "my-server".to_string(),
+    pool_key: None,
     allowed_tools: Some(vec!["tool_a".to_string(), "tool_b".to_string()]),
     list_error: None,
 };

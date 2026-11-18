@@ -107,7 +107,10 @@ pub(crate) struct CachedConnection {
     pub client: Arc<McpClient>,
     /// The connection's tool listing. It leaves the pool with the connection.
     pub listing: Listing,
-    /// The tools the connection last listed; none before its first listing.
+    /// The tools the connection last listed. Before its first listing: the
+    /// tools last listed under its key, if any (those of the connection it
+    /// was pooled in place of, or of a listing that returned for the key
+    /// since).
     pub tools: Arc<[ToolEntry]>,
 }
 
@@ -229,7 +232,12 @@ impl McpConnectionPool {
         {
             let mut connections = self.connections.lock();
             match connections.push(key, cached) {
-                Some((evicted_key, _)) => {
+                Some((evicted_key, evicted)) => {
+                    // A connection pooled in place of another under the same
+                    // key starts with that one's tools.
+                    if let Some(cached) = connections.peek_mut(&evicted_key) {
+                        cached.tools = evicted.tools;
+                    }
                     // Eviction: count stays the same (replaced one entry).
                     if let Some(callback) = &self.eviction_callback {
                         callback(&evicted_key);
@@ -268,21 +276,22 @@ impl McpConnectionPool {
 
     /// Record how `client`'s tool listing ended: with the tools it returned,
     /// or with the server's message. The record is the listing connection's:
-    /// a key the pool no longer holds, or holds for a connection pooled since
-    /// (the lister evicted during its listing), is left alone. A failed
-    /// listing leaves the tools of an earlier one in place.
+    /// a key the pool no longer holds is left alone, and a connection pooled
+    /// under the key since (the lister evicted during its listing) keeps its
+    /// own listing state. While that connection has not listed it takes the
+    /// returned tools: one key is one server under one set of credentials. A
+    /// failed listing leaves the tools of an earlier one in place.
     pub(crate) fn set_listing(
         &self,
         key: &PoolKey,
         client: &Arc<McpClient>,
         listed: Result<Vec<ToolEntry>, String>,
     ) {
-        if let Some(cached) = self
-            .connections
-            .lock()
-            .peek_mut(key)
-            .filter(|cached| Arc::ptr_eq(&cached.client, client))
-        {
+        let mut connections = self.connections.lock();
+        let Some(cached) = connections.peek_mut(key) else {
+            return;
+        };
+        if Arc::ptr_eq(&cached.client, client) {
             match listed {
                 Ok(tools) => {
                     cached.tools = tools.into();
@@ -290,6 +299,8 @@ impl McpConnectionPool {
                 }
                 Err(message) => cached.listing = Listing::Failed(message),
             }
+        } else if let (Listing::Pending, Ok(tools)) = (&cached.listing, listed) {
+            cached.tools = tools.into();
         }
     }
 
@@ -303,8 +314,8 @@ impl McpConnectionPool {
         )
     }
 
-    /// The tools the connection under `key` last listed, in its listing's
-    /// order: none before its first listing, `None` for a key the pool does
+    /// The tools the connection under `key` holds, in their listing's order:
+    /// none before a listing under the key, `None` for a key the pool does
     /// not hold. No promotion.
     pub(crate) fn listed_tools(&self, key: &PoolKey) -> Option<Arc<[ToolEntry]>> {
         self.connections
