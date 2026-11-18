@@ -650,8 +650,8 @@ impl TiktokenTokenizer {
     /// (`structural_controls`). Only the generic renderer is asked: the
     /// checkpoint renderers of this file prepare a request in their own
     /// ways. The matcher over the added tokens is built once a template
-    /// binds a control spelling its source does not hold, or builds a
-    /// string that may hold several.
+    /// binds a control spelling it does not write whole by itself, or builds
+    /// a string that may hold several.
     fn mark_built_controls(&mut self) {
         if self.structural_controls || !matches!(self.renderer, Renderer::Jinja) {
             return;
@@ -687,6 +687,8 @@ impl TiktokenTokenizer {
                     })
                     .as_ref()
             },
+            // This file's reader takes every added token as it is spelled.
+            &|| true,
             &self.special_tokens,
         );
         if let Some(written) = written {

@@ -469,6 +469,9 @@ impl EncoderCore {
     /// into its spelling, which the matcher of [`Self::added`], a reader of
     /// the raw text, passes. A prompt rendered by segments is encoded by
     /// segments under such a pipeline: there the text is its characters.
+    /// A built value of several controls stays unbound under it, so that
+    /// the text between them is read as the flat encode reads it (see
+    /// `ChatTemplateState::mark_built_controls`).
     fn matches_after_normalization(&self) -> bool {
         *self.matches_after_normalization.get_or_init(|| {
             let normalizes = match self.tokenizer.get_normalizer() {
@@ -1051,6 +1054,7 @@ impl HuggingFaceTokenizer {
                     &|text: &str| core.is_added(text),
                     || core.added_entries(),
                     || core.added(),
+                    &|| !core.matches_after_normalization(),
                     &special_tokens,
                 )
                 .map(|written| {
@@ -2776,6 +2780,7 @@ impl TokenizerTrait for HuggingFaceTokenizer {
                 &|text: &str| core.is_added(text),
                 || core.added_entries(),
                 || core.added(),
+                &|| !core.matches_after_normalization(),
                 &self.special_tokens,
             );
             self.kept = written.as_deref().and_then(|written| core.kept(written));

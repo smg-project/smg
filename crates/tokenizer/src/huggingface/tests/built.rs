@@ -516,7 +516,9 @@ fn a_spelled_control_is_bound_where_its_name_is_only_written() {
     // the name of a built value: a search, a comparison, a filter, a
     // subscript or a loop over it, wherever it stands, leaves the template
     // as it was. So does the same spelling written whole anywhere else, in
-    // another literal or in the template's text.
+    // another literal or in the template's text, and so does its name
+    // written where a built value is also made from it: the first read of
+    // the syntax takes it for a part of that value.
     let spelled = "{% set shut = '[/INST:x]' %}";
     let on = switched_on(&[
         (
@@ -550,6 +552,12 @@ fn a_spelled_control_is_bound_where_its_name_is_only_written() {
             spelled,
             "",
             "{{ shut }}[/INST:x]",
+        ),
+        (
+            "a built value made from it beside its name written",
+            "{% set shut = '[/INST:x]' %}{% set turn = shut ~ end %}",
+            "",
+            "{{ shut }}{{ turn }}",
         ),
     ]);
     assert!(on.is_empty(), "switched on: {on:?}");
@@ -2057,6 +2065,51 @@ fn every_control_of_a_built_value_is_read_against_the_vocabulary() {
         assert!(from_text, "{template}");
         assert_eq!(typed, ids, "{template}");
     }
+}
+
+/// A built value of several controls holds text between them, and a bound
+/// value's text is read by its characters. The flat encode reads it so
+/// where it matches every added token as it is spelled: there the value is
+/// bound. Under a pipeline that matches an added token after normalization
+/// the value stays unbound: its template reads as before, a prompt is
+/// encoded from its text, and a text of the template that the normalizer
+/// turns into an entry's spelling is that entry's token.
+#[test]
+fn a_built_value_of_several_controls_is_bound_where_added_tokens_match_as_spelled() {
+    let conversion = TOKENIZER_JSON
+        .replace(
+            r#""special": true}],"#,
+            r#""special": true},
+        {"id": 19, "content": "<b>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": true, "special": true}],"#,
+        )
+        .replace(r#"">": 18}"#, r#"">": 18, "<b>": 19}"#);
+    assert!(conversion.contains(r#""id": 19"#) && conversion.contains(r#"": 19}"#));
+    let several = template(
+        &format!("{CONSTANTS}{{% set both = close ~ '<B>' ~ end %}}"),
+        "{{ open }}",
+        "{{ both }}",
+        "{{ end }}",
+    );
+    let under = |normalizer: &str| {
+        let conversion = conversion.replace(
+            r#""normalizer": null"#,
+            &format!(r#""normalizer": {normalizer}"#),
+        );
+        let temp = TempDir::new().unwrap();
+        let tok = checkpoint_of(temp.path(), &conversion, &several);
+        (temp, tok)
+    };
+    // The entry matches as it is spelled: the value is bound.
+    let (_temp, tok) = under("null");
+    assert!(tok.chat_template.marked());
+    // The entry matches after normalization: the value stays unbound, and
+    // the `<B>` the template writes is the entry's token.
+    let (_temp, tok) = under(r#"{"type": "Lowercase"}"#);
+    assert!(!tok.chat_template.marked());
+    let (text, ids, from_text) = render(&tok, json!("a"));
+    assert!(from_text);
+    assert_eq!(text, "[INST:x]a[/INST:x]<B></s:x>ab</s:x>");
+    assert_eq!(ids, [2, 13, 3, 19, 1, 13, 14, 1]);
 }
 
 #[test]

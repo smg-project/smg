@@ -4364,7 +4364,13 @@ impl ChatTemplateState {
     /// added tokens, is asked for only once a template binds a control
     /// spelling it does not write whole by itself, or builds a value a
     /// plain literal holds that is neither a control spelling nor empty,
-    /// so a checkpoint without either never builds it.
+    /// so a checkpoint without either never builds it. `as_spelled` says
+    /// whether the flat encode matches every added token as it is spelled,
+    /// and is asked only at such a built value: the text between two
+    /// controls of a bound value is read by its characters, and the flat
+    /// encode reads it so only then. Under a pipeline that matches an added
+    /// token after normalization a value of several controls stays unbound,
+    /// and its template as it is.
     ///
     /// Before that the vocabulary is read once: `added` is every added
     /// token, with whether its entry carries a flag. Where the flat encode
@@ -4381,19 +4387,23 @@ impl ChatTemplateState {
         is_control: &dyn Fn(&str) -> bool,
         added: impl FnOnce() -> I,
         controls: impl Fn() -> Option<&'a AddedTokens>,
+        as_spelled: &dyn Fn() -> bool,
         special_tokens: &SpecialTokens,
     ) -> Option<Vec<String>>
     where
         I: Iterator<Item = (&'b str, bool)>,
     {
-        let own = self.control_bindings(is_control, &controls, special_tokens);
+        // A built value of several controls is read with the matcher only
+        // where the flat encode matches every added token as it is spelled.
+        let several = || as_spelled().then(&controls).flatten();
+        let own = self.control_bindings(is_control, &several, special_tokens);
         if own.is_empty() {
             return None;
         }
         let nested: Vec<_> = [&self.tool_use, &self.processor]
             .into_iter()
             .flatten()
-            .map(|state| state.control_bindings(is_control, &controls, special_tokens))
+            .map(|state| state.control_bindings(is_control, &several, special_tokens))
             .collect();
         // Every spelling that would stand between marks: what the templates
         // bind, and the special tokens a render gives by name.
@@ -4496,7 +4506,10 @@ impl ChatTemplateState {
     /// statement binds its control like the ones that build theirs, where
     /// the syntax, read again with it counted among them, shows its name
     /// read as theirs ([`built_values_read_plainly`]); None where it does
-    /// not.
+    /// not. The first read of the syntax stands before that one and counts
+    /// only the statements that build: a spelled control that a built value
+    /// is made from is a part of that value there ([`Watched::Part`]), and a
+    /// template that also writes it by its name stays as it is.
     ///
     /// `matcher`, the matcher over the added tokens, is asked for only at a
     /// value a statement builds that is neither a control spelling nor
