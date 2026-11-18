@@ -7,7 +7,7 @@
 // - Schema adaptation and validation
 // - Mock server integration for reliable testing
 
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use common::mock_mcp_server::{MockMCPServer, MockSearchResponseMCPServer, MockSearchResponseMode};
 use openai_protocol::responses::{ResponseOutputItem, WebSearchAction};
@@ -18,7 +18,7 @@ use smg::routers::common::openai_bridge::{
 use smg_mcp::{
     core::config::{ResponseFormatConfig, ToolConfig},
     McpConfig, McpOrchestrator, McpServerBinding, McpServerConfig, McpToolSession, McpTransport,
-    ToolExecutionInput,
+    QualifiedToolName, Tool, ToolEntry, ToolExecutionInput,
 };
 
 use crate::common;
@@ -584,6 +584,125 @@ async fn test_connection_without_server() {
     let manager = result.unwrap();
     let servers = manager.list_servers();
     assert_eq!(servers.len(), 0, "Should have no connected servers");
+}
+
+/// A configuration with no configured server and room for `connections` pooled ones.
+fn pool_config(connections: usize) -> McpConfig {
+    let mut config = McpConfig {
+        servers: vec![],
+        pool: Default::default(),
+        proxy: None,
+        warmup: Vec::new(),
+        inventory: Default::default(),
+        policy: Default::default(),
+    };
+    config.pool.max_connections = connections;
+    config
+}
+
+/// A request's own server at `server`; `header` tells its connection apart.
+fn dynamic_connection(server: &MockMCPServer, header: &str) -> McpServerConfig {
+    McpServerConfig {
+        name: "dynamic".to_string(),
+        transport: McpTransport::Streamable {
+            url: server.url(),
+            token: None,
+            headers: HashMap::from([("x-connection".to_string(), header.to_string())]),
+        },
+        proxy: None,
+        required: false,
+        tools: None,
+        builtin_type: None,
+        builtin_tool_name: None,
+        internal: false,
+    }
+}
+
+#[tokio::test]
+async fn an_eviction_keeps_the_tools_of_a_server_that_is_still_pooled() {
+    let shared = create_mock_server().await;
+    let other = create_mock_server().await;
+    // Room for two connections.
+    let manager = McpOrchestrator::new(pool_config(2)).await.unwrap();
+
+    // Two pooled connections to one server.
+    let first = manager
+        .connect_dynamic_server(dynamic_connection(&shared, "one"))
+        .await
+        .unwrap();
+    let second = manager
+        .connect_dynamic_server(dynamic_connection(&shared, "two"))
+        .await
+        .unwrap();
+    assert_eq!(first.server_key, second.server_key);
+    let key = second.server_key;
+    let listed = manager
+        .list_tools_for_servers(std::slice::from_ref(&key))
+        .len();
+    assert!(listed > 0, "the server's tools are listed");
+
+    // A third connection, to another server: the pool is full, and the least
+    // recently used connection leaves.
+    manager
+        .connect_dynamic_server(dynamic_connection(&other, "one"))
+        .await
+        .unwrap();
+
+    // The connection that stays is still pooled with its tools listed.
+    let again = manager
+        .connect_dynamic_server(dynamic_connection(&shared, "two"))
+        .await
+        .unwrap();
+    assert_eq!(again.list_error, None);
+    assert_eq!(
+        manager
+            .list_tools_for_servers(std::slice::from_ref(&key))
+            .len(),
+        listed,
+        "the tools of a server that a pooled connection still serves"
+    );
+    manager.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_connection_that_takes_a_servers_last_place_does_not_keep_its_tools() {
+    let shared = create_mock_server().await;
+    // Room for one connection.
+    let manager = McpOrchestrator::new(pool_config(1)).await.unwrap();
+
+    let first = manager
+        .connect_dynamic_server(dynamic_connection(&shared, "one"))
+        .await
+        .unwrap();
+    let key = first.server_key;
+    // An entry under the server's key that no listing brings back: it stays
+    // unless the key is cleared.
+    manager.tool_inventory().insert_entry(ToolEntry::new(
+        QualifiedToolName::new(&key, "marker"),
+        Tool::new("marker", "a marker", Arc::new(serde_json::Map::new())),
+    ));
+    assert!(manager.has_tool(&key, "marker"));
+
+    // Another connection to the same server takes the pool's one place. The
+    // first leaves, and what stood under the server's key leaves with it: the
+    // connection just added has listed nothing yet.
+    let second = manager
+        .connect_dynamic_server(dynamic_connection(&shared, "two"))
+        .await
+        .unwrap();
+    assert_eq!(second.server_key, key);
+    assert_eq!(second.list_error, None);
+    assert!(
+        !manager.has_tool(&key, "marker"),
+        "an entry the evicted connection left is still listed"
+    );
+    assert!(
+        !manager
+            .list_tools_for_servers(std::slice::from_ref(&key))
+            .is_empty(),
+        "the new connection's own tools are listed"
+    );
+    manager.shutdown().await;
 }
 
 // Schema Validation Tests
