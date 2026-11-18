@@ -317,13 +317,15 @@ impl<'de> Deserialize<'de> for LateBoundModel {
 /// A BPE section, whose `type` key comes first in every file the crate
 /// writes, streams here: the vocabulary into its hash map, the merges into
 /// their list, both handed to the crate's own builder, so the model is the
-/// one the crate builds from the same file. A Unigram section, which
-/// starts with `type` or, in a file written before the crate named the
-/// kind, with `unk_id`, is read by [`unigram_scores::section`], for the
-/// scores the reference reads. Any other section (another model kind, a file
-/// without the `type` key or with it later) goes to the crate's own reader,
-/// which streams it as before with the one entry already read put back in
-/// front.
+/// one the crate builds from the same file. A Unigram section is read by
+/// [`unigram_scores::section`], for the scores the reference reads, in any
+/// order of its keys (`type`, `unk_id`, `vocab`, `byte_fallback`): the
+/// entries are read until one tells the kind, which is the value of `type`,
+/// the key `unk_id` (no other kind has it) or a vocabulary that is a list
+/// of pieces with their scores. Any other section (another model kind, a
+/// BPE section with `type` later, a section that shows a key no Unigram
+/// section has before any of those) goes to the crate's own reader, which
+/// streams it as before with the entries already read put back in front.
 struct ModelSection;
 
 impl<'de> Visitor<'de> for ModelSection {
@@ -333,44 +335,78 @@ impl<'de> Visitor<'de> for ModelSection {
         f.write_str("a tokenizer model section")
     }
 
-    fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<LateBoundModel, A::Error> {
-        let mut replay = Replay {
-            key: None,
-            value: None,
-            rest: map,
-        };
-        if let Some(key) = replay.rest.next_key::<String>()? {
-            let value = if key == "type" {
-                let kind: String = replay.rest.next_value()?;
-                if kind == "BPE" {
-                    return bpe_section(replay.rest);
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<LateBoundModel, A::Error> {
+        // The entries read before one tells the kind, and the key that
+        // ended the reading with its value still in the section.
+        let mut read = Vec::new();
+        let mut pending = None;
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "type" => {
+                    let kind: String = map.next_value()?;
+                    if kind == "BPE" && read.is_empty() {
+                        return bpe_section(map);
+                    }
+                    if kind == "Unigram" {
+                        return unigram_scores::section(None, Replay::new(read, None, map))
+                            .map(LateBoundModel::from);
+                    }
+                    read.push((key, Value::String(kind)));
+                    break;
                 }
-                if kind == "Unigram" {
-                    return unigram_scores::section(None, replay.rest).map(LateBoundModel::from);
+                // Only a Unigram section has this key.
+                "unk_id" => {
+                    read.push((key, map.next_value()?));
+                    return unigram_scores::section(None, Replay::new(read, None, map))
+                        .map(LateBoundModel::from);
                 }
-                Value::String(kind)
-            } else if key == "unk_id" {
-                // Only a Unigram section starts with this key: the form of
-                // a file written before the crate named the kind.
-                let unk_id = replay.rest.next_value()?;
-                return unigram_scores::section(unk_id, replay.rest).map(LateBoundModel::from);
-            } else {
-                replay.rest.next_value()?
-            };
-            replay.key = Some(key);
-            replay.value = Some(value);
+                // A list of pieces with their scores is a Unigram section's.
+                "vocab" => match map.next_value_seed(unigram_scores::VocabShape)? {
+                    unigram_scores::Vocab::Scored(vocab) => {
+                        return unigram_scores::section(Some(vocab), Replay::new(read, None, map))
+                            .map(LateBoundModel::from);
+                    }
+                    unigram_scores::Vocab::Other(vocab) => {
+                        read.push((key, vocab));
+                        break;
+                    }
+                },
+                // A Unigram section has this key, and so has a BPE section.
+                "byte_fallback" => read.push((key, map.next_value()?)),
+                // No Unigram section has this key.
+                _ => {
+                    pending = Some(key);
+                    break;
+                }
+            }
         }
-        ModelWrapper::deserialize(de::value::MapAccessDeserializer::new(replay))
-            .map(LateBoundModel::from)
+        ModelWrapper::deserialize(de::value::MapAccessDeserializer::new(Replay::new(
+            read, pending, map,
+        )))
+        .map(LateBoundModel::from)
     }
 }
 
-/// The section's entries with the one already read put back in front: the
-/// crate's reader streams the section as it would have from the start.
+/// The section's entries for a reader that takes it from its start: the
+/// entries already read, in the file's order, then the key read whose value
+/// is still in the section, then the rest of the section.
 struct Replay<A> {
-    key: Option<String>,
+    read: std::vec::IntoIter<(String, Value)>,
+    /// The value of the entry of `read` whose key was just given out.
     value: Option<Value>,
+    key: Option<String>,
     rest: A,
+}
+
+impl<A> Replay<A> {
+    fn new(read: Vec<(String, Value)>, key: Option<String>, rest: A) -> Self {
+        Self {
+            read: read.into_iter(),
+            value: None,
+            key,
+            rest,
+        }
+    }
 }
 
 impl<'de, A: MapAccess<'de>> MapAccess<'de> for Replay<A> {
@@ -380,12 +416,18 @@ impl<'de, A: MapAccess<'de>> MapAccess<'de> for Replay<A> {
         &mut self,
         seed: K,
     ) -> Result<Option<K::Value>, A::Error> {
-        match self.key.take() {
-            Some(key) => seed
-                .deserialize(de::value::StringDeserializer::<A::Error>::new(key))
-                .map(Some),
-            None => self.rest.next_key_seed(seed),
-        }
+        let key = match self.read.next() {
+            Some((key, value)) => {
+                self.value = Some(value);
+                key
+            }
+            None => match self.key.take() {
+                Some(key) => key,
+                None => return self.rest.next_key_seed(seed),
+            },
+        };
+        seed.deserialize(de::value::StringDeserializer::<A::Error>::new(key))
+            .map(Some)
     }
 
     fn next_value_seed<V: DeserializeSeed<'de>>(&mut self, seed: V) -> Result<V::Value, A::Error> {

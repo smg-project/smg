@@ -15,26 +15,30 @@
 //! every score by the plain parser's rule, whatever features the build's
 //! parser has.
 
+use std::fmt;
+
 use serde::{
-    de::{Error as _, IgnoredAny, MapAccess, Unexpected},
+    de::{
+        self, DeserializeSeed, Error as _, IgnoredAny, MapAccess, SeqAccess, Unexpected, Visitor,
+    },
     Deserialize, Deserializer,
 };
-use serde_json::value::RawValue;
+use serde_json::{value::RawValue, Value};
 use tokenizers::models::{unigram::Unigram, ModelWrapper};
 
-/// Reads a Unigram section from its second entry on. The caller has read
-/// the first: `type`, or `unk_id` in a file written before the
-/// `tokenizers` crate named the kind, whose value comes along. These are the
-/// entries the `tokenizers` crate's reader takes (`unk_id`, `vocab`,
-/// `byte_fallback`; any other is skipped), handed to the crate's own
-/// builder, so the model is the one that crate builds from the same file
-/// when its parser has no `float_roundtrip`.
+/// Reads a Unigram section from the entries of `map`: what the caller read
+/// of the section before it knew the kind, put back in front, then the
+/// rest. `vocab` is the vocabulary when the caller has read it already
+/// ([`VocabShape`]). These are the entries the `tokenizers` crate's reader
+/// takes (`unk_id`, `vocab`, `byte_fallback`; any other is skipped), handed
+/// to the crate's own builder, so the model is the one that crate builds
+/// from the same file when its parser has no `float_roundtrip`.
 pub(crate) fn section<'de, A: MapAccess<'de>>(
-    mut unk_id: Option<usize>,
+    mut vocab: Option<Vec<(String, Score)>>,
     mut map: A,
 ) -> Result<ModelWrapper, A::Error> {
+    let mut unk_id: Option<usize> = None;
     let mut byte_fallback = false;
-    let mut vocab: Option<Vec<(String, Score)>> = None;
     while let Some(key) = map.next_key::<String>()? {
         match key.as_str() {
             "unk_id" => unk_id = map.next_value()?,
@@ -61,8 +65,44 @@ pub(crate) fn section<'de, A: MapAccess<'de>>(
         .map_err(A::Error::custom)
 }
 
+/// The value of a `vocab` entry read before the section's kind is known.
+pub(crate) enum Vocab {
+    /// A list of pieces with their scores: a Unigram section's, each score
+    /// read by [`read`].
+    Scored(Vec<(String, Score)>),
+    /// Any other vocabulary, kept for the crate's reader.
+    Other(Value),
+}
+
+/// Reads a `vocab` entry by its shape (see [`Vocab`]).
+pub(crate) struct VocabShape;
+
+impl<'de> DeserializeSeed<'de> for VocabShape {
+    type Value = Vocab;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Vocab, D::Error> {
+        deserializer.deserialize_any(self)
+    }
+}
+
+impl<'de> Visitor<'de> for VocabShape {
+    type Value = Vocab;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a vocabulary")
+    }
+
+    fn visit_seq<S: SeqAccess<'de>>(self, seq: S) -> Result<Vocab, S::Error> {
+        Vec::deserialize(de::value::SeqAccessDeserializer::new(seq)).map(Vocab::Scored)
+    }
+
+    fn visit_map<M: MapAccess<'de>>(self, map: M) -> Result<Vocab, M::Error> {
+        Value::deserialize(de::value::MapAccessDeserializer::new(map)).map(Vocab::Other)
+    }
+}
+
 /// One score of the vocabulary, read from its text by [`read`].
-struct Score(f64);
+pub(crate) struct Score(f64);
 
 impl<'de> Deserialize<'de> for Score {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
@@ -356,14 +396,51 @@ mod tests {
         }
     }
 
+    /// The entries of [`TIED`], one by one.
+    const ENTRIES: [&str; 4] = [
+        r#""type":"Unigram""#,
+        r#""unk_id":0"#,
+        r#""vocab":[["<unk>",0.0],["a",-1.1695698339729451],["aa",-2.3391396679458905]]"#,
+        r#""byte_fallback":false"#,
+    ];
+
+    /// The section made of `entries`, once in each of their orders.
+    fn orders(entries: &[&str]) -> Vec<String> {
+        fn extend(order: &mut Vec<usize>, entries: usize, all: &mut Vec<Vec<usize>>) {
+            if order.len() == entries {
+                all.push(order.clone());
+                return;
+            }
+            for entry in 0..entries {
+                if !order.contains(&entry) {
+                    order.push(entry);
+                    extend(order, entries, all);
+                    order.pop();
+                }
+            }
+        }
+        let mut all = Vec::new();
+        extend(&mut Vec::new(), entries.len(), &mut all);
+        all.iter()
+            .map(|order| {
+                let section: Vec<&str> = order.iter().map(|&entry| entries[entry]).collect();
+                format!("{{{}}}", section.join(","))
+            })
+            .collect()
+    }
+
     #[test]
-    fn a_section_in_another_key_order_still_loads() {
-        for model in [
-            r#"{"unk_id":0,"vocab":[["<unk>",0.0],["a",-1.5]],"byte_fallback":false,"type":"Unigram"}"#,
-            r#"{"vocab":[["<unk>",0.0],["a",-1.5]],"unk_id":0}"#,
-        ] {
-            let tokenizer = load(model).expect("the file loads");
-            assert_eq!(ids(&tokenizer, "a"), [1], "{model}");
+    fn a_section_in_any_key_order_has_the_same_scores() {
+        // The four entries of a section, then the three and the two of a
+        // file written before the kind was named.
+        let named = orders(&ENTRIES);
+        let unnamed = orders(&ENTRIES[1..]);
+        let oldest = orders(&ENTRIES[1..3]);
+        assert_eq!((named.len(), unnamed.len(), oldest.len()), (24, 6, 2));
+        for section in named.iter().chain(&unnamed).chain(&oldest) {
+            scores_of(section);
+            let tokenizer = load(section).expect("the file loads");
+            assert_eq!(ids(&tokenizer, "aa"), [2], "{section}");
         }
     }
 
