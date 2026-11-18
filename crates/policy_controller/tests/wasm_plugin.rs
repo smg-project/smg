@@ -813,9 +813,7 @@ fn an_invalid_answer_is_a_fault_of_the_plugin() {
     ];
     for (mode, name) in cases {
         let case = format!("an invalid answer, {name}");
-        let mut made = 0;
-        loop {
-            made += 1;
+        tried(|made| {
             let plugin = load(&runtime, name, guest::record_guest(), mode);
             let engine = plugin_engine(&plugin);
             let (wall, cpu) = (std::time::Instant::now(), bound_clock());
@@ -827,11 +825,12 @@ fn an_invalid_answer_is_a_fault_of_the_plugin() {
             );
             let stats = plugin.stats();
             assert_eq!(stats.invalid, 1, "{name}");
-            if the_close_rebuilt(&case, &plugin, held, made) {
-                assert_eq!(plugin.stats().lazy_instantiations, 1, "{name}");
-                break;
+            if !the_close_rebuilt(&case, &plugin, held, made) {
+                return false;
             }
-        }
+            assert_eq!(plugin.stats().lazy_instantiations, 1, "{name}");
+            true
+        });
     }
 }
 
@@ -1564,9 +1563,7 @@ fn a_second_memory_and_a_table_past_the_cap_are_refused() {
     assert!(matches!(err, LoadError::Trap { .. }), "{err}");
 
     // The close's rebuild is an `init`, on the wall clock.
-    let mut made = 0;
-    loop {
-        made += 1;
+    tried(|made| {
         let plugin = load(
             &runtime,
             "table-grower",
@@ -1584,10 +1581,8 @@ fn a_second_memory_and_a_table_past_the_cap_are_refused() {
             (1, 1),
             "the constructor answered, the filter trapped"
         );
-        if the_close_rebuilt("a table past the cap", &plugin, held, made) {
-            break;
-        }
-    }
+        the_close_rebuilt("a table past the cap", &plugin, held, made)
+    });
 
     let err = Plugin::load(
         &runtime,
@@ -5237,8 +5232,9 @@ fn the_close_rebuilt(case: &str, plugin: &Plugin, held: std::time::Duration, mad
 
 /// Whether the host said that it ended a rebuild of `plugin`'s dropped
 /// instance at the init frame's deadline, and of no rebuild of that plugin
-/// that it failed another way. The lines are the try's own: a case's tries
-/// load one name, and an earlier try's ended rebuild is not this one's.
+/// that it failed another way. The lines are those kept since the try
+/// began: a case's tries load one name, and an earlier try's ended rebuild
+/// is not this one's.
 fn the_frame_ended_the_rebuild(plugin: &str) -> bool {
     let rebuilds: Vec<String> = warnings(plugin)
         .into_iter()
@@ -6882,9 +6878,7 @@ fn an_observe_fault_leaves_no_mark_for_a_decision_that_never_touched_the_slot() 
 /// waits there and ticks all the same.
 #[test]
 fn a_destructors_bound_is_its_own_not_the_decisions_frame() {
-    let mut made = 0;
-    loop {
-        made += 1;
+    tried(|made| {
         let (runtime, born) = runtime_and_the_threads_born_with_it();
         let mut filler = spec("fill-dtor", guest::record_guest(), mode::FILL_IN_DESTRUCTOR);
         // The frame is the request's 100 ms, and the calibration makes the
@@ -6929,10 +6923,10 @@ fn a_destructors_bound_is_its_own_not_the_decisions_frame() {
                     waited.unwrap_or_default()
                 ),
             );
-            continue;
+            return false;
         }
         if !the_close_rebuilt("a destructor's bound", &plugin, held, made) {
-            continue;
+            return false;
         }
         let s = plugin.stats();
         assert_eq!(
@@ -6945,8 +6939,8 @@ fn a_destructors_bound_is_its_own_not_the_decisions_frame() {
             (1, 0, 0, 1),
             "the destructor ran out, the instance went, the close rebuilt it: {s:?}"
         );
-        break;
-    }
+        true
+    });
 }
 
 /// Under an operator frame below the budget, the charge is per call. A
