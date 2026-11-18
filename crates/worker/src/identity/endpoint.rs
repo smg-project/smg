@@ -831,12 +831,12 @@ mod tests {
     /// path unfindable for removal and update.
     #[test]
     fn a_path_prefix_is_part_of_the_backend() {
-        assert_eq!(key_of("http://proxy:8080/sglang"), "proxy:8080/sglang");
+        assert_eq!(key_of("http://proxy:8080/engine"), "proxy:8080/engine");
         assert_eq!(key_of("https://api.example.com/v1"), "api.example.com/v1");
         assert_eq!(key_of("http://[fd00::1]:8080/v1"), "[fd00::1]:8080/v1");
 
         // Same backend, different spellings.
-        assert_eq!(key_of("grpc://proxy:8080/sglang@2"), "proxy:8080/sglang");
+        assert_eq!(key_of("grpc://proxy:8080/engine@2"), "proxy:8080/engine");
         // Different path, different backend.
         assert_ne!(key_of("http://proxy:8080/a"), key_of("http://proxy:8080/b"));
         // A path is not optional decoration.
@@ -977,7 +977,7 @@ mod tests {
 
         // For a network address the two coincide, and stay scheme-less so a
         // removal still reaches every spelling of the backend.
-        let net = Endpoint::parse("http://proxy:8080/sglang").unwrap();
+        let net = Endpoint::parse("http://proxy:8080/engine").unwrap();
         assert_eq!(net.lookup_form(), net.key().as_str());
         assert_eq!(
             Endpoint::parse(&net.lookup_form()).unwrap().key(),
