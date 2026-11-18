@@ -45,6 +45,10 @@
 //! pool, on the wire whose load report counts resident tokens, is asked
 //! under the resident form of the two-draw preset while the first turns a
 //! rotation, and every pick of it names the engine that holds no tokens.
+//! A prefill request goes by its size: the three engines of a prefill pool
+//! split the sizes among them, requests of like size meet on one engine,
+//! and under the bucket preset's own balance rule an engine a decision
+//! booked gives way to one that booked nothing.
 //!
 //! No stub server: the engines are the mock worker's, the controller is the
 //! one the binary runs and the client is the generated one. Every wait is
@@ -97,10 +101,14 @@ const MODEL: &str = "fleet-model";
 /// The model of the engines whose load reports count resident tokens.
 const COUNTED: &str = "fleet-counted-model";
 
+/// The model of the engines that serve the prefill side of a request.
+const SIZED: &str = "fleet-sized-model";
+
 /// The fleet: four engines of one rank and one of two serve one model on
-/// the first wire, and two engines of one rank serve another on the wire
-/// whose load report counts resident tokens.
-const FLEET: [Shape; 7] = [
+/// the first wire, two engines of one rank serve another on the wire whose
+/// load report counts resident tokens, and three engines of one rank serve
+/// the prefill side of a third.
+const FLEET: [Shape; 10] = [
     Shape {
         model: MODEL,
         role: Role::Single,
@@ -140,6 +148,24 @@ const FLEET: [Shape; 7] = [
     Shape {
         model: COUNTED,
         role: Role::Single,
+        ranks: 1,
+        runtime: RuntimeType::TokenSpeed,
+    },
+    Shape {
+        model: SIZED,
+        role: Role::Prefill,
+        ranks: 1,
+        runtime: RuntimeType::TokenSpeed,
+    },
+    Shape {
+        model: SIZED,
+        role: Role::Prefill,
+        ranks: 1,
+        runtime: RuntimeType::TokenSpeed,
+    },
+    Shape {
+        model: SIZED,
+        role: Role::Prefill,
         ranks: 1,
         runtime: RuntimeType::TokenSpeed,
     },
@@ -233,6 +259,31 @@ fn for_model(mut ask: DecideRequest, model: &str) -> DecideRequest {
         model.clone_into(&mut facts.model);
     }
     ask
+}
+
+/// `ask` as the prefill side of a request of `tokens` for the sized pool.
+fn sized(mut ask: DecideRequest, tokens: u32) -> DecideRequest {
+    if let Some(facts) = &mut ask.facts {
+        SIZED.clone_into(&mut facts.model);
+        facts.phase = smg_policy_controller::proto::Phase::Prefill.into();
+        facts.prompt_tokens = tokens;
+    }
+    ask
+}
+
+/// The bucket preset under a balance rule that no booking of the case
+/// reaches and a window that outlasts it: sizes alone place a request.
+fn by_size() -> Result<PolicySpec, SpecError> {
+    let mut document = PolicySpec::preset("bucket")?;
+    for profile in document.profiles.values_mut() {
+        let sizes = smg_policy_controller::spec::BucketParams {
+            abs_threshold: Some(u32::MAX),
+            adjust_interval_s: Some(3_600),
+            ..Default::default()
+        };
+        profile.score = vec![smg_policy_controller::spec::ScoreStage::Bucket(sizes).into()];
+    }
+    Ok(document)
 }
 
 /// One document of two bindings: the counted model under the two-draw
@@ -1193,6 +1244,71 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             "under its own binding a rotation names each row twice: {turns:?}"
         );
 
+        // A prefill request goes to the engine that owns its size. Under
+        // the bucket preset the prefill pool's three engines split the
+        // span of sizes evenly at their first decision. With a balance
+        // rule no booking reaches, eight asks of one size name one row
+        // whatever their seeds, and a size from each third of the span
+        // names a row of its own.
+        within("the prefill pool's rows read healthy", ROOM, || {
+            harness
+                .view(SIZED, Role::Prefill)
+                .is_ok_and(|pool| pool.len() == 3 && pool.iter().all(|row| row.healthy))
+        })
+        .await
+        .expect("the prefill pool turns ready");
+        harness
+            .apply_document(by_size().expect("a form of this build's preset"))
+            .expect("a form of this build's preset applies");
+        let third = smg_policy_controller::bucket::SPAN / 3;
+        let mut owners = Vec::new();
+        for part in 0u32..3 {
+            let tokens = part * third + third / 2;
+            let first = u64::from(part) * 8;
+            let owner = picked(&mut harness, sized(nth("sized", first), tokens))
+                .await
+                .expect("a pick answers an ask over a ready fleet");
+            for n in 1..8 {
+                let again = picked(&mut harness, sized(nth("sized", first + n), tokens))
+                    .await
+                    .expect("a pick answers an ask over a ready fleet");
+                assert_eq!(again, owner, "requests of like size meet on one engine");
+            }
+            owners.push(owner);
+        }
+        let apart: HashSet<Picked> = owners.iter().copied().collect();
+        assert!(
+            apart.len() == 3 && owners.iter().all(|row| engines[7..].contains(&row.engine)),
+            "a size from each third of the span has an engine of the pool to itself: {owners:?}"
+        );
+
+        // The balance rule spills on what the decisions booked. Under the
+        // preset as the catalog spells it an idle pool places a size on
+        // its owner, and the tokens of that decision are booked on the
+        // engine: the next two asks of the same size go to the two engines
+        // that booked nothing.
+        harness
+            .apply("bucket")
+            .expect("a preset of this build applies");
+        let mut round = Vec::new();
+        for n in 0..3 {
+            let pick = picked(&mut harness, sized(nth("spill", n), third / 2))
+                .await
+                .expect("a pick answers an ask over a ready fleet");
+            round.push(pick);
+        }
+        assert_eq!(
+            round.first(),
+            owners.first(),
+            "an idle pool places a size on its owner"
+        );
+        let spilled: HashSet<Picked> = round.iter().copied().collect();
+        assert_eq!(
+            spilled.len(),
+            3,
+            "an engine a decision booked gives way to one that booked nothing: {round:?}"
+        );
+
         // The death. The kill waits for a view that reads its engine
         // healthy, so the death alone moves its rows. Its promise is held
         // by order below, whatever the host's clock does: the time from the
@@ -1348,6 +1464,9 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
                 (dead, DialEnd::Failed),
                 (laden, DialEnd::Answered(true)),
                 (spare, DialEnd::Answered(true)),
+                (engines[7], DialEnd::Answered(true)),
+                (engines[8], DialEnd::Answered(true)),
+                (engines[9], DialEnd::Answered(true)),
             ],
             "the turn that waited out the bound went on to every engine"
         );
