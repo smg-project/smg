@@ -94,6 +94,7 @@ pub trait Journal: Send + Sync {
     /// each such write, and a call that wrote nothing may be followed by
     /// it too. What a journal wakes at its writes it wakes here, so no
     /// writer and no reservation waits behind the wake; a journal that
-    /// wakes nobody leaves it empty.
+    /// wakes nobody leaves it empty. A journal that hands its writes on to
+    /// another hands this call on too, or the other's wake is never made.
     fn released(&self) {}
 }

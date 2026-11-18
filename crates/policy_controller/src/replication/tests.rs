@@ -324,7 +324,7 @@ fn a_watched_write_is_told_once_the_store_let_its_locks_go() {
     let written: Arc<OnceLock<Weak<MemoryStore>>> = Arc::default();
     let log = {
         let (told, written) = (Arc::clone(&told), Arc::clone(&written));
-        Log::new(64, 64).on_watched(move |_| {
+        Log::new(64, 64).on_watched(move || {
             let store = written.get().and_then(Weak::upgrade);
             told.lock()
                 .push(store.expect("the store that wrote").unlocked());

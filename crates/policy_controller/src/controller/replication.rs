@@ -1376,6 +1376,10 @@ mod tests {
         fn followed(&self) -> Option<u64> {
             self.log.followed()
         }
+
+        fn released(&self) {
+            self.log.released();
+        }
     }
 
     #[test]
