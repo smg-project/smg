@@ -1770,6 +1770,43 @@ fn a_restore_empties_the_lease_file_and_a_hello_books_what_it_lists_once() {
     assert_eq!(in_flight(&store), of(0, 1));
 }
 
+/// A restore tells each lease's end under the decider that issued the
+/// lease, as a frame's end is told, whichever thread restores.
+#[test]
+fn a_restore_tells_each_end_under_the_decider_that_issued_its_lease() {
+    let store = MemoryStore::new();
+    let a = ready(&store, "http://a:1");
+    LeasesStore::set_term(&store, 1);
+    store.tell_through(heard);
+    let (now, world) = (Instant::now(), store.world());
+    let issue = || {
+        let record = booking(GatewayId(1), 0, a, now);
+        let issued = store.issue_decided(record, world.booked_of(a), |_| ());
+        issued.expect("minted under the store's term").id
+    };
+    // One lease issued by a thread that acts as the fourth decider, one by
+    // a thread that names none.
+    let named = {
+        let _acting = Decider::new(3).enter();
+        issue()
+    };
+    let unnamed = issue();
+    // Another replica led over the same row, and this one restores from
+    // its cut on a thread that names none.
+    let leader = MemoryStore::new();
+    assert_eq!(ready(&leader, "http://a:1"), a);
+    assert!(store.restore_from(leader.cut(Kinds::All)));
+    let mut ended: Vec<(u64, Option<Decider>)> = told()
+        .into_iter()
+        .map(|(record, _)| record.lease.id.0)
+        .zip(told_by())
+        .collect();
+    ended.sort_unstable();
+    let mut issued = [(named.0, Some(Decider::new(3))), (unnamed.0, None)];
+    issued.sort_unstable();
+    assert_eq!(ended, issued);
+}
+
 /// A pool that holds another gateway's host-local row is walked as its
 /// build walks it: each row the asking gateway reaches reads its own
 /// worker's count, and a build alone writes none.
