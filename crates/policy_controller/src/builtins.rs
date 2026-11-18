@@ -248,13 +248,32 @@ impl RowTests {
 
 // ---------------------------------------------------------------- scorers
 
+/// The rows whose least and greatest cost are found by compares
+/// ([`normalize_costs`]): the ranks of one engine, the rows of a draw.
+const FEW_COSTS: usize = 16;
+
 /// Lower raw costs become higher normalized scores; equal costs score `1.0`.
 /// Returns the span of the costs, `0.0` when they are all equal.
 fn normalize_costs(out: &mut [f32]) -> f32 {
     let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
-    for &c in out.iter() {
-        lo = lo.min(c);
-        hi = hi.max(c);
+    if out.len() <= FEW_COSTS {
+        // A few rows, compared one by one: a cost that is no number moves
+        // neither end, as the fold below leaves them.
+        for &c in out.iter() {
+            if c < lo {
+                lo = c;
+            }
+            if c > hi {
+                hi = c;
+            }
+        }
+    } else {
+        // Many rows, folded: the minimum and the maximum take any order,
+        // so a step of the loop reads several rows.
+        for &c in out.iter() {
+            lo = lo.min(c);
+            hi = hi.max(c);
+        }
     }
     let span = hi - lo;
     let spread = span > 0.0 && span.is_finite();
@@ -2723,6 +2742,28 @@ mod tests {
 
     fn kept(n: u32) -> Vec<u32> {
         (0..n).collect()
+    }
+
+    /// The costs find the same ends by either way: a few rows are compared
+    /// one by one, many are folded, and a cost that is no number moves
+    /// neither end. So the same costs score the same bits among a few
+    /// rows and among many.
+    #[test]
+    fn a_few_costs_and_many_find_the_same_ends() {
+        // The cost that is no number stands last: no cost behind it could
+        // take an end back from it.
+        let few = [4.0, 2.0, 3.0, f32::NAN];
+        let mut some = few;
+        let span = normalize_costs(&mut some);
+        assert_eq!(span, 2.0);
+        assert_eq!(some[0].to_bits(), 0.0f32.to_bits());
+        assert_eq!((some[1], some[2]), (1.0, 0.5));
+        assert!(some[3].is_nan());
+        let mut many: Vec<f32> = few.iter().copied().chain([3.0; FEW_COSTS]).collect();
+        assert!(many.len() > FEW_COSTS);
+        assert_eq!(normalize_costs(&mut many), span);
+        let bits = |scores: &[f32]| scores.iter().map(|s| s.to_bits()).collect::<Vec<_>>();
+        assert_eq!(bits(&many[..few.len()]), bits(&some));
     }
 
     /// The engine's order around a picker: the set it compares, that set's
