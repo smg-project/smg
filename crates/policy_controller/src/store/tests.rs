@@ -14,8 +14,8 @@ use super::{
     Journal, Kinds, KvEvent, KvEventSink, LeaseRecord, LeaseRefused, LeaseState, LeasesStore,
     LoadSample, LoadSink, LoadSource, MembershipChange, MembershipTail, MemoryStore, Picked, Pin,
     PollMode, Position, Reachability, ReservationKind, ReservationStore, ResyncReason, Said,
-    SequenceHash, SessionsStore, Signals, SnapshotChunk, StoredBlock, VetoWrite, ViewBuffers,
-    WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus, WorkersStore, World,
+    SequenceHash, SessionsStore, Sides, Signals, SnapshotChunk, StoredBlock, VetoWrite,
+    ViewBuffers, WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus, WorkersStore, World,
 };
 use crate::{
     decider::Decider,
@@ -1697,9 +1697,9 @@ fn a_pairs_record_stands_until_its_decode_side_completes() {
     let leases: &dyn LeasesStore = &store;
     let now = Instant::now();
     let gateway = GatewayId(1);
-    let mut pair = lease(gateway, 5, 0, now);
-    pair.decode = Some(decode_side(WorkerId(8)));
-    assert_eq!(leases.issue(pair), Ok(()));
+    let pair = lease(gateway, 5, 0, now);
+    let decode = decode_side(WorkerId(8));
+    assert_eq!(leases.issue_pair(pair, decode), Ok(()));
     let mut outcome = Outcome {
         side: Side::Prefill,
         served: WorkerId(7),
@@ -1733,7 +1733,12 @@ fn booked(store: &MemoryStore, workers: &[WorkerId]) -> Vec<u32> {
 
 /// A pair's record under `id`: the prefill side on `prefill`, the decode
 /// side on the first of `decodes`, the rest the pick's alternates.
-fn pair(id: u64, prefill: WorkerId, decodes: &[WorkerId], now: Instant) -> LeaseRecord {
+fn pair(
+    id: u64,
+    prefill: WorkerId,
+    decodes: &[WorkerId],
+    now: Instant,
+) -> (LeaseRecord, DecodeSide) {
     let mut targets = Targets::new();
     for &decode_id in decodes {
         let pair = crate::decision::Pair {
@@ -1749,11 +1754,19 @@ fn pair(id: u64, prefill: WorkerId, decodes: &[WorkerId], now: Instant) -> Lease
     let mut record = booking(GatewayId(1), id, prefill, now);
     record.lease.side = Side::Prefill;
     record.picked = Picked::of(&targets);
-    record.decode = Some(DecodeSide {
+    let decode = DecodeSide {
         picked: Picked::of_decodes(&targets),
         ..decode_side(decodes[0])
-    });
-    record
+    };
+    (record, decode)
+}
+
+/// Files a pair's two parts by the pair's door.
+fn issue_pair(
+    leases: &dyn LeasesStore,
+    (record, decode): (LeaseRecord, DecodeSide),
+) -> Result<(), LeaseRefused> {
+    leases.issue_pair(record, decode)
 }
 
 /// A dispatch of `side` on the pick's target at `index`.
@@ -1781,8 +1794,8 @@ fn done(side: Side) -> Outcome {
 
 /// Where each side of the pair's lease under `id` stands.
 fn sides(store: &MemoryStore, id: u64) -> Option<(LeaseState, LeaseState)> {
-    let record = LeasesStore::get(store, GatewayId(1), LeaseId(id))?;
-    Some((record.state, record.decode?.state))
+    let found = LeasesStore::sides(store, GatewayId(1), LeaseId(id))?;
+    Some((found.record.state, found.decode?.state))
 }
 
 /// A pair filed with a side that ended books the side that lives, and
@@ -1795,16 +1808,16 @@ fn a_pair_filed_with_an_ended_side_books_the_side_that_lives() {
     let (gateway, now) = (GatewayId(1), Instant::now());
     leases.set_term(1);
     let ended = LeaseState::Completed;
-    let mut half = pair(1, p, &[d], now);
-    half.decode = half.decode.map(|side| DecodeSide {
+    let (record, side) = pair(1, p, &[d], now);
+    let half = DecodeSide {
         state: ended,
         ..side
-    });
-    leases.issue(half).expect("the key is free");
+    };
+    leases.issue_pair(record, half).expect("the key is free");
     assert_eq!(booked(&store, &[p, d]), [1, 0]);
-    let mut half = pair(2, p, &[d], now);
+    let (mut half, side) = pair(2, p, &[d], now);
     half.state = ended;
-    leases.issue(half).expect("the key is free");
+    leases.issue_pair(half, side).expect("the key is free");
     assert_eq!(booked(&store, &[p, d]), [1, 1]);
     assert_eq!(leases.live(gateway), 2);
 }
@@ -1817,12 +1830,24 @@ fn a_side_s_lease_names_the_worker_its_record_books() {
     let now = Instant::now();
     let (p, d) = (WorkerId(3), WorkerId(5));
     let booked = |lease: Option<Lease>| lease.map(|lease| lease.booked);
-    let told = |record: &LeaseRecord, side| booked(record.side(side).map(|(lease, _)| lease));
-    let single = lease(GatewayId(1), 1, 1, now);
-    assert_eq!(single.lease.booked, WorkerId(0), "filed with no word");
-    assert_eq!(told(&single, Side::Single), Some(single.target));
-    assert_eq!(single.ending(None).map(booked), [Some(single.target), None]);
-    let both = pair(2, p, &[d], now);
+    let told = |sides: &Sides, side| booked(sides.side(side).map(|(lease, _)| lease));
+    let record = lease(GatewayId(1), 1, 1, now);
+    let single = Sides {
+        record,
+        decode: None,
+    };
+    assert_eq!(record.lease.booked, WorkerId(0), "filed with no word");
+    assert_eq!(told(&single, Side::Single), Some(record.target));
+    assert_eq!(single.ending(None).map(booked), [Some(record.target), None]);
+    // A single's end is told off its record, with no list built.
+    let mut ended = Vec::new();
+    single.each_ending(None, |lease| ended.push(lease.booked));
+    assert_eq!(ended, [record.target]);
+    let (record, decode) = pair(2, p, &[d], now);
+    let both = Sides {
+        record,
+        decode: Some(decode),
+    };
     assert_eq!(told(&both, Side::Prefill), Some(p));
     assert_eq!(told(&both, Side::Decode), Some(d));
     assert_eq!(both.ending(None).map(booked), [Some(p), Some(d)]);
@@ -1835,9 +1860,7 @@ fn a_pairs_sides_are_dispatched_and_ended_each_by_its_own_frame() {
     let leases: &dyn LeasesStore = &store;
     let (gateway, key, now) = (GatewayId(1), LeaseId(1), Instant::now());
     leases.set_term(1);
-    leases
-        .issue(pair(1, p, &[d], now))
-        .expect("the key is free");
+    issue_pair(leases, pair(1, p, &[d], now)).expect("the key is free");
     // One record, and each side books its own worker.
     assert_eq!(booked(&store, &[p, d]), [1, 1]);
     assert_eq!(leases.live(gateway), 1);
@@ -1877,9 +1900,7 @@ fn a_decodes_dispatch_on_an_alternate_moves_the_decodes_booking_alone() {
     let leases: &dyn LeasesStore = &store;
     let (gateway, key, now) = (GatewayId(1), LeaseId(1), Instant::now());
     leases.set_term(1);
-    leases
-        .issue(pair(1, p, &[d0, d1], now))
-        .expect("the key is free");
+    issue_pair(leases, pair(1, p, &[d0, d1], now)).expect("the key is free");
     assert_eq!(booked(&store, &[p, d0, d1]), [1, 1, 0]);
     // Every target of a pair's pick names the one prefill: its dispatch on
     // the alternate's index moves no booking.
@@ -1887,9 +1908,10 @@ fn a_decodes_dispatch_on_an_alternate_moves_the_decodes_booking_alone() {
     assert_eq!(booked(&store, &[p, d0, d1]), [1, 1, 0]);
     assert!(leases.dispatched(gateway, key, on(Side::Decode, 1), now));
     assert_eq!(booked(&store, &[p, d0, d1]), [1, 0, 1]);
-    let filed = leases.get(gateway, key).expect("on file");
-    assert_eq!((filed.target, filed.lease.target_index), (p, 0));
-    let decode = filed.decode.expect("a pair's record");
+    let filed = leases.sides(gateway, key).expect("on file");
+    let record = filed.record;
+    assert_eq!((record.target, record.lease.target_index), (p, 0));
+    let decode = filed.decode.expect("a pair's lease");
     assert_eq!((decode.target, decode.target_index), (d1, 1));
     assert_eq!(filed.target_of(Side::Decode, 1), Some((d1, 0)));
     // The decode's end frees the count of the worker it moved to.
@@ -1904,9 +1926,7 @@ fn a_release_ends_the_side_it_names_and_with_no_side_every_side() {
     let leases: &dyn LeasesStore = &store;
     let (gateway, now, gone) = (GatewayId(1), Instant::now(), ReleaseReason::ClientGone);
     leases.set_term(1);
-    leases
-        .issue(pair(1, p, &[d], now))
-        .expect("the key is free");
+    issue_pair(leases, pair(1, p, &[d], now)).expect("the key is free");
     // One side given up: its count is free and the other side stands.
     assert!(leases.released(gateway, LeaseId(1), Some(Side::Decode), gone));
     assert_eq!(booked(&store, &[p, d]), [1, 0]);
@@ -1917,14 +1937,58 @@ fn a_release_ends_the_side_it_names_and_with_no_side_every_side() {
     assert_eq!(leases.get(gateway, LeaseId(1)), None);
     assert_eq!(booked(&store, &[p, d]), [0, 0]);
     // A release that names no side ends every side at once.
-    leases
-        .issue(pair(2, p, &[d], now))
-        .expect("the key is free");
+    issue_pair(leases, pair(2, p, &[d], now)).expect("the key is free");
     assert_eq!(booked(&store, &[p, d]), [1, 1]);
     assert!(leases.released(gateway, LeaseId(2), None, gone));
     assert_eq!(leases.get(gateway, LeaseId(2)), None);
     assert_eq!(booked(&store, &[p, d]), [0, 0]);
     assert_eq!(leases.live(gateway), 0);
+}
+
+/// A pair filed with its prefill part dispatched and its decode side
+/// waiting is due at its deadline all the same: the side that waits ends.
+#[test]
+fn a_pair_filed_with_its_decode_side_alone_waiting_is_due_at_its_deadline() {
+    let store = MemoryStore::new();
+    let (p, d) = (ready(&store, "http://p:1"), ready(&store, "http://d:1"));
+    let leases: &dyn LeasesStore = &store;
+    let (gateway, now) = (GatewayId(1), Instant::now());
+    leases.set_term(1);
+    let dispatched = LeaseState::Dispatched { at: now };
+    let (mut record, decode) = pair(1, p, &[d], now);
+    record.state = dispatched;
+    issue_pair(leases, (record, decode)).expect("the key is free");
+    assert_eq!(booked(&store, &[p, d]), [1, 1]);
+    // An issue past the deadline ends the side that waits.
+    let later = now + Duration::from_secs(2);
+    let world = store.world();
+    store
+        .issue_decided(booking(gateway, 0, p, later), world.booked_of(p), |_| ())
+        .expect("minted under the store's term");
+    let abandoned = LeaseState::Released(ReleaseReason::Abandoned);
+    assert_eq!(sides(&store, 1), Some((dispatched, abandoned)));
+    assert_eq!(booked(&store, &[p, d]), [2, 0]);
+}
+
+/// A place let go is the next one laid: a file's list of places is as
+/// long as the most pairs that stood at once.
+#[test]
+fn the_list_of_places_is_as_long_as_the_most_pairs_that_stood_at_once() {
+    let store = MemoryStore::new();
+    let (p, d) = (ready(&store, "http://p:1"), ready(&store, "http://d:1"));
+    let leases: &dyn LeasesStore = &store;
+    let (gateway, now) = (GatewayId(1), Instant::now());
+    leases.set_term(1);
+    for id in 1..=3 {
+        issue_pair(leases, pair(id, p, &[d], now)).expect("the key is free");
+    }
+    assert_eq!(store.places(), 3);
+    // Each pair that ends leaves its place to the next one filed.
+    for id in 4..=9 {
+        assert!(leases.released(gateway, LeaseId(id - 3), None, ReleaseReason::ClientGone));
+        issue_pair(leases, pair(id, p, &[d], now)).expect("the key is free");
+        assert_eq!(store.places(), 3, "pair {id}");
+    }
 }
 
 #[test]
@@ -1936,9 +2000,7 @@ fn the_dispatch_deadline_ends_each_side_that_waits_and_a_dispatched_side_stands(
     leases.set_term(1);
     // Two pairs: the first's prefill is dispatched, the second waits whole.
     for id in [1, 2] {
-        leases
-            .issue(pair(id, p, &[d], now))
-            .expect("the key is free");
+        issue_pair(leases, pair(id, p, &[d], now)).expect("the key is free");
     }
     assert!(leases.dispatched(gateway, LeaseId(1), on(Side::Prefill, 0), now));
     assert_eq!(booked(&store, &[p, d]), [2, 2]);
@@ -1947,22 +2009,18 @@ fn the_dispatch_deadline_ends_each_side_that_waits_and_a_dispatched_side_stands(
     let later = now + Duration::from_secs(2);
     let world = store.world();
     store.tell_through(heard);
-    drop(told());
+    drop(told_sides());
     store
-        .issue_decided(
-            booking(gateway, 0, p, later),
-            [world.booked_of(p), None],
-            |_| (),
-        )
+        .issue_decided(booking(gateway, 0, p, later), world.booked_of(p), |_| ())
         .expect("minted under the store's term");
-    let ended = told().into_iter().map(|(record, said)| {
+    let ended = told_sides().into_iter().map(|(found, said)| {
         let Said::Released(side, ReleaseReason::Abandoned) = said else {
             panic!("this issue tells the deadline's ends alone: {said:?}");
         };
-        // The word reads the side's lease off the record as the end
-        // found it.
-        let lease = record.ending(side)[0];
-        (record.lease.id.0, lease.map(|lease| lease.side))
+        // The word reads the side's lease off the lease as the end found
+        // it.
+        let lease = found.ending(side)[0];
+        (found.record.lease.id.0, lease.map(|lease| lease.side))
     });
     assert_eq!(
         ended.collect::<Vec<_>>(),
@@ -1983,18 +2041,14 @@ fn the_dispatch_deadline_ends_each_side_that_waits_and_a_dispatched_side_stands(
     assert!(leases.completed(gateway, LeaseId(1), &done(Side::Prefill)));
     assert_eq!(leases.get(gateway, LeaseId(1)), None);
     assert_eq!(booked(&store, &[p, d]), [1, 0]);
-    // The store's own sweep hands a pair's record back as it left it.
-    leases
-        .issue(pair(3, p, &[d], later))
-        .expect("the key is free");
+    // The store's own sweep hands a pair's record back as it left its
+    // prefill part.
+    issue_pair(leases, pair(3, p, &[d], later)).expect("the key is free");
     assert!(leases.dispatched(gateway, LeaseId(3), on(Side::Decode, 0), later));
     let swept = leases.expire(later + Duration::from_secs(9));
-    let states = |record: &LeaseRecord| (record.state, record.decode.map(|side| side.state));
+    let third = |record: &LeaseRecord| (record.lease.id, record.state) == (LeaseId(3), abandoned);
+    assert!(swept.iter().any(third));
     let at = LeaseState::Dispatched { at: later };
-    assert!(swept
-        .iter()
-        .map(states)
-        .any(|sides| sides == (abandoned, Some(at))));
     assert_eq!(sides(&store, 3), Some((abandoned, at)));
 }
 
@@ -2012,18 +2066,18 @@ fn a_pair_issued_under_a_rule_with_a_ttl_stands_and_ends_as_any_pair() {
     leases.set_term(1);
     let under = LeaseState::issued(Some(60_000_000));
     let keyed = |id: u64, at: Instant| {
-        let mut record = pair(id, p, &[d], at);
+        let (mut record, side) = pair(id, p, &[d], at);
         record.state = under;
-        record.decode = record.decode.map(|side| DecodeSide {
+        let side = DecodeSide {
             state: under,
             ..side
-        });
-        record
+        };
+        (record, side)
     };
     // The first pair's sides are dispatched one by one, the second's
     // prefill alone.
     for id in [1, 2] {
-        leases.issue(keyed(id, now)).expect("the key is free");
+        issue_pair(leases, keyed(id, now)).expect("the key is free");
     }
     let dispatched = LeaseState::Dispatched { at: now };
     assert!(leases.dispatched(gateway, LeaseId(1), on(Side::Prefill, 0), now));
@@ -2036,25 +2090,20 @@ fn a_pair_issued_under_a_rule_with_a_ttl_stands_and_ends_as_any_pair() {
     let later = now + Duration::from_secs(2);
     let world = store.world();
     store
-        .issue_decided(
-            booking(gateway, 0, p, later),
-            [world.booked_of(p), None],
-            |_| (),
-        )
+        .issue_decided(booking(gateway, 0, p, later), world.booked_of(p), |_| ())
         .expect("minted under the store's term");
     let abandoned = LeaseState::Released(ReleaseReason::Abandoned);
     assert_eq!(sides(&store, 1), Some((dispatched, dispatched)));
     assert_eq!(sides(&store, 2), Some((dispatched, abandoned)));
-    // The store's own sweep hands such a pair's record back as it left it.
-    leases.issue(keyed(3, later)).expect("the key is free");
+    // The store's own sweep hands such a pair's record back as its
+    // prefill part stood, and the decode side's end is read from the
+    // store.
+    issue_pair(leases, keyed(3, later)).expect("the key is free");
     assert!(leases.dispatched(gateway, LeaseId(3), on(Side::Prefill, 0), later));
     let swept = leases.expire(later + Duration::from_secs(9));
-    let states = |record: &LeaseRecord| (record.state, record.decode.map(|side| side.state));
     let at = LeaseState::Dispatched { at: later };
-    assert!(swept
-        .iter()
-        .map(states)
-        .any(|sides| sides == (at, Some(abandoned))));
+    let third = |record: &LeaseRecord| (record.lease.id, record.state) == (LeaseId(3), at);
+    assert!(swept.iter().any(third));
     assert_eq!(sides(&store, 3), Some((at, abandoned)));
 }
 
@@ -2409,7 +2458,7 @@ fn a_restore_tells_each_end_under_the_decider_whose_file_holds_its_lease() {
     let (now, world) = (Instant::now(), store.world());
     let issue = || {
         let record = booking(GatewayId(1), 0, a, now);
-        let issued = store.issue_decided(record, [world.booked_of(a), None], |_| ());
+        let issued = store.issue_decided(record, world.booked_of(a), |_| ());
         issued.expect("minted under the store's term").id
     };
     // One lease issued by a thread that acts as the fourth decider, one by
@@ -3251,6 +3300,119 @@ fn a_dispatch_on_another_rank_of_the_leases_worker_moves_the_index_alone() {
     assert_eq!(filed.target_at(1), Some((a, 3)), "the rank dispatched to");
 }
 
+/// The file's records and its places of decode sides stand and fall
+/// together: after every door of the leases a decode side is on file for
+/// each record that carries the mark of a pair's lease and for no other,
+/// and both agree with the walk's own plain map of what it filed.
+#[test]
+fn a_decode_side_is_on_file_for_each_record_that_carries_the_mark_and_for_no_other() {
+    let store = MemoryStore::new();
+    let [p, d0, d1] = ["p", "d0", "d1"].map(|name| ready(&store, &format!("http://{name}:1")));
+    let leases: &dyn LeasesStore = &store;
+    let (gateway, now) = (GatewayId(1), Instant::now());
+    let gone = ReleaseReason::ClientGone;
+    leases.set_term(1);
+    // The walk's own word: each id it filed, and whether a pair's lease
+    // stands under it; an id that left the file is not a key.
+    let mut filed = std::collections::BTreeMap::<u64, bool>::new();
+    let mut seen = Vec::new();
+    let mut read = |door: &str, filed: &std::collections::BTreeMap<u64, bool>| {
+        let [sides, marks] = store.paired();
+        assert_eq!(sides, marks, "{door}: a decode side for each mark");
+        let pairs = filed.iter().filter(|(_, pair)| **pair);
+        let pairs: Vec<_> = pairs.map(|(id, _)| (gateway, *id)).collect();
+        assert_eq!(sides, pairs, "{door}: the pairs on file");
+        seen.extend(filed.keys().copied());
+        for id in &seen {
+            let found = leases.sides(gateway, LeaseId(*id));
+            let pair = found.map(|found| found.decode.is_some());
+            assert_eq!(pair, filed.get(id).copied(), "{door}: lease {id}");
+        }
+    };
+    // Filed by each door that files: a single's, a pair's, and a record
+    // alone that carries a mark, which is a single's.
+    leases.issue(booking(gateway, 1, p, now)).expect("free");
+    issue_pair(leases, pair(2, p, &[d0], now)).expect("free");
+    issue_pair(leases, pair(3, p, &[d0, d1], now)).expect("free");
+    let alone = LeaseRecord {
+        decode: Some(d0),
+        ..booking(gateway, 4, p, now)
+    };
+    leases.issue(alone).expect("free");
+    filed.extend([(1, false), (2, true), (3, true), (4, false)]);
+    read("an issue", &filed);
+    assert_eq!(
+        leases.get(gateway, LeaseId(4)).expect("on file").decode,
+        None
+    );
+    assert_eq!(
+        leases.get(gateway, LeaseId(2)).expect("on file").decode,
+        Some(d0)
+    );
+    // A side's dispatch and a side's end leave both tables as they stand;
+    // the last side's end takes both.
+    assert!(leases.dispatched(gateway, LeaseId(2), on(Side::Prefill, 0), now));
+    assert!(leases.dispatched(gateway, LeaseId(3), on(Side::Decode, 1), now));
+    read("a side's dispatch", &filed);
+    assert!(leases.completed(gateway, LeaseId(2), &done(Side::Prefill)));
+    read("a side's completion", &filed);
+    assert!(leases.completed(gateway, LeaseId(2), &done(Side::Decode)));
+    filed.remove(&2);
+    read("the last side's completion", &filed);
+    assert!(leases.released(gateway, LeaseId(3), Some(Side::Decode), gone));
+    read("a side's release", &filed);
+    assert!(leases.released(gateway, LeaseId(3), Some(Side::Prefill), gone));
+    filed.remove(&3);
+    read("the last side's release", &filed);
+    // A decision's issue, a pair's and a single's, under ids the store
+    // mints; a release of the pair whole.
+    let world = store.world();
+    let slots = [world.booked_of(p), world.booked_of(d0)];
+    let (record, side) = pair(0, p, &[d0], now);
+    let decided = store.issue_decided_pair(record, side, slots, |_| ());
+    let decided = decided.expect("minted under the store's term").id;
+    let single = store.issue_decided(booking(gateway, 0, p, now), slots[0], |_| ());
+    let single = single.expect("minted under the store's term").id;
+    filed.extend([(decided.0, true), (single.0, false)]);
+    read("a decision's issue", &filed);
+    assert!(leases.released(gateway, decided, None, gone));
+    filed.remove(&decided.0);
+    read("a pair's release whole", &filed);
+    // The dispatch deadline: a pair that waits whole leaves, and one with
+    // a dispatched side stands with its decode side ended.
+    issue_pair(leases, pair(5, p, &[d0], now)).expect("free");
+    issue_pair(leases, pair(6, p, &[d0], now)).expect("free");
+    assert!(leases.dispatched(gateway, LeaseId(6), on(Side::Prefill, 0), now));
+    filed.extend([(5, true), (6, true)]);
+    read("two pairs more", &filed);
+    leases.expire(now + Duration::from_secs(2));
+    filed.retain(|id, _| *id == 6);
+    read("the dispatch deadline", &filed);
+    // A frame applied through a hand, by whoever holds the turn next.
+    let hand = Hand::new(gateway);
+    store.hand(&hand, LeaseId(6), Said::Completed(done(Side::Prefill)));
+    store.hand_back(hand);
+    filed.remove(&6);
+    read("a handed frame", &filed);
+    // A restore over a key on file: its pages list records alone, so the
+    // pair under that key leaves whole and a single's lease stands there.
+    issue_pair(leases, pair(7, p, &[d0], now)).expect("free");
+    issue_pair(leases, pair(8, p, &[d0], now)).expect("free");
+    filed.extend([(7, true), (8, true)]);
+    read("two pairs for a restore", &filed);
+    assert_eq!(leases.restore(gateway, &[pair(7, p, &[d0], now).0]), 1);
+    filed = [(7, false)].into();
+    read("a restore", &filed);
+    // The gateway's end takes every lease, a pair's two parts together.
+    issue_pair(leases, pair(9, p, &[d1], now)).expect("free");
+    filed.insert(9, true);
+    read("a pair beside a restored lease", &filed);
+    assert_eq!(leases.drop_gateways(&[gateway]), [2]);
+    filed.clear();
+    read("the gateway's end", &filed);
+    assert_eq!(booked(&store, &[p, d0, d1]), [0, 0, 0]);
+}
+
 #[test]
 fn every_door_that_takes_a_lease_off_the_file_gives_its_count_back() {
     let store = MemoryStore::new();
@@ -3316,7 +3478,7 @@ fn the_store_mints_a_decisions_lease_under_its_own_term_alone() {
             term,
             ..booking(gateway, 0, a, now)
         };
-        let issued = store.issue_decided(record, [world.booked_of(a), None], |_| ());
+        let issued = store.issue_decided(record, world.booked_of(a), |_| ());
         issued.map(|lease| lease.id.0)
     };
     leases.set_term(3);
@@ -3373,7 +3535,7 @@ fn a_rise_keeps_the_table_of_a_term_whose_lease_is_on_file() {
         ..booking(gateway, 0, a, now)
     };
     let booked = store.world().booked_of(a);
-    let issued = store.issue_decided(record, [booked, None], |_| ());
+    let issued = store.issue_decided(record, booked, |_| ());
     issued.expect("minted under the store's term");
     leases.set_term(4);
     assert_eq!(store.kept_terms(), [3], "a lease of the term is on file");
@@ -3398,7 +3560,7 @@ fn a_restore_that_raises_the_term_starts_the_blocks_under_it() {
     let term: &dyn LeasesStore = &standby;
     term.set_term(3);
     let (gateway, now) = (GatewayId(1), Instant::now());
-    let held = standby.issue_decided(lease(gateway, 0, 3, now), [None, None], |_| ());
+    let held = standby.issue_decided(lease(gateway, 0, 3, now), None, |_| ());
     held.expect("minted under the term the standby stood at");
     let mut cut = MemoryStore::new().cut(Kinds::All);
     cut.at.term = 7;
@@ -3409,21 +3571,22 @@ fn a_restore_that_raises_the_term_starts_the_blocks_under_it() {
         [3],
         "the rise is told the ids on file"
     );
-    let issued = standby.issue_decided(lease(gateway, 1, 7, now), [None, None], |_| ());
+    let issued = standby.issue_decided(lease(gateway, 1, 7, now), None, |_| ());
     assert_eq!(issued.map(|lease| lease.id.0), Ok(7 << 32 | 1));
 }
 
 thread_local! {
-    /// What the store told of leases on this thread, in the order told.
-    static TOLD: RefCell<Vec<(LeaseRecord, Said)>> = const { RefCell::new(Vec::new()) };
+    /// What the store told of leases on this thread, in the order told:
+    /// both parts of each lease.
+    static TOLD: RefCell<Vec<(Sides, Said)>> = const { RefCell::new(Vec::new()) };
     /// The decider each of those tells named, in the same order.
     static TOLD_BY: RefCell<Vec<Option<Decider>>> = const { RefCell::new(Vec::new()) };
 }
 
 /// A teller that keeps its word for [`told`]: the record a frame found on
 /// file and what the frame said, and for [`told_by`] the decider named.
-fn heard(_: &MemoryStore, _: &World, record: &LeaseRecord, said: Said, by: Option<Decider>) {
-    TOLD.with(|told| told.borrow_mut().push((*record, said)));
+fn heard(_: &MemoryStore, _: &World, found: &Sides, said: Said, by: Option<Decider>) {
+    TOLD.with(|told| told.borrow_mut().push((*found, said)));
     TOLD_BY.with(|told| told.borrow_mut().push(by));
 }
 
@@ -3432,8 +3595,16 @@ fn told_by() -> Vec<Option<Decider>> {
     TOLD_BY.with(|told| std::mem::take(&mut *told.borrow_mut()))
 }
 
-/// What [`heard`] kept on this thread since the last call, taken.
+/// What [`heard`] kept on this thread since the last call, taken: each
+/// lease's record.
 fn told() -> Vec<(LeaseRecord, Said)> {
+    let record = |(found, said): (Sides, Said)| (found.record, said);
+    told_sides().into_iter().map(record).collect()
+}
+
+/// What [`heard`] was told since the last call, both parts of each lease,
+/// taken.
+fn told_sides() -> Vec<(Sides, Said)> {
     TOLD.with(|told| std::mem::take(&mut *told.borrow_mut()))
 }
 
@@ -3459,17 +3630,19 @@ fn issued_in(
     };
     let world = store.world();
     store.tell_through(heard);
-    let before = told();
+    let before = told_sides();
     let lease = store
-        .issue_decided(record, [world.booked_of(target), None], |_| ())
+        .issue_decided(record, world.booked_of(target), |_| ())
         .expect("minted under the store's term");
     // What the issue told: the ends of the leases it found past their
     // deadline, taken here, and the frames it applied, kept for the case.
     let abandoned = Said::Released(None, ReleaseReason::Abandoned);
-    let (ended, applied): (Vec<_>, Vec<_>) =
-        told().into_iter().partition(|(_, said)| *said == abandoned);
+    let (ended, applied): (Vec<_>, Vec<_>) = told_sides()
+        .into_iter()
+        .partition(|(_, said)| *said == abandoned);
     TOLD.with(|told| told.borrow_mut().extend(before.into_iter().chain(applied)));
-    let ended = ended.iter().map(|(record, _)| {
+    let ended = ended.iter().map(|(found, _)| {
+        let record = found.record;
         assert_eq!(record.state, LeaseState::Released(ReleaseReason::Abandoned));
         counter(record.lease.id)
     });
@@ -3754,7 +3927,7 @@ thread_local! {
 /// A teller that keeps the epoch of the world each tell is handed. Its
 /// first tell publishes a later world before it returns, so a word told
 /// behind it under the same load reads the earlier epoch.
-fn under(store: &MemoryStore, world: &World, _: &LeaseRecord, _: Said, _: Option<Decider>) {
+fn under(store: &MemoryStore, world: &World, _: &Sides, _: Said, _: Option<Decider>) {
     UNDER.with_borrow_mut(|under| under.push(world.epoch()));
     if LATER.replace(false) {
         ready(store, "http://b:1");
@@ -3886,7 +4059,7 @@ fn a_thread_at_work_does_not_wait_for_a_held_turn_before_its_reads() {
         // Another holder is parked under the turn, in an issue's tell.
         scope.spawn(move || {
             let record = booking(GatewayId(1), 0, a, t0);
-            let issued = store.issue_decided(record, [world.booked_of(a), None], |_| {
+            let issued = store.issue_decided(record, world.booked_of(a), |_| {
                 reached.send(()).expect("the case hears the tell");
                 word.recv_timeout(PATIENCE)
                     .expect("the case lets the issuer go");
@@ -3970,7 +4143,7 @@ fn a_streams_end_applies_what_it_handed() {
 #[test]
 #[should_panic(expected = "taken first or not at all")]
 fn a_tell_that_takes_a_door_of_the_leases_is_refused_in_a_debug_build() {
-    fn takes_a_door(store: &MemoryStore, _: &World, _: &LeaseRecord, _: Said, _: Option<Decider>) {
+    fn takes_a_door(store: &MemoryStore, _: &World, _: &Sides, _: Said, _: Option<Decider>) {
         let _live = LeasesStore::live(store, GatewayId(1));
     }
     let store = MemoryStore::new();
@@ -3978,7 +4151,7 @@ fn a_tell_that_takes_a_door_of_the_leases_is_refused_in_a_debug_build() {
     LeasesStore::set_term(&store, 1);
     store.tell_through(takes_a_door);
     let record = booking(GatewayId(1), 0, a, Instant::now());
-    let issued = store.issue_decided(record, [store.world().booked_of(a), None], |_| ());
+    let issued = store.issue_decided(record, store.world().booked_of(a), |_| ());
     let hand = Hand::new(GatewayId(1));
     store.hand(&hand, issued.expect("minted").id, GONE);
 }
@@ -3992,7 +4165,7 @@ fn a_tell_that_takes_a_door_of_the_leases_is_refused_in_a_debug_build() {
 fn a_frame_handed_as_a_thread_leaves_its_work_is_applied_by_one_of_the_two() {
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::SeqCst};
     static HEARD: AtomicUsize = AtomicUsize::new(0);
-    fn counted(_: &MemoryStore, _: &World, _: &LeaseRecord, _: Said, _: Option<Decider>) {
+    fn counted(_: &MemoryStore, _: &World, _: &Sides, _: Said, _: Option<Decider>) {
         HEARD.fetch_add(1, SeqCst);
     }
     const ROUNDS: usize = 100_000;
@@ -4068,7 +4241,7 @@ fn a_frame_handed_as_a_thread_leaves_its_work_is_applied_by_one_of_the_two() {
                 break;
             }
             let record = booking(gateway, 0, a, now);
-            let issued = store.issue_decided(record, [world.booked_of(a), None], |_| ());
+            let issued = store.issue_decided(record, world.booked_of(a), |_| ());
             lease.store(issued.expect("minted under the store's term").id.0, SeqCst);
             let before = HEARD.load(SeqCst);
             round.store(asked, SeqCst);
@@ -4091,7 +4264,7 @@ fn a_frame_handed_as_a_thread_leaves_its_work_is_applied_by_one_of_the_two() {
 fn a_thread_that_leaves_its_work_waits_for_a_held_turn() {
     use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
     static HEARD: AtomicUsize = AtomicUsize::new(0);
-    fn counted(_: &MemoryStore, _: &World, _: &LeaseRecord, _: Said, _: Option<Decider>) {
+    fn counted(_: &MemoryStore, _: &World, _: &Sides, _: Said, _: Option<Decider>) {
         HEARD.fetch_add(1, SeqCst);
     }
     let store = Arc::new(MemoryStore::new());
@@ -4102,7 +4275,7 @@ fn a_thread_that_leaves_its_work_waits_for_a_held_turn() {
     let first = store
         .issue_decided(
             booking(gateway, 0, a, now),
-            [store.world().booked_of(a), None],
+            store.world().booked_of(a),
             |_| (),
         )
         .expect("minted under the store's term");
@@ -4131,7 +4304,7 @@ fn a_thread_that_leaves_its_work_waits_for_a_held_turn() {
         // Another holder is parked under the turn, in an issue's hook.
         scope.spawn(move || {
             let record = booking(gateway, 0, a, now);
-            let issued = store.issue_decided(record, [store.world().booked_of(a), None], |_| {
+            let issued = store.issue_decided(record, store.world().booked_of(a), |_| {
                 reached.send(()).expect("the case hears the issue");
                 word.recv_timeout(PATIENCE)
                     .expect("the case lets the issuer go");
@@ -4162,7 +4335,7 @@ fn a_thread_that_leaves_its_work_waits_for_a_held_turn() {
 #[test]
 fn the_store_is_printed_from_under_its_leases_turn() {
     thread_local!(static PRINTED: RefCell<String> = const { RefCell::new(String::new()) });
-    fn prints(store: &MemoryStore, _: &World, _: &LeaseRecord, _: Said, _: Option<Decider>) {
+    fn prints(store: &MemoryStore, _: &World, _: &Sides, _: Said, _: Option<Decider>) {
         PRINTED.with(|printed| *printed.borrow_mut() = format!("{store:?}"));
     }
     let store = MemoryStore::new();
@@ -4170,7 +4343,7 @@ fn the_store_is_printed_from_under_its_leases_turn() {
     LeasesStore::set_term(&store, 1);
     store.tell_through(prints);
     let record = booking(GatewayId(1), 0, a, Instant::now());
-    let issued = store.issue_decided(record, [store.world().booked_of(a), None], |_| ());
+    let issued = store.issue_decided(record, store.world().booked_of(a), |_| ());
     let hand = Hand::new(GatewayId(1));
     store.hand(&hand, issued.expect("minted").id, GONE);
     let under = PRINTED.with(|printed| printed.borrow().clone());
@@ -4210,7 +4383,7 @@ fn frames_handed_from_other_threads_are_all_applied_whoever_is_at_work() {
             for stream in &streams {
                 let record = booking(gateway, 0, a, t0);
                 let lease = store
-                    .issue_decided(record, [world.booked_of(a), None], |_| ())
+                    .issue_decided(record, world.booked_of(a), |_| ())
                     .expect("minted under the store's term");
                 stream.send(lease.id).expect("its stream reads on");
             }
@@ -4229,7 +4402,7 @@ fn frames_handed_from_other_threads_are_all_applied_whoever_is_at_work() {
 fn a_leases_events_are_told_under_its_files_decider() {
     let issue = |store: &MemoryStore, a| {
         let record = booking(GatewayId(1), 0, a, Instant::now());
-        let issued = store.issue_decided(record, [store.world().booked_of(a), None], |_| ());
+        let issued = store.issue_decided(record, store.world().booked_of(a), |_| ());
         issued.expect("minted under the store's term").id
     };
     let store = MemoryStore::new().with_deciders(4);
@@ -4278,8 +4451,8 @@ fn told_across(store: &MemoryStore, lease: LeaseId, said: Option<Said>) {
 
 #[test]
 fn a_lease_is_told_issued_before_any_holder_ends_it() {
-    fn ended(store: &MemoryStore, _: &World, record: &LeaseRecord, said: Said, _: Option<Decider>) {
-        told_across(store, record.lease.id, Some(said));
+    fn ended(store: &MemoryStore, _: &World, found: &Sides, said: Said, _: Option<Decider>) {
+        told_across(store, found.record.lease.id, Some(said));
     }
     let store = MemoryStore::new();
     let a = ready(&store, "http://a:1");
@@ -4291,7 +4464,7 @@ fn a_lease_is_told_issued_before_any_holder_ends_it() {
             dispatch_deadline: t0 + Duration::from_millis(1),
             ..booking(GatewayId(1), 0, a, at)
         };
-        let issued = store.issue_decided(record, [world.booked_of(a), None], |lease| {
+        let issued = store.issue_decided(record, world.booked_of(a), |lease| {
             told_across(&store, lease.id, None);
             parked();
         });
@@ -4341,9 +4514,9 @@ fn a_lease_is_told_issued_before_any_holder_ends_it() {
 #[test]
 fn a_decider_issues_into_its_own_file_and_a_leases_id_names_it() {
     static NAMES: Mutex<Vec<(LeaseId, Option<Decider>)>> = Mutex::new(Vec::new());
-    fn named(_: &MemoryStore, _: &World, record: &LeaseRecord, _: Said, by: Option<Decider>) {
+    fn named(_: &MemoryStore, _: &World, found: &Sides, _: Said, by: Option<Decider>) {
         let mut names = NAMES.lock().expect("no case fails under it");
-        names.push((record.lease.id, by));
+        names.push((found.record.lease.id, by));
     }
     let store = Arc::new(MemoryStore::new().with_deciders(3));
     assert_eq!(store.deciders(), 3);
@@ -4354,7 +4527,7 @@ fn a_decider_issues_into_its_own_file_and_a_leases_id_names_it() {
     let issue = |decider: u8| {
         let _acting = Decider::new(decider).enter();
         let record = booking(gateway, 0, a, now);
-        let lease = store.issue_decided(record, [store.world().booked_of(a), None], |_| ());
+        let lease = store.issue_decided(record, store.world().booked_of(a), |_| ());
         lease.expect("minted under the store's term").id
     };
     let (second, third) = (issue(1), issue(2));
@@ -4373,7 +4546,7 @@ fn a_decider_issues_into_its_own_file_and_a_leases_id_names_it() {
         scope.spawn(move || {
             let _acting = Decider::new(2).enter();
             let record = booking(gateway, 0, a, now);
-            let issued = store.issue_decided(record, [store.world().booked_of(a), None], |_| {
+            let issued = store.issue_decided(record, store.world().booked_of(a), |_| {
                 reached.send(()).expect("the case hears the issue");
                 word.recv_timeout(PATIENCE)
                     .expect("the case lets the issuer go");
@@ -4503,7 +4676,7 @@ fn no_thread_acts_at_a_file_beside_the_thread_at_work() {
 fn a_decider_takes_up_its_work_behind_a_hand_that_tells_at_its_file() {
     type Ends = (mpsc::SyncSender<()>, mpsc::Receiver<()>);
     static ENDS: Mutex<Option<Ends>> = Mutex::new(None);
-    fn parks(_: &MemoryStore, _: &World, _: &LeaseRecord, _: Said, _: Option<Decider>) {
+    fn parks(_: &MemoryStore, _: &World, _: &Sides, _: Said, _: Option<Decider>) {
         let ends = ENDS.lock().expect("no case fails under it").take();
         if let Some((reached, word)) = ends {
             reached.send(()).expect("the case hears the tell");
@@ -4520,7 +4693,7 @@ fn a_decider_takes_up_its_work_behind_a_hand_that_tells_at_its_file() {
     let lease = {
         let _acting = Decider::new(1).enter();
         let record = booking(gateway, 0, a, now);
-        let lease = store.issue_decided(record, [store.world().booked_of(a), None], |_| ());
+        let lease = store.issue_decided(record, store.world().booked_of(a), |_| ());
         lease.expect("minted under the store's term").id
     };
     let (reached, parked) = mpsc::sync_channel(1);
@@ -4621,9 +4794,9 @@ fn a_full_ring_stops_its_hand_until_the_thread_at_work_applied() {
 #[test]
 fn the_sweep_ends_a_resting_files_due_leases_under_its_deciders_name() {
     static NAMES: Mutex<Vec<(LeaseId, Option<Decider>)>> = Mutex::new(Vec::new());
-    fn named(_: &MemoryStore, _: &World, record: &LeaseRecord, _: Said, by: Option<Decider>) {
+    fn named(_: &MemoryStore, _: &World, found: &Sides, _: Said, by: Option<Decider>) {
         let mut names = NAMES.lock().expect("no case fails under it");
-        names.push((record.lease.id, by));
+        names.push((found.record.lease.id, by));
     }
     let store = Arc::new(MemoryStore::new().with_deciders(2));
     let a = ready(&store, "http://a:1");
@@ -4633,7 +4806,7 @@ fn the_sweep_ends_a_resting_files_due_leases_under_its_deciders_name() {
     let issue = |decider: u8| {
         let _acting = Decider::new(decider).enter();
         let record = booking(gateway, 0, a, now);
-        let lease = store.issue_decided(record, [store.world().booked_of(a), None], |_| ());
+        let lease = store.issue_decided(record, store.world().booked_of(a), |_| ());
         lease.expect("minted under the store's term").id
     };
     let (first, second) = (issue(0), issue(1));
@@ -4686,7 +4859,7 @@ fn a_gateways_doors_reach_its_leases_in_every_file() {
     let issue = |decider: u8, gateway| {
         let _acting = Decider::new(decider).enter();
         let record = booking(gateway, 0, a, now);
-        let lease = store.issue_decided(record, [store.world().booked_of(a), None], |_| ());
+        let lease = store.issue_decided(record, store.world().booked_of(a), |_| ());
         lease.expect("minted under the store's term").id
     };
     let leases = [issue(0, ours), issue(1, ours), issue(2, ours)];
@@ -4719,7 +4892,7 @@ fn a_followed_terms_start_raises_every_file_and_starts_the_blocks_under_it() {
     let (gateway, now) = (GatewayId(1), Instant::now());
     let issue = |decider: u8, under: u64| {
         let _acting = Decider::new(decider).enter();
-        standby.issue_decided(lease(gateway, 0, under, now), [None, None], |_| ())
+        standby.issue_decided(lease(gateway, 0, under, now), None, |_| ())
     };
     issue(1, 3).expect("minted under the term the standby stood at");
     standby.follow_term(Position { seq: 1, term: 7 });
@@ -4744,9 +4917,9 @@ fn a_followed_terms_start_raises_every_file_and_starts_the_blocks_under_it() {
 #[test]
 fn a_lease_of_the_term_before_is_found_in_its_file_behind_a_rise() {
     static NAMES: Mutex<Vec<(LeaseId, Option<Decider>)>> = Mutex::new(Vec::new());
-    fn named(_: &MemoryStore, _: &World, record: &LeaseRecord, _: Said, by: Option<Decider>) {
+    fn named(_: &MemoryStore, _: &World, found: &Sides, _: Said, by: Option<Decider>) {
         let mut names = NAMES.lock().expect("no case fails under it");
-        names.push((record.lease.id, by));
+        names.push((found.record.lease.id, by));
     }
     let store = MemoryStore::new().with_deciders(3);
     let a = ready(&store, "http://a:1");
@@ -4759,7 +4932,7 @@ fn a_lease_of_the_term_before_is_found_in_its_file_behind_a_rise() {
             target: a,
             ..lease(gateway, 0, term, now)
         };
-        let lease = store.issue_decided(record, [store.world().booked_of(a), None], |_| ());
+        let lease = store.issue_decided(record, store.world().booked_of(a), |_| ());
         lease.expect("minted under the store's term").id
     };
     // The third decider claims the first block of term 1, the second
@@ -4821,7 +4994,7 @@ fn a_door_files_no_id_whose_file_a_claim_would_name_anew() {
             target: a,
             ..lease(gateway, 0, 3, now)
         };
-        let issued = store.issue_decided(record, [store.world().booked_of(a), None], |_| ());
+        let issued = store.issue_decided(record, store.world().booked_of(a), |_| ());
         issued.expect("minted under the store's term").id
     };
     assert_eq!(minted, LeaseId(3 << 32 | 1));
@@ -4849,7 +5022,7 @@ fn a_door_that_waited_behind_a_claim_files_its_id_where_the_claim_named_it() {
     let store = MemoryStore::new().with_deciders(2);
     let a = ready(&store, "http://a:1");
     LeasesStore::set_term(&store, 3);
-    let (store, booked) = (&store, [store.world().booked_of(a), None]);
+    let (store, booked) = (&store, store.world().booked_of(a));
     let record = LeaseRecord {
         target: a,
         ..lease(gateway, 0, 3, now)
@@ -4921,7 +5094,7 @@ fn the_first_leases_of_the_most_deciders_are_far_below_the_terms_mark() {
     let first = |decider: u8| {
         let _acting = Decider::new(decider).enter();
         let record = booking(gateway, 0, a, now);
-        let lease = store.issue_decided(record, [store.world().booked_of(a), None], |_| ());
+        let lease = store.issue_decided(record, store.world().booked_of(a), |_| ());
         lease.expect("minted under the store's term").id.0 & 0xffff_ffff
     };
     let counters: Vec<u64> = (0..=u8::MAX).map(first).collect();
@@ -4938,7 +5111,7 @@ fn the_first_leases_of_the_most_deciders_are_far_below_the_terms_mark() {
 fn the_files_laid_for_deciders_keep_the_word_and_the_fault_count() {
     use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
     static HEARD: AtomicUsize = AtomicUsize::new(0);
-    fn counted(_: &MemoryStore, _: &World, _: &LeaseRecord, _: Said, _: Option<Decider>) {
+    fn counted(_: &MemoryStore, _: &World, _: &Sides, _: Said, _: Option<Decider>) {
         HEARD.fetch_add(1, SeqCst);
     }
     let store = MemoryStore::new();
@@ -4950,7 +5123,7 @@ fn the_files_laid_for_deciders_keep_the_word_and_the_fault_count() {
     LeasesStore::set_term(&store, 1);
     let (gateway, now) = (GatewayId(1), Instant::now());
     let record = booking(gateway, 0, a, now);
-    let lease = store.issue_decided(record, [store.world().booked_of(a), None], |_| ());
+    let lease = store.issue_decided(record, store.world().booked_of(a), |_| ());
     let lease = lease.expect("minted under the store's term").id;
     store.hand(&Hand::new(gateway), lease, GONE);
     assert_eq!(HEARD.load(SeqCst), 1, "told through the word given before");
@@ -4980,7 +5153,7 @@ fn a_store_with_a_lease_on_a_later_file_is_not_laid_again() {
         // file: the first file stays empty.
         let (_acting, world) = (Decider::new(3).enter(), store.world());
         let record = booking(GatewayId(1), 0, a, Instant::now());
-        let issued = store.issue_decided(record, [world.booked_of(a), None], |_| ());
+        let issued = store.issue_decided(record, world.booked_of(a), |_| ());
         issued.expect("minted under the store's term");
     }
     drop(store.with_deciders(8));

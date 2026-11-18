@@ -93,7 +93,7 @@ pub use kv_events::{
     SnapshotChunk,
 };
 pub use leases::{
-    DecodeSide, Dispatch, LeaseRecord, LeaseRefused, LeaseState, LeasesStore, Picked, Said,
+    DecodeSide, Dispatch, LeaseRecord, LeaseRefused, LeaseState, LeasesStore, Picked, Said, Sides,
 };
 pub use loads::{LoadSample, LoadSink, LoadSource, PollMode};
 pub use memory::{AtWork, Cut, Hand, MemoryStore, StoreCounts};

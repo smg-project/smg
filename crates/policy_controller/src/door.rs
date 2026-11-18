@@ -37,7 +37,7 @@ use crate::{
     store::{
         leases::DISPATCH_TTL, Ask, AtWork, Built, DecodeSide, GatewayId, Hand, HealthSink,
         LeaseRecord, LeaseRefused, LeaseState, LeasesStore, MemoryStore, Named, Naming,
-        PairBuffers, Picked, Said, SessionsStore, ViewBuffers, World,
+        PairBuffers, Picked, Said, SessionsStore, Sides, ViewBuffers, World,
     },
     view::{
         fingerprint, AffinityFacts, Candidate, Constraints, NamedAffinity, Phase, PinSource,
@@ -508,27 +508,28 @@ pub(crate) fn issue<A: Asked>(
         request: fingerprint(taken.request.id()),
         target: booking.target,
         picked: booking.picked,
-        decode: booking.decode.map(|(side, _)| side),
+        // The store writes the mark of a pair's lease where it files one.
+        decode: None,
         term,
         issued_at: taken.now,
         dispatch_deadline: taken.due(),
         state: LeaseState::issued(booking.ttl_micros),
     };
     let built = booking.built;
-    let booked = [
-        built.and_then(|built| world.booked(&built, booking.target)),
-        booking.decode.and_then(|(_, booked)| booked),
-    ];
+    let booked = built.and_then(|built| world.booked(&built, booking.target));
     // Under one hold of the turn the store applies what is handed, files
     // the lease, tells the engine that decided of it, once a side of a
     // pair's and the prefill's first, and ends and tells the leases it
     // finds past their dispatch deadline.
     let engine = world.spec().engine();
-    let lease = store.issue_decided(record, booked, |lease| {
-        engine.on_decision_issued(lease, decision);
-    })?;
+    let issued = |lease: &Lease| engine.on_decision_issued(lease, decision);
+    let Some((side, decode)) = booking.decode else {
+        let lease = store.issue_decided(record, booked, issued)?;
+        return Ok((lease, None));
+    };
     // A pair's two leases share the id the store minted.
-    Ok((lease, record.decode.map(|side| side.lease(&lease))))
+    let lease = store.issue_decided_pair(record, side, [booked, decode], issued)?;
+    Ok((lease, Some(side.lease(&lease))))
 }
 
 /// A shed the deciders say in the engine's place, in the shape of the
@@ -843,8 +844,8 @@ pub(crate) struct Viewed<'a> {
 ///
 /// A pair's lease is told by side: a dispatch on the side its frame names,
 /// with that side's lease and on that side's worker, and an end once a
-/// side the record held live, the frame's side or with none every side
-/// ([`LeaseRecord::ending`]).
+/// side the lease held live, the frame's side or with none every side
+/// ([`Sides::ending`]).
 ///
 /// Its caller is whoever applies the report, under the turn of the leases'
 /// file: what it calls is bounded and takes no door of the leases. It
@@ -861,14 +862,14 @@ pub(crate) struct Viewed<'a> {
 pub(crate) fn told(
     store: &MemoryStore,
     world: &World,
-    record: &LeaseRecord,
+    found: &Sides,
     said: Said,
     by: Option<Decider>,
 ) -> bool {
     // The lease's own decider acts while its event is told, whichever
     // thread applies the report.
     let _acting = by.map(Decider::enter);
-    let Err(payload) = catch_unwind(AssertUnwindSafe(|| tell(store, world, record, said))) else {
+    let Err(payload) = catch_unwind(AssertUnwindSafe(|| tell(store, world, found, said))) else {
         store.call_returned();
         return false;
     };
@@ -879,17 +880,17 @@ pub(crate) fn told(
 }
 
 /// What [`told`] tells, under its catch.
-fn tell(store: &MemoryStore, world: &World, record: &LeaseRecord, said: Said) {
+fn tell(store: &MemoryStore, world: &World, found: &Sides, said: Said) {
     let spec = world.spec();
-    let engine = (spec.generation() == record.lease.generation).then(|| spec.engine());
+    let engine = (spec.generation() == found.record.lease.generation).then(|| spec.engine());
     match (said, engine) {
         (Said::Dispatched(dispatch, at), engine) => {
             // The side the frame names: its lease, and its worker at
             // the index the frame names.
-            let Some((lease, stood)) = record.side(dispatch.side) else {
+            let Some((lease, stood)) = found.side(dispatch.side) else {
                 return;
             };
-            let named = record.target_of(dispatch.side, dispatch.target_index);
+            let named = found.target_of(dispatch.side, dispatch.target_index);
             let Some((id, dp_rank)) = named else {
                 return;
             };
@@ -925,14 +926,11 @@ fn tell(store: &MemoryStore, world: &World, record: &LeaseRecord, said: Said) {
             }
         }
         (Said::Completed(outcome), Some(engine)) => {
-            for lease in record.ending(Some(outcome.side)).iter().flatten() {
-                engine.on_completed(lease, &outcome);
-            }
+            let side = Some(outcome.side);
+            found.each_ending(side, |lease| engine.on_completed(lease, &outcome));
         }
         (Said::Released(side, reason), Some(engine)) => {
-            for lease in record.ending(side).iter().flatten() {
-                engine.on_released(lease, reason);
-            }
+            found.each_ending(side, |lease| engine.on_released(lease, reason));
         }
         (Said::Completed(_) | Said::Released(..), None) => {}
     }
@@ -1333,16 +1331,10 @@ const UNNAMED: Decider = Decider::new(0);
 /// that panics there is counted on the store for the host to read
 /// ([`MemoryStore::lifecycle_faults`]), and no line is written: a host in
 /// process writes its own.
-fn quiet(
-    store: &MemoryStore,
-    world: &World,
-    record: &LeaseRecord,
-    said: Said,
-    by: Option<Decider>,
-) {
+fn quiet(store: &MemoryStore, world: &World, found: &Sides, said: Said, by: Option<Decider>) {
     // A stage that keeps a decider's state hears a lease's events under
     // the name it heard the issue under, whichever thread applies them.
-    told(store, world, record, said, Some(by.unwrap_or(UNNAMED)));
+    told(store, world, found, said, Some(by.unwrap_or(UNNAMED)));
 }
 
 impl Door {

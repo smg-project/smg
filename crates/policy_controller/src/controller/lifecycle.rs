@@ -50,7 +50,7 @@ use crate::{
         completed::Class,
         released::{Reason, What},
     },
-    store::{Dispatch, GatewayId, Hand, LeaseRecord, MemoryStore, Said, World},
+    store::{Dispatch, GatewayId, Hand, MemoryStore, Said, Sides, World},
     view::WorkerId,
 };
 
@@ -130,10 +130,10 @@ pub(crate) fn tells(store: &MemoryStore) {
 /// that panics and counts it on the store
 /// ([`MemoryStore::lifecycle_faults`]). A streak of faults writes one line
 /// here.
-fn told(store: &MemoryStore, world: &World, record: &LeaseRecord, said: Said, by: Option<Decider>) {
-    if door::told(store, world, record, said, by) {
+fn told(store: &MemoryStore, world: &World, found: &Sides, said: Said, by: Option<Decider>) {
+    if door::told(store, world, found, said, by) {
         error!(
-            lease = record.lease.id.0,
+            lease = found.record.lease.id.0,
             "a lease's lifecycle call panicked: held, and the lease's event stands as applied"
         );
     }
@@ -524,6 +524,14 @@ pub(crate) mod tests {
                 ..Target::default()
             });
         }
+        let side = DecodeSide {
+            target: d0,
+            picked: Picked::of_decodes(&targets),
+            session: Session::NONE,
+            state: LeaseState::ISSUED,
+            tokens: 0,
+            target_index: 0,
+        };
         let pair = |id: u64| LeaseRecord {
             lease: Lease {
                 id: LeaseId(id),
@@ -535,20 +543,13 @@ pub(crate) mod tests {
             request: id,
             target: p,
             picked: Picked::of(&targets),
-            decode: Some(DecodeSide {
-                target: d0,
-                picked: Picked::of_decodes(&targets),
-                session: Session::NONE,
-                state: LeaseState::ISSUED,
-                tokens: 0,
-                target_index: 0,
-            }),
+            decode: None,
             term: 0,
             issued_at: now,
             dispatch_deadline: now + Duration::from_secs(5),
             state: LeaseState::ISSUED,
         };
-        LeasesStore::issue(&store, pair(1)).expect("the key is free");
+        LeasesStore::issue_pair(&store, pair(1), side).expect("the key is free");
         let frame = |side: proto::Side, index: u32| proto::Dispatched {
             side: side.into(),
             target_index: index,
@@ -587,7 +588,7 @@ pub(crate) mod tests {
         assert_eq!(heard.lock()[3..], [("released decode", 1, WorkerId(0))]);
         assert_eq!(LeasesStore::get(&store, A, LeaseId(1)), None);
         // A pair given up whole is told once a side.
-        LeasesStore::issue(&store, pair(2)).expect("the key is free");
+        LeasesStore::issue_pair(&store, pair(2), side).expect("the key is free");
         released(&store, &open(&store, A), &a_released(2)).expect("the frame reads");
         let whole = ["released prefill", "released decode"].map(|call| (call, 2, WorkerId(0)));
         assert_eq!(heard.lock()[4..], whole);
@@ -1010,6 +1011,14 @@ pub(crate) mod tests {
             ..Target::default()
         });
         let issued = LeaseState::issued(Some(60_000_000));
+        let side = DecodeSide {
+            target: d,
+            picked: Picked::of_decodes(&targets),
+            session: DECODE_KEY,
+            state: issued,
+            tokens: 0,
+            target_index: 0,
+        };
         let record = LeaseRecord {
             lease: Lease {
                 id: LeaseId(1),
@@ -1024,20 +1033,13 @@ pub(crate) mod tests {
             request: 1,
             target: p,
             picked: Picked::of(&targets),
-            decode: Some(DecodeSide {
-                target: d,
-                picked: Picked::of_decodes(&targets),
-                session: DECODE_KEY,
-                state: issued,
-                tokens: 0,
-                target_index: 0,
-            }),
+            decode: None,
             term: 0,
             issued_at: t0,
             dispatch_deadline: t0 + Duration::from_secs(5),
             state: issued,
         };
-        LeasesStore::issue(&store, record).expect("the key is free");
+        LeasesStore::issue_pair(&store, record, side).expect("the key is free");
         let at = t0 + Duration::from_millis(3);
         for side in [proto::Side::Prefill, proto::Side::Decode] {
             let frame = proto::Dispatched {
