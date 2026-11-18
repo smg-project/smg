@@ -25,11 +25,16 @@
 //! assert_eq!(Decider::acting(), None);
 //! ```
 
-use std::{cell::Cell, marker::PhantomData};
+use std::{
+    cell::{Cell, RefCell},
+    marker::PhantomData,
+};
 
 thread_local! {
-    /// The decider the thread acts as.
+    /// The decider the thread acts as: the name of its newest live guard.
     static ACTING: Cell<Option<Decider>> = const { Cell::new(None) };
+    /// The thread's live guards, oldest first, each by its number and name.
+    static LIVE: RefCell<Vec<(u32, Decider)>> = const { RefCell::new(Vec::new()) };
 }
 
 /// One of a host's deciders, by the number the host gave it: a byte, so a
@@ -56,16 +61,20 @@ impl Decider {
     /// The calling thread acts as this decider until the guard drops: what
     /// the holder of the decider's turn says before it decides or tells a
     /// lease's event, for as long as it holds the turn and no longer. A
-    /// thread that enters again acts as the later name, and as the earlier
-    /// one once the later guard drops. The order is the holder's to keep:
-    /// guards drop in the reverse of the order they were made in, as locals
-    /// do. A guard dropped while a later one lives leaves the thread under
-    /// the wrong name from there on, and a debug build panics at that drop.
+    /// thread that enters again acts as the later name. Guards drop in any
+    /// order: the thread acts as the name of its newest guard still alive,
+    /// so a guard kept in a field and renewed by assignment keeps its name,
+    /// and the thread acts as none once its last guard is gone.
     #[must_use = "the thread acts as the decider only while the guard lives"]
     pub fn enter(self) -> Acting {
+        let number = LIVE.with_borrow_mut(|live| {
+            let number = live.last().map_or(0, |(newest, _)| newest + 1);
+            live.push((number, self));
+            number
+        });
+        ACTING.set(Some(self));
         Acting {
-            name: self,
-            before: ACTING.replace(Some(self)),
+            number,
             thread: PhantomData,
         }
     }
@@ -87,25 +96,25 @@ impl Decider {
 /// ```
 #[derive(Debug)]
 pub struct Acting {
-    /// The name this guard set.
-    name: Decider,
-    /// What the thread acted as before.
-    before: Option<Decider>,
+    /// The guard's number among its thread's live guards.
+    number: u32,
     /// A raw pointer is not `Send`, so the guard is not.
     thread: PhantomData<*const ()>,
 }
 
 impl Drop for Acting {
     fn drop(&mut self) {
-        // The newest guard drops first. A thread that unwinds is past the
-        // check: a second panic there would end the process.
-        debug_assert!(
-            std::thread::panicking() || ACTING.get() == Some(self.name),
-            "a decider's guard dropped while a later one lives: acting {:?}, the guard's {:?}",
-            ACTING.get(),
-            self.name
-        );
-        ACTING.set(self.before);
+        // The guard leaves the thread's list wherever it stands in it, and
+        // the newest one left names the thread. A guard that outlives the
+        // list (one kept in another thread-local, at its thread's end) has
+        // nothing to end.
+        let _ = LIVE.try_with(|live| {
+            let mut live = live.borrow_mut();
+            if let Some(at) = live.iter().rposition(|(number, _)| *number == self.number) {
+                live.remove(at);
+            }
+            ACTING.set(live.last().map(|(_, name)| *name));
+        });
     }
 }
 
@@ -141,19 +150,30 @@ mod tests {
         assert_eq!(Decider::acting(), Some(Decider::new(1)));
     }
 
-    /// The order is the holder's to keep, and a debug build says where it
-    /// was not kept. On a thread of its own: the name it leaves is wrong.
     #[test]
-    #[cfg(debug_assertions)]
-    fn a_guard_dropped_while_a_later_one_lives_panics_in_a_debug_build() {
-        let dropped = std::thread::spawn(|| {
-            let earlier = Decider::new(1).enter();
-            let _later = Decider::new(2).enter();
-            drop(earlier);
-        })
-        .join();
-        let panic = dropped.expect_err("the drop out of its order panics");
-        let said = panic.downcast_ref::<String>().map_or("", String::as_str);
-        assert!(said.contains("dropped while a later one lives"), "{said}");
+    fn a_guard_dropped_while_a_later_one_lives_leaves_the_later_name() {
+        let earlier = Decider::new(1).enter();
+        let later = Decider::new(2).enter();
+        drop(earlier);
+        assert_eq!(Decider::acting(), Some(Decider::new(2)));
+        let newest = Decider::new(3).enter();
+        drop(later);
+        assert_eq!(Decider::acting(), Some(Decider::new(3)));
+        drop(newest);
+        assert_eq!(Decider::acting(), None, "no guard is left");
+    }
+
+    /// A guard kept in a field and renewed by assignment: the new guard
+    /// enters before the old one drops, and the name holds at each renewal.
+    #[test]
+    fn a_guard_renewed_by_assignment_keeps_its_name() {
+        let mut held = Decider::new(4).enter();
+        for _ in 0..3 {
+            // What an assignment does: the new guard enters, the old drops.
+            drop(std::mem::replace(&mut held, Decider::new(4).enter()));
+            assert_eq!(Decider::acting(), Some(Decider::new(4)));
+        }
+        drop(held);
+        assert_eq!(Decider::acting(), None);
     }
 }
