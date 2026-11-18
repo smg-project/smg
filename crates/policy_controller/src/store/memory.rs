@@ -80,10 +80,10 @@ pub struct MemoryStore {
     kv: Arc<KvTables>,
     reservations: Mutex<Reservations>,
     sessions: Mutex<FxHashMap<u64, Pin>>,
-    /// The instant the pins' next sweep is due ([`Self::sweep_pins`]);
-    /// `None` before the first.
+    /// The instant of the pins' last sweep ([`Self::sweep_pins`]); `None`
+    /// before the first.
     #[cfg(feature = "controller")]
-    pins_due: Mutex<Option<Instant>>,
+    pins_swept: Mutex<Option<Instant>>,
     leases: Mutex<Leases>,
     /// What a decision reads, through one load: swapped whole at each
     /// publication.
@@ -174,7 +174,7 @@ impl MemoryStore {
             reservations: Mutex::default(),
             sessions: Mutex::default(),
             #[cfg(feature = "controller")]
-            pins_due: Mutex::default(),
+            pins_swept: Mutex::default(),
             leases: Mutex::new(leases),
             world,
             origin,
@@ -1877,21 +1877,25 @@ impl SessionsStore for MemoryStore {
 impl MemoryStore {
     /// One pass of the pins' sweep at `now`, where one is due: the pins of
     /// record last used longer ago than the longest TTL among the standing
-    /// generation's sessions rules leave the table. A pass is due once an
-    /// interval of the rule that sweeps most often, so a clock that ticks
-    /// faster walks nothing between two passes. Where a rule keeps its
-    /// keys with no TTL no pass runs. Returns how many pins left.
+    /// generation's sessions rules leave the table. A pass is due once the
+    /// interval of the standing rule that sweeps most often has passed
+    /// since the last one, so a clock that ticks faster walks nothing
+    /// between two passes. The interval is the standing generation's at
+    /// each tick: the pins outlive generations, and an apply that shortens
+    /// it waits out no earlier one. Where a rule keeps its keys with no
+    /// TTL no pass runs. Returns how many pins left.
     pub(crate) fn sweep_pins(&self, now: Instant) -> usize {
         let horizon = self.with_world(|world| world.spec().engine().pins_horizon());
         let Some((ttl, every)) = horizon else {
             return 0;
         };
         {
-            let mut due = self.pins_due.lock();
-            if due.is_some_and(|due| now < due) {
+            let mut swept = self.pins_swept.lock();
+            let interval = Duration::from_micros(every);
+            if swept.is_some_and(|last| now.saturating_duration_since(last) < interval) {
                 return 0;
             }
-            *due = Some(now + Duration::from_micros(every));
+            *swept = Some(now);
         }
         now.checked_sub(Duration::from_micros(ttl))
             .map_or(0, |before| SessionsStore::expire(self, before))

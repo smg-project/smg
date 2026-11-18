@@ -1153,11 +1153,23 @@ fn two_gateways_sharing_a_lease_number_hold_separate_reservations() {
     assert_eq!(rooms.held(id, ReservationKind::Room), 0);
 }
 
+/// The manual preset as `generation`, its keys pinned for `ttl_s` and swept
+/// every `sweep_s`.
+#[cfg(feature = "controller")]
+fn manual_ruled(generation: u64, ttl_s: u32, sweep_s: u32) -> crate::spec::AppliedSpec {
+    use crate::spec::{AppliedSpec, PolicySpec};
+
+    let mut document = PolicySpec::preset("manual").expect("a preset of this build");
+    document.generation = generation;
+    let rule = document.bindings[0].sessions.as_mut();
+    let rule = rule.expect("the preset's rule");
+    (rule.ttl_s, rule.sweep_s) = (ttl_s, sweep_s);
+    AppliedSpec::validate(&document).expect("the document validates")
+}
+
 #[cfg(feature = "controller")]
 #[test]
 fn the_pins_sweep_drops_the_pins_past_the_rules_ttl_once_an_interval() {
-    use crate::spec::{AppliedSpec, PolicySpec};
-
     let store = MemoryStore::new();
     let now = Instant::now();
     let t = |seconds: u64| now + Duration::from_secs(seconds);
@@ -1165,17 +1177,9 @@ fn the_pins_sweep_drops_the_pins_past_the_rules_ttl_once_an_interval() {
     // No sessions rule stands: no pass runs, whatever the age of a pin.
     sessions.pin(1, WorkerId(1), now);
     assert_eq!(store.sweep_pins(t(1_000_000)), 0);
-    // The manual preset, its keys pinned for `ttl_s` and swept every
-    // `sweep_s`.
-    let ruled = |generation: u64, ttl_s: u32, sweep_s: u32| {
-        let mut document = PolicySpec::preset("manual").expect("a preset of this build");
-        document.generation = generation;
-        let rule = document.bindings[0].sessions.as_mut();
-        let rule = rule.expect("the preset's rule");
-        (rule.ttl_s, rule.sweep_s) = (ttl_s, sweep_s);
-        AppliedSpec::validate(&document).expect("the document validates")
-    };
-    store.apply(ruled(1, 60, 30)).expect("a first generation");
+    store
+        .apply(manual_ruled(1, 60, 30))
+        .expect("a first generation");
     for key in 2..=1_001 {
         sessions.pin(key, WorkerId(1), t(10));
     }
@@ -1191,11 +1195,37 @@ fn the_pins_sweep_drops_the_pins_past_the_rules_ttl_once_an_interval() {
     assert!(sessions.is_empty());
     // A rule that keeps its keys for ever: no pass runs.
     store
-        .apply(ruled(2, u32::MAX, u32::MAX))
+        .apply(manual_ruled(2, u32::MAX, u32::MAX))
         .expect("a later generation");
     sessions.pin(1, WorkerId(1), now);
     assert_eq!(store.sweep_pins(t(1_000_000)), 0);
     assert_eq!(sessions.len(), 1);
+}
+
+/// The pins outlive generations, and the interval read at a tick is the
+/// standing generation's: an apply that shortens the sweep waits out no
+/// earlier interval, however long the one the last pass ran under.
+#[cfg(feature = "controller")]
+#[test]
+fn a_shorter_sweep_applied_waits_out_no_earlier_interval() {
+    let store = MemoryStore::new();
+    let now = Instant::now();
+    let t = |seconds: u64| now + Duration::from_secs(seconds);
+    let sessions: &dyn SessionsStore = &store;
+    store
+        .apply(manual_ruled(1, 7_200, 3_600))
+        .expect("a first generation");
+    sessions.pin(1, WorkerId(1), now);
+    // The first pass runs at once and finds no pin past the TTL.
+    assert_eq!(store.sweep_pins(t(1)), 0);
+    // A generation that sweeps every thirty seconds: its pass is due
+    // thirty seconds after the last one, not an hour after it.
+    store
+        .apply(manual_ruled(2, 60, 30))
+        .expect("a later generation");
+    assert_eq!(store.sweep_pins(t(30)), 0, "inside the standing interval");
+    assert_eq!(store.sweep_pins(t(61)), 1);
+    assert!(sessions.is_empty());
 }
 
 #[test]
