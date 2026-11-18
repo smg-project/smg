@@ -65,8 +65,8 @@ as of `tokenizer/src/*`.
 - Exposes `apply_chat_template` for JSON message payloads and template parameters.
 - Tells the control tokens a template writes from the same spellings typed into a request, for two
   kinds of checkpoint: one that ships its own vocabulary file beside the conversion, and one
-  whose template builds its control spellings (it never spells a control
-  token whole: it binds each to a name out of a constant of its own and writes the names). On
+  whose template builds its control spellings (it writes no control
+  token whole by itself: it binds each to a name out of a constant of its own and writes the names). On
   `apply_chat_template_with_encoding` the template's tokens are tokens and a spelling typed into
   a message, a tool, a document or a template argument stays text, also when it is typed in two
   parts the template joins, and so does a text that only the pipeline's normalizer makes an

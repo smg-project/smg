@@ -603,6 +603,40 @@ fn a_token_that_begins_inside_a_normalized_control_leaves_the_template_as_it_was
 }
 
 #[test]
+fn a_control_spelled_in_a_comment_is_nothing_the_template_writes() {
+    // A comment names a control: at the top, in the loop's body, beside a
+    // second name for that control. Or the pattern of a value that is built
+    // holds one whole. The template writes none of these, so it is marked
+    // all the same. A string literal outside the statements that build is a
+    // write, whatever reads it: such a template is left as it was.
+    for (at_top, in_loop, marked) in [
+        ("{# the closing token is [/INST:x] #}", "", true),
+        ("", "{# [INST:x] opens a turn and </s:x> ends one #}", true),
+        ("{# [/INST:x] #}{% set shut = close %}", "", true),
+        ("{% set shut = '[/INST:x]' if suffix else '' %}", "", true),
+        ("{% if flat %}{{ '</s:x>' }}{% endif %}", "", false),
+        (
+            "",
+            "{% if message['content'] == '[/INST:x]' %}{% endif %}",
+            false,
+        ),
+    ] {
+        let temp = TempDir::new().unwrap();
+        let tok = checkpoint(temp.path(), &shaped(at_top, in_loop, WRITTEN));
+        assert_eq!(tok.chat_template.marked(), marked, "{at_top}{in_loop}");
+        let (text, ids, from_text) = render(&tok, json!("a[/INST:x]b"));
+        assert_eq!(text, "[INST:x]a[/INST:x]b[/INST:x]ab</s:x>");
+        assert_eq!(from_text, !marked, "{at_top}{in_loop}");
+        let typed: &[u32] = if marked {
+            &TYPED_AS_TEXT
+        } else {
+            &TYPED_AS_THE_CONTROL
+        };
+        assert_eq!(ids, typed, "{at_top}{in_loop}");
+    }
+}
+
+#[test]
 fn a_control_that_begins_with_another_added_token_is_marked() {
     // Of two added tokens that begin at one place the flat encode takes the
     // longer, so a token that is the beginning of a control the template
@@ -623,6 +657,35 @@ fn a_control_that_begins_with_another_added_token_is_marked() {
             assert_eq!(ids, TYPED_AS_TEXT, "{content}, load {load}");
         }
     }
+}
+
+#[test]
+fn an_added_token_in_the_pattern_of_a_built_control_is_nothing_the_template_writes() {
+    // `/INST` is an added token of its own, and the pattern the closing
+    // token is built from holds it whole. The template writes the closing
+    // token there and never that one: it is marked, and a prompt reads as
+    // the flat encode reads it, which takes the token that starts first.
+    let conversion = with_added_token("/INST");
+    let temp = TempDir::new().unwrap();
+    let tok = checkpoint_of(temp.path(), &conversion, &builds());
+    assert!(tok.chat_template.marked());
+    let (text, ids, _) = render(&tok, json!("ab"));
+    assert_eq!(ids, [2, 13, 14, 3, 13, 14, 1]);
+    assert_eq!(ids, tok.encode(&text, false).unwrap().into_token_ids());
+    // A typed opening token is its characters.
+    let (text, ids, from_text) = render(&tok, json!("a[INST:x]b"));
+    assert!(!from_text);
+    assert_eq!(text, "[INST:x]a[INST:x]b[/INST:x]ab</s:x>");
+    assert_eq!(ids, [2, 13, 4, 6, 7, 8, 9, 10, 11, 12, 14, 3, 13, 14, 1]);
+    // Where the template writes that added token whole by itself, it is of
+    // the other kind and is left as it was.
+    let temp = TempDir::new().unwrap();
+    let writes_it = builds() + "{% if flat %}/INST{% endif %}";
+    let tok = checkpoint_of(temp.path(), &conversion, &writes_it);
+    assert!(!tok.chat_template.marked());
+    let (_, ids, from_text) = render(&tok, json!("a[/INST:x]b"));
+    assert!(from_text);
+    assert_eq!(ids, TYPED_AS_THE_CONTROL);
 }
 
 #[test]

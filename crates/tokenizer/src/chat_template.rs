@@ -2474,6 +2474,31 @@ fn contested<'a>(spellings: &[&str], mut added: impl Iterator<Item = (&'a str, b
     })
 }
 
+/// What `source`, a chat template, writes by itself: its raw text and its
+/// string literals, each behind a separator ([`VALUE_SEPARATOR`]). A comment
+/// is not in it, and neither is a literal that `built` names by its byte
+/// offset: one inside an expression the template builds a value from, the
+/// pattern of that value, which it writes only as the value. A template the
+/// lexer refuses is read whole.
+fn written_text(source: &str, built: impl Fn(usize) -> bool) -> String {
+    let mut written = String::new();
+    for item in tokenize(source, false, SyntaxConfig, WhitespaceConfig::default()) {
+        let Ok((token, span)) = item else {
+            return source.to_owned();
+        };
+        let text = match &token {
+            Token::TemplateData(text) | Token::Str(text) => *text,
+            Token::String(text) => &**text,
+            _ => continue,
+        };
+        if !built(span.start_offset as usize) {
+            written.push(char::from(VALUE_SEPARATOR));
+            written.push_str(text);
+        }
+    }
+    written
+}
+
 /// The names a render gives the four special tokens a template reads
 /// ([`RENDER_CONTEXT_NAMES`]). No template reads any other special token of
 /// the vocabulary.
@@ -4278,15 +4303,16 @@ impl ChatTemplateState {
     /// it is built from is read by nothing else. A template that reads one
     /// any other way (a filter, a comparison, a search, a slice), binds one
     /// from a request argument, builds a value that is neither a control
-    /// spelling nor empty, or spells a control whole stays as it is,
+    /// spelling nor empty, or writes an added token whole by itself (in
+    /// its text or in a string literal, not in a comment) stays as it is,
     /// its prompts encoded from their text as before. So does one that
     /// writes a control outside its constants on a probe conversation
     /// ([`Self::marks_every_control`]). Every reading is
     /// made through copies of the templates ([`Self::twin`]), so the render
     /// of a request carries nothing for it. `controls`, the matcher over the
     /// added tokens, is asked for only once a template binds a control
-    /// spelling its source does not hold, so a checkpoint without one never
-    /// builds it.
+    /// spelling it does not write whole by itself, so a checkpoint without
+    /// one never builds it.
     ///
     /// Before that the vocabulary is read once: `added` is every added
     /// token, with whether its entry carries a flag. Where the flat encode
@@ -4408,10 +4434,12 @@ impl ChatTemplateState {
     /// builds a value that is neither one control spelling nor empty,
     /// whether a string or not ([`NOT_A_STRING`]): it may be a piece of a
     /// control, which takes no marks, and the template would complete that
-    /// control where it writes the piece. None as well when the source
-    /// spells one of the spellings whole: that template is of the other
+    /// control where it writes the piece. None as well when the template
+    /// writes one of the spellings whole by itself, in its text or in a
+    /// string literal ([`written_text`]): that template is of the other
     /// kind, and it says so here, before the matcher over the added tokens
-    /// is asked for.
+    /// is asked for. A comment that names a spelling is nothing the
+    /// template writes, and neither is the pattern a value is built from.
     fn control_bindings(
         &self,
         is_control: &dyn Fn(&str) -> bool,
@@ -4475,6 +4503,14 @@ impl ChatTemplateState {
         if values.len() != computed.len() {
             return Vec::new();
         }
+        let built = |at| {
+            computed.iter().any(|statement| {
+                statement.builds && (statement.span.0..statement.span.1).contains(&at)
+            })
+        };
+        // What the template writes by itself, read once the source holds a
+        // control spelling somewhere.
+        let mut written = None;
         let mut bindings = Vec::new();
         for (statement, value) in computed.iter().zip(values) {
             if !is_control(value) {
@@ -4486,7 +4522,18 @@ impl ChatTemplateState {
                 }
                 continue;
             }
-            if !statement.fixed || unsettled.contains(&statement.name) || source.contains(value) {
+            if !statement.fixed || unsettled.contains(&statement.name) {
+                return Vec::new();
+            }
+            // The source holds the spelling: the template may write it
+            // whole by itself, in its text or in a string literal. In a
+            // comment, or in the pattern a value is built from, it writes
+            // nothing.
+            if source.contains(value)
+                && written
+                    .get_or_insert_with(|| written_text(source, built))
+                    .contains(value)
+            {
                 return Vec::new();
             }
             bindings.push(ControlBinding {
@@ -4519,11 +4566,25 @@ impl ChatTemplateState {
             );
             None
         };
-        // A source that spells a control whole is of the other kind: its
-        // spellings would want the scan of `mark_controls`, which is not
-        // made here.
+        // A template that writes an added token whole by itself is of the
+        // other kind: its spellings would want the scan of `mark_controls`,
+        // which is not made here. The whole source is asked first, and what
+        // the template writes only where the source holds an added token
+        // somewhere: in a comment, or in the pattern a bound spelling is
+        // built from, the template writes none.
         if controls.ranges(source).next().is_some() {
-            return declined("its source spells an added token whole");
+            let bound = |at| {
+                bindings
+                    .iter()
+                    .any(|binding| (binding.span.0..binding.span.1).contains(&at))
+            };
+            if controls
+                .ranges(&written_text(source, bound))
+                .next()
+                .is_some()
+            {
+                return declined("it writes an added token whole by itself");
+            }
         }
         let Some(literals) = with_marked_literals(source, bindings) else {
             return declined("no string literal holds one of the spellings");
