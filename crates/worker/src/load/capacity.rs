@@ -1,7 +1,4 @@
 //! Aggregate backend capacity tracking.
-//!
-//! See `.claude/priority-scheduling/01-worker-capacity-design.md` for the
-//! full design rationale.
 
 use std::sync::{
     atomic::{AtomicU16, AtomicU8, Ordering},
@@ -11,9 +8,9 @@ use std::sync::{
 use futures::FutureExt as _;
 use tokio::sync::watch;
 
-use crate::worker::{
+use crate::{
+    identity::basic::Worker,
     registry::{Generation, WorkerRegistry},
-    Worker,
 };
 
 /// Which precedence tier produced the most recently computed capacity value.
@@ -394,7 +391,7 @@ mod tests {
 
     use std::collections::HashMap;
 
-    use crate::worker::BasicWorkerBuilder;
+    use crate::test_support::BasicWorkerBuilder;
 
     fn worker_with_capacity(url: &str, reported: Option<u16>) -> Arc<dyn Worker> {
         let mut labels = HashMap::new();
@@ -498,10 +495,9 @@ mod tests {
 
     use std::time::Duration;
 
-    use openai_protocol::worker::WorkerStatus;
     use tokio::time::timeout;
 
-    use crate::worker::WorkerRegistry;
+    use crate::{test_support::WorkerRegistry, worker::WorkerStatus};
 
     #[tokio::test]
     async fn test_event_task_recomputes_on_registered() {

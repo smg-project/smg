@@ -1,9 +1,11 @@
 //! What the crate's tests, and the tests of a crate that hosts the runtime,
 //! build their workers with, behind `test-util`: a health-check configuration
 //! that leaves a worker as the test built it, a ready worker, a worker under
-//! its model's aliases, a removed worker and its witness, and the registry
-//! and the builder a test of this crate names ([`WorkerRegistry`] over
-//! [`Members`], [`BasicWorkerBuilder`] with no connector). [`RefusedAddress`]
+//! its model's aliases, a removed worker and its witness, and the registry,
+//! the load monitor and the builder a test of this crate names
+//! ([`WorkerRegistry`] and [`WorkerMonitor`] over [`Members`],
+//! [`BasicWorkerBuilder`] with no connector). [`LoadReaders`] is the routing
+//! side a load monitor's test stands beside it. [`RefusedAddress`]
 //! is the loopback address nothing answers at: a dead worker's port, held for
 //! as long as the test needs it. [`NoEngine`] is an engine connection with no
 //! engine behind it, and [`CountingConnector`] the connector that hands those
@@ -28,6 +30,7 @@ use crate::{
         basic::{ConnectionMode, Worker},
         builder,
     },
+    load::monitor::{self, LoadConsumer},
     model_card::ModelCard,
     registry,
     registry::Generation,
@@ -58,6 +61,27 @@ pub type WorkerRegistry = registry::WorkerRegistry<Members>;
 
 /// The builder a test of this crate names: the one with no connector.
 pub type BasicWorkerBuilder = builder::BasicWorkerBuilder;
+
+/// The load monitor a test of this crate builds, over the same generations.
+pub type WorkerMonitor = monitor::WorkerMonitor<Members>;
+
+/// The routing side a test stands beside the load monitor: it says whether
+/// a reader wants worker loads, and reconciles nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadReaders {
+    /// No reader wants loads, as under a policy that reads none.
+    Blind,
+    /// A reader wants loads, as under a load-aware policy.
+    Aware,
+}
+
+impl LoadConsumer for LoadReaders {
+    fn needs_loads(&self) -> bool {
+        matches!(self, Self::Aware)
+    }
+
+    fn reconcile_in_flight(&self, _worker: &dyn Worker) {}
+}
 
 /// The health checker disabled, everything else default: a test's worker
 /// keeps the state it was built with, with no probe behind it.

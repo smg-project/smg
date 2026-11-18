@@ -22,16 +22,18 @@ axum = ["dep:axum"]
 # label set, the model labels' one set and the handles a record keeps.
 metrics = ["dep:dashmap", "dep:rustc-hash"]
 # The worker's runtime, for the process that hosts the workers: the worker
-# with its builder, its registry, its health and its metric writers, the
-# engine handle, the HTTP client factory and the cache of worker-directed
-# clients, the worker errors, the periodic task and the merge of scraped
-# metrics.
+# with its builder, its registry, its health, its load monitor and its metric
+# writers, the engine handle, the HTTP client factory and the cache of
+# worker-directed clients, the worker errors, the periodic task and the merge
+# of scraped metrics.
 runtime = [
     "metrics",
     "dep:anyhow",
     "dep:arc-swap",
     "dep:async-trait",
     "dep:blake3",
+    "dep:chrono",
+    "dep:futures",
     "dep:metrics",
     "dep:metrics-exporter-prometheus",
     "dep:metrics-util",
@@ -58,7 +60,9 @@ async-trait = { workspace = true, optional = true }
 axum = { workspace = true, optional = true }
 bitflags.workspace = true
 blake3 = { workspace = true, optional = true }
+chrono = { workspace = true, optional = true }
 dashmap = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
 metrics = { version = "0.24.6", optional = true }
 metrics-exporter-prometheus = { version = "0.18.3", default-features = false, optional = true }
 metrics-util = { version = "0.20.4", default-features = false, features = ["registry"], optional = true }
@@ -83,6 +87,7 @@ uuid = { workspace = true, optional = true }
 [dev-dependencies]
 # The test servers speak HTTP/2 to the prior-knowledge clients.
 axum = { workspace = true, features = ["http2"] }
+base64 = "0.23"
 http.workspace = true
 openssl = "0.10.81"
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "sync", "test-util", "time"] }

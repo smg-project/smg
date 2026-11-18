@@ -175,19 +175,19 @@ async fn the_engine_id_read_dials_the_base_address_of_a_rank_row() {
 
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use http::{header::AUTHORIZATION, HeaderMap};
-use openai_protocol::{
-    model_card::ModelCard,
-    worker::{HealthCheckConfig, WorkerStatus},
-};
 
 use super::*;
-use crate::worker::{
+use crate::{
     connection::engine::{EngineConnection, EngineConnector, ZmqLink},
     health::circuit_breaker::CircuitState,
-    identity::builder,
-    test_support::{CountingConnector, RefusedAddress},
-    BasicWorkerBuilder, ConnectionMode, RuntimeType, Worker, WorkerError, WorkerRegistry,
-    WorkerType,
+    identity::{
+        basic::{ConnectionMode, RuntimeType, Worker, WorkerType},
+        builder,
+        error::WorkerError,
+    },
+    model_card::ModelCard,
+    test_support::{BasicWorkerBuilder, CountingConnector, RefusedAddress, WorkerRegistry},
+    worker::{HealthCheckConfig, WorkerStatus},
 };
 
 fn make_worker(url: &str, success_threshold: u32, failure_threshold: u32) -> Arc<dyn Worker> {
@@ -361,7 +361,7 @@ fn labels_follow_the_engine_for_local_self_hosted_workers_only() {
     let zmq_id = registry.register(zmq.clone()).unwrap();
     assert!(labels_follow_the_engine(&registry, &zmq_id, &zmq));
 
-    registry.on_remote_worker_state(&crate::worker::RemoteWorkerState {
+    registry.on_remote_worker_state(&crate::registry::RemoteWorkerState {
         worker_id: "peer-w1".to_string(),
         model_id: "m".to_string(),
         url: "http://remote:1".to_string(),
@@ -803,7 +803,7 @@ async fn manager_loop_promotes_zmq_worker_on_connect_signal() {
 }
 
 fn make_dp_worker(base: &str, rank: usize, size: usize) -> Arc<dyn Worker> {
-    let spec: openai_protocol::worker::WorkerSpec = serde_json::from_value(serde_json::json!({
+    let spec: crate::worker::WorkerSpec = serde_json::from_value(serde_json::json!({
         "url": format!("{base}@{rank}"),
         "dp_base_url": base,
         "dp_rank": rank,
@@ -854,7 +854,7 @@ fn the_probe_slot_follows_the_status_and_the_health_settings() {
 #[tokio::test]
 async fn a_failed_mesh_import_under_removal_keeps_its_probe_slot() {
     let registry = Arc::new(WorkerRegistry::new());
-    registry.on_remote_worker_state(&crate::worker::RemoteWorkerState {
+    registry.on_remote_worker_state(&crate::registry::RemoteWorkerState {
         worker_id: "peer-w1".to_string(),
         model_id: "m".to_string(),
         url: "http://remote:1".to_string(),
@@ -2052,7 +2052,7 @@ fn a_failed_workers_removal_follows_the_scope() {
             .build(),
     );
     let discovered_id = registry.register(discovered).unwrap();
-    registry.on_remote_worker_state(&crate::worker::RemoteWorkerState {
+    registry.on_remote_worker_state(&crate::registry::RemoteWorkerState {
         worker_id: "peer-w1".to_string(),
         model_id: "m".to_string(),
         url: "http://remote:1".to_string(),

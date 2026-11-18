@@ -1,6 +1,6 @@
 //! The recorder of the gateway's minimum-tokens rank: each row is one worker
 //! with its data-parallel ranks, a list of steps and the rank each request
-//! took. A step is what the gateway's rank cache is handed: a poll's answer
+//! took. A step is what the rank cache is handed: a poll's answer
 //! (a row a rank), a poll that failed, the worker's loads dropped as it
 //! leaves the ready set, or a request, which asks the rank cache's select
 //! for a rank and books its estimated tokens on the rank it takes. The
@@ -9,7 +9,7 @@
 //! controller crate replays the rows through its store
 //! (`crates/policy_controller/tests/classic/minimum_tokens.rs`).
 //!
-//! This file is an ignored test of the gateway crate, kept beside the code
+//! This file is an ignored test of the worker crate, kept beside the code
 //! it runs. It records from the checkout it is built in and writes the sheet
 //! under `CLASSIC_ROWS_OUT`, naming `CLASSIC_ROWS_COMMIT` as the commit it
 //! recorded from. The sheets the policy controller crate replays are in
@@ -17,7 +17,7 @@
 //!
 //! ```text
 //! CLASSIC_ROWS_OUT=<dir> CLASSIC_ROWS_COMMIT=<commit> \
-//!   cargo test -p smg --lib worker::load::monitor::classic_minimum_tokens_rows -- --ignored --nocapture
+//!   cargo test -p smg-worker --all-features --lib load::monitor::classic_minimum_tokens_rows -- --ignored --nocapture
 //! ```
 //!
 //! Nothing in a row draws. The recorder runs each row twice, each time from
@@ -25,20 +25,21 @@
 
 use std::{fs, path::PathBuf};
 
-use openai_protocol::{
-    model_card::ModelCard,
-    worker::{HealthCheckConfig, WorkerStatus},
-};
 use serde::Serialize;
 
 use super::*;
-use crate::worker::{test_support::LoadReaders, BasicWorkerBuilder, WorkerRegistry, WorkerType};
+use crate::{
+    identity::basic::WorkerType,
+    model_card::ModelCard,
+    test_support::{BasicWorkerBuilder, LoadReaders, WorkerRegistry},
+    worker::{HealthCheckConfig, WorkerStatus},
+};
 
 const URL: &str = "http://w0:8000";
 const MODEL: &str = "m";
 
 /// One rank's row in a poll's answer: the tokens its cache uses, which is
-/// the count the gateway's rank cache reads, its token capacity, and the
+/// the count the rank cache reads, its token capacity, and the
 /// context tokens of the requests it holds where the rank reports them.
 #[derive(Clone, Copy, Serialize)]
 struct Figures {
@@ -161,7 +162,7 @@ fn answer(ranks: usize, figures: &[Option<Figures>]) -> WorkerLoadResponse {
 }
 
 /// One run of a row from a fresh monitor and a fresh worker: the rank each
-/// request took. Each step reaches the rank cache as the gateway's poll loop
+/// request took. Each step reaches the rank cache as the monitor's poll loop
 /// hands it over, under the worker's own URL, which names its rank where it
 /// stands for one: an answer with no row drops the worker's ranks, or its own
 /// rank where the worker stands for one; an answer with absolute token data

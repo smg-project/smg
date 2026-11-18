@@ -3,17 +3,17 @@ mod worker_load_manager;
 
 use std::collections::HashMap;
 
-use openai_protocol::{
-    model_card::ModelCard,
-    worker::{EngineMemoryMetricsSnapshot, HealthCheckConfig, WorkerStatus},
-};
-
 use super::*;
-use crate::worker::{
+use crate::{
     health::overload::OverloadThresholds,
+    identity::basic::{ConnectionMode, WorkerType},
+    model_card::ModelCard,
     runtime::StallReason,
-    test_support::{ready_worker, render_with_recorder, LoadReaders},
-    BasicWorkerBuilder, ConnectionMode, WorkerMonitor, WorkerRegistry, WorkerType,
+    test_support::{
+        ready_worker, render_with_recorder, BasicWorkerBuilder, LoadReaders, WorkerMonitor,
+        WorkerRegistry,
+    },
+    worker::{EngineMemoryMetricsSnapshot, HealthCheckConfig, WorkerStatus},
 };
 
 /// Build an isolated monitor and registry beside a routing side that reads

@@ -56,10 +56,6 @@ use std::{
 
 use dashmap::DashMap;
 use futures::future;
-use openai_protocol::worker::{
-    LoadRecord, LoadTelemetry, RuntimeType, SchedulerLoadSnapshot, WorkerGroupKey,
-    WorkerLoadResponse, WorkerStatus,
-};
 use parking_lot::{Mutex, RwLock};
 use reqwest::StatusCode;
 use rustc_hash::FxHashMap;
@@ -69,13 +65,19 @@ use tokio::{
 };
 use tracing::{debug, info, warn};
 
-use crate::worker::{
+use crate::{
     health::liveness,
-    identity::endpoint::Endpoint,
+    identity::{
+        basic::{ConnectionMode, Worker},
+        endpoint::Endpoint,
+    },
     load::state::{LoadReceiver, LoadSnapshot, LoadState},
-    metrics::Metrics,
+    metrics::writers::Metrics,
     registry::{event::WorkerEvent, worker_model_ids, Generation, WorkerRegistry},
-    ConnectionMode, Worker,
+    worker::{
+        LoadRecord, LoadTelemetry, RuntimeType, SchedulerLoadSnapshot, WorkerGroupKey,
+        WorkerLoadResponse, WorkerStatus,
+    },
 };
 
 mod scrape;
@@ -659,7 +661,7 @@ impl<G: Generation> WorkerMonitor<G> {
     /// a load-aware or dp-rank policy, the engine-metrics export or overload
     /// protection on a member needs it. The poll tick and the decision to
     /// open a worker's load stream read the same answer.
-    pub(crate) fn loads_wanted(&self, workers: &[Arc<dyn Worker>]) -> bool {
+    pub fn loads_wanted(&self, workers: &[Arc<dyn Worker>]) -> bool {
         if !self.conditional_polling {
             return true;
         }
@@ -892,8 +894,8 @@ impl<G: Generation> WorkerMonitor<G> {
 
     /// `flush_pushed` for a host's tests: the publish of the pushed reports
     /// without the window's wait.
-    #[cfg(test)]
-    pub(crate) fn flush_pushed_for_test(&self) {
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn flush_pushed_for_test(&self) {
         self.flush_pushed();
     }
 
@@ -905,7 +907,7 @@ impl<G: Generation> WorkerMonitor<G> {
 
     /// The current published load snapshot — what routing is acting on, and
     /// what `GET /loads` serves.
-    pub(crate) fn load_snapshot(&self) -> Arc<LoadSnapshot> {
+    pub fn load_snapshot(&self) -> Arc<LoadSnapshot> {
         self.load_state.snapshot()
     }
 
@@ -915,7 +917,7 @@ impl<G: Generation> WorkerMonitor<G> {
     /// `Arc` out of `borrow()` and scan without holding the watch guard.
     /// Stale entries are pruned on each tick of the relevant group and by
     /// the batched eviction flusher.
-    pub(crate) fn subscribe(&self) -> LoadReceiver {
+    pub fn subscribe(&self) -> LoadReceiver {
         self.load_state.subscribe()
     }
 
@@ -971,7 +973,7 @@ impl<G: Generation> WorkerMonitor<G> {
         *self.eviction_flush_task.lock() = Some(flush_handle);
 
         // The liveness sweep: vetoes a worker that stayed silent for the stall
-        // threshold after a transport failure (see `worker::health::liveness::sweep`).
+        // threshold after a transport failure (see `health::liveness::sweep`).
         let monitor = Arc::downgrade(self);
         #[expect(
             clippy::disallowed_methods,
@@ -1589,7 +1591,7 @@ fn group_interval(workers: &[Arc<dyn Worker>], default_interval: Duration) -> Du
 /// strong reference has been dropped. Each iteration upgrades the
 /// `Weak` only for the duration of the work and drops the temporary
 /// `Arc` before the next `recv().await`, so the monitor's `Drop` can
-/// fire as soon as the owning `AppContext` goes away.
+/// fire as soon as its owner, the gateway's `AppContext`, goes away.
 async fn run_event_loop<G: Generation>(
     monitor: Weak<WorkerMonitor<G>>,
     mut events_rx: broadcast::Receiver<WorkerEvent>,
@@ -1973,8 +1975,8 @@ async fn poll_group_once<G: Generation>(
 
 /// `poll_group_once` for a host's tests: one tick over engines the host's own
 /// connector reaches.
-#[cfg(test)]
-pub(crate) async fn poll_group_once_for_test<G: Generation>(
+#[cfg(any(test, feature = "test-util"))]
+pub async fn poll_group_once_for_test<G: Generation>(
     monitor: &Arc<WorkerMonitor<G>>,
     group_key: &WorkerGroupKey,
     interval: Duration,
@@ -1990,15 +1992,12 @@ mod tests;
 mod native_loads_tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use openai_protocol::{
-        model_card::ModelCard,
-        worker::{HealthCheckConfig, OverloadUpdate},
-    };
-
     use super::{tests::PushedRecord, *};
-    use crate::worker::{
-        test_support::LoadReaders, BasicWorkerBuilder, ConnectionMode, WorkerLoadGuard,
-        WorkerMonitor, WorkerRegistry, WorkerType,
+    use crate::{
+        identity::basic::{ConnectionMode, WorkerLoadGuard, WorkerType},
+        model_card::ModelCard,
+        test_support::{BasicWorkerBuilder, LoadReaders, WorkerMonitor, WorkerRegistry},
+        worker::{HealthCheckConfig, OverloadUpdate},
     };
 
     const ENGINE_METRICS: &str = "vllm:num_requests_running{m=\"a\"} 7.0\n\

@@ -2,7 +2,7 @@
 //! and incremented, nothing for a worker it has not seen.
 
 use super::super::*;
-use crate::worker::{BasicWorkerBuilder, WorkerType};
+use crate::{identity::basic::WorkerType, test_support::BasicWorkerBuilder};
 
 #[test]
 fn test_new_dp_load_manager_instance() {
