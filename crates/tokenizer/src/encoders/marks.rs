@@ -133,8 +133,10 @@ const MIDDLE: u8 = 0xB7;
 /// The first place of [`MIDDLE`] in `bytes`, read eight bytes a step: with
 /// every [`MIDDLE`] of a step turned to zero, the step holds a zero byte
 /// exactly when taking one from each byte sets a high bit that was clear.
-/// A prompt holds the byte almost nowhere but in a mark (no ASCII character
-/// has it, and no fullwidth bar of a control spelling), so most steps pass.
+/// No ASCII character holds the byte, and no fullwidth bar of a control
+/// spelling does, so most steps of a Latin-script prompt pass. A letter
+/// that holds it (Greek eta, Cyrillic ze, some CJK characters) stops the
+/// scan for one look at that place.
 fn middle(bytes: &[u8]) -> Option<usize> {
     const ONES: u64 = u64::from_ne_bytes([0x01; 8]);
     const HIGHS: u64 = u64::from_ne_bytes([0x80; 8]);
