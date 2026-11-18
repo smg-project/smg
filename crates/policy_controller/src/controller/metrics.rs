@@ -79,7 +79,9 @@ pub const DECIDE_BUSY_TOTAL: &str = "smg_policy_controller_decide_busy_total";
 /// `pair_side`, `prompt_text`, `decider_gone`, `lease_ids_spent`): the
 /// `Busy` answers with no reason, each under what took its decision. A
 /// lease's lifecycle call that panics as its decider leaves its work is a
-/// `fault` too, and answered no request.
+/// `fault` too, and answered no request. So is one that panics as a decider
+/// gives up an answer its stream refused: that request was decided, and
+/// its answer is counted with the answers no stream took as well.
 pub const DECIDE_NO_DECISION_TOTAL: &str = "smg_policy_controller_decide_no_decision_total";
 /// Decide requests that carried more block hashes than their generation
 /// reads of them: decided over the first ones, the rest hashed for nothing.

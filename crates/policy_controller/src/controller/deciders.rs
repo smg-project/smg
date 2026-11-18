@@ -63,18 +63,22 @@
 //! each issue ends the leases at the head of the store's deadline queue
 //! that no gateway named a dispatch for in time, two at most, and their
 //! engine is told under the turn where its generation still stands. So a
-//! lease whose answer never reached its gateway (a stream that ended, a
-//! full queue, a decision that panicked past its issue) stands until its
-//! deadline and the issues after it, and through a lull until the next
-//! issue: no timer ends one yet. A decision its stream stops at the send
-//! is none of them: the stream hands its lease's release there, as a
-//! session hands a frame's ([`super::decide`]).
+//! lease whose answer never reached its gateway (an answer in the queue
+//! of a stream that then ended, a decision that panicked past its issue)
+//! stands until its deadline and the issues after it, and through a lull
+//! until the next issue: no timer ends one yet. A decision its stream
+//! stops at the send is none of them: the stream hands its lease's
+//! release there, as a session hands a frame's ([`super::decide`]). Nor
+//! is an answer its stream's queue does not take, full or closed: its
+//! decider hands the release where the queue refuses it.
 //!
 //! What a lease does not do yet. A request sent twice under one id is
-//! issued two leases. A stage hears a lease's issue here, its dispatch,
-//! completion and release at its gateway's word and its end at the
-//! dispatch deadline, and not the end of a lease whose gateway was let go:
-//! a document that names a stage in need of the calls stays refused.
+//! issued two leases. A stage hears a lease's issue here, its release
+//! where its decider's last read or its stream's send stops its answer or
+//! its stream's queue refuses it, its dispatch, completion and release at
+//! its gateway's word and its end at the dispatch deadline, and not the
+//! end of a lease whose gateway was let go: a document that names a stage
+//! in need of the calls stays refused.
 //!
 //! A term mints 2^32 - 1 ids, and under every term but the last a leader
 //! leaves before they end. The first answer a term hands over with an id at
@@ -148,7 +152,7 @@ use crate::{
     sessions::SessionVerdict,
     store::{
         leases::DISPATCH_TTL, Ask, AtWork, Built, GatewayId, LeaseRecord, LeaseRefused, LeaseState,
-        MemoryStore, Named, Naming, Picked, SessionsStore, ViewBuffers, World,
+        MemoryStore, Named, Naming, Picked, Said, SessionsStore, ViewBuffers, World,
     },
     view::{
         fingerprint, AffinityFacts, Candidate, Constraints, Phase, PinSource, PoolFacts,
@@ -169,7 +173,7 @@ pub(crate) struct Counts {
     /// `Busy` answers, each at its reason's number on the wire.
     pub(crate) busy: [AtomicU64; 5],
     /// Decisions that panicked, and the lifecycle calls that did as a
-    /// decider left its work.
+    /// decider left its work or gave up an answer its stream refused.
     pub(crate) faults: AtomicU64,
     /// Requests for a side of a pair plan: prefill or decode under either
     /// pair plan, encode under the plan that has an encode side.
@@ -549,18 +553,24 @@ impl Deciding {
                 answers,
             } = job;
             let answer = self.answer(request, gateway, received);
-            let sent = answers.try_send(answer);
-            // The answer is handed over, or dropped with its lease on file:
-            // the word of its term's mark follows it.
+            // An answer its stream does not take is counted, and the lease
+            // it carries is given up: no gateway will name a dispatch for
+            // it. The word of the answer's term's mark follows either way.
+            if let Err(refused) = answers.try_send(answer) {
+                let (dropped, unsent) = match refused {
+                    mpsc::error::TrySendError::Full(unsent) => {
+                        (&self.reads.counts.dropped_full, unsent)
+                    }
+                    mpsc::error::TrySendError::Closed(unsent) => {
+                        (&self.reads.counts.dropped_gone, unsent)
+                    }
+                };
+                dropped.fetch_add(1, Ordering::Relaxed);
+                self.unsent(gateway, unsent);
+            }
             if let Some(term) = self.marked.take() {
                 self.leave_at(term);
             }
-            let dropped = match sent {
-                Ok(()) => continue,
-                Err(mpsc::error::TrySendError::Full(_)) => &self.reads.counts.dropped_full,
-                Err(mpsc::error::TrySendError::Closed(_)) => &self.reads.counts.dropped_gone,
-            };
-            dropped.fetch_add(1, Ordering::Relaxed);
         }
         // The queue's last handle is gone: the work drops here too.
         self.rest();
@@ -568,15 +578,57 @@ impl Deciding {
 
     /// Leaves the decider's work at the leases' file. What was handed
     /// behind its last take is applied here, and the engine's lifecycle
-    /// calls run with it, outside any decision. A call that panics there
-    /// is held as a decision's is: counted with the faults and told once
-    /// a streak, and what it left in the ring is the next take's.
+    /// calls run with it, outside any decision ([`Self::held`]).
     fn rest(&mut self) {
         let Some(leaving) = self.working.take() else {
             return;
         };
-        let Err(payload) = catch_unwind(AssertUnwindSafe(|| drop(leaving))) else {
+        self.held(
+            "a lease's lifecycle call panicked as its decider left its work: what it left is applied at the decider's next take",
+            |_| drop(leaving),
+        );
+    }
+
+    /// Gives up the lease of an answer its stream did not take: the queue
+    /// was full, or the stream had ended. No gateway will name a dispatch
+    /// for it, and it would book its worker to its dispatch deadline. The
+    /// decider hands its release to the leases' file as abandoned, as a
+    /// stream does for a decision it stops at the send, and whoever takes
+    /// the turn next applies it: this decider, before its next decision
+    /// reads a count. A full ring makes the hand apply in place, outside
+    /// any decision ([`Self::held`]). A call that panics there unwinds the
+    /// hand before its frame is in the ring, and that call's own frame is
+    /// out of it: the release is handed once more. A second panic there
+    /// leaves the lease to its dispatch deadline.
+    #[cold]
+    fn unsent(&mut self, gateway: GatewayId, answer: wire::Decided) {
+        let wire::Decided::Decision {
+            lease: Some(leased),
+            ..
+        } = answer
+        else {
             return;
+        };
+        let give_up = |reads: &Reads| {
+            let hand = lifecycle::open(&reads.store, gateway);
+            let abandoned = Said::Released(None, ReleaseReason::Abandoned);
+            reads.store.hand(&hand, leased.lease.id, abandoned);
+        };
+        let line = "a lease's lifecycle call panicked as its decider gave up an answer its stream refused: the give-up is handed again, and what the call left is applied at the decider's next take";
+        if self.held(line, give_up) {
+            self.held(line, give_up);
+        }
+    }
+
+    /// Runs what applies handed frames outside a decision. A lifecycle
+    /// call that panics there is held as a decision's is: counted with the
+    /// faults and written once a streak, as `line`. What it left in the
+    /// ring is the next take's; a frame its caller had not written yet is
+    /// the caller's to hand again. True where a call panicked.
+    fn held(&mut self, line: &'static str, apply: impl FnOnce(&Reads)) -> bool {
+        let reads = &self.reads;
+        let Err(payload) = catch_unwind(AssertUnwindSafe(|| apply(reads))) else {
+            return false;
         };
         // A payload's own drop can panic: the engine's helper frees it
         // under a catch of its own.
@@ -585,10 +637,11 @@ impl Deciding {
         if !self.faulted {
             error!(
                 decider = thread::current().name().unwrap_or_default(),
-                "a lease's lifecycle call panicked as its decider left its work: what it left is applied at the decider's next take"
+                "{line}"
             );
         }
         self.faulted = true;
+        true
     }
 
     /// The word of `term`'s mark: the planned hand-over, so the next take
@@ -2356,6 +2409,174 @@ pub(crate) mod tests {
             .expect("the stage's issue call");
         word.send(()).expect("the stage waits for the case");
         picked(&bed.answer().await);
+    }
+
+    /// An answer its stream's queue does not take carries a lease no
+    /// gateway will name a dispatch for. Its decider hands the release
+    /// where the queue refuses the answer, full or closed: the lease is
+    /// off the file and its stage told, abandoned, before the next
+    /// decision reads a count. An answer the queue took keeps its lease.
+    #[tokio::test]
+    async fn a_lease_whose_answer_no_stream_took_is_given_up_where_it_is_dropped() {
+        let (mut bed, told, at_issue, word) = waiting();
+        let passed = || {
+            at_issue
+                .recv_timeout(PATIENCE)
+                .expect("the stage's issue call");
+            word.send(()).expect("the stage waits for the case");
+        };
+        let job = |bed: &Bed, id: u8, answers: &mpsc::Sender<wire::Decided>| Job {
+            request: checked(frame(id, 1)),
+            gateway: GATEWAY,
+            received: bed.script.taken,
+            answers: answers.clone(),
+        };
+        // A stream whose queue holds one answer and that reads none: the
+        // first answer waits in it, and the second finds it full.
+        let (sender, answers) = mpsc::channel(1);
+        for id in [1, 2] {
+            assert!(bed.deciders.submit(job(&bed, id, &sender)).is_none());
+            passed();
+        }
+        // One decider decides a model's requests in order: it is past the
+        // two when it answers a third, on a queue that is read.
+        assert_eq!(bed.submit(frame(3, 1)), None);
+        passed();
+        picked(&bed.answer().await);
+        let id = |count: u64| 1 << 32 | count;
+        let abandoned = Some(ReleaseReason::Abandoned);
+        let mut heard = vec![
+            (id(1), None),
+            (id(2), None),
+            (id(2), abandoned),
+            (id(3), None),
+        ];
+        assert_eq!(*told.lock(), heard);
+        assert_eq!(bed.store.live(GATEWAY), 2);
+        // The stream ends, and the answer in its queue with it: a fourth
+        // answer finds the queue closed.
+        drop(answers);
+        assert!(bed.deciders.submit(job(&bed, 4, &sender)).is_none());
+        passed();
+        assert_eq!(bed.submit(frame(5, 1)), None);
+        passed();
+        picked(&bed.answer().await);
+        heard.extend([(id(4), None), (id(4), abandoned), (id(5), None)]);
+        assert_eq!(*told.lock(), heard);
+        assert_eq!(bed.store.live(GATEWAY), 3);
+        let dropped = [&bed.counts.dropped_full, &bed.counts.dropped_gone];
+        assert_eq!(dropped.map(|count| count.load(Ordering::Relaxed)), [1, 1]);
+    }
+
+    /// The hand of an unsent answer applies in place where the ring is
+    /// full, outside any decision. A stage's call that panics there is a
+    /// fault as a decision's is: counted, and the decider stands for its
+    /// next request.
+    #[tokio::test]
+    async fn a_stages_panic_at_an_unsent_answers_give_up_is_a_fault_its_decider_outlives() {
+        let (mut bed, told, at_issue, word) = waits(true);
+        let ended = bed.deciders.ended();
+        // A stream that ended: its answer finds the queue closed.
+        let (sender, answers) = mpsc::channel(1);
+        drop(answers);
+        let job = Job {
+            request: checked(frame(1, 1)),
+            gateway: GATEWAY,
+            received: bed.script.taken,
+            answers: sender,
+        };
+        assert!(bed.deciders.submit(job).is_none());
+        at_issue
+            .recv_timeout(PATIENCE)
+            .expect("the stage's issue call");
+        // While the stage's call runs, its gateway gives the lease up and
+        // fills the ring behind that frame: the decider's own hand finds
+        // the ring full and applies in place, where the stage's release
+        // call panics.
+        let id = LeaseId(1 << 32 | 1);
+        let hand = lifecycle::open(&bed.store, GATEWAY);
+        let gone = || Said::Released(None, ReleaseReason::ClientGone);
+        bed.store.hand(&hand, id, gone());
+        for _ in 1..MemoryStore::HANDOVER {
+            bed.store.hand(&hand, LeaseId(0), gone());
+        }
+        word.send(()).expect("the stage waits for the case");
+        let (faults, waited) = (&bed.counts.faults, Instant::now());
+        while faults.load(Ordering::Relaxed) == 0 && !*ended.borrow() {
+            assert!(
+                waited.elapsed() < PATIENCE,
+                "the decider never gave the lease up"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(!*ended.borrow(), "the decider's thread unwound");
+        assert_eq!(faults.load(Ordering::Relaxed), 1);
+        // The lease left the file ahead of the call that panicked.
+        assert_eq!(bed.store.live(GATEWAY), 0);
+        assert_eq!(*told.lock(), [(id.0, None)]);
+        // The decider stands: its next request is decided.
+        assert_eq!(bed.submit(frame(2, 1)), None);
+        at_issue
+            .recv_timeout(PATIENCE)
+            .expect("the stage's issue call");
+        word.send(()).expect("the stage waits for the case");
+        picked(&bed.answer().await);
+    }
+
+    /// A give-up whose hand applies in place and meets another lease's
+    /// panicking call there is handed once more: that call unwound the hand
+    /// before its frame was in the ring. The unsent answer's lease leaves
+    /// the file at the decider's next take.
+    #[tokio::test]
+    async fn a_give_up_behind_another_leases_panic_at_a_full_ring_is_handed_again() {
+        let (mut bed, told, at_issue, word) = waits(true);
+        let ended = bed.deciders.ended();
+        // The first lease: its answer is taken and the lease stays on file.
+        assert_eq!(bed.submit(frame(1, 1)), None);
+        at_issue
+            .recv_timeout(PATIENCE)
+            .expect("the stage's issue call");
+        word.send(()).expect("the stage waits for the case");
+        picked(&bed.answer().await);
+        assert_eq!(bed.store.live(GATEWAY), 1);
+        // The second: a stream that ended, so its answer finds the queue
+        // closed.
+        let (sender, answers) = mpsc::channel(1);
+        drop(answers);
+        let job = Job {
+            request: checked(frame(2, 1)),
+            gateway: GATEWAY,
+            received: bed.script.taken,
+            answers: sender,
+        };
+        assert!(bed.deciders.submit(job).is_none());
+        at_issue
+            .recv_timeout(PATIENCE)
+            .expect("the stage's issue call");
+        // While the stage's call runs, the gateway gives the first lease up
+        // and fills the ring behind that frame.
+        let first = LeaseId(1 << 32 | 1);
+        let hand = lifecycle::open(&bed.store, GATEWAY);
+        let gone = || Said::Released(None, ReleaseReason::ClientGone);
+        bed.store.hand(&hand, first, gone());
+        for _ in 1..MemoryStore::HANDOVER {
+            bed.store.hand(&hand, LeaseId(0), gone());
+        }
+        word.send(()).expect("the stage waits for the case");
+        // Two faults: the first lease's release call, where the give-up's
+        // hand applied in place, and the second lease's own, where the
+        // decider leaves its work and applies the frame handed again.
+        let (faults, waited) = (&bed.counts.faults, Instant::now());
+        while faults.load(Ordering::Relaxed) < 2 && !*ended.borrow() {
+            assert!(
+                waited.elapsed() < PATIENCE,
+                "the give-up was not handed again"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(!*ended.borrow(), "the decider's thread unwound");
+        assert_eq!(bed.store.live(GATEWAY), 0);
+        assert_eq!(*told.lock(), [(first.0, None), (first.0 + 1, None)]);
     }
 
     /// A lease's dispatch span counts from its decision's first read, and
