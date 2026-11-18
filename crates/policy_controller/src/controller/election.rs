@@ -807,7 +807,10 @@ fn report(
 /// term; a holder under a lower term, or one told no term, closes its fence,
 /// releases the lease and holds its takes back. `Some(true)` when this
 /// replica held the lease and left it: a release that failed is tried again
-/// at every step, in place of a renewal. `None` when the elector refused
+/// at every step, in place of a renewal. `Some(false)` when it left none: a
+/// replica that saw the lease released under a term below the highest its
+/// run saw writes that release again under that highest, and a write that
+/// failed is logged and not tried again. `None` when the elector refused
 /// the word, a term that leaves none to take: nothing was counted.
 fn step_down(elector: &mut Elector, above: Option<u64>) -> Option<bool> {
     match elector.step_down(above, Instant::now()) {
