@@ -29,9 +29,9 @@
 //! file system that links: where no link is made, every write is refused
 //! at the link in the system's own words, and nothing of it stays on file.
 //! A write refused after its link removes its name and syncs the directory
-//! again, and says so where that fails: alone the name would run at a
-//! start, and beside the other form's name the two refuse it until that
-//! name leaves.
+//! again, and says which of the two failed. A name that stays may run at a
+//! start, or refuse it beside the other form's name. A name that is gone
+//! where the directory did not sync may come back after a crash.
 //!
 //! A start reads the directory: the highest number is the generation to
 //! run, and a file a write left under its temporary name is removed. Any
@@ -168,19 +168,26 @@ fn backs_out(generation: u64) -> io::Error {
     io::Error::new(io::ErrorKind::AlreadyExists, text)
 }
 
-/// What a write says where its refused generation did not come off file
-/// again: the write's own failure, then the removal's, then what a start
-/// meets. A name left alone runs. `beside` the other form's name the two
-/// refuse the start while that name stands, and this one runs once it is
-/// gone: the other writer may back out next.
-fn stays(generation: u64, failed: &io::Error, left: &io::Error, beside: bool) -> io::Error {
-    let start = if beside {
-        "while the other form's name stands a start is refused by the two, and a start runs it once that name is gone"
-    } else {
-        "a start may run it"
-    };
-    let text =
-        format!("{failed}; generation {generation} was not taken off file again ({left}): {start}");
+/// What a write says where its refused generation's name did not come off
+/// file again: the write's own failure, then the removal's, then what a
+/// start may meet. A start runs the newest generation on file, which this
+/// one may be, and beside the other form's name the two refuse a start.
+fn stays(generation: u64, failed: &io::Error, left: &io::Error) -> io::Error {
+    let text = format!(
+        "{failed}; generation {generation} was not taken off file again ({left}): a start may run it, \
+         and beside the other form's name the two refuse a start"
+    );
+    io::Error::other(text)
+}
+
+/// What a write says where its refused generation's name came off file
+/// again and the directory did not sync after it: the write's own failure,
+/// then the sync's. The name is gone, and a crash may bring it back.
+fn unsynced(generation: u64, failed: &io::Error, left: &io::Error) -> io::Error {
+    let text = format!(
+        "{failed}; generation {generation} was taken off file again, but the directory did not sync \
+         ({left}): a crash may bring its name back"
+    );
     io::Error::other(text)
 }
 
@@ -304,7 +311,7 @@ impl SpecStore {
         self.writes += 1;
         let (id, opened, write) = (process::id(), self.opened, self.writes);
         let writing = self.dir.join(format!("{WRITING}{id}-{opened}-{write}"));
-        let (mut linked, mut beside) = (false, false);
+        let mut linked = false;
         let written = (|| {
             let mut file = fs::OpenOptions::new()
                 .write(true)
@@ -324,7 +331,6 @@ impl SpecStore {
             // form looks for this one after its own link, so one of the two
             // backs out at least: the two never both stay.
             if other.try_exists()? {
-                beside = true;
                 return Err(backs_out(generation));
             }
             sync(&self.dir)
@@ -340,11 +346,15 @@ impl SpecStore {
             return Err(failed);
         }
         // The link may have reached the disk, and a start runs the newest
-        // generation on file: the removal is synced as the link was, and one
-        // that fails is told beside the write's own failure.
-        match fs::remove_file(&name).and_then(|()| sync(&self.dir)) {
+        // generation on file: the removal is synced as the link was. A name
+        // that stays and a removal that did not sync are each told, in its
+        // own words, beside the write's own failure.
+        if let Err(left) = fs::remove_file(&name) {
+            return Err(stays(generation, &failed, &left));
+        }
+        match sync(&self.dir) {
             Ok(()) => Err(failed),
-            Err(left) => Err(stays(generation, &failed, &left, beside)),
+            Err(left) => Err(unsynced(generation, &failed, &left)),
         }
     }
 
@@ -619,7 +629,12 @@ pub(crate) mod tests {
             .split_once("; generation 1 was not taken off file again (")
             .expect("the write's failure, then the removal's");
         assert_eq!(failed, "the directory did not sync");
-        assert!(left.ends_with("): a start may run it"), "{told}");
+        assert!(
+            left.ends_with(
+                "): a start may run it, and beside the other form's name the two refuse a start"
+            ),
+            "{told}"
+        );
         assert_eq!(store.kept(), []);
     }
 
@@ -653,30 +668,26 @@ pub(crate) mod tests {
         assert_eq!(store.kept(), [at(1, YAML)]);
     }
 
-    /// A back-out whose removal does not reach the disk says what a start
-    /// meets: while the other form's name stands the two refuse it, and
-    /// once that name is gone, as where its writer backs out next, this
-    /// one runs.
+    /// A back-out whose name comes off file where the directory does not
+    /// sync after it says that, and not that the name stays: the name is
+    /// gone as the words say, and a crash may bring it back.
     #[cfg(unix)]
     #[test]
-    fn a_back_out_that_stays_on_file_is_told_beside_the_other_name() {
+    fn a_back_out_whose_removal_does_not_sync_is_told_so() {
         let dir = tempfile::tempdir().expect("a temp dir");
         let mut store = SpecStore::open(dir.path().to_owned()).expect("an empty directory");
         symlink(name_of(1, "yaml"), dir.path().join(name_of(1, "json"))).expect("a link");
-        let unsynced = |_: &Path| Err(io::Error::other("the directory did not sync"));
+        let never = |_: &Path| Err(io::Error::other("the directory did not sync"));
         let refused = store
-            .persist_synced(at(1, YAML), b"one", unsynced)
+            .persist_synced(at(1, YAML), b"one", never)
             .expect_err("the other form's name stands");
-        let told = refused.to_string();
-        let (failed, left) = told
-            .split_once("; generation 1 was not taken off file again (")
-            .expect("the back-out, then the removal's failure");
-        assert!(failed.ends_with(": this write backs out"), "{told}");
         assert_eq!(
-            left,
-            "the directory did not sync): while the other form's name stands a start is refused by the two, \
-             and a start runs it once that name is gone"
+            refused.to_string(),
+            "generation 1 was written in the other form as this write was: this write backs out; \
+             generation 1 was taken off file again, but the directory did not sync \
+             (the directory did not sync): a crash may bring its name back"
         );
+        assert_eq!(names(dir.path()), BTreeSet::from([name_of(1, "json")]));
         assert_eq!(store.kept(), []);
     }
 
