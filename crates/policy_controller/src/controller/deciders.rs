@@ -30,28 +30,34 @@
 //!    with it where it states its wires, and the engine of the generation
 //!    those rows were published under;
 //! 5. the engine's decision, told what is left of the budget;
-//! 6. the fence again, and the budget at the same read: a decision whose
-//!    budget ended while it was made leaves as `Busy` under the reason a
-//!    late arrival is told, and under a count of its own ([`Counts`]);
-//! 7. the lease, for a pick that leaves: one a decision, a credit on the
-//!    pick's first target, minted and filed by the store under the term
-//!    both reads showed ([`MemoryStore::issue_decided`]). The engine that
-//!    decided is told of it, and the answer carries it.
+//! 6. the lease, for a pick: one a decision, a credit on the pick's first
+//!    target, minted and filed by the store under the term the first read
+//!    showed, at that read's instant ([`MemoryStore::issue_decided`]). The
+//!    engine that decided is told of it, and the answer carries it;
+//! 7. the fence again, and the budget at the same read, with the answer's
+//!    build alone behind it: a decision whose budget ended while it was
+//!    made, its lease's filing and the stages' hearing of it included,
+//!    leaves as `Busy` under the reason a late arrival is told, and under
+//!    a count of its own ([`Counts`]). The lease of an answer that does
+//!    not leave is given up at once by the door a `Released` frame takes:
+//!    the store first, then the engine told, of a commit that failed
+//!    under a closed fence and of a late decision past the budget.
 //!
 //! A lease is what the next decisions read. The store counts the leases on
 //! file by the worker each books, and a decision whose profile declares
 //! the count ([`crate::Needs::in_flight`]) reads it on each row as the
 //! row's requests in flight: it is made over what the decisions before it
 //! left on file. The file is the one thing every decider writes, under
-//! one lock held for one lease's filing. A lease leaves the file at its
-//! gateway's word (a `Session`'s `Completed` or `Released` frame, the
-//! gateway's own end) or at its dispatch deadline: each issue ends the
-//! leases at the head of the store's deadline queue that no gateway named
-//! a dispatch for in time, two at most, and tells the engine of those its
-//! own generation issued. So a lease whose answer never reached its
-//! gateway (a stream that ended, a full queue, a decision that panicked
-//! past its issue) stands until its deadline and the issues after it, and
-//! through a lull until the next issue: no timer ends one yet.
+//! one lock held for one lease's filing or its giving up. A lease leaves
+//! the file where its answer does not leave (step 7), at its gateway's
+//! word (a `Session`'s `Completed` or `Released` frame, the gateway's own
+//! end) or at its dispatch deadline: each issue ends the leases at the
+//! head of the store's deadline queue that no gateway named a dispatch
+//! for in time, two at most, and tells the engine of those its own
+//! generation issued. So a lease whose answer never reached its gateway
+//! (a stream that ended, a full queue, a decision that panicked past its
+//! issue) stands until its deadline and the issues after it, and through
+//! a lull until the next issue: no timer ends one yet.
 //!
 //! What a lease does not do yet. It books the pick's first target alone: a
 //! dispatch that names another target moves no count. A request sent twice
@@ -458,10 +464,10 @@ impl Decider {
         received: Instant,
     ) -> proto::DecideAnswer {
         // What the claim rests on: a decision does not write the fence, and
-        // writes the store at one place, its lease's issue, whole or not at
-        // all under a lock no panic poisons; the engine closes an open
-        // scope where it unwinds, and the buffers a fault leaves are
-        // dropped whole below.
+        // writes the store at its lease's issue and, where its last read
+        // fails, at that lease's release, each whole or not at all under a
+        // lock no panic poisons; the engine closes an open scope where it
+        // unwinds, and the buffers a fault leaves are dropped whole below.
         let decided = catch_unwind(AssertUnwindSafe(|| {
             self.decide(&request, gateway, received)
         }));
@@ -530,37 +536,50 @@ impl Decider {
                 counts.pair_sides.fetch_add(1, Ordering::Relaxed);
                 return Err(Reason::Unspecified);
             };
-            // The fence, read again where the answer is handed over: it
-            // leaves under the term it was made under, or `Busy` leaves in
-            // its place. The budget is judged at that read too, with no
-            // clock read more: a decision late by this clock since the
-            // receipt is late at its gateway, whose clock started earlier.
-            // It leaves as `Busy` under the reason a late arrival is told,
-            // and under a count of its own.
-            let handed = clock();
-            if fence.leader_term(handed) != Some(term) {
-                return Err(Reason::NotLeader);
-            }
-            if taken.outlasted(handed) {
-                counts.outlasted.fetch_add(1, Ordering::Relaxed);
-                return Err(Reason::BudgetGoneOnArrival);
-            }
-            // The lease, last: a pick is filed only where it leaves, under
-            // the term both reads showed.
+            // The lease, for a pick: filed under the first read's term and
+            // at its instant, and the engine told, before the read that
+            // lets the answer leave. That read judges the store's write
+            // and a stage's call with the build before them.
             let filed = booking
-                .map(|booking| issue(store, world, &taken, (term, handed), &decision, booking));
-            match filed.transpose() {
-                Ok(lease) => Ok((term, decision, lease)),
-                // The term mints no more ids. A pick with no lease is no
-                // answer: its gateway decides it locally.
-                Err(LeaseRefused::Unminted { lease, store }) if lease == store => {
-                    counts.unleased.fetch_add(1, Ordering::Relaxed);
-                    Err(Reason::Unspecified)
-                }
-                // The store stands under another term than the fence
-                // showed: a take or a loss this decision straddled.
-                Err(_) => Err(Reason::NotLeader),
+                .map(|booking| issue(store, world, &taken, term, &decision, booking))
+                .transpose();
+            // The fence, read again where the answer is handed over, with
+            // the answer's build alone behind it: the answer leaves under
+            // the term it was made under, or `Busy` leaves in its place.
+            // The budget is judged at that read too, with no clock read
+            // more: a decision late by this clock since the receipt is
+            // late at its gateway, whose clock started earlier. It leaves
+            // as `Busy` under the reason a late arrival is told, and under
+            // a count of its own.
+            let handed = clock();
+            let failed = if fence.leader_term(handed) != Some(term) {
+                Some((Reason::NotLeader, ReleaseReason::CommitFailed))
+            } else if taken.outlasted(handed) {
+                counts.outlasted.fetch_add(1, Ordering::Relaxed);
+                Some((Reason::BudgetGoneOnArrival, ReleaseReason::LateDecision))
+            } else {
+                None
+            };
+            let Some((busy, ended)) = failed else {
+                return match filed {
+                    Ok(lease) => Ok((term, decision, lease)),
+                    // The term mints no more ids. A pick with no lease is
+                    // no answer: its gateway decides it locally.
+                    Err(LeaseRefused::Unminted { lease, store }) if lease == store => {
+                        counts.unleased.fetch_add(1, Ordering::Relaxed);
+                        Err(Reason::Unspecified)
+                    }
+                    // The store stands under another term than the fence
+                    // showed: a take or a loss this decision straddled.
+                    Err(_) => Err(Reason::NotLeader),
+                };
+            };
+            // The answer does not leave, and the lease filed for it goes
+            // with it.
+            if let Ok(Some(lease)) = filed {
+                give_up(store, world, taken.gateway, &lease, ended);
             }
+            Err(busy)
         })
     }
 }
@@ -713,12 +732,13 @@ struct Booking {
     built: Option<Built>,
 }
 
-/// Issues the lease of a pick that leaves, one a decision: a credit on the
-/// pick's first target, minted and filed by the store under `term`, the
-/// fence's at both of its reads, at `handed`, the hand-over's instant, with
-/// [`DISPATCH_TTL`] for its gateway to name a dispatch. The lease books
-/// the count the decision's own world lays beside its target's row, and
-/// the engine that decided is told of it.
+/// Issues the lease of a pick, one a decision, ahead of the read that lets
+/// its answer leave: a credit on the pick's first target, minted and filed
+/// by the store under `term`, the fence's at the decision's first read, at
+/// that read's instant, from which [`DISPATCH_TTL`] runs for its gateway
+/// to name a dispatch. The lease books the count the decision's own world
+/// lays beside its target's row, and the engine that decided is told of
+/// it.
 ///
 /// # Errors
 ///
@@ -728,7 +748,7 @@ fn issue(
     store: &MemoryStore,
     world: &World,
     taken: &Taken<'_>,
-    (term, handed): (u64, Instant),
+    term: u64,
     decision: &Decision,
     booking: Booking,
 ) -> Result<Lease, LeaseRefused> {
@@ -751,8 +771,8 @@ fn issue(
         target: booking.target,
         decode: None,
         term,
-        issued_at: handed,
-        dispatch_deadline: handed + DISPATCH_TTL,
+        issued_at: taken.now,
+        dispatch_deadline: taken.now + DISPATCH_TTL,
         state: LeaseState::Issued,
     };
     let built = booking.built;
@@ -769,6 +789,23 @@ fn issue(
         }
     }
     Ok(lease)
+}
+
+/// Gives up the lease of a decision whose answer does not leave, by the
+/// door a gateway's `Released` frame takes: the store first, and the
+/// engine that heard the issue told once, where the store held the lease.
+/// A lease the store no longer holds was ended by another hand, and
+/// nothing is told of it here.
+fn give_up(
+    store: &MemoryStore,
+    world: &World,
+    gateway: GatewayId,
+    lease: &Lease,
+    reason: ReleaseReason,
+) {
+    if crate::store::LeasesStore::released(store, gateway, lease.id, None, reason) {
+        world.spec().engine().on_released(lease, reason);
+    }
 }
 
 /// A shed the deciders say in the engine's place, in the shape of the
@@ -1571,6 +1608,127 @@ pub(crate) mod tests {
         ) {
             Random.pick(facts, candidates, kept, scores, band, out);
         }
+    }
+
+    /// [`Told`], whose issue call waits for its case: what falls while a
+    /// stage's own call runs is the case's to say.
+    #[derive(Debug)]
+    struct Waits {
+        told: Told,
+        reached: std_mpsc::SyncSender<()>,
+        go: Arc<Mutex<std_mpsc::Receiver<()>>>,
+    }
+
+    impl Lifecycle for Waits {
+        fn on_decision_issued(&self, lease: &Lease, decision: &Decision) {
+            self.told.on_decision_issued(lease, decision);
+            self.reached.send(()).expect("the case waits for this call");
+            let word = self.go.lock().recv_timeout(PATIENCE);
+            word.expect("the case lets the call go on");
+        }
+
+        fn on_released(&self, lease: &Lease, reason: ReleaseReason) {
+            self.told.on_released(lease, reason);
+        }
+    }
+
+    impl Picker for Waits {
+        fn name(&self) -> &'static str {
+            "waits"
+        }
+
+        fn pick(
+            &self,
+            facts: &RequestFacts<'_>,
+            candidates: &[Candidate],
+            kept: &[u32],
+            scores: &[f32],
+            band: TieBand,
+            out: &mut Targets,
+        ) {
+            Random.pick(facts, candidates, kept, scores, band, out);
+        }
+    }
+
+    /// A leader whose one picker waits inside its issue call: the bed, what
+    /// the engine told the stage of leases, and the case's two ends of the
+    /// wait, the call reached and the word that lets it go on.
+    fn waiting() -> (
+        Bed,
+        Arc<Mutex<Calls>>,
+        std_mpsc::Receiver<()>,
+        std_mpsc::SyncSender<()>,
+    ) {
+        let told = Arc::new(Mutex::new(Vec::new()));
+        let (reached, at_issue) = std_mpsc::sync_channel(1);
+        let (word, go) = std_mpsc::sync_channel(1);
+        let (kept, go) = (Arc::clone(&told), Arc::new(Mutex::new(go)));
+        let mut catalog = Catalog::builtin();
+        catalog
+            .picker("waits", move || {
+                Box::new(Waits {
+                    told: Told(Arc::clone(&kept)),
+                    reached: reached.clone(),
+                    go: Arc::clone(&go),
+                })
+            })
+            .expect("a free name");
+        let mut document = PolicySpec::preset("random").expect("a preset of this build");
+        let profile = document.profiles.get_mut("random");
+        profile.expect("the preset's profile").pick = "waits".into();
+        let digest = document.digest().expect("the document digests");
+        let spec = AppliedSpec::validate_digested(&document, digest, &catalog)
+            .expect("the catalog holds the stage");
+        (bed(Some(spec), true, (2, 8), []), told, at_issue, word)
+    }
+
+    /// The budget is judged behind the lease's issue: what a stage's issue
+    /// call takes is the decision's time too. A decision that call outlasts
+    /// leaves as `Busy`, its lease is off the file, and the engine that
+    /// heard the issue hears the release.
+    #[tokio::test]
+    async fn a_decision_its_stages_issue_call_outlasts_leaves_as_busy_and_gives_its_lease_up() {
+        let (mut bed, told, at_issue, word) = waiting();
+        assert_eq!(bed.submit(frame(1, 1)), None);
+        at_issue
+            .recv_timeout(PATIENCE)
+            .expect("the stage's issue call");
+        assert_eq!(bed.store.live(GATEWAY), 1, "filed before the call");
+        // The call took the budget: the next read of the clock, the
+        // decision's last, shows the hour past it.
+        bed.script.steps.lock().push_back(Step::At(BUDGET));
+        word.send(()).expect("the stage waits for the case");
+        let answer = bed.answer().await;
+        assert_eq!(busy(&answer), Reason::BudgetGoneOnArrival);
+        assert_eq!(bed.counts.outlasted.load(Ordering::Relaxed), 1);
+        assert_eq!(bed.store.live(GATEWAY), 0);
+        let (id, late) = (1 << 32 | 1, Some(ReleaseReason::LateDecision));
+        assert_eq!(*told.lock(), [(id, None), (id, late)]);
+        // Two reads of the clock, as for a decision that leaves.
+        assert_eq!(bed.script.readers.lock().len(), 2);
+    }
+
+    /// The fence is judged behind the lease's issue too: a word that closes
+    /// it while a stage's issue call runs stops the answer, and the lease
+    /// filed for it is given up as a commit that failed.
+    #[tokio::test]
+    async fn a_fence_closed_by_a_word_inside_a_stages_issue_call_stops_the_answer_and_its_lease() {
+        let (mut bed, told, at_issue, word) = waiting();
+        assert_eq!(bed.submit(frame(1, 1)), None);
+        at_issue
+            .recv_timeout(PATIENCE)
+            .expect("the stage's issue call");
+        // The candidate gives the lead up while the call runs. A successor
+        // takes at once on that word: no answer made under the term leaves
+        // after it.
+        assert!(bed.elector.release().expect("the release"));
+        word.send(()).expect("the stage waits for the case");
+        let answer = bed.answer().await;
+        assert_eq!(busy(&answer), Reason::NotLeader);
+        assert_eq!(bed.counts.outlasted.load(Ordering::Relaxed), 0);
+        assert_eq!(bed.store.live(GATEWAY), 0);
+        let (id, failed) = (1 << 32 | 1, Some(ReleaseReason::CommitFailed));
+        assert_eq!(*told.lock(), [(id, None), (id, failed)]);
     }
 
     #[tokio::test]
