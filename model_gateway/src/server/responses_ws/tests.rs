@@ -105,12 +105,14 @@ async fn idle_socket_expires_after_prewarm_and_releases_session() {
                                     },
                                 ),
                             ),
-                            track_response: Arc::new(|| Ok(Box::new(()))),
+                            tracker: InFlightRequestTracker::new(),
                             max_payload_bytes: MAX_MESSAGE_BYTES,
+                            origins: Arc::default(),
+                            connections: Arc::default(),
                         },
                         HeaderMap::new(),
                         None,
-                        None,
+                        "fixture".into(),
                         Duration::from_millis(500),
                     )
                     .await;
@@ -183,7 +185,7 @@ async fn a_stalled_response_body_is_dropped_at_the_read_deadline() {
 
     struct PendingBody(Arc<AtomicBool>);
     impl Stream for PendingBody {
-        type Item = Result<Bytes, std::io::Error>;
+        type Item = Result<Bytes, io::Error>;
         fn poll_next(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
             Poll::Pending
         }
@@ -201,4 +203,26 @@ async fn a_stalled_response_body_is_dropped_at_the_read_deadline() {
     .await;
     assert_eq!(result.unwrap(), Err(ResponseBodyError::Timeout));
     assert!(dropped.load(Ordering::SeqCst));
+}
+
+#[test]
+fn connection_permits_bound_tenants_and_the_listener_and_return_on_drop() {
+    let connections = Arc::new(Connections::default());
+    let mut permits = Vec::new();
+    for _ in 0..MAX_CONNECTIONS_PER_TENANT {
+        permits.push(connections.try_acquire("tenant-a".into()).unwrap());
+    }
+    assert!(connections.try_acquire("tenant-a".into()).is_none());
+    for n in permits.len()..MAX_CONNECTIONS {
+        permits.push(
+            connections
+                .try_acquire(TenantKey::from(format!("tenant-{n}")))
+                .unwrap(),
+        );
+    }
+    assert!(connections.try_acquire("tenant-b".into()).is_none());
+    permits.clear();
+    assert_eq!(connections.0.lock().total, 0);
+    assert!(connections.0.lock().tenants.is_empty());
+    assert!(connections.try_acquire("tenant-a".into()).is_some());
 }

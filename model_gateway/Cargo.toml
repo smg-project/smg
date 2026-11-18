@@ -17,8 +17,6 @@ categories = ["web-programming", "network-programming"]
 
 [features]
 default = ["grpc-client", "jemalloc-stats", "providers"]
-# Experimental transport; disabled in normal builds pending API/security review.
-experimental-responses-websocket = []
 tokenizers-v1 = ["llm-tokenizer/tokenizers-v1"]
 grpc-client = []
 jemalloc-stats = ["tikv-jemallocator/stats", "dep:tikv-jemalloc-ctl"]

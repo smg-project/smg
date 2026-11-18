@@ -1,11 +1,10 @@
 use futures::{SinkExt, StreamExt};
+use tokio::sync::Notify;
 use tokio_tungstenite::{
     connect_async, tungstenite::Message as ClientMessage, MaybeTlsStream, WebSocketStream,
 };
 
 use super::*;
-#[cfg(feature = "experimental-responses-websocket")]
-use crate::observability::inflight_tracker::InFlightRequestTracker;
 
 struct Fixture {
     socket: WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
@@ -18,17 +17,16 @@ impl Drop for Fixture {
         self.server.abort();
     }
 }
-#[cfg(feature = "experimental-responses-websocket")]
 struct NativeFixture {
     fixture: Fixture,
     auth: crate::middleware::AuthConfig,
     tracker: Arc<InFlightRequestTracker>,
     drops: Arc<AtomicUsize>,
+    resume: Arc<Notify>,
     url: String,
     bucket: Arc<crate::middleware::TokenBucket>,
 }
 
-#[cfg(feature = "experimental-responses-websocket")]
 fn admission_state(bucket: Arc<crate::middleware::TokenBucket>) -> Arc<crate::server::AppState> {
     use std::sync::OnceLock;
 
@@ -40,10 +38,9 @@ fn admission_state(bucket: Arc<crate::middleware::TokenBucket>) -> Arc<crate::se
     use crate::{
         app_context::AppContext,
         config::RouterConfig,
-        health::ProbeState,
         policies::PolicyRegistry,
         routers::gateway::Gateway,
-        server::{http_client, AppState},
+        server::{health::ProbeState, http_client, AppState},
         worker::WorkerRegistry,
     };
     let config = RouterConfig::default();
@@ -104,20 +101,16 @@ impl Fixture {
             service: protected
                 .clone()
                 .layer(axum::extract::DefaultBodyLimit::max(512)),
-            track_response: Arc::new(|| Ok(Box::new(()))),
+            tracker: InFlightRequestTracker::new(),
             max_payload_bytes: 512,
+            origins: Arc::default(),
+            connections: Arc::default(),
         };
         let websocket = axum::Router::new()
             .route("/v1/responses", axum::routing::get(upgrade))
             .layer(Extension(dispatch))
+            .layer(Extension(DataPlaneCaller::new("fixture".into())))
             .layer(axum::middleware::from_fn(capture_credential));
-        // The gateway's configured payload cap is outside protected_routes.
-        #[cfg(feature = "experimental-responses-websocket")]
-        let websocket = websocket.layer(
-            crate::middleware::TenantResolutionState::new(&crate::config::RouterConfig::default())
-                .unwrap()
-                .layer(),
-        );
         let app = protected
             .merge(websocket)
             .layer(axum::extract::DefaultBodyLimit::max(512));
@@ -162,17 +155,11 @@ impl Fixture {
         }
     }
 
-    #[cfg(feature = "experimental-responses-websocket")]
-    async fn native() -> NativeFixture {
-        Self::native_with_auth(true).await
-    }
-
-    #[cfg(feature = "experimental-responses-websocket")]
     #[expect(
         clippy::disallowed_methods,
         reason = "Fixture owns and aborts the loopback server in Drop"
     )]
-    async fn native_with_auth(authenticated: bool) -> NativeFixture {
+    async fn native() -> NativeFixture {
         use openai_protocol::validated::ValidatedJson;
         use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
@@ -191,70 +178,75 @@ impl Fixture {
                 key: "fixture-key-b".into(),
             },
         ];
-        let auth = AuthConfig::with_tenant_keys(None, if authenticated { &keys } else { &[] });
+        let auth = AuthConfig::with_tenant_keys(None, &keys);
         let auth_layer = axum::middleware::from_fn_with_state(auth.clone(), auth_middleware);
         let tenant = TenantResolutionState::from_config(&TenantResolutionConfig {
-            trust_tenant_header: authenticated,
+            trust_tenant_header: true,
             tenant_header_name: "x-tenant-id".into(),
         })
         .unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
         let drops = Arc::new(AtomicUsize::new(0));
+        let resume = Arc::new(Notify::new());
         let bucket = Arc::new(crate::middleware::TokenBucket::new(1, 0));
         let admission = admission_state(bucket.clone());
         let counted = calls.clone();
         let dropped = drops.clone();
+        let release = resume.clone();
+        let tracker = InFlightRequestTracker::new();
         struct DropProbe(Arc<AtomicUsize>);
         impl Drop for DropProbe {
             fn drop(&mut self) {
                 self.0.fetch_add(1, Ordering::SeqCst);
             }
         }
-        let protected = axum::Router::new().route("/v1/responses", axum::routing::post(move |Extension(meta): Extension<TenantRequestMeta>, prewarm: Option<Extension<Prewarm>>, ValidatedJson(body): ValidatedJson<ResponsesRequest>| {
+        let protected = axum::Router::new().route("/v1/responses", axum::routing::post(move |Extension(meta): Extension<TenantRequestMeta>, turn: Option<Extension<SocketTurn>>, ValidatedJson(body): ValidatedJson<ResponsesRequest>| {
             let counted = counted.clone();
             let dropped = dropped.clone();
+            let release = release.clone();
             async move {
                 let number = counted.fetch_add(1, Ordering::SeqCst);
-                if prewarm.is_some() { return prewarm_response(body); }
+                if turn.is_some_and(|Extension(turn)| turn.prewarm) { return prewarm_response(body); }
                 if serde_json::to_string(&body.input).unwrap().contains("stall-fixture") {
                     let probe = DropProbe(dropped);
                     let event = json!({"type":"response.output_text.delta","delta":"x".repeat(1024 * 1024)});
                     let frame = axum::body::Bytes::from(format!("data: {event}\n\n"));
                     let stream = futures::stream::unfold((probe, frame), |(probe, frame)| async move {
-                        Some((Ok::<_, std::io::Error>(frame.clone()), (probe, frame)))
+                        Some((Ok::<_, io::Error>(frame.clone()), (probe, frame)))
                     });
                     return Response::builder().header("content-type", "text/event-stream").body(Body::from_stream(stream)).unwrap();
                 }
                 if serde_json::to_string(&body.input).unwrap().contains("wait-fixture") {
                     let probe = DropProbe(dropped);
-                    let pending = futures::stream::unfold(probe, |probe| async move {
-                        futures::future::pending::<Option<(Result<axum::body::Bytes, std::io::Error>, DropProbe)>>().await.map(|(chunk, _)| (chunk, probe))
+                    let pending = futures::stream::once(async move {
+                        let _probe = probe;
+                        release.notified().await;
+                        let event = json!({
+                            "type": "response.completed",
+                            "response": {"id": "resp_wait", "status": "completed", "output": []},
+                        });
+                        Ok::<_, io::Error>(axum::body::Bytes::from(format!("data: {event}\n\n")))
                     });
-                    let first = futures::stream::once(async { Ok::<_, std::io::Error>(axum::body::Bytes::from_static(b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_wait\"}}\n\n")) });
+                    let first = futures::stream::once(async { Ok::<_, io::Error>(axum::body::Bytes::from_static(b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_wait\"}}\n\n")) });
                     return Response::builder().header("content-type", "text/event-stream").body(Body::from_stream(first.chain(pending))).unwrap();
                 }
                 let tenant = meta.tenant_key().as_str().to_owned();
                 let event = json!({"type":"response.completed","response":{"id":format!("resp_native_{number}"),"status":"completed","output":[{"type":"message","id":"msg_fixture","role":"assistant","content":[{"type":"output_text","text":tenant}]}]}});
                 ([("content-type","text/event-stream")], format!("data: {event}\n\n")).into_response()
             }
-        })).layer(crate::middleware::ConcurrencyLimitLayer::new(admission.clone()))
-            .layer(crate::middleware::HttpMetricsLayer::new(InFlightRequestTracker::new()))
-            .layer(axum::middleware::from_fn(tenant_binding_guard))
-        .layer(tenant.clone().layer()).layer(auth_layer.clone()).layer(axum::extract::DefaultBodyLimit::max(4096));
-        let tracker = InFlightRequestTracker::new();
-        let track = tracker.clone();
+        }))
+        .layer(crate::middleware::ConcurrencyLimitLayer::new(admission.clone()))
+        .layer(axum::middleware::from_fn(tenant_binding_guard))
+        .layer(tenant.clone().layer())
+        .layer(auth_layer.clone())
+        .layer(crate::middleware::HttpMetricsLayer::new(tracker.clone()))
+        .layer(axum::extract::DefaultBodyLimit::max(4096));
         let dispatch = Dispatch {
             service: protected.clone(),
-            track_response: Arc::new(move || {
-                let guard = track.track();
-                if track.is_draining() {
-                    return Err(
-                        json!({"type":"error","status":503,"error":{"code":"gateway_draining"}}),
-                    );
-                }
-                Ok(Box::new(guard))
-            }),
+            tracker: tracker.clone(),
             max_payload_bytes: 4096,
+            origins: Arc::default(),
+            connections: Arc::default(),
         };
         let websocket = axum::Router::new()
             .route("/v1/responses", axum::routing::get(upgrade))
@@ -296,13 +288,13 @@ impl Fixture {
             auth,
             tracker,
             drops,
+            resume,
             url,
             bucket,
         }
     }
 }
 
-#[cfg(feature = "experimental-responses-websocket")]
 #[tokio::test]
 async fn native_auth_tenant_scope_rotation_prewarm_and_drain_are_preserved() {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -385,27 +377,38 @@ async fn native_auth_tenant_scope_rotation_prewarm_and_drain_are_preserved() {
     assert!(tracker.wait_for_drain(Duration::from_secs(1)).await);
     fixture.socket = other;
     tracker.begin_drain();
-    let draining = fixture
-        .turn(json!({"type":"response.create","model":"fixture-model","input":"next"}))
-        .await;
-    assert_eq!(draining["status"], 503);
-    assert!(tracker.wait_for_drain(Duration::from_secs(1)).await);
+    let closed = tokio::time::timeout(Duration::from_secs(1), fixture.socket.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(matches!(closed, ClientMessage::Close(Some(frame)) if u16::from(frame.code) == 1012));
+    assert!(tracker.wait_for_shutdown(Duration::from_secs(1)).await);
 }
 
-#[cfg(feature = "experimental-responses-websocket")]
 #[tokio::test]
-async fn an_unauthenticated_caller_keeps_its_peer_based_admission_identity() {
-    let NativeFixture { mut fixture, .. } = Fixture::native_with_auth(false).await;
-    let response = fixture
-        .turn(json!({"type":"response.create","model":"fixture-model","input":"seed"}))
+async fn removing_the_last_key_refuses_new_upgrades_and_existing_turns() {
+    use tokio_tungstenite::tungstenite::Error as WsError;
+    let NativeFixture {
+        mut fixture,
+        auth,
+        tracker,
+        url,
+        ..
+    } = Fixture::native().await;
+    auth.replace(Default::default());
+    let denied = connect_async(url).await.unwrap_err();
+    assert!(matches!(denied, WsError::Http(response) if response.status() == 401));
+    let refusal = fixture
+        .turn(json!({
+            "type": "response.create", "model": "fixture-model", "generate": false, "input": "warm",
+        }))
         .await;
-    assert_eq!(
-        response["response"]["output"][0]["content"][0]["text"],
-        "ip:127.0.0.1"
-    );
+    assert_eq!(refusal["error"]["code"], "websocket_tenant_changed");
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+    assert!(tracker.wait_for_shutdown(Duration::from_secs(1)).await);
 }
 
-#[cfg(feature = "experimental-responses-websocket")]
 #[tokio::test]
 async fn a_reassigned_key_cannot_replay_another_tenants_retained_history() {
     use crate::{config::TenantApiKeyEntry, middleware::AuthConfig};
@@ -485,7 +488,6 @@ fn durable_storage_and_conversation_modes_are_explicitly_unsupported() {
     }
 }
 
-#[cfg(feature = "experimental-responses-websocket")]
 #[tokio::test]
 async fn the_lifetime_limit_cancels_an_active_response_and_clears_its_guard() {
     let NativeFixture {
@@ -535,7 +537,6 @@ async fn the_lifetime_limit_cancels_an_active_response_and_clears_its_guard() {
     assert_eq!(bucket.available_tokens(), 1.0);
 }
 
-#[cfg(feature = "experimental-responses-websocket")]
 #[tokio::test]
 async fn disconnect_drops_the_native_body_and_releases_the_drain_guard() {
     let NativeFixture {
@@ -578,7 +579,6 @@ async fn disconnect_drops_the_native_body_and_releases_the_drain_guard() {
     assert_eq!(bucket.available_tokens(), 1.0);
 }
 
-#[cfg(feature = "experimental-responses-websocket")]
 #[tokio::test]
 async fn a_client_that_stops_reading_releases_the_body_and_guard() {
     let NativeFixture {
@@ -669,4 +669,59 @@ async fn websocket_obeys_the_configured_http_payload_cap() {
         "expanded continuations must preserve the operator's payload limit"
     );
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn drain_allows_an_active_response_to_finish_and_then_closes_the_socket() {
+    let NativeFixture {
+        mut fixture,
+        tracker,
+        resume,
+        bucket,
+        ..
+    } = Fixture::native().await;
+    fixture
+        .socket
+        .send(ClientMessage::Text(
+            json!({"type": "response.create", "model": "fixture-model", "input": "wait-fixture"})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let first = tokio::time::timeout(Duration::from_secs(2), fixture.socket.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap()
+        .into_text()
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&first).unwrap()["type"],
+        "response.created"
+    );
+    assert_eq!(tracker.len(), 1);
+    assert_eq!(bucket.available_tokens(), 0.0);
+    tracker.begin_drain();
+    assert!(!tracker.wait_for_shutdown(Duration::ZERO).await);
+    resume.notify_one();
+    let terminal = tokio::time::timeout(Duration::from_secs(2), fixture.socket.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap()
+        .into_text()
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&terminal).unwrap()["type"],
+        "response.completed"
+    );
+    let close = tokio::time::timeout(Duration::from_secs(2), fixture.socket.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(matches!(close, ClientMessage::Close(Some(frame)) if u16::from(frame.code) == 1012));
+    assert!(tracker.wait_for_shutdown(Duration::from_secs(1)).await);
+    assert_eq!(bucket.available_tokens(), 1.0);
 }

@@ -395,6 +395,7 @@ class RouterArgs:
     # Tracing (otlp_traces_endpoint names the collector)
     enable_trace: bool = False
     # WASM support
+    enable_responses_websocket: bool = False
     enable_wasm: bool = False
     encode_policy: str | None = None  # Specific policy for encode nodes in EPD mode
     encode_selector: dict[str, str] = dataclasses.field(default_factory=dict)
@@ -2221,6 +2222,12 @@ class RouterArgs:
                 " not pre-open. 0 keeps idle connections open until the client"
                 " closes them"
             ),
+        )
+        request_group.add_argument(
+            f"--{prefix}enable-responses-websocket",
+            action="store_true",
+            default=RouterArgs.enable_responses_websocket,
+            help="Enable authenticated GET upgrades on /v1/responses for store:false sessions",
         )
         request_group.add_argument(
             f"--{prefix}max-connections",

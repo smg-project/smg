@@ -197,6 +197,9 @@ pub struct RouterConfig {
     /// bound.
     #[serde(default)]
     pub max_connections: usize,
+    /// Enable authenticated, ephemeral Responses WebSocket sessions.
+    #[serde(default)]
+    pub enable_responses_websocket: bool,
     /// Seconds a request may take: the read of its body overall (`408` past
     /// it), and each attempt at an HTTP worker from its dispatch to its last
     /// message (`504` `call_upstream_timeout` past it; on a stream, the error
@@ -2192,6 +2195,7 @@ impl Default for RouterConfig {
             header_read_timeout_secs: default_header_read_timeout_secs(),
             idle_connection_timeout_secs: default_idle_connection_timeout_secs(),
             max_connections: 0,
+            enable_responses_websocket: false,
             admin_max_connections: 0,
             request_timeout_secs: 1800, // 30 minutes
             grpc_request_timeout_secs: 0,

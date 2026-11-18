@@ -581,6 +581,7 @@ struct Router {
     enable_mesh: bool,
     enable_rl: bool,
     enable_trace: bool,
+    enable_responses_websocket: bool,
     enable_wasm: bool,
     encode_policy: Option<PolicyType>,
     encode_selector: HashMap<String, String>,
@@ -1527,6 +1528,7 @@ impl Router {
             .maybe_tool_call_parser(self.tool_call_parser.as_ref())
             .maybe_mcp_config_path(self.mcp_config_path.as_ref())
             .maybe_storage_hook_wasm_path(self.storage_hook_wasm_path.as_deref())
+            .enable_responses_websocket(self.enable_responses_websocket)
             .enable_wasm(self.enable_wasm)
             .dp_aware(self.dp_aware)
             .engine_metrics(self.engine_metrics)
@@ -1649,6 +1651,7 @@ impl Router {
         enable_mesh = false,
         enable_rl = false,
         enable_trace = false,
+        enable_responses_websocket = false,
         enable_wasm = false,
         encode_policy = None,
         encode_selector = HashMap::new(),
@@ -1876,6 +1879,7 @@ impl Router {
         enable_mesh: bool,
         enable_rl: bool,
         enable_trace: bool,
+        enable_responses_websocket: bool,
         enable_wasm: bool,
         encode_policy: Option<PolicyType>,
         encode_selector: HashMap<String, String>,
@@ -2154,6 +2158,7 @@ impl Router {
             enable_mesh,
             enable_rl,
             enable_trace,
+            enable_responses_websocket,
             enable_wasm,
             encode_policy,
             encode_selector,

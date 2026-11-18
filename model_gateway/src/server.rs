@@ -52,7 +52,6 @@ use tokio::{signal, spawn};
 use tracing::{debug, error, info, warn, Level};
 use wfaas::LoggingSubscriber;
 
-#[cfg(feature = "experimental-responses-websocket")]
 mod responses_ws;
 
 pub mod connection_limit;
@@ -340,14 +339,28 @@ async fn v1_responses(
     headers: HeaderMap,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
     cancel: middleware::scheduler::PreemptionGuard,
-    #[cfg(feature = "experimental-responses-websocket")] prewarm: Option<
-        Extension<responses_ws::Prewarm>,
-    >,
+    socket_turn: Option<Extension<responses_ws::SocketTurn>>,
     ValidatedJson(body): ValidatedJson<ResponsesRequest>,
 ) -> Response {
-    #[cfg(feature = "experimental-responses-websocket")]
-    if prewarm.is_some() {
-        return responses_ws::prewarm_response(body);
+    if let Some(Extension(turn)) = socket_turn {
+        // Check the final body after any WASM rewrite, before it can be stored or routed.
+        if body.store != Some(false)
+            || body.stream != Some(true)
+            || body.background == Some(true)
+            || body.conversation.is_some()
+            || body.previous_response_id.is_some()
+        {
+            return route_error::bad_request(
+                "websocket_request_mode",
+                "Responses WebSockets require a streamed, non-stored request with connection-local history",
+            );
+        }
+        if turn.prewarm {
+            if !state.context.worker_registry.contains_model(&body.model) {
+                return route_error::model_not_found(&body.model);
+            }
+            return responses_ws::prewarm_response(body);
+        }
     }
     let model = body.model.clone();
     cancel
@@ -1337,10 +1350,15 @@ pub fn build_apps(
         .layer(InertLayer(wasm_layer.clone()))
         .layer(InertLayer(serving_auth_layer.clone()))
         .layer(tenant_resolution_state.clone().layer());
-    #[cfg(feature = "experimental-responses-websocket")]
-    let typed_protection = typed_protection.layer(axum::middleware::from_fn(
-        responses_ws::tenant_binding_guard,
-    ));
+    let access_log_fields = middleware::AccessLogFields::from_fields(
+        &app_state.context.router_config.access_log_fields,
+    );
+    let websocket_enabled = app_state.context.router_config.enable_responses_websocket;
+    let typed_protection =
+        typed_protection
+            .layer(InertLayer(websocket_enabled.then(|| {
+                axum::middleware::from_fn(responses_ws::tenant_binding_guard)
+            })));
     let typed_routes = Router::new()
         .route("/v1/responses", post(v1_responses))
         .route("/v1/responses/{response_id}", get(v1_responses_get))
@@ -1430,30 +1448,7 @@ pub fn build_apps(
     // WebSocket and WebRTC routes: auth + admission but no WASM middleware.
     // The hooks filter HTTP requests and responses; a realtime session is
     // upgraded away from HTTP and its frames are not run through modules.
-    let realtime_routes = Router::new();
-    #[cfg(feature = "experimental-responses-websocket")]
-    let realtime_routes = realtime_routes.route(
-        "/v1/responses",
-        get(responses_ws::upgrade).layer(Extension(responses_ws::Dispatch {
-            service: protected_routes
-                .clone()
-                .layer(middleware::RequestBodyLimitLayer::new(max_payload_size))
-                .layer(axum::extract::DefaultBodyLimit::max(max_payload_size))
-                .with_state(app_state.clone()),
-            track_response: Arc::new({
-                let tracker = app_state.context.inflight_tracker.clone();
-                move || {
-                    let guard = tracker.track();
-                    if tracker.is_draining() {
-                        return Err(serde_json::json!({"type":"error","status":503,"error":{"type":"server_error","code":"gateway_draining","message":"Gateway is draining; reconnect to continue."}}));
-                    }
-                    Ok(Box::new(guard) as Box<dyn Send>)
-                }
-            }),
-            max_payload_bytes: max_payload_size,
-        })),
-    );
-    let realtime_routes = realtime_routes
+    let realtime_routes = Router::new()
         .route("/v1/realtime", get(v1_realtime_ws))
         .route("/v1/realtime/calls", post(v1_realtime_webrtc))
         .route_layer(
@@ -1463,10 +1458,36 @@ pub fn build_apps(
                 .layer(InertLayer(priority_admission.clone()))
                 .layer(InertLayer(legacy_limit.clone())),
         );
-
-    #[cfg(feature = "experimental-responses-websocket")]
-    let realtime_routes =
-        realtime_routes.layer(axum::middleware::from_fn(responses_ws::capture_credential));
+    let realtime_routes = if websocket_enabled {
+        let max_payload_bytes = max_payload_size.min(responses_ws::MAX_PAYLOAD_BYTES);
+        let dispatch = responses_ws::Dispatch {
+            // The edge takes ownership of admission and keep-alive duties
+            // from the protected service and holds them on the response body.
+            service: attach_edge_layers(
+                protected_routes.clone(),
+                max_payload_bytes,
+                app_state.context.inflight_tracker.clone(),
+                request_id_headers.clone(),
+                Vec::new(),
+                access_log_fields,
+            )
+            .with_state(app_state.clone()),
+            tracker: app_state.context.inflight_tracker.clone(),
+            max_payload_bytes,
+            origins: cors_allowed_origins.clone().into(),
+            connections: Arc::default(),
+        };
+        let websocket = Router::new().route(
+            "/v1/responses",
+            get(responses_ws::upgrade)
+                .layer(Extension(dispatch))
+                .layer(InertLayer(serving_auth_layer.clone()))
+                .layer(axum::middleware::from_fn(responses_ws::capture_credential)),
+        );
+        realtime_routes.merge(websocket)
+    } else {
+        realtime_routes
+    };
 
     // Multipart upload routes: auth + admission but NO WASM middleware.
     // The WASM OnRequest phase buffers the full body into a `Vec<u8>` subject
@@ -1599,9 +1620,6 @@ pub fn build_apps(
 
     // Each listener's router gets the edge layers; their not-found fallback
     // is what answers 404 for a route that lives on the other listener.
-    let access_log_fields = middleware::AccessLogFields::from_fields(
-        &app_state.context.router_config.access_log_fields,
-    );
     let finish = |app: Router<Arc<AppState>>| {
         attach_edge_layers(
             app,
@@ -2924,8 +2942,8 @@ async fn graceful_shutdown(
     // Phase 2: Drain — wait for in-flight requests to complete
     // Re-check after gating to catch requests that arrived between the
     // snapshot and graceful_shutdown stopping the accept loop.
-    if !inflight_tracker.is_empty() {
-        let drained = inflight_tracker.wait_for_drain(drain_timeout).await;
+    if inflight_tracker.shutdown_pending() {
+        let drained = inflight_tracker.wait_for_shutdown(drain_timeout).await;
         if drained {
             info!("All in-flight requests drained");
         } else {
@@ -3082,7 +3100,7 @@ async fn drain_before_teardown(
     failure: Option<(tokio::time::Instant, bool)>,
     drain: Duration,
 ) {
-    if inflight_tracker.is_empty() {
+    if !inflight_tracker.shutdown_pending() {
         return;
     }
     // With no failure the listeners ended on their own, now, and the drain
@@ -3096,7 +3114,7 @@ async fn drain_before_teardown(
             // with no time left it is given up on here, and said.
             Ok(Some(deadline)) => {
                 let left = deadline.saturating_duration_since(tokio::time::Instant::now());
-                if !inflight_tracker.wait_for_drain(left).await {
+                if !inflight_tracker.wait_for_shutdown(left).await {
                     warn!(
                         remaining = inflight_tracker.len(),
                         "Drain timed out, forcing shutdown with requests still in-flight"
@@ -3111,7 +3129,7 @@ async fn drain_before_teardown(
         // What is left of the drain since the failure; a listener it stopped
         // closed its connections inside the same drain.
         let left = drain.saturating_sub(stopped.elapsed());
-        if !inflight_tracker.wait_for_drain(left).await {
+        if !inflight_tracker.wait_for_shutdown(left).await {
             warn!(
                 remaining = inflight_tracker.len(),
                 "Drain timed out after a listener failed, tearing down with requests still in-flight"

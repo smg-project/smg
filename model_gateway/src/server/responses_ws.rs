@@ -5,7 +5,8 @@
 //! the socket drops its history and any in-flight response body; this never
 //! flushes the inference engine's shared radix/KV cache.
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
+    io::{self, Write},
     net::SocketAddr,
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -24,42 +25,97 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use futures::StreamExt;
-use openai_protocol::responses::ResponsesRequest;
+use openai_protocol::responses::{
+    ResponseStatus, ResponseUsage, ResponsesRequest, ResponsesResponse, ResponsesUsage,
+};
+use parking_lot::Mutex;
 use serde_json::{json, Value};
 use smg_external_router::sse::SseDecoder;
 use tower::ServiceExt;
 
-/// In-process access to the existing protected POST route: authentication,
-/// tenant accounting, admission, validation and cancellation remain native.
-pub(super) type TrackResponse = Arc<dyn Fn() -> Result<Box<dyn Send>, Value> + Send + Sync>;
+use crate::{
+    observability::inflight_tracker::InFlightRequestTracker,
+    routers::error as route_error,
+    tenant::{DataPlaneCaller, TenantKey},
+};
+
+/// The protected POST service and limits shared by this listener's sessions.
 #[derive(Clone)]
 pub(super) struct Dispatch {
     pub(super) service: axum::Router,
-    pub(super) track_response: TrackResponse,
+    pub(super) tracker: Arc<InFlightRequestTracker>,
     pub(super) max_payload_bytes: usize,
+    pub(super) origins: Arc<[String]>,
+    pub(super) connections: Arc<Connections>,
 }
 
-/// An internal request extension; a network caller cannot supply this marker.
+/// Marks a socket turn after it is expanded to a normal POST request.
 #[derive(Clone)]
-pub(super) struct Prewarm;
+pub(super) struct SocketTurn {
+    tenant: TenantKey,
+    pub(super) prewarm: bool,
+}
 
-#[derive(Clone)]
-struct ConnectionTenant(String);
+#[derive(Default)]
+pub(super) struct Connections(Mutex<ConnectionCounts>);
+
+#[derive(Default)]
+struct ConnectionCounts {
+    total: usize,
+    tenants: HashMap<TenantKey, usize>,
+}
+
+impl Connections {
+    fn try_acquire(self: &Arc<Self>, tenant: TenantKey) -> Option<ConnectionPermit> {
+        let mut counts = self.0.lock();
+        if counts.total >= MAX_CONNECTIONS {
+            return None;
+        }
+        let count = counts.tenants.entry(tenant.clone()).or_default();
+        if *count >= MAX_CONNECTIONS_PER_TENANT {
+            return None;
+        }
+        *count += 1;
+        counts.total += 1;
+        Some(ConnectionPermit {
+            connections: self.clone(),
+            tenant,
+        })
+    }
+}
+
+struct ConnectionPermit {
+    connections: Arc<Connections>,
+    tenant: TenantKey,
+}
+
+impl Drop for ConnectionPermit {
+    fn drop(&mut self) {
+        let mut counts = self.connections.0.lock();
+        if let Some(count) = counts.tenants.get_mut(&self.tenant) {
+            *count -= 1;
+            if *count == 0 {
+                counts.tenants.remove(&self.tenant);
+            }
+        }
+        counts.total -= 1;
+    }
+}
+
 #[derive(Clone)]
 struct TenantChanged;
 
 /// Bound histories cannot change tenants when a serving key is reassigned.
 /// This runs after authentication/tenant resolution, before admission.
-#[cfg(feature = "experimental-responses-websocket")]
 pub(super) async fn tenant_binding_guard(
     request: Request<Body>,
     next: axum::middleware::Next,
 ) -> Response {
-    if let Some(expected) = request.extensions().get::<ConnectionTenant>() {
+    if let Some(expected) = request.extensions().get::<SocketTurn>() {
         let matches = request
             .extensions()
-            .get::<crate::middleware::TenantRequestMeta>()
-            .is_some_and(|current| current.tenant_key().as_str() == expected.0);
+            .get::<DataPlaneCaller>()
+            .is_some_and(|current| current.tenant_key() == &expected.tenant);
         if !matches {
             let mut response = (
                 StatusCode::FORBIDDEN,
@@ -81,27 +137,34 @@ pub(super) async fn tenant_binding_guard(
 /// Called by the normal POST handler after auth, tenant resolution, admission,
 /// body limits and typed validation. No generation or durable storage is done.
 pub(super) fn prewarm_response(request: ResponsesRequest) -> Response {
-    axum::Json(json!({
-        "id": format!("resp_{}", uuid::Uuid::now_v7().simple()),
-        "object": "response",
-        "created_at": chrono::Utc::now().timestamp(),
-        "status": "completed",
-        "model": request.model,
-        "output": [],
-        "store": false,
-        "error": null,
-        "incomplete_details": null,
-        "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+    let response = ResponsesResponse::builder(
+        format!("resp_{}", uuid::Uuid::now_v7().simple()),
+        &request.model,
+    )
+    .copy_from_request(&request)
+    .status(ResponseStatus::Completed)
+    .completed_at(chrono::Utc::now().timestamp())
+    .store(false)
+    .usage(ResponsesUsage::Modern(ResponseUsage {
+        input_tokens: 0,
+        output_tokens: 0,
+        total_tokens: 0,
+        input_tokens_details: Default::default(),
+        output_tokens_details: Default::default(),
     }))
-    .into_response()
+    .build();
+    axum::Json(response).into_response()
 }
 
 #[cfg(test)]
 const MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
-const MAX_EVENT_BYTES: usize = 16 * 1024 * 1024;
-const MAX_CACHE_BYTES: usize = 32 * 1024 * 1024;
+pub(super) const MAX_PAYLOAD_BYTES: usize = 4 * 1024 * 1024;
+const MAX_CONNECTIONS: usize = 32;
+const MAX_CONNECTIONS_PER_TENANT: usize = 4;
+const MAX_EVENT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_CACHE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_CACHE_ENTRIES: usize = 4;
-const GLOBAL_CACHE_BYTES: usize = 256 * 1024 * 1024;
+const GLOBAL_CACHE_BYTES: usize = 128 * 1024 * 1024;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(900);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(15);
 const RESPONSE_READ_TIMEOUT: Duration = Duration::from_secs(15);
@@ -162,16 +225,11 @@ impl SessionCache {
     fn remember(&mut self, id: String, input: Vec<Value>, output: Vec<Value>) {
         // Retention is charged in logical bytes (3x serialized JSON), not RSS.
         // Frame and HTTP body limits bound individual incoming requests.
-        let bytes = match serde_json::to_vec(&(&input, &output))
-            .ok()
-            .and_then(|v| v.len().checked_mul(3))
-        {
-            Some(bytes) if bytes <= MAX_CACHE_BYTES => bytes,
-            _ => {
-                self.clear();
-                return;
-            }
-        };
+        let mut count = JsonLimit::new(io::sink(), MAX_CACHE_BYTES / 3);
+        if serde_json::to_writer(&mut count, &(&input, &output)).is_err() {
+            return;
+        }
+        let bytes = count.written * 3;
         while !self.entries.is_empty()
             && (self.entries.len() >= MAX_CACHE_ENTRIES || self.bytes + bytes > MAX_CACHE_BYTES)
         {
@@ -201,6 +259,41 @@ impl SessionCache {
         }
     }
 }
+/// Stops encoding at the byte budget. The POST retains the bytes and the
+/// history charge counts them without allocating another copy of the JSON.
+struct JsonLimit<W> {
+    writer: W,
+    written: usize,
+    limit: usize,
+}
+
+impl<W> JsonLimit<W> {
+    fn new(writer: W, limit: usize) -> Self {
+        Self {
+            writer,
+            written: 0,
+            limit,
+        }
+    }
+}
+
+impl<W: Write> Write for JsonLimit<W> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.len() > self.limit - self.written {
+            return Err(io::Error::other(
+                "Responses WebSocket JSON exceeds its byte limit",
+            ));
+        }
+        let written = self.writer.write(bytes)?;
+        self.written += written;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.writer.flush()
+    }
+}
+
 fn error(code: &str, message: &str, param: Option<&str>) -> Value {
     json!({
         "type": "error",
@@ -430,24 +523,64 @@ pub(super) async fn upgrade(
     mut headers: HeaderMap,
     Extension(dispatch): Extension<Dispatch>,
     Extension(credential): Extension<UpgradeCredential>,
-    #[cfg(feature = "experimental-responses-websocket")] Extension(tenant): Extension<
-        crate::middleware::TenantRequestMeta,
-    >,
+    caller: Option<Extension<DataPlaneCaller>>,
     upgrade: WebSocketUpgrade,
 ) -> Response {
+    let Some(Extension(caller)) = caller else {
+        let mut response = route_error::create_error(
+            StatusCode::UNAUTHORIZED,
+            "websocket_auth_required",
+            "Responses WebSockets require a gateway API key",
+        );
+        response
+            .headers_mut()
+            .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+        return response;
+    };
+    // Browsers may only upgrade from a single, explicitly allowed Origin.
+    let mut origins = headers.get_all(header::ORIGIN).iter();
+    if let Some(origin) = origins.next() {
+        let allowed = origin.to_str().is_ok_and(|origin| {
+            origin != "null"
+                && dispatch
+                    .origins
+                    .iter()
+                    .any(|allowed| allowed != "*" && allowed == origin)
+        });
+        if !allowed || origins.next().is_some() {
+            return route_error::create_error(
+                StatusCode::FORBIDDEN,
+                "websocket_origin_forbidden",
+                "WebSocket Origin is not allowed",
+            );
+        }
+    }
+    let tenant = caller.tenant_key().clone();
+    let Some(permit) = dispatch.connections.try_acquire(tenant.clone()) else {
+        let mut response = route_error::create_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "websocket_connections_exhausted",
+            "Responses WebSocket connection limit reached",
+        );
+        response
+            .headers_mut()
+            .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+        return response;
+    };
+    let upgrade_guard = dispatch.tracker.track_upgrade();
+    if dispatch.tracker.is_draining() {
+        return route_error::service_unavailable("gateway_draining", "Gateway is draining");
+    }
     if let Some(credential) = credential.0 {
         headers.insert(header::AUTHORIZATION, credential);
     }
     let peer = credential.1;
-    #[cfg(feature = "experimental-responses-websocket")]
-    let bound_tenant = Some(tenant.tenant_key().as_str().to_owned());
-    #[cfg(not(feature = "experimental-responses-websocket"))]
-    let bound_tenant = None;
     upgrade
         .max_message_size(dispatch.max_payload_bytes)
         .max_frame_size(dispatch.max_payload_bytes)
-        .on_upgrade(move |socket| {
-            serve(socket, dispatch, headers, peer, bound_tenant, IDLE_TIMEOUT)
+        .on_upgrade(move |socket| async move {
+            let _guards = (upgrade_guard, permit);
+            serve(socket, dispatch, headers, peer, tenant, IDLE_TIMEOUT).await;
         })
         .into_response()
 }
@@ -475,14 +608,25 @@ async fn serve(
     dispatch: Dispatch,
     headers: HeaderMap,
     peer: Option<SocketAddr>,
-    bound_tenant: Option<String>,
+    tenant: TenantKey,
     idle_timeout: Duration,
 ) {
     let mut cache = SessionCache::default();
     let expires = tokio::time::Instant::now() + CONNECTION_LIFETIME;
     loop {
         let deadline = expires.min(tokio::time::Instant::now() + idle_timeout);
-        let message = match tokio::time::timeout_at(deadline, socket.recv()).await {
+        let incoming = tokio::select! {
+            biased;
+            () = dispatch.tracker.draining() => {
+                let _ = write_message(&mut socket, Message::Close(Some(CloseFrame {
+                    code: 1012,
+                    reason: "Gateway is draining".into(),
+                }))).await;
+                return;
+            }
+            incoming = tokio::time::timeout_at(deadline, socket.recv()) => incoming,
+        };
+        let message = match incoming {
             Ok(Some(Ok(Message::Text(text)))) => text,
             Ok(Some(Ok(Message::Ping(bytes)))) => {
                 if !write_message(&mut socket, Message::Pong(bytes)).await {
@@ -521,7 +665,7 @@ async fn serve(
                 continue;
             }
         };
-        let prepared = match prepare(value, &mut cache) {
+        let mut prepared = match prepare(value, &mut cache) {
             Ok(prepared) => prepared,
             Err(error) => {
                 if !send(&mut socket, &error).await {
@@ -530,16 +674,38 @@ async fn serve(
                 continue;
             }
         };
-        // Count each logical response, including its streaming body, in the
-        // server's existing drain tracker. A closed socket drops this guard.
-        let _active = match (dispatch.track_response)() {
-            Ok(active) => active,
-            Err(error) => {
-                let _ = send(&mut socket, &error).await;
+        // The protected service's edge tracks the response body. The upgrade
+        // guard keeps shutdown waiting while a turn enters that service.
+        if dispatch.tracker.is_draining() {
+            let _ = write_message(
+                &mut socket,
+                Message::Close(Some(CloseFrame {
+                    code: 1012,
+                    reason: "Gateway is draining".into(),
+                })),
+            )
+            .await;
+            return;
+        }
+        let mut payload = JsonLimit::new(Vec::new(), dispatch.max_payload_bytes);
+        if serde_json::to_writer(&mut payload, &prepared.body).is_err() {
+            let refusal = json!({
+                "type": "error",
+                "status": 413,
+                "error": {
+                    "type": "invalid_request_error",
+                    "code": "request_body_too_large",
+                    "message": "Expanded Responses request exceeds the WebSocket payload limit",
+                },
+            });
+            if !send(&mut socket, &refusal).await {
                 return;
             }
-        };
-        let mut body = Request::new(Body::from(prepared.body.to_string()));
+            continue;
+        }
+        drop(prepared.body);
+        drop(message);
+        let mut body = Request::new(Body::from(payload.writer));
         *body.method_mut() = Method::POST;
         *body.uri_mut() = Uri::from_static("/v1/responses");
         *body.headers_mut() = headers.clone();
@@ -547,10 +713,10 @@ async fn serve(
             body.extensions_mut()
                 .insert(axum::extract::ConnectInfo(peer));
         }
-        if let Some(tenant) = &bound_tenant {
-            body.extensions_mut()
-                .insert(ConnectionTenant(tenant.clone()));
-        }
+        body.extensions_mut().insert(SocketTurn {
+            tenant: tenant.clone(),
+            prewarm: !prepared.generate,
+        });
         for name in [
             "host",
             "connection",
@@ -568,9 +734,6 @@ async fn serve(
         body.headers_mut()
             .insert("content-type", HeaderValue::from_static("application/json"));
         axum::extract::DefaultBodyLimit::max(dispatch.max_payload_bytes).apply(&mut body);
-        if !prepared.generate {
-            body.extensions_mut().insert(Prewarm);
-        }
         metrics::counter!("smg_responses_ws_requests_total").increment(1);
         // Invoke the real protected POST service in process. No extra network
         // hop, alternative tokenizer, parser, routing or generation path.
@@ -637,6 +800,8 @@ async fn serve(
             let id = id.to_owned();
             let mut created = response.clone();
             created["status"] = json!("in_progress");
+            created["completed_at"] = Value::Null;
+            created["usage"] = Value::Null;
             if !send(
                 &mut socket,
                 &json!({"type":"response.created","sequence_number":0,"response":created}),
@@ -693,11 +858,11 @@ async fn serve(
                                 }
                                 let response = &event["response"];
                                 if let (Some(id), Some(output)) = (response["id"].as_str(), response["output"].as_array()) {
-                                    cache.remember(id.to_owned(), prepared.input.clone(), output.clone());
+                                    cache.remember(id.to_owned(), std::mem::take(&mut prepared.input), output.clone());
                                 }
                                 complete = true;
                             }
-                            Some("response.failed") => complete = true,
+                            Some("response.failed" | "response.cancelled" | "error") => complete = true,
                             _ => {}
                         }
                         if !send(&mut socket, &event).await { return; }

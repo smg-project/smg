@@ -9,6 +9,7 @@ use std::{
 use dashmap::DashMap;
 use serde::Serialize;
 use tokio::sync::Notify;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::{
@@ -33,8 +34,9 @@ pub struct InFlightRequestTracker {
     count: AtomicUsize,
     next_id: AtomicU64,
     sampler: OnceLock<PeriodicTask>,
-    /// Monotonic flag: false → true. Never reset.
     draining: AtomicBool,
+    drain_signal: CancellationToken,
+    upgraded: AtomicUsize,
     /// Signaled when requests drain to zero during shutdown.
     drain_complete: Notify,
 }
@@ -48,6 +50,8 @@ impl InFlightRequestTracker {
             next_id: AtomicU64::new(0),
             sampler: OnceLock::new(),
             draining: AtomicBool::new(false),
+            drain_signal: CancellationToken::new(),
+            upgraded: AtomicUsize::new(0),
             drain_complete: Notify::new(),
         })
     }
@@ -107,6 +111,7 @@ impl InFlightRequestTracker {
     /// Begin graceful shutdown: mark as draining. Idempotent.
     pub fn begin_drain(&self) {
         self.draining.store(true, Ordering::Release);
+        self.drain_signal.cancel();
     }
 
     /// Returns `true` if drain has been initiated.
@@ -115,11 +120,34 @@ impl InFlightRequestTracker {
         self.draining.load(Ordering::Acquire)
     }
 
+    pub(crate) async fn draining(&self) {
+        self.drain_signal.cancelled().await;
+    }
+
+    /// Upgraded sessions keep the shutdown alive through their close frames.
+    /// They are tracked separately from requests and worker-drain snapshots.
+    pub(crate) fn track_upgrade(self: &Arc<Self>) -> UpgradeGuard {
+        self.upgraded.fetch_add(1, Ordering::AcqRel);
+        UpgradeGuard(self.clone())
+    }
+
+    pub(crate) fn shutdown_pending(&self) -> bool {
+        !self.is_empty() || self.upgraded.load(Ordering::Acquire) != 0
+    }
+
+    pub(crate) async fn wait_for_shutdown(&self, timeout: Duration) -> bool {
+        self.wait_until(timeout, || !self.shutdown_pending()).await
+    }
+
     /// Wait until all in-flight requests complete, or until `max_timeout` elapses.
     ///
     /// Returns `true` if all requests drained, `false` if timed out.
     pub async fn wait_for_drain(&self, max_timeout: Duration) -> bool {
-        if self.is_empty() {
+        self.wait_until(max_timeout, || self.is_empty()).await
+    }
+
+    async fn wait_until(&self, max_timeout: Duration, done: impl Fn() -> bool) -> bool {
+        if done() {
             return true;
         }
         tokio::time::timeout(max_timeout, async {
@@ -127,7 +155,7 @@ impl InFlightRequestTracker {
                 // Create the notified future BEFORE checking the condition
                 // to avoid TOCTOU race where a guard drops between check and wait.
                 let notified = self.drain_complete.notified();
-                if self.is_empty() {
+                if done() {
                     return;
                 }
                 notified.await;
@@ -170,6 +198,16 @@ impl InFlightRequestTracker {
 pub struct InFlightSnapshot {
     pub instance_id: Uuid,
     pub request_ids: Vec<u64>,
+}
+
+pub(crate) struct UpgradeGuard(Arc<InFlightRequestTracker>);
+
+impl Drop for UpgradeGuard {
+    fn drop(&mut self) {
+        if self.0.upgraded.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.0.drain_complete.notify_waiters();
+        }
+    }
 }
 
 pub struct InFlightGuard {

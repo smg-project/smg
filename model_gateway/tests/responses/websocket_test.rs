@@ -1,6 +1,7 @@
 //! The experimental transport must reuse production Responses routing.
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
+use axum::{body::Body, http::Request};
 use futures::{SinkExt, StreamExt};
 use openai_protocol::{model_card::ModelCard, worker::HealthCheckConfig};
 use serde_json::{json, Value};
@@ -18,6 +19,7 @@ use tokio_tungstenite::{
     connect_async,
     tungstenite::{client::IntoClientRequest, Error as WsError, Message},
 };
+use tower::ServiceExt;
 
 struct Servers(Vec<AbortHandle>);
 impl Drop for Servers {
@@ -59,7 +61,9 @@ async fn native_responses_websocket_uses_auth_validation_and_grpc_tool_pipeline(
     config.health_check.disable_health_check = true;
     config.tool_call_parser = Some("qwen".into());
     config.api_key = Some("fixture-key".into());
+    config.enable_responses_websocket = true;
     config.max_concurrent_requests = 1;
+    config.cors_allowed_origins = vec!["https://allowed.example".into()];
     let tokenizer = Arc::new(ScriptedTokenizer::new(
         r#"<tool_call>{"name":"echo","arguments":{"message":"fixture"}}</tool_call>"#,
     ));
@@ -80,6 +84,7 @@ async fn native_responses_websocket_uses_auth_validation_and_grpc_tool_pipeline(
         ))
         .unwrap();
     let router = RouterFactory::create_router(&context).await.unwrap();
+    let tracker = context.inflight_tracker.clone();
     let app = create_test_app_with_context(router.into(), context);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -95,11 +100,44 @@ async fn native_responses_websocket_uses_auth_validation_and_grpc_tool_pipeline(
     let url = format!("ws://{address}/v1/responses");
     let denied = connect_async(&url).await.unwrap_err();
     assert!(matches!(denied, WsError::Http(response) if response.status() == 401));
-    let mut upgrade = url.into_client_request().unwrap();
+    let mut denied_origin = url.as_str().into_client_request().unwrap();
+    denied_origin
+        .headers_mut()
+        .insert("authorization", "Bearer fixture-key".parse().unwrap());
+    denied_origin
+        .headers_mut()
+        .insert("origin", "https://unlisted.example".parse().unwrap());
+    let denied_origin = connect_async(denied_origin).await.unwrap_err();
+    assert!(matches!(denied_origin, WsError::Http(response) if response.status() == 403));
+    let mut upgrade = url.as_str().into_client_request().unwrap();
     upgrade
         .headers_mut()
         .insert("authorization", "Bearer fixture-key".parse().unwrap());
+    upgrade
+        .headers_mut()
+        .insert("origin", "https://allowed.example".parse().unwrap());
     let (mut socket, _) = connect_async(upgrade).await.unwrap();
+    socket
+        .send(Message::Text(
+            json!({
+                "type": "response.create", "model": "missing", "generate": false, "input": "fixture",
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    let refusal = timeout(Duration::from_secs(3), socket.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap()
+        .into_text()
+        .unwrap();
+    let refusal: Value = serde_json::from_str(&refusal).unwrap();
+    assert_eq!(refusal["status"], 404);
+    assert_eq!(refusal["error"]["code"], "model_not_found");
+    assert!(requests.lock().unwrap().is_empty());
     socket
         .send(Message::Text(
             json!({"type":"response.create","model":MODEL,"store":null,"input":"fixture input"})
@@ -154,6 +192,16 @@ async fn native_responses_websocket_uses_auth_validation_and_grpc_tool_pipeline(
         assert_eq!(terminal["type"], "response.completed", "{terminal}");
         parent = terminal["response"]["id"].clone();
         if turn == 0 {
+            assert_eq!(terminal["response"]["store"], false);
+            assert_eq!(terminal["response"]["usage"]["total_tokens"], 0);
+            assert_eq!(
+                terminal["response"]["usage"]["input_tokens_details"]["cached_tokens"],
+                0
+            );
+            let tool = &terminal["response"]["tools"][0];
+            assert_eq!(tool["type"], "function");
+            assert_eq!(tool["name"], "echo");
+            assert_eq!(tool["parameters"], tools[0]["parameters"]);
             assert!(terminal["response"]["output"]
                 .as_array()
                 .unwrap()
@@ -175,5 +223,30 @@ async fn native_responses_websocket_uses_auth_validation_and_grpc_tool_pipeline(
         }
     }
     assert_eq!(requests.lock().unwrap().len(), 2);
-    socket.close(None).await.unwrap();
+    assert!(tracker.is_empty());
+    tracker.begin_drain();
+    let close = timeout(Duration::from_secs(3), socket.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(matches!(close, Message::Close(Some(frame)) if u16::from(frame.code) == 1012));
+}
+
+#[tokio::test]
+async fn responses_get_is_disabled_by_default() {
+    let config = RouterConfig::default();
+    let context = smg_test_harness::test_app::create_test_app_context_with_config(&config).await;
+    let router = RouterFactory::create_router(&context).await.unwrap();
+    let app = create_test_app_with_context(router.into(), context);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/responses")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 405);
 }

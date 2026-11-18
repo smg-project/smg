@@ -113,6 +113,34 @@ Full documentation lives at **[lightseek.org/smg](https://lightseek.org/smg/)**.
 | [API Reference](https://lightseek.org/smg/reference/api/openai) | OpenAI-compatible endpoints |
 | [Kubernetes Setup](https://lightseek.org/smg/getting-started/service-discovery) | In-cluster discovery and production setup |
 
+### Responses WebSockets
+
+Set `--enable-responses-websocket` on the gateway to enable authenticated
+`GET /v1/responses` upgrades. The Python launcher accepts the same flag, and
+`RouterArgs(enable_responses_websocket=True)` enables it when embedding the
+gateway. For the Helm chart, pass the flag in `router.extraArgs`.
+
+Send a gateway API key as `Authorization: Bearer <key>`. If an upgrade sends an
+`Origin` header, that origin must appear explicitly in the gateway's CORS
+allowlist. The wildcard does not permit browser upgrades. Use TLS at the
+gateway or at a trusted proxy.
+
+A session handles one `response.create` at a time. Set `store: false` or omit
+`store`. `previous_response_id` refers to a recent response on the same socket.
+After reconnecting or losing an entry to eviction, resend the full input.
+`generate: false` accepts context for a registered model and returns a typed
+response without calling a worker. Background responses, conversation-backed
+requests, and multiplexed `stream_id` requests are refused.
+
+A listener accepts up to 32 Responses sockets, with up to four per authenticated
+tenant. A frame or expanded request is limited to the smaller of 4 MiB and the
+configured HTTP payload limit. History keeps up to four responses per socket.
+Its accounting limits are 16 MiB per socket and 128 MiB per process. The
+accounting charges three times the serialized JSON size. Sessions expire after
+15 minutes of idle time or one hour of total connection time. During shutdown,
+idle sockets receive close code 1012, and active responses can finish within
+the gateway's shutdown grace period.
+
 ## Contributing
 
 We welcome contributions! See the [Contributing Guide](https://lightseek.org/smg/contributing) for details.
