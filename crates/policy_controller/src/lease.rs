@@ -236,6 +236,10 @@ impl fmt::Debug for EventSet {
 
 /// The lifecycle a stateful stage implements. Every hook defaults to a
 /// no-op, so a stateless stage implements nothing.
+///
+/// A served controller tells a lease's dispatch, its completion and its
+/// release while it holds the turn of its leases' file: those hooks are
+/// bounded, and call no door of the leases' store.
 pub trait Lifecycle: Send + Sync {
     /// The engine issued `decision` under `lease`. In the embedded mode the
     /// commit follows at once and the accounting happens at dispatch; a

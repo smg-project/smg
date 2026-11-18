@@ -42,28 +42,33 @@
 //!    under a millisecond of its dispatch span left at that read: the span
 //!    counts from the first read, and the answer's lease carries what is
 //!    left of it. The lease of an answer that does not leave is given up
-//!    at once: the store's release door first, the one a `Released` frame
-//!    takes, then the engine told, as abandoned under a closed fence and
-//!    as a late decision past the budget or the span.
+//!    at once: the store's release door first, then the engine told, as
+//!    abandoned under a closed fence and as a late decision past the
+//!    budget or the span.
 //!
 //! A lease is what the next decisions read. The store counts the leases on
 //! file by the worker each books, and a decision reads that count as each
 //! row's requests in flight ([`crate::RequestFacts::in_flight`]): beside
 //! the rows where the store lent them, in the row where they were written
 //! for the request. A decision is made over what the decisions before it
-//! left on file. The file is the one thing every decider writes, under
-//! one lock held for one lease's filing or its giving up. A lease leaves
-//! the file where its answer does not leave (step 7), at its gateway's
-//! word (a `Session`'s `Completed` or `Released` frame, the gateway's own
-//! end) or at its dispatch deadline: each issue ends the leases at the
-//! head of the store's deadline queue that no gateway named a dispatch
-//! for in time, two at most, and tells the engine of those its own
-//! generation issued. So a lease whose answer never reached its gateway
-//! (a stream that ended, a full queue, a decision that panicked past its
-//! issue) stands until its deadline and the issues after it, and through
-//! a lull until the next issue: no timer ends one yet. A decision its
-//! stream stops at the send is none of them: the stream gives its lease
-//! up there ([`super::decide`]).
+//! left on file. The file is the one thing every decider writes, under its
+//! turn, held for an apply and for one lease's filing or its giving up,
+//! never across a decision. What a gateway's frame says of a lease is
+//! handed to the file by its session and applied by a decider at work:
+//! before a decision reads its rows' counts, at its issue, and once more
+//! before the decider waits on an empty queue. Where no decider is at work
+//! the session applies it. A lease leaves the file where its answer does
+//! not leave (step 7), at its gateway's word (a `Session`'s `Completed` or
+//! `Released` frame, the gateway's own end) or at its dispatch deadline:
+//! each issue ends the leases at the head of the store's deadline queue
+//! that no gateway named a dispatch for in time, two at most, and their
+//! engine is told under the turn where its generation still stands. So a
+//! lease whose answer never reached its gateway (a stream that ended, a
+//! full queue, a decision that panicked past its issue) stands until its
+//! deadline and the issues after it, and through a lull until the next
+//! issue: no timer ends one yet. A decision its stream stops at the send
+//! is none of them: the stream gives its lease up there
+//! ([`super::decide`]).
 //!
 //! What a lease does not do yet. A request sent twice under one id is
 //! issued two leases. A stage hears a lease's issue here, its dispatch,
@@ -118,7 +123,7 @@ use std::{
     panic::{catch_unwind, AssertUnwindSafe},
     sync::{
         atomic::{AtomicU64, Ordering},
-        mpsc::{sync_channel, Receiver, SyncSender, TrySendError},
+        mpsc::{sync_channel, Receiver, SyncSender, TryRecvError, TrySendError},
         Arc, OnceLock,
     },
     thread,
@@ -130,9 +135,11 @@ use tracing::{error, info, warn};
 
 use super::{
     election::Standing,
+    lifecycle,
     wire::{self, Checked, Lists, Viewed},
 };
 use crate::{
+    decider::Decider,
     decision::{Decision, Shed, ShedReason, Trace},
     elector::{term_said, Fence},
     framework::{release, Plan, Scratch},
@@ -140,7 +147,7 @@ use crate::{
     proto::{self, busy::Reason},
     sessions::SessionVerdict,
     store::{
-        leases::DISPATCH_TTL, Ask, Built, GatewayId, LeaseRecord, LeaseRefused, LeaseState,
+        leases::DISPATCH_TTL, Ask, AtWork, Built, GatewayId, LeaseRecord, LeaseRefused, LeaseState,
         MemoryStore, Named, Naming, Picked, SessionsStore, ViewBuffers, World,
     },
     view::{
@@ -373,6 +380,7 @@ impl Deciders {
     /// Starts `deciders` threads, each behind a queue of `depth` requests:
     /// at least one thread, and a queue of at least one.
     pub(crate) fn start(deciders: usize, depth: usize, reads: &Reads) -> io::Result<Self> {
+        lifecycle::tells(&reads.store);
         let told = Arc::new(watch::Sender::new(false));
         let mark = Arc::new(Mark::default());
         let queues = (0..deciders.max(1))
@@ -385,6 +393,8 @@ impl Deciders {
                     index,
                     marked: None,
                     mark: Arc::clone(&mark),
+                    working: None,
+                    name: u8::try_from(index).ok().map(Decider::new),
                 };
                 watched(index, &told, move || decider.run(&jobs)).map(|_running| queue)
             })
@@ -498,12 +508,38 @@ struct Deciding {
     marked: Option<u64>,
     /// The mark's word and its latch, shared by the deciders.
     mark: Arc<Mark>,
+    /// Its place among the threads at work at the leases' file, while it
+    /// has a job at hand ([`MemoryStore::at_work`]).
+    working: Option<AtWork>,
+    /// Its name among the host's deciders, which its thread acts as while
+    /// it decides ([`Decider::enter`]): none past the names a host gives.
+    name: Option<Decider>,
 }
 
 impl Deciding {
-    /// Decides until the last handle of the queue is dropped.
+    /// Decides until the last handle of the queue is dropped. With a job
+    /// at hand the decider is at work at the leases' file: what the
+    /// sessions hand is left to it, applied before each decision reads
+    /// its rows' counts and at each issue. It leaves that work before it
+    /// waits on an empty queue: what is handed meanwhile is applied by
+    /// the session that hands it.
     fn run(mut self, jobs: &Receiver<Job>) {
-        while let Ok(job) = jobs.recv() {
+        loop {
+            let job = match jobs.try_recv() {
+                Ok(job) => job,
+                Err(TryRecvError::Disconnected) => break,
+                Err(TryRecvError::Empty) => {
+                    self.working = None;
+                    let Ok(job) = jobs.recv() else { break };
+                    job
+                }
+            };
+            if self.working.is_none() {
+                self.working = Some(self.reads.store.at_work());
+            }
+            // The thread acts as its decider for the turn: a local, so the
+            // name is let go where the turn ends.
+            let _acting = self.name.map(Decider::enter);
             let Job {
                 request,
                 gateway,
@@ -647,6 +683,11 @@ impl Deciding {
             .ok_or(Reason::BudgetGoneOnArrival)?
             .lent(&pins);
         let (buffers, own) = (&mut self.buffers, counts.part(self.index));
+        // What the sessions handed is applied before the rows' counts are
+        // read: two loads where nothing is handed.
+        if let Some(at_work) = &self.working {
+            at_work.apply();
+        }
         // One load of the world for the decision and for its lease: the
         // lease books the count that load laid beside its target's row,
         // and the engine told of it is the one that decided.
@@ -978,25 +1019,22 @@ fn issue(
     };
     let built = booking.built;
     let booked = built.and_then(|built| world.booked(&built, booking.target));
-    let (lease, abandoned) = store.issue_decided(record, booked)?;
-    let (engine, generation) = (world.spec().engine(), world.spec().generation());
-    engine.on_decision_issued(&lease, decision);
-    // The leases this issue found past their dispatch deadline. The engine
-    // at hand is told of those its own generation issued: a later
-    // generation's stages never saw the issue.
-    for record in abandoned.into_iter().flatten() {
-        if record.lease.generation == generation {
-            engine.on_released(&record.lease, ReleaseReason::Abandoned);
-        }
-    }
+    // Under one hold of the turn the store applies what is handed, files
+    // the lease, tells the engine that decided of it, and ends and tells
+    // the leases it finds past their dispatch deadline.
+    let engine = world.spec().engine();
+    let lease = store.issue_decided(record, booked, |lease| {
+        engine.on_decision_issued(lease, decision);
+    })?;
     Ok(lease)
 }
 
 /// Gives up the lease of a decision whose answer does not leave: the
-/// store's release door first ([`crate::store::LeasesStore::released`], the
-/// one a gateway's `Released` frame takes), then the engine that heard the
-/// issue, told once where the store held the lease. A lease the store no
-/// longer holds was ended by another hand, and nothing is told of it here.
+/// store's release door first ([`crate::store::LeasesStore::released`],
+/// which applies what is handed ahead of it), then the engine that heard
+/// the issue, told once where the store held the lease. A lease the store
+/// no longer holds was ended by another hand, and nothing is told of it
+/// here.
 fn give_up(
     store: &MemoryStore,
     world: &World,
@@ -1278,8 +1316,10 @@ pub(crate) mod tests {
         controller::{
             election::Standing,
             gateways::tests::PATIENT,
+            lifecycle,
             wire::{self, Checked},
         },
+        decider::Decider,
         decision::{Decision, Targets},
         elector::{Elector, Tick, TERM_CEILING},
         framework::{DecisionScope, Filter, Picker, Scratch, TieBand},
@@ -1288,7 +1328,7 @@ pub(crate) mod tests {
         spec::{AppliedSpec, PolicySpec, PowerOfTwoMetric},
         store::{
             leases::DISPATCH_TTL, Ask, Dispatch, GatewayId, HealthSink, LeaseState, LeasesStore,
-            MemoryStore, ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore,
+            MemoryStore, Said, ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore,
         },
         view::{
             fingerprint, AffinityFacts, Candidate, Constraints, PoolFacts, RequestFacts, Role,
@@ -2295,6 +2335,127 @@ pub(crate) mod tests {
         let store: &dyn LeasesStore = bed.store.as_ref();
         assert_eq!(store.get(GATEWAY, LeaseId(id(1))), None);
         assert_eq!(store.live(GATEWAY), 2);
+    }
+
+    /// A decider with a job at hand is at work at the leases' file: what a
+    /// session hands meanwhile is left to it, and it applies it before its
+    /// decision reads the rows' counts, ahead of its own issue. A frame
+    /// handed while no decider has a job is applied all the same.
+    #[tokio::test]
+    async fn a_frame_handed_while_a_decider_decides_is_applied_by_that_decider() {
+        let told = Arc::new(Mutex::new(Vec::new()));
+        let kept = Arc::clone(&told);
+        let mut catalog = Catalog::builtin();
+        catalog
+            .picker("told", move || Box::new(Told(Arc::clone(&kept))))
+            .expect("a free name");
+        let mut document = PolicySpec::preset("random").expect("a preset of this build");
+        let profile = document.profiles.get_mut("random");
+        profile.expect("the preset's profile").pick = "told".into();
+        let digest = document.digest().expect("the document digests");
+        let spec = AppliedSpec::validate_digested(&document, digest, &catalog)
+            .expect("the catalog holds the stage");
+        let mut bed = bed(Some(spec), true, (1, 8), []);
+        let id = |count: u64| 1 << 32 | count;
+        let gone = Said::Released(None, ReleaseReason::ClientGone);
+        bed.ask(frame(1, 1)).await;
+        // The second decision is held at its first read of the clock: its
+        // decider has the job at hand.
+        let (reached, held) = std_mpsc::sync_channel(1);
+        let (go, word) = std_mpsc::sync_channel(1);
+        let hold = Step::Hold { reached, go: word };
+        bed.script.steps.lock().push_back(hold);
+        assert_eq!(bed.submit(frame(2, 1)), None);
+        held.recv_timeout(PATIENCE)
+            .expect("the decider reads the clock");
+        let hand = lifecycle::open(&bed.store, GATEWAY);
+        bed.store.hand(&hand, LeaseId(id(1)), gone);
+        assert_eq!(*told.lock(), [(id(1), None)], "left to the decider at work");
+        go.send(()).expect("the decider holds the other end");
+        bed.answer().await;
+        let released = |count| (id(count), Some(ReleaseReason::ClientGone));
+        assert_eq!(*told.lock(), [(id(1), None), released(1), (id(2), None)]);
+        // The decider waits on its empty queue, or is about to: it applies
+        // as it leaves its work, or the hand does.
+        bed.store.hand(&hand, LeaseId(id(2)), gone);
+        let since = Instant::now();
+        while told.lock().len() < 4 {
+            assert!(
+                since.elapsed() < PATIENCE,
+                "a handed frame waits on no lull"
+            );
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(told.lock()[3], released(2));
+    }
+
+    /// The `random` picker, keeping the decider its thread acts as at each
+    /// call of a lease's issue and release.
+    #[derive(Debug)]
+    struct Named(Arc<Mutex<Vec<Option<Decider>>>>);
+
+    impl Lifecycle for Named {
+        fn on_decision_issued(&self, _: &Lease, _: &Decision) {
+            self.0.lock().push(Decider::acting());
+        }
+
+        fn on_released(&self, _: &Lease, _: ReleaseReason) {
+            self.0.lock().push(Decider::acting());
+        }
+    }
+
+    impl Picker for Named {
+        fn name(&self) -> &'static str {
+            "named"
+        }
+
+        fn pick(
+            &self,
+            facts: &RequestFacts<'_>,
+            candidates: &[Candidate],
+            kept: &[u32],
+            scores: &[f32],
+            band: TieBand,
+            out: &mut Targets,
+        ) {
+            Random.pick(facts, candidates, kept, scores, band, out);
+        }
+    }
+
+    /// A decider's thread acts as its decider while it decides, and a
+    /// lease's event is told under the name of the decider that issued it,
+    /// whichever thread applies the frame.
+    #[tokio::test]
+    async fn a_decision_and_its_leases_events_act_as_the_leases_decider() {
+        let named = Arc::new(Mutex::new(Vec::new()));
+        let kept = Arc::clone(&named);
+        let mut catalog = Catalog::builtin();
+        catalog
+            .picker("named", move || Box::new(Named(Arc::clone(&kept))))
+            .expect("a free name");
+        let mut document = PolicySpec::preset("random").expect("a preset of this build");
+        let profile = document.profiles.get_mut("random");
+        profile.expect("the preset's profile").pick = "named".into();
+        let digest = document.digest().expect("the document digests");
+        let spec = AppliedSpec::validate_digested(&document, digest, &catalog)
+            .expect("the catalog holds the stage");
+        let mut bed = bed(Some(spec), true, (1, 8), []);
+        let answer = bed.ask(frame(1, 1)).await;
+        // The case's thread names no decider: its hand applies the release,
+        // or the decider does as it leaves its work.
+        let hand = lifecycle::open(&bed.store, GATEWAY);
+        let gone = Said::Released(None, ReleaseReason::ClientGone);
+        bed.store.hand(&hand, LeaseId(lease_of(&answer).id), gone);
+        let since = Instant::now();
+        while named.lock().len() < 2 {
+            assert!(
+                since.elapsed() < PATIENCE,
+                "a handed frame waits on no lull"
+            );
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(*named.lock(), [Some(Decider::new(0)); 2]);
+        assert_eq!(Decider::acting(), None);
     }
 
     /// An abandoned lease is told to the engine whose generation issued it
@@ -3733,6 +3894,8 @@ pub(crate) mod tests {
             reads: bed.reads.clone(),
             buffers: Buffers::default(),
             faulted: false,
+            working: None,
+            name: None,
             index: 0,
             marked: None,
             mark: Arc::default(),
@@ -4409,7 +4572,8 @@ pub(crate) mod tests {
             let answer = bed.ask(keyed(key, 1_000 + key)).await;
             let worker = picked(&answer);
             assert_eq!(verdict(&bed, &answer), SessionVerdict::Claimed(worker));
-            lifecycle::dispatched(&bed.store, GATEWAY, &a_dispatched(lease_of(&answer).id), at)
+            let hand = lifecycle::open(&bed.store, GATEWAY);
+            lifecycle::dispatched(&bed.store, &hand, &a_dispatched(lease_of(&answer).id), at)
                 .expect("the frame reads");
             first.push((key, worker, session(&bed, &answer)));
         }
