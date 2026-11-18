@@ -344,10 +344,11 @@ impl SpecStore {
         Self::read_under(dir, root, unheld)
     }
 
-    /// Refuses a path that leads to no directory.
-    fn found(dir: &Path) -> Result<(), StoreRefused> {
+    /// What the system reads at a path that leads to a directory. A path
+    /// that leads to none is refused.
+    fn found(dir: &Path) -> Result<fs::Metadata, StoreRefused> {
         match fs::metadata(dir) {
-            Ok(found) if found.is_dir() => Ok(()),
+            Ok(found) if found.is_dir() => Ok(found),
             Ok(_) => Err(StoreRefused::NotADirectory),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 Err(StoreRefused::NotADirectory)
@@ -528,28 +529,34 @@ impl SpecStore {
         }
     }
 
-    /// Whether the path `dir` leads to the directory `root`, by the
-    /// system's own identity of the two. A path that leads nowhere says
-    /// so in the system's words.
+    /// Whether the path `dir` leads to the directory `root`. A path that
+    /// leads nowhere says so in the system's words.
     fn leads(dir: &Path, root: &fs::File) -> io::Result<bool> {
+        Self::is_held(&fs::metadata(dir)?, root)
+    }
+
+    /// Whether `at_path`, what the system read at a path, is the directory
+    /// `root`, by the system's own identity of the two.
+    fn is_held(at_path: &fs::Metadata, root: &fs::File) -> io::Result<bool> {
         use std::os::unix::fs::MetadataExt as _;
 
-        let (path, held) = (fs::metadata(dir)?, root.metadata()?);
-        Ok((path.dev(), path.ino()) == (held.dev(), held.ino()))
+        let held = root.metadata()?;
+        Ok((at_path.dev(), at_path.ino()) == (held.dev(), held.ino()))
     }
 
     /// Refuses a start whose path leads to another directory than the one
     /// it locked, or to none, once the lock is held: the directory was
     /// renamed or removed while the start waited, and the one held is no
-    /// longer the one its path names. A link in the path that turned
-    /// passes: the path was resolved once, before the wait.
+    /// longer the one its path names. The path is asked once, as a new
+    /// start asks it, and the two identities are compared on that answer:
+    /// a file laid there is a path to no directory, as it is to that
+    /// start. A link in the path that turned passes: the path was resolved
+    /// once, before the wait.
     fn named_still(dir: &Path, root: &fs::File) -> Result<(), StoreRefused> {
-        match Self::leads(dir, root) {
+        let at_path = Self::found(dir)?;
+        match Self::is_held(&at_path, root) {
             Ok(true) => Ok(()),
             Ok(false) => Err(StoreRefused::Moved),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                Err(StoreRefused::NotADirectory)
-            }
             Err(error) => Err(StoreRefused::Unreadable(error.to_string())),
         }
     }
@@ -1247,6 +1254,30 @@ pub(crate) mod tests {
             .expect("the waiter")
             .expect_err("the path leads nowhere");
         assert_eq!(refused, StoreRefused::NotADirectory);
+    }
+
+    /// Where a directory is renamed under a waiting start and a file is
+    /// laid at its path, that start is refused as a new start is: as a
+    /// path to no directory.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_laid_under_a_waiting_start_refuses_it_as_a_new_start_is() {
+        let base = tempfile::tempdir().expect("a temp dir");
+        let (dir, moved) = (base.path().join("store"), base.path().join("moved"));
+        fs::create_dir(&dir).expect("the directory");
+        let holder = SpecStore::open(dir.clone()).expect("the holder");
+        let waiter = Waiter::held_off(dir.clone());
+        fs::rename(&dir, &moved).expect("the directory moves");
+        fs::write(&dir, "a file").expect("a file stands at its path");
+        drop(holder);
+        let refused = waiter
+            .start
+            .join()
+            .expect("the waiter")
+            .expect_err("no directory stands at the path");
+        assert_eq!(refused, StoreRefused::NotADirectory);
+        let new = SpecStore::open(dir).expect_err("a file is no store");
+        assert_eq!(new, StoreRefused::NotADirectory);
     }
 
     /// A removal goes through the directory the store holds. Where the
