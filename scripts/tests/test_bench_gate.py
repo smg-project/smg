@@ -1808,6 +1808,13 @@ def test_the_repository_gate_files_mark_the_rows_that_time_a_whole_decision(mod)
             "policy_affinity/decide/cache_aware/512": True,
             "policy_affinity/view_build/64": False,
         },
+        "policy-engine-prefix-hash.toml": {
+            "policy_engine/prefix_hash/owner/512": True,
+            "policy_engine/prefix_hash/levels_owner/512": True,
+            "policy_engine/prefix_hash/levels_owner/64": True,
+            "policy_engine/prefix_hash/passed_over/8": True,
+            "policy_engine/prefix_hash/levels_passed_over/8": True,
+        },
     }
     for name, ids in marked.items():
         gates = mod.load_gates(root / name)
@@ -1818,5 +1825,13 @@ def test_the_repository_gate_files_mark_the_rows_that_time_a_whole_decision(mod)
     assert engine.threshold_for("policy_engine/decide/least_load_credited/8").threshold == 0.15
     assert engine.threshold_for("policy_engine/decide/cache_aware/8").threshold == 0.10
     assert engine.threshold_for("policy_engine/decide/random/64").threshold == 0.10
+    prefix = mod.load_gates(root / "policy-engine-prefix-hash.toml")
+    # The 512-row ids read above 5 % on the hosted runner and take 15 %.
+    for path in ("owner", "passed_over", "levels_owner", "levels_passed_over"):
+        assert prefix.threshold_for(f"policy_engine/prefix_hash/{path}/512").threshold == 0.15, path
+    for bench_id in ("owner/64", "passed_over/64", "levels_owner/64", "passed_over/8"):
+        assert prefix.threshold_for(f"policy_engine/prefix_hash/{bench_id}").threshold == 0.10, (
+            bench_id
+        )
     for name in ("policy-engine-power-of-two.toml", "policy-store.toml"):
         assert not any(gate.whole_pass for gate in mod.load_gates(root / name).gates), name
