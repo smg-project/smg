@@ -372,7 +372,7 @@ fn both_worlds_load_and_the_load_instantiates_on_the_applying_thread() {
     );
     assert_eq!(record.world(), World::Record);
     assert_eq!(packed.world(), World::Packed);
-    assert_eq!(record.abi(), Abi::V1_0);
+    assert_eq!(record.abi(), Abi::V1_1);
     assert!(record.is_warm() && packed.is_warm());
     assert_eq!(record.stats().instantiations, 1);
     assert_eq!(record.name(), "record");
@@ -444,13 +444,13 @@ fn a_component_with_an_async_export_is_refused_at_its_compile() {
 fn the_abi_pin_the_memory_floor_the_init_failure_and_bad_bytes_are_refused() {
     let runtime = runtime();
     let mut pinned = spec("pinned", guest::record_guest(), mode::LEAST_IN_FLIGHT);
-    pinned.abi = Some(Abi { major: 1, minor: 1 });
+    pinned.abi = Some(Abi { major: 1, minor: 2 });
     let err = Plugin::load(&runtime, pinned).expect_err("refused");
     assert!(
         matches!(
             err,
             LoadError::AbiPin {
-                found: Abi::V1_0,
+                found: Abi::V1_1,
                 ..
             }
         ),
@@ -8343,11 +8343,10 @@ fn an_instance_made_anew_hears_the_membership_as_it_stands() {
     assert_eq!(pick(), Some(102), "two members stand");
 }
 
-/// The feed keeps nothing of the models a worker left, since no contract
-/// carries the word yet: an instance level with the feed hears no call for
-/// it and counts the members it counted.
+/// The feed keeps the models a worker left: an instance level with the feed
+/// hears one call for the word, and counts the members it counted.
 #[test]
-fn a_guest_hears_nothing_of_the_models_a_worker_left() {
+fn a_guest_level_with_the_feed_hears_the_models_a_worker_left() {
     use smg_policy_controller::Membership;
     let runtime = runtime();
     let plugin = load(&runtime, "left", guest::record_guest(), mode::COUNT_MEMBERS);
@@ -8362,7 +8361,7 @@ fn a_guest_hears_nothing_of_the_models_a_worker_left() {
         models: &models,
     });
     assert_eq!(pick(), Some(102), "the same two members");
-    assert_eq!(plugin.stats().observed, level, "no call for the word");
+    assert_eq!(plugin.stats().observed, level + 1, "one call for the word");
 }
 
 /// The feed keeps its last 64 changes. An instance behind that many hears
@@ -9030,4 +9029,79 @@ fn a_warm_up_that_asks_first_warms_every_named_decider() {
         "one a decider, the load's among them: {stats:?}"
     );
     assert!(!plugin.is_warm(), "the load's instance went to a decider");
+}
+
+/// The models a worker left reach a guest as one word, with its names, ahead
+/// of the relabelling of the same write: on either world an instance behind
+/// the feed hears the two in the host's order, one call each.
+#[test]
+fn an_instance_behind_hears_the_models_a_worker_left_ahead_of_its_relabelling() {
+    use smg_policy_controller::Membership;
+    let models = ["m-chat".to_owned(), "m-embed".to_owned()];
+    for (world, component) in [
+        ("left-record", guest::record_guest()),
+        ("left-packed", guest::packed_guest()),
+    ] {
+        let runtime = runtime();
+        let plugin = load(&runtime, world, component, mode::COUNT_LEFT);
+        let engine = plugin_engine(&plugin);
+        engine.on_membership(&Membership::Snapshot(&[WorkerId(100), WorkerId(101)]));
+        plugin.warm().expect("it warms");
+        let warmed = plugin.stats().observed;
+        engine.on_membership(&Membership::Left {
+            id: WorkerId(100),
+            models: &models,
+        });
+        engine.on_membership(&Membership::Relabelled(WorkerId(100)));
+        // One up each name of the word and one more up the relabelling
+        // behind it: the row at three. A word not told, or told behind its
+        // relabelling, names another row; one told twice names none of the
+        // pool; a name the guest cannot read is its fault.
+        let picked = own_pick(&plugin, &engine);
+        let stats = plugin.stats();
+        assert_eq!(picked, Some(103), "{world}: {stats:?}");
+        assert_eq!(stats.observed - warmed, 2, "{world}: {stats:?}");
+        assert_eq!(stats.traps, 0, "{world}: {stats:?}");
+    }
+}
+
+/// A module built against an older minor of the world is refused by the
+/// host's range, both versions named, before anything of it is linked. Its
+/// shapes are today's here, so nothing but its version stops it.
+#[test]
+fn a_module_of_an_older_minor_is_refused_by_the_range() {
+    let older = spec("older", guest::older_minor_guest(), mode::LEAST_IN_FLIGHT);
+    let err = Plugin::load(&runtime(), older).expect_err("refused");
+    assert!(matches!(err, LoadError::Abi { .. }), "{err}");
+    assert_eq!(
+        err.to_string(),
+        "plugin older: targets smg:policy@1.0.0; this host accepts 1.1"
+    );
+}
+
+/// A snapshot names ids and no pool. An instance further behind than the
+/// feed keeps hears the list as it stands, in one call, and no word of the
+/// models a worker left among the changes it missed.
+#[test]
+fn an_instance_that_hears_a_snapshot_for_what_it_missed_hears_no_left_word() {
+    use smg_policy_controller::Membership;
+    let models = ["m-chat".to_owned(), "m-embed".to_owned()];
+    let runtime = runtime();
+    let plugin = load(&runtime, "behind", guest::record_guest(), mode::COUNT_LEFT);
+    let engine = plugin_engine(&plugin);
+    engine.on_membership(&Membership::Snapshot(&[WorkerId(100), WorkerId(101)]));
+    plugin.warm().expect("it warms");
+    let warmed = plugin.stats().observed;
+    engine.on_membership(&Membership::Left {
+        id: WorkerId(100),
+        models: &models,
+    });
+    // The feed keeps 64 changes, and the word is the oldest of 65.
+    for _ in 0..64 {
+        engine.on_membership(&Membership::Resized(WorkerId(101)));
+    }
+    let picked = own_pick(&plugin, &engine);
+    let stats = plugin.stats();
+    assert_eq!(picked, Some(100), "no name was counted: {stats:?}");
+    assert_eq!(stats.observed - warmed, 1, "one snapshot: {stats:?}");
 }

@@ -6,7 +6,8 @@
 //! (`smg:policy/policy`, the view as records) or the packed world
 //! (`smg:policy/policy-packed`, the view as the bytes of the WIT's layout
 //! table); the host reads which from its exports. The host accepts
-//! `smg:policy@1.x` up to [`Abi::SUPPORTED_MINOR`] and a spec may pin the
+//! `smg:policy@1.x` from [`Abi::FLOOR_MINOR`] up to
+//! [`Abi::SUPPORTED_MINOR`] and a spec may pin the
 //! version. `examples/wasm/wasm-guest-policy` is a record-world module to
 //! copy, with its build line; `tests/wasm_example.rs` loads what that line
 //! builds.
@@ -31,8 +32,9 @@
 //! on whatever thread, with no guest call there, and every instance hears it
 //! before its decider's next decision or told event, one call a change. An
 //! instance new to the feed, or behind more than the 64 changes the feed
-//! keeps, hears the membership as it stands, as one snapshot. Each profile
-//! that binds the plugin holds one [`Bound`] set, taken
+//! keeps, hears the membership as it stands, as one snapshot of ids: the
+//! models a worker left, among the changes it missed, are not told. Each
+//! profile that binds the plugin holds one [`Bound`] set, taken
 //! from its engine build's [`Binder`] (one adapter of a build forwards the
 //! lifecycle, so an event reaches the plugin once per engine); the
 //! engine opens it once per decision over the profile's view (a pair

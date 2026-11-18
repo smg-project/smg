@@ -118,7 +118,8 @@
 //! version the plugin's `Decide` streams last fixed: none opens before one
 //! has settled (the events wait in the queue), a call that ends is opened
 //! again under that version, and once a settle fixes another the call is
-//! ended for the next to name that one.
+//! ended for the next to name that one. A word the stream's version has no
+//! kind for is not written and takes no number.
 //!
 //! The runtime: one I/O thread per process ([`Runtime`]) owns every stream;
 //! a deciding thread hands it a frame and waits on that frame's place in
@@ -167,8 +168,10 @@ pub type GrpcScorer = crate::plugins::PluginScorer<Bound>;
 /// See [`GrpcFilter`].
 pub type GrpcPicker = crate::plugins::PluginPicker<Bound>;
 
-/// The newest protocol version this host speaks.
-pub const PROTOCOL: u32 = 1;
+/// The newest protocol version this host speaks. Version 2 added the
+/// membership kind for the models a worker left; a stream that settled on
+/// version 1 is not sent it.
+pub const PROTOCOL: u32 = 2;
 /// The oldest protocol version this host speaks. A `Decide` hello offers
 /// from this one to [`PROTOCOL`] until the plugin's first settled stream
 /// fixes the version it speaks.

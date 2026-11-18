@@ -317,6 +317,17 @@ impl Spoken {
             Some(fixed) => Err(fixed),
         }
     }
+
+    /// Whether a stream stands on a version older than `since`. An event
+    /// that version first carries is then written to no stream of the
+    /// plugin, so it is not raised: in the queue it would take a place a
+    /// heard event needs, and a refusal of it would number a loss the
+    /// stream never had. With no stream standing the next settle may fix
+    /// any version: the event waits, and the write decides.
+    pub(crate) fn stands_under(&self, since: u32) -> bool {
+        let (fixed, standing) = *self.fixed.borrow();
+        standing != 0 && fixed < since
+    }
 }
 
 /// One settled `Decide` stream's stand on its plugin's version, given up
@@ -1326,7 +1337,8 @@ async fn observe_streams<O, F, C, T>(
                 std::future::pending::<()>().await;
             }
         };
-        let ended = match forward(call, tx, queue, sent, lost, frame, moved).await {
+        let requests = Requests { tx, version };
+        let ended = match forward(call, requests, queue, sent, lost, frame, moved).await {
             Turn::Dropped => return,
             // No call failed and no pause is owed: the next call opens at
             // once, under the version the settle fixed.
@@ -1340,6 +1352,13 @@ async fn observe_streams<O, F, C, T>(
         // for the call's outcome is inside it.
         tokio::time::sleep_until(ended.at + frame).await;
     }
+}
+
+/// The request side of one `Observe` call: where its events are written,
+/// and the protocol version its hello named, which says what it carries.
+struct Requests {
+    tx: mpsc::Sender<proto::ObserveRequest>,
+    version: u32,
 }
 
 /// How one turn of the events task ended.
@@ -1375,7 +1394,7 @@ struct Ended {
 /// first seen.
 async fn forward<C, T, M>(
     call: C,
-    tx: mpsc::Sender<proto::ObserveRequest>,
+    requests: Requests,
     queue: &mut mpsc::Receiver<proto::ObserveRequest>,
     sent: &mut u64,
     lost: &mut u64,
@@ -1386,6 +1405,7 @@ where
     C: Future<Output = Result<T, tonic::Status>>,
     M: Future<Output = ()>,
 {
+    let Requests { tx, version } = requests;
     tokio::pin!(call);
     tokio::pin!(moved);
     let opened = tokio::time::Instant::now();
@@ -1400,6 +1420,19 @@ where
                     if let Some(proto::observe_request::Request::Event(numbered)) =
                         event.request.as_mut()
                     {
+                        // A word the call's version has no kind for is not
+                        // written and takes no number: the stream hears
+                        // what it heard before the word came. The refusals
+                        // it carried still count. One reaches the write
+                        // where no stream stood as it was raised.
+                        let newer = numbered
+                            .event
+                            .as_ref()
+                            .is_some_and(|event| view::since(event) > version);
+                        if newer {
+                            *lost = (*lost).max(numbered.seq);
+                            continue;
+                        }
                         numbered.seq = number(sent, lost, numbered.seq);
                     }
                     if tx.send(event).await.is_err() {
@@ -1466,7 +1499,7 @@ mod tests {
 
     use super::{
         number, observe, run_commands, Command, Ended, Fault, Lane, LaneEvents, LaneState,
-        ObserveLane, Opened, Peer, Runtime, Said, SendError, Spoken, Turn, Wait, Witness,
+        ObserveLane, Opened, Peer, Requests, Runtime, Said, SendError, Spoken, Turn, Wait, Witness,
         OBSERVE_WINDOW, PEER_TEXT, PROMISE_MICROS, RECONNECT_PAUSE, STAND, WINDOW,
     };
     use crate::{grpc::config::Transport, plugins::OpenDecisions, proto};
@@ -2172,8 +2205,8 @@ mod tests {
     where
         C: Future<Output = Result<T, tonic::Status>>,
     {
-        let never = std::future::pending();
-        match super::forward(call, tx, queue, sent, lost, frame, never).await {
+        let (requests, never) = (Requests { tx, version: 1 }, std::future::pending());
+        match super::forward(call, requests, queue, sent, lost, frame, never).await {
             Turn::Ended(ended) => Some(ended),
             Turn::Dropped | Turn::Moved => None,
         }
@@ -2187,8 +2220,10 @@ mod tests {
     fn the_first_settle_fixes_a_plugins_version_until_its_last_stream_ends() {
         let (spoken, host) = (Spoken::default(), 1..=2);
         assert_eq!(spoken.offer(&host), (1, 2), "no stream stands");
+        assert!(!spoken.stands_under(2), "none stands: the write decides");
         let first = spoken.settle(2).expect("the first settle fixes it");
         assert_eq!(spoken.offer(&host), (2, 2), "one stands: its version alone");
+        assert!(!spoken.stands_under(2), "a stream on 2 hears a word of 2");
         let second = spoken.settle(2).expect("a second stream joins it");
         assert_eq!(spoken.settle(1).err(), Some(2), "an ack names another");
         drop(first);
@@ -2197,6 +2232,10 @@ mod tests {
         assert_eq!(spoken.offer(&host), (1, 2), "the last end frees it");
         let _anew = spoken.settle(1).expect("the next settle fixes it anew");
         assert_eq!(spoken.offer(&host), (1, 1));
+        assert!(
+            spoken.stands_under(2) && !spoken.stands_under(1),
+            "a stream on 1 hears no word of 2"
+        );
     }
 
     fn raised() -> proto::ObserveRequest {
@@ -2273,6 +2312,56 @@ mod tests {
         assert_eq!(number(&mut sent, &mut lost, 0), 5);
         // One more refusal: a gap of one, behind the third.
         assert_eq!(number(&mut sent, &mut lost, 3), 7);
+    }
+
+    /// A word the call's version has no kind for is not written and takes no
+    /// number, and the refusals it carried still count. Here a stream on
+    /// protocol 1 is handed a left word raised behind two refusals, then a
+    /// relabelling raised ahead of them: the call hears the relabelling
+    /// alone, numbered behind both.
+    #[tokio::test(start_paused = true)]
+    async fn a_word_the_calls_version_has_no_kind_for_takes_no_number_and_keeps_its_refusals() {
+        use crate::{grpc::view, lease::Membership, view::WorkerId};
+        let word = |change: Membership<'_>, refusals| proto::ObserveRequest {
+            request: Some(proto::observe_request::Request::Event(
+                proto::LifecycleEvent {
+                    seq: refusals,
+                    event: Some(view::membership(&change)),
+                },
+            )),
+        };
+        let models = ["m".to_owned()];
+        let left = Membership::Left {
+            id: WorkerId(7),
+            models: &models,
+        };
+        let (raise, mut queue) = mpsc::channel(4);
+        raise.try_send(word(left, 2)).expect("the queue takes it");
+        raise
+            .try_send(word(Membership::Relabelled(WorkerId(7)), 0))
+            .expect("the queue takes it");
+        let (tx, mut rx) = mpsc::channel::<proto::ObserveRequest>(OBSERVE_WINDOW);
+        let heard = RefCell::new(Vec::new());
+        let told = &heard;
+        let call = async move {
+            let event = rx.recv().await.expect("the call takes an event");
+            let Some(proto::observe_request::Request::Event(event)) = event.request else {
+                panic!("an event, not a hello");
+            };
+            let Some(proto::lifecycle_event::Event::Membership(change)) = event.event else {
+                panic!("a membership word");
+            };
+            told.borrow_mut().push((event.seq, change.kind));
+            Err::<(), _>(tonic::Status::unavailable("the plugin went"))
+        };
+        let (mut sent, mut lost) = (0, 0);
+        let ended = forward(call, tx, &mut queue, &mut sent, &mut lost, RECONNECT_PAUSE)
+            .await
+            .expect("the plugin is loaded");
+        assert!(ended.why.contains("the plugin went"), "{}", ended.why);
+        let relabelled = proto::membership_change::Kind::Relabelled as i32;
+        assert_eq!(heard.into_inner(), [(3, relabelled)]);
+        assert_eq!((sent, lost), (1, 2), "the left word took no number");
     }
 
     /// An outage is the failures with no call that stood between them, and

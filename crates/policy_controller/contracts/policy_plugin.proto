@@ -601,12 +601,26 @@ message MembershipChange {
     KIND_RESIZED = 5;
     // After a resync, `ids` lists every worker of every pool, never one pool.
     KIND_SNAPSHOT = 6;
+    // Since protocol 2; a stream on protocol 1 is not sent it. The worker
+    // keeps its registration and its id and stands in no pool of `models`
+    // any more: its role moved, or it serves them no longer. Sent ahead of
+    // the KIND_RELABELLED or KIND_RESIZED of the same write. A plugin that
+    // lists workers by model unlists the worker under these names and keeps
+    // what it holds by id. A model joined has no kind, a role move names
+    // every model of the old list, and a write that moves neither sends
+    // none. A snapshot names ids and no pool: a plugin that lists workers by
+    // model then drops the ids the snapshot leaves out and holds the rest as
+    // it knew them, and a decision's candidates say who stands in the pool
+    // it decides over.
+    KIND_LEFT = 7;
   }
   Kind kind = 1;
   fixed64 worker_id = 2;
   // The retiring id of a replacement.
   fixed64 old_worker_id = 3;
   repeated fixed64 ids = 4 [packed = true];
+  // KIND_LEFT: the models whose pools the worker left.
+  repeated string models = 5;
 }
 
 message Signal {
@@ -674,7 +688,12 @@ message LifecycleEvent {
 // names the plugin's version, protocol_min = protocol_max. A plugin that
 // does not speak the one version offered ends the stream, as the server,
 // with FAILED_PRECONDITION, its message naming the offered and the spoken
-// versions.
+// versions. No Observe hello is sent before a Decide stream has settled:
+// the events wait, so a plugin may be asked a decision before it heard the
+// pool. An Observe stream names the version last fixed and lives under it:
+// one that ends is opened again under that version, and once the plugin's
+// Decide streams settle on another, the controller ends it and the next
+// names that one. Version 2 adds MembershipChange.KIND_LEFT.
 message PluginHello {
   uint32 protocol_min = 1;
   uint32 protocol_max = 2;

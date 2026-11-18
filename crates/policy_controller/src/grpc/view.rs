@@ -480,13 +480,16 @@ pub(crate) fn released(l: &Lease, r: ReleaseReason) -> proto::lifecycle_event::E
     })
 }
 
-/// A membership word as the plugin contract carries it. `None` for
-/// [`Membership::Left`]: the contract has no kind for it, and a plugin
-/// hears the write's own word, said beside it.
-pub(crate) fn membership(m: &Membership<'_>) -> Option<proto::lifecycle_event::Event> {
+/// A membership word as the plugin contract carries it. A stream whose
+/// protocol version has no kind for a word is not sent it ([`since`]).
+pub(crate) fn membership(m: &Membership<'_>) -> proto::lifecycle_event::Event {
     use proto::membership_change::Kind;
+    let mut models = Vec::new();
     let (kind, worker_id, old_worker_id, ids) = match m {
-        Membership::Left { .. } => return None,
+        Membership::Left { id, models: left } => {
+            models.extend_from_slice(left);
+            (Kind::Left, id.0, 0, Vec::new())
+        }
         Membership::Added(w) => (Kind::Added, w.0, 0, Vec::new()),
         Membership::Removed(w) => (Kind::Removed, w.0, 0, Vec::new()),
         Membership::Replaced { old, new } => (Kind::Replaced, new.0, old.0, Vec::new()),
@@ -496,14 +499,24 @@ pub(crate) fn membership(m: &Membership<'_>) -> Option<proto::lifecycle_event::E
             (Kind::Snapshot, 0, 0, workers.iter().map(|w| w.0).collect())
         }
     };
-    Some(proto::lifecycle_event::Event::Membership(
-        proto::MembershipChange {
-            kind: kind as i32,
-            worker_id,
-            old_worker_id,
-            ids,
-        },
-    ))
+    proto::lifecycle_event::Event::Membership(proto::MembershipChange {
+        kind: kind as i32,
+        worker_id,
+        old_worker_id,
+        ids,
+        models,
+    })
+}
+
+/// The first protocol version whose streams carry `event`. A stream on an
+/// older one is not sent it, and hears what it heard before the word came.
+#[inline]
+pub(crate) fn since(event: &proto::lifecycle_event::Event) -> u32 {
+    use proto::{lifecycle_event::Event, membership_change::Kind};
+    match event {
+        Event::Membership(change) if change.kind == Kind::Left as i32 => 2,
+        _ => 1,
+    }
 }
 
 /// A signal; a veto's instant on the host's clock becomes the microseconds
@@ -684,7 +697,7 @@ pub(crate) fn read(
 
 #[cfg(test)]
 mod tests {
-    use super::{membership, proto, Answer, Invalid, FILTER, PICK, SCORE};
+    use super::{membership, proto, since, Answer, Invalid, FILTER, PICK, SCORE};
     use crate::{lease::Membership, view::WorkerId};
 
     /// The stages' rules, under a plugin that declared no counter.
@@ -1129,17 +1142,24 @@ mod tests {
         }
     }
 
-    /// The contract has no kind for the models a worker left: the mapper
-    /// hands a plugin nothing for that word, and the write's own word as
-    /// before.
+    /// The contract carries the models a worker left as a kind of protocol
+    /// 2: the mapper hands a plugin the word with its models, and the
+    /// write's own word as a kind every version carries.
     #[test]
-    fn a_plugin_is_told_nothing_of_the_models_a_worker_left() {
+    fn a_plugin_is_told_the_models_a_worker_left_as_a_kind_of_protocol_2() {
         let (id, models) = (WorkerId(7), ["m".to_string()]);
         let left = Membership::Left {
             id,
             models: &models,
         };
-        assert!(membership(&left).is_none());
-        assert!(membership(&Membership::Relabelled(id)).is_some());
+        let word = membership(&left);
+        assert_eq!(since(&word), 2);
+        let proto::lifecycle_event::Event::Membership(change) = word else {
+            panic!("a membership word");
+        };
+        let kind = proto::membership_change::Kind::Left as i32;
+        assert_eq!((change.kind, change.worker_id), (kind, 7));
+        assert_eq!(change.models, models);
+        assert_eq!(since(&membership(&Membership::Relabelled(id))), 1);
     }
 }

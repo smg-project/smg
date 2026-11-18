@@ -1196,9 +1196,15 @@ impl BoundPlugin for Bound {
     }
 
     fn observe_membership(&self, change: &Membership<'_>) {
-        if let Some(event) = view::membership(change) {
-            self.plugin.inner.observe(event);
+        let (inner, word) = (&self.plugin.inner, view::membership(change));
+        // A word the standing streams' version has no kind for is not
+        // raised: in the queue it would take a place a heard event needs,
+        // and a refusal of it would number a loss the stream never had.
+        let since = view::since(&word);
+        if since > PROTOCOL_MIN && inner.peer.spoken.stands_under(since) {
+            return;
         }
+        inner.observe(word);
     }
 
     fn observe_signal(&self, signal: &Signal) {

@@ -583,7 +583,7 @@ struct Instance {
     heard: u64,
     /// The feed's list, and its changes, as copied out for one telling.
     members: Vec<WorkerId>,
-    changes: Vec<Membership<'static>>,
+    changes: Vec<Kept>,
     /// The instance's number on its plugin: a resource is live on the store
     /// that made it and on no other.
     generation: u64,
@@ -744,7 +744,8 @@ fn bump(counter: &AtomicU64) {
 }
 
 /// How many membership changes a plugin's feed keeps for the instances
-/// behind it. An instance further behind hears the list as it stands.
+/// behind it. An instance further behind hears the list as it stands: ids
+/// and no pool, so a `Left` among the changes it missed is not told.
 const FEED_CHANGES: usize = 64;
 
 /// The membership feed of a plugin whose row lists the kind: the pool's one
@@ -766,7 +767,35 @@ struct Told {
     members: Vec<WorkerId>,
     /// The last changes told, the newest last, [`FEED_CHANGES`] at most. A
     /// snapshot is `None`: the list above holds it.
-    changes: VecDeque<Option<Membership<'static>>>,
+    changes: VecDeque<Option<Kept>>,
+}
+
+/// A membership change as the feed keeps it for the instances behind it:
+/// the host's word, case for case, the names of a `Left` owned once for
+/// every instance that hears it. A snapshot is not kept: the feed's list
+/// holds it.
+#[derive(Clone)]
+enum Kept {
+    Added(WorkerId),
+    Removed(WorkerId),
+    Replaced { old: WorkerId, new: WorkerId },
+    Relabelled(WorkerId),
+    Resized(WorkerId),
+    Left { id: WorkerId, models: Arc<[String]> },
+}
+
+impl Kept {
+    /// The word as the host told it.
+    fn word(&self) -> Membership<'_> {
+        match *self {
+            Self::Added(worker) => Membership::Added(worker),
+            Self::Removed(worker) => Membership::Removed(worker),
+            Self::Replaced { old, new } => Membership::Replaced { old, new },
+            Self::Relabelled(worker) => Membership::Relabelled(worker),
+            Self::Resized(worker) => Membership::Resized(worker),
+            Self::Left { id, ref models } => Membership::Left { id, models },
+        }
+    }
 }
 
 impl Feed {
@@ -1000,12 +1029,7 @@ impl Plugin {
             .ok_or_else(|| LoadError::Abi {
                 name: name.clone(),
                 found: version.to_string(),
-                accepted: format!(
-                    "{}.0 to {}.{}",
-                    Abi::MAJOR,
-                    Abi::MAJOR,
-                    Abi::SUPPORTED_MINOR
-                ),
+                accepted: Abi::accepted_range(),
             })?;
         if let Some(pinned) = spec.abi {
             if pinned != abi {
@@ -1905,11 +1929,11 @@ impl Plugin {
                 if !told.members.contains(&worker) {
                     told.members.push(worker);
                 }
-                Some(Membership::Added(worker))
+                Some(Kept::Added(worker))
             }
             Membership::Removed(worker) => {
                 told.members.retain(|member| *member != worker);
-                Some(Membership::Removed(worker))
+                Some(Kept::Removed(worker))
             }
             Membership::Replaced { old, new } => {
                 if let Some(member) = told.members.iter_mut().find(|member| **member == old) {
@@ -1917,12 +1941,16 @@ impl Plugin {
                 } else if !told.members.contains(&new) {
                     told.members.push(new);
                 }
-                Some(Membership::Replaced { old, new })
+                Some(Kept::Replaced { old, new })
             }
-            Membership::Relabelled(worker) => Some(Membership::Relabelled(worker)),
-            Membership::Resized(worker) => Some(Membership::Resized(worker)),
-            // No contract carries the word yet: a plugin is told nothing.
-            Membership::Left { .. } => return,
+            Membership::Relabelled(worker) => Some(Kept::Relabelled(worker)),
+            Membership::Resized(worker) => Some(Kept::Resized(worker)),
+            // The list holds ids and no pool, so the worker stays in it. Its
+            // names are owned here, once for every instance that hears them.
+            Membership::Left { id, models } => Some(Kept::Left {
+                id,
+                models: models.into(),
+            }),
         };
         if told.changes.len() == FEED_CHANGES {
             told.changes.pop_front();
@@ -1969,23 +1997,26 @@ impl Plugin {
                 members.extend_from_slice(&told.members);
             } else {
                 let level = told.changes.len() - behind;
-                changes.extend(told.changes.iter().skip(level).flatten());
+                changes.extend(told.changes.iter().skip(level).flatten().cloned());
             }
             instance.heard = place;
             whole
         };
         if whole {
-            if let Some(event) = marshal::membership(&Membership::Snapshot(&members), &mut ids) {
-                self.tell(slot, wit::LifecycleEvent::Membership(event));
-            }
+            let (word, mut names) = (Membership::Snapshot(&members), Vec::new());
+            let event = marshal::membership(&word, &mut ids, &mut names);
+            self.tell(slot, wit::LifecycleEvent::Membership(event));
         } else {
-            for change in &changes {
+            // Each change is told and let go: a left word lends its names
+            // to its one call, and the buffer alone stays with the instance.
+            // A fault ends the telling, and the changes behind it go too.
+            for change in changes.drain(..) {
                 if slot.is_none() {
                     break;
                 }
-                if let Some(event) = marshal::membership(change, &mut ids) {
-                    self.tell(slot, wit::LifecycleEvent::Membership(event));
-                }
+                let (word, mut names) = (change.word(), Vec::new());
+                let event = marshal::membership(&word, &mut ids, &mut names);
+                self.tell(slot, wit::LifecycleEvent::Membership(event));
             }
         }
         if let Some(instance) = slot.as_mut() {
