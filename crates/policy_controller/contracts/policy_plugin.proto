@@ -412,7 +412,7 @@ message Lease {
   // the request's session key carries in its hash form (see Identity); 0
   // when none.
   fixed64 session_key = 6;
-  // Token-work booked on the target.
+  // The prompt size the request stated, in tokens; 0 where it stated none.
   uint32 tokens = 7;
   // The leader's term that minted the lease.
   uint64 term = 8;
