@@ -320,13 +320,14 @@ impl<'de> Deserialize<'de> for LateBoundModel {
 /// one the crate builds from the same file. A Unigram section is read by
 /// [`unigram_scores::section`], for the scores the reference reads, in any
 /// order of its keys (`type`, `unk_id`, `vocab`, `byte_fallback`): the
-/// entries are read until one tells the kind, which is the value of `type`
-/// or a vocabulary that is a list of pieces with their scores. Every other
-/// entry is held until then, a key no section has among them, so the place
-/// of a key does not decide which reader takes the section. Any other
-/// section (another model kind, a BPE section with `type` later) goes to
-/// the crate's own reader, which streams it as before with the entries
-/// already read put back in front.
+/// entries are read until one tells the kind, which is the value of `type`,
+/// a key of another kind of section (`unk_token`, `dropout`, `merges` and
+/// the like) or a vocabulary that is a list of pieces with their scores.
+/// Any other entry is held until then (`unk_id`, `byte_fallback`, a key no
+/// section has), so the place of such a key does not decide which reader
+/// takes the section. Any other section (another model kind, a BPE section
+/// with `type` later) goes to the crate's own reader, which streams it as
+/// before with the entries already read put back in front.
 struct ModelSection;
 
 impl<'de> Visitor<'de> for ModelSection {
@@ -337,8 +338,10 @@ impl<'de> Visitor<'de> for ModelSection {
     }
 
     fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<LateBoundModel, A::Error> {
-        // The entries read before one tells the kind.
+        // The entries read before one tells the kind, and the key that
+        // ended the reading with its value still in the section.
         let mut read = Vec::new();
+        let mut pending = None;
         while let Some(key) = map.next_key::<String>()? {
             match key.as_str() {
                 "type" => {
@@ -364,6 +367,21 @@ impl<'de> Visitor<'de> for ModelSection {
                         break;
                     }
                 },
+                // A key of another kind of section, which no Unigram section
+                // has: the crate's reader takes the section from here, the
+                // value of this key unread, so an older file of another
+                // kind, written without `type`, loads at the cost it had.
+                "dropout"
+                | "unk_token"
+                | "continuing_subword_prefix"
+                | "end_of_word_suffix"
+                | "fuse_unk"
+                | "ignore_merges"
+                | "merges"
+                | "max_input_chars_per_word" => {
+                    pending = Some(key);
+                    break;
+                }
                 // No other entry tells the kind: `unk_id`, which a section
                 // of another kind may carry (the crate's reader skips it
                 // there), `byte_fallback`, which a BPE section has too, or a
@@ -373,7 +391,7 @@ impl<'de> Visitor<'de> for ModelSection {
             }
         }
         ModelWrapper::deserialize(de::value::MapAccessDeserializer::new(Replay::new(
-            read, None, map,
+            read, pending, map,
         )))
         .map(LateBoundModel::from)
     }
@@ -838,6 +856,29 @@ mod tests {
         // a key it does not know: the key does not claim the section.
         let json = r#"{"unk_id":0,"type":"BPE","vocab":{"a":0},"merges":[]}"#;
         assert_eq!(loading_reading(json), crate_reading(json));
+    }
+
+    #[test]
+    fn a_key_of_another_kind_hands_the_section_to_the_crate_reader() {
+        // Each is a key of a BPE, WordPiece or WordLevel section, and no
+        // Unigram section has it. The scores behind it are the tie of
+        // `unigram_scores`, which the crate's reader and the section's own
+        // read one bit apart: the reading is the crate's.
+        for entry in [
+            r#""dropout":null"#,
+            r#""unk_token":"<unk>""#,
+            r#""continuing_subword_prefix":"""#,
+            r#""end_of_word_suffix":"""#,
+            r#""fuse_unk":false"#,
+            r#""ignore_merges":false"#,
+            r#""merges":[]"#,
+            r#""max_input_chars_per_word":100"#,
+        ] {
+            let json = format!(
+                r#"{{{entry},"unk_id":0,"vocab":[["<unk>",0.0],["a",-1.1695698339729451],["aa",-2.3391396679458905]]}}"#
+            );
+            assert_eq!(loading_reading(&json), crate_reading(&json), "{json}");
+        }
     }
 
     #[test]
