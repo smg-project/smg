@@ -116,10 +116,11 @@ pub enum Spread {
     /// value, or two that differ by this much or more.
     Levels(f32),
     /// One value for every row, 1.0: the stage orders nothing and widens no
-    /// tie, so the band it returns is none, `TieBand(0.0)`. A decision by
-    /// rank does not ask such a stage, and a band it returned would be read
-    /// by the whole pass alone: a debug build checks it where the stage is
-    /// asked.
+    /// tie, so the band it returns is none, `TieBand(0.0)`. Among its
+    /// leading ranks a decision by rank does not ask such a stage: its
+    /// share stands in every row's sum unasked. Past them it is asked like
+    /// any stage and a band it returned would be read: a debug build checks
+    /// it at every ask.
     Alike,
 }
 
@@ -241,10 +242,10 @@ pub trait Scorer: Lifecycle + Debug {
     /// it too of a stage handed the rows a rank put in front, which says
     /// there that it must be asked whole ([`Front::Whole`]) where its answer
     /// reads rows it was not handed. A scorer that says its front has one
-    /// body: it asks its own `score` and reads the word off the scores
-    /// ([`Front::of`]), so a row scores alike by either entry. A debug
-    /// build checks the word against the scores. The default scores and
-    /// says nothing.
+    /// body behind both entries, so a row scores alike by either. It says
+    /// the word from what that body knows, or reads it off the scores
+    /// ([`Front::of`]). A debug build checks the word against the scores.
+    /// The default scores and says nothing.
     fn score_front(
         &self,
         facts: &RequestFacts<'_>,
@@ -333,6 +334,10 @@ pub const DRAW_FROM: usize = 16;
 /// The size is the draw's ([`DRAW_FROM`]): a decision reads one floor for
 /// both.
 pub const RANK_FROM: usize = DRAW_FROM;
+
+// A decision compares the pool's size with one floor for the draw and the
+// ranks.
+const _: () = assert!(RANK_FROM == DRAW_FROM);
 
 /// Turns the survivors into ordered targets, in two steps the engine runs
 /// around the scorers: `narrow` names the set the picker compares, the
@@ -804,8 +809,9 @@ fn combine(
         stage.clear();
         stage.resize(kept.len(), 0.0);
         let stage_band = weighted.scorer.score(facts, candidates, kept, stage);
-        // A decision by rank does not ask a stage that orders nothing, so
-        // the band of one is none here too ([`Spread::Alike`]).
+        // Among its leading ranks a decision by rank does not ask a stage
+        // that orders nothing, so the band of one is none here too
+        // ([`Spread::Alike`]).
         debug_assert!(
             bandless(weighted, stage_band),
             "{} orders nothing and returned a band",
@@ -903,9 +909,9 @@ fn as_said(spread: Spread, said: Front, stage: &[f32]) -> bool {
 /// where every row was asked every stage.
 ///
 /// A rank that leaves every row at its ceiling adds its share to what each
-/// row holds, and a stage that orders nothing is not asked. A rank parts
-/// the rows where some stand at its ceiling and some under it. The rows at
-/// the ceiling stand in front where they fill a decision's targets, are at
+/// row holds, and a leading stage that orders nothing is not asked. A rank
+/// parts the rows where some stand at its ceiling and some under it. The rows
+/// at the ceiling stand in front where they fill a decision's targets, are at
 /// most half of the rows asked, and the build let the rank put rows in
 /// front ([`Order`]): the stages behind are asked of them alone
 /// ([`combine_few`]), and a row left behind keeps the sum the ranks gave
@@ -1007,11 +1013,13 @@ fn combine_ranked(
             let n = n as usize;
             // The list keeps its length from one decision to the next and
             // is filled only as it grows: every entry read of it was
-            // written for this decision first.
+            // written for this decision first. It is sliced to the front, a
+            // half for the candidates and a half for their places: the walk
+            // below stops at that count.
             if tied.len() < 2 * n {
                 tied.resize(2 * n, 0);
             }
-            let (asked, places) = tied.split_at_mut(n);
+            let (asked, places) = tied[..2 * n].split_at_mut(n);
             let mut next = 0;
             for (at, &value) in stage.iter().enumerate() {
                 if value >= 1.0 && next < n {
@@ -1124,6 +1132,8 @@ fn combine_few(
             }
             continue;
         }
+        // A row a stage leaves unwritten reads nothing, as in the zeroed
+        // buffer the whole pass hands: not the score of the stage before.
         let out = &mut outs[..few];
         out.fill(0.0);
         let (stage_band, said) = weighted
@@ -2220,7 +2230,8 @@ impl Marks {
     /// ([`PoolFacts::rated`]), asks its stages by rank ([`run_ranked`]).
     /// Under a picker that draws for a request that names rows
     /// ([`Self::JOINED`]) that request is the draw's, and every other is
-    /// the ranks'.
+    /// the ranks'. Never set under a picker that draws for every request:
+    /// the draw is asked first there.
     const RANKED: u8 = 1 << 4;
     /// The plain ring alone places a keyed request by its session key:
     /// under a binding that steers, such a request keeps its key's worker
@@ -2250,9 +2261,12 @@ impl Marks {
         } else {
             0
         };
+        let draws_always = draws_first != 0 && joined == 0;
         // The picker says it itself: a name can be answered by a host's
-        // picker that reads every score.
-        let front = profile.picker.front_wise();
+        // picker that reads every score. A profile that draws for every
+        // request holds no rank mark: the draw is asked first there, and a
+        // decision knows the profile by one compare of its marks.
+        let front = profile.picker.front_wise() && !draws_always;
         let ranked = if (scoped | by_assignment) == 0 && order.gains() && front {
             Self::RANKED
         } else {
@@ -2267,15 +2281,6 @@ impl Marks {
         self.0 & (Self::SCOPED | Self::BY_ASSIGNMENT | Self::KEYED) == 0
     }
 
-    /// How the profile draws, its two marks in one masked read: zero where
-    /// it never draws first, [`Self::DRAWS_FIRST`] alone where it draws for
-    /// every request, both marks where it draws for a request that names
-    /// rows. A decision asks once, so a profile that never draws pays the
-    /// one compare it paid before the second mark.
-    const fn draw(self) -> u8 {
-        self.0 & (Self::DRAWS_FIRST | Self::JOINED)
-    }
-
     /// A scope to open, under the key's mark or under none.
     const fn scoped(self) -> bool {
         self.0 & (Self::SCOPED | Self::KEYED_SCOPE) != 0
@@ -2284,6 +2289,18 @@ impl Marks {
     /// A scope to open and no key's mark: the opening's first arm.
     const fn opens_first(self) -> bool {
         self.0 & Self::SCOPED != 0
+    }
+
+    /// What may stand ahead of the profile's whole pass in a plain
+    /// decision, its marks in one masked read: the draw's two and the
+    /// ranks' ([`Self::RANKED`]). Of the draw's, [`Self::DRAWS_FIRST`]
+    /// stands alone where the profile draws for every request, and beside
+    /// [`Self::JOINED`] where it draws for a request that names rows. A
+    /// decision asks once, so a profile that neither draws nor ranks pays
+    /// the one compare it paid before the third mark, and one that draws
+    /// for every request reads `DRAWS_FIRST` alone: it holds no rank mark.
+    const fn ahead(self) -> u8 {
+        self.0 & (Self::DRAWS_FIRST | Self::JOINED | Self::RANKED)
     }
 
     const fn ranked(self) -> bool {
@@ -3280,23 +3297,33 @@ impl Engine {
         ) {
             return run_encode(profile, index, facts, pool, set, cx, buf);
         }
-        // A picker the rows named join draws for a request that names rows.
-        let draw = marks.draw();
-        if draw != 0
-            && candidates.len() >= DRAW_FROM
-            && (draw == Marks::DRAWS_FIRST || facts.named.is_some())
-        {
-            return run_drawn(self, index, facts, pool, set, cx, buf);
-        }
-        // A profile whose leading stages are ranks is asked by rank where
-        // the draw left the decision, over a pool of `RANK_FROM` rows or
-        // more whose host says that every row holds a rate
-        // ([`PoolFacts::rated`]). The load stage reads every row to cost a
-        // row without a rate, so over a pool that holds one it would say of
-        // the rows in front that it must be asked whole, after the ranks
-        // were read: a pool not said to hold none is asked whole at once.
-        if marks.ranked() && candidates.len() >= RANK_FROM && pool.rated {
-            return run_ranked(self, index, facts, pool, set, cx, buf);
+        // What may stand ahead of the whole pass, a draw or the ranks, is
+        // asked of the marks once, and only over a pool of `DRAW_FROM` rows
+        // or more: the ranks' floor is the draw's.
+        let ahead = marks.ahead();
+        if ahead != 0 && candidates.len() >= DRAW_FROM {
+            // A profile that draws for every request is the draw's at one
+            // compare, the one it paid before the ranks: it holds no rank
+            // mark, so its marks read `DRAWS_FIRST` alone ([`Marks::of`]).
+            if ahead == Marks::DRAWS_FIRST {
+                return run_drawn(self, index, facts, pool, set, cx, buf);
+            }
+            // A picker the rows named join draws for a request that names
+            // rows. The request is asked first: one that names none skips
+            // the mark.
+            if facts.named.is_some() && ahead & Marks::JOINED != 0 {
+                return run_drawn(self, index, facts, pool, set, cx, buf);
+            }
+            // A profile whose leading stages are ranks is asked by rank
+            // where the draw left the decision and the host says that every
+            // row of the pool holds a rate ([`PoolFacts::rated`]). The load
+            // stage reads every row to cost a row without a rate, so over a
+            // pool that holds one it would say of the rows in front that it
+            // must be asked whole, after the ranks were read: a pool not
+            // said to hold none is asked whole at once.
+            if marks.ranked() && pool.rated {
+                return run_ranked(self, index, facts, pool, set, cx, buf);
+            }
         }
         run_single(profile, index, facts, pool, set, cx, buf)
     }
@@ -10307,6 +10334,39 @@ mod tests {
         }
     }
 
+    /// A host's picker that draws for every request and says that it takes
+    /// its targets from a front.
+    #[derive(Debug)]
+    struct Eager;
+
+    impl Lifecycle for Eager {}
+
+    impl Picker for Eager {
+        fn name(&self) -> &'static str {
+            "eager"
+        }
+
+        fn pick(
+            &self,
+            facts: &RequestFacts<'_>,
+            candidates: &[Candidate],
+            kept: &[u32],
+            scores: &[f32],
+            band: TieBand,
+            out: &mut Targets,
+        ) {
+            Lowest.pick(facts, candidates, kept, scores, band, out);
+        }
+
+        fn draws_first(&self) -> bool {
+            true
+        }
+
+        fn front_wise(&self) -> bool {
+            true
+        }
+    }
+
     /// One profile over the healthy rows: `stages` under `picker`.
     fn staged(stages: Vec<Weighted>, picker: Box<dyn Picker>) -> Engine {
         Engine::new(
@@ -10435,6 +10495,18 @@ mod tests {
         assert_eq!(plain.marks[0].0 & Marks::RANKED, 0);
         assert!(marked(Box::new(Best)) && marked(Box::new(CountFirst)));
         assert!(!marked(Box::new(Lowest)) && !marked(Box::new(Random)));
+        // A profile whose picker draws for every request holds no mark
+        // either, whatever that picker says of a front: the draw is asked
+        // first, and a decision knows the profile by one compare of its
+        // marks ([`Marks::ahead`]).
+        let eager = Profile {
+            name: "eager".into(),
+            filters: Vec::new(),
+            scorers: Vec::new(),
+            picker: Box::new(Eager),
+        };
+        let gains = staged(vec![level(1.0, 3.0), wise(1.0)], Box::new(Best)).orders[0];
+        assert_eq!(Marks::of(&eager, gains).ahead(), Marks::DRAWS_FIRST);
         // The cache-aware preset: the warm-up slice and the holders' tiers
         // are ranks, the gate's stage orders nothing, and the load is asked
         // of the rows they put in front.
@@ -10503,9 +10575,33 @@ mod tests {
         assert_eq!(*handed.lock().expect("the probe's rows"), every);
     }
 
-    /// A stage that orders nothing is not asked by a ranked decision: its
-    /// share stands in every row's sum, and the decision is the one the
-    /// weighted sum reads, which asks it once.
+    /// A request that names rows is the draw's only under a picker that
+    /// draws for it ([`Marks::JOINED`]). Under one that never draws, a
+    /// profile of ranks is asked by rank: the stage behind the rank of the
+    /// rows in front alone.
+    #[test]
+    fn a_request_that_names_rows_is_asked_by_rank_where_the_picker_never_draws() {
+        let handed = Arc::new(Mutex::new(Vec::new()));
+        let probe = Weighted {
+            scorer: Box::new(Asked(Arc::clone(&handed))),
+            weight: 1.0,
+        };
+        let levels = [1.0, 0.5, 1.0, 0.0, 1.0, 0.5, 1.0, 0.0, 0.5];
+        let engine = staged(vec![rank(&levels, 4.0, true), probe], Box::new(Best));
+        assert_eq!(engine.marks[0].ahead(), Marks::RANKED);
+        let pool = ranked_pool(9);
+        let facts = RequestFacts {
+            named: Some(NamedAffinity::default()),
+            ..request(7)
+        };
+        let decision = rated(&engine, &facts, &pool);
+        assert_eq!(*handed.lock().expect("the probe's rows"), vec![0, 2, 4, 6]);
+        assert_eq!(positions(&decision), vec![6, 4, 2, 0]);
+    }
+
+    /// A leading stage that orders nothing is not asked by a ranked
+    /// decision: its share stands in every row's sum, and the decision is
+    /// the one the weighted sum reads, which asks it once.
     #[test]
     fn a_stage_that_orders_nothing_is_not_asked() {
         let asks = Arc::new(Mutex::new(0));
@@ -11033,6 +11129,70 @@ mod tests {
         let decision = rated(&engine, &request(9), &pool);
         assert_eq!(*handed.lock().expect("the probe's rows"), vec![4, 5, 6, 7]);
         assert_eq!(positions(&decision), vec![7, 6, 5, 4]);
+    }
+
+    /// A stage that writes only the rows it has a score for, and keeps the
+    /// rows it was handed last: a negative entry leaves its row unwritten.
+    #[derive(Debug)]
+    struct Sparse(Vec<f32>, Arc<Mutex<Vec<u32>>>);
+
+    impl Lifecycle for Sparse {}
+
+    impl Scorer for Sparse {
+        fn name(&self) -> &'static str {
+            "sparse"
+        }
+
+        fn score(
+            &self,
+            _: &RequestFacts<'_>,
+            candidates: &[Candidate],
+            kept: &[u32],
+            out: &mut [f32],
+        ) -> TieBand {
+            let mut handed = self.1.lock().expect("the probe's rows");
+            handed.clear();
+            for (o, &row) in out.iter_mut().zip(kept) {
+                let position = candidates[row as usize].position;
+                handed.push(position);
+                let value = self.0[position as usize];
+                if value >= 0.0 {
+                    *o = value;
+                }
+            }
+            TieBand(0.0)
+        }
+
+        fn front_wise(&self) -> bool {
+            true
+        }
+    }
+
+    /// A row a stage leaves unwritten reads nothing by rank too. The first
+    /// rank puts eight rows in front, and the second, asked of them, leaves
+    /// four there, each written its ceiling. The stage behind is handed
+    /// those four and writes three: the fourth reads nothing, as in the
+    /// zeroed buffer the whole pass hands, and stands last. A front that
+    /// kept the rank's output would hand it that ceiling and stand it first.
+    #[test]
+    fn a_row_a_stage_leaves_unwritten_reads_nothing_among_the_rows_in_front() {
+        let handed = Arc::new(Mutex::new(Vec::new()));
+        let pool: Vec<Candidate> = (0..16).map(|i| candidate(i, 0)).collect();
+        let first: Vec<f32> = (0..16).map(|i| if i < 8 { 1.0 } else { 0.5 }).collect();
+        let second: Vec<f32> = (0..16).map(|i| if i < 4 { 1.0 } else { 0.5 }).collect();
+        let mut third = vec![-1.0; 16];
+        third[..3].copy_from_slice(&[0.25, 0.5, 0.75]);
+        let sparse = Weighted {
+            scorer: Box::new(Sparse(third, Arc::clone(&handed))),
+            weight: 1.0,
+        };
+        let stages = vec![rank(&first, 12.0, true), rank(&second, 3.0, true), sparse];
+        let engine = staged(stages, Box::new(Best));
+        let by_rank = positions(&rated(&engine, &request(9), &pool));
+        assert_eq!(*handed.lock().expect("the probe's rows"), vec![0, 1, 2, 3]);
+        assert_eq!(by_rank, vec![2, 1, 0, 3]);
+        let by_sum = positions(&whole_pass(&engine, &request(9), &pool));
+        assert_eq!(by_rank, by_sum);
     }
 
     /// A rank parts the rows in front without leaving fewer there, the

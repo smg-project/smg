@@ -1599,7 +1599,7 @@ mod tests {
         assert!(!keyed.opens_first() && !keyed.asks_nothing_first());
         let bare = Marks(Marks::DRAWS_FIRST).with_key();
         assert!(!bare.scoped() && !bare.keyed_scope());
-        assert_eq!(bare.draw(), Marks::DRAWS_FIRST);
+        assert_eq!(bare.ahead(), Marks::DRAWS_FIRST);
         assert!(!bare.asks_nothing_first());
         let placed = Marks(Marks::SCOPED | Marks::BY_ASSIGNMENT);
         assert_eq!(placed.with_key(), placed);
