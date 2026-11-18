@@ -847,8 +847,11 @@ impl Standby {
             // the head its leader stated: a frame inside a replay, or in
             // the tail a restore leaves, moves nothing. A frame that states
             // no head, a leader of a build before the field, moves it as
-            // every applied frame did.
-            if batch.head_seq == 0 || batch.head_seq == self.follower.place().seq {
+            // every applied frame did. A place is the leader's under a
+            // term alone: a row of the standby's own stands under none,
+            // and a head stated at its number is another event's.
+            let place = self.follower.place();
+            if batch.head_seq == 0 || (place.term != 0 && batch.head_seq == place.seq) {
                 self.shared.lag.applied(now);
             }
         }
@@ -1914,6 +1917,54 @@ mod tests {
             let (ended, ()) = tokio::join!(standby.stream(&named, &applied), script);
             assert_eq!((ended.next, ended.applied), (Next::Lease, true));
         }
+    }
+
+    #[tokio::test]
+    async fn a_head_stated_at_the_number_of_the_standbys_own_row_moves_no_sync() {
+        let mut bed = Bed::new().await;
+        let (_elector, standing, standby) = standing_by(&bed, FIVE);
+        // A log's places start where its run drew, and a row of the
+        // store's own stands past every place its log drew: it takes the
+        // next number where the leader's places lie above the standby's
+        // own. This leader's start there.
+        let drawn = standby.follower.log.head(Kinds::All);
+        let above = journaled_from(&LeasePlace::File("shared".into()), drawn.seq + 1);
+        let leader: Replica = (above.0, above.1.log);
+        leader.0.set_term(1);
+        leader.0.upsert(facts("http://a:8000", 1));
+        let now = Instant::now();
+        let id = leader.0.upsert(facts("http://b:8000", 1)).id();
+        follow(&standby.follower, &leader.1, now);
+        let followed = standby.follower.place();
+        // A poll's late answer lands as a row of the standby's own: at the
+        // next number, under no term.
+        standby
+            .follower
+            .store
+            .record(id, 0, running(1), now, LoadSource::Stream);
+        let own = standby.follower.place();
+        assert_eq!((own.seq, own.term), (followed.seq + 1, 0));
+        standing.send_replace(bed.holds("leader-1", 1));
+        let named = standby.shared.leader(None);
+        let applied = AtomicBool::new(false);
+        let script = async {
+            let mut opened = bed.opened().await;
+            assert!(matches!(opened.frame().await, Some(Frame::Hello(_))));
+            // The leader wrote one event since, and its heartbeat states
+            // that head: the number of the standby's own row.
+            let beat = proto::ReplicationBatch {
+                first_seq: followed.seq + 1,
+                term: followed.term,
+                head_seq: own.seq,
+                ..proto::ReplicationBatch::default()
+            };
+            opened.says(beat).await;
+            opened.refuses(Status::aborted("deposed")).await;
+        };
+        let (ended, ()) = tokio::join!(standby.stream(&named, &applied), script);
+        assert_eq!((ended.next, ended.applied), (Next::Lease, true));
+        let age = standby.shared.lag.age(Instant::now());
+        assert!(age.is_none(), "synced by a head at an own row's number");
     }
 
     #[tokio::test]
