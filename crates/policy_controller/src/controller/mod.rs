@@ -594,8 +594,8 @@ impl Controller {
     ///
     /// Refused here, before anything serves ([`StoreRefused`]): a path that
     /// leads to no directory, a directory another controller still holds at
-    /// the end of that wait, a lock the system does not give (a directory
-    /// with no lock file, where the controller may make none, has none), a
+    /// the end of that wait, a lock the system does not give, a directory
+    /// with no lock file where the controller may make none, a
     /// directory that is not read, two files under one number, a newest
     /// generation that does not run, a spec source taken before this one,
     /// and a lease another replica can take ([`LeasePlace`]). A standby does
@@ -628,10 +628,14 @@ impl Controller {
             // a caller that drops this call while the start waits leaves a
             // store bound with both.
             tokio::task::spawn_blocking(move || {
-                generations.bind_store(SpecStore::open_within(path.clone(), wait)?)?;
+                let store = SpecStore::open_within(path, wait)?;
+                // The line names the directory held: its path as resolved,
+                // the one the line of a wait names.
+                let held = store.dir().to_owned();
+                generations.bind_store(store)?;
                 info!(
                     controller_id = %controller_id,
-                    path = %path.display(),
+                    path = %held.display(),
                     generation = generations.generation(),
                     "spec store"
                 );
