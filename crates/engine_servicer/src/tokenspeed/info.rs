@@ -289,6 +289,7 @@ fn reported_entry(
         // The direct TokenSpeed wire reports active pages, excluding
         // retained cache (unlike the Python legacy GetLoad projection).
         active_token_usage: Some(figures.usage),
+        num_resident_tokens: load.num_resident_tokens,
         num_waiting_uncached_tokens: estimate.queued_token_work,
         gen_throughput: estimate.gen_throughput,
         prefill_throughput: estimate.prefill_throughput,

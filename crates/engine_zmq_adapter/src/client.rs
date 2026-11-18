@@ -1742,6 +1742,9 @@ impl ZmqEngineClient {
                 num_running_reqs: i32::try_from(load.num_running).unwrap_or(i32::MAX),
                 num_waiting_reqs: i32::try_from(load.num_waiting).unwrap_or(i32::MAX),
                 token_usage: load.kv_cache_usage,
+                num_resident_tokens: load
+                    .num_resident_tokens
+                    .map(|tokens| i64::try_from(tokens).unwrap_or(i64::MAX)),
                 ..Default::default()
             })
     }

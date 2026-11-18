@@ -470,6 +470,7 @@ pub(crate) fn load_changed(last: &common::EngineLoad, current: &common::EngineLo
     prefill_changed || last.running_requests != current.running_requests
         || last.waiting_requests != current.waiting_requests
         || last.waiting_uncached_tokens != current.waiting_uncached_tokens
+        || last.num_resident_tokens != current.num_resident_tokens
         || last.max_running_requests != current.max_running_requests
         || (last.token_usage - current.token_usage).abs() > 0.005
         || (last.active_token_usage.unwrap_or(last.token_usage)

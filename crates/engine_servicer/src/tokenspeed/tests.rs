@@ -4400,3 +4400,78 @@ async fn the_relays_rank_record_is_the_get_loads_entry_of_the_rank() {
     assert!(state.rank_load(Some(1)).is_none());
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
+
+#[tokio::test]
+async fn resident_tokens_reach_direct_loads_and_grpc_reports() {
+    use engine_zmq_client::protocol::tokenspeed::output::{
+        BASE_COLUMN_NAMES, BATCH_TOKEN_ID_OUT_SLIM_TAG, FINISHED_MESSAGES, FINISHED_STATUS_CODES,
+        NUM_RESIDENT_TOKENS,
+    };
+
+    let mut ready = default_ready_response();
+    ready.positional_layouts.insert(
+        BATCH_TOKEN_ID_OUT_SLIM_TAG.into(),
+        BASE_COLUMN_NAMES
+            .into_iter()
+            .chain([
+                FINISHED_STATUS_CODES,
+                FINISHED_MESSAGES,
+                NUM_RESIDENT_TOKENS,
+            ])
+            .map(str::to_string)
+            .collect(),
+    );
+    let mut h = harness_with_ready(model_info(), None, ready).await;
+    let mut running = h
+        .client
+        .generate(generate_request("running", true, Vec::new()))
+        .await
+        .unwrap()
+        .into_inner();
+    recv_add(&mut h.engine_in).await;
+    let adapter = h.server.state.shared.engine().unwrap();
+
+    for (completion, resident) in [Some(5_000_000_000), Some(0), None].into_iter().enumerate() {
+        let mut step = batch(
+            "running",
+            vec![10],
+            completion as u32 + 1,
+            None,
+            Some((1, 0, 10, 100)),
+        );
+        step.num_resident_tokens = resident;
+        send(&mut h.engine_out, &step).await;
+        running.message().bounded().await.unwrap().unwrap();
+
+        let direct = adapter.get_loads();
+        assert_eq!(
+            direct.loads[0].num_resident_tokens,
+            resident.map(|tokens| tokens as i64)
+        );
+        let polled = h
+            .client
+            .get_loads(ts::GetLoadsRequest::default())
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            polled.loads[0].num_resident_tokens,
+            resident.map(|tokens| tokens as i64)
+        );
+        let pushed = h.server.state.rank_load(Some(0)).unwrap();
+        assert_eq!(pushed.num_resident_tokens, resident);
+    }
+    let mut done = batch(
+        "running",
+        Vec::new(),
+        3,
+        Some("length"),
+        Some((1, 0, 10, 100)),
+    );
+    done.num_resident_tokens = Some(5_000_000_000);
+    send(&mut h.engine_out, &done).await;
+    while running.message().bounded().await.unwrap().is_some() {}
+    let idle = adapter.get_loads();
+    assert_eq!(idle.loads[0].num_resident_tokens, Some(0));
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}

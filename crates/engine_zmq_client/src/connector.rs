@@ -820,6 +820,7 @@ impl<P: EngineProtocol> ClientInner<P> {
             if let Some(load) = routing.load.get_mut(&engine_index) {
                 load.num_running = 0;
                 load.num_waiting = 0;
+                load.num_resident_tokens = load.num_resident_tokens.map(|_| 0);
             }
         }
     }
