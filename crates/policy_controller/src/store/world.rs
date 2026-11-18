@@ -1933,9 +1933,9 @@ pub(super) struct Writer {
     /// stands here until an answer or a record names it again, or its
     /// member's rows go. While a rank the answer named has a record on
     /// file, an unnamed rank's rows carry the overload bit
-    /// ([`Self::judge`]): no decision takes a rank its engine stopped
-    /// naming while another answers. Empty until an answer names part of
-    /// an engine.
+    /// ([`Self::judge`]): a decision that drops overloaded rows takes no
+    /// rank its engine stopped naming while another answers. Empty until
+    /// an answer names part of an engine.
     unnamed: Vec<(WorkerId, u16)>,
     /// How many writes to the load table moved an overload verdict.
     flips: u64,

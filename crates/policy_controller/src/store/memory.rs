@@ -1776,7 +1776,7 @@ impl LoadSink for MemoryStore {
             writer,
         } = &mut *loads;
         // The answer is one engine's: its rows are written whole before
-        // the one judgment and the one publication, so its ranks are read
+        // its judgment and the one publication, so its ranks are read
         // as one answer left them. A caller's mix of engines judges each,
         // and each engine is heard by its own ranks' rows.
         let mut first: Option<(u32, Said)> = None;

@@ -69,7 +69,7 @@ pub struct LoadSample {
 /// worker stays polled until its records resume.
 ///
 /// Every write that changes what is on file for an engine judges the
-/// engine's overload verdict once, when the write is whole: a record, a
+/// engine's overload verdict when the write is whole: a record, a
 /// report, the word that no report came, an eviction. Once the caller
 /// told how often it hears a rank ([`LoadSink::heard_every`]), a judgment
 /// counts a rank's sample only while its engine still says it.
@@ -101,7 +101,7 @@ pub trait LoadSink: Send + Sync {
     /// One engine's answer to the poll asked at `polled_at`, whole: for
     /// each rank the poll was for, under the rank's own id, the row the
     /// answer brought, or `None` where it brought none. The rows are
-    /// written and the engine is judged once, so two ranks that trade
+    /// written whole before the engine is judged, so two ranks that trade
     /// their load in one answer are never read as one new rank beside one
     /// old. A rank the answer omits keeps what is on file, and beside a
     /// rank the answer names it is avoided from this write on. An answer

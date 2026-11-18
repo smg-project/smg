@@ -136,8 +136,10 @@ pub struct Health {
     /// Being drained; nothing new goes there.
     pub draining: bool,
     /// The latched overload verdict of the last load report: the engine
-    /// is at a threshold, or its last answer named another of its ranks
-    /// and not this one.
+    /// is at a threshold, or an answer of it named another of its ranks
+    /// and not this one. That mark stands until an answer or a record
+    /// names the rank again, and the bit reads it only while a rank the
+    /// answer named has a record on file.
     pub overloaded: bool,
 }
 

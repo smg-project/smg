@@ -263,10 +263,10 @@ own types. The overload sheet's recorder is a child of the load monitor's module
 through the monitor's own functions and the verdict is read off the worker the monitor wrote it on. The bucket
 sheet's recorder is a child of the policy's own module and stands in that policy's directory: the adjustment and
 the window are the policy's private state, and a module beside the policy's could reach neither.
-The minimum-tokens sheet's recorder is a child of the load monitor too: each step reaches the rank cache as the
-monitor's poll loop hands it over, and each request asks the cache's select, which the policy forwards to. The
-sticky rank sheet's recorder is a child of the stage that sends a request to its worker, and calls the stage's own
-pin.
+The minimum-tokens sheet's recorder is a child of the load monitor too: each step reaches the rank cache by the
+recorder's own repeat of the hand-over the monitor's poll loop makes, and each request asks the cache's select,
+which the policy forwards to. The sticky rank sheet's recorder is a child of the stage that sends a request to its
+worker, and calls the stage's own pin.
 
 A sheet is never edited by hand. A new recording replaces the whole sheet and its row in the table above, in one
 pull request that names the commit and says which rows moved: a sequence row moves only when the policy's
