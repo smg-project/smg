@@ -157,7 +157,7 @@ const DEFAULT_WEDGE: Duration = Duration::from_secs(3);
 const DEFAULT_STALE: Duration = Duration::from_secs(15);
 
 /// How often the sweep runs.
-pub const SWEEP_INTERVAL: Duration = Duration::from_millis(250);
+pub(crate) const SWEEP_INTERVAL: Duration = Duration::from_millis(250);
 
 /// In-flight requests this many deep with no token for the wedge threshold
 /// are a wedged engine even when nothing new arrives (a saturated client
@@ -773,7 +773,7 @@ pub fn on_contact(worker: &Arc<dyn Worker>) {
 /// timeout apart, or an interval if that is shorter, once one passes); a
 /// probe that short-circuited it would make one passing probe out of a
 /// flapping engine's run a return to service.
-pub fn on_probe_passed(worker: &Arc<dyn Worker>) {
+pub(crate) fn on_probe_passed(worker: &Arc<dyn Worker>) {
     let state = worker.runtime_state();
     let state = state.as_deref();
     if let Some(state) = state {
@@ -786,7 +786,7 @@ pub fn on_probe_passed(worker: &Arc<dyn Worker>) {
 
 /// A transport failure from `what`. Vetoes the worker when nothing has been
 /// heard from it for the stall threshold; a failure right after a contact is
-/// remembered, and [`sweep`] vetoes the worker once the threshold passes
+/// remembered, and the sweep vetoes the worker once the threshold passes
 /// without a contact. A worker vetoed as wedged is no exception: the failure
 /// took the connection its pile was on, so the streams that were to show
 /// progress are gone and only a contact can say the worker is back; its veto
@@ -821,7 +821,7 @@ fn on_contact_failed_with(worker: &Arc<dyn Worker>, what: &'static str, stall: D
 /// Periodic check: a worker whose transport failed and that has then stayed
 /// silent for the stall threshold is vetoed now, not at its next failed poll,
 /// so the exclusion lands at the threshold itself.
-pub fn sweep(worker: &Arc<dyn Worker>) {
+pub(crate) fn sweep(worker: &Arc<dyn Worker>) {
     let (stall, wedge, stale) = thresholds();
     sweep_with(worker, stall, wedge, stale);
 }
@@ -953,7 +953,7 @@ pub fn on_token_progress_on(runtime: &WorkerRuntime, worker: &Arc<dyn Worker>, n
 /// A standing veto is judged at the threshold on either wire, whatever
 /// the servicer reports pending: the allowance lifts no veto, as the
 /// cold-shape grace lifts none.
-pub fn on_load_report(
+pub(crate) fn on_load_report(
     worker: &Arc<dyn Worker>,
     waiting: i64,
     engine_silence: Option<Duration>,

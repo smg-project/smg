@@ -126,7 +126,7 @@ impl WorkerLoadManager {
     }
 
     /// Replace cached rank loads for the supplied workers, preserving other workers.
-    pub fn update_dp_loads(&self, loads: &HashMap<String, HashMap<isize, isize>>) {
+    pub(crate) fn update_dp_loads(&self, loads: &HashMap<String, HashMap<isize, isize>>) {
         debug!(
             "WorkerLoadManager update_dp_loads map:{:?}",
             MaskedLoads(loads)
@@ -158,7 +158,7 @@ impl WorkerLoadManager {
         Some(dp_rank)
     }
 
-    pub fn remove_workers(&self, urls: &[String]) {
+    pub(crate) fn remove_workers(&self, urls: &[String]) {
         let mut cached = self.dp_cached_loads.write();
         for url in urls {
             cached.remove(url);
@@ -993,7 +993,7 @@ impl<G: Generation> WorkerMonitor<G> {
     /// when no groups were running, so a lag-recovery rebuild cannot
     /// inherit stale per-rank loads from a previous incarnation.
     /// Idempotent.
-    pub fn stop_all_groups(&self) {
+    pub(crate) fn stop_all_groups(&self) {
         let drained: Vec<(WorkerGroupKey, GroupState)> = {
             let mut handles = self.group_handles.lock();
             handles.drain().collect()
