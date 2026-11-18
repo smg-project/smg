@@ -2012,11 +2012,15 @@ def test_a_count_reads_level_where_every_count_is_within_the_level(mod):
     once = level_row(mod, (100_020, 100_000), (100_000, 100_000))
     del once.counts["pr"]["again"]
     assert not once.reads_level
-    # A count that moved, the same twice on each executable, is work the change moved: it
-    # reads level for an id that times a whole pass alone.
+    # Each neighbour inside the level and the two second counts 1.4 % apart: every pair of the
+    # four is compared.
+    assert not level_row(mod, (100_000, 99_500), (100_400, 100_900)).reads_level
+    # A count that moved, the same twice on each executable, is the same noise in its other
+    # state: inside the level it reads level too, on an id that times a whole pass or none.
     moved = (100_000, 100_000), (100_020, 100_020)
-    assert not level_row(mod, *moved).reads_level
+    assert level_row(mod, *moved).reads_level
     assert level_row(mod, *moved, whole=True).reads_level
+    assert not level_row(mod, (100_000, 100_000), (100_600, 100_600)).reads_level
 
 
 def test_a_second_measurement_short_of_its_runs_leaves_the_first_to_decide(mod):

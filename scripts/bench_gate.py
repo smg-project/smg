@@ -102,14 +102,14 @@ same instruction count on both executables at the same address, the re-measured 
 agreeing, and each passed when its job ran again (2026-11-18). An id that still fails on a
 count that reads level is therefore measured again before it fails: the gate's N interleaved
 runs a side once more, from a fresh copy of each executable, read within itself. A count reads
-level when it is the same on both executables, when it is a level count of an id that times a
-whole pass, or when it is not steady and every count is within `LEVEL_COUNT`: the two
-executables against each other, and each against its own second count. A count that moved on
-an id that times no whole pass is work the change moved, and fails as before. The id fails
-where the second measurement too is beyond its threshold with every pull-request run worse
-than every base run, and is reported as not repeated otherwise. No threshold moves. An id
-whose second measurement the run's budget has no room for keeps the first: it starts only with
-room for all of its runs, by the longest run of the failing ids so far.
+level when it is the same on both executables, or when each executable was counted twice and
+the four counts lie within `LEVEL_COUNT` of each other at every batch where two of them last
+differ. A count that moved and one that is not steady are one noise in two states, and inside
+the level neither carries a failure by the clock. The id fails where the second measurement
+too is beyond its threshold with every pull-request run worse than every base run, and is
+reported as not repeated otherwise. No threshold moves, and a count beyond the level fails as
+before. An id whose second measurement the run's budget has no room for keeps the first: it
+starts only with room for all of its runs, by the longest run of the failing ids so far.
 
 Usage:
     bench_gate.py build --out FILE [--name BENCH] [--gates FILE [--sources-from REV]]
@@ -1253,25 +1253,27 @@ class Row:
     @property
     def reads_level(self) -> bool:
         """Whether no count read more work on the pull request's executable than the level, so
-        that the id is measured again before it fails: the same count; for an id that times a
-        whole pass, a level count; or a count that is not steady while every count is within
-        `LEVEL_COUNT`, the two executables against each other and each against its own second
-        count. A count that moved on an id that times no whole pass is work the change moved,
-        and fails as it did."""
+        that the id is measured again before it fails: the same count, or two counts of each
+        executable that all lie within `LEVEL_COUNT` of each other at every batch where two of
+        the four last differ. A count that moved and one that is not steady are one noise in
+        two states (a few instructions an iteration more or fewer from one process to the
+        next): inside the level neither carries a failure by the clock."""
         counted = self.counted
         if counted is None or self.beyond_once is not None:
             return False
-        if counted.state != "unsteady":
-            return counted.state == "same" or (self.whole_pass and self.level_count)
+        if counted.state == "same":
+            return True
         if not self.counted_twice:
             return False
-        level = abs(counted.pr - counted.base) <= LEVEL_COUNT * counted.base
-        for side in SIDES:
-            first, again = self.counts[side]["batches"], self.counts[side]["again"]
-            own = differs_at(first, again)
-            if own is not None and abs(again[own] - first[own]) > LEVEL_COUNT * first[own]:
-                level = False
-        return level
+        counts = [self.counts[side][take] for take in ("batches", "again") for side in SIDES]
+        ran = min(len(count) for count in counts)
+        base, pr, base_again, pr_again = (count[:ran] for count in counts)
+        for n in (differs_at(base, pr), differs_at(base, base_again), differs_at(pr, pr_again)):
+            if n is not None:
+                four = [count[n] for count in (base, pr, base_again, pr_again)]
+                if max(four) - min(four) > LEVEL_COUNT * base[n]:
+                    return False
+        return True
 
     @property
     def measured_again(self) -> Row | None:
