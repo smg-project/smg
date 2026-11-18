@@ -26,7 +26,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use smg_grpc_client::common_proto::GetTokenizerChunk;
 use smg_test_harness::grpc_harness::serve_mock_worker_with;
-use tokio::sync::Notify;
+use tokio::sync::{Mutex, Notify};
 use tonic::{body::Body, transport::Channel};
 use tower::{Service, ServiceExt};
 use zip::{write::SimpleFileOptions, ZipWriter};
@@ -35,6 +35,9 @@ use zip::{write::SimpleFileOptions, ZipWriter};
 mod gateway_launch;
 
 const WAIT: Duration = Duration::from_secs(60);
+// Each scenario launches separate gateway processes on picked loopback ports.
+// Keep the default parallel cargo test run within the same fixture budget.
+static GATEWAYS: Mutex<()> = Mutex::const_new(());
 
 struct BundleGate {
     calls: AtomicUsize,
@@ -456,6 +459,7 @@ async fn seed_a(gateway: &Gateway) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn local_preparation_keeps_a_ready_and_b_processing_with_one_queue_slot() {
+    let _serial = GATEWAYS.lock().await;
     let gateway = Gateway::start("local", None, false).await;
     seed_a(&gateway).await;
     let (url, gate) = worker("model-b", &[1]).await;
@@ -474,6 +478,7 @@ async fn local_preparation_keeps_a_ready_and_b_processing_with_one_queue_slot() 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_cold_gateway_stays_unready_until_its_first_tokenizer_is_prepared() {
+    let _serial = GATEWAYS.lock().await;
     let gateway = Gateway::start("cold", None, false).await;
     let (url, gate) = worker("model-b", &[1]).await;
     let id = gateway.create(&url, "model-b").await;
@@ -493,6 +498,7 @@ async fn a_cold_gateway_stays_unready_until_its_first_tokenizer_is_prepared() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_peer_prepares_its_own_tokenizer_before_importing_a_ready_worker() {
+    let _serial = GATEWAYS.lock().await;
     let owner = Gateway::start("owner", None, true).await;
     let peer = Gateway::start("peer", Some(owner.mesh_port), true).await;
     seed_a(&owner).await;
@@ -523,6 +529,7 @@ async fn a_peer_prepares_its_own_tokenizer_before_importing_a_ready_worker() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_mesh_tombstone_cancels_preparation_without_resurrecting_the_import() {
+    let _serial = GATEWAYS.lock().await;
     let owner = Gateway::start("owner", None, true).await;
     let peer = Gateway::start("peer", Some(owner.mesh_port), true).await;
     seed_a(&owner).await;
@@ -563,6 +570,7 @@ async fn a_mesh_tombstone_cancels_preparation_without_resurrecting_the_import() 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn default_local_registration_keeps_the_existing_asynchronous_readiness_behavior() {
+    let _serial = GATEWAYS.lock().await;
     let gateway = Gateway::start_mode("legacy", None, false, false).await;
     seed_a(&gateway).await;
     let (url, gate) = worker("model-b", &[1]).await;
@@ -588,6 +596,7 @@ async fn default_local_registration_keeps_the_existing_asynchronous_readiness_be
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_replicas_deduplicate_and_other_models_do_not_wait_for_their_load() {
+    let _serial = GATEWAYS.lock().await;
     let gateway = Gateway::start("concurrent", None, false).await;
     seed_a(&gateway).await;
     let (url, first) = worker("model-b", &[1]).await;
@@ -614,6 +623,7 @@ async fn concurrent_replicas_deduplicate_and_other_models_do_not_wait_for_their_
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn local_cancellation_does_not_publish_a_worker_after_its_bundle_is_released() {
+    let _serial = GATEWAYS.lock().await;
     let gateway = Gateway::start("cancel", None, false).await;
     seed_a(&gateway).await;
     let (url, gate) = worker("model-b", &[1]).await;
@@ -648,6 +658,7 @@ async fn local_cancellation_does_not_publish_a_worker_after_its_bundle_is_releas
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_failed_preparation_leaves_a_serving_and_allows_a_clean_same_url_retry() {
+    let _serial = GATEWAYS.lock().await;
     let gateway = Gateway::start("failure", None, false).await;
     seed_a(&gateway).await;
     let (url, gate) = worker("model-b", &[1]).await;
@@ -675,6 +686,7 @@ async fn a_failed_preparation_leaves_a_serving_and_allows_a_clean_same_url_retry
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_slow_put_keeps_the_old_worker_and_cannot_overwrite_a_newer_put() {
+    let _serial = GATEWAYS.lock().await;
     let gateway = Gateway::start("put", None, false).await;
     let (url, gate) = worker("model-a", &[2]).await;
     let id = gateway.create(&url, "model-a").await;
@@ -750,6 +762,7 @@ async fn a_slow_put_keeps_the_old_worker_and_cannot_overwrite_a_newer_put() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn default_mesh_imports_keep_the_existing_no_local_autoload_behavior() {
+    let _serial = GATEWAYS.lock().await;
     let owner = Gateway::start_mode("owner", None, true, false).await;
     let peer = Gateway::start_mode("peer", Some(owner.mesh_port), true, false).await;
     let (url, gate) = worker("model-a", &[]).await;
@@ -771,6 +784,7 @@ async fn default_mesh_imports_keep_the_existing_no_local_autoload_behavior() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_newer_mesh_generation_wins_over_a_held_older_tokenizer_load() {
+    let _serial = GATEWAYS.lock().await;
     let owner = Gateway::start("owner", None, true).await;
     let peer = Gateway::start("peer", Some(owner.mesh_port), true).await;
     seed_a(&owner).await;
