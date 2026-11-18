@@ -35,7 +35,7 @@ const DEFAULT_ADMIN_LISTEN: &str = "0.0.0.0:30103";
     name = VERSION.name,
     version = VERSION.version,
     about = "The SMG policy controller: the owner of the routing data, serving decisions to the gateways",
-    group = clap::ArgGroup::new("spec_source").required(true).args(["spec_file", "spec_store"])
+    group = clap::ArgGroup::new("spec_source").required(true).multiple(false).args(["spec_file", "spec_store"])
 )]
 struct Cli {
     // ==================== Identity ====================
@@ -198,12 +198,7 @@ struct Cli {
     /// refuses each apply by name until it starts again. The directory
     /// stands on a file system that links: a generation's file is linked
     /// under its name
-    #[arg(
-        long,
-        value_name = "DIR",
-        conflicts_with = "spec_file",
-        help_heading = "Policy Spec"
-    )]
+    #[arg(long, value_name = "DIR", help_heading = "Policy Spec")]
     spec_store: Option<PathBuf>,
 
     // ==================== Shutdown ====================

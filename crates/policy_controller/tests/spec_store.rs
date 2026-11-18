@@ -2,16 +2,17 @@
 //! binary started on a spec store, an empty directory, on ephemeral ports,
 //! and handed its document by the generated client on the control listener.
 //! Before any apply the start reads ready and a decision is shed, declined
-//! by the binding. An enforce is on file and runs as generation 1, the read call answers its
-//! bytes, and the next one runs as generation 2. The process is then killed
-//! and started again on the same directory: it runs generation 2 before any
-//! call, under the bytes its caller sent, rolls back to a generation the
-//! process before it wrote, and answers each generation on file by its
-//! number. A start the store refuses exits, naming why, and so does a start
-//! that names no source of its spec.
+//! by the binding. An enforce is on file and runs as generation 1, the read
+//! call answers its bytes, and the next one runs as generation 2. The
+//! process is then killed and started again on the same directory: it runs
+//! generation 2 before any call, under the bytes its caller sent, rolls
+//! back to a generation the process before it wrote, and answers each
+//! generation on file by its number. A start the store refuses exits,
+//! naming why, and so does a start that names no source of its spec.
 //!
 //! The cases wait on an answer, never on a clock: a wait that outlasts its
-//! room fails with the last answer it saw.
+//! room fails with the last answer it saw, or names the answer that never
+//! came.
 #![cfg(unix)]
 #![expect(
     clippy::expect_used,
@@ -37,6 +38,7 @@ use std::{
     collections::BTreeSet,
     ffi::OsStr,
     fs,
+    future::Future,
     path::Path,
     process::{Command, Stdio},
     thread,
@@ -92,15 +94,22 @@ fn as_gateway<T>(frames: mpsc::Receiver<T>) -> Request<ReceiverStream<T>> {
     request
 }
 
+/// `wait`'s answer inside the room: a wait that outlasts it fails the case,
+/// by `what` it waited for.
+async fn inside<T>(what: &str, wait: impl Future<Output = T>) -> T {
+    tokio::time::timeout(ROOM, wait).await.expect(what)
+}
+
 /// What one `Decide` is answered on the gateway listener: asked as
-/// `gateway-a`, behind that gateway's `Hello` on a session held open.
+/// `gateway-a`, behind that gateway's `Hello` on a session held open. Each
+/// of its five waits on the controller ends inside the room.
 async fn decide(replica: &Replica) -> Option<decide_answer::Answer> {
-    let mut client = PolicyControllerClient::connect(format!("http://{}", replica.gateway))
+    let dial = PolicyControllerClient::connect(format!("http://{}", replica.gateway));
+    let mut client = inside("the gateway listener's connection", dial)
         .await
         .expect("the gateway listener takes a connection");
     let (frames, sent) = mpsc::channel(1);
-    let mut session = client
-        .session(as_gateway(sent))
+    let mut session = inside("the session's open", client.session(as_gateway(sent)))
         .await
         .expect("a session opens")
         .into_inner();
@@ -118,7 +127,9 @@ async fn decide(replica: &Replica) -> Option<decide_answer::Answer> {
         })
         .await
         .expect("the session takes the Hello");
-    let welcome = session.message().await.expect("a frame, not a status");
+    let welcome = inside("the Welcome", session.message())
+        .await
+        .expect("a frame, not a status");
     assert!(
         matches!(
             welcome.as_ref().and_then(|frame| frame.frame.as_ref()),
@@ -127,8 +138,7 @@ async fn decide(replica: &Replica) -> Option<decide_answer::Answer> {
         "{welcome:?}"
     );
     let (requests, sent) = mpsc::channel(1);
-    let mut answers = client
-        .decide(as_gateway(sent))
+    let mut answers = inside("the decide stream's open", client.decide(as_gateway(sent)))
         .await
         .expect("a present gateway's stream opens")
         .into_inner();
@@ -144,9 +154,8 @@ async fn decide(replica: &Replica) -> Option<decide_answer::Answer> {
         })
         .await
         .expect("the stream takes the request");
-    tokio::time::timeout(ROOM, answers.message())
+    inside("the decision", answers.message())
         .await
-        .expect("an answer inside the room")
         .expect("an answer, not a status")
         .expect("an answer, not the stream's end")
         .answer
