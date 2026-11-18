@@ -479,7 +479,8 @@ impl<'a> McpToolSession<'a> {
     /// The tools a binding lists: its server's visible tools narrowed to the
     /// binding's own allowlist (a server bound under several labels lists
     /// each label's own set; the model sees their union). Of a URL bound more
-    /// than once a label lists the tools that came from its own connection.
+    /// than once a label lists the tools that came from its own connection,
+    /// and none when its own listing failed.
     pub fn list_tools_for_binding(&self, binding: &McpServerBinding) -> Vec<ToolEntry> {
         let allowed = binding.allowed_tools.as_deref().map(Self::allowlist);
         self.list_tools_for_server(&binding.server_key)
@@ -492,7 +493,10 @@ impl<'a> McpToolSession<'a> {
             .filter(|entry| {
                 self.tool_owners
                     .get(&entry.qualified_name)
-                    .is_none_or(|&place| self.all_mcp_servers[place].pool_key == binding.pool_key)
+                    .is_none_or(|&place| {
+                        binding.list_error.is_none()
+                            && self.all_mcp_servers[place].pool_key == binding.pool_key
+                    })
             })
             .collect()
     }
@@ -690,6 +694,10 @@ impl<'a> McpToolSession<'a> {
                 }
                 continue;
             };
+            // A binding whose own listing failed lists no tools.
+            if binding.list_error.is_some() {
+                continue;
+            }
             let shared = server_keys
                 .iter()
                 .filter(|other| **other == binding.server_key)

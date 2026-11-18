@@ -1389,8 +1389,9 @@ mod tests {
     /// Two requests under one key connect at once, and the second
     /// connection's listing is refused while the first's is still out. The
     /// first request lists the server's tool and its call runs; the second
-    /// request's item carries the refusal. The server's signals order the
-    /// steps, no timer.
+    /// request's item carries the refusal, and it lists no tool once the
+    /// first's listing has returned. The server's signals order the steps,
+    /// no timer.
     #[tokio::test]
     async fn two_connects_at_once_under_one_key_keep_the_tools_when_the_second_listing_is_refused()
     {
@@ -1445,7 +1446,8 @@ mod tests {
         });
         let (second, first) = returned.factor_first();
         assert!(
-            list_item_error(&orchestrator, second, "conf").is_some_and(|error| error.is_string()),
+            list_item_error(&orchestrator, second.clone(), "conf")
+                .is_some_and(|error| error.is_string()),
             "the second request's item carries the refusal"
         );
         hold.release.notify_one();
@@ -1453,6 +1455,11 @@ mod tests {
             lists_and_calls_echo(&orchestrator, first.await).await,
             (vec!["echo".to_string()], None),
             "the first request lists the tool and its call runs: its listing returned after the second's was refused"
+        );
+        let (listed, call_error) = lists_and_calls_echo(&orchestrator, second).await;
+        assert!(
+            listed.is_empty() && call_error.is_some(),
+            "the second request lists no tool and calls none once the first's listing has returned: {listed:?}, {call_error:?}"
         );
     }
 
@@ -1549,6 +1556,53 @@ mod tests {
             list_item_error(&orchestrator, second, "conf"),
             None,
             "the pooled connection listed again for the second request"
+        );
+    }
+
+    /// One URL stands under two labels with one credential in one session;
+    /// the server refuses the first label's `tools/list` and lists for the
+    /// second. The first label's item carries the refusal and no tool; the
+    /// second label's item lists the server's tool, and its call runs.
+    #[tokio::test]
+    async fn a_label_whose_own_listing_was_refused_lists_no_tool() {
+        let (orchestrator, format_registry) = create_test_orchestrator_no_builtin().await;
+        let refusing = Arc::new(AtomicBool::new(true));
+        let url = serve_local_mcp_server(LocalServer {
+            tools: Some(&["echo"]),
+            refusing: Some(Arc::clone(&refusing)),
+            calls: Some(Arc::default()),
+            ..Default::default()
+        })
+        .await;
+        let input = |label: &str| McpServerInput {
+            label: label.to_string(),
+            url: Some(url.clone()),
+            authorization: None,
+            headers: HashMap::new(),
+            allowed_tools: None,
+        };
+
+        let mut bindings =
+            connect_mcp_servers(&orchestrator, &format_registry, &[input("refused")]).await;
+        refusing.store(false, Ordering::SeqCst);
+        bindings
+            .extend(connect_mcp_servers(&orchestrator, &format_registry, &[input("listed")]).await);
+        let session = McpToolSession::new(&orchestrator, bindings.clone(), "test-request");
+        let item = |label: &str| openai_bridge::mcp_list_tools_json(&session, label, &url);
+        let refused = item("refused");
+        assert!(
+            refused["error"].is_string() && refused["tools"] == json!([]),
+            "the refused label's item carries the refusal and no tool: {refused}"
+        );
+        let listed = item("listed");
+        assert!(
+            listed.get("error").is_none() && listed["tools"][0]["name"] == "echo",
+            "the other label's item lists the server's tool: {listed}"
+        );
+        assert_eq!(
+            lists_and_calls_echo(&orchestrator, bindings).await,
+            (vec!["echo".to_string()], None),
+            "the session lists the tool once, and its call runs"
         );
     }
 
