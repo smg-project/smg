@@ -24,8 +24,16 @@
 //! indexed under its first model name, and only when its signals ask for
 //! events.
 //!
-//! No decision reads an index yet: the change that fills the affinity
-//! column from it brings the reader.
+//! A decision reads an index through its pool's standing in it
+//! (`PoolIndex`), which the store publishes with the pool's rows: where
+//! each index id stands in the pool, and the pool's warming rows as a
+//! write last read them. The lookup itself is live, as the index is: the
+//! request's blocks are looked up once a decision, under the cap of its
+//! profile's sample, and the holders are named by their place in the
+//! decision's rows. An index id is free for the next row once its row
+//! leaves, and a decision may read a world published before that: the
+//! index keeps who took each id last (`Index`), and a row is named a holder
+//! only while its own worker holds the id its blocks were read under.
 //!
 //! Locks: the table's, taken under the workers lock by a membership write
 //! and alone by a batch, each for as long as it takes to find or to change
@@ -38,7 +46,7 @@
 use std::{
     collections::HashMap,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{fence, AtomicU64, Ordering},
         Arc,
     },
 };
@@ -49,11 +57,15 @@ use parking_lot::Mutex;
 use rustc_hash::FxHashMap;
 
 use crate::{
+    affinity::{WarmRule, Warming},
     store::{
         kv_events::{Admission, BatchFacts, BatchOutcome, KvCursor, RankCursor, ResyncReason},
         workers::WorkerRow,
+        world::Naming,
+        GatewayId,
     },
-    view::WorkerId,
+    view::{Candidate, NamedAffinity, NamedHolder, Role, WorkerId},
+    Draw,
 };
 
 #[cfg(test)]
@@ -104,7 +116,7 @@ trait Blocks {
 
 /// A lane's place in its model's index.
 struct Held {
-    index: Arc<ChainIndex>,
+    index: Arc<Index>,
     /// The row's id in `index`.
     worker: u32,
     /// The worker's blocks by the engine's hash: the index asks each writer
@@ -118,16 +130,22 @@ impl Blocks for Held {
         blocks: &[StoredBlock],
         parent: Option<SequenceHash>,
     ) -> Result<(), ApplyError> {
+        // Before the batch's blocks reach the chain: a decision that reads
+        // one of them then reads this row as its id's holder ([`Index`]).
+        fence(Ordering::Release);
         self.index
+            .chain
             .apply_stored(self.worker, blocks, parent, &mut self.map)
     }
 
     fn removed(&mut self, hashes: &[SequenceHash]) {
-        self.index.apply_removed(self.worker, hashes, &mut self.map);
+        self.index
+            .chain
+            .apply_removed(self.worker, hashes, &mut self.map);
     }
 
     fn cleared(&mut self) {
-        self.index.apply_cleared(self.worker, &mut self.map);
+        self.index.chain.apply_cleared(self.worker, &mut self.map);
     }
 }
 
@@ -223,12 +241,453 @@ struct Lane {
 struct Entry {
     rank: u16,
     model: Box<str>,
+    /// The row's id in its model's index.
+    worker: u32,
     lane: Arc<Mutex<Lane>>,
+}
+
+/// No row: an index id no row of the pool holds, a row its model's index
+/// does not hold.
+const NONE: u32 = u32::MAX;
+
+/// The words of a read's mask at most: a bit an index id.
+const MASK_WORDS: usize = INDEX_WORKERS / 64;
+
+/// The bits of the wire type: a pool keeps one mask a bit.
+const WIRE_BITS: usize = u8::BITS as usize;
+
+/// The streams of a decision's seed the cut of its holders and the cut of
+/// its warming rows are drawn from: none another site reads ([`Draw`]).
+const HOLDERS_STREAM: u64 = 0x3c6e_f372_fe94_f82b;
+const WARMING_STREAM: u64 = 0xa54f_f53a_5f1d_36f1;
+
+/// A value under `under` from `draw`, by a multiply: no division.
+fn below(draw: &mut Draw, under: u32) -> u32 {
+    ((u128::from(draw.next_u64()) * u128::from(under)) >> 64) as u32
+}
+
+/// The rows a naming wrote in the affinity column's place
+/// ([`World::name`](crate::store::World::name)), with the naming's own
+/// buffers: a host keeps it across decisions beside its view.
+#[derive(Debug, Default)]
+pub struct Named {
+    /// The rows that hold a leading part of the request, ascending by row.
+    pub holders: Vec<NamedHolder>,
+    /// The pool's warming rows the decision reads, ascending.
+    pub warming: Vec<u32>,
+    /// The warming rows are the thin.
+    pub thin: bool,
+    kept: Vec<(u32, u32)>,
+    picked: Vec<u32>,
+    live: Vec<(u32, u64)>,
+}
+
+impl Named {
+    /// The lists as a request carries them
+    /// ([`RequestFacts::named`](crate::RequestFacts::named)).
+    pub fn affinity(&self) -> NamedAffinity<'_> {
+        NamedAffinity {
+            holders: &self.holders,
+            warming: &self.warming,
+            thin: self.thin,
+            mean_in_flight: None,
+        }
+    }
+
+    /// No row named.
+    pub(super) fn clear(&mut self) {
+        self.holders.clear();
+        self.warming.clear();
+        self.thin = false;
+    }
+}
+
+/// Where a pool stands in its model's index, as the membership write that
+/// made the pool derived it.
+struct Tables {
+    /// The pool the tables are of: its model and its rows' role.
+    model: Box<str>,
+    role: Option<Role>,
+    /// The model's index; `None` while no row of the model is indexed.
+    index: Option<Arc<Index>>,
+    /// Index id -> row of the pool; [`NONE`] for an id no row of it holds.
+    row_of: Box<[u32]>,
+    /// Row -> index id; [`NONE`] for a row the index does not hold.
+    id_of: Box<[u32]>,
+    /// The pool's rows as the index names them, a bit an id: what a read is
+    /// kept within.
+    members: Box<[u64]>,
+    /// The members that state each bit of the wire type, by the bit's
+    /// number, as `members` holds them; empty for a bit no member states.
+    by_wire: [Box<[u64]>; WIRE_BITS],
+    /// Each row's admission, in the rows' clock.
+    admitted: Box<[u64]>,
+}
+
+impl Tables {
+    /// The workers a read is kept within for the view a decision holds: the
+    /// pool's members, those that state one of its gateway's wires where it
+    /// states them, less another gateway's host-local rows. `mask` is the
+    /// caller's, written where the pool's own does not serve as it stands.
+    fn within<'a>(
+        &'a self,
+        naming: &Naming<'_>,
+        locals: &[(u32, GatewayId)],
+        mask: &'a mut [u64; MASK_WORDS],
+    ) -> &'a [u64] {
+        let foreign = locals.iter().any(|&(_, owner)| owner != naming.gateway);
+        if naming.wires.is_none() && !foreign {
+            return &self.members;
+        }
+        let words = self.members.len().min(MASK_WORDS);
+        let mask = &mut mask[..words];
+        match naming.wires {
+            None => mask.copy_from_slice(&self.members[..words]),
+            Some(wires) => {
+                mask.fill(0);
+                // The narrowing's own test, a bit of the wire type at a time:
+                // a member is kept where it states one of the gateway's.
+                for (bit, stated) in self.by_wire.iter().enumerate() {
+                    if wires.bits() & (1 << bit) != 0 {
+                        for (word, stated) in mask.iter_mut().zip(stated.iter()) {
+                            *word |= stated;
+                        }
+                    }
+                }
+            }
+        }
+        for &(row, owner) in locals {
+            let id = self.id_of.get(row as usize).copied().unwrap_or(NONE);
+            if owner != naming.gateway && id != NONE {
+                if let Some(word) = mask.get_mut((id / 64) as usize) {
+                    *word &= !(1u64 << (id % 64));
+                }
+            }
+        }
+        mask
+    }
+}
+
+/// What a publication carries of one pool's index: where the pool stands in
+/// it, and the pool's warming rows by its profile's warm-up ruling as a
+/// write last read them. The tables are of the membership write that made
+/// the pool. The warming rows are read again at a window's publication and
+/// replaced when they moved, so a decision reads them with the rows it
+/// loaded and never derives them. A young row's naming ends at an instant
+/// of its own, which the list carries: a decision past it names the row no
+/// more, whether or not a window was published between.
+pub(super) struct PoolIndex {
+    tables: Arc<Tables>,
+    /// The ruling the warming rows were read under.
+    rule: Option<WarmRule>,
+    /// The pool's warming rows, ascending, each with the instant its naming
+    /// ends on the store's clock, in microseconds.
+    warming: Box<[(u32, u64)]>,
+    /// Whether the rows are the thin, and from when they are named.
+    ruled: Warming,
+    /// The earliest end among the rows: a decision before it names them as
+    /// they stand.
+    first_end: u64,
+}
+
+/// A writer's buffers for the reading of a pool, kept across readings.
+#[derive(Default)]
+pub(super) struct Reading {
+    sizes: Vec<u32>,
+    level: Vec<u32>,
+    rows: Vec<(u32, u64)>,
+}
+
+impl PoolIndex {
+    /// The pool's warming rows at `at` under `rule`, into `reading`, and
+    /// how they are read at a later instant: the ruling's own entry over
+    /// each row's blocks in the index and its admission.
+    fn warming(tables: &Tables, rule: Option<WarmRule>, at: u64, reading: &mut Reading) -> Warming {
+        let Some(rule) = rule else {
+            reading.rows.clear();
+            return Warming::default();
+        };
+        let size = |&id: &u32| match &tables.index {
+            Some(index) if id != NONE => {
+                u32::try_from(index.chain.worker_block_count(id)).unwrap_or(u32::MAX)
+            }
+            _ => 0,
+        };
+        reading.sizes.clear();
+        reading.sizes.extend(tables.id_of.iter().map(size));
+        rule.name(
+            &reading.sizes,
+            &tables.admitted,
+            at,
+            &mut reading.level,
+            &mut reading.rows,
+        )
+    }
+
+    /// The ruling the warming rows were read under.
+    pub(super) fn rule(&self) -> Option<WarmRule> {
+        self.rule
+    }
+
+    /// Whether the standing is of the pool of `rows` serving `model`: a
+    /// pool is its model's in one role.
+    pub(super) fn is_of(&self, model: &str, rows: &[Candidate]) -> bool {
+        let tables = &*self.tables;
+        *tables.model == *model && tables.role == rows.first().map(|row| row.role)
+    }
+
+    /// Whether the tables are of `rows` as they stand, each admitted at its
+    /// instant in `admitted`, where no lane of theirs moved since the
+    /// tables were made: the rows are as many, each was admitted when it
+    /// was, and each lane's row states the wires it stated. A row with no
+    /// lane is in no table but by its admission.
+    pub(super) fn holds(&self, rows: &[Candidate], admitted: &[u64]) -> bool {
+        let tables = &*self.tables;
+        rows.len() == tables.id_of.len()
+            && *admitted == *tables.admitted
+            && rows.iter().zip(tables.id_of.iter()).all(|(row, &id)| {
+                let (word, bit) = ((id / 64) as usize, 1u64 << (id % 64));
+                id == NONE
+                    || tables.by_wire.iter().enumerate().all(|(wire, stated)| {
+                        stated.get(word).is_some_and(|held| held & bit != 0)
+                            == (row.wire_modes.bits() & (1 << wire) != 0)
+                    })
+            })
+    }
+
+    /// The pool read again at `at` under `rule`: `None` while the warming
+    /// rows stand as they were read, so a publication that moved none
+    /// allocates nothing.
+    pub(super) fn again(
+        &self,
+        rule: Option<WarmRule>,
+        at: u64,
+        reading: &mut Reading,
+    ) -> Option<Self> {
+        let ruled = Self::warming(&self.tables, rule, at, reading);
+        let stands = rule == self.rule && ruled == self.ruled && *reading.rows == *self.warming;
+        (!stands).then(|| Self::read(Arc::clone(&self.tables), rule, ruled, &reading.rows))
+    }
+
+    /// A pool's standing from a reading of its warming rows.
+    fn read(
+        tables: Arc<Tables>,
+        rule: Option<WarmRule>,
+        ruled: Warming,
+        rows: &[(u32, u64)],
+    ) -> Self {
+        let ends = rows.iter().map(|&(_, until)| until);
+        Self {
+            tables,
+            rule,
+            warming: rows.into(),
+            ruled,
+            first_end: ends.min().unwrap_or(u64::MAX),
+        }
+    }
+
+    /// The rows of the pool a read for `naming` is kept within, by their
+    /// index in the pool, ascending: for the cases.
+    #[cfg(test)]
+    pub(super) fn reached(&self, naming: &Naming<'_>, locals: &[(u32, GatewayId)]) -> Vec<u32> {
+        let mut mask = [0u64; MASK_WORDS];
+        let within = self.tables.within(naming, locals, &mut mask);
+        let named = |id: &usize| within[id / 64] & (1 << (id % 64)) != 0;
+        let ids = (0..within.len() * 64).filter(named);
+        let mut rows: Vec<u32> = ids
+            .filter_map(|id| self.tables.row_of.get(id).copied())
+            .collect();
+        rows.sort_unstable();
+        rows
+    }
+
+    /// Name the rows of a decision's view for the affinity stages
+    /// ([`NamedAffinity`]): the request's deepest holders and the pool's
+    /// warming rows, each list at most `naming.cap` rows, ascending, by
+    /// position in `view`. `pool` is the pool's rows as the publication
+    /// holds them, `locals` its host-local rows, and `view` the rows the
+    /// decision is made over: the pool's, less another gateway's host-local
+    /// rows and the rows its gateway's wires took.
+    ///
+    /// The holders are one lookup under the cap: whole depths from the
+    /// deepest while they fit, the depth the cap cuts by a draw from the
+    /// decision's seed on a stream of its own; a head the whole pool holds
+    /// is never listed. The lookup is kept within the rows the view can
+    /// hold, so the cap is filled from them. The warming rows are the
+    /// publication's that the view holds, less the rows whose naming ended
+    /// by the decision's instant: whole within the cap, a draw of the cap
+    /// past it, on another stream.
+    pub(super) fn name(
+        &self,
+        naming: &Naming<'_>,
+        pool: &[Candidate],
+        locals: &[(u32, GatewayId)],
+        view: &[Candidate],
+        named: &mut Named,
+    ) {
+        named.clear();
+        named.thin = self.ruled.thin;
+        let tables = &*self.tables;
+        let whole = view.len() == pool.len();
+        let cap = match naming.cap {
+            0 => usize::MAX,
+            cap => cap as usize,
+        };
+        // Where a row of the pool stands in the view: at its own index where
+        // the view is the pool whole, else by its id, the sorted slice its
+        // own index.
+        let place = |row: u32| -> Option<u32> {
+            if whole {
+                return Some(row);
+            }
+            let id = pool.get(row as usize)?.id;
+            let at = view.binary_search_by_key(&id, |candidate| candidate.id);
+            at.ok().map(|at| at as u32)
+        };
+        let index = tables.index.as_ref();
+        if let Some(index) = index.filter(|_| !naming.block_hashes.is_empty()) {
+            let mut mask = [0u64; MASK_WORDS];
+            let within = tables.within(naming, locals, &mut mask);
+            let mut draw = Draw::new(naming.seed ^ HOLDERS_STREAM);
+            index.chain.deepest_into(
+                naming.block_hashes,
+                |hash| *hash,
+                within,
+                cap,
+                |under| below(&mut draw, under),
+                &mut named.kept,
+            );
+            // Every read of the lookup stands before this fence, and each
+            // question of who holds an id after it ([`Index`]).
+            fence(Ordering::Acquire);
+            for &(id, blocks) in &named.kept {
+                let row = tables.row_of.get(id as usize).copied().unwrap_or(NONE);
+                debug_assert!(row != NONE, "a read is kept within the pool's rows");
+                // The id may have been taken again since this world was
+                // published: the blocks read under it are the row's only
+                // while the row's own worker holds it.
+                let Some(member) = pool.get(row as usize) else {
+                    continue;
+                };
+                if !index.held_by(id, member.id) {
+                    continue;
+                }
+                let at = place(row);
+                debug_assert!(
+                    at.is_some(),
+                    "a holder the read was kept within is in the view"
+                );
+                if let Some(at) = at {
+                    named.holders.push(NamedHolder {
+                        row: at,
+                        overlap_blocks: blocks,
+                        predicted_blocks: 0,
+                    });
+                }
+            }
+            named.holders.sort_unstable_by_key(|holder| holder.row);
+        }
+        // The warming rows of the decision's instant: nobody before the
+        // ruling names them, and each row until its own end.
+        let now = naming.now_micros;
+        if now < self.ruled.from {
+            return;
+        }
+        // The warming rows the view holds at the decision's instant, each
+        // by its place there: the cap and the draw are over these, so a
+        // view its gateway narrowed is named the cap of its own rows. The
+        // pool's list serves as it stands where the view is the pool whole
+        // and no naming has ended.
+        let mut warming: &[(u32, u64)] = &self.warming;
+        if !whole || now >= self.first_end {
+            named.live.clear();
+            let live = warming.iter().filter(|&&(_, until)| now < until);
+            let placed = live.filter_map(|&(row, until)| Some((place(row)?, until)));
+            named.live.extend(placed);
+            warming = &named.live;
+        }
+        if warming.len() <= cap {
+            named.warming.extend(warming.iter().map(|&(row, _)| row));
+            return;
+        }
+        // Past the cap, a draw of the cap by position: each row as likely as
+        // another, none twice.
+        let mut draw = Draw::new(naming.seed ^ WARMING_STREAM);
+        let count = warming.len() as u32;
+        named.picked.clear();
+        for last in count - cap as u32..count {
+            let at = below(&mut draw, last + 1);
+            let taken = named.picked.contains(&at);
+            named.picked.push(if taken { last } else { at });
+        }
+        let rows = named
+            .picked
+            .iter()
+            .filter_map(|&at| warming.get(at as usize));
+        named.warming.extend(rows.map(|&(row, _)| row));
+        named.warming.sort_unstable();
+    }
+}
+
+/// One model's index: the chain index, and who holds each of its ids.
+///
+/// The chain frees an id for the next row once its row leaves, and a pool's
+/// tables of before still map the id to the row that left
+/// ([`Tables::row_of`]). So a decision asks who holds an id after its
+/// lookup read blocks under it ([`Self::held_by`]), and the answer must be
+/// no older than those blocks. The chain writes and reads its coverage
+/// relaxed. Its reader runs an acquire fence after its reads, for its own
+/// snapshot: this file does not rest on where that fence stands. Three
+/// things of this file order the two:
+///
+/// - the table's lock: the holder is said under it before the row's lane
+///   exists ([`KvTables::member`]), and a batch finds its lane under it;
+/// - a release fence on the lane's thread, before a batch's blocks reach
+///   the chain ([`Held`]);
+/// - an acquire fence in the naming, between its lookup and its questions
+///   ([`PoolIndex::name`]).
+///
+/// The two fences synchronize where the lookup read what the batch wrote,
+/// so a decision that read a row's block reads that row as the holder, or
+/// a later one. The orderings of the holder's own store and load carry
+/// none of this.
+struct Index {
+    chain: ChainIndex,
+    /// Index id -> the worker whose row took the id last, by its number.
+    holders: [AtomicU64; INDEX_WORKERS],
+}
+
+impl Index {
+    fn new() -> Self {
+        Self {
+            chain: ChainIndex::with_max_workers(INDEX_WORKERS),
+            holders: std::array::from_fn(|_| AtomicU64::new(0)),
+        }
+    }
+
+    /// `worker`'s row takes `id`, which the chain just handed out. Said
+    /// under the table's lock, before the row's lane exists: every block
+    /// the row writes reaches the chain after it, behind the lane's fence.
+    fn take(&self, id: u32, worker: WorkerId) {
+        if let Some(holder) = self.holders.get(id as usize) {
+            holder.store(worker.0, Ordering::Release);
+        }
+    }
+
+    /// Whether `worker`'s row is the one that took `id` last. A reader asks
+    /// after its lookup and its fence: where another row took the id since,
+    /// the blocks it read under the id may be that row's. An id nobody took
+    /// since answers true for the row that left, and the chain holds none
+    /// of that row's blocks.
+    fn held_by(&self, id: u32, worker: WorkerId) -> bool {
+        let holder = self.holders.get(id as usize);
+        holder.is_some_and(|holder| holder.load(Ordering::Acquire) == worker.0)
+    }
 }
 
 /// One model's index, and how many lanes write it.
 struct ModelIndex {
-    index: Arc<ChainIndex>,
+    index: Arc<Index>,
     lanes: usize,
 }
 
@@ -237,6 +696,9 @@ struct Table {
     lanes: FxHashMap<WorkerId, Entry>,
     indexes: FxHashMap<Box<str>, ModelIndex>,
     block_sizes: HashMap<String, u32>,
+    /// How many times a lane was made or retired: a pool's place in an
+    /// index moves with one of the two and with no other write.
+    moves: u64,
 }
 
 /// The resync reasons, counted apart.
@@ -299,16 +761,18 @@ impl KvTables {
         }
         let model = model?;
         let mut table = self.table.lock();
+        table.moves += 1;
         let held = table
             .indexes
             .entry(model.as_str().into())
             .or_insert_with(|| ModelIndex {
-                index: Arc::new(ChainIndex::with_max_workers(INDEX_WORKERS)),
+                index: Arc::new(Index::new()),
                 lanes: 0,
             });
         // An index at its ceiling: the row holds no lane, and stands in the
         // store's count, until one of its own later writes finds a place.
-        let worker = held.index.intern_worker(&name_of(row.id)).ok()?;
+        let worker = held.index.chain.intern_worker(&name_of(row.id)).ok()?;
+        held.index.take(worker, row.id);
         held.lanes += 1;
         let index = Arc::clone(&held.index);
         let lane = Lane {
@@ -326,10 +790,115 @@ impl KvTables {
             Entry {
                 rank: facts.dp_rank,
                 model: model.as_str().into(),
+                worker,
                 lane: Arc::new(Mutex::new(lane)),
             },
         );
         Some(worker)
+    }
+
+    /// Where the pool of `rows` serving `model` stands in the model's index
+    /// as this membership write leaves it, with its warming rows at `at`
+    /// under `rule`. A row that lists the model after its first name is in
+    /// the pool and not in the index, and a model with no indexed row has
+    /// no index: its rows warm by their admission alone. `admitted` holds
+    /// each row's admission and `at` the write's instant, both in the rows'
+    /// clock. Called under the workers lock, once a pool a membership
+    /// write.
+    pub(super) fn pool(
+        &self,
+        model: &str,
+        rows: &[Candidate],
+        admitted: &[u64],
+        rule: Option<WarmRule>,
+        at: u64,
+        reading: &mut Reading,
+    ) -> PoolIndex {
+        let (index, id_of) = {
+            let table = self.table.lock();
+            let index = table.indexes.get(model).map(|held| Arc::clone(&held.index));
+            let id_of: Box<[u32]> = rows
+                .iter()
+                .map(|row| match table.lanes.get(&row.id) {
+                    Some(entry) if *entry.model == *model => entry.worker,
+                    _ => NONE,
+                })
+                .collect();
+            (index, id_of)
+        };
+        let ids = id_of
+            .iter()
+            .filter(|&&id| id != NONE)
+            .map(|&id| id as usize + 1)
+            .max()
+            .unwrap_or(0);
+        let mut row_of = vec![NONE; ids];
+        let words = ids.div_ceil(64);
+        let mut members = vec![0u64; words];
+        let mut by_wire: [Vec<u64>; WIRE_BITS] = Default::default();
+        for (row, (&id, candidate)) in id_of.iter().zip(rows).enumerate() {
+            let (word, bit) = ((id / 64) as usize, 1u64 << (id % 64));
+            let (Some(place), Some(member)) = (row_of.get_mut(id as usize), members.get_mut(word))
+            else {
+                continue;
+            };
+            *place = row as u32;
+            *member |= bit;
+            for (wire, stated) in by_wire.iter_mut().enumerate() {
+                if candidate.wire_modes.bits() & (1 << wire) != 0 {
+                    if stated.is_empty() {
+                        stated.resize(words, 0);
+                    }
+                    if let Some(stated) = stated.get_mut(word) {
+                        *stated |= bit;
+                    }
+                }
+            }
+        }
+        let tables = Arc::new(Tables {
+            model: model.into(),
+            role: rows.first().map(|row| row.role),
+            index,
+            row_of: row_of.into(),
+            id_of,
+            members: members.into(),
+            by_wire: by_wire.map(Vec::into_boxed_slice),
+            admitted: admitted.into(),
+        });
+        let ruled = PoolIndex::warming(&tables, rule, at, reading);
+        PoolIndex::read(tables, rule, ruled, &reading.rows)
+    }
+
+    /// How many times a lane was made or retired ([`Self::member`],
+    /// [`Self::forget`]): while the count stands, every pool stands in its
+    /// model's index where its tables hold it.
+    pub(super) fn moves(&self) -> u64 {
+        self.table.lock().moves
+    }
+
+    /// Whether `standing`, which an earlier membership write made of the
+    /// pool of `rows` serving `model`, stands in the model's index where
+    /// [`Self::pool`] would stand it now: the index is the one it reads,
+    /// and each row's id in it is the one its tables hold. Asked where a
+    /// lane moved since the last write ([`Self::moves`]), of a standing
+    /// whose tables are of these rows ([`PoolIndex::holds`]). Called under
+    /// the workers lock.
+    pub(super) fn stands(&self, model: &str, rows: &[Candidate], standing: &PoolIndex) -> bool {
+        let tables = &*standing.tables;
+        let table = self.table.lock();
+        let index = table.indexes.get(model).map(|held| &held.index);
+        let same = match (index, &tables.index) {
+            (Some(now), Some(then)) => Arc::ptr_eq(now, then),
+            (None, None) => true,
+            _ => false,
+        };
+        same && rows.iter().zip(tables.id_of.iter()).all(|(row, &then)| {
+            let now = match table.lanes.get(&row.id) {
+                Some(entry) if *entry.model == *model => entry.worker,
+                _ => NONE,
+            };
+            now == then
+        })
     }
 
     /// Take `id`'s lane out, when it has one: its blocks leave the index,
@@ -343,9 +912,10 @@ impl KvTables {
             return;
         };
         if let Some(Held { index, worker, map }) = entry.lane.lock().held.take() {
-            index.remove_worker(worker, map);
+            index.chain.remove_worker(worker, map);
         }
         let mut table = self.table.lock();
+        table.moves += 1;
         let last = table.indexes.get_mut(&entry.model).is_some_and(|model| {
             model.lanes -= 1;
             model.lanes == 0
@@ -461,7 +1031,7 @@ impl KvTables {
         let lane = lane.lock();
         lane.held
             .as_ref()
-            .map_or(0, |held| held.index.worker_block_count(held.worker))
+            .map_or(0, |held| held.index.chain.worker_block_count(held.worker))
     }
 
     pub(super) fn counts(&self, id: WorkerId, rank: u16) -> Option<LaneCounts> {
@@ -469,8 +1039,8 @@ impl KvTables {
     }
 
     /// The rows holding a prefix of the request's blocks in `model`'s
-    /// index, each with the leading blocks it holds, by id: the read no
-    /// decision makes yet, for the cases.
+    /// index, each with the leading blocks it holds, by id: every holder
+    /// listed, for the cases.
     #[cfg(test)]
     pub(super) fn overlaps(&self, model: &str, hashes: &[u64]) -> Vec<(WorkerId, u32)> {
         let (index, rows) = {
@@ -487,7 +1057,7 @@ impl KvTables {
             (Arc::clone(index), rows)
         };
         let mut held = Vec::new();
-        index.score_into(
+        index.chain.score_into(
             hashes,
             |hash| *hash,
             false,
@@ -515,6 +1085,6 @@ impl KvTables {
         table
             .indexes
             .get(model)
-            .map_or(0, |held| held.index.current_size())
+            .map_or(0, |held| held.index.chain.current_size())
     }
 }

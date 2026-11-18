@@ -127,37 +127,95 @@ fn stripped(value: &Value) -> Value {
     }
 }
 
+/// The byte both marks hold in the middle (`EF B7 90` and `EF B7 91`).
+const MIDDLE: u8 = 0xB7;
+
+/// The first place of [`MIDDLE`] in `bytes`, read eight bytes a step: with
+/// every [`MIDDLE`] of a step turned to zero, the step holds a zero byte
+/// exactly when taking one from each byte sets a high bit that was clear.
+/// No ASCII character holds the byte, and no fullwidth bar of a control
+/// spelling does, so most steps of a Latin-script prompt pass. A letter
+/// that holds it (Greek eta, Cyrillic ze, some CJK characters) stops the
+/// scan for one look at that place.
+fn middle(bytes: &[u8]) -> Option<usize> {
+    const ONES: u64 = u64::from_ne_bytes([0x01; 8]);
+    const HIGHS: u64 = u64::from_ne_bytes([0x80; 8]);
+    const MIDDLES: u64 = u64::from_ne_bytes([MIDDLE; 8]);
+    let (steps, _) = bytes.as_chunks::<8>();
+    let clear = steps
+        .iter()
+        .take_while(|step| {
+            let step = u64::from_ne_bytes(**step) ^ MIDDLES;
+            step.wrapping_sub(ONES) & !step & HIGHS == 0
+        })
+        .count();
+    let read = clear * 8;
+    bytes[read..]
+        .iter()
+        .position(|&byte| byte == MIDDLE)
+        .map(|at| read + at)
+}
+
+/// Calls `piece` with each stretch of a marked prompt, in order: the
+/// spelling between two marks (`true`) and the text outside them (`false`,
+/// never empty). One scan of the bytes. An error when the marks do not pair
+/// up, which a renderer never produces.
+fn pieces<'a>(marked: &'a str, mut piece: impl FnMut(bool, &'a str)) -> Result<()> {
+    let bytes = marked.as_bytes();
+    // Where the stretch being read begins and where the scan goes on;
+    // whether a mark stands open, and whether another opened behind it.
+    let (mut cursor, mut from) = (0, 0);
+    let (mut open, mut nested) = (false, false);
+    while let Some(at) = middle(&bytes[from..]).map(|at| from + at) {
+        let opens = match at.checked_sub(1).and_then(|lead| bytes.get(lead..at + 2)) {
+            Some([0xEF, MIDDLE, 0x90]) => true,
+            Some([0xEF, MIDDLE, 0x91]) => false,
+            _ => {
+                from = at + 1;
+                continue;
+            }
+        };
+        let (begin, end) = (at - 1, at + 2);
+        from = end;
+        if open && opens {
+            nested = true;
+            continue;
+        }
+        let stretch = &marked[cursor..begin];
+        if open {
+            if nested || stretch.is_empty() {
+                bail!("a control-token mark holds no single spelling");
+            }
+            piece(true, stretch);
+        } else if !opens {
+            bail!("a control-token mark closes before one opens");
+        } else if !stretch.is_empty() {
+            piece(false, stretch);
+        }
+        open = opens;
+        cursor = end;
+    }
+    if open {
+        bail!("a control-token mark opens and never closes");
+    }
+    if cursor < marked.len() {
+        piece(false, &marked[cursor..]);
+    }
+    Ok(())
+}
+
 /// The segments of a marked prompt, in order: each marked control token as a
 /// control segment, the text between as a plain segment (never empty). An
 /// error when the marks do not pair up, which a renderer never produces.
 pub(crate) fn segments(marked: &str) -> Result<Vec<PromptSegment>> {
     let mut segments = Vec::new();
-    let mut rest = marked;
-    while let Some(start) = rest.find(START) {
-        let (plain, after) = rest.split_at(start);
-        if !plain.is_empty() {
-            if plain.contains(END) {
-                bail!("a control-token mark closes before one opens");
-            }
-            segments.push(PromptSegment::text(plain));
-        }
-        let after = &after[START.len_utf8()..];
-        let Some(end) = after.find(END) else {
-            bail!("a control-token mark opens and never closes");
-        };
-        let spelling = &after[..end];
-        if spelling.is_empty() || spelling.contains(START) {
-            bail!("a control-token mark holds no single spelling");
-        }
-        segments.push(PromptSegment::control(spelling));
-        rest = &after[end + END.len_utf8()..];
-    }
-    if !rest.is_empty() {
-        if rest.contains(END) {
-            bail!("a control-token mark closes before one opens");
-        }
-        segments.push(PromptSegment::text(rest));
-    }
+    pieces(marked, |control, piece| {
+        segments.push(if control {
+            PromptSegment::control(piece)
+        } else {
+            PromptSegment::text(piece)
+        });
+    })?;
     Ok(segments)
 }
 
@@ -167,30 +225,14 @@ pub(crate) fn segments(marked: &str) -> Result<Vec<PromptSegment>> {
 /// is what gets encoded. An error when the marks do not pair up.
 pub(crate) fn flatten(marked: &str) -> Result<(String, Vec<Range<usize>>)> {
     let mut text = String::with_capacity(marked.len());
-    let mut controls = Vec::new();
-    let mut rest = marked;
-    while let Some(start) = rest.find(START) {
-        let (plain, after) = rest.split_at(start);
-        if plain.contains(END) {
-            bail!("a control-token mark closes before one opens");
+    // The controls of a few turns stand in the first allocation.
+    let mut controls = Vec::with_capacity(32);
+    pieces(marked, |control, piece| {
+        if control {
+            controls.push(text.len()..text.len() + piece.len());
         }
-        text.push_str(plain);
-        let after = &after[START.len_utf8()..];
-        let Some(end) = after.find(END) else {
-            bail!("a control-token mark opens and never closes");
-        };
-        let spelling = &after[..end];
-        if spelling.is_empty() || spelling.contains(START) {
-            bail!("a control-token mark holds no single spelling");
-        }
-        controls.push(text.len()..text.len() + spelling.len());
-        text.push_str(spelling);
-        rest = &after[end + END.len_utf8()..];
-    }
-    if rest.contains(END) {
-        bail!("a control-token mark closes before one opens");
-    }
-    text.push_str(rest);
+        text.push_str(piece);
+    })?;
     Ok((text, controls))
 }
 
@@ -393,6 +435,125 @@ mod tests {
         assert_eq!(text, strip(&marked));
         assert_eq!(flatten("").unwrap(), (String::new(), vec![]));
         assert_eq!(flatten("plain").unwrap(), ("plain".to_owned(), vec![]));
+    }
+
+    /// The one scan of a marked prompt, held to the reading by two searches a
+    /// mark that it took the place of.
+    mod one_scan {
+        use super::*;
+
+        /// `marked` read by two searches a mark, as both readers read it before
+        /// the one scan: the reading the scan is held to.
+        fn segments_by_searches(marked: &str) -> Result<Vec<PromptSegment>> {
+            let mut segments = Vec::new();
+            let mut rest = marked;
+            while let Some(start) = rest.find(START) {
+                let (plain, after) = rest.split_at(start);
+                if !plain.is_empty() {
+                    if plain.contains(END) {
+                        bail!("a control-token mark closes before one opens");
+                    }
+                    segments.push(PromptSegment::text(plain));
+                }
+                let after = &after[START.len_utf8()..];
+                let Some(end) = after.find(END) else {
+                    bail!("a control-token mark opens and never closes");
+                };
+                let spelling = &after[..end];
+                if spelling.is_empty() || spelling.contains(START) {
+                    bail!("a control-token mark holds no single spelling");
+                }
+                segments.push(PromptSegment::control(spelling));
+                rest = &after[end + END.len_utf8()..];
+            }
+            if !rest.is_empty() {
+                if rest.contains(END) {
+                    bail!("a control-token mark closes before one opens");
+                }
+                segments.push(PromptSegment::text(rest));
+            }
+            Ok(segments)
+        }
+
+        fn flatten_by_searches(marked: &str) -> Result<(String, Vec<Range<usize>>)> {
+            let mut text = String::with_capacity(marked.len());
+            let mut controls = Vec::new();
+            let mut rest = marked;
+            while let Some(start) = rest.find(START) {
+                let (plain, after) = rest.split_at(start);
+                if plain.contains(END) {
+                    bail!("a control-token mark closes before one opens");
+                }
+                text.push_str(plain);
+                let after = &after[START.len_utf8()..];
+                let Some(end) = after.find(END) else {
+                    bail!("a control-token mark opens and never closes");
+                };
+                let spelling = &after[..end];
+                if spelling.is_empty() || spelling.contains(START) {
+                    bail!("a control-token mark holds no single spelling");
+                }
+                controls.push(text.len()..text.len() + spelling.len());
+                text.push_str(spelling);
+                rest = &after[end + END.len_utf8()..];
+            }
+            if rest.contains(END) {
+                bail!("a control-token mark closes before one opens");
+            }
+            text.push_str(rest);
+            Ok((text, controls))
+        }
+
+        #[test]
+        fn the_one_scan_reads_what_two_searches_a_mark_read() {
+            // Both marks, their two neighbours in the code space, a character
+            // that ends as the opening mark does behind another lead byte, one
+            // that holds the marks' middle byte, and a letter.
+            const SYMBOLS: [&str; 7] = [
+                "\u{FDD0}", "\u{FDD1}", "\u{FDCF}", "\u{FDD2}", "\u{0DD0}", "\u{B7}", "a",
+            ];
+            // Every string of up to five symbols.
+            let mut strings = vec![String::new()];
+            let mut last = 0..1;
+            for _ in 0..5 {
+                let from = strings.len();
+                for index in last {
+                    for symbol in SYMBOLS {
+                        let longer = format!("{}{symbol}", strings[index]);
+                        strings.push(longer);
+                    }
+                }
+                last = from..strings.len();
+            }
+            assert_eq!(strings.len(), 19_608);
+            let read = |marked: &str| {
+                let text = |error: anyhow::Error| error.to_string();
+                assert_eq!(
+                    flatten(marked).map_err(text),
+                    flatten_by_searches(marked).map_err(text),
+                    "{marked:?}"
+                );
+                assert_eq!(
+                    segments(marked).map_err(text),
+                    segments_by_searches(marked).map_err(text),
+                    "{marked:?}"
+                );
+            };
+            // Behind zero to seven plain bytes, so that a mark stands at every
+            // place of a step.
+            for string in &strings {
+                for pad in 0..8 {
+                    read(&format!("{}{string}", &"xxxxxxx"[..pad]));
+                }
+            }
+            // A control behind and before plain runs of many steps.
+            for run in [8, 9, 15, 16, 17, 64, 200] {
+                let plain = "x".repeat(run);
+                read(&format!("{plain}{USER}{plain}"));
+                read(&format!("{plain}\u{FDD1}{plain}"));
+                read(&format!("{plain}{USER}{plain}\u{FDD0}{plain}"));
+            }
+        }
     }
 
     #[test]

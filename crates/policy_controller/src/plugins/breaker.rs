@@ -8,8 +8,9 @@
 //! without a call. A report stamped during the cool-down, by a call admitted
 //! before the open, is dropped whenever it arrives: one incident is one
 //! opening. One breaker
-//! per plugin, shared by its instances; the latency ring is per thread,
-//! kept across the thread's rebuilds (no shared write per call).
+//! per plugin, shared by its instances; the latency ring is per thread, or
+//! with a named decider's instance where a kind keeps one, kept across
+//! rebuilds (no shared write per call).
 
 use std::sync::atomic::{AtomicU64, Ordering};
 

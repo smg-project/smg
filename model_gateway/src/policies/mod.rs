@@ -24,6 +24,9 @@ mod classic_all_vetoed_rows;
 mod classic_manual_rows;
 #[cfg(test)]
 #[expect(clippy::print_stdout, reason = "a recorder says where its sheet went")]
+mod classic_prefix_hash_rows;
+#[cfg(test)]
+#[expect(clippy::print_stdout, reason = "a recorder says where its sheet went")]
 mod classic_rows;
 mod consistent_hashing;
 pub mod cost;

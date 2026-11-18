@@ -123,3 +123,7 @@ harness = false
 [[bench]]
 name = "parallel_encode"
 harness = false
+
+[[bench]]
+name = "encode_blocks"
+harness = false

@@ -462,7 +462,7 @@ async fn messages(gateway: &Gateway, stream: bool) -> (Vec<Value>, Value) {
     let body = read(
         gateway
             .router
-            .route_messages(None, &tenant(), request, MODEL),
+            .route_messages(None, &tenant(), Arc::new(request), MODEL),
     )
     .await;
     assert!(!body.contains("<tool_call>"), "no framing in {body}");

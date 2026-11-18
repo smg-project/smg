@@ -13,15 +13,13 @@ use super::{
     apply::{WorkerIndexCounters, WorkerIndexState},
     KvEventMonitor,
 };
-use crate::{
-    observability::metrics::Metrics,
-    worker::{
-        identity::endpoint::Endpoint,
-        kv::{
-            event_monitor::recovery::{Admission, RankState, ResyncReason},
-            index_backend::KvIndex,
-        },
+use crate::worker::{
+    identity::endpoint::Endpoint,
+    kv::{
+        event_monitor::recovery::{Admission, RankState, ResyncReason},
+        index_backend::KvIndex,
     },
+    metrics::Metrics,
 };
 
 /// A worker's subscription state: one admission cursor per data-parallel

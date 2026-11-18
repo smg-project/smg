@@ -229,7 +229,9 @@ async fn request(router: &dyn RouterTrait, route: Route, streaming: bool) -> Opt
                 "stream": streaming,
             }))
             .expect("Messages request");
-            router.route_messages(None, &tenant, request, model).await
+            router
+                .route_messages(None, &tenant, Arc::new(request), model)
+                .await
         }
         Route::Generate => {
             let request = serde_json::from_value(serde_json::json!({

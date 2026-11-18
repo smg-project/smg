@@ -138,7 +138,9 @@ async fn one_streaming_request(router: &dyn RouterTrait, route: Route) -> String
                 "stream": true,
             }))
             .unwrap();
-            router.route_messages(None, &tenant(), request, MODEL).await
+            router
+                .route_messages(None, &tenant(), Arc::new(request), MODEL)
+                .await
         }
         Route::Completions => {
             let request = serde_json::from_value(serde_json::json!({

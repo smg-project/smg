@@ -256,12 +256,13 @@ pub trait RouterTrait: Send + Sync + Debug {
         )
     }
 
-    /// Route Anthropic Messages API requests (/v1/messages)
+    /// Route Anthropic Messages API requests (/v1/messages). The request
+    /// comes in the `Arc` its handler built, as a chat request does.
     async fn route_messages(
         &self,
         _headers: Option<&HeaderMap>,
         _tenant_meta: &TenantRequestMeta,
-        _body: CreateMessageRequest,
+        _body: Arc<CreateMessageRequest>,
         _model_id: &str,
     ) -> Response {
         error::not_implemented(
@@ -511,7 +512,7 @@ mod tests {
                     .route_messages(
                         None,
                         &meta,
-                        body(json!({"model": "m", "max_tokens": 1, "messages": [{"role": "user", "content": "hi"}]})),
+                        Arc::new(body(json!({"model": "m", "max_tokens": 1, "messages": [{"role": "user", "content": "hi"}]}))),
                         "m",
                     )
                     .await,

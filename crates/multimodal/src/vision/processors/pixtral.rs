@@ -195,9 +195,7 @@ impl VisionPreProcessor for PixtralProcessor {
         &self,
         images: &[&DynamicImage],
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
-        if images.is_empty() {
-            return Err(TransformError::EmptyBatch);
-        }
+        TransformError::if_empty(images)?;
 
         let mut planes = Vec::with_capacity(images.len());
         let mut original_sizes = Vec::with_capacity(images.len());

@@ -50,7 +50,7 @@ use crate::{
             },
         },
     },
-    worker::{health::liveness, Worker},
+    worker::{health::liveness, metrics::Metrics as WorkerMetrics, Worker},
 };
 
 /// The message a sequential decode side's silence verdict starts with (see
@@ -710,7 +710,7 @@ async fn sequential_prefill_side(
     let bound = prefill_worker
         .and_then(|worker| PrefillBound::at(worker, sides.prompt_tokens, prefill_start));
     if let Some(prefill) = prefill_worker {
-        Metrics::record_worker_request(prefill.url(), prefill.model_id());
+        WorkerMetrics::record_worker_request(prefill.url(), prefill.model_id());
     }
     // Booked before the call is polled, for the servicers that send their
     // headers with the first message (see `PrefillTicket::book`); the bound
@@ -946,7 +946,7 @@ async fn sequential_decode_side(
     let workers = sides.workers;
     // Send request to decode
     if let Some(decode) = workers.decode_worker() {
-        Metrics::record_worker_request(decode.url(), decode.model_id());
+        WorkerMetrics::record_worker_request(decode.url(), decode.model_id());
     }
     // The relay phase ends at the decode dispatch. Everything after this
     // instant, including the engines' KV transfer and the decode scheduling,

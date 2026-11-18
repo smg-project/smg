@@ -54,6 +54,7 @@ import importlib
 import json
 import logging
 import multiprocessing
+import os
 import signal
 import threading
 from collections.abc import Callable, Mapping
@@ -108,7 +109,10 @@ from smg_grpc_servicer.tokenspeed.loads import running_window
 from smg_grpc_servicer.tokenspeed.redact import redact_secrets
 from smg_grpc_servicer.tokenspeed.warmup import (
     DEFAULT_BUDGET_SECS,
+    DEFAULT_REMAINDERS,
+    REMAINDERS_ENV,
     WARMUP_ENV,
+    parse_remainders,
     warmup_inputs,
     warmup_wire,
 )
@@ -125,6 +129,21 @@ PREFILL_TOKENS_PER_SEC_ENV = "SMG_TOKENSPEED_SERVICER_PREFILL_TOKENS_PER_SEC"
 # Set to 0/false/no/off to keep TokenSpeed's KV event publisher off when the
 # launcher was given no --kv-events-config (see `default_kv_events_config`).
 KV_EVENTS_ENV = "SMG_TOKENSPEED_SERVICER_KV_EVENTS"
+
+
+def read_remainders_setting(environ: Mapping[str, str] | None = None) -> str:
+    """The chunk-remainders knob's setting from ``environ[REMAINDERS_ENV]``
+    (:func:`~smg_grpc_servicer.tokenspeed.warmup.parse_remainders`; the
+    process environment by default). A value the knob does not take is a
+    :class:`ServicerConfigError` naming the variable: both launchers read it
+    before any engine work (the Rust launcher with its other knobs, the
+    Python servicer beside its KV-events default), so a typo refuses the
+    start whatever the warm-up level and the engine's role."""
+    source = os.environ if environ is None else environ
+    try:
+        return parse_remainders(source.get(REMAINDERS_ENV))
+    except ValueError as error:
+        raise ServicerConfigError(str(error)) from None
 
 
 def default_kv_events_json(endpoint: str) -> str:
@@ -847,6 +866,15 @@ class TokenSpeedLauncher(RustLauncher):
     # The line the KV-events default logged when the engine's own word kept
     # the publisher off; the facts hand it to the servicer.
     _kv_events_left_off: str | None = None
+    # The chunk-remainders knob's setting (:func:`read_remainders_setting`),
+    # read in ``prepare`` with the launcher's other knobs.
+    _remainders: str = DEFAULT_REMAINDERS
+
+    def prepare(self, args: Any) -> None:
+        # Read before any engine work, whether or not the warm-up runs and
+        # whatever the role: a bad value is the same named exit as a bad
+        # warm-up level, not a start that ignores it.
+        self._remainders = read_remainders_setting()
 
     def metrics_bind_address(
         self, args: Any, environ: Mapping[str, str] | None = None
@@ -917,7 +945,7 @@ class TokenSpeedLauncher(RustLauncher):
             self._bootstrap_server = None
 
     def warmup_inputs(self, args: Any, facts: Mapping[str, Any]) -> Any:
-        return warmup_inputs(args, facts)
+        return warmup_inputs(args, facts, remainders=self._remainders)
 
     def warmup_wire(self, target: str) -> Any:
         return warmup_wire(target)

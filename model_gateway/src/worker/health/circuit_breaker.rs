@@ -4,9 +4,10 @@ use std::{
 };
 
 use parking_lot::Mutex;
+use smg_worker::metrics_labels;
 use tracing::info;
 
-use crate::{observability::metrics::Metrics, worker::identity::endpoint::Endpoint};
+use crate::worker::{identity::endpoint::Endpoint, metrics::Metrics};
 
 /// Circuit breaker configuration
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -222,7 +223,11 @@ impl CircuitBreaker {
             self.record_failure();
         }
 
-        let outcome_str = if success { "success" } else { "failure" };
+        let outcome_str = if success {
+            metrics_labels::CB_SUCCESS
+        } else {
+            metrics_labels::CB_FAILURE
+        };
         Metrics::record_worker_cb_outcome(&self.metric_label, outcome_str);
         self.publish_gauge_metrics();
     }

@@ -5,7 +5,9 @@
 
 use std::fmt;
 
-pub use crate::plugins::config::{BreakerSpec, Exposure, Failure, FrameBudget, HeaderSet, Reveal};
+pub use crate::plugins::config::{
+    BreakerSpec, EventKind, EventSet, Exposure, Failure, FrameBudget, HeaderSet, Reveal,
+};
 use crate::spec::Needs;
 
 /// The `smg:policy` package versions the host accepts: one major, every
@@ -91,10 +93,21 @@ pub struct PluginSpec {
     /// What the host must feed for the plugin's stages to mean anything
     /// (hashes, loads, headers, media, the affinity column behind a
     /// candidate's five affinity facts); the plugin declares it, the host
-    /// cannot read it off a module.
+    /// cannot read it off a module. The view carries the request's block
+    /// hashes where these declare them, in the token form or the text form:
+    /// the first [`MAX_BLOCK_HASHES`](crate::spec::MAX_BLOCK_HASHES) of
+    /// a longer list. Where they declare neither it carries none, whatever
+    /// the other stages of the profile read.
     pub needs: Needs,
     /// The counters the plugin may add to, by id; a name per id.
     pub metrics: Vec<String>,
+    /// The kinds of lifecycle event the module's `observe` is called with,
+    /// none by default: a row that lists none is never told. A row that
+    /// lists any has the plugin's scorer and picker say they need the
+    /// lifecycle's calls ([`crate::Lifecycle::needs_lifecycle`]). Bound as
+    /// a filter alone a plugin hears nothing, whatever this lists: the
+    /// engine forwards the lifecycle to scorers and pickers.
+    pub observes: EventSet,
     pub failure: Failure,
     pub log: LogLimit,
     pub breaker: BreakerSpec,
@@ -124,6 +137,7 @@ impl PluginSpec {
             view: Exposure::default(),
             needs: Needs::default(),
             metrics: Vec::new(),
+            observes: EventSet::default(),
             failure: Failure::default(),
             log: LogLimit::default(),
             breaker: BreakerSpec::default(),

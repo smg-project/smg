@@ -63,6 +63,7 @@ use crate::{
     worker::{
         health::liveness::{self, SideReprieve},
         identity::basic::WorkerTypeExt,
+        metrics::Metrics as WorkerMetrics,
         ConnectionModeExt, Worker,
     },
 };
@@ -75,10 +76,6 @@ pub(crate) type StreamResult = Result<ProtoStream, tonic::Status>;
 pub(crate) type SideDispatch = Pin<Box<dyn Future<Output = StreamResult> + Send>>;
 
 /// How the two parallel sides resolved.
-#[expect(
-    clippy::large_enum_variant,
-    reason = "consumed by its caller on the next line; boxing would add an allocation to the success path to save one stack move"
-)]
 enum PdDispatchOutcome {
     /// Both sides answered; either or both may carry an error.
     Both(StreamResult, StreamResult),
@@ -1169,7 +1166,7 @@ async fn execute_single(
     let streaming = proto_request.stream();
     let worker = workers.single();
     if let Some(worker) = worker {
-        Metrics::record_worker_request(worker.url(), worker.model_id());
+        WorkerMetrics::record_worker_request(worker.url(), worker.model_id());
     }
     // The call's future is boxed, as the disaggregated sides' are: it is the
     // large part of the dispatch, and inlined in the pipeline's future it
@@ -1271,7 +1268,10 @@ pub(crate) fn start_failure_response(
     } else {
         error!(function = function, error = %e, "{}", description);
     }
-    let mut response = e.to_http_error(code, format!("{description}: {}", e.message()));
+    // The status of a dial that failed names the worker's address, for the
+    // line above; the client's answer is the same failure without it.
+    let detail = e.client_message();
+    let mut response = e.to_http_error(code, format!("{description}: {detail}"));
     // INTERNAL is the servicers' code for a request the engine took and failed
     // on: the worker's own answer for this payload, which the retry layer does
     // not replay on it (see `routers::common::attempt_ledger`). tonic gives
@@ -1351,7 +1351,7 @@ async fn execute_embed(
     let worker = workers.single();
     let calls = requests.into_iter().map(|request| {
         if let Some(worker) = worker {
-            Metrics::record_worker_request(worker.url(), worker.model_id());
+            WorkerMetrics::record_worker_request(worker.url(), worker.model_id());
         }
         client.embed(request)
     });
@@ -1516,7 +1516,7 @@ async fn execute_parallel_pd(
         .into_iter()
         .flatten()
     {
-        Metrics::record_worker_request(worker.url(), worker.model_id());
+        WorkerMetrics::record_worker_request(worker.url(), worker.model_id());
     }
     // The side is booked on its worker here, before its call is polled: a
     // servicer that sends its headers with the first message answers the

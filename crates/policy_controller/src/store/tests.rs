@@ -4,13 +4,17 @@
 use std::time::{Duration, Instant};
 
 use super::{
-    identity, identity_of, BatchFacts, BatchOutcome, ContentHash, Dispatch, GatewayId, HealthSink,
-    KvEvent, KvEventSink, LeaseRecord, LeaseRefused, LeaseState, LeasesStore, LoadSink, LoadSource,
-    MembershipChange, MembershipTail, MemoryStore, Pin, PollMode, ReservationKind,
-    ReservationStore, ResyncReason, SequenceHash, SessionsStore, Signals, SnapshotChunk,
-    StoredBlock, WorkerFacts, WorkerPatch, WorkerStatus, WorkersStore,
+    identity, identity_of,
+    leases::{Counts, Slot},
+    Ask, BatchFacts, BatchOutcome, ContentHash, Dispatch, GatewayId, HealthSink, KvEvent,
+    KvEventSink, LeaseRecord, LeaseRefused, LeaseState, LeasesStore, LoadSink, LoadSource,
+    MembershipChange, MembershipTail, MemoryStore, Picked, Pin, PollMode, Reachability,
+    ReservationKind, ReservationStore, ResyncReason, SequenceHash, SessionsStore, Signals,
+    SnapshotChunk, StoredBlock, VetoWrite, ViewBuffers, WorkerFacts, WorkerPatch, WorkerStatus,
+    WorkersStore,
 };
 use crate::{
+    decision::{Target, Targets},
     lease::{Lease, LeaseId, Membership, Outcome, ReleaseReason, Side, TransportClass},
     view::{fingerprint, LoadRow, Role, SignalSource, WorkerId},
 };
@@ -60,6 +64,7 @@ fn lease(gateway: GatewayId, id: u64, term: u64, now: Instant) -> LeaseRecord {
         gateway,
         request: id,
         target: WorkerId(7),
+        picked: Picked::default(),
         decode: None,
         term,
         issued_at: now,
@@ -324,6 +329,40 @@ fn a_counter_at_its_ranges_end_stays_there() {
         health.probe_outcome(id, true, revision()),
         Some((WorkerStatus::Failed, WorkerStatus::Ready))
     );
+}
+
+#[test]
+fn a_threshold_whose_triple_passes_the_counters_range_fails_no_row_early() {
+    // The first threshold whose triple passes 32 bits: a product that
+    // wrapped would read 2.
+    let threshold = 1_431_655_766;
+    let store = MemoryStore::new();
+    let health: &dyn HealthSink = &store;
+    let mut stated = facts("http://w:8000", 1);
+    stated.health.failure_threshold = threshold;
+    let id = store.upsert(stated).id();
+    let revision = || WorkersStore::get(&store, id).expect("the row").revision;
+    assert_eq!(health.probe_outcome(id, true, revision()), None);
+    assert_eq!(
+        health.probe_outcome(id, true, revision()),
+        Some((WorkerStatus::Pending, WorkerStatus::Ready))
+    );
+    // Ready, the row is not ready at the threshold's own count of failed
+    // probes: the count is set one short of it.
+    store.probed(id, threshold - 1, 0, 0);
+    assert_eq!(
+        health.probe_outcome(id, false, revision()),
+        Some((WorkerStatus::Ready, WorkerStatus::NotReady))
+    );
+    // Not ready, it fails at three thresholds of failed probes: five are
+    // far under them.
+    for _ in 0..5 {
+        assert_eq!(
+            health.probe_outcome(id, false, revision()),
+            None,
+            "not ready under the triple"
+        );
+    }
 }
 
 #[test]
@@ -1114,6 +1153,51 @@ fn two_gateways_sharing_a_lease_number_hold_separate_reservations() {
     assert_eq!(rooms.held(id, ReservationKind::Room), 0);
 }
 
+#[cfg(feature = "controller")]
+#[test]
+fn the_pins_sweep_drops_the_pins_past_the_rules_ttl_once_an_interval() {
+    use crate::spec::{AppliedSpec, PolicySpec};
+
+    let store = MemoryStore::new();
+    let now = Instant::now();
+    let t = |seconds: u64| now + Duration::from_secs(seconds);
+    let sessions: &dyn SessionsStore = &store;
+    // No sessions rule stands: no pass runs, whatever the age of a pin.
+    sessions.pin(1, WorkerId(1), now);
+    assert_eq!(store.sweep_pins(t(1_000_000)), 0);
+    // The manual preset, its keys pinned for `ttl_s` and swept every
+    // `sweep_s`.
+    let ruled = |generation: u64, ttl_s: u32, sweep_s: u32| {
+        let mut document = PolicySpec::preset("manual").expect("a preset of this build");
+        document.generation = generation;
+        let rule = document.bindings[0].sessions.as_mut();
+        let rule = rule.expect("the preset's rule");
+        (rule.ttl_s, rule.sweep_s) = (ttl_s, sweep_s);
+        AppliedSpec::validate(&document).expect("the document validates")
+    };
+    store.apply(ruled(1, 60, 30)).expect("a first generation");
+    for key in 2..=1_001 {
+        sessions.pin(key, WorkerId(1), t(10));
+    }
+    assert_eq!(sessions.len(), 1_001);
+    // The first pass: the pin of second 0 is past the TTL at second 61.
+    assert_eq!(store.sweep_pins(t(61)), 1);
+    // A tick inside the interval walks nothing, though every pin is old.
+    assert_eq!(store.sweep_pins(t(80)), 0);
+    assert_eq!(sessions.len(), 1_000);
+    // The next pass due: the thousand pins of second 10 leave together,
+    // so the table holds the keys of one TTL and one interval at most.
+    assert_eq!(store.sweep_pins(t(91)), 1_000);
+    assert!(sessions.is_empty());
+    // A rule that keeps its keys for ever: no pass runs.
+    store
+        .apply(ruled(2, u32::MAX, u32::MAX))
+        .expect("a later generation");
+    sessions.pin(1, WorkerId(1), now);
+    assert_eq!(store.sweep_pins(t(1_000_000)), 0);
+    assert_eq!(sessions.len(), 1);
+}
+
 #[test]
 fn a_pin_is_written_at_the_commit_and_leaves_with_its_worker_or_its_age() {
     let store = MemoryStore::new();
@@ -1271,7 +1355,7 @@ fn hello_pages_restore_exactly_what_they_list_and_a_gone_gateway_loses_its_lease
         "another gateway's page"
     );
     assert_eq!(leases.live(g2), 1, "the other gateway is untouched");
-    assert_eq!(leases.drop_gateway(g1), 2);
+    assert_eq!(leases.drop_gateways(&[g1]), [2]);
     assert_eq!(leases.live(g1), 0);
     assert_eq!(leases.live(g2), 1);
 }
@@ -1284,4 +1368,678 @@ fn the_identity_rule_reads_a_key_through_its_fingerprint() {
         "the wrapper and the rule agree"
     );
     assert_ne!(identity_of(0, 0), WorkerId(0), "an id is never 0");
+}
+
+#[test]
+fn a_noted_veto_is_written_only_while_its_note_stands() {
+    let store = MemoryStore::new();
+    let now = Instant::now();
+    let (first, second) = (now + Duration::from_secs(30), now + Duration::from_secs(60));
+    let g = GatewayId(1);
+    let w = ready(&store, "http://a:8000");
+
+    // No note behind the write: written as the plain door writes it.
+    let written = store.gateway_veto_noted(g, w, Some(first), false, now);
+    assert_eq!(written, VetoWrite::Written);
+    assert!(store.vetoed(g, w, now));
+    // The note's end stands in the store: the later end is written.
+    let written = store.gateway_veto_noted(g, w, Some(second), true, now);
+    assert_eq!(written, VetoWrite::Written);
+    assert!(store.vetoed(g, w, first), "the later end is shown");
+
+    // The row leaves and comes back under the same id, and its vetoes left
+    // with it. A write that says its note stands writes nothing: the row
+    // registered again takes no end of the row before it.
+    let revision = WorkersStore::get(&store, w).expect("the row").revision;
+    WorkersStore::remove(&store, w, revision).expect("removed");
+    assert_eq!(ready(&store, "http://a:8000"), w, "the same id");
+    for until in [Some(second), None] {
+        let written = store.gateway_veto_noted(g, w, until, true, now);
+        assert_eq!(written, VetoWrite::Left);
+    }
+    assert!(!store.vetoed(g, w, now));
+    assert_eq!(store.health_entries(), 0);
+    // With no note behind it the same end is the gateway's word of now,
+    // and a clear behind a note that stands lifts it.
+    let written = store.gateway_veto_noted(g, w, Some(second), false, now);
+    assert_eq!(written, VetoWrite::Written);
+    assert!(store.vetoed(g, w, now));
+    let written = store.gateway_veto_noted(g, w, None, true, now);
+    assert_eq!(written, VetoWrite::Written);
+    assert!(!store.vetoed(g, w, now));
+
+    // A worker without a row: a veto writes nothing, a clear is taken.
+    let none = WorkerId(7);
+    let written = store.gateway_veto_noted(g, none, Some(first), false, now);
+    assert_eq!(written, VetoWrite::NoRow);
+    let written = store.gateway_veto_noted(g, none, None, false, now);
+    assert_eq!(written, VetoWrite::Written);
+    assert_eq!(store.health_entries(), 0);
+}
+
+#[test]
+fn a_dropped_gateway_takes_its_vetoes_and_completed_dispatches_and_no_other_gateways() {
+    let store = MemoryStore::new();
+    let now = Instant::now();
+    let until = now + Duration::from_secs(60);
+    let (g1, g2) = (GatewayId(1), GatewayId(2));
+    let a = ready(&store, "http://a:8000");
+    let b = ready(&store, "http://b:8000");
+    for gateway in [g1, g2] {
+        store.gateway_veto(gateway, a, Some(until));
+        HealthSink::completed(&store, gateway, b, TransportClass::Ok, now);
+    }
+    store.gateway_veto(g1, b, Some(until));
+    assert_eq!(store.health_entries(), 5);
+
+    assert_eq!(store.drop_gateways(&[g1]), [0], "it held no lease");
+    assert!(!store.vetoed(g1, a, now) && !store.vetoed(g1, b, now));
+    assert!(!store.completed_ok_since(g1, b, now));
+    // The other gateway's stand.
+    assert!(store.vetoed(g2, a, now));
+    assert!(store.completed_ok_since(g2, b, now));
+    assert_eq!(store.health_entries(), 2);
+    // A gateway that holds nothing is dropped as cleanly.
+    assert_eq!(store.drop_gateways(&[g1]), [0]);
+    assert_eq!(store.health_entries(), 2);
+}
+
+#[test]
+fn gateways_dropped_together_leave_whole_and_say_their_leases_in_the_order_asked() {
+    let store = MemoryStore::new();
+    let leases: &dyn LeasesStore = &store;
+    let now = Instant::now();
+    let until = now + Duration::from_secs(60);
+    let (g1, g2, g3) = (GatewayId(1), GatewayId(2), GatewayId(3));
+    let a = ready(&store, "http://a:8000");
+    let b = ready(&store, "http://b:8000");
+    leases.set_term(5);
+    let two = [lease(g1, 1, 5, now), lease(g1, 2, 5, now)];
+    assert_eq!(leases.restore(g1, &two), 2);
+    assert_eq!(leases.restore(g2, &[lease(g2, 3, 5, now)]), 1);
+    assert_eq!(leases.restore(g3, &[lease(g3, 4, 5, now)]), 1);
+    for gateway in [g1, g2, g3] {
+        store.gateway_veto(gateway, a, Some(until));
+        HealthSink::completed(&store, gateway, b, TransportClass::Ok, now);
+    }
+    assert_eq!(store.health_entries(), 6);
+
+    // Asked out of order, and one of them twice: each count is its own
+    // gateway's, where the caller named it.
+    assert_eq!(leases.drop_gateways(&[g3, g1, g3]), [1, 2, 1]);
+    for gateway in [g1, g3] {
+        assert_eq!(leases.live(gateway), 0);
+        assert!(!store.vetoed(gateway, a, now));
+        assert!(!store.completed_ok_since(gateway, b, now));
+    }
+    // The gateway the list did not name keeps what it held.
+    assert_eq!(leases.live(g2), 1);
+    assert!(store.vetoed(g2, a, now) && store.completed_ok_since(g2, b, now));
+    assert_eq!(store.health_entries(), 2);
+    // Asked in falling order the list is found whole all the same: the
+    // store sorts what it searches.
+    let falling = [GatewayId(6), GatewayId(5), GatewayId(4)];
+    for gateway in falling {
+        store.gateway_veto(gateway, a, Some(until));
+    }
+    assert_eq!(leases.drop_gateways(&falling), [0, 0, 0]);
+    for gateway in falling {
+        assert!(!store.vetoed(gateway, a, now), "{gateway:?} keeps its veto");
+    }
+    assert!(leases.drop_gateways(&[]).is_empty());
+    assert_eq!(store.health_entries(), 2);
+}
+
+/// No lease's counter: what an issue that ended nothing hands back.
+const NONE: [u64; 0] = [];
+
+/// Each member's requests in flight as a view of the cases' model reads
+/// them for `gateway`, in the view's order: by worker id.
+fn in_flight_for(store: &MemoryStore, gateway: GatewayId) -> Vec<(WorkerId, u32)> {
+    let ask = Ask {
+        gateway,
+        now: Instant::now(),
+        pinned: None,
+        affinity: false,
+    };
+    let mut out = ViewBuffers::default();
+    store.deciding(|world| {
+        if let Some(built) = world.build("m", Role::Single, &ask, &mut out) {
+            world.count_in_flight(&built, &ask, &mut out.candidates);
+        }
+    });
+    let rows = out.candidates.iter();
+    rows.map(|row| (row.id, row.in_flight)).collect()
+}
+
+/// [`in_flight_for`] the gateway the cases issue their leases to.
+fn in_flight(store: &MemoryStore) -> Vec<(WorkerId, u32)> {
+    in_flight_for(store, GatewayId(1))
+}
+
+/// A lease of `gateway` on `target`, issued at `now` under term 1.
+fn booking(gateway: GatewayId, id: u64, target: WorkerId, now: Instant) -> LeaseRecord {
+    LeaseRecord {
+        target,
+        ..lease(gateway, id, 1, now)
+    }
+}
+
+#[test]
+fn a_views_row_reads_the_leases_on_file_that_book_its_worker() {
+    let store = MemoryStore::new();
+    let (a, b) = (ready(&store, "http://a:1"), ready(&store, "http://b:1"));
+    let (first, second) = (a.min(b), a.max(b));
+    let (gateway, now) = (GatewayId(1), Instant::now());
+    store.set_term(1);
+    assert_eq!(in_flight(&store), [(first, 0), (second, 0)]);
+    for (id, target) in [(1, a), (2, a), (3, b)] {
+        LeasesStore::issue(&store, booking(gateway, id, target, now)).expect("filed");
+    }
+    let of = |a_holds, b_holds| {
+        let mut rows = [(a, a_holds), (b, b_holds)];
+        rows.sort_unstable();
+        rows
+    };
+    assert_eq!(in_flight(&store), of(2, 1));
+    // A dispatch moves no count: the lease stands on file.
+    assert!(LeasesStore::dispatched(
+        &store,
+        gateway,
+        LeaseId(1),
+        Dispatch::default(),
+        now
+    ));
+    assert_eq!(in_flight(&store), of(2, 1));
+    // A count is its worker's through a membership write and a status.
+    let c = ready(&store, "http://c:1");
+    let mut rows = in_flight(&store);
+    rows.retain(|&(id, _)| id != c);
+    assert_eq!(rows, of(2, 1), "a member that joined moved no count");
+    assert!(in_flight(&store).contains(&(c, 0)));
+    // A lease of a worker that left ends on its own count, and no other
+    // member's moves.
+    let revision = WorkersStore::get(&store, b).expect("the row").revision;
+    assert!(store.remove(b, revision).is_some());
+    let leases: &dyn LeasesStore = &store;
+    assert!(leases.released(gateway, LeaseId(3), None, ReleaseReason::WorkerRemoved));
+    let mut left = [(a, 2), (c, 0)];
+    left.sort_unstable();
+    assert_eq!(in_flight(&store), left);
+}
+
+/// A pool that holds another gateway's host-local row is walked as its
+/// build walks it: each row the asking gateway reaches reads its own
+/// worker's count, and a build alone writes none.
+#[test]
+fn a_count_is_written_on_its_own_workers_row_past_another_gateways_local_row() {
+    let store = MemoryStore::new();
+    let (gateway, now) = (GatewayId(1), Instant::now());
+    store.set_term(1);
+    let member = |key: &str, reachable_from| {
+        let id = store
+            .upsert(WorkerFacts {
+                reachable_from,
+                ..facts(key, 1)
+            })
+            .id();
+        let revision = WorkersStore::get(&store, id).expect("the row").revision;
+        store
+            .set_status(id, WorkerStatus::Ready, revision)
+            .expect("ready");
+        id
+    };
+    let open = member("http://a:1", Reachability::Any);
+    let theirs = member("unix:///b", Reachability::Gateway(GatewayId(2)));
+    let ours = member("unix:///c", Reachability::Gateway(gateway));
+    let last = member("http://d:1", Reachability::Any);
+    // No two workers hold the same count.
+    let mut id = 0;
+    for (count, target) in [(1, open), (2, theirs), (3, ours), (4, last)] {
+        for _ in 0..count {
+            id += 1;
+            LeasesStore::issue(&store, booking(gateway, id, target, now)).expect("filed");
+        }
+    }
+    let by_id = |mut rows: Vec<(WorkerId, u32)>| {
+        rows.sort_unstable();
+        rows
+    };
+    let seen = |asker: u64| in_flight_for(&store, GatewayId(asker));
+    assert_eq!(seen(1), by_id(vec![(open, 1), (ours, 3), (last, 4)]));
+    assert_eq!(seen(2), by_id(vec![(open, 1), (theirs, 2), (last, 4)]));
+    assert_eq!(seen(3), by_id(vec![(open, 1), (last, 4)]));
+    let mut built = ViewBuffers::default();
+    let ask = Ask {
+        gateway,
+        now,
+        pinned: None,
+        affinity: false,
+    };
+    store.build_view("m", Role::Single, &ask, &mut built);
+    assert!(built.candidates.iter().all(|row| row.in_flight == 0));
+}
+
+/// The counts are one table in pieces that never move: every slot names a
+/// cell of its own in whichever piece holds it, a run of slots is read in
+/// its order across the pieces, and the slot that names no cell reads zero
+/// and books nothing.
+#[test]
+fn a_count_is_found_by_its_slot_in_whichever_piece_holds_it() {
+    let counts = Counts::default();
+    // The first piece holds 1,024 cells and the second 2,048: one slot
+    // more stands in the third.
+    let slots: Vec<Slot> = (0..3_073).map(|_| counts.claim()).collect();
+    for &slot in &slots {
+        counts.book(slot);
+    }
+    assert!(counts.of(&slots).all(|count| count == 1), "a cell a slot");
+    for &slot in &slots {
+        counts.free(slot);
+    }
+    // Both ends of each piece, a count of its own on each.
+    let marked = [0, 1, 1_023, 1_024, 3_071, 3_072];
+    for (times, &at) in (1..).zip(&marked) {
+        for _ in 0..times {
+            counts.book(slots[at]);
+        }
+    }
+    counts.book(Slot::NONE);
+    let ends = marked.iter().rev().map(|&at| slots[at]);
+    let run: Vec<Slot> = ends.chain([Slot::NONE, slots[2]]).collect();
+    assert_eq!(
+        counts.of(&run).collect::<Vec<_>>(),
+        [6, 5, 4, 3, 2, 1, 0, 0]
+    );
+    // A lease that leaves gives one back, and a count at zero stays there.
+    for slot in [slots[1_024], slots[2], Slot::NONE] {
+        counts.free(slot);
+    }
+    let read: Vec<u32> = counts.of(&[slots[1_024], slots[2]]).collect();
+    assert_eq!(read, [3, 0]);
+}
+
+/// A member keeps its slot whichever member leaves or joins beside it, and
+/// the slot of a worker that left is given to no member after it: a worker
+/// that joins reads zero, and the leaver's leases end on the count they
+/// booked.
+#[test]
+fn a_member_keeps_its_slot_and_a_leavers_slot_is_given_to_no_one() {
+    let keys = ["http://a:1", "http://b:1", "http://c:1"];
+    for leaver in 0..keys.len() {
+        let store = MemoryStore::new();
+        let ids: Vec<WorkerId> = keys.iter().map(|key| ready(&store, key)).collect();
+        let leases: &dyn LeasesStore = &store;
+        let (gateway, now) = (GatewayId(1), Instant::now());
+        leases.set_term(1);
+        // One lease on the first worker, two on the second, three on the
+        // third: the leaver's are the ones its turn filed.
+        let (mut id, mut its) = (0, Vec::new());
+        for (count, &target) in (1..).zip(&ids) {
+            for _ in 0..count {
+                id += 1;
+                let filed = leases.issue(booking(gateway, id, target, now));
+                assert_eq!(filed, Ok(()));
+                if target == ids[leaver] {
+                    its.push(LeaseId(id));
+                }
+            }
+        }
+        let revision = WorkersStore::get(&store, ids[leaver]).expect("the row");
+        assert!(store.remove(ids[leaver], revision.revision).is_some());
+        let joined = ready(&store, "http://d:1");
+        let stayers = (1..).zip(&ids).filter(|&(_, &id)| id != ids[leaver]);
+        let mut stand: Vec<(WorkerId, u32)> = stayers.map(|(count, &id)| (id, count)).collect();
+        stand.push((joined, 0));
+        stand.sort_unstable();
+        assert_eq!(in_flight(&store), stand, "worker {leaver} left");
+        for lease in its {
+            assert!(leases.released(gateway, lease, None, ReleaseReason::WorkerRemoved));
+        }
+        assert_eq!(in_flight(&store), stand, "worker {leaver}'s leases ended");
+    }
+}
+
+/// A record filed over one on file under its key gives the first's count
+/// back: a restore whose page names one lease twice keeps one lease and
+/// one count.
+#[test]
+fn a_record_filed_over_one_on_file_gives_the_firsts_count_back() {
+    let store = MemoryStore::new();
+    let a = ready(&store, "http://a:1");
+    let leases: &dyn LeasesStore = &store;
+    let (gateway, now) = (GatewayId(1), Instant::now());
+    leases.set_term(1);
+    let page = booking(gateway, 7, a, now);
+    assert_eq!(leases.restore(gateway, &[page, page]), 1);
+    assert_eq!(in_flight(&store), [(a, 1)]);
+}
+
+/// A sweep's one write ends the leases of every gateway that goes: each
+/// gives its count back, and the leases of a gateway that stays still book
+/// their workers.
+#[test]
+fn a_sweeps_one_write_gives_back_the_counts_of_every_gateway_that_goes() {
+    let store = MemoryStore::new();
+    let (a, b) = (ready(&store, "http://a:1"), ready(&store, "http://b:1"));
+    let leases: &dyn LeasesStore = &store;
+    let now = Instant::now();
+    leases.set_term(1);
+    // Gateways 1 and 3 go, gateway 2 stays with its two leases.
+    for (gateway, id, target) in [(1, 1, a), (1, 2, b), (2, 3, a), (2, 4, a), (3, 5, b)] {
+        let filed = leases.issue(booking(GatewayId(gateway), id, target, now));
+        filed.expect("the key is free");
+    }
+    let of = |a_holds, b_holds| {
+        let mut rows = [(a, a_holds), (b, b_holds)];
+        rows.sort_unstable();
+        rows
+    };
+    assert_eq!(in_flight(&store), of(3, 2));
+    assert_eq!(leases.drop_gateways(&[GatewayId(3), GatewayId(1)]), [1, 2]);
+    assert_eq!(in_flight(&store), of(2, 0));
+    assert_eq!(leases.live(GatewayId(2)), 2);
+}
+
+#[test]
+fn a_dispatch_on_another_target_of_the_pick_moves_the_leases_count() {
+    let store = MemoryStore::new();
+    let (a, b) = (ready(&store, "http://a:1"), ready(&store, "http://b:1"));
+    let (gateway, now) = (GatewayId(1), Instant::now());
+    store.set_term(1);
+    let of = |a_holds, b_holds| {
+        let mut rows = [(a, a_holds), (b, b_holds)];
+        rows.sort_unstable();
+        rows
+    };
+    // A pick of a, then b: the lease books a.
+    let mut targets = Targets::new();
+    for id in [a, b] {
+        targets.push(Target {
+            id,
+            ..Target::default()
+        });
+    }
+    let picked = |id: u64| LeaseRecord {
+        picked: Picked::of(&targets),
+        ..booking(gateway, id, a, now)
+    };
+    let leases: &dyn LeasesStore = &store;
+    leases.issue(picked(1)).expect("filed");
+    assert_eq!(in_flight(&store), of(1, 0));
+    // The gateway dispatched to the pick's second target: the count is b's.
+    let on = |target_index| Dispatch {
+        target_index,
+        ..Dispatch::default()
+    };
+    assert!(leases.dispatched(gateway, LeaseId(1), on(1), now));
+    assert_eq!(in_flight(&store), of(0, 1));
+    let filed = leases.get(gateway, LeaseId(1)).expect("on file");
+    assert_eq!((filed.target, filed.lease.target_index), (b, 1));
+    // A second dispatch of one lease, on the first target, moves nothing.
+    assert!(leases.dispatched(gateway, LeaseId(1), on(0), now));
+    assert_eq!(in_flight(&store), of(0, 1));
+    // The lease ends on the count it books now.
+    assert!(leases.released(gateway, LeaseId(1), None, ReleaseReason::ClientGone));
+    assert_eq!(in_flight(&store), of(0, 0));
+    // An index the pick holds no target at moves the state and no count.
+    leases.issue(picked(2)).expect("filed");
+    assert!(leases.dispatched(gateway, LeaseId(2), on(2), now));
+    assert_eq!(in_flight(&store), of(1, 0));
+    let state = leases.get(gateway, LeaseId(2)).map(|record| record.state);
+    assert_eq!(state, Some(LeaseState::Dispatched { at: now }));
+}
+
+#[test]
+fn every_door_that_takes_a_lease_off_the_file_gives_its_count_back() {
+    let store = MemoryStore::new();
+    let a = ready(&store, "http://a:1");
+    let leases: &dyn LeasesStore = &store;
+    let (gateway, now) = (GatewayId(1), Instant::now());
+    leases.set_term(1);
+    let ok = Outcome {
+        side: Side::Single,
+        served: a,
+        status: 200,
+        class: TransportClass::Ok,
+        ttft_micros: 0,
+        tokens_in: 0,
+        tokens_out: 0,
+        duration_micros: 0,
+    };
+    let key = LeaseId(1);
+    let doors: [(&str, &dyn Fn()); 5] = [
+        ("a completion", &|| {
+            assert!(leases.completed(gateway, key, &ok));
+        }),
+        ("a release", &|| {
+            assert!(leases.released(gateway, key, None, ReleaseReason::ClientGone));
+        }),
+        ("the dispatch deadline", &|| {
+            assert_eq!(leases.expire(now + Duration::from_secs(2)).len(), 1);
+        }),
+        ("a restore that omits it", &|| {
+            assert_eq!(leases.restore(gateway, &[]), 0);
+        }),
+        ("its gateway's end", &|| {
+            assert_eq!(leases.drop_gateways(&[gateway]), [1]);
+        }),
+    ];
+    for (door, through) in doors {
+        leases
+            .issue(booking(gateway, 1, a, now))
+            .expect("the key is free");
+        assert_eq!(in_flight(&store), [(a, 1)], "{door}: the lease books");
+        through();
+        assert_eq!(in_flight(&store), [(a, 0)], "{door}: the count is back");
+        assert_eq!(leases.get(gateway, key), None, "{door}");
+    }
+    // A restore lays the pages' leases on file, each on its worker's count,
+    // and a lease written again under its key books once.
+    let pages = [booking(gateway, 1, a, now), booking(gateway, 2, a, now)];
+    assert_eq!(leases.restore(gateway, &pages), 2);
+    assert_eq!(in_flight(&store), [(a, 2)]);
+    assert_eq!(leases.restore(gateway, &pages[..1]), 1);
+    assert_eq!(in_flight(&store), [(a, 1)]);
+}
+
+#[test]
+fn the_store_mints_a_decisions_lease_under_its_own_term_alone() {
+    let store = MemoryStore::new();
+    let a = ready(&store, "http://a:1");
+    let leases: &dyn LeasesStore = &store;
+    let (gateway, now) = (GatewayId(1), Instant::now());
+    let world = store.world();
+    let decided = |term: u64| {
+        let record = LeaseRecord {
+            term,
+            ..booking(gateway, 0, a, now)
+        };
+        let issued = store.issue_decided(record, world.booked_of(a));
+        issued.map(|(lease, _)| lease.id.0)
+    };
+    leases.set_term(3);
+    assert_eq!(decided(3), Ok(3 << 32 | 1), "the term over its first count");
+    assert_eq!(decided(3), Ok(3 << 32 | 2));
+    let ahead = LeaseRefused::TermAhead { lease: 4, store: 3 };
+    assert_eq!(decided(4), Err(ahead));
+    let behind = LeaseRefused::Unminted { lease: 2, store: 3 };
+    assert_eq!(decided(2), Err(behind), "a term the store left mints none");
+    assert_eq!(in_flight(&store), [(a, 2)], "a refused lease books nothing");
+    let second = LeaseId(3 << 32 | 2);
+    let filed = leases.get(gateway, second).expect("under its minted id");
+    assert_eq!(
+        (filed.lease.id, filed.term, filed.target, filed.state),
+        (second, 3, a, LeaseState::Issued)
+    );
+    // A term's counter starts at 1, and an id a restored lease holds is
+    // passed over: the store's `Duplicate` is no decision's answer.
+    leases.set_term(4);
+    let restored = lease(gateway, 4 << 32 | 2, 4, now);
+    leases.issue(restored).expect("the key is free");
+    assert_eq!(decided(4), Ok(4 << 32 | 1));
+    assert_eq!(decided(4), Ok(4 << 32 | 3), "the id on file is passed over");
+    // A term's last id is its counter's last value: the next is refused,
+    // and the one after it too.
+    store.spend_ids(1);
+    assert_eq!(decided(4), Ok(4 << 32 | u64::from(u32::MAX)));
+    let spent = LeaseRefused::Unminted { lease: 4, store: 4 };
+    assert_eq!((decided(4), decided(4)), (Err(spent), Err(spent)));
+    leases.set_term(5);
+    assert_eq!(decided(5), Ok(5 << 32 | 1), "the next term mints again");
+    // A term past the 31 bits an id carries it in mints none.
+    leases.set_term(1 << 31);
+    let wide = LeaseRefused::Unminted {
+        lease: 1 << 31,
+        store: 1 << 31,
+    };
+    assert_eq!(decided(1 << 31), Err(wide));
+}
+
+/// An issue at `at` on `target` with five seconds to its dispatch: the
+/// counter of its id, and the counters of the leases it ended.
+fn issued_at(store: &MemoryStore, target: WorkerId, at: Instant) -> (u64, Vec<u64>) {
+    let counter = |id: LeaseId| id.0 & 0xffff_ffff;
+    let record = LeaseRecord {
+        dispatch_deadline: at + Duration::from_secs(5),
+        ..booking(GatewayId(1), 0, target, at)
+    };
+    let world = store.world();
+    let (lease, ended) = store
+        .issue_decided(record, world.booked_of(target))
+        .expect("minted under the store's term");
+    let abandoned = LeaseState::Released(ReleaseReason::Abandoned);
+    let ended = ended.iter().flatten().map(|record| {
+        assert_eq!(record.state, abandoned);
+        counter(record.lease.id)
+    });
+    (counter(lease.id), ended.collect())
+}
+
+#[test]
+fn an_issue_ends_two_leases_past_their_dispatch_deadline_at_most() {
+    let store = MemoryStore::new();
+    let a = ready(&store, "http://a:1");
+    let leases: &dyn LeasesStore = &store;
+    let (gateway, t0) = (GatewayId(1), Instant::now());
+    leases.set_term(1);
+    let id = |counter: u64| LeaseId(1 << 32 | counter);
+    // Five leases at the start: the second is dispatched, the fourth ends.
+    for counter in 1..=5 {
+        assert_eq!(issued_at(&store, a, t0), (counter, vec![]));
+    }
+    assert!(leases.dispatched(gateway, id(2), Dispatch::default(), t0));
+    assert!(leases.released(gateway, id(4), None, ReleaseReason::ClientGone));
+    assert_eq!(in_flight(&store), [(a, 4)]);
+    // An issue inside the deadline ends nothing.
+    assert_eq!(issued_at(&store, a, t0 + Duration::from_secs(4)).1, NONE);
+    // One past it ends the first and the third: two, and the dispatched
+    // lease between them stands.
+    let late = t0 + Duration::from_secs(6);
+    assert_eq!(issued_at(&store, a, late).1, [1, 3]);
+    // The next steps over the place of the lease that left and ends the
+    // fifth; the one after finds nothing due.
+    assert_eq!(issued_at(&store, a, late).1, [5]);
+    assert_eq!(issued_at(&store, a, late).1, NONE);
+    for ended in [1, 3, 5] {
+        assert_eq!(leases.get(gateway, id(ended)), None);
+    }
+    // On file: the dispatched lease, the one issued at four seconds and
+    // the three late ones, each on its worker's count.
+    assert_eq!(leases.live(gateway), 5);
+    assert_eq!(in_flight(&store), [(a, 5)]);
+}
+
+#[test]
+fn an_issue_steps_over_four_places_of_the_deadline_queue_at_most() {
+    let store = MemoryStore::new();
+    let a = ready(&store, "http://a:1");
+    let leases: &dyn LeasesStore = &store;
+    let (gateway, t0) = (GatewayId(1), Instant::now());
+    leases.set_term(1);
+    // Seven leases at the start; the first six leave at their gateway's
+    // word and keep their places in the queue.
+    for counter in 1..=7 {
+        assert_eq!(issued_at(&store, a, t0).0, counter);
+    }
+    for counter in 1..=6 {
+        let id = LeaseId(1 << 32 | counter);
+        assert!(leases.released(gateway, id, None, ReleaseReason::ClientGone));
+    }
+    // Past the deadline one issue steps over four of those places and ends
+    // nothing; the next steps over the last two and ends the seventh.
+    let late = t0 + Duration::from_secs(6);
+    assert_eq!(issued_at(&store, a, late).1, NONE);
+    assert_eq!(leases.live(gateway), 2, "the seventh still stands");
+    assert_eq!(issued_at(&store, a, late).1, [7]);
+    assert_eq!(in_flight(&store), [(a, 2)]);
+}
+
+#[test]
+fn a_lease_that_left_or_was_dispatched_leaves_the_deadline_queue_at_the_next_issues() {
+    let store = MemoryStore::new();
+    let a = ready(&store, "http://a:1");
+    let leases: &dyn LeasesStore = &store;
+    let (gateway, t0) = (GatewayId(1), Instant::now());
+    let id = |counter: u64| LeaseId(1 << 32 | counter);
+    leases.set_term(1);
+    // A hundred leases inside one dispatch deadline, each ended before the
+    // next is issued: the queue holds the place of the last one ended and
+    // of the one just issued, not a hundred places.
+    for counter in 1..=100 {
+        assert_eq!(issued_at(&store, a, t0), (counter, NONE.to_vec()));
+        assert!(store.queued() <= 2, "at lease {counter}");
+        assert!(leases.released(gateway, id(counter), None, ReleaseReason::ClientGone));
+    }
+    // A lease that waits for its dispatch keeps its place, and the places
+    // behind it stand until it moves.
+    assert_eq!(issued_at(&store, a, t0).0, 101);
+    for counter in 102..=105 {
+        assert_eq!(issued_at(&store, a, t0).0, counter);
+        assert!(leases.released(gateway, id(counter), None, ReleaseReason::ClientGone));
+    }
+    assert_eq!(store.queued(), 5);
+    // Its dispatch frees them: the next issue steps over four.
+    assert!(leases.dispatched(gateway, id(101), Dispatch::default(), t0));
+    assert_eq!(issued_at(&store, a, t0), (106, NONE.to_vec()));
+    assert_eq!(store.queued(), 2);
+    assert_eq!(
+        in_flight(&store),
+        [(a, 2)],
+        "the dispatched lease and the last one"
+    );
+}
+
+#[test]
+fn the_dispatch_deadlines_fall_due_in_their_own_order_whatever_order_they_were_filed_in() {
+    let store = MemoryStore::new();
+    let leases: &dyn LeasesStore = &store;
+    let (gateway, now) = (GatewayId(1), Instant::now());
+    leases.set_term(1);
+    // Filed with deadlines of five, one and three seconds, in that order.
+    for (id, secs) in [(1, 5), (2, 1), (3, 3)] {
+        let record = LeaseRecord {
+            dispatch_deadline: now + Duration::from_secs(secs),
+            ..lease(gateway, id, 1, now)
+        };
+        leases.issue(record).expect("the key is free");
+    }
+    let due = |secs: u64| {
+        let ended = leases.expire(now + Duration::from_secs(secs));
+        let ids = ended.iter().map(|record| record.lease.id.0);
+        ids.collect::<Vec<u64>>()
+    };
+    assert_eq!(due(0), NONE);
+    assert_eq!(due(2), [2]);
+    assert_eq!(due(2), NONE, "an ended lease is ended once");
+    // A lease written again with a later deadline is due at the later one:
+    // the place its first deadline left in the queue ends nothing.
+    let again = LeaseRecord {
+        dispatch_deadline: now + Duration::from_secs(9),
+        ..lease(gateway, 3, 1, now)
+    };
+    assert_eq!(leases.restore(gateway, &[again]), 1);
+    assert_eq!(due(8), NONE, "the first lease left at the restore");
+    assert_eq!(due(9), [3]);
+    assert_eq!(leases.live(gateway), 0);
 }

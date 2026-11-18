@@ -7,7 +7,8 @@
 //! probe, its load from a poll, an engine that holds requests reading them.
 //! That engine's KV events follow: a subscriber of the case hands each batch
 //! of its stream to the sink, and its row's index holds every block the
-//! events left the engine holding. Then one engine is killed: the first dial
+//! events left the engine holding, where the cache-aware preset then asks a
+//! prompt that states them. Then one engine is killed: the first dial
 //! that hears it dead writes it, and the pool reads its rows unhealthy and
 //! every other row healthy. Next, an engine stops answering with its sockets
 //! open: a probe turn waits out its dial bound, writes it and goes on. Last,
@@ -16,10 +17,34 @@
 //! ok for the dead and the hung one, and nothing of it for another gateway;
 //! a frame that reads wrong ends the session of the gateway that sent it.
 //!
-//! No decision is asked yet: of a gateway's calls the service answers
-//! `Leader` and takes the session's reports, and the case asserts both end
-//! to end. The decisions take the views' place when the service answers
-//! them.
+//! The gateway asks its first decisions end to end: with a preset of the
+//! build applied in the case's process, since no call applies a spec yet,
+//! the reference client asks on its decide stream and each pick names a
+//! rank of the fleet. The call's bounds are the client's own door: an id at
+//! the range's end is answered, a frame past the size leaves cut at its
+//! tail, and a frame the call refuses ends the stream, the next ask opening
+//! a new one. Then the decisions follow the fleet, each read from the
+//! client's answers alone: a load-led pick leaves the engine that holds
+//! requests, a rotation names each row in turn, a routing key returns to its
+//! worker and a retry leaves it, and no decision names the dead engine.
+//! A decision by count follows the leases the decisions before it left on
+//! the store's file: with every lease kept, a round of asks by the fewest
+//! requests names each row once, and once its own leases are given up the
+//! engine that holds requests takes the next pick by the fewest requests,
+//! of two draws compared by count, and of a keyless ask under the prefix
+//! ring.
+//! A session stays where its key was first placed, and where the gateway
+//! sent it: a dispatch on a pick's second target moves the key and the
+//! lease's count there, a key served on its failover keeps its worker,
+//! and the store's pin of record follows the dispatch.
+//! A prompt returns to its worker as a key does: under the prefix preset a
+//! head of 256 tokens names one row whatever follows it, a routing key
+//! leads it, a retry walks to one next worker, and a boundary of the
+//! document's view keys a prompt at its stem.
+//! Each model decides under the profile its own binding names: a second
+//! pool, on the wire whose load report counts resident tokens, is asked
+//! under the resident form of the two-draw preset while the first turns a
+//! rotation, and every pick of it names the engine that holds no tokens.
 //!
 //! No stub server: the engines are the mock worker's, the controller is the
 //! one the binary runs and the client is the generated one. Every wait is
@@ -38,6 +63,7 @@ mod fleet;
 mod net;
 
 use std::{
+    collections::{HashMap, HashSet},
     io::Write,
     sync::mpsc,
     time::{Duration, Instant},
@@ -49,49 +75,315 @@ use fleet::{
     ROOM,
 };
 use net::vm_rss_kib;
+use openai_protocol::worker::RuntimeType;
+use prost::Message as _;
 use smg_policy_controller::{
-    client::{self, blocking, Client},
+    client::{self, blocking, Answer, Client},
     controller::{State, PROTOCOL_VERSION},
-    proto::{completed::Class, principal, released, Completed, Released, Side},
+    proto::{
+        completed::Class, decision::Outcome, identity::Form, principal, released, Completed,
+        DecideRequest, Decision, Identity, Released, RequestFacts, ShedReason, Side,
+    },
+    spec::{BindingSpec, Match},
     store::{LaneCounts, WorkerStatus},
     view::{Role, SignalSource},
+    PolicySpec, PowerOfTwoMetric, SpecError,
 };
 use tokio::sync::oneshot;
 use tonic::Code;
 
 const MODEL: &str = "fleet-model";
 
-/// The fleet: four engines of one rank and one of two, one model.
-const FLEET: [Shape; 5] = [
+/// The model of the engines whose load reports count resident tokens.
+const COUNTED: &str = "fleet-counted-model";
+
+/// The fleet: four engines of one rank and one of two serve one model on
+/// the first wire, and two engines of one rank serve another on the wire
+/// whose load report counts resident tokens.
+const FLEET: [Shape; 7] = [
     Shape {
         model: MODEL,
         role: Role::Single,
         ranks: 1,
+        runtime: RuntimeType::Vllm,
     },
     Shape {
         model: MODEL,
         role: Role::Single,
         ranks: 1,
+        runtime: RuntimeType::Vllm,
     },
     Shape {
         model: MODEL,
         role: Role::Single,
         ranks: 1,
+        runtime: RuntimeType::Vllm,
     },
     Shape {
         model: MODEL,
         role: Role::Single,
         ranks: 1,
+        runtime: RuntimeType::Vllm,
     },
     Shape {
         model: MODEL,
         role: Role::Single,
         ranks: 2,
+        runtime: RuntimeType::Vllm,
+    },
+    Shape {
+        model: COUNTED,
+        role: Role::Single,
+        ranks: 1,
+        runtime: RuntimeType::TokenSpeed,
+    },
+    Shape {
+        model: COUNTED,
+        role: Role::Single,
+        ranks: 1,
+        runtime: RuntimeType::TokenSpeed,
     },
 ];
 
 /// The requests the case holds on one engine.
 const HELD: u32 = 3;
+
+/// The largest `DecideRequest` as encoded, as the contract states it.
+const FRAME: usize = 64 * 1024;
+
+/// An ask for the fleet's model named `id`. It brings the budget of a
+/// client's own patience: an ask that states none has none left.
+fn ask(id: &[u8]) -> DecideRequest {
+    DecideRequest {
+        request_id: id.to_vec(),
+        facts: Some(RequestFacts {
+            model: MODEL.to_owned(),
+            budget_micros: 5_000_000,
+            ..RequestFacts::default()
+        }),
+        constraints: None,
+    }
+}
+
+/// The asks an assertion makes where one draw could hide what it reads.
+const ASKS: u64 = 64;
+
+/// Tokens a block: the view's, where a document names no size.
+const BLOCK: u32 = 16;
+
+/// The blocks of a prompt's head, what the prefix preset keys a request
+/// within: 256 tokens.
+const HEAD: u32 = 256 / BLOCK;
+
+/// The blocks of a prompt's stem, where the case's own view sets its
+/// boundary: 64 tokens.
+const STEM: u32 = 64 / BLOCK;
+
+/// A pick's first target: the row of the fleet it names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct Picked {
+    engine: usize,
+    rank: u16,
+    /// The row's id, as a retry names it.
+    id: u64,
+}
+
+/// The `n`th ask of the run named `run`, with an id and a seed of its own.
+fn nth(run: &str, n: u64) -> DecideRequest {
+    let mut ask = ask(format!("{run}-{n}").as_bytes());
+    if let Some(facts) = &mut ask.facts {
+        facts.seed = n;
+    }
+    ask
+}
+
+/// `ask` under the routing key `key`.
+fn keyed(mut ask: DecideRequest, key: u64) -> DecideRequest {
+    if let Some(facts) = &mut ask.facts {
+        facts.session_key = Some(Identity {
+            form: Some(Form::Hash(key)),
+        });
+    }
+    ask
+}
+
+/// `ask` with the prefix block hashes of a prompt of `runs`, each so many
+/// blocks of one text. A block's hash names the prompt through its block:
+/// two prompts share the hashes of the blocks they share from the start and
+/// none past them.
+fn prompted(mut ask: DecideRequest, runs: &[(u32, u64)]) -> DecideRequest {
+    if let Some(facts) = &mut ask.facts {
+        let mut through = 0u64;
+        for &(blocks, text) in runs {
+            for _ in 0..blocks {
+                through = (through ^ text)
+                    .wrapping_mul(0x0100_0000_01b3)
+                    .rotate_left(29)
+                    | 1;
+                facts.block_hashes.push(through);
+            }
+        }
+    }
+    ask
+}
+
+/// `ask` for the model named `model`.
+fn for_model(mut ask: DecideRequest, model: &str) -> DecideRequest {
+    if let Some(facts) = &mut ask.facts {
+        model.clone_into(&mut facts.model);
+    }
+    ask
+}
+
+/// One document of two bindings: the counted model under the two-draw
+/// preset's resident form, a request priced at the held prompt's tokens,
+/// and every other model under a rotation.
+fn by_model() -> Result<PolicySpec, SpecError> {
+    let mut document = PolicySpec::preset("round_robin")?;
+    let metric = PowerOfTwoMetric::ResidentTokens { request_tokens: 64 };
+    let resident = PolicySpec::power_of_two(metric)?;
+    for (name, profile) in resident.profiles {
+        // The first binding that matches decides: the model's own stands
+        // ahead of the one that matches every model.
+        document.bindings.insert(
+            0,
+            BindingSpec {
+                matcher: Match {
+                    model: COUNTED.to_owned(),
+                    ..Match::default()
+                },
+                profile: Some(name.clone()),
+                ..BindingSpec::default()
+            },
+        );
+        document.profiles.insert(name, profile);
+    }
+    Ok(document)
+}
+
+/// The prefix preset under a view whose one boundary stands at `tokens`.
+fn bounded_at(tokens: u32) -> Result<PolicySpec, SpecError> {
+    let mut document = PolicySpec::preset("prefix_hash")?;
+    document.view.boundaries = vec![tokens];
+    Ok(document)
+}
+
+/// Asks, and reads the pick's first target as the row of the fleet it
+/// names, with the leases the answer carries: the caller's to keep or to
+/// give up. A lease names its request's session: an answer whose lease
+/// names one where the ask states no routing key, or none where it states
+/// one, is refused.
+async fn leased(harness: &mut Harness, ask: DecideRequest) -> Result<(Picked, Vec<u64>), String> {
+    let keyed = ask
+        .facts
+        .as_ref()
+        .is_some_and(|facts| facts.session_key.is_some());
+    let answer = harness.client().decide(ask).await;
+    let Ok(Answer::Decision(Decision {
+        leases,
+        outcome: Some(Outcome::Pick(pick)),
+        ..
+    })) = &answer
+    else {
+        return Err(format!("no pick: {answer:?}"));
+    };
+    if let Some(lease) = leases
+        .iter()
+        .find(|lease| (lease.session_key != 0) != keyed)
+    {
+        return Err(format!(
+            "a lease names a session where its ask states a key, and there alone: {lease:?}"
+        ));
+    }
+    let leases = leases.iter().map(|lease| lease.id).collect();
+    let target = pick.targets.first().ok_or("a pick with no target")?;
+    Ok((row_of(harness, target.id, target.dp_rank)?, leases))
+}
+
+/// Gives `leases` up on the session, as a gateway whose client left, and
+/// waits until the store's file holds `left` leases of the gateway.
+async fn given_up(harness: &mut Harness, leases: &[u64], left: usize) -> Result<(), String> {
+    for &lease in leases {
+        let released = Released {
+            what: Some(released::What::LeaseId(lease)),
+            reason: released::Reason::ClientGone.into(),
+            ..Released::default()
+        };
+        let reported = harness.client().released(released).await;
+        reported.map_err(|status| format!("a lease is not given up: {status:?}"))?;
+    }
+    // Every pick of the case passes here, and a report is one frame the
+    // session reads in its turn: the wait steps by a millisecond, where
+    // the harness's own step would cost each pick twenty-five.
+    let gone = async {
+        while harness.leases(GATEWAY) != left {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    };
+    tokio::time::timeout(ROOM, gone)
+        .await
+        .map_err(|_| format!("the leases given up leave the store's file: not within {ROOM:?}"))
+}
+
+/// Asks, and reads the pick's first target as the row of the fleet it
+/// names. The pick's lease is given up on the session and has left the
+/// store's file before the next ask reads the rows: the file holds what it
+/// held before the ask.
+async fn picked(harness: &mut Harness, ask: DecideRequest) -> Result<Picked, String> {
+    // The asserts by count lean on a decision that books nothing past its
+    // own ask: a lease on file is a request in flight on its worker.
+    let before = harness.leases(GATEWAY);
+    let (row, leases) = leased(harness, ask).await?;
+    given_up(harness, &leases, before).await?;
+    Ok(row)
+}
+
+/// Asks as [`picked`] asks and keeps the pick's lease: its dispatch is
+/// named, so it books its row until the case gives it up.
+async fn kept(harness: &mut Harness, ask: DecideRequest) -> Result<(Picked, u64), String> {
+    let (row, leases) = leased(harness, ask).await?;
+    let &[lease] = leases.as_slice() else {
+        return Err(format!("a pick to keep carries one lease: {leases:?}"));
+    };
+    harness.dispatch(lease).await?;
+    Ok((row, lease))
+}
+
+/// The row of the fleet a target names by its id and its rank.
+fn row_of(harness: &Harness, id: u64, dp_rank: u32) -> Result<Picked, String> {
+    match harness.named(id) {
+        Some((engine, rank)) if dp_rank == u32::from(rank) => Ok(Picked { engine, rank, id }),
+        _ => Err(format!(
+            "a target that is no row of the fleet: {id} at rank {dp_rank}"
+        )),
+    }
+}
+
+/// Asks, and reads every target of the pick as a row of the fleet, best
+/// first, with the one lease the answer carries: its id and the session it
+/// names. The lease is the caller's, to dispatch on a target and to give up.
+async fn offered(
+    harness: &mut Harness,
+    ask: DecideRequest,
+) -> Result<(Vec<Picked>, u64, u64), String> {
+    let answer = harness.client().decide(ask).await;
+    let Ok(Answer::Decision(Decision {
+        leases,
+        outcome: Some(Outcome::Pick(pick)),
+        ..
+    })) = &answer
+    else {
+        return Err(format!("no pick: {answer:?}"));
+    };
+    let [lease] = leases.as_slice() else {
+        return Err(format!("a pick to dispatch carries one lease: {leases:?}"));
+    };
+    let mut rows = Vec::with_capacity(pick.targets.len());
+    for target in &pick.targets {
+        rows.push(row_of(harness, target.id, target.dp_rank)?);
+    }
+    Ok((rows, lease.id, lease.session_key))
+}
 
 /// The whole case's bound: its waits sum to seconds on an idle host.
 const CASE: Duration = Duration::from_secs(180);
@@ -148,7 +440,12 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
         // probe heard its engine, none with a load before a poll read one.
         let engines = harness.register(&FLEET).await.expect("the fleet registers");
         let (busy, dead) = (engines[1], engines[4]);
-        let ranks: usize = FLEET.iter().map(|shape| usize::from(shape.ranks)).sum();
+        let (laden, spare) = (engines[5], engines[6]);
+        let ranks: usize = FLEET
+            .iter()
+            .filter(|shape| shape.model == MODEL)
+            .map(|shape| usize::from(shape.ranks))
+            .sum();
         let pool = harness.view(MODEL, Role::Single).expect("the view");
         assert_eq!(pool.len(), ranks, "every rank is a row: {pool:?}");
         assert!(
@@ -197,10 +494,61 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
         two.sort_unstable();
         assert_eq!(two, [0, 1], "each rank of one engine is a row of its own");
 
+        // Decide. A preset of the build is applied in the case's process,
+        // since no call applies a spec yet. The gateway asks on its decide
+        // stream, and the pick names a rank of the fleet.
+        harness
+            .apply("random")
+            .expect("a preset of this build applies");
+        picked(&mut harness, ask(b"first"))
+            .await
+            .expect("a pick answers an ask over a ready fleet");
+        assert!(
+            harness.term_floor() >= leader.term,
+            "an answer's term never lowers the floor"
+        );
+        // The call's bounds are the client's own door. An id at the end of
+        // its range is answered.
+        picked(&mut harness, ask(&[7; 256]))
+            .await
+            .expect("a pick answers an ask over a ready fleet");
+        // A frame past the size leaves cut at its tail, and the cut is
+        // counted: eight bytes a hash.
+        let mut long = ask(b"long");
+        let facts = long.facts.as_mut().expect("the ask states facts");
+        facts.block_hashes = (0u64..).take(8_300).collect();
+        let over = long.encoded_len() - FRAME;
+        picked(&mut harness, long)
+            .await
+            .expect("a pick answers an ask over a ready fleet");
+        assert_eq!(
+            harness.client().hashes_cut(),
+            over.div_ceil(8),
+            "{over} bytes over"
+        );
+        // A frame the call refuses ends the stream by the field's name, and
+        // the next ask opens a new one.
+        let mut wrong = ask(b"wrong");
+        wrong.facts.as_mut().expect("the ask states facts").phase = 99;
+        let refused = harness.client().decide(wrong).await;
+        assert!(
+            matches!(&refused, Err(client::Error::Status(status))
+                if status.code() == Code::InvalidArgument
+                    && status.message().contains("facts.phase")),
+            "{refused:?}"
+        );
+        picked(&mut harness, ask(b"after"))
+            .await
+            .expect("a pick answers an ask over a ready fleet");
+
         // The loads follow the fleet: requests held on one engine reach its
         // row from that engine's own report, and no other row.
         harness
             .hold(busy, HELD as usize)
+            .await
+            .expect("the held requests");
+        harness
+            .hold(laden, HELD as usize)
             .await
             .expect("the held requests");
         let followed = within(
@@ -224,6 +572,387 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
                 "only the busy engine runs requests: {row:?}"
             );
         }
+
+        // A second pool, on the wire whose load report counts resident
+        // tokens: the requests held on one of its two engines reach that
+        // engine's row as the tokens it holds, and the other's row counts
+        // none. The resident metric's assert below needs both rows counted:
+        // a row that counts nothing is priced from its peer.
+        within(
+            "the counted pool's rows read their engines' resident tokens",
+            POLL_INTERVAL + POLL_INTERVAL + ROOM,
+            || {
+                harness.view(COUNTED, Role::Single).is_ok_and(|pool| {
+                    pool.len() == 2
+                        && pool.iter().all(|row| {
+                            row.healthy
+                                && row.load.is_some_and(|load| {
+                                    load.resident_counted
+                                        && (load.resident_tokens > 0) == (row.engine == laden)
+                                })
+                        })
+                })
+            },
+        )
+        .await
+        .expect("the resident tokens follow");
+
+        // A load-led decision follows the loads the engines told: under the
+        // least-load preset no pick names the engine that holds requests.
+        harness
+            .apply("least_load")
+            .expect("a preset of this build applies");
+        for n in 0..ASKS {
+            let pick = picked(&mut harness, nth("load", n))
+                .await
+                .expect("a pick answers an ask over a ready fleet");
+            assert_ne!(
+                pick.engine, busy,
+                "a load-led pick leaves the engine that holds requests: {pick:?}"
+            );
+        }
+
+        // Two draws compared by the loads the engines told: under the
+        // power-of-two preset no pick names the engine that holds requests.
+        // Unread, the loads leave the busy row one pick in six, so 64 asks
+        // miss it less than once in 100,000 runs.
+        harness
+            .apply("power_of_two")
+            .expect("a preset of this build applies");
+        for n in 0..ASKS {
+            let pick = picked(&mut harness, nth("two", n))
+                .await
+                .expect("a pick answers an ask over a ready fleet");
+            assert_ne!(
+                pick.engine, busy,
+                "of two draws the better load is taken: {pick:?}"
+            );
+        }
+
+        // The first row the filters keep, in the host's order: under the
+        // passthrough preset every pick names the view's first row, and an
+        // ask that names it tried is answered with the view's second.
+        harness
+            .apply("passthrough")
+            .expect("a preset of this build applies");
+        let pool = harness.view(MODEL, Role::Single).expect("the view");
+        let listed: Vec<(usize, u16)> = pool.iter().map(|row| (row.engine, row.rank)).collect();
+        let first = picked(&mut harness, nth("through", 0))
+            .await
+            .expect("a pick answers an ask over a ready fleet");
+        assert_eq!(
+            Some((first.engine, first.rank)),
+            listed.first().copied(),
+            "a passthrough pick is the first row the host lists: {first:?} of {listed:?}"
+        );
+        for n in 1..8 {
+            let again = picked(&mut harness, nth("through", n))
+                .await
+                .expect("a pick answers an ask over a ready fleet");
+            assert_eq!(
+                again, first,
+                "a passthrough pick is one row whatever its seed"
+            );
+        }
+        let mut retry = nth("through", 8);
+        let facts = retry.facts.as_mut().expect("the ask states facts");
+        facts.tried = vec![first.id];
+        facts.attempt = 1;
+        let next = picked(&mut harness, retry)
+            .await
+            .expect("a pick answers an ask over a ready fleet");
+        assert_eq!(
+            Some((next.engine, next.rank)),
+            listed.get(1).copied(),
+            "past its tried first row a passthrough pick is the second: {next:?} of {listed:?}"
+        );
+
+        // A rotation names every row before it names one again: under the
+        // round-robin preset two turns of asks name each row twice.
+        harness
+            .apply("round_robin")
+            .expect("a preset of this build applies");
+        let mut turns: HashMap<Picked, u32> = HashMap::new();
+        for n in (0u64..).take(2 * ranks) {
+            let pick = picked(&mut harness, nth("turn", n))
+                .await
+                .expect("a pick answers an ask over a ready fleet");
+            *turns.entry(pick).or_default() += 1;
+        }
+        assert!(
+            turns.len() == ranks && turns.values().all(|asks| *asks == 2),
+            "two turns of a rotation name each row twice: {turns:?}"
+        );
+
+        // A decision by count reads what the decisions before it left on
+        // file. Under the two-draw preset's form by the fewest requests
+        // each pick keeps its lease, and every round of asks names each
+        // row once: the engine that holds requests too, which no pick by
+        // the expected wait names.
+        let fewest = PolicySpec::power_of_two(PowerOfTwoMetric::LeastRequests)
+            .expect("a form of this build's preset");
+        harness
+            .apply_document(fewest)
+            .expect("a form of this build's preset applies");
+        let mut booked = Vec::new();
+        for n in (0u64..).take(2 * ranks) {
+            let pick = kept(&mut harness, nth("fewest", n))
+                .await
+                .expect("a pick answers an ask over a ready fleet");
+            booked.push(pick);
+        }
+        for round in booked.chunks(ranks) {
+            let named: HashSet<Picked> = round.iter().map(|(row, _)| *row).collect();
+            assert_eq!(
+                named.len(),
+                ranks,
+                "a round by the fewest requests names each row once: {round:?}"
+            );
+        }
+        assert_eq!(
+            harness.leases(GATEWAY),
+            booked.len(),
+            "a kept lease stands on the store's file"
+        );
+        // A lease given up frees its row. Once the leases on the engine
+        // that holds requests are gone, no lease books that engine and two
+        // book every other row: by count the next picks are its own,
+        // whatever its wait.
+        let (freed, booked): (Vec<_>, Vec<_>) =
+            booked.into_iter().partition(|(row, _)| row.engine == busy);
+        let freed: Vec<u64> = freed.into_iter().map(|(_, lease)| lease).collect();
+        given_up(&mut harness, &freed, booked.len())
+            .await
+            .expect("the leases given up leave the file");
+        for n in 0..2 {
+            let pick = picked(&mut harness, nth("freed", n))
+                .await
+                .expect("a pick answers an ask over a ready fleet");
+            assert_eq!(
+                pick.engine, busy,
+                "the row with the fewest requests in flight is taken: {pick:?}"
+            );
+        }
+
+        // Two draws compared by the requests in flight: an ask that names
+        // every row tried but that engine's and one idle engine's draws
+        // those two, and under the form by requests each pick is the
+        // engine that holds requests.
+        let (other, _) = booked.first().copied().expect("a kept lease");
+        let mut tried: Vec<u64> = booked
+            .iter()
+            .map(|(row, _)| row.id)
+            .filter(|id| *id != other.id)
+            .collect();
+        tried.sort_unstable();
+        tried.dedup();
+        let requests = PolicySpec::power_of_two(PowerOfTwoMetric::Requests)
+            .expect("a form of this build's preset");
+        harness
+            .apply_document(requests)
+            .expect("a form of this build's preset applies");
+        for n in 0..8 {
+            let mut retry = nth("requests", n);
+            let facts = retry.facts.as_mut().expect("the ask states facts");
+            facts.tried.clone_from(&tried);
+            facts.attempt = 1;
+            let pick = picked(&mut harness, retry)
+                .await
+                .expect("a pick answers an ask over a ready fleet");
+            assert_eq!(
+                pick.engine, busy,
+                "of two draws the one with fewer requests in flight is taken: {pick:?}"
+            );
+        }
+
+        // The fewest requests in flight take a request that brings no key:
+        // under the prefix-hash preset each keyless pick is that engine
+        // too, one pick in six where the count is not read.
+        harness
+            .apply("prefix_hash")
+            .expect("a preset of this build applies");
+        for n in 0..8 {
+            let pick = picked(&mut harness, nth("keyless", n))
+                .await
+                .expect("a pick answers an ask over a ready fleet");
+            assert_eq!(
+                pick.engine, busy,
+                "a request with no key goes where the fewest requests are in flight: {pick:?}"
+            );
+        }
+        let rest: Vec<u64> = booked.into_iter().map(|(_, lease)| lease).collect();
+        given_up(&mut harness, &rest, 0)
+            .await
+            .expect("the leases given up leave the file");
+
+        // A session stays where its key was first placed. Under the manual
+        // preset a key's first decision places it at random and its later
+        // asks name that row whatever their seeds; 63 more keys do not
+        // share one row.
+        harness
+            .apply("manual")
+            .expect("a preset of this build applies");
+        let stays = picked(&mut harness, keyed(nth("stay", 0), 1))
+            .await
+            .expect("a pick answers an ask over a ready fleet");
+        for n in 1..8 {
+            let again = picked(&mut harness, keyed(nth("stay", n), 1))
+                .await
+                .expect("a pick answers an ask over a ready fleet");
+            assert_eq!(
+                again, stays,
+                "a session key stays on the worker of its first decision"
+            );
+        }
+        let mut homes = HashSet::new();
+        for key in 2..=ASKS {
+            let pick = picked(&mut harness, keyed(nth("homes", key), key))
+                .await
+                .expect("a pick answers an ask over a ready fleet");
+            homes.insert(pick);
+        }
+        assert!(
+            homes.len() > 1,
+            "{} session keys do not share one worker: {homes:?}",
+            ASKS - 1
+        );
+
+        // The session is where the gateway sent its request. A key's first
+        // decision claims the first target of its pick; the gateway
+        // dispatches on the second, and the key's later asks name that
+        // row. The store's pin of record, which no decision writes, names
+        // it from that dispatch on.
+        let sticky = ASKS + 1;
+        let (offer, sent_lease, pin) = offered(&mut harness, keyed(nth("sent", 0), sticky))
+            .await
+            .expect("a pick answers an ask over a ready fleet");
+        let sent = offer
+            .get(1)
+            .copied()
+            .expect("a key's first placement offers a second target");
+        assert_eq!(
+            harness.pinned(pin),
+            None,
+            "a decision alone writes no pin of record"
+        );
+        harness
+            .dispatch_at(sent_lease, 1)
+            .await
+            .expect("the store reads the lease dispatched");
+        // The pin of record is written after the engine's table moved: once
+        // it names the row, the next decision reads the dispatch.
+        within("the pin of record names the row sent to", ROOM, || {
+            harness.pinned(pin) == Some((sent.engine, sent.rank))
+        })
+        .await
+        .expect("a keyed dispatch writes the pin of record");
+        for n in 1..8 {
+            let again = picked(&mut harness, keyed(nth("sent", n), sticky))
+                .await
+                .expect("a pick answers an ask over a ready fleet");
+            assert_eq!(
+                again, sent,
+                "a key first sent to its second target stays where it was sent"
+            );
+        }
+        assert_eq!(
+            harness.pinned(pin),
+            Some((sent.engine, sent.rank)),
+            "a keyed dispatch writes the pin of record on the worker served"
+        );
+
+        // A key served on its failover keeps its worker. With its row
+        // excluded by the gateway the key is placed on another row and
+        // dispatched there; the exclusion over, it is back on its own row,
+        // which the pin of record never left, and excluded again it
+        // returns to that failover.
+        let away = |run: &str, n: u64| {
+            let mut ask = keyed(nth(run, n), sticky);
+            ask.constraints = Some(smg_policy_controller::proto::Constraints {
+                excluded: vec![sent.id],
+                ..Default::default()
+            });
+            ask
+        };
+        let (offer, away_lease, _) = offered(&mut harness, away("away", 0))
+            .await
+            .expect("a pick answers an ask over a ready fleet");
+        let failover = offer.first().copied().expect("a pick names a target");
+        assert_ne!(failover, sent, "a row the gateway excludes is no pick");
+        harness
+            .dispatch_at(away_lease, 0)
+            .await
+            .expect("the store reads the lease dispatched");
+        let back = picked(&mut harness, keyed(nth("back", 0), sticky))
+            .await
+            .expect("a pick answers an ask over a ready fleet");
+        assert_eq!(
+            back, sent,
+            "its own row routable again, a key is back on it"
+        );
+        assert_eq!(
+            harness.pinned(pin),
+            Some((sent.engine, sent.rank)),
+            "a dispatch on the failover leaves the preferred worker pinned"
+        );
+        for n in 1..8 {
+            let again = picked(&mut harness, away("away", n))
+                .await
+                .expect("a pick answers an ask over a ready fleet");
+            assert_eq!(
+                again, failover,
+                "a key away from its row returns to its failover"
+            );
+        }
+        given_up(&mut harness, &[sent_lease, away_lease], 0)
+            .await
+            .expect("the leases given up leave the file");
+
+        // A lease's count follows its dispatch. By the fewest requests a
+        // kept lease books the first target of its pick; dispatched on the
+        // second it books that row instead, and the asks after it, each
+        // kept, name every other row once: the first target among them.
+        // Its request brought a key that no sessions rule governs: the
+        // dispatch pins that session nowhere.
+        let fewest = PolicySpec::power_of_two(PowerOfTwoMetric::LeastRequests)
+            .expect("a form of this build's preset");
+        harness
+            .apply_document(fewest)
+            .expect("a form of this build's preset applies");
+        let (offer, moved, unruled) = offered(&mut harness, keyed(nth("moved", 0), sticky + 1))
+            .await
+            .expect("a pick answers an ask over a ready fleet");
+        let claimed = offer.first().copied().expect("a pick names a target");
+        let served = offer
+            .get(1)
+            .copied()
+            .expect("a pick by the fewest requests offers a second target");
+        harness
+            .dispatch_at(moved, 1)
+            .await
+            .expect("the store reads the lease dispatched");
+        let mut moved = vec![moved];
+        let mut round = HashSet::new();
+        for n in (1u64..).take(ranks - 1) {
+            let (row, lease) = kept(&mut harness, nth("moved", n))
+                .await
+                .expect("a pick answers an ask over a ready fleet");
+            moved.push(lease);
+            round.insert(row);
+        }
+        assert!(
+            round.len() == ranks - 1 && round.contains(&claimed) && !round.contains(&served),
+            "a lease dispatched on its second target books that row and frees the first: \
+             {claimed:?} then {served:?}, the round {round:?}"
+        );
+        assert_eq!(
+            harness.pinned(unruled),
+            None,
+            "a key no sessions rule governs is pinned by no dispatch"
+        );
+        given_up(&mut harness, &moved, 0)
+            .await
+            .expect("the leases given up leave the file");
 
         // The KV events follow the fleet: the busy engine's held requests
         // stored blocks, its stream's batches reached its rank's cursor, and
@@ -263,6 +992,36 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             Some(LaneCounts::default()),
             "no store came without its parent and no block was refused: {fed:?}"
         );
+        // A prompt goes where its blocks are held. Under the cache-aware
+        // preset an ask that states the head the busy engine's events left
+        // it holding names that engine, which its load turns every load-led
+        // pick away from; the ask after it states no block and is placed by
+        // the load, on another engine: no ask reads the holders of the one
+        // before it.
+        let head = harness.head(busy);
+        assert!(!head.is_empty(), "the busy engine holds a prompt's head");
+        harness
+            .apply("cache_aware")
+            .expect("a preset of this build applies");
+        for n in 0..8 {
+            let mut ask = nth("holder", n);
+            let facts = ask.facts.as_mut().expect("the ask states facts");
+            facts.block_hashes.clone_from(&head);
+            let pick = picked(&mut harness, ask)
+                .await
+                .expect("a pick answers an ask over a ready fleet");
+            assert_eq!(
+                pick.engine, busy,
+                "a prompt goes to the engine that holds its blocks: {pick:?}"
+            );
+            let pick = picked(&mut harness, nth("unheld", n))
+                .await
+                .expect("a pick answers an ask over a ready fleet");
+            assert_ne!(
+                pick.engine, busy,
+                "a prompt that states no block is placed by the load: {pick:?}"
+            );
+        }
         for engine in engines.iter().filter(|engine| **engine != busy) {
             for idle in harness.heard(*engine) {
                 assert!(
@@ -276,6 +1035,162 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             harness.snapshot_chunks(),
             0,
             "an engine's own stream carries no snapshot chunk"
+        );
+
+        // A keyed ask returns to its worker: under the ring preset one
+        // routing key names one row at each ask, and 64 keys do not all
+        // share it. On a ring of even shares a correct ring puts 64 keys
+        // on one row less than once in 10^40 runs.
+        harness
+            .apply("consistent_hashing")
+            .expect("a preset of this build applies");
+        let owner = picked(&mut harness, keyed(nth("key", 0), 1))
+            .await
+            .expect("a pick answers an ask over a ready fleet");
+        for n in 1..8 {
+            let again = picked(&mut harness, keyed(nth("key", n), 1))
+                .await
+                .expect("a pick answers an ask over a ready fleet");
+            assert_eq!(again, owner, "one routing key returns to one worker");
+        }
+        let mut owners = HashSet::from([owner]);
+        for n in 1..ASKS {
+            let other = picked(&mut harness, keyed(nth("keys", n), n + 1))
+                .await
+                .expect("a pick answers an ask over a ready fleet");
+            owners.insert(other);
+        }
+        assert!(
+            owners.len() > 1,
+            "{ASKS} routing keys do not share one worker: {owners:?}"
+        );
+        // A retry that names the worker it tried is answered with another.
+        let mut retry = keyed(nth("retry", 0), 1);
+        let facts = retry.facts.as_mut().expect("the ask states facts");
+        facts.tried = vec![owner.id];
+        facts.attempt = 1;
+        let next = picked(&mut harness, retry)
+            .await
+            .expect("a pick answers an ask over a ready fleet");
+        assert_ne!(next, owner, "a retry leaves the worker it names as tried");
+
+        // A prompt returns to its worker. Under the prefix preset an ask
+        // with no routing key is keyed by its prompt's head, the last whole
+        // block within 256 tokens: prompts that share a head name one row
+        // whatever follows it, and 64 heads do not all share that row.
+        harness
+            .apply("prefix_hash")
+            .expect("a preset of this build applies");
+        let home = picked(&mut harness, prompted(nth("head", 0), &[(HEAD, 1)]))
+            .await
+            .expect("a pick answers an ask over a ready fleet");
+        for n in 1..8 {
+            let longer = prompted(nth("head", n), &[(HEAD, 1), (HEAD, ASKS + n)]);
+            let again = picked(&mut harness, longer)
+                .await
+                .expect("a pick answers an ask over a ready fleet");
+            assert_eq!(again, home, "one head returns to one worker");
+        }
+        let mut homes = HashSet::from([home]);
+        for n in 1..ASKS {
+            let other = picked(&mut harness, prompted(nth("heads", n), &[(HEAD, n + 1)]))
+                .await
+                .expect("a pick answers an ask over a ready fleet");
+            homes.insert(other);
+        }
+        assert!(
+            homes.len() > 1,
+            "{ASKS} heads do not share one worker: {homes:?}"
+        );
+        // A routing key leads the prefix: whatever its head, a keyed ask
+        // names the worker the plain ring named for its key.
+        for n in 0..8 {
+            let led = keyed(prompted(nth("led", n), &[(HEAD, n + 1)]), 1);
+            let led = picked(&mut harness, led)
+                .await
+                .expect("a pick answers an ask over a ready fleet");
+            assert_eq!(led, owner, "a routing key leads the prefix");
+        }
+        // A retry that names its head's worker as tried walks to the ring's
+        // next one, the same worker at each retry.
+        let mut walked = HashSet::new();
+        for n in 0..8 {
+            let mut retry = prompted(nth("walk", n), &[(HEAD, 1), (HEAD, ASKS + n)]);
+            let facts = retry.facts.as_mut().expect("the ask states facts");
+            facts.tried = vec![home.id];
+            facts.attempt = 1;
+            let next = picked(&mut harness, retry)
+                .await
+                .expect("a pick answers an ask over a ready fleet");
+            assert_ne!(next, home, "a head's retry leaves the worker it tried");
+            walked.insert(next);
+        }
+        assert_eq!(
+            walked.len(),
+            1,
+            "past the worker it tried a head walks to one worker: {walked:?}"
+        );
+        // A boundary of the document's view moves the key. Prompts that
+        // share a stem of 64 tokens and nothing past it are 64 heads to the
+        // preset; under a view whose boundary stands at the stem's end
+        // they are keyed there, and name one row.
+        let mut apart = HashSet::new();
+        for n in 0..ASKS {
+            let ask = prompted(nth("stems", n), &[(STEM, 1), (HEAD - STEM, n + 2)]);
+            let pick = picked(&mut harness, ask)
+                .await
+                .expect("a pick answers an ask over a ready fleet");
+            apart.insert(pick);
+        }
+        assert!(
+            apart.len() > 1,
+            "past one stem {ASKS} heads do not share one worker: {apart:?}"
+        );
+        let at_stem = bounded_at(STEM * BLOCK).expect("a document of this build's preset");
+        harness
+            .apply_document(at_stem)
+            .expect("a document whose view names a boundary applies");
+        let mut together = HashSet::new();
+        for n in 0..ASKS {
+            let ask = prompted(nth("bounded", n), &[(STEM, 1), (HEAD - STEM, n + 2)]);
+            let pick = picked(&mut harness, ask)
+                .await
+                .expect("a pick answers an ask over a ready fleet");
+            together.insert(pick);
+        }
+        assert_eq!(
+            together.len(),
+            1,
+            "a boundary of the view keys a prompt at its stem: {together:?}"
+        );
+
+        // Each model decides under the profile its binding names. One
+        // document binds the counted model to the two-draw preset's
+        // resident form and every other model to a rotation: two turns of
+        // asks for the first model name each of its rows twice, and every
+        // ask for the counted model names the engine that holds no tokens,
+        // the lesser work of its pool's two rows.
+        let bound = by_model().expect("a document of this build's presets");
+        harness
+            .apply_document(bound)
+            .expect("a document of two bindings applies");
+        let mut turns: HashMap<Picked, u32> = HashMap::new();
+        for n in (0u64..).take(2 * ranks) {
+            let pick = picked(&mut harness, nth("bound", n))
+                .await
+                .expect("a pick answers an ask over a ready fleet");
+            *turns.entry(pick).or_default() += 1;
+            let counted = picked(&mut harness, for_model(nth("counted", n), COUNTED))
+                .await
+                .expect("a pick answers an ask over a ready fleet");
+            assert_eq!(
+                counted.engine, spare,
+                "the lesser resident work is taken: {counted:?}"
+            );
+        }
+        assert!(
+            turns.len() == ranks && turns.values().all(|asks| *asks == 2),
+            "under its own binding a rotation names each row twice: {turns:?}"
         );
 
         // The death. The kill waits for a view that reads its engine
@@ -352,6 +1267,21 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             .map(|verdict| verdict.at.duration_since(death.at))
             .max()
             .unwrap_or_default();
+        // No decision names the dead engine: from the probe that heard it
+        // dead its rows are no candidates.
+        harness
+            .apply("random")
+            .expect("a preset of this build applies");
+        for n in 0..ASKS {
+            let pick = picked(&mut harness, nth("dead", n))
+                .await
+                .expect("a pick answers an ask over a ready fleet");
+            assert_ne!(
+                pick.engine, dead,
+                "a dead engine is named by no decision: {pick:?}"
+            );
+        }
+
         // The dead engine's event stream broke with it, and its subscriber
         // keeps what refuses it since: the dial of an engine that is gone.
         within(
@@ -416,6 +1346,8 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
                 (hung, DialEnd::TimedOut),
                 (engines[3], DialEnd::Answered(true)),
                 (dead, DialEnd::Failed),
+                (laden, DialEnd::Answered(true)),
+                (spare, DialEnd::Answered(true)),
             ],
             "the turn that waited out the bound went on to every engine"
         );
@@ -611,7 +1543,8 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
         // service's, never the service's own.
         let wall = started.elapsed();
         let mut out = std::io::stdout();
-        writeln!(out, "FLEET_ENGINES {} FLEET_RANKS {ranks}", FLEET.len()).expect("stdout");
+        let rows: usize = FLEET.iter().map(|shape| usize::from(shape.ranks)).sum();
+        writeln!(out, "FLEET_ENGINES {} FLEET_RANKS {rows}", FLEET.len()).expect("stdout");
         writeln!(
             out,
             "FLEET_PROBE_INTERVAL_MS {}",
@@ -633,7 +1566,7 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
 
         harness.stop().await.expect("a clean stop");
     };
-    tokio::time::timeout(CASE, case)
+    tokio::time::timeout(CASE, Box::pin(case))
         .await
         .expect("the case ends inside its outer bound");
 }
@@ -655,11 +1588,12 @@ async fn the_blocking_client_asks_a_started_controller_from_a_thread_of_its_own(
                         .principal
                         .as_ref()
                         .map(|told| told.subject.clone());
-                    Ok((leader, client.term_floor(), subject))
+                    let decided = client.decide(ask(b"blocking"))?;
+                    Ok((leader, client.term_floor(), subject, decided))
                 });
             let _ = answered.send(asked.map_err(|error| error.to_string()));
         });
-        let (leader, floor, subject) = tokio::time::timeout(ROOM, answer)
+        let (leader, floor, subject, decided) = tokio::time::timeout(ROOM, answer)
             .await
             .expect("the blocking client answers inside its bound")
             .expect("the client's thread sends its answer")
@@ -671,6 +1605,13 @@ async fn the_blocking_client_asks_a_started_controller_from_a_thread_of_its_own(
             subject.as_deref(),
             Some("blocking-gateway"),
             "the welcome names the gateway the client states"
+        );
+        // Nothing was applied to this controller: no generation binds the
+        // model, and the answer is the engine's own shed.
+        assert!(
+            matches!(&decided, Answer::Decision(Decision { outcome: Some(Outcome::Shed(shed)), .. })
+                if shed.reason() == ShedReason::PolicyDeclined && shed.emptied_by == "binding"),
+            "{decided:?}"
         );
         harness.stop().await.expect("a clean stop");
     };

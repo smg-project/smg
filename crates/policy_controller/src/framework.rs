@@ -3,10 +3,11 @@
 //! to its binding and decides. A scorer or picker allocates nothing per
 //! decision: scratch lives in the per-thread [`Scratch`] the host keeps.
 
-use std::fmt::Debug;
+use std::{any::Any, collections::HashMap, fmt::Debug};
 
 use crate::{
-    builtins::{target_of, Best, FewestSessions, LeastRequests, Random},
+    affinity::WarmRule,
+    builtins::{target_of, Best, FewestSessions, LeastRequests, Random, RowTests},
     decision::{
         Decision, Pair, Pick, Shed, ShedReason, Survivors, Target, Targets, Trace, MAX_TARGETS,
         TRACE_TOP,
@@ -14,14 +15,27 @@ use crate::{
     lease::{Lease, Lifecycle, Membership, Outcome, ReleaseReason, Side, Signal},
     sessions::{Assignment, Claim, SessionRule, SessionTable, SessionVerdict},
     spec::Needs,
-    view::{AffinityFacts, Candidate, Constraints, Phase, PoolFacts, RequestFacts, WorkerId},
+    view::{
+        mean_in_flight, AffinityFacts, Candidate, Constraints, NamedAffinity, Phase, PoolFacts,
+        RequestFacts, WorkerId,
+    },
     Draw,
 };
+
+mod encode;
+mod vetoed;
+
+pub use encode::{EncodeItems, EncodePlaced, EncodePool, EncoderFacts};
+use vetoed::AllVetoed;
 
 /// Drops candidates before scoring. A `soft` filter steps aside when it would
 /// leave nothing: the engines a retry already tried step aside while another
 /// candidate remains, and a pool with nothing else is used whole.
-pub trait Filter: Send + Sync + Debug {
+///
+/// `Any`: the engine's build knows its own filters by their type, and a
+/// decision that draws first asks a profile made of them alone about a row
+/// in one test, with no call a filter.
+pub trait Filter: Any + Send + Sync + Debug {
     fn name(&self) -> &'static str;
 
     fn keep(&self, facts: &RequestFacts<'_>, candidate: &Candidate, cx: &Constraints<'_>) -> bool;
@@ -33,8 +47,11 @@ pub trait Filter: Send + Sync + Debug {
     /// Whether a decision that draws first ([`Picker::draw_first`]) may ask
     /// this filter about the rows it drew alone, with no pass over the
     /// rest: [`Filter::keep`] of one row is the filter's whole word on it.
-    /// The default is no, and a profile that holds such a filter runs its
-    /// whole pass: a plugin's filter is shown the whole view.
+    /// A row-wise filter reads each row alone and is promised no order of
+    /// the rows it is asked about: they come ascending where the pool is
+    /// read whole, and in the draw's order behind a draw. The default is
+    /// no, and a profile that holds such a filter runs its whole pass: a
+    /// plugin's filter is shown the whole view.
     fn row_wise(&self) -> bool {
         false
     }
@@ -42,7 +59,10 @@ pub trait Filter: Send + Sync + Debug {
     /// What the host must feed for this filter to mean anything. A filter
     /// that reads the affinity column ([`RequestFacts::affinity`]) declares
     /// [`Needs::affinity`]; one that does not may be handed an empty
-    /// column, which reads as nothing held.
+    /// column, which reads as nothing held. So with the request's block
+    /// hashes: a stage that reads them declares [`Needs::token_hashes`] or
+    /// [`Needs::text_hashes`], and one that declares neither may be handed
+    /// none.
     fn needs(&self) -> Needs {
         Needs::default()
     }
@@ -86,6 +106,74 @@ impl TieBand {
     pub const NORMALIZED: Self = Self(1e-6);
 }
 
+/// How the values a scorer writes for the rows of one decision lie
+/// ([`Scorer::spread`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Spread {
+    /// Anywhere in `0.0..=1.0`.
+    Any,
+    /// On levels in `0.0..=1.0` at least this far apart: two rows read one
+    /// value, or two that differ by this much or more.
+    Levels(f32),
+    /// One value for every row, 1.0: the stage orders nothing and widens no
+    /// tie, so the band it returns is none, `TieBand(0.0)`. A decision by
+    /// rank does not ask such a stage, and a band it returned would be read
+    /// by the whole pass alone: a debug build checks it where the stage is
+    /// asked.
+    Alike,
+}
+
+/// What a rank's answer left in front, said beside its scores
+/// ([`Scorer::score_front`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Front {
+    /// Nothing is said of the scores.
+    Unsaid,
+    /// Every row was written the ceiling, 1.0: the stage parts nothing.
+    Alike,
+    /// This many rows were written the ceiling, and every other row a level
+    /// under it.
+    At(u32),
+    /// The stage reads a row against rows it was not handed, so its answer
+    /// for these rows stands only where they are every row the decision
+    /// compares: it must be asked whole. Nothing is said of the scores, and
+    /// the stage need not have written them.
+    Whole,
+}
+
+impl Front {
+    /// The word a stage's scores read as under its spread, in one pass over
+    /// them. Under levels: [`Front::Alike`] where every row stands at the
+    /// ceiling, [`Front::At`] where some do and every other row stands a
+    /// whole level or more under it, and nothing of any other scores. A
+    /// stage that orders nothing reads alike, and one that promises no
+    /// levels says nothing.
+    #[must_use]
+    pub fn of(spread: Spread, stage: &[f32]) -> Self {
+        let step = match spread {
+            Spread::Levels(step) => step,
+            Spread::Alike => return Self::Alike,
+            Spread::Any => return Self::Unsaid,
+        };
+        // Two counts and no way out early: the pass stays free of branches
+        // on the rows.
+        let mut ceilings = 0u32;
+        let mut under = 0u32;
+        for &value in stage {
+            ceilings += u32::from(value >= 1.0);
+            under += u32::from(value <= 1.0 - step && value < 1.0);
+        }
+        let rows = stage.len();
+        if ceilings as usize == rows {
+            Self::Alike
+        } else if (ceilings + under) as usize == rows {
+            Self::At(ceilings)
+        } else {
+            Self::Unsaid
+        }
+    }
+}
+
 /// Scores the set the profile's picker compares: every survivor of the
 /// filters, unless the picker narrows them ([`Picker::narrow`]). `out[i]` is
 /// the score of `kept[i]`, normalized to `0.0..=1.0` with higher better; a
@@ -110,22 +198,83 @@ pub trait Scorer: Lifecycle + Debug {
 
     /// Whether the scorer may be handed the rows a picker drew first
     /// ([`Picker::draw_first`]), where no pass over the pool ran before it.
-    /// The default is no, and a profile that holds such a scorer runs its
-    /// whole pass: a plugin's scorer is shown the whole view.
+    /// A row-wise scorer reads each row alone and is promised no order of
+    /// the rows it is handed: they stand ascending where the pool is read
+    /// whole, and in the draw's order behind a draw. The default is no,
+    /// and a profile that holds such a scorer runs its whole pass: a
+    /// plugin's scorer is shown the whole view.
     fn row_wise(&self) -> bool {
         false
+    }
+
+    /// Whether the scorer may be handed the rows a rank put in front
+    /// ([`Self::spread`]) and no other. It orders them as it would among
+    /// every row, or says that it must be asked whole
+    /// ([`Self::score_front`], [`Front::Whole`]). The promise is the order
+    /// and not the values: a scorer that spreads its values over the rows
+    /// handed writes a front's rows further apart, and two of them that a
+    /// sum over every row rounds together are ordered there, where the
+    /// whole pass draws among them. A draw's rows are scored among
+    /// themselves ([`Self::row_wise`]) and a front's are not: a scorer
+    /// whose order of two rows turns on the other rows handed says no. The
+    /// default is no, and behind a rank such a stage is asked of every row.
+    fn front_wise(&self) -> bool {
+        false
+    }
+
+    /// How this scorer's values lie ([`Spread`]), asked once when the engine
+    /// is built. A scorer that writes levels is a rank where its weight
+    /// outweighs every stage behind it: a plain decision then asks those
+    /// stages of the rows at its ceiling alone, where they fill the
+    /// decision's targets and are at most half of the rows it was asked of,
+    /// where each of those stages orders nothing or answers for a front
+    /// alone ([`Self::front_wise`]), and where at most one of them that is
+    /// no rank orders the rows. A stage that cannot promise its levels says nothing,
+    /// the default.
+    fn spread(&self) -> Spread {
+        Spread::Any
+    }
+
+    /// As [`Self::score`], with what the answer left in front ([`Front`]). A
+    /// plain decision asks it of a stage that is a rank ([`Self::spread`]),
+    /// and reads nothing of the scores where every row stands alike. It asks
+    /// it too of a stage handed the rows a rank put in front, which says
+    /// there that it must be asked whole ([`Front::Whole`]) where its answer
+    /// reads rows it was not handed. A scorer that says its front has one
+    /// body: it asks its own `score` and reads the word off the scores
+    /// ([`Front::of`]), so a row scores alike by either entry. A debug
+    /// build checks the word against the scores. The default scores and
+    /// says nothing.
+    fn score_front(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &[u32],
+        out: &mut [f32],
+    ) -> (TieBand, Front) {
+        (self.score(facts, candidates, kept, out), Front::Unsaid)
     }
 
     /// What the host must feed for this scorer to mean anything. A scorer
     /// that reads the affinity column ([`RequestFacts::affinity`]) declares
     /// [`Needs::affinity`]; one that does not may be handed an empty
-    /// column, which reads as nothing held.
+    /// column, which reads as nothing held. So with the request's block
+    /// hashes: a stage that reads them declares [`Needs::token_hashes`] or
+    /// [`Needs::text_hashes`], and one that declares neither may be handed
+    /// none.
     fn needs(&self) -> Needs {
         Needs::default()
     }
 
     /// The per-decision scope this stage reads, if it holds one.
     fn scope(&self) -> Option<&dyn DecisionScope> {
+        None
+    }
+
+    /// The warm-up ruling this stage applies, where it applies one: what a
+    /// host that names a pool's warming rows enters
+    /// ([`WarmRule::name`]). No other stage holds one.
+    fn warm_rule(&self) -> Option<WarmRule> {
         None
     }
 }
@@ -153,11 +302,12 @@ impl Narrowed {
     }
 }
 
-/// The most rows a decision that draws first ([`Picker::draw_first`]) may see
-/// refused before it stops drawing: the one bound every picker that draws
-/// first counts against. A draw asks the filters about no more rows than
-/// the targets it hands out and these, and a decision about no more than
-/// those and the whole pass's.
+/// The most rows a decision that draws its one or two picks first
+/// ([`Picker::draw_first`]) may see refused before it stops drawing: the
+/// bound those pickers count against. Such a draw asks the filters about no
+/// more rows than the targets it hands out and these, and a decision about
+/// no more than those and the whole pass's. A picker that draws a sample
+/// counts none: its own draws, twice the sample, bound what it asks.
 pub const DRAW_BOUND: u32 = 8;
 
 /// The smallest pool at which a decision draws first, set by run. A draw
@@ -174,6 +324,16 @@ pub const DRAW_BOUND: u32 = 8;
 /// and where it ends.
 pub const DRAW_FROM: usize = 16;
 
+/// The pool size from which a profile whose leading stages are ranks is
+/// decided by rank ([`Scorer::spread`]); a smaller pool is asked whole. Rows
+/// stand in front where four fill the targets and are at most half, so in a
+/// small pool a front spares the stages behind few rows, four at eight rows,
+/// while a decision with no row in front pays for the ranks' reading: at
+/// eight rows 67 instructions, and 1.04 to 1.09 of the whole pass by time.
+/// The size is the draw's ([`DRAW_FROM`]): a decision reads one floor for
+/// both.
+pub const RANK_FROM: usize = DRAW_FROM;
+
 /// Turns the survivors into ordered targets, in two steps the engine runs
 /// around the scorers: `narrow` names the set the picker compares, the
 /// scorers are handed that set alone, and `pick` orders it. `scores[i]`
@@ -186,8 +346,10 @@ pub trait Picker: Lifecycle + Debug {
     /// that set to the front of `kept` and says how many survivors behind it
     /// follow the pick as alternates. It permutes `kept` and writes no other
     /// value. A survivor the picker passed over is handed to no scorer, so
-    /// it moves no input of a built-in's estimate. The default compares
-    /// every survivor.
+    /// it moves no input of a built-in's estimate. The affinity stages
+    /// read the rows a host named fastest where the compared set stands
+    /// ascending: a row asked behind the one before it costs a search.
+    /// The default compares every survivor.
     fn narrow(
         &self,
         _facts: &RequestFacts<'_>,
@@ -229,8 +391,9 @@ pub trait Picker: Lifecycle + Debug {
     /// it hands out, each one kept by `keep` and none twice: the scorers are
     /// handed them and [`Picker::order_drawn`] orders them. On `false`
     /// nothing is decided, what `kept` holds is dropped and the whole pass
-    /// runs: the picker does not draw first, or [`DRAW_BOUND`] rows were
-    /// refused before it held its pick. A draw that keeps nobody says
+    /// runs: the picker does not draw first, or its bound ran out before it
+    /// held its pick ([`DRAW_BOUND`] refused rows, or a sample's draws). A
+    /// draw that keeps nobody says
     /// nothing of the pool: the pass alone sheds. `draw` is the seed's stream: the
     /// picker takes its values from it and from nowhere else, and whatever
     /// follows the draw reads the stream past them.
@@ -262,10 +425,36 @@ pub trait Picker: Lifecycle + Debug {
         self.pick(facts, candidates, kept, scores, band, out);
     }
 
+    /// Whether the rows a host named in the affinity column's place
+    /// ([`NamedAffinity`]) join the rows this picker draws first: the
+    /// engine keeps, behind the rows drawn, each named row every filter
+    /// keeps, and hands the stages the drawn rows' mean in flight, so a
+    /// named row does not move the mean it is judged against. The engine
+    /// asks such a picker to draw for a request that names rows in the
+    /// column's place, and for no other. The default is no: what the picker
+    /// drew is all it compares.
+    fn joined_by_named(&self) -> bool {
+        false
+    }
+
+    /// Whether the picker takes its targets from the best of the rows it is
+    /// handed and reads no row behind them. A profile's ranks may then hand
+    /// it the rows they put in front alone, with the sums every stage gave
+    /// them: each row behind lies under every row in front by more than
+    /// the tie band. The default is no: a picker may read
+    /// every score, so its profile asks every row every stage. The engine
+    /// reads it once per profile when it is built.
+    fn front_wise(&self) -> bool {
+        false
+    }
+
     /// What the host must feed for this picker to mean anything. A picker
     /// that reads the affinity column ([`RequestFacts::affinity`]) declares
     /// [`Needs::affinity`]; one that does not may be handed an empty
-    /// column, which reads as nothing held.
+    /// column, which reads as nothing held. So with the request's block
+    /// hashes: a stage that reads them declares [`Needs::token_hashes`] or
+    /// [`Needs::text_hashes`], and one that declares neither may be handed
+    /// none.
     fn needs(&self) -> Needs {
         Needs::default()
     }
@@ -333,7 +522,21 @@ impl Profile {
     pub fn needs(&self) -> Needs {
         let filters = self.filters.iter().map(|f| f.needs());
         let scorers = self.scorers.iter().map(|w| w.scorer.needs());
-        filters.chain(scorers).fold(self.picker.needs(), Needs::or)
+        let needs = filters.chain(scorers).fold(self.picker.needs(), Needs::or);
+        // A sample is the need of a profile that may draw. Under a stage
+        // that is not row-wise the pool is read whole, and lists capped at
+        // the sample would hide holders from that pass.
+        Needs {
+            sample: if draws_first(self) { needs.sample } else { 0 },
+            ..needs
+        }
+    }
+
+    /// The rulings of this profile's warm-up stages ([`Scorer::warm_rule`]),
+    /// in the stages' order.
+    fn warm_rules(&self) -> impl Iterator<Item = WarmRule> + '_ {
+        let stages = self.scorers.iter();
+        stages.filter_map(|stage| stage.scorer.warm_rule())
     }
 
     /// Whether any stage holds a [`DecisionScope`].
@@ -455,7 +658,7 @@ const RELEASE_DEPTH: usize = 4;
 /// forgotten, since its drop could panic in turn.
 #[cold]
 #[inline(never)]
-pub(crate) fn release(payload: Box<dyn std::any::Any + Send>) {
+pub(crate) fn release(payload: Box<dyn Any + Send>) {
     let mut next = Some(payload);
     for _ in 0..RELEASE_DEPTH {
         let Some(payload) = next.take() else { return };
@@ -478,11 +681,18 @@ pub struct Scratch {
     /// decode the decode profile keeps, then the ones the routable prefills
     /// pair with.
     marks: ClassBits,
+    /// The encode side of an encode-pair decision, boxed: the entry moves
+    /// one pointer out of the scratch while the pair entry holds the rest.
+    encode: Option<Box<encode::EncodeScratch>>,
 }
 
 /// The buffers of one profile run: the survivors, the combined scores of the
 /// set the picker compares, one scorer's stage and the survivors a soft
-/// filter restores when it would leave nothing. A pair decision keeps the
+/// filter restores when it would leave nothing. A decision by rank lends
+/// two of them more ([`combine_ranked`]): the stage's buffer holds the sums
+/// of the rows in front behind a stage's scores of them, and the soft
+/// filter's backup holds their list, which keeps its length from one
+/// decision to the next. A pair decision keeps the
 /// prefill's apart from the decode side's, so the prefill's survivors stay
 /// for the next prefill target.
 #[derive(Debug, Default)]
@@ -499,7 +709,9 @@ impl Buffers {
     /// Room in every buffer for the whole pass over a pool of `rows`. A
     /// decision that draws first writes a few rows and asks for the room
     /// all the same: the pass it widens to may be many decisions away, and
-    /// it allocates nothing the thread's first decision did not.
+    /// it allocates nothing the thread's first decision did not. A decision
+    /// by rank asks for no more than the whole pass: what it keeps of the
+    /// rows in front stands in these buffers ([`combine_few`]).
     fn reserve(&mut self, rows: usize) {
         if self.room < rows {
             self.grow(rows);
@@ -526,7 +738,8 @@ impl Scratch {
     }
 }
 
-/// A set of a pair table's decode classes: one bit a class number.
+/// A set of class numbers, a pair table's decode classes or a pool's encode
+/// classes: one bit a number.
 #[derive(Debug, Default)]
 struct ClassBits {
     words: Vec<u64>,
@@ -540,7 +753,7 @@ impl ClassBits {
     }
 
     /// Adds `class` and says whether the set holds it. A number the set was
-    /// not sized for is no class of the table and is left out.
+    /// not sized for is left out: what it means is each caller's to say.
     fn insert(&mut self, class: u32) -> bool {
         let Some(word) = self.words.get_mut(class as usize / 64) else {
             return false;
@@ -591,6 +804,13 @@ fn combine(
         stage.clear();
         stage.resize(kept.len(), 0.0);
         let stage_band = weighted.scorer.score(facts, candidates, kept, stage);
+        // A decision by rank does not ask a stage that orders nothing, so
+        // the band of one is none here too ([`Spread::Alike`]).
+        debug_assert!(
+            bandless(weighted, stage_band),
+            "{} orders nothing and returned a band",
+            weighted.scorer.name()
+        );
         let share = weighted.weight * norm;
         band += share * stage_band.0.clamp(0.0, 1.0);
         for (sum, s) in scores.iter_mut().zip(stage.iter()) {
@@ -647,6 +867,417 @@ fn score_and_pick(
     }
 }
 
+/// Whether a stage's band is one its spread allows: a stage that says it
+/// orders nothing returns none ([`Spread::Alike`]). Read in debug builds
+/// at every ask of a stage: a leading one that orders nothing is not asked
+/// by rank, and one behind a stage that orders the rows is.
+fn bandless(weighted: &Weighted, band: TieBand) -> bool {
+    weighted.scorer.spread() != Spread::Alike || band.0 == 0.0
+}
+
+/// Whether a rank's scores are what it said of them ([`Front`]): at the
+/// ceiling in the count it named, and every other row a step of its spread
+/// under it. Read in debug builds, where a stage that says a wrong word
+/// fails its author's case; a build without the check trusts the word.
+fn as_said(spread: Spread, said: Front, stage: &[f32]) -> bool {
+    let ceilings = stage.iter().filter(|&&value| value >= 1.0).count();
+    match said {
+        Front::Unsaid | Front::Whole => true,
+        Front::Alike => ceilings == stage.len(),
+        Front::At(n) => {
+            let step = match spread {
+                Spread::Levels(step) => step,
+                Spread::Any | Spread::Alike => 0.0,
+            };
+            ceilings == n as usize
+                && stage
+                    .iter()
+                    .all(|&value| value >= 1.0 || value <= 1.0 - step)
+        }
+    }
+}
+
+/// The combined scores of a profile whose leading stages are ranks
+/// ([`Order`]), for the rows in `kept`, written into `scores`. The
+/// profile's tie band comes back, and how many rows stand in front: zero
+/// where every row was asked every stage.
+///
+/// A rank that leaves every row at its ceiling adds its share to what each
+/// row holds, and a stage that orders nothing is not asked. A rank parts
+/// the rows where some stand at its ceiling and some under it. The rows at
+/// the ceiling stand in front where they fill a decision's targets, are at
+/// most half of the rows asked, and the build let the rank put rows in
+/// front ([`Order`]): the stages behind are asked of them alone
+/// ([`combine_few`]), and a row left behind keeps the sum the ranks gave
+/// it. That sum lies under every row in front by more than the later
+/// stages add, so the targets come from the rows in front. A stage asked
+/// of them alone orders them as it would among every row, or says that it
+/// must be asked whole ([`Front::Whole`]), so their order is the weighted
+/// sum's over every row wherever that sum tells them apart. It does not
+/// everywhere: a stage that spreads its values over the rows it is handed
+/// writes a front's rows further apart, and two of them whose values among
+/// every row meet in one `f32` sum stand apart here. The whole pass draws
+/// among such rows, and the front orders them by the stage's own rule.
+/// Where a stage must be asked whole, where the tie band is wider than the
+/// ranks' room, and anywhere else, every row is asked on from the rank
+/// that parted them, and the scores are the weighted sum's to the bit: a
+/// row's sum is taken in the stages' order either way.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "combine's inputs, the build's word and the list of the rows in front"
+)]
+fn combine_ranked(
+    profile: &Profile,
+    order: Order,
+    facts: &RequestFacts<'_>,
+    candidates: &[Candidate],
+    kept: &[u32],
+    scores: &mut Vec<f32>,
+    stage: &mut Vec<f32>,
+    tied: &mut Vec<u32>,
+) -> (TieBand, usize) {
+    let rows = kept.len();
+    scores.clear();
+    scores.resize(rows, 0.0);
+    // Room for the list of the rows a rank may put in front, their
+    // candidates and their places: at most the rows. The list lives in the
+    // buffer a soft filter fills, and a profile without one never sized it.
+    // A front's sums take no room of their own: they stand in the stage's
+    // buffer ([`combine_few`]).
+    if tied.capacity() < rows {
+        tied.reserve(rows - tied.len());
+    }
+    if rows == 0 {
+        return (TieBand::NORMALIZED, 0);
+    }
+    let stages = &profile.scorers[..];
+    let total: f32 = stages.iter().map(|w| w.weight).sum();
+    let norm = if total > 0.0 { 1.0 / total } else { 1.0 };
+    let ranks = usize::from(order.ranks).min(stages.len());
+    let mut band = 0.0f32;
+    // What every row holds while all are tied.
+    let mut held = 0.0f32;
+    // The leading ranks, while every row is tied. `Alike` stands for no
+    // rank having parted the rows.
+    let mut front = Front::Alike;
+    let mut i = 0;
+    while i < ranks {
+        let weighted = &stages[i];
+        let share = weighted.weight * norm;
+        i += 1;
+        if order.alike(i - 1) {
+            // Not asked: every row holds its share.
+            held += share;
+            continue;
+        }
+        stage.clear();
+        stage.resize(rows, 0.0);
+        let (mut stage_band, mut said) =
+            weighted.scorer.score_front(facts, candidates, kept, stage);
+        if said == Front::Whole {
+            // It was handed every row: its plain answer is its word.
+            stage_band = weighted.scorer.score(facts, candidates, kept, stage);
+            said = Front::Unsaid;
+        }
+        debug_assert!(
+            as_said(weighted.scorer.spread(), said, stage),
+            "{} said {said:?} of scores that read otherwise",
+            weighted.scorer.name()
+        );
+        band += share * stage_band.0.clamp(0.0, 1.0);
+        if said == Front::Alike {
+            held += share;
+            continue;
+        }
+        // The rows part here: each holds its own sum from now on.
+        for (sum, value) in scores.iter_mut().zip(stage.iter()) {
+            *sum = held + share * value.clamp(0.0, 1.0);
+        }
+        front = said;
+        break;
+    }
+    match front {
+        Front::Alike => scores.fill(held),
+        Front::At(n)
+            if order.fronts(i - 1)
+                && n as usize >= MAX_TARGETS
+                && n as usize * 2 <= rows
+                && i < stages.len() =>
+        {
+            let n = n as usize;
+            // The list keeps its length from one decision to the next and
+            // is filled only as it grows: every entry read of it was
+            // written for this decision first.
+            if tied.len() < 2 * n {
+                tied.resize(2 * n, 0);
+            }
+            let (asked, places) = tied.split_at_mut(n);
+            let mut next = 0;
+            for (at, &value) in stage.iter().enumerate() {
+                if value >= 1.0 && next < n {
+                    asked[next] = kept[at];
+                    places[next] = at as u32;
+                    next += 1;
+                }
+            }
+            // A scorer that counted wrong puts nobody in front.
+            if next == n {
+                let decided = combine_few(
+                    profile, order, facts, candidates, scores, stage, tied, n, i, norm, band,
+                );
+                if let Some(decided) = decided {
+                    return decided;
+                }
+            }
+        }
+        Front::At(_) | Front::Unsaid | Front::Whole => {}
+    }
+    // Every row is asked on, as a profile without ranks asks: no row stood
+    // in front, or the rows in front could not decide alone.
+    for (at, weighted) in stages.iter().enumerate().skip(i) {
+        let share = weighted.weight * norm;
+        if order.alike(at) {
+            scores.iter_mut().for_each(|sum| *sum += share);
+            continue;
+        }
+        stage.clear();
+        stage.resize(rows, 0.0);
+        let stage_band = weighted.scorer.score(facts, candidates, kept, stage);
+        debug_assert!(
+            bandless(weighted, stage_band),
+            "{} orders nothing and returned a band",
+            weighted.scorer.name()
+        );
+        band += share * stage_band.0.clamp(0.0, 1.0);
+        for (sum, value) in scores.iter_mut().zip(stage.iter()) {
+            *sum += share * value.clamp(0.0, 1.0);
+        }
+    }
+    (TieBand(band), 0)
+}
+
+/// The stages from `from` on, asked of the `few` rows in front alone: `tied`
+/// holds their candidates, then their places among the rows. A later rank
+/// puts fewer in front where they still fill the targets ([`fewer`]) and no
+/// stage has parted them since they stood in front. The profile's tie band
+/// comes back, and how many rows stand in front at the
+/// end: their sums are written among the rows' then, and a row a later rank
+/// left behind keeps what the ranks asked of every row gave it. Until then
+/// each row in front holds its sum in the stage's buffer, behind the scores
+/// a stage writes of those rows: room the rank's own ask took.
+///
+/// No stage of this build is asked here as a rank: its ranks say nothing of
+/// a front alone, and `least-load`, which answers for one, is no rank. A
+/// later rank that leaves fewer in front is a host's, and so are the rows
+/// it must find level ([`fewer`]).
+///
+/// `None` where the rows in front cannot decide alone, the rows' sums left
+/// as the ranks wrote them: a stage said it must be asked whole
+/// ([`Front::Whole`]), or the tie band is wider than the ranks' room
+/// ([`Order`]) and reaches a row behind. Out of line: a decision that puts
+/// nobody in front carries none of this.
+#[inline(never)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "combine's inputs and what the ranks before left"
+)]
+fn combine_few(
+    profile: &Profile,
+    order: Order,
+    facts: &RequestFacts<'_>,
+    candidates: &[Candidate],
+    scores: &mut [f32],
+    stage: &mut Vec<f32>,
+    tied: &mut [u32],
+    mut few: usize,
+    from: usize,
+    norm: f32,
+    mut band: f32,
+) -> Option<(TieBand, usize)> {
+    // What each row in front holds, kept in the stage's buffer behind the
+    // room a stage's scores of those rows take, until the rows in front
+    // have decided. The buffer held a score for every row when the rank
+    // was asked, and the rows in front are at most half of them: nothing
+    // is sized here, whatever the thread's first decision of this size was.
+    let first = few;
+    debug_assert!(
+        stage.capacity() >= 2 * first,
+        "the stage's buffer holds a score for every row"
+    );
+    stage.clear();
+    stage.resize(2 * first, 0.0);
+    let (outs, sums) = stage.split_at_mut(first);
+    for (sum, &place) in sums.iter_mut().zip(&tied[first..2 * first]) {
+        *sum = scores[place as usize];
+    }
+    let last = profile.scorers.len() - 1;
+    let mut whole = false;
+    // Whether every row in front holds one sum: a rank puts fewer in front
+    // only of rows no stage has parted since they stood there.
+    let mut level = true;
+    for (i, weighted) in profile.scorers.iter().enumerate().skip(from) {
+        let share = weighted.weight * norm;
+        if order.alike(i) {
+            // Not asked: every row in front holds its share.
+            for sum in &mut sums[..few] {
+                *sum += share;
+            }
+            continue;
+        }
+        let out = &mut outs[..few];
+        out.fill(0.0);
+        let (stage_band, said) = weighted
+            .scorer
+            .score_front(facts, candidates, &tied[..few], out);
+        if said == Front::Whole {
+            whole = true;
+            break;
+        }
+        debug_assert!(
+            as_said(weighted.scorer.spread(), said, out),
+            "{} said {said:?} of scores that read otherwise",
+            weighted.scorer.name()
+        );
+        debug_assert!(
+            bandless(weighted, stage_band),
+            "{} orders nothing and returned a band",
+            weighted.scorer.name()
+        );
+        band += share * stage_band.0.clamp(0.0, 1.0);
+        for (sum, value) in sums[..few].iter_mut().zip(out.iter()) {
+            *sum += share * value.clamp(0.0, 1.0);
+        }
+        match said {
+            Front::At(front) if level && order.fronts(i) && i < last => {
+                let left = fewer(out, tied, sums, few, front as usize);
+                // The rows it left in front stand at its ceiling. Where it
+                // left them all it parted them, unless all stand there.
+                level = left < few || front as usize == few;
+                few = left;
+            }
+            Front::Alike => {}
+            Front::At(_) | Front::Unsaid | Front::Whole => level = false,
+        }
+    }
+    if whole || band > order.room {
+        return None;
+    }
+    for (&sum, &place) in sums[..few].iter().zip(&tied[few..2 * few]) {
+        scores[place as usize] = sum;
+    }
+    Some((TieBand(band), few))
+}
+
+/// The rows in front after a rank asked of `few` of them wrote `stage`: the
+/// ones at its ceiling, listed in place of the `few` with what each holds
+/// (`sums`), where they fill a decision's targets and are at most half of
+/// them; else the `few` stay.
+fn fewer(stage: &[f32], tied: &mut [u32], sums: &mut [f32], few: usize, front: usize) -> usize {
+    let at = stage.iter().filter(|&&value| value >= 1.0).count();
+    if at != front || front < MAX_TARGETS || front * 2 > few {
+        return few;
+    }
+    // The candidates and their sums first, then the places: each is written
+    // at or before the entry it is read from.
+    let mut next = 0;
+    for at in 0..few {
+        if stage[at] >= 1.0 {
+            tied[next] = tied[at];
+            sums[next] = sums[at];
+            next += 1;
+        }
+    }
+    let mut next = 0;
+    for at in 0..few {
+        if stage[at] >= 1.0 {
+            tied[front + next] = tied[few + at];
+            next += 1;
+        }
+    }
+    front
+}
+
+/// The single plan's whole pass for a profile whose leading stages are
+/// ranks ([`Order`]): the filter half as [`run_single`] runs it, then the
+/// scoring half with the stages asked by rank ([`combine_ranked`]). Where
+/// rows stand in front they fill the targets, and the picker compares them
+/// alone. A keyed request under a sessions rule never comes here: it is the
+/// rule's, in [`Engine::decide`]. Nor does an encode item, whose pass is its
+/// own ([`run_encode`]), nor a request the profile's picker draws for.
+///
+/// Out of line, so a decision of a profile without ranks keeps the engine's
+/// decision path as it was.
+#[inline(never)]
+fn run_ranked(
+    engine: &Engine,
+    index: u16,
+    facts: &RequestFacts<'_>,
+    pool: &PoolFacts<'_>,
+    set: Set<'_>,
+    cx: &Constraints<'_>,
+    buf: &mut Buffers,
+) -> Decision {
+    // The profile and its ranks are read here, by the index, as a draw
+    // reads its profile and its fold.
+    let at = usize::from(index);
+    let (profile, order) = (&engine.profiles[at], engine.orders[at]);
+    let candidates = set.candidates;
+    if let Some(emptied_by) = filter(profile, facts, cx, buf, set) {
+        return single_emptied(index, facts, pool, candidates, emptied_by, buf);
+    }
+    let narrowed = profile.picker.narrow(facts, candidates, &mut buf.kept);
+    let compared = narrowed.compared.min(buf.kept.len());
+    let alternates = narrowed.alternates.min(buf.kept.len() - compared);
+    let (band, few) = combine_ranked(
+        profile,
+        order,
+        facts,
+        candidates,
+        &buf.kept[..compared],
+        &mut buf.scores,
+        &mut buf.stage,
+        &mut buf.before_soft,
+    );
+
+    let mut targets = Targets::new();
+    if few == 0 {
+        profile.picker.pick(
+            facts,
+            candidates,
+            &buf.kept[..compared],
+            &buf.scores,
+            band,
+            &mut targets,
+        );
+    } else {
+        // The rows in front fill the targets: the picker compares them
+        // alone, by the sums every stage gave them.
+        let (asked, places) = buf.before_soft.split_at(few);
+        buf.stage.clear();
+        buf.stage
+            .extend(places.iter().take(few).map(|&at| buf.scores[at as usize]));
+        profile
+            .picker
+            .pick(facts, candidates, asked, &buf.stage, band, &mut targets);
+    }
+    let trace = trace_of(index, facts, pool, candidates, &buf.kept, &buf.scores);
+    if targets.is_empty() {
+        return shed(ShedReason::PolicyDeclined, profile.picker.name(), trace);
+    }
+    // A full list keeps what it has: the walk is bounded by the list's size.
+    for &i in buf.kept[compared..compared + alternates]
+        .iter()
+        .take(MAX_TARGETS)
+    {
+        targets.push(target_of(&candidates[i as usize]));
+    }
+    Decision::Pick(Pick {
+        targets,
+        trace,
+        session_verdict: SessionVerdict::None,
+    })
+}
+
 /// Whether `class` is one of the sorted `classes`. Class 0 is outside any
 /// pairing, whatever a list names.
 fn classed(classes: &[u32], class: u32) -> bool {
@@ -670,6 +1301,12 @@ fn only(classes: &[u32]) -> Option<u32> {
 /// Returns the name of the stage that emptied the pool, if one did (design
 /// 4.2: a shed names it): a pool with no candidate was emptied by no stage,
 /// a prefill whose classes hold no decode by the partners.
+///
+/// A pool a hard filter empties is put to the set's all-vetoed rule before
+/// its stage is returned ([`vetoed::emptied`]). Where the rule steers, the
+/// rows it kept stay in `buf.kept` behind the stage's name, and the plan's
+/// home for an emptied pool tells the two by them ([`single_emptied`]): no
+/// caller holds anything for the rule past this call.
 fn filter(
     profile: &Profile,
     facts: &RequestFacts<'_>,
@@ -682,6 +1319,7 @@ fn filter(
         class,
         partnered,
         encode,
+        ..
     } = set;
     let kept = &mut buf.kept;
     kept.clear();
@@ -726,7 +1364,7 @@ fn filter(
     for hard in profile.filters.iter().filter(|f| !f.soft()) {
         hard.retain(facts, candidates, cx, kept);
         if kept.is_empty() {
-            return Some(hard.name());
+            return Some(vetoed::emptied(hard.name(), profile, facts, cx, buf, set));
         }
     }
     for soft in profile.filters.iter().filter(|f| f.soft()) {
@@ -743,40 +1381,52 @@ fn filter(
 }
 
 /// The single plan's opening for a request a sessions rule pins or places:
-/// the profile's filters over the whole pool, the survivors left in
-/// `buf.kept`. `Some` is the shed, when a filter leaves nobody
+/// the profile's filters over the set's whole pool, the survivors left in
+/// `buf.kept`. `Some` is the plan's answer when a filter leaves nobody
 /// ([`single_emptied`]).
 fn single_survivors(
     profile: &Profile,
     index: u16,
     facts: &RequestFacts<'_>,
     pool: &PoolFacts<'_>,
-    candidates: &[Candidate],
+    set: Set<'_>,
     cx: &Constraints<'_>,
     buf: &mut Buffers,
 ) -> Option<Decision> {
-    let set = Set {
-        candidates,
-        class: None,
-        partnered: None,
-        encode: false,
-    };
     let emptied_by = filter(profile, facts, cx, buf, set)?;
-    Some(single_emptied(index, facts, pool, candidates, emptied_by))
+    Some(single_emptied(
+        index,
+        facts,
+        pool,
+        set.candidates,
+        emptied_by,
+        buf,
+    ))
 }
 
 /// What the single plan decides over a pool its filter half emptied: the
-/// shed that names the stage. Every path of the plan ends here when a stage
-/// leaves nobody, a plain request ([`run_single`]) and the two a sessions
-/// rule or an assignment places ([`single_survivors`]): what the plan asks
-/// of an emptied pool has this one home.
+/// shed that names the stage, or the all-vetoed rule's pick where the rule
+/// left the rows it kept in `buf.kept` ([`vetoed::steered`]). Every path of
+/// the plan ends here when a stage leaves nobody, a plain request
+/// ([`run_single`]) and the two a sessions rule or an assignment places
+/// ([`single_survivors`]): what the plan asks of an emptied pool has this
+/// one home.
+///
+/// Cold and out of line, its arguments in the order the shed takes them: a
+/// pass that keeps a row sets up nothing for this call.
+#[cold]
+#[inline(never)]
 fn single_emptied(
     index: u16,
     facts: &RequestFacts<'_>,
     pool: &PoolFacts<'_>,
     candidates: &[Candidate],
     emptied_by: &'static str,
+    buf: &mut Buffers,
 ) -> Decision {
+    if !buf.kept.is_empty() {
+        return vetoed::steered(index, facts, pool, candidates, buf);
+    }
     shed(
         reason_of(emptied_by),
         emptied_by,
@@ -784,7 +1434,38 @@ fn single_emptied(
     )
 }
 
+/// The trace of a decision that counted its pool: `kept` holds every
+/// survivor of the filters, and `scores` the scores of the set compared.
 fn trace_of(
+    profile: u16,
+    facts: &RequestFacts<'_>,
+    pool: &PoolFacts<'_>,
+    candidates: &[Candidate],
+    kept: &[u32],
+    scores: &[f32],
+) -> Trace {
+    trace_by::<false>(profile, facts, pool, candidates, kept, scores)
+}
+
+/// [`trace_of`] behind a draw. The rows stand in the draw's order, so
+/// their best are read as a draw's ([`top_drawn`]); and a draw reads a
+/// part of the pool, so its survivors are not counted.
+fn trace_drawn(
+    profile: u16,
+    facts: &RequestFacts<'_>,
+    pool: &PoolFacts<'_>,
+    candidates: &[Candidate],
+    kept: &[u32],
+    scores: &[f32],
+) -> Trace {
+    trace_by::<true>(profile, facts, pool, candidates, kept, scores)
+}
+
+/// The trace of a decision over the rows `kept` and their `scores`: a
+/// pool read whole, or the rows of a draw (`DRAWN`). One body, the read
+/// of the best scores chosen where it is entered.
+#[inline(always)]
+fn trace_by<const DRAWN: bool>(
     profile: u16,
     facts: &RequestFacts<'_>,
     pool: &PoolFacts<'_>,
@@ -794,25 +1475,54 @@ fn trace_of(
 ) -> Trace {
     let mut trace = Trace {
         profile,
-        survivors: Survivors::counted(kept.len() as u32),
+        survivors: if DRAWN {
+            Survivors::NOT_COUNTED
+        } else {
+            Survivors::counted(kept.len() as u32)
+        },
         seed: facts.seed,
         generation: pool.generation,
         ..Trace::default()
     };
-    // One pass: a row enters the top when it beats the lowest row kept, and
-    // moves above a kept row only when strictly better, so equal scores keep
-    // the scan's order (the earlier row ahead).
-    let mut top: [(usize, f32); TRACE_TOP] = [(0, f32::NEG_INFINITY); TRACE_TOP];
+    let mut top = [(0, f32::NEG_INFINITY); TRACE_TOP];
+    let len = if DRAWN {
+        top_drawn(scores, &mut top)
+    } else {
+        top_pass(scores, &mut top)
+    };
+    for (slot, &(i, score)) in top.iter().enumerate().take(len) {
+        trace.top[slot] = (candidates[kept[i] as usize].id, score);
+    }
+    trace.top_len = len as u8;
+    trace
+}
+
+/// The `K` best of `scores` in descending order, each with its place in
+/// the scan, into the first slots of `top`; the answer is how many there
+/// are, and a slot past them is left as it was. A row enters when it
+/// beats the lowest row kept, and moves above a kept row only when
+/// strictly better, so equal scores keep the scan's order (the earlier
+/// row ahead).
+///
+/// This is the read of a pool read whole. Its rows come in the host's
+/// order decision after decision: a row that beats nobody kept is passed
+/// over by one test, which a processor predicts.
+///
+/// The slots are the caller's, not an array handed back: by count, the
+/// array by value cost a whole pass a copy a decision in the ranked push
+/// and four instructions a row in the trace.
+#[inline(always)]
+pub(crate) fn top_pass<const K: usize>(scores: &[f32], top: &mut [(usize, f32); K]) -> usize {
     let mut len = 0usize;
     for (i, &score) in scores.iter().enumerate() {
-        if len == TRACE_TOP && score <= top[TRACE_TOP - 1].1 {
+        if len == K && score <= top[K - 1].1 {
             continue;
         }
-        let mut slot = if len < TRACE_TOP {
+        let mut slot = if len < K {
             len += 1;
             len - 1
         } else {
-            TRACE_TOP - 1
+            K - 1
         };
         while slot > 0 && score > top[slot - 1].1 {
             top[slot] = top[slot - 1];
@@ -820,11 +1530,67 @@ fn trace_of(
         }
         top[slot] = (i, score);
     }
-    for (slot, &(i, score)) in top.iter().enumerate().take(len) {
-        trace.top[slot] = (candidates[kept[i] as usize].id, score);
+    len
+}
+
+/// [`top_pass`] behind a draw: the same answer at another cost. The rows
+/// come in the draw's order and no test of a score is predicted, so each
+/// row is placed by its key ([`top_keyed`]), the same work whatever it
+/// scores. Three lists are read as the pass reads them: one under
+/// [`KEYED_FROM`] rows, one that holds a score without an order, and one
+/// past the keys' places.
+#[inline(always)]
+pub(crate) fn top_drawn<const K: usize>(scores: &[f32], top: &mut [(usize, f32); K]) -> usize {
+    if scores.len() >= KEYED_FROM
+        && scores.len() <= 1 << PLACE_BITS
+        && !scores.iter().fold(false, |nan, score| nan | score.is_nan())
+    {
+        return top_keyed(scores, top);
     }
-    trace.top_len = len as u8;
-    trace
+    top_pass(scores, top)
+}
+
+/// From how many rows a draw's best scores are read by keys. A shorter
+/// list holds few tests to mispredict, and the pass's form reads it in
+/// fewer instructions: by count the four rows another picker draws cost
+/// 92 more a decision by keys. Keys were measured over lists of sixteen
+/// rows and more.
+const KEYED_FROM: usize = 16;
+
+/// How many bits of a key name a row's place: a list of up to
+/// `1 << PLACE_BITS` rows is read by keys.
+const PLACE_BITS: u32 = 20;
+
+/// [`top_drawn`] over scores that order. Each row is one key: its score's
+/// bits in the scores' order, above its place counted from the end, so the
+/// greater key is the better score and, between equal scores, the earlier
+/// row. The best `K` keys are kept by a maximum and a minimum a slot, the
+/// same work whatever a row scores. A key is a whole number
+/// under 2^52 and exact as an `f64`: a processor takes the greater of two
+/// such numbers by one instruction, and of two integers by a conditional
+/// move, which a compiler turns back into a branch inside a loop.
+#[inline(always)]
+fn top_keyed<const K: usize>(scores: &[f32], top: &mut [(usize, f32); K]) -> usize {
+    let places = (1u64 << PLACE_BITS) - 1;
+    let mut keys = [0.0f64; K];
+    for (i, &score) in scores.iter().enumerate() {
+        // A negative zero reads as zero. The sign bit is turned, and under
+        // a set sign every other bit, so the bits order as the scores do.
+        let bits = (score + 0.0).to_bits();
+        let order = bits ^ (((bits as i32 >> 31) as u32) | 0x8000_0000);
+        let mut key = ((u64::from(order) << PLACE_BITS | (places - i as u64)) as i64) as f64;
+        for slot in &mut keys {
+            let held = *slot;
+            *slot = held.max(key);
+            key = held.min(key);
+        }
+    }
+    let len = scores.len().min(K);
+    for (slot, &key) in top.iter_mut().zip(&keys).take(len) {
+        let i = (places - (key as u64 & places)) as usize;
+        *slot = (i, scores[i]);
+    }
+    len
 }
 
 fn shed(reason: ShedReason, emptied_by: &'static str, trace: Trace) -> Decision {
@@ -860,6 +1626,30 @@ struct Set<'a> {
     /// The `epd` plan's filters apply: the pool is the encode pool and the
     /// rows' compatibility and vision bits are read.
     encode: bool,
+    /// What the binding says of a pool the overload veto empties
+    /// ([`AllVetoed`]): the filter half puts such a pool to the rule by this
+    /// word ([`vetoed::emptied`]).
+    vetoed: AllVetoed,
+}
+
+impl<'a> Set<'a> {
+    /// One side of a pair: `candidates` narrowed by the classes a chosen
+    /// prefill pairs with or by the partnered list. A side sheds a pool the
+    /// overload veto empties: the pair plan does not enter the all-vetoed
+    /// rule.
+    const fn side(
+        candidates: &'a [Candidate],
+        class: Option<&'a [u32]>,
+        partnered: Option<&'a [u32]>,
+    ) -> Self {
+        Self {
+            candidates,
+            class,
+            partnered,
+            encode: false,
+            vetoed: AllVetoed::Shed,
+        }
+    }
 }
 
 /// The `epd` plan's vision rule: a request carrying images takes an encoder
@@ -922,8 +1712,10 @@ fn run_profile(
 /// The single plan's whole pass for a plain request (an `epd` plan's encode
 /// item among them, its rules in `set`): the filter half of the profile's
 /// run, then the scoring half; a pool the filters emptied ends in the
-/// plan's one home for it ([`single_emptied`]). Inlined, as the profile's
-/// run was in the decision before a draw could stand in front of it.
+/// plan's one home for it ([`single_emptied`]). The filter half has put
+/// such a pool to the binding's all-vetoed rule by then, so the pass holds
+/// nothing for the rule. Inlined, as the profile's run was in the decision
+/// before a draw could stand in front of it.
 #[inline(always)]
 fn run_single(
     profile: &Profile,
@@ -936,7 +1728,7 @@ fn run_single(
 ) -> Decision {
     let candidates = set.candidates;
     if let Some(emptied_by) = filter(profile, facts, cx, buf, set) {
-        return single_emptied(index, facts, pool, candidates, emptied_by);
+        return single_emptied(index, facts, pool, candidates, emptied_by, buf);
     }
     score_survivors(profile, index, facts, pool, candidates, buf)
 }
@@ -949,15 +1741,80 @@ fn draws_first(profile: &Profile) -> bool {
         && profile.scorers.iter().all(|w| w.scorer.row_wise())
 }
 
+/// The rows a host named join the rows a picker drew
+/// ([`Picker::joined_by_named`]): each named row every filter keeps is
+/// pushed behind the draw, none twice, the holders before the warming rows.
+/// Returns the mean in flight of the rows drawn, which the spill gate reads
+/// in place of the mean of the rows handed. A named row past the pool names
+/// no candidate and is passed over.
+fn join_named(
+    named: &NamedAffinity<'_>,
+    candidates: &[Candidate],
+    keep: &mut dyn FnMut(&Candidate) -> bool,
+    kept: &mut Vec<u32>,
+) -> f32 {
+    let mean = mean_in_flight(candidates, kept);
+    let holders = named.holders.iter().map(|holder| holder.row);
+    for row in holders.chain(named.warming.iter().copied()) {
+        if !kept.contains(&row) && candidates.get(row as usize).is_some_and(&mut *keep) {
+            kept.push(row);
+        }
+    }
+    mean
+}
+
+/// The picker's order of a draw the rows a host named join
+/// ([`Picker::joined_by_named`]): the named rows join the rows drawn
+/// ([`join_named`]) and the stages are handed the drawn rows' mean in
+/// flight. Out of line: a draw nothing joins keeps the code it had.
+#[inline(never)]
+fn order_joined(
+    profile: &Profile,
+    after: &RequestFacts<'_>,
+    named: NamedAffinity<'_>,
+    candidates: &[Candidate],
+    keep: &mut dyn FnMut(&Candidate) -> bool,
+    buf: &mut Buffers,
+    out: &mut Targets,
+) {
+    let mean = join_named(&named, candidates, keep, &mut buf.kept);
+    let joined = RequestFacts {
+        named: Some(NamedAffinity {
+            mean_in_flight: Some(mean),
+            ..named
+        }),
+        ..*after
+    };
+    let band = combine(
+        profile,
+        &joined,
+        candidates,
+        &buf.kept,
+        &mut buf.scores,
+        &mut buf.stage,
+    );
+    profile
+        .picker
+        .order_drawn(&joined, candidates, &buf.kept, &buf.scores, band, out);
+}
+
 /// A single-plan decision by a picker that draws first
 /// ([`Picker::draw_first`]), in front of the plan's opening. The picker
 /// draws rows and every filter of the profile is asked about each through
 /// the filter's own `keep`, hard and soft alike. A row every filter keeps is
 /// a row the whole pass keeps, so every target handed out is one the pass
 /// could have handed out; the scorers are handed the rows drawn and the
-/// picker orders them. A draw that keeps nobody says nothing of the pool:
-/// the decision widens to the whole pass ([`run_single`]), which alone sheds
-/// and names a stage.
+/// picker orders them. Where the picker takes them
+/// ([`Picker::joined_by_named`]), the rows a host named join the rows drawn
+/// before the scorers run ([`order_joined`]). A draw that keeps nobody says
+/// nothing of the pool: the decision widens to the whole pass
+/// ([`run_single`]), which alone sheds, names a stage and asks the
+/// all-vetoed rule.
+///
+/// Where the build folded the profile's filters into one test of a row
+/// (`row_tests`), a row is asked about in that one test, and about the host's
+/// mask only where a veto stands. A profile with a filter of a host's is
+/// asked a call a filter.
 ///
 /// Whatever follows the draw reads the seed's stream past the values the
 /// draw read. The stream is continued, never restarted: a pass behind
@@ -969,7 +1826,7 @@ fn draws_first(profile: &Profile) -> bool {
 /// path as it was.
 #[inline(never)]
 fn run_drawn(
-    profile: &Profile,
+    engine: &Engine,
     index: u16,
     facts: &RequestFacts<'_>,
     pool: &PoolFacts<'_>,
@@ -977,17 +1834,34 @@ fn run_drawn(
     cx: &Constraints<'_>,
     buf: &mut Buffers,
 ) -> Decision {
+    // The profile and its fold are read here, by the index: the call takes
+    // the engine where a whole pass takes the profile, and no argument more.
+    let at = usize::from(index);
+    let (profile, rows) = (&engine.profiles[at], engine.row_tests[at]);
     let candidates = set.candidates;
     buf.reserve(candidates.len());
     buf.kept.clear();
     let mut draw = Draw::new(facts.seed);
-    let drew = profile.picker.draw_first(
-        facts,
-        pool,
-        candidates,
-        &mut |c| profile.filters.iter().all(|f| f.keep(facts, c, cx)),
-        &mut buf.kept,
-        &mut draw,
+    let mut draw_by = |ask: &mut dyn FnMut(&Candidate) -> bool| {
+        profile
+            .picker
+            .draw_first(facts, pool, candidates, ask, &mut buf.kept, &mut draw)
+    };
+    let drew = match rows {
+        Some(tests) if tests.masked(cx) => {
+            draw_by(&mut |c| tests.keeps(facts, c, cx) && !cx.masks(c.position))
+        }
+        Some(tests) => draw_by(&mut |c| tests.keeps(facts, c, cx)),
+        None => draw_by(&mut |c| profile.filters.iter().all(|f| f.keep(facts, c, cx))),
+    };
+    // The host caps both lists at the picker's sample: past it a decision
+    // reads dearer, never wrong, so a debug build alone asserts it.
+    debug_assert!(
+        facts.named.is_none_or(|named| {
+            let cap = profile.picker.needs().sample as usize;
+            cap == 0 || named.holders.len().max(named.warming.len()) <= cap
+        }),
+        "each list of rows named stands at or under the sample of the picker that draws"
     );
     // A picker that read no value of the stream left the seed as it was.
     let resumed;
@@ -1001,28 +1875,46 @@ fn run_drawn(
         &resumed
     };
     if drew {
-        let band = combine(
-            profile,
-            after,
-            candidates,
-            &buf.kept,
-            &mut buf.scores,
-            &mut buf.stage,
-        );
         let mut targets = Targets::new();
-        profile.picker.order_drawn(
-            after,
-            candidates,
-            &buf.kept,
-            &buf.scores,
-            band,
-            &mut targets,
-        );
+        match after.named {
+            // The rows the host named join the rows drawn where the picker
+            // takes them: out of line, so a draw nothing joins keeps the
+            // code it had.
+            Some(named) if profile.picker.joined_by_named() => {
+                // The rows named are few: each is asked a call a filter,
+                // which answers as the folded test does.
+                let mut keep = |c: &Candidate| profile.filters.iter().all(|f| f.keep(facts, c, cx));
+                order_joined(
+                    profile,
+                    after,
+                    named,
+                    candidates,
+                    &mut keep,
+                    buf,
+                    &mut targets,
+                );
+            }
+            _ => {
+                let band = combine(
+                    profile,
+                    after,
+                    candidates,
+                    &buf.kept,
+                    &mut buf.scores,
+                    &mut buf.stage,
+                );
+                profile.picker.order_drawn(
+                    after,
+                    candidates,
+                    &buf.kept,
+                    &buf.scores,
+                    band,
+                    &mut targets,
+                );
+            }
+        }
         if !targets.is_empty() {
-            let trace = Trace {
-                survivors: Survivors::NOT_COUNTED,
-                ..trace_of(index, facts, pool, candidates, &buf.kept, &buf.scores)
-            };
+            let trace = trace_drawn(index, facts, pool, candidates, &buf.kept, &buf.scores);
             return Decision::Pick(Pick {
                 targets,
                 trace,
@@ -1037,6 +1929,27 @@ fn run_drawn(
         Decision::Queue(queue) => queue.trace.seed = facts.seed,
     }
     decision
+}
+
+/// The whole pass of an encode item of the `epd` plan: the plan's rules
+/// filter the encode pool before the profile's ([`filter`]). Out of line,
+/// so the decision's entry builds one set for every other request and the
+/// flag is this call's alone.
+#[inline(never)]
+fn run_encode(
+    profile: &Profile,
+    index: u16,
+    facts: &RequestFacts<'_>,
+    pool: &PoolFacts<'_>,
+    set: Set<'_>,
+    cx: &Constraints<'_>,
+    buf: &mut Buffers,
+) -> Decision {
+    let set = Set {
+        encode: true,
+        ..set
+    };
+    run_single(profile, index, facts, pool, set, cx, buf)
 }
 
 /// The plan: the sequence of profiles a request runs.
@@ -1078,8 +1991,9 @@ fn profile_index(binding: &Binding, phase: Phase) -> Option<u16> {
     }
 }
 
-/// The overload thresholds a binding hands the pools it matches: its block's
-/// two values, each else the spec's default, resolved once by validation.
+/// The overload thresholds a binding hands the pools decided under it
+/// ([`Engine::pool_binding`]): its block's two values, each else the spec's
+/// default, resolved once by validation.
 /// The host judges an engine's load reports against them and latches the
 /// verdict on the engine's rows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1107,9 +2021,9 @@ pub struct Binding {
     /// Sticky sessions: a keyed request of the `single` plan stays on the
     /// worker its key was placed on (design 4.6).
     pub sessions: Option<SessionRule>,
-    /// The overload thresholds of the pools the binding matches; `None`
-    /// when its block is switched off, and for a binding built by hand
-    /// that names none.
+    /// The overload thresholds of the pools decided under the binding
+    /// ([`Engine::pool_binding`]); `None` when its block is switched off,
+    /// and for a binding built by hand that names none.
     pub overload: Option<OverloadThresholds>,
 }
 
@@ -1144,6 +2058,127 @@ pub struct Engine {
     /// Per profile, what its stages ask of a decision beyond the profile's
     /// own run ([`Marks`]).
     marks: Vec<Marks>,
+    /// Per profile, its filters as one test of a row, where the engine
+    /// holds every one itself ([`RowTests::of`]). A decision that draws
+    /// first asks it about a row in place of a call a filter, and no other
+    /// decision reads it.
+    row_tests: Vec<Option<RowTests>>,
+    /// Per profile, which of its leading stages are ranks ([`Order`]). A
+    /// decision reads it where the profile's mark says so, and no other
+    /// decision does.
+    orders: Vec<Order>,
+}
+
+/// Which of a profile's leading stages are ranks, read once when the engine
+/// is built: a stage that writes levels ([`Spread::Levels`]) and whose
+/// weight outweighs every stage behind it, or a stage that orders nothing
+/// ([`Spread::Alike`]). A rank leaves two rows tied, or apart by more than
+/// every later stage can add, so the stages behind it are asked of the rows
+/// it left tied ([`combine_ranked`]).
+///
+/// A rank is a stage here. An engine's data-parallel rank is a candidate
+/// row ([`Candidate::dp_rank`]), and no stage or plan of its own.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Order {
+    /// How many leading stages are ranks; none, and the profile's score is
+    /// the weighted sum of every stage over every row.
+    ranks: u8,
+    /// The ranks that order nothing, a bit a stage.
+    alike: u8,
+    /// The ranks that may put rows in front, a bit a stage: one that writes
+    /// levels where every stage behind it orders nothing or answers for a
+    /// front alone ([`Scorer::front_wise`]), so each may be asked of those
+    /// rows alone.
+    fronts: u8,
+    /// The widest tie band under which the rows a rank put in front stay
+    /// apart from the rows behind them: half the least a rank's step
+    /// outweighs the stages behind it by, as a share of the profile's
+    /// weights. A decision whose band is wider asks every row every stage.
+    room: f32,
+}
+
+impl Order {
+    /// The most leading stages read as ranks: each has a bit in `alike`.
+    const MOST: usize = 8;
+    /// The least share of the profile's weights a rank's step outweighs the
+    /// stages behind it by. Under it the rounding of two rows' sums could
+    /// meet, and the stage is read as no rank.
+    const LEAST: f32 = 1e-4;
+
+    fn of(profile: &Profile) -> Self {
+        let stages = &profile.scorers;
+        let mut order = Self::default();
+        let sound = stages
+            .iter()
+            .all(|stage| stage.weight > 0.0 && stage.weight.is_finite());
+        if !sound {
+            return order;
+        }
+        let total: f32 = stages.iter().map(|stage| stage.weight).sum();
+        let mut room = f32::INFINITY;
+        for (i, stage) in stages.iter().enumerate().take(Self::MOST) {
+            match stage.scorer.spread() {
+                Spread::Alike => order.alike |= 1 << i,
+                Spread::Levels(step) => {
+                    // The most the stages behind can add between two rows.
+                    let behind: f32 = stages[i + 1..]
+                        .iter()
+                        .filter(|later| later.scorer.spread() != Spread::Alike)
+                        .map(|later| later.weight)
+                        .sum();
+                    // By how much its step outweighs them, of the whole.
+                    let over = (stage.weight * step - behind) / total;
+                    if over.is_nan() || over < Self::LEAST {
+                        break;
+                    }
+                    room = room.min(over / 2.0);
+                    let alone = stages[i + 1..].iter().all(|later| {
+                        later.scorer.spread() == Spread::Alike || later.scorer.front_wise()
+                    });
+                    if alone {
+                        order.fronts |= 1 << i;
+                    }
+                }
+                Spread::Any => break,
+            }
+            order.ranks = i as u8 + 1;
+        }
+        // Two stages behind the ranks that each order the rows: asked of the
+        // rows in front alone, each would be weighed against the other anew,
+        // so no rank of the profile puts rows in front.
+        let plain = stages[usize::from(order.ranks)..]
+            .iter()
+            .filter(|later| later.scorer.spread() != Spread::Alike)
+            .count();
+        if plain > 1 {
+            order.fronts = 0;
+        }
+        // A profile whose ranks all order nothing puts no row in front.
+        order.room = if room.is_finite() { room } else { 0.0 };
+        order
+    }
+
+    /// Whether stage `i` is a rank.
+    const fn ranks(self, i: usize) -> bool {
+        i < self.ranks as usize
+    }
+
+    /// Whether a decision by rank has anything to leave unasked: a rank
+    /// that may put rows in front, or one that orders nothing.
+    const fn gains(self) -> bool {
+        self.fronts != 0 || self.alike != 0
+    }
+
+    /// Whether stage `i` is a rank that may put rows in front. A stage past
+    /// the ranks is none, whatever its index: the bits are the ranks' alone.
+    const fn fronts(self, i: usize) -> bool {
+        self.ranks(i) && self.fronts & (1 << i) != 0
+    }
+
+    /// Whether stage `i` is a rank that orders nothing.
+    const fn alike(self, i: usize) -> bool {
+        self.ranks(i) && self.alike & (1 << i) != 0
+    }
 }
 
 /// What a profile's stages ask of a decision beyond the profile's own run,
@@ -1162,8 +2197,21 @@ impl Marks {
     /// ([`draws_first`]): a pool of [`DRAW_FROM`] rows or more is decided by
     /// the rows drawn. It asks nothing before the profile's run.
     const DRAWS_FIRST: u8 = 1 << 2;
+    /// The rows a host named join the rows the picker draws
+    /// ([`Picker::joined_by_named`]): such a profile draws for a request
+    /// that names rows in the column's place, and for no other. Set only
+    /// beside [`Self::DRAWS_FIRST`].
+    const JOINED: u8 = 1 << 3;
+    /// The profile's leading stages are ranks ([`Order`]) and nothing else
+    /// is asked before its run: a plain decision over a pool of
+    /// [`RANK_FROM`] rows or more, each said to hold a rate
+    /// ([`PoolFacts::rated`]), asks its stages by rank ([`run_ranked`]).
+    /// Under a picker that draws for a request that names rows
+    /// ([`Self::JOINED`]) that request is the draw's, and every other is
+    /// the ranks'.
+    const RANKED: u8 = 1 << 4;
 
-    fn of(profile: &Profile) -> Self {
+    fn of(profile: &Profile, order: Order) -> Self {
         let scoped = if profile.scoped() { Self::SCOPED } else { 0 };
         let by_assignment = if profile.picker.by_assignment() {
             Self::BY_ASSIGNMENT
@@ -1175,7 +2223,20 @@ impl Marks {
         } else {
             0
         };
-        Self(scoped | by_assignment | draws_first)
+        let joined = if draws_first != 0 && profile.picker.joined_by_named() {
+            Self::JOINED
+        } else {
+            0
+        };
+        // The picker says it itself: a name can be answered by a host's
+        // picker that reads every score.
+        let front = profile.picker.front_wise();
+        let ranked = if (scoped | by_assignment) == 0 && order.gains() && front {
+            Self::RANKED
+        } else {
+            0
+        };
+        Self(scoped | by_assignment | draws_first | joined | ranked)
     }
 
     /// Whether no stage asks anything before the profile's run: no scope
@@ -1184,12 +2245,21 @@ impl Marks {
         self.0 & (Self::SCOPED | Self::BY_ASSIGNMENT) == 0
     }
 
-    const fn draws_first(self) -> bool {
-        self.0 & Self::DRAWS_FIRST != 0
+    /// How the profile draws, its two marks in one masked read: zero where
+    /// it never draws first, [`Self::DRAWS_FIRST`] alone where it draws for
+    /// every request, both marks where it draws for a request that names
+    /// rows. A decision asks once, so a profile that never draws pays the
+    /// one compare it paid before the second mark.
+    const fn draw(self) -> u8 {
+        self.0 & (Self::DRAWS_FIRST | Self::JOINED)
     }
 
     const fn scoped(self) -> bool {
         self.0 & Self::SCOPED != 0
+    }
+
+    const fn ranked(self) -> bool {
+        self.0 & Self::RANKED != 0
     }
 
     const fn by_assignment(self) -> bool {
@@ -1219,6 +2289,11 @@ struct Entry {
     /// is built, so no decision asks and the binding keeps the rule as
     /// declared.
     placing: Assignment,
+    /// What a decision of the binding does when the overload veto leaves it
+    /// no worker ([`AllVetoed`]): the document's word, or the default. A
+    /// decision copies it into its set ([`Set`]), and the filter half reads
+    /// it where a hard filter left nobody and nowhere else.
+    vetoed: AllVetoed,
 }
 
 /// Every phase, in the order [`Engine::phase_needs`] keeps them.
@@ -1472,6 +2547,7 @@ impl<'a> PairTable<'a> {
             classes.dedup();
             return;
         }
+        // A number above the table's width is no class of the table.
         marks.reset(self.width());
         let mut any = false;
         for class in open {
@@ -1567,6 +2643,8 @@ impl<'a> PairPools<'a> {
                 seed,
                 affinity,
                 named: None,
+                // A pin is a position in one pool: neither side takes it.
+                pinned_at: 0,
                 ..*facts
             };
             (pool, facts)
@@ -1577,6 +2655,10 @@ impl<'a> PairPools<'a> {
 /// The stage a decision names when it is refused for its affinity column:
 /// what a host counts its sheds under.
 const AFFINITY_COLUMN: &str = "affinity-column";
+
+/// The stage a decision names when a profile that shows its rows to a
+/// plugin was handed rows that carry a mask or a pin beside them.
+const WRITTEN_ROWS: &str = "written-rows";
 
 /// Whether an affinity column stands for `pool`: empty, or one entry a
 /// candidate, in the candidates' order. Asked once where a decision takes
@@ -1594,23 +2676,26 @@ fn column_fits(column: &[AffinityFacts], pool: &[Candidate]) -> bool {
 }
 
 /// A debug build asserts that the rows a host named in the column's place
-/// ([`NamedAffinity`](crate::NamedAffinity)) stand for `pool`, once where a
+/// ([`NamedAffinity`]) stand for `pool`, once where a
 /// decision takes its inputs: both lists ascending and under the pool's
-/// size, beside an empty column. A list out of order hides a holder from
-/// the stages' search, and a column beside the rows is read in their
-/// place. A release build does not check what the host derived: the test
-/// would ride every decision, a keyed one among them.
+/// size, beside an empty column, and no mean in flight, which is the
+/// engine's to set behind a draw. A list out of order hides a holder from
+/// the stages' search, a column beside the rows is read in their place,
+/// and a mean the host wrote is read for the mean of the rows wherever
+/// the pool is read whole. A release build does not check what the host
+/// derived: the test would ride every decision, a keyed one among them.
 fn debug_assert_named(facts: &RequestFacts<'_>, pool: &[Candidate]) {
     let under = |row: u32| (row as usize) < pool.len();
     debug_assert!(
         facts.named.is_none_or(|named| {
             facts.affinity.is_empty()
+                && named.mean_in_flight.is_none()
                 && named.holders.is_sorted_by(|a, b| a.row < b.row)
                 && named.holders.last().is_none_or(|holder| under(holder.row))
                 && named.warming.is_sorted_by(|a, b| a < b)
                 && named.warming.last().is_none_or(|&row| under(row))
         }),
-        "rows named in the column's place stand ascending and under the pool's size, beside an empty column"
+        "rows named in the column's place stand ascending and under the pool's size, beside an empty column and no mean in flight"
     );
 }
 
@@ -1687,7 +2772,16 @@ impl Engine {
             }
         }
         let sessions = SessionTable::new(shortest_sweep(&bindings));
-        let marks: Vec<Marks> = profiles.iter().map(Marks::of).collect();
+        let orders: Vec<Order> = profiles.iter().map(Order::of).collect();
+        let marks: Vec<Marks> = profiles
+            .iter()
+            .zip(&orders)
+            .map(|(profile, &order)| Marks::of(profile, order))
+            .collect();
+        let row_tests = profiles
+            .iter()
+            .map(|profile| RowTests::of(&profile.filters))
+            .collect();
         // A picker that leaves the placement to its rule has no stages to
         // delegate to: the assignment that places is written beside each
         // binding here, once, so no decision asks. The binding itself keeps
@@ -1704,6 +2798,7 @@ impl Engine {
                     .map_or(Assignment::Delegate, |rule| rule.assignment);
                 Entry {
                     placing: placed_by(declared, by_assignment),
+                    vetoed: AllVetoed::default(),
                     binding,
                 }
             })
@@ -1717,6 +2812,8 @@ impl Engine {
             sessions,
             assignment: AssignmentStages::default(),
             marks,
+            row_tests,
+            orders,
         }
     }
 
@@ -1727,6 +2824,28 @@ impl Engine {
     /// The session table: the pins of every key a sessions rule placed.
     pub fn sessions(&self) -> &SessionTable {
         &self.sessions
+    }
+
+    /// What ends the pins a host keeps of this generation's sessions rules:
+    /// the longest TTL among the rules and the shortest interval one of
+    /// them sweeps at, both in microseconds. `None` where no rule pins a
+    /// key, and where a rule keeps its keys with no TTL: no instant ends
+    /// such a pin.
+    pub fn pins_horizon(&self) -> Option<(u64, u64)> {
+        let rules = || {
+            self.bindings
+                .iter()
+                .filter_map(|entry| entry.binding.sessions.as_ref())
+        };
+        let mut ttl = 0;
+        for rule in rules() {
+            ttl = ttl.max(rule.ttl_micros?);
+        }
+        let every = rules()
+            .map(|rule| rule.sweep_micros)
+            .filter(|every| *every > 0)
+            .min()?;
+        Some((ttl, every))
     }
 
     /// What the host must feed before any request exists: every profile's
@@ -1742,25 +2861,77 @@ impl Engine {
     /// decode answer carries that profile's needs too. The host reads it per
     /// worker, at registration, to choose the worker's stream.
     pub fn needs_for(&self, model: &str, phase: Phase) -> Needs {
-        let own = self
+        self.reads_for(model, phase).0
+    }
+
+    /// [`Self::needs_for`], and whether the profile that decision resolves
+    /// to shows its rows to a plugin ([`Profile::scoped`]), by one lookup.
+    /// A host hands such a decision rows written for it: a plugin's view
+    /// carries each row's bits and ages as the row's own fields, and
+    /// [`Self::decide`] declines such a profile over rows that carry a mask
+    /// or a pin beside them ([`Constraints::stalled`],
+    /// [`RequestFacts::pinned_at`]).
+    pub fn reads_for(&self, model: &str, phase: Phase) -> (Needs, bool) {
+        let (own, shown) = self
             .resolve(model, phase)
-            .map(|(entry, _, profile)| profile.needs().or(session_needs(&entry.binding)))
+            .map(|(entry, index, profile)| {
+                (
+                    profile.needs().or(session_needs(&entry.binding)),
+                    self.marks[usize::from(index)].scoped(),
+                )
+            })
             .unwrap_or_default();
         match phase {
-            Phase::Decode => own.or(self.pair_decode_needs(model)),
-            _ => own,
+            Phase::Decode => (own.or(self.pair_decode_needs(model)), shown),
+            _ => (own, shown),
         }
     }
 
-    /// The needs of the decode profile of the pair binding `model`'s prefill
-    /// lookup resolves to, nothing when that binding is not a pair.
+    /// The sample of the profile that decides a request of `phase` for
+    /// `model` ([`Needs::sample`]), `0` where that profile never draws and
+    /// where no binding matches. A host that names a decision's rows takes
+    /// its cap from [`Self::named_for`], not from here: a profile that
+    /// keeps its column has a sample too. [`Self::needs_for`] answers for a
+    /// worker's stream, where the larger of two needs is the safe one: for a
+    /// decode decision of a model that also pairs it carries the pair's
+    /// decode side, whose sample may be the larger. A cap's safe side is
+    /// the smaller.
+    pub fn sample_for(&self, model: &str, phase: Phase) -> u32 {
+        self.resolve(model, phase)
+            .map_or(0, |(_, _, profile)| profile.needs().sample)
+    }
+
+    /// The needs of the decode profile of `model`'s pair binding
+    /// ([`Self::pair_binding`]), nothing where the model has none.
     fn pair_decode_needs(&self, model: &str) -> Needs {
-        self.binding(model, Phase::Prefill)
-            .filter(|b| matches!(b.plan, Plan::PdPair | Plan::Epd { .. }))
+        self.pair_binding(model)
             .and_then(|b| profile_index(b, Phase::Decode))
             .and_then(|i| self.profiles.get(usize::from(i)))
             .map(Profile::needs)
             .unwrap_or_default()
+    }
+
+    /// The pair binding of `model`: the binding its prefill lookup resolves
+    /// to, where that binding's plan pairs (`pd-pair` or `epd`). Both sides
+    /// of a pair decision run under it ([`Self::decide_pair`]), whatever
+    /// binding covers the decode phase first.
+    fn pair_binding(&self, model: &str) -> Option<&Binding> {
+        self.binding(model, Phase::Prefill)
+            .filter(|b| matches!(b.plan, Plan::PdPair | Plan::Epd { .. }))
+    }
+
+    /// The binding a `phase` pool of `model` is decided under, whose
+    /// overload block judges the pool. Every decision resolves by its own
+    /// phase but a pair's decode side, which runs under the pair binding:
+    /// a decode pool is that binding's wherever the model has one. A
+    /// decode-phase binding ahead of it still decides a decode request
+    /// asked alone, and its block is not read for the pool.
+    pub fn pool_binding(&self, model: &str, phase: Phase) -> Option<&Binding> {
+        let pair = match phase {
+            Phase::Decode => self.pair_binding(model),
+            Phase::Single | Phase::Prefill | Phase::Encode => None,
+        };
+        pair.or_else(|| self.binding(model, phase))
     }
 
     /// What some decision of `phase` may read, over every binding that
@@ -1768,6 +2939,55 @@ impl Engine {
     /// read the request text" and its kin, read at apply.
     pub fn needs_for_phase(&self, phase: Phase) -> Needs {
         self.phase_needs[slot(phase)]
+    }
+
+    /// What a host must feed, as rows: one for each model glob the bindings
+    /// write and each phase with something to feed, in the bindings' order
+    /// (design 5.1's needs summary). A row is an obligation and not the
+    /// lookup: a host that feeds, for a model and a phase, every row whose
+    /// glob matches the model feeds what any decision of that model and
+    /// phase reads ([`Self::needs_for`]), and copies neither the bindings'
+    /// order nor the pair's rule. The union feeds over where an earlier
+    /// binding with fewer needs shadows a later one.
+    ///
+    /// A binding's row is its profile's stages and its sessions rule, for
+    /// each phase it covers. A pair's decode profile is a decode row of the
+    /// pair binding's glob, whichever binding a decode lookup resolves to.
+    /// Two bindings of one glob write one row a phase.
+    pub fn needs_rows(&self) -> Vec<(&str, Phase, Needs)> {
+        let mut rows: Vec<(&str, Phase, Needs)> = Vec::new();
+        let mut held: HashMap<(&str, Phase), usize> = HashMap::new();
+        for entry in &self.bindings {
+            let binding = &entry.binding;
+            let covers = |phase| binding.phases.is_empty() || binding.phases.contains(&phase);
+            let profile = |phase| {
+                profile_index(binding, phase)
+                    .and_then(|index| self.profiles.get(usize::from(index)))
+            };
+            let pairs = matches!(binding.plan, Plan::PdPair | Plan::Epd { .. });
+            for phase in PHASES {
+                let mut needs = Needs::default();
+                if let Some(profile) = profile(phase).filter(|_| covers(phase)) {
+                    needs = profile.needs().or(session_needs(binding));
+                }
+                // The decode side of every pair this binding's prefill
+                // lookup starts.
+                if phase == Phase::Decode && pairs && covers(Phase::Prefill) {
+                    needs = needs.or(profile(phase).map(Profile::needs).unwrap_or_default());
+                }
+                if needs == Needs::default() {
+                    continue;
+                }
+                let key = (binding.model.as_str(), phase);
+                if let Some(&row) = held.get(&key) {
+                    rows[row].2 = rows[row].2.or(needs);
+                } else {
+                    held.insert(key, rows.len());
+                    rows.push((key.0, phase, needs));
+                }
+            }
+        }
+        rows
     }
 
     pub fn profiles(&self) -> &[Profile] {
@@ -1782,7 +3002,10 @@ impl Engine {
     }
 
     /// The first binding that matches, beside what the build derived from
-    /// it: the engine's own lookup.
+    /// it: the engine's own lookup. Always inlined: it is the head of every
+    /// decision, and its second caller (the all-vetoed rule resolves the
+    /// binding again where a pass left nobody) must not move it out of line.
+    #[inline(always)]
     fn entry(&self, model: &str, phase: Phase) -> Option<&Entry> {
         self.bindings
             .iter()
@@ -1796,9 +3019,51 @@ impl Engine {
             .map(|(_, index, profile)| (index, profile))
     }
 
+    /// The warm-up ruling a decision of `phase` for `model` applies: the one
+    /// its profile's warm-up stages rule by, `None` where that profile holds
+    /// no such stage, where two of them rule by different numbers, or no
+    /// binding matches. A host that names a pool's warming rows enters it
+    /// ([`WarmRule::name`]): it names a pool by one ruling, and a profile
+    /// that applies two is named no rows ([`Self::named_for`]). A binding
+    /// is found by model and phase alone, so a pool is decided by one
+    /// profile and has one ruling.
+    pub fn warm_rule_for(&self, model: &str, phase: Phase) -> Option<WarmRule> {
+        let (_, _, profile) = self.resolve(model, phase)?;
+        let mut rules = profile.warm_rules();
+        let first = rules.next()?;
+        rules.all(|rule| rule == first).then_some(first)
+    }
+
+    /// The cap of each list of rows a host names in the affinity column's
+    /// place for a decision of `phase` for `model`: the sample of the
+    /// profile that decision resolves to ([`Self::sample_for`]) where that
+    /// profile's own stages read the column and its warm-up stages rule by
+    /// one ruling. `0` otherwise, and where no binding matches: such a
+    /// decision is handed the column where its needs declare it. The
+    /// profile answers for itself here: [`Self::needs_for`] is merged over
+    /// a pair's two phases and a binding's sessions rule, and says where to
+    /// ask.
+    pub fn named_for(&self, model: &str, phase: Phase) -> u32 {
+        let Some((_, _, profile)) = self.resolve(model, phase) else {
+            return 0;
+        };
+        let needs = profile.needs();
+        let mut rules = profile.warm_rules();
+        let first = rules.next();
+        let one = first.is_none_or(|first| rules.all(|rule| rule == first));
+        if needs.affinity && one {
+            needs.sample
+        } else {
+            0
+        }
+    }
+
     /// The binding a request resolves to, with its profile for the phase: one
-    /// walk of the bindings per decision; `None` when no binding matches or
-    /// the binding's plan has no side for the phase.
+    /// walk of the bindings per decision, and a second where a pass left
+    /// nobody; `None` when no binding matches or the binding's plan has no
+    /// side for the phase. Always inlined, as [`Self::entry`] is and for its
+    /// reason.
+    #[inline(always)]
     fn resolve(&self, model: &str, phase: Phase) -> Option<(&Entry, u16, &Profile)> {
         let entry = self.entry(model, phase)?;
         let index = profile_index(&entry.binding, phase)?;
@@ -1814,12 +3079,19 @@ impl Engine {
     /// to that rule is placed by its assignment. Every other request of a
     /// profile whose picker draws first ([`Picker::draw_first`]) is decided
     /// by the rows it draws where the pool is large enough, and by the whole
-    /// pass under that size or when the draw keeps nobody. The request's affinity
+    /// pass under that size or when the draw keeps nobody. A picker the rows
+    /// named join ([`Picker::joined_by_named`]) draws for a request that
+    /// names rows and for no other. A pass the overload veto leaves nobody is
+    /// put to the binding's all-vetoed rule: the request goes to the
+    /// least-vetoed worker, or is shed where the binding says so. A pool the
+    /// other hard filters empty keeps its shed. The request's affinity
     /// column is empty or holds one entry a candidate; any other is
     /// refused, as a decline under the stage name `affinity-column`. Rows
-    /// named in the column's place
-    /// ([`NamedAffinity`](crate::NamedAffinity)) are read as the host
+    /// named in the column's place ([`NamedAffinity`]) are read as the host
     /// derived them: a debug build asserts that they stand for the pool.
+    /// A profile that shows its rows to a plugin is declined over rows that
+    /// carry a mask or a pin beside them, under the stage name
+    /// `written-rows` ([`Self::reads_for`]).
     pub fn decide(
         &self,
         facts: &RequestFacts<'_>,
@@ -1841,11 +3113,31 @@ impl Engine {
         let Some((entry, index, profile)) = self.resolve(facts.model, facts.phase) else {
             return shed(ShedReason::PolicyDeclined, "binding", bare);
         };
-        let Entry { binding, placing } = entry;
+        let Entry {
+            binding,
+            placing,
+            vetoed,
+        } = entry;
+        // The single plan's rows, under the binding's word for a pool the
+        // overload veto empties: every path below filters this set.
+        let set = Set {
+            candidates,
+            class: None,
+            partnered: None,
+            encode: false,
+            vetoed: *vetoed,
+        };
         let marks = self.marks[usize::from(index)];
         let _opened = if marks.asks_nothing_first() {
             None
         } else {
+            // A plugin is shown each row as a record of the row's own
+            // fields: its host hands rows written for the decision
+            // ([`Self::reads_for`]). A mask or a pin beside the rows says
+            // they are not, and the decision is declined.
+            if marks.scoped() && (!cx.stalled.is_empty() || facts.pinned_at != 0) {
+                return shed(ShedReason::PolicyDeclined, WRITTEN_ROWS, bare);
+            }
             let opened = marks
                 .scoped()
                 .then(|| profile.open(facts, candidates, pool));
@@ -1855,33 +3147,42 @@ impl Engine {
             // or under none.
             let pinned_first = binding.sessions.is_some() && !facts.session_key.is_none();
             if marks.by_assignment() && binding.plan == Plan::Single && !pinned_first {
-                return self.assign(
-                    profile, index, *placing, facts, pool, candidates, cx, scratch,
-                );
+                return self.assign(profile, index, *placing, facts, pool, set, cx, scratch);
             }
             opened
         };
         if let Some(rule) = binding.sessions {
             if binding.plan == Plan::Single && !facts.session_key.is_none() {
                 return self.decide_session(
-                    profile, index, &rule, *placing, facts, pool, candidates, cx, scratch,
+                    profile, index, &rule, *placing, facts, pool, set, cx, scratch,
                 );
             }
         }
-        let encode = matches!(
-            (binding.plan, facts.phase),
-            (Plan::Epd { .. }, Phase::Encode)
-        );
-        let set = Set {
-            candidates,
-            class: None,
-            partnered: None,
-            encode,
-        };
         let buf = &mut scratch.single;
         // An encode item's rules are the whole pass's own: it never draws.
-        if marks.draws_first() && !encode && candidates.len() >= DRAW_FROM {
-            return run_drawn(profile, index, facts, pool, set, cx, buf);
+        if matches!(
+            (binding.plan, facts.phase),
+            (Plan::Epd { .. }, Phase::Encode)
+        ) {
+            return run_encode(profile, index, facts, pool, set, cx, buf);
+        }
+        // A picker the rows named join draws for a request that names rows.
+        let draw = marks.draw();
+        if draw != 0
+            && candidates.len() >= DRAW_FROM
+            && (draw == Marks::DRAWS_FIRST || facts.named.is_some())
+        {
+            return run_drawn(self, index, facts, pool, set, cx, buf);
+        }
+        // A profile whose leading stages are ranks is asked by rank where
+        // the draw left the decision, over a pool of `RANK_FROM` rows or
+        // more whose host says that every row holds a rate
+        // ([`PoolFacts::rated`]). The load stage reads every row to cost a
+        // row without a rate, so over a pool that holds one it would say of
+        // the rows in front that it must be asked whole, after the ranks
+        // were read: a pool not said to hold none is asked whole at once.
+        if marks.ranked() && candidates.len() >= RANK_FROM && pool.rated {
+            return run_ranked(self, index, facts, pool, set, cx, buf);
         }
         run_single(profile, index, facts, pool, set, cx, buf)
     }
@@ -1908,13 +3209,14 @@ impl Engine {
         placing: Assignment,
         facts: &RequestFacts<'_>,
         pool: &PoolFacts<'_>,
-        candidates: &[Candidate],
+        set: Set<'_>,
         cx: &Constraints<'_>,
         scratch: &mut Scratch,
     ) -> Decision {
+        let candidates = set.candidates;
         let buf = &mut scratch.single;
-        if let Some(shed) = single_survivors(profile, index, facts, pool, candidates, cx, buf) {
-            return shed;
+        if let Some(answer) = single_survivors(profile, index, facts, pool, set, cx, buf) {
+            return answer;
         }
         let key = facts.session();
         let pins = self.sessions.lookup(key, facts.now_micros, rule);
@@ -2019,13 +3321,14 @@ impl Engine {
         assignment: Assignment,
         facts: &RequestFacts<'_>,
         pool: &PoolFacts<'_>,
-        candidates: &[Candidate],
+        set: Set<'_>,
         cx: &Constraints<'_>,
         scratch: &mut Scratch,
     ) -> Decision {
+        let candidates = set.candidates;
         let buf = &mut scratch.single;
-        if let Some(shed) = single_survivors(profile, index, facts, pool, candidates, cx, buf) {
-            return shed;
+        if let Some(answer) = single_survivors(profile, index, facts, pool, set, cx, buf) {
+            return answer;
         }
         self.place(profile, index, assignment, facts, pool, candidates, buf)
     }
@@ -2145,10 +3448,7 @@ impl Engine {
         // One binding for both sides: the prefill's lookup, whose decode
         // profile is the pair's decode side. A binding of the single plan
         // declines a pair decision: the host and the spec disagree.
-        let Some(binding) = self
-            .binding(facts.model, Phase::Prefill)
-            .filter(|b| matches!(b.plan, Plan::PdPair | Plan::Epd { .. }))
-        else {
+        let Some(binding) = self.pair_binding(facts.model) else {
             return shed(ShedReason::PolicyDeclined, "binding", bare);
         };
         let decode_index = binding.decode_profile.unwrap_or(binding.profile);
@@ -2198,12 +3498,7 @@ impl Engine {
             binding.profile,
             &prefill_facts,
             pool,
-            Set {
-                candidates: prefills,
-                class: None,
-                partnered: Some(&scratch.classes),
-                encode: false,
-            },
+            Set::side(prefills, None, Some(&scratch.classes)),
             cx,
             &mut scratch.single,
         );
@@ -2240,12 +3535,7 @@ impl Engine {
                             &prefill_facts,
                             cx,
                             &mut scratch.single,
-                            Set {
-                                candidates: prefills,
-                                class: None,
-                                partnered: None,
-                                encode: false,
-                            },
+                            Set::side(prefills, None, None),
                         )
                         .unwrap_or("none");
                         return shed(reason_of(stage), stage, prefill_shed.trace);
@@ -2263,12 +3553,7 @@ impl Engine {
                         &decode_facts,
                         decode_cx,
                         &mut scratch.decode,
-                        Set {
-                            candidates: decodes,
-                            class: None,
-                            partnered: Some(&scratch.classes),
-                            encode: false,
-                        },
+                        Set::side(decodes, None, Some(&scratch.classes)),
                     )
                     .filter(|&stage| stage != "none")
                     {
@@ -2297,12 +3582,7 @@ impl Engine {
                 decode_index,
                 &decode_facts,
                 pool,
-                Set {
-                    candidates: decodes,
-                    class: Some(pools.table.of(&class)),
-                    partnered: None,
-                    encode: false,
-                },
+                Set::side(decodes, Some(pools.table.of(&class)), None),
                 decode_cx,
                 &mut scratch.decode,
             );
@@ -2417,6 +3697,13 @@ impl Lifecycle for Engine {
             }
             profile.picker.on_signal(signal);
         }
+    }
+
+    fn needs_lifecycle(&self) -> bool {
+        self.profiles.iter().any(|profile| {
+            profile.picker.needs_lifecycle()
+                || profile.scorers.iter().any(|w| w.scorer.needs_lifecycle())
+        })
     }
 }
 
@@ -2699,6 +3986,72 @@ mod tests {
         }
     }
 
+    /// A pair's decode side runs under the model's pair binding, so the
+    /// pool's lookup names that binding for a decode pool whatever covers
+    /// the decode phase first. Every other pool is its own phase's: an
+    /// encode item resolves by the encode phase under `epd` too.
+    #[test]
+    fn a_decode_pool_is_decided_under_its_models_pair_binding() {
+        let phase_first = |phase: Phase| Binding {
+            phases: vec![phase],
+            ..single_binding()
+        };
+        let pair = |plan: Plan| Binding {
+            model: "m".into(),
+            plan,
+            ..pair_binding()
+        };
+        let engine = |bindings: Vec<Binding>| {
+            Engine::new(
+                vec![least_requests_profile()],
+                bindings,
+                1,
+                Needs::default(),
+            )
+        };
+        let plan_of = |engine: &Engine, model: &str, phase: Phase| {
+            engine.pool_binding(model, phase).map(|b| b.plan)
+        };
+
+        let pd = engine(vec![phase_first(Phase::Decode), pair(Plan::PdPair)]);
+        // A decode request asked alone still resolves to the phase's first
+        // binding. The pool follows the pair, which is what decides over it.
+        assert_eq!(
+            pd.binding("m", Phase::Decode).map(|b| b.plan),
+            Some(Plan::Single)
+        );
+        assert_eq!(plan_of(&pd, "m", Phase::Decode), Some(Plan::PdPair));
+        assert_eq!(plan_of(&pd, "m", Phase::Prefill), Some(Plan::PdPair));
+        // A model the pair binding does not match has the phase's own.
+        assert_eq!(plan_of(&pd, "n", Phase::Decode), Some(Plan::Single));
+        assert_eq!(plan_of(&pd, "n", Phase::Prefill), None);
+        // A binding of another plan that covers prefill ahead of the pair
+        // binding takes the model's prefill lookup: no pair decision runs
+        // for the model, and its decode pool is the decode phase's own.
+        let ahead = engine(vec![
+            phase_first(Phase::Prefill),
+            phase_first(Phase::Decode),
+            pair(Plan::PdPair),
+        ]);
+        let decode = ahead.pool_binding("m", Phase::Decode);
+        assert_eq!(
+            decode.map(|b| (b.plan, b.phases.clone())),
+            Some((Plan::Single, vec![Phase::Decode]))
+        );
+
+        let epd = Plan::Epd { encode: 0 };
+        let with_encoders = engine(vec![
+            phase_first(Phase::Decode),
+            phase_first(Phase::Encode),
+            pair(epd),
+        ]);
+        assert_eq!(plan_of(&with_encoders, "m", Phase::Decode), Some(epd));
+        assert_eq!(
+            plan_of(&with_encoders, "m", Phase::Encode),
+            Some(Plan::Single)
+        );
+    }
+
     /// One profile that keeps the healthy rows and leads with the deepest
     /// overlap, under `binding`.
     fn overlap_engine(binding: Binding) -> Engine {
@@ -2887,6 +4240,7 @@ mod tests {
                         holders: &holders,
                         warming,
                         thin: false,
+                        mean_in_flight: None,
                     }),
                     ..RequestFacts::default()
                 };
@@ -3023,7 +4377,7 @@ mod tests {
         let (prefills, decodes) = (paired(2), paired(2));
         let facts = RequestFacts {
             model: "m",
-            named: Some(crate::NamedAffinity::default()),
+            named: Some(NamedAffinity::default()),
             ..RequestFacts::default()
         };
         let decision = engine.decide_pair(
@@ -3053,10 +4407,12 @@ mod tests {
         }];
         let facts = RequestFacts {
             model: "m",
-            named: Some(crate::NamedAffinity {
+            named: Some(NamedAffinity {
                 holders: &holders,
-                ..crate::NamedAffinity::default()
+                ..NamedAffinity::default()
             }),
+            // A pin is a position in one pool: no side takes it either.
+            pinned_at: 2,
             ..RequestFacts::default()
         };
         let pools = PairPools {
@@ -3067,6 +4423,7 @@ mod tests {
         for (side, name) in [(PairSide::Prefill, "prefill"), (PairSide::Decode, "decode")] {
             let (_, read) = pools.side(side, &facts).expect("an empty column fits");
             assert!(read.named.is_none(), "the {name} side");
+            assert_eq!(read.pinned_at, 0, "the {name} side");
         }
     }
 
@@ -3126,6 +4483,104 @@ mod tests {
             &mut Scratch::new(),
         );
         assert_eq!(lead(&decision), Some(3));
+    }
+
+    /// A profile that shows its rows to a plugin says so by the engine's one
+    /// lookup, and its decision over rows that carry a mask or a pin beside
+    /// them is declined under a name of its own, in every build.
+    #[test]
+    fn a_profile_that_shows_its_rows_is_told_and_declines_rows_not_written_for_it() {
+        #[derive(Debug)]
+        struct Shown;
+
+        impl Lifecycle for Shown {}
+
+        impl DecisionScope for Shown {
+            fn open(&self, _: &RequestFacts<'_>, _: &[Candidate], _: &PoolFacts<'_>) {}
+
+            fn close(&self) {}
+        }
+
+        impl Filter for Shown {
+            fn name(&self) -> &'static str {
+                "shown"
+            }
+
+            fn keep(&self, _: &RequestFacts<'_>, _: &Candidate, _: &Constraints<'_>) -> bool {
+                true
+            }
+
+            fn scope(&self) -> Option<&dyn DecisionScope> {
+                Some(self)
+            }
+        }
+
+        let engine_of =
+            |profile| Engine::new(vec![profile], vec![single_binding()], 1, Needs::default());
+        let plain = engine_of(least_requests_profile());
+        let needs = plain.needs_for("m", Phase::Single);
+        assert_eq!(plain.reads_for("m", Phase::Single), (needs, false));
+        let engine = engine_of(Profile {
+            filters: vec![Box::new(Shown)],
+            ..least_requests_profile()
+        });
+        assert!(engine.reads_for("m", Phase::Single).1);
+        let pool = [candidate(0, 0), candidate(1, 0)];
+        let facts = RequestFacts {
+            model: "m",
+            ..RequestFacts::default()
+        };
+        let pinned = RequestFacts {
+            pinned_at: 1,
+            ..facts
+        };
+        let masked = Constraints {
+            stalled: &[0],
+            ..Constraints::default()
+        };
+        let written = Constraints::default();
+        let decide = |facts: &RequestFacts<'_>, cx: &Constraints<'_>| {
+            engine.decide(facts, &PoolFacts::default(), &pool, cx, &mut Scratch::new())
+        };
+        assert!(lead(&decide(&facts, &written)).is_some());
+        for (facts, cx, beside) in [(&facts, &masked, "a mask"), (&pinned, &written, "a pin")] {
+            let Decision::Shed(shed) = decide(facts, cx) else {
+                panic!("{beside} beside the rows is declined");
+            };
+            assert_eq!(
+                (shed.reason, shed.emptied_by),
+                (ShedReason::PolicyDeclined, WRITTEN_ROWS),
+                "{beside}"
+            );
+        }
+        // A profile that shows nothing reads both.
+        assert!(lead(&plain.decide(
+            &facts,
+            &PoolFacts::default(),
+            &pool,
+            &masked,
+            &mut Scratch::new()
+        ))
+        .is_some());
+        // Under a pair binding the word is the phase's own profile's: the
+        // decode side shows its rows here, and the prefill side does not.
+        let pair = Engine::new(
+            vec![
+                least_requests_profile(),
+                Profile {
+                    filters: vec![Box::new(Shown)],
+                    ..least_requests_profile()
+                },
+            ],
+            vec![Binding {
+                decode_profile: Some(1),
+                ..pair_binding()
+            }],
+            1,
+            Needs::default(),
+        );
+        assert!(!pair.reads_for("m", Phase::Prefill).1);
+        assert!(pair.reads_for("m", Phase::Decode).1);
     }
 
     /// A stage that reads the affinity column as a filter alone, or as the
@@ -3206,7 +4661,8 @@ mod tests {
 
     #[test]
     fn an_all_overloaded_pool_sheds_as_saturated() {
-        let engine = strict_engine();
+        let mut engine = strict_engine();
+        engine.shed_when_all_vetoed(0);
         let mut pool = [candidate(0, 1), candidate(1, 1)];
         for c in &mut pool {
             c.health.overloaded = true;
@@ -3236,7 +4692,8 @@ mod tests {
 
     #[test]
     fn a_pool_emptied_behind_the_healthy_filter_names_the_later_stage() {
-        let engine = strict_engine();
+        let mut engine = strict_engine();
+        engine.shed_when_all_vetoed(0);
         let mut pool = [candidate(0, 1), candidate(1, 1)];
         pool[0].health.healthy = false;
         pool[1].health.overloaded = true;
@@ -3765,6 +5222,84 @@ mod tests {
             }
             other => panic!("an unbound model answered {other:?}"),
         }
+    }
+
+    /// A pair's decode profile is a decode row of the pair binding's glob,
+    /// whatever phases the binding covers: an engine built by hand may bind
+    /// a pair for the prefill phase alone, and a decode decision of that
+    /// model carries the pair's decode profile. A pair bound off the prefill
+    /// phase starts no pair: it writes no decode row.
+    #[test]
+    fn a_pairs_decode_profile_is_a_needs_row_of_the_pairs_glob() {
+        #[derive(Debug)]
+        struct Fed;
+
+        impl Filter for Fed {
+            fn name(&self) -> &'static str {
+                "fed"
+            }
+
+            fn keep(&self, _: &RequestFacts<'_>, _: &Candidate, _: &Constraints<'_>) -> bool {
+                true
+            }
+
+            fn needs(&self) -> Needs {
+                Needs {
+                    loads: true,
+                    ..Needs::default()
+                }
+            }
+        }
+
+        // A profile whose stages read nothing a host feeds.
+        let quiet = || Profile {
+            scorers: Vec::new(),
+            ..least_requests_profile()
+        };
+        let fed = Profile {
+            filters: vec![Box::new(Fed)],
+            ..quiet()
+        };
+        let decode = fed.needs();
+        assert_eq!(quiet().needs(), Needs::default());
+        assert!(decode.loads);
+        let engine = Engine::new(
+            vec![quiet(), fed],
+            vec![Binding {
+                model: "pd/*".into(),
+                phases: vec![Phase::Prefill],
+                plan: Plan::PdPair,
+                profile: 0,
+                decode_profile: Some(1),
+                sessions: None,
+                overload: None,
+            }],
+            1,
+            Needs::default(),
+        );
+        assert_eq!(engine.needs_for("pd/x", Phase::Decode), decode);
+        assert_eq!(engine.needs_rows(), [("pd/*", Phase::Decode, decode)]);
+        // No prefill lookup resolves to a pair bound for another phase.
+        let fed = Profile {
+            filters: vec![Box::new(Fed)],
+            ..quiet()
+        };
+        let engine = Engine::new(
+            vec![quiet(), fed],
+            vec![Binding {
+                model: "pd/*".into(),
+                phases: vec![Phase::Encode],
+                plan: Plan::PdPair,
+                profile: 0,
+                decode_profile: Some(1),
+                sessions: None,
+                overload: None,
+            }],
+            1,
+            Needs::default(),
+        );
+        assert_eq!(engine.needs_for("pd/x", Phase::Decode), Needs::default());
+        assert!(engine.needs_rows().is_empty(), "{:?}", engine.needs_rows());
     }
 
     #[test]
@@ -5903,6 +7438,42 @@ mod tests {
         )
     }
 
+    #[test]
+    fn the_pins_horizon_is_the_longest_ttl_and_the_shortest_sweep_of_the_rules() {
+        let rule = |ttl_micros, sweep_micros| SessionRule {
+            assignment: Assignment::Random,
+            inflight_cap: 0,
+            ttl_micros,
+            sweep_micros,
+            recovery: Recovery::Original,
+        };
+        let bound = |model: &str, sessions| Binding {
+            model: model.into(),
+            phases: vec![],
+            plan: Plan::Single,
+            profile: 0,
+            decode_profile: None,
+            sessions,
+            overload: None,
+        };
+        let two = |first, second| {
+            Engine::new(
+                vec![manual_profile()],
+                vec![bound("a", Some(first)), bound("*", Some(second))],
+                1,
+                Needs::default(),
+            )
+        };
+        assert_eq!(manual_engine(None).pins_horizon(), None, "no rule");
+        let one = manual_engine(Some(rule(Some(1_000), 100)));
+        assert_eq!(one.pins_horizon(), Some((1_000, 100)));
+        let both = two(rule(Some(1_000), 100), rule(Some(5_000), 40));
+        assert_eq!(both.pins_horizon(), Some((5_000, 40)));
+        // A rule that keeps its keys with no TTL: no instant ends a pin.
+        let for_ever = two(rule(Some(1_000), 100), rule(None, 0));
+        assert_eq!(for_ever.pins_horizon(), None);
+    }
+
     /// One decision for `key` (`0`: no key) drawn by `seed`: the worker and
     /// what the decision did with the key.
     fn decide_seeded(
@@ -6452,9 +8023,9 @@ mod tests {
     /// The whole pass of the engine's profile over `pool`, as a decision
     /// under [`DRAW_FROM`] rows runs it.
     fn whole_pass(engine: &Engine, facts: &RequestFacts<'_>, pool: &[Candidate]) -> Decision {
-        let (index, profile) = engine
-            .profile_for(facts.model, Phase::Single)
-            .expect("a profile");
+        let (entry, index, profile) = engine
+            .resolve(facts.model, Phase::Single)
+            .expect("a binding");
         run_single(
             profile,
             index,
@@ -6465,6 +8036,7 @@ mod tests {
                 class: None,
                 partnered: None,
                 encode: false,
+                vetoed: entry.vetoed,
             },
             &Constraints::default(),
             &mut Buffers::default(),
@@ -6475,6 +8047,22 @@ mod tests {
         engine.decide(
             facts,
             &PoolFacts::default(),
+            pool,
+            &Constraints::default(),
+            &mut Scratch::new(),
+        )
+    }
+
+    /// A decision over a pool whose host says that every row holds a rate
+    /// ([`PoolFacts::rated`]): what a profile is asked by rank under.
+    fn rated(engine: &Engine, facts: &RequestFacts<'_>, pool: &[Candidate]) -> Decision {
+        let said = PoolFacts {
+            rated: true,
+            ..PoolFacts::default()
+        };
+        engine.decide(
+            facts,
+            &said,
             pool,
             &Constraints::default(),
             &mut Scratch::new(),
@@ -7020,6 +8608,248 @@ mod tests {
     }
 
     #[test]
+    fn a_profile_of_the_engines_own_filters_draws_as_one_asked_a_call_a_filter() {
+        /// A host's filter around one of the engine's: the same word on
+        /// every row, and no filter the build knows.
+        #[derive(Debug)]
+        struct Hosted(Box<dyn Filter>);
+        impl Filter for Hosted {
+            fn name(&self) -> &'static str {
+                self.0.name()
+            }
+
+            fn soft(&self) -> bool {
+                self.0.soft()
+            }
+
+            fn row_wise(&self) -> bool {
+                self.0.row_wise()
+            }
+
+            fn keep(&self, facts: &RequestFacts<'_>, c: &Candidate, cx: &Constraints<'_>) -> bool {
+                self.0.keep(facts, c, cx)
+            }
+        }
+        use crate::builtins::filters_of;
+        fn engine_of(filters: Vec<Box<dyn Filter>>, picker: Box<dyn Picker>) -> Engine {
+            Engine::new(
+                vec![Profile {
+                    name: "p".into(),
+                    filters,
+                    scorers: Vec::new(),
+                    picker,
+                }],
+                vec![single_binding()],
+                1,
+                Needs::default(),
+            )
+        }
+        const PICKERS: [fn() -> Box<dyn Picker>; 4] = [
+            || Box::new(Passthrough),
+            || Box::new(Random),
+            || Box::new(RoundRobin::new()),
+            || Box::new(PowerOfTwo),
+        ];
+        // By position modulo eight: a row each of four bits refuses and four
+        // the rows' own bits keep, of which the host's mask names one. A
+        // request names one row tried, and the host one excluded.
+        let pool: Vec<Candidate> = (0..64u32)
+            .map(|i| {
+                let mut c = Candidate {
+                    has_capacity: true,
+                    has_room: true,
+                    ..candidate(i, i % 5)
+                };
+                match i % 8 {
+                    1 => c.health.healthy = false,
+                    2 => c.health.overloaded = true,
+                    3 => c.has_capacity = false,
+                    4 => c.has_room = false,
+                    _ => {}
+                }
+                c
+            })
+            .collect();
+        let mask: Vec<u32> = (0..64).filter(|i| i % 8 == 7).collect();
+        let (mut drew, mut masked) = (0u32, 0u32);
+        for set in 0..32u8 {
+            for (which, picker) in PICKERS.into_iter().enumerate() {
+                let folded = engine_of(filters_of(set), picker());
+                let hosted = filters_of(set)
+                    .into_iter()
+                    .map(|filter| Box::new(Hosted(filter)) as Box<dyn Filter>)
+                    .collect();
+                let each = engine_of(hosted, picker());
+                assert!(folded.row_tests[0].is_some(), "set {set:#07b}: folded");
+                // A profile of no filter folds into the empty test whoever built it.
+                assert_eq!(
+                    each.row_tests[0].is_none(),
+                    set != 0,
+                    "set {set:#07b}: a host's"
+                );
+                for seed in 0..24u64 {
+                    let tried = [pool[(seed as usize * 8 + 5) % pool.len()].id];
+                    let excluded = [pool[(seed as usize * 8 + 6) % pool.len()].id];
+                    let facts = RequestFacts {
+                        tried: if seed % 2 == 0 { &tried } else { &[] },
+                        ..request(seed ^ u64::from(set) << 32)
+                    };
+                    let cx = Constraints {
+                        excluded: if seed % 3 == 0 { &excluded } else { &[] },
+                        stalled: if seed % 4 < 2 { mask.as_slice() } else { &[] },
+                        overload_lifted: seed % 5 == 0,
+                        ..Constraints::default()
+                    };
+                    let decide = |engine: &Engine| {
+                        engine.decide(
+                            &facts,
+                            &PoolFacts::default(),
+                            &pool,
+                            &cx,
+                            &mut Scratch::new(),
+                        )
+                    };
+                    let (got, want) = (decide(&folded), decide(&each));
+                    let at = format!("set {set:#07b}, picker {which}, seed {seed}");
+                    assert_eq!(got, want, "{at}");
+                    if got.trace().drew_first() {
+                        drew += 1;
+                        masked += u32::from(set & 1 != 0 && !cx.stalled.is_empty());
+                    }
+                    if set & 1 != 0 {
+                        assert!(
+                            positions(&got).iter().all(|&row| !cx.masks(row)),
+                            "{at}: a row the host's mask names"
+                        );
+                    }
+                }
+            }
+        }
+        // Most decisions drew, some of them under the health filter and a
+        // standing veto, where the mask is asked beside the folded test.
+        assert!(drew > 1_000 && masked > 200, "{drew} drew, {masked} masked");
+    }
+
+    #[test]
+    fn a_draw_asks_the_folded_test_of_its_own_profile() {
+        // Two profiles of one engine, each folded: the first keeps a row
+        // over its ceiling and the second refuses it. A draw under either
+        // asks that profile's own test.
+        let profile = |name: &str, filters: Vec<Box<dyn Filter>>| Profile {
+            name: name.into(),
+            filters,
+            scorers: Vec::new(),
+            picker: Box::new(Random),
+        };
+        let binding = |model: &str, profile: u16| Binding {
+            model: model.into(),
+            profile,
+            ..single_binding()
+        };
+        let engine = Engine::new(
+            vec![
+                profile("lenient", vec![Box::new(Healthy)]),
+                profile("strict", vec![Box::new(Healthy), Box::new(NotOverloaded)]),
+            ],
+            vec![binding("lenient", 0), binding("strict", 1)],
+            1,
+            Needs::default(),
+        );
+        assert!(engine.row_tests[0].is_some() && engine.row_tests[1].is_some());
+        assert_ne!(engine.row_tests[0], engine.row_tests[1]);
+        // Every second row is over its ceiling.
+        let pool: Vec<Candidate> = (0..64u32)
+            .map(|i| {
+                let mut c = candidate(i, 0);
+                c.health.overloaded = i % 2 == 0;
+                c
+            })
+            .collect();
+        let (mut drew, mut over) = ([0u32; 2], [0usize; 2]);
+        for (at, model) in ["lenient", "strict"].into_iter().enumerate() {
+            for seed in 0..64u64 {
+                let facts = RequestFacts {
+                    model,
+                    ..request(seed)
+                };
+                let decision = engine.decide(
+                    &facts,
+                    &PoolFacts::default(),
+                    &pool,
+                    &Constraints::default(),
+                    &mut Scratch::new(),
+                );
+                drew[at] += u32::from(decision.trace().drew_first());
+                let handed = positions(&decision);
+                over[at] += handed.iter().filter(|&&row| row % 2 == 0).count();
+            }
+        }
+        assert!(drew[0] == 64 && drew[1] > 48, "{drew:?} drew");
+        // The first profile hands such rows out and the second none.
+        assert!(over[0] > 0, "the lenient profile handed none");
+        assert_eq!(
+            over[1], 0,
+            "the strict profile handed a row over its ceiling"
+        );
+    }
+
+    /// A draw asks the folded test of the profile its binding names: two
+    /// profiles are bound crosswise, so a binding's place and its profile's
+    /// index part. The lenient profile hands out overloaded rows and the
+    /// strict one hands out none.
+    #[test]
+    fn a_draw_asks_the_test_of_the_profile_its_binding_names() {
+        let profile = |name: &str, filters: Vec<Box<dyn Filter>>| Profile {
+            name: name.into(),
+            filters,
+            scorers: Vec::new(),
+            picker: Box::new(Random),
+        };
+        let binding = |model: &str, profile: u16| Binding {
+            model: model.into(),
+            profile,
+            ..single_binding()
+        };
+        let engine = Engine::new(
+            vec![
+                profile("lenient", vec![Box::new(Healthy)]),
+                profile("strict", vec![Box::new(Healthy), Box::new(NotOverloaded)]),
+            ],
+            vec![binding("strict", 1), binding("lenient", 0)],
+            1,
+            Needs::default(),
+        );
+        // Every other row is overloaded.
+        let pool: Vec<Candidate> = (0..64u32)
+            .map(|i| {
+                let mut row = candidate(i, 0);
+                row.health.overloaded = i % 2 == 0;
+                row
+            })
+            .collect();
+        let (mut drew, mut overloaded) = ([0u32; 2], [0usize; 2]);
+        for (at, model) in ["lenient", "strict"].into_iter().enumerate() {
+            for seed in 0..64u64 {
+                let facts = RequestFacts {
+                    model,
+                    ..request(seed)
+                };
+                let decision = drawn(&engine, &facts, &pool);
+                drew[at] += u32::from(decision.trace().drew_first());
+                overloaded[at] += positions(&decision)
+                    .iter()
+                    .filter(|&&row| row % 2 == 0)
+                    .count();
+            }
+        }
+        assert!(drew[0] == 64 && drew[1] > 48, "{drew:?} decisions drew");
+        assert!(
+            overloaded[0] > 0 && overloaded[1] == 0,
+            "overloaded rows handed out: {overloaded:?}"
+        );
+    }
+
+    #[test]
     fn a_pool_under_a_new_membership_epoch_turns_its_own_rotation() {
         let engine = preset("round_robin");
         let ready = pool_of(32, |_| false);
@@ -7196,5 +9026,1961 @@ mod tests {
             1,
             "a chain one past the depth ends there, with one payload forgotten"
         );
+    }
+
+    // ---- a draw the rows a host named join
+
+    fn holding(row: u32, overlap_blocks: u32) -> crate::NamedHolder {
+        crate::NamedHolder {
+            row,
+            overlap_blocks,
+            predicted_blocks: 0,
+        }
+    }
+
+    /// A request of sixteen blocks whose host names `holders`.
+    fn naming(seed: u64, holders: &[crate::NamedHolder]) -> RequestFacts<'_> {
+        static HASHES: [u64; 16] = [0; 16];
+        RequestFacts {
+            block_hashes: &HASHES,
+            prompt_tokens: 256,
+            named: Some(NamedAffinity {
+                holders,
+                ..NamedAffinity::default()
+            }),
+            ..request(seed)
+        }
+    }
+
+    /// Behind the draw of a `best` that takes a sample, the rows a host
+    /// named join the rows drawn: the deepest named holder leads whether the
+    /// draw reached it or not, one a filter refuses leaves the lead to the
+    /// next, and a named row the draw reached too is handed out once.
+    #[test]
+    fn the_rows_a_host_named_join_the_rows_a_sampled_best_drew() {
+        let engine = preset("cache_aware");
+        assert_eq!(engine.needs().sample, 16);
+        let holders = [holding(20, 8), holding(40, 12)];
+        crate::view::LOOKS_BEHIND.with(|looks| looks.set(0));
+        for (down, lead) in [(64u32, 40u32), (40, 20)] {
+            let pool = pool_of(64, |i| i == down);
+            for seed in 0..200u64 {
+                let got = drawn(&engine, &naming(seed, &holders), &pool);
+                assert!(got.trace().drew_first(), "seed {seed}: the decision drew");
+                let rows = positions(&got);
+                assert_eq!(rows.first(), Some(&lead), "seed {seed}, row {down} down");
+                let mut once = rows.clone();
+                once.sort_unstable();
+                once.dedup();
+                assert_eq!(once.len(), rows.len(), "seed {seed}: {rows:?}, a row twice");
+            }
+        }
+        // Behind the draw the stages search the rows named: no walk looked
+        // behind its cursor in any of the decisions.
+        assert_eq!(crate::view::LOOKS_BEHIND.with(std::cell::Cell::get), 0);
+    }
+
+    /// A host caps each list of rows it names at the picker's sample. Past
+    /// it a decision reads dearer and is never wrong, so a debug build
+    /// alone stops, by the assertion's own words.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "at or under the sample of the picker that draws")]
+    fn rows_named_past_the_sample_stop_a_debug_build_where_the_picker_draws() {
+        let engine = preset("cache_aware");
+        let holders: Vec<crate::NamedHolder> = (0..17).map(|row| holding(row, 12)).collect();
+        let decision = drawn(&engine, &naming(1, &holders), &pool_of(64, |_| false));
+        panic!("seventeen rows named answered {decision:?}");
+    }
+
+    /// A pool of at most twice the sample is read whole, rows named or not,
+    /// and so is a larger pool whose host names none: the draw is for the
+    /// pools a host names rows in.
+    #[test]
+    fn a_sampled_best_reads_a_small_pool_and_a_pool_with_no_rows_named_whole() {
+        let (engine, twin) = (preset("cache_aware"), preset("cache_aware"));
+        let holders = [holding(3, 12)];
+        for seed in 0..40u64 {
+            // Twice the sample, rows named: the whole pass, row for row.
+            let pool = pool_of(32, |i| i % 17 == 5);
+            let facts = naming(seed, &holders);
+            let got = drawn(&engine, &facts, &pool);
+            assert!(!got.trace().drew_first(), "seed {seed}");
+            assert_eq!(got, whole_pass(&twin, &facts, &pool), "seed {seed}");
+            // One row more: the decision draws.
+            let pool = pool_of(33, |i| i % 17 == 5);
+            let got = drawn(&engine, &facts, &pool);
+            assert!(got.trace().drew_first(), "seed {seed}");
+            // No rows named: the whole pass, whatever the pool's size.
+            let pool = pool_of(257, |i| i % 17 == 5);
+            let facts = request(seed);
+            let got = drawn(&engine, &facts, &pool);
+            assert!(!got.trace().drew_first(), "seed {seed}");
+            assert_eq!(got, whole_pass(&twin, &facts, &pool), "seed {seed}");
+        }
+    }
+
+    /// The joined mark stands only beside the draw's: under a filter that is
+    /// not row-wise a `best` that takes a sample reads its pool whole,
+    /// whatever rows the host names.
+    #[test]
+    fn a_joined_picker_under_a_stage_that_is_not_row_wise_never_draws() {
+        /// Keeps every row, and its word on one row is not its whole word.
+        #[derive(Debug)]
+        struct Whole;
+        impl Filter for Whole {
+            fn name(&self) -> &'static str {
+                "whole"
+            }
+
+            fn keep(&self, _: &RequestFacts<'_>, _: &Candidate, _: &Constraints<'_>) -> bool {
+                true
+            }
+        }
+        let engine = Engine::new(
+            vec![Profile {
+                name: "whole".into(),
+                filters: vec![Box::new(Healthy), Box::new(Whole)],
+                scorers: Vec::new(),
+                picker: Box::new(crate::builtins::SampledBest::new(16)),
+            }],
+            vec![single_binding()],
+            1,
+            Needs::default(),
+        );
+        // It says no sample: a host feeds such a profile a column.
+        assert_eq!(engine.needs().sample, 0);
+        let holders = [holding(3, 12)];
+        let pool = pool_of(64, |_| false);
+        for seed in 0..20u64 {
+            let got = drawn(&engine, &naming(seed, &holders), &pool);
+            assert!(!got.trace().drew_first(), "seed {seed}");
+            assert_eq!(got.trace().survivors.get(), Some(64), "seed {seed}");
+        }
+    }
+
+    /// The mean the spill gate reads behind a draw is the drawn rows': four
+    /// named holders with seven in flight spill against rows drawn at two,
+    /// where the mean of the rows handed, the holders among them, would
+    /// keep each of them in the lead.
+    #[test]
+    fn the_rows_named_do_not_move_the_mean_they_are_judged_against() {
+        let engine = preset("cache_aware");
+        let holders = [
+            holding(8, 12),
+            holding(24, 12),
+            holding(40, 12),
+            holding(56, 12),
+        ];
+        let pool: Vec<Candidate> = (0..64u32)
+            .map(|i| candidate(i, if i % 16 == 8 { 7 } else { 2 }))
+            .collect();
+        let mut led = 0u32;
+        for seed in 0..200u64 {
+            let got = drawn(&engine, &naming(seed, &holders), &pool);
+            assert!(got.trace().drew_first(), "seed {seed}");
+            led += u32::from(positions(&got).first().is_some_and(|row| row % 16 == 8));
+        }
+        // A draw that takes all four holders reads a mean they pass: rare.
+        assert!(led < 20, "{led} of 200 decisions were led by a busy holder");
+    }
+
+    /// A named row past the pool names no candidate: the join passes over
+    /// it in every build and asks no filter about it. A decision of a debug
+    /// build stops before the join ([`debug_assert_named`]).
+    #[test]
+    fn the_join_passes_over_a_row_named_past_the_pool() {
+        let pool = pool_of(4, |i| i == 2);
+        let holders = [holding(1, 12), holding(2, 12), holding(9, 12)];
+        let named = NamedAffinity {
+            holders: &holders,
+            warming: &[3, 4, u32::MAX],
+            ..NamedAffinity::default()
+        };
+        let mut asked = Vec::new();
+        let mut keep = |row: &Candidate| {
+            asked.push(row.position);
+            row.health.healthy
+        };
+        let mut kept = vec![0];
+        join_named(&named, &pool, &mut keep, &mut kept);
+        assert_eq!(kept, [0, 1, 3], "the pool's rows a filter keeps join");
+        assert_eq!(
+            asked,
+            [1, 2, 3],
+            "a filter is asked of the pool's rows alone"
+        );
+    }
+
+    /// Two profiles whose `best` takes a sample of four and of sixteen, for
+    /// the models `narrow` and `wide`.
+    fn two_samples() -> Engine {
+        let bound = |model: &str, profile| Binding {
+            model: model.into(),
+            profile,
+            ..single_binding()
+        };
+        sampled_under(vec![bound("narrow", 0), bound("wide", 1)])
+    }
+
+    /// Two profiles that draw, under `bindings`: a sample of four (profile
+    /// 0) and a sample of sixteen (profile 1).
+    fn sampled_under(bindings: Vec<Binding>) -> Engine {
+        let sampled = |name: &str, sample| Profile {
+            name: name.into(),
+            filters: vec![Box::new(Healthy)],
+            scorers: Vec::new(),
+            picker: Box::new(crate::builtins::SampledBest::new(sample)),
+        };
+        Engine::new(
+            vec![sampled("narrow", 4), sampled("wide", 16)],
+            bindings,
+            1,
+            Needs::default(),
+        )
+    }
+
+    /// A host caps the rows it names by the sample of the profile that
+    /// decides, which [`Engine::sample_for`] says; the engine's summary
+    /// holds the largest sample of every profile. The cache-aware preset
+    /// says sixteen for a model's single decision.
+    #[test]
+    fn a_host_reads_the_cap_of_the_rows_it_names_from_the_profile_that_decides() {
+        let engine = two_samples();
+        assert_eq!(engine.needs().sample, 16);
+        let pool = pool_of(64, |_| false);
+        let holders: Vec<crate::NamedHolder> = (0..16).map(|row| holding(row, 12)).collect();
+        for (model, sample) in [("narrow", 4usize), ("wide", 16)] {
+            let cap = engine.sample_for(model, Phase::Single) as usize;
+            assert_eq!(cap, sample, "{model}");
+            let facts = RequestFacts {
+                model,
+                ..naming(1, &holders[..cap])
+            };
+            let got = drawn(&engine, &facts, &pool);
+            assert!(got.trace().drew_first(), "{model}: capped so, it draws");
+        }
+        let cache_aware = preset("cache_aware");
+        assert_eq!(cache_aware.sample_for("m", Phase::Single), 16);
+    }
+
+    /// Capped by the engine's summary instead, the rows a host names under
+    /// the narrower profile stand past its picker's sample: a debug build
+    /// stops, by the assertion's own words.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "at or under the sample of the picker that draws")]
+    fn rows_capped_by_the_engines_summary_stop_a_debug_build_under_a_narrower_profile() {
+        let engine = two_samples();
+        let holders: Vec<crate::NamedHolder> = (0..engine.needs().sample)
+            .map(|row| holding(row, 12))
+            .collect();
+        let facts = RequestFacts {
+            model: "narrow",
+            ..naming(1, &holders)
+        };
+        let decision = drawn(&engine, &facts, &pool_of(64, |_| false));
+        panic!("sixteen rows named under a sample of four answered {decision:?}");
+    }
+
+    /// The mean in flight is the engine's to set behind a draw. A host that
+    /// writes one stops a debug build, by the assertion's own words: on a
+    /// pool read whole the stages would read its number for their rows'.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "beside an empty column and no mean in flight")]
+    fn a_mean_in_flight_a_host_wrote_stops_a_debug_build() {
+        let engine = preset("cache_aware");
+        let holders = [holding(3, 12)];
+        let facts = RequestFacts {
+            named: Some(NamedAffinity {
+                holders: &holders,
+                mean_in_flight: Some(2.0),
+                ..NamedAffinity::default()
+            }),
+            ..request(1)
+        };
+        let decision = drawn(&engine, &facts, &pool_of(8, |_| false));
+        panic!("a mean the host wrote answered {decision:?}");
+    }
+
+    /// A sampled `best` counts no refused rows: under a filter that refuses
+    /// half of the pool every decision still draws, and none of its targets
+    /// is a refused row. A pool refused whole is the whole pass's to shed.
+    #[test]
+    fn a_sampled_draw_stands_under_a_filter_that_refuses_half_of_the_pool() {
+        let engine = preset("cache_aware");
+        let holders = [holding(5, 12)];
+        let pool = pool_of(64, |i| i % 2 == 0);
+        for seed in 0..500u64 {
+            let got = drawn(&engine, &naming(seed, &holders), &pool);
+            assert!(got.trace().drew_first(), "seed {seed}");
+            let rows = positions(&got);
+            assert!(rows.iter().all(|row| row % 2 == 1), "seed {seed}: {rows:?}");
+        }
+        let got = drawn(&engine, &naming(1, &holders), &pool_of(64, |_| true));
+        assert!(!got.trace().drew_first());
+        assert!(got.pick().is_none());
+    }
+
+    /// A draw's read of the best scores is the whole pass's, slot for slot:
+    /// ties, scores under zero, scores without an order and every count of
+    /// rows around the count kept. The keys' own read is held to the pass's
+    /// at every count, under the count a draw reads by keys too.
+    #[test]
+    fn the_best_scores_of_a_draw_are_the_best_scores_of_a_pass() {
+        fn bits<const K: usize>(
+            read: impl Fn(&[f32], &mut [(usize, f32); K]) -> usize,
+            scores: &[f32],
+        ) -> ([(usize, u32); K], usize) {
+            let mut top = [(usize::MAX, f32::NEG_INFINITY); K];
+            let len = read(scores, &mut top);
+            (top.map(|(i, score)| (i, score.to_bits())), len)
+        }
+        fn held<const K: usize>(scores: &[f32]) {
+            assert_eq!(
+                bits(top_drawn::<K>, scores),
+                bits(top_pass::<K>, scores),
+                "{scores:?}"
+            );
+            if !scores.iter().any(|score| score.is_nan()) {
+                assert_eq!(
+                    bits(top_keyed::<K>, scores),
+                    bits(top_pass::<K>, scores),
+                    "{scores:?}"
+                );
+            }
+        }
+        let values = [
+            0.0f32,
+            -0.0,
+            0.25,
+            0.5,
+            0.5,
+            0.75,
+            1.0,
+            f32::NEG_INFINITY,
+            f32::INFINITY,
+            f32::NAN,
+        ];
+        // Scores under zero alone, a tiny one among them: their order is the
+        // keys' turn of every bit under a set sign.
+        let under = [
+            -0.0f32,
+            -1.0e-40,
+            -0.25,
+            -0.25,
+            -1.0,
+            -3.5,
+            f32::MIN,
+            f32::NEG_INFINITY,
+        ];
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        for round in 0..4_000usize {
+            let scores: Vec<f32> = (0..round % 41)
+                .map(|_| {
+                    state = state
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1_442_695_040_888_963_407);
+                    let pick = (state >> 33) as usize;
+                    match round % 4 {
+                        // Every fourth list holds scores under zero alone.
+                        3 => under[pick % under.len()],
+                        // Every second list holds no score without an order.
+                        _ => values[pick % (values.len() - round % 2)],
+                    }
+                })
+                .collect();
+            held::<1>(&scores);
+            held::<TRACE_TOP>(&scores);
+            held::<5>(&scores);
+        }
+    }
+
+    /// A list past the keys' places is read as the pass reads it, and a list
+    /// that ends at their last place by keys: its last row's place is zero.
+    #[test]
+    fn a_list_past_the_keys_places_is_read_as_the_pass_reads_it() {
+        let last = 1usize << PLACE_BITS;
+        for len in [last - 1, last, last + 1, last + 7] {
+            // One score everywhere but at both ends: the best rows stand at
+            // the first place and at the last ones, ties among them.
+            let mut scores = vec![0.25f32; len];
+            scores[0] = 1.0;
+            for (back, score) in [1.0f32, 0.5, 0.75, 1.0, 0.5].into_iter().enumerate() {
+                scores[len - 1 - back] = score;
+            }
+            let mut drawn = [(usize::MAX, f32::NEG_INFINITY); 5];
+            let mut pass = drawn;
+            assert_eq!(top_drawn(&scores, &mut drawn), top_pass(&scores, &mut pass));
+            assert_eq!(drawn, pass, "{len} rows");
+        }
+    }
+
+    /// A draw's trace names the best of its rows as a pass's trace does,
+    /// equal scores among them, and does not count its survivors.
+    #[test]
+    fn a_draws_trace_names_its_best_rows_as_a_passes_trace_does() {
+        let pool = pool_of(60, |_| false);
+        let facts = request(7);
+        // A draw's order, and scores that tie: twenty rows, which a draw
+        // reads by keys.
+        let kept: Vec<u32> = (0..60u32).rev().step_by(3).collect();
+        assert!(kept.len() >= KEYED_FROM);
+        let scores: Vec<f32> = kept.iter().map(|&row| (row % 7) as f32 / 8.0).collect();
+        let pass = trace_of(3, &facts, &PoolFacts::default(), &pool, &kept, &scores);
+        let draw = trace_drawn(3, &facts, &PoolFacts::default(), &pool, &kept, &scores);
+        assert_eq!(usize::from(pass.top_len), TRACE_TOP);
+        assert_eq!(draw.survivors, Survivors::NOT_COUNTED);
+        assert_eq!(
+            Trace {
+                survivors: pass.survivors,
+                ..draw
+            },
+            pass
+        );
+    }
+
+    /// A decode decision of a model that also pairs is decided by its own
+    /// profile, and the rows a host names for it are capped by that
+    /// profile's sample ([`Engine::sample_for`]). A decode worker's needs
+    /// carry the pair's decode side too ([`Engine::needs_for`]), whose
+    /// sample is the larger here: a list capped by them stands past the
+    /// cap.
+    #[test]
+    fn a_decode_decision_of_a_model_that_also_pairs_is_capped_by_its_own_profile() {
+        let alone = Binding {
+            model: "mixed".into(),
+            phases: vec![Phase::Decode],
+            ..single_binding()
+        };
+        let pair = Binding {
+            model: "mixed".into(),
+            profile: 1,
+            decode_profile: Some(1),
+            ..pair_binding()
+        };
+        let engine = sampled_under(vec![alone, pair]);
+        assert_eq!(engine.needs_for("mixed", Phase::Decode).sample, 16);
+        assert_eq!(engine.sample_for("mixed", Phase::Decode), 4);
+        assert_eq!(engine.sample_for("nobody", Phase::Decode), 0);
+        let holders: Vec<crate::NamedHolder> = (0..4).map(|row| holding(row, 12)).collect();
+        let facts = RequestFacts {
+            model: "mixed",
+            phase: Phase::Decode,
+            ..naming(1, &holders)
+        };
+        let got = drawn(&engine, &facts, &pool_of(64, |_| false));
+        assert!(
+            got.trace().drew_first(),
+            "capped by its own profile, it draws"
+        );
+    }
+
+    /// The engine asks a draw of a pool of [`DRAW_FROM`] rows or more,
+    /// whatever the sample: under a sample of four a pool of nine to
+    /// fifteen rows, more than twice the sample, is still read whole.
+    #[test]
+    fn a_sample_under_eight_draws_from_sixteen_rows_on() {
+        let engine = two_samples();
+        let holders = [holding(0, 12)];
+        let facts = RequestFacts {
+            model: "narrow",
+            ..naming(1, &holders)
+        };
+        for (rows, drew) in [(9, false), (12, false), (15, false), (16, true)] {
+            let got = drawn(&engine, &facts, &pool_of(rows, |_| false));
+            assert_eq!(got.trace().drew_first(), drew, "{rows} rows");
+        }
+    }
+
+    /// A rank of the tests: a row reads the level named for its position,
+    /// whichever rows it is asked of.
+    /// Where it `says`, it says its spread and its front, as a rank does;
+    /// where it does not it is a stage of any values, and its profile's
+    /// decision is the weighted sum's.
+    #[derive(Debug)]
+    struct Levelled {
+        levels: Vec<f32>,
+        step: f32,
+        says: bool,
+    }
+
+    impl Lifecycle for Levelled {}
+
+    impl Scorer for Levelled {
+        fn name(&self) -> &'static str {
+            "levelled"
+        }
+
+        fn score(
+            &self,
+            facts: &RequestFacts<'_>,
+            candidates: &[Candidate],
+            kept: &[u32],
+            out: &mut [f32],
+        ) -> TieBand {
+            self.score_front(facts, candidates, kept, out).0
+        }
+
+        fn spread(&self) -> Spread {
+            if self.says {
+                Spread::Levels(self.step)
+            } else {
+                Spread::Any
+            }
+        }
+
+        fn front_wise(&self) -> bool {
+            true
+        }
+
+        fn score_front(
+            &self,
+            _: &RequestFacts<'_>,
+            candidates: &[Candidate],
+            kept: &[u32],
+            out: &mut [f32],
+        ) -> (TieBand, Front) {
+            let mut top = 0;
+            for (o, &row) in out.iter_mut().zip(kept) {
+                *o = self.levels[candidates[row as usize].position as usize];
+                top += u32::from(*o >= 1.0);
+            }
+            let front = if self.says {
+                Front::At(top)
+            } else {
+                Front::Unsaid
+            };
+            (TieBand(0.0), front)
+        }
+    }
+
+    /// A stage of any values: a row reads the value named for its position,
+    /// under the tie band the stage was given.
+    #[derive(Debug)]
+    struct Valued(Vec<f32>, f32);
+
+    impl Lifecycle for Valued {}
+
+    impl Scorer for Valued {
+        fn name(&self) -> &'static str {
+            "valued"
+        }
+
+        fn score(
+            &self,
+            _: &RequestFacts<'_>,
+            candidates: &[Candidate],
+            kept: &[u32],
+            out: &mut [f32],
+        ) -> TieBand {
+            for (o, &row) in out.iter_mut().zip(kept) {
+                *o = self.0[candidates[row as usize].position as usize];
+            }
+            TieBand(self.1)
+        }
+
+        fn front_wise(&self) -> bool {
+            true
+        }
+    }
+
+    /// The probe of the rows a stage is handed, answering row by row: a
+    /// later position scores higher, and the rows handed last are kept.
+    #[derive(Debug)]
+    struct Asked(Arc<Mutex<Vec<u32>>>);
+
+    impl Lifecycle for Asked {}
+
+    impl Scorer for Asked {
+        fn name(&self) -> &'static str {
+            "asked"
+        }
+
+        fn score(
+            &self,
+            _: &RequestFacts<'_>,
+            candidates: &[Candidate],
+            kept: &[u32],
+            out: &mut [f32],
+        ) -> TieBand {
+            *self.0.lock().expect("the probe's rows") = kept.to_vec();
+            for (o, &row) in out.iter_mut().zip(kept) {
+                *o = candidates[row as usize].position as f32 / 8.0;
+            }
+            TieBand::NORMALIZED
+        }
+
+        fn front_wise(&self) -> bool {
+            true
+        }
+    }
+
+    /// A stage that orders nothing, counting the times it is asked.
+    #[derive(Debug)]
+    struct Flat(Arc<Mutex<u32>>);
+
+    impl Lifecycle for Flat {}
+
+    impl Scorer for Flat {
+        fn name(&self) -> &'static str {
+            "flat"
+        }
+
+        fn score(
+            &self,
+            _: &RequestFacts<'_>,
+            _: &[Candidate],
+            _: &[u32],
+            out: &mut [f32],
+        ) -> TieBand {
+            *self.0.lock().expect("the count") += 1;
+            out.fill(1.0);
+            TieBand(0.0)
+        }
+
+        fn spread(&self) -> Spread {
+            Spread::Alike
+        }
+    }
+
+    /// A picker that reads every score: the lowest first.
+    #[derive(Debug)]
+    struct Lowest;
+
+    impl Lifecycle for Lowest {}
+
+    impl Picker for Lowest {
+        fn name(&self) -> &'static str {
+            "lowest"
+        }
+
+        fn pick(
+            &self,
+            _: &RequestFacts<'_>,
+            candidates: &[Candidate],
+            kept: &[u32],
+            scores: &[f32],
+            _: TieBand,
+            out: &mut Targets,
+        ) {
+            let mut order: Vec<usize> = (0..kept.len()).collect();
+            order.sort_by(|&a, &b| scores[a].total_cmp(&scores[b]));
+            for at in order.into_iter().take(MAX_TARGETS) {
+                out.push(target_of(&candidates[kept[at] as usize]));
+            }
+        }
+    }
+
+    /// One profile over the healthy rows: `stages` under `picker`.
+    fn staged(stages: Vec<Weighted>, picker: Box<dyn Picker>) -> Engine {
+        Engine::new(
+            vec![Profile {
+                name: "staged".into(),
+                filters: vec![Box::new(Healthy)],
+                scorers: stages,
+                picker,
+            }],
+            vec![single_binding()],
+            1,
+            Needs::default(),
+        )
+    }
+
+    /// A rank of `levels` with a step of a half, and a stage of any values.
+    fn rank(levels: &[f32], weight: f32, says: bool) -> Weighted {
+        Weighted {
+            scorer: Box::new(Levelled {
+                levels: levels.to_vec(),
+                step: 0.5,
+                says,
+            }),
+            weight,
+        }
+    }
+
+    fn valued(values: &[f32], band: f32) -> Weighted {
+        Weighted {
+            scorer: Box::new(Valued(values.to_vec(), band)),
+            weight: 1.0,
+        }
+    }
+
+    /// `rows` ready candidates, then candidates that are not ready up to
+    /// the count a decision is taken by rank from ([`RANK_FROM`]): the
+    /// filters leave the `rows`.
+    fn ranked_pool(rows: u32) -> Vec<Candidate> {
+        (0..rows.max(RANK_FROM as u32))
+            .map(|i| Candidate {
+                health: Health {
+                    healthy: i < rows,
+                    ..Health::default()
+                },
+                ..candidate(i, 0)
+            })
+            .collect()
+    }
+
+    /// What the build reads of a profile's stages: which lead as ranks, the
+    /// band's room under them, and the mark, which is the front pickers'
+    /// alone.
+    #[test]
+    fn the_build_reads_which_leading_stages_are_ranks() {
+        let order = |stages: Vec<Weighted>| staged(stages, Box::new(Best)).orders[0];
+        let level = |step: f32, weight: f32| Weighted {
+            scorer: Box::new(Levelled {
+                levels: Vec::new(),
+                step,
+                says: true,
+            }),
+            weight,
+        };
+        let any = |weight: f32| Weighted {
+            scorer: Box::new(LeastRequests),
+            weight,
+        };
+        let flat = |weight: f32| Weighted {
+            scorer: Box::new(Flat(Arc::default())),
+            weight,
+        };
+        let wise = |weight: f32| Weighted {
+            weight,
+            ..valued(&[], 0.0)
+        };
+        let ranks = |ranks: u8, alike: u8, fronts: u8, room: f32| Order {
+            ranks,
+            alike,
+            fronts,
+            room,
+        };
+        let none = ranks(0, 0, 0, 0.0);
+        // A level that outweighs what stands behind it is a rank, and the
+        // band's room is half of what it outweighs it by; one that only
+        // equals it is none.
+        assert_eq!(order(vec![level(1.0, 3.0), any(1.0)]), ranks(1, 0, 0, 0.25));
+        // It may put rows in front where every stage behind it answers row
+        // by row, or orders nothing.
+        assert_eq!(
+            order(vec![level(1.0, 3.0), wise(1.0)]),
+            ranks(1, 0, 0b1, 0.25)
+        );
+        assert_eq!(
+            order(vec![level(0.5, 4.0), flat(1.0), wise(1.0)]),
+            ranks(2, 0b10, 0b01, 1.0 / 6.0 / 2.0)
+        );
+        // Two stages behind it that each order the rows: every row is asked.
+        assert_eq!(
+            order(vec![level(1.0, 4.0), wise(1.0), wise(1.0)]),
+            ranks(1, 0, 0, 1.0 / 3.0 / 2.0)
+        );
+        assert_eq!(order(vec![level(1.0, 1.0), any(1.0)]), none);
+        assert_eq!(order(vec![level(0.5, 2.0), any(1.0)]), none);
+        // One that outweighs it by less than the least share is none.
+        assert_eq!(order(vec![level(1.0, 1.000_01), any(1.0)]), none);
+        // A stage that orders nothing is a rank where it leads, and weighs
+        // nothing behind one.
+        assert_eq!(
+            order(vec![level(0.5, 4.0), flat(1.0), any(1.0)]),
+            ranks(2, 0b10, 0, 1.0 / 6.0 / 2.0)
+        );
+        assert_eq!(order(vec![flat(1.0), any(1.0)]), ranks(1, 0b1, 0, 0.0));
+        // Behind the first stage that is no rank, none is.
+        assert_eq!(order(vec![any(1.0), level(1.0, 8.0)]), none);
+        // A weight that is not above zero leaves the profile its sum.
+        assert_eq!(order(vec![level(1.0, 2.0), any(0.0)]), none);
+        // The mark is the front pickers': one that may read every score
+        // has its profile asked whole, and so has one that draws first.
+        let marked = |picker: Box<dyn Picker>| {
+            let engine = staged(vec![level(1.0, 3.0), wise(1.0)], picker);
+            assert_eq!(engine.orders[0].ranks, 1);
+            engine.marks[0].0 & Marks::RANKED != 0
+        };
+        // A profile whose ranks leave nothing unasked decides by its sum.
+        let plain = staged(vec![level(1.0, 3.0), any(1.0)], Box::new(Best));
+        assert_eq!(plain.marks[0].0 & Marks::RANKED, 0);
+        assert!(marked(Box::new(Best)) && marked(Box::new(CountFirst)));
+        assert!(!marked(Box::new(Lowest)) && !marked(Box::new(Random)));
+        // The cache-aware preset: the warm-up slice and the holders' tiers
+        // are ranks, the gate's stage orders nothing, and the load is asked
+        // of the rows they put in front.
+        let engine = preset("cache_aware");
+        let order = engine.orders[0];
+        assert_eq!((order.ranks, order.alike, order.fronts), (3, 0b100, 0b010));
+        assert!(order.room > 0.0);
+        assert_ne!(engine.marks[0].0 & Marks::RANKED, 0);
+        // A profile of one scorer of any values, or of none, holds no rank.
+        for name in ["least_load", "round_robin", "consistent_hashing"] {
+            let engine = preset(name);
+            assert_eq!(engine.orders, vec![none], "{name}");
+            assert_eq!(engine.marks[0].0 & Marks::RANKED, 0, "{name}");
+        }
+    }
+
+    /// Who a stage behind a rank is asked of. The rows at the rank's
+    /// ceiling stand in front where they fill a decision's four targets and
+    /// are at most half of the rows: the stage behind is asked of them
+    /// alone. Fewer than the targets, or more than half, and every row is
+    /// asked. The probe scores a later position higher.
+    #[test]
+    fn a_stage_behind_a_rank_is_asked_of_the_rows_in_front_alone() {
+        let handed = Arc::new(Mutex::new(Vec::new()));
+        let pool = ranked_pool(9);
+        // The targets by position, and the rows the stage behind was handed.
+        let asked = |levels: &[f32]| {
+            let probe = Weighted {
+                scorer: Box::new(Asked(Arc::clone(&handed))),
+                weight: 1.0,
+            };
+            let engine = staged(vec![rank(levels, 4.0, true), probe], Box::new(Best));
+            assert_eq!(engine.orders[0].ranks, 1);
+            let decision = rated(&engine, &request(7), &pool);
+            let rows = handed.lock().expect("the probe's rows").clone();
+            (positions(&decision), rows)
+        };
+        let every: Vec<u32> = (0..9).collect();
+        // Four of nine fill the targets and are under half: the four alone.
+        let (order, rows) = asked(&[1.0, 0.5, 1.0, 0.0, 1.0, 0.5, 1.0, 0.0, 0.5]);
+        assert_eq!(rows, vec![0, 2, 4, 6]);
+        assert_eq!(order, vec![6, 4, 2, 0]);
+        // Five of nine are more than half: every row.
+        let (order, rows) = asked(&[1.0, 1.0, 1.0, 0.0, 1.0, 0.5, 1.0, 0.0, 0.5]);
+        assert_eq!(rows, every);
+        assert_eq!(order, vec![6, 4, 2, 1]);
+        // Three of nine are fewer than the targets: every row, and the
+        // fourth target is the best of the rows a level under.
+        let (order, rows) = asked(&[1.0, 0.5, 1.0, 0.0, 1.0, 0.5, 0.0, 0.0, 0.5]);
+        assert_eq!(rows, every);
+        assert_eq!(order, vec![4, 2, 0, 8]);
+        // No row at the ceiling: every row.
+        let (order, rows) = asked(&[0.5; 9]);
+        assert_eq!(rows, every);
+        assert_eq!(order, vec![8, 7, 6, 5]);
+        // Behind a stage that does not answer for a front alone no row
+        // stands in front: four of nine, and every row is asked.
+        let whole = Weighted {
+            scorer: Box::new(Handed(Arc::clone(&handed))),
+            weight: 1.0,
+        };
+        let levels = [1.0, 0.5, 1.0, 0.0, 1.0, 0.5, 1.0, 0.0, 0.5];
+        let engine = staged(vec![rank(&levels, 4.0, true), whole], Box::new(Best));
+        assert_eq!((engine.orders[0].ranks, engine.orders[0].fronts), (1, 0));
+        rated(&engine, &request(7), &pool);
+        assert_eq!(*handed.lock().expect("the probe's rows"), every);
+    }
+
+    /// A stage that orders nothing is not asked by a ranked decision: its
+    /// share stands in every row's sum, and the decision is the one the
+    /// weighted sum reads, which asks it once.
+    #[test]
+    fn a_stage_that_orders_nothing_is_not_asked() {
+        let asks = Arc::new(Mutex::new(0));
+        let stages = vec![
+            rank(&[1.0, 0.5, 0.0, 0.5, 1.0], 4.0, true),
+            Weighted {
+                scorer: Box::new(Flat(Arc::clone(&asks))),
+                weight: 1.0,
+            },
+            Weighted {
+                scorer: Box::new(Asked(Arc::default())),
+                weight: 1.0,
+            },
+        ];
+        let engine = staged(stages, Box::new(Best));
+        let order = engine.orders[0];
+        assert_eq!((order.ranks, order.alike), (2, 0b10));
+        let pool = ranked_pool(5);
+        let facts = request(3);
+        let ranked = rated(&engine, &facts, &pool);
+        assert_eq!(*asks.lock().expect("the count"), 0);
+        let summed = whole_pass(&engine, &facts, &pool);
+        assert_eq!(*asks.lock().expect("the count"), 1);
+        assert_eq!(ranked, summed);
+    }
+
+    /// The word a stage's scores read as under its spread ([`Front::of`]):
+    /// alike where every row stands at the ceiling, a count where every
+    /// other row stands a whole level or more under it, and nothing of any
+    /// other scores.
+    #[test]
+    fn a_word_is_read_off_the_scores_by_the_spread() {
+        let levels = Spread::Levels(0.5);
+        assert_eq!(Front::of(levels, &[1.0, 1.0]), Front::Alike);
+        assert_eq!(Front::of(levels, &[]), Front::Alike);
+        assert_eq!(Front::of(levels, &[1.0, 0.5, 0.0, 1.0]), Front::At(2));
+        assert_eq!(Front::of(levels, &[0.5, 0.0]), Front::At(0));
+        // A row less than a whole level under the ceiling, or no number.
+        assert_eq!(Front::of(levels, &[1.0, 0.75]), Front::Unsaid);
+        assert_eq!(Front::of(levels, &[1.0, f32::NAN]), Front::Unsaid);
+        assert_eq!(Front::of(Spread::Any, &[1.0, 0.0]), Front::Unsaid);
+        assert_eq!(Front::of(Spread::Alike, &[1.0, 1.0]), Front::Alike);
+    }
+
+    /// A pool under the count a decision is taken by rank from is asked as
+    /// a profile without ranks asks: the stage that orders nothing is asked
+    /// at fifteen rows and is not at sixteen.
+    #[test]
+    fn a_pool_under_sixteen_rows_is_not_decided_by_rank() {
+        let asks = Arc::new(Mutex::new(0));
+        let levels: Vec<f32> = (0..16).map(|i| if i < 4 { 1.0 } else { 0.5 }).collect();
+        let stages = vec![
+            rank(&levels, 4.0, true),
+            Weighted {
+                scorer: Box::new(Flat(Arc::clone(&asks))),
+                weight: 1.0,
+            },
+            Weighted {
+                scorer: Box::new(Asked(Arc::default())),
+                weight: 1.0,
+            },
+        ];
+        let engine = staged(stages, Box::new(Best));
+        assert_ne!(engine.marks[0].0 & Marks::RANKED, 0);
+        let pool: Vec<Candidate> = (0..16).map(|i| candidate(i, 0)).collect();
+        let facts = request(3);
+        let under = rated(&engine, &facts, &pool[..RANK_FROM - 1]);
+        assert_eq!(*asks.lock().expect("the count"), 1);
+        rated(&engine, &facts, &pool);
+        assert_eq!(*asks.lock().expect("the count"), 1);
+        assert_eq!(under, whole_pass(&engine, &facts, &pool[..RANK_FROM - 1]));
+    }
+
+    /// Under each picker of the catalog, and under one that reads every
+    /// score, a decision whose leading stage is a rank is the decision of
+    /// the weighted sum of every stage over every row: the targets, the
+    /// alternates and the trace, over random rows, levels, values, weights,
+    /// tie bands and seeds. The twin's stages score alike and say nothing,
+    /// so its profile holds no rank. A picker the validator builds from its
+    /// parameters is not of this build yet.
+    #[test]
+    fn a_ranked_decision_is_the_weighted_sums_under_every_picker() {
+        use crate::catalog::{Catalog, Found};
+        let catalog = Catalog::builtin();
+        let build = |name: &str| match catalog.find_picker(name) {
+            Some(Found::Built(picker)) => Some(picker),
+            Some(Found::Typed) => None,
+            None => Some(Box::new(Lowest) as Box<dyn Picker>),
+        };
+        let mut marked = Vec::new();
+        for name in catalog.pickers().chain(["lowest"]) {
+            let mut draw = Draw::new(0x5eed);
+            for round in 0..300u64 {
+                let (Some(by_rank), Some(by_sum)) = (build(name), build(name)) else {
+                    break;
+                };
+                let rows = 1 + draw.below(40) as u32;
+                let levels: Vec<f32> = (0..rows)
+                    .map(|_| [0.0, 0.5, 0.5, 1.0][draw.below(4)])
+                    .collect();
+                let values: Vec<f32> = (0..rows).map(|_| draw.below(9) as f32 / 8.0).collect();
+                // A band of none, a small one, and two a rank's room may
+                // not hold.
+                let band = [0.0, 1e-6, 0.3, 1.0][draw.below(4)];
+                // A lead that is no rank, and two that are.
+                let lead = [1.5, 3.0, 8.0][draw.below(3)];
+                let stages = |says| vec![rank(&levels, lead, says), valued(&values, band)];
+                let (ranked, summed) =
+                    (staged(stages(true), by_rank), staged(stages(false), by_sum));
+                assert_eq!(summed.marks[0].0 & Marks::RANKED, 0, "{name}");
+                if ranked.marks[0].0 & Marks::RANKED != 0 && !marked.contains(&name) {
+                    marked.push(name);
+                }
+                let pool: Vec<Candidate> = (0..rows)
+                    .map(|i| candidate(i, draw.below(3) as u32))
+                    .collect();
+                for seed in 0..4 {
+                    let facts = request(round * 4 + seed);
+                    assert_eq!(
+                        rated(&ranked, &facts, &pool),
+                        rated(&summed, &facts, &pool),
+                        "{name}, round {round}, seed {seed}: levels {levels:?}, values \
+                         {values:?}, band {band}, lead {lead}"
+                    );
+                }
+            }
+        }
+        // The front pickers decided by rank: the case is not of sums alone.
+        assert_eq!(marked, ["best", "count-first"]);
+    }
+
+    /// A tie band wider than a rank's room reaches from the rows in front
+    /// to a row behind them, and the decision asks every row every stage.
+    /// Four rows stand at the ceiling with the stage behind at nothing, and
+    /// one a level under them with it at its most: 0.75 and 0.625 of the
+    /// sum, one tie under a band of 0.25. Over the seeds the row behind
+    /// leads some decisions, as it does by the weighted sum.
+    #[test]
+    fn a_tie_band_wider_than_a_ranks_room_asks_every_row_every_stage() {
+        let levels = [1.0, 1.0, 1.0, 1.0, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let values = [0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let engine = |says| {
+            let stages = vec![rank(&levels, 3.0, says), valued(&values, 1.0)];
+            staged(stages, Box::new(Best))
+        };
+        let (ranked, summed) = (engine(true), engine(false));
+        assert_eq!(
+            ranked.orders[0],
+            Order {
+                ranks: 1,
+                alike: 0,
+                fronts: 0b1,
+                room: 0.0625
+            }
+        );
+        let pool = ranked_pool(10);
+        let mut led = Vec::new();
+        for seed in 0..64 {
+            let facts = request(seed);
+            let decision = rated(&ranked, &facts, &pool);
+            assert_eq!(decision, rated(&summed, &facts, &pool), "seed {seed}");
+            led.push(positions(&decision)[0]);
+        }
+        assert!(led.contains(&4), "{led:?}");
+    }
+
+    /// A rank of the tests that says `1` of the scores `0`, which its
+    /// first rows read; every other row reads nothing.
+    #[derive(Debug)]
+    struct Says(Vec<f32>, Front);
+
+    impl Lifecycle for Says {}
+
+    impl Scorer for Says {
+        fn name(&self) -> &'static str {
+            "says"
+        }
+
+        fn score(
+            &self,
+            facts: &RequestFacts<'_>,
+            candidates: &[Candidate],
+            kept: &[u32],
+            out: &mut [f32],
+        ) -> TieBand {
+            self.score_front(facts, candidates, kept, out).0
+        }
+
+        fn spread(&self) -> Spread {
+            Spread::Levels(0.5)
+        }
+
+        fn score_front(
+            &self,
+            _: &RequestFacts<'_>,
+            _: &[Candidate],
+            _: &[u32],
+            out: &mut [f32],
+        ) -> (TieBand, Front) {
+            out.fill(0.0);
+            out[..self.0.len()].copy_from_slice(&self.0);
+            (TieBand(0.0), self.1)
+        }
+    }
+
+    /// A decision over twelve rows under a rank that says `said` of
+    /// `scores`, ahead of a stage that answers for a front alone: the
+    /// profile is decided by rank, so the engine reads the word.
+    fn told(scores: &[f32], said: Front) {
+        let stages = vec![
+            Weighted {
+                scorer: Box::new(Says(scores.to_vec(), said)),
+                weight: 4.0,
+            },
+            valued(&[0.5; 12], 0.0),
+        ];
+        let engine = staged(stages, Box::new(Best));
+        let pool = ranked_pool(12);
+        rated(&engine, &request(1), &pool);
+    }
+
+    /// A rank that says a count of ceilings its scores do not hold fails a
+    /// debug build at the engine's check of the word: its author's case,
+    /// never a wrong decision in the field.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "says said At(5) of scores that read otherwise")]
+    fn a_rank_that_miscounts_its_front_fails_a_debug_build() {
+        told(&[1.0, 1.0, 1.0, 1.0], Front::At(5));
+    }
+
+    /// And so does one whose row stands within a step of the ceiling: the
+    /// rows behind a front lie a step of the spread under it.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "says said At(4) of scores that read otherwise")]
+    fn a_rank_with_a_row_within_a_step_of_its_ceiling_fails_a_debug_build() {
+        told(&[1.0, 1.0, 1.0, 1.0, 0.75], Front::At(4));
+    }
+
+    /// The cache-aware preset by rank is its weighted sum. Over pools of 4
+    /// to 64 rows where every row holds the request's prefix, one in two,
+    /// one in eight or none, under random loads and seeds, the decision is
+    /// the whole pass's: its targets, its alternates and the rows its trace
+    /// names. The whole pass asks each stage by its `score`, the decision by
+    /// rank asks the ranks by their `score_front`: a row scores alike by
+    /// either. The load is asked of the holders in front alone and scores
+    /// them among themselves, so their scores are not the whole pass's.
+    #[test]
+    fn the_cache_aware_preset_decides_by_rank_what_its_weighted_sum_decides() {
+        let engine = preset("cache_aware");
+        let mut draw = Draw::new(0xace);
+        let mut fronts = 0;
+        for round in 0..300u64 {
+            let rows = 4 + draw.below(61) as u32;
+            let pool: Vec<Candidate> = (0..rows)
+                .map(|i| candidate(i, draw.below(4) as u32))
+                .collect();
+            let odds = [1, 2, 8, 1 << 20][draw.below(4)];
+            let overlaps: Vec<u32> = (0..rows)
+                .map(|_| if draw.below(odds) == 0 { 4 } else { 0 })
+                .collect();
+            let column = held(&overlaps);
+            let facts = RequestFacts {
+                prompt_tokens: 512,
+                now_micros: 1_000_000,
+                affinity: &column,
+                ..request(round)
+            };
+            let holders = overlaps.iter().filter(|&&blocks| blocks > 0).count();
+            fronts += usize::from(holders >= MAX_TARGETS && holders * 2 <= pool.len());
+            let (ranked, summed) = (
+                rated(&engine, &facts, &pool),
+                whole_pass(&engine, &facts, &pool),
+            );
+            assert_eq!(
+                positions(&ranked),
+                positions(&summed),
+                "round {round}: {overlaps:?}"
+            );
+            let named = |decision: &Decision| {
+                let trace = decision.pick().expect("a pick").trace;
+                (trace.top.map(|(id, _)| id), trace.top_len, trace.survivors)
+            };
+            assert_eq!(named(&ranked), named(&summed), "round {round}");
+        }
+        // In some rounds the holders fill the targets and are under half.
+        assert!(fronts > 20, "{fronts}");
+    }
+
+    /// The cache-aware preset over fleets whose load reports are mixed: by
+    /// rank it decides what its whole pass decides, in every round of three
+    /// mixes. Where every row reports a rate the load is asked of the
+    /// holders in front alone. A report without a rate drains at the rows'
+    /// mean rate and a row without a report is costed from its reporting
+    /// peers: there the load says it must be asked whole, and is.
+    #[test]
+    fn the_cache_aware_preset_decides_by_rank_its_whole_pass_under_mixed_reports() {
+        let engine = preset("cache_aware");
+        let mut draw = Draw::new(0xace);
+        let mut fronts = [0u32; 3];
+        for round in 0..30_000u64 {
+            // Every row rated, a third of the reports without a rate, a
+            // third of the rows without a report.
+            let mix = (round % 3) as usize;
+            let rows = 8 + draw.below(57) as u32;
+            let pool: Vec<Candidate> = (0..rows)
+                .map(|i| {
+                    let mut row = candidate(i, draw.below(4) as u32);
+                    let reports = mix != 2 || draw.below(3) != 0;
+                    let rated = mix != 1 || draw.below(3) != 0;
+                    if reports {
+                        row.load = Some(crate::view::LoadRow {
+                            running: draw.below(8) as u32,
+                            queued: draw.below(4) as u32,
+                            waiting_uncached_tokens: draw.below(8192) as u32,
+                            live_rate: if rated {
+                                500 + draw.below(4000) as u32
+                            } else {
+                                0
+                            },
+                            ..Default::default()
+                        });
+                    }
+                    row
+                })
+                .collect();
+            let odds = [2, 4, 8][draw.below(3)];
+            let overlaps: Vec<u32> = (0..rows)
+                .map(|_| if draw.below(odds) == 0 { 4 } else { 0 })
+                .collect();
+            let column = held(&overlaps);
+            let facts = RequestFacts {
+                prompt_tokens: 512,
+                now_micros: 1_000_000,
+                affinity: &column,
+                ..request(round)
+            };
+            let holders = overlaps.iter().filter(|&&blocks| blocks > 0).count();
+            fronts[mix] += u32::from(holders >= MAX_TARGETS && holders * 2 <= pool.len());
+            let (ranked, summed) = (
+                rated(&engine, &facts, &pool),
+                whole_pass(&engine, &facts, &pool),
+            );
+            assert_eq!(
+                positions(&ranked),
+                positions(&summed),
+                "round {round}, mix {mix}: {overlaps:?}"
+            );
+            let named = |decision: &Decision| {
+                let trace = decision.pick().expect("a pick").trace;
+                (trace.top.map(|(id, _)| id), trace.top_len, trace.survivors)
+            };
+            assert_eq!(named(&ranked), named(&summed), "round {round}, mix {mix}");
+        }
+        // In each mix the holders fill the targets and are under half in
+        // most rounds.
+        assert!(fronts.iter().all(|&rounds| rounds > 5_000), "{fronts:?}");
+    }
+
+    /// The cache-aware preset where the whole pass cannot tell the rows in
+    /// front apart. Eight of thirty-two rows hold the request's prefix. Each
+    /// runs one request and their rates step by one token a second from
+    /// 20,000, so their waits lie 2.56 microseconds apart: outside the
+    /// load's tie of one microsecond. With no queue behind them the
+    /// decision by rank is the whole pass's under every seed. With a queue
+    /// of 200 on one row behind, the pool's costs span a hundred seconds:
+    /// the whole pass spreads the load over that span, the eight's sums
+    /// meet in one value and its picker draws among them. By rank the load
+    /// is asked of the eight alone and orders them by their wait: the
+    /// targets are the four fastest under every seed, and each is a row the
+    /// whole pass draws among.
+    #[test]
+    fn the_rows_in_front_are_ordered_where_the_whole_pass_draws_among_them() {
+        let engine = preset("cache_aware");
+        let pool_of = |queued: u32| -> Vec<Candidate> {
+            (0..32u32)
+                .map(|at| {
+                    let mut row = candidate(at, 0);
+                    row.load = Some(crate::view::LoadRow {
+                        running: 1,
+                        queued: if at == 31 { queued } else { 0 },
+                        live_rate: if at < 8 { 20_000 + at } else { 2_000 },
+                        ..Default::default()
+                    });
+                    row
+                })
+                .collect()
+        };
+        let overlaps: Vec<u32> = (0..32).map(|at| if at < 8 { 4 } else { 0 }).collect();
+        let column = held(&overlaps);
+        // The targets of 64 seeds, each list of four once: by rank, and by
+        // the whole pass.
+        let read = |pool: &[Candidate]| {
+            let (mut by_rank, mut by_sum) = (Vec::new(), Vec::new());
+            for seed in 0..64u64 {
+                let facts = RequestFacts {
+                    prompt_tokens: 512,
+                    now_micros: 1_000_000,
+                    affinity: &column,
+                    ..request(seed)
+                };
+                by_rank.push(positions(&rated(&engine, &facts, pool)));
+                by_sum.push(positions(&whole_pass(&engine, &facts, pool)));
+            }
+            by_rank.sort_unstable();
+            by_rank.dedup();
+            by_sum.sort_unstable();
+            by_sum.dedup();
+            (by_rank, by_sum)
+        };
+        let fastest = [vec![7, 6, 5, 4]];
+        let (by_rank, by_sum) = read(&pool_of(0));
+        assert_eq!(by_rank, fastest);
+        assert_eq!(by_sum, fastest);
+        let (by_rank, by_sum) = read(&pool_of(200));
+        assert_eq!(by_rank, fastest);
+        assert!(by_sum.len() > 1, "{by_sum:?}");
+        assert!(by_sum.iter().flatten().all(|&at| at < 8), "{by_sum:?}");
+    }
+
+    /// A host that says every row holds a rate of a pool where one does
+    /// not. Among the rows in front such a row makes the load stage say
+    /// that it must be asked whole: the decision is the whole pass's, and
+    /// so are its trace's scores. Behind the rows in front it is not read:
+    /// they are costed alone, each from its own report, so the targets are
+    /// the whole pass's and the trace's scores are the front's own.
+    #[test]
+    fn a_row_without_a_rate_is_read_only_among_the_rows_in_front() {
+        let engine = preset("cache_aware");
+        // Thirty-two rows with work of their own, the first eight holding
+        // the request's prefix. The row at `bare` reports no rate.
+        let pool_of = |bare: u32| -> Vec<Candidate> {
+            (0..32u32)
+                .map(|at| {
+                    let mut row = candidate(at, 0);
+                    row.load = Some(crate::view::LoadRow {
+                        running: 1 + at % 4,
+                        live_rate: if at == bare { 0 } else { 1_000 + 100 * at },
+                        ..Default::default()
+                    });
+                    row
+                })
+                .collect()
+        };
+        let overlaps: Vec<u32> = (0..32).map(|at| if at < 8 { 4 } else { 0 }).collect();
+        let column = held(&overlaps);
+        let facts = RequestFacts {
+            prompt_tokens: 512,
+            now_micros: 1_000_000,
+            affinity: &column,
+            ..request(11)
+        };
+        // Whether the trace's scores by rank are the whole pass's; the
+        // targets are, either way.
+        let scored_whole = |pool: &[Candidate]| {
+            let (ranked, summed) = (
+                rated(&engine, &facts, pool),
+                whole_pass(&engine, &facts, pool),
+            );
+            assert_eq!(positions(&ranked), positions(&summed));
+            let top = |decision: &Decision| decision.pick().expect("a pick").trace.top;
+            top(&ranked) == top(&summed)
+        };
+        assert!(scored_whole(&pool_of(3)), "among the rows in front");
+        assert!(!scored_whole(&pool_of(20)), "behind them");
+    }
+
+    /// A later rank puts fewer rows in front where they still fill the
+    /// targets and are at most half of the rows the rank before left. Of
+    /// sixteen rows the first rank leaves eight and the second four of
+    /// those: the stage behind both is asked of the four alone. Five of the
+    /// eight are more than half, and the eight are asked.
+    #[test]
+    fn a_later_rank_puts_fewer_rows_in_front() {
+        let handed = Arc::new(Mutex::new(Vec::new()));
+        let pool: Vec<Candidate> = (0..16).map(|i| candidate(i, 0)).collect();
+        let first: Vec<f32> = (0..16).map(|i| if i < 8 { 1.0 } else { 0.5 }).collect();
+        let asked = |second: &[f32]| {
+            let probe = Weighted {
+                scorer: Box::new(Asked(Arc::clone(&handed))),
+                weight: 1.0,
+            };
+            let stages = vec![rank(&first, 12.0, true), rank(second, 3.0, true), probe];
+            let engine = staged(stages, Box::new(Best));
+            assert_eq!(engine.orders[0].ranks, 2);
+            let decision = rated(&engine, &request(9), &pool);
+            let rows = handed.lock().expect("the probe's rows").clone();
+            (positions(&decision), rows)
+        };
+        // Three of the eight are fewer than the targets: the eight are
+        // asked, and the fourth target is the best of the other five.
+        let mut second = vec![0.5; 16];
+        second[..3].fill(1.0);
+        let (order, rows) = asked(&second);
+        assert_eq!(rows, (0..8).collect::<Vec<u32>>());
+        assert_eq!(order, vec![2, 1, 0, 7]);
+        second[3] = 1.0;
+        let (order, rows) = asked(&second);
+        assert_eq!(rows, vec![0, 1, 2, 3]);
+        assert_eq!(order, vec![3, 2, 1, 0]);
+        second[4] = 1.0;
+        let (order, rows) = asked(&second);
+        assert_eq!(rows, (0..8).collect::<Vec<u32>>());
+        assert_eq!(order, vec![4, 3, 2, 1]);
+    }
+
+    /// A rank that puts fewer rows in front keeps what each of them holds.
+    /// The second rank leaves the last four of the eight in front, above
+    /// rows it wrote two other levels: the stage behind orders the four.
+    #[test]
+    fn a_narrowing_rank_keeps_the_sums_of_the_rows_it_leaves_in_front() {
+        let handed = Arc::new(Mutex::new(Vec::new()));
+        let pool: Vec<Candidate> = (0..16).map(|i| candidate(i, 0)).collect();
+        let first: Vec<f32> = (0..16).map(|i| if i < 8 { 1.0 } else { 0.5 }).collect();
+        let mut second = vec![0.5; 16];
+        second[2..4].fill(0.0);
+        second[4..8].fill(1.0);
+        let probe = Weighted {
+            scorer: Box::new(Asked(Arc::clone(&handed))),
+            weight: 1.0,
+        };
+        let stages = vec![rank(&first, 12.0, true), rank(&second, 3.0, true), probe];
+        let engine = staged(stages, Box::new(Best));
+        let decision = rated(&engine, &request(9), &pool);
+        assert_eq!(*handed.lock().expect("the probe's rows"), vec![4, 5, 6, 7]);
+        assert_eq!(positions(&decision), vec![7, 6, 5, 4]);
+    }
+
+    /// A rank parts the rows in front without leaving fewer there, the
+    /// three at its ceiling being under the targets. The rank behind it
+    /// then leaves no fewer either, although four stand at its own ceiling:
+    /// the stage behind is asked of the eight, and the targets are the
+    /// weighted sum's.
+    #[test]
+    fn a_rank_behind_a_parted_front_leaves_no_fewer_in_front() {
+        let handed = Arc::new(Mutex::new(Vec::new()));
+        let pool: Vec<Candidate> = (0..16).map(|i| candidate(i, 0)).collect();
+        let first: Vec<f32> = (0..16).map(|i| if i < 8 { 1.0 } else { 0.5 }).collect();
+        let mut second = vec![0.5; 16];
+        second[..3].fill(1.0);
+        let mut third = vec![0.5; 16];
+        third[2..6].fill(1.0);
+        let stages = |says| {
+            let probe = Weighted {
+                scorer: Box::new(Asked(Arc::clone(&handed))),
+                weight: 1.0,
+            };
+            vec![
+                rank(&first, 48.0, says),
+                rank(&second, 12.0, says),
+                rank(&third, 3.0, says),
+                probe,
+            ]
+        };
+        let (ranked, summed) = (
+            staged(stages(true), Box::new(Best)),
+            staged(stages(false), Box::new(Best)),
+        );
+        assert_eq!(ranked.orders[0].ranks, 3);
+        let facts = request(9);
+        let decision = rated(&ranked, &facts, &pool);
+        assert_eq!(
+            *handed.lock().expect("the probe's rows"),
+            (0..8).collect::<Vec<u32>>()
+        );
+        assert_eq!(positions(&decision), vec![2, 1, 0, 5]);
+        assert_eq!(
+            positions(&decision),
+            positions(&rated(&summed, &facts, &pool))
+        );
+    }
+
+    /// A profile is asked by rank only over a pool whose host says that
+    /// every row holds a rate ([`PoolFacts::rated`]): the stage behind the
+    /// rank is handed the four rows in front there, and every row where the
+    /// host does not say it. The turn is read in both directions over one
+    /// engine, and the targets are the same either way.
+    #[test]
+    fn a_pool_not_said_to_hold_a_rate_on_every_row_is_asked_whole_at_once() {
+        let handed = Arc::new(Mutex::new(Vec::new()));
+        let probe = Weighted {
+            scorer: Box::new(Asked(Arc::clone(&handed))),
+            weight: 1.0,
+        };
+        let levels = [1.0, 0.5, 1.0, 0.0, 1.0, 0.5, 1.0, 0.0, 0.5];
+        let engine = staged(vec![rank(&levels, 4.0, true), probe], Box::new(Best));
+        let pool = ranked_pool(9);
+        // The targets by position, and the rows the stage behind was handed.
+        let asked = |rated: bool| {
+            let facts = PoolFacts {
+                rated,
+                ..PoolFacts::default()
+            };
+            let decision = engine.decide(
+                &request(7),
+                &facts,
+                &pool,
+                &Constraints::default(),
+                &mut Scratch::new(),
+            );
+            let rows = handed.lock().expect("the probe's rows").clone();
+            (positions(&decision), rows)
+        };
+        let targets = vec![6, 4, 2, 0];
+        let front = (targets.clone(), vec![0, 2, 4, 6]);
+        assert_eq!(asked(true), front);
+        // One row without a rate, a fresh worker before its first sample
+        // among them, and the host stops saying it: every row.
+        assert_eq!(asked(false), (targets, (0..9).collect::<Vec<u32>>()));
+        // It reports: the four in front again.
+        assert_eq!(asked(true), front);
+    }
+
+    /// The list of the rows in front keeps its length from one decision to
+    /// the next over one scratch, and is filled only as it grows. A front
+    /// of four, then of six, then of four again: each decision hands the
+    /// stage behind the rank its own front and decides as the whole pass,
+    /// whatever the list held before.
+    #[test]
+    fn a_front_is_listed_anew_over_a_scratch_that_held_another() {
+        let handed = Arc::new(Mutex::new(Vec::new()));
+        let front_of = |levels: &[f32]| {
+            let probe = Weighted {
+                scorer: Box::new(Asked(Arc::clone(&handed))),
+                weight: 1.0,
+            };
+            staged(vec![rank(levels, 4.0, true), probe], Box::new(Best))
+        };
+        let four: Vec<f32> = (0..16)
+            .map(|i| if i < 8 && i % 2 == 0 { 1.0 } else { 0.5 })
+            .collect();
+        let six: Vec<f32> = (0..16).map(|i| if i < 6 { 1.0 } else { 0.5 }).collect();
+        let (four, six) = (front_of(&four), front_of(&six));
+        let pool = ranked_pool(16);
+        let said = PoolFacts {
+            rated: true,
+            ..PoolFacts::default()
+        };
+        let mut scratch = Scratch::new();
+        // The targets by position, and the rows the stage behind was handed.
+        let mut asked = |engine: &Engine| {
+            let facts = request(7);
+            let decision =
+                engine.decide(&facts, &said, &pool, &Constraints::default(), &mut scratch);
+            let rows = handed.lock().expect("the probe's rows").clone();
+            assert_eq!(
+                positions(&decision),
+                positions(&whole_pass(engine, &facts, &pool))
+            );
+            (positions(&decision), rows)
+        };
+        assert_eq!(asked(&four), (vec![6, 4, 2, 0], vec![0, 2, 4, 6]));
+        assert_eq!(asked(&six), (vec![5, 4, 3, 2], vec![0, 1, 2, 3, 4, 5]));
+        assert_eq!(asked(&four), (vec![6, 4, 2, 0], vec![0, 2, 4, 6]));
+    }
+
+    /// A stage of the tests that answers row by row, and says it must be
+    /// asked whole where it is handed fewer rows than its count. It notes
+    /// how many rows each ask handed it.
+    #[derive(Debug)]
+    struct Wholly(Arc<Mutex<Vec<usize>>>, usize);
+
+    impl Lifecycle for Wholly {}
+
+    impl Scorer for Wholly {
+        fn name(&self) -> &'static str {
+            "wholly"
+        }
+
+        fn score(
+            &self,
+            _: &RequestFacts<'_>,
+            candidates: &[Candidate],
+            kept: &[u32],
+            out: &mut [f32],
+        ) -> TieBand {
+            self.0.lock().expect("the asks").push(kept.len());
+            for (o, &row) in out.iter_mut().zip(kept) {
+                *o = candidates[row as usize].position as f32 / 16.0;
+            }
+            TieBand::NORMALIZED
+        }
+
+        fn front_wise(&self) -> bool {
+            true
+        }
+
+        fn score_front(
+            &self,
+            facts: &RequestFacts<'_>,
+            candidates: &[Candidate],
+            kept: &[u32],
+            out: &mut [f32],
+        ) -> (TieBand, Front) {
+            if kept.len() < self.1 {
+                self.0.lock().expect("the asks").push(kept.len());
+                return (TieBand::NORMALIZED, Front::Whole);
+            }
+            (self.score(facts, candidates, kept, out), Front::Unsaid)
+        }
+    }
+
+    /// A stage behind a rank that says it must be asked whole is asked
+    /// again of every row, and the decision is the weighted sum's: the rows
+    /// in front decide alone only where the stage answers for them alone.
+    #[test]
+    fn a_stage_that_must_be_asked_whole_is_asked_of_every_row() {
+        let pool: Vec<Candidate> = (0..16).map(|i| candidate(i, 0)).collect();
+        let levels: Vec<f32> = (0..16).map(|i| if i < 8 { 1.0 } else { 0.5 }).collect();
+        let decided = |least: usize| {
+            let asks = Arc::new(Mutex::new(Vec::new()));
+            let stage = Weighted {
+                scorer: Box::new(Wholly(Arc::clone(&asks), least)),
+                weight: 1.0,
+            };
+            let engine = staged(vec![rank(&levels, 4.0, true), stage], Box::new(Best));
+            assert_ne!(engine.marks[0].0 & Marks::RANKED, 0);
+            let decision = rated(&engine, &request(3), &pool);
+            let asks = asks.lock().expect("the asks").clone();
+            (positions(&decision), asks)
+        };
+        // It answers for the eight in front alone: asked once, of them.
+        let (alone, asks) = decided(8);
+        assert_eq!(asks, vec![8]);
+        // It must be asked whole: asked of the eight, then of every row,
+        // and the targets are the same four.
+        let (whole, asks) = decided(16);
+        assert_eq!(asks, vec![8, 16]);
+        assert_eq!(whole, alone);
+        assert_eq!(whole, vec![7, 6, 5, 4]);
+    }
+
+    /// A rank of the tests that says it must be asked whole and writes
+    /// nothing then: its plain answer is the level named for a row's
+    /// position.
+    #[derive(Debug)]
+    struct Shy(Vec<f32>);
+
+    impl Lifecycle for Shy {}
+
+    impl Scorer for Shy {
+        fn name(&self) -> &'static str {
+            "shy"
+        }
+
+        fn score(
+            &self,
+            _: &RequestFacts<'_>,
+            candidates: &[Candidate],
+            kept: &[u32],
+            out: &mut [f32],
+        ) -> TieBand {
+            for (o, &row) in out.iter_mut().zip(kept) {
+                *o = self.0[candidates[row as usize].position as usize];
+            }
+            TieBand(0.0)
+        }
+
+        fn spread(&self) -> Spread {
+            Spread::Levels(0.5)
+        }
+
+        fn score_front(
+            &self,
+            _: &RequestFacts<'_>,
+            _: &[Candidate],
+            _: &[u32],
+            _: &mut [f32],
+        ) -> (TieBand, Front) {
+            (TieBand(0.0), Front::Whole)
+        }
+    }
+
+    /// A pool the overload veto empties is put to the binding's all-vetoed
+    /// rule by a decision asked by rank, as by the whole pass: the filter
+    /// half is one, and so is the plan's home for an emptied pool. The rule
+    /// steers the request by default, and sheds it where the binding says so.
+    #[test]
+    fn a_decision_by_rank_puts_an_all_vetoed_pool_to_the_bindings_rule() {
+        let mut engine = preset("cache_aware");
+        assert_ne!(engine.marks[0].0 & Marks::RANKED, 0);
+        let mut pool: Vec<Candidate> = (0..32).map(|i| candidate(i, i % 5)).collect();
+        for c in &mut pool {
+            c.health.overloaded = true;
+        }
+        let facts = RequestFacts {
+            prompt_tokens: 512,
+            now_micros: 1_000_000,
+            ..request(7)
+        };
+        let steered = rated(&engine, &facts, &pool);
+        assert!(steered.pick().is_some(), "{steered:?}");
+        assert_eq!(steered, whole_pass(&engine, &facts, &pool));
+        engine.shed_when_all_vetoed(0);
+        let shed = rated(&engine, &facts, &pool);
+        assert!(shed.pick().is_none(), "{shed:?}");
+        assert_eq!(shed, whole_pass(&engine, &facts, &pool));
+    }
+
+    /// A stage of the tests that orders nothing and notes how many rows
+    /// each ask handed it.
+    #[derive(Debug)]
+    struct Still(Arc<Mutex<Vec<usize>>>);
+
+    impl Lifecycle for Still {}
+
+    impl Scorer for Still {
+        fn name(&self) -> &'static str {
+            "still"
+        }
+
+        fn score(
+            &self,
+            _: &RequestFacts<'_>,
+            _: &[Candidate],
+            kept: &[u32],
+            out: &mut [f32],
+        ) -> TieBand {
+            self.0.lock().expect("the asks").push(kept.len());
+            out.fill(1.0);
+            TieBand(0.0)
+        }
+
+        fn spread(&self) -> Spread {
+            Spread::Alike
+        }
+    }
+
+    /// A profile of ten stages: a rank, seven stages that order nothing, a
+    /// ninth that says its front and a tenth that orders nothing. The build
+    /// reads eight stages as ranks, so the ninth is none and its word
+    /// leaves no fewer rows in front: the tenth is asked of the eight rows
+    /// the leading rank put there, and the decision is the weighted sum's.
+    /// A stage past the eighth has no bit of the build's to be read by.
+    /// Read by its index, the ninth stopped a debug build, and a release
+    /// build read the leading rank's bit and asked the tenth of four rows.
+    #[test]
+    fn a_stage_past_the_eighth_that_says_its_front_is_no_rank() {
+        let lead: Vec<f32> = (0..16).map(|i| if i < 8 { 1.0 } else { 0.5 }).collect();
+        let last: Vec<f32> = (0..16)
+            .map(|i| if i % 2 == 0 { 1.0 } else { 0.5 })
+            .collect();
+        let handed = Arc::new(Mutex::new(Vec::new()));
+        let mut stages = vec![rank(&lead, 8.0, true)];
+        stages.extend((0..7).map(|_| Weighted {
+            scorer: Box::new(Flat(Arc::default())),
+            weight: 1.0,
+        }));
+        stages.push(rank(&last, 1.0, true));
+        stages.push(Weighted {
+            scorer: Box::new(Still(Arc::clone(&handed))),
+            weight: 1.0,
+        });
+        let engine = staged(stages, Box::new(Best));
+        assert_ne!(engine.marks[0].0 & Marks::RANKED, 0);
+        assert_eq!(usize::from(engine.orders[0].ranks), Order::MOST);
+        let pool: Vec<Candidate> = (0..16).map(|i| candidate(i, 0)).collect();
+        let facts = request(5);
+        let ranked = rated(&engine, &facts, &pool);
+        assert_eq!(*handed.lock().expect("the asks"), vec![8]);
+        // The four rows at both ceilings tie, and the seed draws their order.
+        let mut targets = positions(&ranked);
+        targets.sort_unstable();
+        assert_eq!(targets, vec![0, 2, 4, 6]);
+        assert_eq!(
+            positions(&ranked),
+            positions(&whole_pass(&engine, &facts, &pool))
+        );
+    }
+
+    /// A level stage of the tests that answers among the rows it is handed:
+    /// the last of them reads the ceiling. It does not say that it may be
+    /// asked of a front alone, and notes how many rows each ask handed it.
+    #[derive(Debug)]
+    struct Among(Arc<Mutex<Vec<usize>>>);
+
+    impl Lifecycle for Among {}
+
+    impl Scorer for Among {
+        fn name(&self) -> &'static str {
+            "among"
+        }
+
+        fn score(
+            &self,
+            _: &RequestFacts<'_>,
+            _: &[Candidate],
+            kept: &[u32],
+            out: &mut [f32],
+        ) -> TieBand {
+            self.0.lock().expect("the asks").push(kept.len());
+            out.fill(0.5);
+            if let Some(last) = out.last_mut() {
+                *last = 1.0;
+            }
+            TieBand(0.0)
+        }
+
+        fn spread(&self) -> Spread {
+            Spread::Levels(0.5)
+        }
+    }
+
+    /// A rank that parts the rows and may not put them in front, since a
+    /// rank behind it answers among the rows it is handed: every row is
+    /// asked on, and the decision is the weighted sum's. The build's word is
+    /// read where the rows part.
+    #[test]
+    fn a_rank_that_may_not_put_rows_in_front_asks_every_row_on() {
+        let asks = Arc::new(Mutex::new(Vec::new()));
+        let lead: Vec<f32> = (0..16).map(|i| if i < 8 { 1.0 } else { 0.5 }).collect();
+        let early: Vec<f32> = (0..16).map(|i| 1.0 - i as f32 / 16.0).collect();
+        let stages = vec![
+            rank(&lead, 8.0, true),
+            Weighted {
+                scorer: Box::new(Among(Arc::clone(&asks))),
+                weight: 2.0,
+            },
+            Weighted {
+                scorer: Box::new(Valued(early, 0.0)),
+                weight: 0.5,
+            },
+        ];
+        let engine = staged(stages, Box::new(Best));
+        assert_ne!(engine.marks[0].0 & Marks::RANKED, 0);
+        // The second rank may put rows in front, the first may not.
+        assert_eq!((engine.orders[0].ranks, engine.orders[0].fronts), (2, 0b10));
+        let pool: Vec<Candidate> = (0..16).map(|i| candidate(i, 0)).collect();
+        let facts = request(11);
+        let ranked = rated(&engine, &facts, &pool);
+        assert_eq!(*asks.lock().expect("the asks"), vec![16]);
+        assert_eq!(positions(&ranked), vec![0, 1, 2, 3]);
+        assert_eq!(
+            positions(&ranked),
+            positions(&whole_pass(&engine, &facts, &pool))
+        );
+    }
+
+    /// A host's picker that answers a built-in's name and reads every score:
+    /// the lowest first.
+    #[derive(Debug)]
+    struct Namesake;
+
+    impl Lifecycle for Namesake {}
+
+    impl Picker for Namesake {
+        fn name(&self) -> &'static str {
+            "best"
+        }
+
+        fn pick(
+            &self,
+            facts: &RequestFacts<'_>,
+            candidates: &[Candidate],
+            kept: &[u32],
+            scores: &[f32],
+            band: TieBand,
+            out: &mut Targets,
+        ) {
+            Lowest.pick(facts, candidates, kept, scores, band, out);
+        }
+    }
+
+    /// A picker is handed a front alone by its own word
+    /// ([`Picker::front_wise`]), never by its name: a host's picker that
+    /// answers `best` and reads every score is handed every row, and its
+    /// profile is not decided by rank.
+    #[test]
+    fn a_picker_is_handed_a_front_by_its_word_and_not_by_its_name() {
+        let lead: Vec<f32> = (0..16).map(|i| if i < 8 { 1.0 } else { 0.5 }).collect();
+        let stages = |probe: &Arc<Mutex<Vec<u32>>>| {
+            vec![
+                rank(&lead, 4.0, true),
+                Weighted {
+                    scorer: Box::new(Asked(Arc::clone(probe))),
+                    weight: 1.0,
+                },
+            ]
+        };
+        let pool: Vec<Candidate> = (0..16).map(|i| candidate(i, 0)).collect();
+        let facts = request(13);
+        let handed = Arc::new(Mutex::new(Vec::new()));
+        let host = staged(stages(&handed), Box::new(Namesake));
+        assert_eq!(host.marks[0].0 & Marks::RANKED, 0);
+        // The lowest sums are the rows behind the rank's ceiling.
+        assert_eq!(positions(&rated(&host, &facts, &pool)), vec![8, 9, 10, 11]);
+        assert_eq!(handed.lock().expect("the probe's rows").len(), 16);
+        let built = staged(stages(&handed), Box::new(Best));
+        assert_ne!(built.marks[0].0 & Marks::RANKED, 0);
+        assert_eq!(positions(&rated(&built, &facts, &pool)), vec![7, 6, 5, 4]);
+        assert_eq!(handed.lock().expect("the probe's rows").len(), 8);
+    }
+
+    /// A stage of the tests that says it orders nothing and returns a band.
+    #[derive(Debug)]
+    struct Banded;
+
+    impl Lifecycle for Banded {}
+
+    impl Scorer for Banded {
+        fn name(&self) -> &'static str {
+            "banded"
+        }
+
+        fn score(
+            &self,
+            _: &RequestFacts<'_>,
+            _: &[Candidate],
+            _: &[u32],
+            out: &mut [f32],
+        ) -> TieBand {
+            out.fill(1.0);
+            TieBand(0.5)
+        }
+
+        fn spread(&self) -> Spread {
+            Spread::Alike
+        }
+    }
+
+    /// A stage that says it orders nothing returns no band
+    /// ([`Spread::Alike`]): a decision by rank does not ask it, so a band of
+    /// its own would widen the whole pass's ties and no other's. One that
+    /// returns a band fails a debug build where it is asked: its author's
+    /// case, never two decisions in the field.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "banded orders nothing and returned a band")]
+    fn a_stage_that_orders_nothing_and_returns_a_band_fails_a_debug_build() {
+        let lead: Vec<f32> = (0..16).map(|i| if i < 8 { 1.0 } else { 0.5 }).collect();
+        let stages = vec![
+            rank(&lead, 4.0, true),
+            Weighted {
+                scorer: Box::new(Banded),
+                weight: 1.0,
+            },
+        ];
+        let engine = staged(stages, Box::new(Best));
+        let pool: Vec<Candidate> = (0..16).map(|i| candidate(i, 0)).collect();
+        whole_pass(&engine, &request(17), &pool);
+    }
+
+    /// The stage of the case above behind a stage that orders the rows: by
+    /// rank it is asked, and the decision ends at its band.
+    #[cfg(debug_assertions)]
+    fn banded_behind(levels: &[f32]) {
+        let stages = vec![
+            rank(levels, 8.0, true),
+            Weighted {
+                scorer: Box::new(Asked(Arc::default())),
+                weight: 1.0,
+            },
+            Weighted {
+                scorer: Box::new(Banded),
+                weight: 1.0,
+            },
+        ];
+        let engine = staged(stages, Box::new(Best));
+        assert_eq!(engine.orders[0].ranks, 1);
+        rated(&engine, &request(7), &ranked_pool(9));
+    }
+
+    /// Behind a stage that orders the rows, a stage that says it orders
+    /// nothing is asked by rank: of the rows in front where four of nine
+    /// stand at the rank's ceiling. A band of its own fails a debug build
+    /// there too.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "banded orders nothing and returned a band")]
+    fn a_band_from_a_stage_that_orders_nothing_fails_a_debug_build_behind_a_front() {
+        banded_behind(&[1.0, 0.5, 1.0, 0.0, 1.0, 0.5, 1.0, 0.0, 0.5]);
+    }
+
+    /// And of every row where three of nine stand at the rank's ceiling,
+    /// fewer than a decision's targets.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "banded orders nothing and returned a band")]
+    fn a_band_from_a_stage_that_orders_nothing_fails_a_debug_build_where_every_row_is_asked_on() {
+        banded_behind(&[1.0, 0.5, 1.0, 0.0, 1.0, 0.5, 0.0, 0.0, 0.5]);
+    }
+
+    /// A leading rank that says it must be asked whole was handed every
+    /// row: it is asked again plainly, and the decision is the weighted
+    /// sum's.
+    #[test]
+    fn a_leading_rank_that_must_be_asked_whole_is_asked_plainly() {
+        let levels = [1.0, 0.5, 1.0, 0.0, 0.5, 1.0, 1.0, 0.0, 1.0, 0.5];
+        let values = [0.1, 0.9, 0.3, 0.8, 0.2, 0.7, 0.4, 0.6, 0.5, 0.0];
+        let shy = Weighted {
+            scorer: Box::new(Shy(levels.to_vec())),
+            weight: 3.0,
+        };
+        let ranked = staged(vec![shy, valued(&values, 0.0)], Box::new(Best));
+        assert_ne!(ranked.marks[0].0 & Marks::RANKED, 0);
+        let stages = vec![rank(&levels, 3.0, false), valued(&values, 0.0)];
+        let summed = staged(stages, Box::new(Best));
+        let pool = ranked_pool(10);
+        for seed in 0..16 {
+            let facts = request(seed);
+            assert_eq!(
+                positions(&rated(&ranked, &facts, &pool)),
+                positions(&rated(&summed, &facts, &pool)),
+                "seed {seed}"
+            );
+        }
+        // The five at the ceiling in the order of the stage behind.
+        let led = positions(&rated(&ranked, &request(0), &pool));
+        assert_eq!(led, vec![5, 8, 6, 2]);
     }
 }
