@@ -545,9 +545,8 @@ impl Engine {
             side.far_member.sort_unstable();
         }
         // The pairs by membership: one at all, one an encoder serves, and
-        // one whose decode takes images. They are read only where an answer
-        // is asked: a request without items that asks no images of its
-        // decode pays the pair entry's cost alone.
+        // one whose decode takes images. Every request that comes here asks
+        // one of them: the request that asks none left by the early answer.
         //
         // The decodes' classes stand in sets of bits no wider than the
         // fleet. Under a table the width is the table's own, as the pair
@@ -557,49 +556,47 @@ impl Engine {
         // numbers above it, which a dense numbering never names.
         let class_of = |at: usize| encode.prefill_classes.get(at).copied().unwrap_or(0);
         let (mut any_pair, mut any_served, mut any_vision) = (false, false, false);
-        if needs || items.decode_images || (items.references && images) {
-            let tabled = !pools.table.is_empty();
-            let width = if tabled {
-                pools.table.width()
-            } else {
-                pools.decodes.len() + 1
-            };
-            side.decodes_of.reset(width);
-            side.vision_of.reset(width);
-            side.far.clear();
-            side.far_vision.clear();
-            for row in pools.decodes.iter().filter(|row| row.pair_class != 0) {
-                if side.decodes_of.insert(row.pair_class) {
-                    if row.vision {
-                        side.vision_of.insert(row.pair_class);
-                    }
-                } else if !tabled {
-                    side.far.push(row.pair_class);
-                    if row.vision {
-                        side.far_vision.push(row.pair_class);
-                    }
+        let tabled = !pools.table.is_empty();
+        let width = if tabled {
+            pools.table.width()
+        } else {
+            pools.decodes.len() + 1
+        };
+        side.decodes_of.reset(width);
+        side.vision_of.reset(width);
+        side.far.clear();
+        side.far_vision.clear();
+        for row in pools.decodes.iter().filter(|row| row.pair_class != 0) {
+            if side.decodes_of.insert(row.pair_class) {
+                if row.vision {
+                    side.vision_of.insert(row.pair_class);
+                }
+            } else if !tabled {
+                side.far.push(row.pair_class);
+                if row.vision {
+                    side.far_vision.push(row.pair_class);
                 }
             }
-            side.far.sort_unstable();
-            side.far_vision.sort_unstable();
-            // The three answers only rise: the pass ends at the prefill
-            // that gives the last of them.
-            for (at, row) in pools.prefills.iter().enumerate() {
-                let listed = pools.table.of(&row.pair_class);
-                if listed
-                    .iter()
-                    .any(|&class| holds(&side.decodes_of, &side.far, class))
-                {
-                    any_pair = true;
-                    if !needs || holds(&side.member, &side.far_member, class_of(at)) {
-                        any_served = true;
-                        if listed
-                            .iter()
-                            .any(|&class| holds(&side.vision_of, &side.far_vision, class))
-                        {
-                            any_vision = true;
-                            break;
-                        }
+        }
+        side.far.sort_unstable();
+        side.far_vision.sort_unstable();
+        // The three answers only rise: the pass ends at the prefill
+        // that gives the last of them.
+        for (at, row) in pools.prefills.iter().enumerate() {
+            let listed = pools.table.of(&row.pair_class);
+            if listed
+                .iter()
+                .any(|&class| holds(&side.decodes_of, &side.far, class))
+            {
+                any_pair = true;
+                if !needs || holds(&side.member, &side.far_member, class_of(at)) {
+                    any_served = true;
+                    if listed
+                        .iter()
+                        .any(|&class| holds(&side.vision_of, &side.far_vision, class))
+                    {
+                        any_vision = true;
+                        break;
                     }
                 }
             }
