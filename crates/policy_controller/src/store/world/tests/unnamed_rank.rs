@@ -46,6 +46,30 @@ fn names_one_alone(store: &MemoryStore, zero: WorkerId, one: WorkerId, at: Insta
     );
 }
 
+/// The engine of [`two_ranks`] under a threshold, with rank zero left
+/// unnamed and then the word that no report came: the engine's verdict
+/// reads clear, and the mark alone holds a bit. With the instant of that
+/// word.
+fn silent_with_a_mark() -> (MemoryStore, Instant, WorkerId, WorkerId) {
+    let (store, t0, zero, one) = two_ranks();
+    store
+        .apply(generation_with(1, block(8, 0.8)))
+        .expect("applied");
+    // Rank one answers at the count beside rank zero left out: the
+    // engine's verdict holds both, and rank zero takes the mark.
+    let t1 = t0 + Duration::from_secs(1);
+    store.report(
+        &[(zero, 0, None), (one, 1, Some(pressure(9, 0)))],
+        t1,
+        LoadSource::Poll,
+    );
+    // A later poll brings no report.
+    let t2 = t1 + Duration::from_secs(1);
+    store.report(&[(zero, 0, None), (one, 1, None)], t2, LoadSource::Poll);
+    assert_eq!(overloaded(&store, t2), [zero], "the mark holds its rank");
+    (store, t2, zero, one)
+}
+
 #[test]
 fn a_rank_an_answer_leaves_out_beside_a_named_one_is_avoided_at_once() {
     let (store, t0, zero, one) = two_ranks();
@@ -113,6 +137,68 @@ fn the_write_that_ends_the_last_mark_is_counted_as_a_verdict_moved() {
 }
 
 #[test]
+fn an_answer_that_moves_the_last_mark_to_another_rank_is_counted_once() {
+    // In either order of its rows: the row that ends the mark ahead of
+    // the rank left out, and behind it.
+    for ends_first in [true, false] {
+        let (store, t0, zero, one) = two_ranks();
+        names_one_alone(&store, zero, one, t0);
+        assert_eq!(store.overload_flips(), 1, "the mark");
+        // The next answer names rank zero and leaves rank one out: the
+        // last mark ends and another begins with one write.
+        let mut answer = [(zero, 0, Some(load(1, 0))), (one, 1, None)];
+        if !ends_first {
+            answer.reverse();
+        }
+        store.report(&answer, t0, LoadSource::Poll);
+        assert_eq!(
+            (overloaded(&store, t0), store.overload_flips()),
+            (vec![one], 2),
+            "the row that ends the mark first: {ends_first}"
+        );
+        assert_eq!(store.unnamed_ranks(), 1);
+    }
+}
+
+#[test]
+fn a_record_that_ends_the_last_mark_and_its_engine_s_silence_is_counted_once() {
+    let (store, t2, zero, one) = silent_with_a_mark();
+    let mut both = [zero, one];
+    both.sort_unstable();
+    let before = store.overload_flips();
+    // The marked rank's record ends the mark and the word that no report
+    // came: the engine's verdict holds both ranks again.
+    let t3 = t2 + Duration::from_secs(1);
+    store.record(zero, 0, load(1, 0), t3, LoadSource::Stream);
+    assert_eq!(
+        (overloaded(&store, t3), store.unnamed_ranks()),
+        (both.to_vec(), 0)
+    );
+    assert_eq!(store.overload_flips(), before + 1);
+}
+
+#[test]
+fn an_answer_that_ends_the_last_mark_and_its_engine_s_silence_is_counted_once() {
+    let (store, t2, zero, one) = silent_with_a_mark();
+    let mut both = [zero, one];
+    both.sort_unstable();
+    let before = store.overload_flips();
+    // An answer that names both ranks ends the mark and the word that no
+    // report came: the engine's verdict holds both ranks again.
+    let t3 = t2 + Duration::from_secs(1);
+    store.report(
+        &[(zero, 0, Some(load(1, 0))), (one, 1, Some(pressure(9, 0)))],
+        t3,
+        LoadSource::Poll,
+    );
+    assert_eq!(
+        (overloaded(&store, t3), store.unnamed_ranks()),
+        (both.to_vec(), 0)
+    );
+    assert_eq!(store.overload_flips(), before + 1);
+}
+
+#[test]
 fn a_rank_that_pushed_since_the_poll_began_takes_no_mark_beside_one_the_answer_leaves_out() {
     // Three ranks of one engine, each with a record on file from one answer.
     let store = MemoryStore::with_publish_window(Duration::ZERO);
@@ -168,6 +254,23 @@ fn a_rank_left_out_beside_a_named_rank_that_pushed_since_the_poll_began_is_avoid
     names_one_alone(&store, zero, one, t0);
     assert_eq!(overloaded(&store, t0), [zero]);
     assert_eq!((store.overload_flips(), store.unnamed_ranks()), (1, 1));
+}
+
+#[test]
+fn a_row_passed_over_ahead_of_the_rank_left_out_names_its_engine() {
+    let (store, t0, zero, one) = two_ranks();
+    // Rank zero pushes inside the poll. The poll's answer lists that
+    // rank's row first, which is passed over, and leaves rank one out
+    // behind it: the door reads the passed-over row's engine once it
+    // knows a rank was left out.
+    store.record(zero, 0, load(5, 0), t0, LoadSource::Stream);
+    store.report(
+        &[(zero, 0, Some(load(1, 0))), (one, 1, None)],
+        t0,
+        LoadSource::Poll,
+    );
+    assert_eq!(store.unnamed_ranks(), 1, "the answer named its peer");
+    assert_eq!(overloaded(&store, t0), [one]);
 }
 
 #[test]
