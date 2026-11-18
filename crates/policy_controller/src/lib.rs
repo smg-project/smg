@@ -61,7 +61,7 @@
 //!
 //! - Section 9, the WebAssembly plugin host (the `wasm` module, behind the `wasm`
 //!   feature): user policies as components of the committed `smg:policy`
-//!   package, one kept instance per deciding thread, every call under fuel,
+//!   package, one kept instance per decider, every call under fuel,
 //!   bound to a profile as the framework's own stages. What every plugin
 //!   kind shares (the breaker, the counters, the stage adapters) is the
 //!   `plugins` module.
@@ -90,12 +90,15 @@
 //! report's sample instant); the wire carries durations only.
 
 pub mod affinity;
+pub mod bucket;
 pub mod builtins;
 pub mod catalog;
 #[cfg(feature = "client")]
 pub mod client;
 #[cfg(feature = "controller")]
 pub mod controller;
+pub mod counts;
+pub mod decider;
 pub mod decision;
 pub mod elector;
 pub mod framework;
@@ -119,17 +122,19 @@ pub mod wasm;
 pub mod wit;
 
 pub use catalog::{Catalog, CatalogError, StageKind};
+pub use counts::{KeptCounts, LentCounts};
 pub use decision::{
-    Decision, Pair, Pick, Queue, Shed, ShedReason, Survivors, Target, Targets, Trace, MAX_TARGETS,
-    TRACE_TOP,
+    Decision, Lifted, Pair, Pick, Queue, Shed, ShedReason, Survivors, Target, Targets, Trace,
+    MAX_TARGETS, TRACE_TOP,
 };
 pub use framework::{
-    Binding, DecisionScope, Engine, Filter, Narrowed, PairPools, PairTable, PairTableError, Picker,
-    Plan, Profile, Scorer, Scratch, TieBand, Weighted, DRAW_BOUND, DRAW_FROM,
+    Binding, DecisionScope, EncodeItems, EncodePlaced, EncodePool, EncoderFacts, Engine, Filter,
+    Front, Narrowed, PairPools, PairTable, PairTableError, Picker, Plan, Profile, Scorer, Scratch,
+    Spread, TieBand, Weighted, DRAW_BOUND, DRAW_FROM, RANK_FROM,
 };
 pub use lease::{
-    Lease, LeaseId, LeaseKind, Lifecycle, Membership, Outcome, ReleaseReason, Side, Signal,
-    TransportClass,
+    EventKind, EventSet, Lease, LeaseId, LeaseKind, Lifecycle, Membership, Outcome, ReleaseReason,
+    Side, Signal, TransportClass,
 };
 pub use ring::{ConsistentHash, Ring};
 pub use sessions::{Assignment, Pins, Recovery, SessionRule, SessionTable, SessionVerdict};
@@ -156,7 +161,10 @@ pub use view::{
 /// - the seed under the alternates' mask: the order of equal counts among
 ///   the workers the count-first picker passed over;
 /// - the first value of the seed's stream: the seed a pair plan hands its
-///   decode side, whose stages derive their streams from it as above.
+///   decode side, whose stages derive their streams from it as above;
+/// - the seed under the store's two naming masks: where the store names a
+///   decision's rows and cuts a list at the profile's sample, the holders'
+///   draw and the warming rows' draw.
 #[derive(Clone, Copy, Debug)]
 pub struct Draw(u64);
 

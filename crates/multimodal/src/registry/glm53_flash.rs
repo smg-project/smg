@@ -166,10 +166,7 @@ impl Glm53FlashSpec {
     }
 
     fn unsupported(modality: Modality) -> ModelRegistryError {
-        ModelRegistryError::UnsupportedModality {
-            spec: "glm53_flash",
-            modality,
-        }
+        ModelRegistryError::unsupported("glm53_flash", modality)
     }
 }
 
@@ -269,10 +266,7 @@ impl ModelProcessorSpec for Glm53FlashSpec {
                     },
                 )?,
             )),
-            _ => Err(ModelRegistryError::UnsupportedModality {
-                spec: self.name(),
-                modality,
-            }),
+            _ => Err(ModelRegistryError::unsupported(self.name(), modality)),
         }
     }
 

@@ -19,7 +19,11 @@ use image::{DynamicImage, Rgb, RgbImage};
 use ndarray::Array4;
 
 use crate::{
-    encoder_inputs::{ModelSpecificValue, PreprocessedEncoderInputs},
+    buffer_pool,
+    encoder_inputs::{
+        EncoderDtype, EncoderInput, ModelSpecificValue, PixelNorm, PreprocessedEncoderInputs,
+    },
+    pixel_convert::WireWriter,
     vision::{
         preprocessor_config::PreProcessorConfig,
         processor::VisionPreProcessor,
@@ -287,6 +291,83 @@ impl DeepseekV41Processor {
             }
         }
     }
+
+    /// [`Self::patchify_into`] in a wire dtype: the same elements in the same
+    /// order, each written once through `writer` into `band`, the bytes of
+    /// exactly this image's patches.
+    fn patchify_into_wire(
+        &self,
+        image: &RgbImage,
+        plan: &GridPlan,
+        writer: &WireWriter,
+        band: &mut [u8],
+    ) {
+        let p = self.patch_size;
+        let raw = image.as_raw();
+        let row_stride = plan.best_width * 3;
+        let run_bytes = p * writer.element_size();
+        let mut written = 0;
+        for i in 0..plan.n_vit_h {
+            for j in 0..plan.n_vit_w {
+                for c in 0..3 {
+                    for dy in 0..p {
+                        let row = &raw[(i * p + dy) * row_stride + j * p * 3..][..p * 3];
+                        writer.write_channel(
+                            &mut band[written..written + run_bytes],
+                            row.as_chunks::<3>().0,
+                            c,
+                        );
+                        written += run_bytes;
+                    }
+                }
+            }
+        }
+    }
+
+    /// The resize plan of every image of the batch, in order.
+    fn plans(&self, images: &[&DynamicImage]) -> Vec<GridPlan> {
+        images
+            .iter()
+            .map(|image| self.plan_image_grid(image.width(), image.height()))
+            .collect()
+    }
+
+    /// [`VisionPreProcessor::preprocess_wire`]'s work once the writer exists:
+    /// the batch's patches written once in the wire's dtype into one pooled
+    /// buffer, each image's band behind the one before it.
+    fn preprocess_into_wire(
+        &self,
+        images: &[&DynamicImage],
+        dtype: EncoderDtype,
+        writer: &WireWriter,
+    ) -> Result<PreprocessedEncoderInputs, TransformError> {
+        if images.is_empty() {
+            return Err(TransformError::EmptyBatch);
+        }
+        let plans = self.plans(images);
+        let total_patches: usize = plans.iter().map(|plan| plan.n_vit_h * plan.n_vit_w).sum();
+        let p = self.patch_size;
+        let patch_bytes = 3 * p * p * writer.element_size();
+        // A pooled buffer: its bytes are a previous request's until the
+        // bands are written, and the bands cover it.
+        let mut wire = buffer_pool::take(total_patches * patch_bytes);
+        let mut written = 0;
+        for (image, plan) in images.iter().zip(&plans) {
+            let transformed = self.transform(image, plan)?;
+            let band_bytes = plan.n_vit_h * plan.n_vit_w * patch_bytes;
+            self.patchify_into_wire(
+                &transformed,
+                plan,
+                writer,
+                &mut wire[written..written + band_bytes],
+            );
+            written += band_bytes;
+        }
+        let encoder_input =
+            EncoderInput::wire(wire, dtype, vec![total_patches, 3, p, p], wire_norm(p))
+                .map_err(TransformError::ShapeError)?;
+        Ok(with_spans(images, &plans, encoder_input))
+    }
 }
 
 /// The `f32` every pixel byte normalizes to, in the reference's own `f32`
@@ -295,6 +376,73 @@ impl DeepseekV41Processor {
 /// entry is that computation.
 fn value_table() -> [f32; 256] {
     std::array::from_fn(|value| (value as f32 / 255.0 - 0.5) / 0.5)
+}
+
+/// [`value_table`]'s normalization in the form a wire carries: every byte
+/// less 127.5, over 127.5, the same for the three channels. In `f32` it
+/// rounds once where the reference rounds twice, so half of its `float32`
+/// values are not the reference's; narrowed to `bfloat16` or `float16`,
+/// every byte's value is the reference's value narrowed, which is why the
+/// one-pass wire is written in those two dtypes only.
+fn wire_norm(patch_size: usize) -> PixelNorm {
+    PixelNorm {
+        scale: 1.0,
+        offset: [127.5; 3],
+        divisor: [127.5; 3],
+        channel_block: patch_size * patch_size,
+    }
+}
+
+/// The batch's outputs around its patches, the same for both forms of the
+/// encoder input: every image's token count and size, its grids and the
+/// roles of its span.
+fn with_spans(
+    images: &[&DynamicImage],
+    plans: &[GridPlan],
+    encoder_input: EncoderInput,
+) -> PreprocessedEncoderInputs {
+    let mut feature_token_counts = Vec::with_capacity(images.len());
+    let mut item_sizes = Vec::with_capacity(images.len());
+    let mut vit_grid = Vec::with_capacity(images.len() * 2);
+    let mut llm_grid = Vec::with_capacity(images.len() * 2);
+    let mut types = Vec::new();
+    let mut patches_per_image = Vec::with_capacity(images.len());
+    let mut types_per_image = Vec::with_capacity(images.len());
+    for (image, plan) in images.iter().zip(plans) {
+        feature_token_counts.push(plan.num_image_tokens());
+        item_sizes.push((image.width(), image.height()));
+        vit_grid.extend([plan.n_vit_h as i64, plan.n_vit_w as i64]);
+        llm_grid.extend([plan.n_llm_h as i64, plan.n_llm_w as i64]);
+        types.extend(image_token_types(plan.n_llm_h, plan.n_llm_w));
+        patches_per_image.push((plan.n_vit_h * plan.n_vit_w) as i64);
+        types_per_image.push(plan.num_image_tokens() as i64);
+    }
+
+    let n_images = images.len();
+    PreprocessedEncoderInputs::new(encoder_input, feature_token_counts, item_sizes)
+        .with_extra(
+            "vit_grid",
+            ModelSpecificValue::IntTensor {
+                data: vit_grid,
+                shape: vec![n_images, 2],
+            },
+        )
+        .with_extra(
+            "llm_grid",
+            ModelSpecificValue::IntTensor {
+                data: llm_grid,
+                shape: vec![n_images, 2],
+            },
+        )
+        .with_extra("types", ModelSpecificValue::int_1d(types))
+        .with_extra(
+            "patches_per_image",
+            ModelSpecificValue::int_1d(patches_per_image),
+        )
+        .with_extra(
+            "types_per_image",
+            ModelSpecificValue::int_1d(types_per_image),
+        )
 }
 
 impl VisionPreProcessor for DeepseekV41Processor {
@@ -314,14 +462,9 @@ impl VisionPreProcessor for DeepseekV41Processor {
         &self,
         images: &[&DynamicImage],
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
-        if images.is_empty() {
-            return Err(TransformError::EmptyBatch);
-        }
+        TransformError::if_empty(images)?;
 
-        let plans: Vec<GridPlan> = images
-            .iter()
-            .map(|image| self.plan_image_grid(image.width(), image.height()))
-            .collect();
+        let plans = self.plans(images);
         let total_patches: usize = plans.iter().map(|plan| plan.n_vit_h * plan.n_vit_w).sum();
         let p = self.patch_size;
         let patch_len = 3 * p * p;
@@ -329,59 +472,33 @@ impl VisionPreProcessor for DeepseekV41Processor {
         // order; no per-image copy.
         let mut encoder_input = Vec::with_capacity(total_patches * patch_len);
         let table = value_table();
-
-        let mut feature_token_counts = Vec::with_capacity(images.len());
-        let mut item_sizes = Vec::with_capacity(images.len());
-        let mut vit_grid = Vec::with_capacity(images.len() * 2);
-        let mut llm_grid = Vec::with_capacity(images.len() * 2);
-        let mut types = Vec::new();
-        let mut patches_per_image = Vec::with_capacity(images.len());
-        let mut types_per_image = Vec::with_capacity(images.len());
-
         for (image, plan) in images.iter().zip(&plans) {
             let transformed = self.transform(image, plan)?;
             self.patchify_into(&transformed, plan, &table, &mut encoder_input);
-            feature_token_counts.push(plan.num_image_tokens());
-            item_sizes.push((image.width(), image.height()));
-            vit_grid.extend([plan.n_vit_h as i64, plan.n_vit_w as i64]);
-            llm_grid.extend([plan.n_llm_h as i64, plan.n_llm_w as i64]);
-            types.extend(image_token_types(plan.n_llm_h, plan.n_llm_w));
-            patches_per_image.push((plan.n_vit_h * plan.n_vit_w) as i64);
-            types_per_image.push(plan.num_image_tokens() as i64);
         }
 
         // The engine consumes patches as `(np, 3, p, p)` (see its
         // `DeepseekV4VLImagePixelInputs`).
         let encoder_input = Array4::from_shape_vec((total_patches, 3, p, p), encoder_input)
             .expect("the patch buffer matches its shape by construction");
+        Ok(with_spans(images, &plans, encoder_input.into()))
+    }
 
-        let n_images = images.len();
-        Ok(
-            PreprocessedEncoderInputs::new(encoder_input, feature_token_counts, item_sizes)
-                .with_extra(
-                    "vit_grid",
-                    ModelSpecificValue::IntTensor {
-                        data: vit_grid,
-                        shape: vec![n_images, 2],
-                    },
-                )
-                .with_extra(
-                    "llm_grid",
-                    ModelSpecificValue::IntTensor {
-                        data: llm_grid,
-                        shape: vec![n_images, 2],
-                    },
-                )
-                .with_extra("types", ModelSpecificValue::int_1d(types))
-                .with_extra(
-                    "patches_per_image",
-                    ModelSpecificValue::int_1d(patches_per_image),
-                )
-                .with_extra(
-                    "types_per_image",
-                    ModelSpecificValue::int_1d(types_per_image),
-                ),
-        )
+    /// The batch written once in `dtype` through the crate's writer, for
+    /// `bfloat16` and `float16`: every byte's value there is the float
+    /// path's value narrowed. `None` for `float32`, where the values of the
+    /// normalization a wire carries are not the reference's (the two-pass
+    /// path serves them), and for `uint8` (the processor emits floats).
+    fn preprocess_wire(
+        &self,
+        images: &[&DynamicImage],
+        dtype: EncoderDtype,
+    ) -> Option<Result<PreprocessedEncoderInputs, TransformError>> {
+        if !matches!(dtype, EncoderDtype::BFloat16 | EncoderDtype::Float16) {
+            return None;
+        }
+        let writer = WireWriter::new(&wire_norm(self.patch_size), dtype)?;
+        Some(self.preprocess_into_wire(images, dtype, &writer))
     }
 
     fn calculate_num_tokens(&self, width: u32, height: u32) -> Result<usize, TransformError> {
@@ -396,6 +513,7 @@ impl VisionPreProcessor for DeepseekV41Processor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::encoder_inputs::{f32_to_bf16_bits, f32_to_f16_bits};
 
     fn plan(width: u32, height: u32) -> GridPlan {
         DeepseekV41Processor::new().plan_image_grid(width, height)
@@ -594,5 +712,118 @@ mod tests {
         let center_patch = (plan.n_vit_h / 2) * plan.n_vit_w + plan.n_vit_w / 2;
         let expected = (10.0f32 / 255.0 - 0.5) / 0.5;
         assert!((out.encoder_input.as_f32()[[center_patch, 0, 0, 0]] - expected).abs() < 0.02);
+    }
+
+    /// An image whose three channels run through the byte values at
+    /// different paces.
+    fn gradient(width: u32, height: u32, step: u32) -> DynamicImage {
+        DynamicImage::ImageRgb8(RgbImage::from_fn(width, height, |x, y| {
+            Rgb([
+                (x * step + y) as u8,
+                (x + y * step) as u8,
+                (255 - (x + y) % 256) as u8,
+            ])
+        }))
+    }
+
+    /// The one-pass wire against the two-pass bytes (`preprocess`, then the
+    /// write in the wire's dtype): single images and a batch of different
+    /// sizes, resized and padded (640x480, 1920x1080, 96x48) and at the
+    /// plan's own size (546x546), in both dtypes the wire is written in.
+    /// The outputs beside the patches are the two-pass path's.
+    #[test]
+    fn the_wire_equals_the_two_pass_bytes() {
+        let processor = DeepseekV41Processor::new();
+        let images = [
+            gradient(640, 480, 3),
+            gradient(1920, 1080, 5),
+            gradient(96, 48, 9),
+            gradient(546, 546, 7),
+        ];
+        let own_size = processor.plan_image_grid(546, 546);
+        assert_eq!((own_size.best_width, own_size.best_height), (546, 546));
+        for dtype in [EncoderDtype::BFloat16, EncoderDtype::Float16] {
+            for refs in [
+                vec![&images[0]],
+                vec![&images[3]],
+                vec![&images[1], &images[2], &images[3], &images[0]],
+            ] {
+                let two_pass = processor.preprocess(&refs).unwrap();
+                let wire = processor
+                    .preprocess_wire(&refs, dtype)
+                    .expect("this dtype is written in one pass")
+                    .unwrap();
+                let EncoderInput::Wire { dtype: own, .. } = &wire.encoder_input else {
+                    panic!("{dtype}: the one-pass form is a wire");
+                };
+                assert_eq!(*own, dtype);
+                assert_eq!(wire.encoder_input.shape(), two_pass.encoder_input.shape());
+                assert!(
+                    wire.encoder_input.write_as(dtype) == two_pass.encoder_input.write_as(dtype),
+                    "{dtype}, {} images: the one-pass wire differs from the two-pass bytes",
+                    refs.len()
+                );
+                assert_eq!(wire.feature_token_counts, two_pass.feature_token_counts);
+                assert_eq!(wire.item_sizes, two_pass.item_sizes);
+                assert_eq!(wire.model_specific.len(), two_pass.model_specific.len());
+                for (key, value) in &two_pass.model_specific {
+                    assert_eq!(
+                        format!("{:?}", wire.model_specific[key]),
+                        format!("{value:?}"),
+                        "{dtype}: {key}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Why the wire is written in two dtypes only. Narrowed to `bfloat16` or
+    /// `float16`, the writer's value of every byte is the float path's value
+    /// narrowed. In `float32` the normalization a wire carries rounds once
+    /// where the reference rounds twice, and half of the bytes differ: that
+    /// dtype is left to the two-pass path, as `uint8` is (the processor
+    /// emits floats). The empty batch answers as `preprocess` does.
+    #[test]
+    fn the_wire_is_written_only_where_its_values_are_the_float_paths() {
+        let processor = DeepseekV41Processor::new();
+        let norm = wire_norm(processor.patch_size);
+        let reference = value_table();
+        let pixels: [[u8; 3]; 256] = std::array::from_fn(|value| [value as u8; 3]);
+        for (dtype, narrow) in [
+            (EncoderDtype::BFloat16, f32_to_bf16_bits as fn(f32) -> u16),
+            (EncoderDtype::Float16, f32_to_f16_bits),
+        ] {
+            let writer = WireWriter::new(&norm, dtype).unwrap();
+            let expected: Vec<u8> = reference
+                .iter()
+                .flat_map(|&value| narrow(value).to_le_bytes())
+                .collect();
+            for channel in 0..3 {
+                let mut written = [0u8; 512];
+                writer.write_channel(&mut written, &pixels, channel);
+                assert!(written[..] == expected[..], "{dtype}, channel {channel}");
+            }
+        }
+        let differing = norm.table_f32()[0]
+            .iter()
+            .zip(&reference)
+            .filter(|(wire, float)| wire.to_bits() != float.to_bits())
+            .count();
+        assert_eq!(
+            differing, 128,
+            "float32 values that are not the reference's"
+        );
+
+        let image = gradient(64, 48, 1);
+        for dtype in [EncoderDtype::Float32, EncoderDtype::Uint8] {
+            assert!(
+                processor.preprocess_wire(&[&image], dtype).is_none(),
+                "{dtype}"
+            );
+        }
+        assert!(matches!(
+            processor.preprocess_wire(&[], EncoderDtype::BFloat16),
+            Some(Err(TransformError::EmptyBatch))
+        ));
     }
 }

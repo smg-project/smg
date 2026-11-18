@@ -20,7 +20,7 @@ use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowRe
 
 use crate::{
     worker::{identity::endpoint::Endpoint, Worker},
-    workflow::data::WorkerRemovalWorkflowData,
+    workflow::data::{require_app_context, WorkerRemovalWorkflowData},
 };
 
 /// Step that transitions Ready workers to `Draining` and waits for the
@@ -33,11 +33,7 @@ impl StepExecutor<WorkerRemovalWorkflowData> for DrainWorkersStep {
         &self,
         context: &mut WorkflowContext<WorkerRemovalWorkflowData>,
     ) -> WorkflowResult<StepResult> {
-        let app_context = context
-            .data
-            .app_context
-            .as_ref()
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
+        let app_context = require_app_context(context.data.app_context.as_ref())?;
         let workers_to_remove = context
             .data
             .actual_workers_to_remove

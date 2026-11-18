@@ -13,7 +13,7 @@ use crate::{
         common::overload,
         error,
         grpc::{
-            backend_client::BackendClient,
+            backend_client::{get_backend_client, BackendClient},
             context::{ClientSelection, WorkerSelection},
         },
     },
@@ -80,8 +80,7 @@ async fn get_backend_client_from_worker(
     worker: &Arc<dyn Worker>,
 ) -> Result<BackendClient, Response> {
     // Get cached client from worker (or create one if not cached yet)
-    let client_arc = worker
-        .get_backend_client()
+    let client_arc = get_backend_client(worker.as_ref())
         .await
         .map_err(|e| {
             error!(

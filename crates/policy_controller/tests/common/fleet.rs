@@ -16,6 +16,12 @@
 //! the events an index applies and hands it to the sink. Each stand-in leaves
 //! the day a driver feeds its sink.
 //!
+//! An engine speaks the wire of its kind ([`Shape::runtime`]): the fleet's
+//! first wire, or the one whose load report counts resident tokens. The
+//! controller's load driver polls each through that kind's own arm, the
+//! prober asks each its own health check, and the subscriber speaks the
+//! first wire alone.
+//!
 //! A fleet registers as an operator's does ([`Harness::register`]): an
 //! engine of one rank is an add on the control listener, under the name the
 //! harness states there. The call makes one rank, so a rank of a wider
@@ -38,15 +44,14 @@ use std::{
 
 use kv_index::compute_content_hash;
 use mock_worker::{
-    config::Config as EngineConfig,
-    engine::{EngineParams, TimingModel},
+    config::{Config as EngineConfig, SchedulerWire},
+    engine::{EngineParams, LoadsLike, TimingModel},
 };
 use openai_protocol::worker::RuntimeType;
 use parking_lot::Mutex;
 use smg_grpc_client::{
     common_proto::{kv_cache_event::Data, KvEventBatch},
-    vllm_engine::AbortOnDropStream,
-    vllm_proto, VllmEngineClient,
+    tokenspeed_proto, vllm_proto, TokenSpeedSchedulerClient, VllmEngineClient,
 };
 use smg_policy_controller::{
     client::Client,
@@ -60,10 +65,11 @@ use smg_policy_controller::{
     },
     store::{
         Ask, BatchFacts, BatchOutcome, GatewayId, HealthPolicy, HealthSink, KvCursor, KvEvent,
-        KvEventSink, LaneCounts, MemoryStore, SequenceHash, Signals, StoredBlock, ViewBuffers,
-        WorkerFacts, WorkerStatus, WorkersStore,
+        KvEventSink, LaneCounts, LeaseState, MemoryStore, SequenceHash, Signals, StoredBlock,
+        ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore,
     },
     view::{fingerprint, LoadRow, Role, WireModes, WorkerId},
+    AppliedSpec, LeaseId, PolicySpec,
 };
 use tokio::{
     io::{copy, sink},
@@ -118,6 +124,8 @@ pub struct Shape {
     pub model: &'static str,
     pub role: Role,
     pub ranks: u16,
+    /// The engine's kind, as its registration states it: the wire it speaks.
+    pub runtime: RuntimeType,
 }
 
 /// One row of a pool as a view reads it, named by the engine that
@@ -181,6 +189,8 @@ pub struct Death {
 /// process's do.
 struct Engine {
     endpoint: String,
+    /// Its kind: the wire a request the harness holds on it is sent on.
+    runtime: RuntimeType,
     /// Where its listener is bound.
     addr: SocketAddr,
     kill: Option<oneshot::Sender<()>>,
@@ -263,6 +273,10 @@ struct Stream {
     /// the sink reads a restarted publisher there and empties the rank,
     /// and this set keeps what it had. No engine of the fleet opens one.
     held: HashSet<SequenceHash>,
+    /// The first chain the stream stored, in the chain's order: the blocks of
+    /// the first store under no parent, then of each store whose parent is
+    /// the chain's last block. A prompt's head as the engine holds it.
+    head: Vec<StoredBlock>,
 }
 
 /// An engine as the stand-in prober dials it: its address and the rows its
@@ -270,6 +284,7 @@ struct Stream {
 #[derive(Clone)]
 struct Probed {
     engine: usize,
+    runtime: RuntimeType,
     endpoint: String,
     ids: Vec<WorkerId>,
 }
@@ -301,9 +316,11 @@ pub struct Harness {
     /// Whether the feeds run: an engine registered after their start gets
     /// its subscriber at its registration.
     feeding: bool,
-    held: Vec<AbortOnDropStream>,
+    held: Vec<Box<dyn std::any::Any>>,
     /// The requests sent so far: the next one's lease id.
     sent: u64,
+    /// The spec generations applied so far.
+    generation: u64,
     buffers: ViewBuffers,
     stop_feeds: watch::Sender<bool>,
     feeds: JoinSet<()>,
@@ -340,6 +357,30 @@ fn millis(duration: Duration) -> u32 {
     u32::try_from(duration.as_millis()).unwrap_or(u32::MAX)
 }
 
+/// The health policy every registration states: one probe turn moves a
+/// rank between ready and unhealthy, at the stand-in prober's interval and
+/// under its dial bound.
+fn health_policy() -> HealthPolicy {
+    HealthPolicy {
+        failure_threshold: 1,
+        success_threshold: 1,
+        check_interval_ms: millis(PROBE_INTERVAL),
+        timeout_ms: millis(DIAL_TIMEOUT),
+        probes: true,
+    }
+}
+
+/// The policy in the contract's form, for an operator's add.
+fn wire_health(policy: HealthPolicy) -> proto::HealthPolicy {
+    proto::HealthPolicy {
+        failure_threshold: policy.failure_threshold,
+        success_threshold: policy.success_threshold,
+        check_interval_ms: policy.check_interval_ms,
+        timeout_ms: policy.timeout_ms,
+        disabled: !policy.probes,
+    }
+}
+
 /// `role` as the contract names it.
 fn wire_role(role: Role) -> proto::Role {
     match role {
@@ -363,13 +404,38 @@ fn engine_params() -> EngineParams {
     }
 }
 
-/// One mock engine with `ranks` ranks, served on a runtime of this thread
+/// The mock engine's configuration at `port` for an engine of kind
+/// `runtime`: the fleet's first wire, or the wire whose load report counts
+/// resident tokens, served with its report in full.
+fn wire_config(runtime: RuntimeType, port: u16, ranks: u16) -> EngineConfig {
+    let config = engine_config(port, ranks);
+    if counts_resident(runtime) {
+        EngineConfig {
+            grpc_wire: SchedulerWire::TokenSpeed,
+            loads_like: LoadsLike::Mock,
+            ..config
+        }
+    } else {
+        config
+    }
+}
+
+/// Whether an engine of kind `runtime` speaks the wire whose load report
+/// counts resident tokens. The subscriber stand-in speaks the first wire
+/// alone: an engine of this kind states no events signal, and none of its
+/// streams is opened.
+fn counts_resident(runtime: RuntimeType) -> bool {
+    runtime == RuntimeType::TokenSpeed
+}
+
+/// One mock engine of kind `kind` with `ranks` ranks, served on a runtime of this thread
 /// until `killed` resolves; the runtime is dropped at the return, and every
 /// task of the engine with it. `bound` takes the listener's address. A
 /// receiver sent on `hung` stops the thread on it: nothing of the engine
 /// answers and its sockets stay open, until that receiver's sender drops.
 fn serve_engine(
     ranks: u16,
+    kind: RuntimeType,
     bound: oneshot::Sender<Result<SocketAddr, String>>,
     killed: oneshot::Receiver<()>,
     hung: oneshot::Receiver<mpsc::Receiver<()>>,
@@ -401,7 +467,7 @@ fn serve_engine(
         };
         let config = Arc::new(EngineConfig {
             engine: engine_params(),
-            ..engine_config(addr.port(), ranks)
+            ..wire_config(kind, addr.port(), ranks)
         });
         if bound.send(Ok(addr)).is_err() {
             return;
@@ -425,9 +491,9 @@ fn serve_engine(
     });
 }
 
-/// Starts one mock engine with `ranks` ranks on a runtime and a thread of
+/// Starts one mock engine of kind `runtime` with `ranks` ranks on a runtime and a thread of
 /// its own.
-async fn start_engine(ranks: u16) -> Result<Engine, String> {
+async fn start_engine(ranks: u16, runtime: RuntimeType) -> Result<Engine, String> {
     let (bound, address) = oneshot::channel::<Result<SocketAddr, String>>();
     let (kill, killed) = oneshot::channel::<()>();
     let (ending, ended) = oneshot::channel::<()>();
@@ -435,7 +501,7 @@ async fn start_engine(ranks: u16) -> Result<Engine, String> {
     thread::Builder::new()
         .name("mock-engine".to_owned())
         .spawn(move || {
-            serve_engine(ranks, bound, killed, hung);
+            serve_engine(ranks, runtime, bound, killed, hung);
             drop(ending);
         })
         .map_err(|error| error.to_string())?;
@@ -451,6 +517,7 @@ async fn start_engine(ranks: u16) -> Result<Engine, String> {
     .map_err(|error| error.to_string())?;
     Ok(Engine {
         endpoint: format!("http://{addr}"),
+        runtime,
         addr,
         kill: Some(kill),
         ended: Some(ended),
@@ -460,18 +527,50 @@ async fn start_engine(ranks: u16) -> Result<Engine, String> {
     })
 }
 
+/// An engine's client on the wire its kind speaks.
+#[derive(Clone)]
+enum EngineClient {
+    First(VllmEngineClient),
+    Counting(TokenSpeedSchedulerClient),
+}
+
+impl EngineClient {
+    /// Dials an engine of kind `runtime`.
+    async fn connect(runtime: RuntimeType, endpoint: &str) -> Option<Self> {
+        if counts_resident(runtime) {
+            let client = TokenSpeedSchedulerClient::connect(endpoint).await.ok()?;
+            Some(Self::Counting(client))
+        } else {
+            let client = VllmEngineClient::connect(endpoint).await.ok()?;
+            Some(Self::First(client))
+        }
+    }
+
+    /// The wire's health answer, when one came.
+    async fn healthy(&self) -> Option<bool> {
+        match self {
+            Self::First(client) => Some(client.health_check().await.ok()?.healthy),
+            Self::Counting(client) => Some(client.health_check().await.ok()?.healthy),
+        }
+    }
+}
+
 /// How one dial of an engine ended: its wire's health answer, a failure,
 /// or nothing within [`DIAL_TIMEOUT`]. The connection is kept across turns
 /// and dropped when no answer came, so the next turn dials anew.
-async fn dial(clients: &mut HashMap<String, VllmEngineClient>, endpoint: &str) -> DialEnd {
+async fn dial(
+    clients: &mut HashMap<String, EngineClient>,
+    runtime: RuntimeType,
+    endpoint: &str,
+) -> DialEnd {
     let kept = clients.get(endpoint).cloned();
     let asked = tokio::time::timeout(DIAL_TIMEOUT, async {
         let client = match kept {
             Some(client) => client,
-            None => VllmEngineClient::connect(endpoint).await.ok()?,
+            None => EngineClient::connect(runtime, endpoint).await?,
         };
-        let answer = client.health_check().await.ok()?;
-        Some((client, answer.healthy))
+        let healthy = client.healthy().await?;
+        Some((client, healthy))
     })
     .await;
     match asked {
@@ -512,11 +611,12 @@ async fn probe(
         let engines = probed.lock().clone();
         for Probed {
             engine,
+            runtime,
             endpoint,
             ids,
         } in engines
         {
-            let end = dial(&mut clients, &endpoint).await;
+            let end = dial(&mut clients, runtime, &endpoint).await;
             let healthy = end.healthy();
             turns.dialed.lock().push(Dialed { engine, turn, end });
             for id in ids {
@@ -607,7 +707,10 @@ fn admit(store: &MemoryStore, engine: &Probed, events: &Events, batch: &KvEventB
             row.applied += 1;
             for event in decoded {
                 match event {
-                    KvEvent::Stored { blocks, .. } => {
+                    KvEvent::Stored { parent, blocks } => {
+                        if parent == row.head.last().map(|block| block.seq_hash) {
+                            row.head.extend(&blocks);
+                        }
                         row.held.extend(blocks.iter().map(|block| block.seq_hash));
                     }
                     KvEvent::Removed(hashes) => {
@@ -847,6 +950,7 @@ impl Harness {
             feeding: false,
             held: Vec::new(),
             sent: 0,
+            generation: 0,
             buffers: ViewBuffers::default(),
             stop_feeds,
             feeds: JoinSet::new(),
@@ -876,6 +980,28 @@ impl Harness {
         self.replica.gateway()
     }
 
+    /// Applies the preset named `preset` as the store's next generation,
+    /// in the case's process: no call of the controller applies a spec yet.
+    pub fn apply(&mut self, preset: &str) -> Result<(), String> {
+        let document = PolicySpec::preset(preset).map_err(|error| error.to_string())?;
+        self.apply_document(document)
+    }
+
+    /// Applies `document` as the store's next generation, in the case's
+    /// process: a form of a preset that the catalog spells under no name.
+    pub fn apply_document(&mut self, mut document: PolicySpec) -> Result<(), String> {
+        self.generation += 1;
+        document.generation = self.generation;
+        let spec = AppliedSpec::validate(&document).map_err(|error| error.to_string())?;
+        self.store.apply(spec).map_err(|error| error.to_string())
+    }
+
+    /// The engine and the rank of the row a decision names by `id`, where
+    /// it names a row of the fleet.
+    pub fn named(&self, id: u64) -> Option<(usize, u16)> {
+        self.members.get(&WorkerId(id)).copied()
+    }
+
     /// Register: starts one mock engine per shape and registers each of its
     /// ranks, pending: only a probe's verdict makes a rank ready. The check
     /// interval and the timeout are the stand-in prober's own, and both
@@ -886,7 +1012,7 @@ impl Harness {
     pub async fn register(&mut self, shapes: &[Shape]) -> Result<Vec<usize>, String> {
         let mut started = Vec::with_capacity(shapes.len());
         for shape in shapes {
-            let running = start_engine(shape.ranks).await?;
+            let running = start_engine(shape.ranks, shape.runtime).await?;
             let endpoint = running.endpoint.clone();
             let engine = self.engines.len();
             let mut ids = Vec::with_capacity(usize::from(shape.ranks));
@@ -897,10 +1023,11 @@ impl Harness {
             }
             let probed = Probed {
                 engine,
+                runtime: shape.runtime,
                 endpoint,
                 ids,
             };
-            if self.feeding {
+            if self.feeding && !counts_resident(shape.runtime) {
                 self.subscriber(probed.clone());
             }
             self.probed.lock().push(probed);
@@ -930,21 +1057,15 @@ impl Harness {
                 incarnation: 1,
                 role: shape.role,
                 wire_modes: WireModes::GRPC,
-                engine_kind: RuntimeType::Vllm.as_str().to_owned(),
+                engine_kind: shape.runtime.as_str().to_owned(),
                 models: vec![shape.model.to_owned()],
                 dp_rank: rank,
                 dp_size: shape.ranks,
                 signals: Signals {
-                    events: true,
+                    events: !counts_resident(shape.runtime),
                     ..Signals::default()
                 },
-                health: HealthPolicy {
-                    failure_threshold: 1,
-                    success_threshold: 1,
-                    check_interval_ms: millis(PROBE_INTERVAL),
-                    timeout_ms: millis(DIAL_TIMEOUT),
-                    probes: true,
-                },
+                health: health_policy(),
                 ..WorkerFacts::default()
             })
             .id();
@@ -959,17 +1080,11 @@ impl Harness {
                 url: endpoint.to_owned(),
                 wire: proto::WireMode::Grpc.into(),
                 role: wire_role(shape.role).into(),
-                runtime: RuntimeType::Vllm.as_str().to_owned(),
+                runtime: shape.runtime.as_str().to_owned(),
                 models: vec![shape.model.to_owned()],
-                health_policy: Some(proto::HealthPolicy {
-                    failure_threshold: 1,
-                    success_threshold: 1,
-                    check_interval_ms: millis(PROBE_INTERVAL),
-                    timeout_ms: millis(DIAL_TIMEOUT),
-                    disabled: false,
-                }),
+                health_policy: Some(wire_health(health_policy())),
                 signals: Some(proto::Signals {
-                    events: true,
+                    events: !counts_resident(shape.runtime),
                     ..proto::Signals::default()
                 }),
                 ..proto::WorkerSpec::default()
@@ -1014,7 +1129,9 @@ impl Harness {
         ));
         let engines = self.probed.lock().clone();
         for engine in engines {
-            self.subscriber(engine);
+            if !counts_resident(engine.runtime) {
+                self.subscriber(engine);
+            }
         }
         self.feeding = true;
     }
@@ -1027,6 +1144,25 @@ impl Harness {
             Arc::clone(&self.events),
             self.stop_feeds.subscribe(),
         ));
+    }
+
+    /// The first chain the first rank of the engine at `engine` stored, in
+    /// the chain's order, each block by the hash of its tokens: what a
+    /// request that brings the same prompt states of its head.
+    pub fn head(&self, engine: usize) -> Vec<u64> {
+        let streams = self.events.rows.lock();
+        self.members
+            .iter()
+            .find(|(_, (of, rank))| *of == engine && *rank == 0)
+            .and_then(|(id, _)| streams.get(id))
+            .map(|stream| {
+                stream
+                    .head
+                    .iter()
+                    .map(|block| block.content_hash.0)
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// The KV events of the engine at `engine`, a rank a row: what each
@@ -1108,11 +1244,14 @@ impl Harness {
     /// engine's own wire: its reports then say so by themselves. A held
     /// stream is never read and is dropped with the harness.
     pub async fn hold(&mut self, engine: usize, count: usize) -> Result<(), String> {
-        let endpoint = self
+        let (endpoint, runtime) = self
             .engines
             .get(engine)
-            .map(|engine| engine.endpoint.clone())
+            .map(|engine| (engine.endpoint.clone(), engine.runtime))
             .ok_or_else(|| format!("no engine {engine}"))?;
+        if counts_resident(runtime) {
+            return self.hold_counting(engine, &endpoint, count).await;
+        }
         let client = bounded(
             "the holder connects to its engine",
             ROOM,
@@ -1139,7 +1278,44 @@ impl Harness {
             let stream = bounded("an engine accepts a held request", ROOM, asked)
                 .await?
                 .map_err(|status| status.to_string())?;
-            self.held.push(stream);
+            self.held.push(Box::new(stream));
+        }
+        Ok(())
+    }
+
+    /// [`Harness::hold`] on the wire whose load report counts resident
+    /// tokens: the same requests in that wire's form.
+    async fn hold_counting(
+        &mut self,
+        engine: usize,
+        endpoint: &str,
+        count: usize,
+    ) -> Result<(), String> {
+        let client = bounded(
+            "the holder connects to its engine",
+            ROOM,
+            TokenSpeedSchedulerClient::connect(endpoint),
+        )
+        .await?
+        .map_err(|error| error.to_string())?;
+        for request in 0..count {
+            let asked = client.generate_framed(tokenspeed_proto::GenerateRequest {
+                request_id: format!("held-{engine}-{request}"),
+                tokenized: Some(tokenspeed_proto::TokenizedInput {
+                    input_ids: vec![1; 64],
+                    ..Default::default()
+                }),
+                sampling_params: Some(tokenspeed_proto::SamplingParams {
+                    max_new_tokens: Some(HELD_TOKENS),
+                    ..Default::default()
+                }),
+                stream: true,
+                ..Default::default()
+            });
+            let stream = bounded("an engine accepts a held request", ROOM, asked)
+                .await?
+                .map_err(|status| status.to_string())?;
+            self.held.push(Box::new(stream));
         }
         Ok(())
     }
@@ -1239,6 +1415,60 @@ impl Harness {
     /// The client: a case reports what the harness has no form for.
     pub fn client(&mut self) -> &mut Client {
         &mut self.client
+    }
+
+    /// The leases the store holds for the gateway named `gateway`, issued
+    /// or dispatched: each books a request in flight on its worker.
+    pub fn leases(&self, gateway: &str) -> usize {
+        let gateway = GatewayId(fingerprint(gateway.as_bytes()));
+        // By the trait's path: in scope, its `get` would meet the rows' own.
+        smg_policy_controller::store::LeasesStore::live(self.store.as_ref(), gateway)
+    }
+
+    /// Names the dispatch of the client's lease `lease` on its session, to
+    /// the pick's first target, and waits until the store reads the lease
+    /// dispatched: no dispatch deadline ends it then, so it books its
+    /// worker until its gateway gives it up.
+    pub async fn dispatch(&mut self, lease: u64) -> Result<(), String> {
+        self.dispatch_at(lease, 0).await
+    }
+
+    /// As [`Harness::dispatch`], on the target at `target` of the lease's
+    /// pick, best first: a gateway that sent its request past the first
+    /// target names the one it sent to.
+    pub async fn dispatch_at(&mut self, lease: u64, target: u32) -> Result<(), String> {
+        let dispatched = Dispatched {
+            lease_id: lease,
+            target_index: target,
+            side: Side::Single.into(),
+            since_decision_micros: 0,
+        };
+        bounded(
+            "the client reports a dispatch",
+            ROOM,
+            self.client.dispatched(dispatched),
+        )
+        .await?
+        .map_err(|error| error.to_string())?;
+        let gateway = GatewayId(fingerprint(GATEWAY.as_bytes()));
+        let store = self.store.as_ref();
+        within("the store reads the lease dispatched", ROOM, || {
+            // By the trait's path, as `leases` reads the file.
+            smg_policy_controller::store::LeasesStore::get(store, gateway, LeaseId(lease))
+                .is_some_and(|record| matches!(record.state, LeaseState::Dispatched { .. }))
+        })
+        .await
+        .map(|_| ())
+    }
+
+    /// The row the store's pin of record names for `session`, the value a
+    /// lease states of its request's session; `None` where the store pins
+    /// the session nowhere.
+    pub fn pinned(&self, session: u64) -> Option<(usize, u16)> {
+        // By the trait's path, as `leases` reads the file.
+        let pin =
+            smg_policy_controller::store::SessionsStore::lookup(self.store.as_ref(), session)?;
+        self.named(pin.worker.0)
     }
 
     /// Whether the store holds a completion of class ok by the gateway named

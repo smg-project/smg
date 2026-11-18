@@ -371,8 +371,9 @@ impl ToolInventory {
     /// the aliases that target a dropped tool, index and entry alike. An
     /// alias that targets a kept tool takes that tool's definition as it is
     /// now: its entry is a copy, and the listing may have changed the tool.
-    /// A refresh installs its listing first and calls this after, so a
-    /// reader never finds the server without the tools both listings hold.
+    /// A refresh or a reconnect installs its listing first and calls this
+    /// after, so a reader never finds the server without the tools both
+    /// listings hold.
     pub fn retain_server_tool_entries(&self, server_key: &str, listed: &HashSet<String>) {
         let dropped: Vec<QualifiedToolName> = self
             .tools_by_server
@@ -395,16 +396,7 @@ impl ToolInventory {
             .filter(|entry| entry.value().server_key() == server_key)
             .map(|entry| (entry.key().clone(), entry.value().clone()))
             .partition(|(_, target)| listed.contains(target.tool_name()));
-        for (alias, _) in gone {
-            self.aliases.remove(&alias);
-            let qualified = QualifiedToolName::new(ALIAS_SERVER_KEY, &alias);
-            self.remove_entry(&qualified);
-            if let Some(mut names) = self.tools_by_server.get_mut(ALIAS_SERVER_KEY) {
-                names.remove(&qualified);
-            }
-            self.tools_by_server
-                .remove_if(ALIAS_SERVER_KEY, |_, names| names.is_empty());
-        }
+        self.drop_aliases(gone);
         // The entry under the alias key is a copy of the target's tool, taken
         // when the alias was registered: a kept alias takes the tool again,
         // unless another server took the alias's name over since the read
@@ -425,6 +417,26 @@ impl ToolInventory {
                     }
                 });
             }
+        }
+    }
+
+    /// Drop the aliases a retain read as targeting a dropped tool, index and
+    /// entry alike. An alias goes only while the index still holds the
+    /// target that was read: a name another server took over since the read
+    /// is the taker's, and stays.
+    fn drop_aliases(&self, gone: Vec<(String, QualifiedToolName)>) {
+        for (alias, target) in gone {
+            let removed = self.aliases.remove_if(&alias, |_, held| *held == target);
+            if removed.is_none() {
+                continue;
+            }
+            let qualified = QualifiedToolName::new(ALIAS_SERVER_KEY, &alias);
+            self.remove_entry(&qualified);
+            if let Some(mut names) = self.tools_by_server.get_mut(ALIAS_SERVER_KEY) {
+                names.remove(&qualified);
+            }
+            self.tools_by_server
+                .remove_if(ALIAS_SERVER_KEY, |_, names| names.is_empty());
         }
     }
 
@@ -1222,6 +1234,43 @@ mod tests {
             Some("Test tool: lookup"),
             "the definition under an alias that targets another server's tool"
         );
+        assert_eq!(alias.alias_target.map(|held| held.target), Some(theirs));
+    }
+
+    #[test]
+    fn a_dropped_alias_another_server_took_over_stays_the_takers() {
+        let inventory = ToolInventory::new();
+        let mine = QualifiedToolName::new("s", "search");
+        let theirs = QualifiedToolName::new("other", "lookup");
+        inventory.insert_entry(ToolEntry::new(theirs.clone(), create_test_tool("lookup")));
+        inventory.insert_entry(
+            ToolEntry::new(
+                QualifiedToolName::new(ALIAS_SERVER_KEY, "find"),
+                create_test_tool("search"),
+            )
+            .with_alias(AliasTarget::new(mine.clone())),
+        );
+        inventory.register_alias("find".to_string(), mine.clone());
+        // What a retain reads while the alias is still this server's.
+        let read = vec![("find".to_string(), mine)];
+        // The other server registers the name before the removal: its
+        // entry, then the index.
+        inventory.insert_entry(
+            ToolEntry::new(
+                QualifiedToolName::new(ALIAS_SERVER_KEY, "find"),
+                create_test_tool("lookup"),
+            )
+            .with_alias(AliasTarget::new(theirs.clone())),
+        );
+        inventory.register_alias("find".to_string(), theirs.clone());
+
+        inventory.drop_aliases(read);
+
+        assert_eq!(inventory.resolve_alias("find"), Some(theirs.clone()));
+        let alias = inventory
+            .get_entry(ALIAS_SERVER_KEY, "find")
+            .expect("the taker's entry under the alias stays");
+        assert_eq!(alias.tool.description.as_deref(), Some("Test tool: lookup"));
         assert_eq!(alias.alias_target.map(|held| held.target), Some(theirs));
     }
 

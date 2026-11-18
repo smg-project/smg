@@ -5,8 +5,9 @@ use tracing::{debug, info};
 use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
 use crate::{
-    policies::as_cache_aware, worker::identity::endpoint::Endpoint,
-    workflow::data::WorkerRemovalWorkflowData,
+    policies::as_cache_aware,
+    worker::identity::endpoint::Endpoint,
+    workflow::data::{require_app_context, WorkerRemovalWorkflowData},
 };
 
 /// Step to update cache-aware policies for remaining workers.
@@ -21,11 +22,7 @@ impl StepExecutor<WorkerRemovalWorkflowData> for UpdateRemainingPoliciesStep {
         &self,
         context: &mut WorkflowContext<WorkerRemovalWorkflowData>,
     ) -> WorkflowResult<StepResult> {
-        let app_context = context
-            .data
-            .app_context
-            .as_ref()
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
+        let app_context = require_app_context(context.data.app_context.as_ref())?;
         let affected_models = &context.data.affected_models;
         let worker_urls = &context.data.worker_urls;
 

@@ -66,16 +66,23 @@ pub(crate) fn installed() -> Option<&'static Arc<WorkerSeries>> {
 /// registry's handoff to the store reads.
 #[cfg(test)]
 pub(crate) fn installed_or_default() -> &'static Arc<WorkerSeries> {
-    INSTALLED.get_or_init(|| {
-        Arc::new(WorkerSeries::new(DistributionBuilder::new(
+    INSTALLED.get_or_init(|| Arc::new(WorkerSeries::with_exporter_quantiles()))
+}
+
+#[cfg(test)]
+impl WorkerSeries {
+    /// A store as a test builds one: a copy of the exporter's default
+    /// quantiles, spelled here, and no buckets.
+    pub(crate) fn with_exporter_quantiles() -> Self {
+        Self::new(DistributionBuilder::new(
             metrics_util::parse_quantiles(&[0.0, 0.5, 0.9, 0.95, 0.99, 0.999, 1.0]),
             None,
             None,
             None,
             None,
             None,
-        )))
-    })
+        ))
+    }
 }
 
 /// Append the installed store's series to a scrape.

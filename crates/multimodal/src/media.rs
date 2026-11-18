@@ -31,6 +31,7 @@ use url::Url;
 use crate::opencv_buffer::{open_capture, BufferedCapture, RgbOutputBuffer};
 use crate::{
     audio::decode_audio_mono_f32,
+    buffer_pool,
     data_url::{base64_payload, data_url_payload},
     fetch_policy::{MediaHostPolicy, MediaHostResolver},
     hasher::{hash_audio, hash_image_with_transparency, hash_video_with_sampling},
@@ -5109,10 +5110,11 @@ pub(crate) fn decode_image_bytes(
                     oriented(image, webp_orientation(bytes))
                 }
                 None => {
-                    let mut decoder = image::ImageReader::new(std::io::Cursor::new(bytes))
+                    let reader = image::ImageReader::new(std::io::Cursor::new(bytes))
                         .with_guessed_format()
-                        .map_err(MediaConnectorError::Io)?
-                        .into_decoder()?;
+                        .map_err(MediaConnectorError::Io)?;
+                    let is_png = reader.format() == Some(image::ImageFormat::Png);
+                    let mut decoder = reader.into_decoder()?;
                     // `ImageReader::decode` reserves the decoded buffer against the
                     // crate's allocation limit (512 MiB by default) before it
                     // decodes; `into_decoder` does not, so the reservation is made
@@ -5125,7 +5127,11 @@ pub(crate) fn decode_image_bytes(
                     let orientation = decoder
                         .orientation()
                         .unwrap_or(image::metadata::Orientation::NoTransforms);
-                    let image = image::DynamicImage::from_decoder(decoder)?;
+                    let image = if is_png {
+                        png_into_pool(decoder)?
+                    } else {
+                        image::DynamicImage::from_decoder(decoder)?
+                    };
                     oriented(image, orientation)
                 }
             }
@@ -5140,6 +5146,48 @@ pub(crate) fn decode_image_bytes(
     image = apply_transparency(image, bytes, transparency);
     image = apply_max_long_side_pixel(image, max_long_side_pixel);
     Ok(image)
+}
+
+/// What `DynamicImage::from_decoder` returns for a PNG of an eight-bit
+/// layout, with the pixels in a buffer of the pool the JPEG and WebP decoders
+/// take theirs from. The crate's own vector is a zeroed allocation of the
+/// image's size, which is fresh pages on every request; the PNG decoder
+/// writes every byte of the image it reports, so the buffer need not arrive
+/// zeroed. A sixteen-bit layout, which the pool does not take back, keeps the
+/// crate's path.
+fn png_into_pool(decoder: impl image::ImageDecoder) -> image::ImageResult<image::DynamicImage> {
+    type Layout = fn(u32, u32, Vec<u8>) -> Option<image::DynamicImage>;
+    let layout: Layout = match decoder.color_type() {
+        image::ColorType::Rgb8 => |width, height, pixels| {
+            image::RgbImage::from_raw(width, height, pixels).map(image::DynamicImage::ImageRgb8)
+        },
+        image::ColorType::Rgba8 => |width, height, pixels| {
+            image::RgbaImage::from_raw(width, height, pixels).map(image::DynamicImage::ImageRgba8)
+        },
+        image::ColorType::L8 => |width, height, pixels| {
+            image::GrayImage::from_raw(width, height, pixels).map(image::DynamicImage::ImageLuma8)
+        },
+        image::ColorType::La8 => |width, height, pixels| {
+            image::GrayAlphaImage::from_raw(width, height, pixels)
+                .map(image::DynamicImage::ImageLumaA8)
+        },
+        _ => return image::DynamicImage::from_decoder(decoder),
+    };
+    let Ok(len) = usize::try_from(decoder.total_bytes()) else {
+        return image::DynamicImage::from_decoder(decoder);
+    };
+    let (width, height) = decoder.dimensions();
+    let mut pixels = buffer_pool::take(len);
+    if let Err(error) = decoder.read_image(&mut pixels) {
+        // A refused decode hands its buffer back; the next take is warm.
+        buffer_pool::recycle(pixels);
+        return Err(error);
+    }
+    layout(width, height, pixels).ok_or_else(|| {
+        image::ImageError::Parameter(image::error::ParameterError::from_kind(
+            image::error::ParameterErrorKind::DimensionMismatch,
+        ))
+    })
 }
 
 /// The four bytes that open an icon file (reserved 0, type 1), the magic the
@@ -5322,20 +5370,24 @@ pub(crate) fn apply_transparency(
     if !image.color().has_alpha() {
         return image;
     }
-    match policy {
-        TransparencyPolicy::KeepAlpha => image,
-        TransparencyPolicy::DropAlpha => image::DynamicImage::ImageRgb8(image.to_rgb8()),
+    let flattened = match policy {
+        TransparencyPolicy::KeepAlpha => return image,
+        TransparencyPolicy::DropAlpha => image.to_rgb8(),
         TransparencyPolicy::CompositeOverWhite => {
             if png_colour_type(bytes) == Some(PNG_COLOUR_TYPE_TRUECOLOUR) {
-                return image::DynamicImage::ImageRgb8(image.to_rgb8());
+                image.to_rgb8()
+            } else {
+                match &image {
+                    image::DynamicImage::ImageRgba8(rgba) => composite_over_white(rgba),
+                    other => composite_over_white(&other.to_rgba8()),
+                }
             }
-            let composited = match image {
-                image::DynamicImage::ImageRgba8(rgba) => composite_over_white(&rgba),
-                other => composite_over_white(&other.to_rgba8()),
-            };
-            image::DynamicImage::ImageRgb8(composited)
         }
-    }
+    };
+    // The frame holds the flattened image from here on, so nothing later
+    // would return the decoder's buffer to the pool.
+    buffer_pool::recycle_image(image);
+    image::DynamicImage::ImageRgb8(flattened)
 }
 
 /// The eight-byte PNG signature.
@@ -5355,19 +5407,34 @@ fn png_colour_type(bytes: &[u8]) -> Option<u8> {
     }
 }
 
-/// Composite straight-alpha RGBA over opaque white with the reference's
-/// integer blend, `(src * a + 255 * (255 - a) + 127) / 255` per channel.
+/// `OVER_WHITE[alpha][value]`: a channel value composited over opaque white
+/// at that alpha with the reference's integer blend,
+/// `(value * alpha + 255 * (255 - alpha) + 127) / 255`.
+static OVER_WHITE: [[u8; 256]; 256] = {
+    let mut table = [[0u8; 256]; 256];
+    let mut alpha = 0;
+    while alpha < 256 {
+        let white = 255 * (255 - alpha) + 127;
+        let mut value = 0;
+        while value < 256 {
+            table[alpha][value] = ((value * alpha + white) / 255) as u8;
+            value += 1;
+        }
+        alpha += 1;
+    }
+    table
+};
+
+/// Composite straight-alpha RGBA over opaque white: per channel one read of
+/// [`OVER_WHITE`], in the row the pixel's alpha names. The output is a buffer
+/// of the pool, and every pixel of the image writes its three bytes.
 fn composite_over_white(rgba: &image::RgbaImage) -> image::RgbImage {
     let (width, height) = rgba.dimensions();
-    let mut out = Vec::with_capacity(width as usize * height as usize * 3);
-    for px in rgba.as_raw().as_chunks::<4>().0 {
-        let alpha = u32::from(px[3]);
-        let white = 255 * (255 - alpha) + 127;
-        out.extend_from_slice(&[
-            ((u32::from(px[0]) * alpha + white) / 255) as u8,
-            ((u32::from(px[1]) * alpha + white) / 255) as u8,
-            ((u32::from(px[2]) * alpha + white) / 255) as u8,
-        ]);
+    let (pixels, _) = rgba.as_raw()[..4 * width as usize * height as usize].as_chunks::<4>();
+    let mut out = buffer_pool::take(3 * pixels.len());
+    for (rgb, px) in out.as_chunks_mut::<3>().0.iter_mut().zip(pixels) {
+        let over_white = &OVER_WHITE[usize::from(px[3])];
+        *rgb = [px[0], px[1], px[2]].map(|value| over_white[usize::from(value)]);
     }
     #[expect(
         clippy::expect_used,
@@ -5436,12 +5503,18 @@ fn apply_max_long_side_pixel(
     // The same fit `encoded_image_size` promised from the header.
     match max_long_side_pixel.and_then(|cap| capped_dimensions(image.width(), image.height(), cap))
     {
-        Some((width, height)) => match image {
-            image::DynamicImage::ImageRgb8(rgb) => {
-                image::DynamicImage::ImageRgb8(resize_catmull_rom_rgb(&rgb, width, height))
-            }
-            other => other.resize_exact(width, height, image::imageops::FilterType::CatmullRom),
-        },
+        Some((width, height)) => {
+            let resized = match &image {
+                image::DynamicImage::ImageRgb8(rgb) => {
+                    image::DynamicImage::ImageRgb8(resize_catmull_rom_rgb(rgb, width, height))
+                }
+                other => other.resize_exact(width, height, image::imageops::FilterType::CatmullRom),
+            };
+            // The frame holds the resized image from here on, so nothing
+            // later would return the decoder's buffer to the pool.
+            buffer_pool::recycle_image(image);
+            resized
+        }
         None => image,
     }
 }

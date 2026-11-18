@@ -26,9 +26,9 @@ use std::{
 
 use metrics_exporter_prometheus::PrometheusHandle;
 use smg::{
-    observability::metrics::{start_prometheus, Metrics, PrometheusConfig},
+    observability::metrics::{start_prometheus, PrometheusConfig},
     routers::common::header_utils::extract_routing_key,
-    worker::{BasicWorkerBuilder, Worker, WorkerLoadGuard, WorkerType},
+    worker::{metrics::Metrics, BasicWorkerBuilder, Worker, WorkerLoadGuard, WorkerType},
 };
 
 thread_local! {

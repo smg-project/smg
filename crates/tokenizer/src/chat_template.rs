@@ -3368,12 +3368,13 @@ impl ChatTemplateState {
         messages: &[serde_json::Value],
         params: ChatTemplateParams,
     ) -> Result<(String, bool)> {
+        // A render call carries no template of its own, so the words name
+        // what holds for every caller: the model has none, and only its
+        // configuration can bring one.
         let env = self.env.as_ref().ok_or_else(|| {
             anyhow!(
-                "Cannot use chat template functions because tokenizer.chat_template is not set \
-                 and no template argument was passed! For information about writing templates and \
-                 setting the tokenizer.chat_template attribute, please see the documentation at \
-                 https://huggingface.co/docs/transformers/main/en/chat_templating",
+                "The model has no chat template. One must be configured for the model; \
+                 a request cannot supply it.",
             )
         })?;
 

@@ -72,6 +72,7 @@ def nothing_of_the_launchers_in_the_environment():
         vllm_warmup.WARMUP_ENV,
         sglang_warmup.WARMUP_ENV,
         tokenspeed_warmup.WARMUP_ENV,
+        tokenspeed_warmup.REMAINDERS_ENV,
     )
     before = {name: os.environ.pop(name, None) for name in names}
     try:

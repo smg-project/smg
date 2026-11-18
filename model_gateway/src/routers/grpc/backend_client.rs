@@ -8,10 +8,16 @@
 //! pipeline (which works against `ProtoStream`/`ProtoGenerateRequest`) is
 //! shared unchanged.
 
+use std::sync::{Arc, LazyLock};
+
+use async_trait::async_trait;
 use engine_zmq_adapter::admin::{flush_reply_wait, PROFILE_WAIT};
 use openai_protocol::{
-    chat::ChatCompletionRequest, completion::CompletionRequest, generate::GenerateRequest,
-    messages::CreateMessageRequest, worker::WorkerLoadResponse,
+    chat::ChatCompletionRequest,
+    completion::CompletionRequest,
+    generate::GenerateRequest,
+    messages::CreateMessageRequest,
+    worker::{ProfileOptions, WorkerLoadResponse},
 };
 use smg_grpc_client::{
     common_proto, sglang_proto,
@@ -38,7 +44,14 @@ use crate::{
         },
         MultimodalData,
     },
-    worker::{identity::endpoint::Endpoint, RuntimeType, Worker},
+    worker::{
+        connection::engine::{
+            AdminAnswer, ConnectorDefault, EngineConnection, EngineConnector, ZmqLink,
+        },
+        identity::endpoint::Endpoint,
+        kv::event_monitor::EngineStreams,
+        RuntimeType, Worker, WorkerError, WorkerResult,
+    },
 };
 
 /// A backend connection: gRPC (any engine) or direct ZMQ (vLLM EngineCore,
@@ -151,7 +164,7 @@ impl BackendClient {
     pub fn finalize_generate_request(
         &self,
         request: &mut ProtoGenerateRequest,
-        tokenizer: Option<&std::sync::Arc<dyn llm_tokenizer::traits::Tokenizer>>,
+        tokenizer: Option<&Arc<dyn llm_tokenizer::traits::Tokenizer>>,
     ) -> Vec<String> {
         let token_only_wire = self.is_zmq();
         let router_stops = helpers::resolve_string_stops(request, tokenizer, token_only_wire);
@@ -171,25 +184,6 @@ impl BackendClient {
             fold_tokenizer_eos_backstop(request, tokenizer);
         }
         router_stops
-    }
-
-    /// Whether the backend answers the admin RPCs (cache flush, profiling):
-    /// a gRPC servicer does, a ZMQ engine when its wire carries control calls
-    /// (an SGLang scheduler, or a TokenSpeed one that declares them).
-    pub fn carries_admin_calls(&self) -> bool {
-        match self {
-            Self::Grpc(_) => true,
-            Self::Zmq(client) => client.carries_control_calls(),
-        }
-    }
-
-    /// Local liveness. gRPC has no cheap local flag (it uses a health RPC), so
-    /// this reports `true` for gRPC; ZMQ reflects its connection liveness.
-    pub fn is_alive(&self) -> bool {
-        match self {
-            Self::Grpc(_) => true,
-            Self::Zmq(client) => client.is_alive(),
-        }
     }
 
     pub async fn health_check(&self) -> Result<HealthCheckResponse, tonic::Status> {
@@ -216,79 +210,6 @@ impl BackendClient {
         match self {
             Self::Grpc(client) => client.get_server_info().await,
             Self::Zmq(client) => Ok(zmq_client::server_info(client)),
-        }
-    }
-
-    pub async fn get_loads(&self) -> Result<WorkerLoadResponse, tonic::Status> {
-        match self {
-            Self::Grpc(client) => client.get_loads().await,
-            Self::Zmq(client) => Ok(client.get_loads()),
-        }
-    }
-
-    pub async fn flush_cache(
-        &self,
-        timeout_s: f32,
-    ) -> Result<common_proto::FlushCacheResponse, tonic::Status> {
-        match self {
-            Self::Grpc(client) => client.flush_cache(timeout_s).await,
-            // The reply wait is the servicers' rule, read from the adapter.
-            Self::Zmq(client) => {
-                let (success, message) = client
-                    .flush_cache_control(timeout_s, flush_reply_wait(timeout_s))
-                    .await?;
-                Ok(common_proto::FlushCacheResponse { success, message })
-            }
-        }
-    }
-
-    pub async fn start_profile(
-        &self,
-        req: common_proto::StartProfileRequest,
-    ) -> Result<common_proto::ProfileResponse, tonic::Status> {
-        match self {
-            Self::Grpc(client) => client.start_profile(req).await,
-            Self::Zmq(client) => {
-                let (success, message) = client
-                    .profile_control(Some(SglangProfileStart::from_request(req)), PROFILE_WAIT)
-                    .await?;
-                Ok(common_proto::ProfileResponse { success, message })
-            }
-        }
-    }
-
-    pub async fn stop_profile(&self) -> Result<common_proto::ProfileResponse, tonic::Status> {
-        match self {
-            Self::Grpc(client) => client.stop_profile().await,
-            Self::Zmq(client) => {
-                let (success, message) = client.profile_control(None, PROFILE_WAIT).await?;
-                Ok(common_proto::ProfileResponse { success, message })
-            }
-        }
-    }
-
-    pub async fn subscribe_kv_events(
-        &self,
-        start_seq: u64,
-    ) -> Result<tonic::Streaming<common_proto::KvEventBatch>, tonic::Status> {
-        match self {
-            Self::Grpc(client) => client.subscribe_kv_events(start_seq).await,
-            Self::Zmq(_) => Err(tonic::Status::unimplemented(
-                "SubscribeKvEvents not supported over ZMQ",
-            )),
-        }
-    }
-
-    /// The worker's load records alone, no events; `Unimplemented` over ZMQ
-    /// (the engine pushes its scheduler stats on that wire already).
-    pub async fn subscribe_load_records(
-        &self,
-    ) -> Result<tonic::Streaming<common_proto::KvEventBatch>, tonic::Status> {
-        match self {
-            Self::Grpc(client) => client.subscribe_load_records().await,
-            Self::Zmq(_) => Err(tonic::Status::unimplemented(
-                "SubscribeKvEvents not supported over ZMQ",
-            )),
         }
     }
 
@@ -444,6 +365,249 @@ impl BackendClient {
     }
 }
 
+/// The worker runtime's view of the client. A call the runtime alone makes
+/// has its one body here: the client has no inherent method of its name, so
+/// the call cannot resolve to itself.
+#[async_trait]
+impl EngineConnection for BackendClient {
+    /// Whether the backend answers the admin RPCs (cache flush, profiling):
+    /// a gRPC servicer does, a ZMQ engine when its wire carries control calls
+    /// (an SGLang scheduler, or a TokenSpeed one that declares them).
+    fn carries_admin_calls(&self) -> bool {
+        match self {
+            Self::Grpc(_) => true,
+            Self::Zmq(client) => client.carries_control_calls(),
+        }
+    }
+
+    /// Local liveness. gRPC has no cheap local flag (it uses a health RPC), so
+    /// this reports `true` for gRPC; ZMQ reflects its connection liveness.
+    fn is_alive(&self) -> bool {
+        match self {
+            Self::Grpc(_) => true,
+            Self::Zmq(client) => client.is_alive(),
+        }
+    }
+
+    /// The client's own health read, narrowed to its verdict. The inherent
+    /// method answers the whole reply, so this path cannot come back here:
+    /// without that method `healthy` names no field.
+    async fn health_check(&self) -> Result<bool, tonic::Status> {
+        BackendClient::health_check(self)
+            .await
+            .map(|response| response.healthy)
+    }
+
+    async fn get_loads(&self) -> Result<WorkerLoadResponse, tonic::Status> {
+        match self {
+            Self::Grpc(client) => client.get_loads().await,
+            Self::Zmq(client) => Ok(client.get_loads()),
+        }
+    }
+
+    async fn flush_cache(&self, timeout_s: f32) -> Result<AdminAnswer, tonic::Status> {
+        let (success, message) = match self {
+            Self::Grpc(client) => {
+                let answer = client.flush_cache(timeout_s).await?;
+                (answer.success, answer.message)
+            }
+            // The reply wait is the servicers' rule, read from the adapter.
+            Self::Zmq(client) => {
+                client
+                    .flush_cache_control(timeout_s, flush_reply_wait(timeout_s))
+                    .await?
+            }
+        };
+        Ok(AdminAnswer { success, message })
+    }
+
+    async fn start_profile(&self, options: &ProfileOptions) -> Result<AdminAnswer, tonic::Status> {
+        let req = common_proto::StartProfileRequest {
+            output_dir: options.output_dir.clone(),
+            start_step: options.start_step,
+            num_steps: options.num_steps,
+            activities: options.activities.clone().unwrap_or_default(),
+            with_stack: options.with_stack,
+            record_shapes: options.record_shapes,
+            profile_by_stage: options.profile_by_stage,
+        };
+        let (success, message) = match self {
+            Self::Grpc(client) => {
+                let answer = client.start_profile(req).await?;
+                (answer.success, answer.message)
+            }
+            Self::Zmq(client) => {
+                client
+                    .profile_control(Some(SglangProfileStart::from_request(req)), PROFILE_WAIT)
+                    .await?
+            }
+        };
+        Ok(AdminAnswer { success, message })
+    }
+
+    async fn stop_profile(&self) -> Result<AdminAnswer, tonic::Status> {
+        let (success, message) = match self {
+            Self::Grpc(client) => {
+                let answer = client.stop_profile().await?;
+                (answer.success, answer.message)
+            }
+            Self::Zmq(client) => client.profile_control(None, PROFILE_WAIT).await?,
+        };
+        Ok(AdminAnswer { success, message })
+    }
+
+    async fn kv_engine_id(&self) -> Result<Option<String>, tonic::Status> {
+        let mut labels = BackendClient::get_server_info(self).await?.to_labels();
+        Ok(labels.remove("kv_engine_id").filter(|id| !id.is_empty()))
+    }
+}
+
+/// The engine's two pushed streams, for their one caller: the subscription
+/// loop of the KV event monitor.
+#[async_trait]
+impl EngineStreams for BackendClient {
+    async fn subscribe_kv_events(
+        &self,
+        start_seq: u64,
+    ) -> Result<tonic::Streaming<common_proto::KvEventBatch>, tonic::Status> {
+        match self {
+            Self::Grpc(client) => client.subscribe_kv_events(start_seq).await,
+            Self::Zmq(_) => Err(tonic::Status::unimplemented(
+                "SubscribeKvEvents not supported over ZMQ",
+            )),
+        }
+    }
+
+    /// The worker's load records alone, no events; `Unimplemented` over ZMQ
+    /// (the engine pushes its scheduler stats on that wire already).
+    async fn subscribe_load_records(
+        &self,
+    ) -> Result<tonic::Streaming<common_proto::KvEventBatch>, tonic::Status> {
+        match self {
+            Self::Grpc(client) => client.subscribe_load_records().await,
+            Self::Zmq(_) => Err(tonic::Status::unimplemented(
+                "SubscribeKvEvents not supported over ZMQ",
+            )),
+        }
+    }
+}
+
+/// Makes the gateway's client for a worker. It is the default of the worker
+/// builder as the gateway names it, and the gateway hands it to the registry
+/// it builds, for the workers the registry imports.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BackendConnector;
+
+impl BackendConnector {
+    /// The connector as a worker builder and the registry take it: one
+    /// allocation for the process, and each worker holds a clone of it.
+    pub fn shared() -> Arc<dyn EngineConnector> {
+        static SHARED: LazyLock<Arc<dyn EngineConnector>> =
+            LazyLock::new(|| Arc::new(BackendConnector));
+        Arc::clone(&SHARED)
+    }
+}
+
+impl ConnectorDefault for BackendConnector {
+    fn default_connector() -> Option<Arc<dyn EngineConnector>> {
+        Some(Self::shared())
+    }
+}
+
+#[async_trait]
+impl EngineConnector for BackendConnector {
+    async fn connect_grpc(
+        &self,
+        base_url: &str,
+        runtime: RuntimeType,
+    ) -> Result<Arc<dyn EngineConnection>, String> {
+        match GrpcClient::connect(base_url, &runtime.to_string()).await {
+            Ok(client) => Ok(Arc::new(BackendClient::Grpc(client))),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    async fn connect_zmq(&self, link: ZmqLink) -> Result<Arc<dyn EngineConnection>, String> {
+        let client = zmq_client::connect_for_worker(
+            &link.base_url,
+            link.model_id,
+            link.runtime,
+            link.handshake_address.as_deref(),
+            link.engine_count.map_or(
+                zmq_client::EngineCount::Declared,
+                zmq_client::EngineCount::Exactly,
+            ),
+            link.startup,
+            link.request_timeout,
+        )
+        .await?;
+        client.check_declared_role(link.worker_type)?;
+        Ok(Arc::new(BackendClient::Zmq(client)))
+    }
+}
+
+/// The gateway's client behind a worker's engine connection: the same
+/// allocation. A connection another host made is an error that says so,
+/// never `None`: `None` is what a worker without a connection answers.
+fn typed(
+    worker: &dyn Worker,
+    connection: Arc<dyn EngineConnection>,
+) -> WorkerResult<Arc<BackendClient>> {
+    connection
+        .downcast_arc()
+        .ok_or_else(|| not_the_gateways(worker))
+}
+
+/// The error for a connection another host made: never built on a request
+/// the gateway serves.
+#[cold]
+fn not_the_gateways(worker: &dyn Worker) -> WorkerError {
+    WorkerError::ConnectionFailed {
+        url: worker.url().to_string(),
+        reason: "its engine connection is not the gateway's backend client".to_string(),
+    }
+}
+
+/// The worker's engine connection as the gateway's client; `None` for an
+/// HTTP worker. A connected worker answers from its slot
+/// ([`Worker::engine_connection_if_initialized`]): the allocation its
+/// connect handed out, read without the boxed future of the trait's async
+/// call. The first use, and a worker still connecting, go through
+/// [`Worker::engine_connection`].
+pub async fn get_backend_client(worker: &dyn Worker) -> WorkerResult<Option<Arc<BackendClient>>> {
+    if let Some(connection) = worker.engine_connection_if_initialized() {
+        return typed(worker, connection).map(Some);
+    }
+    match worker.engine_connection().await? {
+        Some(connection) => typed(worker, connection).map(Some),
+        None => Ok(None),
+    }
+}
+
+/// [`get_backend_client`] without the connect
+/// ([`Worker::engine_connection_if_initialized`]): `None` for a worker
+/// still connecting and for an HTTP worker.
+pub fn backend_client_if_initialized(
+    worker: &dyn Worker,
+) -> WorkerResult<Option<Arc<BackendClient>>> {
+    worker
+        .engine_connection_if_initialized()
+        .map(|connection| typed(worker, connection))
+        .transpose()
+}
+
+/// [`backend_client_if_initialized`] for a reader with no error path: a
+/// connection that is not the gateway's client is said at error level, and
+/// the reader goes on as it does before a connect.
+pub(crate) fn connected_backend_client(worker: &dyn Worker) -> Option<Arc<BackendClient>> {
+    let client = worker.engine_connection_if_initialized()?.downcast_arc();
+    if client.is_none() {
+        let error = not_the_gateways(worker);
+        tracing::error!(%error, "Reading the worker as not connected");
+    }
+    client
+}
+
 // The encode-worker wires of a rendezvous handoff (the EPD encode stage's
 // dispatch): the encoder RPC of a gRPC encode worker and the encode frame of
 // a TokenSpeed encode server on the direct ZMQ lane.
@@ -460,8 +624,7 @@ pub(crate) async fn send_tokenspeed_encode_frame(
     // A failure's text is the dispatch's error line: it names the worker by
     // its masked address.
     let shown = worker.redacted_url();
-    let client = worker
-        .get_backend_client()
+    let client = get_backend_client(worker)
         .await
         .map_err(|e| format!("encode worker {shown} is not connected: {e}"))?
         .ok_or_else(|| format!("encode worker {shown} has no ZMQ connection"))?;
@@ -695,4 +858,109 @@ fn mm_variant_mismatch(expected: &str, got: &MultimodalData) -> String {
         MultimodalData::TokenSpeed(_) => "TokenSpeed",
     };
     format!("multimodal data variant mismatch: {expected} ZMQ backend got {got} data")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        routers::grpc::test_engine::mock_engine,
+        worker::{
+            test_support::{no_health_check, NoEngine},
+            BasicWorkerBuilder, ConnectionMode,
+        },
+    };
+
+    /// A connected worker's client is read from its slot: the acquisition
+    /// after the connect, and the reader that never connects, hand out the
+    /// allocation the connect made.
+    #[tokio::test]
+    async fn a_connected_workers_client_is_the_slots_own_allocation() {
+        let (url, engine) = mock_engine("m").await;
+        let worker = BasicWorkerBuilder::new(url.replacen("http://", "grpc://", 1))
+            .connection_mode(ConnectionMode::Grpc)
+            .runtime_type(RuntimeType::Vllm)
+            .health_config(no_health_check())
+            .build();
+        assert!(backend_client_if_initialized(&worker).unwrap().is_none());
+
+        let connected = get_backend_client(&worker).await.unwrap().unwrap();
+        let again = get_backend_client(&worker).await.unwrap().unwrap();
+        let peeked = backend_client_if_initialized(&worker).unwrap().unwrap();
+        assert!(Arc::ptr_eq(&connected, &again));
+        assert!(Arc::ptr_eq(&connected, &peeked));
+        engine.abort();
+    }
+
+    /// The handle's health read is the engine's verdict, not the arrival of
+    /// a reply: an engine that answers unhealthy reads `false`.
+    #[tokio::test]
+    async fn an_engine_that_answers_unhealthy_reads_unhealthy_through_the_handle() {
+        let (url, engine) = mock_engine("m").await;
+        let port: u16 = url
+            .rsplit(':')
+            .next()
+            .and_then(|port| port.parse().ok())
+            .expect("the mock engine's port");
+        let connection = BackendConnector
+            .connect_grpc(
+                &url.replacen("http://", "grpc://", 1),
+                RuntimeType::TokenSpeed,
+            )
+            .await
+            .expect("the mock engine connects");
+        assert!(connection.health_check().await.expect("the engine answers"));
+
+        mock_worker::overrides::for_port(port).set_serving(false);
+        assert!(!connection.health_check().await.expect("the engine answers"));
+        engine.abort();
+    }
+
+    /// A worker the gateway builds without naming a connector carries the
+    /// gateway's own: the default of the builder as the gateway names it.
+    #[tokio::test]
+    async fn a_worker_the_gateway_builds_carries_the_gateways_connector() {
+        let worker = BasicWorkerBuilder::new("grpc://engine:50051")
+            .connection_mode(ConnectionMode::Grpc)
+            .health_config(no_health_check())
+            .build();
+
+        let connector = worker.engine_connector.as_ref().expect("the default");
+        assert_eq!(format!("{connector:?}"), "BackendConnector");
+    }
+
+    /// A connection the gateway did not make is an error that says so on
+    /// both readers, never the `None` of a worker without a connection. A
+    /// reader with no error path reads the worker as not connected.
+    #[tokio::test]
+    async fn a_connection_the_gateway_did_not_make_is_an_error_that_says_so() {
+        let worker = BasicWorkerBuilder::new("grpc://engine:50051")
+            .connection_mode(ConnectionMode::Grpc)
+            .health_config(no_health_check())
+            .engine_connection(NoEngine)
+            .build();
+
+        for refusal in [
+            get_backend_client(&worker).await.err(),
+            backend_client_if_initialized(&worker).err(),
+        ] {
+            let refusal = refusal.expect("an error, never None").to_string();
+            assert!(
+                refusal.contains("not the gateway's backend client"),
+                "{refusal}"
+            );
+        }
+        assert!(connected_backend_client(&worker).is_none());
+    }
+
+    /// A worker without an engine connection answers `None` on both readers.
+    #[tokio::test]
+    async fn an_http_worker_has_no_backend_client() {
+        let worker = BasicWorkerBuilder::new("http://worker:8000")
+            .health_config(no_health_check())
+            .build();
+
+        assert!(get_backend_client(&worker).await.unwrap().is_none());
+        assert!(backend_client_if_initialized(&worker).unwrap().is_none());
+    }
 }

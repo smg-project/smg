@@ -99,10 +99,7 @@ impl ModelProcessorSpec for QwenVLVisionSpec {
             Modality::Video if Self::names_a_video_token(metadata.config) => {
                 Ok(VIDEO_PAD_TOKEN.to_string())
             }
-            _ => Err(ModelRegistryError::UnsupportedModality {
-                spec: self.name(),
-                modality,
-            }),
+            _ => Err(ModelRegistryError::unsupported(self.name(), modality)),
         }
     }
 
@@ -116,10 +113,7 @@ impl ModelProcessorSpec for QwenVLVisionSpec {
             Modality::Video if Self::names_a_video_token(metadata.config) => {
                 Self::video_pad_token_id(metadata)
             }
-            _ => Err(ModelRegistryError::UnsupportedModality {
-                spec: self.name(),
-                modality,
-            }),
+            _ => Err(ModelRegistryError::unsupported(self.name(), modality)),
         }
     }
 
@@ -170,10 +164,7 @@ impl ModelProcessorSpec for QwenVLVisionSpec {
             Modality::Video if Self::names_a_video_token(model_config) => Ok(Box::new(
                 Qwen2VLProcessor::from_config_for(preprocessor_config, modality),
             )),
-            _ => Err(ModelRegistryError::UnsupportedModality {
-                spec: self.name(),
-                modality,
-            }),
+            _ => Err(ModelRegistryError::unsupported(self.name(), modality)),
         }
     }
 
@@ -215,10 +206,7 @@ impl ModelProcessorSpec for QwenVLVisionSpec {
                     &preprocessed.feature_token_counts,
                 ))
             }
-            _ => Err(ModelRegistryError::UnsupportedModality {
-                spec: self.name(),
-                modality,
-            }),
+            _ => Err(ModelRegistryError::unsupported(self.name(), modality)),
         }
     }
 

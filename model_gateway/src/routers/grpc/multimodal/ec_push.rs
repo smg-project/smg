@@ -24,6 +24,7 @@ use crate::{
     routers::{
         error,
         grpc::{
+            backend_client::get_backend_client,
             context::EncodeWorkerAssignment,
             proto_wrapper::{ProtoGenerateRequest, ProtoGenerateResponse},
             utils::tonic_ext::TonicStatusExt,
@@ -108,8 +109,7 @@ impl PushEncodePlan {
         };
         let (encoder, mut params) = encoder_request(original, worker, self.destination.as_deref());
         let cleanup = PushCleanup::new(&params);
-        let backend = worker
-            .get_backend_client()
+        let backend = get_backend_client(worker)
             .await
             .map_err(|e| error::service_unavailable("ec_encoder_connection", e.to_string()))?
             .ok_or_else(|| {
@@ -119,7 +119,7 @@ impl PushEncodePlan {
         let mut stream = client
             .generate(ProtoGenerateRequest::Vllm(Box::new(encoder)))
             .await
-            .map_err(|e| e.to_http_error("ec_encode_failed", e.message().to_string()))?;
+            .map_err(|e| encode_start_failure(&e))?;
         while let Some(reply) = stream.next().await {
             let reply =
                 reply.map_err(|e| e.to_http_error("ec_encode_failed", e.message().to_string()))?;
@@ -151,6 +151,14 @@ impl PushEncodePlan {
             "Encoder closed without a completion",
         ))
     }
+}
+
+/// The answer for an encode call the encoder did not start. The status of a
+/// dial that failed names the encoder's address, for the line here; the
+/// client's answer is the same failure without it.
+fn encode_start_failure(status: &tonic::Status) -> Response {
+    tracing::warn!(error = %status, "The encoder did not start the encode call");
+    status.to_http_error("ec_encode_failed", status.client_message().to_string())
 }
 
 /// A Mooncake consumer must advertise a destination before E reserves buffers.
@@ -641,6 +649,63 @@ mod tests {
         assert_eq!(
             handles["ec_items"],
             json!([{"transfer_id":"one","mm_hash":"h"},{"transfer_id":"two","mm_hash":"h"}])
+        );
+    }
+
+    /// The encoder's port refuses the dial under an encode call: the client's
+    /// answer is that failure in the dial's own words, without the encoder's
+    /// address.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_refused_dial_to_the_encoder_is_answered_without_its_address() {
+        use smg_grpc_client::tokenspeed_proto as ts;
+
+        use crate::worker::test_support::RefusedAddress;
+
+        // An encoder the gateway reached once and that is gone, on a port
+        // that stays taken after it: the port refuses from then on.
+        let address = RefusedAddress::reserve_shared();
+        let listener = address.listen_shared();
+        let url = format!("http://127.0.0.1:{}", address.port());
+        let channel = smg_grpc_client::connect_channel(&url)
+            .await
+            .expect("the encoder listens");
+        let (connection, _) = listener.accept().await.expect("the gateway's connection");
+        drop(connection);
+        drop(listener);
+        // The channel's status for a failed dial is the same under any call
+        // of any client. A first call may still go out on the connection
+        // that was closed; the call after it dials.
+        let mut client = ts::token_speed_scheduler_client::TokenSpeedSchedulerClient::new(channel);
+        let refused = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            for _ in 0..8 {
+                let status = client
+                    .health_check(tonic::Request::new(ts::HealthCheckRequest {}))
+                    .await
+                    .expect_err("the encoder is gone");
+                if smg_grpc_client::dial_failure_without_peer(&status).is_some() {
+                    return Some(status);
+                }
+            }
+            None
+        })
+        .await
+        .expect("every call ends");
+        let status = refused.expect("a call dials and is refused");
+        assert!(status.message().contains("127.0.0.1"), "{status:?}");
+
+        let response = encode_start_failure(&status);
+        assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("drain body");
+        let error: serde_json::Value = serde_json::from_slice(&body).expect("a JSON body");
+        assert_eq!(error["error"]["code"], "ec_encode_failed", "{error}");
+        let message = error["error"]["message"].as_str().expect("a message");
+        assert!(message.contains("refused"), "{message}");
+        assert!(
+            !message.contains("127.0.0.1") && !message.contains(&address.port().to_string()),
+            "the answer names the encoder's address: {message}"
         );
     }
 

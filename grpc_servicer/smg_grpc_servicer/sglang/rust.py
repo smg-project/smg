@@ -86,12 +86,16 @@ from smg_grpc_servicer.rust_lifecycle import (  # noqa: F401
     apply_kv_events_default,
     ensure_spawn_start_method,
     on_fault_signal,
-    resolve_tokenizer_dir,
     servicer_switch,
 )
 from smg_grpc_servicer.sglang import METRICS_HOST_ENV, METRICS_PORT_ENV
 from smg_grpc_servicer.sglang.config_view import EngineConfigView
 from smg_grpc_servicer.sglang.lora import PreloadedLoras
+from smg_grpc_servicer.sglang.model_artifacts import (
+    local_metadata_source,
+    prepare_model_metadata,
+    tokenizer_dir_for,
+)
 from smg_grpc_servicer.sglang.warmup import WARMUP_ENV, media_warmup, warmup_inputs, warmup_wire
 
 logger = logging.getLogger(__name__)
@@ -446,12 +450,6 @@ def launch_scheduler_ranks(
     return engine
 
 
-def tokenizer_dir_for(server_args: Any) -> str | None:
-    """The local tokenizer directory for the served model, or ``None``."""
-    args = EngineConfigView(server_args).server_args
-    return resolve_tokenizer_dir(str(args.tokenizer_path or args.model_path), args.revision)
-
-
 # ---------------------------------------------------------------------------
 # Lifecycle
 # ---------------------------------------------------------------------------
@@ -576,6 +574,9 @@ class SglangLauncher(RustLauncher):
     without_tokenizer = "GetTokenizer will be unavailable"
     warmup_env = WARMUP_ENV
 
+    def prepare(self, args: Any) -> None:
+        prepare_model_metadata(args)
+
     def kv_events_default(self, args: Any) -> str | None:
         return default_kv_events_config(args)
 
@@ -625,7 +626,7 @@ class SglangLauncher(RustLauncher):
             configure_threads()
             return {
                 "smg_media_processor": {
-                    "model_dir": str(args.model_path),
+                    "model_dir": local_metadata_source(str(args.model_path)),
                     "model_id": str(args.model_path),
                     "encoder_dtype": dtype,
                     "source": "env",

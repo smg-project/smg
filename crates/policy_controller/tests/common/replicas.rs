@@ -21,20 +21,51 @@ use std::{
 };
 
 use parking_lot::Mutex;
+use prost::Message as _;
 use smg_policy_controller::{
     elector::ElectionSettings,
     proto::{
         controller_frame, gateway_frame, policy_controller_client::PolicyControllerClient,
-        GatewayFrame, Hello, LeaderInfo, LeaderRequest,
+        GatewayFrame, Hello, LeaderInfo, LeaderRequest, NotLeader,
     },
 };
 use tokio::sync::mpsc;
 use tonic::{
     codegen::tokio_stream::wrappers::ReceiverStream, metadata::AsciiMetadataValue,
-    transport::Channel, Request,
+    transport::Channel, Request, Status,
 };
 
 const BIN: &str = env!("CARGO_BIN_EXE_smg-policy-controller");
+
+/// `google.rpc.Status`, as a client of any gRPC stack decodes a status's
+/// details.
+#[derive(Clone, PartialEq, prost::Message)]
+struct RpcStatus {
+    #[prost(int32, tag = "1")]
+    code: i32,
+    #[prost(string, tag = "2")]
+    message: String,
+    #[prost(message, repeated, tag = "3")]
+    details: Vec<prost_types::Any>,
+}
+
+/// The `NotLeader` in a refusal's details, read the way every gRPC client
+/// reads them: a `google.rpc.Status` that says the refusal's code and
+/// message again and holds the one message under its type's URL.
+pub fn not_leader(refused: &Status) -> NotLeader {
+    let details = RpcStatus::decode(refused.details()).expect("a google.rpc.Status");
+    assert_eq!(
+        (details.code, details.message.as_str()),
+        (refused.code() as i32, refused.message())
+    );
+    assert_eq!(details.details.len(), 1, "one detail: {details:?}");
+    let detail = details.details.first().expect("one detail");
+    assert_eq!(
+        detail.type_url,
+        "type.googleapis.com/smg.policy.v1.NotLeader"
+    );
+    NotLeader::decode(detail.value.as_slice()).expect("a NotLeader")
+}
 
 /// How long a start may take before its listeners are in its log.
 const START: Duration = Duration::from_secs(30);
@@ -148,7 +179,15 @@ pub struct Replica {
     /// Where its admin endpoints listen.
     pub admin: SocketAddr,
     client: Option<PolicyControllerClient<Channel>>,
+    /// The directory of the spec source it was given where its flags named
+    /// none, kept as long as the process.
+    _spec: Option<tempfile::TempDir>,
 }
+
+/// A document of one plain profile: what a replica runs where its flags
+/// name no spec source and a store is refused.
+const PLAIN_SPEC: &str =
+    "apiVersion: smg.policy/v1\nprofiles:\n  default:\n    filter: [healthy]\n    pick: random\n";
 
 impl Replica {
     /// Starts the binary as `id` over `lease`, every listener on an
@@ -205,6 +244,7 @@ impl Replica {
         for variable in AMBIENT {
             command.env_remove(variable);
         }
+        let alone = matches!(lease, Lease::Own);
         match lease {
             Lease::File(path) => {
                 command.arg("--lease-file").arg(path);
@@ -219,6 +259,30 @@ impl Replica {
         if let Some(address) = advertise {
             command.args(["--advertise-address", address]);
         }
+        // A start names its spec's source. A replica whose flags name none
+        // takes one that changes nothing it runs where it can: a store on an
+        // empty directory, alone. Beside a lease another replica can take a
+        // store is refused, so there it takes a file of one plain profile.
+        let named = flags.iter().any(|flag| {
+            ["--spec-file", "--spec-store"]
+                .map(OsStr::new)
+                .contains(flag)
+        });
+        let spec = if named {
+            None
+        } else {
+            let dir =
+                tempfile::tempdir().map_err(|error| format!("{id}: a spec directory: {error}"))?;
+            if alone {
+                command.arg("--spec-store").arg(dir.path());
+            } else {
+                let file = dir.path().join("policy.yaml");
+                std::fs::write(&file, PLAIN_SPEC)
+                    .map_err(|error| format!("{id}: a spec file: {error}"))?;
+                command.arg("--spec-file").arg(file);
+            }
+            Some(dir)
+        };
         command
             .args(["--controller-id", id])
             .args(["--gateway-listen", "127.0.0.1:0"])
@@ -272,6 +336,7 @@ impl Replica {
             replication: unbound(),
             admin: unbound(),
             client: None,
+            _spec: spec,
         };
         let started = Instant::now();
         loop {
@@ -426,6 +491,11 @@ impl Replica {
     /// listener: the term of the `Welcome` that answers it, or the name of
     /// what answered in its place.
     pub async fn hello(&self, gateway: &str) -> Result<u64, String> {
+        self.hello_under(gateway, 0).await
+    }
+
+    /// The same with the gateway's term floor on the frame.
+    pub async fn hello_under(&self, gateway: &str, term_floor: u64) -> Result<u64, String> {
         let endpoint = Channel::from_shared(format!("http://{}", self.gateway))
             .map_err(|error| error.to_string())?
             .connect_timeout(CALL);
@@ -452,7 +522,7 @@ impl Replica {
         frames
             .send(GatewayFrame {
                 seq: 0,
-                term_floor: 0,
+                term_floor,
                 frame: Some(gateway_frame::Frame::Hello(hello)),
             })
             .await

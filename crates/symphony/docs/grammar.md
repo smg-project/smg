@@ -15,9 +15,10 @@ wrapper state the calls sit in, and the thought's close the row from the reasoni
 where the thought opened; the request's tools give each call its name and schema. What the syntax
 inside the markers constrains comes from the call syntax: a JSON object around each tool's schema
 for the JSON family; the engines' `glm_xml` style of a schema for keyed arguments in the compact
-spelling, and the table's own tags written one pair per property for Ling's newlines and Hy4's
-suffixed tags (the `keyed` module); `<function=` and `<parameter=` tags, one per property, for Qwen
-3.5's and Seed-OSS's tagged syntax (the `tagged` module); a tag grammar per parameter for DSML; for
+spelling, its values free of the markers that end a call as the other keyed values are, and the
+table's own tags written one pair per property for Ling's newlines and Hy4's suffixed tags (the
+`keyed` module); `<function=` and `<parameter=` tags, one per property, for Qwen 3.5's and
+Seed-OSS's tagged syntax (the `tagged` module); a tag grammar per parameter for DSML; for
 Kimi K3's XTML, one argument tag per property of the schema (the `xtml` module); `<invoke name="…">`
 blocks of `<parameter name="…">` tags for MiniMax M2 (the `attributed` module); Python calls, one
 per line or as a list, each value in the template's spelling, for Olmo 3 and LFM2.5 (the `pythonic`

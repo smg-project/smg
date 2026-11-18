@@ -190,10 +190,7 @@ impl ModelProcessorSpec for LlavaSpec {
                     preprocessor_config,
                 )),
             }),
-            _ => Err(ModelRegistryError::UnsupportedModality {
-                spec: self.name(),
-                modality,
-            }),
+            _ => Err(ModelRegistryError::unsupported(self.name(), modality)),
         }
     }
 
@@ -266,10 +263,7 @@ impl ModelProcessorSpec for LlavaNextSpec {
                 model_config,
                 preprocessor_config,
             ))),
-            _ => Err(ModelRegistryError::UnsupportedModality {
-                spec: self.name(),
-                modality,
-            }),
+            _ => Err(ModelRegistryError::unsupported(self.name(), modality)),
         }
     }
 

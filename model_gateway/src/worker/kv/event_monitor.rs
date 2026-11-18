@@ -26,10 +26,12 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc, OnceLock, Weak,
     },
+    time::Instant,
 };
 
 use dashmap::{mapref::entry::Entry, DashMap};
 use futures::FutureExt as _;
+use smg_grpc_client::common_proto::EngineLoad;
 use tokio::{
     sync::{oneshot, watch, Mutex},
     task::JoinHandle,
@@ -37,12 +39,13 @@ use tokio::{
 use tracing::{debug, error, info, warn};
 
 use super::index_backend::KvIndex;
-use crate::{
-    observability::metrics::Metrics,
-    worker::{
-        identity::endpoint::Endpoint, load::monitor::WorkerMonitor, periodic_task::PeriodicTask,
-        registry::WorkerRegistry, ConnectionMode, Worker, UNKNOWN_MODEL_ID,
-    },
+use crate::worker::{
+    identity::endpoint::Endpoint,
+    load::monitor::WorkerMonitor,
+    metrics::Metrics,
+    periodic_task::PeriodicTask,
+    registry::{Generation, WorkerRegistry},
+    ConnectionMode, Worker, UNKNOWN_MODEL_ID,
 };
 
 mod admission;
@@ -52,6 +55,7 @@ mod subscription;
 
 #[cfg(any(test, feature = "test-util"))]
 pub(crate) use apply::WorkerIndexState;
+pub(crate) use subscription::EngineStreams;
 
 /// Interval between publications of each model's index size and, for the chain
 /// index, its shape and memory (`smg_kv_index_*` gauges by model).
@@ -111,12 +115,54 @@ pub struct KvEventMonitor {
     /// Where the load records on the event streams go (`KvEventBatch.load`):
     /// the worker monitor, which treats them as polls. Weak: the monitors
     /// are peers in the app context, neither owns the other.
-    load_sink: OnceLock<Weak<WorkerMonitor>>,
+    load_sink: OnceLock<Weak<dyn PushedLoadSink>>,
     /// The registry whose object under a URL an add starts a stream for:
     /// `on_worker_added` reads it under the slot lock. Weak like the load
     /// sink, a peer in the app context. Unset in a monitor built alone (the
     /// tests), which holds every object.
-    worker_registry: OnceLock<Weak<WorkerRegistry>>,
+    worker_registry: OnceLock<Weak<dyn WorkerLookup>>,
+}
+
+/// Where a load record pushed on a worker's event stream goes: the load
+/// monitor, as this monitor's streams hold it. Held by this name,
+/// the sink brings nothing of the registry the load monitor is built over.
+pub(crate) trait PushedLoadSink: Send + Sync {
+    /// Take the record of `dp_rank` received at `received_at`
+    /// ([`WorkerMonitor::apply_pushed_load`]).
+    fn push_load(
+        self: Arc<Self>,
+        worker: &Arc<dyn Worker>,
+        dp_rank: i32,
+        record: &EngineLoad,
+        received_at: Instant,
+    );
+}
+
+impl<G: Generation> PushedLoadSink for WorkerMonitor<G> {
+    fn push_load(
+        self: Arc<Self>,
+        worker: &Arc<dyn Worker>,
+        dp_rank: i32,
+        record: &EngineLoad,
+        received_at: Instant,
+    ) {
+        self.apply_pushed_load(worker, dp_rank, record, received_at);
+    }
+}
+
+/// The registry as a peer that asks one thing of it holds it: the worker
+/// registered under a URL. Such a holder reads no generation, so it names
+/// no value of the registry's host.
+pub(crate) trait WorkerLookup: Send + Sync {
+    /// The worker registered under `url`, as [`WorkerRegistry::get_by_url`]
+    /// reads it.
+    fn get_by_url(&self, url: &str) -> Option<Arc<dyn Worker>>;
+}
+
+impl<G: Generation> WorkerLookup for WorkerRegistry<G> {
+    fn get_by_url(&self, url: &str) -> Option<Arc<dyn Worker>> {
+        Self::get_by_url(self, url)
+    }
 }
 
 /// A worker URL's slot in the subscription map.
@@ -191,16 +237,18 @@ impl KvEventMonitor {
 
     /// Route the load records on every worker's event stream to the worker
     /// monitor (once; a later call is ignored).
-    pub fn set_load_sink(&self, monitor: &Arc<WorkerMonitor>) {
-        let _ = self.load_sink.set(Arc::downgrade(monitor));
+    pub fn set_load_sink<G: Generation>(&self, monitor: &Arc<WorkerMonitor<G>>) {
+        let sink = Arc::downgrade(monitor);
+        let _ = self.load_sink.set(sink);
     }
 
     /// Have the add read the registry before it stops or starts a stream
     /// (once; a later call is ignored): a worker the registry no longer
     /// holds under its URL gets none. The app sets it where it wires the
     /// load sink; a monitor without one holds every object.
-    pub fn set_worker_registry(&self, registry: &Arc<WorkerRegistry>) {
-        let _ = self.worker_registry.set(Arc::downgrade(registry));
+    pub fn set_worker_registry<G: Generation>(&self, registry: &Arc<WorkerRegistry<G>>) {
+        let registry = Arc::downgrade(registry);
+        let _ = self.worker_registry.set(registry);
     }
 
     /// Whether the registry still holds this object under its URL, by
@@ -864,7 +912,7 @@ mod tests {
         subscription::{INDEX_REMOVAL_PERMITS, MAX_CONCURRENT_INDEX_REMOVALS},
         *,
     };
-    use crate::worker::{kv::index_backend::WorkerBlocks, BasicWorkerBuilder};
+    use crate::worker::{kv::index_backend::WorkerBlocks, BasicWorkerBuilder, WorkerRegistry};
 
     async fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
         for _ in 0..200 {
@@ -917,9 +965,9 @@ mod tests {
     fn a_removals_late_write_recreates_no_series_for_the_address() {
         use metrics_exporter_prometheus::PrometheusBuilder;
 
-        use crate::observability::worker_metrics::{self, WorkerSeriesRecorder};
+        use crate::worker::metrics::series::{self as worker_series, WorkerSeriesRecorder};
 
-        let series = worker_metrics::installed_or_default();
+        let series = worker_series::installed_or_default();
         let recorder = WorkerSeriesRecorder::new(
             PrometheusBuilder::new().build_recorder(),
             Arc::clone(series),

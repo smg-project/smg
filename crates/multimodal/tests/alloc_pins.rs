@@ -10,7 +10,8 @@
 //! (TurboJPEG and libwebp are runtime bindings; their C allocations never reach this
 //! allocator), so the decode pin counts the large buffers only, per decoder: the TurboJPEG
 //! binding decodes a frame of 256 KiB or more into a buffer from the pool, the fallback
-//! decoder allocates its own.
+//! decoder allocates its own. A PNG of an eight-bit layout decodes into a pool buffer under
+//! either, and an alpha channel composited over white is written into one.
 //! The warm pass returns its buffers the way a request does (the frame dropped, the wire
 //! payload sent), so the pins hold the steady state of the buffer pool: a decoded frame or a
 //! wire the pool serves counts no large buffer.
@@ -42,8 +43,9 @@ use llm_multimodal::{
     jpeg_turbo::turbojpeg_available,
     types::{ImageDetail, ImageFrame, ImageSize, ImageSource, TransparencyPolicy},
     vision::{
-        preprocessor_config::PreProcessorConfig, processors::Qwen3VLProcessor, VideoClipOptions,
-        VisionPreProcessor,
+        preprocessor_config::PreProcessorConfig,
+        processors::{NemotronOmniProcessor, Qwen3VLProcessor},
+        VideoClipOptions, VisionPreProcessor,
     },
     Modality, Parallelism,
 };
@@ -402,8 +404,8 @@ const PINS: &[Pin] = &[
     Pin {
         class: "png-rgb",
         decode_large: Frames {
-            fallback: 2,
-            turbo: 2,
+            fallback: 1,
+            turbo: 1,
         },
         copy: (1, 1),
         preprocess_calls: Calls {
@@ -419,8 +421,8 @@ const PINS: &[Pin] = &[
     Pin {
         class: "png-rgba",
         decode_large: Frames {
-            fallback: 3,
-            turbo: 3,
+            fallback: 1,
+            turbo: 1,
         },
         copy: (1, 1),
         preprocess_calls: Calls {
@@ -609,3 +611,40 @@ const VIDEO_CALLS: Calls = Calls {
     avx512: 8737,
 };
 const VIDEO_LARGE: usize = 4;
+
+/// A processor that composites the alpha channel itself reads an RGBA8 image where it
+/// stands: against the same pixels given as RGB8, its preprocess allocates the composited
+/// bytes and nothing else, one call of three bytes a pixel.
+#[test]
+fn an_alpha_composite_allocates_its_output_alone() {
+    let _window = window();
+    assert_eq!(
+        configure_parallelism(Parallelism::Inline),
+        Ok(()),
+        "the pins count the calling thread alone: this test must own the process's mode"
+    );
+    let processor = NemotronOmniProcessor::new();
+    // Opaque everywhere, so the composite is the image's own RGB and the two inputs give
+    // the processor the same pixels.
+    let rgba = RgbaImage::from_fn(640, 480, |x, y| {
+        Rgba([(x % 256) as u8, (y % 256) as u8, ((x + y) % 256) as u8, 255])
+    });
+    let rgb = DynamicImage::ImageRgb8(DynamicImage::ImageRgba8(rgba.clone()).to_rgb8());
+    let rgba = DynamicImage::ImageRgba8(rgba);
+    let mut counts = Vec::new();
+    for image in [&rgb, &rgba] {
+        // Warm: the first pass pays for the thread-local scratch and the pool's buffers.
+        returned(processor.preprocess(&[image]).expect("warm"));
+        let (inputs, count) = counted(|| processor.preprocess(&[image]).expect("preprocess"));
+        returned(inputs);
+        counts.push(count);
+    }
+    assert_eq!(
+        (
+            counts[1].calls - counts[0].calls,
+            counts[1].bytes - counts[0].bytes
+        ),
+        (1, 3 * 640 * 480),
+        "the composite of an RGBA8 image allocates its output alone"
+    );
+}

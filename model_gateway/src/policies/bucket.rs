@@ -659,6 +659,10 @@ impl Bucket {
 }
 
 #[cfg(test)]
+#[expect(clippy::print_stdout, reason = "a recorder says where its sheet went")]
+mod classic_bucket_rows;
+
+#[cfg(test)]
 mod tests {
     use tracing_test::traced_test;
 
