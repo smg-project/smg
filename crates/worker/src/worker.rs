@@ -4,7 +4,7 @@
 //! enums, and core configuration. These types are shared across API
 //! request/response boundaries and internal runtime state.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 #[cfg(feature = "axum")]
 use axum::{
@@ -12,6 +12,7 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
+use bitflags::bitflags;
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 #[cfg(feature = "axum")]
@@ -1576,6 +1577,59 @@ pub struct SchedulerLoadSnapshot {
     /// "prefill", "decode", or "null" as reported by the backend.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disagg_mode: Option<String>,
+}
+
+bitflags! {
+    /// The telemetry a pushed load record can carry beside its core: one
+    /// flag for each part of [`SchedulerLoadSnapshot`] a record may leave
+    /// out.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct LoadTelemetry: u8 {
+        /// `cache_hit_rate`.
+        const CACHE_HIT_RATE = 1 << 0;
+        /// `num_used_tokens`.
+        const USED_TOKENS = 1 << 1;
+        /// `max_total_num_tokens`.
+        const TOTAL_TOKENS = 1 << 2;
+        /// `memory`.
+        const MEMORY = 1 << 3;
+        /// `queues`.
+        const QUEUES = 1 << 4;
+        /// The KV transfer latency and speed, the prefill and decode queue
+        /// depths and the mode.
+        const DISAGGREGATION = 1 << 5;
+    }
+}
+
+/// A load record pushed on a worker's stream, as the worker's load report
+/// and its liveness read it. The wire's message implements this where it is
+/// declared, so the code that keeps the report names no wire type.
+pub trait LoadRecord {
+    /// The sample's age when the record was sent.
+    fn age(&self) -> Duration;
+
+    /// The telemetry the record carries. What it leaves out keeps, in the
+    /// report, the figure of the last record that carried it.
+    fn telemetry(&self) -> LoadTelemetry;
+
+    /// The rank's entry a poll would have produced from the record, with
+    /// the telemetry it leaves out at the type's default. The rank is the
+    /// caller's to set.
+    fn snapshot(&self) -> SchedulerLoadSnapshot;
+
+    /// How long the engine has produced no output while it held requests
+    /// it reports on every step. `None` while it holds none, or when the
+    /// sender cannot tell.
+    fn engine_silence(&self) -> Option<Duration>;
+
+    /// Whether the engine reports every scheduler step, so its silence is
+    /// one step's at most while it serves.
+    fn reports_every_step(&self) -> bool;
+
+    /// Prompt tokens handed to the engine that have produced no output yet,
+    /// across every client of the sender: the prefill work in hand. `None`
+    /// when the sender does not report it.
+    fn prefill_pending(&self) -> Option<u64>;
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]

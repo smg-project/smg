@@ -26,10 +26,12 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc, OnceLock, Weak,
     },
+    time::Instant,
 };
 
 use dashmap::{mapref::entry::Entry, DashMap};
 use futures::FutureExt as _;
+use smg_grpc_client::common_proto::EngineLoad;
 use tokio::{
     sync::{oneshot, watch, Mutex},
     task::JoinHandle,
@@ -39,10 +41,10 @@ use tracing::{debug, error, info, warn};
 use super::index_backend::KvIndex;
 use crate::worker::{
     identity::endpoint::Endpoint,
-    load::monitor::{PushedLoadSink, WorkerMonitor},
+    load::monitor::WorkerMonitor,
     metrics::Metrics,
     periodic_task::PeriodicTask,
-    registry::{Generation, WorkerLookup, WorkerRegistry},
+    registry::{Generation, WorkerRegistry},
     ConnectionMode, Worker, UNKNOWN_MODEL_ID,
 };
 
@@ -119,6 +121,48 @@ pub struct KvEventMonitor {
     /// sink, a peer in the app context. Unset in a monitor built alone (the
     /// tests), which holds every object.
     worker_registry: OnceLock<Weak<dyn WorkerLookup>>,
+}
+
+/// Where a load record pushed on a worker's event stream goes: the load
+/// monitor, as this monitor's streams hold it. Held by this name,
+/// the sink brings nothing of the registry the load monitor is built over.
+pub(crate) trait PushedLoadSink: Send + Sync {
+    /// Take the record of `dp_rank` received at `received_at`
+    /// ([`WorkerMonitor::apply_pushed_load`]).
+    fn push_load(
+        self: Arc<Self>,
+        worker: &Arc<dyn Worker>,
+        dp_rank: i32,
+        record: &EngineLoad,
+        received_at: Instant,
+    );
+}
+
+impl<G: Generation> PushedLoadSink for WorkerMonitor<G> {
+    fn push_load(
+        self: Arc<Self>,
+        worker: &Arc<dyn Worker>,
+        dp_rank: i32,
+        record: &EngineLoad,
+        received_at: Instant,
+    ) {
+        self.apply_pushed_load(worker, dp_rank, record, received_at);
+    }
+}
+
+/// The registry as a peer that asks one thing of it holds it: the worker
+/// registered under a URL. Such a holder reads no generation, so it names
+/// no value of the registry's host.
+pub(crate) trait WorkerLookup: Send + Sync {
+    /// The worker registered under `url`, as [`WorkerRegistry::get_by_url`]
+    /// reads it.
+    fn get_by_url(&self, url: &str) -> Option<Arc<dyn Worker>>;
+}
+
+impl<G: Generation> WorkerLookup for WorkerRegistry<G> {
+    fn get_by_url(&self, url: &str) -> Option<Arc<dyn Worker>> {
+        Self::get_by_url(self, url)
+    }
 }
 
 /// A worker URL's slot in the subscription map.

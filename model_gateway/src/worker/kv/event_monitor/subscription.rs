@@ -16,7 +16,7 @@ use tracing::{debug, error, info, warn};
 use super::{
     admission::{BatchOutcome, WorkerStreamState},
     apply::{WorkerIndexCounters, WorkerIndexState},
-    KvBlockSize, KvEventMonitor, SubscriptionKind,
+    KvBlockSize, KvEventMonitor, PushedLoadSink, SubscriptionKind,
 };
 use crate::{
     routers::grpc::backend_client::BackendClient,
@@ -24,7 +24,6 @@ use crate::{
         health::liveness,
         identity::endpoint::Endpoint,
         kv::{event_monitor::recovery::ResyncReason, index_backend::KvIndex},
-        load::monitor::PushedLoadSink,
         metrics::Metrics,
         Worker,
     },
