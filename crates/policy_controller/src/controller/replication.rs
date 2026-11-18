@@ -486,6 +486,9 @@ struct Feed {
     standby: String,
     /// Where the feed stands in a restore of its standby.
     restore: Restore,
+    /// When the last part of the stream's last snapshot was made: a
+    /// restore that follows it on the stream waits a beat from there.
+    restored: Option<Instant>,
 }
 
 impl Feed {
@@ -529,6 +532,7 @@ impl Feed {
             source: source.clone(),
             standby: standby.to_owned(),
             restore,
+            restored: None,
         }
     }
 
@@ -555,8 +559,19 @@ impl Feed {
     }
 
     /// The snapshot's cut and its first part at `now`, or the stream's end
-    /// where this replica cuts nothing under the feed's term.
+    /// where this replica cuts nothing under the feed's term. The
+    /// stream's first restore is cut at once. One that follows a restore
+    /// waits a beat from that one's last part: where writes outrun a
+    /// snapshot's send, the leader copies its store for the stream once a
+    /// beat at most, and its writers have the time between.
     fn cut(&mut self, why: Why, now: Instant) -> Step {
+        let since = self
+            .restored
+            .map(|last| now.saturating_duration_since(last));
+        if since.is_some_and(|since| since < BEAT) {
+            self.restore = Restore::Cut(why);
+            return Step::Idle;
+        }
         match self.source.cut(self.term) {
             Ok(cut) => {
                 info!(
@@ -583,6 +598,7 @@ impl Feed {
         if last {
             self.place = parts.cut.at;
             self.acked = self.place.seq;
+            self.restored = Some(now);
         } else {
             self.restore = Restore::Parts(parts);
         }
@@ -889,6 +905,7 @@ mod tests {
                 source: self.replication(),
                 standby: STANDBY.to_owned(),
                 restore: Restore::No,
+                restored: None,
             }
         }
 
@@ -1701,6 +1718,29 @@ mod tests {
         let next = batch(feed.look(leader.at));
         assert_eq!((next.first_seq, next.events.len()), (head.seq + 1, 1));
         assert!(next.snapshot.is_none());
+    }
+
+    #[test]
+    fn a_repeat_restore_on_a_stream_waits_a_beat_from_the_end_of_the_last() {
+        let leader = Leader::leading();
+        leader.writes(3);
+        let lost = past_the_head(&leader);
+        let at = leader.at;
+        let mut feed = leader.feed(lost, RING);
+        // The stream's first restore: the word, and its cut at the next look.
+        assert_eq!(resync(&mut feed, at), Why::Place(lost));
+        while !matches!(feed.restore, Restore::No) {
+            assert!(batch(feed.look(at)).snapshot.is_some());
+        }
+        // Writes outran the snapshot's send, and the log no longer holds
+        // the place it left the standby at: the word again,
+        feed.place = lost;
+        assert_eq!(resync(&mut feed, at), Why::Place(lost));
+        // and the cut a beat from the first restore's last part, no sooner.
+        assert!(matches!(feed.look(at), Step::Idle));
+        let short = at + BEAT - Duration::from_millis(1);
+        assert!(matches!(feed.look(short), Step::Idle));
+        assert!(batch(feed.look(at + BEAT)).snapshot.is_some());
     }
 
     #[test]
