@@ -122,10 +122,16 @@
 //! band of two and the next band's row; over 512 members from one band.
 //! Every member reports 2,097,152 requests beneath its band, more than a
 //! row has decisions, and a request names no prompt size, so its lease
-//! books no token-work and a dispatch told on the session credits its
-//! member none: a lease on file moves no row's cost, and a
+//! books no token-work: a lease on file moves no row's cost, and a
 //! build that files leases and one that files none pick over the same
-//! costs. The bands stand in for the ties a fleet's leases make: here the
+//! costs. A dispatch told on the session is credited to its member: the
+//! load stage prices one whose request names no size at its mean
+//! prefill, one request's work, until the member's next report, and a
+//! row's dispatches all fall on its least member. A gateway row's bands
+//! therefore stand 4,194,304 requests apart where the other rows' stand
+//! one: twice what a row has decisions, so its credits stay beneath the
+//! next band as its leases stay beneath a report, and no row's place
+//! moves. The bands stand in for the ties a fleet's leases make: here the
 //! reports fix them, and a row whose decisions fall under more than one
 //! count of the tally stops the bench, its pool having moved. Every wire
 //! row prints how the three best rows of
@@ -559,6 +565,14 @@ const LATE: Duration = Duration::from_micros(100);
 /// decisions ([`wire`] checks each row's count), so no count of leases on
 /// file reaches it and a lease on file moves no row's cost.
 const HELD: u32 = 1 << 21;
+/// The requests between two bands of a row that tells its dispatches,
+/// where a row that tells none has one: twice the floor beneath the bands,
+/// so more than twice a row's decisions. A dispatch told is credited to its
+/// member at one request's work (the load stage's mean prefill, a request
+/// naming no size) until that member's next report, and every dispatch of
+/// a row falls on its least member: the credits stay beneath the next
+/// band, and a dispatch told moves no row's place.
+const APART: u32 = 2 * HELD;
 /// The reports a stream hands the session together: a hand-over wakes the
 /// session's thread, and one a request would time the wake.
 const REPORTS: usize = 16;
@@ -957,6 +971,8 @@ fn bands(members: u32) -> Vec<u32> {
 
 /// The shape's fleet: ready members, each with a load report in its band
 /// ([`bands`]), under the row's preset as generation 1, their rows built.
+/// A row that tells its dispatches stands its bands apart ([`APART`]), and
+/// each member's ceiling at twice the highest band's report.
 /// A shared fleet is one deal of the bands over members that serve every
 /// model; fleets of their own are the same deal a model, over members
 /// that serve it alone.
@@ -971,6 +987,12 @@ fn fill(store: &MemoryStore, shape: Shape) {
             .collect(),
     };
     let bands = bands(shape.members);
+    let (step, ceiling) = if shape.frames {
+        let highest = bands.iter().copied().max().unwrap_or(0);
+        (APART, 2 * (HELD + APART * highest))
+    } else {
+        (1, 2 * HELD)
+    };
     let now = Instant::now();
     for (fleet, models) in &fleets {
         for (index, band) in (0..shape.members).zip(&bands) {
@@ -983,7 +1005,7 @@ fn fill(store: &MemoryStore, shape: Shape) {
                     role: Role::Single,
                     models: models.clone(),
                     dp_size: 1,
-                    max_running: Some(2 * HELD),
+                    max_running: Some(ceiling),
                     ..WorkerFacts::default()
                 })
                 .id();
@@ -993,8 +1015,8 @@ fn fill(store: &MemoryStore, shape: Shape) {
                 id,
                 0,
                 LoadRow {
-                    running: HELD + band,
-                    max_running: 2 * HELD,
+                    running: HELD + step * band,
+                    max_running: ceiling,
                     ..LoadRow::default()
                 },
                 now,
@@ -1699,7 +1721,10 @@ struct Row {
 fn wire(shape: Shape) -> Row {
     // The floor under the bands stands above the row's whole count of
     // decisions: whatever leases its streams and its session's frames hold
-    // at once, a member's leases stay beneath what it reports.
+    // at once, a member's leases stay beneath what it reports. A row that
+    // tells its dispatches stands its bands twice that floor apart
+    // ([`APART`]): the credits of every dispatch it tells, on one member,
+    // stay beneath the next band.
     let decisions = u64::from(shape.streams) * (shape.warm + shape.measured);
     assert!(
         decisions < u64::from(HELD),
@@ -1833,10 +1858,10 @@ fn wire(shape: Shape) -> Row {
         row.leases
     );
     // The reports fix the pool, so every decision of a row scores its
-    // three best rows one way. A tally under two counts means a cost
-    // moved, by a lease on file or by a dispatch told: the row would read
-    // one pool on a build that files leases and another on one that
-    // files none.
+    // three best rows one way. A tally under two counts means a row left
+    // its band, by a lease on file or by a dispatch's credit: the row
+    // would read one pool on a build that files leases and another on one
+    // that files none.
     assert!(
         row.ties.iter().filter(|count| **count > 0).count() <= 1,
         "the row's pool moved: its decisions' three best rows scored {}",
