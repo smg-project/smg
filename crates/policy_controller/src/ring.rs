@@ -727,7 +727,13 @@ impl Scorer for ConsistentHash {
             }
             // A member of another pool is no row of this one.
             let id = ring.members().get(member as usize);
-            let row = id.and_then(|id| candidates.binary_search_by_key(id, |row| row.id).ok());
+            // A ring that learned one pool in its rows' order names a
+            // member by its row's position: the row there is read first,
+            // its id compared.
+            let row = id.and_then(|id| match candidates.get(member as usize) {
+                Some(row) if row.id == *id => Some(member as usize),
+                _ => candidates.binary_search_by_key(id, |row| row.id).ok(),
+            });
             let (Some(row), Some(slot)) = (row, met.get_mut(asked)) else {
                 return Probe::Skip;
             };
