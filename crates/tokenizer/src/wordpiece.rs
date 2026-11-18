@@ -80,12 +80,10 @@ fn in_class(class: &[(u32, u32)], c: char) -> bool {
 }
 
 /// What `clean_text` removes: NUL, the replacement character, and the
-/// library's control characters (its `is_other`, the three it counts as
-/// whitespace apart).
+/// library's control characters (the three it counts as whitespace
+/// apart).
 fn removed(c: char) -> bool {
-    c == '\0'
-        || c == '\u{fffd}'
-        || (!matches!(c, '\t' | '\n' | '\r') && in_class(classes::OTHER, c))
+    in_class(classes::REMOVED, c)
 }
 
 /// The ideographs `handle_chinese_chars` sets apart (the library's ranges).
@@ -105,7 +103,7 @@ fn is_cjk(c: char) -> bool {
 
 /// What the pre-tokenizer sets apart as a word of its own.
 fn is_punctuation(c: char) -> bool {
-    c.is_ascii_punctuation() || in_class(classes::PUNCTUATION, c)
+    in_class(classes::PUNCTUATION, c)
 }
 
 /// The table of the ASCII bytes under `rules`: each byte through the rules

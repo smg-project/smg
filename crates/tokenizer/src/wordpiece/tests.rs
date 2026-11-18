@@ -4,7 +4,10 @@
 //! tokens, the bound on a word, and the configurations the encoder declines.
 
 use serde_json::{json, Map, Value};
-use tokenizers::Tokenizer;
+use tokenizers::{
+    normalizers::bert::BertNormalizer, pre_tokenizers::bert::BertPreTokenizer, NormalizedString,
+    Normalizer, OffsetReferential, OffsetType, PreTokenizedString, PreTokenizer, Tokenizer,
+};
 
 use super::WordPieceEncoder;
 use crate::{
@@ -501,4 +504,83 @@ fn a_declined_tokenizer_encodes_in_the_library_as_before() {
         encoding.token_ids(),
         library_ids(&library, "Hello, worlds!", true)
     );
+}
+
+/// The code points `accepts` holds, as inclusive ranges.
+fn ranges_where(mut accepts: impl FnMut(char) -> bool) -> Vec<(u32, u32)> {
+    let mut ranges: Vec<(u32, u32)> = Vec::new();
+    for c in (0..=0x10_FFFF).filter_map(char::from_u32) {
+        if !accepts(c) {
+            continue;
+        }
+        let code = u32::from(c);
+        match ranges.last_mut() {
+            Some((_, last)) if *last + 1 == code => *last = code,
+            _ => ranges.push((code, code)),
+        }
+    }
+    ranges
+}
+
+/// What the library's normalizer leaves of `text`.
+fn normalized(normalizer: BertNormalizer, text: &str) -> String {
+    let mut normalized = NormalizedString::from(text);
+    normalizer
+        .normalize(&mut normalized)
+        .expect("the normalizer runs");
+    normalized.get().to_owned()
+}
+
+/// Prints the tables of `classes.rs`, each class read off the library
+/// itself one character at a time: what its normalizer removes under
+/// `clean_text`, what it drops under `strip_accents`, and what its
+/// pre-tokenizer sets apart.
+///
+/// Run: `cargo test -p llm-tokenizer --lib wordpiece::tests::print_the_class_tables -- --ignored --nocapture`
+/// and replace the tables of the file with the output between the markers.
+#[test]
+#[ignore = "prints the tables of wordpiece/classes.rs"]
+#[expect(clippy::print_stdout)]
+fn print_the_class_tables() {
+    let clean = BertNormalizer::new(true, false, Some(false), false);
+    let strip = BertNormalizer::new(false, false, Some(true), false);
+    let removed = ranges_where(|c| normalized(clean, &format!("a{c}b")) == "ab");
+    let marks = ranges_where(|c| normalized(strip, c.encode_utf8(&mut [0; 4])).is_empty());
+    let punctuation = ranges_where(|c| {
+        let mut text = PreTokenizedString::from(format!("a{c}b"));
+        BertPreTokenizer
+            .pre_tokenize(&mut text)
+            .expect("the pre-tokenizer runs");
+        text.get_splits(OffsetReferential::Original, OffsetType::Byte)
+            .len()
+            == 3
+    });
+    let tables = [
+        (
+            "REMOVED",
+            "What `clean_text` removes: NUL, the replacement character and the\n/// library's control characters.",
+            removed,
+        ),
+        (
+            "NONSPACING_MARK",
+            "The marks `strip_accents` drops after the decomposition.",
+            marks,
+        ),
+        (
+            "PUNCTUATION",
+            "What the pre-tokenizer sets apart as a word of its own.",
+            punctuation,
+        ),
+    ];
+    println!("\n// BEGIN");
+    for (name, doc, ranges) in tables {
+        println!("/// {doc}");
+        println!("pub(super) const {name}: &[(u32, u32)] = &[");
+        for (first, last) in ranges {
+            println!("    (0x{first:04X}, 0x{last:04X}),");
+        }
+        println!("];");
+        println!();
+    }
+    println!("// END");
 }

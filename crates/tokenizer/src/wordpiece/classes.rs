@@ -1,13 +1,22 @@
-//! The character classes of the word-piece pipeline, as the reference library reads them.
+//! The character classes of the WordPiece pipeline, as the library reads
+//! them.
 //!
-//! Generated from the tables of the crate `unicode_categories` 0.1.1, the one `tokenizers` asks: each class is
-//! that crate's arrays of single characters merged into inclusive ranges, so a character is in a class here
-//! exactly when the library finds it there (a newer Unicode table would answer differently for characters
-//! assigned since, and the ids would differ). A test compares the encoder with the library on every code point.
+//! Generated: each class is read off `tokenizers` itself, one character at
+//! a time (its normalizer for what `clean_text` removes and for the marks
+//! `strip_accents` drops, its pre-tokenizer for what it sets apart), so a
+//! character is in a class here exactly when the library treats it so,
+//! whatever Unicode tables the library carries. Regenerate with
+//! `cargo test -p llm-tokenizer --lib wordpiece::tests::print_the_class_tables -- --ignored --nocapture`
+//! and replace the tables below with the output between the markers. The
+//! test `every_code_point_encodes_as_the_library_does` fails with the code
+//! point when a table and the library part ways.
 
-/// Control, format and private-use characters (`is_other`).
-pub(super) const OTHER: &[(u32, u32)] = &[
-    (0x0000, 0x001F),
+/// What `clean_text` removes: NUL, the replacement character and the
+/// library's control characters.
+pub(super) const REMOVED: &[(u32, u32)] = &[
+    (0x0000, 0x0008),
+    (0x000B, 0x000C),
+    (0x000E, 0x001F),
     (0x007F, 0x009F),
     (0x00AD, 0x00AD),
     (0x0600, 0x0605),
@@ -22,6 +31,7 @@ pub(super) const OTHER: &[(u32, u32)] = &[
     (0xE000, 0xF8FF),
     (0xFEFF, 0xFEFF),
     (0xFFF9, 0xFFFB),
+    (0xFFFD, 0xFFFD),
     (0x110BD, 0x110BD),
     (0x1BCA0, 0x1BCA3),
     (0x1D173, 0x1D17A),
@@ -31,7 +41,7 @@ pub(super) const OTHER: &[(u32, u32)] = &[
     (0x100000, 0x10FFFD),
 ];
 
-/// Nonspacing marks (`is_mark_nonspacing`).
+/// The marks `strip_accents` drops after the decomposition.
 pub(super) const NONSPACING_MARK: &[(u32, u32)] = &[
     (0x0300, 0x036F),
     (0x0483, 0x0487),
@@ -301,17 +311,12 @@ pub(super) const NONSPACING_MARK: &[(u32, u32)] = &[
     (0xE0100, 0xE01EF),
 ];
 
-/// Punctuation of every kind (`is_punctuation`).
+/// What the pre-tokenizer sets apart as a word of its own.
 pub(super) const PUNCTUATION: &[(u32, u32)] = &[
-    (0x0021, 0x0023),
-    (0x0025, 0x002A),
-    (0x002C, 0x002F),
-    (0x003A, 0x003B),
-    (0x003F, 0x0040),
-    (0x005B, 0x005D),
-    (0x005F, 0x005F),
-    (0x007B, 0x007B),
-    (0x007D, 0x007D),
+    (0x0021, 0x002F),
+    (0x003A, 0x0040),
+    (0x005B, 0x0060),
+    (0x007B, 0x007E),
     (0x00A1, 0x00A1),
     (0x00A7, 0x00A7),
     (0x00AB, 0x00AB),
