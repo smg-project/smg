@@ -194,6 +194,11 @@ impl McpConnectionPool {
         }
     }
 
+    /// Sets the callback that is run with the key of an evicted connection.
+    ///
+    /// The callback runs only when the eviction leaves no earlier pooled
+    /// connection to that key's URL. The connection whose arrival caused the
+    /// eviction does not count as one.
     pub fn set_eviction_callback<F>(&mut self, callback: F)
     where
         F: Fn(&PoolKey) + Send + Sync + 'static,
@@ -228,15 +233,17 @@ impl McpConnectionPool {
             match connections.push(key, cached) {
                 Some((evicted_key, _)) => {
                     // Eviction: count stays the same (replaced one entry).
-                    // The callback clears what stands under the URL, and another
-                    // pooled connection may still hold that URL.
-                    let callback = self.eviction_callback.as_ref().filter(|_| {
-                        !connections
-                            .iter()
-                            .any(|(pooled, _)| pooled.url == evicted_key.url)
-                    });
-                    if let Some(callback) = callback {
-                        callback(&evicted_key);
+                    // The callback clears what stands under the URL, so it runs
+                    // only once no connection pooled before this one holds that
+                    // URL. The connection just added does not count: it has
+                    // listed nothing yet.
+                    if let Some(callback) = &self.eviction_callback {
+                        let url_still_held = connections.iter().any(|(pooled, held)| {
+                            !Arc::ptr_eq(&held.client, &client_arc) && pooled.url == evicted_key.url
+                        });
+                        if !url_still_held {
+                            callback(&evicted_key);
+                        }
                     }
                 }
                 None => {
