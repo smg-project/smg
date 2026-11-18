@@ -2,7 +2,8 @@
 //! thread (which sizes the thread's scratch and lets the ring learn the pool),
 //! an encode item's decision allocates nothing, over 8, 64 and 512 encoders
 //! and under each encode preset; and neither does the plan's one decision,
-//! the pair with its items, with every row admitted or with rows left out.
+//! the pair with its items, with every row admitted or with rows left out,
+//! and under a mask on every side that the first decisions did not meet.
 //! The count is the test thread's own
 //! (`common::counting_alloc`), so what runs beside it in the process, the
 //! harness included, is not charged to the decisions: a second thread
@@ -184,7 +185,9 @@ fn side(role: Role, first: u32, n: u32) -> Vec<Candidate> {
 /// takes no image while the request asks one of its decode: the pair is
 /// picked over pools of admitted rows. The first decisions size the
 /// scratch, the admitted pools and the placed list, and let the ring learn
-/// the encoders of both classes.
+/// the encoders of both classes. They meet no mask: the measured decisions
+/// meet one on every side from the hundredth on, and allocate nothing for
+/// the lists it is numbered anew into.
 #[test]
 fn an_encode_pair_decision_allocates_nothing_after_the_first() {
     let beside = Beside::start();
@@ -231,9 +234,15 @@ fn an_encode_pair_decision_allocates_nothing_after_the_first() {
                     ..PoolFacts::default()
                 };
                 let cx = Constraints::default();
+                // The first row of each pool, masked.
+                let stalled = [0u32];
+                let masked = Constraints {
+                    stalled: &stalled,
+                    ..Constraints::default()
+                };
                 let mut scratch = Scratch::new();
                 let mut placed = EncodePlaced::new();
-                let mut decide = |seed: u64| {
+                let mut decide = |seed: u64, cx: &Constraints<'_>| {
                     let keys = [1u64, 2, 3].map(|item| Identity::hashed(seed * 16 + item));
                     let facts = RequestFacts {
                         model: "m",
@@ -257,9 +266,9 @@ fn an_encode_pair_decision_allocates_nothing_after_the_first() {
                         pools,
                         encode,
                         items,
-                        &cx,
-                        &cx,
-                        &cx,
+                        cx,
+                        cx,
+                        cx,
                         &mut scratch,
                         &mut placed,
                     );
@@ -267,12 +276,13 @@ fn an_encode_pair_decision_allocates_nothing_after_the_first() {
                     placed.encoders().len()
                 };
                 for seed in 1..=32u64 {
-                    assert_eq!(decide(seed), 3);
+                    assert_eq!(decide(seed, &cx), 3);
                 }
                 let mut encoders_placed = 0usize;
                 let allocated = beside.allocations_of(|| {
                     for seed in 33..=231u64 {
-                        encoders_placed += decide(seed);
+                        let cx = if seed < 132 { &cx } else { &masked };
+                        encoders_placed += decide(seed, cx);
                     }
                 });
                 assert_eq!(encoders_placed, 3 * 199);

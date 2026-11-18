@@ -144,7 +144,8 @@ struct Admitted {
     from: Vec<u32>,
     affinity: Vec<AffinityFacts>,
     /// The rows here that a mask over the pool names, by their index here:
-    /// empty until a mask is numbered anew ([`Admitted::renumber`]).
+    /// empty until a mask is numbered anew ([`Admitted::renumber`]). Its
+    /// room is taken with the rows ([`Admitted::take_room`]).
     masked: Vec<u32>,
 }
 
@@ -167,6 +168,13 @@ impl Admitted {
                 self.masked.push(index);
             }
         }
+    }
+
+    /// Takes the room a mask numbered anew fills at most, one place a row
+    /// admitted: a decision under a mask then allocates nothing that a
+    /// decision under none did not.
+    fn take_room(&mut self) {
+        self.masked.reserve(self.rows.len());
     }
 
     /// Admits the pool's row `at`; its position becomes its index here.
@@ -561,6 +569,7 @@ impl Engine {
                     side.prefills.push(row, at, pools.prefill_affinity);
                 }
             }
+            side.prefills.take_room();
             if !cx.stalled.is_empty() {
                 side.prefills.renumber(cx.stalled);
                 prefill_mask = Constraints {
@@ -580,6 +589,7 @@ impl Engine {
                     side.decodes.push(row, at, pools.decode_affinity);
                 }
             }
+            side.decodes.take_room();
             if !decode_cx.stalled.is_empty() {
                 side.decodes.renumber(decode_cx.stalled);
                 decode_mask = Constraints {
@@ -628,6 +638,7 @@ impl Engine {
                 side.offered.push(row, at, encode.affinity);
             }
         }
+        side.offered.take_room();
         // The offered encoders are numbered anew unless they are the whole
         // pool, and the encode side's mask is numbered with them.
         let offered_mask;
