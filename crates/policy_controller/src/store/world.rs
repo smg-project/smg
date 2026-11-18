@@ -160,9 +160,10 @@ pub struct Naming<'a> {
     /// The decision's seed: where a list is cut, the rows kept are drawn
     /// from it, on streams of the naming's own.
     pub seed: u64,
-    /// The most rows either list may hold: the sample of the profile's
-    /// picker ([`Needs::sample`](crate::Needs::sample)); `0` holds every
-    /// row.
+    /// The most rows either list may hold: what the engine names for the
+    /// decision ([`Engine::named_for`](crate::Engine::named_for)), which is
+    /// 0 for a profile that keeps its column. A host names no rows there:
+    /// a naming under 0 holds every row.
     pub cap: u32,
     /// The wires the view was narrowed by since its build, where the
     /// decision's gateway states them.
@@ -251,7 +252,7 @@ pub struct Built {
     /// gateway dials whole and reads alike.
     pub reach: u64,
     /// The pool the rows were read from, by its place among its world's
-    /// pools: what [`World::booked`] takes, and good for that world alone.
+    /// pools: what `World::booked` takes, and good for that world alone.
     pub(crate) pool: u32,
 }
 

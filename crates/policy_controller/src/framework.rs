@@ -2784,12 +2784,14 @@ impl Engine {
     }
 
     /// The sample of the profile that decides a request of `phase` for
-    /// `model`: the cap of each list of rows a host names for that decision
-    /// ([`Needs::sample`]), `0` where that profile never draws and where no
-    /// binding matches. [`Self::needs_for`] answers for a worker's stream,
-    /// where the larger of two needs is the safe one: for a decode decision
-    /// of a model that also pairs it carries the pair's decode side, whose
-    /// sample may be the larger. A cap's safe side is the smaller.
+    /// `model` ([`Needs::sample`]), `0` where that profile never draws and
+    /// where no binding matches. A host that names a decision's rows takes
+    /// its cap from [`Self::named_for`], not from here: a profile that
+    /// keeps its column has a sample too. [`Self::needs_for`] answers for a
+    /// worker's stream, where the larger of two needs is the safe one: for a
+    /// decode decision of a model that also pairs it carries the pair's
+    /// decode side, whose sample may be the larger. A cap's safe side is
+    /// the smaller.
     pub fn sample_for(&self, model: &str, phase: Phase) -> u32 {
         self.resolve(model, phase)
             .map_or(0, |(_, _, profile)| profile.needs().sample)

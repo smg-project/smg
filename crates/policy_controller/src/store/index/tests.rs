@@ -1282,6 +1282,72 @@ mod named {
         assert_eq!(named(OTHER, Some(WireModes::GRPC), 16, 1), reached);
     }
 
+    /// An index id is free for the next row once its row leaves, and a
+    /// decision may hold a world published before that. It reads the live
+    /// index under that world's tables: the row that left is named no
+    /// holder by the blocks of the row that took its id, and a row that
+    /// stands is named by what it holds now.
+    #[test]
+    fn an_index_id_taken_again_names_no_holder_under_the_row_that_left() {
+        let store = MemoryStore::new();
+        store.apply(sampled(1)).expect("above the unbound start");
+        let (left, stays) = (admitted(&store, "left"), admitted(&store, "stays"));
+        let request = [1, 2, 3];
+        // A row's id in the model's index, as the world of now holds it.
+        let index_id = |id: WorkerId| {
+            store.deciding(|world| {
+                let rows = handed(&store, GatewayId::LOCAL, None, &[], (16, 7)).rows;
+                let row = rows.iter().position(|&row| row == id).expect("a row");
+                let standing = world.standing(MODEL, Role::Single).expect("a standing");
+                standing.tables.id_of[row]
+            })
+        };
+        let mut view = ViewBuffers::default();
+        let mut named = Named::default();
+        let (before, taker): (Vec<WorkerId>, WorkerId) = store.deciding(|world| {
+            let ask = Ask {
+                gateway: GatewayId::LOCAL,
+                now: Instant::now(),
+                pinned: None,
+                affinity: false,
+            };
+            let built = world
+                .build(MODEL, Role::Single, &ask, &mut view)
+                .expect("the pool");
+            // Under the world this decision holds, the row leaves, another
+            // takes its id and holds the request whole, and the row that
+            // stands comes to hold two of its blocks.
+            let freed = index_id(left);
+            let revision = WorkersStore::get(&store, left).expect("the row").revision;
+            store.remove(left, revision).expect("removed");
+            let taker = admitted(&store, "taker");
+            assert_eq!(index_id(taker), freed, "the id is taken again");
+            holds(&store, taker, &request);
+            holds(&store, stays, &[1, 2]);
+            let naming = Naming {
+                gateway: GatewayId::LOCAL,
+                block_hashes: &request,
+                seed: 7,
+                cap: 16,
+                wires: None,
+                now_micros: built.now_micros,
+            };
+            world.name(MODEL, Role::Single, &naming, &view.candidates, &mut named);
+            (view.candidates.iter().map(|row| row.id).collect(), taker)
+        });
+        assert!(before.contains(&left), "the world of before holds the row");
+        let holders: Vec<(WorkerId, u32)> = named
+            .holders
+            .iter()
+            .map(|holder| (before[holder.row as usize], holder.overlap_blocks))
+            .collect();
+        assert_eq!(holders, [(stays, 2)]);
+        // The world of now names both by what they hold.
+        let now = handed(&store, GatewayId::LOCAL, None, &request, (16, 7));
+        assert_eq!(now.holders.len(), 2);
+        assert!(now.holders.contains(&(stays, 2)) && now.holders.contains(&(taker, 3)));
+    }
+
     /// The pool's warming rows are named as a publication read them: the
     /// thin once the fleet holds a cache worth catching up to, then the
     /// young, and nobody once the window is over. A write to the index
