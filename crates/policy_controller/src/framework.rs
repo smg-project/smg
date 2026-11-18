@@ -2180,6 +2180,9 @@ impl Engine {
     /// refused, as a decline under the stage name `affinity-column`. Rows
     /// named in the column's place ([`NamedAffinity`]) are read as the host
     /// derived them: a debug build asserts that they stand for the pool.
+    /// A profile that shows its rows to a plugin is declined over rows that
+    /// carry a mask or a pin beside them, under the stage name
+    /// `written-rows` ([`Self::reads_for`]).
     pub fn decide(
         &self,
         facts: &RequestFacts<'_>,
@@ -3652,6 +3655,25 @@ mod tests {
             &mut Scratch::new()
         ))
         .is_some());
+        // Under a pair binding the word is the phase's own profile's: the
+        // decode side shows its rows here, and the prefill side does not.
+        let pair = Engine::new(
+            vec![
+                least_requests_profile(),
+                Profile {
+                    filters: vec![Box::new(Shown)],
+                    ..least_requests_profile()
+                },
+            ],
+            vec![Binding {
+                decode_profile: Some(1),
+                ..pair_binding()
+            }],
+            1,
+            Needs::default(),
+        );
+        assert!(!pair.reads_for("m", Phase::Prefill).1);
+        assert!(pair.reads_for("m", Phase::Decode).1);
     }
 
     /// A stage that reads the affinity column as a filter alone, or as the
