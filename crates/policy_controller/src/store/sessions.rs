@@ -25,8 +25,9 @@ pub struct Pin {
 
 /// Where session pins are written: at the commit of a keyed decision, never
 /// at selection. Keys are fingerprints (never `0`). A removed worker takes its
-/// pins with it; the gateways keep a bounded table of the pins they received
-/// and replay it in `Hello`, merged here by last use.
+/// pins with it. By the design the gateways keep a bounded table of the pins
+/// they received and replay it in `Hello`, merged here by last use: no
+/// gateway replays its pins in this build, and the merge door has no caller.
 pub trait SessionsStore: Send + Sync {
     /// Pin `key` to `worker` at `at`, to end at `ends` on the decision
     /// clock (`None`: at no instant); a re-pin moves it and its end.
