@@ -91,7 +91,8 @@ mod tests {
     use crate::{
         ids::CallIds,
         testing::{
-            an_invoke_whose_arguments_are_json_reads_as_the_engines_do, arguments_of, bytes,
+            a_call_terminal_ends_an_invoke_whose_arguments_are_json,
+            an_invoke_whose_arguments_are_json_reads_as_the_engines_do, arguments_of, bytes, calls,
             content, drive, drive_to, malformed, reasoning, the_same_at_every_cut, weather_tools,
         },
     };
@@ -1316,11 +1317,11 @@ mod tests {
     }
 
     /// An invoke whose arguments the model wrote as one JSON object in place of the parameter
-    /// tags reads as the serving engines' own parsers read it: SGLang's DSML detector takes the
-    /// object as the call's arguments, as written (its second format), and the structural tag it
-    /// builds for a call writes the object between the invoke tag and its close, so an engine
-    /// constraining a call that way gets this shape back. The family's reference encoder writes
-    /// parameter tags alone, and its parser refuses the shape outright ("Tool name format
+    /// tags reads as one serving engine's own parser for the family reads it: that parser takes
+    /// the object as the call's arguments, as written (its second format), and the structural tag
+    /// the engine builds for a call writes the object between the invoke tag and its close, so an
+    /// engine constraining a call that way gets this shape back. The family's reference encoder
+    /// writes parameter tags alone, and its parser refuses the shape outright ("Tool name format
     /// error"), so it reads no call there; before, this table read the call with no arguments.
     /// The shared [`an_invoke_whose_arguments_are_json_reads_as_the_engines_do`] lists the shapes.
     #[test]
@@ -1333,6 +1334,61 @@ mod tests {
             "</｜DSML｜tool_calls>",
             "<｜User｜>Weather in Paris?<｜Assistant｜></think>",
         );
+    }
+
+    /// The invoke's close or the block's close inside a string of an invoke's JSON object ends
+    /// the call there, as it does inside a parameter's value: the shared
+    /// [`a_call_terminal_ends_an_invoke_whose_arguments_are_json`] says what is read.
+    #[test]
+    fn a_call_terminal_inside_a_string_of_an_invokes_json_object_ends_the_call_there() {
+        a_call_terminal_ends_an_invoke_whose_arguments_are_json(
+            run,
+            "<｜DSML｜invoke name=\"",
+            "</｜DSML｜invoke>",
+            "<｜DSML｜tool_calls>",
+            "</｜DSML｜tool_calls>",
+            "<｜User｜>Weather in Paris?<｜Assistant｜></think>",
+        );
+    }
+
+    /// Under the JSON-answer option ([`Engine::reads_json_answer`]) an invoke whose arguments are
+    /// one JSON object reads as it does without the option. The table's calls are tagged, not one
+    /// JSON value each, so the option's quote state stands outside them: the object is the call's
+    /// arguments, and the invoke's close inside one of its strings still ends the call there.
+    #[test]
+    fn a_json_answer_reads_an_invoke_whose_arguments_are_one_json_object_the_same() {
+        let chat = "<｜User｜>Weather in Paris?<｜Assistant｜></think>";
+        let read = |output: &str, json_answer: bool| {
+            let mut parser =
+                Engine::with_call_ids(Arc::new(deepseek_v4()), Declared::default(), ids());
+            if json_answer {
+                parser = parser.reads_json_answer();
+            }
+            drive(&mut parser, chat, &[output])
+        };
+        let object = r#"{"location": "Paris", "days": 3}"#;
+        let whole = format!(
+            "\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">{object}\
+             </｜DSML｜invoke>\n</｜DSML｜tool_calls>"
+        );
+        let answer = read(&whole, true);
+        assert_eq!(
+            calls(&answer),
+            vec![("get_weather".to_string(), object.to_string())]
+        );
+        assert!(malformed(&answer).is_empty(), "{answer:?}");
+        assert_eq!(answer, read(&whole, false));
+        let cut = concat!(
+            "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">",
+            "{\"location\": \"x </｜DSML｜invoke> y\"}</｜DSML｜invoke>\n</｜DSML｜tool_calls>"
+        );
+        let answer = read(cut, true);
+        assert_eq!(
+            calls(&answer),
+            vec![("get_weather".to_string(), "{\"location\": \"x ".to_string())]
+        );
+        assert_eq!(calls(&answer), calls(&read(cut, false)));
+        assert_eq!(bytes(&answer), cut);
     }
 
     #[test]

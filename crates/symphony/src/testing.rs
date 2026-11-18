@@ -357,10 +357,10 @@ pub(crate) fn an_invoke_outside_a_block_reads_as_the_engines_do(
 
 /// Every shape of an invoke whose arguments the model wrote as one JSON object in place of the
 /// parameter tags, on a DSML table whose `run` reads an output after a prompt, read whole, one
-/// character at a time and at every two-way cut as the serving engines' own parsers read them
-/// (SGLang's DSML detector takes the object as the arguments, as written, and the structural tag
-/// it builds for a call writes the object between the invoke tag and its close): right after the
-/// tag, on lines of its own, two such invokes after a preamble, and an invoke outside a block.
+/// character at a time and at every two-way cut as one serving engine's own parser for the family
+/// reads them (it takes the object as the arguments, as written, and the structural tag that
+/// engine builds for a call writes the object between the invoke tag and its close): right after
+/// the tag, on lines of its own, two such invokes after a preamble, and an invoke outside a block.
 /// `invoke` is the invoke tag up to the name's quote, `close` its closing tag, `open` and
 /// `block_close` the block's tags, `chat` the prompt that closed the thought. Nothing is
 /// malformed, every byte lands in one event, and a chat client reads the calls.
@@ -422,6 +422,71 @@ pub(crate) fn an_invoke_whose_arguments_are_json_reads_as_the_engines_do(
         assert_eq!(
             choice.finish_reason.as_deref(),
             Some("tool_calls"),
+            "{name}"
+        );
+    }
+}
+
+/// What ends an invoke whose arguments are one JSON object, on a DSML table whose `run` reads an
+/// output after a prompt, the same whole, one character at a time and at every two-way cut. The
+/// two parameter tags inside one of the object's strings are its text; the invoke's close and the
+/// block's close are the table's terminals, and either ends the call where it stands, inside one
+/// of the object's strings too, as it does inside a parameter's value. The object such a tag cuts
+/// stays as written, no whole value, under one `Malformed` event of no bytes, and what the model
+/// wrote after the tag is read where the table then stands: after the invoke's close it is text
+/// between calls, which a chat client reads as content, and after the block's close it is
+/// content. Every byte lands in one event. `invoke` is the invoke tag up to the name's quote,
+/// `close` its closing tag, `open` and `block_close` the block's tags, `chat` the prompt that
+/// closed the thought.
+pub(crate) fn a_call_terminal_ends_an_invoke_whose_arguments_are_json(
+    run: impl Fn(&str, &[&str]) -> Vec<Event<'static>>,
+    invoke: &str,
+    close: &str,
+    open: &str,
+    block_close: &str,
+    chat: &str,
+) {
+    let cut = r#"{"location": "x "#;
+    let head = format!("{open}\n{invoke}get_weather\">{cut}");
+    // A shape's name, the output, the content the table reads and the content a chat client reads.
+    let shapes = [
+        (
+            "the invoke's close",
+            format!("{head}{close} y\", \"days\": 3}}{close}\n{block_close}"),
+            String::new(),
+            format!("y\", \"days\": 3}}{close}"),
+        ),
+        (
+            "the block's close",
+            format!("{head}{block_close} y\"}}{close}\n{block_close}"),
+            format!(" y\"}}{close}\n{block_close}"),
+            format!(" y\"}}{close}\n{block_close}"),
+        ),
+    ];
+    for (name, output, content, shown) in shapes {
+        let events = run(chat, &[&output]);
+        assert_eq!(bytes(&events), output, "{name}");
+        assert!(
+            malformed(&events).iter().any(|(text, _)| text.is_empty()),
+            "{name}: {events:?}"
+        );
+        let said = the_same_at_every_cut(|pieces| run(chat, pieces), &output);
+        assert_eq!(
+            said.calls,
+            vec![("get_weather".to_string(), cut.to_string())],
+            "{name}"
+        );
+        assert_eq!(said.content, content, "{name}");
+        assert_eq!(said.finish.map(|(_, count)| count), Some(1), "{name}");
+        let choice = adapt::chat::message(0, &events);
+        assert_eq!(
+            choice.finish_reason.as_deref(),
+            Some("tool_calls"),
+            "{name}"
+        );
+        assert_eq!(
+            choice.message.content.as_deref(),
+            Some(shown.as_str()),
             "{name}"
         );
     }

@@ -70,6 +70,7 @@ mod tests {
     use crate::{
         ids::CallIds,
         testing::{
+            a_call_terminal_ends_an_invoke_whose_arguments_are_json,
             an_invoke_outside_a_block_reads_as_the_engines_do,
             an_invoke_whose_arguments_are_json_reads_as_the_engines_do, arguments_of, bytes, calls,
             content, dropped, reasoning, weather_tools,
@@ -1075,11 +1076,26 @@ mod tests {
 
     /// An invoke whose arguments the model wrote as one JSON object in place of the parameter
     /// tags (the shared [`an_invoke_whose_arguments_are_json_reads_as_the_engines_do`] lists the
-    /// shapes) gives the object as the call's arguments, as the serving engines' own parsers read
-    /// it; the V4 table's notes say why.
+    /// shapes) gives the object as the call's arguments, as one serving engine's own parser for
+    /// the family reads it; the V4 table's notes say why.
     #[test]
     fn an_invoke_whose_arguments_are_one_json_object_reads_as_the_engines_own_parsers_read_it() {
         an_invoke_whose_arguments_are_json_reads_as_the_engines_do(
+            run,
+            "<｜DSML｜ invoke name=\"",
+            "</｜DSML｜ invoke>",
+            "<｜DSML｜ calls>",
+            "</｜DSML｜ calls>",
+            "<｜Assistant｜></think>",
+        );
+    }
+
+    /// The invoke's close or the block's close inside a string of an invoke's JSON object ends
+    /// the call there, as it does inside a parameter's value: the shared
+    /// [`a_call_terminal_ends_an_invoke_whose_arguments_are_json`] says what is read.
+    #[test]
+    fn a_call_terminal_inside_a_string_of_an_invokes_json_object_ends_the_call_there() {
+        a_call_terminal_ends_an_invoke_whose_arguments_are_json(
             run,
             "<｜DSML｜ invoke name=\"",
             "</｜DSML｜ invoke>",
