@@ -2659,9 +2659,27 @@ impl<'a> PairPools<'a> {
 /// what a host counts its sheds under.
 const AFFINITY_COLUMN: &str = "affinity-column";
 
+/// Whether the request carries a column of its own or names rows. A pair
+/// reads neither: its columns ride its two pools ([`PairPools`]), and
+/// either on the request names neither pool.
+fn carries_a_column(facts: &RequestFacts<'_>) -> bool {
+    !facts.affinity.is_empty() || facts.named.is_some()
+}
+
 /// The stage a decision names when a profile that shows its rows to a
 /// plugin was handed rows that carry a mask or a pin beside them.
 const WRITTEN_ROWS: &str = "written-rows";
+
+/// The decline of a pair decision whose rows were not written for the
+/// plugin they are shown to. Cold and out of line: the pair entry's path
+/// past the refusal keeps its weight, and the passes it calls stay
+/// inlined. Built in place, the refusal cost a pair decision under no mask
+/// 26 instructions.
+#[cold]
+#[inline(never)]
+fn rows_not_written(bare: Trace) -> Decision {
+    shed(ShedReason::PolicyDeclined, WRITTEN_ROWS, bare)
+}
 
 /// Whether an affinity column stands for `pool`: empty, or one entry a
 /// candidate, in the candidates' order. Asked once where a decision takes
@@ -2873,7 +2891,10 @@ impl Engine {
     /// carries each row's bits and ages as the row's own fields, and
     /// [`Self::decide`] declines such a profile over rows that carry a mask
     /// or a pin beside them ([`Constraints::stalled`],
-    /// [`RequestFacts::pinned_at`]).
+    /// [`RequestFacts::pinned_at`]). [`Self::decide_pair`] declines a mask
+    /// beside a side that shows its rows: for a decode decision of a model
+    /// that also pairs, the word carries the pair's decode side too, as the
+    /// needs do. Written rows are the safe side.
     pub fn reads_for(&self, model: &str, phase: Phase) -> (Needs, bool) {
         let (own, shown) = self
             .resolve(model, phase)
@@ -2885,7 +2906,10 @@ impl Engine {
             })
             .unwrap_or_default();
         match phase {
-            Phase::Decode => (own.or(self.pair_decode_needs(model)), shown),
+            Phase::Decode => (
+                own.or(self.pair_decode_needs(model)),
+                shown || self.pair_decode_shown(model),
+            ),
             _ => (own, shown),
         }
     }
@@ -2902,6 +2926,15 @@ impl Engine {
     pub fn sample_for(&self, model: &str, phase: Phase) -> u32 {
         self.resolve(model, phase)
             .map_or(0, |(_, _, profile)| profile.needs().sample)
+    }
+
+    /// Whether the decode profile of `model`'s pair binding shows its rows
+    /// to a plugin, `false` where the model has none.
+    fn pair_decode_shown(&self, model: &str) -> bool {
+        self.pair_binding(model)
+            .and_then(|b| profile_index(b, Phase::Decode))
+            .and_then(|i| self.marks.get(usize::from(i)))
+            .is_some_and(|marks| marks.scoped())
     }
 
     /// The needs of the decode profile of `model`'s pair binding
@@ -3421,6 +3454,12 @@ impl Engine {
     /// side's affinity column rides its pool ([`PairPools`]); the request
     /// carries none here and names no rows, and either is refused under
     /// the stage name `affinity-column`.
+    ///
+    /// A side whose profile shows its rows to a plugin is handed rows
+    /// written for the decision ([`Self::reads_for`]). A mask beside that
+    /// side's rows ([`Constraints::stalled`]) is declined under the stage
+    /// name `written-rows` before either scope opens, as [`Self::decide`]
+    /// declines it. A pair side carries no pin.
     pub fn decide_pair(
         &self,
         facts: &RequestFacts<'_>,
@@ -3438,7 +3477,7 @@ impl Engine {
         // A pair's columns ride its two pools. One on the request, or rows
         // named on it, name neither pool: refused, where they would be
         // dropped in silence and both sides scored as if nothing were held.
-        if !facts.affinity.is_empty() || facts.named.is_some() {
+        if carries_a_column(facts) {
             return shed(ShedReason::PolicyDeclined, AFFINITY_COLUMN, bare);
         }
         // Each side's stages read their own pool and its own column.
@@ -3461,15 +3500,24 @@ impl Engine {
         ) else {
             return shed(ShedReason::PolicyDeclined, "binding", bare);
         };
+        // A plugin reads a row's own fields: a side that shows its rows is
+        // handed rows written for the decision. A mask beside that side's
+        // rows says they are not, and the decision is declined before
+        // either scope opens. A side that shows nothing reads no mask here.
+        let prefill_shown = self.marks[usize::from(binding.profile)].scoped();
+        let decode_shown = self.marks[usize::from(decode_index)].scoped();
+        if (prefill_shown && !cx.stalled.is_empty())
+            || (decode_shown && !decode_cx.stalled.is_empty())
+        {
+            return rows_not_written(bare);
+        }
         // One scope per side: the WIT view has one candidate list, so the
         // prefill stages read the prefill pool and the decode stages the
         // decode pool, through every decode run and the partner passes.
-        let _prefill_opened = self.marks[usize::from(binding.profile)]
-            .scoped()
-            .then(|| prefill_profile.open(&prefill_facts, prefills, pool));
-        let _decode_opened = self.marks[usize::from(decode_index)]
-            .scoped()
-            .then(|| decode_profile.open(&decode_facts, decodes, pool));
+        let _prefill_opened =
+            prefill_shown.then(|| prefill_profile.open(&prefill_facts, prefills, pool));
+        let _decode_opened =
+            decode_shown.then(|| decode_profile.open(&decode_facts, decodes, pool));
         // The prefill pool narrows to the prefills with a partner the decode
         // profile's hard filters keep, before the prefill picker truncates to
         // its targets: a pair that exists is found. A decode of class 0 is
@@ -4593,6 +4641,154 @@ mod tests {
         );
         assert!(!pair.reads_for("m", Phase::Prefill).1);
         assert!(pair.reads_for("m", Phase::Decode).1);
+    }
+
+    /// The pair entry declines as the single entry does. A side whose
+    /// profile shows its rows is handed rows written for the decision: a
+    /// mask beside that side's rows is declined before either scope opens,
+    /// and rows that carry the veto in their own field are shown with it. A
+    /// mask beside a side that shows nothing is read by that side's filters.
+    /// The host is told of the pair's decode side where a decode binding of
+    /// another profile stands ahead of it, as it is told that side's needs.
+    #[test]
+    fn a_pair_side_that_shows_its_rows_declines_a_mask_beside_them() {
+        /// The scopes opened, and the rows they were shown stalled.
+        #[derive(Debug)]
+        struct Shown(Arc<Mutex<(u32, u32)>>);
+
+        impl Lifecycle for Shown {}
+
+        impl DecisionScope for Shown {
+            fn open(&self, _: &RequestFacts<'_>, rows: &[Candidate], _: &PoolFacts<'_>) {
+                let mut seen = self.0.lock().expect("the lock");
+                seen.0 += 1;
+                seen.1 += rows.iter().filter(|row| row.health.stalled).count() as u32;
+            }
+
+            fn close(&self) {}
+        }
+
+        impl Filter for Shown {
+            fn name(&self) -> &'static str {
+                "shown"
+            }
+
+            fn keep(&self, _: &RequestFacts<'_>, _: &Candidate, _: &Constraints<'_>) -> bool {
+                true
+            }
+
+            fn scope(&self) -> Option<&dyn DecisionScope> {
+                Some(self)
+            }
+        }
+
+        let seen = Arc::new(Mutex::new((0u32, 0u32)));
+        let shows = || Profile {
+            filters: vec![Box::new(Healthy), Box::new(Shown(Arc::clone(&seen)))],
+            ..least_requests_profile()
+        };
+        let read = || *seen.lock().expect("the lock");
+        let pair_of = |prefill: Profile, decode: Profile| {
+            let binding = Binding {
+                decode_profile: Some(1),
+                ..pair_binding()
+            };
+            Engine::new(vec![prefill, decode], vec![binding], 1, Needs::default())
+        };
+        let (prefills, mut decodes) = (paired(2), paired(2));
+        let facts = RequestFacts {
+            model: "m",
+            ..RequestFacts::default()
+        };
+        let masked = Constraints {
+            stalled: &[0],
+            ..Constraints::default()
+        };
+        let written = Constraints::default();
+        let decide = |engine: &Engine, decodes: &[Candidate], sides: [&Constraints<'_>; 2]| {
+            let pools = PairPools {
+                prefills: &prefills,
+                decodes,
+                ..PairPools::default()
+            };
+            let pool = PoolFacts::default();
+            engine.decide_pair(
+                &facts,
+                &pool,
+                pools,
+                sides[0],
+                sides[1],
+                &mut Scratch::new(),
+            )
+        };
+        let declined = |decision: &Decision| {
+            matches!(decision, Decision::Shed(shed)
+                if (shed.reason, shed.emptied_by) == (ShedReason::PolicyDeclined, WRITTEN_ROWS))
+        };
+        // The decode side shows its rows, the prefill side shows nothing.
+        let engine = pair_of(least_requests_profile(), shows());
+        assert!(lead(&decide(&engine, &decodes, [&written, &written])).is_some());
+        assert_eq!(read(), (1, 0));
+        // A mask beside the decode side's rows: declined, and no scope opens.
+        let decision = decide(&engine, &decodes, [&written, &masked]);
+        assert!(declined(&decision), "{decision:?}");
+        assert_eq!(read(), (1, 0), "no scope opens for a declined decision");
+        // A mask beside the prefill side, which shows nothing: its filters
+        // read it, and the masked prefill is passed over.
+        assert_eq!(
+            lead(&decide(&engine, &decodes, [&masked, &written])),
+            Some(1)
+        );
+        assert_eq!(read(), (2, 0));
+        // Rows written for the decision carry the veto in their own field:
+        // the plugin is shown it, and the built-in filter reads it there.
+        decodes[0].health.stalled = true;
+        let decision = decide(&engine, &decodes, [&written, &written]);
+        let decode = decision
+            .pick()
+            .and_then(|pick| pick.targets.first().and_then(|target| target.pair));
+        assert_eq!(
+            decode.map(|pair| pair.decode_position),
+            Some(1),
+            "{decision:?}"
+        );
+        assert_eq!(read(), (3, 1));
+        decodes[0].health.stalled = false;
+
+        // The other way round: the prefill side shows its rows.
+        let turned = pair_of(shows(), least_requests_profile());
+        let decision = decide(&turned, &decodes, [&masked, &written]);
+        assert!(declined(&decision), "{decision:?}");
+        let decision = decide(&turned, &decodes, [&written, &masked]);
+        let decode = decision
+            .pick()
+            .and_then(|pick| pick.targets.first().and_then(|target| target.pair));
+        assert_eq!(
+            decode.map(|pair| pair.decode_position),
+            Some(1),
+            "{decision:?}"
+        );
+
+        // A decode binding of a profile that shows nothing stands ahead of
+        // the pair binding: the pair's decode side still runs under the pair
+        // binding, and the host is told so.
+        let ahead = Engine::new(
+            vec![least_requests_profile(), shows()],
+            vec![
+                Binding {
+                    phases: vec![Phase::Decode],
+                    ..single_binding()
+                },
+                Binding {
+                    decode_profile: Some(1),
+                    ..pair_binding()
+                },
+            ],
+            1,
+            Needs::default(),
+        );
+        assert!(!ahead.reads_for("m", Phase::Prefill).1);
+        assert!(ahead.reads_for("m", Phase::Decode).1);
     }
 
     /// A stage that reads the affinity column as a filter alone, or as the

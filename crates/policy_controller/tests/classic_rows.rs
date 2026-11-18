@@ -976,7 +976,7 @@ fn an_encode_pair_row_is_held_to_the_stores_lists_and_the_decision() {
     assert!(
         matches!(served.as_slice(), [store, decision]
             if store.contains("yet the class of prefill 0 holds encoder 0")
-                && decision.contains("refused as ec_incompatible, replayed")),
+                && decision.contains("refused as ec_incompatible, replayed Pick(")),
         "{served:#?}"
     );
     let bare = "an-encoder-whose-runtime-states-no-handoff-serves-no-item";
