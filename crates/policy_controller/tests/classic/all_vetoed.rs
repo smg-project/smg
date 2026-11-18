@@ -32,6 +32,8 @@ enum State {
     Over,
     /// Ready, under its thresholds, doubted by the liveness tracker.
     Stalled,
+    /// Ready, over its thresholds and doubted by the liveness tracker.
+    StalledOver,
     /// Not ready.
     Down,
 }
@@ -40,8 +42,8 @@ impl State {
     fn health(self) -> Health {
         Health {
             healthy: self != Self::Down,
-            overloaded: self == Self::Over,
-            stalled: self == Self::Stalled,
+            overloaded: matches!(self, Self::Over | Self::StalledOver),
+            stalled: matches!(self, Self::Stalled | Self::StalledOver),
             ..Health::default()
         }
     }

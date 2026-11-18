@@ -66,6 +66,8 @@ enum State {
     Over,
     /// Ready, under its thresholds, doubted by the liveness tracker.
     Stalled,
+    /// Ready, over its thresholds and doubted by the liveness tracker.
+    StalledOver,
     /// Not ready.
     Down,
 }
@@ -205,8 +207,10 @@ impl Bed {
                 WorkerStatus::Ready
             });
             self.registry
-                .set_worker_overloaded(worker, state == State::Over);
-            worker.set_stall((state == State::Stalled).then_some(StallReason::Wedged));
+                .set_worker_overloaded(worker, matches!(state, State::Over | State::StalledOver));
+            worker.set_stall(
+                matches!(state, State::Stalled | State::StalledOver).then_some(StallReason::Wedged),
+            );
         }
     }
 
@@ -740,6 +744,7 @@ fn rows() -> Vec<Row> {
         mixed(&[(State::Over, 0), (State::Free, 3)]),
         vec![keyed("k1"), keyed("k1")],
     ));
+    liveness_rows(&mut rows);
     rows
 }
 
@@ -761,4 +766,201 @@ fn record_the_classic_all_vetoed_rows() {
     let text = serde_json::to_string_pretty(&sheet).expect("the sheet serializes");
     fs::write(&path, text + "\n").expect("the sheet is written");
     println!("{} rows -> {}", sheet.rows.len(), path.display());
+}
+
+/// A row's name under `policy`: the policy's name, then what the row shows.
+fn leaked(policy: &str, shows: &str) -> &'static str {
+    Box::leak(format!("{}-{shows}", policy.replace('_', "-")).into_boxed_str())
+}
+
+/// The rows of the liveness veto: a pool whose ready workers are each
+/// doubted by the liveness tracker, over their thresholds, or both.
+fn liveness_rows(rows: &mut Vec<Row>) {
+    use State::Stalled;
+    // Under every policy: a pool doubted on every worker goes to the fewest
+    // in flight, with shedding off and on.
+    for policy in POLICIES {
+        rows.push(sequence_row(
+            leaked(
+                policy,
+                "a-pool-doubted-on-every-worker-goes-to-the-fewest-in-flight",
+            ),
+            policy,
+            false,
+            all(Stalled, &[3, 1, 2]),
+            vec![
+                pick(),
+                Step::Loads(vec![0, 5, 2]),
+                pick(),
+                Step::Loads(vec![4, 5, 2]),
+                pick(),
+            ],
+        ));
+        rows.push(sequence_row(
+            leaked(
+                policy,
+                "a-pool-doubted-on-every-worker-is-placed-under-shedding-too",
+            ),
+            policy,
+            true,
+            all(Stalled, &[3, 1, 2]),
+            vec![pick()],
+        ));
+    }
+    // Equal loads are drawn, over the tied workers alone.
+    for policy in ["round_robin", "consistent_hashing"] {
+        rows.push(drawn_row(
+            leaked(policy, "equal-loads-doubted-on-every-worker-are-drawn"),
+            policy,
+            false,
+            all(Stalled, &[2, 2, 5]),
+            vec![pick()],
+        ));
+    }
+    liveness_cells(rows);
+    liveness_keys(rows);
+}
+
+/// The cells of one policy: the two vetoes beside each other.
+fn liveness_cells(rows: &mut Vec<Row>) {
+    use State::{Down, Free, Over, Stalled, StalledOver};
+    let rr = "round_robin";
+    let follow = || vec![pick(), Step::Loads(vec![0, 1, 3]), pick()];
+    let cells: Vec<(&str, bool, Vec<(State, u32)>, Vec<Step>)> = vec![
+        (
+            "a-doubted-worker-under-its-thresholds-beside-one-over-under-shedding",
+            true,
+            vec![(Over, 0), (Stalled, 3), (Stalled, 1)],
+            follow(),
+        ),
+        (
+            "a-pool-over-on-every-worker-some-doubted-too-under-shedding",
+            true,
+            vec![(Over, 3), (StalledOver, 1)],
+            vec![pick()],
+        ),
+        (
+            "a-pool-doubted-and-over-on-every-worker-under-shedding",
+            true,
+            all_of(StalledOver),
+            vec![pick()],
+        ),
+        (
+            "a-pool-doubted-and-over-on-every-worker",
+            false,
+            all_of(StalledOver),
+            vec![pick(), Step::Loads(vec![0, 5, 2]), pick()],
+        ),
+        (
+            "a-worker-over-alone-beside-the-doubted-ones",
+            false,
+            vec![(StalledOver, 0), (Stalled, 3), (Over, 5)],
+            vec![pick()],
+        ),
+        (
+            "doubted-workers-over-their-thresholds-or-not",
+            false,
+            vec![(StalledOver, 2), (Stalled, 1), (Down, 0)],
+            vec![pick(), Step::Loads(vec![0, 5, 0]), pick()],
+        ),
+        (
+            "a-doubted-worker-over-its-thresholds-beside-one-under-them-under-shedding",
+            true,
+            vec![(StalledOver, 0), (Stalled, 3)],
+            vec![pick()],
+        ),
+        (
+            "a-worker-that-is-down-beside-the-doubted-ones",
+            false,
+            vec![(Down, 0), (Stalled, 3), (Stalled, 1)],
+            follow(),
+        ),
+        (
+            "a-worker-free-of-both-vetoes-beside-the-doubted-ones",
+            false,
+            vec![(Stalled, 0), (Free, 9), (StalledOver, 0)],
+            vec![pick(), pick(), pick()],
+        ),
+        (
+            "a-worker-free-of-both-vetoes-beside-the-doubted-ones-under-shedding",
+            true,
+            vec![(Stalled, 0), (Free, 9), (StalledOver, 0)],
+            vec![pick(), pick(), pick()],
+        ),
+        (
+            "a-tried-worker-among-the-doubted",
+            false,
+            all_of(Stalled),
+            vec![retry(&[1]), retry(&[1, 2])],
+        ),
+    ];
+    for (shows, shed, workers, steps) in cells {
+        rows.push(sequence_row(
+            leaked(rr, shows),
+            rr,
+            shed,
+            mixed(&workers),
+            steps,
+        ));
+    }
+}
+
+/// Three workers in one state, holding 3, 1 and 2 requests.
+fn all_of(state: State) -> Vec<(State, u32)> {
+    vec![(state, 3), (state, 1), (state, 2)]
+}
+
+/// Keyed requests under the liveness veto: a pinned key of the manual
+/// policy, and a routing key on the ring.
+fn liveness_keys(rows: &mut Vec<Row>) {
+    use State::{Free, Over, Stalled};
+    rows.push(sequence_row(
+        "manual-a-key-while-every-worker-is-doubted",
+        "manual",
+        false,
+        all(Free, &[1, 2, 3]),
+        vec![
+            keyed("k1"),
+            Step::States(vec![Stalled, Stalled, Stalled]),
+            Step::Loads(vec![9, 2, 3]),
+            keyed("k1"),
+            keyed("k1"),
+            Step::States(vec![Free, Free, Free]),
+            keyed("k1"),
+        ],
+    ));
+    let ring = "consistent_hashing";
+    let beside_over = [(Stalled, 5), (Over, 4), (Over, 0), (Over, 2)];
+    let cells: [(&str, bool, [(State, u32); 4]); 4] = [
+        (
+            "a-key-whose-worker-is-doubted-beside-free-members",
+            false,
+            [(Stalled, 5), (Free, 4), (Free, 0), (Free, 2)],
+        ),
+        (
+            "a-key-with-every-worker-doubted",
+            false,
+            [(Stalled, 5), (Stalled, 4), (Stalled, 0), (Stalled, 2)],
+        ),
+        (
+            "a-key-whose-worker-is-doubted-beside-members-over-their-thresholds",
+            false,
+            beside_over,
+        ),
+        (
+            "a-key-whose-worker-is-doubted-beside-members-over-their-thresholds-under-shedding",
+            true,
+            beside_over,
+        ),
+    ];
+    for (shows, shed, workers) in cells {
+        rows.push(ring_row(
+            leaked(ring, shows),
+            ring,
+            shed,
+            "k1",
+            mixed(&workers),
+            vec![keyed("k1")],
+        ));
+    }
 }
