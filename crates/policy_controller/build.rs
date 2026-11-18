@@ -17,7 +17,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "contracts/policy_plugin.proto",
         "contracts/policy_controller.proto",
     ];
-    const ENGINE_WIRE: &str = "../grpc_client/proto";
+    // The worker crate's proto directory, by its path in the repository: this
+    // crate is built from a checkout, in the workspace or imported by git.
+    const ENGINE_WIRE: &str = "../worker/proto";
     println!("cargo:rerun-if-changed=build.rs");
     for contract in CONTRACTS {
         println!("cargo:rerun-if-changed={contract}");

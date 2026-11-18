@@ -26,8 +26,10 @@ def main(argv: list[str]) -> int:
         return 2
     target = pathlib.Path(argv[1]).resolve()
     repo = pathlib.Path(__file__).resolve().parents[2]
-    proto_dir = repo / "crates" / "grpc_client" / "proto"
     package_src = repo / "crates" / "grpc_client" / "python" / "smg_grpc_proto"
+    # The package's own proto directory: its links gather every file the release
+    # ships, the gRPC client's and the worker crate's.
+    proto_dir = package_src / "proto"
     protos = sorted(proto_dir.glob("*.proto"))
     if not protos:
         print(f"no .proto files under {proto_dir}", file=sys.stderr)

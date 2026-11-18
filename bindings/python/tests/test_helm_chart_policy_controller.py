@@ -1814,7 +1814,7 @@ def test_the_image_job_starts_on_what_these_cases_read():
         crate / "contracts" / "smg-policy.wit",
         # The engine wire's messages the controller's protocol imports: the
         # build script reads them beside the contract.
-        REPO / "crates" / "grpc_client" / "proto" / "common.proto",
+        REPO / "crates" / "worker" / "proto" / "common.proto",
         # The example controller, whose image the job builds beside the
         # stock one: its package and what the package compiles.
         REPO / "examples" / "policy-controller" / "Cargo.toml",
