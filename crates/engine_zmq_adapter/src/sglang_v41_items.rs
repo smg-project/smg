@@ -10,12 +10,15 @@
 //! the Python servicer's rule (`_deepseek_v41_items`). A batch whose counts
 //! disagree is refused before the scheduler, where it would stop the engine.
 
-use std::{collections::BTreeMap, path::Path};
+use std::collections::BTreeMap;
 
 use bytes::Bytes;
 use engine_zmq_client::{
     codec::tensor::WireArrayData,
-    protocol::sglang::multimodal::{SglangWireMmItem, SglangWireModality, SglangWireTensor},
+    protocol::{
+        handshake::EngineCoreReadyResponse,
+        sglang::multimodal::{SglangWireMmItem, SglangWireModality, SglangWireTensor},
+    },
 };
 
 const PREFIX: &str = "DeepSeek-V4.1 image batch:";
@@ -33,10 +36,9 @@ pub(crate) fn is_v41_batch(tensors: &BTreeMap<String, SglangWireTensor>) -> bool
 
 /// The served DeepSeek-V4.1 model's patch size and downsample ratio, as its
 /// SGLang model reads them (`vision_patch_size`, `vision_downsample_ratio`).
-/// The Python servicer takes them from SGLang's loaded config; this servicer
-/// reads the model directory's `config.json`, as SGLang's V4.1 config does
-/// (`configs/deepseek_v41.py`): a top-level field first, else the
-/// `vision_config` one.
+/// The scheduler declares them at its handshake, off the model config it
+/// loads, so model overrides are in them; the Python servicer loads that
+/// config the same way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct V41Vision {
     patch_size: u64,
@@ -44,29 +46,15 @@ pub(crate) struct V41Vision {
 }
 
 impl V41Vision {
-    /// From `dir/config.json`: `None` without one, for another model, or when
-    /// a field is missing (SGLang has no default for either).
-    pub(crate) async fn from_model_dir(dir: &Path) -> Option<Self> {
-        let text = tokio::fs::read_to_string(dir.join("config.json"))
-            .await
-            .ok()?;
-        Self::from_config(&serde_json::from_str(&text).ok()?)
-    }
-
-    fn from_config(config: &serde_json::Value) -> Option<Self> {
-        if config.get("model_type")?.as_str()? != "deepseek_v41" {
-            return None;
-        }
-        let field = |top_level: &str, nested: &str| {
-            config
-                .get(top_level)
-                .or_else(|| config.get("vision_config")?.get(nested))?
-                .as_u64()
-                .filter(|&value| value > 0)
-        };
+    /// From a scheduler's handshake: `None` unless it declared both values,
+    /// each above zero. A scheduler declares none when its model is not a
+    /// V4.1 or its config does not hold both, or when its plugin predates the
+    /// fields.
+    pub(crate) fn from_handshake(ready: &EngineCoreReadyResponse) -> Option<Self> {
+        let declared = |value: Option<u64>| value.filter(|&value| value > 0);
         Some(Self {
-            patch_size: field("vision_patch_size", "patch_size")?,
-            downsample_ratio: field("vision_downsample_ratio", "downsample_ratio")?,
+            patch_size: declared(ready.vision_patch_size)?,
+            downsample_ratio: declared(ready.vision_downsample_ratio)?,
         })
     }
 
@@ -273,12 +261,21 @@ fn scalar(value: u64) -> SglangWireTensor {
 
 #[cfg(test)]
 mod tests {
-    use engine_zmq_client::protocol::sglang::multimodal::SglangWireMmInputs;
-    use serde_json::json;
+    use engine_zmq_client::{
+        codec::decode_msgpack,
+        mock_engine::default_ready_response,
+        protocol::{
+            handshake::EngineCoreReadyResponse,
+            sglang::{
+                multimodal::SglangWireMmInputs, request::TokenizedGenerateReqInput as WireRequest,
+            },
+        },
+    };
+    use openai_protocol::worker::RuntimeType;
     use smg_grpc_client::sglang_proto;
 
     use super::V41Vision;
-    use crate::sglang::translate_sglang_multimodal;
+    use crate::{sglang::translate_sglang_multimodal, test_support::connected_pair_declaring};
 
     /// Two images: a 2x3 and a 1x2 patch grid, 6 + 2 patches of 3x2x2 floats,
     /// filling token spans of 5 and 4 positions in a 12-token prompt. The
@@ -365,6 +362,19 @@ mod tests {
                 .iter()
                 .map(|&(offset, length)| sglang_proto::PlaceholderRange { offset, length })
                 .collect(),
+            ..Default::default()
+        }
+    }
+
+    /// A generate request of `PROMPT_LEN` tokens carrying `batch`.
+    fn generate_request(batch: sglang_proto::MultimodalInputs) -> sglang_proto::GenerateRequest {
+        sglang_proto::GenerateRequest {
+            request_id: "v41".into(),
+            tokenized: Some(sglang_proto::TokenizedInput {
+                input_ids: (0..PROMPT_LEN as u32).collect(),
+                original_text: String::new(),
+            }),
+            mm_inputs: Some(Box::new(batch)),
             ..Default::default()
         }
     }
@@ -555,8 +565,9 @@ mod tests {
         assert_eq!(output.mm_items[0].offsets, Some(vec![(2, 5)]));
     }
 
-    /// Without the served model's geometry (its model id is not a local
-    /// directory, or it is not a V4.1) the width and grid checks are skipped.
+    /// Without the served model's geometry (its scheduler declared none: it
+    /// serves another model, or its plugin predates the two fields) the width
+    /// and grid checks are skipped.
     #[test]
     fn without_the_models_vision_its_checks_are_skipped() {
         let batch = with_pixel_rows(
@@ -568,40 +579,82 @@ mod tests {
         assert_eq!(output.mm_items.len(), 2);
     }
 
-    /// The geometry as SGLang's V4.1 config takes it from `config.json`: a
-    /// top-level field first, else the `vision_config` one; none for another
-    /// model or a missing field.
+    /// The geometry is what the scheduler declared at its handshake: both
+    /// values, each above zero; none when one is missing or zero.
     #[test]
-    fn the_models_vision_is_read_as_sglang_reads_it() {
-        let read = |config: serde_json::Value| V41Vision::from_config(&config);
-        let expected = Some(V41Vision {
-            patch_size: 14,
-            downsample_ratio: 3,
-        });
-        let top_level = json!({
-            "model_type": "deepseek_v41",
-            "vision_patch_size": 14,
-            "vision_downsample_ratio": 3,
-        });
-        let nested = json!({
-            "model_type": "deepseek_v41",
-            "vision_config": {"patch_size": 14, "downsample_ratio": 3},
-        });
-        let both = json!({
-            "model_type": "deepseek_v41",
-            "vision_patch_size": 14,
-            "vision_config": {"patch_size": 16, "downsample_ratio": 3},
-        });
-        assert_eq!(read(top_level), expected);
-        assert_eq!(read(nested), expected);
-        assert_eq!(read(both), expected);
-        let missing = json!({"model_type": "deepseek_v41", "vision_config": {"patch_size": 14}});
-        let other = json!({
-            "model_type": "qwen2_vl",
-            "vision_config": {"patch_size": 14, "downsample_ratio": 3},
-        });
-        assert_eq!(read(missing), None);
-        assert_eq!(read(other), None);
+    fn the_models_vision_is_what_the_scheduler_declared() {
+        let declared = |patch_size, downsample_ratio| {
+            V41Vision::from_handshake(&EngineCoreReadyResponse {
+                vision_patch_size: patch_size,
+                vision_downsample_ratio: downsample_ratio,
+                ..default_ready_response()
+            })
+        };
+        assert_eq!(
+            declared(Some(14), Some(3)),
+            Some(V41Vision {
+                patch_size: 14,
+                downsample_ratio: 3,
+            })
+        );
+        for (patch_size, downsample_ratio) in [
+            (None, None),
+            (Some(14), None),
+            (None, Some(3)),
+            (Some(0), Some(3)),
+            (Some(14), Some(0)),
+        ] {
+            assert_eq!(
+                declared(patch_size, downsample_ratio),
+                None,
+                "{patch_size:?} {downsample_ratio:?}"
+            );
+        }
+    }
+
+    /// The geometry a batch is checked against is the scheduler's own,
+    /// whatever the model id is (here not a local directory): a scheduler
+    /// that declared 2x2 patches has a batch of wider rows refused before it
+    /// is sent, and a fitting batch sent on as two items; a scheduler that
+    /// declared nothing has the wider rows sent on.
+    #[tokio::test]
+    async fn a_batch_is_checked_against_the_geometry_its_scheduler_declared() {
+        let request = generate_request;
+        let wide = || with_pixel_rows(v41_batch(&GRIDS, &PATCHES, &SPANS), 8, &[3, 2, 3]);
+        let declared = EngineCoreReadyResponse {
+            vision_patch_size: Some(2),
+            vision_downsample_ratio: Some(2),
+            ..default_ready_response()
+        };
+        for (ready, checked) in [(declared, true), (default_ready_response(), false)] {
+            let (client, engine, _dir) = connected_pair_declaring(RuntimeType::Sglang, ready).await;
+            let (mut input, _output) = engine.split();
+            let sent = if checked {
+                let refused = client
+                    .generate_sglang(request(wide()))
+                    .await
+                    .err()
+                    .expect("rows the declared patches do not take are refused");
+                assert_eq!(refused.code(), tonic::Code::InvalidArgument);
+                assert!(
+                    refused.message().contains(
+                        "each patch row holds 18 values, but the model's 2x2 patches take 3x2x2 = \
+                         12"
+                    ),
+                    "{refused:?}"
+                );
+                v41_batch(&GRIDS, &PATCHES, &SPANS)
+            } else {
+                wide()
+            };
+            let (stream, frames) =
+                tokio::join!(client.generate_sglang(request(sent)), input.recv_frames());
+            let stream = stream.expect("sent on");
+            let wire: WireRequest = decode_msgpack(frames.unwrap()[1].as_ref()).unwrap();
+            let items = wire.mm_inputs.expect("the processor output").mm_items;
+            assert_eq!(items.len(), 2, "checked={checked}");
+            drop(stream);
+        }
     }
 
     /// Empty grids make no items. Refused alone, and refused, not a panic,

@@ -418,7 +418,7 @@ pub(crate) fn fan_out_sglang_requests(
 /// side of a disaggregated pair, by its room's residue
 /// ([`room_residue_rank`]), a pin's yield to the room logged on `yields`, the
 /// connection's note, at WARN once and at DEBUG after. `v41_vision` is the
-/// served DeepSeek-V4.1 model's patch geometry, when the connection read it.
+/// served DeepSeek-V4.1 model's patch geometry, when its scheduler declared it.
 pub(crate) fn translate_request_sglang(
     req: sglang_proto::GenerateRequest,
     max_model_len: u64,

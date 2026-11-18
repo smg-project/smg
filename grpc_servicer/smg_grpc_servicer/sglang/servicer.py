@@ -47,7 +47,7 @@ from smg_grpc_servicer.sglang.compat import (
     get_multimodal_types,
     get_tokenizer,
 )
-from smg_grpc_servicer.sglang.config_view import EngineConfigView
+from smg_grpc_servicer.sglang.config_view import EngineConfigView, v41_vision
 from smg_grpc_servicer.sglang.health_servicer import SGLangHealthServicer
 from smg_grpc_servicer.sglang.hidden_states import (
     refuse_hidden_states_above_server_mode,
@@ -99,21 +99,6 @@ V41_MARKER = "vit_grid"
 V41_PREFIX = "DeepSeek-V4.1 image batch:"
 
 
-def _v41_vision(hf_config) -> tuple[int, int] | None:
-    """The served DeepSeek-V4.1 model's patch size and downsample ratio, as its
-    SGLang model reads them (``vision_patch_size``, ``vision_downsample_ratio``);
-    None for another model, or a config without them."""
-    if getattr(hf_config, "model_type", None) != "deepseek_v41":
-        return None
-    patch_size = getattr(hf_config, "vision_patch_size", None)
-    ratio = getattr(hf_config, "vision_downsample_ratio", None)
-    if not (isinstance(patch_size, int) and isinstance(ratio, int)):
-        return None
-    if patch_size < 1 or ratio < 1:
-        return None
-    return patch_size, ratio
-
-
 def _v41_image_tokens(height: int, width: int, ratio: int) -> int:
     """How many prompt positions SGLang's V4.1 model fills for a patch grid: the
     length of its ``image_token_types`` for the downsampled grid, a start token,
@@ -130,7 +115,7 @@ def _deepseek_v41_items(feature, tensors: dict, offsets: list, vision=None) -> l
     V4.1 model encodes one image per item and reads its grid as ``n_vit_h`` /
     ``n_vit_w``; a batch whose counts disagree is refused here, before the
     scheduler, where it would stop the engine. With the served model's patch
-    size and downsample ratio (``vision``, from ``_v41_vision``), so is a batch
+    size and downsample ratio (``vision``, from ``v41_vision``), so is a batch
     whose patch rows or spans do not fit that model.
     """
     prefix = V41_PREFIX
@@ -1229,7 +1214,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                 for key, value in batch.model_specific_tensors.items()
             }
             if modality == Modality.IMAGE and V41_MARKER in tensors:
-                vision = _v41_vision(self.model_config.hf_config)
+                vision = v41_vision(self.model_config.hf_config)
                 mm_items.extend(_deepseek_v41_items(feature, tensors, offsets, vision))
                 continue
             mm_items.append(

@@ -202,11 +202,6 @@ pub(crate) struct ZmqConnectionMeta {
     /// (see [`ZmqEngineClient::set_request_timeout`]); unset leaves the
     /// streams unbounded.
     request_timeout: OnceLock<Duration>,
-    /// The served DeepSeek-V4.1 model's patch geometry, read from the model
-    /// directory's `config.json` at connect on the SGLang wire; unset when the
-    /// model id is not a local directory or the model is not a V4.1, and the
-    /// V4.1 image checks that need it are skipped.
-    v41_vision: OnceLock<V41Vision>,
 }
 
 /// Bind the SMG-side ZMQ sockets and complete the handshake with the
@@ -322,11 +317,7 @@ pub async fn connect_with_eos(
     tracing::info!(
         "Binding ZMQ client for worker {base_url} (handshake={handshake}, engines={engine_count:?})"
     );
-    let v41_vision = match runtime {
-        RuntimeType::Sglang => V41Vision::from_model_dir(Path::new(&model_id)).await,
-        _ => None,
-    };
-    let client = ZmqEngineClient::connect(
+    ZmqEngineClient::connect(
         &handshake,
         &input,
         &output,
@@ -337,11 +328,7 @@ pub async fn connect_with_eos(
         startup,
     )
     .await
-    .map_err(|e| format!("Failed to connect ZMQ engine: {e}"))?;
-    if let Some(vision) = v41_vision {
-        let _ = client.meta.v41_vision.set(vision);
-    }
-    Ok(client)
+    .map_err(|e| format!("Failed to connect ZMQ engine: {e}"))
 }
 
 /// Model metadata as the connected engine's native proto response.
@@ -454,7 +441,6 @@ impl ZmqEngineClient {
                 engine_ranks_are_replicas: OnceLock::new(),
                 pin_yield: PinYieldNote::default(),
                 request_timeout: OnceLock::new(),
-                v41_vision: OnceLock::new(),
             }),
         };
         // Every wire bounds a prompt by the window the engine reported
@@ -1228,6 +1214,13 @@ impl ZmqEngineClient {
         } else {
             RankPlacement::RoomResidue
         };
+        // The served DeepSeek-V4.1 model's patch geometry, as the first rank
+        // declared it at its handshake (every rank loads the one model): where
+        // the context window is read.
+        let v41_vision = client
+            .engines()
+            .first()
+            .and_then(|engine| V41Vision::from_handshake(&engine.ready_response));
         let mut streams = Vec::new();
         // Fan-out clones share identical media; cache only within this request.
         let mut shared_hashes = None;
@@ -1239,7 +1232,7 @@ impl ZmqEngineClient {
                 ranks,
                 placement,
                 &self.meta.pin_yield,
-                self.meta.v41_vision.get().copied(),
+                v41_vision,
             )
             .map_err(tonic::Status::invalid_argument)?;
             request.trace_headers.clone_from(&trace_headers);
@@ -2267,54 +2260,6 @@ mod tests {
         crate::sockets::knock_ipc_socket(&path)
             .await
             .expect("the listener still answers at its path");
-    }
-
-    /// An SGLang connection reads the served DeepSeek-V4.1 model's patch
-    /// geometry from its model directory's `config.json`; a model id that is
-    /// not a local directory leaves it unset.
-    #[tokio::test]
-    async fn an_sglang_connection_reads_the_v41_vision_from_its_model_dir() {
-        let dir = tempfile::tempdir().unwrap();
-        let model = dir.path().join("model");
-        std::fs::create_dir(&model).unwrap();
-        std::fs::write(
-            model.join("config.json"),
-            r#"{"model_type": "deepseek_v41",
-                "vision_config": {"patch_size": 14, "downsample_ratio": 3}}"#,
-        )
-        .unwrap();
-        let read = V41Vision::from_model_dir(&model).await;
-        assert!(read.is_some());
-        let model_ids = [
-            model.display().to_string(),
-            "deepseek-ai/DeepSeek-V4.1".into(),
-        ];
-        for (index, (model_id, expected)) in model_ids.into_iter().zip([read, None]).enumerate() {
-            let base_url = format!("ipc://{}", dir.path().join(format!("w{index}")).display());
-            let handshake = format!(
-                "ipc://{}",
-                dir.path().join(format!("hs{index}.sock")).display()
-            );
-            let (client, engine) = tokio::join!(
-                connect_with_eos(
-                    &base_url,
-                    model_id,
-                    RuntimeType::Sglang,
-                    Handshake::TcpOrIpc(&handshake),
-                    1,
-                    EosTokenIds::default(),
-                    Duration::from_secs(10),
-                ),
-                connect_to_frontend(
-                    &handshake,
-                    EngineId::from_engine_index(0),
-                    default_ready_response()
-                ),
-            );
-            engine.expect("mock engine");
-            let client = client.expect("adapter connect");
-            assert_eq!(client.meta.v41_vision.get().copied(), expected);
-        }
     }
 
     /// The gateway's connect path across a retry: the first handshake greets

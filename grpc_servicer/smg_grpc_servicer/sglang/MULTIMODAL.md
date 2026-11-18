@@ -35,19 +35,25 @@ range and its grid. A batch is a V4.1 batch when it carries `vit_grid`, which no
 other family sends (GLM-5.3 Flash sends `patches_per_image` too). A V4.1 batch
 is refused with `INVALID_ARGUMENT` before the scheduler when:
 
-- its grids, patch counts, token counts and placeholders disagree;
+- its grids, patch counts, token counts and placeholders disagree (when it
+  sends `types_per_image`, each span must be as long as its count);
 - it carries no images, no patch counts or no pixels;
 - its placeholders are out of prompt order or overlap (SGLang writes the items'
   embeddings over the placeholders in prompt order);
-- its patch rows or spans do not fit the served model: each row must hold
-  3 x `vision_patch_size`^2 values, and each span must be as long as SGLang's
-  V4.1 model makes the image's grid with `vision_downsample_ratio`.
+- its patch rows or spans do not fit the served model, when that model's
+  geometry is known: each row must hold 3 x `vision_patch_size`^2 values, and
+  each span must be as long as SGLang's V4.1 model makes the image's grid with
+  `vision_downsample_ratio`.
 
-The Python servicer reads those two values from SGLang's loaded model config.
-The Rust servicer reads them from `config.json` in the model directory, a
-top-level `vision_*` field first, else the `vision_config` one, as SGLang does.
-When the model id is not a local directory, it skips these two checks.
-Other families keep one item per batch.
+The geometry is those two values in the model config SGLang loads from the
+server arguments, with `--json-model-override-args` applied. The scheduler,
+its model and the Python servicer each load it that way. The scheduler declares
+the two values at its handshake for the Rust servicer and for a router
+connected to it directly. The two geometry checks are skipped when the loaded
+config is not a `deepseek_v41` one or does not hold both values as integers
+above zero, and on the Rust side also when the scheduler's plugin predates the
+two handshake fields. The other checks do not need the geometry. Other
+families keep one item per batch.
 
 ## Mixed images and videos
 
