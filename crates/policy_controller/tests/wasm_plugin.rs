@@ -8189,6 +8189,8 @@ enum Inside {
     WarmsAs(Decider),
     /// Ends the thread's name and tells a dispatch under none.
     TellsUnderNoName,
+    /// Hands the membership feed one worker that comes.
+    HandsAMember(WorkerId),
 }
 
 thread_local! {
@@ -8239,6 +8241,10 @@ impl smg_policy_controller::DecisionScope for ActsInside {
                 self.tells
                     .on_dispatched(&Lease::default(), &Target::default(), Side::Single, 3);
             }
+            Inside::HandsAMember(worker) => {
+                self.tells
+                    .on_membership(&smg_policy_controller::Membership::Added(worker));
+            }
         }
     }
 
@@ -8248,13 +8254,18 @@ impl smg_policy_controller::DecisionScope for ActsInside {
 /// An engine over the plugin whose decision, after the plugin's scope
 /// opened, runs a scope of the host that acts inside it.
 fn engine_that(plugin: &Arc<Plugin>, tells: &Arc<Engine>, does: Inside) -> Engine {
+    single_engine(profile_that(plugin, tells, does))
+}
+
+/// The plugin's profile with a scope of the host opened after the plugin's.
+fn profile_that(plugin: &Arc<Plugin>, tells: &Arc<Engine>, does: Inside) -> Profile {
     let mut profile = plugin_profile(plugin, None, None, None);
     profile.filters.push(Box::new(ActsInside {
         plugin: Arc::clone(plugin),
         tells: Arc::clone(tells),
         does,
     }));
-    single_engine(profile)
+    profile
 }
 
 /// What a thread still holds of one named decider goes back to that
@@ -8332,4 +8343,40 @@ fn a_thread_whose_name_ends_gives_the_held_decider_back_before_it_acts_as_itself
             .expect("the thread that acts as the first decider")
     });
     assert_eq!(as_first, Some(102), "its two dispatches and no more");
+}
+
+/// The feed is heard at the plugin's first open of a decision alone. A
+/// change handed between a pair's two opens is not told inside the pair,
+/// where the first side's resource is live on the instance: it is heard at
+/// the next decision's first open.
+#[test]
+fn a_change_handed_between_a_pairs_opens_is_heard_at_the_next_decision() {
+    use smg_policy_controller::Membership;
+    let runtime = runtime();
+    let plugin = load(
+        &runtime,
+        "between-sides",
+        guest::record_guest(),
+        mode::COUNT_MEMBERS,
+    );
+    let plain = Arc::new(plugin_engine(&plugin));
+    // The first side's profile: the plugin's scope opens, then the host's
+    // scope hands a change. The second side's open follows it.
+    let prefill = profile_that(&plugin, &plain, Inside::HandsAMember(WorkerId(900)));
+    let decode = plugin_profile(&plugin, None, None, None);
+    let engine = pair_engine(vec![prefill, decode], 1);
+    plain.on_membership(&Membership::Snapshot(&[WorkerId(100), WorkerId(101)]));
+    plugin
+        .warm()
+        .expect("it warms, and hears the two that stand");
+    let warmed = plugin.stats().observed;
+    let _ = pair_decide(&engine);
+    let paired = plugin.stats().observed;
+    assert_eq!(paired - warmed, 0, "no telling inside the pair");
+    let _ = pair_decide(&engine);
+    assert_eq!(
+        plugin.stats().observed - paired,
+        1,
+        "the first pair's change, at the second pair's first open"
+    );
 }

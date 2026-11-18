@@ -1706,19 +1706,17 @@ impl Plugin {
     }
 
     /// One of this plugin's opens of decision `decision` on this thread;
-    /// says whether the plugin already failed that decision (the one read
-    /// of the cell an open makes).
-    fn note_open(&self, decision: u64) -> bool {
+    /// says whether the plugin already failed that decision, and whether
+    /// this open is the plugin's first of it (the one read of the cell an
+    /// open makes).
+    fn note_open(&self, decision: u64) -> (bool, bool) {
         let opens = self.decision_opens.get_or_default();
         let (mut part, init) = opens.get();
-        let init = if part.is_of(decision) {
-            init
-        } else {
-            OwnTime::default()
-        };
+        let first = !part.is_of(decision);
+        let init = if first { OwnTime::default() } else { init };
         let failed = part.open(decision);
         opens.set((part, init));
-        failed
+        (failed, first)
     }
 
     /// The time of a lazy `init` decision `decision` paid on this thread:
@@ -2242,7 +2240,8 @@ impl Bound {
         let mut budget = plugin.runtime.decisions.on_this_thread();
         let decision = budget.open(facts.budget_micros);
         open.decision = decision;
-        if plugin.note_open(decision) {
+        let (failed, first) = plugin.note_open(decision);
+        if failed {
             // The plugin already failed this decision (the other side of a
             // pair, another binding): its part in the decision is over, with
             // no call, no `init` and no second count.
@@ -2365,12 +2364,18 @@ impl Bound {
         }
         // What the membership feed told since this instance last heard comes
         // before the decision reads the instance, as told events: outside
-        // the decision's sums. A change that faults it ends the plugin's
-        // part in the decision, and the close rebuilds the slot.
-        plugin.catch_up(&mut guard);
-        if guard.is_none() {
-            open.bypass = true;
-            return;
+        // the decision's sums. The plugin's first open of the decision
+        // alone: a later one (a pair's other side, another profile) finds a
+        // resource of the decision live on the instance, so a change handed
+        // between them waits for the decider's next decision or told event.
+        // A change that faults the instance ends the plugin's part in the
+        // decision, and the close rebuilds the slot.
+        if first {
+            plugin.catch_up(&mut guard);
+            if guard.is_none() {
+                open.bypass = true;
+                return;
+            }
         }
         if let Some(inst) = guard.as_mut() {
             match &inst.exports {
