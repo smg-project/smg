@@ -371,6 +371,9 @@ enum Word {
     /// Leave and stay in the election: a planned hand-over, or a term a
     /// caller says it saw.
     StepDown(Option<u64>),
+    /// The planned hand-over of the lease held under this term: a replica
+    /// that no longer holds the lease under it keeps on as it is.
+    HandOver(u64),
 }
 
 /// The running election: its words and its end.
@@ -464,15 +467,17 @@ impl Door {
         }
     }
 
-    /// The planned hand-over, the word of [`Running::step_down`] with no
-    /// term: a holder closes its fence, releases the lease and takes
-    /// nothing for one lease duration, and a replica that holds no lease
-    /// keeps on as it is. Behind a handle that is gone nobody leads, and
-    /// the word is said to no one.
-    pub(crate) fn hand_over(&self) {
+    /// The planned hand-over of the lease held under the term `under`: its
+    /// holder closes its fence, releases the lease and takes nothing for
+    /// one lease duration, as at the word of [`Running::step_down`] with
+    /// no term. A replica that no longer holds the lease under that term
+    /// keeps on as it is: a hand-over made under one term and taken after
+    /// a later take leaves that take alone. Behind a handle that is gone
+    /// nobody leads, and the word is said to no one.
+    pub(crate) fn hand_over(&self, under: u64) {
         if let Some(words) = self.words.upgrade() {
-            // No term is said, so no term error comes back.
-            let _ = leave(&words, None);
+            // A thread that is gone holds no lease.
+            let _ = words.send(Word::HandOver(under));
         }
     }
 }
@@ -508,7 +513,7 @@ impl Said {
             .try_iter()
             .filter_map(|word| match word {
                 Word::StepDown(above) => above,
-                Word::Stop => None,
+                Word::HandOver(_) | Word::Stop => None,
             })
             .collect()
     }
@@ -671,30 +676,36 @@ fn run(
         // the next step goes on.
         let next = began + period;
         let stop = loop {
-            match words.recv_timeout(next.saturating_duration_since(Instant::now())) {
+            let above = match words.recv_timeout(next.saturating_duration_since(Instant::now())) {
                 Err(mpsc::RecvTimeoutError::Timeout) => break false,
                 Ok(Word::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => break true,
-                Ok(Word::StepDown(above)) => {
-                    // A word the elector refused counts nothing here
-                    // either.
-                    let Some(left) = step_down(&mut elector, above) else {
-                        continue;
-                    };
-                    // The fence closed at the word: the take that opens it
-                    // again says so, as the first take did.
-                    if left {
-                        leading = false;
-                    }
-                    // A lease this replica left names nobody, and so does a
-                    // term above the one the holder is named under: the
-                    // elector counted the term said.
-                    let highest = elector.highest_term();
-                    if left || highest > seen.term {
-                        seen.holder.clear();
-                        seen.term = seen.term.max(highest);
-                        standing.send_replace(seen.clone());
-                    }
-                }
+                Ok(Word::StepDown(above)) => above,
+                // The planned hand-over leaves the lease of its own term, as
+                // a word with no term does.
+                Ok(Word::HandOver(under)) if holds_under(&elector, under) => None,
+                // Planned under a term this replica no longer holds the lease
+                // under, it asks nothing: that lease is left already, and
+                // the take since stands.
+                Ok(Word::HandOver(_)) => continue,
+            };
+            // A word the elector refused counts nothing here
+            // either.
+            let Some(left) = step_down(&mut elector, above) else {
+                continue;
+            };
+            // The fence closed at the word: the take that opens it
+            // again says so, as the first take did.
+            if left {
+                leading = false;
+            }
+            // A lease this replica left names nobody, and so does a
+            // term above the one the holder is named under: the
+            // elector counted the term said.
+            let highest = elector.highest_term();
+            if left || highest > seen.term {
+                seen.holder.clear();
+                seen.term = seen.term.max(highest);
+                standing.send_replace(seen.clone());
             }
         };
         if stop {
@@ -819,6 +830,12 @@ fn report(
         }
         _ => *leading = false,
     }
+}
+
+/// Whether this replica holds the lease under the term `under`, the term a
+/// planned hand-over was made under.
+fn holds_under(elector: &Elector, under: u64) -> bool {
+    elector.is_holder() && elector.fence().term() == under
 }
 
 /// A word to leave, taken by the election thread. The elector counts the
@@ -3224,6 +3241,36 @@ mod tests {
         assert_eq!(fence.leader_term(Instant::now()), Some(1));
         let (leading, text) = looping.stopped_with(": leading");
         assert_eq!(leading, 1, "{text}");
+    }
+
+    /// A planned hand-over is of one term's lease. Made under term one and
+    /// taken after a gateway's floor moved this replica to term three, it
+    /// leaves that take alone; made under the term held, it is taken.
+    #[test]
+    fn a_hand_over_planned_under_a_term_the_replica_left_releases_nothing() {
+        let elector = Elector::alone("a@127.0.0.1:1", brisk()).expect("the settings are in order");
+        let fence = elector.fence();
+        let (standing, mut stood) = watch::channel(Standing::default());
+        let running = start(elector, Arc::new(MemoryStore::new()), standing).expect("a thread");
+        until("the first lead", || {
+            fence.leader_term(Instant::now()) == Some(1)
+        });
+        let door = running.door();
+        door.saw(2).expect("a term that leaves one to take");
+        until("the take above the floor", || {
+            fence.leader_term(Instant::now()) == Some(3)
+        });
+        // The hand-over of term one comes late: three steps on, the lease
+        // of term three is still held.
+        door.hand_over(1);
+        looks(&mut stood, 3);
+        assert_eq!(fence.leader_term(Instant::now()), Some(3));
+        door.hand_over(3);
+        until("the take after the hand-over of the term held", || {
+            fence.leader_term(Instant::now()) == Some(4)
+        });
+        running.stop();
+        ended(running);
     }
 
     #[test]
