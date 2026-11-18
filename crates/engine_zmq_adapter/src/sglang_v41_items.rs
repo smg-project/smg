@@ -131,8 +131,11 @@ pub(crate) fn deepseek_v41_items(
             return Err(format!("{PREFIX} {images} images but {count} {name}"));
         }
     }
+    // A patch row holds at least one value.
     let (rows, row_dims) = match feature.shape.split_first() {
-        Some((&rows, row_dims)) if !row_dims.is_empty() => (rows, row_dims),
+        Some((&rows, row_dims)) if !row_dims.is_empty() && !row_dims.contains(&0) => {
+            (rows, row_dims)
+        }
         _ => {
             return Err(format!(
                 "{PREFIX} pixel_values has shape {:?}, not rows of patches",
@@ -764,6 +767,39 @@ mod tests {
         let _stream = stream.expect("sent on");
         let wire: WireRequest = decode_msgpack(frames.unwrap()[1].as_ref()).unwrap();
         assert_eq!(wire.mm_inputs.expect("the items").mm_items.len(), 2);
+    }
+
+    /// A patch row holds at least one value. A pixel tensor with a row
+    /// dimension of zero is refused when the model's geometry is not known,
+    /// where an empty tensor would otherwise reach the scheduler.
+    #[test]
+    fn patch_rows_without_values_are_refused() {
+        for row_shape in [&[0][..], &[3, 0, 2]] {
+            let batch = with_pixel_rows(v41_batch(&GRIDS, &PATCHES, &SPANS), 8, row_shape);
+            let error =
+                translate_sglang_multimodal(batch, Vec::new(), PROMPT_LEN, None).unwrap_err();
+            assert!(
+                error.contains("not rows of patches"),
+                "{row_shape:?}: {error:?}"
+            );
+        }
+    }
+
+    /// Only an image batch is cut into V4.1 items. A batch that carries
+    /// `vit_grid` under the video label would go on as a video item, which
+    /// SGLang's V4.1 model has no embedder for, so it is refused: alone, and
+    /// as the extra batch after an image batch.
+    #[test]
+    fn a_grid_on_a_video_batch_is_refused() {
+        let mut video = v41_batch(&GRIDS, &PATCHES, &SPANS);
+        video.modalities = vec!["video".to_string()];
+        let needle = "DeepSeek-V4.1 image batch: vit_grid on a video batch";
+        let error = translate(video.clone()).unwrap_err();
+        assert!(error.contains(needle), "{error:?}");
+        let image = v41_batch(&GRIDS, &PATCHES, &SPANS);
+        let error =
+            translate_sglang_multimodal(image, vec![video], PROMPT_LEN, Some(VISION)).unwrap_err();
+        assert!(error.contains(needle), "{error:?}");
     }
 
     /// SGLang pads the image positions only when the request names the image

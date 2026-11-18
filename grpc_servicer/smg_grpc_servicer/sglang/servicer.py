@@ -147,7 +147,8 @@ def _deepseek_v41_items(feature, tensors: dict, offsets: list, vision=None) -> l
     ):
         if count != images:
             raise ValueError(f"{prefix} {images} images but {count} {name}")
-    if len(feature.shape) < 2:
+    # A patch row holds at least one value.
+    if len(feature.shape) < 2 or 0 in feature.shape[1:]:
         raise ValueError(
             f"{prefix} pixel_values has shape {list(feature.shape)}, not rows of patches"
         )
@@ -1213,6 +1214,11 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                 key: self._decode_tensor_data(value)
                 for key, value in batch.model_specific_tensors.items()
             }
+            if modality != Modality.IMAGE and V41_MARKER in tensors:
+                # Only an image batch is cut into V4.1 items. Under the video
+                # label the batch would go on as a video item, which SGLang's
+                # V4.1 model has no embedder for.
+                raise ValueError(f"{V41_PREFIX} vit_grid on a video batch")
             if modality == Modality.IMAGE and V41_MARKER in tensors:
                 if token is None:
                     # SGLang pads the image positions only when the id is set.

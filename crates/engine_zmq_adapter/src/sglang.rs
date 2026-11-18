@@ -662,6 +662,12 @@ fn translate_sglang_batch(
     } else {
         Some(offsets)
     };
+    // Only an image batch is cut into V4.1 items. Under the video label the
+    // batch would go on as a video item, which SGLang's V4.1 model has no
+    // embedder for.
+    if modality != SglangWireModality::Image && is_v41_batch(&model_specific_data) {
+        return Err(format!("{V41_PREFIX} vit_grid on a video batch"));
+    }
     if modality == SglangWireModality::Image && is_v41_batch(&model_specific_data) {
         // SGLang pads the image positions only when the id is set. Without it
         // the model finds no position for the items' embeddings and fails in

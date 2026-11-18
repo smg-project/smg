@@ -356,6 +356,33 @@ def test_a_batch_without_its_image_token_id_is_refused(v41_converter):
         _convert(servicer, pb, video, extras=[batch])
 
 
+@pytest.mark.parametrize("row_shape", [(0,), (3, 0, 2)], ids=["no-values", "a-zero-dimension"])
+def test_patch_rows_without_values_are_refused(v41_converter, row_shape):
+    """A patch row holds at least one value. A pixel tensor with a row dimension of
+    zero is refused when the model's geometry is not known, where an empty tensor
+    would otherwise reach the scheduler."""
+    servicer, pb = v41_converter
+    servicer.model_config = SimpleNamespace(hf_config=SimpleNamespace(model_type="other"))
+    batch = _with_pixel_rows(pb, _v41_batch(pb), row_shape)
+    with pytest.raises(ValueError, match="not rows of patches"):
+        _convert(servicer, pb, batch)
+
+
+def test_a_grid_on_a_video_batch_is_refused(v41_converter):
+    """Only an image batch is cut into V4.1 items. A batch that carries ``vit_grid``
+    under the video label would go on as a video item, which SGLang's V4.1 model has
+    no embedder for, so it is refused: alone, and as the extra batch after an image
+    batch."""
+    servicer, pb = v41_converter
+    video = _v41_batch(pb)
+    video.modalities[:] = ["video"]
+    message = "DeepSeek-V4.1 image batch: vit_grid on a video batch"
+    with pytest.raises(ValueError, match=message):
+        _convert(servicer, pb, video)
+    with pytest.raises(ValueError, match=message):
+        _convert(servicer, pb, _v41_batch(pb), extras=[video])
+
+
 def test_media_references_without_tensors_still_convert(v41_converter):
     """A request carrying only media references (the encode dispatch's) is not refused."""
     servicer, pb = v41_converter
