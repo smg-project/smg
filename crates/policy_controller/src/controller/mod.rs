@@ -690,14 +690,14 @@ impl Controller {
     /// control listener that takes a principal: `SERVING` while this replica
     /// leads, so a client that checks the service's health by that name
     /// finds the leader's control listener. That word is told at every move
-    /// of the run loop and after every step of the election, so a fence that
-    /// closes between two steps reads `SERVING` until the next; a
-    /// registration call reads the fence itself and is refused in that
-    /// window. An open watch of the rows follows the same telling: it ends
-    /// `ABORTED` when this replica stops leading, an idle one at the next
-    /// step of the election. A lead can open between two steps, and a watch
-    /// admitted before the next one is ended by any telling that finds no
-    /// leader here, the drain's first.
+    /// of the run loop, after every step of the election and where the
+    /// fence's window opens or ends, so a fence that closes between two
+    /// steps is told as it closes; a registration call reads the fence
+    /// itself. An open watch of the rows follows the same telling: it ends
+    /// `ABORTED` when this replica stops leading, an idle one where the
+    /// fence closes. A lead opens between two steps, a moment before its
+    /// telling: a watch admitted in that moment is ended by any telling
+    /// that finds no leader here, the drain's first.
     ///
     /// A listener, an election thread or a deciding thread that ends before
     /// the shutdown ends the serve with its error, the other listeners
@@ -1022,10 +1022,10 @@ impl Controller {
 /// does not, where a door is told at the change alone. A take with no
 /// holder to wait for leads one renew deadline after its write, between
 /// two steps of the election: the fence admits a watch from that instant,
-/// and until the next step such a watch stands under the word that nobody
-/// leads here. The word told again ends it, the drain's included; told at
-/// the change alone, the drain would leave that watch open to the end of
-/// the grace period.
+/// and until the telling that instant wakes such a watch stands under the
+/// word that nobody leads here. The word told again ends it, the drain's
+/// included; told at the change alone, the drain would leave that watch
+/// open to the end of the grace period.
 async fn tell_role(
     mut role: Readiness,
     mut stop: watch::Receiver<bool>,
@@ -1034,7 +1034,8 @@ async fn tell_role(
 ) {
     let (mut last, mut left) = (None, false);
     loop {
-        let leads = !left && role.state() == State::Leader;
+        let (state, turn) = role.read();
+        let leads = !left && state == State::Leader;
         // The watches first: nothing is awaited between the read of the
         // fence and their word.
         if leads {
@@ -1061,7 +1062,7 @@ async fn tell_role(
         // same.
         tokio::select! {
             _ = stop.wait_for(|stop| *stop) => left = true,
-            moved = role.moved() => left = moved.is_none(),
+            moved = role.moved_by(turn) => left = moved.is_none(),
         }
     }
 }
@@ -1130,7 +1131,7 @@ async fn tell_readiness(
 ) -> Infallible {
     let mut said = None;
     loop {
-        let (state, lapse) = role.read();
+        let (state, turn) = role.read();
         let ready = state.is_ready();
         if told != Some(ready) {
             let word = if ready {
@@ -1160,7 +1161,7 @@ async fn tell_readiness(
             }
             said = Some(ready);
         }
-        if !follows || role.moved_by(lapse).await.is_none() {
+        if !follows || role.moved_by(turn).await.is_none() {
             std::future::pending::<()>().await;
         }
     }
@@ -1716,9 +1717,15 @@ mod tests {
                 );
             }
             steps.send_replace(Standing::default());
-            // The lead opens by itself and the fence admits a watch. No step
-            // came since: the word the watch finds says that nobody leads.
-            tokio::time::sleep(settings.renew_deadline).await;
+            let mut first = role.clone();
+            first.changed().await.expect("the teller tells the step");
+            assert!(!*first.borrow());
+            // The lead opens by itself and the fence admits a watch. The
+            // teller sleeps to that instant: this thread, the runtime's
+            // one, is held across it with nothing awaited, so the opening
+            // is told to no one ahead of the read below. The word the watch
+            // finds says that nobody leads.
+            thread::sleep(settings.renew_deadline);
             assert_eq!(elector.fence().leader_term(Instant::now()), Some(1));
             let mut watch = role.clone();
             assert!(!*watch.borrow_and_update());
