@@ -45,7 +45,7 @@ use tokenizers::{
     Model, Result as TokenizersResult, Token, TokenizerImpl,
 };
 
-use crate::huggingface::HuggingFaceTokenizer;
+use crate::{huggingface::HuggingFaceTokenizer, unigram_scores};
 
 /// A tokenizer of the crate's components over any model type: a built
 /// [`tokenizers::Tokenizer`] derefs to the one over [`ModelWrapper`], a
@@ -317,10 +317,12 @@ impl<'de> Deserialize<'de> for LateBoundModel {
 /// A BPE section, whose `type` key comes first in every file the crate
 /// writes, streams here: the vocabulary into its hash map, the merges into
 /// their list, both handed to the crate's own builder, so the model is the
-/// one the crate builds from the same file. Any other section (another
-/// model kind, a file without the `type` key or with it later) goes to the
-/// crate's own reader, which streams it as before with the one entry
-/// already read put back in front.
+/// one the crate builds from the same file. A Unigram section with the
+/// same first key is read by [`unigram_scores::section`], for the scores
+/// the reference reads. Any other section (another model kind, a file
+/// without the `type` key or with it later) goes to the crate's own reader,
+/// which streams it as before with the one entry already read put back in
+/// front.
 struct ModelSection;
 
 impl<'de> Visitor<'de> for ModelSection {
@@ -341,6 +343,9 @@ impl<'de> Visitor<'de> for ModelSection {
                 let kind: String = replay.rest.next_value()?;
                 if kind == "BPE" {
                     return bpe_section(replay.rest);
+                }
+                if kind == "Unigram" {
+                    return unigram_scores::section(replay.rest).map(LateBoundModel::from);
                 }
                 Value::String(kind)
             } else {
