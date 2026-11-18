@@ -1152,18 +1152,22 @@ pub enum ResponseModality {
     Audio,
 }
 
-/// Whether a `response_format` is, or holds, the legacy form, a raw JSON
-/// schema: an object whose `type` is none of the typed formats' (`text`,
-/// `image`, `audio`, `video`), or absent. A list counts as legacy when one of
-/// its formats is.
+/// Whether a `response_format` is read as the legacy form, a raw JSON
+/// schema: anything but a typed format (an object whose `type` is `text`,
+/// `image`, `audio` or `video`) or a list holding only typed formats. So an
+/// object with another `type` or none, a boolean schema, and a list that
+/// holds one of those or is empty all keep the rule every `response_format`
+/// had before the typed ones.
 fn is_legacy_response_format(format: &Value) -> bool {
-    match format {
-        Value::Object(object) => !matches!(
-            object.get("type").and_then(Value::as_str),
+    fn is_typed(format: &Value) -> bool {
+        matches!(
+            format.get("type").and_then(Value::as_str),
             Some("text" | "image" | "audio" | "video")
-        ),
-        Value::Array(formats) => formats.iter().any(is_legacy_response_format),
-        _ => false,
+        )
+    }
+    match format {
+        Value::Array(formats) => formats.is_empty() || !formats.iter().all(is_typed),
+        format => !is_typed(format),
     }
 }
 
@@ -1373,6 +1377,9 @@ mod tests {
             serde_json::json!([schema.clone()]),
             serde_json::json!([text.clone(), schema.clone()]),
             serde_json::json!({"properties": {"city": {"type": "string"}}}),
+            // the boolean schema, and a list of no format
+            serde_json::json!(true),
+            serde_json::json!([]),
         ] {
             let (code, _) = refusal(validate_interactions_request(&request(legacy)));
             assert_eq!(code, "response_mime_type_required");

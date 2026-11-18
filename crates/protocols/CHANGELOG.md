@@ -246,9 +246,9 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 - An Interactions request with a typed `response_format` (`text`, `image`, `audio` or `video`, or
   a list of them) validates without `response_mime_type`, as the public API's polymorphic field
   takes it; a typed format may name its own `mime_type`. The gateway still requires
-  `response_mime_type` beside the legacy form, a raw JSON schema. That rule is the gateway's own:
-  the SDK (python-genai 3.3.0) marks the field deprecated. Every typed format had been refused as
-  `response_mime_type_required`.
+  `response_mime_type` beside any other `response_format`, which it reads as the legacy form, a
+  raw JSON schema. That rule is the gateway's own: the SDK (python-genai 3.3.0) marks the field
+  deprecated. Every typed format had been refused as `response_mime_type_required`.
 - Realtime events read and write as the public API does. A `session.update`, `session.created`
   or `session.updated` event reads its session into the variant its `type` names, where every
   one the API writes failed with "missing field `type`", and is written with that `type` once,
