@@ -92,9 +92,11 @@ pub enum Probe<T> {
 
 /// The ids a lifecycle pruned within [`FENCE`], fenced against relearning
 /// from a view older than the pruning. A stage that learns its members from
-/// a decision's view holds one.
+/// a decision's view holds one. It keeps pruned workers out of a listing
+/// and is no kin of [`crate::elector::Fence`], which holds the term a
+/// process leads under.
 #[derive(Debug, Default)]
-pub struct Fence {
+pub(crate) struct Fence {
     /// The retirements within [`FENCE`], oldest first. Those of an id the
     /// feed named since stay until they lapse and lift nothing.
     retired: VecDeque<(WorkerId, Instant)>,
@@ -105,32 +107,32 @@ pub struct Fence {
 
 impl Fence {
     /// Whether no id holds a fence.
-    pub fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.fenced.is_empty()
     }
 
     /// Whether `id` holds a fence the last [`Fence::expire`] left standing.
-    pub fn holds(&self, id: WorkerId) -> bool {
+    pub(crate) fn holds(&self, id: WorkerId) -> bool {
         self.fenced.contains_key(&id)
     }
 
     /// Whether `id` was pruned within [`FENCE`] of `now` and is fenced
     /// against relearning.
-    pub fn is_retired(&self, id: WorkerId, now: Instant) -> bool {
+    pub(crate) fn is_retired(&self, id: WorkerId, now: Instant) -> bool {
         self.fenced
             .get(&id)
             .is_some_and(|&at| now.saturating_duration_since(at) < FENCE)
     }
 
     /// Lift the fence on `id`: the feed named it as a member again.
-    pub fn admit(&mut self, id: WorkerId) {
+    pub(crate) fn admit(&mut self, id: WorkerId) {
         // Its retirements stay in the list: none is its last any more, so
         // their lapses lift nothing.
         self.fenced.remove(&id);
     }
 
     /// Forget the retirements older than [`FENCE`] at `now`.
-    pub fn expire(&mut self, now: Instant) {
+    pub(crate) fn expire(&mut self, now: Instant) {
         while let Some(&(old, at)) = self.retired.front() {
             if now.saturating_duration_since(at) < FENCE {
                 break;
@@ -145,7 +147,7 @@ impl Fence {
     }
 
     /// Fence `id` for [`FENCE`] from `now`: a lifecycle pruned it.
-    pub fn retire(&mut self, id: WorkerId, now: Instant) {
+    pub(crate) fn retire(&mut self, id: WorkerId, now: Instant) {
         self.expire(now);
         let last = self.fenced.entry(id).or_insert(now);
         *last = (*last).max(now);
