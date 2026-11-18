@@ -7,7 +7,8 @@
 //! `policy_engine/decide/bucket_prefill_joined/512` and
 //! `policy_engine/decide/bucket_prefill_two_rows/256`. The fleet is the one
 //! the `decision` bench decides over, and the first ids are the rows that
-//! bench times for every other preset. They stand here because that binary
+//! bench times for every other preset, built by the one body the two
+//! binaries share (`common/preset.rs`). They stand here because that binary
 //! runs at its gate's bound: a preset's rows there are three rows more in
 //! every pull request's gate. This file is a pull-request gate's too
 //! (`.github/bench-gates/policy-engine-bucket.toml` runs the whole binary
@@ -18,6 +19,8 @@
 )]
 
 mod common;
+#[path = "common/preset.rs"]
+mod preset;
 
 use std::hint::black_box;
 
@@ -25,52 +28,18 @@ use common::{build_view, engine_of, fleet};
 use criterion::{
     criterion_group, criterion_main, measurement::WallTime, BenchmarkGroup, BenchmarkId, Criterion,
 };
+use preset::SIZES;
 use smg_policy_controller::{
     Constraints, Lease, Lifecycle, Phase, PoolFacts, RequestFacts, Scratch,
 };
 
-const SIZES: [usize; 3] = [8, 64, 512];
-
 fn decide(c: &mut Criterion) {
     let mut group = c.benchmark_group("policy_engine/decide");
-    preset(&mut group);
+    preset::rows(&mut group, "bucket");
     bucket_prefill(&mut group);
     bucket_prefill_models(&mut group);
     bucket_prefill_parted(&mut group);
     group.finish();
-}
-
-/// The preset's decision for a request that is no prefill placement, which
-/// the stage leaves to the picker: the row the `decision` bench times for
-/// every other preset, built as that bench builds it.
-fn preset(group: &mut BenchmarkGroup<'_, WallTime>) {
-    let engine = engine_of("bucket");
-    for &n in &SIZES {
-        let fleet = fleet(n);
-        let mut view = Vec::with_capacity(n);
-        build_view(&fleet, &mut view);
-        let mut scratch = Scratch::new();
-        let pool = PoolFacts {
-            pool_size: n as u32,
-            generation: 1,
-            ..PoolFacts::default()
-        };
-        let cx = Constraints::default();
-        group.bench_with_input(BenchmarkId::new("bucket", n), &n, |b, _| {
-            let mut seed = 0u64;
-            b.iter(|| {
-                seed += 1;
-                let facts = RequestFacts {
-                    model: "m",
-                    prompt_tokens: 512,
-                    seed,
-                    now_micros: 1_000_000,
-                    ..RequestFacts::default()
-                };
-                engine.decide(&facts, &pool, black_box(&view), &cx, &mut scratch)
-            });
-        });
-    }
 }
 
 /// A prefill placement under the bucket preset, booked as a host books it.

@@ -63,6 +63,7 @@ filter = "^policy_engine/decide/bucket"
 sources = [
     "crates/policy_controller/benches/bucket.rs",
     "crates/policy_controller/benches/common/mod.rs",
+    "crates/policy_controller/benches/common/preset.rs",
 ]
 
 # The first gate whose pattern matches an id decides its threshold.
