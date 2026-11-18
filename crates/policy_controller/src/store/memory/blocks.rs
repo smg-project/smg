@@ -19,11 +19,12 @@
 //!
 //! An id's file never changes while its lease can be on file. A rise of
 //! the term starts the blocks again under the new term and keeps the table
-//! it leaves while a lease of that term is on file ([`Blocks::rise`]): the
-//! kept tables are at most the terms that hold a lease on file. So an id
-//! names its file by one rule ([`Blocks::file_of`]): an id of the leading
-//! term by the leading table, an id of a kept term by that term's table,
-//! any other id by its block modulo the files.
+//! it leaves while a lease of that term is on file ([`Blocks::rise`]): at
+//! a rise the kept tables are at most the terms that hold a lease on
+//! file, and a table whose last lease ended goes at the next rise. So an
+//! id names its file by one rule ([`Blocks::file_of`]): an id of the
+//! leading term by the leading table, an id of a kept term by that term's
+//! table, any other id by its block modulo the files.
 
 use std::sync::{
     atomic::{AtomicU64, AtomicU8, Ordering},

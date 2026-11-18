@@ -257,8 +257,9 @@ impl MemoryStore {
 
     /// The file a lease's id names
     /// ([`Blocks::file_of`](super::blocks::Blocks::file_of)): an id of the
-    /// leading term by its block's byte, any other id by its block modulo
-    /// the files. The file is one today, so every id names it.
+    /// leading term by its block's byte, an id of a kept term by that
+    /// term's table, any other id by its block modulo the files. The file
+    /// is one today, so every id names it.
     fn file_of(&self, lease: LeaseId) -> &File {
         let files = std::slice::from_ref(&self.file);
         let named = self.blocks.file_of(lease, files.len());
