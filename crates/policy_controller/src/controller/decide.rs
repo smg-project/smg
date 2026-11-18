@@ -32,7 +32,9 @@
 //! A decision leaves under the fence (design 5.3): it waits in its
 //! stream's queue for as long as the gateway reads nothing, so the stream
 //! reads the fence where it sends one. Past the term a decision was made
-//! under, `Busy` for the leader that is elsewhere leaves in its place.
+//! under, `Busy` for the leader that is elsewhere leaves in its place. A
+//! decision waits in the queue as it was made ([`wire::Decided`]), and its
+//! frame is built at the send, on the thread that encodes it.
 //!
 //! The reader is the stream itself and never waits for a decision: a frame
 //! is stamped with its receipt, checked ([`Checked`]) and handed to its
@@ -83,7 +85,7 @@ use super::{
     wire::{self, Checked, Refusal},
 };
 use crate::{
-    proto::{self, busy::Reason, decide_answer::Answer},
+    proto::{self, busy::Reason},
     store::GatewayId,
 };
 
@@ -174,8 +176,8 @@ pub(crate) struct Answers<S = Streaming<proto::DecideRequest>> {
     inbound: Option<S>,
     /// The deciders' answers, and the handle each request carries to its
     /// decider.
-    decided: mpsc::Receiver<proto::DecideAnswer>,
-    sender: mpsc::Sender<proto::DecideAnswer>,
+    decided: mpsc::Receiver<wire::Decided>,
+    sender: mpsc::Sender<wire::Decided>,
     /// The term the stream's place in the presence table was asked under;
     /// `None` while it asked nothing, opened where the replica did not
     /// lead.
@@ -289,19 +291,21 @@ impl<S> Answers<S> {
     /// A decider's answer as it is sent: a decision leaves under the fence
     /// (design 5.3). It waited in the stream's queue for as long as its
     /// gateway read nothing, so the fence is read here, after the
-    /// decider's reads. Past the term it was made under, `Busy` leaves in
-    /// its place, as it does from a decider whose second read finds the
-    /// fence moved. Nothing is recorded for a decision yet, so nothing is
-    /// taken back.
-    fn fenced(&self, answer: proto::DecideAnswer) -> proto::DecideAnswer {
-        if !matches!(answer.answer, Some(Answer::Decision(_))) {
-            return answer;
-        }
+    /// decider's reads, and its frame is built here, on the thread that
+    /// encodes it. Past the term it was made under, `Busy` leaves in its
+    /// place, as it does from a decider whose second read finds the fence
+    /// moved, and the lease filed for it stands until its dispatch
+    /// deadline.
+    fn fenced(&self, decided: wire::Decided) -> proto::DecideAnswer {
         let deciders = &self.shared.deciders;
-        if self.shared.fence.leader_term(deciders.now()) == Some(answer.term) {
-            return answer;
+        match decided {
+            wire::Decided::Decision { id, term, .. }
+                if self.shared.fence.leader_term(deciders.now()) != Some(term) =>
+            {
+                deciders.busy(id, Reason::NotLeader)
+            }
+            sent => sent.frame(),
         }
-        deciders.busy(answer.request_id, Reason::NotLeader)
     }
 
     /// One frame of the gateway: handed to its model's decider, or answered
@@ -423,9 +427,9 @@ where
         // own, and its budget runs: it leaves first. The reader's answer
         // waits, and no further frame is read while it does, so a run of
         // requests answered here never holds a decision back.
-        if let Poll::Ready(Some(answer)) = this.decided.poll_recv(cx) {
+        if let Poll::Ready(Some(decided)) = this.decided.poll_recv(cx) {
             this.deciding -= 1;
-            let answer = this.fenced(answer);
+            let answer = this.fenced(decided);
             return this.leave(answer, true);
         }
         if let Some((answer, spent)) = this.own.take() {

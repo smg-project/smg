@@ -48,7 +48,7 @@
 //! on the pick's first target, with the time its gateway has to name the
 //! dispatch. A shed and a queue ticket carry none.
 
-use std::{mem, ops::Deref, time::Duration};
+use std::{mem, time::Duration};
 
 use crate::{
     decision::{Decision, Lifted, ShedReason, Target, Trace},
@@ -389,8 +389,7 @@ fn narrowed(count: u32) -> u16 {
 }
 
 /// A pick's lease as its decider hands it over: the lease the store filed
-/// and what its decision left of the lease's dispatch span. It reads as
-/// the lease.
+/// and what its decision left of the lease's dispatch span.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Leased {
     /// The lease as the store filed it.
@@ -399,11 +398,38 @@ pub(crate) struct Leased {
     pub(crate) left: Duration,
 }
 
-impl Deref for Leased {
-    type Target = Lease;
+/// A decider's answer as its stream's queue holds it. A decision waits as
+/// it was made, with the lease issued for its pick, and its frame is built
+/// where its stream sends it ([`Decided::frame`]): the lists a frame
+/// carries (a pick's targets, the trace's top, the lease) are made and
+/// freed on the thread that encodes them, and a deciding thread makes
+/// none.
+#[derive(Debug)]
+pub(crate) enum Decided {
+    /// A decision made under `term` for the request `id`, and the lease
+    /// its decider hands over with it.
+    Decision {
+        id: Vec<u8>,
+        term: u64,
+        decision: Decision,
+        lease: Option<Leased>,
+    },
+    /// An answer that carries no list: a `Busy`.
+    Frame(proto::DecideAnswer),
+}
 
-    fn deref(&self) -> &Lease {
-        &self.lease
+impl Decided {
+    /// The frame the wire carries.
+    pub(crate) fn frame(self) -> proto::DecideAnswer {
+        match self {
+            Self::Decision {
+                id,
+                term,
+                decision,
+                lease,
+            } => decided(id, term, &decision, lease.as_ref()),
+            Self::Frame(frame) => frame,
+        }
     }
 }
 
@@ -437,7 +463,8 @@ pub(super) fn millis(duration: Duration) -> u32 {
 /// that minted it, with what its decision left of the time its gateway has
 /// to name the dispatch. The decide call issues one kind of lease, a credit
 /// on a single request's target, so the kind and the side are those two.
-fn lease(lease: &Leased, term: u64) -> proto::Lease {
+fn lease(leased: &Leased, term: u64) -> proto::Lease {
+    let Leased { lease, left } = leased;
     proto::Lease {
         id: lease.id.0,
         kind: proto::LeaseKind::Credit.into(),
@@ -447,7 +474,7 @@ fn lease(lease: &Leased, term: u64) -> proto::Lease {
         session_key: lease.session.get(),
         tokens: lease.tokens,
         term,
-        dispatch_ttl_ms: millis(lease.left),
+        dispatch_ttl_ms: millis(*left),
         origin: proto::LeaseOrigin::Controller.into(),
     }
 }
