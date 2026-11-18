@@ -21,7 +21,7 @@ use std::{
     collections::BTreeMap,
     future::Future,
     io::{ErrorKind, Write as _},
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener},
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
@@ -1617,28 +1617,53 @@ const FOLLOWER: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2));
 /// hands such a bind from. Each draw of this process takes the next
 /// number, a leader's and another address's from ranges apart: a replica
 /// served alone on the standby's address takes no number a leader holds.
+/// A number is its pair's while the pair's leader lives. A standby that
+/// outlives its leader keeps it on its own address, so a pair's leader
+/// takes a number only where [`free`] finds no holder there.
 fn pair_ports(ip: IpAddr) -> impl Iterator<Item = u16> {
     const SPAN: usize = 4096;
     static NEXT: AtomicUsize = AtomicUsize::new(0);
     // Linux says where the range starts. A host that does not is taken to
-    // start it at 32,768, Linux's own default.
+    // start it at 32,768, Linux's own default, and so is one that starts
+    // it at or under 12,288: its draws then lie inside its own range,
+    // where a bind of port `0` can be handed one.
     let low = std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range")
         .ok()
         .and_then(|range| range.split_whitespace().next()?.parse::<usize>().ok())
         .filter(|low| *low > 3 * SPAN)
         .unwrap_or(32_768);
     let base = low - if ip == LEADER { 2 * SPAN } else { SPAN };
-    let start = usize::try_from(std::process::id()).unwrap_or(0);
+    // Processes started together have ids side by side. Each starts at a
+    // place its id spreads over the span, so their runs seldom meet.
+    let spread = std::process::id().wrapping_mul(0x9E37_79B1) >> 20;
+    let start = usize::try_from(spread).unwrap_or(0);
     (0..SPAN).map(move |_| {
         let drawn = start.wrapping_add(NEXT.fetch_add(1, Ordering::Relaxed)) % SPAN;
         u16::try_from(base + drawn).expect("a port below the host's range")
     })
 }
 
+/// Whether nothing holds `port` on `ip`. A pair's leader asks it of the
+/// standby's address once it has bound the number itself. No other pair's
+/// standby binds a number this leader holds, so the look disturbs no pair
+/// and finds one holder alone: a standby that outlived its leader. A bind
+/// refused for another reason fails the case, as the draw's own does.
+fn free(ip: IpAddr, port: u16) -> bool {
+    match TcpListener::bind((ip, port)) {
+        // In use on that address: a holder.
+        Err(error) if error.kind() == ErrorKind::AddrInUse => false,
+        bound => {
+            drop(bound.expect("the look's bind"));
+            true
+        }
+    }
+}
+
 impl Replica {
     /// Binds a replica of the lease at `place` on `ip`, its replication
     /// listener at `port`, and serves it. `0` takes a number of the pairs'
-    /// own ([`pair_ports`]), the next one free on `ip`: the number a
+    /// own ([`pair_ports`]), the next one free on `ip` and, for a pair's
+    /// leader, on its standby's address too ([`free`]): the number a
     /// standby of this replica then binds on its own address.
     async fn serve(id: &str, ip: IpAddr, port: u16, place: LeasePlace) -> Self {
         let listener = |name: &str, scopes: &[Scope], port| Listener {
@@ -1671,6 +1696,10 @@ impl Replica {
                 match Controller::bind(config(drawn)).await {
                     // In use on this address: the next number.
                     Err(Error::Bind { source, .. }) if source.kind() == ErrorKind::AddrInUse => {}
+                    // Held on the standby's address by a standby that
+                    // outlived its leader: the next number, and this bind
+                    // is let go.
+                    Ok(_) if ip == LEADER && !free(FOLLOWER, drawn) => {}
                     other => {
                         bound = Some(other.expect("bind"));
                         break;
