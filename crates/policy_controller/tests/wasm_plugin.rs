@@ -1025,10 +1025,10 @@ impl tracing::Subscriber for Said {
                 .position(|named| fields.0.contains(named.as_str()))
                 .map(|at| asked.swap_remove(at))
         };
-        assert!(
-            panics.is_none(),
-            "the host panics inside a guest's log line"
-        );
+        if panics.is_some() {
+            // A panic with a payload of the case's own; the hook stays quiet.
+            std::panic::resume_unwind(Box::new("the host panics inside a guest's log line"));
+        }
         let nap = HOLDS
             .lock()
             .expect("the holds")
@@ -3797,45 +3797,36 @@ fn a_plugins_close_that_stops_half_way_leaves_its_scope_closed() {
     }
 }
 
-/// A thread under no name holds no instance but its own, where it takes the
-/// working place of a thread that exited with a named decider's state lent.
-/// The first thread, as decider 1, makes a decision whose close the host
-/// stops half-way, by a panic inside the destructor's log line: the close
-/// does not reach the give-back, and the thread exits with the decider's
-/// instance in its place. The thread that takes the place reads the mark
-/// the first left there: under no name it is not warm, and decider 1's
-/// state is at its rest again for the thread that next acts as decider 1.
+/// How many pairs of threads a case of a taken place makes for one pair to
+/// share a place.
+const PLACES: u32 = 64;
+
+/// A plugin one of whose working places a thread left lent to decider 1 at
+/// its exit, with the engine that decides on it. The thread made a decision
+/// as decider 1 whose close the host stopped half-way, by a panic inside
+/// the destructor's log line: the close did not reach the give-back, and
+/// the thread exited with the decider's instance in its place.
 ///
-/// `thread_local` hands a new thread the lowest id that is free. The second
-/// thread starts once the first's id is: a thread-local of the case's own,
-/// first used ahead of that crate's, goes behind it at the thread's end and
-/// says so. The suite's other threads take and free ids all the while, and
-/// that crate keys every map of its kind by the one id, so an entry of the
-/// case's own says whether the second thread stands in the first's place.
-/// A pair that shared none is made again, [`PLACES`] pairs at most, and the
-/// case asserts that one pair did.
-#[test]
-fn a_thread_under_no_name_gives_back_the_state_its_place_was_left_with() {
-    /// How many pairs of threads the case makes for one to share a place.
-    const PLACES: u32 = 64;
-    /// Says at its thread's end that the thread's id is free again.
-    struct SaysItsIdIsFree(mpsc::Sender<()>);
-    impl Drop for SaysItsIdIsFree {
-        fn drop(&mut self) {
-            let _ = self.0.send(());
-        }
-    }
-    thread_local! {
-        static AT_END: std::cell::RefCell<Option<SaysItsIdIsFree>> =
-            const { std::cell::RefCell::new(None) };
-    }
-    // One pair: whether the second thread stood in the first's place, and
-    // whether it was warm there under no name, then as decider 1.
-    let pair = || {
-        let runtime = runtime();
+/// `thread_local` hands a new thread the lowest id that is free, and the
+/// first thread's is free at its join, which returns behind the thread's
+/// destructors, that crate's among them. The suite's other threads take and
+/// free ids all the while, and that crate keys every map of its kind by the
+/// one id, so an entry of the case's own says whether a later thread stands
+/// in the first's place. A pair that shared none is made again, [`PLACES`]
+/// pairs at most, and a case asserts that one pair did. The calling thread
+/// takes its id ahead of the first thread: its place is its own.
+struct LeftLent {
+    plugin: Arc<Plugin>,
+    engine: Engine,
+    candidates: Vec<Candidate>,
+    place: thread_local::ThreadLocal<std::cell::Cell<bool>>,
+}
+
+impl LeftLent {
+    fn by_a_thread_that_exited(name: &str) -> Self {
         let plugin = loaded(
-            &runtime,
-            spec("left-lent", guest::record_guest(), mode::LOG_IN_DESTRUCTOR),
+            &runtime(),
+            spec(name, guest::record_guest(), mode::LOG_IN_DESTRUCTOR),
         );
         let engine = single_engine(Profile {
             name: "one-stage".into(),
@@ -3846,41 +3837,106 @@ fn a_thread_under_no_name_gives_back_the_state_its_place_was_left_with() {
             }],
             picker: Box::new(Best),
         });
-        let candidates = pool(3);
-        let place = thread_local::ThreadLocal::<std::cell::Cell<bool>>::new();
-        panic_in_a_line_of("left-lent");
-        let (free, freed) = mpsc::channel();
+        let left = Self {
+            plugin,
+            engine,
+            candidates: pool(3),
+            place: thread_local::ThreadLocal::new(),
+        };
+        left.place.get_or_default().set(false);
+        panic_in_a_line_of(name);
         let ended = std::thread::scope(|scope| {
             scope
                 .spawn(|| {
-                    AT_END.with(|at_end| *at_end.borrow_mut() = Some(SaysItsIdIsFree(free)));
-                    place.get_or_default().set(true);
+                    left.place.get_or_default().set(true);
                     let _turn = Decider::new(1).enter();
-                    decide(&engine, &candidates, 1)
+                    decide(&left.engine, &left.candidates, 1)
                 })
                 .join()
         });
         assert!(ended.is_err(), "the first thread's close panicked");
-        freed
-            .recv()
-            .expect("the first thread's end says its id is free");
+        left
+    }
+
+    /// Whether a new thread stood in the first thread's place, and what
+    /// `act` said there.
+    fn taken<T: Send>(&self, act: impl FnOnce(&Plugin) -> T + Send) -> (bool, T) {
         std::thread::scope(|scope| {
             scope
-                .spawn(|| {
-                    let shared = place.get_or_default().get();
-                    let own = plugin.is_warm();
-                    let _turn = Decider::new(1).enter();
-                    (shared, own, plugin.is_warm())
-                })
+                .spawn(|| (self.place.get_or_default().get(), act(&self.plugin)))
                 .join()
                 .expect("the second thread")
         })
+    }
+}
+
+/// A thread under no name holds no instance but its own, where it takes the
+/// working place of a thread that exited with a named decider's state lent
+/// ([`LeftLent`]). The thread that takes the place reads the mark the first
+/// left there: under no name it is not warm, and decider 1's state is at
+/// its rest again for the thread that next acts as decider 1.
+#[test]
+fn a_thread_under_no_name_gives_back_the_state_its_place_was_left_with() {
+    // One pair: whether the second thread stood in the first's place, and
+    // whether it was warm there under no name, then as decider 1.
+    let pair = || {
+        LeftLent::by_a_thread_that_exited("left-lent").taken(|plugin| {
+            let own = plugin.is_warm();
+            let _turn = Decider::new(1).enter();
+            (own, plugin.is_warm())
+        })
+    };
+    let shared = (0..PLACES).map(|_| pair()).find(|(shared, _)| *shared);
+    assert_eq!(
+        shared,
+        Some((true, (false, true))),
+        "a second thread stood in the first's place: under no name it held no instance there, and decider 1's state was at its rest behind it"
+    );
+}
+
+/// A state that comes back late does not replace the one that rests. The
+/// first thread exits with decider 1's instance in its place ([`LeftLent`]).
+/// Decider 1 then takes its turns on the case's own thread: its rest is
+/// empty, so its first decision makes an instance. One member is then told,
+/// and its second decision hears the list as it stands. The thread that
+/// takes the first thread's place gives back what it finds there, late. The
+/// rest keeps the instance of the later turns: it is level with the feed,
+/// and decider 1's third decision hears nothing. The instance the first
+/// thread left never heard the feed: put over the newer one, it would hear
+/// the list there.
+#[test]
+fn a_state_given_back_late_does_not_replace_the_one_at_rest() {
+    // One pair: whether the second thread stood in the first's place and
+    // was warm there under no name, the `observe` calls of decider 1's three
+    // decisions on this thread, and the instances made.
+    let pair = || {
+        let left = LeftLent::by_a_thread_that_exited("came-late");
+        let heard = || {
+            let before = left.plugin.stats().observed;
+            let _turn = Decider::new(1).enter();
+            assert!(
+                matches!(decide(&left.engine, &left.candidates, 1), Decision::Pick(_)),
+                "decider 1 decides on this thread"
+            );
+            left.plugin.stats().observed - before
+        };
+        let anew = heard();
+        left.engine
+            .on_membership(&smg_policy_controller::Membership::Added(WorkerId(102)));
+        let behind = heard();
+        let (shared, own) = left.taken(Plugin::is_warm);
+        (
+            shared,
+            own,
+            [anew, behind, heard()],
+            left.plugin.stats().instantiations,
+        )
     };
     let shared = (0..PLACES).map(|_| pair()).find(|(shared, ..)| *shared);
     assert_eq!(
         shared,
-        Some((true, false, true)),
-        "a second thread stood in the first's place: under no name it held no instance there, and decider 1's state was at its rest behind it"
+        Some((true, false, [0, 1, 0], 2)),
+        "decider 1's later instance heard the list once and nothing behind the late give-back: it rests"
     );
 }
 

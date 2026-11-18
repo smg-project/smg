@@ -786,6 +786,9 @@ impl Feed {
 struct Rest {
     instance: Option<Instance>,
     ring: ThreadRing,
+    /// The working place of the state's last bring, by its address, zero
+    /// before the first: a give-back from any other place comes late.
+    at: usize,
 }
 
 impl Rest {
@@ -793,6 +796,7 @@ impl Rest {
         Box::new(Self {
             instance: None,
             ring: ThreadRing::new(),
+            at: 0,
         })
     }
 }
@@ -800,15 +804,16 @@ impl Rest {
 /// One named decider's place of rest: empty until the decider first acts.
 type Resting = Mutex<Option<Box<Rest>>>;
 
-/// What a thread is to a plugin, beside what stands in its working slots.
+/// What a thread is to a plugin, beside what stands in its working place.
 #[derive(Clone, Copy, Default)]
 struct Standing {
     /// An instance came to stand in the thread's slot under no name (the
     /// thread decided, warmed or took the apply's own): it is a decider of
     /// its own, and what it tells reaches its instance.
     own: bool,
-    /// The named decider whose kept state stands in the thread's working
-    /// slots, from the time it is brought to the time it is given back.
+    /// The named decider whose kept state the thread holds, its instance in
+    /// the working place, from the time it is brought to the time it is
+    /// given back.
     lent: Option<Decider>,
 }
 
@@ -837,9 +842,8 @@ struct Spare {
     by: ThreadId,
 }
 
-/// A named decider's kept state in a thread's working slots for the span of
-/// one call outside a decision: given back at the drop, where this hold
-/// brought it.
+/// A named decider's kept state on a thread for the span of one call
+/// outside a decision: given back at the drop, where this hold brought it.
 struct Lent<'a> {
     plugin: &'a Plugin,
     /// The thread's working place: the call reads its slot here.
@@ -882,8 +886,10 @@ pub struct Plugin {
     /// one left: an instance is `Send`, one live thread holds an id at a
     /// time, and the adopter keeps it warm. What the thread is to the plugin
     /// stands in the same place: an adopter reads a state the dead thread
-    /// left lent there, and gives it back before it acts.
-    instances: ThreadLocal<Working>,
+    /// left lent there, and gives it back before it acts under another name
+    /// or under none. Under that decider's own name it holds the state as
+    /// its own, in the decision the dead thread left open.
+    places: ThreadLocal<Working>,
     /// Where a named decider's kept state rests between its decisions, one
     /// place a name ([`Decider`]), made at the first named use. A place's
     /// lock is taken where a decision brings the state and where it gives it
@@ -1035,7 +1041,7 @@ impl Plugin {
             counters: Counters::new(spec.metrics),
             breaker: Breaker::new(spec.breaker),
             tally: Tally::default(),
-            instances: ThreadLocal::new(),
+            places: ThreadLocal::new(),
             rests: OnceLock::new(),
             aside: ThreadLocal::new(),
             spare: Spare {
@@ -1209,7 +1215,7 @@ impl Plugin {
 
     /// This thread's working place.
     fn working(&self) -> &Working {
-        self.instances.get_or_default()
+        self.places.get_or_default()
     }
 
     fn slot(&self) -> &RefCell<Option<Instance>> {
@@ -1270,15 +1276,16 @@ impl Plugin {
         &rests[usize::from(decider.number())]
     }
 
-    /// Brings the kept state of the decider the calling thread acts as into
-    /// the thread's working place, where the thread names one and does not
-    /// hold it already, and says whether it did. A decision's first open
-    /// brings it and the plugin's last close of the decision gives it back;
-    /// a told event holds it for its one call. What the place never gave
-    /// back (a close that did not return, on this thread or on one that
-    /// exited and left it the place) goes back first, under another name or
-    /// under none: a thread decides on no instance but the one of the
-    /// decider it acts as.
+    /// Brings the kept state of the decider the calling thread acts as to
+    /// the thread, its instance into the working place, where the thread
+    /// names one and does not hold it already, and says whether it did. The
+    /// decider's rest then names this place as that of its last bring. A
+    /// decision's first open brings it and the plugin's last close of
+    /// the decision gives it back; a told event holds it for its one call.
+    /// What the place never gave back (a close that did not return, on this
+    /// thread or on one that exited and left it the place) goes back first,
+    /// under another name or under none: a thread decides on no instance
+    /// but the one of the decider it acts as.
     fn lend(&self, working: &Working) -> bool {
         let mut now = working.standing.get();
         let Some(decider) = Decider::acting() else {
@@ -1305,6 +1312,7 @@ impl Plugin {
         }
         *slot = rest.instance.take();
         std::mem::swap(&mut rest.ring, &mut *self.ring().borrow_mut());
+        rest.at = std::ptr::from_ref(working).addr();
         now.lent = Some(decider);
         working.standing.set(now);
         true
@@ -1322,24 +1330,33 @@ impl Plugin {
 
     /// [`Plugin::rest`] where the calling thread has a working place.
     fn rest_here(&self) {
-        if let Some(working) = self.instances.get() {
+        if let Some(working) = self.places.get() {
             self.rest(working);
         }
     }
 
-    /// The working place's instance and ring go to `decider`'s rest, and the
-    /// thread's own come back. An instance already resting there was made by
-    /// a second thread acting as the decider at the same time, against the
-    /// turn's rule: it is dropped here.
+    /// The instance in the working place and the ring the thread holds go to
+    /// `decider`'s rest, and the thread's own come back, where the rest
+    /// names this place as that of its last bring. Where it names another,
+    /// the state comes back late: the decider was brought to another place
+    /// since. That is inside the turn's rule after a close that did not
+    /// return left the state here, and against it where a second thread
+    /// acts as the decider at the same time. What rests stays, and what the
+    /// later bring holds is not touched: the late instance is dropped, and
+    /// the ring the thread holds, which was that state's, stays the
+    /// thread's.
     fn give_back(&self, working: &Working, decider: Decider) {
         let mut rest = self.rest_of(decider).lock();
         let rest = rest.get_or_insert_with(Rest::new);
         let mut slot = working.slot.borrow_mut();
-        rest.instance = slot.take();
+        let back = slot.take();
         if let Some(aside) = self.aside.get() {
             *slot = aside.borrow_mut().take();
         }
-        std::mem::swap(&mut rest.ring, &mut *self.ring().borrow_mut());
+        if rest.at == std::ptr::from_ref(working).addr() {
+            rest.instance = back;
+            std::mem::swap(&mut rest.ring, &mut *self.ring().borrow_mut());
+        }
     }
 
     /// The acting decider's kept state in this thread's working place until
@@ -1365,7 +1382,7 @@ impl Plugin {
     /// for it would hear what no decision reads. Such an event is dropped
     /// and counted, and the plugin's first writes its one warning.
     fn telling(&self) -> Option<Lent<'_>> {
-        let working = self.instances.get();
+        let working = self.places.get();
         if Decider::acting().is_none()
             && !working.is_some_and(|working| working.standing.get().own)
             && !self.spare_is_mine()
