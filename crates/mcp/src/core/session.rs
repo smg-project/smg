@@ -479,9 +479,12 @@ impl<'a> McpToolSession<'a> {
     /// The tools a binding lists: its server's visible tools narrowed to the
     /// binding's own allowlist (a server bound under several labels lists
     /// each label's own set; the model sees their union). Of a URL bound more
-    /// than once a label lists the tools that came from its own connection,
-    /// and none when its own listing failed.
+    /// than once a label lists the tools that came from its own connection.
+    /// A binding whose own listing failed lists none.
     pub fn list_tools_for_binding(&self, binding: &McpServerBinding) -> Vec<ToolEntry> {
+        if binding.list_error.is_some() {
+            return Vec::new();
+        }
         let allowed = binding.allowed_tools.as_deref().map(Self::allowlist);
         self.list_tools_for_server(&binding.server_key)
             .into_iter()
@@ -493,10 +496,7 @@ impl<'a> McpToolSession<'a> {
             .filter(|entry| {
                 self.tool_owners
                     .get(&entry.qualified_name)
-                    .is_none_or(|&place| {
-                        binding.list_error.is_none()
-                            && self.all_mcp_servers[place].pool_key == binding.pool_key
-                    })
+                    .is_none_or(|&place| self.all_mcp_servers[place].pool_key == binding.pool_key)
             })
             .collect()
     }
@@ -681,6 +681,10 @@ impl<'a> McpToolSession<'a> {
         let mut visible_tools = Vec::new();
         let mut owners = HashMap::new();
         for (place, binding) in mcp_servers.iter().enumerate() {
+            // A binding whose own listing failed lists no tools.
+            if binding.list_error.is_some() {
+                continue;
+            }
             let listed = if let Some(key) = &binding.pool_key {
                 orchestrator.listed_tools(key)
             } else if mcp_servers
@@ -692,7 +696,12 @@ impl<'a> McpToolSession<'a> {
                 // tools as a binding of the URL lists its connection's.
                 orchestrator.list_tools_for_servers(&server_keys[place..=place])
             } else {
-                if !server_keys[..place].contains(&binding.server_key) {
+                // A configured server lists its tools once, for the first of
+                // its bindings whose listing succeeded.
+                let listed_before = mcp_servers[..place]
+                    .iter()
+                    .any(|b| b.list_error.is_none() && b.server_key == binding.server_key);
+                if !listed_before {
                     for direct_entry in
                         orchestrator.list_tools_for_servers(&server_keys[place..=place])
                     {
@@ -704,10 +713,6 @@ impl<'a> McpToolSession<'a> {
                 }
                 continue;
             };
-            // A binding whose own listing failed lists no tools.
-            if binding.list_error.is_some() {
-                continue;
-            }
             let shared = server_keys
                 .iter()
                 .filter(|other| **other == binding.server_key)
@@ -747,12 +752,15 @@ impl<'a> McpToolSession<'a> {
         }
 
         // An alias whose target is not listed: offered for a configured
-        // server, not for a bound one.
+        // server whose listing succeeded, not for a bound one.
         for (target, mut alias_entries) in aliases_by_target {
             let bound = mcp_servers
                 .iter()
                 .any(|b| b.pool_key.is_some() && b.server_key == target.server_key());
-            if !bound {
+            let listed = mcp_servers
+                .iter()
+                .any(|b| b.list_error.is_none() && b.server_key == target.server_key());
+            if !bound && listed {
                 visible_tools.append(&mut alias_entries);
             }
         }

@@ -2581,6 +2581,165 @@ mod tests {
         );
     }
 
+    /// A binding of a configured server whose own listing failed lists no
+    /// tools and the session offers none; a binding of the same server whose
+    /// listing succeeded lists the server's tools.
+    #[tokio::test]
+    async fn a_configured_binding_whose_own_listing_failed_lists_no_tool() {
+        let url = serve_local_mcp_server(LocalServer {
+            tools: Some(&["echo"]),
+            ..Default::default()
+        })
+        .await;
+        let orchestrator = orchestrator_connected_to(url).await;
+        let binding = |label: &str, list_error: Option<&str>| McpServerBinding {
+            label: label.to_string(),
+            server_key: "conf".to_string(),
+            pool_key: None,
+            allowed_tools: None,
+            list_error: list_error.map(str::to_string),
+        };
+        let refused = binding("refused", Some("the listing was refused"));
+        let listed = binding("listed", None);
+        let tools_of = |session: &McpToolSession<'_>, binding: &McpServerBinding| -> Vec<String> {
+            session
+                .list_tools_for_binding(binding)
+                .iter()
+                .map(|entry| entry.tool_name().to_string())
+                .collect()
+        };
+        for alias in [false, true] {
+            if alias {
+                orchestrator
+                    .register_alias("lookup", "conf", "echo", None)
+                    .expect("the alias registers");
+            }
+            let tool = if alias { "lookup" } else { "echo" };
+            let session = McpToolSession::new(&orchestrator, vec![refused.clone()], "test-request");
+            assert!(
+                tools_of(&session, &refused).is_empty() && !session.has_exposed_tool(tool),
+                "the binding whose listing failed lists no tool and the session offers none"
+            );
+            let session = McpToolSession::new(
+                &orchestrator,
+                vec![refused.clone(), listed.clone()],
+                "test-request",
+            );
+            assert!(
+                tools_of(&session, &refused).is_empty(),
+                "beside a binding that listed, the binding whose listing failed still lists no tool"
+            );
+            assert_eq!(
+                tools_of(&session, &listed),
+                [tool],
+                "the binding whose listing succeeded lists the server's tool"
+            );
+        }
+    }
+
+    /// Of a configured server and a URL of one name, the binding whose own
+    /// listing failed lists no tools and the other lists its own server's.
+    #[tokio::test]
+    async fn under_one_name_the_binding_whose_own_listing_failed_lists_no_tool() {
+        let named_at = serve_local_mcp_server(LocalServer {
+            tools: Some(&["own"]),
+            ..Default::default()
+        })
+        .await;
+        let url = serve_local_mcp_server(LocalServer {
+            tools: Some(&["other"]),
+            ..Default::default()
+        })
+        .await;
+        let mut config = config_holding(&url, named_at);
+        let orchestrator = Arc::new(McpOrchestrator::new(McpConfig::default()).await.unwrap());
+        orchestrator
+            .connect_static_server(&config.servers.remove(0))
+            .await
+            .expect("the server connects");
+        let inputs = [
+            McpServerInput {
+                label: url.clone(),
+                url: None,
+                authorization: None,
+                headers: HashMap::new(),
+                allowed_tools: None,
+            },
+            McpServerInput {
+                label: "by-url".to_string(),
+                url: Some(url.clone()),
+                authorization: Some("one-token".to_string()),
+                headers: HashMap::new(),
+                allowed_tools: None,
+            },
+        ];
+        let bound = connect_mcp_servers(&orchestrator, &FormatRegistry::new(), &inputs).await;
+        for (failed, its_tool, the_others) in [(0, "own", "other"), (1, "other", "own")] {
+            let mut bindings = bound.clone();
+            bindings[failed].list_error = Some("the listing was refused".to_string());
+            let session = McpToolSession::new(&orchestrator, bindings.clone(), "test-request");
+            let listed: Vec<Vec<String>> = bindings
+                .iter()
+                .map(|binding| {
+                    session
+                        .list_tools_for_binding(binding)
+                        .iter()
+                        .map(|entry| entry.tool_name().to_string())
+                        .collect()
+                })
+                .collect();
+            assert!(
+                listed[failed].is_empty() && !session.has_exposed_tool(its_tool),
+                "the binding whose listing failed lists no tool and the session offers none"
+            );
+            assert_eq!(
+                listed[1 - failed],
+                [the_others],
+                "the other binding lists its own server's tool"
+            );
+        }
+    }
+
+    /// The binding of a built-in tool's configured server whose own listing
+    /// failed lists no tools: the built-in tool is not offered.
+    #[tokio::test]
+    async fn a_built_in_tools_server_whose_own_listing_failed_offers_no_tool() {
+        let named_at = serve_local_mcp_server(LocalServer {
+            tools: Some(&["search"]),
+            ..Default::default()
+        })
+        .await;
+        let mut config = config_holding("routed", named_at);
+        let mut server = config.servers.remove(0);
+        server.builtin_type = Some(BuiltinToolType::WebSearchPreview);
+        server.builtin_tool_name = Some("search".to_string());
+        let orchestrator = Arc::new(McpOrchestrator::new(McpConfig::default()).await.unwrap());
+        orchestrator
+            .connect_static_server(&server)
+            .await
+            .expect("the server connects");
+        let mut bindings = ensure_mcp_servers(
+            &orchestrator,
+            &FormatRegistry::new(),
+            &[],
+            &[BuiltinToolType::WebSearchPreview],
+        )
+        .await
+        .expect("the built-in tool binds its server");
+        assert!(
+            McpToolSession::new(&orchestrator, bindings.clone(), "test-request")
+                .is_builtin_tool("search"),
+            "the built-in tool is offered while its server's listing stands"
+        );
+        bindings[0].list_error = Some("the listing was refused".to_string());
+        let session = McpToolSession::new(&orchestrator, bindings.clone(), "test-request");
+        assert!(
+            session.list_tools_for_binding(&bindings[0]).is_empty()
+                && !session.has_exposed_tool("search"),
+            "the binding whose listing failed lists no tool and the built-in tool is not offered"
+        );
+    }
+
     /// A configured server named by a URL keeps its tools when a request's
     /// connection to that URL leaves the pool. The pool has room for one
     /// connection: a connect to a second URL takes the place of the first,
