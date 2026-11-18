@@ -473,6 +473,20 @@ impl MemoryStore {
             && self.loads.try_lock().is_some()
     }
 
+    /// Whether the membership lock is free at this instant, tried: a stage
+    /// told a membership write finds it held.
+    #[cfg(all(test, feature = "controller"))]
+    pub(crate) fn workers_lock_free(&self) -> bool {
+        self.workers.try_lock().is_some()
+    }
+
+    /// Whether the load lock is free at this instant, tried: a stage told a
+    /// membership write finds it free.
+    #[cfg(all(test, feature = "controller"))]
+    pub(crate) fn load_lock_free(&self) -> bool {
+        self.loads.try_lock().is_some()
+    }
+
     /// The KV tables, for the index's cases.
     #[cfg(test)]
     pub(super) fn kv(&self) -> &KvTables {

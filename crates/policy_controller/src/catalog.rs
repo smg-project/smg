@@ -138,8 +138,9 @@ impl Catalog {
         }
     }
 
-    /// The catalog of a host that makes no lifecycle call: the validator
-    /// refuses a stage that needs them, by name, as not in this build.
+    /// The catalog of a host that makes some lifecycle calls only: the
+    /// validator refuses a stage that needs them, by name, as not in this
+    /// build.
     #[cfg(any(test, feature = "controller"))]
     pub(crate) fn without_lifecycle(mut self) -> Self {
         self.lifecycle = false;

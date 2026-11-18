@@ -2397,7 +2397,8 @@ fn check_profile(
             None
         }
     };
-    // A host that makes no lifecycle call holds no stage that needs them:
+    // A host that makes some lifecycle calls only holds no stage that needs
+    // them:
     // it would decide on state nothing keeps. Every entry of a complete
     // profile is built, so a scorer stands at its entry's place.
     if complete && !catalog.makes_lifecycle_calls() {
@@ -3105,7 +3106,7 @@ impl PolicySpec {
     /// is then refused by name as [`SpecError::NotInBuild`], and so is a
     /// stage that needs the lifecycle's calls
     /// ([`crate::Lifecycle::needs_lifecycle`]) under the standalone
-    /// controller, which makes none of them yet.
+    /// controller, which makes the membership call alone.
     pub fn validate_in(
         &self,
         catalog: &Catalog,

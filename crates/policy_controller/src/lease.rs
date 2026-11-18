@@ -181,6 +181,9 @@ pub trait Lifecycle: Send + Sync {
     /// The host gave the lease up before its completion.
     fn on_released(&self, _lease: &Lease, _reason: ReleaseReason) {}
 
+    /// The host's membership changed. A host may call this under its own
+    /// membership lock, as the policy store does, so a stage that calls
+    /// back into the host from here waits on itself.
     fn on_membership(&self, _change: &Membership<'_>) {}
 
     fn on_signal(&self, _signal: &Signal) {}
@@ -188,10 +191,11 @@ pub trait Lifecycle: Send + Sync {
     /// Whether the stage decides wrong under a host that makes none of
     /// these calls: `true` for one whose state the calls keep, as the
     /// workers it lists or the bookings it learns from. The standalone
-    /// controller makes none yet and refuses a document that names such a
-    /// stage as not in this build ([`crate::SpecError::NotInBuild`]); a
-    /// host that embeds the engine makes them. `false` by default: a stage
-    /// that takes a call to shed state early decides the same without it.
+    /// controller makes the membership call alone and refuses a document
+    /// that names such a stage as not in this build
+    /// ([`crate::SpecError::NotInBuild`]); a host that embeds the engine
+    /// makes them all. `false` by default: a stage that takes a call to
+    /// shed state early decides the same without it.
     fn needs_lifecycle(&self) -> bool {
         false
     }
