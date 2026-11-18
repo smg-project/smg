@@ -880,7 +880,9 @@ mod tests {
     /// tensor's write; a pair with one level the norm does not give keeps the
     /// float tensor. The grid holds pairs of both kinds in each dtype, and its
     /// mixed cases take one channel from a pair of the other kind: one channel
-    /// that misses a level keeps the float tensor too.
+    /// that misses a level keeps the float tensor too. A last case gives each
+    /// channel an offered pair of its own: the wire is the float tensor's
+    /// write through three different tables.
     #[test]
     fn the_wire_is_offered_exactly_where_its_norm_gives_every_level() {
         let image = DynamicImage::ImageRgb8(
@@ -891,7 +893,7 @@ mod tests {
             (EncoderDtype::Float16, f32_to_f16_bits),
         ] {
             let (mut offered, mut kept) = (0, 0);
-            let (mut offered_pair, mut kept_pair) = (None, None);
+            let (mut offered_pairs, mut kept_pair) = (Vec::new(), None);
             // Every level of every channel, narrowed, is its norm's.
             let agree = |params: &MoonVitParams| {
                 let reference = normalized_levels(&params.mean, &params.std);
@@ -924,7 +926,7 @@ mod tests {
                             "{dtype}, mean {mean}, std {std}"
                         );
                         offered += 1;
-                        offered_pair = Some((mean, std));
+                        offered_pairs.push((mean, std));
                     } else {
                         kept += 1;
                         kept_pair = Some((mean, std));
@@ -938,7 +940,7 @@ mod tests {
             // A mixed case: one channel from a pair the wire is not offered
             // for among two from a pair it is offered for, in each position.
             let (offered_pair, kept_pair) = (
-                offered_pair.expect("an offered pair"),
+                *offered_pairs.last().expect("an offered pair"),
                 kept_pair.expect("a kept pair"),
             );
             for odd in 0..3 {
@@ -956,6 +958,33 @@ mod tests {
                     "{dtype}: no wire with channel {odd} of mean {mean:?}, std {std:?}"
                 );
             }
+            // A mixed case of the other kind: three pairs the wire is offered
+            // for, one a channel. The wire is offered, and its bytes are the
+            // float tensor's write through three different tables.
+            let pairs = offered_pairs.len();
+            assert!(pairs >= 3, "{dtype}: {pairs} offered pairs");
+            let [a, b, c] = [
+                offered_pairs[0],
+                offered_pairs[pairs / 2],
+                offered_pairs[pairs - 1],
+            ];
+            let params = MoonVitParams {
+                mean: [a.0, b.0, c.0],
+                std: [a.1, b.1, c.1],
+                ..params_with_a_budget_of_three_patches()
+            };
+            assert!(agree(&params), "{dtype}: three offered channels");
+            let wire = preprocess_wire(params, &[&image], None, dtype)
+                .expect("offered with three tables")
+                .unwrap();
+            let floats = preprocess(params, &[&image], None).unwrap();
+            assert_eq!(
+                wire.encoder_input.write_as(dtype),
+                floats.encoder_input.write_as(dtype),
+                "{dtype}: mean {:?}, std {:?}",
+                params.mean,
+                params.std
+            );
         }
     }
 
