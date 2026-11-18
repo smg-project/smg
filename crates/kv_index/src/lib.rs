@@ -34,7 +34,7 @@ pub use block::{
     ContentHash, OverlapScores, SequenceHash, StoredBlock, WorkerId, WorkerIdExhausted, XXH3_SEED,
 };
 pub use chain_index::{BlockRef, ChainIndex, ChainIndexStats};
-pub use common::{MatchResult, TenantId};
+pub use common::{MatchResult, TenantId, CANCEL_CHECK_EVERY};
 pub use groups::{Cap, Group, GroupCap, GroupKind, GroupViews, GroupViewsRead, WorkerGroups};
 pub use lane_map::ChainBlockMap;
 pub use lane_pool::{
