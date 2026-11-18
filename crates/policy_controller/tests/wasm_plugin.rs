@@ -7908,3 +7908,213 @@ fn a_named_pair_decision_keeps_its_instance_to_the_plugins_last_close() {
         "the same calls, the two destructors of each pair among them, on one instance"
     );
 }
+
+/// The membership is fed to every instance of a plugin whose row lists it.
+/// A change is told once, on a thread that only tells, and makes no guest
+/// call there and no instance; each decider's instance hears it before its
+/// next decision, one call a change. An instance made after a telling hears
+/// the list as it stands first.
+#[test]
+fn a_membership_told_once_reaches_every_deciders_instance_before_it_decides() {
+    use smg_policy_controller::Membership;
+    let runtime = runtime();
+    let plugin = load(&runtime, "fed", guest::record_guest(), mode::COUNT_MEMBERS);
+    let engine = plugin_engine(&plugin);
+    // The guest's pick names the row at the count of members its instance
+    // heard: on a thread of its own, acting as the decider of that number.
+    let acting = |number: u8| {
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let _turn = Decider::new(number).enter();
+                    pick_ids(&decide(&engine, &pool(4), 1)).first().copied()
+                })
+                .join()
+                .expect("the acting thread")
+        })
+    };
+    // Told on a thread that names no decider and never decides.
+    let tell = |change: Membership<'_>| {
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| engine.on_membership(&change))
+                .join()
+                .expect("the telling thread");
+        });
+    };
+    assert_eq!(acting(0), Some(100), "no member told yet");
+    tell(Membership::Snapshot(&[WorkerId(100), WorkerId(101)]));
+    let told = plugin.stats();
+    assert_eq!(
+        (told.observed, told.instantiations, told.events_dropped),
+        (0, 1, 0),
+        "a telling calls no guest, makes no instance and drops nothing: {told:?}"
+    );
+    assert_eq!(acting(0), Some(102), "the first decider's instance heard");
+    assert_eq!(
+        acting(1),
+        Some(102),
+        "an instance made after the telling hears the list as it stands"
+    );
+    tell(Membership::Added(WorkerId(102)));
+    assert_eq!((acting(1), acting(0)), (Some(103), Some(103)));
+    tell(Membership::Removed(WorkerId(100)));
+    tell(Membership::Removed(WorkerId(101)));
+    assert_eq!((acting(0), acting(1)), (Some(101), Some(101)));
+    let stats = plugin.stats();
+    assert_eq!(
+        (stats.observed, stats.instantiations),
+        (8, 2),
+        "one call a decider a change, the snapshot among them: {stats:?}"
+    );
+}
+
+/// An instance new to the feed hears the membership as it stands, as one
+/// snapshot, whatever the host told: the first instance where only changes
+/// were told, an instance remade after a fault, which then counts what one
+/// that heard every change counts, and an instance made at the warm-up,
+/// which hears there and not at its first decision. A change told before a
+/// lease's event is heard before it.
+#[test]
+fn an_instance_made_anew_hears_the_membership_as_it_stands() {
+    use smg_policy_controller::Membership;
+    let runtime = runtime();
+    let plugin = load(&runtime, "anew", guest::record_guest(), mode::COUNT_MEMBERS);
+    let engine = plugin_engine(&plugin);
+    let pick = || pick_ids(&decide(&engine, &pool(4), 1)).first().copied();
+    // Five workers come, one change each, and no snapshot was ever told: an
+    // instance new to the feed still hears them as one snapshot.
+    for id in 100..105 {
+        engine.on_membership(&Membership::Added(WorkerId(id)));
+    }
+    // Five members over four rows: the guest's pick names no row, an answer
+    // outside the contract, and its instance is dropped.
+    let _ = pick();
+    let faulted = plugin.stats();
+    assert_eq!((faulted.invalid, faulted.observed), (1, 1), "{faulted:?}");
+    engine.on_membership(&Membership::Removed(WorkerId(104)));
+    engine.on_membership(&Membership::Removed(WorkerId(103)));
+    assert_eq!(pick(), Some(103), "three members stand");
+    let remade = plugin.stats();
+    assert_eq!(
+        remade.observed - faulted.observed,
+        1,
+        "one snapshot, not the two changes: {remade:?}"
+    );
+    let (at_the_warm_up, at_its_decision) = std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                plugin.warm().expect("it warms");
+                let warmed = plugin.stats().observed;
+                assert_eq!(pick(), Some(103), "the warmed instance counts three");
+                (warmed - remade.observed, plugin.stats().observed - warmed)
+            })
+            .join()
+            .expect("the warming thread")
+    });
+    assert_eq!((at_the_warm_up, at_its_decision), (1, 0));
+    // A change, then a lease's event with no decision between: the instance
+    // hears the change first, then the event.
+    let before = plugin.stats().observed;
+    engine.on_membership(&Membership::Removed(WorkerId(102)));
+    engine.on_dispatched(&Lease::default(), &Target::default(), Side::Single, 3);
+    assert_eq!(plugin.stats().observed - before, 2);
+    assert_eq!(pick(), Some(102), "two members stand");
+}
+
+/// The feed keeps its last 64 changes. An instance behind that many hears
+/// each, one call a change; one further behind, or behind a snapshot, hears
+/// the list as it stands, as one snapshot.
+#[test]
+fn an_instance_behind_more_than_the_feed_keeps_hears_one_snapshot() {
+    use smg_policy_controller::Membership;
+    let runtime = runtime();
+    let plugin = load(
+        &runtime,
+        "behind",
+        guest::record_guest(),
+        mode::COUNT_MEMBERS,
+    );
+    let engine = plugin_engine(&plugin);
+    // The row the guest picks, and the `observe` calls the decision's
+    // catch-up made.
+    let pick = || {
+        let before = plugin.stats().observed;
+        let row = pick_ids(&decide(&engine, &pool(4), 1)).first().copied();
+        (row, plugin.stats().observed - before)
+    };
+    let come_and_go = |times: u32| {
+        for _ in 0..times {
+            engine.on_membership(&Membership::Added(WorkerId(300)));
+            engine.on_membership(&Membership::Removed(WorkerId(300)));
+        }
+    };
+    engine.on_membership(&Membership::Snapshot(&[WorkerId(100)]));
+    assert_eq!(pick(), (Some(101), 1), "new to the feed: the snapshot");
+    come_and_go(32);
+    assert_eq!(pick(), (Some(101), 64), "sixty-four behind: each change");
+    come_and_go(32);
+    engine.on_membership(&Membership::Added(WorkerId(301)));
+    assert_eq!(pick(), (Some(102), 1), "sixty-five behind: one snapshot");
+    engine.on_membership(&Membership::Added(WorkerId(302)));
+    engine.on_membership(&Membership::Snapshot(&[WorkerId(100), WorkerId(101)]));
+    engine.on_membership(&Membership::Added(WorkerId(303)));
+    assert_eq!(
+        pick(),
+        (Some(103), 1),
+        "behind a snapshot: the list as it stands"
+    );
+    assert_eq!(pick(), (Some(103), 0), "level: no call");
+    // A replacement is folded into the list: an instance made after it
+    // counts what stands.
+    engine.on_membership(&Membership::Replaced {
+        old: WorkerId(303),
+        new: WorkerId(304),
+    });
+    engine.on_membership(&Membership::Removed(WorkerId(304)));
+    plugin.forget_instance();
+    assert_eq!(
+        pick(),
+        (Some(102), 1),
+        "the two that stand, as one snapshot"
+    );
+}
+
+/// A warm-up whose telling faults the instance leaves no mark for a decision:
+/// the next decision on that thread makes an instance at its open and is the
+/// plugin's own, not the fallback's.
+#[test]
+fn a_warm_up_whose_telling_faults_leaves_the_next_decision_the_plugins_own() {
+    use smg_policy_controller::Membership;
+    let runtime = runtime();
+    let plugin = load(
+        &runtime,
+        "cold-warm",
+        guest::record_guest(),
+        mode::TRAP_ON_FIVE_MEMBERS,
+    );
+    let engine = plugin_engine(&plugin);
+    let five: Vec<WorkerId> = (100..105).map(WorkerId).collect();
+    engine.on_membership(&Membership::Snapshot(&five));
+    // The warm-up tells the snapshot of five and this guest traps on it: the
+    // fault is the breaker's, and the slot is cold.
+    plugin.warm().expect("the warm-up's own work is done");
+    let warmed = plugin.stats();
+    assert_eq!((warmed.traps, warmed.observed), (1, 1), "{warmed:?}");
+    assert!(!plugin.is_warm(), "the faulted instance is gone");
+    // Three members go. The decision makes an instance at its open, which
+    // hears the two that stand, and its pick names the row at that count:
+    // neither the first row nor the least loaded.
+    for id in [104, 103, 102] {
+        engine.on_membership(&Membership::Removed(WorkerId(id)));
+    }
+    let picked = pick_ids(&decide(&engine, &pool(4), 1)).first().copied();
+    let decided = plugin.stats();
+    assert_eq!(picked, Some(102), "the plugin's own pick: {decided:?}");
+    assert_eq!(
+        decided.observed - warmed.observed,
+        1,
+        "the instance made at the open hears one snapshot: {decided:?}"
+    );
+    assert!(decided.answered > warmed.answered, "{decided:?}");
+}

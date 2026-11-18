@@ -5,6 +5,7 @@
 
 use std::{
     cell::{Cell, RefCell, RefMut},
+    collections::VecDeque,
     fmt,
     sync::{
         atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
@@ -23,7 +24,7 @@ use wasmtime::{
 
 use super::{
     bindings::{packed, record, wit, HostState, LogGate, Watch},
-    config::{Abi, EventSet, Exposure, Failure, FrameBudget, PluginSpec},
+    config::{Abi, EventKind, EventSet, Exposure, Failure, FrameBudget, PluginSpec},
     view::{self as marshal, Packed, Records, TooLong},
 };
 use crate::{
@@ -37,7 +38,7 @@ use crate::{
         Part,
     },
     spec::Needs,
-    view::{Candidate, Phase, PoolFacts, RequestFacts},
+    view::{Candidate, Phase, PoolFacts, RequestFacts, WorkerId},
     Draw,
 };
 
@@ -577,6 +578,12 @@ struct Instance {
     records: Records,
     packed: Packed,
     snapshot: Vec<u64>,
+    /// The place in its plugin's membership feed the instance heard up to;
+    /// zero: it is new to the feed.
+    heard: u64,
+    /// The feed's list, and its changes, as copied out for one telling.
+    members: Vec<WorkerId>,
+    changes: Vec<Membership<'static>>,
     /// The instance's number on its plugin: a resource is live on the store
     /// that made it and on no other.
     generation: u64,
@@ -670,10 +677,11 @@ pub struct Stats {
     pub fuel_used: u64,
     /// `observe` calls made.
     pub observed: u64,
-    /// Lifecycle events dropped: told on a thread that names no decider and
-    /// is none of its own (no instance of the plugin came to stand in its
-    /// slot), so no instance was theirs to reach and none was made. The
-    /// plugin's first writes its one warning.
+    /// A lease's events and signals dropped: told on a thread that names no
+    /// decider and is none of its own (no instance of the plugin came to
+    /// stand in its slot), so no instance was theirs to reach and none was
+    /// made. The plugin's first writes its one warning. A membership is fed
+    /// and never dropped.
     pub events_dropped: u64,
     /// Late calls the host held that answered or declined, by a reading: the
     /// wall clock put the call at or past its bound in whole ticks, and the
@@ -733,6 +741,44 @@ struct Tally {
 
 fn bump(counter: &AtomicU64) {
     counter.fetch_add(1, Ordering::Relaxed);
+}
+
+/// How many membership changes a plugin's feed keeps for the instances
+/// behind it. An instance further behind hears the list as it stands.
+const FEED_CHANGES: usize = 64;
+
+/// The membership feed of a plugin whose row lists the kind: the pool's one
+/// hand-over to every instance of the plugin. The host tells a change once,
+/// on whatever thread, and no guest call is made there ([`Plugin::hand`]);
+/// each instance hears what is past its own place before its decider's next
+/// decision or told event, one call a change ([`Plugin::catch_up`]).
+struct Feed {
+    /// The place of the last change told, zero before the first: what an
+    /// instance compares its own with, without the lock.
+    place: AtomicU64,
+    told: Mutex<Told>,
+}
+
+/// What the host told of the membership.
+struct Told {
+    /// The membership as it stands: the last snapshot told, with each change
+    /// since folded in.
+    members: Vec<WorkerId>,
+    /// The last changes told, the newest last, [`FEED_CHANGES`] at most. A
+    /// snapshot is `None`: the list above holds it.
+    changes: VecDeque<Option<Membership<'static>>>,
+}
+
+impl Feed {
+    fn new() -> Self {
+        Self {
+            place: AtomicU64::new(0),
+            told: Mutex::new(Told {
+                members: Vec::new(),
+                changes: VecDeque::with_capacity(FEED_CHANGES),
+            }),
+        }
+    }
 }
 
 /// What a named decider keeps of a plugin between its decisions: what
@@ -839,6 +885,8 @@ pub struct Plugin {
     spare: Spare,
     /// Whether the plugin's one warning of a dropped event is written.
     drop_said: AtomicBool,
+    /// The membership feed, for a plugin whose row lists the kind.
+    feed: Option<Feed>,
     /// Instances made so far, numbering each.
     generations: AtomicU64,
     /// Per thread: this decision emptied the slot (a dropped instance), so
@@ -979,6 +1027,10 @@ impl Plugin {
                 by: std::thread::current().id(),
             },
             drop_said: AtomicBool::new(false),
+            feed: spec
+                .observes
+                .contains(EventKind::Membership)
+                .then(Feed::new),
             generations: AtomicU64::new(0),
             emptied: ThreadLocal::new(),
             spent: ThreadLocal::new(),
@@ -1022,6 +1074,13 @@ impl Plugin {
             *slot.borrow_mut() = Some(instance);
             self.stand();
         }
+        // A plugin fed the membership hears it as it stands here, not at
+        // the decider's first decision. A telling that faults the instance
+        // leaves the slot cold: the fault is the breaker's, and the next
+        // decision makes an instance. The mark the fault set is cleared as
+        // a told event clears it: the warm-up is no decision's.
+        self.catch_up(&mut slot.borrow_mut());
+        self.emptied.get_or_default().set(false);
         Ok(())
     }
 
@@ -1336,6 +1395,9 @@ impl Plugin {
             records: Records::default(),
             packed: Packed::default(),
             snapshot: Vec::new(),
+            heard: 0,
+            members: Vec::new(),
+            changes: Vec::new(),
             generation: self.generations.fetch_add(1, Ordering::Relaxed) + 1,
         });
         (instance, used)
@@ -1734,6 +1796,111 @@ impl Plugin {
         before
     }
 
+    /// One membership change of the host, told on whatever thread: folded
+    /// into the feed's list and kept among its last changes. No guest call
+    /// is made here and no instance: each instance hears it before its
+    /// decider's next decision or told event ([`Plugin::catch_up`]).
+    fn hand(&self, change: &Membership<'_>) {
+        let Some(feed) = &self.feed else {
+            return;
+        };
+        let mut told = feed.told.lock();
+        let kept = match *change {
+            Membership::Snapshot(members) => {
+                told.members.clear();
+                told.members.extend_from_slice(members);
+                None
+            }
+            Membership::Added(worker) => {
+                if !told.members.contains(&worker) {
+                    told.members.push(worker);
+                }
+                Some(Membership::Added(worker))
+            }
+            Membership::Removed(worker) => {
+                told.members.retain(|member| *member != worker);
+                Some(Membership::Removed(worker))
+            }
+            Membership::Replaced { old, new } => {
+                if let Some(member) = told.members.iter_mut().find(|member| **member == old) {
+                    *member = new;
+                } else if !told.members.contains(&new) {
+                    told.members.push(new);
+                }
+                Some(Membership::Replaced { old, new })
+            }
+            Membership::Relabelled(worker) => Some(Membership::Relabelled(worker)),
+            Membership::Resized(worker) => Some(Membership::Resized(worker)),
+        };
+        if told.changes.len() == FEED_CHANGES {
+            told.changes.pop_front();
+        }
+        told.changes.push_back(kept);
+        // Under the lock: the changes a place names are the ones the lock
+        // shows whoever read that place.
+        feed.place.fetch_add(1, Ordering::Release);
+    }
+
+    /// Tells the instance in `slot` what the membership feed holds past the
+    /// instance's place, before its decider reads it: nothing where it is
+    /// level (one load and one compare); each change, in the host's order,
+    /// where the feed still keeps them all; the list as it stands, as one
+    /// snapshot, where the instance is new to the feed (made at the warm-up,
+    /// lazily or after a fault), further behind than the changes kept, or
+    /// behind a snapshot. So an instance hears each change once, or a
+    /// snapshot that holds it. A change that faults the instance ends the
+    /// telling: the instance made after it is new to the feed. Each call is
+    /// a told event's ([`Plugin::tell`]), also where a decision's open makes
+    /// it: a frame of its own, outside the decision's sums.
+    fn catch_up(&self, slot: &mut Option<Instance>) {
+        let (Some(feed), Some(instance)) = (&self.feed, slot.as_mut()) else {
+            return;
+        };
+        if instance.heard == feed.place.load(Ordering::Acquire) {
+            return;
+        }
+        let mut ids = std::mem::take(&mut instance.snapshot);
+        let mut members = std::mem::take(&mut instance.members);
+        let mut changes = std::mem::take(&mut instance.changes);
+        members.clear();
+        changes.clear();
+        // The copy is made under the lock and the calls after it: no teller
+        // waits on a guest.
+        let whole = {
+            let told = feed.told.lock();
+            let place = feed.place.load(Ordering::Relaxed);
+            let behind = usize::try_from(place - instance.heard).unwrap_or(usize::MAX);
+            let whole = instance.heard == 0
+                || behind > told.changes.len()
+                || told.changes.iter().rev().take(behind).any(Option::is_none);
+            if whole {
+                members.extend_from_slice(&told.members);
+            } else {
+                let level = told.changes.len() - behind;
+                changes.extend(told.changes.iter().skip(level).flatten());
+            }
+            instance.heard = place;
+            whole
+        };
+        if whole {
+            let event = marshal::membership(&Membership::Snapshot(&members), &mut ids);
+            self.tell(slot, wit::LifecycleEvent::Membership(event));
+        } else {
+            for change in &changes {
+                if slot.is_none() {
+                    break;
+                }
+                let event = marshal::membership(change, &mut ids);
+                self.tell(slot, wit::LifecycleEvent::Membership(event));
+            }
+        }
+        if let Some(instance) = slot.as_mut() {
+            instance.snapshot = ids;
+            instance.members = members;
+            instance.changes = changes;
+        }
+    }
+
     /// Delivers one lifecycle event to the kept instance of the decider the
     /// calling thread acts as: the thread's own where it names none and is
     /// one. A thread that only tells delivers nothing ([`Plugin::telling`]).
@@ -1763,6 +1930,22 @@ impl Plugin {
                 }
             }
         }
+        // What the membership feed holds past this instance's place comes
+        // first: the instance hears in the order the host told.
+        self.catch_up(&mut guard);
+        if guard.is_some() {
+            self.tell(&mut guard, event);
+        }
+        // Outside a decision: a dropped instance is made again lazily by the
+        // next event or open. The mark is a decision's, for its close; a
+        // decision never rebuilds a slot it did not touch.
+        self.emptied.get_or_default().set(false);
+    }
+
+    /// One `observe` call on the instance in `slot`, outside every
+    /// decision's sums: the live clock, the instance's own draw, the plugin's
+    /// frame (the event frame where its budget is unset).
+    fn tell(&self, slot: &mut Option<Instance>, event: wit::LifecycleEvent<'_>) {
         let frame = if self.frame.micros == 0 {
             OBSERVE_FRAME_MICROS
         } else {
@@ -1783,7 +1966,7 @@ impl Plugin {
             decision: 0,
             seed_micros: 0,
         };
-        let _ = self.call(&mut guard, lifecycle, |inst| {
+        let _ = self.call(slot, lifecycle, |inst| {
             let result = match &inst.exports {
                 Exports::Record(b) => b.smg_policy_plugin().call_observe(&mut inst.store, event),
                 Exports::Packed(b) => b
@@ -1792,10 +1975,6 @@ impl Plugin {
             };
             result.map(Ok)
         });
-        // Outside a decision: a dropped instance is made again lazily by the
-        // next event or open. The mark is a decision's, for its close; a
-        // decision never rebuilds a slot it did not touch.
-        self.emptied.get_or_default().set(false);
     }
 }
 
@@ -2151,6 +2330,15 @@ impl Bound {
                     return;
                 }
             }
+        }
+        // What the membership feed told since this instance last heard comes
+        // before the decision reads the instance, as told events: outside
+        // the decision's sums. A change that faults it ends the plugin's
+        // part in the decision, and the close rebuilds the slot.
+        plugin.catch_up(&mut guard);
+        if guard.is_none() {
+            open.bypass = true;
+            return;
         }
         if let Some(inst) = guard.as_mut() {
             match &inst.exports {
@@ -2577,28 +2765,7 @@ impl BoundPlugin for Bound {
     }
 
     fn observe_membership(&self, change: &Membership<'_>) {
-        let plugin = &self.plugin;
-        let Some(_lent) = plugin.telling() else {
-            return;
-        };
-        // The snapshot's ids are copied into the instance's own buffer; a
-        // borrow of the slot for the copy and another for the call would
-        // alias, so the copy is taken apart and handed back after.
-        let mut snapshot = {
-            let slot = plugin.slot();
-            let mut guard = slot.borrow_mut();
-            guard
-                .as_mut()
-                .map(|inst| std::mem::take(&mut inst.snapshot))
-                .unwrap_or_default()
-        };
-        plugin.observe(wit::LifecycleEvent::Membership(marshal::membership(
-            change,
-            &mut snapshot,
-        )));
-        if let Some(inst) = plugin.slot().borrow_mut().as_mut() {
-            inst.snapshot = snapshot;
-        }
+        self.plugin.hand(change);
     }
 
     fn observe_signal(&self, signal: &Signal) {
