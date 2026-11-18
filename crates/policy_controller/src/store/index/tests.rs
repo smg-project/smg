@@ -1585,7 +1585,8 @@ mod named {
     /// holding two. The lane of `first` leaves, a row between takes its id
     /// and holds the request under it, and a decision that holds the world
     /// of before names the request: at `point` of that naming `step` runs,
-    /// and the naming is held to have reached it. The holders by their
+    /// and the naming is held to have reached it and to leave no step set
+    /// behind it. The holders by their
     /// workers, then the rows that hold one block and `stays`.
     fn named_with_a_step_inside(
         point: seam::Point,
@@ -1662,6 +1663,7 @@ mod named {
             };
             world.name(MODEL, Role::Single, &naming, &view.candidates, &mut named);
             assert!(ran.get(), "the step ran inside the naming");
+            assert!(!seam::pending(), "no step is left set behind the naming");
             view.candidates.iter().map(|row| row.id).collect()
         });
         let holders = named
