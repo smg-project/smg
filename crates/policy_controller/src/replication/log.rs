@@ -214,8 +214,9 @@ struct Ring {
     adopting: Option<Position>,
     /// How many places a standby has asked for, wrapping: a guard gives the
     /// pending place up while its own is the last asked for, and reads the
-    /// count for that alone. Its four bytes stand beside `leads`, so the
-    /// ring keeps its size, and with it the lock's place in [`Log`].
+    /// count for that alone. A guard misreads it only if it outlives 2^32
+    /// later adoptions, and a guard lives one apply. Its four bytes stand
+    /// beside `leads`: the count adds nothing to the ring's size.
     adoptions: u32,
     /// Whether the store leads the log's term: from its take until it
     /// follows another history.
@@ -321,6 +322,12 @@ impl Ring {
 /// row for a replacement, so 4,096 membership events are about 2.1 MB at
 /// that row. A pairing descriptor stands apart from its row, 168 bytes and
 /// its strings, held once for every copy of that row.
+///
+/// The fields stand in the order written (`repr(C)`), the lock first: a
+/// read addresses the ring off the log's own pointer, whatever the ring's
+/// size. Each field's size is a multiple of eight bytes, so the order
+/// costs no padding.
+#[repr(C)]
 pub struct Log {
     ring: Mutex<Ring>,
     /// The highest term the log has seen: the store's takes, the events it
@@ -2110,14 +2117,13 @@ mod tests {
         assert_ne!(log.head(All), at(2, 3), "a dropped guard's place was taken");
     }
 
-    /// The lock is the log's first field, as the compiler lays the log out:
-    /// a read then addresses the ring off the log's own pointer. With the
-    /// lock further in, a read keeps the lock's address in a register of
-    /// its own, and its loop runs three instructions more an entry. The
-    /// compiler orders the fields by their sizes, so the ring's size
-    /// decides it: eight bytes more move the lock behind two fields.
+    /// The lock is the log's first field, by the order the log declares
+    /// (`repr(C)`): a read addresses the ring off the log's own pointer.
+    /// With the lock further in, a read keeps the lock's address in a
+    /// register of its own, and its loop runs three instructions more an
+    /// entry. Left to the compiler, the order follows the ring's size:
+    /// eight bytes more moved the lock behind two fields.
     #[test]
-    #[cfg(target_pointer_width = "64")]
     fn the_logs_lock_is_its_first_field() {
         assert_eq!(std::mem::offset_of!(Log, ring), 0);
     }
