@@ -19,11 +19,15 @@
 //! it hands back and for no other peer, and adds what it reads to
 //! [`Shared`], which [`Shared::new`] alone builds.
 //!
-//! The spec source is a file, which no call writes, so the controller
-//! takes neither write: `ApplyPolicySpec` answers a dry run's verdict with
-//! nothing applied and an enforce `read_only`, and `RollbackPolicySpec`
-//! answers `read_only`. One dry run runs at a time, and a call past the
-//! ones that wait their turn is told to ask again.
+//! A spec source that is a file takes no write, since no call writes a
+//! file: `ApplyPolicySpec` answers a dry run's verdict with nothing applied
+//! and an enforce `read_only`, and `RollbackPolicySpec` answers
+//! `read_only`. A spec store takes an enforce: the document is persisted,
+//! then applied as the next generation. It takes a rollback to a generation
+//! on file, whose document runs again as the next generation, and
+//! `GetPolicySpec` answers a generation on file by its number. One dry run
+//! runs at a time and one write, and a call past the ones that wait their
+//! turn is told to ask again.
 
 use std::{
     io,
@@ -45,13 +49,18 @@ use super::{
     config::Scope,
     decide::{self, Streams},
     deciders::{self, Deciders, Reads},
-    election::{split_identity, Standing},
+    election::{self, split_identity, Running, Standing},
+    floor::Floors,
     gateways::Gateways,
-    generations::{DryRun, Format, Generations, Unanswered, DRY_RUNS_WAITING},
+    generations::{
+        DryRun, Enforced, Format, Generations, SpecRejected, Unanswered, DRY_RUNS_WAITING,
+        WRITES_WAITING,
+    },
     membership::Door,
     principal::{self, Layer, Principal},
     replication::{Batches, Replication},
     session,
+    standby::{self, Lag},
     watch_workers::{self, Feed, Source, Watchers, Watching},
     wire, PROTOCOL_VERSION,
 };
@@ -63,6 +72,7 @@ use crate::{
         policy_controller_server::{PolicyController, PolicyControllerServer},
     },
     replication::Unled,
+    spec::Digest,
     store::MemoryStore,
 };
 
@@ -170,6 +180,14 @@ pub(crate) struct Shared {
     pub(crate) role: watch::Sender<bool>,
     /// Who watches this replica: the bounds of a watch's open.
     pub(crate) watchers: Arc<Watchers>,
+    /// A gateway's term floor above this replica's term, on its way to the
+    /// election.
+    pub(crate) floors: Floors,
+    /// How far behind its leader this replica is while it follows one: the
+    /// standby loop writes it. It holds the bound a standby reads synced
+    /// under, the first of the three counts of design 5.4: made again
+    /// where the configuration is known.
+    pub(crate) lag: Arc<Lag>,
 }
 
 /// Who leads, as this replica knows it at one read of its fence.
@@ -236,6 +254,7 @@ impl Shared {
                 Arc::clone(&feed.log),
                 elector.fence(),
             ),
+            lag: Arc::new(Lag::new(standby::synced_within(Duration::ZERO))),
             store,
             gateways,
             hello_deadline: session::HELLO_DEADLINE,
@@ -245,7 +264,30 @@ impl Shared {
             feed,
             role: watch::channel(false).0,
             watchers: Arc::new(Watchers::new(session::PRESENT_MAX)),
+            floors: Floors::default(),
         })
+    }
+
+    /// Starts the election thread over `elector` for this state: the term
+    /// goes to its store at every take, each step's sight of the lease to
+    /// `standing`, and the election's door to the two that say a word
+    /// through it: the floors, a term a gateway saw, and the deciders, the
+    /// planned hand-over at a term's mark.
+    ///
+    /// # Errors
+    ///
+    /// The election's thread could not be started.
+    pub(crate) fn elect(
+        &self,
+        elector: Elector,
+        standing: watch::Sender<Standing>,
+    ) -> io::Result<Running> {
+        let election = election::start(elector, Arc::clone(&self.store), standing)?;
+        let door = election.door();
+        self.floors.open(door.clone());
+        self.deciders
+            .leave_through(move |term| door.hand_over(term));
+        Ok(election)
     }
 
     /// Who leads, given `leading`, one read of the fence: the term this
@@ -351,14 +393,13 @@ impl Call {
         }
     }
 
-    /// The scopes that make the call, by the contract's header: the
-    /// snapshot is the operators' read and a standby's re-sync base.
+    /// The scopes that make the call, by the contract's header.
     pub(crate) const fn scopes(self) -> &'static [Scope] {
         match self {
             Call::Session | Call::Decide | Call::WatchWorkers => &[Scope::Gateway],
             Call::PushLoad | Call::PushKvEvents => &[Scope::Ingestion],
-            Call::GetSnapshot => &[Scope::Control, Scope::Replication],
-            Call::RegisterWorker
+            Call::GetSnapshot
+            | Call::RegisterWorker
             | Call::PatchWorker
             | Call::DeregisterWorker
             | Call::Explain
@@ -496,7 +537,7 @@ impl Service {
     fn sourceless<T, R>(&self, call: Call, request: &Request<T>) -> Result<R, Status> {
         self.admit(call, request)?;
         Err(Status::unimplemented(format!(
-            "{} is not served by a controller started with no spec file",
+            "{} is not served by a controller started with no spec source",
             call.name()
         )))
     }
@@ -559,15 +600,24 @@ impl Service {
             term,
             is_leader,
         } = shared.leader(shared.fence.leader_term(now));
+        // A replica that follows says how far behind it is, by the age of
+        // its stream's last applied frame; a leader follows nobody.
+        // `synced` is the same read of that lag, and reads it alone: the
+        // live ranks and the generation narrow the same bit with their
+        // steps.
+        let read = shared.lag.read(now).filter(|_| !is_leader);
         proto::LeaderInfo {
             controller_id,
             address,
             term,
             is_leader,
-            // The sync state is a standby's and arrives with it; one lease
-            // covers every model until a lease per model group exists.
-            synced: false,
-            sync: None,
+            synced: read.is_some_and(|(_, lapse)| lapse.is_some()),
+            sync: read.map(|(lag, _)| proto::SyncState {
+                replication_lag_ms: u32::try_from(lag.as_millis()).unwrap_or(u32::MAX),
+                ..proto::SyncState::default()
+            }),
+            // One lease covers every model until a lease per model group
+            // exists.
             groups: Vec::new(),
             protocol_min: PROTOCOL_VERSION,
             protocol_max: PROTOCOL_VERSION,
@@ -589,19 +639,24 @@ fn read_only(generations: &Generations) -> proto::ApplyResult {
     }
 }
 
-/// A dry run's verdict as the call answers it: accepted, with the number
-/// the document would run under now and its digest, or refused, with the
-/// standing number and digest and one issue by its field. The source is a
-/// file, so either answer reads `read_only`.
-fn verdict(dry_run: DryRun) -> proto::ApplyResult {
-    let (standing, standing_digest) = dry_run.standing;
-    match dry_run.would_run {
+/// A document's verdict as a write call answers it, a dry run's or an
+/// enforce's: accepted, with the number the document runs under (a dry
+/// run's: would run under now) and its digest, or refused, with the
+/// standing number and digest and one issue by its field. `read_only` is
+/// whether the source takes no write: a file takes none.
+fn verdict(
+    (standing, standing_digest): (u64, Option<Digest>),
+    outcome: Result<(u64, Digest), SpecRejected>,
+    needs: Option<proto::NeedsDiff>,
+    read_only: bool,
+) -> proto::ApplyResult {
+    match outcome {
         Ok((generation, digest)) => proto::ApplyResult {
             accepted: true,
             generation,
             digest: digest.to_string(),
-            needs: dry_run.needs,
-            read_only: true,
+            needs,
+            read_only,
             ..proto::ApplyResult::default()
         },
         Err(rejected) => proto::ApplyResult {
@@ -615,14 +670,16 @@ fn verdict(dry_run: DryRun) -> proto::ApplyResult {
                 message: rejected.to_string(),
                 plugin: String::new(),
             }],
-            read_only: true,
+            read_only,
             ..proto::ApplyResult::default()
         },
     }
 }
 
-/// The status of a dry run that gave no verdict: a guard's by the standing
-/// generation, and a full wait's as one to ask again.
+/// The status of a spec call that gave no answer of its own: a guard's by
+/// the standing generation, a full wait's as one to ask again, a generation
+/// no document is held for as not found, and a call's thread that did not
+/// end or a file that was not read as internal.
 fn unanswered(unanswered: Unanswered) -> Status {
     match unanswered {
         Unanswered::Guarded(standing, digest) => {
@@ -635,6 +692,14 @@ fn unanswered(unanswered: Unanswered) -> Status {
             "{DRY_RUNS_WAITING} dry runs wait their turn: ask again later"
         )),
         Unanswered::Unended(join) => Status::internal(format!("the dry run did not end: {join}")),
+        Unanswered::Waiting => Status::resource_exhausted(format!(
+            "{WRITES_WAITING} applies wait their turn: ask again later"
+        )),
+        Unanswered::Unwritten(join) => Status::internal(format!("the apply did not end: {join}")),
+        Unanswered::NotHeld(not_held) => Status::not_found(not_held.to_string()),
+        Unanswered::Unread { generation, why } => Status::internal(format!(
+            "generation {generation} was not read from its file: {why}"
+        )),
     }
 }
 
@@ -731,23 +796,13 @@ impl PolicyController for Service {
             .map(Response::new)
     }
 
-    /// The complete snapshot, on the listener that mounts the replication
-    /// scope: a caller admitted there can ask `Replicate` for the same
-    /// rows. The control scope's redacted read is not served yet.
+    /// The operators' read, which this build does not serve. A standby is
+    /// restored on its `Replicate` stream, never from this call.
     async fn get_snapshot(
         &self,
         request: Request<proto::SnapshotRequest>,
     ) -> Result<Response<proto::Snapshot>, Status> {
-        if !self.scopes.contains(&Scope::Replication) {
-            return self.unserved(Call::GetSnapshot, &request);
-        }
-        self.admit(Call::GetSnapshot, &request)?;
-        let now = Instant::now();
-        let term = self.leading(now)?;
-        self.shared
-            .replication
-            .snapshot(term, &self.shared.controller_id, now)
-            .map(Response::new)
+        self.unserved(Call::GetSnapshot, &request)
     }
 
     async fn explain(
@@ -761,12 +816,16 @@ impl PolicyController for Service {
     /// one order: the scope, the lead, the mode, the source, the guard, the
     /// document. A replica that does not lead refuses by the leader's name.
     /// A write states its mode: none is refused by its field, and audit is
-    /// not served by this build. The source is a file, which no call
-    /// writes: an enforce answers `read_only` with the standing number and
-    /// digest, whatever its guard and its document. A dry run whose
-    /// `expected_digest` is not the standing one is refused; any other
-    /// answers its document's verdict and applies nothing, one dry run at a
-    /// time ([`Generations::dry_run_in_turn`]).
+    /// not served by this build. Under a file, which no call writes, an
+    /// enforce answers `read_only` with the standing number and digest,
+    /// whatever its guard and its document. Under a spec store an enforce
+    /// whose `expected_digest` is not the standing one is refused: another
+    /// apply landed first. Any other is persisted, then applied as the next
+    /// generation, one apply at a time ([`Generations::enforce_in_turn`]),
+    /// and answers the number it runs under, or the one issue it was
+    /// refused by. A dry run is guarded alike and answers its document's
+    /// verdict with nothing applied, one dry run at a time
+    /// ([`Generations::dry_run_in_turn`]).
     async fn apply_policy_spec(
         &self,
         request: Request<proto::ApplyRequest>,
@@ -778,8 +837,9 @@ impl PolicyController for Service {
         self.admit(Call::ApplyPolicySpec, &request)?;
         self.leading(Instant::now())?;
         let apply = request.into_inner();
-        match proto::ApplyMode::try_from(apply.mode) {
-            Ok(proto::ApplyMode::DryRun) => {}
+        let enforce = match proto::ApplyMode::try_from(apply.mode) {
+            Ok(proto::ApplyMode::DryRun) => false,
+            Ok(proto::ApplyMode::Enforce) if generations.writable() => true,
             Ok(proto::ApplyMode::Enforce) => return Ok(Response::new(read_only(generations))),
             Ok(proto::ApplyMode::Audit) => {
                 return Err(Status::unimplemented(
@@ -791,7 +851,7 @@ impl PolicyController for Service {
                     "mode: a write states its mode, enforce, audit or dry-run",
                 ));
             }
-        }
+        };
         let format = match apply.format.as_str() {
             "yaml" => Format::Yaml,
             "json" => Format::Json,
@@ -805,17 +865,36 @@ impl PolicyController for Service {
             }
         };
         // The guard is the door's to read, behind the turn its pass waits.
-        let dry_run = generations
-            .dry_run_in_turn(apply.expected_digest, apply.document, format)
-            .await
-            .map_err(unanswered)?;
-        Ok(Response::new(verdict(dry_run)))
+        let (expected, document) = (apply.expected_digest, apply.document);
+        let answer = if enforce {
+            let Enforced {
+                standing,
+                ran,
+                needs,
+            } = generations
+                .enforce_in_turn(expected, document, format)
+                .await
+                .map_err(unanswered)?;
+            verdict(standing, ran, needs, false)
+        } else {
+            let DryRun {
+                standing,
+                would_run,
+                needs,
+            } = generations
+                .dry_run_in_turn(expected, document, format)
+                .await
+                .map_err(unanswered)?;
+            verdict(standing, would_run, needs, !generations.writable())
+        };
+        Ok(Response::new(answer))
     }
 
     /// The standing generation's document as its source wrote it, with the
     /// number and the digest beside it: every replica answers from its own
-    /// holder. A controller that was given no spec source serves no spec
-    /// call.
+    /// holder. Under a spec store a generation on file is answered by its
+    /// number, from its file ([`Generations::read`]). A controller that was
+    /// given no spec source serves no spec call.
     async fn get_policy_spec(
         &self,
         request: Request<proto::GetPolicySpecRequest>,
@@ -826,14 +905,21 @@ impl PolicyController for Service {
         }
         self.admit(Call::GetPolicySpec, &request)?;
         generations
-            .document(request.get_ref().generation)
+            .read(request.get_ref().generation)
+            .await
             .map(Response::new)
-            .map_err(|not_held| Status::not_found(not_held.to_string()))
+            .map_err(unanswered)
     }
 
     /// `RollbackPolicySpec` by a controller with a spec source: the scope,
-    /// the lead, then the source, which is a file and which no call writes.
-    /// The answer is `read_only`, with the standing number and digest.
+    /// the lead, then the source. Under a file, which no call writes, the
+    /// answer is `read_only`, with the standing number and digest. Under a
+    /// spec store the document of the generation the call names, one on
+    /// file, is persisted and applied again as the next generation, one
+    /// write at a time ([`Generations::roll_back_in_turn`]), and the call
+    /// answers as an enforce does. A call that names no generation is
+    /// refused by the field, and one that names a generation not on file is
+    /// answered `NOT_FOUND`.
     async fn rollback_policy_spec(
         &self,
         request: Request<proto::RollbackRequest>,
@@ -844,7 +930,24 @@ impl PolicyController for Service {
         }
         self.admit(Call::RollbackPolicySpec, &request)?;
         self.leading(Instant::now())?;
-        Ok(Response::new(read_only(generations)))
+        if !generations.writable() {
+            return Ok(Response::new(read_only(generations)));
+        }
+        let wanted = request.get_ref().generation;
+        if wanted == 0 {
+            return Err(Status::invalid_argument(
+                "generation: a rollback names a generation on file",
+            ));
+        }
+        let Enforced {
+            standing,
+            ran,
+            needs,
+        } = generations
+            .roll_back_in_turn(wanted)
+            .await
+            .map_err(unanswered)?;
+        Ok(Response::new(verdict(standing, ran, needs, false)))
     }
 
     /// Every scope, every replica, any caller: no principal is read, since
@@ -889,14 +992,19 @@ impl PolicyController for Service {
 #[cfg(test)]
 mod tests {
     use std::{
-        sync::Arc,
+        collections::BTreeSet,
+        sync::{atomic::Ordering, Arc},
         thread,
         time::{Duration, Instant},
     };
 
     use http::uri::PathAndQuery;
     use prost::Message as _;
-    use tokio::{net::TcpListener, sync::watch, task::JoinSet};
+    use tokio::{
+        net::TcpListener,
+        sync::{mpsc, watch},
+        task::JoinSet,
+    };
     use tonic::{
         client::Grpc,
         codegen::tokio_stream::StreamExt as _,
@@ -910,21 +1018,24 @@ mod tests {
         catalog::Catalog,
         controller::{
             config::Scope,
+            deciders::{tests as bed, TERM_MARK},
             election::{self, LeasePlace, Standing},
             gateways::tests::PATIENT,
-            generations::{tests::LEAST_LOAD, Format},
+            generations::{tests::LEAST_LOAD, Format, Unanswered},
             principal::{
                 tests::{stating, told, NO_PRINCIPAL},
                 Layer,
             },
             replication::journaled_from,
+            spec_store::{tests::names, SpecStore},
             PROTOCOL_VERSION,
         },
         elector::{
             ElectError, ElectionSettings, Elector, FileLease, LeaseBackend, LeaseRecord,
             MemoryLease, Tick, Written,
         },
-        proto::{self, policy_controller_server::PolicyController},
+        lease::{LeaseId, ReleaseReason},
+        proto::{self, busy::Reason, policy_controller_server::PolicyController},
         store::{Kinds, LeasesStore, Position, WorkersStore},
     };
 
@@ -995,6 +1106,277 @@ mod tests {
                 "{what} did not happen in 20 s: {info:?}"
             );
             thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    /// A leader whose term's lease ids pass their mark leaves and decides on
+    /// under the next term, over the election's own thread as the controller
+    /// starts it. Every request sent across the hand-over is answered, by a
+    /// pick or by `Busy` for no leader; no lease id is minted twice; the
+    /// leases of the term before stay on file for their frames.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_leader_at_its_terms_mark_leaves_and_decides_on_under_the_next_term() {
+        let settings = ElectionSettings {
+            duration: Duration::from_millis(600),
+            renew_period: Duration::from_millis(20),
+            renew_deadline: Duration::from_millis(400),
+        };
+        let elector = Elector::alone(IDENTITY, settings).expect("the settings are in order");
+        let (standing, stood) = watch::channel(Standing::default());
+        let (store, feed) = journaled_from(&LeasePlace::Process, 0);
+        let shared = Shared::new(
+            ID.to_owned(),
+            ADDRESS.to_owned(),
+            &elector,
+            stood,
+            (Arc::clone(&store), feed),
+            Arc::new(Catalog::builtin()),
+            1,
+        )
+        .expect("the decider starts");
+        let mut running = shared.elect(elector, standing).expect("a thread");
+        let wait = Duration::from_secs(5);
+
+        // The first take, then a fleet, a profile and the ids just under
+        // the term's mark.
+        let begun = Instant::now();
+        while shared.fence.leader_term(Instant::now()).is_none() {
+            assert!(begun.elapsed() < wait, "no first take");
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        bed::fleet(&store);
+        let applied = store.apply(bed::preset("random", 1));
+        applied.expect("above the unbound start");
+        store.spend_ids(u32::MAX - TERM_MARK + 4);
+
+        let (sender, mut answers) = mpsc::channel(64);
+        let (mut picks, mut busies, mut sent) = (Vec::<u64>::new(), Vec::new(), 0);
+        let begun = Instant::now();
+        while picks.iter().filter(|id| **id >> 32 == 2).count() < 32 {
+            assert!(
+                begun.elapsed() < wait,
+                "no pick under the next term: {} picks, {} Busy",
+                picks.len(),
+                busies.len()
+            );
+            sent += 16;
+            for answer in bed::burst(&shared.deciders, &sender, &mut answers).await {
+                match answer {
+                    Ok(id) => picks.push(id),
+                    Err(reason) => busies.push(reason),
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+
+        // Every request sent was answered, a `Busy` for no leader alone,
+        // and the counter never reached its end.
+        assert_eq!(picks.len() + busies.len(), sent);
+        assert!(
+            busies.iter().all(|reason| *reason == Reason::NotLeader),
+            "{busies:?}"
+        );
+        let unleased = &shared.deciders.counts().unleased;
+        assert_eq!(unleased.load(Ordering::Relaxed), 0);
+        // The term before decided up to its mark and past it, the next one
+        // from its first id on, and no id came twice.
+        let old = picks.iter().take_while(|id| **id >> 32 == 1).count();
+        let (old, new) = picks.split_at(old);
+        assert!(old.contains(&(1 << 32 | u64::from(TERM_MARK))));
+        assert_eq!(new.first(), Some(&(2 << 32 | 1)));
+        assert!(new.iter().all(|id| id >> 32 == 2), "{new:?}");
+        assert_eq!(picks.iter().collect::<BTreeSet<_>>().len(), picks.len());
+        // A lease of the term before stays on file, and its frame is taken.
+        let last = LeaseId(*old.last().expect("a pick under the first term"));
+        let leases: &dyn LeasesStore = store.as_ref();
+        assert!(leases.get(bed::GATEWAY, last).is_some());
+        assert!(leases.released(bed::GATEWAY, last, None, ReleaseReason::ClientGone));
+
+        running.stop();
+        tokio::time::timeout(Duration::from_secs(20), running.ended())
+            .await
+            .expect("the election thread ends within 20 s of its stop");
+    }
+
+    /// The deciders hold the election's door, and the door holds its words
+    /// weakly: an election started for this state and dropped with no stop
+    /// ends and leads no more, while the state and its deciders live on.
+    #[tokio::test]
+    async fn an_election_dropped_without_a_stop_ends_while_the_deciders_hold_its_door() {
+        let settings = ElectionSettings {
+            duration: Duration::from_millis(600),
+            renew_period: Duration::from_millis(20),
+            renew_deadline: Duration::from_millis(400),
+        };
+        let elector = Elector::alone(IDENTITY, settings).expect("the settings are in order");
+        let (standing, stood) = watch::channel(Standing::default());
+        let (store, feed) = journaled_from(&LeasePlace::Process, 0);
+        let shared = Shared::new(
+            ID.to_owned(),
+            ADDRESS.to_owned(),
+            &elector,
+            stood,
+            (store, feed),
+            Arc::new(Catalog::builtin()),
+            1,
+        )
+        .expect("the decider starts");
+        let running = shared.elect(elector, standing).expect("a thread");
+        let patience = Duration::from_secs(20);
+        let mut looks = shared.standing.clone();
+        {
+            let led = looks.wait_for(|standing| standing.holder == IDENTITY);
+            let led = tokio::time::timeout(patience, led).await;
+            assert!(matches!(led, Ok(Ok(_))), "the first take");
+        }
+
+        // The thread's end drops the standing's sender: no look follows it.
+        drop(running);
+        let ended = async { while looks.changed().await.is_ok() {} };
+        tokio::time::timeout(patience, ended)
+            .await
+            .expect("the election thread ends within 20 s of its handle's drop");
+        assert_eq!(shared.fence.leader_term(Instant::now()), None);
+        assert!(looks.borrow().holder.is_empty(), "the lease is given up");
+    }
+
+    /// Who may take the lease a leader hands over at its term's mark.
+    #[derive(Clone, Copy, Debug)]
+    enum Place {
+        /// The leader is alone over a lease of its own.
+        Alone,
+        /// One replica over a shared lease, and no standby.
+        Shared,
+        /// A shared lease a standby looks at.
+        Standby,
+    }
+
+    /// What a term's mark costs, by the clock: how long the leader decides
+    /// on under the term it leaves, past the burst that carried the mark's
+    /// pick; then the time with no leader, to the next leader's open fence,
+    /// this replica's under its next term or the standby's; and the `Busy`
+    /// answers this replica gave from the mark on.
+    async fn left_with_no_leader(
+        place: Place,
+        settings: ElectionSettings,
+    ) -> (Duration, Duration, usize) {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let lease = dir.path().join("lease");
+        let elector = match place {
+            Place::Alone => Elector::alone(IDENTITY, settings),
+            Place::Shared | Place::Standby => {
+                Elector::new(Box::new(FileLease::new(&lease)), IDENTITY, settings)
+            }
+        }
+        .expect("the settings are in order");
+        let (standing, stood) = watch::channel(Standing::default());
+        let (store, feed) = journaled_from(&LeasePlace::Process, 0);
+        let shared = Shared::new(
+            ID.to_owned(),
+            ADDRESS.to_owned(),
+            &elector,
+            stood,
+            (Arc::clone(&store), feed),
+            Arc::new(Catalog::builtin()),
+            1,
+        )
+        .expect("the decider starts");
+        let mut running = shared.elect(elector, standing).expect("a thread");
+        let (wait, begun) = (Duration::from_secs(60), Instant::now());
+        while shared.fence.leader_term(Instant::now()).is_none() {
+            assert!(begun.elapsed() < wait, "no first take");
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        // The standby starts under a leader and has read its record: it
+        // follows.
+        let mut standby = None;
+        if matches!(place, Place::Standby) {
+            let other = "controller-1@10.0.0.8:30100";
+            let other = Elector::new(Box::new(FileLease::new(&lease)), other, settings)
+                .expect("the settings are in order");
+            let fence = other.fence();
+            let (standing, mut stood) = watch::channel(Standing::default());
+            let store = journaled_from(&LeasePlace::Process, 0).0;
+            let running = election::start(other, store, standing).expect("a thread");
+            let follows = stood.wait_for(|standing| standing.holder == IDENTITY);
+            let followed = tokio::time::timeout(wait, follows).await;
+            assert!(
+                matches!(followed, Ok(Ok(_))),
+                "the standby reads the leader's record"
+            );
+            standby = Some((fence, running));
+        }
+        bed::fleet(&store);
+        let applied = store.apply(bed::preset("random", 1));
+        applied.expect("above the unbound start");
+        store.spend_ids(u32::MAX - TERM_MARK + 4);
+
+        let (sender, mut answers) = mpsc::channel(64);
+        let mark = Ok(1 << 32 | u64::from(TERM_MARK));
+        // The burst of the mark's pick, then the last burst a pick of the
+        // term it leaves came in: the time with no leader starts there.
+        let (mut marked, mut last, mut busy) = (None, begun, 0);
+        let led = loop {
+            assert!(begun.elapsed() < wait, "no leader after the mark");
+            let read = bed::burst(&shared.deciders, &sender, &mut answers).await;
+            let now = Instant::now();
+            if marked.is_some() {
+                busy += read.iter().filter(|answer| answer.is_err()).count();
+                let led = match &standby {
+                    Some((fence, _)) => fence.leader_term(now).is_some(),
+                    None => read
+                        .iter()
+                        .any(|answer| matches!(answer, Ok(id) if id >> 32 == 2)),
+                };
+                if led {
+                    break now;
+                }
+            } else if read.contains(&mark) {
+                marked = Some(now);
+            }
+            if read
+                .iter()
+                .any(|answer| matches!(answer, Ok(id) if id >> 32 == 1))
+            {
+                last = now;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        };
+        let marked = marked.expect("the mark's pick came before the next leader");
+
+        let patience = Duration::from_secs(20);
+        running.stop();
+        tokio::time::timeout(patience, running.ended())
+            .await
+            .expect("the election thread ends within 20 s of its stop");
+        if let Some((_, other)) = standby.as_mut() {
+            other.stop();
+            tokio::time::timeout(patience, other.ended())
+                .await
+                .expect("the standby's thread ends within 20 s of its stop");
+        }
+        (last.duration_since(marked), led.duration_since(last), busy)
+    }
+
+    /// What the page's Numbers say of a hand-over at a term's mark under
+    /// the default settings, by who may take the lease: the time the leader
+    /// still decides past the mark, the time with no leader and the `Busy`
+    /// answers. A measurement, run by name with `--ignored`: it prints, and
+    /// asserts only that a leader follows.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "a measurement for the Numbers table, run by name"]
+    async fn the_time_a_terms_mark_leaves_with_no_leader() {
+        use std::io::Write as _;
+
+        let mut out = std::io::stdout();
+        for place in [Place::Alone, Place::Shared, Place::Standby] {
+            let (decided, none, busy) =
+                left_with_no_leader(place, ElectionSettings::default()).await;
+            writeln!(
+                out,
+                "MARK {place:?}: decided on for {decided:?}, no leader for {none:?}, {busy} Busy"
+            )
+            .expect("stdout");
         }
     }
 
@@ -1071,7 +1453,12 @@ mod tests {
             |info| !info.is_leader,
         );
         assert_eq!(fenced, answer("", "", 2, false));
-        let third = answers_until(&service, &mut last, "the take above", |info| info.is_leader);
+        // A renewal that landed before the restore can open the fence once
+        // more under term two, where the host held the election thread: the
+        // take above is the first leader's answer past that term.
+        let third = answers_until(&service, &mut last, "the take above", |info| {
+            info.is_leader && info.term > 2
+        });
         assert_eq!(third, answer(ID, ADDRESS, 3, true));
 
         running.stop();
@@ -1118,7 +1505,7 @@ mod tests {
             ("RegisterWorker", &[Scope::Control]),
             ("PatchWorker", &[Scope::Control]),
             ("DeregisterWorker", &[Scope::Control]),
-            ("GetSnapshot", &[Scope::Control, Scope::Replication]),
+            ("GetSnapshot", &[Scope::Control]),
             ("Explain", &[Scope::Control]),
             ("ApplyPolicySpec", &[Scope::Control]),
             ("GetPolicySpec", &[Scope::Control]),
@@ -1196,7 +1583,7 @@ mod tests {
         assert_eq!(unserved.code(), Code::Unimplemented);
         assert_eq!(
             unserved.message(),
-            "GetPolicySpec is not served by a controller started with no spec file"
+            "GetPolicySpec is not served by a controller started with no spec source"
         );
         // A caller no layer placed is refused before the call is named
         // unserved: no call body is reached without a principal.
@@ -1207,13 +1594,14 @@ mod tests {
         assert_eq!(unplaced.code(), Code::Unauthenticated);
         assert_eq!(unplaced.message(), NO_PRINCIPAL);
 
-        // The snapshot: the operators' read is unserved; a standby's
-        // re-sync base is the leader's to answer.
+        // The snapshot is the operators' read, unserved. A standby is
+        // restored on its Replicate stream: the replication scope does not
+        // make the call.
         let snapshot = || from("standby-a", proto::SnapshotRequest::default());
         for (listener, code) in [
             (&gateway, Code::PermissionDenied),
             (&control, Code::Unimplemented),
-            (&replication, Code::FailedPrecondition),
+            (&replication, Code::PermissionDenied),
         ] {
             let status = listener
                 .get_snapshot(snapshot())
@@ -1388,16 +1776,14 @@ mod tests {
 
     /// The calls a step serves, beside `Leader`, each with its refusal by a
     /// replica that never took the lease: a write is the leader's alone, as
-    /// are a standby's batches and, on the replication scope alone, the
-    /// snapshot; a watch of the rows is a standby's once it follows the
-    /// leader's log, which none does in this build.
-    fn refused_off_the_leader(call: Call, scopes: &[Scope]) -> Option<(Code, &'static str)> {
+    /// are a standby's batches; a watch of the rows is a standby's once it
+    /// follows the leader's log, which none does in this build.
+    fn refused_off_the_leader(call: Call) -> Option<(Code, &'static str)> {
         const NOT_LEADING: (Code, &str) = (Code::FailedPrecondition, "this replica does not lead");
         match call {
             Call::RegisterWorker | Call::PatchWorker | Call::DeregisterWorker | Call::Replicate => {
                 Some(NOT_LEADING)
             }
-            Call::GetSnapshot if scopes.contains(&Scope::Replication) => Some(NOT_LEADING),
             Call::WatchWorkers => Some((Code::Unavailable, super::FOLLOWS_NO_LOG)),
             _ => None,
         }
@@ -1500,7 +1886,9 @@ mod tests {
                 {
                     (
                         Code::Unimplemented,
-                        format!("{method} is not served by a controller started with no spec file"),
+                        format!(
+                            "{method} is not served by a controller started with no spec source"
+                        ),
                     )
                 } else if layer == Layer::AsTold && stated && *method == "Decide" {
                     // The stream opens, and the call itself refuses the
@@ -1510,7 +1898,7 @@ mod tests {
                         "request_id is out of its range in this protocol version".to_owned(),
                     )
                 } else if layer == Layer::AsTold && stated {
-                    match call.and_then(|call| refused_off_the_leader(call, scopes)) {
+                    match call.and_then(refused_off_the_leader) {
                         Some((code, why)) => (code, why.to_owned()),
                         None => (
                             Code::Unimplemented,
@@ -1744,6 +2132,43 @@ mod tests {
         assert_eq!(service.leader_info(now), answer("", "", 5, false));
     }
 
+    #[test]
+    fn a_follower_says_its_lag_and_reads_synced_under_the_bound() {
+        let (mut elector, standing, service) = service(&[Scope::Replication]);
+        standing.send_replace(saw("controller-1@10.0.0.8:30100", 4));
+        let at = Instant::now();
+        // No frame applied yet: no sync state.
+        let info = service.leader_info(at);
+        assert!(!info.is_leader && !info.synced && info.sync.is_none());
+        service.shared.lag.applied(at);
+        // The lag holds the frame's instant at a whole microsecond: read
+        // from that instant, the bound is met to the nanosecond.
+        let at = at - service.shared.lag.age(at).expect("a frame applied");
+        let within = service.shared.lag.within();
+        let lag = |info: &proto::LeaderInfo| info.sync.map(|sync| sync.replication_lag_ms);
+        let under = service.leader_info(at + within - Duration::from_millis(1));
+        assert!(under.synced);
+        assert_eq!(lag(&under), u32::try_from(within.as_millis() - 1).ok());
+        // The bound itself is not under it.
+        let at_it = service.leader_info(at + within);
+        assert!(!at_it.synced);
+        assert_eq!(lag(&at_it), u32::try_from(within.as_millis()).ok());
+
+        // A replica that leads follows nobody, whatever frame it applied
+        // before its take: it is not synced and says no sync state. A take
+        // of a lease nobody held leads from its first renewal one renew
+        // deadline later.
+        let took = Instant::now();
+        elector.tick(took).expect("the take");
+        // The wait runs from the take's own read, a moment after `took`.
+        let wait = ElectionSettings::default().renew_deadline + Duration::from_secs(1);
+        let now = took + wait;
+        elector.tick(now).expect("the renewal");
+        service.shared.lag.applied(now);
+        let led = service.leader_info(now);
+        assert!(led.is_leader && !led.synced && led.sync.is_none());
+    }
+
     #[tokio::test]
     async fn leader_answers_on_every_listener_and_for_every_model() {
         for scopes in [
@@ -1811,10 +2236,9 @@ mod tests {
     }
 
     /// A control listener's service over an election no case outlasts (an
-    /// hour's deadline), its spec source bound to `LEAST_LOAD` as generation
-    /// 1: the leader where `leads`, else a follower whose last look saw
-    /// `controller-1` hold the lease.
-    fn sourced(leads: bool) -> (Elector, watch::Sender<Standing>, Service) {
+    /// hour's deadline), with no spec source: the leader where `leads`,
+    /// else a follower whose last look saw `controller-1` hold the lease.
+    fn electing(leads: bool) -> (Elector, watch::Sender<Standing>, Service) {
         let hour = Duration::from_secs(3600);
         let settings = ElectionSettings {
             duration: 2 * hour,
@@ -1832,6 +2256,13 @@ mod tests {
         } else {
             standing.send_replace(saw("controller-1@10.0.0.8:30100", 4));
         }
+        (elector, standing, control)
+    }
+
+    /// [`electing`]'s service, its spec source a file's document:
+    /// `LEAST_LOAD`, applied as generation 1.
+    fn sourced(leads: bool) -> (Elector, watch::Sender<Standing>, Service) {
+        let (elector, standing, control) = electing(leads);
         control
             .shared
             .generations
@@ -2028,13 +2459,14 @@ mod tests {
 
     /// A take at or below a term the log followed starts no term in it: the
     /// replica holds the lease and its store's writes stand under no term.
-    /// A watch's open, a registration, a patch, a removal and the snapshot
-    /// are refused then, `UNAVAILABLE`, and the words say that it lasts the
-    /// lead.
+    /// A watch's open, a registration, a patch and a removal are refused
+    /// then, `UNAVAILABLE`, and the words say that it lasts the lead. The
+    /// snapshot call is served to no caller by this build, whatever the
+    /// term: a standby's restore rides its stream, refused below.
     #[tokio::test]
-    async fn a_take_that_started_no_term_serves_no_watch_membership_or_snapshot_call() {
+    async fn a_take_that_started_no_term_serves_no_watch_or_membership_call() {
         for followed in [1, 5] {
-            let scopes = [Scope::Gateway, Scope::Control, Scope::Replication];
+            let scopes = [Scope::Gateway, Scope::Control];
             let (mut elector, _standing, service) = service_alone(&scopes);
             // The log followed a term: a restart at a snapshot's place of
             // it. The take is of term 1, and the store is told it.
@@ -2042,7 +2474,12 @@ mod tests {
                 seq: 40,
                 term: followed,
             };
-            service.shared.feed.log.restart(place);
+            service
+                .shared
+                .feed
+                .log
+                .restart(place)
+                .expect("a place the log takes");
             elector.lead_at(Instant::now());
             service.shared.store.set_term(1);
             assert_eq!(service.shared.feed.log.followed(), Some(followed));
@@ -2068,8 +2505,6 @@ mod tests {
             refused(service.patch_worker(patch).await.err(), "a patch");
             let removal = from("operator-a", proto::DeregisterWorkerRequest::default());
             refused(service.deregister_worker(removal).await.err(), "a removal");
-            let snapshot = from("standby-a", proto::SnapshotRequest::default());
-            refused(service.get_snapshot(snapshot).await.err(), "the snapshot");
             assert_eq!(service.shared.feed.log.head(Kinds::Watched), place);
         }
     }
@@ -2080,7 +2515,12 @@ mod tests {
     async fn a_take_that_started_no_term_serves_no_spec_call() {
         let (mut elector, standing, control) = sourced(false);
         let place = Position { seq: 40, term: 1 };
-        control.shared.feed.log.restart(place);
+        control
+            .shared
+            .feed
+            .log
+            .restart(place)
+            .expect("a place the log takes");
         elector.lead_at(Instant::now());
         control.shared.store.set_term(1);
         standing.send_replace(saw(IDENTITY, 1));
@@ -2112,7 +2552,12 @@ mod tests {
     async fn a_take_that_started_no_term_serves_no_standbys_stream() {
         let (mut elector, _standing, service) = service_alone(&[Scope::Replication]);
         let place = Position { seq: 40, term: 1 };
-        service.shared.feed.log.restart(place);
+        service
+            .shared
+            .feed
+            .log
+            .restart(place)
+            .expect("a place the log takes");
         elector.lead_at(Instant::now());
         service.shared.store.set_term(1);
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -2308,6 +2753,218 @@ mod tests {
         assert_eq!(
             full.message(),
             "32 dry runs wait their turn: ask again later"
+        );
+    }
+
+    /// [`electing`]'s service, its spec source a store over a new, empty
+    /// directory, handed back beside it.
+    fn stored(leads: bool) -> (tempfile::TempDir, Elector, watch::Sender<Standing>, Service) {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let (elector, standing, control) = electing(leads);
+        let opened = SpecStore::open(dir.path().to_owned()).expect("the directory opens");
+        control
+            .shared
+            .generations
+            .bind_store(opened)
+            .expect("the store binds");
+        (dir, elector, standing, control)
+    }
+
+    /// An enforce under a spec store, on the leader: the document is
+    /// persisted and runs as the next generation, and the answer says so:
+    /// accepted, the number, the digest, the feed before and after, and not
+    /// `read_only`. The read call answers the bytes. A document that does
+    /// not run answers the standing number and one issue, a guard that
+    /// names another digest is refused, and a dry run answers what an
+    /// enforce would with nothing applied.
+    #[tokio::test]
+    async fn an_enforce_under_a_spec_store_runs_as_the_next_generation() {
+        let (dir, _elector, _standing, control) = stored(true);
+        let on_file = || names(dir.path()).len();
+        let read = || {
+            let standing = proto::GetPolicySpecRequest::default();
+            control.get_policy_spec(from("operator-a", standing))
+        };
+        let write = |mode: proto::ApplyMode, document: &'static str, expected: &str| {
+            control.apply_policy_spec(apply(mode, document, "yaml", expected))
+        };
+        // No generation yet: the spec calls are served, and the read has
+        // no document to answer.
+        let none = read().await.expect_err("no document yet");
+        assert_eq!(none.code(), Code::NotFound);
+
+        let first = write(proto::ApplyMode::Enforce, RANDOM, "")
+            .await
+            .expect("an answer")
+            .into_inner();
+        assert!(first.accepted && !first.read_only, "{first:?}");
+        assert_eq!(first.generation, 1);
+        assert!(first.digest.starts_with("sha256:"), "{first:?}");
+        assert!(first.issues.is_empty(), "{first:?}");
+        let nothing = Some(proto::NeedsSummary::default());
+        let feed = first.needs.clone().expect("the needs diff");
+        assert_eq!((&feed.before, &feed.after), (&nothing, &nothing));
+        assert_eq!((control.shared.generations.generation(), on_file()), (1, 1));
+        let standing = read().await.expect("the standing document").into_inner();
+        assert_eq!(
+            (standing.generation, standing.document.as_slice()),
+            (1, RANDOM.as_bytes())
+        );
+        assert_eq!(standing.digest, first.digest);
+
+        // A document that does not run: the standing number and digest,
+        // and one issue by its field.
+        let refused = write(proto::ApplyMode::Enforce, NOWHERE, &first.digest)
+            .await
+            .expect("an answer")
+            .into_inner();
+        assert!(!refused.accepted && !refused.read_only, "{refused:?}");
+        assert_eq!((refused.generation, &refused.digest), (1, &first.digest));
+        let [issue] = refused.issues.as_slice() else {
+            panic!("one issue: {refused:?}")
+        };
+        assert!(!issue.field_path.is_empty(), "{issue:?}");
+        assert!(issue.message.contains("nowhere"), "{issue:?}");
+        assert!(refused.needs.is_none(), "{refused:?}");
+
+        // A guard that names another digest than the standing one: another
+        // apply landed first.
+        let other = format!("sha256:{}", "0".repeat(64));
+        let late = write(proto::ApplyMode::Enforce, LEAST_LOAD, &other)
+            .await
+            .expect_err("guarded");
+        assert_eq!(late.code(), Code::FailedPrecondition);
+        assert_eq!(
+            late.message(),
+            format!(
+                "expected_digest: generation 1 stands with digest {}",
+                first.digest
+            )
+        );
+
+        // A dry run answers what an enforce would and applies nothing.
+        let dry = write(proto::ApplyMode::DryRun, LEAST_LOAD, &first.digest)
+            .await
+            .expect("a verdict")
+            .into_inner();
+        assert!(dry.accepted && !dry.read_only, "{dry:?}");
+        assert_eq!(dry.generation, 2);
+        assert_eq!((control.shared.generations.generation(), on_file()), (1, 1));
+
+        let second = write(proto::ApplyMode::Enforce, LEAST_LOAD, &first.digest)
+            .await
+            .expect("an answer")
+            .into_inner();
+        assert!(second.accepted, "{second:?}");
+        assert_eq!((second.generation, on_file()), (2, 2));
+        let feed = second.needs.expect("the needs diff");
+        assert_eq!(feed.before, nothing);
+        assert!(
+            feed.after.is_some_and(|after| !after.models.is_empty()),
+            "the standing document reads the loads"
+        );
+    }
+
+    /// A follower takes no write under a spec store either: it refuses an
+    /// enforce and a rollback by the leader's name, and nothing is on file.
+    #[tokio::test]
+    async fn a_follower_refuses_a_write_under_a_spec_store() {
+        let (dir, _elector, _standing, control) = stored(false);
+        let refused = control
+            .apply_policy_spec(apply(proto::ApplyMode::Enforce, RANDOM, "yaml", ""))
+            .await
+            .expect_err("a follower");
+        assert_eq!(refused.code(), Code::FailedPrecondition);
+        assert_eq!(refused.message(), "this replica does not lead");
+        let rollback = from("operator-a", proto::RollbackRequest { generation: 1 });
+        let refused = control
+            .rollback_policy_spec(rollback)
+            .await
+            .expect_err("a follower");
+        assert_eq!(refused.code(), Code::FailedPrecondition);
+        assert_eq!(refused.message(), "this replica does not lead");
+        assert_eq!(names(dir.path()).len(), 0);
+        assert_eq!(control.shared.generations.generation(), 0);
+    }
+
+    /// A rollback under a spec store, on the leader: the document of a
+    /// generation on file runs again as the next generation, and the answer
+    /// is an enforce's. The read call answers each generation on file by
+    /// its number. A rollback that names no generation is refused by the
+    /// field, and a generation that is not on file is not found, by a
+    /// rollback and by the read call alike.
+    #[tokio::test]
+    async fn a_rollback_under_a_spec_store_runs_a_generation_on_file_again() {
+        let (dir, _elector, _standing, control) = stored(true);
+        let write = |document: &'static str| {
+            control.apply_policy_spec(apply(proto::ApplyMode::Enforce, document, "yaml", ""))
+        };
+        let rollback = |generation: u64| {
+            let request = proto::RollbackRequest { generation };
+            control.rollback_policy_spec(from("operator-a", request))
+        };
+        let read = |generation: u64| {
+            let request = proto::GetPolicySpecRequest { generation };
+            control.get_policy_spec(from("operator-a", request))
+        };
+        let first = write(RANDOM).await.expect("an answer").into_inner();
+        let second = write(LEAST_LOAD).await.expect("an answer").into_inner();
+        assert_eq!((first.generation, second.generation), (1, 2));
+
+        let back = rollback(1).await.expect("an answer").into_inner();
+        assert!(back.accepted && !back.read_only, "{back:?}");
+        assert_eq!((back.generation, &back.digest), (3, &first.digest));
+        assert!(back.issues.is_empty(), "{back:?}");
+        let feed = back.needs.expect("the needs diff");
+        assert!(
+            feed.before.is_some_and(|before| !before.models.is_empty()),
+            "the document rolled away from reads the loads"
+        );
+        assert_eq!(feed.after, Some(proto::NeedsSummary::default()));
+        assert_eq!(control.shared.generations.generation(), 3);
+        assert_eq!(names(dir.path()).len(), 3);
+
+        for (asked, answered, document, digest) in [
+            (1, 1, RANDOM, &first.digest),
+            (2, 2, LEAST_LOAD, &second.digest),
+            (3, 3, RANDOM, &first.digest),
+            (0, 3, RANDOM, &first.digest),
+        ] {
+            let held = read(asked).await.expect("a document").into_inner();
+            assert_eq!(held.generation, answered, "asked for {asked}");
+            assert_eq!(
+                (held.document.as_slice(), &held.digest, held.format.as_str()),
+                (document.as_bytes(), digest, "yaml")
+            );
+        }
+
+        let unnamed = rollback(0).await.expect_err("no generation is named");
+        assert_eq!(unnamed.code(), Code::InvalidArgument);
+        assert_eq!(
+            unnamed.message(),
+            "generation: a rollback names a generation on file"
+        );
+        let gone = [
+            rollback(9).await.expect_err("not on file"),
+            read(9).await.expect_err("not on file"),
+        ];
+        for refused in gone {
+            assert_eq!(refused.code(), Code::NotFound);
+            assert_eq!(
+                refused.message(),
+                "no document is held for generation 9: the spec store has 3 on file, from generation 1 to generation 3"
+            );
+        }
+        assert_eq!(control.shared.generations.generation(), 3);
+    }
+
+    #[test]
+    fn a_write_call_that_found_no_place_is_told_to_ask_again() {
+        let full = unanswered(Unanswered::Waiting);
+        assert_eq!(full.code(), Code::ResourceExhausted);
+        assert_eq!(
+            full.message(),
+            "32 applies wait their turn: ask again later"
         );
     }
 }

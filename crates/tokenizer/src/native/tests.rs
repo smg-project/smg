@@ -1645,7 +1645,7 @@ fn a_stage_after_the_byte_level_reads_the_image() {
             .map(|(piece, _, _)| piece.to_owned())
             .collect();
         let mut ours = Vec::new();
-        native.pieces_mapping(0, from, text, &mut image, &mut |raw: &[u8]| {
+        native.staged_pieces_mapping(from, text, &mut image, |raw: &[u8]| {
             ours.push(
                 raw.iter()
                     .map(|&b| table[usize::from(b)])
@@ -1875,7 +1875,7 @@ fn a_space_joined_run_is_never_cut_by_the_pool() {
         ] {
             let whole: Vec<String> = {
                 let mut out = Vec::new();
-                native.pieces(0, text, &mut |piece| out.push(piece.to_owned()));
+                native.staged_pieces(text, |piece| out.push(piece.to_owned()));
                 out
             };
             let mut chunked = Vec::new();
@@ -1884,7 +1884,7 @@ fn a_space_joined_run_is_never_cut_by_the_pool() {
                 let Segment::Text(chunk) = unit else {
                     panic!("no added tokens in this text");
                 };
-                native.pieces(0, chunk, &mut |piece| chunked.push(piece.to_owned()));
+                native.staged_pieces(chunk, |piece| chunked.push(piece.to_owned()));
             }
             assert_eq!(chunked, whole, "pattern {index}: a cut split a piece");
             let pooled = native
@@ -1946,7 +1946,7 @@ fn a_cut_window_begins_where_a_whitespace_run_begins_under_a_fixed_count_alterna
         let native = NativeEncoder::from_tokenizer(&tokenizer).expect("native path");
         let whole: Vec<String> = {
             let mut out = Vec::new();
-            native.pieces(0, &text, &mut |piece| out.push(piece.to_owned()));
+            native.staged_pieces(&text, |piece| out.push(piece.to_owned()));
             out
         };
         let mut chunked = Vec::new();
@@ -1955,7 +1955,7 @@ fn a_cut_window_begins_where_a_whitespace_run_begins_under_a_fixed_count_alterna
             let Segment::Text(chunk) = unit else {
                 panic!("no added tokens in this text");
             };
-            native.pieces(0, chunk, &mut |piece| chunked.push(piece.to_owned()));
+            native.staged_pieces(chunk, |piece| chunked.push(piece.to_owned()));
         }
         assert_eq!(chunked, whole, "case {index}: a cut split a piece");
         let pooled = native
@@ -2257,7 +2257,7 @@ fn a_later_stage_runs_over_the_earlier_stage_pieces_of_the_cut_window() {
         let native = NativeEncoder::from_tokenizer(&tokenizer).expect("native path");
         let whole: Vec<String> = {
             let mut out = Vec::new();
-            native.pieces(0, &text, &mut |piece| out.push(piece.to_owned()));
+            native.staged_pieces(&text, |piece| out.push(piece.to_owned()));
             out
         };
         let mut chunked = Vec::new();
@@ -2265,7 +2265,7 @@ fn a_later_stage_runs_over_the_earlier_stage_pieces_of_the_cut_window() {
             let Segment::Text(chunk) = unit else {
                 panic!("no added tokens in this text");
             };
-            native.pieces(0, chunk, &mut |piece| chunked.push(piece.to_owned()));
+            native.staged_pieces(chunk, |piece| chunked.push(piece.to_owned()));
         }
         assert_eq!(chunked, whole, "case {index}: a cut split a piece");
         let pooled = native
@@ -2918,7 +2918,7 @@ fn stable_cuts_leave_the_pieces_as_they_are() {
         let text = normalize(&text, shape.normalizer, None).into_owned();
         let whole: Vec<String> = {
             let mut out = Vec::new();
-            native.pieces(0, &text, &mut |piece| out.push(piece.to_owned()));
+            native.staged_pieces(&text, |piece| out.push(piece.to_owned()));
             out
         };
         let mut chunked = Vec::new();
@@ -2947,7 +2947,7 @@ fn stable_cuts_leave_the_pieces_as_they_are() {
             let Segment::Text(chunk) = unit else {
                 panic!("no added tokens in this text");
             };
-            native.pieces(0, chunk, &mut |piece| chunked.push(piece.to_owned()));
+            native.staged_pieces(chunk, |piece| chunked.push(piece.to_owned()));
         }
         assert_eq!(chunked, whole, "{}: a cut split a piece", shape.name);
     }
@@ -3092,7 +3092,7 @@ fn split_tokenizer(pattern: &str, model: BPE) -> HfTokenizer {
 /// The pieces the native pre-tokenizer cuts `text` into.
 fn native_pieces(native: &NativeEncoder, text: &str) -> Vec<String> {
     let mut pieces = Vec::new();
-    native.pieces(0, text, &mut |piece| pieces.push(piece.to_owned()));
+    native.staged_pieces(text, |piece| pieces.push(piece.to_owned()));
     pieces
 }
 
@@ -6073,6 +6073,118 @@ fn the_cased_template_scanner_cuts_the_fixture_and_fuzz_texts_as_its_program_doe
 }
 
 #[test]
+fn the_byte_level_scanner_cuts_the_fixture_and_fuzz_texts_as_its_program_does() {
+    // The walk over a pipeline's stages reaches this scanner, the pattern's
+    // iterator does not: it is held against the program through its own.
+    let parsed = Pattern::parse(BYTE_LEVEL_PATTERN).expect("parses");
+    let program = parsed.program_only();
+    let fixtures = fixture_texts();
+    let mut state = 0x7F4A_7C15_9E37_79B9u64;
+    let check = |text: &str| {
+        let scanned = parsed.split_matches(text).expect("the split's scanner");
+        assert_eq!(
+            scanned.collect::<Vec<_>>(),
+            program.find_iter(text).collect::<Vec<_>>(),
+            "text {text:?}"
+        );
+    };
+    for text in &fixtures {
+        check(text);
+    }
+    for _ in 0..fuzz_rounds() {
+        check(&fuzz_text(&mut state, &fixtures));
+    }
+}
+
+/// The walk cuts a pipeline that holds the byte-level split, which it
+/// matches by the scanner, as the same stages cut it by their programs: the
+/// same final pieces on every fixture text and fuzz input, and the same
+/// pieces over the image where stages follow the map. Two pipelines hold a
+/// split of the same form whose classes leave characters to no alternative,
+/// its matches kept and removed: there the walk owes the text between two
+/// matches and after the last.
+#[test]
+fn the_walk_with_the_byte_level_scanner_cuts_as_the_stage_programs_do() {
+    const HOLES: &str = "ab|ac|[ab]?[bc]+|[cd]?[de]+|[ef]?[fg]+|[gh]+(?![hi])|[hi]+";
+    let with_holes = |name: &'static str, behavior: SplitDelimiterBehavior| Shape {
+        name,
+        normalizer: Normalizer::None,
+        pre_tokenizers: vec![
+            split(DIGITS, SplitDelimiterBehavior::Isolated, false),
+            split(HOLES, behavior, false),
+            byte_level(false),
+        ],
+        ignore_merges: false,
+        special: &[],
+        added: &[],
+        stripped: &[],
+    };
+    let named = |name: &str| {
+        shapes()
+            .into_iter()
+            .find(|shape| shape.name == name)
+            .expect("the shape")
+    };
+    let fixtures = fixture_texts();
+    let mut state = 0x5350_4C49_5400_0001u64;
+    for shape in [
+        named("digits-then-byte-level-regex"),
+        named("punctuation-each-then-byte-level-regex"),
+        named("punctuation-then-byte-level-regex-then-digits"),
+        named("punctuation-then-byte-level-regex-then-digit-runs-then-threes"),
+        with_holes(
+            "digits-then-a-split-with-holes",
+            SplitDelimiterBehavior::Isolated,
+        ),
+        with_holes(
+            "digits-then-a-removed-split-with-holes",
+            SplitDelimiterBehavior::Removed,
+        ),
+    ] {
+        let name = shape.name;
+        let tokenizer = tokenizer_of(&shape, &mut state);
+        let native = seeded(&tokenizer);
+        assert!(native.byte_split, "{name}");
+        let mut by_programs = seeded(&tokenizer);
+        for stage in &mut by_programs.stages {
+            stage.pattern = stage.pattern.program_only();
+        }
+        assert!(
+            !by_programs
+                .stages
+                .iter()
+                .any(|stage| stage.pattern.has_byte_split()),
+            "{name}"
+        );
+        let check = |text: &str| {
+            let mut spans = Vec::new();
+            native.piece_spans(text, &mut spans);
+            assert_eq!(
+                spans,
+                staged(&by_programs.stages, text),
+                "{name}: text {text:?}"
+            );
+            if let Some(from) = native.mapped_from {
+                let (mut image, mut ours, mut theirs) = (String::new(), Vec::new(), Vec::new());
+                native.staged_pieces_mapping(from, text, &mut image, |raw: &[u8]| {
+                    ours.push(raw.to_vec());
+                });
+                by_programs.staged_pieces_mapping(from, text, &mut image, |raw: &[u8]| {
+                    theirs.push(raw.to_vec());
+                });
+                assert_eq!(ours, theirs, "{name}: over the image; text {text:?}");
+            }
+        };
+        for text in &fixtures {
+            check(text);
+        }
+        for _ in 0..fuzz_rounds() {
+            check(&fuzz_text(&mut state, &fixtures));
+        }
+    }
+}
+
+#[test]
 fn the_chain_scanner_cuts_the_fixture_and_fuzz_texts_as_its_stage_programs_do() {
     let stages: Vec<Stage> = [DIGITS, CJK, DEEPSEEK]
         .iter()
@@ -6476,7 +6588,7 @@ fn a_failed_run_before_a_character_that_never_comes_is_left_behind() {
                 .collect();
             let mut ours = Vec::new();
             let started = Instant::now();
-            native.pieces_mapping(0, from, &text, &mut image, &mut |raw: &[u8]| {
+            native.staged_pieces_mapping(from, &text, &mut image, |raw: &[u8]| {
                 ours.push(
                     raw.iter()
                         .map(|&b| table[usize::from(b)])
@@ -6605,7 +6717,7 @@ fn the_search_past_a_failed_run_cuts_as_the_reference_does() {
                     .collect();
                 if let Some(from) = native.mapped_from {
                     let mut ours = Vec::new();
-                    native.pieces_mapping(0, from, &text, &mut image, &mut |raw: &[u8]| {
+                    native.staged_pieces_mapping(from, &text, &mut image, |raw: &[u8]| {
                         ours.push(
                             raw.iter()
                                 .map(|&b| table[usize::from(b)])
@@ -6635,7 +6747,8 @@ fn the_search_past_a_failed_run_cuts_as_the_reference_does() {
 /// first would rescan an ordinary text's run of letters from every start
 /// (the search passes over a failed run only when the program opens with
 /// it), so it is declined at load; the same shapes before the map load, as
-/// does a leading run after it.
+/// does a leading run after it. The byte-level split as such a stage answers
+/// by its program, whatever matches it, and is declined with them.
 #[test]
 fn image_stages_whose_pattern_rescans_a_run_are_declined() {
     let mut state = 0x5245_5343_414E_0001u64;
@@ -6658,6 +6771,7 @@ fn image_stages_whose_pattern_rescans_a_run_are_declined() {
         r"\p{L}*\p{N}+!",
         r"(?:[!]?\p{L}){3,}",
         r"(?:[!]?\p{L}){100000,}",
+        BYTE_LEVEL_PATTERN,
     ] {
         let stage = || split(pattern, SplitDelimiterBehavior::Isolated, false);
         let after = tokenizer_of(&shape_of(vec![byte_level(false), stage()]), &mut state);
@@ -6858,7 +6972,7 @@ fn a_piece_without_an_opening_byte_is_final_before_its_image() {
                 .map(|(piece, _, _)| piece.to_owned())
                 .collect();
             let mut ours = Vec::new();
-            native.pieces_mapping(0, from, text, &mut image, &mut |raw: &[u8]| {
+            native.staged_pieces_mapping(from, text, &mut image, |raw: &[u8]| {
                 ours.push(
                     raw.iter()
                         .map(|&b| table[usize::from(b)])
@@ -6866,7 +6980,7 @@ fn a_piece_without_an_opening_byte_is_final_before_its_image() {
                 );
             });
             let mut walked = Vec::new();
-            full.pieces_mapping(0, from, text, &mut image, &mut |raw: &[u8]| {
+            full.staged_pieces_mapping(from, text, &mut image, |raw: &[u8]| {
                 walked.push(
                     raw.iter()
                         .map(|&b| table[usize::from(b)])

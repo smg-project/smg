@@ -1,6 +1,6 @@
-//! The replication scope's two calls end to end (design 5.4), against the
+//! The replication scope's call end to end (design 5.4), against the
 //! controller's serve in the case's own process: `Replicate` from a
-//! standby's place, and the complete snapshot a standby is restored from.
+//! standby's place, and the snapshot a standby is restored from on it.
 //!
 //! No stub server: the client is the generated one and the server is the
 //! controller's own serve. The writes go through the handle of its store,
@@ -21,7 +21,7 @@ use std::{
     collections::BTreeMap,
     future::Future,
     io::Write as _,
-    net::SocketAddr,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -30,17 +30,17 @@ use std::{
     time::{Duration, Instant},
 };
 
-use net::loopback;
+use net::{http_get, loopback};
 use prost::Message as _;
 use smg_policy_controller::{
-    controller::{Config, Controller, Election, LeasePlace, Listener, Scope, State},
+    controller::{Config, Controller, Election, LeasePlace, Listener, Readiness, Scope, State},
     elector::{ElectionSettings, Elector, FileLease, Tick},
     proto::{
         self, policy_controller_client::PolicyControllerClient, replica_frame::Frame,
         replication_event::Event as Sent, worker_event::Event,
     },
-    store::{LoadSink, LoadSource, MemoryStore, WorkerFacts, WorkerStatus, WorkersStore},
-    LoadRow, WorkerId,
+    store::{Kinds, LoadSink, LoadSource, MemoryStore, WorkerFacts, WorkerStatus, WorkersStore},
+    LoadRow, WireModes, WorkerId,
 };
 use tokio::{
     sync::{mpsc, oneshot},
@@ -49,6 +49,9 @@ use tokio::{
 use tonic::{
     codegen::tokio_stream::wrappers::ReceiverStream, metadata::AsciiMetadataValue,
     transport::Channel, Code, Request, Status, Streaming,
+};
+use tonic_health::pb::{
+    health_check_response::ServingStatus, health_client::HealthClient, HealthCheckRequest,
 };
 
 /// Long against a loaded host: the leader of the case's start leads to its
@@ -158,21 +161,25 @@ struct RpcStatus {
 /// shared lease, so the store journals its load rows, and one the case's
 /// replica leads at its take. A take of a record with no holder to wait
 /// for opens its fence one renew deadline later.
+/// The case's first ask makes the file; a second replica of the case
+/// finds it.
 fn shared(dir: &tempfile::TempDir) -> LeasePlace {
     let path = dir.path().join("lease");
-    let lease = Box::new(FileLease::new(&path));
-    let mut before = Elector::new(lease, "replication-9@127.0.0.1:9", settings())
-        .expect("the settings are in order");
-    let took = before.tick(Instant::now());
-    assert!(matches!(took, Ok(Tick::Acquired { .. })), "{took:?}");
-    // A release inside the take's wait hands the wait on, so the holder
-    // before leads first: its take opens no fence until a renewal one
-    // renew deadline after it.
-    let led = Instant::now() + settings().renew_deadline;
-    let renewed = before.tick(led);
-    assert!(matches!(renewed, Ok(Tick::Renewed { .. })), "{renewed:?}");
-    assert!(before.fence().leader_term(led).is_some(), "{led:?}");
-    assert!(before.release().expect("the release's write"));
+    if !path.exists() {
+        let lease = Box::new(FileLease::new(&path));
+        let mut before = Elector::new(lease, "replication-9@127.0.0.1:9", settings())
+            .expect("the settings are in order");
+        let took = before.tick(Instant::now());
+        assert!(matches!(took, Ok(Tick::Acquired { .. })), "{took:?}");
+        // A release inside the take's wait hands the wait on, so the holder
+        // before leads first: its take opens no fence until a renewal one
+        // renew deadline after it.
+        let led = Instant::now() + settings().renew_deadline;
+        let renewed = before.tick(led);
+        assert!(matches!(renewed, Ok(Tick::Renewed { .. })), "{renewed:?}");
+        assert!(before.fence().leader_term(led).is_some(), "{led:?}");
+        assert!(before.release().expect("the release's write"));
+    }
     LeasePlace::File(path)
 }
 
@@ -202,6 +209,8 @@ fn stated<T>(message: T) -> Request<T> {
 struct Standby {
     frames: mpsc::Sender<proto::ReplicaFrame>,
     batches: Streaming<proto::ReplicationBatch>,
+    /// The bytes of each part of the last snapshot read.
+    parts: Vec<usize>,
 }
 
 fn place(seq: u64, term: u64) -> proto::ReplicaHello {
@@ -227,7 +236,11 @@ async fn replicate(addr: SocketAddr, hello: proto::ReplicaHello) -> Result<Stand
         .replicate(stated(ReceiverStream::new(sent)))
         .await?
         .into_inner();
-    Ok(Standby { frames, batches })
+    Ok(Standby {
+        frames,
+        batches,
+        parts: Vec::new(),
+    })
 }
 
 impl Standby {
@@ -238,8 +251,8 @@ impl Standby {
             .expect("the leader answers within 20 s")
     }
 
-    /// The next frame as it is: a batch of events, the word to re-sync or
-    /// a heartbeat.
+    /// The next frame as it is: a batch of events, the word to re-sync, a
+    /// part of a snapshot or a heartbeat.
     async fn frame(&mut self) -> proto::ReplicationBatch {
         self.next()
             .await
@@ -267,7 +280,8 @@ impl Standby {
         let mut found = None;
         for _ in 0..64 {
             let batch = self.frame().await;
-            if !batch.resync_required && batch.events.is_empty() {
+            let part = batch.snapshot.is_some();
+            if !batch.resync_required && batch.events.is_empty() && !part {
                 found = Some(batch);
                 break;
             }
@@ -284,7 +298,8 @@ impl Standby {
         for _ in 0..4_096 {
             match self.next().await {
                 Ok(Some(batch)) => {
-                    beats += u32::from(!batch.resync_required && batch.events.is_empty());
+                    let said = batch.resync_required || batch.snapshot.is_some();
+                    beats += u32::from(!said && batch.events.is_empty());
                     if beats == 8 {
                         break;
                     }
@@ -326,17 +341,49 @@ impl Standby {
         }
     }
 
-    /// The stream's last two answers of a refused place: one
-    /// `resync_required` batch, then the status.
-    async fn refused(&mut self) -> Code {
-        let batch = self.batch().await;
-        assert!(batch.resync_required);
-        assert!(batch.events.is_empty());
-        assert_eq!((batch.first_seq, batch.term), (0, 0));
-        self.next()
-            .await
-            .expect_err("a status follows the resync batch")
-            .code()
+    /// The leader's answer to a place it does not hold: the word to
+    /// re-sync, then its snapshot on the same stream
+    /// ([`Standby::snapshot`]).
+    async fn restored(&mut self) -> Result<proto::Snapshot, Status> {
+        let word = self.batch().await;
+        assert!(word.resync_required, "the word to re-sync");
+        assert!(word.events.is_empty() && word.snapshot.is_none());
+        assert_eq!((word.first_seq, word.term), (0, 0));
+        self.snapshot().await
+    }
+
+    /// The parts of the leader's snapshot, read to the last and put
+    /// together: the rows, the load rows, the place every part names and
+    /// the epoch. The stream stands after it: the log follows from that
+    /// place. `parts` holds each part's bytes on the wire.
+    async fn snapshot(&mut self) -> Result<proto::Snapshot, Status> {
+        let mut whole = proto::Snapshot::default();
+        self.parts.clear();
+        loop {
+            let batch = self.next().await?.expect("a part, not the stream's end");
+            let bytes = batch.encoded_len();
+            assert!(batch.events.is_empty() && !batch.resync_required);
+            let part = batch.snapshot.expect("a part of the snapshot");
+            assert_eq!(part.part as usize, self.parts.len(), "the parts in order");
+            let at = (batch.first_seq - 1, batch.term, part.membership_epoch);
+            if self.parts.is_empty() {
+                whole.replication_seq = at.0;
+                whole.replication_term = at.1;
+                whole.membership_epoch = at.2;
+            }
+            let said = (
+                whole.replication_seq,
+                whole.replication_term,
+                whole.membership_epoch,
+            );
+            assert_eq!(said, at, "every part at the snapshot's place");
+            self.parts.push(bytes);
+            whole.workers.extend(part.workers);
+            whole.loads.extend(part.loads);
+            if part.last {
+                return Ok(whole);
+            }
+        }
     }
 }
 
@@ -383,7 +430,15 @@ fn cases(events: &[proto::ReplicationEvent]) -> Vec<&'static str> {
         .collect()
 }
 
+/// The leader's snapshot at `addr` as a standby that asks to be restored is
+/// sent it (a number under no term, which no log holds): the parts of one
+/// stream, put together.
 async fn snapshot(addr: SocketAddr) -> Result<proto::Snapshot, Status> {
+    replicate(addr, place(1, 0)).await?.restored().await
+}
+
+/// The snapshot call at `addr`, the operators' read.
+async fn get_snapshot(addr: SocketAddr) -> Result<proto::Snapshot, Status> {
     client(addr)
         .await
         .get_snapshot(stated(proto::SnapshotRequest::default()))
@@ -392,13 +447,12 @@ async fn snapshot(addr: SocketAddr) -> Result<proto::Snapshot, Status> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_standby_is_sent_the_log_from_its_place_and_told_to_resync_from_any_other() {
+async fn a_standby_is_sent_the_log_from_its_place_and_restored_from_any_other() {
     let dir = tempfile::tempdir().expect("a temp dir");
     with_leader(shared(&dir), |leader| async move {
         let id = writes(&leader.store, 3);
         let base = snapshot(leader.replication).await.expect("a snapshot");
         let term = base.replication_term;
-        assert_eq!(base.term, term);
         assert_ne!(term, 0, "the leader's place stands under its term");
         // The run drew where its places start. The take, the registration
         // and three load rows stand after that place.
@@ -451,23 +505,24 @@ async fn a_standby_is_sent_the_log_from_its_place_and_told_to_resync_from_any_ot
         assert_eq!((beat.first_seq, beat.term), (nth(7), term));
 
         // A position past the head and a position that names no term: each
-        // is told to re-sync.
-        for refused in [
+        // is told to re-sync and restored on the stream it holds, at the
+        // leader's head, and reads on from there.
+        for lost in [
             place(nth(70), term),
             proto::ReplicaHello {
                 last_applied_term: 0,
                 ..place(nth(5), term)
             },
         ] {
-            let mut stream = replicate(leader.replication, refused.clone())
+            let mut stream = replicate(leader.replication, lost.clone())
                 .await
                 .expect("a stream");
-            assert_eq!(
-                stream.refused().await,
-                Code::FailedPrecondition,
-                "{refused:?}"
-            );
-            assert_eq!(stream.next().await.expect("the stream's end"), None);
+            let restored = stream.restored().await.expect("a snapshot");
+            let at = (restored.replication_seq, restored.replication_term);
+            assert_eq!(at, (nth(6), term), "{lost:?}");
+            assert_eq!(restored.workers.len(), 1, "{lost:?}");
+            let beat = stream.beat().await;
+            assert_eq!((beat.first_seq, beat.term), (nth(7), term));
         }
 
         // A standby that saw a later term than this replica leads under.
@@ -553,8 +608,8 @@ async fn a_standby_that_acknowledges_nothing_is_cut_at_its_backlog() {
         }
 
         // The same log to a standby that acknowledges nothing: sent its 300
-        // events and no more, told to re-sync a second later, then the
-        // status.
+        // events and no more, told to re-sync a second later, and restored
+        // at the leader's head on the stream it holds.
         let mut slow = replicate(leader.replication, hello)
             .await
             .expect("a stream");
@@ -569,7 +624,9 @@ async fn a_standby_that_acknowledges_nothing_is_cut_at_its_backlog() {
         };
         assert_eq!(held, 300, "events before the cut");
         assert!(cut.events.is_empty());
-        assert_eq!(slow.ended().await, Some(Code::ResourceExhausted));
+        let restored = slow.snapshot().await.expect("the snapshot");
+        assert_eq!(restored.replication_seq, head);
+        assert_eq!(slow.beat().await.first_seq, head + 1);
 
         // A bound under one batch: a standby that acknowledges each batch
         // is sent the same log to its head, 64 events a batch at the most.
@@ -843,6 +900,15 @@ fn churn(store: &MemoryStore, stop: &AtomicBool) -> u32 {
     rounds
 }
 
+/// Waits, within 20 s, until `store` wrote past position `seq`.
+async fn written_past(store: &MemoryStore, seq: u64) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while store.cut(Kinds::All).at.seq <= seq {
+        assert!(Instant::now() < deadline, "no write past {seq} in 20 s");
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_snapshot_and_the_batches_after_it_are_the_next_snapshot_under_a_writer() {
     let dir = tempfile::tempdir().expect("a temp dir");
@@ -852,36 +918,43 @@ async fn a_snapshot_and_the_batches_after_it_are_the_next_snapshot_under_a_write
             let (store, stop) = (Arc::clone(&leader.store), Arc::clone(&stop));
             thread::spawn(move || churn(&store, &stop))
         };
-        // Three snapshots while the writer writes, each joined at its
-        // place and read up to the next one's.
-        let mut snapshots = Vec::new();
+        // Three standbys restored while the writer writes, each on a stream
+        // of its own, which then carries the log from its snapshot's place.
+        let mut streams = Vec::new();
         for _ in 0..3 {
             tokio::time::sleep(Duration::from_millis(150)).await;
-            snapshots.push(snapshot(leader.replication).await.expect("a snapshot"));
+            let mut standby = replicate(leader.replication, place(1, 0))
+                .await
+                .expect("a stream");
+            let taken = standby.restored().await.expect("a snapshot");
+            // The next snapshot parts from this one by a write: the writer
+            // is waited for, never taken to have run meanwhile.
+            written_past(&leader.store, taken.replication_seq).await;
+            streams.push((standby, taken));
         }
         stop.store(true, Ordering::Relaxed);
         let rounds = writer.join().expect("the writer");
-        snapshots.push(snapshot(leader.replication).await.expect("a snapshot"));
+        let last = snapshot(leader.replication).await.expect("a snapshot");
+        let later = streams.iter().skip(1).map(|(_, taken)| taken.clone());
+        let nexts: Vec<_> = later.chain([last]).collect();
 
+        // A snapshot and the batches after it on its stream are the next
+        // snapshot: every position after its place, with no gap.
         let mut events = 0;
-        for pair in snapshots.windows(2) {
-            let (from, to) = (&pair[0], &pair[1]);
+        for ((mut standby, from), to) in streams.into_iter().zip(nexts) {
             assert!(
                 from.replication_seq < to.replication_seq,
                 "the writer wrote"
             );
-            let mut standby = replicate(
-                leader.replication,
-                place(from.replication_seq, from.replication_term),
-            )
-            .await
-            .expect("a stream");
-            let mut twin = Twin::of(from);
-            for event in standby.until(to.replication_seq).await {
-                twin.apply(&event).expect("an event the leader journals");
+            let mut twin = Twin::of(&from);
+            let told = standby.until(to.replication_seq).await;
+            let positions = to.replication_seq - from.replication_seq;
+            assert_eq!(count(told.len()), positions, "no gap after a snapshot");
+            for event in &told {
+                twin.apply(event).expect("an event the leader journals");
                 events += 1;
             }
-            let apart = twin.apart(&Twin::of(to));
+            let apart = twin.apart(&Twin::of(&to));
             assert!(
                 apart.is_empty(),
                 "the snapshot at {} and the events after it are not the snapshot at {}: {apart:?}",
@@ -911,95 +984,108 @@ async fn a_controller_that_leads_itself_serves_no_standby() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_complete_snapshot_is_the_replication_listeners_alone() {
+async fn the_snapshot_call_restores_no_standby() {
     let dir = tempfile::tempdir().expect("a temp dir");
     with_leader(shared(&dir), |leader| async move {
         let id = writes(&leader.store, 2);
-        let complete = snapshot(leader.replication).await.expect("a snapshot");
-        assert_eq!(complete.controller_id, "replication-0");
-        assert_eq!(
-            complete
-                .workers
-                .iter()
-                .map(|row| row.id)
-                .collect::<Vec<_>>(),
-            [id.0]
-        );
-        assert_eq!(complete.loads.len(), 1);
-        // The control scope's own read is not served yet, and the gateways'
-        // listener mounts neither scope of the call.
-        let unserved = snapshot(leader.control).await.expect_err("not served yet");
-        assert_eq!(unserved.code(), Code::Unimplemented);
-        let denied = snapshot(leader.gateway).await.expect_err("not its scope");
-        assert_eq!(denied.code(), Code::PermissionDenied);
+        // A standby's snapshot rides its stream: the row and its load row.
+        let restored = snapshot(leader.replication).await.expect("a snapshot");
+        let rows: Vec<u64> = restored.workers.iter().map(|row| row.id).collect();
+        assert_eq!(rows, [id.0]);
+        assert_eq!(restored.loads.len(), 1);
+        // The call is the operators' read: the replication listener and the
+        // gateways' mount no scope of it, and the control scope does not
+        // serve it yet.
+        for (addr, code) in [
+            (leader.replication, Code::PermissionDenied),
+            (leader.gateway, Code::PermissionDenied),
+            (leader.control, Code::Unimplemented),
+        ] {
+            let refused = get_snapshot(addr).await.expect_err("no snapshot");
+            assert_eq!(refused.code(), code, "{addr}");
+        }
     })
     .await;
 }
 
-/// The bound on the complete snapshot is the transport's own: a client with
-/// no limit of its own reads the largest snapshot the leader serves, and the
-/// first one above it is refused in the leader's words, never by the
-/// client's transport.
+/// A store whose rows pass one message of the transport restores a standby
+/// whole: its snapshot arrives in parts on the standby's stream, each one
+/// the transport reads, and the log follows from the snapshot's place.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_largest_snapshot_served_is_one_the_transport_reads() {
+async fn a_store_past_one_message_restores_a_standby_whole_on_its_stream() {
     let dir = tempfile::tempdir().expect("a temp dir");
     with_leader(shared(&dir), |leader| async move {
         // Rows of a few kilobytes each, by their key.
         let wide = "k".repeat(2_000);
-        let mut rows = 0;
-        let mut served = 0;
-        let refused = loop {
-            for _ in 0..50 {
-                leader
-                    .store
-                    .upsert(facts(&format!("http://{wide}-{rows}:8000"), 1, 0));
-                rows += 1;
-            }
-            match snapshot(leader.replication).await {
-                Ok(complete) => served = complete.encoded_len(),
-                Err(refused) => break refused,
-            }
-            assert!(rows < 10_000, "no snapshot of {rows} rows was refused");
-        };
-        assert!(
-            served > (3 << 20),
-            "the last snapshot served was {served} bytes"
-        );
-        assert_eq!(refused.code(), Code::ResourceExhausted);
-        assert!(
-            refused.message().contains("above one message of 4194304"),
-            "{}",
-            refused.message()
-        );
-        // Past the ceiling the leader writes on and feeds a standby whose
-        // place its log holds; one that needs a snapshot is still refused.
-        leader.store.upsert(facts("http://after:8000", 1, 0));
-        let mut joined = replicate(leader.replication, place(0, 0))
+        for row in 0..1_500 {
+            leader
+                .store
+                .upsert(facts(&format!("http://{wide}-{row}:8000"), 1, 0));
+        }
+        let id = writes(&leader.store, 3);
+        let mut standby = replicate(leader.replication, place(1, 0))
             .await
             .expect("a stream");
-        assert!(!joined.batch().await.events.is_empty());
-        let again = snapshot(leader.replication).await.err();
-        assert_eq!(
-            again.map(|refused| refused.code()),
-            Some(Code::ResourceExhausted)
-        );
+        let restored = standby.restored().await.expect("a snapshot");
+        let (parts, bytes) = (standby.parts.len(), standby.parts.iter().sum::<usize>());
+        assert!(bytes > 4 * 1024 * 1024, "{bytes} bytes in {parts} parts");
+        // Each part is a page of rows and the batch's own fields at most:
+        // half of what the transport reads.
+        let page = 2 * 1024 * 1024 + 64;
+        assert!(standby.parts.iter().all(|part| *part <= page));
+        // Every row and load row the leader holds, at its head.
+        let held = leader.store.cut(Kinds::All);
+        let at = (restored.replication_seq, restored.replication_term);
+        assert_eq!(at, (held.at.seq, held.at.term));
+        assert_eq!(restored.membership_epoch, held.epoch);
+        let told: Vec<u64> = restored.workers.iter().map(|row| row.id).collect();
+        let rows: Vec<u64> = held.rows.iter().map(|row| row.id.0).collect();
+        assert_eq!(told, rows);
+        assert_eq!(restored.loads.len(), held.loads.len());
+        // The log follows from the snapshot's place, on the same stream.
+        leader
+            .store
+            .record(id, 0, running(7), Instant::now(), LoadSource::Stream);
+        let next = standby.batch().await;
+        assert_eq!((next.first_seq, next.term), (at.0 + 1, at.1));
+        assert_eq!(cases(&next.events), ["load"]);
     })
     .await;
 }
 
-/// A measurement, run by name with `--ignored --nocapture`: the complete
-/// snapshot's bytes at the design's top fleet, 512 workers of a production
+/// A measurement, run by name with `--ignored --nocapture`: a standby's
+/// snapshot at the design's top fleet and at 4,096 workers of a production
 /// row's shape (a 56-byte address, one 36-byte model, four labels, a zone)
-/// with no load row, then 1, 8 and 64 of them a worker, each as a share of
-/// the transport's one message.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "a measurement: run by name"]
-async fn the_snapshots_weight_at_the_top_fleet() {
+/// with 0, 1, 8 and 64 load rows a worker. Each line: the parts, their
+/// bytes together and the widest one, and how long a standby that asks
+/// waits for the whole (the leader's cut, its parts, the client's read),
+/// with the CPU of both ends over the eleven snapshots timed.
+/// Then the leader's memory for a held cut, over the rows alone (what a
+/// watch's kept cut holds) and with 64 load rows a worker: the resident
+/// growth of 32 streams left inside their snapshots at 32 places. Each
+/// fleet is measured in a process of its own: a resident reading starts
+/// where no cut of another fleet was let go.
+async fn snapshots_numbers(workers: u32) {
+    // A load row with every count set, as a busy engine reports it.
+    let busy = LoadRow {
+        running: 48,
+        queued: 12,
+        waiting_uncached_tokens: 180_000,
+        kv_usage_permille: 870,
+        active_kv_permille: 640,
+        live_rate: 3_200,
+        resident_tokens: 1_500_000,
+        resident_counted: true,
+        report_age_ms: 40,
+        max_running: 64,
+        ..LoadRow::default()
+    };
     let dir = tempfile::tempdir().expect("a temp dir");
     with_leader(shared(&dir), |leader| async move {
         let mut ids = Vec::new();
-        for worker in 0..512u32 {
-            let address = format!("http://engine-{worker:04}.serving-pool.example.internal:8000");
+        for worker in 0..workers {
+            let address =
+                format!("http://engine-{worker:04}.serving-pool.example.internal:8000");
             let labels = (0..4)
                 .map(|n| (format!("label-key-{n:02}"), format!("value-{worker:04}")))
                 .collect();
@@ -1012,23 +1098,10 @@ async fn the_snapshots_weight_at_the_top_fleet() {
             };
             ids.push(leader.store.upsert(wide).id());
         }
-        // A load row with every count set, as a busy engine reports it.
-        let busy = LoadRow {
-            running: 48,
-            queued: 12,
-            waiting_uncached_tokens: 180_000,
-            kv_usage_permille: 870,
-            active_kv_permille: 640,
-            live_rate: 3_200,
-            resident_tokens: 1_500_000,
-            resident_counted: true,
-            report_age_ms: 40,
-            max_running: 64,
-            ..LoadRow::default()
-        };
         let now = Instant::now();
         let mut out = std::io::stdout();
         let mut written = 0u16;
+        let mut held = Vec::new();
         for each in [0u16, 1, 8, 64] {
             for rank in written..each {
                 for id in &ids {
@@ -1038,17 +1111,72 @@ async fn the_snapshots_weight_at_the_top_fleet() {
                 }
             }
             written = each;
-            let complete = snapshot(leader.replication).await.expect("a snapshot");
-            let bytes = complete.encoded_len();
+            let mut micros = Vec::new();
+            let mut parts = Vec::new();
+            let cpu = cpu_ms();
+            for _ in 0..11 {
+                let began = Instant::now();
+                let mut standby = replicate(leader.replication, place(1, 0))
+                    .await
+                    .expect("a stream");
+                standby.restored().await.expect("a snapshot");
+                micros.push(began.elapsed().as_micros());
+                parts = standby.parts;
+            }
+            let cpu = cpu_ms() - cpu;
+            micros.sort_unstable();
             writeln!(
                 out,
-                "WEIGHT workers=512 load_rows_each={each} bytes={bytes} permille_of_one_message={}",
-                bytes * 1000 / (4 << 20)
+                "SNAPSHOT workers={workers} load_rows_each={each} parts={} bytes={} widest_part={} median_us={} cpu_ms_of_11={cpu}",
+                parts.len(),
+                parts.iter().sum::<usize>(),
+                parts.iter().max().copied().unwrap_or(0),
+                micros[5]
+            )
+            .expect("stdout");
+            if each != 0 && each != 64 {
+                continue;
+            }
+            // Streams left inside their snapshots, each at a place of its
+            // own: a load row between two moves the head, so no two share a
+            // cut. Each read the word and its first part, and no further.
+            // Over the rows alone a cut is what a watch's kept cut holds.
+            // The first 32 stay held: the second reading reuses nothing
+            // they let go.
+            let before = resident_kb();
+            for turn in 0..32u32 {
+                let id = ids[turn as usize % ids.len()];
+                leader.store.record(id, 0, busy, now, LoadSource::Stream);
+                let mut standby = replicate(leader.replication, place(1, 0))
+                    .await
+                    .expect("a stream");
+                assert!(standby.batch().await.resync_required);
+                assert!(standby.frame().await.snapshot.is_some());
+                held.push(standby);
+            }
+            let grew = resident_kb().saturating_sub(before);
+            writeln!(
+                out,
+                "HELD workers={workers} load_rows_each={each} cuts=32 resident_kb_a_cut={}",
+                grew / 32
             )
             .expect("stdout");
         }
+        assert_eq!(held.len(), 64, "each stream still holds its cut");
     })
     .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "a measurement: run by name"]
+async fn the_snapshots_numbers_at_512_workers() {
+    snapshots_numbers(512).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "a measurement: run by name"]
+async fn the_snapshots_numbers_at_4096_workers() {
+    snapshots_numbers(4_096).await;
 }
 
 /// The principal is the transport's, never a field a peer fills in: a hello
@@ -1072,9 +1200,10 @@ async fn a_standby_is_the_principal_its_call_states() {
             refused.message(),
             "the hello's replica_id is not the principal the call is from"
         );
+        let (_frames, sent) = mpsc::channel::<proto::ReplicaFrame>(1);
         let unnamed = client(leader.replication)
             .await
-            .get_snapshot(proto::SnapshotRequest::default())
+            .replicate(ReceiverStream::new(sent))
             .await
             .expect_err("the call states no name");
         assert_eq!(unnamed.code(), Code::Unauthenticated);
@@ -1152,6 +1281,7 @@ async fn a_standby_that_closes_its_half_ends_the_stream() {
         let Standby {
             frames,
             mut batches,
+            ..
         } = replicate(leader.replication, place(0, 0))
             .await
             .expect("a stream");
@@ -1190,7 +1320,7 @@ async fn a_leader_that_loses_its_lease_ends_its_stream_and_joins_no_other() {
             .await
             .expect("a stream");
         // A second call says no hello yet, from a task of its own. Nothing
-        // orders it ahead of the snapshot asked here: it has that round
+        // orders it ahead of the call made here: it has that round
         // trip, and the leader's wait for its next look at the lease, to
         // be admitted while the leader leads.
         let mut waits = client(leader.replication).await;
@@ -1206,9 +1336,9 @@ async fn a_leader_that_loses_its_lease_ends_its_stream_and_joins_no_other() {
             }
         });
         waits
-            .get_snapshot(stated(proto::SnapshotRequest::default()))
+            .leader(proto::LeaderRequest::default())
             .await
-            .expect("a snapshot while the leader leads");
+            .expect("the leader's word while it leads");
         std::fs::remove_file(&lease).expect("the lease file");
         assert_eq!(open.ended().await, Some(Code::Aborted));
         // The fence is closed, and the hello names a place past the head.
@@ -1368,7 +1498,7 @@ async fn window(leader: &Leader, ids: &Arc<Vec<WorkerId>>, rate: u64, standbys: 
 /// The Numbers table's rows of the stream, run by name with `--ignored
 /// --nocapture`: the resident memory of a full log; the bytes and the CPU
 /// at the design's busy rate (ten load rows a rank a second) with no
-/// standby and with one; the complete snapshot's bytes and time; the idle
+/// standby and with one; the snapshot's bytes and time; the idle
 /// stream. Leader and standby share the process, so the CPU is both ends'.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "a measurement: run by name"]
@@ -1456,4 +1586,511 @@ async fn the_streams_numbers() {
         }
     })
     .await;
+}
+
+/// One replica of a pair over one lease, as a case reaches it.
+struct Replica {
+    replication: SocketAddr,
+    admin: SocketAddr,
+    store: Arc<MemoryStore>,
+    readiness: Readiness,
+    stop: oneshot::Sender<()>,
+    served: JoinSet<()>,
+}
+
+/// The leader's address and the standby's: one host, two addresses, so
+/// both listen on one replication port as replicas configured alike do.
+const LEADER: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+const FOLLOWER: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2));
+
+impl Replica {
+    /// Binds a replica of the lease at `place` on `ip`, its replication
+    /// listener at `port` (`0` takes one), and serves it.
+    async fn serve(id: &str, ip: IpAddr, port: u16, place: LeasePlace) -> Self {
+        let listener = |name: &str, scopes: &[Scope], port| Listener {
+            name: name.to_owned(),
+            addr: SocketAddr::new(ip, port),
+            scopes: scopes.to_vec(),
+            tls: None,
+        };
+        let mut controller = Controller::bind(Config {
+            controller_id: id.to_owned(),
+            listeners: vec![
+                listener("gateway", &[Scope::Gateway, Scope::Ingestion], 0),
+                listener("control", &[Scope::Control], 0),
+                listener("replication", &[Scope::Replication], port),
+            ],
+            admin: SocketAddr::new(ip, 0),
+            shutdown_settle: Duration::from_millis(50),
+            shutdown_grace: Duration::from_secs(5),
+            load_poll_interval: Config::DEFAULT_LOAD_POLL_INTERVAL,
+            decide_shards: 2,
+            election: Election {
+                lease: place,
+                settings: settings(),
+                advertise: None,
+            },
+        })
+        .await
+        .expect("bind");
+        for name in ["control", "replication"] {
+            controller
+                .identity_as_told(name)
+                .expect("a listener of the configuration");
+        }
+        let replication = controller
+            .addresses()
+            .of(Scope::Replication)
+            .expect("the scope is mounted");
+        let admin = controller.addresses().admin;
+        let (store, readiness) = (controller.store(), controller.readiness());
+        let (stop, stopped) = oneshot::channel::<()>();
+        let mut served = JoinSet::new();
+        served.spawn(async move {
+            let shutdown = async {
+                let _ = stopped.await;
+            };
+            controller.serve(shutdown).await.expect("a clean drain");
+        });
+        Self {
+            replication,
+            admin,
+            store,
+            readiness,
+            stop,
+            served,
+        }
+    }
+
+    /// Resolves once the replica leads, within 30 s.
+    async fn leads(&mut self) {
+        let led = self.readiness.wait_for(State::Leader);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(30), led).await,
+            Ok(Some(State::Leader))
+        );
+    }
+
+    /// Resolves once the replica's state is `state`, within 30 s.
+    async fn reads(&mut self, state: State) {
+        let read = self.readiness.wait_for(state);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(30), read).await,
+            Ok(Some(state))
+        );
+    }
+
+    /// The planned stop, which releases the lease, and its drain.
+    async fn stop(mut self) {
+        self.stop.send(()).expect("the serve still runs");
+        let drained = tokio::time::timeout(Duration::from_secs(30), self.served.join_next()).await;
+        assert!(
+            matches!(drained, Ok(Some(Ok(())))),
+            "a clean drain within 30 s"
+        );
+    }
+
+    /// What the replica holds, without its instants: its place, then its
+    /// epoch, its rows and its load rows, each row without its age.
+    fn held(&self) -> ((u64, u64), impl PartialEq + std::fmt::Debug) {
+        let cut = self.store.cut(Kinds::All);
+        let rows: Vec<_> = cut
+            .rows
+            .into_iter()
+            .map(|row| (row.id, row.facts, row.status, row.revision))
+            .collect();
+        let loads: Vec<_> = cut
+            .loads
+            .into_iter()
+            .map(|(id, rank, sample)| {
+                let row = LoadRow {
+                    report_age_ms: 0,
+                    ..sample.row
+                };
+                (id, rank, row)
+            })
+            .collect();
+        ((cut.at.seq, cut.at.term), (cut.epoch, rows, loads))
+    }
+
+    /// Waits, within 20 s, until the replica stands at `place`.
+    async fn stands_at(&self, place: (u64, u64)) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while self.held().0 != place {
+            assert!(
+                Instant::now() < deadline,
+                "the replica stands at {:?}, not at {place:?}, after 20 s",
+                self.held().0
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+}
+
+/// How many polls the replica whose admin listener is `admin` has sent, by
+/// its metrics page.
+async fn polls(admin: SocketAddr) -> u64 {
+    let (status, page) = http_get(admin, "/metrics").await.expect("the metrics page");
+    assert_eq!(status, 200);
+    let counter = "smg_policy_controller_load_polls_total{mode=\"poll\"} ";
+    let count = page.lines().find_map(|line| line.strip_prefix(counter));
+    count
+        .and_then(|count| count.trim().parse().ok())
+        .expect("the polls' counter")
+}
+
+/// The `Leader` call's answer at `addr`.
+async fn leader_info(addr: SocketAddr) -> proto::LeaderInfo {
+    client(addr)
+        .await
+        .leader(proto::LeaderRequest::default())
+        .await
+        .expect("every listener answers")
+        .into_inner()
+}
+
+/// The snapshot of a replica that took the lease, within 20 s: between its
+/// take and the take's own write the call is `UNAVAILABLE`.
+async fn promoted(addr: SocketAddr) -> proto::Snapshot {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        match snapshot(addr).await {
+            Ok(served) => return served,
+            Err(wait) => {
+                assert_eq!(wait.code(), Code::Unavailable, "no snapshot: {wait}");
+                assert!(Instant::now() < deadline, "no snapshot in 20 s: {wait}");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_promoted_standby_holds_every_row_and_load_row_of_its_leader() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let mut leader = Replica::serve("replication-0", LEADER, 0, shared(&dir)).await;
+    leader.leads().await;
+    let began = leader.held().0;
+    let port = leader.replication.port();
+    let mut standby = Replica::serve("replication-1", FOLLOWER, port, shared(&dir)).await;
+    // A ready worker the load driver polls, at an address nobody answers.
+    let polled = WorkerFacts {
+        wire_modes: WireModes::GRPC,
+        ..facts("grpc://127.0.0.1:1", 1, 0)
+    };
+    let polled = leader.store.upsert(polled).id();
+    let revision = leader.store.get(polled).expect("the row").revision;
+    leader
+        .store
+        .set_status(polled, WorkerStatus::Ready, revision);
+    // The leader writes while the standby follows.
+    let stop = Arc::new(AtomicBool::new(false));
+    let writer = {
+        let (store, stop) = (Arc::clone(&leader.store), Arc::clone(&stop));
+        thread::spawn(move || churn(&store, &stop))
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    stop.store(true, Ordering::Relaxed);
+    let rounds = writer.join().expect("the writer");
+    let (head, wrote) = leader.held();
+    let events = head.0 - began.0;
+    assert!(events > 100, "{rounds} rounds wrote {events} events");
+    standby.stands_at(head).await;
+    assert_eq!(standby.held().1, wrote, "{rounds} rounds");
+    // The leader's driver polls the ready worker. The standby holds the
+    // same row and polls nobody while it follows: a tick of its driver
+    // later, its counter still reads none.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while polls(leader.admin).await == 0 {
+        assert!(Instant::now() < deadline, "the leader polls its worker");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    assert_eq!(polls(standby.admin).await, 0, "a follower polls nobody");
+    // The standby says how far behind it is; the leader follows nobody.
+    let info = leader_info(standby.replication).await;
+    assert!(!info.is_leader && info.synced, "{info:?}");
+    let lag = info.sync.map(|sync| sync.replication_lag_ms);
+    assert!(lag.is_some_and(|lag| lag < 5_000), "{lag:?}");
+    let own = leader_info(leader.replication).await;
+    assert!(
+        own.is_leader && !own.synced && own.sync.is_none(),
+        "{own:?}"
+    );
+
+    // The leader stops: the standby takes the lease with what it held and
+    // serves it under a term of its own.
+    leader.stop().await;
+    standby.leads().await;
+    let served = promoted(standby.replication).await;
+    assert_eq!(
+        served.replication_seq,
+        head.0 + 1,
+        "its term starts after the last event"
+    );
+    assert!(served.replication_term > head.1);
+    let (place, holds) = standby.held();
+    assert_eq!(place, (served.replication_seq, served.replication_term));
+    assert_eq!(holds, wrote);
+    // A leader follows nobody: its answer says no sync state.
+    let promoted = leader_info(standby.replication).await;
+    assert!(
+        promoted.is_leader && !promoted.synced && promoted.sync.is_none(),
+        "{promoted:?}"
+    );
+    standby.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_standby_that_joins_late_is_restored_whole_from_a_snapshot_past_one_message() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let mut leader = Replica::serve("replication-0", LEADER, 0, shared(&dir)).await;
+    leader.leads().await;
+    let began = leader.held().0;
+    // More status changes than the log retains of the watched kinds
+    // (4,096): the place a new standby names is gone from it.
+    let id = leader.store.upsert(facts("http://late:8000", 1, 0)).id();
+    let revision = leader.store.get(id).expect("the row").revision;
+    for round in 1..=4_300 {
+        let status = if round % 2 == 1 {
+            WorkerStatus::Ready
+        } else {
+            WorkerStatus::NotReady
+        };
+        leader
+            .store
+            .set_status(id, status, revision)
+            .expect("the row's revision");
+    }
+    // Rows of a few kilobytes each, by their key: more than one message of
+    // the transport holds, so the snapshot is several parts.
+    let wide = "k".repeat(2_000);
+    for row in 0..1_500 {
+        leader
+            .store
+            .upsert(facts(&format!("http://{wide}-{row}:8000"), 1, 0));
+    }
+    writes(&leader.store, 3);
+    let port = leader.replication.port();
+    let standby = Replica::serve("replication-1", FOLLOWER, port, shared(&dir)).await;
+    let (head, wrote) = leader.held();
+    assert!(head.0 - began.0 > 4_300);
+    standby.stands_at(head).await;
+    assert_eq!(standby.held().1, wrote);
+    // It follows the log from the snapshot's place.
+    leader.store.upsert(facts("http://after:8000", 1, 0));
+    let (head, wrote) = leader.held();
+    standby.stands_at(head).await;
+    assert_eq!(standby.held().1, wrote);
+    standby.stop().await;
+    leader.stop().await;
+}
+
+/// A promoted standby holds its leader's history from the first write: a
+/// reader that holds nothing is fed it whole, then the new term's start. A
+/// standby restored from a snapshot tells such a reader to start again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_promoted_standby_feeds_a_reader_that_holds_nothing_from_its_leaders_first_write() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let mut leader = Replica::serve("replication-0", LEADER, 0, shared(&dir)).await;
+    leader.leads().await;
+    let port = leader.replication.port();
+    let mut standby = Replica::serve("replication-1", FOLLOWER, port, shared(&dir)).await;
+    writes(&leader.store, 3);
+    let (head, wrote) = leader.held();
+    standby.stands_at(head).await;
+    assert_eq!(standby.held().1, wrote);
+    leader.stop().await;
+    standby.leads().await;
+    let served = promoted(standby.replication).await;
+    let mut reader = replicate(standby.replication, place(0, 0))
+        .await
+        .expect("a stream");
+    let fed = reader.until(served.replication_seq).await;
+    let mut twin = Twin::default();
+    for event in &fed {
+        twin.apply(event).expect("an event the leader journals");
+    }
+    let apart = twin.apart(&Twin::of(&served));
+    assert!(apart.is_empty(), "{apart:?}");
+    // The first leader's term's start and its writes, then the promoted
+    // replica's own term's start.
+    let starts: Vec<_> = fed
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| matches!(event.event, Some(Sent::TermStart(_))))
+        .map(|(index, _)| index)
+        .collect();
+    assert_eq!(starts, [0, fed.len() - 1], "{} events", fed.len());
+    standby.stop().await;
+}
+
+/// Four seconds of 5,120 load rows a second on `leader`: the rows written
+/// and the process's CPU over them.
+async fn busy(leader: &Replica, ids: &Arc<Vec<WorkerId>>) -> (u64, u64) {
+    let before = cpu_ms();
+    let writer = {
+        let (store, ids) = (Arc::clone(&leader.store), Arc::clone(ids));
+        thread::spawn(move || paced(&store, &ids, 5_120, Duration::from_secs(4)))
+    };
+    while !writer.is_finished() {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    (writer.join().expect("the writer"), cpu_ms() - before)
+}
+
+/// A measurement, run by name with `--ignored --nocapture`: a leader of 512
+/// workers at the design's busy rate, alone and with a standby that follows
+/// it in the same process (the CPU is both replicas' then); how long the
+/// standby takes to stand at the head once the writer stops; what it says
+/// of its lag; and the resident memory a following replica adds once its
+/// log's ring is full.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "a measurement: run by name"]
+async fn a_following_standbys_numbers() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let mut leader = Replica::serve("replication-0", LEADER, 0, shared(&dir)).await;
+    leader.leads().await;
+    let ids: Vec<WorkerId> = (0..512)
+        .map(|n| {
+            let key = format!("http://w{n}:8000");
+            leader.store.upsert(facts(&key, 1, 0)).id()
+        })
+        .collect();
+    let ids = Arc::new(ids);
+    let fill = |store: &MemoryStore| {
+        let now = Instant::now();
+        for turn in 0..70_000usize {
+            store.record(
+                ids[turn % ids.len()],
+                0,
+                running(3),
+                now,
+                LoadSource::Stream,
+            );
+        }
+    };
+    let mut out = std::io::stdout();
+    // The leader's own ring is full before anything is read.
+    fill(&leader.store);
+    let (written, cpu) = busy(&leader, &ids).await;
+    writeln!(out, "BUSY standbys=0 written={written} cpu_ms={cpu}").expect("stdout");
+    let alone = resident_kb();
+    let port = leader.replication.port();
+    let standby = Replica::serve("replication-1", FOLLOWER, port, shared(&dir)).await;
+    standby.stands_at(leader.held().0).await;
+    let (written, cpu) = busy(&leader, &ids).await;
+    let stopped = Instant::now();
+    standby.stands_at(leader.held().0).await;
+    writeln!(
+        out,
+        "BUSY standbys=1 written={written} cpu_ms={cpu} at_the_head_after_ms={}",
+        stopped.elapsed().as_millis()
+    )
+    .expect("stdout");
+    let info = leader_info(standby.replication).await;
+    writeln!(
+        out,
+        "LAG ms={:?} synced={}",
+        info.sync.map(|sync| sync.replication_lag_ms),
+        info.synced
+    )
+    .expect("stdout");
+    // The standby's ring fills as the leader's did.
+    fill(&leader.store);
+    standby.stands_at(leader.held().0).await;
+    writeln!(
+        out,
+        "RESIDENT the_leader_alone_kb={alone} with_a_standby_at_a_full_ring_kb={}",
+        resident_kb()
+    )
+    .expect("stdout");
+    standby.stop().await;
+    leader.stop().await;
+}
+
+/// The listener's overall word: the health service's answer for no name.
+async fn overall(addr: SocketAddr) -> ServingStatus {
+    let channel = Channel::from_shared(format!("http://{addr}"))
+        .expect("a uri")
+        .connect()
+        .await
+        .expect("the listener accepts");
+    HealthClient::new(channel)
+        .check(HealthCheckRequest {
+            service: String::new(),
+        })
+        .await
+        .expect("the health service answers for no name")
+        .into_inner()
+        .status()
+}
+
+/// The sample of `series`, a series of no label, on the replica's metrics
+/// page.
+async fn sample(admin: SocketAddr, series: &str) -> String {
+    let (status, page) = http_get(admin, "/metrics").await.expect("the metrics page");
+    assert_eq!(status, 200);
+    let sample = page
+        .lines()
+        .find_map(|line| line.strip_prefix(series)?.strip_prefix(' '));
+    sample.expect("the series").to_owned()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_standby_passes_its_probes_only_while_it_is_synced_with_its_leader() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let mut leader = Replica::serve("replication-0", LEADER, 0, shared(&dir)).await;
+    leader.leads().await;
+    let port = leader.replication.port();
+
+    // A standby that cannot reach its leader: it dials the leader's
+    // address at its own replication port, where no replication listener
+    // answers. It serves, and no probe of it passes.
+    let mut apart = Replica::serve("replication-1", FOLLOWER, 0, shared(&dir)).await;
+    assert_ne!(apart.replication.port(), port);
+    apart.reads(State::Syncing).await;
+    let (status, body) = http_get(apart.admin, "/readiness")
+        .await
+        .expect("the probe");
+    assert_eq!(
+        (status, body.as_str()),
+        (503, r#"{"status":"not ready","reason":"syncing"}"#)
+    );
+    assert_eq!(overall(apart.replication).await, ServingStatus::NotServing);
+    let state = "smg_policy_controller_state{state=\"syncing\"}";
+    assert_eq!(sample(apart.admin, state).await, "1");
+    assert_eq!(
+        sample(apart.admin, "smg_policy_controller_replication_synced").await,
+        "0"
+    );
+    apart.stop().await;
+
+    // One that follows its leader passes them once its first frame is
+    // applied, and says so on its metrics page.
+    let mut standby = Replica::serve("replication-1", FOLLOWER, port, shared(&dir)).await;
+    standby.reads(State::Follower).await;
+    let (status, body) = http_get(standby.admin, "/readiness")
+        .await
+        .expect("the probe");
+    assert_eq!(
+        (status, body.as_str()),
+        (200, r#"{"status":"ready","role":"follower"}"#)
+    );
+    // The word is told after the state turns.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while overall(standby.replication).await != ServingStatus::Serving {
+        assert!(
+            Instant::now() < deadline,
+            "a synced standby's word is not SERVING after 20 s"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        sample(standby.admin, "smg_policy_controller_replication_synced").await,
+        "1"
+    );
+    assert_eq!(sample(standby.admin, state).await, "0");
+    standby.stop().await;
+    leader.stop().await;
 }

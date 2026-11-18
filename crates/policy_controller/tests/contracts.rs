@@ -26,9 +26,9 @@ use prost_types::{
 };
 use smg_policy_controller::{
     fingerprint, spec::DENIED_HEADERS, AffinityFacts, Candidate, Constraints, HashKind, Health,
-    Identity, Lease, LeaseKind, LoadRow, MediaCounts, Membership, Outcome, OverloadRegime, Pair,
-    Phase, PoolFacts, Queue, ReleaseReason, RequestFacts, Role, Shed, ShedReason, Side, Signal,
-    SignalSource, Target, Trace, TransportClass, ZoneCapacity,
+    Identity, Lease, LeaseKind, Lifted, LoadRow, MediaCounts, Membership, Outcome, OverloadRegime,
+    Pair, Phase, PoolFacts, Queue, ReleaseReason, RequestFacts, Role, Shed, ShedReason, Side,
+    Signal, SignalSource, Target, Trace, TransportClass, ZoneCapacity,
 };
 use wit_parser::{InterfaceId, PackageId, Resolve, TypeDefKind, WorldId, WorldItem, WorldKey};
 
@@ -165,6 +165,8 @@ fn request_record() -> &'static [&'static str] {
             block_size,
             now_micros,
             pinned_at,
+            lent_in_flight,
+            session_counted,
             affinity,
             named,
             model_fingerprint,
@@ -199,7 +201,8 @@ fn constraints_record() -> &'static [&'static str] {
             wire_modes,
             overload_lifted,
             subset_hint,
-            stalled
+            stalled,
+            pins
         }
     )
 }
@@ -215,6 +218,7 @@ fn pool_record() -> &'static [&'static str] {
             generation,
             zones,
             reach,
+            rated,
         }
     )
 }
@@ -311,7 +315,8 @@ fn trace_record() -> &'static [&'static str] {
             top,
             top_len,
             seed,
-            generation
+            generation,
+            lifted
         }
     )
 }
@@ -634,6 +639,8 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
             host_only: &[
                 "now_micros",
                 "pinned_at",
+                "lent_in_flight",
+                "session_counted",
                 "affinity",
                 "named",
                 "model_fingerprint",
@@ -666,7 +673,7 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
         ProtoMirror {
             message: "Constraints",
             record: constraints_record(),
-            host_only: &["stalled"],
+            host_only: &["stalled", "pins"],
             wire_only: &[],
             wire: &[
                 ("excluded", Type::Fixed64),
@@ -680,7 +687,7 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
         ProtoMirror {
             message: "PoolFacts",
             record: pool_record(),
-            host_only: &["reach"],
+            host_only: &["reach", "rated"],
             wire_only: &[],
             wire: &[
                 ("pool_size", Type::Uint32),
@@ -781,6 +788,7 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
                 ("fallback", Type::Bool),
                 ("affinity_source", Type::Enum),
                 ("drew_first", Type::Bool),
+                ("lifted", Type::Enum),
             ],
             repeated: &["top", "drops"],
             optional: &["survivors"],
@@ -869,6 +877,8 @@ fn wit_mirrors() -> Vec<WitMirror> {
             host_only: &[
                 "now_micros",
                 "pinned_at",
+                "lent_in_flight",
+                "session_counted",
                 "affinity",
                 "named",
                 "model_fingerprint",
@@ -886,7 +896,7 @@ fn wit_mirrors() -> Vec<WitMirror> {
         WitMirror {
             record: "pool",
             crate_record: pool_record(),
-            host_only: &["reach"],
+            host_only: &["reach", "rated"],
             before: &[],
             beside: &[],
         },
@@ -1457,6 +1467,21 @@ fn the_protocol_compiles_and_mirrors_the_engine_record() {
     }
     let found = enum_values(plugin, "ShedReason").expect("ShedReason is an enum");
     assert_eq!(found, proto_enum("SHED_REASON", shed_reasons()));
+    // The lifted veto: the mark's variants in order, numbered from zero.
+    // Its zero is none, a case, on purpose: the enum's comment says why.
+    let found = enum_values(plugin, "LiftedVeto").expect("LiftedVeto is an enum");
+    let expected: Vec<(String, i32)> = cases!(Lifted, Lifted { None, Overload })
+        .iter()
+        .enumerate()
+        .map(|(i, case)| {
+            let number = i32::try_from(i).unwrap_or(i32::MAX);
+            (format!("LIFTED_VETO_{}", screaming_case(case)), number)
+        })
+        .collect();
+    assert_eq!(
+        found, expected,
+        "the lifted vetoes are the mark's, from none"
+    );
     // The health bits: the record's flags in order, one bit each.
     let found = enum_values(plugin, "HealthFlag").expect("HealthFlag is an enum");
     let mut expected = vec![("HEALTH_FLAG_UNSPECIFIED".to_owned(), 0)];

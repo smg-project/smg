@@ -5407,19 +5407,34 @@ fn png_colour_type(bytes: &[u8]) -> Option<u8> {
     }
 }
 
-/// Composite straight-alpha RGBA over opaque white with the reference's
-/// integer blend, `(src * a + 255 * (255 - a) + 127) / 255` per channel.
+/// `OVER_WHITE[alpha][value]`: a channel value composited over opaque white
+/// at that alpha with the reference's integer blend,
+/// `(value * alpha + 255 * (255 - alpha) + 127) / 255`.
+static OVER_WHITE: [[u8; 256]; 256] = {
+    let mut table = [[0u8; 256]; 256];
+    let mut alpha = 0;
+    while alpha < 256 {
+        let white = 255 * (255 - alpha) + 127;
+        let mut value = 0;
+        while value < 256 {
+            table[alpha][value] = ((value * alpha + white) / 255) as u8;
+            value += 1;
+        }
+        alpha += 1;
+    }
+    table
+};
+
+/// Composite straight-alpha RGBA over opaque white: per channel one read of
+/// [`OVER_WHITE`], in the row the pixel's alpha names. The output is a buffer
+/// of the pool, and every pixel of the image writes its three bytes.
 fn composite_over_white(rgba: &image::RgbaImage) -> image::RgbImage {
     let (width, height) = rgba.dimensions();
-    let mut out = Vec::with_capacity(width as usize * height as usize * 3);
-    for px in rgba.as_raw().as_chunks::<4>().0 {
-        let alpha = u32::from(px[3]);
-        let white = 255 * (255 - alpha) + 127;
-        out.extend_from_slice(&[
-            ((u32::from(px[0]) * alpha + white) / 255) as u8,
-            ((u32::from(px[1]) * alpha + white) / 255) as u8,
-            ((u32::from(px[2]) * alpha + white) / 255) as u8,
-        ]);
+    let (pixels, _) = rgba.as_raw()[..4 * width as usize * height as usize].as_chunks::<4>();
+    let mut out = buffer_pool::take(3 * pixels.len());
+    for (rgb, px) in out.as_chunks_mut::<3>().0.iter_mut().zip(pixels) {
+        let over_white = &OVER_WHITE[usize::from(px[3])];
+        *rgb = [px[0], px[1], px[2]].map(|value| over_white[usize::from(value)]);
     }
     #[expect(
         clippy::expect_used,
@@ -5488,12 +5503,18 @@ fn apply_max_long_side_pixel(
     // The same fit `encoded_image_size` promised from the header.
     match max_long_side_pixel.and_then(|cap| capped_dimensions(image.width(), image.height(), cap))
     {
-        Some((width, height)) => match image {
-            image::DynamicImage::ImageRgb8(rgb) => {
-                image::DynamicImage::ImageRgb8(resize_catmull_rom_rgb(&rgb, width, height))
-            }
-            other => other.resize_exact(width, height, image::imageops::FilterType::CatmullRom),
-        },
+        Some((width, height)) => {
+            let resized = match &image {
+                image::DynamicImage::ImageRgb8(rgb) => {
+                    image::DynamicImage::ImageRgb8(resize_catmull_rom_rgb(rgb, width, height))
+                }
+                other => other.resize_exact(width, height, image::imageops::FilterType::CatmullRom),
+            };
+            // The frame holds the resized image from here on, so nothing
+            // later would return the decoder's buffer to the pool.
+            buffer_pool::recycle_image(image);
+            resized
+        }
         None => image,
     }
 }

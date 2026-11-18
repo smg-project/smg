@@ -30,7 +30,7 @@ use crate::{
             utils::{self, Names},
         },
     },
-    worker::{ModelLabels, Worker},
+    worker::{ModelLabels, Worker, WorkerRegistryExt},
 };
 
 /// What preparation found for the response.

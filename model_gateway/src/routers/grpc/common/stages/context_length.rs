@@ -413,7 +413,8 @@ mod tests {
     use crate::{
         routers::{error::HEADER_X_SMG_ERROR_CODE, grpc::context::CompletionItem},
         worker::{
-            BasicWorkerBuilder, ConnectionMode, RuntimeType, Worker, WorkerRegistry, WorkerType,
+            BasicWorkerBuilder, ConnectionMode, RuntimeType, Worker, WorkerRegistry,
+            WorkerRegistryExt, WorkerType,
         },
     };
 

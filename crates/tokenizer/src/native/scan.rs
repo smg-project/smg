@@ -25,7 +25,7 @@
 //! boundaries, so the lead byte gives the length and no validation is
 //! repeated).
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 use super::pattern::Class;
 
@@ -44,6 +44,8 @@ const BLOCK: usize = 64;
 /// the start of a row fits sixteen bits whatever the classes are.
 const BLOCKS: usize = PLANE as usize / BLOCK;
 const _: () = assert!(BLOCKS * BLOCK - BLOCK <= u16::MAX as usize);
+// A block is one word of a class's bitmap of the plane (`Roles::build`).
+const _: () = assert!(BLOCK == u64::BITS as usize);
 
 /// The code point of the character beyond ASCII whose lead byte `lead`
 /// stands at `pos` of `bytes`, and its length. The text is valid UTF-8 and
@@ -237,30 +239,87 @@ impl Roles {
         }
         let mut block_rows = [0u16; BLOCKS];
         let mut rows: Vec<Bits> = Vec::new();
-        let mut seen: HashMap<[Bits; BLOCK], u16> = HashMap::new();
+        let mut seen: FxHashMap<[Bits; BLOCK], u16> = FxHashMap::default();
+        // The row of the block before, when that block was read from the
+        // classes' words: a block with the same words shares it. The
+        // ideographs, the syllables and the unassigned stretches are long
+        // runs of such blocks.
+        let mut before: Option<u16> = None;
         for (block, row) in block_rows.iter_mut().enumerate() {
             let mut block_bits = [0; BLOCK];
-            for (low, bits) in block_bits.iter_mut().enumerate() {
-                let code = (block * BLOCK + low) as u32;
-                *bits = char::from_u32(code).map_or(0, bits_of);
+            let first = (block * BLOCK) as u32;
+            let by_words = first >= 0x80 && !(0xD800..0xE000).contains(&first);
+            if !by_words {
+                // ASCII has a table of its own in each class, and no
+                // character is a surrogate: asked one code point at a time.
+                for (low, bits) in block_bits.iter_mut().enumerate() {
+                    *bits = char::from_u32(first + low as u32).map_or(0, bits_of);
+                }
+            } else if let Some(same) = before.filter(|_| {
+                classes
+                    .iter()
+                    .all(|class| class.plane_block(block) == class.plane_block(block - 1))
+            }) {
+                *row = same;
+                continue;
+            } else {
+                // A block is one word of each class's bitmap of the plane,
+                // and most blocks hold a class whole or not at all: the
+                // classes that hold it whole are set in one pass at the end,
+                // the others bit by bit of their word. Asking every class
+                // about every code point cost 12 M instructions per scanner
+                // at load (counted).
+                let mut whole: Bits = 0;
+                for (slot, class) in classes.iter().enumerate() {
+                    let mut members = class.plane_block(block);
+                    if members == u64::MAX {
+                        whole |= 1 << slot;
+                        continue;
+                    }
+                    while members != 0 {
+                        block_bits[members.trailing_zeros() as usize] |= 1 << slot;
+                        members &= members - 1;
+                    }
+                }
+                for bits in &mut block_bits {
+                    *bits |= whole;
+                }
             }
             *row = *seen.entry(block_bits).or_insert_with(|| {
                 rows.extend_from_slice(&block_bits);
                 (rows.len() - BLOCK) as u16
             });
+            before = by_words.then_some(*row);
         }
         // Above the plane the bits change only where a class's membership
-        // does: one run from each such point to the next, equal neighbours
-        // as one.
-        let mut changes = vec![PLANE, u32::from(char::MAX) + 1];
+        // can: one run from each such point to the next, equal neighbours
+        // as one, and a run without bits past the last character. The
+        // points come as a few sorted tables, which the stable sort merges,
+        // and each class answers for all of them in one walk along its
+        // tables, where asking point by point is a search per table per
+        // class.
+        let limit = u32::from(char::MAX) + 1;
+        let mut points = vec![PLANE];
         for class in classes {
-            class.changes_from(PLANE, &mut changes);
+            class.changes_from(PLANE, &mut points);
         }
-        changes.sort_unstable();
-        changes.dedup();
+        #[expect(
+            clippy::stable_sort_primitive,
+            reason = "the stable sort merges sorted tables"
+        )]
+        points.sort();
+        points.dedup();
+        points.pop_if(|code| *code == limit);
+        let mut point_bits: Vec<Bits> = vec![0; points.len()];
+        let mut members = Vec::new();
+        for (slot, class) in classes.iter().enumerate() {
+            class.members_among(&points, &mut members);
+            for (bits, &member) in point_bits.iter_mut().zip(&members) {
+                *bits |= Bits::from(member) << slot;
+            }
+        }
         let mut above: Vec<(u32, Bits)> = Vec::new();
-        for code in changes {
-            let bits = char::from_u32(code).map_or(0, bits_of);
+        for (code, bits) in points.into_iter().zip(point_bits).chain([(limit, 0)]) {
             if above.last().is_none_or(|&(_, last)| last != bits) {
                 above.push((code, bits));
             }

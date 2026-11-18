@@ -53,6 +53,11 @@ impl Object {
         }
     }
 
+    /// Whether no member was written yet.
+    pub(super) fn is_empty(&self) -> bool {
+        self.written == 0
+    }
+
     /// `{` before the first member, `, ` before every other.
     fn separator(&self) -> &'static str {
         if self.written == 0 {

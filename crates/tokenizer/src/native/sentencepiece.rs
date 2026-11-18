@@ -71,11 +71,11 @@ pub(super) struct CharSymbols {
     ascii: [u32; 128],
     /// The token of each other character the vocabulary has, by scalar value.
     beyond: FxHashMap<u32, u32>,
-    /// Bit `prev << 8 | cur`: no piece cut goes between the raw bytes
-    /// `prev` and `cur`: some vocabulary token holds them adjacent (a space
-    /// read as the marker, its last byte before the cut and its first byte
-    /// after it), or `cur` continues a UTF-8 character. Read from the
-    /// tokens' text, then rewritten for the raw text by
+    /// Bit [`pair_bit`] of `prev` and `cur`: no piece cut goes between the
+    /// raw bytes `prev` and `cur`: some vocabulary token holds them adjacent
+    /// (a space read as the marker, its last byte before the cut and its
+    /// first byte after it), or `cur` continues a UTF-8 character. Read
+    /// from the tokens' text, then rewritten for the raw text by
     /// [`Self::bridge_raw_text`].
     bridge: Box<[u64; BRIDGE_WORDS]>,
     marker: Marker,
@@ -146,9 +146,8 @@ impl CharSymbols {
                 "the token {token:?} spells a byte token inside it"
             )));
         }
-        for pair in token.as_bytes().windows(2) {
-            let bit = usize::from(pair[0]) << 8 | usize::from(pair[1]);
-            self.bridge[bit >> 6] |= 1 << (bit & 63);
+        for pair in token.as_bytes().array_windows() {
+            Self::set(&mut self.bridge, pair_bit(*pair));
         }
         let mut chars = token.chars();
         if let (Some(c), None) = (chars.next(), chars.next()) {
@@ -174,8 +173,7 @@ impl CharSymbols {
                 let before = if prev == b' ' { MARKER_BYTES[2] } else { prev };
                 let after = if cur == b' ' { MARKER_BYTES[0] } else { cur };
                 if is_continuation(cur) || self.bridged(before, after) {
-                    let bit = usize::from(prev) << 8 | usize::from(cur);
-                    raw[bit >> 6] |= 1 << (bit & 63);
+                    Self::set(&mut raw, pair_bit([prev, cur]));
                 }
             }
         }
@@ -239,8 +237,20 @@ impl CharSymbols {
     /// field).
     #[inline(always)]
     fn bridged(&self, prev: u8, cur: u8) -> bool {
-        let bit = usize::from(prev) << 8 | usize::from(cur);
+        self.holds(pair_bit([prev, cur]))
+    }
+
+    /// Whether the table holds `bit`, the bit of a pair of bytes
+    /// ([`pair_bit`]).
+    #[inline(always)]
+    fn holds(&self, bit: usize) -> bool {
         (self.bridge[bit >> 6] >> (bit & 63)) & 1 != 0
+    }
+
+    /// Sets `bit`, the bit of a pair of bytes ([`pair_bit`]), in `table`:
+    /// the write of what [`Self::holds`] reads.
+    fn set(table: &mut [u64; BRIDGE_WORDS], bit: usize) {
+        table[bit >> 6] |= 1 << (bit & 63);
     }
 
     /// The token of `c`, or [`NO_ID`].
@@ -274,10 +284,10 @@ impl CharSymbols {
     #[inline(always)]
     pub(super) fn pieces<F: FnMut(usize, usize)>(&self, text: &[u8], mut f: F) {
         let mut start = 0;
-        for (i, pair) in text.windows(2).enumerate() {
-            if !self.bridged(pair[0], pair[1]) {
-                f(start, i + 1);
-                start = i + 1;
+        for (at, pair) in (1..).zip(text.array_windows()) {
+            if !self.holds(pair_bit(*pair)) {
+                f(start, at);
+                start = at;
             }
         }
         if start < text.len() {
@@ -337,6 +347,14 @@ fn is_byte_token(token: &str) -> bool {
 #[inline(always)]
 fn is_continuation(byte: u8) -> bool {
     (0x80..0xC0).contains(&byte)
+}
+
+/// The bit of a pair of adjacent bytes in a bridge table: the pair as the
+/// text holds it, read as one little-endian number, so the walk over a text
+/// tests each pair with one load.
+#[inline(always)]
+fn pair_bit(pair: [u8; 2]) -> usize {
+    usize::from(u16::from_le_bytes(pair))
 }
 
 #[cfg(test)]

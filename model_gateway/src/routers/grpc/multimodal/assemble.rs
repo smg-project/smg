@@ -399,7 +399,13 @@ fn assemble_vllm(
     intermediate: PrecomputedMultimodalIntermediate,
     assembly: &VllmAssembly,
 ) -> Result<VllmMultimodalData> {
-    let dtype = vllm_pixel_dtype(&intermediate.preprocessed, assembly)?;
+    // Audio follows vLLM's floating-point model dtype, independently of
+    // the worker's image-only device-normalization setting.
+    let dtype = if intermediate.media.modality() == Modality::Audio {
+        assembly.encoder_dtype.as_ref()
+    } else {
+        vllm_pixel_dtype(&intermediate.preprocessed, assembly)?
+    };
     let (pixel_values, pixel_values_shape, pixel_values_dtype) =
         serialize_encoder_input_owned(intermediate.preprocessed.encoder_input, dtype)?;
     let model_specific_tensors = serialize_model_specific(intermediate.preprocessed.model_specific);
@@ -412,9 +418,10 @@ fn assemble_vllm(
             common::Modality::Video,
             videos.iter().map(|video| video.hash.clone()).collect(),
         ),
-        MediaBatch::Audios(_) => {
-            anyhow::bail!("vLLM assembly requires an image or video batch")
-        }
+        MediaBatch::Audios(audios) => (
+            common::Modality::Audio,
+            audios.iter().map(|audio| audio.hash.clone()).collect(),
+        ),
     };
     let mm_placeholders = placeholders_for_bindings(&intermediate.bindings, false)?;
     // The primary tensor travels in the proto's `pixel_values` field but is

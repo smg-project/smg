@@ -19,7 +19,7 @@ use crate::{
     },
     worker::{
         health::overload::STAGE_SELECTION, identity::endpoint::Endpoint, ProviderType, RuntimeType,
-        Worker, WorkerRegistry,
+        Worker, WorkerRegistry, WorkerRegistryExt,
     },
 };
 

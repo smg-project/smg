@@ -1446,3 +1446,204 @@ fn worker_slots_are_bounded_and_reused_after_removal() {
     );
     assert_eq!(index.intern_worker("a"), Err(WorkerIdExhausted));
 }
+
+// ---- the deepest holders under a cap
+
+/// Every worker: a caller that reads the whole fleet.
+const EVERY: [u64; MAX_WORDS] = [u64::MAX; MAX_WORDS];
+
+/// The deepest read of `query` under `cap` among `within`, sorted by worker, and how many
+/// values its draw was asked for. The draw is a fixed stream from `seed` and is never asked
+/// to pick one of one; what the list held before the read goes.
+fn deepest(
+    index: &ChainIndex,
+    query: &[ContentHash],
+    within: &[u64],
+    cap: usize,
+    seed: u64,
+) -> (Vec<(u32, u32)>, u32) {
+    let (mut state, mut asked) = (seed, 0u32);
+    let mut kept = vec![(u32::MAX, u32::MAX)];
+    index.deepest_into(
+        query,
+        |content| content.0,
+        within,
+        cap,
+        |under| {
+            assert!(under >= 2, "asked to pick one of {under}");
+            asked += 1;
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((state >> 33) % u64::from(under)) as u32
+        },
+        &mut kept,
+    );
+    kept.sort_unstable();
+    (kept, asked)
+}
+
+/// `count` workers that each hold the first `held(worker)` blocks of one chain of `len`
+/// blocks, stored from the last worker to the first.
+fn fleet(count: u32, len: usize, held: impl Fn(u32) -> usize) -> (ChainIndex, Vec<ContentHash>) {
+    let index = ChainIndex::with_max_workers(1024);
+    let chain: Vec<ContentHash> = (0..len).map(|p| content(9, p)).collect();
+    let blocks = blocks_of(&chain);
+    for worker in 0..count {
+        assert_eq!(index.intern_worker(&format!("w{worker}")), Ok(worker));
+    }
+    for worker in (0..count).rev() {
+        index
+            .apply_stored(
+                worker,
+                &blocks[..held(worker)],
+                None,
+                &mut ChainBlockMap::default(),
+            )
+            .expect("store");
+    }
+    (index, chain)
+}
+
+/// Under a cap it never reaches the deepest read is the lookup: every holder with its score.
+/// Under a smaller one, over 64 workers each a block deeper than the one before, it keeps the
+/// deepest exactly and asks its draw nothing: no score is cut.
+#[test]
+fn the_deepest_read_is_the_lookup_cut_at_the_cap_from_the_deepest_score() {
+    let (index, chain) = fleet(64, 64, |worker| worker as usize + 1);
+    let all = scores(&index, &chain);
+    assert_eq!(all.len(), 64);
+    for cap in [1usize, 2, 5, 16, 63, 64, 100, 1024] {
+        let (kept, asked) = deepest(&index, &chain, &EVERY, cap, 7);
+        assert_eq!(kept, all[64usize.saturating_sub(cap)..], "cap {cap}");
+        assert_eq!(asked, 0, "cap {cap}: nothing ties");
+    }
+    // A request that leaves the chain after ten blocks, a miss, no request and no room.
+    let mut forked = chain[..10].to_vec();
+    forked.push(content(8, 0));
+    assert_eq!(
+        deepest(&index, &forked, &EVERY, 1024, 7).0,
+        scores(&index, &forked)
+    );
+    assert_eq!(deepest(&index, &[content(8, 1)], &EVERY, 16, 7).0, vec![]);
+    assert_eq!(deepest(&index, &[], &EVERY, 16, 7).0, vec![]);
+    assert_eq!(deepest(&index, &chain, &EVERY, 0, 7).0, vec![]);
+}
+
+/// A head the whole fleet holds: the cap cuts one score, and the workers kept are a draw of
+/// it by position, one value a worker kept, each worker as likely as another.
+#[test]
+fn a_score_the_cap_cuts_is_drawn_by_position_each_worker_as_likely() {
+    let (index, chain) = fleet(600, 8, |_| 8);
+    let mut picked = vec![0u32; 600];
+    for seed in 0..2_000u64 {
+        let (kept, asked) = deepest(&index, &chain, &EVERY, 16, seed);
+        assert_eq!((kept.len(), asked), (16, 16), "seed {seed}");
+        assert!(
+            kept.windows(2).all(|pair| pair[0].0 < pair[1].0),
+            "{kept:?}"
+        );
+        for (worker, score) in kept {
+            assert_eq!(score, 8);
+            picked[worker as usize] += 1;
+        }
+    }
+    // 2,000 draws of 16 in 600: about 53 a worker.
+    let (least, most) = (picked.iter().min(), picked.iter().max());
+    assert!(
+        least >= Some(&25) && most <= Some(&90),
+        "{least:?} to {most:?}"
+    );
+}
+
+/// A few workers deeper than a head the fleet holds are kept whole and the head fills what is
+/// left by its draw; a cap the deeper ones fill reads nothing of the head, and one they pass
+/// cuts them.
+#[test]
+fn the_deeper_scores_are_kept_whole_above_the_score_the_cap_cuts() {
+    let deep = [7u32, 40, 93];
+    let (index, chain) = fleet(
+        100,
+        16,
+        |worker| if deep.contains(&worker) { 16 } else { 8 },
+    );
+    for seed in 0..50u64 {
+        let (kept, asked) = deepest(&index, &chain, &EVERY, 8, seed);
+        let deeper: Vec<u32> = kept
+            .iter()
+            .filter(|kept| kept.1 == 16)
+            .map(|kept| kept.0)
+            .collect();
+        assert_eq!(
+            (deeper.as_slice(), kept.len(), asked),
+            (&deep[..], 8, 5),
+            "seed {seed}"
+        );
+        assert!(kept.iter().all(|kept| kept.1 == 16 || kept.1 == 8));
+        let (kept, asked) = deepest(&index, &chain, &EVERY, 3, seed);
+        assert_eq!(
+            (kept, asked),
+            (deep.map(|worker| (worker, 16)).to_vec(), 0),
+            "seed {seed}"
+        );
+        let (kept, asked) = deepest(&index, &chain, &EVERY, 2, seed);
+        assert_eq!((kept.len(), asked), (2, 2), "seed {seed}");
+        assert!(kept
+            .iter()
+            .all(|kept| deep.contains(&kept.0) && kept.1 == 16));
+    }
+}
+
+/// Workers that end alone inside a run tie like any others: twelve prefix holders of one
+/// depth under a worker that holds the whole run. The whole holder is kept and the twelve
+/// fill the rest, each as likely as another.
+#[test]
+fn single_workers_of_one_score_are_drawn_each_as_likely() {
+    let (index, chain) = fleet(13, 24, |worker| if worker == 12 { 24 } else { 10 });
+    assert_eq!(
+        index.stats().runs_live,
+        1,
+        "the twelve end inside the one run"
+    );
+    let mut picked = [0u32; 12];
+    for seed in 0..2_400u64 {
+        let (kept, _) = deepest(&index, &chain, &EVERY, 4, seed);
+        assert_eq!(kept.len(), 4, "seed {seed}");
+        assert_eq!(kept.last(), Some(&(12, 24)), "seed {seed}");
+        for &(worker, score) in &kept[..3] {
+            assert_eq!(score, 10);
+            picked[worker as usize] += 1;
+        }
+    }
+    // 2,400 draws of 3 in 12: about 600 a worker.
+    assert!(
+        picked.iter().all(|count| (480..=720).contains(count)),
+        "{picked:?}"
+    );
+    // Without the whole holder among the workers read: four of the twelve.
+    let (kept, _) = deepest(&index, &chain, &[0x0fff], 4, 1);
+    assert_eq!(kept.len(), 4);
+    assert!(kept.iter().all(|kept| kept.0 < 12 && kept.1 == 10));
+}
+
+/// The read keeps only the workers its caller names: the cap is filled from them alone, and a
+/// word the caller hands none of names nobody.
+#[test]
+fn the_deepest_read_keeps_only_the_workers_its_caller_names() {
+    let (index, chain) = fleet(64, 64, |worker| worker as usize + 1);
+    // Without the ten deepest: the sixteen under them.
+    let (kept, asked) = deepest(&index, &chain, &[(1u64 << 54) - 1], 16, 3);
+    let under: Vec<(u32, u32)> = (38u32..54).map(|worker| (worker, worker + 1)).collect();
+    assert_eq!((kept, asked), (under, 0));
+    let (index, chain) = fleet(200, 8, |_| 8);
+    let evens = [0x5555_5555_5555_5555u64; 2];
+    for seed in 0..20u64 {
+        let (kept, _) = deepest(&index, &chain, &evens, 16, seed);
+        assert_eq!(kept.len(), 16);
+        assert!(
+            kept.iter().all(|kept| kept.0 % 2 == 0 && kept.0 < 128),
+            "seed {seed}: {kept:?}"
+        );
+    }
+    assert_eq!(deepest(&index, &chain, &[], 16, 1).0, vec![]);
+}

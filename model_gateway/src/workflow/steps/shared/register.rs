@@ -15,7 +15,11 @@ use wfaas::{
 use super::{pool_group, refresh_worker_pool_sizes, PoolGroups};
 use crate::{
     routers::{common::pd_admission, grpc::regular::symphony::telemetry},
-    worker::{health::bootstrap_probe, registry::WorkerId, Worker, WorkerRegistry},
+    worker::{
+        health::bootstrap_probe,
+        registry::{worker_model_ids, WorkerId},
+        Worker, WorkerRegistry,
+    },
     workflow::data::{require_app_context, WorkerRegistrationData, WorkerRegistrationMode},
 };
 
@@ -295,7 +299,7 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for RegisterWorke
             if has_retry_overrides {
                 let resolved = worker.resilience();
                 let retry_config = resolved.retry.clone();
-                for model_id in WorkerRegistry::worker_model_ids(worker) {
+                for model_id in worker_model_ids(worker) {
                     app_context.worker_registry.set_model_retry_config(
                         &model_id,
                         retry_config.clone(),

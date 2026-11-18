@@ -53,9 +53,10 @@ pub enum Kinds {
 /// What a store tells at each replicated write.
 ///
 /// Every call but [`Journal::released`] arrives under a lock of the store
-/// (the membership lock, the load lock or the lease lock), so an
-/// implementation returns at once: it takes no lock a reader may hold for
-/// long, it never waits on a standby and it calls nothing of the store.
+/// (the membership lock, the load lock or the turn of the leases' file),
+/// so an implementation returns at once: it takes no lock a reader may
+/// hold for long, it never waits on a standby and it calls nothing of the
+/// store.
 pub trait Journal: Send + Sync {
     /// A membership or status write: the epoch it made, the change, the
     /// row it is about as the write left it in the table (`None` for a
@@ -94,6 +95,13 @@ pub trait Journal: Send + Sync {
     /// each such write, and a call that wrote nothing may be followed by
     /// it too. What a journal wakes at its writes it wakes here, so no
     /// writer and no reservation waits behind the wake; a journal that
-    /// wakes nobody leaves it empty.
+    /// wakes nobody leaves it empty. A journal that hands its writes on to
+    /// another hands this call on too, or the other's wake is never made.
     fn released(&self) {}
+
+    /// The store restores a snapshot that stands at `at`: the journal starts
+    /// again there, inside the restore's own locks, and wakes nobody there:
+    /// the restore's release follows ([`Journal::released`]). `false` where
+    /// the journal refuses the place, and the store then restores nothing.
+    fn restart(&self, at: Position) -> bool;
 }

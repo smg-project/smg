@@ -1435,7 +1435,11 @@ def test_a_counting_gate_ends_its_count_before_its_gate_step_does(mod):
         found = step.search(text)
         if found is None:
             continue
-        for name in sorted(set(re.findall(r"[\w-]+\.toml", text))):
+        # A comment may name another workflow's gate file, as the store workflows name the
+        # decision bench's for its placement flags. The files a workflow runs stand outside
+        # its comment lines.
+        runs = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
+        for name in sorted(set(re.findall(r"[\w-]+\.toml", runs))):
             path = root / ".github" / "bench-gates" / name
             if path.exists() and mod.load_gates(path).count:
                 budget = mod.load_gates(path).run_budget

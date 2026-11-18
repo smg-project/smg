@@ -2,6 +2,14 @@
 //! `metrics` feature: the bounded label set, the one process-wide set of model
 //! labels, and the handles a record keeps ([`handles`]). `smg-external-router`
 //! re-exports each item at the path it had there.
+//!
+//! The `runtime` feature adds the worker's own writers (`writers`) and the
+//! store that keeps their series (`series`).
+
+#[cfg(feature = "runtime")]
+pub mod series;
+#[cfg(feature = "runtime")]
+pub mod writers;
 
 use std::sync::{
     atomic::{AtomicUsize, Ordering},

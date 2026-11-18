@@ -1,2 +1,4 @@
 pub mod pair_index;
-pub mod pairing;
+
+// The worker crate's, at the path it had here.
+pub use smg_worker::pd::pairing;

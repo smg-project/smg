@@ -55,7 +55,7 @@ use crate::{
         common::json_response, error, grpc::regular::symphony::template::Templates, RouterTrait,
     },
     tenant::storage_tenant,
-    worker::{RoutingPool, WorkerRegistry, WorkerType, UNKNOWN_MODEL_ID},
+    worker::{RoutingPool, WorkerRegistry, WorkerRegistryExt, WorkerType, UNKNOWN_MODEL_ID},
 };
 
 /// The gRPC family router: one router over the gRPC request pipelines, built for one `Mode`.

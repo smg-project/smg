@@ -93,29 +93,25 @@ impl ExternalRouter for AnthropicRouter {
                 })
                 .collect();
 
-            match mcp_utils::ensure_mcp_servers(
+            let Some(servers) = mcp_utils::ensure_mcp_servers(
                 &self.router_ctx.mcp_orchestrator,
                 &self.router_ctx.mcp_format_registry,
                 &inputs,
                 &[],
             )
             .await
-            {
-                Some(servers) => {
-                    info!(
-                        server_count = servers.len(),
-                        "MCP: connected to MCP servers"
-                    );
-                    Some(servers)
-                }
-                None => {
-                    error!("Failed to connect to any MCP servers");
-                    return bad_gateway(
-                        "mcp_connection_failed",
-                        "Failed to connect to MCP servers. Check server URLs and authorization.",
-                    );
-                }
-            }
+            else {
+                error!("Failed to connect to any MCP servers");
+                return bad_gateway(
+                    "mcp_connection_failed",
+                    "Failed to connect to MCP servers. Check server URLs and authorization.",
+                );
+            };
+            info!(
+                server_count = servers.len(),
+                "MCP: connected to MCP servers"
+            );
+            Some(servers)
         } else {
             None
         };

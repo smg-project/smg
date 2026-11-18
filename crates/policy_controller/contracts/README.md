@@ -63,11 +63,15 @@ clock, a lease's issue instant), and each file's comments name them.
   guest builds without `std` and exports its own `cabi_realloc`. The host
   imports are `log`, `now-micros`, `counter` and `random-u64`; the exports are
   `init`, the `decision` resource (constructor, `filter`, `score`, `pick`) and
-  `observe`. A `policy-packed` guest reads its three blocks in place: the
+  `observe`, which the host calls with the kinds of lifecycle event the
+  plugin's row lists, none by default (a gRPC plugin's `Observe` stream
+  carries those). A `policy-packed` guest reads its three blocks in place: the
   offsets are in the WIT comments, the model name is padded so the u64
   sections stay 8-byte aligned for any name length, and the guest's
   `cabi_realloc` returns 8-aligned memory for the blocks (or it reads with
-  unaligned loads).
+  unaligned loads). Either world's view carries the request's block hashes
+  only where the plugin's row declares them among its needs, 8,190 at most,
+  as a gRPC plugin's frame does.
 - The validity rules a plugin must keep are in the files: surviving positions
   unique and in range, one finite score per candidate clamped to `0..1`, a
   pick inside the surviving set; a violation is a trap (the instance is

@@ -4,7 +4,7 @@
 //! enums, and core configuration. These types are shared across API
 //! request/response boundaries and internal runtime state.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 #[cfg(feature = "axum")]
 use axum::{
@@ -12,6 +12,7 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
+use bitflags::bitflags;
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 #[cfg(feature = "axum")]
@@ -703,6 +704,53 @@ impl TagVocabulary {
         match value {
             Some(Self::OLDER) => Self::Older,
             _ => Self::Current,
+        }
+    }
+}
+
+/// Where the engine that runs a forced call's grammar starts applying it on a
+/// prompt that ends inside the model's thinking block, as its worker
+/// advertises it (the `constrained_decoding_start` label).
+///
+/// An engine's own server picks the grammar's shape from this: it sends
+/// xgrammar's reasoning-aware tags (the thought, its close, then the calls)
+/// when it runs no reasoning parser and the bare calls when it does, because
+/// its grammar backend then waits for the thought's end; an engine with a
+/// reasoning parser set (and `enable_in_reasoning` off) waits the same way.
+/// The gateway reads the same fact from the worker and shapes the calls'
+/// prefix accordingly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GrammarStart {
+    /// The worker does not say (an older servicer, an engine without the
+    /// label): free text with nothing owed at its end precedes the calls,
+    /// which fits an engine of either kind.
+    #[default]
+    Unknown,
+    /// The engine applies the grammar only once its reasoning parser has
+    /// seen the model's own `</think>`: nothing precedes the calls, so the
+    /// call is forced right at that gate, as the engine's own server does.
+    AfterReasoning,
+    /// The engine applies the grammar from the first generated token: the
+    /// thought, its close and then the calls, so the call is not forced into
+    /// the thought.
+    FirstToken,
+}
+
+impl GrammarStart {
+    /// The worker label that carries it.
+    pub const LABEL: &'static str = "constrained_decoding_start";
+    /// The label's value for [`Self::AfterReasoning`].
+    pub const AFTER_REASONING: &'static str = "after_reasoning";
+    /// The label's value for [`Self::FirstToken`].
+    pub const FIRST_TOKEN: &'static str = "first_token";
+
+    /// The start a worker's `constrained_decoding_start` label names; anything
+    /// else, the label's absence included, is [`Self::Unknown`].
+    pub fn from_label(value: Option<&str>) -> Self {
+        match value {
+            Some(Self::AFTER_REASONING) => Self::AfterReasoning,
+            Some(Self::FIRST_TOKEN) => Self::FirstToken,
+            _ => Self::Unknown,
         }
     }
 }
@@ -1576,6 +1624,61 @@ pub struct SchedulerLoadSnapshot {
     /// "prefill", "decode", or "null" as reported by the backend.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disagg_mode: Option<String>,
+}
+
+bitflags! {
+    /// The telemetry a pushed load record can carry beside its core: one
+    /// flag for each part of [`SchedulerLoadSnapshot`] whose figure a report
+    /// keeps from the last record that carried it. An optional figure
+    /// outside these six is published as the record sends it.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct LoadTelemetry: u8 {
+        /// `cache_hit_rate`.
+        const CACHE_HIT_RATE = 1 << 0;
+        /// `num_used_tokens`.
+        const USED_TOKENS = 1 << 1;
+        /// `max_total_num_tokens`.
+        const TOTAL_TOKENS = 1 << 2;
+        /// `memory`.
+        const MEMORY = 1 << 3;
+        /// `queues`.
+        const QUEUES = 1 << 4;
+        /// The KV transfer latency and speed, the prefill and decode queue
+        /// depths and the mode.
+        const DISAGGREGATION = 1 << 5;
+    }
+}
+
+/// A load record pushed on a worker's stream, as the worker's load report
+/// and its liveness read it. The wire's message implements this where it is
+/// declared, so the code that keeps the report names no wire type.
+pub trait LoadRecord {
+    /// The sample's age when the record was sent.
+    fn age(&self) -> Duration;
+
+    /// The telemetry the record carries. A flagged part it leaves out
+    /// keeps, in the report, the figure of the last record that carried it;
+    /// nothing else is kept.
+    fn telemetry(&self) -> LoadTelemetry;
+
+    /// The rank's entry a poll would have produced from the record, with
+    /// the telemetry it leaves out at the type's default. The rank is the
+    /// caller's to set.
+    fn snapshot(&self) -> SchedulerLoadSnapshot;
+
+    /// How long the engine has produced no output while it held requests
+    /// it reports on every step. `None` while it holds none, or when the
+    /// sender cannot tell.
+    fn engine_silence(&self) -> Option<Duration>;
+
+    /// Whether the engine reports every scheduler step, so its silence is
+    /// one step's at most while it serves.
+    fn reports_every_step(&self) -> bool;
+
+    /// Prompt tokens handed to the engine that have produced no output yet,
+    /// across every client of the sender: the prefill work in hand. `None`
+    /// when the sender does not report it.
+    fn prefill_pending(&self) -> Option<u64>;
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]

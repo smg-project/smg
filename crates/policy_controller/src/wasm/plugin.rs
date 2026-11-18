@@ -1,18 +1,21 @@
 //! A loaded plugin and how the host runs it: one compiled component, one
-//! kept instance per deciding thread, one `decision` resource per decision
+//! kept instance per decider, one `decision` resource per decision
 //! per profile that binds the plugin, every call under fuel, and the rules
 //! for what a trap, an exhausted budget, an invalid answer or a decline does.
 
 use std::{
     cell::{Cell, RefCell, RefMut},
+    collections::VecDeque,
     fmt,
     sync::{
         atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
-        Arc,
+        Arc, OnceLock,
     },
+    thread::ThreadId,
     time::Instant,
 };
 
+use parking_lot::Mutex;
 use thread_local::ThreadLocal;
 use wasmtime::{
     component::{Component, HasSelf, Linker, ResourceAny},
@@ -21,10 +24,11 @@ use wasmtime::{
 
 use super::{
     bindings::{packed, record, wit, HostState, LogGate, Watch},
-    config::{Abi, Exposure, Failure, FrameBudget, PluginSpec},
+    config::{Abi, EventKind, EventSet, Exposure, Failure, FrameBudget, PluginSpec},
     view::{self as marshal, Packed, Records, TooLong},
 };
 use crate::{
+    decider::Decider,
     decision::{Decision, Target, MAX_TARGETS},
     framework::{self, DecisionScope},
     lease::{Lease, Membership, Outcome, ReleaseReason, Side, Signal},
@@ -34,7 +38,7 @@ use crate::{
         Part,
     },
     spec::Needs,
-    view::{Candidate, Phase, PoolFacts, RequestFacts},
+    view::{Candidate, Phase, PoolFacts, RequestFacts, WorkerId},
     Draw,
 };
 
@@ -540,9 +544,7 @@ pub enum LoadError {
     Memory { name: String },
     #[error("plugin {name}: fuel_per_micro must be at least 1")]
     Fuel { name: String },
-    #[error(
-        "the plugins ask {asked} MiB of memory per deciding thread; the budget is {budget} MiB"
-    )]
+    #[error("the plugins ask {asked} MiB of memory per decider; the budget is {budget} MiB")]
     MemoryBudget { asked: u64, budget: u64 },
     #[error("plugin {name}: init failed: {reason}")]
     Init { name: String, reason: String },
@@ -576,6 +578,12 @@ struct Instance {
     records: Records,
     packed: Packed,
     snapshot: Vec<u64>,
+    /// The place in its plugin's membership feed the instance heard up to;
+    /// zero: it is new to the feed.
+    heard: u64,
+    /// The feed's list, and its changes, as copied out for one telling.
+    members: Vec<WorkerId>,
+    changes: Vec<Membership<'static>>,
     /// The instance's number on its plugin: a resource is live on the store
     /// that made it and on no other.
     generation: u64,
@@ -669,6 +677,12 @@ pub struct Stats {
     pub fuel_used: u64,
     /// `observe` calls made.
     pub observed: u64,
+    /// A lease's events and signals dropped: told on a thread that names no
+    /// decider and is none of its own (no instance of the plugin came to
+    /// stand in its slot), so no instance was theirs to reach and none was
+    /// made. The plugin's first writes its one warning. A membership is fed
+    /// and never dropped.
+    pub events_dropped: u64,
     /// Late calls the host held that answered or declined, by a reading: the
     /// wall clock put the call at or past its bound in whole ticks, and the
     /// thread's CPU clock, read at the call's start and at its end, says the
@@ -720,12 +734,120 @@ struct Tally {
     lazy_instantiations: AtomicU64,
     fuel_used: AtomicU64,
     observed: AtomicU64,
+    events_dropped: AtomicU64,
     stalls: AtomicU64,
     unread: AtomicU64,
 }
 
 fn bump(counter: &AtomicU64) {
     counter.fetch_add(1, Ordering::Relaxed);
+}
+
+/// How many membership changes a plugin's feed keeps for the instances
+/// behind it. An instance further behind hears the list as it stands.
+const FEED_CHANGES: usize = 64;
+
+/// The membership feed of a plugin whose row lists the kind: the pool's one
+/// hand-over to every instance of the plugin. The host tells a change once,
+/// on whatever thread, and no guest call is made there ([`Plugin::hand`]);
+/// each instance hears what is past its own place before its decider's next
+/// decision or told event, one call a change ([`Plugin::catch_up`]).
+struct Feed {
+    /// The place of the last change told, zero before the first: what an
+    /// instance compares its own with, without the lock.
+    place: AtomicU64,
+    told: Mutex<Told>,
+}
+
+/// What the host told of the membership.
+struct Told {
+    /// The membership as it stands: the last snapshot told, with each change
+    /// since folded in.
+    members: Vec<WorkerId>,
+    /// The last changes told, the newest last, [`FEED_CHANGES`] at most. A
+    /// snapshot is `None`: the list above holds it.
+    changes: VecDeque<Option<Membership<'static>>>,
+}
+
+impl Feed {
+    fn new() -> Self {
+        Self {
+            place: AtomicU64::new(0),
+            told: Mutex::new(Told {
+                members: Vec::new(),
+                changes: VecDeque::with_capacity(FEED_CHANGES),
+            }),
+        }
+    }
+}
+
+/// What a named decider keeps of a plugin between its decisions: what
+/// outlives one, the instance and the latency ring.
+struct Rest {
+    instance: Option<Instance>,
+    ring: ThreadRing,
+}
+
+impl Rest {
+    fn new() -> Box<Self> {
+        Box::new(Self {
+            instance: None,
+            ring: ThreadRing::new(),
+        })
+    }
+}
+
+/// One named decider's place of rest: empty until the decider first acts.
+type Resting = Mutex<Option<Box<Rest>>>;
+
+thread_local! {
+    /// How many plugins' named deciders the thread holds the kept state of,
+    /// from a bring to its give-back: what a thread under no name reads
+    /// before it acts as itself.
+    static HOLDS: Cell<u32> = const { Cell::new(0) };
+}
+
+/// What a thread is to a plugin, beside what stands in its working slots.
+#[derive(Clone, Copy, Default)]
+struct Standing {
+    /// An instance came to stand in the thread's slot under no name (the
+    /// thread decided, warmed or took the apply's own): it is a decider of
+    /// its own, and what it tells reaches its instance.
+    own: bool,
+    /// The named decider whose kept state stands in the thread's working
+    /// slots, from the time it is brought to the time it is given back.
+    lent: Option<Decider>,
+}
+
+/// The apply's own instance (`init` ran at the load, and its failure was the
+/// apply's), kept apart until a decider needs one: the thread that loaded
+/// takes it at its first need, as if it had stood in its slot since the
+/// load, and a named decider that needs an instance takes it where it asks
+/// first. So a host that names its deciders makes as many instances as it
+/// has deciders, whichever thread loads, where it warms them before the
+/// loading thread tells anything ([`Plugin::warm`]).
+struct Spare {
+    instance: Mutex<Option<Instance>>,
+    /// Whether the instance still waits: read before the lock.
+    left: AtomicBool,
+    /// The thread that loaded.
+    by: ThreadId,
+}
+
+/// A named decider's kept state in a thread's working slots for the span of
+/// one call outside a decision: given back at the drop, where this hold
+/// brought it.
+struct Lent<'a> {
+    plugin: &'a Plugin,
+    brought: bool,
+}
+
+impl Drop for Lent<'_> {
+    fn drop(&mut self) {
+        if self.brought {
+            self.plugin.rest();
+        }
+    }
 }
 
 /// A loaded plugin, shared by every profile that binds it and every thread
@@ -741,16 +863,38 @@ pub struct Plugin {
     frame: FrameBudget,
     exposure: Exposure,
     needs: Needs,
+    observes: EventSet,
     failure: Failure,
     log: super::config::LogLimit,
     counters: Counters,
     breaker: Breaker,
     tally: Tally,
-    /// One kept instance per thread, by `thread_local`'s thread id. That crate
-    /// recycles the id of a thread that exited, so a later thread may adopt
-    /// the instance a dead one left: an instance is `Send`, one live thread
-    /// holds an id at a time, and the adopter keeps it warm.
+    /// A thread's working slot, by `thread_local`'s thread id: the kept
+    /// instance of a thread that names no decider (it is a decider of its
+    /// own), and the place a named decider's instance is brought to for a
+    /// decision or a told event. That crate recycles the id of a thread that
+    /// exited, so a later thread may adopt the instance a dead one left: an
+    /// instance is `Send`, one live thread holds an id at a time, and the
+    /// adopter keeps it warm.
     instances: ThreadLocal<RefCell<Option<Instance>>>,
+    /// Where a named decider's kept state rests between its decisions, one
+    /// place a name ([`Decider`]), made at the first named use. A place's
+    /// lock is taken where a decision brings the state and where it gives it
+    /// back, and by no stage call. It is free unless a host lets two threads
+    /// act as one decider at once: the second then finds no instance, makes
+    /// one, and the later of the two to give back drops the other's.
+    rests: OnceLock<Box<[Resting]>>,
+    /// Per thread: the thread's own instance (it also decides under no
+    /// name) while a named decider's stands in its working slot.
+    aside: ThreadLocal<RefCell<Option<Instance>>>,
+    /// Per thread: what the thread is to this plugin.
+    standing: ThreadLocal<Cell<Standing>>,
+    /// The apply's own instance, until a decider needs one.
+    spare: Spare,
+    /// Whether the plugin's one warning of a dropped event is written.
+    drop_said: AtomicBool,
+    /// The membership feed, for a plugin whose row lists the kind.
+    feed: Option<Feed>,
     /// Instances made so far, numbering each.
     generations: AtomicU64,
     /// Per thread: this decision emptied the slot (a dropped instance), so
@@ -774,6 +918,11 @@ pub struct Plugin {
     /// and the time of a lazy `init` the decision paid at its two ends (part
     /// of its sample, not of its own spend).
     decision_opens: ThreadLocal<Cell<(Part, OwnTime)>>,
+    /// Per thread: the decision, by its number on this thread, whose open
+    /// caught the thread's instance up with the membership feed. A decision
+    /// does so once, at the plugin's first open of it that reaches the
+    /// instance. Zero: none yet, and no decision's number.
+    heard_in: ThreadLocal<Cell<u64>>,
 }
 
 impl fmt::Debug for Plugin {
@@ -875,28 +1024,44 @@ impl Plugin {
             frame,
             exposure: spec.view,
             needs: spec.needs,
+            observes: spec.observes,
             failure: spec.failure,
             log: spec.log,
             counters: Counters::new(spec.metrics),
             breaker: Breaker::new(spec.breaker),
             tally: Tally::default(),
             instances: ThreadLocal::new(),
+            rests: OnceLock::new(),
+            aside: ThreadLocal::new(),
+            standing: ThreadLocal::new(),
+            spare: Spare {
+                instance: Mutex::new(None),
+                left: AtomicBool::new(false),
+                by: std::thread::current().id(),
+            },
+            drop_said: AtomicBool::new(false),
+            feed: spec
+                .observes
+                .contains(EventKind::Membership)
+                .then(Feed::new),
             generations: AtomicU64::new(0),
             emptied: ThreadLocal::new(),
             spent: ThreadLocal::new(),
             latency: ThreadLocal::new(),
             decision_opens: ThreadLocal::new(),
+            heard_in: ThreadLocal::new(),
         });
         // The apply's own instance: `init` runs here, and its failure is the
-        // apply's.
+        // apply's. It waits apart for the first decider that needs one.
         let instance = plugin.instantiate(plugin.init_fuel())?;
-        *plugin.slot().borrow_mut() = Some(instance);
+        *plugin.spare.instance.lock() = Some(instance);
+        plugin.spare.left.store(true, Ordering::Relaxed);
         Ok(plugin)
     }
 
     /// The total of `memory_mib` over `specs` against the budget, per
-    /// deciding thread: what the spec's `plugins.memory_budget_mib` checks
-    /// at validation.
+    /// decider: what the spec's `plugins.memory_budget_mib` checks at
+    /// validation.
     pub fn check_memory_budget(specs: &[PluginSpec], budget_mib: u32) -> Result<(), LoadError> {
         let asked: u64 = specs.iter().map(|s| u64::from(s.memory_mib)).sum();
         if asked > u64::from(budget_mib) {
@@ -908,27 +1073,61 @@ impl Plugin {
         Ok(())
     }
 
-    /// Creates this thread's kept instance when it has none: the apply calls
-    /// it on every deciding thread, so no decision pays the instantiation.
+    /// Creates the kept instance of the decider the calling thread acts as
+    /// (the thread's own where it names none) when it has none: the apply
+    /// calls it as every decider, so no decision pays the instantiation. The
+    /// first to ask takes the apply's own instance where it may. A host that
+    /// names its deciders warms as each of them before it tells anything on
+    /// the thread that loaded: an event told there first takes the apply's
+    /// own instance for that thread, one more than the host has deciders,
+    /// and no decision reads what that instance hears.
     pub fn warm(&self) -> Result<(), LoadError> {
+        let _lent = self.lent_here();
         let slot = self.slot();
         if slot.borrow().is_none() {
-            let instance = self.instantiate(self.init_fuel())?;
-            *slot.borrow_mut() = Some(instance);
+            let instance = match self.adopt() {
+                Some(instance) => instance,
+                None => self.instantiate(self.init_fuel())?,
+            };
+            self.seat(&mut slot.borrow_mut(), instance);
         }
+        // A plugin fed the membership hears it as it stands here, not at
+        // the decider's first decision. A telling that faults the instance
+        // leaves the slot cold: the fault is the breaker's, and the next
+        // decision makes an instance. The mark the fault set is cleared as
+        // a told event clears it: the warm-up is no decision's.
+        self.catch_up(&mut slot.borrow_mut());
+        self.emptied.get_or_default().set(false);
         Ok(())
     }
 
-    /// Whether this thread holds a kept instance.
+    /// Whether the decider the calling thread acts as (the thread itself
+    /// where it names none) holds a kept instance: its next decision makes
+    /// none. The thread that loaded is warm under no name by the apply's own
+    /// instance too, which it alone takes there. Under a name that instance
+    /// counts for no decider: the first to warm or decide takes it, so a
+    /// warm-up that asks here first still warms every decider.
     pub fn is_warm(&self) -> bool {
-        self.slot().borrow().is_some()
+        let _lent = self.lent_here();
+        let kept = self
+            .instances
+            .get()
+            .is_some_and(|slot| slot.borrow().is_some());
+        kept || (Decider::acting().is_none() && self.spare_is_mine())
     }
 
-    /// Forgets this thread's kept instance, so the next decision or
+    /// Forgets the kept instance of the decider the calling thread acts as
+    /// (the thread's own where it names none), so the next decision or
     /// `observe` on it instantiates again: what a host without a kept
     /// instance would pay per decision, for the measurements.
     #[doc(hidden)]
     pub fn forget_instance(&self) {
+        let _lent = self.lent_here();
+        if self.adopt().is_some() {
+            // The load's instance was this thread's to take: it is
+            // forgotten as one that stood here.
+            self.stand();
+        }
         *self.slot().borrow_mut() = None;
     }
 
@@ -955,6 +1154,12 @@ impl Plugin {
         self.needs
     }
 
+    /// The kinds of lifecycle event the plugin hears, as its row lists
+    /// them.
+    pub fn observes(&self) -> EventSet {
+        self.observes
+    }
+
     /// The counters the plugin adds to.
     pub fn counters(&self) -> &Counters {
         &self.counters
@@ -976,6 +1181,7 @@ impl Plugin {
             lazy_instantiations: t.lazy_instantiations.load(Ordering::Relaxed),
             fuel_used: t.fuel_used.load(Ordering::Relaxed),
             observed: t.observed.load(Ordering::Relaxed),
+            events_dropped: t.events_dropped.load(Ordering::Relaxed),
             stalls: t.stalls.load(Ordering::Relaxed),
             unread: t.unread.load(Ordering::Relaxed),
             breaker_opens: self.breaker.opens(),
@@ -1002,6 +1208,168 @@ impl Plugin {
 
     fn slot(&self) -> &RefCell<Option<Instance>> {
         self.instances.get_or_default()
+    }
+
+    /// This thread's latency ring.
+    fn ring(&self) -> &RefCell<ThreadRing> {
+        self.latency.get_or(|| RefCell::new(ThreadRing::new()))
+    }
+
+    /// Whether the apply's own instance still waits and the caller may take
+    /// it: the thread that loaded, or a thread acting as a named decider.
+    fn spare_is_mine(&self) -> bool {
+        self.spare.left.load(Ordering::Relaxed)
+            && (Decider::acting().is_some() || std::thread::current().id() == self.spare.by)
+    }
+
+    /// The apply's own instance, where it still waits for the caller: no
+    /// `init` runs and nothing is charged.
+    fn adopt(&self) -> Option<Instance> {
+        if !self.spare_is_mine() {
+            return None;
+        }
+        let taken = self.spare.instance.lock().take();
+        if taken.is_some() {
+            self.spare.left.store(false, Ordering::Relaxed);
+        }
+        taken
+    }
+
+    /// Puts `instance` in the thread's working slot: the one place an
+    /// instance comes to stand in one, whoever made it (the load, a warm-up,
+    /// a cold open, a told event, a close's rebuild).
+    fn seat(&self, slot: &mut Option<Instance>, instance: Instance) {
+        *slot = Some(instance);
+        self.stand();
+    }
+
+    /// An instance came to stand in this thread's working slot. Under no
+    /// name the thread is a decider of its own from here on: what it tells
+    /// reaches its instance.
+    fn stand(&self) {
+        if Decider::acting().is_none() {
+            let standing = self.standing.get_or_default();
+            standing.set(Standing {
+                own: true,
+                ..standing.get()
+            });
+        }
+    }
+
+    /// Where `decider`'s kept state rests.
+    fn rest_of(&self, decider: Decider) -> &Resting {
+        let rests = self
+            .rests
+            .get_or_init(|| (0..Decider::COUNT).map(|_| Mutex::new(None)).collect());
+        &rests[usize::from(decider.number())]
+    }
+
+    /// Brings the kept state of the decider the calling thread acts as into
+    /// the thread's working slots, where the thread names one and does not
+    /// hold it already, and says whether it did. A decision's first open
+    /// brings it and the plugin's last close of the decision gives it back;
+    /// a told event holds it for its one call. What the thread never gave
+    /// back (a close that did not return) goes back first, under another
+    /// name or under none: a thread decides on no instance but the one of
+    /// the decider it acts as.
+    fn lend(&self) -> bool {
+        let Some(decider) = Decider::acting() else {
+            // Under no name the thread acts as itself. One count says
+            // whether it holds any named decider's state, so a host that
+            // names none pays one load here.
+            if HOLDS.get() != 0 {
+                self.rest();
+            }
+            return false;
+        };
+        let standing = self.standing.get_or_default();
+        let mut now = standing.get();
+        match now.lent {
+            Some(held) if held == decider => return false,
+            Some(held) => self.give_back(held),
+            None => {}
+        }
+        let mut rest = self.rest_of(decider).lock();
+        let rest = rest.get_or_insert_with(Rest::new);
+        let mut slot = self.slot().borrow_mut();
+        if slot.is_some() {
+            // The thread's own instance (it also decides under no name)
+            // stands aside while the thread acts as the decider.
+            *self.aside.get_or_default().borrow_mut() = slot.take();
+        }
+        *slot = rest.instance.take();
+        std::mem::swap(&mut rest.ring, &mut *self.ring().borrow_mut());
+        now.lent = Some(decider);
+        standing.set(now);
+        HOLDS.set(HOLDS.get() + 1);
+        true
+    }
+
+    /// Gives the working slots back to the named decider whose kept state
+    /// stands in them, where one does.
+    fn rest(&self) {
+        let Some(standing) = self.standing.get() else {
+            return;
+        };
+        let mut now = standing.get();
+        if let Some(held) = now.lent.take() {
+            standing.set(now);
+            self.give_back(held);
+        }
+    }
+
+    /// The working slots' instance and ring go to `decider`'s rest, and the
+    /// thread's own come back. An instance already resting there was made by
+    /// a second thread acting as the decider at the same time, against the
+    /// turn's rule: it is dropped here.
+    fn give_back(&self, decider: Decider) {
+        HOLDS.set(HOLDS.get().saturating_sub(1));
+        let mut rest = self.rest_of(decider).lock();
+        let rest = rest.get_or_insert_with(Rest::new);
+        let mut slot = self.slot().borrow_mut();
+        rest.instance = slot.take();
+        if let Some(aside) = self.aside.get() {
+            *slot = aside.borrow_mut().take();
+        }
+        std::mem::swap(&mut rest.ring, &mut *self.ring().borrow_mut());
+    }
+
+    /// The acting decider's kept state in this thread's working slots until
+    /// the guard drops.
+    fn lent_here(&self) -> Lent<'_> {
+        Lent {
+            plugin: self,
+            brought: self.lend(),
+        }
+    }
+
+    /// The start of a told event: the kept state of the decider the calling
+    /// thread acts as is this thread's until the guard drops. `None` where
+    /// the event has no instance to reach: the thread names no decider and
+    /// is none of its own (no instance came to stand in its slot, and the
+    /// apply's is not its to take), so it only tells, and an instance made
+    /// for it would hear what no decision reads. Such an event is dropped
+    /// and counted, and the plugin's first writes its one warning.
+    fn telling(&self) -> Option<Lent<'_>> {
+        if Decider::acting().is_none()
+            && !self
+                .standing
+                .get()
+                .is_some_and(|standing| standing.get().own)
+            && !self.spare_is_mine()
+        {
+            bump(&self.tally.events_dropped);
+            if !self.drop_said.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    plugin = self.name,
+                    "a lifecycle event was told on a thread that names no decider and holds no \
+                     instance of the plugin: it is dropped and counted, as each such event is; a \
+                     host tells a lease's events as the decider that issued the lease"
+                );
+            }
+            return None;
+        }
+        Some(self.lent_here())
     }
 
     /// The fuel of `init` when nothing clamps it.
@@ -1066,6 +1434,9 @@ impl Plugin {
             records: Records::default(),
             packed: Packed::default(),
             snapshot: Vec::new(),
+            heard: 0,
+            members: Vec::new(),
+            changes: Vec::new(),
             generation: self.generations.fetch_add(1, Ordering::Relaxed) + 1,
         });
         (instance, used)
@@ -1375,13 +1746,14 @@ impl Plugin {
     /// decision (its constructor and stage calls, whatever ended them) plus
     /// the time of a lazy `init` the decision paid, over the decision's
     /// budget. A decision that charged the plugin nothing records nothing.
-    fn note_close(&self, decision: u64, seed_micros: u64) {
+    /// Says whether this close was the plugin's last of the decision.
+    fn note_close(&self, decision: u64, seed_micros: u64) -> bool {
         let opens = self.decision_opens.get_or_default();
         let (mut part, init) = opens.get();
         let last = part.close(decision);
         opens.set((part, init));
         if !last {
-            return;
+            return false;
         }
         let (spent_stamp, spent) = self.spent.get_or_default().get();
         let own = if spent_stamp == decision {
@@ -1392,6 +1764,7 @@ impl Plugin {
         if own.sample > 0 {
             self.sample(own, seed_micros);
         }
+        true
     }
 
     /// One latency sample into the thread's ring: a decision's time as a
@@ -1462,8 +1835,118 @@ impl Plugin {
         before
     }
 
-    /// Delivers one lifecycle event to this thread's kept instance.
+    /// One membership change of the host, told on whatever thread: folded
+    /// into the feed's list and kept among its last changes. No guest call
+    /// is made here and no instance: each instance hears it before its
+    /// decider's next decision or told event ([`Plugin::catch_up`]).
+    fn hand(&self, change: &Membership<'_>) {
+        let Some(feed) = &self.feed else {
+            return;
+        };
+        let mut told = feed.told.lock();
+        let kept = match *change {
+            Membership::Snapshot(members) => {
+                told.members.clear();
+                told.members.extend_from_slice(members);
+                None
+            }
+            Membership::Added(worker) => {
+                if !told.members.contains(&worker) {
+                    told.members.push(worker);
+                }
+                Some(Membership::Added(worker))
+            }
+            Membership::Removed(worker) => {
+                told.members.retain(|member| *member != worker);
+                Some(Membership::Removed(worker))
+            }
+            Membership::Replaced { old, new } => {
+                if let Some(member) = told.members.iter_mut().find(|member| **member == old) {
+                    *member = new;
+                } else if !told.members.contains(&new) {
+                    told.members.push(new);
+                }
+                Some(Membership::Replaced { old, new })
+            }
+            Membership::Relabelled(worker) => Some(Membership::Relabelled(worker)),
+            Membership::Resized(worker) => Some(Membership::Resized(worker)),
+        };
+        if told.changes.len() == FEED_CHANGES {
+            told.changes.pop_front();
+        }
+        told.changes.push_back(kept);
+        // Under the lock: the changes a place names are the ones the lock
+        // shows whoever read that place.
+        feed.place.fetch_add(1, Ordering::Release);
+    }
+
+    /// Tells the instance in `slot` what the membership feed holds past the
+    /// instance's place, before its decider reads it: nothing where it is
+    /// level (one load and one compare); each change, in the host's order,
+    /// where the feed still keeps them all; the list as it stands, as one
+    /// snapshot, where the instance is new to the feed (made at the warm-up,
+    /// lazily or after a fault), further behind than the changes kept, or
+    /// behind a snapshot. So an instance hears each change once, or a
+    /// snapshot that holds it. A change that faults the instance ends the
+    /// telling: the instance made after it is new to the feed. Each call is
+    /// a told event's ([`Plugin::tell`]), also where a decision's open makes
+    /// it: a frame of its own, outside the decision's sums.
+    fn catch_up(&self, slot: &mut Option<Instance>) {
+        let (Some(feed), Some(instance)) = (&self.feed, slot.as_mut()) else {
+            return;
+        };
+        if instance.heard == feed.place.load(Ordering::Acquire) {
+            return;
+        }
+        let mut ids = std::mem::take(&mut instance.snapshot);
+        let mut members = std::mem::take(&mut instance.members);
+        let mut changes = std::mem::take(&mut instance.changes);
+        members.clear();
+        changes.clear();
+        // The copy is made under the lock and the calls after it: no teller
+        // waits on a guest.
+        let whole = {
+            let told = feed.told.lock();
+            let place = feed.place.load(Ordering::Relaxed);
+            let behind = usize::try_from(place - instance.heard).unwrap_or(usize::MAX);
+            let whole = instance.heard == 0
+                || behind > told.changes.len()
+                || told.changes.iter().rev().take(behind).any(Option::is_none);
+            if whole {
+                members.extend_from_slice(&told.members);
+            } else {
+                let level = told.changes.len() - behind;
+                changes.extend(told.changes.iter().skip(level).flatten());
+            }
+            instance.heard = place;
+            whole
+        };
+        if whole {
+            let event = marshal::membership(&Membership::Snapshot(&members), &mut ids);
+            self.tell(slot, wit::LifecycleEvent::Membership(event));
+        } else {
+            for change in &changes {
+                if slot.is_none() {
+                    break;
+                }
+                let event = marshal::membership(change, &mut ids);
+                self.tell(slot, wit::LifecycleEvent::Membership(event));
+            }
+        }
+        if let Some(instance) = slot.as_mut() {
+            instance.snapshot = ids;
+            instance.members = members;
+            instance.changes = changes;
+        }
+    }
+
+    /// Delivers one lifecycle event to the kept instance of the decider the
+    /// calling thread acts as: the thread's own where it names none and is
+    /// one. A thread that only tells delivers nothing ([`Plugin::telling`]).
     fn observe(&self, event: wit::LifecycleEvent<'_>) {
+        let Some(_lent) = self.telling() else {
+            return;
+        };
         let slot = self.slot();
         let mut guard = slot.borrow_mut();
         let now = self.runtime.now_micros();
@@ -1471,10 +1954,15 @@ impl Plugin {
             return;
         }
         if guard.is_none() {
+            if let Some(instance) = self.adopt() {
+                self.seat(&mut guard, instance);
+            }
+        }
+        if guard.is_none() {
             match self.instantiate(self.init_fuel()) {
                 Ok(instance) => {
                     bump(&self.tally.lazy_instantiations);
-                    *guard = Some(instance);
+                    self.seat(&mut guard, instance);
                 }
                 Err(_) => {
                     self.report(now);
@@ -1482,6 +1970,22 @@ impl Plugin {
                 }
             }
         }
+        // What the membership feed holds past this instance's place comes
+        // first: the instance hears in the order the host told.
+        self.catch_up(&mut guard);
+        if guard.is_some() {
+            self.tell(&mut guard, event);
+        }
+        // Outside a decision: a dropped instance is made again lazily by the
+        // next event or open. The mark is a decision's, for its close; a
+        // decision never rebuilds a slot it did not touch.
+        self.emptied.get_or_default().set(false);
+    }
+
+    /// One `observe` call on the instance in `slot`, outside every
+    /// decision's sums: the live clock, the instance's own draw, the plugin's
+    /// frame (the event frame where its budget is unset).
+    fn tell(&self, slot: &mut Option<Instance>, event: wit::LifecycleEvent<'_>) {
         let frame = if self.frame.micros == 0 {
             OBSERVE_FRAME_MICROS
         } else {
@@ -1502,7 +2006,7 @@ impl Plugin {
             decision: 0,
             seed_micros: 0,
         };
-        let _ = self.call(&mut guard, lifecycle, |inst| {
+        let _ = self.call(slot, lifecycle, |inst| {
             let result = match &inst.exports {
                 Exports::Record(b) => b.smg_policy_plugin().call_observe(&mut inst.store, event),
                 Exports::Packed(b) => b
@@ -1511,10 +2015,6 @@ impl Plugin {
             };
             result.map(Ok)
         });
-        // Outside a decision: a dropped instance is made again lazily by the
-        // next event or open. The mark is a decision's, for its close; a
-        // decision never rebuilds a slot it did not touch.
-        self.emptied.get_or_default().set(false);
     }
 }
 
@@ -1779,6 +2279,9 @@ impl Bound {
             open.bypass = true;
             return;
         }
+        // A named decider's kept state comes to this thread for the
+        // decision; the plugin's last close of it gives it back.
+        plugin.lend();
         let slot = plugin.slot();
         let mut guard = slot.borrow_mut();
         if guard.is_none() {
@@ -1789,6 +2292,13 @@ impl Bound {
                 open.bypass = true;
                 return;
             }
+            // The apply's own instance, where it still waits for this
+            // decider: no `init` runs and nothing is charged.
+            if let Some(instance) = plugin.adopt() {
+                plugin.seat(&mut guard, instance);
+            }
+        }
+        if guard.is_none() {
             // A cold slot: `init` runs under what the decision has left (a
             // slot still empty at the close is rebuilt under the full frame).
             // The budget is wall time here as in a call: the instantiation is
@@ -1822,7 +2332,7 @@ impl Bound {
                     bump(&plugin.tally.lazy_instantiations);
                     budget.remaining_micros = budget.remaining_micros.saturating_sub(charged);
                     plugin.note_init(decision, own);
-                    *guard = Some(instance);
+                    plugin.seat(&mut guard, instance);
                 }
                 Err(LoadError::Trap { .. })
                     if left < init_fuel && charged >= budget.remaining_micros =>
@@ -1862,11 +2372,32 @@ impl Bound {
                 }
             }
         }
+        // What the membership feed told since this instance last heard comes
+        // before the decision reads the instance, as told events: outside
+        // the decision's sums. Once a decision, at the first of the plugin's
+        // opens that reaches the instance: a later one (a pair's other side,
+        // another profile) finds a resource of the decision live on the
+        // instance, so a change handed between them waits for the decider's
+        // next decision or told event. An open the breaker turned away
+        // above reached no instance and is not that first: the instance the
+        // decision's next open reaches, or makes, still hears.
+        // A change that faults the instance ends the plugin's part in the
+        // decision, and the close rebuilds the slot.
+        if plugin.feed.is_some() && plugin.heard_in.get_or_default().replace(decision) != decision {
+            plugin.catch_up(&mut guard);
+            if guard.is_none() {
+                open.bypass = true;
+                return;
+            }
+        }
         if let Some(inst) = guard.as_mut() {
             match &inst.exports {
                 Exports::Record(_) => inst.records.fill(facts, candidates, pool),
                 Exports::Packed(_) => {
-                    if inst.packed.fill(facts, candidates, pool, &plugin.exposure) == Err(TooLong) {
+                    let filled =
+                        inst.packed
+                            .fill(facts, candidates, pool, &plugin.exposure, plugin.needs);
+                    if filled == Err(TooLong) {
                         bump(&plugin.tally.too_long);
                         open.bypass = true;
                         return;
@@ -1876,12 +2407,14 @@ impl Bound {
         }
         let count = open.count;
         let exposure = &plugin.exposure;
+        let needs = plugin.needs;
         let frame = open.frame(&mut budget, frame.fuel_per_micro);
         let constructed = plugin.call(&mut guard, frame, |inst| {
             let result = match &inst.exports {
                 Exports::Record(b) => {
                     let headers = marshal::headers(facts, exposure);
-                    let request = marshal::request(facts, exposure, &inst.records.tried, &headers);
+                    let request =
+                        marshal::request(facts, exposure, needs, &inst.records.tried, &headers);
                     let pool = marshal::pool(pool, &inst.records.zones);
                     b.smg_policy_plugin().decision().call_constructor(
                         &mut inst.store,
@@ -1951,6 +2484,8 @@ impl Bound {
         // The decision these opens are of: each open of it returned the one
         // number.
         let mut decision = 0;
+        // Whether the plugin's last open of that decision closes here.
+        let mut last = false;
         // The phases that were open, the lowest first.
         while closing != 0 {
             let open = &mut opens.0[closing.trailing_zeros() as usize];
@@ -1991,7 +2526,7 @@ impl Bound {
             }
             decision = open.decision;
             open.reset();
-            plugin.note_close(decision, budget.seed_micros);
+            last = plugin.note_close(decision, budget.seed_micros);
         }
         walk.returned = true;
         drop(budget);
@@ -2011,7 +2546,7 @@ impl Bound {
                     match plugin.instantiate(plugin.init_fuel()) {
                         Ok(instance) => {
                             bump(&plugin.tally.lazy_instantiations);
-                            *guard = Some(instance);
+                            plugin.seat(&mut guard, instance);
                         }
                         Err(error) => {
                             tracing::warn!(plugin = plugin.name, %error, "the rebuild of a dropped instance failed");
@@ -2025,6 +2560,11 @@ impl Bound {
                     }
                 }
             }
+        }
+        // The decision is over for the plugin: a named decider's kept state
+        // goes back to its rest, rebuilt here where the decision emptied it.
+        if last {
+            plugin.rest();
         }
     }
 
@@ -2092,6 +2632,10 @@ impl BoundPlugin for Bound {
 
     fn needs(&self) -> Needs {
         self.plugin.needs()
+    }
+
+    fn observes(&self) -> EventSet {
+        self.plugin.observes()
     }
 
     /// The first scorer or picker adapter made from any bound set of the
@@ -2271,25 +2815,7 @@ impl BoundPlugin for Bound {
     }
 
     fn observe_membership(&self, change: &Membership<'_>) {
-        let plugin = &self.plugin;
-        // The snapshot's ids are copied into the instance's own buffer; a
-        // borrow of the slot for the copy and another for the call would
-        // alias, so the copy is taken apart and handed back after.
-        let mut snapshot = {
-            let slot = plugin.slot();
-            let mut guard = slot.borrow_mut();
-            guard
-                .as_mut()
-                .map(|inst| std::mem::take(&mut inst.snapshot))
-                .unwrap_or_default()
-        };
-        plugin.observe(wit::LifecycleEvent::Membership(marshal::membership(
-            change,
-            &mut snapshot,
-        )));
-        if let Some(inst) = plugin.slot().borrow_mut().as_mut() {
-            inst.snapshot = snapshot;
-        }
+        self.plugin.hand(change);
     }
 
     fn observe_signal(&self, signal: &Signal) {

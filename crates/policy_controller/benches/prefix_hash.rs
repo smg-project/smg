@@ -31,6 +31,10 @@ use smg_policy_controller::{
 
 const SIZES: [usize; 3] = [8, 64, 512];
 
+/// The blocks of sixteen tokens a prompt cut at the shallower boundary, 64
+/// tokens, carries.
+const SHALLOW_BLOCKS: usize = 4;
+
 /// The block hashes of a prompt of 1,024 tokens in blocks of sixteen. The
 /// key is the sixteenth: the last whole block at or under 256 tokens.
 fn prompt() -> Vec<u64> {
@@ -128,10 +132,17 @@ fn paths(c: &mut Criterion) {
     for &n in &SIZES {
         // An engine a size and a form: the ring learns its members from
         // the view. The owner keeps its key over the fleet's loads; then the
-        // same owner holds a thousand requests and is passed over.
-        for (engine, kept, passed) in [
-            (Some(engine_of("prefix_hash")), "owner", "passed_over"),
-            (levelled(), "levels_owner", "levels_passed_over"),
+        // same owner holds a thousand requests and is passed over. Under the
+        // boundaries the passed key lands on the shallower boundary's owner,
+        // the row the prompt cut at that boundary is placed on.
+        for (engine, kept, passed, levels) in [
+            (
+                Some(engine_of("prefix_hash")),
+                "owner",
+                "passed_over",
+                false,
+            ),
+            (levelled(), "levels_owner", "levels_passed_over", true),
         ] {
             let Some(engine) = engine else {
                 continue;
@@ -139,13 +150,18 @@ fn paths(c: &mut Criterion) {
             let mut view = Vec::with_capacity(n);
             build_view(&fleet(n), &mut view);
             let owner = owner_of(&engine, &view, &hashes);
+            let shallow = levels.then(|| owner_of(&engine, &view, &hashes[..SHALLOW_BLOCKS]));
             decide_over(&mut group, kept, &engine, &view, &hashes);
             view[owner].in_flight = 1_000;
-            assert_ne!(
-                placed(&engine, &view, &hashes),
-                owner,
-                "the owner is passed over"
-            );
+            let landed = placed(&engine, &view, &hashes);
+            assert_ne!(landed, owner, "the owner is passed over");
+            if let Some(shallow) = shallow {
+                assert_ne!(shallow, owner, "the two boundaries' keys have two owners");
+                assert_eq!(
+                    landed, shallow,
+                    "the shallower boundary's owner takes the key"
+                );
+            }
             decide_over(&mut group, passed, &engine, &view, &hashes);
         }
     }

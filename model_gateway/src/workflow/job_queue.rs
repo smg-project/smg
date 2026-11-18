@@ -2733,6 +2733,69 @@ mod tests {
         );
     }
 
+    /// The queue as the worker's health manager holds it ([`WorkerJobs`]): a
+    /// label refresh asked through the trait is the queue's own refresh job.
+    /// With nothing in flight under the address it is submitted under its
+    /// kind; behind a job that holds the address it is kept, the holder's
+    /// status left to it, and runs under its own kind when the holder ends.
+    #[tokio::test]
+    async fn a_refresh_asked_through_the_workers_trait_is_the_queues_refresh() {
+        use crate::service_discovery::testing::create_test_app_context;
+        let context = create_test_app_context();
+        let queue = JobQueue::new(JobQueueConfig::default(), Arc::downgrade(&context));
+        let jobs: Arc<dyn WorkerJobs> = queue.clone();
+
+        let free = "http://free:8000";
+        assert_eq!(jobs.refresh_worker_labels(free.to_string()).await, Ok(true));
+        assert_eq!(
+            queue
+                .get_status(free)
+                .expect("the refresh's status")
+                .job_type,
+            "RefreshWorkerLabels"
+        );
+
+        let held = "http://held:8000";
+        queue.hold_url_for_tests(held, "AddWorker");
+        assert_eq!(
+            jobs.refresh_worker_labels(held.to_string()).await,
+            Ok(false)
+        );
+        assert!(queue.kept_for(held), "kept behind the job that holds it");
+        assert_eq!(
+            queue
+                .get_status(held)
+                .expect("the holder's status")
+                .job_type,
+            "AddWorker",
+            "the holder's status is left to it"
+        );
+        JobQueue::record_job_completion(
+            "AddWorker",
+            held,
+            Duration::ZERO,
+            &Ok("done".to_string()),
+            &queue.status_map,
+        );
+        JobQueue::run_kept(
+            held,
+            &context,
+            &queue.status_map,
+            &queue.kept,
+            &queue.cancelled_before_start,
+        )
+        .await;
+        assert!(!queue.kept_for(held));
+        assert_eq!(
+            queue
+                .get_status(held)
+                .expect("the kept job's status")
+                .job_type,
+            "RefreshWorkerLabels",
+            "the kept job is the refresh"
+        );
+    }
+
     /// The wiring at `process_job`: a kept job runs at the completion of the
     /// job that held the URL, through the dispatcher and not by hand. A hold
     /// by hand keeps the first submission; a plain submission for the same
