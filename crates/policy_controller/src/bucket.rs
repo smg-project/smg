@@ -417,14 +417,16 @@ impl Pool {
 
     /// Book `tokens` on a member at `at_micros`. The bookings older than the
     /// window leave first, each with its tokens off its worker's load, and
-    /// so does one dated after this one: a clock that went back ends what it
-    /// passed.
+    /// so does one dated more than the window after this one: a clock that
+    /// went back that far ends what it passed. A booking dated a little
+    /// before the window's oldest arrived out of its clock's order, as the
+    /// bookings of two deciders can, and nothing leaves on its account.
     fn book(&mut self, member: u32, tokens: u32, at_micros: u64, window_micros: u64) {
         if let Some(booked) = self.members.get_mut(member as usize) {
             booked.load = booked.load.saturating_add(u64::from(tokens));
         }
         while let Some(oldest) = self.window.front() {
-            let aged = at_micros < oldest.at_micros || at_micros - oldest.at_micros > window_micros;
+            let aged = at_micros.abs_diff(oldest.at_micros) > window_micros;
             if !aged && self.window.len() < WINDOW_CAP {
                 break;
             }
@@ -1010,13 +1012,35 @@ mod tests {
         assert_eq!(loads(&scorer), (vec![100, 40], 140));
         book(&scorer, &pool, 1, 10, 6 * SECOND + 1);
         assert_eq!(loads(&scorer), (vec![0, 50], 50), "the first booking left");
-        // A booking dated before the window's oldest ends what it passed.
-        book(&scorer, &pool, 0, 7, 2 * SECOND);
-        assert_eq!(loads(&scorer), (vec![7, 0], 7));
+        // A booking dated a little before the window's oldest arrived out
+        // of its clock's order: both stand.
+        book(&scorer, &pool, 0, 7, 6 * SECOND - 5);
+        assert_eq!(loads(&scorer), (vec![7, 50], 57));
+        // One dated more than an interval before it is a clock that went
+        // back: it ends what it passed.
+        book(&scorer, &pool, 0, 3, SECOND / 2);
+        assert_eq!(loads(&scorer), (vec![3, 0], 3));
         // A worker no partition lists takes no booking.
         let stranger = self::pool(3);
         book(&scorer, &stranger, 2, 1_000, 2 * SECOND);
-        assert_eq!(loads(&scorer), (vec![7, 0], 7));
+        assert_eq!(loads(&scorer), (vec![3, 0], 3));
+    }
+
+    #[test]
+    fn two_bookings_that_arrive_out_of_their_clocks_order_both_count() {
+        let scorer = scorer(NEVER, 1.5, 5);
+        let pool = pool(2);
+        led(&scorer, &pool, 0, SECOND);
+        // Two deciders read the clock five microseconds apart and book in
+        // the reverse order, into a window that holds nothing older.
+        book(&scorer, &pool, 0, 100, SECOND + 5);
+        book(&scorer, &pool, 1, 40, SECOND);
+        assert_eq!(loads(&scorer), (vec![100, 40], 140));
+        // The older one waits behind the newer and leaves with it.
+        book(&scorer, &pool, 1, 10, 6 * SECOND + 1);
+        assert_eq!(loads(&scorer), (vec![100, 50], 150));
+        book(&scorer, &pool, 1, 10, 6 * SECOND + 6);
+        assert_eq!(loads(&scorer), (vec![0, 20], 20), "both left");
     }
 
     #[test]
