@@ -2489,9 +2489,8 @@ fn check_profile(
         }
     };
     // A host that makes some lifecycle calls only holds no stage that needs
-    // them:
-    // it would decide on state nothing keeps. Every entry of a complete
-    // profile is built, so a scorer stands at its entry's place.
+    // them: it would decide on state nothing keeps. Every entry of a
+    // complete profile is built, so a scorer stands at its entry's place.
     if complete && !catalog.makes_lifecycle_calls() {
         let mut entries = p.score.iter().zip(&scorers).enumerate();
         let scorer = entries.find_map(|(i, (entry, built))| {

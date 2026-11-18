@@ -4702,3 +4702,123 @@ fn an_apply_that_derives_the_classes_again_reads_every_member_under_its_own_list
     assert_eq!(listed(&third, west), (0, 0, 0));
     assert_eq!(store.outside_lists(), OutsideLists::default());
 }
+
+#[test]
+fn a_membership_write_reads_the_member_it_writes_and_carries_every_others_fields() {
+    let store = MemoryStore::new();
+    // A document of zones and families alone lists a member too.
+    let zones = ["east", "west"];
+    let engines = ["alpha", "beta"];
+    store
+        .apply(generation_listing(1, &[], &zones, &engines))
+        .expect("applied");
+    let west = listed_member(&store, "w", "beta", Some("west"), &[("tier", "gold")]);
+    let east = listed_member(&store, "e", "alpha", Some("east"), &[]);
+    let world = store.world();
+    assert_eq!(listed(&world, west), (2, 2, 0));
+    assert_eq!(listed(&world, east), (1, 1, 0));
+    // A refresh that states another zone and family moves the member's
+    // positions and its count: the write reads the member it writes.
+    let again = listed_member(&store, "w", "alpha", Some("north"), &[("tier", "gold")]);
+    assert_eq!(again, west);
+    let world = store.world();
+    assert_eq!(listed(&world, west), (1, 0, 0));
+    assert_eq!(listed(&world, east), (1, 1, 0));
+    let outside = OutsideLists {
+        engines: 0,
+        zones: 1,
+    };
+    assert_eq!(store.outside_lists(), outside);
+    // A patch of one member's labels moves its bits and no other's.
+    store
+        .apply(generation_listing(
+            2,
+            &["tier=gold", "lane"],
+            &zones,
+            &engines,
+        ))
+        .expect("applied");
+    assert_eq!(listed(&store.world(), west), (1, 0, 0b01));
+    let row = WorkersStore::get(&store, east).expect("the row");
+    let lane = [("lane".to_string(), "a".to_string())];
+    let patch = WorkerPatch {
+        labels: Some(lane.into_iter().collect()),
+        priority: None,
+        overload: None,
+    };
+    store.patch(east, patch, row.revision).expect("patched");
+    let world = store.world();
+    assert_eq!(listed(&world, east), (1, 1, 0b10));
+    assert_eq!(listed(&world, west), (1, 0, 0b01));
+    // A member that leaves takes its count with it, and the member that
+    // stays reads as before.
+    let row = WorkersStore::get(&store, west).expect("the row");
+    store.remove(west, row.revision).expect("removed");
+    assert_eq!(listed(&store.world(), east), (1, 1, 0b10));
+    assert_eq!(store.outside_lists(), OutsideLists::default());
+    // It joins again under other facts, and reads as those say.
+    let back = listed_member(&store, "w", "beta", Some("west"), &[]);
+    assert_eq!(listed(&store.world(), back), (2, 2, 0));
+}
+
+#[test]
+fn a_member_whose_rows_revision_stands_is_carried_and_one_whose_revision_moved_is_read() {
+    let origin = Instant::now();
+    let row = |id: u64, zone: &str, revision: u64| WorkerRow {
+        id: WorkerId(id),
+        facts: WorkerFacts {
+            zone: Some(zone.to_string()),
+            ..facts(&format!("http://w{id}:8000"), Role::Single, &[MODEL])
+        },
+        status: WorkerStatus::Ready,
+        revision,
+        admitted_at: origin,
+    };
+    let zones = |world: &World| (listed(world, WorkerId(3)).1, listed(world, WorkerId(7)).1);
+    let mut writer = Writer::new(PUBLISH_WINDOW, origin);
+    let lists = Arc::new(generation_listing(1, &[], &["east", "west"], &[]));
+    writer
+        .apply(lists, std::iter::empty(), |_, _| None)
+        .expect("applied");
+    let members = [row(3, "east", 1), row(7, "west", 1)];
+    let first = writer.rebuild(1, members.iter(), |_, _| None, Classes::Derive);
+    assert_eq!(zones(&first), (1, 2));
+    // The revision is what says a row's facts moved. At a standing revision
+    // a member's fields are the last read's, whatever the row states: a
+    // store hands no such row, and the case does, to tell a carry from a
+    // read.
+    let members = [row(3, "west", 1), row(7, "east", 1)];
+    let carried = writer.rebuild(2, members.iter(), |_, _| None, Classes::Derive);
+    assert_eq!(zones(&carried), (1, 2));
+    // At another revision a member is read, and the other is carried.
+    let members = [row(3, "west", 1), row(7, "east", 2)];
+    let read = writer.rebuild(3, members.iter(), |_, _| None, Classes::Derive);
+    assert_eq!(zones(&read), (1, 1));
+    // An apply whose lists differ reads every member, at any revision and
+    // in whatever order the store's table hands them,
+    let other = Arc::new(generation_listing(2, &[], &["west", "east"], &[]));
+    let members = [row(7, "east", 2), row(3, "east", 1)];
+    let (relisted, _) = writer
+        .apply(other, members.iter(), |_, _| None)
+        .expect("applied");
+    assert_eq!(zones(&relisted), (2, 2));
+    // and the write after it carries that reading.
+    let members = [row(3, "west", 1), row(7, "west", 2)];
+    let after = writer.rebuild(4, members.iter(), |_, _| None, Classes::Derive);
+    assert_eq!(zones(&after), (2, 2));
+    // A member that leaves takes its entry with it, on either side of a
+    // member that stays. One that joins again at the id and the revision
+    // it left at is read: no field of its last life is carried.
+    let members = [row(7, "west", 2)];
+    let left = writer.rebuild(5, members.iter(), |_, _| None, Classes::Derive);
+    assert_eq!(listed(&left, WorkerId(7)).1, 2);
+    let members = [row(3, "west", 1), row(7, "west", 2)];
+    let back = writer.rebuild(6, members.iter(), |_, _| None, Classes::Derive);
+    assert_eq!(zones(&back), (1, 2));
+    let members = [row(3, "west", 1)];
+    let left = writer.rebuild(7, members.iter(), |_, _| None, Classes::Derive);
+    assert_eq!(listed(&left, WorkerId(3)).1, 1);
+    let members = [row(3, "west", 1), row(7, "west", 2)];
+    let back = writer.rebuild(8, members.iter(), |_, _| None, Classes::Derive);
+    assert_eq!(zones(&back), (1, 1));
+}

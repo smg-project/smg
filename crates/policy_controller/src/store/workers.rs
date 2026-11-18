@@ -184,7 +184,9 @@ pub struct WorkerRow {
     pub status: WorkerStatus,
     /// Counts the row's stated facts: it moves on every write of them (a
     /// registration's refresh, a patch) and on no status change. The guard
-    /// a racing write names.
+    /// a racing write names. The world's writer carries a member's fields
+    /// under the view's lists while it stands, so a write of the facts must
+    /// move it.
     pub revision: u64,
     /// When the row was created on the host's clock.
     pub admitted_at: Instant,
