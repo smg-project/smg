@@ -26,6 +26,9 @@
 //! template, and a test cuts generated text both ways. No rule reads the
 //! text before a piece's start, so the pass can begin at any such start
 //! ([`pieces`]) and hand the text back to the scanner at any other.
+//!
+//! The template of the three-stage chain (`chain::Scanner`) takes the same
+//! pass by three rules of its own ([`chain_pieces`]).
 
 /// Bytes per block: one bit of a mask per byte.
 pub(super) const BLOCK: usize = 64;
@@ -170,7 +173,7 @@ impl Edge {
     /// which may be whitespace too: the scanner's to say. `clitic_end(pos)`
     /// is the end of the clitic at `pos`, if one begins there.
     #[inline(always)]
-    fn starts<C: Fn(usize) -> Option<usize>>(
+    fn starts<const CHAIN: bool, C: Fn(usize) -> Option<usize>>(
         &mut self,
         text: &[u8],
         base: usize,
@@ -196,7 +199,11 @@ impl Edge {
         // break is the run's last, which is where the blanks from it end:
         // in this block, in the next or beyond it.
         let run_starts = rest & !before(rest, self.rest);
-        let last_blanks = blanks & !after(block.whitespace, next.whitespace);
+        // The chain's template never sees a digit (the stage before it cut
+        // the digits out), so there a digit ends the text for this rule as
+        // whitespace does: the blank before one starts no piece of its own.
+        let (unseen, next_unseen) = if CHAIN { (digits, next.digits) } else { (0, 0) };
+        let last_blanks = blanks & !after(block.whitespace | unseen, next.whitespace | next_unseen);
         let mut starts = punct_starts | run_starts | last_blanks;
         let mut behind_break = blanks & before(breaks, self.breaks) & !starts;
         while behind_break != 0 {
@@ -230,7 +237,8 @@ impl Edge {
         let word_starts =
             letters & !before(letters, self.letters) & !before(lead_ins, self.lead_ins);
         let mut behind_clitics = std::mem::take(&mut self.behind_clitics);
-        let mut quotes = lead_ins & punct_starts;
+        // The chain's template has no clitics.
+        let mut quotes = if CHAIN { 0 } else { lead_ins & punct_starts };
         while quotes != 0 {
             let at = base + quotes.trailing_zeros() as usize;
             quotes &= quotes - 1;
@@ -294,7 +302,7 @@ impl Edge {
 /// through the caller's walk between two stretches as well (counted: 1.4
 /// instructions per token on a Cyrillic text, 2 to 4 on long mixed text).
 #[inline(always)]
-pub(super) fn pieces<C, F>(
+fn pieces_of<const CHAIN: bool, C, F>(
     text: &[u8],
     from: usize,
     digit_cap: u32,
@@ -310,7 +318,7 @@ where
     };
     if !text[from..]
         .first_chunk::<{ 2 * BLOCK }>()
-        .is_some_and(|stretch| stretch.is_ascii())
+        .is_some_and(|stretch| reads::<CHAIN>(stretch))
     {
         return from;
     }
@@ -320,12 +328,14 @@ where
     // The stretch's first byte starts the open piece and ends none.
     let mut opening = 1;
     for (index, block) in rest.iter().enumerate() {
-        if !block.is_ascii() {
+        if !reads::<CHAIN>(block) {
             break;
         }
         let next = Masks::of(block);
         let base = from + index * BLOCK;
-        let Some(starts) = edge.starts(text, base, &masks, &next, digit_cap, &clitic_end) else {
+        let Some(starts) =
+            edge.starts::<CHAIN, C>(text, base, &masks, &next, digit_cap, &clitic_end)
+        else {
             break;
         };
         let mut starts = starts & !opening;
@@ -339,6 +349,52 @@ where
         masks = next;
     }
     open
+}
+
+/// Whether the pass reads `bytes`: all ASCII, and for the chain's template
+/// (`CHAIN`) no control character either. There a control character is a
+/// lead-in of letters and no punctuation, which the masks do not say, so a
+/// block that holds one is the scanner's, as a block beyond ASCII is. The
+/// ASCII test stands first and alone: it ends at the first bytes beyond
+/// ASCII, so a try of the pass on text in another script costs little.
+#[inline(always)]
+fn reads<const CHAIN: bool>(bytes: &[u8]) -> bool {
+    bytes.is_ascii()
+        && !(CHAIN
+            && bytes.iter().fold(false, |odd, &byte| {
+                odd | (byte.is_ascii_control() && !is_space(byte))
+            }))
+}
+
+/// [`pieces_of`] by the GPT-4 family's template.
+#[inline(always)]
+pub(super) fn pieces<C, F>(
+    text: &[u8],
+    from: usize,
+    digit_cap: u32,
+    clitic_end: C,
+    piece: &mut F,
+) -> usize
+where
+    C: Fn(usize) -> Option<usize>,
+    F: FnMut(usize, usize),
+{
+    pieces_of::<false, C, F>(text, from, digit_cap, clitic_end, piece)
+}
+
+/// [`pieces_of`] by the template of the three-stage chain (`chain`), whose
+/// first stage cuts the digits by the bound `digit_cap`. On plain ASCII it
+/// cuts as the GPT-4 family's template but for three rules: it has no
+/// clitics, a run of blanks before a digit stays whole, and a control
+/// character is no punctuation (such a block is left to the scanner).
+#[inline(always)]
+pub(super) fn chain_pieces<F: FnMut(usize, usize)>(
+    text: &[u8],
+    from: usize,
+    digit_cap: u32,
+    piece: &mut F,
+) -> usize {
+    pieces_of::<true, _, F>(text, from, digit_cap, |_| None, piece)
 }
 
 /// Bytes between two places a text is asked at for an ASCII stretch
