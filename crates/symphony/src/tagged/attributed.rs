@@ -997,8 +997,9 @@ impl Assembler {
     /// stream's cut or the model's stop inside the call (no bytes). The bytes held inside the
     /// object are its text. An object the end found open stays as the model wrote it, as the JSON
     /// family's reader leaves one ([`named_arguments::Object::cut`]): the word it held, then one
-    /// `Malformed` event of no bytes that says the arguments are no whole value, no brace made up
-    /// for the model. An object that closed whole, with nothing refused after it, is whole as
+    /// `Malformed` event of no bytes that says the arguments are no whole value, unless the reader
+    /// said so already at a byte that is no JSON; no brace is made up for the model.
+    /// An object that closed whole, with nothing refused after it, is whole as
     /// the model wrote it: its closing brace, held back since it arrived, is the last fragment,
     /// and the whitespace carried and a tag's start held are the template's, dropped. Where the
     /// syntax refused bytes after the object the brace left with them ([`Self::release`]): the
@@ -3016,6 +3017,29 @@ mod tests {
     /// tag its text, under the one `Malformed { InvalidArguments }` event of no bytes that says
     /// the arguments are no JSON: nothing is refused and no byte is lost, however the bytes are
     /// cut.
+    #[test]
+    fn an_object_the_reader_refused_is_reported_once_at_every_end() {
+        // The reader says the first byte that is no JSON where it stands, with an event of no
+        // bytes. The call's end, whichever it is, adds no second report of the same object and
+        // makes up no brace: the arguments stay as the model wrote them.
+        for tags in [Tags::DSML, Tags::DSML_V4] {
+            let call = "f\">\n{\"n\": ?";
+            for (end, events) in [
+                ("the close", run_with(tags, &[call], false)),
+                ("the cut", run_with(tags, &[call], true)),
+                ("the stop", stopped(tags, &[call], false)),
+                ("the stop as the marker", stopped(tags, &[call], true)),
+            ] {
+                assert_eq!(arguments(&events), "{\"n\": ?", "{end}");
+                assert_eq!(
+                    malformed(&events),
+                    [(String::new(), MalformedReason::InvalidArguments)],
+                    "{end}: {events:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn whitespace_before_a_json_object_is_dropped_and_a_tag_inside_it_is_its_text() {
         for tags in [Tags::DSML, Tags::DSML_V4] {

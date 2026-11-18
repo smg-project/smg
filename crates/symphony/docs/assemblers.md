@@ -370,8 +370,9 @@ What the syntax says, and what the assembler does with it:
   stream cut, and the table reads what follows the tag from where it stands, after the next
   invoke's opening the next call. The newlines around the object are the template's, dropped, and
   the invoke's close is the call's end. An object a terminal, the cut or the stop found open stays
-  as written, and the reader's `Malformed` event of no bytes says it is no whole value, no brace
-  made up; an object closed before a cut or a stop is whole, as the
+  as written, no brace made up, and one `Malformed` event of no bytes says it is no whole value:
+  the reader's at the first byte that is no JSON where it refused the object, else the one at
+  the call's end; an object closed before a cut or a stop is whole, as the
   JSON assembler ends one. A word or a tag after the object is text where the syntax has tags,
   refused as below, and the call it stands in is no whole call, as a call of parameter tags the
   syntax refused bytes in is none: the object's closing brace, held back until the call ends, is

@@ -498,10 +498,29 @@ pub(crate) fn a_call_terminal_ends_an_invoke_whose_arguments_are_json(
             Some(""),
             "{name}: {events:?}"
         );
+        // It is the one report before the first call's end: a second one of the same reason
+        // would hide behind the first below, where a reason that repeats is said once.
+        let first_end = events
+            .iter()
+            .position(|event| matches!(event, Event::ToolCallEnd { .. }))
+            .unwrap_or(events.len());
+        assert_eq!(
+            malformed(&events[..first_end]).len(),
+            1,
+            "{name}: {events:?}"
+        );
         let mut said_why: Vec<MalformedReason> = reports.into_iter().map(|(_, why)| why).collect();
         said_why.dedup();
         assert_eq!(said_why, reasons, "{name}: {events:?}");
-        let said = the_same_at_every_cut(|pieces| run(chat, pieces), &output);
+        // Every byte lands in one event at every cut too, a tag's bytes among them.
+        let said = the_same_at_every_cut(
+            |pieces| {
+                let events = run(chat, pieces);
+                assert_eq!(bytes(&events), output, "{name}: {pieces:?}");
+                events
+            },
+            &output,
+        );
         assert_eq!(
             said.finish.map(|(_, count)| count),
             u32::try_from(calls.len()).ok(),
