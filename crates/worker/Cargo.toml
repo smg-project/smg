@@ -21,16 +21,26 @@ axum = ["dep:axum"]
 # The mechanism the worker's metric writers share with a host's: the bounded
 # label set, the model labels' one set and the handles a record keeps.
 metrics = ["dep:dashmap", "dep:rustc-hash"]
-# The worker's runtime, for the process that hosts the workers. Its first
-# part is the HTTP client factory and the cache of worker-directed clients.
-runtime = ["dep:reqwest", "dep:rustls", "dep:tracing"]
+# The worker's runtime, for the process that hosts the workers: the HTTP
+# client factory and the cache of worker-directed clients, the worker errors,
+# the periodic task and the merge of scraped metrics.
+runtime = [
+    "dep:anyhow",
+    "dep:openmetrics-parser",
+    "dep:reqwest",
+    "dep:rustls",
+    "dep:thiserror",
+    "dep:tracing",
+]
 # The runtime's test support, for the tests of a crate that hosts it.
 test-util = ["runtime"]
 
 [dependencies]
+anyhow = { workspace = true, optional = true }
 axum = { workspace = true, optional = true }
 bitflags.workspace = true
 dashmap = { workspace = true, optional = true }
+openmetrics-parser = { version = "0.4.4", optional = true }
 reqwest = { workspace = true, optional = true, features = ["blocking", "http2", "rustls-no-provider"] }
 rustc-hash = { version = "2", optional = true }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"], optional = true }
@@ -38,6 +48,7 @@ schemars.workspace = true
 serde = { workspace = true, features = ["derive", "rc"] }
 serde_json = { workspace = true, features = ["preserve_order"] }
 serde_with.workspace = true
+thiserror = { workspace = true, optional = true }
 tracing = { workspace = true, optional = true }
 url = "2.5"
 
