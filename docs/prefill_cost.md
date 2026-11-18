@@ -1,8 +1,13 @@
 # Prefill cost routing
 
-`prefill_cost` is an opt-in policy for regular native gRPC workers. The default
-`cache_aware` policy is unchanged. IGW, HTTP, ZMQ and PD/EPD configurations are rejected
-for this policy because those paths do not transfer its per-attempt lease.
+`prefill_cost` routes requests by estimated input processing time. It accounts
+for the prefix each worker has cached and the work already assigned to it, so
+a busy worker can give up a cache hit when another worker can process the
+whole prompt sooner.
+
+## Usage
+
+Start a regular native gRPC router:
 
 ```sh
 smg --policy prefill_cost \
@@ -13,8 +18,7 @@ smg --policy prefill_cost \
   --prefill-cost-kv-pressure-weight 0.15
 ```
 
-The same policy and tunables are available through the Python launcher. Its
-configuration form is:
+The Python launcher accepts the same options. In a configuration file:
 
 ```yaml
 policy:
@@ -25,74 +29,77 @@ policy:
   kv_pressure_weight: 0.15
 ```
 
-Select it in the gateway configuration. A worker's `policy=prefill_cost` label
-only inherits an already configured `prefill_cost` default; it cannot enable this
-policy on a gateway using another default and bypass transport validation.
+Select the policy in the router configuration. A worker's
+`policy=prefill_cost` label inherits that configuration when the router's
+default is also `prefill_cost`. With another default, the label follows the
+unknown-policy fallback and leaves that default in place.
 
-The throughput fallback is input tokens per second. Calibrate it to the serving
-engines when measured input rates are unavailable. Generation throughput is never
-substituted for input throughput.
+Use a regular worker pool with IGW disabled. HTTP and ZMQ workers and PD/EPD
+pools are unsupported.
 
-## Decision and ownership
+## Choosing a worker
 
-Every eligible worker, including workers with no cache hit, competes on estimated
-input drain time plus a convex KV-pressure penalty. Native KV events give the
-first prompt's reusable prefix. With no index, the cache credit is zero; the
-policy still balances pending work. It does not build an approximate placement
-tree or copy KV tensors between workers.
+The policy considers every eligible worker. Native KV events tell it how much
+of the prompt each worker holds. Matching uses the request's cache namespace
+and the engine's block size, with `--block-size` as the fallback. Until an
+index is available, the whole prompt counts as input work.
 
-The input-work estimate includes backend queue work, a configurable running-work
-estimate, local reservations and the incoming uncached prompt. Each live local
-request also keeps a `mean_prefill_tokens` running-work estimate until completion,
-including fully cached requests and requests already decoding. This prevents
-zero-prefill reservations from disappearing behind stale idle reports. A reported queue
-without token counts uses `waiting_requests * mean_prefill_tokens`. Valid input
-rates normalize heterogeneous capacity; a missing rate uses nominal measured peer
-capacity or the configured fallback. KV pressure contributes
-`kv_pressure_weight * k / (1 - k)` seconds, with the existing bound near full KV.
+For example, two 16k prompts sharing a cached 4k prefix each need 12k of new
+prefill on the worker holding that prefix. If the first is still prefilling
+when the second arrives, the second would add to that worker's outstanding
+work. An idle peer can take it at the cost of recomputing the 4k prefix.
+With a 64-token suffix behind a large cached prefix, reusing the cache costs
+far less work than sending the whole prompt to a cold peer.
 
-One registry-owned ledger is shared across model policies and aliases. Selection
-and reservation run under its lock, so the next local decision sees booked work
-even before the first request reaches the engine. A request/attempt owns its
-lease through selection, dispatch and the raw response stream:
+The score divides estimated input work by the worker's input-token rate and
+adds a KV-pressure penalty. Input work includes the incoming uncached prompt,
+the engine's queue and an allowance for running requests. A queue report
+without token counts uses `waiting_requests * mean_prefill_tokens`. Running
+requests use the same allowance, including requests already decoding; the
+engine does not report their remaining prefill work.
 
-- Refusal, dispatch failure and cancellation release the lease.
-- Empty chunk/control frames keep the prefill reservation.
-- The first output-token frame or a terminal response releases prefill work.
-- Error, EOF or stream drop releases the remaining attempt owner.
-- Retry starts a fresh reservation and gives back the previous attempt first.
-- A batch prices the sum of all prompts, with cache credit only for the first
-  affinity prompt; the other prompts are conservatively charged in full. Its
-  prefill reservation remains until every sibling starts producing output or ends.
-  The running-work estimate is scaled by the number of input items and held until
-  the last sibling ends, so a partially finished batch can be overestimated.
+The rate comes from valid prefill-throughput reports. A missing or invalid
+rate uses the mean reported input rate of the eligible workers, or
+`default_throughput` when none has one. All these rates are input tokens per
+second. KV usage contributes `kv_pressure_weight * k / (1 - k)` seconds,
+clamped near a full cache.
 
-Sticky overrides and the existing all-vetoed fallback retain their target. If
-they bypass or replace a provisional choice, the actual worker receives a full
-prompt reservation and the displaced reservation is rolled back.
+## Outstanding requests
 
-## Limits and local validation
+SMG records a request's estimated work as part of selecting its worker. The
+next selection in that process sees the assignment even before dispatch.
+Model policies and aliases share these counters for each worker.
 
-This is an estimate of work, not an exact TTFT predictor. Running requests include
-decode, and the backend does not expose exact remaining running-prefill work.
-Older sent reservations may overlap a load report and use a `max` approximation
-to avoid double counting; it can undercount disjoint remote or in-transit work.
-Unsent work and work sent after the sample are added separately. A timestamp does
-not prove engine acceptance. A stale report can retain work until the next
-refresh. Reservations are local to one gateway process; separate
-gateway replicas do not share an atomic admission transaction.
-Embedding calls retain their reservation until the unary batch completes and
-conservatively keep it additive to backend reports throughout that batch.
+The first output token or a terminal response clears the prefill estimate;
+empty response frames keep it. The running-request allowance stays until
+the request ends, including fully cached requests. A refused or cancelled
+attempt gives its work back, as does a failed dispatch. A retry releases the
+old attempt before selecting again.
 
-The paired routing tests give both policies the same native index and backend
-load feed. For two distinct 16k prompts with a shared 4k cached prefix, retained
-reservations spread the new policy's second request to the cold worker while
-`cache_aware` retains both at the holder. For two 64-token suffixes behind a large
-warm prefix, both policies preserve the holder. Other cases cover queue and rate
-fallback, namespace isolation, batch work, unavailable workers and concurrent
-choices. Raw gRPC stream tests cover first-token, empty frames, replay,
-disconnect, failure, EOF and batch sibling cleanup.
+A batch counts every prompt, with cache credit only for the first. Its
+prefill estimate stays until every input produces a token or ends, and its
+running allowance stays until the last input ends. Partly finished batches
+can therefore count more work than remains. An embedding batch continues to
+count in full even after an engine load report includes it, until the batch
+completes.
 
-These CPU and protocol checks do not measure GPU latency or throughput. A serving
-benchmark must hold engine settings, request arrivals, token IDs and actual cache
-state fixed before drawing a TTFT or capacity conclusion.
+Sticky assignments keep their worker. When a sticky assignment or overload
+fallback bypasses normal selection, the final worker is charged the full
+prompt and any provisional assignment is released.
+
+Backend load reports can include requests SMG has already counted. The score
+takes the larger of the reported work and older dispatched work, then adds
+work not yet dispatched and work sent after the report. A report can arrive
+before a dispatched request reaches the engine, so this can undercount work
+in transit. Stale reports retain their queue estimate until a new one arrives.
+The counters belong to one gateway process; other gateway replicas see its
+requests through engine load reports.
+
+## Tuning
+
+| Option | Default | Meaning |
+|---|---|---|
+| `--prefill-cost-default-throughput` | `2000` | Input tokens/s when no eligible worker has a valid input-rate report. Set this to the engines' measured input throughput. |
+| `--prefill-cost-mean-prefill-tokens` | `1024` | Work allowance for each running request, and for each queued request whose token count is unknown. |
+| `--prefill-cost-kv-pressure-weight` | `0.15` | Weight of the KV-pressure penalty, in seconds. Increasing it moves requests away from workers with full caches sooner. |
+| `--block-size` | `16` | KV block size used before the engine reports its own. |

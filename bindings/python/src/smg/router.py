@@ -276,8 +276,9 @@ class Router:
             - PolicyType.PowerOfTwo: Sample two random workers and route to the
               one with the lower expected wait (least-load scoring over the pair)
             - PolicyType.LeastLoad: Route to the worker with the lowest load score
-            - PolicyType.PrefillCost: Native gRPC KV reuse versus reserved prefill/decode work
               (in-flight requests plus KV-cache pressure)
+            - PolicyType.PrefillCost: Estimate input work after KV-cache reuse
+              and include outstanding requests
             Default: PolicyType.CacheAware
         host: Host address to bind the router server. Supports IPv4, IPv6 (e.g., ::,
             ::1), or 0.0.0.0 for all interfaces. Default: '0.0.0.0'
