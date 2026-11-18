@@ -871,7 +871,9 @@ impl MemoryStore {
     /// store asks for itself where a write is of a worker's row: a lease on
     /// the worker, a poll's answer for a rank of it. The ask builds the
     /// whole membership under the workers lock and the load lock: a
-    /// writer's wait, never a decision's.
+    /// writer's wait. No decision asks; a host that files its decision's
+    /// lease through the issue door takes the wait where the pick left the
+    /// standing world before the lease was filed.
     pub fn publish_now(&self) {
         let workers = self.workers.lock();
         self.pay(&workers, None);
@@ -2450,6 +2452,9 @@ struct Held {
     /// `None` for a lease whose worker stood in no pool when it was
     /// written, the build its registration owed paid first
     /// ([`MemoryStore::slot_ahead`]): it books no row a decision reads.
+    /// A first dispatch that moves the lease to another worker reads the
+    /// standing world and asks for no build: a worker inside its
+    /// registration window is not booked, then or later.
     booked: Option<Slot>,
 }
 
