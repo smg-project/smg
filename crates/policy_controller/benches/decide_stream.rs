@@ -1143,6 +1143,8 @@ struct Tally {
     /// alone, the best alone and the next two alike, the best two alike,
     /// all three alike.
     ties: [u64; 4],
+    /// The measured picks whose trace held fewer than three rows.
+    short: u64,
     /// The measured picks whose answer carried a lease.
     leases: u64,
 }
@@ -1157,6 +1159,7 @@ impl Tally {
         if let Some(count) = self.ties.get_mut(pick.place) {
             *count += 1;
         }
+        self.short += u64::from(pick.short);
         self.leases += u64::from(pick.lease.is_some());
     }
 }
@@ -1171,6 +1174,8 @@ fn gateway() -> GatewayId {
 struct Answered {
     /// Its place in the stream's tally of ties ([`Tally::ties`]).
     place: usize,
+    /// Its trace held fewer than the three rows a place reads.
+    short: bool,
     /// The lease the answer carried.
     lease: Option<u64>,
     /// The pick's first target: the member a gateway dispatches to.
@@ -1267,10 +1272,6 @@ fn answered(decision: &Decision) -> Answered {
     };
     assert!(first.is_some(), "a pick over the fleet: {decision:?}");
     let top = decision.trace.as_ref().map_or(&[][..], |trace| &trace.top);
-    assert!(
-        top.len() >= 3,
-        "a pick's trace holds its three best rows: {decision:?}"
-    );
     let place = match top {
         [first, second, third, ..] => {
             let alike = |one: f32, other: f32| usize::from(one.to_bits() == other.to_bits());
@@ -1280,6 +1281,7 @@ fn answered(decision: &Decision) -> Answered {
     };
     Answered {
         place,
+        short: top.len() < 3,
         lease: decision.leases.first().map(|lease| lease.id),
         served: first.map_or(0, |target| target.id),
     }
@@ -1356,6 +1358,7 @@ async fn ask(addr: SocketAddr, shape: Shape, ends: &mut Ends) -> Tally {
         local: 0,
         overtaken: 0,
         ties: [0; 4],
+        short: 0,
         leases: 0,
     };
     if shape.counted && shape.warm == 0 {
@@ -1463,6 +1466,7 @@ async fn offer(addr: SocketAddr, shape: Shape, ends: &mut Ends) -> Tally {
         local: 0,
         overtaken: 0,
         ties: [0; 4],
+        short: 0,
         leases: 0,
     };
     let start = Instant::now();
@@ -1601,7 +1605,14 @@ fn session(
                     }
                 }
                 drop(frames);
-                while let Ok(Some(_)) = answers.message().await {}
+                // The session ends as its frames do; a status in place
+                // of that end says the last frames were not applied.
+                while answers
+                    .message()
+                    .await
+                    .expect("the controller ended the session")
+                    .is_some()
+                {}
                 seq
             });
             (sent, Spent::of("thread-self"))
@@ -1675,6 +1686,8 @@ struct Row {
     overtaken: u64,
     /// The streams' tallies of ties together ([`Tally::ties`]).
     ties: [u64; 4],
+    /// The streams' picks of a short trace together ([`Tally::short`]).
+    short: u64,
     /// The leases the streams' measured picks carried.
     leases: u64,
     /// The frames the gateway's session sent for the streams' reports.
@@ -1781,6 +1794,7 @@ fn wire(shape: Shape) -> Row {
         local: 0,
         overtaken: 0,
         ties: [0; 4],
+        short: 0,
         leases: 0,
         frames,
     };
@@ -1806,6 +1820,7 @@ fn wire(shape: Shape) -> Row {
         for (sum, count) in row.ties.iter_mut().zip(tally.ties) {
             *sum += count;
         }
+        row.short += tally.short;
         row.leases += tally.leases;
         row.nanos.extend(tally.nanos);
     }
@@ -1826,6 +1841,13 @@ fn wire(shape: Shape) -> Row {
         row.ties.iter().filter(|count| **count > 0).count() <= 1,
         "the row's pool moved: its decisions' three best rows scored {}",
         ties(row.ties)
+    );
+    // A place reads a pick's three best rows. A fleet that has three and
+    // traced fewer lost its trace: its picks would all read as no tie.
+    assert!(
+        row.short == 0 || shape.members < 3,
+        "{} of the row's {picks} measured picks traced under three rows",
+        row.short
     );
     row.nanos.sort_unstable();
     row
@@ -2220,6 +2242,13 @@ fn main() -> io::Result<()> {
         (20_000, 200_000)
     };
     let all = rows.is_empty();
+    if quick && all {
+        // A count cell takes any fleet, and one under three members has
+        // no third row to trace.
+        for cell in ["stream:1:200", "stream:2:200"] {
+            count(cell, &mut out)?;
+        }
+    }
     if all || rows == "round_trip" {
         for in_flight in [1, 8, 64] {
             let row = wire(Shape {
