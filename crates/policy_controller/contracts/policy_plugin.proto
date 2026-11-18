@@ -276,8 +276,12 @@ message RequestFacts {
   bool streaming = 5;
   uint32 max_output_tokens = 6;
   uint32 prompt_tokens = 7;  // the host's count or estimate
-  // Prefix block hashes, capped by `view.max_block_hashes`: a controller
-  // reads the first that many of a longer list and refuses none.
+  // Prefix block hashes, capped by `view.max_block_hashes` (1 to 8,190): a
+  // controller reads the first of a longer list, as many as the stages of
+  // its generation read and that many at most, and refuses no list for its
+  // length under the frame's bound. A DecideRequest over that bound, 64 KiB
+  // as encoded, is refused whole: a sender cuts its list at the tail until
+  // the frame fits, and counts the cut on its own side.
   repeated fixed64 block_hashes = 8 [packed = true];
   HashKind hash_kind = 9;
   // The routing key as the host derives it; its `hash` form is the
@@ -297,9 +301,13 @@ message RequestFacts {
   // Wire-only, foreign hosts only (a front with text and no tokenizer): the
   // controller hashes it into `block_hashes` before any stage sees the view,
   // bounded by `view.max_prompt_text_bytes`, a field of the spec still to
-  // come with the step that hashes text. A controller that does not hash
-  // it yet keeps none of it: it answers the request `Busy` with no reason
-  // and never decides it as a request with no prefix.
+  // come with the step that hashes text: a text over the cap is read to the
+  // cap and its tail is not read, and a cap of 0 takes no text. The
+  // frame's bound comes first: a text that carries its DecideRequest over
+  // 64 KiB is refused with the frame. A
+  // controller that does not hash it yet keeps none of it: it answers the
+  // request `Busy` with no reason and never decides it as a request with no
+  // prefix.
   bytes prompt_text = 18;
   // The size in tokens of one of the request's blocks as the host counted
   // them: an index's learned block size on an event-fed request, the
@@ -416,8 +424,9 @@ message Lease {
 // Serves the routing trace header and Explain; positions into the generation's
 // spec. The record carries the first five fields (its `top` at most three
 // entries, each only `worker_id` and `score`) and reads `drew_first` from
-// its count, which a decision that drew first does not hold; the
-// observability contract fills the rest, unset until then.
+// its count, which a decision that drew first does not hold, and `lifted`
+// from the all-vetoed rule's pick; the observability contract fills the
+// rest, unset until then.
 message Trace {
   // Zero-based position in the spec's profile names in ascending UTF-8 order.
   uint32 profile = 1;  // u16
@@ -448,6 +457,18 @@ message Trace {
   // `survivors` is unset and `drops` is empty, neither one a count, and
   // `top` is of the rows drawn.
   bool drew_first = 12;
+  // The soft veto the all-vetoed rule lifted to make this pick; none unless
+  // the rule made it. A host counts its steered picks from this field.
+  LiftedVeto lifted = 13;
+}
+
+// The soft vetoes the all-vetoed rule lifts, in the order it lifts them. The
+// zero value is none, with no presence bit: a pick that no rule made reads it
+// truly, and a reader makes one comparison.
+enum LiftedVeto {
+  LIFTED_VETO_NONE = 0;
+  // Every usable worker was over its overload thresholds.
+  LIFTED_VETO_OVERLOAD = 1;
 }
 
 message FilterDrop {
@@ -599,14 +620,19 @@ message Signal {
 // the controller's (bit 63 clear): a gateway-minted fallback id is re-minted
 // when the controller first learns the lease, its origin kept LOCAL.
 message LifecycleEvent {
-  // Monotonic for the plugin's life, across every Observe stream the host
-  // opens to it. The host numbers what it owed: the events it sent and the
-  // events it refused at a full queue. A gap is events the plugin never
-  // received (refused at a full queue, or in flight on a stream that
-  // ended), and a plugin that keeps a ledger of leases treats it as a loss.
-  // A gap's size is exact and its place is not: events raised before the
-  // loss can arrive behind it. A loss after the last event sent shows at
-  // the next event.
+  // Monotonic for one load of the plugin by one controller, across every
+  // Observe stream of that load; a new load starts again at one. The host
+  // numbers what it owed: the events it sent and the events it refused at a
+  // full queue. A gap is events the plugin never received (refused at a
+  // full queue, or in flight on a stream that ended), and a plugin that
+  // keeps a ledger of leases treats it as a loss. A gap sits at the loss.
+  // For a refusal, every event that entered the host's queue before it
+  // arrives ahead of the gap; an event whose thread stood between its read
+  // of the count and its entry when the refusal fell can arrive on either
+  // side; a refusal after the last event raised shows at the next event.
+  // For a stream that ended, the gap is the events in flight on it: it sits
+  // before the first event of the next stream, and events that waited in
+  // the host's queue behind them arrive after it.
   uint64 seq = 1;
   oneof event {
     Issued issued = 2;
@@ -680,7 +706,11 @@ message PluginHelloAck {
 
 // `scores_in` carries the native scorers' combined scores when the plugin is
 // asked for the pick alone; a row the filters dropped scores below zero. The
-// candidate list is bounded by `plugins[].max_candidates`.
+// candidate list is bounded by `plugins[].max_candidates`. The request's
+// `block_hashes` are filled only for a plugin whose row declares a request's
+// hashes (token hashes or text hashes among its needs), with the first 8,190
+// of a longer list; a plugin that declares neither receives none, whatever
+// the other stages of its generation read.
 message PluginDecide {
   fixed64 decision_id = 1;
   RequestFacts request = 2;

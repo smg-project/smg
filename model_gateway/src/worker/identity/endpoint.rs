@@ -137,7 +137,7 @@ pub struct Endpoint {
     host: Host,
     port: Option<u16>,
     /// What follows the authority, when the address carries anything: a
-    /// path prefix (`validate_worker_url` accepts `http://proxy:8080/sglang`,
+    /// path prefix (`validate_worker_url` accepts `http://proxy:8080/engine`,
     /// and `endpoint_url` appends the route to it, so the prefix is part of
     /// which backend this names), with any query or fragment as written.
     /// Stored from its leading `/`, `?` or `#` and without a trailing slash.
@@ -554,6 +554,32 @@ fn parse_host(host: &str) -> Result<Host, EndpointError> {
         });
     }
     Ok(Host::Name(host.to_ascii_lowercase()))
+}
+
+/// `url` without `scheme` when it starts with it, in any letter case.
+pub(crate) fn strip_scheme<'a>(url: &'a str, scheme: &str) -> Option<&'a str> {
+    url.get(..scheme.len())
+        .filter(|prefix| prefix.eq_ignore_ascii_case(scheme))
+        .map(|_| &url[scheme.len()..])
+}
+
+/// Strip protocol prefix (http://, https://, grpc://, grpcs://) from URL.
+pub(crate) fn strip_protocol(url: &str) -> String {
+    for scheme in ["http://", "https://", "grpc://", "grpcs://"] {
+        if let Some(rest) = strip_scheme(url, scheme) {
+            return rest.to_string();
+        }
+    }
+    url.to_string()
+}
+
+/// Ensure URL has a gRPC scheme — handles bare `host:port` and HTTP(S) inputs.
+pub(crate) fn grpc_base_url(url: &str) -> String {
+    if strip_scheme(url, "grpc://").is_some() || strip_scheme(url, "grpcs://").is_some() {
+        url.trim_end_matches('/').to_string()
+    } else {
+        format!("grpc://{}", strip_protocol(url).trim_end_matches('/'))
+    }
 }
 
 #[cfg(test)]
@@ -1055,5 +1081,20 @@ mod tests {
             Endpoint::redacted_url("not an address"),
             "<unparsable address>"
         );
+    }
+
+    /// The gRPC base keeps a gRPC scheme as the address has it, the secure
+    /// one too, names any other address `grpc://`, and ends without a slash.
+    #[test]
+    fn the_grpc_base_keeps_a_secure_scheme_and_ends_without_a_slash() {
+        for (url, base) in [
+            ("grpc://p:1", "grpc://p:1"),
+            ("grpcs://p:1", "grpcs://p:1"),
+            ("grpcs://p:1/", "grpcs://p:1"),
+            ("http://p:1/", "grpc://p:1"),
+            ("p:1", "grpc://p:1"),
+        ] {
+            assert_eq!(grpc_base_url(url), base, "{url}");
+        }
     }
 }

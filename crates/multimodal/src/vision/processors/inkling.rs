@@ -266,9 +266,7 @@ impl VisionPreProcessor for InklingImageProcessor {
         &self,
         images: &[&DynamicImage],
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
-        if images.is_empty() {
-            return Err(TransformError::EmptyBatch);
-        }
+        TransformError::if_empty(images)?;
 
         let (mean, std) = (self.mean, self.std);
 

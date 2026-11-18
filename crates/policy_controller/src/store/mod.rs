@@ -65,6 +65,7 @@
 //!
 //! [`LoadRow`]: crate::view::LoadRow
 
+pub mod encoding;
 pub mod health;
 pub mod index;
 pub mod journal;
@@ -72,6 +73,7 @@ pub mod kv_events;
 pub mod leases;
 pub mod loads;
 pub mod memory;
+pub mod pairing;
 pub mod reservations;
 pub mod sessions;
 pub mod workers;
@@ -80,7 +82,8 @@ pub mod world;
 #[cfg(test)]
 mod tests;
 
-pub use health::HealthSink;
+pub use encoding::{EncodeClasses, EncodeHandoff, EncodeOffer};
+pub use health::{HealthSink, VetoWrite};
 pub use index::{ContentHash, KvEvent, LaneCounts, SequenceHash, StoredBlock, INDEX_WORKERS};
 pub use journal::{Journal, Kinds, Position};
 pub use kv_events::{
@@ -90,13 +93,17 @@ pub use kv_events::{
 pub use leases::{Dispatch, LeaseRecord, LeaseRefused, LeaseState, LeasesStore};
 pub use loads::{LoadSample, LoadSink, LoadSource, PollMode};
 pub use memory::{Cut, MemoryStore};
+pub use pairing::{PairClasses, PairingDescriptor};
 pub use reservations::{ReservationKind, ReservationStore};
 pub use sessions::{Pin, SessionsStore};
 pub use workers::{
     identity, identity_of, HealthPolicy, MembershipChange, MembershipTail, Overload, Reachability,
     Signals, WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus, WorkersStore,
 };
-pub use world::{Ask, Built, StaleGeneration, ViewBuffers, World, PUBLISH_WINDOW};
+pub use world::{
+    Ask, Built, OutsideLists, PairBuffers, PoolView, StaleGeneration, ViewBuffers, World,
+    PUBLISH_WINDOW,
+};
 
 /// The verified identity of a gateway: the fingerprint of the subject its
 /// session was authenticated as, never a message field. Leases, vetoes and

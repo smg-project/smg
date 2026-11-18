@@ -1620,6 +1620,101 @@ def test_a_level_count_is_two_counts_of_each_executable_that_agree(mod, tmp_path
     assert "it is not steady on one executable alone" in said and "level" not in said
 
 
+def test_two_counts_that_differ_are_decided_at_a_batch_all_four_counts_ran(mod, tmp_path):
+    # A second count that ended one batch early: the row is decided one batch earlier, where
+    # every count ran, and its line names that batch.
+    short = counted_twice(400_000, 400_024)
+    short["pr"]["again"] = doubling(400_024, 2)[:2]
+    verdict, said = whole_row(mod, tmp_path, short)
+    assert verdict == "placement"
+    assert (
+        "200,000 instructions on the base and 200,012 on the pull request over a batch of 2 "
+        "iterations (+0.006%, 6.0 instructions an iteration more), the same in two counts of each"
+    ) in said
+    # The base's second count one batch short bounds the row the same way.
+    mirror = counted_twice(400_000, 400_024)
+    mirror["base"]["again"] = doubling(400_000, 2)[:2]
+    verdict, said = whole_row(mod, tmp_path, mirror)
+    assert verdict == "placement" and "over a batch of 2 iterations" in said
+    # The batch that decides is the last that differs, not the last every count ran: four
+    # counts 1 % apart at the second batch and the same at the third keep the failure.
+    early = counted_twice(400_000, 400_000)
+    for key in ("batches", "again"):
+        early["pr"][key][1] = 202_000
+    verdict, said = whole_row(mod, tmp_path, early)
+    assert verdict == "regression" and "over a batch of 2 iterations (+1.000%" in said
+    # A second count of its first batch alone leaves no batch all four ran: the time decides.
+    alone = counted_twice(400_000, 400_024)
+    for side in ("base", "pr"):
+        alone[side]["again"] = alone[side]["again"][:1]
+    verdict, said = whole_row(mod, tmp_path, alone)
+    assert verdict == "regression"
+    assert said == (
+        " The count was not read (a second count ended before the batches that differ): the "
+        "time alone decides."
+    )
+    # First counts of two batches say the same: one ran past the first, and no second count.
+    two = counted_twice(400_000, 400_024, last=1)
+    for side in ("base", "pr"):
+        two[side]["again"] = two[side]["again"][:1]
+    assert whole_row(mod, tmp_path, two) == ("regression", said)
+
+
+def test_a_batch_counted_once_grants_no_level_count_and_refuses_one(mod, tmp_path):
+    def read_once(pr_last, short="pr"):
+        """Four counts 12 instructions apart at the last batch all of them ran, a level count,
+        and the pull request's `pr_last` at the batch the `short` side's second count left."""
+        count = counted_twice(400_000, 400_024)
+        for key in ("batches", "again"):
+            count["pr"][key][2] = pr_last
+        count[short]["again"].pop()
+        return whole_row(mod, tmp_path, count)
+
+    # Within the level, the batch all four ran decides as it did.
+    for pr_last in (400_024, 402_000, 398_000):
+        verdict, said = read_once(pr_last)
+        assert verdict == "placement" and "over a batch of 2 iterations (+0.006%" in said, pr_last
+    # Beyond it the placement is refused, whichever second count ended early.
+    for pr_last in (402_004, 397_996):
+        assert read_once(pr_last)[0] == "regression", pr_last
+        assert read_once(pr_last, short="base")[0] == "regression", pr_last
+    verdict, said = read_once(404_000)
+    assert verdict == "regression"
+    assert said == (
+        " The count is level where all four counts ran: 200,000 instructions on the base and "
+        "200,012 on the pull request over a batch of 2 iterations (+0.006%, 6.0 instructions an "
+        f"iteration more), the same in two counts of each, within {LEVEL}. Past it the first "
+        "counts read 400,000 and 404,000 over a batch of 4 iterations (+1.000%), beyond the "
+        "level, and a second count did not run that batch: the failure stands."
+    )
+    # Work that grows with the iterations, +0.2, +0.4 and +0.8 % of a batch: the last batch
+    # fails it with the second counts whole, and refuses the placement with one a batch short.
+    grown = counted_twice(800_000, 800_000, last=3)
+    for key in ("batches", "again"):
+        grown["pr"][key] = [100_100, 200_400, 401_600, 806_400]
+    assert whole_row(mod, tmp_path, grown)[0] == "regression"
+    grown["pr"]["again"] = grown["pr"]["again"][:3]
+    verdict, said = whole_row(mod, tmp_path, grown)
+    assert verdict == "regression" and "over a batch of 8 iterations (+0.800%)" in said
+    # The batch read is the last of the first counts that differs, so a row reads the same
+    # whether a second count ran it or not: 1 % apart at the third batch, and beyond the level,
+    # within it or the same at the fourth.
+    for fourth, verdict in [
+        (816_000, "regression"),
+        (800_800, "placement"),
+        (800_000, "regression"),
+    ]:
+        grown["pr"]["batches"][2:] = [404_000, fourth]
+        grown["pr"]["again"] = [100_100, 200_400]
+        short = whole_row(mod, tmp_path, grown)
+        grown["pr"]["again"] = list(grown["pr"]["batches"])
+        assert short[0] == whole_row(mod, tmp_path, grown)[0] == verdict, fourth
+    # A batch one first count alone ran has no pair, and nothing is read there.
+    longer = counted_twice(400_000, 400_024)
+    longer["base"]["batches"].append(900_000)
+    assert whole_row(mod, tmp_path, longer)[0] == "placement"
+
+
 def test_a_whole_pass_id_on_the_same_count_asks_no_moved_function(mod, tmp_path):
     same = {"base": {"batches": [9, 20, 40]}, "pr": {"batches": [7, 20, 40]}}
     verdict, said = whole_row(mod, tmp_path, same)
@@ -1689,7 +1784,18 @@ def test_the_repository_gate_files_mark_the_rows_that_time_a_whole_decision(mod)
         "policy-engine.toml": {
             "policy_engine/decide/cache_aware/8": True,
             "policy_engine/decide/least_load_credited/8": True,
-            "policy_engine/decide/manual_keyed_hit/64": True,
+            "policy_engine/decide/cache_aware/512": True,
+            "policy_engine/decide/passthrough/8": True,
+            "policy_engine/decide/manual_keyed_miss/8": True,
+            "policy_engine/decide/manual_keyed_hit/8": False,
+            "policy_engine/decide/passthrough/64": False,
+            "policy_engine/decide/power_of_two/512": False,
+            "policy_engine/decide/random/64": False,
+            "policy_engine/decide/round_robin/512": False,
+            "policy_engine/decide/passthrough/512": False,
+            "policy_engine/decide/power_of_two/64": False,
+            "policy_engine/decide/random/512": False,
+            "policy_engine/decide/round_robin/64": False,
             "policy_engine/view_build/64": False,
             "policy_engine/spec/parse_validate": False,
         },
@@ -1707,5 +1813,6 @@ def test_the_repository_gate_files_mark_the_rows_that_time_a_whole_decision(mod)
     engine = mod.load_gates(root / "policy-engine.toml")
     assert engine.threshold_for("policy_engine/decide/least_load_credited/8").threshold == 0.15
     assert engine.threshold_for("policy_engine/decide/cache_aware/8").threshold == 0.10
+    assert engine.threshold_for("policy_engine/decide/random/64").threshold == 0.10
     for name in ("policy-engine-power-of-two.toml", "policy-store.toml"):
         assert not any(gate.whole_pass for gate in mod.load_gates(root / name).gates), name

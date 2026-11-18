@@ -30,12 +30,6 @@ impl EmbeddingRequestBuildingStage {
     }
 }
 
-impl Default for EmbeddingRequestBuildingStage {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[async_trait]
 impl BuildStage for EmbeddingRequestBuildingStage {
     async fn build(&self, ctx: &mut RequestContext) -> Result<BuildOutput, Response> {

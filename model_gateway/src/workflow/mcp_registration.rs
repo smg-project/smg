@@ -8,7 +8,7 @@ use wfaas::{
     WorkflowContext, WorkflowDefinition, WorkflowError, WorkflowResult,
 };
 
-use super::data::McpWorkflowData;
+use super::data::{require_app_context, McpWorkflowData};
 use crate::{
     app_context::AppContext, observability::metrics::Metrics, routers::common::openai_bridge,
 };
@@ -49,11 +49,7 @@ impl StepExecutor<McpWorkflowData> for ConnectMcpServerStep {
         context: &mut WorkflowContext<McpWorkflowData>,
     ) -> WorkflowResult<StepResult> {
         let config_request = &context.data.config;
-        let app_context = context
-            .data
-            .app_context
-            .as_ref()
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
+        let app_context = require_app_context(context.data.app_context.as_ref())?;
 
         debug!("Connecting to MCP server: {}", config_request.name);
 

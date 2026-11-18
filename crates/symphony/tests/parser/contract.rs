@@ -1930,6 +1930,20 @@ const DSML_OUTPUTS: &[&str] = &[
      </｜DSML｜ calls>",
     "</think>Sure. \n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n</｜DSML｜ invoke>\n\
      </｜DSML｜ calls>",
+    // An invoke whose arguments are one JSON object in place of the parameter tags, as the
+    // serving engines' parsers read it: whole, with a closing tag inside a string, cut short, and
+    // a fault inside it and after it.
+    "</think>\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"get_weather\">\n{\"city\": \"Paris\", \
+     \"days\": 3}\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+    "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">{\"a\": \"x </｜DSML｜ parameter> <｜DSML｜\"}\
+     </｜DSML｜ invoke>\n</｜DSML｜ calls>",
+    "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n{\"a\": \"par",
+    "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n{\"a\": 1}\n</｜DSML｜ parame",
+    "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">{\"a\": 1}</｜D",
+    "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n{\"a\": 1,} more\n</｜DSML｜ invoke>\n\
+     </｜DSML｜ calls>",
+    "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n{\"a\": 1} more\n</｜DSML｜ invoke>\n\
+     </｜DSML｜ calls>",
 ];
 
 /// Outputs in the tagged syntax: the recorded shapes, and the cuts and faults the assembler
@@ -2060,6 +2074,11 @@ const DEEPSEEK_V4_OUTPUTS: &[&str] = &[
     "Hello!",
     "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"location\" string=\"true\">Par",
     "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"location\" string=\"true\">Par</｜DSML｜tool_calls>",
+    // An invoke whose arguments are one JSON object, whole, cut short, and with a fault after it.
+    "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n{\"location\": \"Paris\"}\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>",
+    "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">{\"location\": \"Par",
+    "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">{\"location\": \"Paris\"}</｜DSML｜par",
+    "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">{\"location\": \"Paris\"} more</｜DSML｜invoke>\n</｜DSML｜tool_calls>",
 ];
 
 /// DeepSeek V3.2's DSML as its reference encoder renders it (the thought the prompt opens written
@@ -2084,6 +2103,10 @@ const DEEPSEEK_V3_2_OUTPUTS: &[&str] = &[
     "<think>still thinking",
     "Hello!",
     "<｜DSML｜function_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"location\" string=\"true\">Par",
+    // An invoke whose arguments are one JSON object, whole, cut short, and with a fault after it.
+    "<｜DSML｜function_calls>\n<｜DSML｜invoke name=\"get_weather\">\n{\"location\": \"Paris\"}\n</｜DSML｜invoke>\n</｜DSML｜function_calls>",
+    "<｜DSML｜function_calls>\n<｜DSML｜invoke name=\"get_weather\">{\"location\": \"Par",
+    "<｜DSML｜function_calls>\n<｜DSML｜invoke name=\"get_weather\">{\"location\": \"Paris\"} more</｜DSML｜invoke>\n</｜DSML｜function_calls>",
 ];
 
 /// DeepSeek V3.1's calls as its chat template renders them (the thought the prompt opens written

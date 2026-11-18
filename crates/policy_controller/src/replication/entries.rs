@@ -44,6 +44,7 @@ pub const ENTRIES: &[(&str, &str, Fate)] = &[
     ("HealthSink", "probe_outcome", Fate::Journaled),
     ("HealthSink", "connected", Fate::Journaled),
     ("HealthSink", "gateway_veto", Fate::Rebuilt(HELLO)),
+    ("HealthSink", "gateway_veto_noted", Fate::Rebuilt(HELLO)),
     ("HealthSink", "vetoed", Fate::Read),
     (
         "HealthSink",
@@ -58,6 +59,13 @@ pub const ENTRIES: &[(&str, &str, Fate)] = &[
     // first poll.
     ("LoadSink", "report", Fate::Journaled),
     ("LoadSink", "poll_mode", Fate::Read),
+    // The report period is the load driver's own setting, told where the
+    // driver is built: every replica builds its own.
+    (
+        "LoadSink",
+        "heard_every",
+        Fate::Rebuilt("each replica's load driver tells its own report period"),
+    ),
     ("LoadSink", "load", Fate::Read),
     ("LoadSink", "ranks", Fate::Read),
     (
@@ -100,22 +108,26 @@ pub const ENTRIES: &[(&str, &str, Fate)] = &[
     ("LeasesStore", "get", Fate::Read),
     ("LeasesStore", "expire", Fate::NotYet(PINS)),
     ("LeasesStore", "restore", Fate::Rebuilt(HELLO)),
-    ("LeasesStore", "drop_gateway", Fate::NotYet(PINS)),
+    ("LeasesStore", "drop_gateways", Fate::NotYet(PINS)),
     ("LeasesStore", "live", Fate::Read),
     // The store type's own entries. A generation's apply is its one write:
     // a standby holds the generation applied to it, not its leader's.
     ("MemoryStore", "new", Fate::Read),
     ("MemoryStore", "with_publish_window", Fate::Read),
     ("MemoryStore", "journaled", Fate::Read),
+    ("MemoryStore", "followed", Fate::Read),
     ("MemoryStore", "cut", Fate::Read),
     ("MemoryStore", "apply", Fate::NotYet(GENERATION)),
     ("MemoryStore", "world", Fate::Read),
     ("MemoryStore", "build_view", Fate::Read),
+    ("MemoryStore", "with_world", Fate::Read),
     ("MemoryStore", "build_pair", Fate::Read),
     ("MemoryStore", "deciding", Fate::Read),
     ("MemoryStore", "micros", Fate::Read),
     ("MemoryStore", "overload_flips", Fate::Read),
+    ("MemoryStore", "outside_lists", Fate::Read),
     ("MemoryStore", "publication_allocations", Fate::Read),
+    ("MemoryStore", "publications", Fate::Read),
     ("MemoryStore", "resyncs", Fate::Read),
     ("MemoryStore", "indexed_blocks", Fate::Read),
     ("MemoryStore", "lane_counts", Fate::Read),

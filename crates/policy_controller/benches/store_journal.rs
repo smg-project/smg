@@ -17,7 +17,11 @@
 //!   of the log, the longest the log's lock is held;
 //! - `policy_store_journal/cut/<watched|every>/<n>`: one cut of the tables
 //!   of the watched kinds or of every kind: the copy a writer of those
-//!   tables waits for, and the sort after it.
+//!   tables waits for, and the sort after it;
+//! - `policy_store_journal/load_write_drained/<n>`: the journaled load
+//!   write while a reader on another thread drains the log, a batch a read
+//!   and never resting: the most a standby's stream asks of the log's
+//!   lock. For a run pinned to two cores; no gate reads it.
 //!
 //! Every member is ready with a record on file, in a store that leads a
 //! term as a serving controller's does. The journaled store's log
@@ -29,7 +33,11 @@
 
 use std::{
     hint::black_box,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    thread,
     time::{Duration, Instant},
 };
 
@@ -279,6 +287,63 @@ fn cut(c: &mut Criterion) {
     group.finish();
 }
 
+fn load_write_drained(c: &mut Criterion) {
+    let mut group = c.benchmark_group("policy_store_journal/load_write_drained");
+    for n in SIZES {
+        let pool = pool_of(n, Some(LOADS));
+        let log = Arc::clone(pool.log.as_ref().expect("the journaled pool's log"));
+        let stop = Arc::new(AtomicBool::new(false));
+        // The reader's start, taken before the first write: whatever the
+        // run writes stands after it.
+        let mut place = log.head(Kinds::All);
+        let reader = {
+            let stop = Arc::clone(&stop);
+            thread::spawn(move || {
+                let mut out = Vec::with_capacity(Log::BATCH);
+                let mut read = 0u64;
+                loop {
+                    // Asked before the read: one read follows the last
+                    // write, so a run of one write is read too.
+                    let asked = stop.load(Ordering::Relaxed);
+                    if log.read(Kinds::All, place, Log::BATCH, &mut out).is_err() {
+                        // The ring passed the reader: it starts again at
+                        // the head, as a standby does from a snapshot.
+                        place = log.head(Kinds::All);
+                    } else if let Some(last) = out.last() {
+                        place = last.at;
+                        read += out.len() as u64;
+                    } else {
+                        std::hint::spin_loop();
+                    }
+                    if asked {
+                        break read;
+                    }
+                }
+            })
+        };
+        let at = pool.opened + Duration::from_millis(1);
+        let mut turn = 0u64;
+        group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
+            b.iter(|| {
+                turn += 1;
+                let index = (turn as usize).wrapping_mul(67) % n;
+                pool.store.record(
+                    black_box(pool.ids[index]),
+                    0,
+                    record_of(index, turn),
+                    at,
+                    LoadSource::Stream,
+                );
+            });
+        });
+        stop.store(true, Ordering::Relaxed);
+        let read = reader.join().expect("the reader ends when asked");
+        // Held to what it claims: the reader read of what the writer wrote.
+        assert!(turn == 0 || read > 0, "nothing read of {turn} writes");
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     load_write,
@@ -286,6 +351,7 @@ criterion_group!(
     member_write,
     view_build,
     read,
-    cut
+    cut,
+    load_write_drained
 );
 criterion_main!(benches);

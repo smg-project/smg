@@ -327,6 +327,12 @@ pub(in crate::elector) mod tests {
 
     const S: Duration = Duration::from_secs(1);
 
+    /// How far ahead of the clock a case that steps through a wait starts its
+    /// instants: the elector dates a first sight at the later of the caller's
+    /// instant and its own clock, and an instant the real clock overtakes
+    /// moves the wait.
+    const AHEAD: Duration = S.saturating_mul(3_600);
+
     /// One `Lease` on an API server in this process: the three calls the
     /// backend makes, the resource version that makes a write conditional,
     /// and the answers a real server gives.
@@ -589,7 +595,7 @@ pub(in crate::elector) mod tests {
         assert!(empty.is_released());
         assert_eq!(empty.term, 0);
         let mut a = cell.candidate("a@host:1");
-        let t0 = Instant::now() + S;
+        let t0 = Instant::now() + AHEAD;
         assert_eq!(a.tick(t0).expect("take"), Tick::Acquired { term: 1 });
         // Term zero is no holder's word, and an apply that replaces the
         // object leaves this shape under a live leader: the fence stays
@@ -699,7 +705,7 @@ pub(in crate::elector) mod tests {
         let cell = Cell::new();
         let mut a = cell.candidate("a@host:1");
         cell.server.state.lock().lost_answers = 1;
-        let t0 = Instant::now() + S;
+        let t0 = Instant::now() + AHEAD;
         let err = a.tick(t0).expect_err("the answer was lost");
         assert!(
             err.to_string()
@@ -717,14 +723,18 @@ pub(in crate::elector) mod tests {
             "the take landed"
         );
         assert_eq!(a.tick(t0 + S).expect("own"), Tick::Acquired { term: 1 });
-        // No Lease record stood at the attempt: the fence opens one renew
-        // deadline after it, at the renewal that lands then.
-        assert_eq!(a.fence().leader_term(t0 + S), None);
+        // No Lease record stood at the attempt, and an attempt in doubt
+        // dates nothing: the fence opens one renew deadline after the write
+        // that made the take this run's own. The take alone carries it
+        // nowhere, and with one renewal behind it the fence opens by
+        // itself, at no step.
+        assert_eq!(a.fence().leader_term(t0 + 3 * S), None);
         assert_eq!(
             a.tick(t0 + 2 * S).expect("renew"),
             Tick::Renewed { term: 1 }
         );
-        assert_eq!(a.fence().leader_term(t0 + 2 * S), Some(1));
+        assert_eq!(a.fence().leader_term(t0 + 2 * S), None);
+        assert_eq!(a.fence().leader_term(t0 + 3 * S), Some(1));
     }
 
     #[test]
@@ -750,8 +760,8 @@ pub(in crate::elector) mod tests {
 
     #[test]
     fn a_release_inside_the_takes_wait_is_written_in_whole_seconds() {
-        // The wait such a release hands on is the renew deadline, and the
-        // spec stores whole seconds: a deadline with a fraction rounds up,
+        // The wait such a release hands on is what its take still owed, and
+        // the spec stores whole seconds: a wait with a fraction rounds up,
         // the safe side of a wait, where a holder's duration is refused.
         let cell = Cell::new();
         let settings = ElectionSettings {
@@ -760,15 +770,16 @@ pub(in crate::elector) mod tests {
             renew_deadline: Duration::from_millis(1_500),
         };
         let mut a = Elector::new(Box::new(cell.backend()), "a@host:1", settings).expect("settings");
-        assert_eq!(
-            a.tick(Instant::now() + S).expect("take"),
-            Tick::Acquired { term: 1 }
-        );
+        // A minute ahead of the clock: each write here crosses a socket.
+        let t0 = Instant::now() + 60 * S;
+        assert_eq!(a.tick(t0).expect("take"), Tick::Acquired { term: 1 });
+        assert_eq!(a.tick(t0 + S).expect("renew"), Tick::Renewed { term: 1 });
         assert!(a.waits_to_lead());
         assert!(a.release().expect("release"));
         let spec = cell.server.object().spec.expect("a spec");
         assert_eq!(spec.holder_identity, None);
-        assert_eq!(spec.lease_duration_seconds, Some(2));
+        // Half a second of the take's second and a half was still owed.
+        assert_eq!(spec.lease_duration_seconds, Some(1));
     }
 
     #[test]
@@ -776,7 +787,7 @@ pub(in crate::elector) mod tests {
         let cell = Cell::new();
         let mut a = cell.candidate("a@host:1");
         let mut b = cell.candidate("b@host:2");
-        let t0 = Instant::now() + S;
+        let t0 = Instant::now() + AHEAD;
         assert_eq!(a.tick(t0).expect("take"), Tick::Acquired { term: 1 });
         assert_eq!(
             b.tick(t0 + S / 2).expect("follow"),

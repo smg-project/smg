@@ -4,6 +4,7 @@ mod exif_orientation;
 mod hop_budget;
 mod ico_png_entry;
 mod max_long_side_pixel;
+mod pooled_png;
 mod seek_decode;
 mod sixteen_bit_colour;
 mod sixteen_bit_grey;
@@ -1194,4 +1195,89 @@ async fn a_url_scheme_the_connector_does_not_fetch_is_refused_before_the_client(
             format!("unsupported media scheme: {scheme}")
         );
     }
+}
+
+/// The connector over a default client whose local media root is `root`.
+fn connector_with_local_root(root: Option<&Path>) -> MediaConnector {
+    let config = MediaConnectorConfig {
+        allowed_local_media_path: root.map(Path::to_path_buf),
+        ..MediaConnectorConfig::default()
+    };
+    MediaConnector::new(http_client_builder(), config).expect("connector")
+}
+
+/// With no local root configured every local path is refused, and before the
+/// file system is asked about it: a path that does not exist gets the same
+/// refusal, not an I/O error.
+#[tokio::test]
+async fn a_local_path_is_refused_without_a_configured_root() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("missing.bin");
+    let error = connector_with_local_root(None)
+        .allowed_local_path(&path)
+        .await
+        .expect_err("no root configured");
+    assert!(
+        matches!(&error, MediaConnectorError::DisallowedLocalPath(got) if *got == path.display().to_string()),
+        "{error:?}"
+    );
+}
+
+/// A file under the root comes back as its canonical path, whatever way the
+/// caller spelled it.
+#[tokio::test]
+async fn a_local_path_under_the_root_comes_back_canonical() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let root = dir.path().canonicalize().expect("canonical root");
+    std::fs::create_dir(root.join("sub")).expect("sub directory");
+    std::fs::write(root.join("a.bin"), b"x").expect("file");
+    let canonical = connector_with_local_root(Some(&root))
+        .allowed_local_path(&root.join("sub").join("..").join("a.bin"))
+        .await
+        .expect("a file under the root");
+    assert_eq!(canonical, root.join("a.bin"));
+}
+
+/// A path that starts under the root and climbs out of it resolves outside
+/// the root and is refused, in the caller's own spelling.
+#[tokio::test]
+async fn a_local_path_that_climbs_out_of_the_root_is_refused() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let base = dir.path().canonicalize().expect("canonical base");
+    let root = base.join("root");
+    std::fs::create_dir(&root).expect("root directory");
+    std::fs::write(base.join("outside.bin"), b"x").expect("file");
+    let path = root.join("..").join("outside.bin");
+    let error = connector_with_local_root(Some(&root))
+        .allowed_local_path(&path)
+        .await
+        .expect_err("a path outside the root");
+    assert!(
+        matches!(&error, MediaConnectorError::DisallowedLocalPath(got) if *got == path.display().to_string()),
+        "{error:?}"
+    );
+}
+
+/// A link under the root is followed before the test of the root: one that
+/// points outside the root is refused.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_link_under_the_root_that_points_outside_is_refused() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let base = dir.path().canonicalize().expect("canonical base");
+    let root = base.join("root");
+    std::fs::create_dir(&root).expect("root directory");
+    std::fs::write(base.join("outside.bin"), b"x").expect("file");
+    let link = root.join("link.bin");
+    symlink(base.join("outside.bin"), &link).expect("link");
+    let error = connector_with_local_root(Some(&root))
+        .allowed_local_path(&link)
+        .await
+        .expect_err("a link that leaves the root");
+    assert!(
+        matches!(&error, MediaConnectorError::DisallowedLocalPath(got) if *got == link.display().to_string()),
+        "{error:?}"
+    );
 }

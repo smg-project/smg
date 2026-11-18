@@ -153,7 +153,7 @@ pub enum Signal {
     },
 }
 
-/// The lifecycle a stateful stage implements. Every method defaults to a
+/// The lifecycle a stateful stage implements. Every hook defaults to a
 /// no-op, so a stateless stage implements nothing.
 pub trait Lifecycle: Send + Sync {
     /// The engine issued `decision` under `lease`. In the embedded mode the
@@ -181,9 +181,27 @@ pub trait Lifecycle: Send + Sync {
     /// The host gave the lease up before its completion.
     fn on_released(&self, _lease: &Lease, _reason: ReleaseReason) {}
 
+    /// The host's membership changed. A host may call this under its own
+    /// membership lock, as the policy store does: a stage that calls from
+    /// here a door of the host that takes that lock waits on itself. A read
+    /// that takes no lock does not.
     fn on_membership(&self, _change: &Membership<'_>) {}
 
     fn on_signal(&self, _signal: &Signal) {}
+
+    /// Whether the stage decides wrong under a host that makes none of
+    /// these calls: `true` for one whose state the calls keep, as the
+    /// workers it lists or the bookings it learns from. The standalone
+    /// controller makes the membership call and tells a stage of a lease's
+    /// issue and of its end at the dispatch deadline, and of no dispatch,
+    /// completion or release yet: it refuses a document that names such a
+    /// stage as not in this build ([`crate::SpecError::NotInBuild`]). A
+    /// host that embeds the engine makes every call. `false` by default: a
+    /// stage that takes a call to
+    /// shed state early decides the same without it.
+    fn needs_lifecycle(&self) -> bool {
+        false
+    }
 }
 
 /// A boxed stage forwards to the stage it holds.
@@ -217,6 +235,10 @@ impl<T: Lifecycle + ?Sized> Lifecycle for Box<T> {
     fn on_signal(&self, signal: &Signal) {
         (**self).on_signal(signal);
     }
+
+    fn needs_lifecycle(&self) -> bool {
+        (**self).needs_lifecycle()
+    }
 }
 
 #[cfg(test)]
@@ -243,6 +265,23 @@ mod tests {
     struct Stateless;
 
     impl Lifecycle for Stateless {}
+
+    /// A stage whose state the calls keep.
+    struct Kept;
+
+    impl Lifecycle for Kept {
+        fn needs_lifecycle(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn a_boxed_stage_says_what_its_stage_says_of_the_calls() {
+        let kept: Box<dyn Lifecycle> = Box::new(Kept);
+        assert!(Lifecycle::needs_lifecycle(&kept));
+        let stateless: Box<dyn Lifecycle> = Box::new(Stateless);
+        assert!(!Lifecycle::needs_lifecycle(&stateless));
+    }
 
     #[test]
     fn a_boxed_stage_forwards_its_hooks_and_a_stateless_one_ignores_them() {

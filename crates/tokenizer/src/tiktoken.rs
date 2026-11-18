@@ -981,42 +981,91 @@ const CHECKPOINT_RUN_CHARS: usize = 25_000;
 /// Any other text is one piece.
 fn checkpoint_pieces(text: &str) -> Vec<&str> {
     let mut pieces = Vec::new();
-    let mut window_start = 0;
-    let mut window_chars = 0;
-    for (at, _) in text.char_indices() {
-        if window_chars == CHECKPOINT_WINDOW_CHARS {
-            cut_runs(&text[window_start..at], &mut pieces);
-            window_start = at;
-            window_chars = 0;
-        }
-        window_chars += 1;
-    }
-    if !text.is_empty() {
-        cut_runs(&text[window_start..], &mut pieces);
+    let mut rest = text;
+    while !rest.is_empty() {
+        let (window, later) = rest.split_at(window_len(rest));
+        cut_runs(window, &mut pieces);
+        rest = later;
     }
     pieces
 }
 
+/// Whether `text` can be more than one of [`checkpoint_pieces`]. Both cuts
+/// need more characters than [`CHECKPOINT_RUN_CHARS`], and a text holds no
+/// more characters than bytes: a text within the bound is one piece, encoded
+/// without the walk for its cuts and the list of its pieces.
+fn may_cut(text: &str) -> bool {
+    text.len() > CHECKPOINT_RUN_CHARS
+}
+
+/// The bytes of the first window of `text`: of its first
+/// [`CHECKPOINT_WINDOW_CHARS`] characters, or of all of it when it holds no
+/// more. Only a text of more bytes than that is counted, by the character
+/// iterator's skip, which counts whole blocks of bytes.
+fn window_len(text: &str) -> usize {
+    if text.len() <= CHECKPOINT_WINDOW_CHARS {
+        return text.len();
+    }
+    let mut later = text.chars();
+    match later.nth(CHECKPOINT_WINDOW_CHARS - 1) {
+        Some(_) => text.len() - later.as_str().len(),
+        None => text.len(),
+    }
+}
+
 /// One window of [`checkpoint_pieces`], cut at its long runs.
+///
+/// A run of more than [`CHECKPOINT_RUN_CHARS`] characters is more than that
+/// many bytes, so the runs between two run starts at most that many bytes
+/// apart hold no cut. The walk steps from a run start to the last one within
+/// that many bytes and counts characters only in a run that fills the step:
+/// prose and code, with whitespace every few characters, take one look a
+/// step.
 fn cut_runs<'a>(window: &'a str, pieces: &mut Vec<&'a str>) {
-    let mut run_is_space = window.chars().next().is_some_and(python_isspace);
-    let mut run_chars = 0;
     let mut piece_start = 0;
-    for (at, c) in window.char_indices() {
-        let is_space = python_isspace(c);
-        if run_is_space == is_space {
-            run_chars += 1;
-            if run_chars > CHECKPOINT_RUN_CHARS {
-                pieces.push(&window[piece_start..at]);
-                piece_start = at;
-                run_chars = 1;
+    let mut run_start = 0;
+    while window.len() - run_start > CHECKPOINT_RUN_CHARS {
+        let reach = window.floor_char_boundary(run_start + CHECKPOINT_RUN_CHARS);
+        if let Some(next) = last_run_start(window, run_start, reach) {
+            run_start = next;
+            continue;
+        }
+        // One run fills the step and goes on at `reach`. Up to there it is at most
+        // `CHECKPOINT_RUN_CHARS` bytes, so no more characters and no cut; from there each
+        // character that follows a full count starts a piece.
+        let is_space = window[reach..].chars().next().is_some_and(python_isspace);
+        let mut run_chars = window[run_start..reach].chars().count();
+        run_start = window.len();
+        for (at, c) in window[reach..].char_indices() {
+            if python_isspace(c) != is_space {
+                run_start = reach + at;
+                break;
             }
-        } else {
-            run_is_space = is_space;
-            run_chars = 1;
+            if run_chars == CHECKPOINT_RUN_CHARS {
+                pieces.push(&window[piece_start..reach + at]);
+                piece_start = reach + at;
+                run_chars = 0;
+            }
+            run_chars += 1;
         }
     }
     pieces.push(&window[piece_start..]);
+}
+
+/// The last run start of `window` after `from` and no later than `reach`:
+/// the greatest index there whose character is not of the kind of the one
+/// before it. Read from `reach` down, so a run start near it is found at
+/// once.
+fn last_run_start(window: &str, from: usize, reach: usize) -> Option<usize> {
+    let is_space = window[reach..].chars().next().is_some_and(python_isspace);
+    let mut start = reach;
+    for (at, before) in window[from..reach].char_indices().rev() {
+        if python_isspace(before) != is_space {
+            return Some(start);
+        }
+        start = from + at;
+    }
+    None
 }
 
 /// Piecewise encode for a segmented prompt: control pieces with special
@@ -1069,10 +1118,7 @@ fn encode_segments_into(
     ids: &mut Vec<TokenIdType>,
 ) -> Result<()> {
     for segment in segments {
-        // The checkpoint cuts at a window of characters and at a run of them, both longer than
-        // this bound in bytes: a shorter segment is one piece, encoded without the cut's walk
-        // over its characters and the list of its pieces.
-        if checkpoint_pieces && segment.text.len() > CHECKPOINT_RUN_CHARS {
+        if checkpoint_pieces && may_cut(&segment.text) {
             for piece in self::checkpoint_pieces(&segment.text) {
                 encode_piece(bpe, native, allowed, piece, segment.allow_special, ids)?;
             }
@@ -1153,11 +1199,17 @@ impl Encoder for TiktokenTokenizer {
         // vocabulary's own encoder adds: BOS for a tekken.json file, nothing
         // for a tiktoken file (no concept of one).
         let native = self.native.as_deref();
-        let mut tokens: Vec<TokenIdType> = if self.checkpoint_pieces {
+        let mut tokens: Vec<TokenIdType> = if self.checkpoint_pieces && may_cut(input) {
+            // The first piece's ids take the later pieces': a text of one piece, as most
+            // long texts are, is not copied.
             checkpoint_pieces(input)
                 .into_iter()
-                .flat_map(|piece| encode_with_special_tokens(&self.tokenizer, native, piece))
-                .collect()
+                .map(|piece| encode_with_special_tokens(&self.tokenizer, native, piece))
+                .reduce(|mut ids, piece_ids| {
+                    ids.extend(piece_ids);
+                    ids
+                })
+                .unwrap_or_default()
         } else {
             encode_with_special_tokens(&self.tokenizer, native, input)
         };
@@ -2397,23 +2449,166 @@ mod tests {
         assert_eq!(flat.token_ids().iter().filter(|&&id| id == 300).count(), 2);
     }
 
-    /// The segment encode skips the checkpoint's cut for a segment of at most
+    /// Both encodes skip the checkpoint's cut for a text of at most
     /// `CHECKPOINT_RUN_CHARS` bytes: such a text holds at most that many
     /// characters, so neither cut can fall inside it and it is one piece.
     #[test]
-    fn a_segment_within_the_run_bound_in_bytes_is_one_checkpoint_piece() {
+    fn a_text_within_the_run_bound_in_bytes_is_one_checkpoint_piece() {
         let at_the_bound = " ".repeat(CHECKPOINT_RUN_CHARS);
+        assert!(!may_cut(&at_the_bound));
         assert_eq!(
             checkpoint_pieces(&at_the_bound),
             vec![at_the_bound.as_str()]
         );
         let past_it = " ".repeat(CHECKPOINT_RUN_CHARS + 1);
+        assert!(may_cut(&past_it));
         assert_eq!(checkpoint_pieces(&past_it).len(), 2);
         let two_byte_characters = "\u{e9}".repeat(CHECKPOINT_RUN_CHARS / 2);
+        assert!(!may_cut(&two_byte_characters));
         assert_eq!(
             checkpoint_pieces(&two_byte_characters),
             vec![two_byte_characters.as_str()]
         );
+    }
+
+    /// The cut steps by bytes and counts by characters: a run is cut at its
+    /// 25,001st character whatever the bytes of its characters, wherever it
+    /// starts, and whichever character the step's end falls in.
+    #[test]
+    fn a_long_run_is_cut_by_its_characters_from_any_start() {
+        // More bytes than the bound and no more characters: whole.
+        let wide = "\u{4e2d}".repeat(CHECKPOINT_RUN_CHARS);
+        assert_eq!(checkpoint_pieces(&wide), vec![wide.as_str()]);
+        let wide_over = format!("{wide}\u{4e2d}");
+        assert_eq!(
+            checkpoint_pieces(&wide_over),
+            vec![wide.as_str(), "\u{4e2d}"]
+        );
+        // The step's end falls inside a two-byte character.
+        let odd = format!("a{}", "\u{e9}".repeat(CHECKPOINT_RUN_CHARS));
+        assert_eq!(
+            checkpoint_pieces(&odd),
+            vec![&odd[..odd.len() - 2], "\u{e9}"]
+        );
+        // A run that starts exactly one step after the run before it.
+        let run = "x".repeat(CHECKPOINT_RUN_CHARS);
+        let next = format!("{run} {run}x");
+        assert_eq!(checkpoint_pieces(&next), vec![&next[..next.len() - 1], "x"]);
+        // A run after a short one, cut twice.
+        let twice = format!(" {run}{run}x");
+        assert_eq!(
+            checkpoint_pieces(&twice),
+            vec![&twice[..=CHECKPOINT_RUN_CHARS], run.as_str(), "x"]
+        );
+        // Whitespace of every width is one kind.
+        let spaces = format!(
+            "{}x",
+            " \u{a0}\u{3000}\u{1c}\n".repeat(CHECKPOINT_RUN_CHARS / 5)
+        );
+        assert_eq!(checkpoint_pieces(&spaces), vec![spaces.as_str()]);
+        let spaces_over = format!(" {spaces}");
+        assert_eq!(
+            checkpoint_pieces(&spaces_over),
+            vec![&spaces_over[..spaces_over.len() - 2], "\nx"]
+        );
+        // A window's end restarts the count: the run across it is not cut.
+        let window = format!(
+            "{}{}",
+            "a ".repeat(CHECKPOINT_WINDOW_CHARS / 2 - 10_000),
+            "x".repeat(20_000)
+        );
+        let across = format!("{window}{} b", "x".repeat(20_000));
+        assert_eq!(
+            checkpoint_pieces(&across),
+            vec![window.as_str(), &across[window.len()..]]
+        );
+    }
+
+    /// The checkpoint's cut as its definition reads, one character at a
+    /// time: the reference [`checkpoint_pieces`] is held against.
+    fn pieces_by_the_definition(text: &str) -> Vec<&str> {
+        let mut pieces = Vec::new();
+        let mut piece_start = 0;
+        let mut window_chars = 0;
+        let mut run_chars = 0;
+        let mut run_is_space = false;
+        for (at, c) in text.char_indices() {
+            let is_space = python_isspace(c);
+            let window_ends = window_chars == CHECKPOINT_WINDOW_CHARS;
+            if window_ends {
+                window_chars = 0;
+            }
+            if window_ends || is_space != run_is_space {
+                run_chars = 0;
+            }
+            if window_ends || run_chars == CHECKPOINT_RUN_CHARS {
+                pieces.push(&text[piece_start..at]);
+                piece_start = at;
+                run_chars = 0;
+            }
+            run_is_space = is_space;
+            run_chars += 1;
+            window_chars += 1;
+        }
+        if !text.is_empty() {
+            pieces.push(&text[piece_start..]);
+        }
+        pieces
+    }
+
+    /// Texts of runs around both bounds, in characters of every width and
+    /// whitespace of both ranges, are cut as the definition cuts them.
+    #[test]
+    fn checkpoint_pieces_are_the_definitions_on_generated_runs() {
+        const SPACES: [char; 5] = [' ', '\n', '\u{1c}', '\u{a0}', '\u{3000}'];
+        const OTHERS: [char; 4] = ['x', '\u{e9}', '\u{4e2d}', '\u{1f600}'];
+        const AT_THE_BOUND: [usize; 5] = [
+            CHECKPOINT_RUN_CHARS - 1,
+            CHECKPOINT_RUN_CHARS,
+            CHECKPOINT_RUN_CHARS + 1,
+            2 * CHECKPOINT_RUN_CHARS,
+            2 * CHECKPOINT_RUN_CHARS + 1,
+        ];
+        let mut state = 0x9E37_79B9usize;
+        let mut below = move |bound: usize| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state % bound
+        };
+        for round in 0..24 {
+            let chars = [30_000, 130_000, CHECKPOINT_WINDOW_CHARS + 60_000][round % 3];
+            let mut text = String::new();
+            let mut len = 0;
+            let mut space = below(2) == 0;
+            while len < chars {
+                // One run at the bound, or a stretch of short runs as prose has them.
+                let at_the_bound = below(3) == 0;
+                let runs = if at_the_bound { 1 } else { 1 + below(4_000) };
+                for _ in 0..runs {
+                    let kind: &[char] = if space { &SPACES } else { &OTHERS };
+                    let run = if at_the_bound {
+                        AT_THE_BOUND[below(AT_THE_BOUND.len())]
+                    } else {
+                        1 + below(9)
+                    };
+                    let one = kind[below(kind.len())];
+                    let mixed = below(2) == 0;
+                    for _ in 0..run {
+                        text.push(if mixed { kind[below(kind.len())] } else { one });
+                    }
+                    len += run;
+                    space = !space;
+                }
+            }
+            let lens =
+                |pieces: Vec<&str>| pieces.iter().map(|piece| piece.len()).collect::<Vec<_>>();
+            assert_eq!(
+                lens(checkpoint_pieces(&text)),
+                lens(pieces_by_the_definition(&text)),
+                "round {round}"
+            );
+        }
     }
 
     #[test]

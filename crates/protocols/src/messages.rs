@@ -710,6 +710,41 @@ pub enum InputContentBlock {
     McpToolUse(McpToolUseBlock),
     /// MCP tool result block (the same message, beside its use)
     McpToolResult(McpToolResultBlock),
+    /// Web fetch tool result block (a server tool's result, replayed)
+    WebFetchToolResult(ServerToolResultBlock),
+    /// Code execution tool result block (a server tool's result, replayed)
+    CodeExecutionToolResult(ServerToolResultBlock),
+    /// Bash code execution tool result block (a server tool's result, replayed)
+    BashCodeExecutionToolResult(ServerToolResultBlock),
+    /// Text editor code execution tool result block (a server tool's result,
+    /// replayed)
+    TextEditorCodeExecutionToolResult(ServerToolResultBlock),
+    /// Container upload block: a file the request hands the code execution
+    /// container
+    ContainerUpload(ContainerUploadParam),
+}
+
+/// The result of a server tool the public API ran (web fetch, code execution,
+/// bash, the text editor), replayed in an assistant turn. Its `content` is
+/// kept as written, for the upstream that ran the tool to read.
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ServerToolResultBlock {
+    pub tool_use_id: String,
+    pub content: Value,
+    pub cache_control: Option<CacheControl>,
+    /// Who issued the call, when the public API reports it (a web fetch
+    /// result's `caller`).
+    pub caller: Option<ToolUseCaller>,
+}
+
+/// A file the request hands the code execution container
+/// (`container_upload`).
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ContainerUploadParam {
+    pub file_id: String,
+    pub cache_control: Option<CacheControl>,
 }
 
 /// Whether `messages` end with an assistant message that has text and no
@@ -938,6 +973,30 @@ pub struct ServerToolUseBlock {
     pub cache_control: Option<CacheControl>,
 }
 
+/// A text item of a search result's content. The public API requires its
+/// `type`, so it is written with it; an item read without one, as this build
+/// wrote them before, reads as text.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct SearchResultTextBlock {
+    /// Block type (always "text")
+    #[serde(rename = "type", default)]
+    pub block_type: SearchResultTextType,
+
+    #[serde(flatten)]
+    pub text: TextBlock,
+}
+
+/// The `type` of a search result's text item: the public API defines only
+/// `text`, so any other value fails to read.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchResultTextType {
+    #[default]
+    Text,
+}
+
 /// Search result block
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
@@ -949,7 +1008,7 @@ pub struct SearchResultBlock {
     pub title: String,
 
     /// Content of the search result
-    pub content: Vec<TextBlock>,
+    pub content: Vec<SearchResultTextBlock>,
 
     /// Cache control for this block
     pub cache_control: Option<CacheControl>,
@@ -983,6 +1042,12 @@ pub enum WebSearchToolResultContent {
 /// Web search result block
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct WebSearchResultBlock {
+    /// Block type (always "web_search_result"). The public API writes it on
+    /// every result and requires it on a replayed one, so a result read
+    /// without it is written with it.
+    #[serde(rename = "type", default = "WebSearchResultBlock::default_type")]
+    pub block_type: String,
+
     /// Title of the search result
     pub title: String,
 
@@ -992,9 +1057,16 @@ pub struct WebSearchResultBlock {
     /// Encrypted content
     pub encrypted_content: String,
 
-    /// Page age (if available)
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Page age, null when the search does not know it, as the public API
+    /// writes it
+    #[serde(default)]
     pub page_age: Option<String>,
+}
+
+impl WebSearchResultBlock {
+    fn default_type() -> String {
+        "web_search_result".to_string()
+    }
 }
 
 /// Web search tool result error
@@ -1014,6 +1086,7 @@ pub enum WebSearchToolResultErrorCode {
     MaxUsesExceeded,
     TooManyRequests,
     QueryTooLong,
+    RequestTooLarge,
 }
 
 /// Cache control configuration
@@ -1601,7 +1674,7 @@ pub enum ContentBlock {
     /// Tool search tool result
     ToolSearchToolResult {
         tool_use_id: String,
-        content: ToolSearchResultContent,
+        content: ToolSearchToolResultContent,
     },
     /// Tool reference (returned by tool search)
     ToolReference {
@@ -1622,6 +1695,24 @@ pub enum ContentBlock {
         content: Option<ToolResultContent>,
         is_error: Option<bool>,
     },
+    /// A block this build does not read, kept as the upstream sent it: an
+    /// upstream answer must parse whatever block the public API adds (a web
+    /// fetch or code execution result, a container upload, ...), and leave
+    /// with the same object. Only a JSON object reads here, as a content block
+    /// is always one.
+    #[serde(untagged, deserialize_with = "deserialize_block_object")]
+    Other(Value),
+}
+
+/// A content block of a kind this build does not read: any JSON object, and
+/// nothing else.
+fn deserialize_block_object<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Value, D::Error> {
+    let block = Value::deserialize(deserializer)?;
+    if block.is_object() {
+        Ok(block)
+    } else {
+        Err(de::Error::custom("a content block is a JSON object"))
+    }
 }
 
 /// The caller of a `tool_use` block, as the public API reports it: the model
@@ -2883,6 +2974,11 @@ pub struct ToolReferenceBlock {
     /// Tool description
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+
+    /// Cache control for this reference, which a replayed tool search result
+    /// may set, as a tool result's reference does
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControl>,
 }
 
 /// Tool search result content — wraps tool references returned by tool search
@@ -2895,14 +2991,43 @@ pub struct ToolSearchResultContent {
     pub tool_references: Vec<ToolReferenceBlock>,
 }
 
+/// A tool search's result: the tool references it found, or the error it
+/// ended with, as the web search's result is
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum ToolSearchToolResultContent {
+    Results(ToolSearchResultContent),
+    Error(ToolSearchToolResultError),
+}
+
+/// Tool search tool result error
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ToolSearchToolResultError {
+    #[serde(rename = "type")]
+    pub error_type: String, // "tool_search_tool_result_error"
+    pub error_code: ToolSearchToolResultErrorCode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
+}
+
+/// Tool search tool result error codes
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolSearchToolResultErrorCode {
+    InvalidToolInput,
+    Unavailable,
+    TooManyRequests,
+    ExecutionTimeExceeded,
+}
+
 /// Tool search tool result block (beta)
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ToolSearchToolResultBlock {
     /// The ID of the tool use this is a result for
     pub tool_use_id: String,
 
-    /// The search results
-    pub content: ToolSearchResultContent,
+    /// The search results or error
+    pub content: ToolSearchToolResultContent,
 
     /// Cache control for this block
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3096,7 +3221,7 @@ pub enum BetaContentBlock {
     // Beta tool search types
     ToolSearchToolResult {
         tool_use_id: String,
-        content: ToolSearchResultContent,
+        content: ToolSearchToolResultContent,
     },
     ToolReference {
         tool_name: String,
@@ -3222,6 +3347,40 @@ mod tests {
         assert_eq!(written["content"][1]["type"], "mcp_tool_result");
     }
 
+    /// A conversation replaying the public API's server tool results (web
+    /// fetch, code execution, bash, the text editor) and a container upload
+    /// reads them as input and writes them back as sent, on a create and on a
+    /// token count alike.
+    #[test]
+    fn a_replayed_server_tool_result_or_container_upload_is_accepted() {
+        let assistant = json!({"role": "assistant", "content": [
+            {"type": "web_fetch_tool_result", "tool_use_id": "srvtoolu_1", "caller": {"type": "direct"},
+             "content": {"type": "web_fetch_result", "url": "https://example.com",
+                         "content": {"type": "document", "source": {"type": "text", "media_type": "text/plain", "data": "page"}}}},
+            {"type": "code_execution_tool_result", "tool_use_id": "srvtoolu_2",
+             "content": {"type": "code_execution_result", "stdout": "4\n", "stderr": "", "return_code": 0, "content": []}},
+            {"type": "bash_code_execution_tool_result", "tool_use_id": "srvtoolu_3", "cache_control": {"type": "ephemeral"},
+             "content": {"type": "bash_code_execution_result", "stdout": "ok", "stderr": "", "return_code": 0, "content": []}},
+            {"type": "text_editor_code_execution_tool_result", "tool_use_id": "srvtoolu_4",
+             "content": {"type": "text_editor_code_execution_view_result", "file_type": "text", "content": "x = 1",
+                         "num_lines": 1, "start_line": 1, "total_lines": 1}}
+        ]});
+        let user = json!({"role": "user", "content": [
+            {"type": "container_upload", "file_id": "file_1"},
+            {"type": "text", "text": "run it"}
+        ]});
+        for message in [&assistant, &user] {
+            let parsed: InputMessage = serde_json::from_value(message.clone())
+                .unwrap_or_else(|e| panic!("{message}: {e}"));
+            assert_eq!(&serde_json::to_value(&parsed).unwrap(), message);
+        }
+        let count: CountMessageTokensRequest = serde_json::from_value(json!({
+            "model": "m", "messages": [user.clone(), assistant.clone()]
+        }))
+        .expect("a token count with the blocks reads");
+        assert_eq!(count.messages.len(), 2);
+    }
+
     /// A content field that is neither a string nor an array of blocks, or
     /// holds a block that cannot be read, is refused with the block's own
     /// reason: the unknown `type` with the accepted ones, the missing field,
@@ -3235,11 +3394,11 @@ mod tests {
         };
         let unknown_block = refusal(json!({
             "role": "user",
-            "content": [{"type": "container_upload", "file_id": "file_1"}]
+            "content": [{"type": "a_block_kind_of_no_api", "file_id": "file_1"}]
         }));
         assert!(
             unknown_block.starts_with(
-                "unknown variant `container_upload`, expected one of `text`, `image`, `document`, `tool_use`, `tool_result`, `thinking`"
+                "unknown variant `a_block_kind_of_no_api`, expected one of `text`, `image`, `document`, `tool_use`, `tool_result`, `thinking`"
             ),
             "{unknown_block}"
         );
@@ -3876,6 +4035,69 @@ mod tests {
         }
     }
 
+    /// The blocks of the public API's answers this build does not read: the
+    /// web fetch, code execution, bash and text editor results and a
+    /// container upload, in the SDK's shapes.
+    fn blocks_this_build_does_not_read() -> Vec<Value> {
+        vec![
+            json!({
+                "type": "web_fetch_tool_result", "tool_use_id": "srvtoolu_1",
+                "content": {
+                    "type": "web_fetch_result", "url": "https://example.com",
+                    "retrieved_at": "2026-11-13T00:00:00Z",
+                    "content": {"type": "document", "source": {"type": "text", "media_type": "text/plain", "data": "page"}}
+                }
+            }),
+            json!({
+                "type": "code_execution_tool_result", "tool_use_id": "srvtoolu_2",
+                "content": {"type": "code_execution_result", "stdout": "4\n", "stderr": "", "return_code": 0, "content": []}
+            }),
+            json!({
+                "type": "bash_code_execution_tool_result", "tool_use_id": "srvtoolu_3",
+                "content": {"type": "bash_code_execution_result", "stdout": "ok", "stderr": "", "return_code": 0, "content": []}
+            }),
+            json!({
+                "type": "text_editor_code_execution_tool_result", "tool_use_id": "srvtoolu_4",
+                "content": {"type": "text_editor_code_execution_view_result", "file_type": "text", "content": "x = 1", "num_lines": 1, "start_line": 1, "total_lines": 1}
+            }),
+            json!({"type": "container_upload", "file_id": "file_1"}),
+        ]
+    }
+
+    /// An answer with a block this build does not read parses, the block kept
+    /// as `ContentBlock::Other` and written back as the upstream sent it,
+    /// beside the blocks it reads; a streamed block reads the same way.
+    #[test]
+    fn an_answer_keeps_a_block_this_build_does_not_read() {
+        for block in blocks_this_build_does_not_read() {
+            let answer = json!({
+                "id": "msg_1", "type": "message", "role": "assistant", "model": "m",
+                "content": [{"type": "text", "text": "before"}, block.clone()],
+                "stop_reason": "end_turn", "stop_sequence": null, "stop_details": null,
+                "usage": {"input_tokens": 1, "output_tokens": 1}, "container": null
+            });
+            let message: Message =
+                serde_json::from_value(answer.clone()).unwrap_or_else(|e| panic!("{block}: {e}"));
+            assert!(matches!(message.content[0], ContentBlock::Text { .. }));
+            assert!(matches!(&message.content[1], ContentBlock::Other(kept) if *kept == block));
+            assert_eq!(serde_json::to_value(&message).unwrap()["content"][1], block);
+
+            let start =
+                json!({"type": "content_block_start", "index": 1, "content_block": block.clone()});
+            let event: MessageStreamEvent =
+                serde_json::from_value(start.clone()).unwrap_or_else(|e| panic!("{block}: {e}"));
+            assert_eq!(serde_json::to_value(&event).unwrap(), start);
+        }
+        // A content block is always an object: a value of another JSON type
+        // is no block at all, not one this build does not read.
+        for not_a_block in [json!("text"), json!(1), json!(null), json!([])] {
+            assert!(
+                serde_json::from_value::<ContentBlock>(not_a_block.clone()).is_err(),
+                "{not_a_block}"
+            );
+        }
+    }
+
     #[test]
     fn test_content_block_tool_search_tool_result_deserialization() {
         let json = r#"{
@@ -3897,11 +4119,169 @@ mod tests {
                 content,
             } => {
                 assert_eq!(tool_use_id, "srvtoolu_015dw5iXvktXLmqwpyzo4Dp2");
+                let ToolSearchToolResultContent::Results(content) = content else {
+                    panic!("Expected the search's results");
+                };
                 assert_eq!(content.tool_references.len(), 1);
                 assert_eq!(content.tool_references[0].tool_name, "get_weather");
             }
             _ => panic!("Expected ToolSearchToolResult variant"),
         }
+    }
+
+    /// A search result's text items are written with their `type`, which the
+    /// public API requires of them, whether the block stands in a message or
+    /// in a tool result; an item read without one is written with it.
+    #[test]
+    fn a_search_results_text_items_keep_their_type() {
+        let search_result = json!({
+            "type": "search_result",
+            "source": "https://docs.example.com/install",
+            "title": "Install",
+            "content": [{"type": "text", "text": "Run the installer."}]
+        });
+        let request: CreateMessageRequest = serde_json::from_value(json!({
+            "model": "m",
+            "max_tokens": 16,
+            "messages": [
+                {"role": "user", "content": [search_result.clone()]},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "toolu_1", "name": "search", "input": {}}
+                ]},
+                {"role": "user", "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_1",
+                    "content": [search_result.clone()]
+                }]}
+            ]
+        }))
+        .unwrap();
+        let written = serde_json::to_value(&request).unwrap();
+        assert_eq!(written["messages"][0]["content"][0], search_result);
+        assert_eq!(
+            written["messages"][2]["content"][0]["content"][0],
+            search_result
+        );
+
+        let untyped: InputContentBlock = serde_json::from_value(json!({
+            "type": "search_result",
+            "source": "https://docs.example.com/install",
+            "title": "Install",
+            "content": [{"text": "Run the installer."}]
+        }))
+        .unwrap();
+        assert_eq!(serde_json::to_value(&untyped).unwrap(), search_result);
+
+        let other = serde_json::from_value::<InputContentBlock>(json!({
+            "type": "search_result",
+            "source": "https://docs.example.com/install",
+            "title": "Install",
+            "content": [{"type": "image", "text": "Run the installer."}]
+        }));
+        assert!(other.is_err(), "an item of a type the API does not define");
+    }
+
+    /// A web search's results and errors read and write as the public API
+    /// writes them: each result with its `type` and its null `page_age`, and
+    /// the `request_too_large` error. A result read without its `type` is
+    /// written with it, which the public API requires of a replayed one.
+    #[test]
+    fn a_web_search_result_reads_and_writes_as_the_public_api_writes_it() {
+        let results = json!({
+            "type": "web_search_tool_result",
+            "tool_use_id": "srvtoolu_1",
+            "content": [{
+                "type": "web_search_result",
+                "title": "Claude Shannon",
+                "url": "https://en.wikipedia.org/wiki/Claude_Shannon",
+                "encrypted_content": "EqgfCioIARgBIiQ3",
+                "page_age": null
+            }]
+        });
+        let block: ContentBlock = serde_json::from_value(results.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&block).unwrap(), results);
+
+        let error = json!({
+            "type": "web_search_tool_result",
+            "tool_use_id": "srvtoolu_2",
+            "content": {"type": "web_search_tool_result_error", "error_code": "request_too_large"}
+        });
+        let block: ContentBlock = serde_json::from_value(error.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&block).unwrap(), error);
+
+        let request: CreateMessageRequest = serde_json::from_value(json!({
+            "model": "m",
+            "max_tokens": 16,
+            "messages": [
+                {"role": "user", "content": "Who was Claude Shannon?"},
+                {"role": "assistant", "content": [{
+                    "type": "web_search_tool_result",
+                    "tool_use_id": "srvtoolu_1",
+                    "content": [{
+                        "title": "Claude Shannon",
+                        "url": "https://en.wikipedia.org/wiki/Claude_Shannon",
+                        "encrypted_content": "EqgfCioIARgBIiQ3"
+                    }]
+                }]}
+            ]
+        }))
+        .unwrap();
+        let written = serde_json::to_value(&request).unwrap();
+        assert_eq!(
+            written["messages"][1]["content"][0]["content"],
+            results["content"]
+        );
+    }
+
+    /// A tool search that ended with an error reads and writes as the public
+    /// API writes it, in an answer and replayed in a request.
+    #[test]
+    fn a_tool_search_error_reads_and_writes_as_the_public_api_writes_it() {
+        let error = json!({
+            "type": "tool_search_tool_result",
+            "tool_use_id": "srvtoolu_1",
+            "content": {
+                "type": "tool_search_tool_result_error",
+                "error_code": "execution_time_exceeded",
+                "error_message": "The tool search took too long."
+            }
+        });
+        let block: ContentBlock = serde_json::from_value(error.clone()).unwrap();
+        let ContentBlock::ToolSearchToolResult {
+            content: ToolSearchToolResultContent::Error(ref reason),
+            ..
+        } = block
+        else {
+            panic!("Expected the search's error, got {block:?}");
+        };
+        assert!(matches!(
+            reason.error_code,
+            ToolSearchToolResultErrorCode::ExecutionTimeExceeded
+        ));
+        assert_eq!(serde_json::to_value(&block).unwrap(), error);
+
+        let replayed: InputContentBlock = serde_json::from_value(error.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&replayed).unwrap(), error);
+    }
+
+    /// A tool reference in a replayed tool search result keeps its cache
+    /// breakpoint, as the public API takes it.
+    #[test]
+    fn a_replayed_tool_reference_keeps_its_cache_breakpoint() {
+        let references = json!({
+            "type": "tool_search_tool_result",
+            "tool_use_id": "srvtoolu_1",
+            "content": {
+                "type": "tool_search_tool_search_result",
+                "tool_references": [{
+                    "type": "tool_reference",
+                    "tool_name": "get_weather",
+                    "cache_control": {"type": "ephemeral"}
+                }]
+            }
+        });
+        let replayed: InputContentBlock = serde_json::from_value(references.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&replayed).unwrap(), references);
     }
 
     /// A document's content source and the request's container take the

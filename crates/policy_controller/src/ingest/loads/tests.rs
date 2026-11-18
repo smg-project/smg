@@ -1522,6 +1522,118 @@ async fn an_answer_with_no_row_says_nothing_of_an_engine_whose_other_rank_its_st
     assert_eq!(driver.stats().rows.load(Ordering::Relaxed), 0);
 }
 
+#[test]
+fn the_driver_tells_the_sink_the_longer_of_its_interval_and_its_poll_s_deadline_and_a_tick() {
+    let store = Arc::new(MemoryStore::new());
+    let probe = Arc::new(FakeProbe::default());
+    let _driver = driver(&store, &probe, TEN);
+    // Told once, where the driver is built. Another period is asked
+    // first: a sink the driver told nothing would take it as its own. The
+    // interval alone is not the period: a poll starts on a tick, a tenth
+    // of a second here, so two starts lie up to a tick further apart.
+    assert!(!store.heard_every(TEN));
+    assert!(store.heard_every(TEN + Duration::from_millis(100)));
+
+    // An interval shorter than the poll's deadline: the deadline, three
+    // seconds, and a tick make the period, so a poll that takes its whole
+    // deadline is still heard inside it. The scrape's five seconds are not
+    // in it: a scrape reads an engine of one rank, which never ages.
+    let store = Arc::new(MemoryStore::new());
+    let _driver = driver(&store, &probe, Duration::from_secs(1));
+    assert!(!store.heard_every(Duration::from_millis(5_100)));
+    assert!(store.heard_every(Duration::from_millis(3_100)));
+
+    // The defaults tell eleven seconds. An interval just over the deadline
+    // tells the interval and a tick, where the deadline and a tick are
+    // the same four seconds and one tick short.
+    assert_eq!(
+        LoadDriverConfig::default().report_period(),
+        Duration::from_secs(11)
+    );
+    let near = LoadDriverConfig {
+        poll_interval: Duration::from_secs(4),
+        ..LoadDriverConfig::default()
+    };
+    assert_eq!(near.report_period(), Duration::from_secs(5));
+
+    // The largest deadline a host can set saturates the sum, and so does
+    // the largest interval, so the driver still builds.
+    let largest = LoadDriverConfig {
+        poll_deadline: Duration::MAX,
+        ..LoadDriverConfig::default()
+    };
+    assert_eq!(largest.report_period(), Duration::MAX);
+    let endless = LoadDriverConfig {
+        poll_interval: Duration::MAX,
+        ..LoadDriverConfig::default()
+    };
+    assert_eq!(endless.report_period(), Duration::MAX);
+}
+
+/// One lost report does not end a polled rank's sample at an interval just
+/// over the poll's deadline. An engine's polls start on a tick: at four
+/// seconds over a three-second deadline and a one-second tick they start
+/// at 0 s, 5 s and 10 s where each tick comes late. The second answer has
+/// no row for the rank and the third is still out when the rank's sibling
+/// writes on its stream at 12.5 s: the sample of 0 s lies inside three
+/// periods of five seconds, where it lay past three of four.
+#[tokio::test(start_paused = true)]
+async fn a_polled_rank_is_counted_through_one_lost_report_at_an_interval_near_the_deadline() {
+    let store = Arc::new(MemoryStore::new());
+    let probe = Arc::new(FakeProbe::default());
+    let rank0 = ready(
+        &store,
+        "grpc://b:1@0",
+        "grpc://b:1",
+        0,
+        2,
+        WireModes::GRPC,
+        0,
+    );
+    let rank1 = ready(
+        &store,
+        "grpc://b:1@1",
+        "grpc://b:1",
+        1,
+        2,
+        WireModes::GRPC,
+        0,
+    );
+    store.apply(vetoing_at(5)).expect("applied");
+    let _driver = LoadDriver::new(
+        Arc::clone(&store),
+        Arc::clone(&probe),
+        LoadDriverConfig {
+            poll_interval: Duration::from_secs(4),
+            ..LoadDriverConfig::default()
+        },
+    );
+    // The poll that started at 0 s hears the rank at its threshold.
+    let waiting = LoadRow {
+        queued: 5,
+        ..LoadRow::default()
+    };
+    store.report(&[(rank1, 1, Some(waiting))], now(), LoadSource::Poll);
+    assert_eq!(
+        (vetoed(&store), store.overload_flips()),
+        (vec![true, true], 1)
+    );
+    // The sibling's stream at 12.5 s: the rank is still counted.
+    tokio::time::advance(Duration::from_millis(12_500)).await;
+    store.record(rank0, 0, LoadRow::default(), now(), LoadSource::Stream);
+    assert_eq!(
+        (vetoed(&store), store.overload_flips()),
+        (vec![true, true], 1)
+    );
+    // A microsecond past three periods the silent rank's sample has ended.
+    tokio::time::advance(Duration::from_micros(2_500_001)).await;
+    store.record(rank0, 0, LoadRow::default(), now(), LoadSource::Stream);
+    assert_eq!(
+        (vetoed(&store), store.overload_flips()),
+        (vec![false, false], 2)
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_rank_that_is_not_ready_does_not_hold_the_word_off() {
     let store = Arc::new(MemoryStore::new());

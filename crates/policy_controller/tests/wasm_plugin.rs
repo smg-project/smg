@@ -113,9 +113,93 @@ fn load_unheld(runtime: &Arc<Runtime>, spec: PluginSpec) -> Result<Arc<Plugin>, 
     }
 }
 
-/// A load that must succeed, a held one made again.
+/// How many times a load that must succeed is made.
+const LOADS: u32 = 10;
+
+/// A load that must succeed: its case claims nothing of the `init`'s time.
+/// An `init` the host ended at the frame's deadline was ended by the
+/// runner, off the CPU or slowed on its core, where the thread's clock reads
+/// it on the CPU and no witness of time off the CPU sees it. Such a load is
+/// made again with no witness asked, [`LOADS`] loads at most. The last
+/// asserts what it says, so a host that ends every `init` fails the case.
 fn loaded(runtime: &Arc<Runtime>, spec: PluginSpec) -> Arc<Plugin> {
-    load_unheld(runtime, spec).expect("the guest loads")
+    loaded_by(|| Plugin::load(runtime, spec.clone()))
+}
+
+/// [`loaded`] over the load it makes: the rule apart from the host.
+fn loaded_by(mut load: impl FnMut() -> Result<Arc<Plugin>, LoadError>) -> Arc<Plugin> {
+    let mut loads = 0;
+    loop {
+        let made = load();
+        loads += 1;
+        let ended = matches!(
+            &made,
+            Err(LoadError::Trap { reason, .. }) if reason.ends_with("wasm trap: interrupt")
+        );
+        if !ended || loads == LOADS {
+            return made.expect("the guest loads");
+        }
+        made_again("a load", "the host ended its init at the frame's deadline");
+    }
+}
+
+/// An `init` the host ended at the frame's deadline, as a load says it.
+fn ended_at_the_frame() -> LoadError {
+    LoadError::Trap {
+        name: "held".to_owned(),
+        reason: "wasm trap: interrupt".to_owned(),
+    }
+}
+
+/// A load that must succeed is made again after an `init` the host ended at
+/// the frame, with no witness asked. Here every load but the last one
+/// allowed is handed back as such an end, and the last is the guest's own.
+#[test]
+fn a_load_the_host_ended_is_made_again() {
+    let runtime = runtime();
+    let mut made = 0;
+    let plugin = loaded_by(|| {
+        made += 1;
+        if made < LOADS {
+            return Err(ended_at_the_frame());
+        }
+        Plugin::load(
+            &runtime,
+            spec("held", guest::record_guest(), mode::LEAST_IN_FLIGHT),
+        )
+    });
+    assert_eq!(made, LOADS);
+    assert_eq!(plugin.stats().traps, 0);
+}
+
+/// The last load asserts what it says: a host that ends every `init` fails
+/// the case, at the last load allowed.
+#[test]
+fn a_host_that_ends_every_init_fails_the_load() {
+    let mut made = 0;
+    let load = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        loaded_by(|| {
+            made += 1;
+            Err(ended_at_the_frame())
+        })
+    }));
+    assert!(load.is_err(), "a load the host ended every time stood");
+    assert_eq!(made, LOADS);
+}
+
+/// A load refused for any other reason is the case's failure at once: it is
+/// made one time.
+#[test]
+fn a_load_refused_for_another_reason_is_made_once() {
+    let mut made = 0;
+    let load = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        loaded_by(|| {
+            made += 1;
+            Err(LoadError::Runtime("refused".to_owned()))
+        })
+    }));
+    assert!(load.is_err(), "a refused load stood");
+    assert_eq!(made, 1);
 }
 
 fn load(runtime: &Arc<Runtime>, name: &str, component: Vec<u8>, mode: u8) -> Arc<Plugin> {
@@ -1111,6 +1195,54 @@ fn the_memory_cap_is_the_specs_and_a_growth_past_it_traps() {
         (0, 4),
         "under 64 MiB the growth fits"
     );
+}
+
+/// A module's view carries the request's block hashes where its row
+/// declares them, in the token form or the text form, and none where it
+/// declares neither: a guest of each world counts the hashes its decisions
+/// handed it.
+#[test]
+fn a_view_carries_block_hashes_to_a_row_that_declares_them_alone() {
+    let hashes: Vec<u64> = (1..=300).collect();
+    let token = Needs {
+        token_hashes: true,
+        ..Needs::default()
+    };
+    let text = Needs {
+        text_hashes: true,
+        ..Needs::default()
+    };
+    let candidates = pool(4);
+    for (world, component) in guest::hash_counting_guests() {
+        for (needs, handed) in [(Needs::default(), 0), (token, 300), (text, 300)] {
+            let runtime = runtime();
+            let mut row = spec("counting", component.clone(), mode::LEAST_IN_FLIGHT);
+            row.metrics.push("hashes".to_string());
+            row.needs = needs;
+            let plugin = loaded(&runtime, row);
+            let engine = plugin_engine(&plugin);
+            let decision = engine.decide(
+                &RequestFacts {
+                    block_hashes: &hashes,
+                    ..facts(1)
+                },
+                &PoolFacts {
+                    pool_size: 4,
+                    generation: 1,
+                    ..PoolFacts::default()
+                },
+                &candidates,
+                &Constraints::default(),
+                &mut Scratch::new(),
+            );
+            assert!(decision.pick().is_some(), "{world} {needs:?}: {decision:?}");
+            assert_eq!(
+                counter_value(&plugin, counter::HASHES),
+                handed,
+                "the {world} world, {needs:?}"
+            );
+        }
+    }
 }
 
 #[test]

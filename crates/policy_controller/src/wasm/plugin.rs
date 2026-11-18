@@ -1866,7 +1866,10 @@ impl Bound {
             match &inst.exports {
                 Exports::Record(_) => inst.records.fill(facts, candidates, pool),
                 Exports::Packed(_) => {
-                    if inst.packed.fill(facts, candidates, pool, &plugin.exposure) == Err(TooLong) {
+                    let filled =
+                        inst.packed
+                            .fill(facts, candidates, pool, &plugin.exposure, plugin.needs);
+                    if filled == Err(TooLong) {
                         bump(&plugin.tally.too_long);
                         open.bypass = true;
                         return;
@@ -1876,12 +1879,14 @@ impl Bound {
         }
         let count = open.count;
         let exposure = &plugin.exposure;
+        let needs = plugin.needs;
         let frame = open.frame(&mut budget, frame.fuel_per_micro);
         let constructed = plugin.call(&mut guard, frame, |inst| {
             let result = match &inst.exports {
                 Exports::Record(b) => {
                     let headers = marshal::headers(facts, exposure);
-                    let request = marshal::request(facts, exposure, &inst.records.tried, &headers);
+                    let request =
+                        marshal::request(facts, exposure, needs, &inst.records.tried, &headers);
                     let pool = marshal::pool(pool, &inst.records.zones);
                     b.smg_policy_plugin().decision().call_constructor(
                         &mut inst.store,

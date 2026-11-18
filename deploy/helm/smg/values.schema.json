@@ -412,6 +412,7 @@
             }
           }
         },
+        "spec": { "type": ["object", "null"] },
         "ports": {
           "type": ["object", "null"],
           "additionalProperties": false,

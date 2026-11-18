@@ -15,12 +15,14 @@
 
 use std::{
     borrow::Cow,
+    cmp::Ordering,
     collections::{btree_map, BTreeMap, BTreeSet},
     fmt, io,
     marker::PhantomData,
     sync::LazyLock,
 };
 
+use rustc_hash::FxHashMap;
 use schemars::{json_schema, JsonSchema, Schema, SchemaGenerator};
 use serde::{
     de::{self, value::SeqAccessDeserializer, MapAccess, SeqAccess, Visitor},
@@ -30,16 +32,16 @@ use serde::{
 use sha2::{Digest as _, Sha256};
 
 use crate::{
-    affinity::{Gates, KvPressure, PrefixAffinity, WarmupSlice},
+    affinity::{blocks_within, Gates, KvPressure, PrefixAffinity, WarmupSlice},
     builtins::{
-        FewestSessions, LeastLoad, LeastRequests, ResidentWork, SessionAffinity,
+        FewestSessions, LeastLoad, LeastRequests, ResidentWork, SampledBest, SessionAffinity,
         DEFAULT_MEAN_PREFILL_TOKENS,
     },
     catalog::{Catalog, Found},
     framework::{Binding, Engine, OverloadThresholds, Picker, Plan, Profile, Scorer, Weighted},
     ring::ConsistentHash,
     sessions::SessionRule,
-    view::{permille, Phase},
+    view::{permille, HashKind, Phase},
 };
 
 pub const API_VERSION: &str = "smg.policy/v1";
@@ -59,6 +61,24 @@ pub const DENIED_HEADERS: [&str; 7] = [
 /// The most headers `view.headers` may list: a view names an allow-listed
 /// header by its position in one byte.
 pub const MAX_HEADERS: usize = 256;
+
+/// The highest `view.max_block_hashes`: the hashes a `DecideRequest` at
+/// the contract's bound of 64 KiB carries beside an id of one byte, at
+/// eight bytes a hash and ten of tags and lengths. A higher cap would
+/// bind on no frame the call accepts.
+pub const MAX_BLOCK_HASHES: u32 = 8_190;
+
+/// The most label selectors `view.labels` may list: a row holds its labels
+/// as one bit a selector, in 64 bits.
+pub const MAX_LABELS: usize = 64;
+
+/// The most zones `view.zones` may list. A row's position is wider: the cap
+/// is the document's own, so a list never meets the width by accident.
+pub const MAX_ZONES: usize = 256;
+
+/// The most engine families `view.engines` may list, capped as the zones
+/// are.
+pub const MAX_ENGINES: usize = 64;
 
 /// The filters this build carries.
 pub const FILTERS: [&str; 5] = [
@@ -87,7 +107,8 @@ pub const SCORERS: [&str; 10] = [
 /// The pickers of v1; `count-first` and `power-of-two-count-first` compare
 /// the requests in flight before the score; `manual` leaves the placement
 /// to the binding's sessions rule, by its assignment; `best-with-temperature`
-/// takes its temperature and is written in the parameter form.
+/// takes its temperature and is written in the parameter form, as `best` is
+/// when it takes a sample.
 pub const PICKERS: [&str; 9] = [
     "best",
     "round-robin",
@@ -108,6 +129,10 @@ static STOCK: LazyLock<Catalog> = LazyLock::new(Catalog::builtin);
 /// needs at least one.
 const SAMPLING_PICKERS: [&str; 2] = ["power-of-two", "power-of-two-count-first"];
 
+/// The most rows the `best` picker's sample may hold: a row joins the
+/// sample after a search of the rows already in it.
+const MAX_SAMPLE: u32 = 64;
+
 /// The side names a binding's `profiles` map may use.
 const SIDES: [&str; 4] = ["single", "prefill", "decode", "encode"];
 
@@ -118,7 +143,16 @@ pub struct Needs {
     /// The request text in the view (a text-window hash form, for a host
     /// without a tokenizer).
     pub text: bool,
+    /// The request's prefix block hashes over its token ids. A decision is
+    /// handed the hashes as deep as the stages that declare them read
+    /// ([`AppliedSpec::block_hashes_read`]), so a stage that reads the list
+    /// declares one of the two kinds: under a generation where no stage
+    /// does, it is handed none. A plugin is shown the list where its own
+    /// row declares one of the two, and none of it otherwise.
     pub token_hashes: bool,
+    /// The request's prefix block hashes over windows of its text, which a
+    /// host without a tokenizer feeds in their place. A stage that reads a
+    /// prefix by either kind sets this beside `text`.
     pub text_hashes: bool,
     /// Load reports per worker.
     pub loads: bool,
@@ -129,6 +163,15 @@ pub struct Needs {
     /// Allow-listed headers in the view.
     pub headers: bool,
     pub media: bool,
+    /// The count of requests in flight, per worker
+    /// ([`Candidate::in_flight`](crate::Candidate::in_flight)): the
+    /// `least-requests` scorer, the load scorers' unreported term, the
+    /// count pickers, the ring's bounded-load rule and the affinity stages'
+    /// spill. A host that books its own dispatches holds it on every row;
+    /// a host that counts leases writes it for a decision whose profile
+    /// declares it, and a row reads zero elsewhere. A stage that shows its
+    /// rows to a plugin declares it for the guest.
+    pub in_flight: bool,
     /// The count of session keys with a request in flight, per worker (the
     /// `min_group` assignment and the `fewest-sessions` scorer).
     pub active_sessions: bool,
@@ -151,9 +194,29 @@ pub struct Needs {
     /// candidate and nothing is refused. What holds a host to the need is
     /// the builder of its view, by a case of its own.
     pub affinity: bool,
+    /// The sample of a picker that decides a large pool by a draw of this
+    /// many rows and the rows the host names; `0` for none. A host that can
+    /// name the request's holders and the pool's warming rows
+    /// ([`NamedAffinity`](crate::NamedAffinity)) hands those in the
+    /// column's place, each list capped at this many rows: the holders by
+    /// depth, whole depth groups from the deepest while they fit and the
+    /// group at the cap's edge by a uniform draw from the decision's seed;
+    /// the warming rows by that draw over their whole list. A host that
+    /// cannot fills the column, and the pool is read whole. The cap of a
+    /// decision is its own profile's, which
+    /// [`Engine::sample_for`](crate::Engine::sample_for) says: the engine's
+    /// summary holds the largest sample of every profile, and a decode
+    /// worker's needs the larger of its two profiles'.
+    pub sample: u32,
 }
 
 impl Needs {
+    /// Whether these declare a request's block hashes, in the token form or
+    /// the text form. A stage that declares neither reads none of them.
+    pub(crate) fn request_hashes(self) -> bool {
+        self.token_hashes || self.text_hashes
+    }
+
     /// Both sides' needs: what a host feeding either of two stage sets must
     /// feed.
     pub(crate) fn or(self, other: Self) -> Self {
@@ -166,9 +229,11 @@ impl Needs {
             ring: self.ring || other.ring,
             headers: self.headers || other.headers,
             media: self.media || other.media,
+            in_flight: self.in_flight || other.in_flight,
             active_sessions: self.active_sessions || other.active_sessions,
             session_in_flight: self.session_in_flight || other.session_in_flight,
             affinity: self.affinity || other.affinity,
+            sample: self.sample.max(other.sample),
         }
     }
 }
@@ -178,8 +243,10 @@ fn is_default<T: Default + PartialEq>(value: &T) -> bool {
 }
 
 /// What the host builds into every decision's view beyond the facts it
-/// derives itself: the request headers a stage may read, and the hashing
-/// inputs a host keeps until it learns them from its engines.
+/// derives itself: the request headers a stage may read, the hashing
+/// inputs a host keeps until it learns them from its engines, and the
+/// lists a worker's row names its labels, its zone and its engine family
+/// by.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields, default)]
 pub struct ViewSpec {
@@ -200,9 +267,33 @@ pub struct ViewSpec {
     /// Ascending token positions the hash index and the prefix-hash ring
     /// key on; empty for none. A hash index needs at least one.
     pub boundaries: Vec<u32>,
-    /// How many prefix block hashes a request carries into the view.
-    #[schemars(range(min = 1))]
+    /// How many prefix block hashes a request carries into the view, 8,190
+    /// at most: one frame of the Decide call carries no more.
+    #[schemars(range(min = 1, max = 8190))]
     pub max_block_hashes: u32,
+    /// The worker labels a stage may read, each a selector of one label
+    /// key: `key` (the worker carries the label, whatever its value) or
+    /// `key=value` (it carries the label with that value), split at the
+    /// first `=`. A worker's row holds one bit for each selector it meets,
+    /// in this order. At most 64; empty for none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[schemars(length(max = 64))]
+    pub labels: Vec<String>,
+    /// The zones a stage may tell apart. A worker's row names its zone by
+    /// its position in this list, from 1; a worker with no zone reads 0,
+    /// and so does one whose zone this list does not name. At most 256;
+    /// empty for none, where every row reads 0.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[schemars(length(max = 256))]
+    pub zones: Vec<String>,
+    /// The engine families a stage may tell apart, spelled as a worker's
+    /// registration spells its own. A worker's row names its family by its
+    /// position in this list, from 1; a worker whose family this list does
+    /// not name reads 0. At most 64; empty for none, where every row reads
+    /// 0.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[schemars(length(max = 64))]
+    pub engines: Vec<String>,
 }
 
 impl Default for ViewSpec {
@@ -212,6 +303,9 @@ impl Default for ViewSpec {
             block_size: None,
             boundaries: Vec::new(),
             max_block_hashes: 256,
+            labels: Vec::new(),
+            zones: Vec::new(),
+            engines: Vec::new(),
         }
     }
 }
@@ -543,22 +637,28 @@ impl Default for BucketParams {
     }
 }
 
-/// The bounded-load rule of the consistent-hash scorer: a ring owner loaded
-/// this far past the mean passes the request on.
+/// The bounded-load rule of the consistent-hash scorer: a ring owner whose
+/// requests in flight are past both parts of the rule over the candidates'
+/// mean, the request being placed counted in the mean, is passed over. A
+/// prefix keyed at a boundary is then tried at the next boundary down. A
+/// request no owner keeps is scored as one with no key: the profile's next
+/// stage places it, and in a profile with no stage after the ring the picker
+/// draws among every candidate, the passed owner among them.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct BoundedLoadParams {
     /// The relative part of the rule; at least 1 (default 1.25).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1.0))]
-    pub factor: Option<f32>,
+    pub factor: Option<f64>,
     /// The absolute part of the rule, in requests (default 10).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub abs_margin: Option<u32>,
 }
 
-/// The consistent-hash scorer: a per-model ring keyed by the routing key or
-/// by the request's prefix, with a bounded-load rule.
+/// The consistent-hash scorer: a per-model ring keyed by the routing key
+/// and, under `prefix_tokens`, by the prefix of a request that carries none,
+/// with a bounded-load rule.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ConsistentHashParams {
@@ -566,8 +666,17 @@ pub struct ConsistentHashParams {
     #[serde(default = "one")]
     #[schemars(extend("exclusiveMinimum" = 0))]
     pub weight: f32,
-    /// How many prefix tokens hash when the ring keys by prefix; above zero
-    /// (default 256).
+    /// The depth in tokens at which a request with no routing key is keyed
+    /// by its prefix: the last whole block at or under the depth, so at
+    /// least one block of the view's block size and at most the blocks a
+    /// request carries. Under the view's `boundaries` a request that reaches
+    /// one is keyed there instead, at the deepest it reaches. The depth is
+    /// checked in the view's token blocks and read in the blocks a request
+    /// was hashed by. A text request's windows are `block_size` characters,
+    /// a quarter of a token block, so it carries a quarter of the checked
+    /// depth and a deeper depth keys at its last window. Under a block size
+    /// an engine published above the depth a request has no key. Absent, a
+    /// request with no routing key has none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1))]
     pub prefix_tokens: Option<u32>,
@@ -598,6 +707,18 @@ pub struct ResidentWorkParams {
     /// What one request a candidate holds adds to its resident tokens, in
     /// context tokens; zero compares the tokens alone.
     pub request_tokens: u32,
+}
+
+/// The `best` picker's parameters.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BestParams {
+    /// How many rows the picker draws where the host names the request's
+    /// holders and the pool's warming rows: a pool of more than twice this
+    /// many rows, and of at least 16, is decided by that sample and the
+    /// named rows, any other by the whole pool. From 1 to 64.
+    #[schemars(range(min = 1, max = 64))]
+    pub sample: u32,
 }
 
 /// The `best-with-temperature` picker's parameters.
@@ -943,6 +1064,7 @@ impl JsonSchema for ScoreSpec {
 #[derive(Clone, Debug, PartialEq, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum PickStage {
+    Best(BestParams),
     BestWithTemperature(BestWithTemperatureParams),
 }
 
@@ -950,6 +1072,7 @@ impl PickStage {
     /// The picker's name, as the document spells it.
     pub fn name(&self) -> &'static str {
         match self {
+            Self::Best(_) => "best",
             Self::BestWithTemperature(_) => "best-with-temperature",
         }
     }
@@ -995,6 +1118,11 @@ impl Serialize for PickSpec {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         match self {
             Self::Name(name) => serializer.serialize_str(name),
+            Self::Params(PickStage::Best(p)) => {
+                let mut map = serializer.serialize_map(Some(1))?;
+                map.serialize_entry("best", p)?;
+                map.end()
+            }
             Self::Params(PickStage::BestWithTemperature(p)) => {
                 let mut map = serializer.serialize_map(Some(1))?;
                 map.serialize_entry("best-with-temperature", p)?;
@@ -1006,11 +1134,12 @@ impl Serialize for PickSpec {
 
 /// The one picker of a pick entry's map, read by its key.
 fn picker_entry<'de, A: MapAccess<'de>>(mut map: A) -> Result<PickStage, A::Error> {
-    const WITH_PARAMETERS: [&str; 1] = ["best-with-temperature"];
+    const WITH_PARAMETERS: [&str; 2] = ["best", "best-with-temperature"];
     let Some(key) = map.next_key::<String>()? else {
         return Err(de::Error::custom("a pick entry names one picker"));
     };
     let stage = match key.as_str() {
+        "best" => PickStage::Best(map.next_value()?),
         "best-with-temperature" => PickStage::BestWithTemperature(map.next_value()?),
         other => return Err(de::Error::unknown_variant(other, &WITH_PARAMETERS)),
     };
@@ -1072,7 +1201,9 @@ impl JsonSchema for PickSpec {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ProfileSpec {
-    /// The hard filters, in order.
+    /// The hard filters, in order. Which workers the hard filters keep does
+    /// not turn on their order; a shed's reason does: a shed names the
+    /// first filter, in this order, that left nobody.
     #[serde(default)]
     pub filter: Vec<String>,
     /// The scorers, each a name or a name with its weight and parameters.
@@ -1154,8 +1285,9 @@ pub const OVERLOAD_WAITING_REQUESTS: u32 = 8;
 /// vetoed where a binding's overload block names no usage.
 pub const OVERLOAD_TOKEN_USAGE: f32 = 0.8;
 
-/// The overload veto's defaults for the binding's workers: evaluated per
-/// load report by the host and latched, never per request; a worker's own
+/// The overload veto's defaults for the workers of the pools decided under
+/// the binding, as the binding's `overload` field says: evaluated per load
+/// report by the host and latched, never per request; a worker's own
 /// registration thresholds resolve over these.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields, default)]
@@ -1374,12 +1506,19 @@ pub struct BindingSpec {
     /// The profiles per side: `single`, or every side of the plan
     /// (`prefill` and `decode`; `encode` too under `epd`), each named.
     #[serde(
-        default,
         deserialize_with = "keyed_once",
         skip_serializing_if = "BTreeMap::is_empty"
     )]
     pub profiles: BTreeMap<String, String>,
-    /// The overload veto's defaults for the binding's workers.
+    /// The overload veto's defaults for the workers of the pools decided
+    /// under the binding: the pools whose model and phase it is the first
+    /// to match. A decode pool of a model whose prefill lookup resolves to
+    /// a pair binding (`pd-pair` or `epd`) is decided under that binding,
+    /// so its block judges the pool: a decode-phase binding's block is not
+    /// read for it, and a pair binding with its block switched off leaves
+    /// the pool unjudged. Where a binding of another plan takes the
+    /// model's prefill lookup first, no pair decision runs for the model
+    /// and its decode pool is the decode phase's own.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub overload: Option<OverloadSpec>,
     /// Sticky sessions.
@@ -1486,6 +1625,12 @@ pub enum SpecError {
     TooManyProfiles { count: usize, max: u16 },
     #[error("view.headers names {count} headers; at most {max}")]
     TooManyHeaders { count: usize, max: usize },
+    #[error("{path} lists {count} entries; at most {max}")]
+    TooManyListed {
+        path: &'static str,
+        count: usize,
+        max: usize,
+    },
     #[error("binding {index}: profiles names an unknown side {side:?}")]
     UnknownSide { index: usize, side: String },
     #[error("binding {index}: the {plan} plan has no {side:?} side")]
@@ -1540,6 +1685,61 @@ pub enum SpecError {
     NoCanonicalForm(String),
 }
 
+impl SpecError {
+    /// The field of the document the error is about, as a path from the
+    /// document's root in the document's own names (`profiles.default.pick`,
+    /// `bindings[2].match.model`): what a `SpecIssue` carries. It names the
+    /// field to edit: an unknown stage is at the list that names it, a
+    /// binding's error at the binding's field, and a path the validator
+    /// built is handed back as it stands. Empty where the error is about no
+    /// one field of a document.
+    pub fn field_path(&self) -> String {
+        match self {
+            Self::Kind(_) => "kind".to_owned(),
+            Self::ApiVersion(_) => "apiVersion".to_owned(),
+            Self::UnknownFilter { profile, .. } => format!("profiles.{profile}.filter"),
+            Self::UnknownScorer { profile, .. } | Self::PickerRunsNoScorer { profile, .. } => {
+                format!("profiles.{profile}.score")
+            }
+            Self::UnknownPicker { profile, .. } | Self::PickerNeedsScorer { profile, .. } => {
+                format!("profiles.{profile}.pick")
+            }
+            Self::UnknownProfile { index, .. } => format!("bindings[{index}]"),
+            Self::NoProfile { index }
+            | Self::ProfileUnderPlan { index, .. }
+            | Self::ProfileTwice { index } => format!("bindings[{index}].profile"),
+            Self::SideUnnamed { index, side, .. } => format!("bindings[{index}].profiles.{side}"),
+            Self::UnknownSide { index, side } | Self::SideNotInPlan { index, side, .. } => {
+                format!("bindings[{index}].profiles.{side}")
+            }
+            Self::PlanPhases { index, .. } => format!("bindings[{index}].match.phase"),
+            Self::BadModelGlob { index, .. } => format!("bindings[{index}].match.model"),
+            // The one sessions refusal that is about the binding's plan.
+            Self::BadSessions {
+                index,
+                name: "plan",
+                ..
+            } => format!("bindings[{index}].plan"),
+            Self::BadSessions { index, name, .. } => format!("bindings[{index}].sessions.{name}"),
+            Self::NoBindings { .. } => "bindings".to_owned(),
+            Self::IndexOverlap { first, .. } => format!("index.{first}"),
+            Self::HashIndexNeedsBoundaries { model } => format!("index.{model}.kind"),
+            Self::TooManyProfiles { .. } | Self::Empty => "profiles".to_owned(),
+            Self::TooManyHeaders { .. } => "view.headers".to_owned(),
+            Self::TooManyListed { path, .. } => (*path).to_owned(),
+            Self::BadField { path, .. }
+            | Self::NotInBuild { path, .. }
+            | Self::DeniedHeader { path, .. }
+            | Self::HeaderNotAllowed { path, .. }
+            | Self::Duplicate { path, .. }
+            | Self::UnknownProfileAt { path, .. }
+            | Self::CanaryForm { path, .. }
+            | Self::Reserved { path, .. } => path.clone(),
+            Self::UnknownPreset(_) | Self::NoCanonicalForm(_) => String::new(),
+        }
+    }
+}
+
 /// A field path under construction, for the messages.
 struct At(String);
 
@@ -1565,11 +1765,11 @@ impl At {
     }
 
     /// A written number passes `ok`, or is refused for `reason`.
-    fn number(
+    fn number<T: Copy + fmt::Display>(
         &self,
         name: &str,
-        value: Option<f32>,
-        ok: fn(f32) -> bool,
+        value: Option<T>,
+        ok: fn(T) -> bool,
         reason: &'static str,
     ) -> Result<(), SpecError> {
         match value {
@@ -1602,7 +1802,8 @@ fn unit_interval(v: f32) -> bool {
     v.is_finite() && (0.0..=1.0).contains(&v)
 }
 
-fn at_least_one(v: f32) -> bool {
+fn at_least_one<T: Into<f64>>(v: T) -> bool {
+    let v: f64 = v.into();
     v.is_finite() && v >= 1.0
 }
 
@@ -1686,22 +1887,76 @@ fn check_view(view: &ViewSpec, denied: &[&str]) -> Result<(), SpecError> {
             }
         }
     }
-    at.nonzero("max_block_hashes", Some(view.max_block_hashes))
+    at.nonzero("max_block_hashes", Some(view.max_block_hashes))?;
+    if view.max_block_hashes > MAX_BLOCK_HASHES {
+        return Err(at.bad(
+            "max_block_hashes",
+            view.max_block_hashes,
+            "at most 8190, the hashes one Decide frame carries",
+        ));
+    }
+    check_list(&view.labels, "view.labels", MAX_LABELS)?;
+    for (i, label) in view.labels.iter().enumerate() {
+        let (key, value) = selector(label);
+        if key.is_empty() || value == Some("") {
+            return Err(SpecError::BadField {
+                path: format!("view.labels[{i}]"),
+                value: format!("{label:?}"),
+                reason: "a label key or `key=value` with no empty side",
+            });
+        }
+    }
+    check_list(&view.zones, "view.zones", MAX_ZONES)?;
+    check_list(&view.engines, "view.engines", MAX_ENGINES)
+}
+
+/// A label selector's two sides: the key, and the value after the first
+/// `=` when it names one.
+fn selector(label: &str) -> (&str, Option<&str>) {
+    label
+        .split_once('=')
+        .map_or((label, None), |(key, value)| (key, Some(value)))
+}
+
+/// A list the view declares: at most `max` entries, none empty, each once.
+fn check_list(list: &[String], path: &'static str, max: usize) -> Result<(), SpecError> {
+    if list.len() > max {
+        return Err(SpecError::TooManyListed {
+            path,
+            count: list.len(),
+            max,
+        });
+    }
+    if let Some(i) = list.iter().position(String::is_empty) {
+        return Err(SpecError::BadField {
+            path: format!("{path}[{i}]"),
+            value: "\"\"".to_string(),
+            reason: "a name",
+        });
+    }
+    check_unique(list, path)
 }
 
 fn check_index(index: &BTreeMap<String, IndexSpec>, view: &ViewSpec) -> Result<(), SpecError> {
     for (model, spec) in index {
-        let at = At::new(format!("index.{model}"));
+        // The key's path is built at a refusal alone: a key that passes
+        // formats nothing.
+        let at = || At::new(format!("index.{model}"));
         if !glob_ok(model) {
             return Err(SpecError::BadField {
-                path: at.0,
+                path: at().0,
                 value: model.clone(),
                 reason: "an id, `prefix*`, `*suffix` or `*`",
             });
         }
-        at.nonzero("ttl_s", Some(spec.ttl_s))?;
-        at.nonzero("max_size", Some(spec.max_size))?;
-        at.nonzero("sweep_s", Some(spec.sweep_s))?;
+        let counts = [
+            ("ttl_s", u64::from(spec.ttl_s)),
+            ("max_size", spec.max_size),
+            ("sweep_s", u64::from(spec.sweep_s)),
+        ];
+        if let Some((name, zero)) = counts.into_iter().find(|(_, count)| *count == 0) {
+            return Err(at().bad(name, zero, "above zero"));
+        }
         if spec.kind == IndexKind::Hash && view.boundaries.is_empty() {
             return Err(SpecError::HashIndexNeedsBoundaries {
                 model: model.clone(),
@@ -1886,6 +2141,67 @@ impl Deferred {
     }
 }
 
+/// What a prefix depth breaks against the view that carries a request's
+/// block hashes: `under` when it holds no whole block of the view's block
+/// size, `over` when a request carries no block that deep.
+fn depth_edge(
+    depth: u32,
+    gates: Gates,
+    view: &ViewSpec,
+    under: &'static str,
+    over: &'static str,
+) -> Option<&'static str> {
+    match depth / gates.block_size {
+        0 => Some(under),
+        blocks if blocks > view.max_block_hashes => Some(over),
+        _ => None,
+    }
+}
+
+/// A consistent-hash stage's prefix depths against the view. A key is the
+/// last whole block at or under its depth, so `prefix_tokens` and each of
+/// the view's boundaries hold at least one block and no more blocks than a
+/// request carries.
+fn check_prefix_depth(
+    stage: &ScoreStage,
+    gates: Gates,
+    view: &ViewSpec,
+    at: &At,
+) -> Result<(), SpecError> {
+    let ScoreStage::ConsistentHash(ConsistentHashParams {
+        prefix_tokens: Some(tokens),
+        ..
+    }) = stage
+    else {
+        return Ok(());
+    };
+    if let Some(reason) = depth_edge(
+        *tokens,
+        gates,
+        view,
+        "at least one block of view.block_size",
+        "at most view.max_block_hashes blocks of view.block_size",
+    ) {
+        return Err(at.bad("prefix_tokens", tokens, reason));
+    }
+    for (i, &boundary) in view.boundaries.iter().enumerate() {
+        if let Some(reason) = depth_edge(
+            boundary,
+            gates,
+            view,
+            "at least one block of view.block_size under a consistent-hash prefix key",
+            "at most view.max_block_hashes blocks of view.block_size under a consistent-hash prefix key",
+        ) {
+            return Err(SpecError::BadField {
+                path: format!("view.boundaries[{i}]"),
+                value: boundary.to_string(),
+                reason,
+            });
+        }
+    }
+    Ok(())
+}
+
 fn built_scorer(scorer: impl Scorer + 'static) -> Resolved<Box<dyn Scorer>> {
     Resolved::Built(Box::new(scorer))
 }
@@ -1906,7 +2222,8 @@ fn gates_of(p: &ProfileSpec, view: &ViewSpec) -> Gates {
     Gates::of(affinity, kv, view.block_size)
 }
 
-fn scorer_of(stage: &ScoreStage, gates: Gates) -> Resolved<Box<dyn Scorer>> {
+/// The stage's scorer. `boundaries` are the view's, where a prefix ring keys.
+fn scorer_of(stage: &ScoreStage, gates: Gates, boundaries: &[u32]) -> Resolved<Box<dyn Scorer>> {
     match stage {
         ScoreStage::LeastLoad(p) => built_scorer(LeastLoad::new(
             p.kv_pressure_weight.unwrap_or(0.15),
@@ -1933,10 +2250,13 @@ fn scorer_of(stage: &ScoreStage, gates: Gates) -> Resolved<Box<dyn Scorer>> {
         ScoreStage::KvPressure(_) => built_scorer(KvPressure),
         ScoreStage::WarmupSlice(p) => built_scorer(WarmupSlice::new(p, gates)),
         ScoreStage::Bucket(_) => Resolved::NotInBuild("the bucket scorer"),
-        ScoreStage::ConsistentHash(p) if p.prefix_tokens.is_some() => {
-            Resolved::NotInBuild("the consistent-hash prefix key")
+        ScoreStage::ConsistentHash(p) => {
+            let ring = ConsistentHash::new(p.bounded_load.as_ref());
+            built_scorer(match p.prefix_tokens {
+                Some(tokens) => ring.keyed_by_prefix(tokens, gates, boundaries),
+                None => ring,
+            })
         }
-        ScoreStage::ConsistentHash(p) => built_scorer(ConsistentHash::new(p.bounded_load.as_ref())),
         ScoreStage::ResidentWork(p) => built_scorer(ResidentWork::new(p.request_tokens)),
     }
 }
@@ -1965,6 +2285,16 @@ fn picker_of(
                 })
             }
         },
+        PickSpec::Params(PickStage::Best(p)) => {
+            if !(1..=MAX_SAMPLE).contains(&p.sample) {
+                return Err(at.sub("pick").sub("best").bad(
+                    "sample",
+                    p.sample,
+                    "a whole number from 1 to 64",
+                ));
+            }
+            Resolved::Built(Box::new(SampledBest::new(p.sample)))
+        }
         PickSpec::Params(PickStage::BestWithTemperature(p)) => {
             if !at_or_above_zero(p.temperature) {
                 return Err(at.sub("pick").sub("best-with-temperature").bad(
@@ -2060,13 +2390,63 @@ fn added_weight(written: &serde_json::Value, at: &At) -> Result<f32, SpecError> 
     Ok(weight)
 }
 
+/// How deep the stages of one generation read a request's block hashes, in
+/// the depths' own order: a deeper read holds every shallower one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+enum HashDepth {
+    /// No stage reads them.
+    #[default]
+    Unread,
+    /// The deepest prefix a stage keys at, in tokens.
+    Tokens(u32),
+    /// A stage reads the list whole, as far as the view's cap carries it.
+    Whole,
+}
+
+impl HashDepth {
+    /// What a stage that declares `needs` reads when it names no depth of
+    /// its own: the list whole where it declares the request's hashes.
+    fn of(needs: Needs) -> Self {
+        if needs.request_hashes() {
+            Self::Whole
+        } else {
+            Self::Unread
+        }
+    }
+
+    /// What a built scorer reads: a consistent-hash stage keyed by a prefix
+    /// reads as deep as its `prefix_tokens` or the deepest of the view's
+    /// `boundaries`, where a request that reaches one is keyed, and any
+    /// other stage as its `needs` declare.
+    fn of_scorer(stage: &ScoreStage, boundaries: &[u32], needs: Needs) -> Self {
+        match stage {
+            ScoreStage::ConsistentHash(ConsistentHashParams {
+                prefix_tokens: Some(tokens),
+                ..
+            }) => {
+                let deepest = boundaries.iter().copied().max().unwrap_or(0);
+                Self::Tokens(deepest.max(*tokens))
+            }
+            _ => Self::of(needs),
+        }
+    }
+
+    /// This depth or `other`, the deeper.
+    fn deepen(&mut self, other: Self) {
+        *self = (*self).max(other);
+    }
+}
+
 /// One profile's stages, built when this build carries every one of them.
+/// `depth` is deepened to what the built stages read of a request's block
+/// hashes.
 fn check_profile(
     name: &str,
     p: &ProfileSpec,
     view: &ViewSpec,
     catalog: &Catalog,
     deferred: &mut Deferred,
+    depth: &mut HashDepth,
 ) -> Result<Option<Profile>, SpecError> {
     let gates = gates_of(p, view);
     let at = At::new(format!("profiles.{name}"));
@@ -2088,17 +2468,23 @@ fn check_profile(
         let stage = match scored(entry, name, &entry_at, catalog)? {
             Scored::Typed(stage) => stage,
             Scored::Built(weighted) => {
+                depth.deepen(HashDepth::of(weighted.scorer.needs()));
                 scorers.push(weighted);
                 continue;
             }
         };
         let stage_at = entry_at.sub(stage.name());
         check_stage(&stage, &stage_at)?;
-        match scorer_of(&stage, gates) {
-            Resolved::Built(scorer) => scorers.push(Weighted {
-                scorer,
-                weight: stage.weight(),
-            }),
+        check_prefix_depth(&stage, gates, view, &stage_at)?;
+        match scorer_of(&stage, gates, &view.boundaries) {
+            Resolved::Built(scorer) => {
+                let read = HashDepth::of_scorer(&stage, &view.boundaries, scorer.needs());
+                depth.deepen(read);
+                scorers.push(Weighted {
+                    scorer,
+                    weight: stage.weight(),
+                });
+            }
             Resolved::NotInBuild(what) => {
                 complete = false;
                 deferred.note(stage_at.0, what);
@@ -2112,6 +2498,23 @@ fn check_profile(
             None
         }
     };
+    // A host that makes some lifecycle calls only holds no stage that needs
+    // them: it would decide on state nothing keeps. Every entry of a
+    // complete profile is built, so a scorer stands at its entry's place.
+    if complete && !catalog.makes_lifecycle_calls() {
+        let mut entries = p.score.iter().zip(&scorers).enumerate();
+        let scorer = entries.find_map(|(i, (entry, built))| {
+            let needs = built.scorer.needs_lifecycle();
+            needs.then(|| format!("{}.score[{i}].{}", at.0, entry.name()))
+        });
+        let needs = picker
+            .as_ref()
+            .is_some_and(|picker| picker.needs_lifecycle());
+        if let Some(path) = scorer.or_else(|| needs.then(|| at.field("pick"))) {
+            complete = false;
+            deferred.note(path, "the lifecycle this stage needs");
+        }
+    }
     if p.score.is_empty() && SAMPLING_PICKERS.contains(&p.pick.name()) {
         return Err(SpecError::PickerNeedsScorer {
             profile: name.to_string(),
@@ -2128,12 +2531,17 @@ fn check_profile(
         });
     }
     Ok(match picker {
-        Some(picker) if complete => Some(Profile {
-            name: name.to_string(),
-            filters,
-            scorers,
-            picker,
-        }),
+        Some(picker) if complete => {
+            // A filter and a picker name no depth of their own.
+            let unkeyed = filters.iter().map(|filter| filter.needs());
+            depth.deepen(HashDepth::of(unkeyed.fold(picker.needs(), Needs::or)));
+            Some(Profile {
+                name: name.to_string(),
+                filters,
+                scorers,
+                picker,
+            })
+        }
         _ => None,
     })
 }
@@ -2527,13 +2935,14 @@ fn session_rule(
 
 /// The ten preset names of today, as whole profiles. The ones whose stages
 /// this build does not carry yet answer `UnknownPreset`.
-pub const PRESETS: [&str; 8] = [
+pub const PRESETS: [&str; 9] = [
     "random",
     "round_robin",
     "passthrough",
     "power_of_two",
     "least_load",
     "consistent_hashing",
+    "prefix_hash",
     "manual",
     "cache_aware",
 ];
@@ -2629,6 +3038,31 @@ impl PolicySpec {
                 score: vec!["consistent-hash".into()],
                 pick: "best".into(),
             },
+            // The ring owner of the request's key: its routing key, else its
+            // prefix at 256 tokens. An owner past the bounded-load rule is
+            // passed over and a request with no key has no owner: the
+            // fewest requests in flight take both. The ring's weight is by
+            // arithmetic: an owner leads the ring's next member by a
+            // quarter of the stage's score and the count ranges over one
+            // whole score, so any weight past four keeps a kept owner above
+            // the least loaded worker. The pick names no sample: the owner
+            // must be among the rows scored, so the pool is read whole.
+            "prefix_hash" => ProfileSpec {
+                filter: standard_filters(),
+                score: vec![
+                    ScoreStage::ConsistentHash(ConsistentHashParams {
+                        weight: 8.0,
+                        prefix_tokens: Some(256),
+                        bounded_load: Some(BoundedLoadParams {
+                            factor: Some(1.25),
+                            abs_margin: Some(10),
+                        }),
+                    })
+                    .into(),
+                    "least-requests".into(),
+                ],
+                pick: "best".into(),
+            },
             // Sticky sessions over a random assignment: a key stays with the
             // first worker it was placed on, no in-flight cap, the first
             // worker back in the lead when it recovers; the idle TTL of four
@@ -2661,7 +3095,9 @@ impl PolicySpec {
                     "kv-pressure".into(),
                     "least-load".into(),
                 ],
-                pick: "best".into(),
+                // A large pool is decided by a draw of sixteen rows and the
+                // rows the host names: its holders and its warming rows.
+                pick: PickStage::Best(BestParams { sample: 16 }).into(),
             },
             other => return Err(SpecError::UnknownPreset(other.to_string())),
         };
@@ -2767,12 +3203,26 @@ impl PolicySpec {
     ///
     /// Every field is checked in shape first; a field this build cannot
     /// honour (a stage, a plan, a matcher or a binding rule of a later step)
-    /// is then refused by name as [`SpecError::NotInBuild`].
+    /// is then refused by name as [`SpecError::NotInBuild`], and so is a
+    /// stage that needs the lifecycle's calls
+    /// ([`crate::Lifecycle::needs_lifecycle`]) under the standalone
+    /// controller, which makes the membership call alone.
     pub fn validate_in(
         &self,
         catalog: &Catalog,
         denied_headers: &[&str],
     ) -> Result<Engine, SpecError> {
+        let (engine, _) = self.built(catalog, denied_headers)?;
+        Ok(engine)
+    }
+
+    /// [`PolicySpec::validate_in`], and beside the engine how deep its
+    /// stages read a request's block hashes.
+    fn built(
+        &self,
+        catalog: &Catalog,
+        denied_headers: &[&str],
+    ) -> Result<(Engine, HashDepth), SpecError> {
         if let Some(kind) = &self.kind {
             return Err(SpecError::Kind(kind.clone()));
         }
@@ -2796,6 +3246,7 @@ impl PolicySpec {
         check_view(&self.view, denied_headers)?;
         check_index(&self.index, &self.view)?;
         let mut deferred = Deferred::default();
+        let mut depth = HashDepth::default();
         // What no stage declares: the sessions rules' counts and the view's
         // headers. The engine folds every profile's stages in.
         let mut needs = Needs::default();
@@ -2804,7 +3255,15 @@ impl PolicySpec {
         // positions only once nothing is deferred.
         let mut by_assignment = Vec::new();
         for (name, profile) in &self.profiles {
-            if let Some(built) = check_profile(name, profile, &self.view, catalog, &mut deferred)? {
+            let built = check_profile(
+                name,
+                profile,
+                &self.view,
+                catalog,
+                &mut deferred,
+                &mut depth,
+            )?;
+            if let Some(built) = built {
                 if built.picker.by_assignment() {
                     by_assignment.push(name.as_str());
                 }
@@ -2823,6 +3282,9 @@ impl PolicySpec {
             positions.insert(name.as_str(), position);
         }
         let mut bindings = Vec::with_capacity(self.bindings.len());
+        // The built bindings whose document sheds a pool the overload veto
+        // empties, by their place in `bindings`.
+        let mut sheds = Vec::new();
         for (index, binding) in self.bindings.iter().enumerate() {
             let cx = BindingContext {
                 index,
@@ -2832,6 +3294,13 @@ impl PolicySpec {
                 by_assignment: &by_assignment,
             };
             if let Some(built) = check_binding(binding, &cx, &mut needs, &mut deferred)? {
+                if binding
+                    .overload
+                    .as_ref()
+                    .is_some_and(|overload| overload.shed_when_all_vetoed)
+                {
+                    sheds.push(bindings.len());
+                }
                 bindings.push(built);
             }
         }
@@ -2856,7 +3325,11 @@ impl PolicySpec {
             });
         }
         needs.headers |= !self.view.headers.is_empty();
-        Ok(Engine::new(profiles, bindings, self.generation, needs))
+        let mut engine = Engine::new(profiles, bindings, self.generation, needs);
+        for at in sheds {
+            engine.shed_when_all_vetoed(at);
+        }
+        Ok((engine, depth))
     }
 
     /// A document of this version with the given profiles and nothing else
@@ -3018,14 +3491,24 @@ impl io::Write for HashWriter<'_> {
 /// It carries the document's digest beside the number ([`Digest`]): the
 /// number says which generation a replica runs, the digest which document,
 /// and one load reads the pair.
+///
+/// It also holds what a store derives under, beside the engine: the
+/// document's pairing mode ([`AppliedSpec::pairing`]). And it says how deep
+/// a host hashes a request for it ([`AppliedSpec::block_hashes_read`]).
 #[derive(Debug)]
 pub struct AppliedSpec {
     engine: Engine,
     /// The digest of the document the engine was validated from; none for
     /// the unbound start, which has no document.
     digest: Option<Digest>,
-    /// The document's `view.max_block_hashes`.
+    /// How deep the engine's stages read a request's block hashes.
+    depth: HashDepth,
+    /// The document's `view.max_block_hashes`: no read is past it.
     max_block_hashes: u32,
+    /// The view's block size: a request that names none is counted by it.
+    block_size: u32,
+    pairing: Pairing,
+    lists: ViewLists,
 }
 
 impl AppliedSpec {
@@ -3040,12 +3523,8 @@ impl AppliedSpec {
         document: &PolicySpec,
         denied_headers: &[&str],
     ) -> Result<Self, SpecError> {
-        let engine = document.validate_with(denied_headers)?;
-        Ok(Self {
-            engine,
-            digest: Some(document.digest()?),
-            max_block_hashes: document.view.max_block_hashes,
-        })
+        let built = document.built(&STOCK, denied_headers)?;
+        Ok(Self::of(document, document.digest()?, built))
     }
 
     /// [`AppliedSpec::validate`] over the stages `catalog` holds, under a
@@ -3058,23 +3537,38 @@ impl AppliedSpec {
         digest: Digest,
         catalog: &Catalog,
     ) -> Result<Self, SpecError> {
-        let engine = document.validate_in(catalog, &[])?;
-        Ok(Self {
+        let built = document.built(catalog, &[])?;
+        Ok(Self::of(document, digest, built))
+    }
+
+    /// The generation of `document` under its `digest`: the engine it
+    /// validated into, with the depth of that engine's stages.
+    fn of(document: &PolicySpec, digest: Digest, (engine, depth): (Engine, HashDepth)) -> Self {
+        Self {
             engine,
             digest: Some(digest),
+            depth,
             max_block_hashes: document.view.max_block_hashes,
-        })
+            block_size: Gates::of(None, None, document.view.block_size).block_size,
+            pairing: document.plans.pd_pair.pairing,
+            lists: ViewLists::of(&document.view),
+        }
     }
 
     /// The generation a store holds before any document is applied: number
     /// 0, an engine with no profile and no binding, which declines every
-    /// decision by name as an engine declines a model no binding covers.
+    /// decision by name as an engine declines a model no binding covers,
+    /// and the pairing mode a document that names none has.
     #[must_use]
     pub fn unbound() -> Self {
         Self {
             engine: Engine::new(Vec::new(), Vec::new(), 0, Needs::default()),
             digest: None,
+            depth: HashDepth::Unread,
             max_block_hashes: ViewSpec::default().max_block_hashes,
+            block_size: Gates::default().block_size,
+            pairing: Pairing::default(),
+            lists: ViewLists::default(),
         }
     }
 
@@ -3098,12 +3592,40 @@ impl AppliedSpec {
         &self.engine
     }
 
-    /// How many of a request's prefix block hashes a decision under this
-    /// generation reads: the document's `view.max_block_hashes`. A host
-    /// hands the engine the first that many of a longer list.
+    /// The most prefix block hashes of one request a decision under this
+    /// generation reads: the document's `view.max_block_hashes`. What a
+    /// decision reads of a request is [`Self::block_hashes_read`], this
+    /// many at most.
     #[must_use]
     pub fn max_block_hashes(&self) -> usize {
         usize::try_from(self.max_block_hashes).unwrap_or(usize::MAX)
+    }
+
+    /// How many of a request's prefix block hashes a decision under this
+    /// generation reads, for a request counted in `kind` by blocks of
+    /// `block_size`, `0` for the view's size. The generation's depth is in
+    /// tokens, the deepest `prefix_tokens` of its consistent-hash stages,
+    /// and the blocks are the request's own, counted as the key counts
+    /// them. A stage that declares the request's hashes and names no depth
+    /// reads to the cap ([`Self::max_block_hashes`]), which no depth is
+    /// past, and a generation with no such stage reads none. A host hashes
+    /// that many blocks of a request and no more, and hands the engine the
+    /// first that many of a longer list.
+    #[must_use]
+    pub fn block_hashes_read(&self, kind: HashKind, block_size: u32) -> usize {
+        let blocks = match self.depth {
+            HashDepth::Unread => 0,
+            HashDepth::Tokens(tokens) => {
+                let block_size = if block_size > 0 {
+                    block_size
+                } else {
+                    self.block_size
+                };
+                blocks_within(tokens, kind, block_size).min(self.max_block_hashes)
+            }
+            HashDepth::Whole => self.max_block_hashes,
+        };
+        usize::try_from(blocks).unwrap_or(usize::MAX)
     }
 
     /// What the host must feed under this generation
@@ -3112,34 +3634,327 @@ impl AppliedSpec {
     pub fn needs(&self) -> Needs {
         self.engine.needs()
     }
+
+    /// The mode a store derives its pair classes under while this
+    /// generation stands: the document's `plans.pd-pair.pairing`.
+    #[must_use]
+    pub fn pairing(&self) -> Pairing {
+        self.pairing
+    }
+
+    /// The lists this generation declares, as a store reads them when it
+    /// writes a worker's row.
+    #[must_use]
+    pub fn lists(&self) -> &ViewLists {
+        &self.lists
+    }
+}
+
+/// The lists a generation declares, as a store reads them when it writes a
+/// worker's row ([`Candidate`](crate::view::Candidate)): the row names its
+/// engine family and its zone by a position from 1, and holds one bit for
+/// each label selector the worker meets. Built once, at validation.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ViewLists {
+    /// The label selectors in their keys' order, each with its bit: a
+    /// worker's labels are in their keys' order too, so one pass over the
+    /// two finds every selector the worker meets.
+    labels: Vec<LabelSelector>,
+    zones: FxHashMap<Box<str>, u16>,
+    engines: FxHashMap<Box<str>, u16>,
+}
+
+/// One label selector: its key, the value it asks for when it names one,
+/// and its bit, which is its place in the document's list.
+#[derive(Debug, PartialEq, Eq)]
+struct LabelSelector {
+    key: Box<str>,
+    value: Option<Box<str>>,
+    bit: u8,
+}
+
+/// What one worker's registration reads as under a generation's lists.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Listed {
+    /// The position of the worker's engine family, from 1; `0` when the
+    /// list does not name it.
+    pub engine_kind: u16,
+    /// The position of the worker's zone, from 1; `0` for a worker with no
+    /// zone and for a zone the list does not name.
+    pub zone: u16,
+    /// One bit for each label selector the worker meets.
+    pub labels: u64,
+    /// The worker names an engine family, and the list holds entries and
+    /// not that one.
+    pub engine_outside: bool,
+    /// The worker names a zone, and the list holds entries and not that
+    /// one.
+    pub zone_outside: bool,
+}
+
+impl ViewLists {
+    fn of(view: &ViewSpec) -> Self {
+        let positions = |list: &[String]| {
+            let named = list.iter().zip(1u16..);
+            named.map(|(name, at)| (name.as_str().into(), at)).collect()
+        };
+        let sides = |(label, bit): (&String, u8)| {
+            let (key, value) = selector(label);
+            LabelSelector {
+                key: key.into(),
+                value: value.map(Into::into),
+                bit,
+            }
+        };
+        let mut labels: Vec<LabelSelector> = view.labels.iter().zip(0u8..).map(sides).collect();
+        // The sort is stable: selectors of one key keep the list's order.
+        labels.sort_by(|a, b| a.key.cmp(&b.key));
+        Self {
+            labels,
+            zones: positions(&view.zones),
+            engines: positions(&view.engines),
+        }
+    }
+
+    /// Whether the generation declares no list: every row reads 0 in the
+    /// three fields, and a store looks nothing up.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.labels.is_empty() && self.zones.is_empty() && self.engines.is_empty()
+    }
+
+    /// A worker's three fields under these lists, from the engine family,
+    /// the zone and the labels of its registration.
+    #[must_use]
+    pub fn listed(
+        &self,
+        engine: &str,
+        zone: Option<&str>,
+        labels: &BTreeMap<String, String>,
+    ) -> Listed {
+        let engine_at = self.engines.get(engine).copied();
+        let zone = zone.filter(|zone| !zone.is_empty());
+        let zone_at = zone.and_then(|zone| self.zones.get(zone).copied());
+        Listed {
+            engine_kind: engine_at.unwrap_or(0),
+            zone: zone_at.unwrap_or(0),
+            labels: self.met(labels),
+            engine_outside: engine_at.is_none() && !engine.is_empty() && !self.engines.is_empty(),
+            zone_outside: zone_at.is_none() && zone.is_some() && !self.zones.is_empty(),
+        }
+    }
+
+    /// The bits of the selectors a worker's labels meet, in one pass over
+    /// the two, each in its keys' order.
+    fn met(&self, labels: &BTreeMap<String, String>) -> u64 {
+        let mut bits = 0;
+        let mut wanted = self.labels.iter().peekable();
+        'held: for (key, held) in labels {
+            while let Some(want) = wanted.peek() {
+                match (*want.key).cmp(key.as_str()) {
+                    Ordering::Less => {}
+                    Ordering::Greater => continue 'held,
+                    Ordering::Equal => {
+                        let value = want.value.as_deref();
+                        let met = value.is_none_or(|value| value == held.as_str());
+                        bits |= u64::from(met) << want.bit;
+                    }
+                }
+                wanted.next();
+            }
+            break;
+        }
+        bits
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{Candidate, Constraints, Filter, Lifecycle, RequestFacts, Targets, TieBand};
 
     #[test]
-    fn an_applied_generation_keeps_its_views_cap_on_block_hashes() {
-        let mut document = PolicySpec::preset("random").expect("a preset of this build");
-        document.generation = 1;
-        let cap = |document: &PolicySpec| {
-            AppliedSpec::validate(document)
-                .expect("the preset validates")
-                .max_block_hashes()
+    fn an_applied_generation_reads_block_hashes_as_deep_as_its_stages_do() {
+        use HashKind::{Text, Token};
+        let preset = |name: &str| {
+            let mut document = PolicySpec::preset(name).expect("a preset of this build");
+            document.generation = 1;
+            document
         };
-        assert_eq!(cap(&document), 256);
-        document.view.max_block_hashes = 128;
-        assert_eq!(cap(&document), 128);
+        let applied = |document: &PolicySpec| {
+            AppliedSpec::validate(document).expect("the document validates")
+        };
+        // No stage of the random preset reads the hashes, and the unbound
+        // start has no stage.
+        let random = applied(&preset("random"));
+        assert_eq!(random.block_hashes_read(Token, 0), 0);
+        assert_eq!(random.block_hashes_read(Text, 0), 0);
+        assert_eq!(AppliedSpec::unbound().block_hashes_read(Token, 0), 0);
         assert_eq!(AppliedSpec::unbound().max_block_hashes(), 256);
+        // A prefix key 256 tokens deep, in the request's own blocks: 16 of
+        // the view's 16 tokens, 32 of a request counted by 8 and 8 of one
+        // counted by 32, and of a text its 1,024 characters in blocks of
+        // the size it was counted by. The cap stays the document's.
+        let mut keyed = preset("prefix_hash");
+        let ring = applied(&keyed);
+        assert_eq!(ring.block_hashes_read(Token, 0), 16);
+        assert_eq!(ring.block_hashes_read(Token, 8), 32);
+        assert_eq!(ring.block_hashes_read(Token, 32), 8);
+        assert_eq!(ring.block_hashes_read(Text, 0), 64);
+        assert_eq!(ring.block_hashes_read(Text, 64), 16);
+        assert_eq!(ring.max_block_hashes(), 256);
+        // A request that names no block size is counted by the view's, and
+        // no depth is past the view's cap.
+        keyed.view.block_size = Some(32);
+        keyed.view.max_block_hashes = 24;
+        let ring = applied(&keyed);
+        assert_eq!(ring.max_block_hashes(), 24);
+        assert_eq!(ring.block_hashes_read(Token, 0), 8);
+        assert_eq!(ring.block_hashes_read(Text, 0), 24);
         // The controller's door builds a generation under a digest it took
-        // already: that builder keeps the cap too.
+        // already: that builder keeps the depth too.
         #[cfg(feature = "controller")]
         {
-            let digest = document.digest().expect("the document digests");
-            let applied = AppliedSpec::validate_digested(&document, digest, &Catalog::builtin())
+            let digest = keyed.digest().expect("the document digests");
+            let applied = AppliedSpec::validate_digested(&keyed, digest, &Catalog::builtin())
                 .expect("the preset validates");
-            assert_eq!(applied.max_block_hashes(), 128);
+            assert_eq!(applied.block_hashes_read(Token, 0), 8);
         }
+        // A stage with no depth of its own reads to the view's cap.
+        let mut held = preset("cache_aware");
+        assert_eq!(applied(&held).block_hashes_read(Token, 0), 256);
+        held.view.max_block_hashes = 128;
+        assert_eq!(applied(&held).block_hashes_read(Text, 4), 128);
+        // A generation reads as deep as the deepest of its profiles.
+        let two = doc(
+            r#"{"apiVersion":"smg.policy/v1","profiles":{"p":{"score":[{"consistent-hash":{"prefix_tokens":256}}],"pick":"best"},"q":{"score":[{"consistent-hash":{"prefix_tokens":512}}],"pick":"best"}},"bindings":[{"match":{"model":"a*"},"profiles":{"single":"p"}},{"match":{"model":"*"},"profiles":{"single":"q"}}]}"#,
+        );
+        assert_eq!(applied(&two).block_hashes_read(Token, 0), 32);
+        // Under a view's boundaries a prefix key is read at the deepest one
+        // a request reaches, so the generation reads as deep as that one,
+        // and no shallower than the key's own depth.
+        let mut levelled = preset("prefix_hash");
+        levelled.view.boundaries = vec![64, 1024];
+        assert_eq!(applied(&levelled).block_hashes_read(Token, 0), 64);
+        levelled.view.boundaries = vec![64];
+        assert_eq!(applied(&levelled).block_hashes_read(Token, 0), 16);
+    }
+
+    /// A guest stage of each kind, under the name it is registered by, that
+    /// declares the request's token hashes and names no depth.
+    #[derive(Debug)]
+    struct ReadsHashes(&'static str);
+
+    impl ReadsHashes {
+        fn declared() -> Needs {
+            Needs {
+                token_hashes: true,
+                ..Needs::default()
+            }
+        }
+    }
+
+    impl Lifecycle for ReadsHashes {}
+
+    impl Filter for ReadsHashes {
+        fn name(&self) -> &'static str {
+            self.0
+        }
+
+        fn keep(&self, _: &RequestFacts<'_>, _: &Candidate, _: &Constraints<'_>) -> bool {
+            true
+        }
+
+        fn needs(&self) -> Needs {
+            Self::declared()
+        }
+    }
+
+    impl Scorer for ReadsHashes {
+        fn name(&self) -> &'static str {
+            self.0
+        }
+
+        fn score(
+            &self,
+            _: &RequestFacts<'_>,
+            _: &[Candidate],
+            _: &[u32],
+            out: &mut [f32],
+        ) -> TieBand {
+            out.fill(0.0);
+            TieBand::NORMALIZED
+        }
+
+        fn needs(&self) -> Needs {
+            Self::declared()
+        }
+    }
+
+    impl Picker for ReadsHashes {
+        fn name(&self) -> &'static str {
+            self.0
+        }
+
+        fn pick(
+            &self,
+            _: &RequestFacts<'_>,
+            _: &[Candidate],
+            _: &[u32],
+            _: &[f32],
+            _: TieBand,
+            _: &mut Targets,
+        ) {
+        }
+
+        fn needs(&self) -> Needs {
+            Self::declared()
+        }
+    }
+
+    #[test]
+    fn a_stage_that_names_no_depth_reads_the_block_hashes_to_the_cap() {
+        let mut catalog = Catalog::builtin();
+        catalog
+            .filter("hashing-filter", || Box::new(ReadsHashes("hashing-filter")))
+            .and_then(|catalog| {
+                catalog.scorer("hashing-scorer", || Box::new(ReadsHashes("hashing-scorer")))
+            })
+            .and_then(|catalog| {
+                catalog.picker("hashing-picker", || Box::new(ReadsHashes("hashing-picker")))
+            })
+            .expect("three free names");
+        let depth = |profile: &str| {
+            let document = doc(&format!(
+                r#"{{"apiVersion":"smg.policy/v1","profiles":{{"p":{profile}}}}}"#
+            ));
+            let (_, depth) = document
+                .built(&catalog, &[])
+                .expect("the document validates");
+            depth
+        };
+        assert_eq!(depth(r#"{"pick":"random"}"#), HashDepth::Unread);
+        // A guest of each kind declares the hashes and names no depth.
+        for profile in [
+            r#"{"filter":["hashing-filter"],"pick":"random"}"#,
+            r#"{"score":["hashing-scorer"],"pick":"best"}"#,
+            r#"{"pick":"hashing-picker"}"#,
+        ] {
+            assert_eq!(depth(profile), HashDepth::Whole, "{profile}");
+        }
+        // A prefix key reads to its own depth, and beside a stage that
+        // reads the list whole the generation reads it whole.
+        let key = r#"{"consistent-hash":{"prefix_tokens":256}}"#;
+        assert_eq!(
+            depth(&format!(r#"{{"score":[{key}],"pick":"best"}}"#)),
+            HashDepth::Tokens(256)
+        );
+        assert_eq!(
+            depth(&format!(
+                r#"{{"score":[{key},"hashing-scorer"],"pick":"best"}}"#
+            )),
+            HashDepth::Whole
+        );
     }
 
     fn doc(text: &str) -> PolicySpec {
@@ -3198,7 +4013,12 @@ mod tests {
             let engine = spec.validate().expect(name);
             let load_aware = ["least_load", "power_of_two", "cache_aware"].contains(&name);
             assert_eq!(engine.needs().loads, load_aware, "{name}");
-            assert_eq!(engine.needs().ring, name == "consistent_hashing", "{name}");
+            let ring = ["consistent_hashing", "prefix_hash"].contains(&name);
+            assert_eq!(engine.needs().ring, ring, "{name}");
+            // A request's block hashes are fed where a stage reads them: the
+            // affinity stage and the ring's prefix form.
+            let hashes = ["cache_aware", "prefix_hash"].contains(&name);
+            assert_eq!(engine.needs().token_hashes, hashes, "{name}");
             assert_eq!(engine.needs().events, name == "cache_aware", "{name}");
             // The affinity column is fed where an affinity stage reads it
             // and nowhere else: a preset without one declares no column.
@@ -3206,6 +4026,11 @@ mod tests {
             assert_eq!(engine.needs().headers, name == "manual", "{name}");
             assert!(!engine.needs().active_sessions, "{name}");
             assert!(!engine.needs().session_in_flight, "{name}");
+            // A worker's requests in flight are declared where a stage
+            // reads them: the load scorer, the ring's bounded-load rule
+            // beside the fewest requests, the affinity stages.
+            let counted = ["power_of_two", "least_load", "prefix_hash", "cache_aware"];
+            assert_eq!(engine.needs().in_flight, counted.contains(&name), "{name}");
             assert!(engine.profile_for("any", Phase::Single).is_some(), "{name}");
             // One profile bound to every model and phase: the per-phase and
             // per-binding reads are the summary.
@@ -3239,7 +4064,10 @@ mod tests {
           ]
         }"#;
         let engine = doc(text).validate().expect("validates");
+        // What the `least-load` scorer reads: a worker's reports and its
+        // requests in flight.
         let loads = Needs {
+            in_flight: true,
             loads: true,
             ..Needs::default()
         };
@@ -3309,6 +4137,104 @@ mod tests {
         assert_eq!(engine.needs_for("pd/x", Phase::Prefill), Needs::default());
         assert_eq!(engine.needs_for_phase(Phase::Decode), loads.or(headers));
         assert_eq!(engine.needs_for_phase(Phase::Prefill), Needs::default());
+    }
+
+    /// The needs rows are what a host must feed: a host that feeds, for a
+    /// model and a phase, every row whose glob matches the model feeds what
+    /// the decision of that model and phase reads, with no copy of the
+    /// bindings' order or of the pair's rule. A pair's decode profile is a
+    /// decode row of the pair binding's glob, two bindings of one glob write
+    /// one row a phase, and nothing to feed is no row.
+    #[test]
+    fn the_needs_rows_feed_what_every_decision_reads() {
+        /// What a host feeds for `model` and `phase`: the union of the rows
+        /// whose glob matches.
+        fn fed(engine: &Engine, model: &str, phase: Phase) -> Needs {
+            engine
+                .needs_rows()
+                .into_iter()
+                .filter(|(glob, at, _)| {
+                    let matches = match (glob.strip_prefix('*'), glob.strip_suffix('*')) {
+                        _ if *glob == "*" => true,
+                        (Some(suffix), _) => model.ends_with(suffix),
+                        (_, Some(prefix)) => model.starts_with(prefix),
+                        _ => *glob == model,
+                    };
+                    matches && *at == phase
+                })
+                .fold(Needs::default(), |fed, (_, _, needs)| fed.or(needs))
+        }
+        // What the `least-load` scorer reads: a worker's reports and its
+        // requests in flight.
+        let loads = Needs {
+            in_flight: true,
+            loads: true,
+            ..Needs::default()
+        };
+        let headers = Needs {
+            headers: true,
+            ..Needs::default()
+        };
+        let phases = [Phase::Single, Phase::Prefill, Phase::Decode, Phase::Encode];
+
+        // A decode-phase binding before a pair binding, and a catch-all that
+        // reads nothing: the pair's decode profile is a row of the pair's
+        // glob, and the catch-all writes none.
+        let text = r#"{
+          "apiVersion": "smg.policy/v1",
+          "profiles": {
+            "decode-only": { "filter": ["healthy"], "score": ["least-load"], "pick": "best" },
+            "prefill": { "filter": ["healthy"], "pick": "round-robin" },
+            "pair-decode": { "filter": ["healthy"], "score": ["session-affinity"], "pick": "best" },
+            "default": { "filter": ["healthy"], "pick": "round-robin" }
+          },
+          "bindings": [
+            { "match": { "model": "*", "phase": ["decode"] }, "profile": "decode-only" },
+            { "match": { "model": "pd/*", "phase": ["prefill", "decode"] }, "plan": "pd-pair", "profiles": { "prefill": "prefill", "decode": "pair-decode" } },
+            { "match": { "model": "*" }, "profile": "default" }
+          ]
+        }"#;
+        let engine = doc(text).validate().expect("validates");
+        assert_eq!(
+            engine.needs_rows(),
+            [
+                ("*", Phase::Decode, loads),
+                ("pd/*", Phase::Decode, headers)
+            ]
+        );
+        for model in ["pd/x", "other"] {
+            for phase in phases {
+                assert_eq!(
+                    fed(&engine, model, phase),
+                    engine.needs_for(model, phase),
+                    "{model} {phase:?}"
+                );
+            }
+        }
+
+        // Two bindings of one glob write one row a phase. The first decides
+        // the single phase and reads the headers there: the union feeds the
+        // loads over its word, and never under it.
+        let text = r#"{
+          "apiVersion": "smg.policy/v1",
+          "profiles": {
+            "keyed": { "filter": ["healthy"], "score": ["session-affinity"], "pick": "best" },
+            "loaded": { "filter": ["healthy"], "score": ["least-load"], "pick": "best" }
+          },
+          "bindings": [
+            { "match": { "model": "m", "phase": ["single"] }, "profile": "keyed" },
+            { "match": { "model": "m" }, "profile": "loaded" }
+          ]
+        }"#;
+        let engine = doc(text).validate().expect("validates");
+        assert_eq!(engine.needs_for("m", Phase::Single), headers);
+        assert_eq!(
+            engine.needs_rows(),
+            phases.map(|phase| match phase {
+                Phase::Single => ("m", phase, headers.or(loads)),
+                _ => ("m", phase, loads),
+            })
+        );
     }
 
     #[test]
@@ -3447,6 +4373,36 @@ mod tests {
         assert_eq!(read.profiles.len(), 2);
         assert_eq!(read.index.len(), 1);
         assert_eq!(read.bindings[0].profiles["single"], "p");
+    }
+
+    /// The YAML form of the three maps is refused in the same words: its
+    /// reader hands a key written twice to the map's own read, which kept
+    /// the last of the two before.
+    #[test]
+    fn a_map_key_written_twice_in_yaml_is_refused_by_name() {
+        let documents = [
+            (
+                "apiVersion: smg.policy/v1\nprofiles:\n  p: {pick: random}\n  p: {pick: round-robin}\n",
+                "p",
+            ),
+            (
+                "apiVersion: smg.policy/v1\nindex:\n  \"a*\": {}\n  \"a*\": {ttl_s: 1}\nprofiles:\n  p: {pick: random}\n",
+                "a*",
+            ),
+            (
+                "apiVersion: smg.policy/v1\nprofiles:\n  p: {pick: random}\nbindings:\n  - match: {model: \"*\"}\n    profiles: {single: p, single: p}\n",
+                "single",
+            ),
+        ];
+        for (document, key) in documents {
+            let refused = serde_yaml::from_str::<PolicySpec>(document)
+                .expect_err("a key written twice")
+                .to_string();
+            assert!(
+                refused.contains(&format!("the key `{key}` is written twice")),
+                "{refused}"
+            );
+        }
     }
 
     #[test]
@@ -3934,9 +4890,125 @@ mod tests {
             bad_field(&spec_with_view(r#"{"max_block_hashes":0}"#)),
             "view.max_block_hashes"
         );
+        // One frame of the Decide call carries 8,190 hashes: that cap is
+        // taken, and one above it is refused by the field's name.
+        let cap = |hashes: u32| spec_with_view(&format!(r#"{{"max_block_hashes":{hashes}}}"#));
+        assert!(cap(MAX_BLOCK_HASHES).validate().is_ok());
+        let refused = cap(MAX_BLOCK_HASHES + 1)
+            .validate()
+            .expect_err("a cap one frame cannot carry");
+        assert_eq!(
+            refused.to_string(),
+            "view.max_block_hashes = 8191 is not at most 8190, the hashes one Decide frame carries"
+        );
         let spec = spec_with_view(r#"{"block_size":128,"boundaries":[256,1024,4096]}"#);
         assert!(spec.validate().is_ok());
         assert_eq!(spec.view.max_block_hashes, 256);
+    }
+
+    #[test]
+    fn the_view_lists_are_capped_named_and_listed_once() {
+        let list = |count: usize| {
+            let names: Vec<String> = (0..count).map(|n| format!("\"n{n}\"")).collect();
+            format!("[{}]", names.join(","))
+        };
+        let caps = [
+            ("labels", MAX_LABELS),
+            ("zones", MAX_ZONES),
+            ("engines", MAX_ENGINES),
+        ];
+        for (field, max) in caps {
+            let at_cap = spec_with_view(&format!(r#"{{"{field}":{}}}"#, list(max)));
+            assert!(at_cap.validate().is_ok(), "{field}");
+            let over = spec_with_view(&format!(r#"{{"{field}":{}}}"#, list(max + 1)));
+            assert!(
+                matches!(
+                    over.validate(),
+                    Err(SpecError::TooManyListed { path, count, max: cap })
+                        if path == format!("view.{field}") && count == max + 1 && cap == max
+                ),
+                "{field}"
+            );
+            let unnamed = spec_with_view(&format!(r#"{{"{field}":["a",""]}}"#));
+            assert_eq!(bad_field(&unnamed), format!("view.{field}[1]"));
+            let twice = spec_with_view(&format!(r#"{{"{field}":["a","b","a"]}}"#));
+            assert!(
+                matches!(
+                    twice.validate(),
+                    Err(SpecError::Duplicate { path, name })
+                        if path == format!("view.{field}") && name == "a"
+                ),
+                "{field}"
+            );
+        }
+        // A label is a key, or a key and a value split at the first `=`:
+        // neither side is empty, and the value may hold a `=` of its own.
+        for label in ["=gold", "tier="] {
+            let empty = spec_with_view(&format!(r#"{{"labels":["tier","{label}"]}}"#));
+            assert_eq!(bad_field(&empty), "view.labels[1]", "{label}");
+        }
+        let spec = spec_with_view(r#"{"labels":["tier","tier=gold","note=a=b"]}"#);
+        assert!(spec.validate().is_ok());
+    }
+
+    #[test]
+    fn a_view_that_declares_no_list_is_written_as_before() {
+        let written = serde_json::to_string(&ViewSpec::default()).expect("the view serializes");
+        for field in ["labels", "zones", "engines"] {
+            assert!(!written.contains(field), "{written}");
+        }
+        let spec =
+            spec_with_view(r#"{"labels":["tier=gold"],"zones":["east"],"engines":["alpha"]}"#);
+        let written = serde_json::to_string(&spec.view).expect("the view serializes");
+        let read: ViewSpec = serde_json::from_str(&written).expect("the view reads back");
+        assert_eq!(read, spec.view);
+        assert_eq!(
+            (read.labels.len(), read.zones.len(), read.engines.len()),
+            (1, 1, 1)
+        );
+    }
+
+    #[test]
+    fn the_lists_read_a_worker_by_position_and_by_bit() {
+        let labels = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
+            let owned = |(key, value): &(&str, &str)| ((*key).to_string(), (*value).to_string());
+            pairs.iter().map(owned).collect()
+        };
+        let spec = spec_with_view(
+            r#"{"labels":["tier","tier=gold","note=a=b"],"zones":["east","west"],"engines":["alpha","beta"]}"#,
+        );
+        let applied = AppliedSpec::validate(&spec).expect("the document validates");
+        let lists = applied.lists();
+        assert!(!lists.is_empty());
+        let held = labels(&[("tier", "gold"), ("note", "a=b")]);
+        let gold = lists.listed("beta", Some("west"), &held);
+        assert_eq!((gold.engine_kind, gold.zone, gold.labels), (2, 2, 0b111));
+        assert!(!gold.engine_outside && !gold.zone_outside);
+        let held = labels(&[("tier", "silver"), ("note", "a")]);
+        let silver = lists.listed("alpha", Some("east"), &held);
+        assert_eq!(
+            (silver.engine_kind, silver.zone, silver.labels),
+            (1, 1, 0b001)
+        );
+        // A bit is the selector's place in the list, whatever the keys'
+        // order: two selectors of one key stand apart here.
+        let mixed = spec_with_view(r#"{"labels":["z","b=1","m","b","a=2","q=x"]}"#);
+        let mixed = AppliedSpec::validate(&mixed).expect("the document validates");
+        let held = labels(&[("a", "2"), ("b", "1"), ("c", "9"), ("m", ""), ("q", "y")]);
+        assert_eq!(mixed.lists().listed("", None, &held).labels, 0b01_1110);
+        // A name the list does not hold reads 0 and says so. No name reads
+        // 0 and is not outside.
+        let stray = lists.listed("gamma", Some("north"), &labels(&[]));
+        assert_eq!((stray.engine_kind, stray.zone, stray.labels), (0, 0, 0));
+        assert!(stray.engine_outside && stray.zone_outside);
+        for zone in [None, Some("")] {
+            assert_eq!(lists.listed("", zone, &labels(&[])), Listed::default());
+        }
+        // No list: every worker reads 0 and none is outside.
+        let none = AppliedSpec::validate(&spec_with_view("{}")).expect("the document validates");
+        assert!(none.lists().is_empty() && AppliedSpec::unbound().lists().is_empty());
+        let read = none.lists().listed("beta", Some("west"), &held);
+        assert_eq!(read, Listed::default());
     }
 
     #[test]
@@ -3947,8 +5019,17 @@ mod tests {
             ))
         };
         assert_eq!(bad_field(&with_index(r#"{"a*b":{}}"#, "{}")), "index.a*b");
+        // Each count is above zero, refused by its own name, the first
+        // written in the type's order where two are zero.
+        for count in ["ttl_s", "max_size", "sweep_s"] {
+            let index = format!(r#"{{"*":{{"{count}":0}}}}"#);
+            assert_eq!(
+                bad_field(&with_index(&index, "{}")),
+                format!("index.*.{count}")
+            );
+        }
         assert_eq!(
-            bad_field(&with_index(r#"{"*":{"ttl_s":0}}"#, "{}")),
+            bad_field(&with_index(r#"{"*":{"sweep_s":0,"ttl_s":0}}"#, "{}")),
             "index.*.ttl_s"
         );
         assert_eq!(
@@ -3963,6 +5044,25 @@ mod tests {
         );
         assert!(hashed.validate().is_ok());
         assert_eq!(hashed.index["chat-*"].sweep_s, 120);
+    }
+
+    /// A zero count of an index key is refused whole: by its path, its
+    /// value and its reason.
+    #[test]
+    fn a_zero_count_of_an_index_key_is_refused_by_path_value_and_reason() {
+        for count in ["ttl_s", "max_size", "sweep_s"] {
+            let spec = doc(&format!(
+                r#"{{"apiVersion":"smg.policy/v1","index":{{"*":{{"{count}":0}}}},"profiles":{{"p":{{"pick":"best"}}}}}}"#
+            ));
+            assert_eq!(
+                spec.validate().err(),
+                Some(SpecError::BadField {
+                    path: format!("index.*.{count}"),
+                    value: "0".to_owned(),
+                    reason: "above zero",
+                })
+            );
+        }
     }
 
     #[test]
@@ -4051,10 +5151,6 @@ mod tests {
                 "prefix-affinity",
             ),
             (r#"{"bucket":{"abs_threshold":32}}"#, "bucket"),
-            (
-                r#"{"consistent-hash":{"prefix_tokens":512,"bounded_load":{"factor":1.5,"abs_margin":4}}}"#,
-                "consistent-hash",
-            ),
         ];
         for (score, name) in with_params {
             let (path, what) = not_in_build(&spec_with_score(score));
@@ -4066,16 +5162,97 @@ mod tests {
         let resident = spec_with_score(r#"{"resident-work":{"request_tokens":512}}"#);
         assert!(resident.validate().expect("validates").needs().loads);
         // The consistent-hash scorer is in the build with its bounded-load
-        // rule; the prefix key form waits for the block hashes in the view.
+        // rule and with its prefix form, which reads the request's block
+        // hashes; without the form it asks for none.
         let bounded = spec_with_score(r#"{"consistent-hash":{"bounded_load":{"factor":1.5}}}"#);
-        assert!(bounded.validate().expect("validates").needs().ring);
-        assert_eq!(
-            not_in_build(&spec_with_score(
-                r#"{"consistent-hash":{"prefix_tokens":512}}"#
-            ))
-            .1,
-            "the consistent-hash prefix key"
+        let needs = bounded.validate().expect("validates").needs();
+        assert!(needs.ring && !needs.token_hashes && !needs.text_hashes);
+        let prefix = spec_with_score(
+            r#"{"consistent-hash":{"prefix_tokens":512,"bounded_load":{"factor":1.5,"abs_margin":4}}}"#,
         );
+        let needs = prefix.validate().expect("validates").needs();
+        assert!(needs.ring && needs.token_hashes && needs.text_hashes);
+        // Under a view that names boundaries the prefix ring keys at the
+        // deepest one a request reaches, and asks for the same.
+        let levelled = doc(
+            r#"{"apiVersion":"smg.policy/v1","view":{"boundaries":[256,1024]},"profiles":{"p":{"score":[{"consistent-hash":{"prefix_tokens":512}}],"pick":"best"}}}"#,
+        );
+        let needs = levelled.validate().expect("validates").needs();
+        assert!(needs.ring && needs.token_hashes && needs.text_hashes);
+        // A ring with no prefix form reads no boundary and asks for no
+        // hashes there.
+        let plain = doc(
+            r#"{"apiVersion":"smg.policy/v1","view":{"boundaries":[256,1024]},"profiles":{"p":{"score":[{"consistent-hash":{"bounded_load":{"factor":1.5}}}],"pick":"best"}}}"#,
+        );
+        let needs = plain.validate().expect("validates").needs();
+        assert!(needs.ring && !needs.token_hashes && !needs.text_hashes);
+    }
+
+    /// The prefix depth is held to the view that carries the hashes: at
+    /// least one block of the view's block size, at most the blocks a
+    /// request carries.
+    #[test]
+    fn a_prefix_depth_the_view_cannot_carry_is_refused() {
+        let spec = |view: &str, tokens: u32| {
+            doc(&format!(
+                r#"{{"apiVersion":"smg.policy/v1","view":{view},"profiles":{{"p":{{"score":[{{"consistent-hash":{{"prefix_tokens":{tokens}}}}}],"pick":"best"}}}}}}"#
+            ))
+        };
+        let refused = |view: &str, tokens: u32| match spec(view, tokens).validate() {
+            Err(SpecError::BadField { path, reason, .. }) => {
+                assert_eq!(
+                    path, "profiles.p.score[0].consistent-hash.prefix_tokens",
+                    "{view} {tokens}"
+                );
+                reason
+            }
+            other => panic!("{view} {tokens}: validated as {other:?}"),
+        };
+        let under = "at least one block of view.block_size";
+        let over = "at most view.max_block_hashes blocks of view.block_size";
+        // The default view: blocks of 16 tokens, 256 of them a request.
+        for tokens in [16, 256, 4096, 4111] {
+            assert!(spec("{}", tokens).validate().is_ok(), "{tokens}");
+        }
+        assert_eq!(refused("{}", 15), under);
+        assert_eq!(refused("{}", 4112), over);
+        // The view's own block size and its cap move both edges.
+        let view = r#"{"block_size":64,"max_block_hashes":4}"#;
+        for tokens in [64, 256, 319] {
+            assert!(spec(view, tokens).validate().is_ok(), "{tokens}");
+        }
+        assert_eq!(refused(view, 63), under);
+        assert_eq!(refused(view, 320), over);
+        // Under a prefix key each of the view's boundaries is held to the
+        // same two edges.
+        let boundary = |boundaries: &str| {
+            let view = format!(r#"{{"boundaries":{boundaries}}}"#);
+            match spec(&view, 256).validate() {
+                Err(SpecError::BadField { path, reason, .. }) => (path, reason),
+                other => panic!("{boundaries}: validated as {other:?}"),
+            }
+        };
+        assert!(spec(r#"{"boundaries":[16,4096,4111]}"#, 256)
+            .validate()
+            .is_ok());
+        assert_eq!(
+            boundary("[8,64]"),
+            (
+                "view.boundaries[0]".to_string(),
+                "at least one block of view.block_size under a consistent-hash prefix key"
+            )
+        );
+        assert_eq!(
+            boundary("[64,4112]"),
+            (
+                "view.boundaries[1]".to_string(),
+                "at most view.max_block_hashes blocks of view.block_size under a consistent-hash prefix key"
+            )
+        );
+        // A view that no prefix key reads keeps such boundaries.
+        assert!(spec_with_view(r#"{"boundaries":[8,4112]}"#)
+            .validate()
+            .is_ok());
     }
 
     #[test]
@@ -4830,6 +6007,265 @@ mod tests {
         );
     }
 
+    /// Every refusal names the field it is about, in the document's own
+    /// names; a path the validator built is handed back as it stands.
+    #[test]
+    fn every_refusal_names_its_field() {
+        let word = || "x".to_owned();
+        let profile = || "default".to_owned();
+        let built = || "a.b[0]".to_owned();
+        let rows = [
+            (SpecError::Kind(word()), "kind"),
+            (SpecError::ApiVersion(word()), "apiVersion"),
+            (
+                SpecError::UnknownFilter {
+                    profile: profile(),
+                    name: word(),
+                },
+                "profiles.default.filter",
+            ),
+            (
+                SpecError::UnknownScorer {
+                    profile: profile(),
+                    name: word(),
+                },
+                "profiles.default.score",
+            ),
+            (
+                SpecError::PickerRunsNoScorer {
+                    profile: profile(),
+                    picker: word(),
+                },
+                "profiles.default.score",
+            ),
+            (
+                SpecError::UnknownPicker {
+                    profile: profile(),
+                    name: word(),
+                },
+                "profiles.default.pick",
+            ),
+            (
+                SpecError::PickerNeedsScorer {
+                    profile: profile(),
+                    picker: word(),
+                },
+                "profiles.default.pick",
+            ),
+            (
+                SpecError::UnknownProfile {
+                    index: 2,
+                    name: word(),
+                },
+                "bindings[2]",
+            ),
+            (SpecError::NoProfile { index: 2 }, "bindings[2].profile"),
+            (
+                SpecError::ProfileUnderPlan {
+                    index: 2,
+                    plan: "pd-pair",
+                },
+                "bindings[2].profile",
+            ),
+            (SpecError::ProfileTwice { index: 2 }, "bindings[2].profile"),
+            (
+                SpecError::SideUnnamed {
+                    index: 2,
+                    plan: "pd-pair",
+                    side: "decode",
+                },
+                "bindings[2].profiles.decode",
+            ),
+            (
+                SpecError::UnknownSide {
+                    index: 2,
+                    side: "left".to_owned(),
+                },
+                "bindings[2].profiles.left",
+            ),
+            (
+                SpecError::SideNotInPlan {
+                    index: 2,
+                    plan: "single",
+                    side: "decode".to_owned(),
+                },
+                "bindings[2].profiles.decode",
+            ),
+            (
+                SpecError::PlanPhases {
+                    index: 2,
+                    plan: "pd-pair",
+                    side: "decode",
+                },
+                "bindings[2].match.phase",
+            ),
+            (
+                SpecError::BadModelGlob {
+                    index: 2,
+                    model: word(),
+                },
+                "bindings[2].match.model",
+            ),
+            (
+                SpecError::BadSessions {
+                    index: 2,
+                    name: "plan",
+                    reason: "so",
+                },
+                "bindings[2].plan",
+            ),
+            (
+                SpecError::BadSessions {
+                    index: 2,
+                    name: "sweep_s",
+                    reason: "so",
+                },
+                "bindings[2].sessions.sweep_s",
+            ),
+            (SpecError::NoBindings { profiles: 2 }, "bindings"),
+            (
+                SpecError::IndexOverlap {
+                    first: "a*".to_owned(),
+                    second: "*b".to_owned(),
+                },
+                "index.a*",
+            ),
+            (
+                SpecError::HashIndexNeedsBoundaries {
+                    model: "a*".to_owned(),
+                },
+                "index.a*.kind",
+            ),
+            (
+                SpecError::TooManyProfiles {
+                    count: 70_000,
+                    max: u16::MAX,
+                },
+                "profiles",
+            ),
+            (SpecError::Empty, "profiles"),
+            (
+                SpecError::TooManyHeaders {
+                    count: 300,
+                    max: 256,
+                },
+                "view.headers",
+            ),
+            (
+                SpecError::TooManyListed {
+                    path: "view.zones",
+                    count: 300,
+                    max: 256,
+                },
+                "view.zones",
+            ),
+            (
+                SpecError::BadField {
+                    path: built(),
+                    value: word(),
+                    reason: "so",
+                },
+                "a.b[0]",
+            ),
+            (
+                SpecError::NotInBuild {
+                    path: built(),
+                    what: "it",
+                },
+                "a.b[0]",
+            ),
+            (
+                SpecError::DeniedHeader {
+                    path: built(),
+                    name: word(),
+                },
+                "a.b[0]",
+            ),
+            (
+                SpecError::HeaderNotAllowed {
+                    path: built(),
+                    name: word(),
+                },
+                "a.b[0]",
+            ),
+            (
+                SpecError::Duplicate {
+                    path: built(),
+                    name: word(),
+                },
+                "a.b[0]",
+            ),
+            (
+                SpecError::UnknownProfileAt {
+                    path: built(),
+                    name: word(),
+                },
+                "a.b[0]",
+            ),
+            (
+                SpecError::CanaryForm {
+                    path: built(),
+                    count: 2,
+                },
+                "a.b[0]",
+            ),
+            (
+                SpecError::Reserved {
+                    path: built(),
+                    reason: "so",
+                },
+                "a.b[0]",
+            ),
+            (SpecError::UnknownPreset(word()), ""),
+            (SpecError::NoCanonicalForm(word()), ""),
+        ];
+        for (error, path) in rows {
+            assert_eq!(error.field_path(), path, "{error}");
+        }
+    }
+
+    /// The path is the validator's own finding's: a document refused for a
+    /// stage, a weight, a binding or its version reads the field to edit.
+    #[test]
+    fn a_refused_document_reads_the_field_to_edit() {
+        let refused = |document: &str| {
+            let document: PolicySpec = serde_yaml::from_str(document).expect("a document");
+            document.validate().expect_err("refused").field_path()
+        };
+        let profile =
+            |stages: &str| format!("apiVersion: smg.policy/v1\nprofiles:\n  default:\n{stages}");
+        assert_eq!(
+            refused(&profile("    filter: [nowhere]\n    pick: random\n")),
+            "profiles.default.filter"
+        );
+        assert_eq!(
+            refused(&profile("    pick: nothing\n")),
+            "profiles.default.pick"
+        );
+        let weight = refused(&profile(
+            "    score: [{ least-load: { weight: -1.0 } }]\n    pick: best\n",
+        ));
+        assert!(weight.starts_with("profiles.default.score[0]"), "{weight}");
+        let bound = |binding: &str| {
+            refused(&format!(
+                "{}bindings:\n  - {binding}\n",
+                profile("    pick: random\n")
+            ))
+        };
+        assert_eq!(
+            bound("{ match: { model: \"*\" }, profile: nowhere }"),
+            "bindings[0]"
+        );
+        assert_eq!(
+            bound("{ match: { model: \"a*b*\" }, profile: default }"),
+            "bindings[0].match.model"
+        );
+        assert_eq!(
+            refused("apiVersion: smg.policy/v9\nprofiles:\n  default:\n    pick: random\n"),
+            "apiVersion"
+        );
+    }
+
     #[test]
     fn a_document_built_in_code_is_this_version_and_validates() {
         let mut profiles = spec_with_binding(r#"{"profile":"p"}"#).profiles;
@@ -5133,5 +6569,53 @@ mod tests {
         let applied = AppliedSpec::validate_digested(&document, handed, &Catalog::builtin())
             .expect("a preset validates");
         assert_eq!(applied.digest(), Some(handed));
+    }
+
+    /// A digest handed on moves nothing else of the generation: its pairing
+    /// mode is the document's, as where the generation digests the document
+    /// itself.
+    #[cfg(feature = "controller")]
+    #[test]
+    fn a_generation_under_a_handed_digest_takes_its_documents_pairing_mode() {
+        let mut document = PolicySpec::preset("least_load").expect("a preset");
+        document.plans.pd_pair.pairing = Pairing::Strict;
+        let digest = document.digest().expect("a digest");
+        let handed = AppliedSpec::validate_digested(&document, digest, &Catalog::builtin())
+            .expect("a preset validates");
+        assert_eq!(handed.pairing(), Pairing::Strict);
+        let own = AppliedSpec::validate(&document).expect("a preset validates");
+        assert_eq!(own.pairing(), Pairing::Strict);
+    }
+
+    /// `best` takes a sample in the parameter form and stays the unit by its
+    /// name: the sample is a whole number from 1 to 64 and the profile's
+    /// need, and the cache-aware preset states sixteen.
+    #[test]
+    fn the_best_picker_takes_a_sample_in_the_parameter_form() {
+        let sampled = spec_with_pick(r#"{"best":{"sample":16}}"#);
+        let engine = sampled.validate().expect("validates");
+        assert_eq!(engine.needs().sample, 16);
+        let written = serde_json::to_string(&sampled).expect("serializes");
+        assert!(
+            written.contains(r#""pick":{"best":{"sample":16}}"#),
+            "{written}"
+        );
+        assert_eq!(doc(&written), sampled);
+        // By its name it is the unit: the whole pool, and no sample needed.
+        let unit = spec_with_pick(r#""best""#);
+        assert_eq!(unit.validate().expect("validates").needs().sample, 0);
+        for sample in [0, 65] {
+            let pick = format!(r#"{{"best":{{"sample":{sample}}}}}"#);
+            assert_eq!(
+                bad_field(&spec_with_pick(&pick)),
+                "profiles.p.pick.best.sample"
+            );
+        }
+        let err = parse_error(
+            r#"{"apiVersion":"smg.policy/v1","profiles":{"p":{"pick":{"best":{"draws":4}}}}}"#,
+        );
+        assert!(err.contains("unknown field `draws`"), "{err}");
+        let preset = PolicySpec::preset("cache_aware").expect("a preset");
+        assert_eq!(preset.validate().expect("validates").needs().sample, 16);
     }
 }

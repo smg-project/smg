@@ -57,11 +57,35 @@ NAME = "smg-policy-controller"
 ON = ("policyController.enabled=true",)
 # The block with the election turned on.
 ELECTED = (*ON, "policyController.election.enabled=true")
+# The spellings of an election that is off.
+OFF = ((), ("policyController.election.enabled=false",), ("policyController.election=null",))
+# The strategy of a controller with the election off: no pod more at a
+# time, so the old pod is told to stop before the new one is made. The type
+# is the rolling update's, as with the election on.
+LONE_STRATEGY = {"type": "RollingUpdate", "rollingUpdate": {"maxSurge": 0, "maxUnavailable": 1}}
 # The variable the elected controller's address is read from: the kubelet
 # writes the pod's address in place of $(POD_IP).
 POD_IP = {"name": "POD_IP", "valueFrom": {"fieldRef": {"fieldPath": "status.podIP"}}}
 # The settle window the controller takes when the chart passes none.
 DEFAULT_SETTLE_SECONDS = 5
+# A policy spec document the stock controller runs, another one, and one no
+# build runs: its filter is none the controller knows.
+LEAST_LOAD = {
+    "apiVersion": "smg.policy/v1",
+    "profiles": {"default": {"filter": ["healthy"], "score": ["least-load"], "pick": "best"}},
+}
+RANDOM = {
+    "apiVersion": "smg.policy/v1",
+    "profiles": {"default": {"filter": ["healthy"], "pick": "random"}},
+}
+UNKNOWN_FILTER = {
+    "apiVersion": "smg.policy/v1",
+    "profiles": {"default": {"filter": ["no-such-filter"], "pick": "random"}},
+}
+# Where the pod mounts the document's ConfigMap, and the file under it that
+# the controller is passed.
+SPEC_MOUNT = "/etc/smg/policy-spec"
+SPEC_FILE = f"{SPEC_MOUNT}/spec.yaml"
 # The started controller is read on a loopback port: a proxy named in the
 # environment is not asked for it.
 DIRECT = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -79,10 +103,14 @@ def helm_template(
     files: tuple[Path, ...] = (),
     chart: Path = CHART,
     namespace: str = "default",
+    skip_schema: bool = False,
 ):
     command = ["helm", "template", "smg", str(chart), "--kube-version", KUBE_VERSION]
     # Pinned so the render never follows the kube context.
     command += ["--namespace", namespace]
+    if skip_schema:
+        # The helper's own refusals are read with the schema's check off.
+        command.append("--skip-schema-validation")
     for file in files:
         command += ["-f", str(file)]
     for setting in settings:
@@ -91,17 +119,23 @@ def helm_template(
 
 
 def render(
-    *settings: str, files: tuple[Path, ...] = (), chart: Path = CHART, namespace: str = "default"
+    *settings: str,
+    files: tuple[Path, ...] = (),
+    chart: Path = CHART,
+    namespace: str = "default",
+    skip_schema: bool = False,
 ) -> list[dict]:
     """The documents the chart renders with ``--set`` pairs."""
-    completed = helm_template(settings, files, chart, namespace)
+    completed = helm_template(settings, files, chart, namespace, skip_schema)
     assert completed.returncode == 0, completed.stderr
     return [document for document in yaml.safe_load_all(completed.stdout) if document]
 
 
-def render_error(*settings: str, files: tuple[Path, ...] = (), chart: Path = CHART) -> str:
+def render_error(
+    *settings: str, files: tuple[Path, ...] = (), chart: Path = CHART, skip_schema: bool = False
+) -> str:
     """Helm's error for ``--set`` pairs the chart must refuse."""
-    completed = helm_template(settings, files, chart)
+    completed = helm_template(settings, files, chart, skip_schema=skip_schema)
     assert completed.returncode != 0, "the chart rendered values it should refuse"
     return completed.stderr
 
@@ -134,6 +168,13 @@ def controller_args(*settings: str) -> list[str]:
     return container(render(*ON, *settings))["args"]
 
 
+def spec_values(directory: Path, document: object, name: str = "spec.yaml") -> Path:
+    """A values file that holds ``document`` as the controller's spec."""
+    values = directory / name
+    values.write_text(yaml.safe_dump({"policyController": {"spec": document}}))
+    return values
+
+
 def selects(selector: dict[str, str], labels: dict[str, str]) -> bool:
     return all(labels.get(key) == value for key, value in selector.items())
 
@@ -162,8 +203,8 @@ def chart_with_no_block(tmp_path) -> Path:
 @needs_helm
 def test_a_controller_that_is_off_asks_nothing_of_the_values(chart_with_no_block):
     """With no block, a null block over the chart's values or over none, the
-    switch alone named off or null, or one value and no switch, the chart
-    renders what its defaults render, byte for byte.
+    switch alone named off or null, or one value or a spec document and no
+    switch, the chart renders what its defaults render, byte for byte.
     Each again with the router's monitor on: the controller's monitor stands
     behind that switch."""
     cells = {
@@ -173,6 +214,10 @@ def test_a_controller_that_is_off_asks_nothing_of_the_values(chart_with_no_block
         "the switch alone, off": (chart_with_no_block, ("policyController.enabled=false",)),
         "the switch alone, null": (chart_with_no_block, ("policyController.enabled=null",)),
         "one value and no switch": (chart_with_no_block, ("policyController.ports.admin=9000",)),
+        "a document and no switch": (
+            chart_with_no_block,
+            ("policyController.spec.apiVersion=smg.policy/v1",),
+        ),
     }
     wrong = {}
     for monitor in ((), ("router.metrics.serviceMonitor.enabled=true",)):
@@ -426,8 +471,8 @@ def test_a_release_older_than_the_first_with_a_controller_image_is_refused():
 
 @needs_helm
 def test_the_block_renders_two_objects_and_the_election_four_more():
-    """No ConfigMap: it arrives with the controller flag that reads it. The
-    election's four objects stand behind the election's switch."""
+    """No ConfigMap without a spec document. The election's four objects
+    stand behind the election's switch."""
     documents = of_the_controller(render(*ON))
     assert sorted(document["kind"] for document in documents) == ["Deployment", "Service"]
     assert {document["metadata"]["name"] for document in documents} == {NAME}
@@ -456,6 +501,121 @@ def test_the_block_renders_two_objects_and_the_election_four_more():
         "Service",
         "ServiceMonitor",
     ]
+
+
+@needs_helm
+def test_a_spec_document_renders_its_configmap_its_mount_and_its_flag(tmp_path):
+    """A document in the values is the one key of one ConfigMap under the
+    controller's name. The pod mounts that ConfigMap whole and read-only,
+    and the controller is passed the key's file under the mount. A null and
+    an empty map are no document: none of the three is rendered."""
+    documents = render(*ON, files=(spec_values(tmp_path, LEAST_LOAD),))
+    assert sorted(document["kind"] for document in of_the_controller(documents)) == [
+        "ConfigMap",
+        "Deployment",
+        "Service",
+    ]
+    config = one(documents, "ConfigMap")
+    assert component(config) == COMPONENT
+    assert list(config["data"]) == [Path(SPEC_FILE).name]
+    assert yaml.safe_load(config["data"]["spec.yaml"]) == LEAST_LOAD
+    pod = one(documents, "Deployment")["spec"]["template"]["spec"]
+    found = container(documents)
+    # The whole ConfigMap, whose updates the kubelet projects (a subPath gets
+    # none), and not optional: the pod waits for it.
+    assert pod["volumes"] == [{"name": "policy-spec", "configMap": {"name": NAME}}]
+    assert found["volumeMounts"] == [
+        {"name": "policy-spec", "mountPath": SPEC_MOUNT, "readOnly": True}
+    ]
+    # The flag once, after the chart's other flags.
+    assert found["args"][-2:] == ["--spec-file", SPEC_FILE]
+    assert found["args"].count("--spec-file") == 1
+    # The read-only root filesystem stands: the mount is a volume of its own.
+    assert found["securityContext"]["readOnlyRootFilesystem"] is True
+    # A null and an empty map are no document: the render is the one of no
+    # spec value, byte for byte.
+    plain = helm_template(ON)
+    assert plain.returncode == 0, plain.stderr
+    assert helm_template((*ON, "policyController.spec=null")).stdout == plain.stdout
+    no_document = spec_values(tmp_path, {}, "empty.yaml")
+    assert helm_template(ON, files=(no_document,)).stdout == plain.stdout
+
+
+def without_the_document(documents: list[dict]) -> list[dict]:
+    """Every rendered object but the spec document's ConfigMap."""
+    config = one(documents, "ConfigMap")
+    return [document for document in documents if document is not config]
+
+
+@needs_helm
+@pytest.mark.parametrize("switches", [ON, ELECTED], ids=["alone", "elected"])
+def test_a_changed_document_changes_its_configmap_and_no_pod(switches, tmp_path):
+    """The pod template holds no checksum of the document. An upgrade to
+    another document renders another ConfigMap and every other object as it
+    was, so it moves no pod: the kubelet turns the mounted file and the
+    running controller reads it. A first document does move the pod: the
+    mount and the flag arrive with it."""
+    first = render(*switches, files=(spec_values(tmp_path, LEAST_LOAD, "first.yaml"),))
+    second = render(*switches, files=(spec_values(tmp_path, RANDOM, "second.yaml"),))
+    assert one(first, "ConfigMap")["data"] != one(second, "ConfigMap")["data"]
+    assert without_the_document(first) == without_the_document(second)
+    assert "annotations" not in one(first, "Deployment")["spec"]["template"]["metadata"]
+    assert one(first, "Deployment") != one(render(*switches), "Deployment")
+
+
+@needs_helm
+def test_the_document_reaches_the_file_as_the_values_hold_it(tmp_path):
+    """The chart reads no line of the document and writes none, so the file
+    reads back as the map the values hold. The map here is no document a
+    controller runs: it asks what the chart carries. Text that reads as a
+    number, a boolean or a null stays text; a list keeps its order; a null,
+    an empty list and an empty map stay what they are; a text of several
+    lines keeps its empty line; braces are no template. No generation line
+    is written, and one the document writes is handed on."""
+    carried = {
+        **LEAST_LOAD,
+        "order": ["c", "a", "b"],
+        "text": {
+            "number": "123",
+            "boolean": "true",
+            "null": "null",
+            "lines": "first\n\nthird\n",
+            "braces": "{{ .Values.none }}",
+        },
+        "numbers": {"whole": 67108864, "ratio": 0.3},
+        "nothing": None,
+        "empty": {"list": [], "map": {}},
+    }
+
+    def file(document: dict) -> str:
+        documents = render(*ON, files=(spec_values(tmp_path, document),))
+        return one(documents, "ConfigMap")["data"]["spec.yaml"]
+
+    written = file(carried)
+    assert yaml.safe_load(written) == carried
+    numbered = file({**carried, "generation": 7})
+    assert yaml.safe_load(numbered) == {**carried, "generation": 7}
+    # By value a whole number equals its float form. The text of its line
+    # holds the form: the controller's reader takes no float there.
+    assert "\n  whole: 67108864\n" in written
+    assert "\ngeneration: 7\n" in numbered
+
+
+@needs_helm
+@pytest.mark.parametrize("written", ["false", "0", '""', "[]", '"apiVersion: smg.policy/v1"'])
+def test_a_document_that_is_no_map_is_refused_though_it_reads_as_empty(
+    written: str, tmp_path: Path
+):
+    """With the schema's check skipped, a document that is no map is refused
+    as it was written. One that reads as empty never renders as no document,
+    and a document handed as one text is not written into the file as a
+    text: null and the empty map alone are no document."""
+    values = tmp_path / "values.yaml"
+    values.write_text(f"policyController:\n  spec: {written}\n")
+    refused = render_error(*ON, files=(values,), skip_schema=True)
+    assert f"policyController.spec is {written}: the policy spec document as a map" in refused
+    # The schema refuses each first, by its type.
+    assert "policyController.spec: Invalid type" in render_error(*ON, files=(values,))
 
 
 @needs_helm
@@ -674,7 +834,8 @@ def test_the_values_the_chart_hands_on_reach_their_objects(tmp_path):
             }
         )
     )
-    documents = render(*ON, files=(values,))
+    # Three replicas render with the election on alone.
+    documents = render(*ELECTED, files=(values,))
     deployment = one(documents, "Deployment")["spec"]
     pod = deployment["template"]["spec"]
     found = container(documents)
@@ -685,7 +846,7 @@ def test_the_values_the_chart_hands_on_reach_their_objects(tmp_path):
     assert pod["tolerations"] == handed_on["tolerations"]
     assert deployment["template"]["metadata"]["annotations"] == handed_on["podAnnotations"]
     assert deployment["template"]["metadata"]["labels"]["team"] == "routing"
-    assert found["env"] == handed_on["extraEnv"]
+    assert found["env"] == [POD_IP, *handed_on["extraEnv"]]
     # A map of the values file joins the default's: the other keys stay.
     assert found["securityContext"]["runAsUser"] == 1000
     assert found["securityContext"]["readOnlyRootFilesystem"] is True
@@ -720,7 +881,7 @@ def test_replicas_prefer_a_node_each_unless_an_affinity_is_given():
     assert single["replicas"] == 1
     assert "affinity" not in single["template"]["spec"]
 
-    pair = one(render(*ON, "policyController.replicas=2"), "Deployment")["spec"]
+    pair = one(render(*ELECTED, "policyController.replicas=2"), "Deployment")["spec"]
     (term,) = pair["template"]["spec"]["affinity"]["podAntiAffinity"][
         "preferredDuringSchedulingIgnoredDuringExecution"
     ]
@@ -731,7 +892,7 @@ def test_replicas_prefer_a_node_each_unless_an_affinity_is_given():
 
     own = one(
         render(
-            *ON,
+            *ELECTED,
             "policyController.replicas=2",
             "policyController.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution"
             ".nodeSelectorTerms[0].matchExpressions[0].key=zone",
@@ -741,6 +902,14 @@ def test_replicas_prefer_a_node_each_unless_an_affinity_is_given():
         "Deployment",
     )["spec"]["template"]["spec"]["affinity"]
     assert list(own) == ["nodeAffinity"]
+
+    # With the schema's check skipped, a count given as text that the
+    # manifest's reader takes as two prefers a node each as the number does.
+    for count in ("2e0", " 2"):
+        text = one(
+            render(*ELECTED, f"policyController.replicas={count}", skip_schema=True), "Deployment"
+        )["spec"]
+        assert text["template"]["spec"]["affinity"] == pair["template"]["spec"]["affinity"], count
 
 
 @needs_helm
@@ -892,30 +1061,119 @@ def test_the_rollout_follows_the_election():
 
 
 @needs_helm
+def test_with_the_election_off_an_upgrade_tells_the_old_pod_to_stop_first():
+    """Off, every pod leads alone, and the server's own strategy starts the
+    new pod beside the old one: two leaders until the new one is ready. The
+    lone controller rolls with no pod more at a time. Its strategy keeps the
+    rolling update's type and names both of its fields, as the elected one
+    does. The API refuses those fields beside Recreate, and a server-side
+    apply takes off a live object only what it put there: the server's own,
+    on a Deployment that named no strategy, would stay. So no upgrade
+    between the three strategies has a field to take off."""
+    for off in OFF:
+        assert one(render(*ON, *off), "Deployment")["spec"]["strategy"] == LONE_STRATEGY, off
+    served = {
+        "type": "RollingUpdate",
+        "rollingUpdate": {"maxSurge": "25%", "maxUnavailable": "25%"},
+    }
+    elected = one(render(*ELECTED), "Deployment")["spec"]["strategy"]
+    lone = one(render(*ON), "Deployment")["spec"]["strategy"]
+    for rendered in (lone, elected):
+        for live in (served, lone, elected):
+            # An apply that takes nothing off: a live field the manifest
+            # does not name stays beside the ones it names.
+            fields = {**live["rollingUpdate"], **rendered["rollingUpdate"]}
+            applied = {**live, **rendered, "rollingUpdate": fields}
+            assert applied == rendered, (rendered, live)
+            assert applied["type"] == "RollingUpdate", (rendered, live)
+
+
+@needs_helm
+def test_no_hook_delays_the_stop_signal():
+    """The lone controller's order rests on the stop signal reaching the old
+    pod at its delete: the old pod decides nothing from that signal on. A
+    preStop hook runs before the signal, and the old pod would lead beside
+    the new one for the hook's length: the container names no hook, with
+    the election on or off."""
+    for values in (ON, ELECTED):
+        assert "lifecycle" not in container(render(*values)), values
+
+
+@needs_helm
 def test_with_the_election_off_nothing_of_it_is_rendered():
-    """A release that does not turn the election on renders what it rendered
-    before the election, in each spelling of off and at any replica count:
-    no object of the election, and on the controller's Deployment no
-    strategy, no account, no variable and neither flag."""
-    for off in (
-        (),
-        ("policyController.election.enabled=false",),
-        ("policyController.election=null",),
-    ):
-        for replicas in (1, 2):
-            documents = render(*ON, f"policyController.replicas={replicas}", *off)
-            kinds = sorted(document["kind"] for document in of_the_controller(documents))
-            assert kinds == ["Deployment", "Service"], off
-            deployment = one(documents, "Deployment")["spec"]
-            assert deployment["replicas"] == replicas, off
-            assert "strategy" not in deployment, off
-            pod = deployment["template"]["spec"]
-            assert "serviceAccountName" not in pod, off
-            assert "serviceAccount" not in pod, off
-            assert pod["automountServiceAccountToken"] is False, off
-            lone = container(documents)
-            assert "env" not in lone, off
-            assert not {"--lease-name", "--advertise-address"} & set(lone["args"]), off
+    """A release that does not turn the election on renders, in each spelling
+    of off, no object of the election, and on the controller's Deployment
+    of one replica the lone controller's strategy, no account, no variable
+    and neither flag."""
+    for off in OFF:
+        documents = render(*ON, *off)
+        kinds = sorted(document["kind"] for document in of_the_controller(documents))
+        assert kinds == ["Deployment", "Service"], off
+        deployment = one(documents, "Deployment")["spec"]
+        assert deployment["replicas"] == 1, off
+        assert deployment["strategy"] == LONE_STRATEGY, off
+        pod = deployment["template"]["spec"]
+        assert "serviceAccountName" not in pod, off
+        assert "serviceAccount" not in pod, off
+        assert pod["automountServiceAccountToken"] is False, off
+        lone = container(documents)
+        assert "env" not in lone, off
+        assert not {"--lease-name", "--advertise-address"} & set(lone["args"]), off
+
+
+@needs_helm
+def test_more_than_one_replica_needs_the_election(tmp_path):
+    """With the election off every replica is a controller of its own: two
+    would each lead alone. The render refuses them in each spelling of off
+    and says the two ways out; with the election on they render. The
+    refusal reads the count as written, and judges it as a reader of the
+    manifest takes it: a number from a values file, a fraction above one,
+    and a text that reads there as a number above one."""
+    for off in OFF:
+        for replicas in (2, 3):
+            refused = render_error(*ON, f"policyController.replicas={replicas}", *off)
+            assert (
+                f"policyController.replicas is {replicas} with policyController.election.enabled"
+                " off: each replica would lead alone. Turn the election on, or keep one replica"
+            ) in refused, off
+    pair = one(render(*ELECTED, "policyController.replicas=2"), "Deployment")["spec"]
+    assert pair["replicas"] == 2
+    # A number from a values file, whole or a fraction above one: the
+    # refusal reads it as written.
+    values = tmp_path / "values.yaml"
+    for replicas, skip_schema in ((2, False), (2.5, True)):
+        values.write_text(yaml.safe_dump({"policyController": {"replicas": replicas}}))
+        refused = render_error(*ON, files=(values,), skip_schema=skip_schema)
+        assert (
+            f"policyController.replicas is {replicas} with policyController.election.enabled off"
+        ) in refused, replicas
+    # A text the manifest's reader takes as a number above one is refused as
+    # that number is. With the election on it is written as asked, for the
+    # API to judge.
+    for count in ("2e0", " 2"):
+        asked = f"policyController.replicas={count}"
+        refused = render_error(*ON, asked, skip_schema=True)
+        assert (
+            f"policyController.replicas is {count} with policyController.election.enabled off"
+        ) in refused, count
+        written = one(render(*ELECTED, asked, skip_schema=True), "Deployment")["spec"]["replicas"]
+        assert written == yaml.safe_load(f"count: {count}")["count"], count
+
+
+@needs_helm
+def test_a_replica_count_the_schema_refuses_is_written_as_asked(tmp_path):
+    """With the schema's check skipped the helper compares the count and
+    writes the value as the values hold it. A null stays the API's default
+    of one replica and a fraction, as text or as a number, stays for the API
+    to refuse: neither is written as zero or as its whole part."""
+    unset = render(*ON, "policyController.replicas=null", skip_schema=True)
+    assert one(unset, "Deployment")["spec"]["replicas"] is None
+    fraction = render(*ON, "policyController.replicas=1.5", skip_schema=True)
+    assert one(fraction, "Deployment")["spec"]["replicas"] == 1.5
+    values = tmp_path / "values.yaml"
+    values.write_text(yaml.safe_dump({"policyController": {"replicas": 1.5}}))
+    number = render(*ON, files=(values,), skip_schema=True)
+    assert one(number, "Deployment")["spec"]["replicas"] == 1.5
 
 
 @pytest.fixture
@@ -934,12 +1192,11 @@ def chart_with_no_election(tmp_path) -> Path:
 @needs_helm
 def test_the_election_over_reused_values_renders_a_fresh_install(chart_with_no_election):
     """Over values that hold no election the controller renders what a fresh
-    install renders, byte for byte: off with nothing set, at one replica and
-    at two, and on, with the Lease under the controller's own name or a
+    install renders, byte for byte: off with nothing set, and on at one
+    replica and at two, with the Lease under the controller's own name or a
     given one."""
     cells = (
         ON,
-        (*ON, "policyController.replicas=2"),
         ELECTED,
         (*ELECTED, "policyController.replicas=2"),
         (*ELECTED, "policyController.election.leaseName=routing"),
@@ -978,6 +1235,40 @@ def test_the_chart_refuses_what_the_controller_refuses_at_start():
         "policyController.shutdownGracePeriodSeconds=1",
         "policyController.shutdownSettleSeconds=0",
     )
+    # A name that is none of the chart's three listeners is refused by the
+    # schema, and by the helper where the schema's check is skipped: it never
+    # renders as no flag at all.
+    for names in ("{admin}", "{ingestion}", "{gateway,admin}"):
+        unknown = render_error(*ON, f"policyController.identityAsTold={names}", skip_schema=True)
+        assert "policyController.identityAsTold names" in unknown
+        assert "none of the chart's listeners (gateway, control, replication)" in unknown
+    assert 'policyController.identityAsTold is "gateway"' in render_error(
+        *ON, "policyController.identityAsTold=gateway", skip_schema=True
+    )
+    # The names the schema takes render the same with its check skipped.
+    told = container(
+        render(*ON, "policyController.identityAsTold={replication,gateway}", skip_schema=True)
+    )["args"]
+    assert told[told.index("--identity-as-told") + 1] == "gateway,replication"
+    # A null is the value left out, with the check skipped too.
+    unset = render(*ON, "policyController.identityAsTold=null", skip_schema=True)
+    assert "--identity-as-told" not in container(unset)["args"]
+
+
+@needs_helm
+@pytest.mark.parametrize("written", ["false", "0", '""', "{}"])
+def test_a_told_value_that_is_no_list_is_refused_though_it_reads_as_empty(
+    written: str, tmp_path: Path
+):
+    """With the schema's check skipped, a value that is no list is refused as
+    it was written. One that reads as empty never renders as no listener
+    told: null alone is the value left out."""
+    values = tmp_path / "values.yaml"
+    values.write_text(f"policyController:\n  identityAsTold: {written}\n")
+    refused = render_error(*ON, files=(values,), skip_schema=True)
+    assert f"policyController.identityAsTold is {written}: a list of listeners' names" in refused
+    # The schema refuses each first.
+    assert "policyController.identityAsTold" in render_error(*ON, files=(values,))
 
 
 def schema_block() -> dict:
@@ -1079,6 +1370,8 @@ SAME_AS_THE_DEFAULT = {
     "extraEnv",
     "identityAsTold",
     "shutdownSettleSeconds",
+    # No document: the controller runs no spec.
+    "spec",
     # The election off, and the Lease under the controller's own name.
     "election",
     "election.enabled",
@@ -1221,6 +1514,7 @@ ARGUMENT_SETS = {
     "extra-arguments": (
         "policyController.extraArgs={--ingestion-listen,0.0.0.0:30104,--load-monitor-interval,2}",
     ),
+    "a-spec-document": ("policyController.spec.apiVersion=smg.policy/v1",),
     "an-election": ("policyController.election.enabled=true", "policyController.replicas=2"),
     "an-election-over-a-named-lease": (
         "policyController.election.enabled=true",
@@ -1327,6 +1621,13 @@ def test_the_image_job_starts_on_what_these_cases_read():
         # The engine wire's messages the controller's protocol imports: the
         # build script reads them beside the contract.
         REPO / "crates" / "grpc_client" / "proto" / "common.proto",
+        # The example controller, whose image the job builds beside the
+        # stock one: its package and what the package compiles.
+        REPO / "examples" / "policy-controller" / "Cargo.toml",
+        REPO / "examples" / "policy-controller" / "src" / "main.rs",
+        # The cargo configuration the build reads: the allocator of an arm64
+        # binary takes its page size from it.
+        REPO / ".cargo" / "config.toml",
     ] + [
         path
         for path in sorted(CHART.rglob("*"))
@@ -1880,3 +2181,214 @@ def test_a_lease_deleted_under_running_pods_leaves_them_ready_and_nobody_leading
         for pod in pods:
             pod.end()
         stand_in.close()
+
+
+# The controller under a spec document, as the Deployment's one pod. No
+# cluster: the document's ConfigMap is laid out here as a kubelet mounts it.
+
+EXAMPLE = EXAMPLES / "with-policy-controller.yaml"
+# The spec's series as /metrics renders them: the generation the controller
+# runs, and its counts of documents applied and rejected.
+SPEC_SERIES = (
+    "smg_policy_spec_generation",
+    'smg_policy_spec_apply_total{result="applied"}',
+    'smg_policy_spec_apply_total{result="rejected"}',
+)
+
+
+def example_values(directory: Path, document: dict, name: str) -> Path:
+    """The controller's example values with ``document`` as the spec, whole:
+    a values file laid over another would join the two documents key by
+    key."""
+    values = yaml.safe_load(EXAMPLE.read_text())
+    values["policyController"]["spec"] = document
+    path = directory / name
+    path.write_text(yaml.safe_dump(values))
+    return path
+
+
+class Mount:
+    """A directory laid out as a kubelet lays a ConfigMap volume: each key's
+    file is a link through ``..data``, itself a link to the directory of the
+    version in use. An update writes a new directory, turns ``..data`` to it
+    by one rename and takes the old directory away: a reader finds one
+    version whole or the other, and a file it holds may go from under it."""
+
+    def __init__(self, directory: Path, config: dict):
+        self.directory = directory
+        self._versions = 0
+        directory.mkdir()
+        self.turn(config)
+        for key in config["data"]:
+            (directory / key).symlink_to(Path("..data") / key)
+
+    def turn(self, config: dict) -> None:
+        """The mount's update to ``config``."""
+        self._versions += 1
+        version = self.directory / f"..version-{self._versions}"
+        version.mkdir()
+        for key, document in config["data"].items():
+            (version / key).write_text(document)
+        staged = self.directory / "..data_tmp"
+        staged.symlink_to(version.name)
+        staged.replace(self.directory / "..data")
+        # The kubelet takes the old version away once the link is turned.
+        if self._versions > 1:
+            shutil.rmtree(self.directory / f"..version-{self._versions - 1}")
+
+
+class DocumentedPod:
+    """The controller as the Deployment's one pod under a spec document:
+    exactly the arguments the Deployment passes, on ports free here and a
+    short grace period, with the pod's name in HOSTNAME and the document's
+    ConfigMap mounted. A directory of the case's stands in for the mount's
+    path, and nothing else of the arguments is another."""
+
+    def __init__(self, binary: str, directory: Path, values: Path):
+        gateway, control, replication, admin = free_ports(4)
+        self._settings = (
+            *ON,
+            f"policyController.ports.gateway={gateway}",
+            f"policyController.ports.control={control}",
+            f"policyController.ports.replication={replication}",
+            f"policyController.ports.admin={admin}",
+            "policyController.shutdownGracePeriodSeconds=4",
+            "policyController.shutdownSettleSeconds=1",
+        )
+        documents = render(*self._settings, files=(values,))
+        self._deployment = one(documents, "Deployment")
+        found = container(documents)
+        (mounted,) = found["volumeMounts"]
+        self._mount = Mount(directory / "mount", one(documents, "ConfigMap"))
+        self.arguments = [
+            argument.replace(mounted["mountPath"], str(self._mount.directory), 1)
+            if argument.startswith(mounted["mountPath"] + "/")
+            else argument
+            for argument in found["args"]
+        ]
+        assert self.arguments != found["args"], "no argument names a file under the mount"
+        self._metrics = f"http://127.0.0.1:{admin}/metrics"
+        environment = {key: value for key, value in os.environ.items() if key not in LOG_VARIABLES}
+        environment["HOSTNAME"] = POD_NAMES[0]
+        self.process = subprocess.Popen(
+            [binary, *self.arguments],
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+
+    def upgrade(self, values: Path) -> None:
+        """An upgrade of the release to ``values``. It renders the Deployment
+        the pod runs under, so it moves no pod and the pod's arguments stand,
+        and the kubelet turns the mount to the upgrade's ConfigMap."""
+        documents = render(*self._settings, files=(values,))
+        assert one(documents, "Deployment") == self._deployment, "the upgrade moves the pod"
+        self._mount.turn(one(documents, "ConfigMap"))
+
+    def spec(self) -> tuple[int, ...] | None:
+        """The spec's series as they read now; none while nothing listens."""
+        if self.process.poll() is not None:
+            output = self.process.stdout.read() if self.process.stdout else ""
+            raise AssertionError(f"the controller exited: {output}")
+        try:
+            with DIRECT.open(self._metrics, timeout=2) as response:
+                rendered = response.read().decode()
+        except (urllib.error.URLError, ConnectionError, TimeoutError):
+            return None
+        series = dict(re.findall(r"^(smg_policy_spec_\S+) (\d+)$", rendered, flags=re.MULTILINE))
+        assert set(SPEC_SERIES) <= set(series), f"/metrics renders {sorted(series)}"
+        return tuple(int(series[name]) for name in SPEC_SERIES)
+
+    def runs(self, generation: int, applied: int, rejected: int, seconds: float = 20) -> None:
+        """Waits until the spec's series read these three."""
+        deadline = time.monotonic() + seconds
+        while (read := self.spec()) != (generation, applied, rejected):
+            assert time.monotonic() < deadline, f"the spec's series read {read} after {seconds} s"
+            time.sleep(0.1)
+
+    def stop(self) -> str:
+        """SIGTERM, the exit status checked, and the log."""
+        self.process.send_signal(signal.SIGTERM)
+        output, _ = self.process.communicate(timeout=15)
+        assert self.process.returncode == 0, output
+        return output
+
+    def end(self) -> None:
+        if self.process.poll() is None:
+            self.process.kill()
+            self.process.wait()
+
+
+@needs_helm
+def test_the_binary_runs_the_mounted_document_and_a_changed_one_in_place(binary, tmp_path):
+    """The controller started as the Deployment's pod on the chart's example,
+    its document mounted as a kubelet mounts a ConfigMap: it runs the
+    document as its first generation. An upgrade to another document moves
+    no pod. The mount turns, and the running controller applies the new
+    document as its next generation and logs each with its digest."""
+    pod = DocumentedPod(binary, tmp_path, EXAMPLE)
+    try:
+        pod.runs(generation=1, applied=1, rejected=0)
+        pod.upgrade(example_values(tmp_path, RANDOM, "random.yaml"))
+        pod.runs(generation=2, applied=2, rejected=0)
+        output = pod.stop()
+    finally:
+        pod.end()
+    applied = [line for line in output.splitlines() if "policy spec applied" in line]
+    assert len(applied) == 2, output
+    for generation, line in enumerate(applied, start=1):
+        assert f"generation={generation} digest=" in line, line
+    assert "policy spec rejected" not in output
+
+
+@needs_helm
+def test_a_mounted_document_that_does_not_run_is_rejected_and_the_running_one_stays(
+    binary, tmp_path
+):
+    """A mounted document turned to one that does not run. The upgrade
+    renders the Deployment as it was, so the pod's arguments stand and no
+    pod is started on the document. The running controller rejects it once,
+    in its log and in its count, and runs the generation it ran. A
+    controller started on those arguments refuses to start and names the
+    document's fault: a pod the upgrade had moved would not come up."""
+    pod = DocumentedPod(binary, tmp_path, EXAMPLE)
+    try:
+        pod.runs(generation=1, applied=1, rejected=0)
+        pod.upgrade(example_values(tmp_path, UNKNOWN_FILTER, "unknown.yaml"))
+        pod.runs(generation=1, applied=1, rejected=1)
+        output = pod.stop()
+    finally:
+        pod.end()
+    (rejected,) = [line for line in output.splitlines() if "policy spec rejected" in line]
+    assert "the running generation stays" in rejected and "generation=1" in rejected
+    assert "no-such-filter" in rejected
+    assert output.count("policy spec applied") == 1
+    assert "no-such-filter" in refusal(binary, pod.arguments)
+
+
+def test_the_image_job_builds_the_example_for_both_platforms_and_pushes_nothing():
+    """The example controller's image is built by the image's file with the
+    package argument naming the example: once for the runner's platform and
+    once for arm64 by the file's own cross build, behind an emulation step,
+    since the final stage runs the binary. No step of the job pushes an image
+    or logs in to a registry."""
+    document = yaml.safe_load(IMAGE_WORKFLOW.read_text())
+    steps = document["jobs"]["image"]["steps"]
+    package = "--build-arg PACKAGE=policy-controller-example"
+    builds = [at for at, step in enumerate(steps) if package in step.get("run", "")]
+    assert len(builds) == 2, f"{len(builds)} step(s) build the example's image"
+    for at in builds:
+        assert "--file docker/policy-controller.Dockerfile" in steps[at]["run"]
+    (cross,) = [at for at in builds if "--platform" in steps[at]["run"]]
+    assert "--platform linux/arm64" in steps[cross]["run"]
+    emulated = [
+        at
+        for at, step in enumerate(steps)
+        if step.get("uses", "").startswith("docker/setup-qemu-action@")
+    ]
+    assert emulated and emulated[0] < cross, "the arm64 build's final stage runs the binary"
+    for step in steps:
+        told = step.get("run", "") + " " + step.get("uses", "")
+        for word in ("docker push", "--push", "docker login", "login-action"):
+            assert word not in told, f"the step {step.get('name')!r} holds {word!r}"

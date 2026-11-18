@@ -13,12 +13,24 @@ router:
 policyController:
   enabled: true
   # No listener takes a caller's stated name until it is named, and a
-  # listener that is not named refuses every call but Leader as
-  # unauthenticated. Nothing is verified on a named listener: whoever
+  # listener that is not named refuses every call of its scopes but Leader
+  # as unauthenticated. Nothing is verified on a named listener: whoever
   # reaches its port acts as any principal of its scopes. Name the gateways'
   # listener only behind a mesh that verifies its callers, or a network
   # policy that admits them alone:
   # identityAsTold: [gateway]
+  # The policy spec the controller runs, a document of apiVersion
+  # smg.policy/v1: here, the healthy worker with the least load. The chart
+  # mounts it as a file the controller watches, so a changed document moves
+  # no pod: the running controller applies it in place, or rejects one that
+  # does not run and keeps the one it runs.
+  spec:
+    apiVersion: smg.policy/v1
+    profiles:
+      default:
+        filter: [healthy]
+        score: [least-load]
+        pick: best
   # The controller runs 2 runtime worker threads by default
   # (runtimeWorkerThreads), the CPU limit here: raise the two together.
   resources:

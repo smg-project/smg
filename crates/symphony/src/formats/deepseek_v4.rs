@@ -91,8 +91,8 @@ mod tests {
     use crate::{
         ids::CallIds,
         testing::{
-            arguments_of, bytes, content, drive, drive_to, malformed, reasoning,
-            the_same_at_every_cut, weather_tools,
+            an_invoke_whose_arguments_are_json_reads_as_the_engines_do, arguments_of, bytes,
+            content, drive, drive_to, malformed, reasoning, the_same_at_every_cut, weather_tools,
         },
     };
 
@@ -1313,6 +1313,26 @@ mod tests {
         let pieces: Vec<&str> = text.split_inclusive(['\n', '"', '>']).collect();
         assert_eq!(pieces.concat(), text);
         pieces
+    }
+
+    /// An invoke whose arguments the model wrote as one JSON object in place of the parameter
+    /// tags reads as the serving engines' own parsers read it: SGLang's DSML detector takes the
+    /// object as the call's arguments, as written (its second format), and the structural tag it
+    /// builds for a call writes the object between the invoke tag and its close, so an engine
+    /// constraining a call that way gets this shape back. The family's reference encoder writes
+    /// parameter tags alone, and its parser refuses the shape outright ("Tool name format
+    /// error"), so it reads no call there; before, this table read the call with no arguments.
+    /// The shared [`an_invoke_whose_arguments_are_json_reads_as_the_engines_do`] lists the shapes.
+    #[test]
+    fn an_invoke_whose_arguments_are_one_json_object_reads_as_the_engines_own_parsers_read_it() {
+        an_invoke_whose_arguments_are_json_reads_as_the_engines_do(
+            run,
+            "<｜DSML｜invoke name=\"",
+            "</｜DSML｜invoke>",
+            "<｜DSML｜tool_calls>",
+            "</｜DSML｜tool_calls>",
+            "<｜User｜>Weather in Paris?<｜Assistant｜></think>",
+        );
     }
 
     #[test]

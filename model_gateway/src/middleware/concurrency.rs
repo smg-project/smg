@@ -365,7 +365,6 @@ mod tests {
     use crate::{
         app_context::AppContext,
         config::RouterConfig,
-        health::ProbeState,
         middleware::{
             edge_body::at_the_edge,
             test_support::{echo_request, echo_route, ECHO_PATH},
@@ -374,7 +373,7 @@ mod tests {
         observability::inflight_tracker::InFlightRequestTracker,
         policies::PolicyRegistry,
         routers::gateway::Gateway,
-        server::http_client,
+        server::{health::ProbeState, http_client},
         worker::WorkerRegistry,
     };
 

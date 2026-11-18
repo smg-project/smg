@@ -31,40 +31,27 @@ mod net;
 )]
 #[path = "common/replicas.rs"]
 mod replicas;
+#[path = "common/spec.rs"]
+mod spec;
 
 use std::{
     ffi::OsStr,
-    fmt::Debug,
     fs,
-    future::Future,
     os::unix::fs::symlink,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     thread,
-    time::{Duration, Instant},
+    time::Instant,
 };
 
-use net::http_get;
 use replicas::{Lease, Replica, ROOM};
-use smg_policy_controller::{
-    elector::ElectionSettings,
-    proto::{
-        policy_controller_client::PolicyControllerClient, GetPolicySpecRequest, PolicySpecDocument,
-    },
-};
+use smg_policy_controller::{elector::ElectionSettings, proto::ApplyMode};
+use spec::{answers, apply, page, read, until, LEAST_LOAD, PACE, RANDOM};
 use tempfile::TempDir;
-use tonic::{metadata::AsciiMetadataValue, Code, Request, Response, Status};
+use tokio::time;
+use tonic::Code;
 
 const BIN: &str = env!("CARGO_BIN_EXE_smg-policy-controller");
-
-/// Between two asks of a wait.
-const PACE: Duration = Duration::from_millis(50);
-
-/// A document in the form of the design's example: no `generation` line.
-const LEAST_LOAD: &str = "apiVersion: smg.policy/v1\nprofiles:\n  default:\n    filter: [healthy]\n    score: [least-load]\n    pick: best\n";
-/// Another one.
-const RANDOM: &str =
-    "apiVersion: smg.policy/v1\nprofiles:\n  default:\n    filter: [healthy]\n    pick: random\n";
 
 /// A directory laid out as a mounted ConfigMap: `policy.yaml` is a link
 /// through `..data` into a version's directory, and an update swaps `..data`
@@ -122,64 +109,30 @@ fn start(id: &str, lease: &TempDir, file: Option<&Path>) -> Replica {
     .expect("the replica starts")
 }
 
-/// One `GetPolicySpec` call on the control listener, as `operator-a`.
-async fn read(replica: &Replica, generation: u64) -> Result<PolicySpecDocument, Status> {
-    let mut client = PolicyControllerClient::connect(format!("http://{}", replica.control))
+/// A probe that never answers ends its wait at the room's end, by name. The
+/// clock is held, so the room passes at once.
+#[tokio::test(start_paused = true)]
+async fn a_probe_that_never_answers_ends_its_wait_at_the_rooms_end() {
+    let waited = time::timeout(2 * ROOM, until(std::future::pending::<u8>, |_| true))
         .await
-        .map_err(|error| Status::unavailable(error.to_string()))?;
-    let mut request = Request::new(GetPolicySpecRequest { generation });
-    request.metadata_mut().insert(
-        "x-smg-principal",
-        AsciiMetadataValue::from_static("operator-a"),
-    );
-    client
-        .get_policy_spec(request)
-        .await
-        .map(Response::into_inner)
+        .expect("the wait ends inside twice its room");
+    let told = waited.expect_err("no probe answered");
+    assert!(told.starts_with("no answer in"), "{told}");
 }
 
-/// What `probe` answers once `met` holds for it, asked every [`PACE`]; the
-/// last answer where the room runs out first.
-async fn until<T: Debug, F: Future<Output = T>>(
-    mut probe: impl FnMut() -> F,
-    met: impl Fn(&T) -> bool,
-) -> Result<T, String> {
-    let started = Instant::now();
-    loop {
-        let answer = probe().await;
-        if met(&answer) {
-            return Ok(answer);
-        }
-        if started.elapsed() > ROOM {
-            return Err(format!("not met in {ROOM:?}; the last answer: {answer:?}"));
-        }
-        tokio::time::sleep(PACE).await;
-    }
-}
-
-/// The standing document once the read call answers it as `generation`.
-async fn answers(replica: &Replica, generation: u64) -> PolicySpecDocument {
-    let asked = until(
-        || read(replica, 0),
-        |answer| matches!(answer, Ok(document) if document.generation == generation),
-    );
-    asked
+/// A probe that answers and is never met ends its wait at the room's end by
+/// that name, with its last answer: a room that ran out between two probes
+/// is not told as a probe with no answer. The probe answers at once, so the
+/// room ends between two probes and nowhere else, and the clock is held.
+#[tokio::test(start_paused = true)]
+async fn a_probe_never_met_ends_its_wait_by_its_last_answer() {
+    let probe = || std::future::ready(7_u8);
+    let waited = time::timeout(2 * ROOM, until(probe, |_| false))
         .await
-        .expect("the read call answers the generation")
-        .expect("an answer")
-}
-
-/// The admin listener's page at `path` once it answers 200 with a `line`.
-async fn page(replica: &Replica, path: &str, line: Option<&str>) -> String {
-    let asked = until(
-        || http_get(replica.admin, path),
-        |page| match (page, line) {
-            (Ok((200, body)), Some(line)) => body.lines().any(|rendered| rendered == line),
-            (Ok((200, _)), None) => true,
-            _ => false,
-        },
-    );
-    asked.await.expect("the page").expect("an answer").1
+        .expect("the wait ends inside twice its room");
+    let told = waited.expect_err("no answer was met");
+    assert!(told.starts_with("not met in"), "{told}");
+    assert!(told.ends_with("Some(7)"), "{told}");
 }
 
 /// The binary on a mounted file answers the file's bytes under generation
@@ -263,6 +216,58 @@ async fn a_swapped_link_under_a_running_replica_is_the_next_generation() {
     }
 }
 
+/// A dry run on a running replica answers its document's verdict and writes
+/// nothing: the next number for a document that would run, the field for
+/// one that would not, and `read_only` for an enforce. The standing
+/// generation keeps answering its document.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dry_run_on_a_running_replica_answers_its_verdict_and_writes_nothing() {
+    let lease = tempfile::tempdir().expect("a directory");
+    let mount = Mount::new(LEAST_LOAD);
+    let replica = start("spec-dry", &lease, Some(&mount.file()));
+    let first = answers(&replica, 1).await;
+
+    // A write is the leader's: the replica answers once it leads its lease.
+    let led = until(|| apply(&replica, ApplyMode::DryRun, RANDOM), Result::is_ok);
+    let would = led.await.expect("the leader answers").expect("a verdict");
+    assert!(would.accepted && would.read_only, "{would:?}");
+    assert_eq!(would.generation, 2);
+    // The feed before and after: the standing document reads the loads, and
+    // the offered one reads nothing.
+    let feed = would.needs.expect("the needs diff");
+    let before = feed.before.expect("the feed before");
+    assert!(
+        !before.models.is_empty() && before.models.iter().all(|row| row.loads),
+        "{before:?}"
+    );
+    assert!(feed.after.expect("the feed after").models.is_empty());
+
+    let unweighed = LEAST_LOAD.replace("[least-load]", "[{ least-load: { weight: -1.0 } }]");
+    let refused = apply(&replica, ApplyMode::DryRun, &unweighed)
+        .await
+        .expect("a verdict");
+    assert!(!refused.accepted, "{refused:?}");
+    assert_eq!((refused.generation, &refused.digest), (1, &first.digest));
+    let [issue] = refused.issues.as_slice() else {
+        panic!("one issue: {refused:?}")
+    };
+    assert!(
+        issue.field_path.starts_with("profiles.default.score[0]"),
+        "{issue:?}"
+    );
+
+    let enforced = apply(&replica, ApplyMode::Enforce, RANDOM)
+        .await
+        .expect("an answer");
+    assert!(enforced.read_only && !enforced.accepted, "{enforced:?}");
+
+    let standing = read(&replica, 0).await.expect("the standing document");
+    assert_eq!(
+        (standing.generation, standing.document.as_slice()),
+        (1, LEAST_LOAD.as_bytes())
+    );
+}
+
 /// A start on a document the validator refuses exits with the refusal in
 /// its log: the file, and the field by its path. Nothing is served.
 #[test]
@@ -319,7 +324,7 @@ async fn a_replica_with_no_spec_file_runs_as_it_did() {
     assert_eq!(unserved.code(), Code::Unimplemented, "{unserved:?}");
     assert_eq!(
         unserved.message(),
-        "GetPolicySpec is not served by a controller started with no spec file"
+        "GetPolicySpec is not served by a controller started with no spec source"
     );
     let metrics = page(&replica, "/metrics", None).await;
     assert!(!metrics.contains("smg_policy_spec"), "{metrics}");

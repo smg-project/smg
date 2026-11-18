@@ -128,7 +128,10 @@ pub struct Health {
     pub healthy: bool,
     /// The pool's circuit breaker refuses execution.
     pub breaker_open: bool,
-    /// The liveness veto: unreachable or wedged.
+    /// The liveness veto: unreachable or wedged. A host writes it into a
+    /// row it copies for the decision. Over a publication's own rows the
+    /// asking host's vetoes stand beside the rows instead, and a reader of
+    /// this bit asks both ([`Constraints::masks`]).
     pub stalled: bool,
     /// Being drained; nothing new goes there.
     pub draining: bool,
@@ -137,12 +140,15 @@ pub struct Health {
 }
 
 impl Health {
-    /// Every routing veto but the overload one.
+    /// Every routing veto but the overload one, as the row carries them: a
+    /// veto that stands beside lent rows is asked of the decision's
+    /// constraints ([`Constraints::masks`]).
     pub const fn routable_ignoring_overload(self) -> bool {
         self.healthy && !self.breaker_open && !self.stalled && !self.draining
     }
 
-    /// Every routing veto.
+    /// Every routing veto the row carries
+    /// ([`Self::routable_ignoring_overload`]).
     pub const fn routable(self) -> bool {
         self.routable_ignoring_overload() && !self.overloaded
     }
@@ -182,7 +188,10 @@ pub struct LoadRow {
     /// count them sends none, which is not a count of zero. The host's own
     /// reading of the report, in no plugin's view.
     pub resident_counted: bool,
-    /// Age of the report's sample at the decision, in milliseconds.
+    /// Age of the report's sample at the decision, in milliseconds. On a
+    /// row a store lends, it is the age the report carried when it was
+    /// recorded: the age at the decision is then the request's
+    /// `now_micros` less the row's `load_sampled_at_micros`.
     pub report_age_ms: u32,
     /// Where the row came from.
     pub source: SignalSource,
@@ -340,8 +349,9 @@ pub struct AffinityFacts {
 /// column, so nothing of the pool's length is filled for a decision. Both
 /// lists are the host's to keep ascending by row and under the candidates'
 /// count: a debug build asserts it where a decision takes its inputs, and a
-/// release build reads them as they stand. In-process only.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// release build reads them as they stand, a row past the count naming
+/// nobody. In-process only.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct NamedAffinity<'a> {
     /// The rows that hold a leading part of the request, ascending by row,
     /// each with what it holds. A row not named reads as holding nothing.
@@ -352,6 +362,12 @@ pub struct NamedAffinity<'a> {
     pub warming: &'a [u32],
     /// The warming rows are the thin.
     pub thin: bool,
+    /// The mean in-flight count the spill gate reads behind a draw: the
+    /// mean of the rows the picker drew, so a row the host named does not
+    /// move the mean it is judged against. The engine sets it; a host
+    /// leaves `None`, which reads as the mean of the rows a stage is
+    /// handed, and a debug build asserts that it did.
+    pub mean_in_flight: Option<f32>,
 }
 
 /// One row a host names as a holder: what the row's entry of a column says
@@ -370,21 +386,43 @@ pub struct NamedHolder {
 impl<'a> NamedAffinity<'a> {
     /// Row `index`'s entry: what the host said the row holds when it is
     /// named, nothing held otherwise.
+    ///
+    /// The search ends on the first holder at or past the row, and the
+    /// entry is read from that holder or from a holder of nothing, by
+    /// whether it is the row: a choice between two places, where a branch
+    /// would tell a named row from another. Behind a draw the rows asked
+    /// come in the draw's order, and such a branch is one nothing predicts.
     #[inline]
     pub(crate) fn entry(&self, index: u32) -> AffinityFacts {
-        let Ok(at) = self
-            .holders
-            .binary_search_by_key(&index, |holder| holder.row)
-        else {
+        const NOBODY: NamedHolder = NamedHolder {
+            row: 0,
+            overlap_blocks: 0,
+            predicted_blocks: 0,
+        };
+        let Some(last) = self.holders.len().checked_sub(1) else {
             return AffinityFacts::default();
         };
-        self.holders[at].facts()
+        let at = self.holders.partition_point(|holder| holder.row < index);
+        let found = &self.holders[at.min(last)];
+        let holder = if found.row == index { found } else { &NOBODY };
+        holder.facts()
     }
 
     /// One pass's reads of the rows, walked beside the rows the pass asks.
     #[inline]
     pub(crate) fn walk(self) -> NamedWalk<'a> {
         NamedWalk(Walk::new(self.holders))
+    }
+
+    /// Whether the engine drew the rows a stage is handed: it set their
+    /// mean ([`NamedAffinity::mean_in_flight`]). They stand in the draw's
+    /// order, so a pass reads each row by a search and keeps no cursor; a
+    /// walk is the read of a pool read whole, whose rows stand ascending.
+    /// The sign chooses a cost and never an answer: both reads answer
+    /// alike in whatever order the rows are asked.
+    #[inline]
+    pub(crate) fn drawn(&self) -> bool {
+        self.mean_in_flight.is_some()
     }
 }
 
@@ -399,6 +437,13 @@ impl NamedHolder {
             ..AffinityFacts::default()
         }
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many times a walk on this thread looked behind its cursor: a
+    /// case reads it to tell a walk from a search.
+    pub(crate) static LOOKS_BEHIND: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 /// A forward cursor over a list its host keeps ascending by row, for one
@@ -446,6 +491,8 @@ impl<'a, T: Copy> Walk<'a, T> {
     #[cold]
     #[inline(never)]
     fn behind(&self, index: u32, row: &impl Fn(&T) -> u32) -> usize {
+        #[cfg(test)]
+        LOOKS_BEHIND.with(|looks| looks.set(looks.get() + 1));
         self.list.partition_point(|entry| row(entry) < index)
     }
 }
@@ -482,6 +529,16 @@ impl Feed<'_> {
         }
     }
 
+    /// The mean in flight the engine set behind a draw
+    /// ([`NamedAffinity::mean_in_flight`]): the rows named carry it, a
+    /// column carries none.
+    pub(crate) fn drawn_mean(self) -> Option<f32> {
+        match self {
+            Self::Column(_) => None,
+            Self::Named(named) => named.mean_in_flight,
+        }
+    }
+
     /// Row `index`'s entry: a column's own, where an index past the end
     /// fails, or a named row's ([`NamedAffinity::entry`]).
     #[inline]
@@ -489,6 +546,23 @@ impl Feed<'_> {
         match self {
             Self::Column(column) => column[index as usize],
             Self::Named(named) => named.entry(index),
+        }
+    }
+
+    /// Row `index`'s entry as one pass reads it: by the pass's own `reads`
+    /// where the pool is read whole, and by a search behind a draw
+    /// (`DRAWN`), where the rows stand in the draw's order and a pass
+    /// keeps no cursor. The choice is a constant of the body that reads.
+    #[inline(always)]
+    pub(crate) fn read<const DRAWN: bool>(
+        self,
+        reads: &mut Reads<'_>,
+        index: u32,
+    ) -> AffinityFacts {
+        if DRAWN {
+            self.entry(index)
+        } else {
+            reads.entry(index)
         }
     }
 }
@@ -573,15 +647,24 @@ pub struct Candidate {
     /// now and leave a load scorer's credit. In-process only; the wire carries
     /// the row's age.
     pub load_sampled_at_micros: u64,
-    /// The session key of the request is pinned to this worker.
+    /// The session key of the request is pinned to this worker. A host
+    /// writes it into a row it copies for the decision. Over a publication's
+    /// own rows the pin stands beside the rows instead
+    /// ([`RequestFacts::pinned_at`]).
     pub session_hit: bool,
     /// Requests of the request's session key in flight on this worker.
     pub session_in_flight: u16,
     /// The pairing class: `0` for a worker outside any pairing. Which decode
     /// classes a prefill class pairs with is the pair table's to say
     /// ([`PairTable`](crate::PairTable)); with no table a decode pairs with a
-    /// prefill of the same class. Until a store derives classes, a host keys
-    /// it by the open prefill a decode partners with.
+    /// prefill of the same class. The store derives the classes and their
+    /// table where a membership write moves a member or an offer, and again
+    /// under a generation of another pairing mode
+    /// ([`store::pairing`](crate::store::pairing)). It numbers each side by
+    /// itself, so a store's class pairs through its table alone: a prefill
+    /// and a decode of one number are not a pair for that. A host that
+    /// builds its own rows keys it by the open prefill a decode partners
+    /// with.
     pub pair_class: u32,
     /// Host-supplied admission bit: the prefill capacity window has a slot.
     pub has_capacity: bool,
@@ -636,6 +719,19 @@ pub struct Header<'a> {
     pub value: &'a str,
 }
 
+/// The mean of the in-flight counts of `rows` of `candidates`; zero over no
+/// row.
+pub(crate) fn mean_in_flight(candidates: &[Candidate], rows: &[u32]) -> f32 {
+    if rows.is_empty() {
+        return 0.0;
+    }
+    let sum: u64 = rows
+        .iter()
+        .map(|&i| u64::from(candidates[i as usize].in_flight))
+        .sum();
+    sum as f32 / rows.len() as f32
+}
+
 /// One request as a decision sees it. Borrowed from the host for the
 /// duration of the decision.
 #[derive(Clone, Copy, Debug, Default)]
@@ -681,6 +777,15 @@ pub struct RequestFacts<'a> {
     /// The host's clock at the decision, in microseconds since its origin.
     /// In-process only; no absolute instant crosses the wire.
     pub now_micros: u64,
+    /// One more than the position of the row the request's session key is
+    /// pinned to, where the host did not write the session bit into the
+    /// row: a view of a publication's own rows hands the pin here. A reader
+    /// of one row's session bit asks both ([`RequestFacts::pins`]), and a
+    /// pass over the rows looks for the pinned position once, as the
+    /// session scorer does. Zero for no pin, and where the rows were written
+    /// for the decision. A pair takes none: a pin is a position in one
+    /// pool, and neither side reads it. In-process only.
+    pub pinned_at: u32,
     /// The candidates' affinity facts, by index in the candidate slice the
     /// decision is made over: the one column the affinity stages read, in
     /// the candidates' own order. It is EMPTY or holds exactly one entry a
@@ -778,6 +883,13 @@ impl<'a> RequestFacts<'a> {
         }
     }
 
+    /// Whether the request's session key is pinned to the row at
+    /// `position`, beside the row's own session bit.
+    #[inline]
+    pub fn pins(&self, position: u32) -> bool {
+        self.pinned_at != 0 && self.pinned_at - 1 == position
+    }
+
     /// The affinity facts of the candidate at `index` of the slice the
     /// decision is made over. An empty column reads as nothing held for
     /// every candidate. Any other column holds the candidate's own entry,
@@ -847,6 +959,22 @@ pub struct Constraints<'a> {
     pub overload_lifted: bool,
     /// A subset hint: decide over at most this many candidates.
     pub subset_hint: Option<u32>,
+    /// The rows a standing veto of this host masks, by position, in order,
+    /// where the host did not write them into the rows: a view of a
+    /// publication's own rows hands them here, and a reader of a row's
+    /// stalled bit asks both ([`Constraints::masks`]). Empty where the rows
+    /// were written for the decision. In-process only.
+    pub stalled: &'a [u32],
+}
+
+impl Constraints<'_> {
+    /// Whether a standing veto of this host masks the row at `position`,
+    /// beside the row's own stalled bit. A decision under no such veto pays
+    /// the first test alone.
+    #[inline]
+    pub fn masks(&self, position: u32) -> bool {
+        !self.stalled.is_empty() && self.stalled.binary_search(&position).is_ok()
+    }
 }
 
 /// Healthy capacity of one zone, by the zone's position.
@@ -1034,6 +1162,54 @@ mod tests {
         let mut walk = NamedAffinity::default().walk();
         assert_eq!(walk.entry(0), AffinityFacts::default());
         assert_eq!(walk.entry(3), AffinityFacts::default());
+    }
+
+    /// Behind a draw a pass reads the rows named by a search: each row reads
+    /// as the walk of a whole read reads it, and no read looks behind a
+    /// cursor, where the walk asked in that order does.
+    #[test]
+    fn a_read_behind_a_draw_searches_the_rows_named_and_keeps_no_cursor() {
+        let holders = [(1, 4), (4, 9), (9, 3)].map(|(row, overlap_blocks)| NamedHolder {
+            row,
+            overlap_blocks,
+            predicted_blocks: 0,
+        });
+        let whole = NamedAffinity {
+            holders: &holders,
+            ..NamedAffinity::default()
+        };
+        let drawn = NamedAffinity {
+            mean_in_flight: Some(1.0),
+            ..whole
+        };
+        assert!(drawn.drawn() && !whole.drawn());
+        let feed = Feed::Named(drawn);
+        let order = [9, 0, 4, 4, 1, 10, 9];
+        LOOKS_BEHIND.with(|looks| looks.set(0));
+        let mut reads = feed.reads();
+        for row in order {
+            assert_eq!(
+                feed.read::<true>(&mut reads, row),
+                whole.entry(row),
+                "row {row}"
+            );
+        }
+        assert_eq!(
+            LOOKS_BEHIND.with(std::cell::Cell::get),
+            0,
+            "a search looked behind"
+        );
+        for row in order {
+            assert_eq!(
+                feed.read::<false>(&mut reads, row),
+                whole.entry(row),
+                "row {row}"
+            );
+        }
+        assert!(
+            LOOKS_BEHIND.with(std::cell::Cell::get) > 0,
+            "the walk never looked behind"
+        );
     }
 
     /// Rows named in the column's place read through the same accessor: a

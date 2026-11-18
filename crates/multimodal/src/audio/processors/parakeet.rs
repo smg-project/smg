@@ -157,9 +157,7 @@ impl ParakeetAudioProcessor {
         &self,
         audios: &[&DecodedAudio],
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
-        if audios.is_empty() {
-            return Err(TransformError::EmptyBatch);
-        }
+        TransformError::if_empty(audios)?;
         let n_mels = self.params.n_mels;
         let frontend = self
             .frontend

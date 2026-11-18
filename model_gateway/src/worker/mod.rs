@@ -5,6 +5,7 @@ pub mod health;
 pub mod identity;
 pub mod kv;
 pub mod load;
+pub mod metrics;
 pub mod pd;
 pub(crate) mod periodic_task;
 pub mod registry;
@@ -34,7 +35,6 @@ pub use identity::{
         WorkerType, DEFAULT_BOOTSTRAP_PORT, MOONCAKE_CONNECTOR, MORIIO_CONNECTOR,
         MORIIO_MODE_LABEL, NIXL_CONNECTOR,
     },
-    builder::BasicWorkerBuilder,
     error::{WorkerError, WorkerResult},
     metadata::DecodingLabels,
     sampling_defaults::DEFAULT_SAMPLING_PARAMS_LABEL,
@@ -45,7 +45,7 @@ pub use kv::{
 };
 pub use load::{
     capacity::{CapacitySource, CapacityTrackerSettings, WorkerCapacity},
-    monitor::{LoadConsumer, WorkerLoadManager, WorkerMonitor},
+    monitor::{LoadConsumer, WorkerLoadManager},
 };
 // Re-export UNKNOWN_MODEL_ID from protocols
 pub use openai_protocol::UNKNOWN_MODEL_ID;
@@ -56,5 +56,21 @@ pub use openai_protocol::{
 };
 pub(crate) use pd::pair_index::{PdPairIndex, PdWire};
 pub use pd::pairing::{PairingMismatch, PdPairing, PdPairingMode};
-pub use registry::{service::WorkerService, WorkerOrigin, WorkerRegistry};
 pub(crate) use registry::{ModelLabels, ModelWorkerSnapshot, RoutingPool, WindowFloor};
+pub use registry::{RemoteWorkerState, WorkerOrigin};
+
+// The gateway's connector, for the gateway's name for the builder below.
+use crate::routers::grpc::backend_client::BackendConnector;
+
+/// The worker builder as the gateway names it: a worker it builds connects
+/// through the gateway's client unless the builder is handed another
+/// connector. The two lines are the gateway's, and stay with it when the
+/// runtime moves into the worker crate.
+pub type BasicWorkerBuilder = identity::builder::BasicWorkerBuilder<BackendConnector>;
+
+/// The registry as the gateway names it: its value of a membership
+/// generation is the model snapshot that keeps the routers' projections.
+/// The load monitor holds that registry. The two lines are the gateway's,
+/// and stay with it when the registry moves into the worker crate.
+pub type WorkerRegistry = registry::WorkerRegistry<ModelWorkerSnapshot>;
+pub type WorkerMonitor = load::monitor::WorkerMonitor<ModelWorkerSnapshot>;

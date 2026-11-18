@@ -69,15 +69,13 @@ use tokio::{
 };
 use tracing::{debug, info, warn};
 
-use crate::{
-    observability::metrics::Metrics,
-    worker::{
-        health::liveness,
-        identity::endpoint::Endpoint,
-        load::state::{LoadReceiver, LoadSnapshot, LoadState},
-        registry::event::WorkerEvent,
-        ConnectionMode, Worker, WorkerRegistry,
-    },
+use crate::worker::{
+    health::liveness,
+    identity::endpoint::Endpoint,
+    load::state::{LoadReceiver, LoadSnapshot, LoadState},
+    metrics::Metrics,
+    registry::{event::WorkerEvent, worker_model_ids, Generation, WorkerRegistry},
+    ConnectionMode, Worker,
 };
 
 mod scrape;
@@ -325,8 +323,8 @@ pub trait LoadConsumer: Send + Sync {
 }
 
 /// Load monitoring service that subscribes to `WorkerRegistry` events.
-pub struct WorkerMonitor {
-    worker_registry: Arc<WorkerRegistry>,
+pub struct WorkerMonitor<G> {
+    worker_registry: Arc<WorkerRegistry<G>>,
     load_consumer: Arc<dyn LoadConsumer>,
     pub worker_load_manager: Arc<WorkerLoadManager>,
     default_interval: Duration,
@@ -340,7 +338,7 @@ pub struct WorkerMonitor {
     conditional_polling: bool,
     /// Shared immutable load snapshots: group ticks and the eviction flusher
     /// publish here; routing readers grab `Arc` snapshots.
-    load_state: Arc<LoadState>,
+    load_state: Arc<LoadState<G>>,
     /// What each worker's probes established about its native load routes,
     /// so discovery is not repeated every tick. A worker whose routes are
     /// all absent is served from `/metrics`. Cleared by
@@ -458,7 +456,7 @@ const PUSHED_PUBLISH_WINDOW: Duration = Duration::from_millis(20);
 /// staying far below the polling cadence that refreshes live entries.
 const EVICTION_DEBOUNCE: Duration = Duration::from_millis(20);
 
-impl Debug for WorkerMonitor {
+impl<G> Debug for WorkerMonitor<G> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WorkerMonitor")
             .field("default_interval", &self.default_interval)
@@ -466,14 +464,14 @@ impl Debug for WorkerMonitor {
     }
 }
 
-impl WorkerMonitor {
+impl<G: Generation> WorkerMonitor<G> {
     /// Construct a `WorkerMonitor` without spawning any background work.
     ///
     /// The caller must invoke [`Self::start_event_loop`] once initial
     /// workers have been registered. Until then, `worker_load_manager`
     /// is still safe to read; it just stays empty.
     pub fn new(
-        worker_registry: Arc<WorkerRegistry>,
+        worker_registry: Arc<WorkerRegistry<G>>,
         load_consumer: Arc<impl LoadConsumer + 'static>,
         default_interval_secs: u64,
         engine_metrics: bool,
@@ -1147,7 +1145,7 @@ impl WorkerMonitor {
             // A worker can serve multiple models (one load group per model),
             // so sentinel every model's series — not just the primary.
             let dp_size = worker.dp_size().unwrap_or(1);
-            for model_id in WorkerRegistry::worker_model_ids(&worker) {
+            for model_id in worker_model_ids(&worker) {
                 Metrics::remove_engine_load_metrics(worker.url(), &model_id, dp_size);
             }
         }
@@ -1324,16 +1322,17 @@ impl WorkerMonitor {
         }
     }
 
-    /// vLLM HTTP: the load from the Prometheus `/metrics` endpoint, read by
-    /// the gauge table in [`scrape`].
+    /// The first family over HTTP: the load from the Prometheus `/metrics`
+    /// endpoint, read by its gauge table in [`scrape`].
     async fn fetch_http_load_vllm(worker: &Arc<dyn Worker>) -> Option<WorkerLoadResponse> {
         let url = format!("{}/metrics", worker.base_url());
         let body = Self::authed_get(worker, &url).await?.text().await.ok()?;
         scrape::vllm(&body).map(Self::single_rank)
     }
 
-    /// SGLang HTTP: the load from the Prometheus `/metrics` gauges, read by
-    /// the gauge table in [`scrape`] (either metric prefix).
+    /// The second family over HTTP: the load from the Prometheus `/metrics`
+    /// gauges, read by its gauge table in [`scrape`] (either metric
+    /// prefix).
     async fn fetch_http_load_sglang(worker: &Arc<dyn Worker>) -> Option<WorkerLoadResponse> {
         let url = format!("{}/metrics", worker.base_url());
         let body = Self::authed_get(worker, &url).await?.text().await.ok()?;
@@ -1377,7 +1376,7 @@ impl WorkerMonitor {
         members: &[Arc<dyn Worker>],
     ) -> Option<WorkerLoadResponse> {
         let worker = members.first()?;
-        let backend_client = match worker.get_backend_client().await {
+        let backend_client = match worker.engine_connection().await {
             Ok(Some(client)) => client,
             Ok(None) => {
                 debug!("No backend client for worker {}", worker.redacted_url());
@@ -1472,7 +1471,34 @@ impl WorkerMonitor {
     }
 }
 
-impl Drop for WorkerMonitor {
+/// Where a load record pushed on a worker's event stream goes: the load
+/// monitor, as the KV event monitor's streams hold it. Held by this name,
+/// the sink brings nothing of the registry the monitor is built over.
+pub(crate) trait PushedLoadSink: Send + Sync {
+    /// Take the record of `dp_rank` received at `received_at`
+    /// ([`WorkerMonitor::apply_pushed_load`]).
+    fn push_load(
+        self: Arc<Self>,
+        worker: &Arc<dyn Worker>,
+        dp_rank: i32,
+        record: &EngineLoad,
+        received_at: Instant,
+    );
+}
+
+impl<G: Generation> PushedLoadSink for WorkerMonitor<G> {
+    fn push_load(
+        self: Arc<Self>,
+        worker: &Arc<dyn Worker>,
+        dp_rank: i32,
+        record: &EngineLoad,
+        received_at: Instant,
+    ) {
+        self.apply_pushed_load(worker, dp_rank, record, received_at);
+    }
+}
+
+impl<G> Drop for WorkerMonitor<G> {
     fn drop(&mut self) {
         if let Some(handle) = self.event_task.get_mut().take() {
             handle.abort();
@@ -1496,7 +1522,10 @@ impl Drop for WorkerMonitor {
 /// Holds the monitor weakly (same cycle-breaking rationale as the other
 /// loops); holding the `LoadState` strongly is fine — it owns no task
 /// handles back into the monitor.
-async fn eviction_flush_loop(load_state: Arc<LoadState>, monitor: Weak<WorkerMonitor>) {
+async fn eviction_flush_loop<G: Generation>(
+    load_state: Arc<LoadState<G>>,
+    monitor: Weak<WorkerMonitor<G>>,
+) {
     loop {
         load_state.eviction_wakeup().await;
         tokio::time::sleep(EVICTION_DEBOUNCE).await;
@@ -1541,7 +1570,7 @@ fn polled_engines(polled: &[Arc<dyn Worker>]) -> Vec<Vec<Arc<dyn Worker>>> {
 /// can belong to multiple groups simultaneously. Each `(model, type,
 /// connection)` triple is one group.
 fn group_keys_for_worker(worker: &Arc<dyn Worker>) -> Vec<WorkerGroupKey> {
-    WorkerRegistry::worker_model_ids(worker)
+    worker_model_ids(worker)
         .into_iter()
         .map(|model_id| WorkerGroupKey {
             model_id,
@@ -1577,8 +1606,8 @@ fn group_interval(workers: &[Arc<dyn Worker>], default_interval: Duration) -> Du
 /// `Weak` only for the duration of the work and drops the temporary
 /// `Arc` before the next `recv().await`, so the monitor's `Drop` can
 /// fire as soon as the owning `AppContext` goes away.
-async fn run_event_loop(
-    monitor: Weak<WorkerMonitor>,
+async fn run_event_loop<G: Generation>(
+    monitor: Weak<WorkerMonitor<G>>,
     mut events_rx: broadcast::Receiver<WorkerEvent>,
 ) {
     loop {
@@ -1672,7 +1701,7 @@ const LOAD_POLL_DEADLINE: Duration = Duration::from_secs(3);
 /// worker (the map has four shards per CPU the process sees, rounded up to a
 /// power of two: 1,024 on a 192-CPU host, 4,096 small allocations a second
 /// with the gateway idle).
-async fn liveness_sweep_loop(monitor: Weak<WorkerMonitor>) {
+async fn liveness_sweep_loop<G: Generation>(monitor: Weak<WorkerMonitor<G>>) {
     let mut ticker = tokio::time::interval(liveness::SWEEP_INTERVAL);
     loop {
         ticker.tick().await;
@@ -1685,8 +1714,8 @@ async fn liveness_sweep_loop(monitor: Weak<WorkerMonitor>) {
     }
 }
 
-async fn group_monitor_loop(
-    monitor: Weak<WorkerMonitor>,
+async fn group_monitor_loop<G: Generation>(
+    monitor: Weak<WorkerMonitor<G>>,
     group_key: WorkerGroupKey,
     interval: Duration,
 ) {
@@ -1708,8 +1737,8 @@ async fn group_monitor_loop(
 
 /// One tick of a group at `now`: the poll decision per worker, the polls of
 /// those not served by their stream, and the publish of what they returned.
-async fn poll_group_once(
-    monitor: &Arc<WorkerMonitor>,
+async fn poll_group_once<G: Generation>(
+    monitor: &Arc<WorkerMonitor<G>>,
     group_key: &WorkerGroupKey,
     interval: Duration,
     now: Instant,
@@ -1768,8 +1797,12 @@ async fn poll_group_once(
                 let native_loads_memo = Arc::clone(&monitor.native_loads_memo);
                 let connection_mode = group_key.connection_mode;
                 async move {
-                    WorkerMonitor::fetch_engine_loads(members, connection_mode, &native_loads_memo)
-                        .await
+                    WorkerMonitor::<G>::fetch_engine_loads(
+                        members,
+                        connection_mode,
+                        &native_loads_memo,
+                    )
+                    .await
                 }
             })
             .collect();
@@ -1967,13 +2000,12 @@ mod native_loads_tests {
     };
 
     use super::*;
-    use crate::{
-        config::types::PolicyConfig,
-        policies::{LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo},
-        worker::{BasicWorkerBuilder, ConnectionMode, WorkerLoadGuard, WorkerType},
+    use crate::worker::{
+        test_support::LoadReaders, BasicWorkerBuilder, ConnectionMode, WorkerLoadGuard,
+        WorkerMonitor, WorkerRegistry, WorkerType,
     };
 
-    const VLLM_METRICS: &str = "vllm:num_requests_running{m=\"a\"} 7.0\n\
+    const ENGINE_METRICS: &str = "vllm:num_requests_running{m=\"a\"} 7.0\n\
          vllm:num_requests_waiting{m=\"a\"} 11.0\n\
          vllm:kv_cache_usage_perc{m=\"a\"} 0.5\n";
 
@@ -2002,7 +2034,7 @@ mod native_loads_tests {
 
     /// Loopback backend stub. Each native route answers with the status and
     /// body it was given and counts its hits; `/metrics` always serves the
-    /// vLLM gauges.
+    /// first family's gauges.
     async fn spawn_backend(
         gateway: (StatusCode, &'static str),
         engine: (StatusCode, &'static str),
@@ -2034,7 +2066,7 @@ mod native_loads_tests {
         let app = axum::Router::new()
             .route("/loads", route(&gateway_probes, &gateway_query, gateway))
             .route("/v1/loads", route(&probes, &engine_query, engine))
-            .route("/metrics", axum::routing::get(|| async { VLLM_METRICS }));
+            .route("/metrics", axum::routing::get(|| async { ENGINE_METRICS }));
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -2066,12 +2098,12 @@ mod native_loads_tests {
         spawn_backend((StatusCode::OK, body), (StatusCode::NOT_FOUND, "")).await
     }
 
-    fn vllm_worker(url: &str) -> Arc<dyn Worker> {
-        vllm_worker_with_overload(url, OverloadUpdate::default())
+    fn gauge_worker(url: &str) -> Arc<dyn Worker> {
+        gauge_worker_with_overload(url, OverloadUpdate::default())
     }
 
     /// Build an HTTP virtual rank whose probes must use the base endpoint.
-    fn vllm_dp_worker(url: &str, rank: usize, size: usize) -> Arc<dyn Worker> {
+    fn gauge_dp_worker(url: &str, rank: usize, size: usize) -> Arc<dyn Worker> {
         Arc::new(
             BasicWorkerBuilder::new(url)
                 .worker_type(WorkerType::Regular)
@@ -2089,15 +2121,15 @@ mod native_loads_tests {
 
     /// Worker carrying a per-worker overload block — protection for it is
     /// enabled by the spec alone, with no gateway thresholds anywhere.
-    fn vllm_worker_with_overload(url: &str, overload: OverloadUpdate) -> Arc<dyn Worker> {
-        vllm_worker_built(url, "a", overload)
+    fn gauge_worker_with_overload(url: &str, overload: OverloadUpdate) -> Arc<dyn Worker> {
+        gauge_worker_built(url, "a", overload)
     }
 
-    fn vllm_worker_with_model(url: &str, model: &str) -> Arc<dyn Worker> {
-        vllm_worker_built(url, model, OverloadUpdate::default())
+    fn gauge_worker_with_model(url: &str, model: &str) -> Arc<dyn Worker> {
+        gauge_worker_built(url, model, OverloadUpdate::default())
     }
 
-    fn vllm_worker_built(url: &str, model: &str, overload: OverloadUpdate) -> Arc<dyn Worker> {
+    fn gauge_worker_built(url: &str, model: &str, overload: OverloadUpdate) -> Arc<dyn Worker> {
         Arc::new(
             BasicWorkerBuilder::new(url)
                 .worker_type(WorkerType::Regular)
@@ -2113,41 +2145,18 @@ mod native_loads_tests {
         )
     }
 
-    fn cache_aware_policy_config(overlap_decay: f32) -> PolicyConfig {
-        PolicyConfig::CacheAware {
-            cache_threshold: 0.5,
-            balance_abs_threshold: 32,
-            balance_rel_threshold: 1.1,
-            eviction_interval_secs: 0,
-            max_tree_size: 4096,
-            block_size: 16,
-            balance_token_usage_threshold: 1.0,
-            overload_token_usage_threshold: 1.0,
-            overlap_decay,
-            selection_temperature: 0.0,
-            cache_index: Default::default(),
-            cache_ttl_secs: 180,
-            cache_boundaries: Vec::new(),
-            selection_policy: None,
-            selection_accounting_ttl_ms: 0,
-            balance_prefix_margin_tokens: 0,
-            balance_uncached_credit: false,
-        }
-    }
-
-    fn monitor_with_policy(config: PolicyConfig) -> (Arc<WorkerRegistry>, Arc<WorkerMonitor>) {
-        monitor_with(config, false)
+    fn monitor_with_readers(readers: LoadReaders) -> (Arc<WorkerRegistry>, Arc<WorkerMonitor>) {
+        monitor_with(readers, false)
     }
 
     fn monitor_with(
-        config: PolicyConfig,
+        readers: LoadReaders,
         conditional_polling: bool,
     ) -> (Arc<WorkerRegistry>, Arc<WorkerMonitor>) {
         let registry = Arc::new(WorkerRegistry::new());
-        let policy_registry = Arc::new(PolicyRegistry::new(config));
         let monitor = Arc::new(WorkerMonitor::new(
             registry.clone(),
-            policy_registry,
+            Arc::new(readers),
             1,
             false,
             conditional_polling,
@@ -2167,49 +2176,38 @@ mod native_loads_tests {
         .unwrap_or_else(|_| panic!("timed out waiting for {label}"));
     }
 
-    /// A policy that records the reconciliation ticks it receives.
+    /// A routing side that records the reconciliation ticks it receives:
+    /// the worker's URL and the requests the router holds on it.
     #[derive(Debug, Default)]
     struct ReconcileRecorder(Mutex<Vec<(String, usize)>>);
 
-    impl LoadBalancingPolicy for ReconcileRecorder {
-        fn select_worker(
-            &self,
-            workers: &[Arc<dyn Worker>],
-            _info: &SelectWorkerInfo,
-        ) -> Option<usize> {
-            (!workers.is_empty()).then_some(0)
+    impl LoadConsumer for ReconcileRecorder {
+        fn needs_loads(&self) -> bool {
+            false
         }
 
-        fn reconcile_in_flight(&self, worker_url: &str, in_flight: usize) {
-            self.0.lock().push((worker_url.to_string(), in_flight));
-        }
-
-        fn name(&self) -> &'static str {
-            "reconcile_recorder"
-        }
-
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
+        fn reconcile_in_flight(&self, worker: &dyn Worker) {
+            self.0
+                .lock()
+                .push((worker.url().to_string(), worker.load()));
         }
     }
 
-    /// Every poll hands each polled worker's policy the router's live
-    /// in-flight count on it, the safety net for a completion that never
-    /// reached the policy.
+    /// Every poll hands the routing side each polled worker, with the
+    /// router's live in-flight count on it: the safety net for a completion
+    /// the routing side never saw.
     #[tokio::test]
-    async fn load_poll_reconciles_in_flight_with_the_workers_policy() {
+    async fn load_poll_reconciles_in_flight_with_the_routing_side() {
         let stub = spawn_engine(StatusCode::OK, NATIVE_BODY).await;
         let registry = Arc::new(WorkerRegistry::new());
-        let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
+        let recorder = Arc::new(ReconcileRecorder::default());
         let monitor = Arc::new(WorkerMonitor::new(
             registry.clone(),
-            Arc::clone(&policy_registry),
+            Arc::clone(&recorder),
             1,
             false,
             false,
         ));
-        let recorder = Arc::new(ReconcileRecorder::default());
-        policy_registry.set_decode_policy(Arc::clone(&recorder) as Arc<dyn LoadBalancingPolicy>);
         let worker: Arc<dyn Worker> = Arc::new(
             BasicWorkerBuilder::new(stub.url.as_str())
                 .worker_type(WorkerType::Decode)
@@ -2227,7 +2225,7 @@ mod native_loads_tests {
         registry.register(Arc::clone(&worker)).unwrap();
         monitor.start_event_loop();
 
-        wait_until("the poll to reconcile the worker's policy", || {
+        wait_until("the poll to reconcile the routing side", || {
             recorder
                 .0
                 .lock()
@@ -2240,14 +2238,14 @@ mod native_loads_tests {
 
     /// `NATIVE_BODY` reports 4 waiting requests, so a threshold of 4 vetoes and
     /// a threshold of 5 does not — the ingestion path must latch the verdict on
-    /// the worker itself, under a policy (round-robin) that reads no loads at
+    /// the worker itself, beside a routing side that reads no loads at
     /// all. The threshold rides the worker's spec block, so this also proves a
     /// spec block alone enables protection with no gateway flags anywhere.
     #[tokio::test]
     async fn load_ingestion_flags_worker_over_waiting_threshold() {
         let stub = spawn_engine(StatusCode::OK, NATIVE_BODY).await;
-        let (registry, monitor) = monitor_with(PolicyConfig::RoundRobin, false);
-        let worker = vllm_worker_with_overload(
+        let (registry, monitor) = monitor_with(LoadReaders::Blind, false);
+        let worker = gauge_worker_with_overload(
             &stub.url,
             OverloadUpdate {
                 waiting_requests: Some(4),
@@ -2271,8 +2269,8 @@ mod native_loads_tests {
     #[tokio::test]
     async fn busy_worker_under_threshold_stays_eligible() {
         let stub = spawn_engine(StatusCode::OK, NATIVE_BODY).await;
-        let (registry, monitor) = monitor_with(PolicyConfig::RoundRobin, false);
-        let worker = vllm_worker_with_overload(
+        let (registry, monitor) = monitor_with(LoadReaders::Blind, false);
+        let worker = gauge_worker_with_overload(
             &stub.url,
             OverloadUpdate {
                 waiting_requests: Some(5),
@@ -2304,8 +2302,8 @@ mod native_loads_tests {
     #[tokio::test]
     async fn overload_thresholds_alone_start_load_polling() {
         let stub = spawn_engine(StatusCode::OK, NATIVE_BODY).await;
-        let (registry, monitor) = monitor_with(PolicyConfig::RoundRobin, true);
-        let worker = vllm_worker_with_overload(
+        let (registry, monitor) = monitor_with(LoadReaders::Blind, true);
+        let worker = gauge_worker_with_overload(
             &stub.url,
             OverloadUpdate {
                 waiting_requests: None,
@@ -2332,10 +2330,10 @@ mod native_loads_tests {
     #[tokio::test]
     async fn unconfigured_thresholds_never_write_the_flag() {
         let stub = spawn_engine(StatusCode::OK, NATIVE_BODY).await;
-        // cache_aware with overlap_decay on, so loads are polled and ingested
-        // for reasons unrelated to overload protection.
-        let (registry, monitor) = monitor_with(cache_aware_policy_config(1.0), false);
-        let worker = vllm_worker(&stub.url);
+        // A load-aware reader, so loads are polled and ingested for reasons
+        // unrelated to overload protection.
+        let (registry, monitor) = monitor_with(LoadReaders::Aware, false);
+        let worker = gauge_worker(&stub.url);
         worker.set_status(WorkerStatus::Ready);
         registry.register(Arc::clone(&worker)).unwrap();
         monitor.start_event_loop();
@@ -2360,9 +2358,9 @@ mod native_loads_tests {
     /// re-admitted rather than stranded out of routing forever.
     #[tokio::test]
     async fn losing_the_load_feed_clears_the_veto() {
-        let (registry, monitor) = monitor_with(PolicyConfig::RoundRobin, false);
+        let (registry, monitor) = monitor_with(LoadReaders::Blind, false);
         // Never-registered address: every fetch fails, so the report is absent.
-        let worker = vllm_worker_with_overload(
+        let worker = gauge_worker_with_overload(
             "http://127.0.0.1:1",
             OverloadUpdate {
                 waiting_requests: Some(1),
@@ -2386,8 +2384,8 @@ mod native_loads_tests {
     /// so it must clear it itself — same rule the load snapshot follows.
     #[tokio::test]
     async fn stop_all_groups_clears_overload_flags() {
-        let (registry, monitor) = monitor_with(PolicyConfig::RoundRobin, false);
-        let worker = vllm_worker_with_overload(
+        let (registry, monitor) = monitor_with(LoadReaders::Blind, false);
+        let worker = gauge_worker_with_overload(
             "http://127.0.0.1:1",
             OverloadUpdate {
                 waiting_requests: Some(1),
@@ -2404,13 +2402,13 @@ mod native_loads_tests {
         assert_eq!(registry.overloaded_worker_count("a"), 0);
     }
 
-    /// A load-aware policy must still be fed with the opt-out set — the
+    /// A load-aware reader must still be fed with the opt-out set — the
     /// conditional gate is "poll when needed", never "never poll".
     #[tokio::test]
-    async fn pressure_configured_cache_aware_starts_load_polling() {
+    async fn a_load_aware_reader_starts_load_polling_under_the_conditional_gate() {
         let stub = spawn_engine(StatusCode::OK, NATIVE_BODY).await;
-        let (registry, monitor) = monitor_with(cache_aware_policy_config(1.0), true);
-        let worker = vllm_worker(&stub.url);
+        let (registry, monitor) = monitor_with(LoadReaders::Aware, true);
+        let worker = gauge_worker(&stub.url);
         worker.set_status(WorkerStatus::Ready);
         registry.register(worker).unwrap();
         monitor.start_event_loop();
@@ -2430,19 +2428,19 @@ mod native_loads_tests {
             }
         })
         .await
-        .expect("cache_aware with overlap_decay must trigger load polling");
+        .expect("a load-aware reader must trigger load polling under the conditional gate");
     }
 
     /// The one predicate behind the poll tick and the load stream: wanted
     /// by default; under `--disable-load-monitoring` only for a reason.
     #[tokio::test]
     async fn loads_wanted_follows_the_conditional_gate() {
-        let (_registry, by_default) = monitor_with(PolicyConfig::Random, false);
-        assert!(by_default.loads_wanted(&[vllm_worker("http://a:8000")]));
-        let (_registry, conditional) = monitor_with(PolicyConfig::Random, true);
-        assert!(!conditional.loads_wanted(&[vllm_worker("http://a:8000")]));
+        let (_registry, by_default) = monitor_with(LoadReaders::Blind, false);
+        assert!(by_default.loads_wanted(&[gauge_worker("http://a:8000")]));
+        let (_registry, conditional) = monitor_with(LoadReaders::Blind, true);
+        assert!(!conditional.loads_wanted(&[gauge_worker("http://a:8000")]));
         assert!(
-            conditional.loads_wanted(&[vllm_worker_with_overload(
+            conditional.loads_wanted(&[gauge_worker_with_overload(
                 "http://a:8000",
                 OverloadUpdate {
                     waiting_requests: Some(1),
@@ -2451,13 +2449,8 @@ mod native_loads_tests {
             )]),
             "overload protection on a member wants the loads"
         );
-        let (_registry, load_aware) = monitor_with(
-            PolicyConfig::PowerOfTwo {
-                load_metric: Default::default(),
-            },
-            true,
-        );
-        assert!(load_aware.loads_wanted(&[vllm_worker("http://a:8000")]));
+        let (_registry, load_aware) = monitor_with(LoadReaders::Aware, true);
+        assert!(load_aware.loads_wanted(&[gauge_worker("http://a:8000")]));
     }
 
     /// Load monitoring is on by default: a load-blind policy with no flags and
@@ -2465,8 +2458,8 @@ mod native_loads_tests {
     #[tokio::test]
     async fn load_blind_policy_polls_by_default() {
         let stub = spawn_engine(StatusCode::OK, NATIVE_BODY).await;
-        let (registry, monitor) = monitor_with_policy(cache_aware_policy_config(0.0));
-        let worker = vllm_worker(&stub.url);
+        let (registry, monitor) = monitor_with_readers(LoadReaders::Blind);
+        let worker = gauge_worker(&stub.url);
         worker.set_status(WorkerStatus::Ready);
         registry.register(Arc::clone(&worker)).unwrap();
         monitor.start_event_loop();
@@ -2484,8 +2477,8 @@ mod native_loads_tests {
     #[tokio::test]
     async fn disable_load_monitoring_restores_the_conditional_gate() {
         let stub = spawn_engine(StatusCode::OK, NATIVE_BODY).await;
-        let (registry, monitor) = monitor_with(PolicyConfig::RoundRobin, true);
-        let worker = vllm_worker(&stub.url);
+        let (registry, monitor) = monitor_with(LoadReaders::Blind, true);
+        let worker = gauge_worker(&stub.url);
         worker.set_status(WorkerStatus::Ready);
         registry.register(worker).unwrap();
         monitor.start_event_loop();
@@ -2497,9 +2490,9 @@ mod native_loads_tests {
     }
 
     #[tokio::test]
-    async fn native_loads_preferred_over_metrics_on_vllm() {
+    async fn native_loads_preferred_over_the_gauge_page() {
         let stub = spawn_engine(StatusCode::OK, NATIVE_BODY).await;
-        let worker = vllm_worker(&stub.url);
+        let worker = gauge_worker(&stub.url);
         let memo = DashMap::new();
 
         let resp = WorkerMonitor::fetch_http_load(&worker, Some(&memo))
@@ -2549,7 +2542,7 @@ mod native_loads_tests {
     /// A backend-wide native response only updates the selected virtual rank.
     async fn native_loads_are_projected_to_the_virtual_worker_rank() {
         let stub = spawn_engine(StatusCode::OK, NATIVE_DP_BODY).await;
-        let worker = vllm_dp_worker(&stub.url, 1, 2);
+        let worker = gauge_dp_worker(&stub.url, 1, 2);
 
         let resp = WorkerMonitor::fetch_http_load(&worker, None)
             .await
@@ -2566,7 +2559,7 @@ mod native_loads_tests {
     async fn missing_native_rank_never_uses_prometheus_average() {
         for body in [NATIVE_BODY, r#"{"loads":[]}"#] {
             let stub = spawn_engine(StatusCode::OK, body).await;
-            let worker = vllm_dp_worker(&stub.url, 1, 2);
+            let worker = gauge_dp_worker(&stub.url, 1, 2);
             let memo = DashMap::new();
             for _ in 0..2 {
                 assert!(WorkerMonitor::fetch_http_load(&worker, Some(&memo))
@@ -2584,7 +2577,7 @@ mod native_loads_tests {
     /// Gateway rollups retain their independent downstream worker identities.
     async fn gateway_fleet_loads_are_not_projected_as_engine_dp_ranks() {
         let stub = spawn_gateway(GATEWAY_FLEET_BODY).await;
-        let worker = vllm_dp_worker(&stub.url, 1, 2);
+        let worker = gauge_dp_worker(&stub.url, 1, 2);
 
         let resp = WorkerMonitor::fetch_http_load(&worker, None)
             .await
@@ -2599,7 +2592,7 @@ mod native_loads_tests {
     #[tokio::test]
     async fn absent_native_endpoint_falls_back_and_is_probed_once() {
         let stub = spawn_engine(StatusCode::NOT_FOUND, "").await;
-        let worker = vllm_worker(&stub.url);
+        let worker = gauge_worker(&stub.url);
         let memo = DashMap::new();
 
         for _ in 0..3 {
@@ -2630,7 +2623,7 @@ mod native_loads_tests {
         // absence per route is what lets the dead one be dropped while the
         // unwell one keeps being asked.
         let stub = spawn_engine(StatusCode::SERVICE_UNAVAILABLE, "").await;
-        let worker = vllm_worker(&stub.url);
+        let worker = gauge_worker(&stub.url);
         let memo = DashMap::new();
 
         for _ in 0..3 {
@@ -2656,7 +2649,7 @@ mod native_loads_tests {
             r#"{"loads":null}"#,
         ] {
             let stub = spawn_engine(StatusCode::OK, body).await;
-            let worker = vllm_worker(&stub.url);
+            let worker = gauge_worker(&stub.url);
             let memo = DashMap::new();
 
             WorkerMonitor::fetch_http_load(&worker, Some(&memo))
@@ -2673,7 +2666,7 @@ mod native_loads_tests {
     async fn empty_loads_array_keeps_probing() {
         // Our schema, no ranks yet — the endpoint exists, so keep asking.
         let stub = spawn_engine(StatusCode::OK, r#"{"loads":[]}"#).await;
-        let worker = vllm_worker(&stub.url);
+        let worker = gauge_worker(&stub.url);
         let memo = DashMap::new();
 
         for _ in 0..2 {
@@ -2693,7 +2686,7 @@ mod native_loads_tests {
     #[tokio::test]
     async fn absent_memo_is_bypassed_when_caller_has_none() {
         let stub = spawn_engine(StatusCode::NOT_FOUND, "").await;
-        let worker = vllm_worker(&stub.url);
+        let worker = gauge_worker(&stub.url);
 
         for _ in 0..2 {
             WorkerMonitor::fetch_http_load(&worker, None)
@@ -2709,7 +2702,7 @@ mod native_loads_tests {
         // A gateway registered as a worker: `/loads` is the only route it
         // has, and it must be tried before the engine one.
         let stub = spawn_gateway(NATIVE_BODY).await;
-        let worker = vllm_worker(&stub.url);
+        let worker = gauge_worker(&stub.url);
         let memo = DashMap::new();
 
         for _ in 0..3 {
@@ -2736,7 +2729,7 @@ mod native_loads_tests {
         // An engine-only stub with the gateway route memoized: the stale
         // memo must be dropped, not treated as "serves neither".
         let stub = spawn_engine(StatusCode::OK, NATIVE_BODY).await;
-        let worker = vllm_worker(&stub.url);
+        let worker = gauge_worker(&stub.url);
         let memo = DashMap::new();
         let mut stale = NativeLoadsMemo::default();
         stale.record_answered(NativeLoadsPath::Gateway);
@@ -2769,7 +2762,7 @@ mod native_loads_tests {
         // A gateway fronts many models; the load of the one this worker was
         // registered for is the only load that belongs to it.
         let stub = spawn_gateway(NATIVE_BODY).await;
-        let worker = vllm_worker_with_model(&stub.url, "meta-llama/Llama-3.1-8B");
+        let worker = gauge_worker_with_model(&stub.url, "meta-llama/Llama-3.1-8B");
 
         WorkerMonitor::fetch_http_load(&worker, None)
             .await
@@ -2791,8 +2784,8 @@ mod native_loads_tests {
             (StatusCode::NOT_FOUND, "", false),
         ] {
             let stub = spawn_engine(status, body).await;
-            let (registry, monitor) = monitor_with_policy(PolicyConfig::RoundRobin);
-            let worker = vllm_dp_worker(&stub.url, 1, 2);
+            let (registry, monitor) = monitor_with_readers(LoadReaders::Blind);
+            let worker = gauge_dp_worker(&stub.url, 1, 2);
             worker.set_status(WorkerStatus::Ready);
             registry.register(Arc::clone(&worker)).unwrap();
             // Simulate a previously cached backend-wide snapshot under this URL.
@@ -2828,8 +2821,8 @@ mod native_loads_tests {
     async fn empty_poll_does_not_resurrect_stale_pushed_ranks() {
         for fresh_offset in [None, Some(Duration::ZERO), Some(Duration::from_millis(1))] {
             let stub = spawn_engine(StatusCode::OK, r#"{"loads":[]}"#).await;
-            let (registry, monitor) = monitor_with_policy(PolicyConfig::RoundRobin);
-            let worker = vllm_worker(&stub.url);
+            let (registry, monitor) = monitor_with_readers(LoadReaders::Blind);
+            let worker = gauge_worker(&stub.url);
             worker.set_status(WorkerStatus::Ready);
             registry.register(Arc::clone(&worker)).unwrap();
             let interval = Duration::from_secs(10);
@@ -2903,10 +2896,10 @@ mod native_loads_tests {
             {"dp_rank":0,"num_running_reqs":3,"num_waiting_reqs":1,"num_used_tokens":300,"max_total_num_tokens":1000,"token_usage":0.3},
             {"dp_rank":1,"num_running_reqs":9,"num_waiting_reqs":4,"num_used_tokens":900,"max_total_num_tokens":1000,"token_usage":0.9}]}"#;
         let stub = spawn_engine(StatusCode::OK, TWO_RANKS).await;
-        let (registry, monitor) = monitor_with_policy(PolicyConfig::RoundRobin);
+        let (registry, monitor) = monitor_with_readers(LoadReaders::Blind);
         let workers = [
-            vllm_dp_worker(&stub.url, 0, 2),
-            vllm_dp_worker(&stub.url, 1, 2),
+            gauge_dp_worker(&stub.url, 0, 2),
+            gauge_dp_worker(&stub.url, 1, 2),
         ];
         for worker in &workers {
             registry.register(Arc::clone(worker)).unwrap();
@@ -2988,7 +2981,7 @@ mod native_loads_tests {
             reason = "test engine: the server task lives for the test process"
         )]
         let _engine = tokio::spawn(mock_worker::grpc::serve_with_listener(cfg, listener));
-        let (registry, monitor) = monitor_with_policy(PolicyConfig::RoundRobin);
+        let (registry, monitor) = monitor_with_readers(LoadReaders::Blind);
         let rank_worker = |rank: usize| -> Arc<dyn Worker> {
             Arc::new(
                 BasicWorkerBuilder::new(format!("grpc://127.0.0.1:{port}"))
@@ -3054,8 +3047,8 @@ mod native_loads_tests {
             {"dp_rank":0,"num_running_reqs":3,"num_waiting_reqs":0,"token_usage":0.25,"cache_hit_rate":0.9},
             {"dp_rank":1,"num_running_reqs":8,"num_waiting_reqs":0,"token_usage":0.5,"cache_hit_rate":0.91}]}"#;
         let stub = spawn_engine(StatusCode::OK, TWO_RANKS).await;
-        let (registry, monitor) = monitor_with_policy(PolicyConfig::RoundRobin);
-        let worker = vllm_worker(&stub.url);
+        let (registry, monitor) = monitor_with_readers(LoadReaders::Blind);
+        let worker = gauge_worker(&stub.url);
         worker.set_status(WorkerStatus::Ready);
         registry.register(Arc::clone(&worker)).unwrap();
         let key = WorkerGroupKey {
@@ -3105,8 +3098,8 @@ mod native_loads_tests {
     /// record publishes nothing.
     #[tokio::test]
     async fn a_windows_records_publish_one_report_in_the_polls_shape() {
-        let (registry, monitor) = monitor_with_policy(PolicyConfig::RoundRobin);
-        let worker = vllm_worker("http://w1:8000");
+        let (registry, monitor) = monitor_with_readers(LoadReaders::Blind);
+        let worker = gauge_worker("http://w1:8000");
         worker.set_status(WorkerStatus::Ready);
         registry.register(Arc::clone(&worker)).unwrap();
         let t0 = Instant::now();
@@ -3150,8 +3143,8 @@ mod native_loads_tests {
     /// rank.
     #[tokio::test]
     async fn a_record_for_a_rank_on_file_replaces_its_entry_in_place() {
-        let (registry, monitor) = monitor_with_policy(PolicyConfig::RoundRobin);
-        let worker = vllm_worker("http://w1:8000");
+        let (registry, monitor) = monitor_with_readers(LoadReaders::Blind);
+        let worker = gauge_worker("http://w1:8000");
         worker.set_status(WorkerStatus::Ready);
         registry.register(Arc::clone(&worker)).unwrap();
         let t0 = Instant::now();
@@ -3213,8 +3206,8 @@ mod native_loads_tests {
     /// reads `answer`, and rank 1 pushes its next record.
     async fn fallback_poll_after_rank_0_pushed(answer: &'static str) -> AfterFallbackPoll {
         let stub = spawn_engine(StatusCode::OK, answer).await;
-        let (registry, monitor) = monitor_with_policy(PolicyConfig::RoundRobin);
-        let worker = vllm_worker_with_overload(
+        let (registry, monitor) = monitor_with_readers(LoadReaders::Blind);
+        let worker = gauge_worker_with_overload(
             &stub.url,
             OverloadUpdate {
                 waiting_requests: Some(4),
@@ -3447,8 +3440,8 @@ mod native_loads_tests {
         also_quiet: &[i32],
     ) -> AfterNextRecord {
         let stub = spawn_engine(StatusCode::OK, answer).await;
-        let (registry, monitor) = monitor_with_policy(PolicyConfig::RoundRobin);
-        let worker = vllm_worker_with_overload(
+        let (registry, monitor) = monitor_with_readers(LoadReaders::Blind);
+        let worker = gauge_worker_with_overload(
             &stub.url,
             OverloadUpdate {
                 waiting_requests: Some(4),
@@ -3749,8 +3742,8 @@ mod native_loads_tests {
     /// stream.
     #[tokio::test]
     async fn a_pushed_record_leaves_the_rank_caches_last_entry() {
-        let (registry, monitor) = monitor_with_policy(PolicyConfig::RoundRobin);
-        let worker = vllm_worker("http://engine:8000");
+        let (registry, monitor) = monitor_with_readers(LoadReaders::Blind);
+        let worker = gauge_worker("http://engine:8000");
         worker.set_status(WorkerStatus::Ready);
         registry.register(Arc::clone(&worker)).unwrap();
         let last_entry = HashMap::from([(0, 900), (1, 500)]);

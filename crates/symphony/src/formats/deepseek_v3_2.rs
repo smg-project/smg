@@ -636,6 +636,22 @@ mod tests {
         );
     }
 
+    /// An invoke whose arguments the model wrote as one JSON object in place of the parameter
+    /// tags (the shared [`testing::an_invoke_whose_arguments_are_json_reads_as_the_engines_do`]
+    /// lists the shapes) gives the object as the call's arguments, as the serving engines' own
+    /// parsers read it; the V4 table's notes say why.
+    #[test]
+    fn an_invoke_whose_arguments_are_one_json_object_reads_as_the_engines_own_parsers_read_it() {
+        testing::an_invoke_whose_arguments_are_json_reads_as_the_engines_do(
+            run,
+            "<｜DSML｜invoke name=\"",
+            "</｜DSML｜invoke>",
+            "<｜DSML｜function_calls>",
+            "</｜DSML｜function_calls>",
+            CHAT,
+        );
+    }
+
     /// The rows from the content into an invoke change no forced-call tag: the grammar takes the
     /// block from the wrapping state's row alone, so a forced call is still written as the block,
     /// the block's opener with the template's blank line first, the invoke inside it, the block's

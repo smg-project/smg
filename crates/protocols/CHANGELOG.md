@@ -243,6 +243,14 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   upstream. The crate refused the request with ``unknown variant `auto`, expected `low` or
   `high` `` and dropped the variable's detail. Breaking: `FileDetail` gains `Auto`, now its default,
   and `PromptVariableTyped::ResponseInputFile` gains `detail: Option<FileDetail>`.
+- Realtime events read and write as the public API does. A `session.update`, `session.created`
+  or `session.updated` event reads its session into the variant its `type` names, where every
+  one the API writes failed with "missing field `type`", and is written with that `type` once,
+  where it was written twice. A transcription's `completed` event keeps its detected `languages`
+  (an empty list means none was detected), a transcription segment its `start` and `end` at the
+  precision written, and a failed response's error its `message`. Breaking:
+  `ServerEvent::InputAudioTranscriptionCompleted` gains `languages`, the segment's `start` and
+  `end` are `f64`, and `ResponseStatusError` gains `message`.
 - Under the MiniMax profile a `reasoning_effort` of `none` switches thinking off
   (`ProviderProfile::thinking_from_reasoning_effort`, so the `template_thinking` of a chat or
   Messages request), as the vendor's contract for the family reads it: the request answers as one
@@ -282,6 +290,15 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 - A Responses `tool_choice` of type `computer` or `computer_use`, as the public API lists them
   (`ToolChoiceTypes`), parses. The crate refused the request whole, as matching no variant of
   `ResponsesToolChoice`. Breaking: `BuiltInToolChoiceType` gains `Computer` and `ComputerUse`.
+- A Messages web search result is written with its `type` (`web_search_result`) and its null
+  `page_age`, and the web search error `request_too_large` and a tool search's error result
+  (`tool_search_tool_result_error`) read, as the public API writes them. A result had been written
+  without the `type` that the public API requires of a replayed one, and each of the two errors
+  failed a whole answer or request that held it. A tool reference in a replayed tool search result
+  keeps its `cache_control`, which was dropped. Breaking: `WebSearchResultBlock` gains
+  `block_type`, `WebSearchToolResultErrorCode` gains `RequestTooLarge`, a tool search result's
+  `content` is the new `ToolSearchToolResultContent`, and `ToolReferenceBlock` gains
+  `cache_control`.
 - A completion request with `"echo": null` is served, as the public API allows. The crate refused
   it as a 400 `invalid_type`. The engine flags `no_stop_trim`, `ignore_eos`, `skip_special_tokens`
   and `return_hidden_states` read a `null` as their default too, as the chat request's flags do.
@@ -301,6 +318,13 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   written back under the canonical `web_search_preview`, and its `search_content_types`. The crate
   refused a request declaring either, as an unknown tool type or field. Breaking:
   `WebSearchPreviewTool` gains `search_content_types: Option<Vec<String>>`.
+- An Interactions request declaring a `computer_use`, `google_maps` or `retrieval` tool is
+  accepted, an `mcp_server` tool takes its `allowed_tools` as the list the public API declares, and
+  `google_search` keeps its `search_types`. The three tools were unknown variants and the list
+  failed to parse, each refusing the whole request, and `search_types` was dropped. Breaking:
+  `InteractionsTool` gains `ComputerUse`, `GoogleMaps` and `Retrieval`, `GoogleSearch` gains
+  `search_types`, `McpServer.allowed_tools` is a `Vec<AllowedTools>`, and `ToolChoiceType`, which
+  the SDK keeps open as it does the tools' other sets, gains `Other` and is `#[non_exhaustive]`.
 - `EmbeddingRequest` and `ClassifyRequest` run the public API's shape rule on `input` (a string,
   an array of strings, an array of token ids or an array of token id arrays; nothing empty; a
   member of another kind than the first is refused by its index), and `EmbeddingRequest` the
@@ -316,6 +340,12 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   `null` metadata reads as the empty map (`deserialize_null_as_empty_map`, a map twin of
   `deserialize_null_as_empty_vec`), and `IncompleteReason`, `#[non_exhaustive]`, gains
   `MaxMessages` and `Steered`.
+- A Messages search result's text items are written with their `type`, which the public API
+  requires of them, in a message and in a tool result alike. They were read into untagged text
+  blocks, so a forwarded search result lost the `type` of each item. An item read without one
+  still reads, as text, and an item of another type is refused. Breaking:
+  `SearchResultBlock.content` holds the new `SearchResultTextBlock`, whose type is
+  `SearchResultTextType`.
 - A `json_schema` response format keeps its `description` when the request is written back for an
   upstream, as the HTTP router and the provider routers write it. The crate dropped the key while
   reading the format. The gRPC path's Responses-to-Chat conversion carries a Responses
@@ -370,6 +400,12 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   them, as the engines' own chat utils build it. Breaking: `ChatMessage::Assistant` gains the
   fields `refusal: Option<String>`, `audio: Option<ChatAssistantAudio>` and
   `function_call: Option<FunctionCallResponse>`.
+- A Realtime `response.create`'s input may reference an item already in the session,
+  `{"type": "item_reference", "id": ...}`, as the public API takes it: such an input was refused as
+  an unknown conversation item variant. `RealtimeResponseCreateParams.input` holds the new
+  `RealtimeResponseInputItem`, a conversation item or a `RealtimeItemReference`; a reference is
+  taken there only, as the API takes it, not as a new conversation item. Breaking: `input` changes
+  type.
 - A GLM-5.3 request with a `minimal`, `medium` or `xhigh` effort is served. The profile reads the
   name as `low`, `high` or `max`, as z.ai does, in `reasoning_effort` and in `thinking.effort`.
   Since 1.11.0 the profile refused those names with `reasoning_effort_not_allowed`, and `medium`
@@ -381,9 +417,20 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   field (#5092). Two different texts are refused as a value (`invalid_value`; `param` names the
   message). Breaking: the `ChatMessage::Assistant` field `reasoning_content: Option<String>` is now
   `reasoning: AssistantReasoning`, whose `text` is that option.
+- A Messages answer with a content block of a kind this build does not read (a web fetch, code
+  execution, bash or text editor result, a container upload, or any block the public API adds)
+  parses, the block kept as written in `ContentBlock::Other`, as `ToolUseCaller::Other` keeps an
+  unknown caller. A whole answer with such a block failed: the provider route answered a 502, and
+  a streamed thread turn was left unstored. Breaking: `ContentBlock` gains `Other(Value)`.
 - `EmbeddingRequest` and `ClassifyRequest` keep the fields they do not model in a flattened
   `other` map, as `ChatCompletionRequest` and `CompletionRequest` do, so the HTTP relay forwards an
   embeddings or classify body as the client wrote it (`truncate_prompt_tokens`,
   `add_special_tokens`, `normalize`, `priority`, `extra_body`, ...). The relay re-serializes the
   typed body and dropped every key the types did not declare. Breaking: the two structs gain the
   field `other: serde_json::Map<String, Value>`.
+- A Messages conversation that replays the public API's server tool results (`web_fetch_tool_result`,
+  `code_execution_tool_result`, `bash_code_execution_tool_result`,
+  `text_editor_code_execution_tool_result`) or sends a `container_upload` block is accepted, and the
+  blocks are forwarded as written. Each was an unknown variant of `InputContentBlock`, which refused
+  the whole request, a token count included. Breaking: `InputContentBlock` gains the five variants,
+  and the crate gains `ServerToolResultBlock` and `ContainerUploadParam`.

@@ -1,15 +1,15 @@
 # Regression gate for `cargo bench -p smg-policy-controller --bench decision`, run by
 # .github/workflows/benchmark-policy-engine.yml on pull requests through scripts/bench_gate.py. It is the
-# first row of that workflow's matrix; policy-engine-power-of-two.toml and policy-engine-affinity.toml gate
-# the second and the third row's binaries.
+# first row of that workflow's matrix; policy-engine-power-of-two.toml, policy-engine-affinity.toml and
+# policy-engine-prefix-hash.toml gate the second, the third and the fourth row's binaries.
 #
 # The gate runs the whole file: the view build at 8, 64 and 512 workers (`policy_engine/view_build/<n>`),
 # the decision per preset at the same sizes (`policy_engine/decide/<preset>/<n>`), the least-load decision
-# with a credit held per row (`policy_engine/decide/least_load_credited/<n>`), a keyed decision under the
+# with a credit held per row (`policy_engine/decide/least_load_credited/<n>`), the steer of a pool over its
+# thresholds on every row (`policy_engine/decide/all_vetoed/<n>`), a keyed decision under the
 # manual preset on its pin and off it at 8 workers (`policy_engine/decide/manual_keyed_hit/8`,
-# `policy_engine/decide/manual_keyed_miss/8`), the spec's parse-and-validate time
-# (`policy_engine/spec/parse_validate`) and one validation by its index keys
-# (`policy_engine/spec/validate_index/<keys>`): 36 single-threaded rows, deterministic by construction (a fresh
+# `policy_engine/decide/manual_keyed_miss/8`) and the spec's parse-and-validate time
+# (`policy_engine/spec/parse_validate`): 39 single-threaded rows, deterministic by construction (a fresh
 # seed per iteration), about five minutes a run, so three interleaved runs a side fit the job's budget.
 #
 # From sixteen workers on, a decision under `passthrough`, `random`, `round_robin` or `power_of_two` is made by
@@ -85,20 +85,21 @@
 # PASS under it with one placement: `decide/cache_aware/8`, +10.4 % against 10 %, 4,001 instructions an
 # iteration on both sides, the decision at 0x0c0 of its page in one binary and at 0x240 in the other.
 #
-# A whole pass. The `decide/` ids time a whole decision: about 150 code lines of 64 bytes over 16 to 20
-# pages, where a set of the processor's op cache holds four or five. Every build leaves some sets over,
-# and each change to the binary draws again which. A change to the decision itself moves its count by a
-# few instructions, so the same count is not there to read and the three facts never hold. A pull request
-# read the affinity gate's `decide/cache_aware/8` and `/64` 15.2 and 11.9 % slower on 2 and 6 instructions
-# more an iteration, 0.04 and 0.03 % of their counts; their op-cache misses a decision went from 58 to 78
-# and from 115 to 343, and the same two sources built without the alignment read them 5.1 and 3.8 %
-# faster (2026-11-16). So the `decide/` entries below carry `whole_pass = true`: such an id is a placement
-# on a level count, the two counts within half a percent of each other with each binary's own two the
-# same, and a change within twice its threshold. No function's address is asked, since any line of the
-# pass can move. A count that moved further leaves the failure: work inserted into the decision (16
-# dependent multiply-adds and 2 more a candidate, never committed) read the same two ids 11.3 and 16.2 %
-# slower on counts 3.4 and 3.1 % higher, 159 and 663 instructions an iteration, and both failed; the id at
-# 512 rows read 20.1 % slower, beyond twice its threshold, and was not counted.
+# A whole pass. The `decide/` ids that score the pool time a whole decision: about 150 code lines of 64
+# bytes over 16 to 20 pages, where a set of the processor's op cache holds four or five. Every build
+# leaves some sets over, and each change to the binary draws again which. A change to the decision itself
+# moves its count by a few instructions, so the same count is not there to read and the three facts never
+# hold. A pull request read the affinity gate's `decide/cache_aware/8` and `/64` 15.2 and 11.9 % slower on
+# 2 and 6 instructions more an iteration, 0.04 and 0.03 % of their counts; their op-cache misses a
+# decision went from 58 to 78 and from 115 to 343, and the same two sources built without the alignment
+# read them 5.1 and 3.8 % faster (2026-11-16). So the `decide/` entries below carry `whole_pass = true`,
+# all but the nine that make no pass over the pool: such an id is a placement on a level count, the two
+# counts within half a percent of each other with each binary's own two the same, and a change within
+# twice its threshold. No function's address is asked, since any line of the pass can move. A count that
+# moved further leaves the failure: work inserted into the decision (16 dependent multiply-adds and 2 more
+# a candidate, never committed) read the same two ids 11.3 and 16.2 % slower on counts 3.4 and 3.1 %
+# higher, 159 and 663 instructions an iteration, and both failed; the id at 512 rows read 20.1 % slower,
+# beyond twice its threshold, and was not counted.
 #
 # Read on this file's 33 ids, both binaries from paths of one length as the gate runs them, 2 to 3 s a count:
 #
@@ -120,8 +121,9 @@
 # when each side happens to repeat itself, as not steady otherwise. `decide/manual_keyed_miss/8` and
 # `spec/parse_validate` differ between two counts of one binary by 0.03 to 3.3 %. Each keeps the time's
 # verdict. The count does not see a change that runs the same instructions slower (a load that misses, a
-# branch that stops predicting): where its measured function moved too, such a row reads as a placement up
-# to twice its threshold, by name, in the summary. A placement is still a row to read.
+# branch that stops predicting): where its measured function moved too, or for a marked id on any level
+# count, such a row reads as a placement up to twice its threshold, by name, in the summary. A placement is
+# still a row to read.
 #
 # A build that starts every function on a page of its own was read on the same pairs and not taken. The pull
 # request's head against its parent reads level under it (-2.2 to +4.1 % on the seven rows, fifteen runs a
@@ -159,6 +161,15 @@ note = "5.1 % in one of three jobs on the hosted runner"
 pattern = "^policy_engine/view_build/64$"
 threshold = 0.15
 note = "6.9 and 8.2 % in two of three jobs on the hosted runner"
+
+# Nine decide ids make no pass over the pool and carry no mark: under `passthrough`, `power_of_two`,
+# `random` and `round_robin` at 64 and 512 workers the decision is made by the rows its picker draws, and
+# the keyed hit decides on its pin. The mark's evidence was read on decisions that score the pool, so
+# these keep the rule of one function until a reading of their own.
+[[gate]]
+pattern = "^policy_engine/decide/((passthrough|power_of_two|random|round_robin)/(64|512)|manual_keyed_hit/8)$"
+threshold = 0.10
+note = "identical build 4.6 % or less on the hosted runner; no pass over the pool"
 
 [[gate]]
 pattern = "^policy_engine/decide/"

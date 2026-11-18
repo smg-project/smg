@@ -8,6 +8,7 @@ on:
     paths:
       - '.github/bench-gates/policy-engine-affinity.toml'
       - '.github/bench-gates/policy-engine-power-of-two.toml'
+      - '.github/bench-gates/policy-engine-prefix-hash.toml'
       - '.github/bench-gates/policy-engine.toml'
       - '.github/workflows/benchmark-policy-engine.yml'
       - 'crates/policy_controller/Cargo.toml'
@@ -17,6 +18,7 @@ on:
       - 'crates/policy_controller/benches/common/placed.rs'
       - 'crates/policy_controller/benches/decision.rs'
       - 'crates/policy_controller/benches/power_of_two.rs'
+      - 'crates/policy_controller/benches/prefix_hash.rs'
       - 'crates/policy_controller/src/**'
       - '!crates/policy_controller/src/**/tests/**'
       - '!crates/policy_controller/src/**/tests.rs'
@@ -27,6 +29,7 @@ on:
     paths:
       - '.github/bench-gates/policy-engine-affinity.toml'
       - '.github/bench-gates/policy-engine-power-of-two.toml'
+      - '.github/bench-gates/policy-engine-prefix-hash.toml'
       - '.github/bench-gates/policy-engine.toml'
       - '.github/workflows/benchmark-policy-engine.yml'
       - 'crates/policy_controller/Cargo.toml'
@@ -36,6 +39,7 @@ on:
       - 'crates/policy_controller/benches/common/placed.rs'
       - 'crates/policy_controller/benches/decision.rs'
       - 'crates/policy_controller/benches/power_of_two.rs'
+      - 'crates/policy_controller/benches/prefix_hash.rs'
       - 'crates/policy_controller/src/**'
       - '!crates/policy_controller/src/**/tests/**'
       - '!crates/policy_controller/src/**/tests.rs'
@@ -74,6 +78,9 @@ jobs:
           - bench: affinity
             gates: policy-engine-affinity.toml
             artifact: policy-engine-affinity-results
+          - bench: prefix_hash
+            gates: policy-engine-prefix-hash.toml
+            artifact: policy-engine-prefix-hash-results
     env:
       BENCH: ${{ matrix.bench }}
       GATES: ${{ matrix.gates }}
@@ -135,9 +142,7 @@ jobs:
         timeout-minutes: 5
         continue-on-error: true
         run: |
-          bash scripts/ci_apt_mirror.sh
-          bash scripts/ci_apt_update.sh sudo
-          bash scripts/ci_retry.sh 3 10 sudo apt-get install -y --no-install-recommends valgrind
+          bash scripts/ci_apt_install.sh sudo -y --no-install-recommends valgrind
 
       - name: Run the benchmark gate
         if: github.event_name == 'pull_request'

@@ -427,8 +427,9 @@ policyController:
     tag: ""
 
   # -- Replicas. With the election off every replica is a controller of its
-  #    own: keep one. With it on, run two or more: one leads and the others
-  #    stand by.
+  #    own and two would each lead alone: the chart refuses more than one,
+  #    and an upgrade tells the old pod to stop before it makes the new one.
+  #    With it on, run two or more: one leads and the others stand by.
   replicas: 1
 
   # -- Leader election among the replicas, over one coordination.k8s.io Lease
@@ -453,6 +454,24 @@ policyController:
     enabled: false
     leaseName: ""
 
+  # -- The policy spec document the controller runs, as a map: a document of
+  #    apiVersion smg.policy/v1. Empty, the controller runs no spec and
+  #    nothing is rendered for one. Given, the chart writes it as the one key
+  #    spec.yaml of a ConfigMap under the controller's name, mounts that
+  #    whole and read-only at /etc/smg/policy-spec and passes
+  #    --spec-file /etc/smg/policy-spec/spec.yaml: the controller reads the
+  #    file at its start and watches it from then on. The chart reads no
+  #    line of the document and writes none: whether a document runs is the
+  #    controller's word.
+  #    A changed document moves no pod. The kubelet turns the mounted file,
+  #    and the running controller applies the document in place, or rejects
+  #    one that does not run and keeps the generation it runs. A pod that
+  #    starts on a document that does not run refuses to start: dry-run a
+  #    document before an upgrade that moves the pods for another reason.
+  #    With the election on each pod watches its own mount: until the
+  #    kubelets have turned both, two pods hold two documents.
+  spec: {}
+
   # -- The listeners' container ports, each passed as its --*-listen flag: the
   #    gateways and the relays (gateway), the operators (control), the standbys
   #    (replication) and the HTTP admin listener with the probes and /metrics
@@ -468,11 +487,11 @@ policyController:
   #    port acts as any principal of its scopes. The listeners that take a
   #    caller's stated name as its identity, passed as --identity-as-told:
   #    any of gateway, control and replication, each once, in any order.
-  #    None by default: the controller then refuses every call but Leader as
-  #    unauthenticated. Name one only behind a mesh that verifies its
-  #    callers, or a network policy that admits them alone: the Service
-  #    carries the gateways' and the operators' ports, and a pod's address
-  #    reaches all three listeners.
+  #    None by default: each listener then refuses every call of its scopes
+  #    but Leader as unauthenticated. Name one only behind a mesh that
+  #    verifies its callers, or a network policy that admits them alone: the
+  #    Service carries the gateways' and the operators' ports, and a pod's
+  #    address reaches all three listeners.
   identityAsTold: []
 
   # -- The Service <fullname>-policy-controller, three ports on the listeners'

@@ -32,13 +32,15 @@
 //! pieces are the same and no character is interpreted op by op. A scanner
 //! reads a character's classes as role bits ([`scan::Roles`]). The classes
 //! are the parser's, so the matchers cannot read a category differently.
+//! The byte-level split is matched the same way, by [`byte_split::Scanner`]
+//! in the walk over a pipeline's stages.
 //!
 //! Character categories come from [`super::unicode`], generated from that
 //! same engine, so `\p{L}` or `\s` cannot mean one thing here and another
 //! there.
 
 use super::{
-    cased, chain,
+    block, byte_split, cased, chain,
     scan::{Bits, Roles, WordScan},
     unicode,
 };
@@ -64,7 +66,7 @@ pub(super) struct Class {
 /// point. The matcher asks it once per character it tests (every class test
 /// and every first-set test on ASCII text), and a table read is one load
 /// where a bit of a 128-bit word costs a two-word select and a variable shift.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 struct AsciiSet([bool; 128]);
 
 impl Default for AsciiSet {
@@ -140,18 +142,28 @@ impl PlaneSet {
 
     /// Inserts every code point of `ranges` that is in the plane.
     fn insert_ranges(&mut self, ranges: &[(u32, u32)]) {
-        for &(start, end) in ranges {
-            for code in start..=end.min(0xFFFF) {
-                self.0[(code >> 6) as usize] |= 1 << (code & 63);
-            }
-        }
+        Self::words_of(ranges, |word, mask| self.0[word] |= mask);
     }
 
     /// Removes every code point of `ranges` that is in the plane.
     fn remove_ranges(&mut self, ranges: &[(u32, u32)]) {
+        Self::words_of(ranges, |word, mask| self.0[word] &= !mask);
+    }
+
+    /// Calls `f` with each word of the bitmap that `ranges` reach in the
+    /// plane and the bits of it they cover: a range is its first and last
+    /// words in part and the words between them whole.
+    fn words_of(ranges: &[(u32, u32)], mut f: impl FnMut(usize, u64)) {
         for &(start, end) in ranges {
-            for code in start..=end.min(0xFFFF) {
-                self.0[(code >> 6) as usize] &= !(1 << (code & 63));
+            let end = end.min(0xFFFF);
+            if start > end {
+                continue;
+            }
+            let (first, last) = ((start >> 6) as usize, (end >> 6) as usize);
+            for word in first..=last {
+                let from = if word == first { start & 63 } else { 0 };
+                let to = if word == last { end & 63 } else { 63 };
+                f(word, (u64::MAX >> (63 - to)) & (u64::MAX << from));
             }
         }
     }
@@ -274,7 +286,7 @@ impl Class {
 
     /// Whether two finished classes are the same set: the same categories,
     /// exclusions, negation and (sorted, merged) ranges.
-    fn same_set(&self, other: &Self) -> bool {
+    pub(super) fn same_set(&self, other: &Self) -> bool {
         self.negated == other.negated
             && self.categories == other.categories
             && self.without == other.without
@@ -366,6 +378,45 @@ impl Class {
                 bounds(table);
             }
         }
+    }
+
+    /// Membership of each of `points`, ascending code points above the
+    /// plane, into `members`: the sets of [`Class::contains_slow`] (the
+    /// class's ranges and the tables of its categories, less the tables of
+    /// its exclusions, the complement for a negated class) by one walk
+    /// along each table.
+    pub(super) fn members_among(&self, points: &[u32], members: &mut Vec<bool>) {
+        let mark = |ranges: &[(u32, u32)], marks: &mut [bool]| {
+            let mut ranges = ranges.iter().peekable();
+            for (&point, mark) in points.iter().zip(marks) {
+                while ranges.next_if(|&&(_, end)| end < point).is_some() {}
+                *mark |= ranges.peek().is_some_and(|&&(start, _)| start <= point);
+            }
+        };
+        let mut hit = vec![false; points.len()];
+        let mut out = vec![false; points.len()];
+        mark(&self.ranges, &mut hit);
+        for &(bit, table) in &CATEGORY_TABLES {
+            if self.categories & bit != 0 {
+                mark(table, &mut hit);
+            }
+            if self.without & bit != 0 {
+                mark(table, &mut out);
+            }
+        }
+        members.clear();
+        members.extend(
+            hit.iter()
+                .zip(&out)
+                .map(|(&hit, &out)| (hit && !out) != self.negated),
+        );
+    }
+
+    /// The class's members among the 64 code points of the plane's block
+    /// `block` (the code points from `64 * block` on), a bit each: one word
+    /// of the bitmap [`Self::contains`] reads beyond ASCII.
+    pub(super) fn plane_block(&self, block: usize) -> u64 {
+        self.plane.0[block]
     }
 
     /// Whether the class may hold a character beyond ASCII.
@@ -571,7 +622,7 @@ pub(super) enum GroupsEnd {
 /// code points, one bit for every character beyond ASCII (set when a class
 /// may hold any of them), and whether the node can match without consuming a
 /// character, in which case any character may follow it.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub(super) struct First {
     ascii: AsciiSet,
     non_ascii: bool,
@@ -624,6 +675,17 @@ pub(crate) struct Pattern {
     /// How the pattern is matched: by the scanner of its template's shape,
     /// else by the program.
     matcher: Matcher,
+    /// The scanner of the byte-level split, when the pattern is that split
+    /// ([`byte_split`]). The walk over a pipeline's stages matches by it
+    /// ([`Self::split_matches`]); the iterator and [`Self::for_each_match`]
+    /// keep the program for this pattern and hold no test for the scanner,
+    /// so a pipeline whose only stage is the split, which takes the
+    /// single-stage loop, still runs the program. It is no variant of
+    /// [`Matcher`] and no arm of the iterator: a fourth variant cost the
+    /// template scanners' loops 1 to 2 % more instructions on a text beyond
+    /// ASCII, and one more test a piece in the iterator cost a pattern the
+    /// program runs 0.6 % (both counted).
+    byte_split: Option<Box<byte_split::Scanner>>,
     /// What the pattern is as a stage of a three-stage chain, when it is
     /// one (see [`chain`]).
     part: Option<chain::Part>,
@@ -651,12 +713,41 @@ pub(crate) struct Pattern {
 /// shapes in use, the program for every other pattern.
 #[derive(Debug, Clone)]
 enum Matcher {
-    /// The compiled program, interpreted (see [`Pattern::match_at`]).
+    /// The compiled program, interpreted (see [`Pattern::match_at`]). The
+    /// byte-level split is of this variant too: its scanner stands in for
+    /// the program in the walk over a pipeline's stages
+    /// (`Pattern::split_matches`).
     Program,
     /// The GPT-4 family's template.
     Template(Scanner),
     /// The cased-letter template.
     Cased(cased::Scanner),
+}
+
+/// A pattern as the reader of a text by blocks. [`Pattern::by_blocks`] alone
+/// makes one, of a template whose text [`block`]'s pass cuts, so the
+/// encoder's block routine cannot be handed another matcher. It holds the
+/// pattern and nothing else: with the scanner and the classes as fields of
+/// their own the routine's walk kept three values where one address reaches
+/// all, 1 to 3 instructions per token on text beyond ASCII (measured).
+#[derive(Clone, Copy)]
+pub(crate) struct ByBlocks<'p>(&'p Pattern);
+
+impl ByBlocks<'_> {
+    /// [`Pattern::for_each_match`] with the ASCII stretches of `text` cut by
+    /// [`block`]'s pass.
+    #[inline(always)]
+    pub(crate) fn for_each_match<F: FnMut(usize, usize)>(self, text: &str, words: bool, mut f: F) {
+        // No other matcher gets here: the type is made of a template alone.
+        let Matcher::Template(scanner) = &self.0.matcher else {
+            return;
+        };
+        if words {
+            scanner.for_each_match_by_blocks::<true, F>(&self.0.classes, text, &mut f);
+        } else {
+            scanner.for_each_match_by_blocks::<false, F>(&self.0.classes, text, &mut f);
+        }
+    }
 }
 
 /// One instruction of a compiled pattern. The tree is flattened into a
@@ -812,7 +903,8 @@ impl Pattern {
     /// unit run is unbounded by construction and no start skip covers it, so
     /// one that falls short of its minimum is rescanned the same way from
     /// every start, as its first op too. The template scanners hold no such
-    /// run.
+    /// run. The byte-level split answers by its program, though its scanner
+    /// holds none either: no vocabulary runs that split over the image.
     pub(super) fn rescans_a_run(&self) -> bool {
         matches!(self.matcher, Matcher::Program)
             && self.program.iter().enumerate().any(|(i, op)| match op {
@@ -856,6 +948,12 @@ impl Pattern {
                 None => Matcher::Program,
             },
         };
+        let byte_split = match matcher {
+            Matcher::Program => {
+                byte_split::Scanner::recognize(&root, &parser.classes).map(Box::new)
+            }
+            _ => None,
+        };
         let part = chain::Part::recognize(&root);
         let end_anchored = holds_end(&root);
         let reads_word_boundary = holds_word_boundary(&root);
@@ -875,6 +973,7 @@ impl Pattern {
             program,
             firsts,
             matcher,
+            byte_split,
             part,
             end_anchored,
             reads_word_boundary,
@@ -1015,6 +1114,7 @@ impl Pattern {
     pub(super) fn program_only(&self) -> Self {
         Self {
             matcher: Matcher::Program,
+            byte_split: None,
             ..self.clone()
         }
     }
@@ -1022,7 +1122,7 @@ impl Pattern {
     /// Whether a scanner matches this pattern (else the program does).
     #[cfg(test)]
     pub(super) fn has_scanner(&self) -> bool {
-        !matches!(self.matcher, Matcher::Program)
+        !matches!(self.matcher, Matcher::Program) || self.byte_split.is_some()
     }
 
     /// The matches in `text`, leftmost first, each continuing after the last.
@@ -1035,6 +1135,26 @@ impl Pattern {
             choices: [Choice::default(); MAX_CHOICES],
             memo: RunMemo::default(),
         }
+    }
+
+    /// Whether the pattern is the byte-level split, which has a scanner
+    /// ([`Self::split_matches`]).
+    pub(super) fn has_byte_split(&self) -> bool {
+        self.byte_split.is_some()
+    }
+
+    /// The matches in `text` by the byte-level split's scanner, leftmost
+    /// first, when the pattern is that split: what [`Self::find_iter`]
+    /// yields by the program. The walk over a pipeline's stages takes them
+    /// from here; the iterator itself keeps the program.
+    #[inline(always)]
+    pub(super) fn split_matches<'p, 't>(
+        &'p self,
+        text: &'t str,
+    ) -> Option<byte_split::Matches<'p, 't>> {
+        self.byte_split
+            .as_ref()
+            .map(|scanner| scanner.matches(&self.classes, text))
     }
 
     /// Whether an all-ASCII text has a walk of its own here
@@ -1089,6 +1209,24 @@ impl Pattern {
                     f(start, end);
                 }
             }
+        }
+    }
+
+    /// The reader of `text` by blocks, where [`block`]'s pass serves it: the
+    /// matcher is a scanner the pass cuts as (`Scanner::blocks`), the text
+    /// is no shorter than the pass's bound, and one of the places it is
+    /// asked at begins an ASCII stretch (`block::has_stretch`).
+    #[inline]
+    pub(crate) fn by_blocks(&self, text: &str) -> Option<ByBlocks<'_>> {
+        match &self.matcher {
+            Matcher::Template(scanner)
+                if scanner.blocks
+                    && text.len() >= block::MIN_BYTES
+                    && block::has_stretch(text.as_bytes()) =>
+            {
+                Some(ByBlocks(self))
+            }
+            _ => None,
         }
     }
 
@@ -1566,6 +1704,10 @@ struct Scanner {
     clitic_beyond_ascii: bool,
     /// The most digits the digit alternative takes at once.
     digit_cap: u32,
+    /// Whether the encoder may read a text by blocks: [`block`]'s pass cuts
+    /// ASCII text as this scanner does ([`Self::reads_ascii_as_blocks`]) and
+    /// the alternatives leave no gap in any text ([`Self::tiles`]).
+    blocks: bool,
 }
 
 impl Scanner {
@@ -1649,13 +1791,120 @@ impl Scanner {
             }
             clitic_beyond_ascii |= class.may_hold_beyond_ascii();
         }
-        Some(Self {
+        let mut scanner = Self {
             roles: Roles::build(&role_classes),
             clitics,
             clitic_start,
             clitic_beyond_ascii,
             digit_cap,
-        })
+            blocks: false,
+        };
+        scanner.blocks = scanner.tiles() && scanner.reads_ascii_as_blocks(classes);
+        Some(scanner)
+    }
+
+    /// Whether the alternatives leave no gap in any text: every character
+    /// holds a role that starts a piece of one character at least. The
+    /// encoder's block routine tokenizes the matches alone and keeps no
+    /// cursor to find a gap by, so only such a scanner reads by blocks.
+    fn tiles(&self) -> bool {
+        self.roles.every_char_holds(
+            Role::Word.bit() | Role::Digit.bit() | Role::Punct.bit() | Role::Space.bit(),
+        )
+    }
+
+    /// Whether [`block`]'s pass cuts ASCII text as this scanner does. The
+    /// pass computes the starts from the plain ASCII sets, so every role
+    /// must hold exactly its set of them; a clitic must begin with the
+    /// apostrophe alone and go on in letters (the pass asks
+    /// [`clitic_match`] at an apostrophe before a letter only, and takes
+    /// the character behind a clitic to follow a letter); and the digit
+    /// rule's bound must fit a block's shifts. A template with another
+    /// class in any role is matched by [`Self::match_at`] alone.
+    fn reads_ascii_as_blocks(&self, classes: &[Class]) -> bool {
+        let ascii = |test: &dyn Fn(u8) -> bool| {
+            (0..128u8)
+                .filter(|&code| test(code))
+                .fold(0u128, |set, code| set | (1 << code))
+        };
+        let letters = ascii(&block::is_letter);
+        let digits = ascii(&block::is_digit);
+        let spaces = ascii(&block::is_space);
+        let breaks = ascii(&block::is_break);
+        let roles = [
+            (Role::WordPrefix, !(letters | digits | breaks)),
+            (Role::Word, letters),
+            (Role::Digit, digits),
+            (Role::PunctPrefix, 1 << b' '),
+            (Role::Punct, !(letters | digits | spaces)),
+            (Role::PunctBreak, breaks),
+            (Role::BreakSpace, spaces),
+            (Role::Break, breaks),
+            (Role::TrailSpace, spaces),
+            (Role::NotTrail, !spaces),
+            (Role::Space, spaces),
+        ];
+        let clitics_go_on_in_letters = self.clitics.iter().all(|clitic| {
+            (2..=block::BLOCK).contains(&clitic.len())
+                && clitic[1..].iter().all(|&class| {
+                    ascii(&|code| classes[class].contains(char::from(code))) & !letters == 0
+                })
+        });
+        roles
+            .into_iter()
+            .all(|(role, set)| self.roles.ascii_members(role.bit()) == set)
+            && (0..128).all(|code| self.clitic_start[code] == (code == usize::from(b'\'')))
+            && clitics_go_on_in_letters
+            && (self.digit_cap < u64::BITS || self.digit_cap == u32::MAX)
+    }
+
+    /// [`Self::for_each_match`] through [`block`]'s pass, for a text
+    /// [`Pattern::by_blocks`] gives a reader of. The pass cuts each ASCII stretch
+    /// of the text. What lies between two stretches and behind the last one
+    /// is matched here piece by piece, from the piece the pass left open:
+    /// text beyond ASCII, a blank run the pass declines, the text's last
+    /// block. Where the pass cut nothing the walk goes twice as far before
+    /// the pass is tried again, up to [`block::MAX_WALK`], so a text with
+    /// no ASCII stretch pays one test of two blocks per walk.
+    #[inline(always)]
+    fn for_each_match_by_blocks<const WORDS: bool, F: FnMut(usize, usize)>(
+        &self,
+        classes: &[Class],
+        text: &str,
+        f: &mut F,
+    ) {
+        let mut pos = 0;
+        let mut walk = 2 * block::BLOCK;
+        while pos < text.len() {
+            let open = block::pieces(
+                text.as_bytes(),
+                pos,
+                self.digit_cap,
+                |at| clitic_match(classes, text, at, &self.clitics),
+                f,
+            );
+            walk = if open > pos {
+                2 * block::BLOCK
+            } else {
+                (2 * walk).min(block::MAX_WALK)
+            };
+            let until = open + walk;
+            pos = open;
+            while pos < text.len() && pos < until {
+                match self.match_at::<WORDS, false>(classes, text, pos) {
+                    Some(end) if end > pos => {
+                        f(pos, end);
+                        pos = end;
+                    }
+                    _ => {
+                        let Some((_, len)) = next_char(text, pos) else {
+                            return;
+                        };
+                        pos += len;
+                    }
+                }
+            }
+        }
     }
 
     /// The end of the piece that starts at `pos`, if one does: the first of
@@ -1947,34 +2196,7 @@ fn compile(node: &Node, program: &mut Vec<Op>, firsts: &mut Vec<First>) {
             // alternation without them would compile to no ops and match
             // empty. Once per pattern, so the check stays in release builds.
             assert_eq!(sets.len(), alternatives.len());
-            let mut previous_split = None;
-            let mut jumps = Vec::new();
-            for (index, (alternative, first)) in alternatives.iter().zip(sets).enumerate() {
-                let split = program.len();
-                if let Some(previous) = previous_split {
-                    if let Op::Split { first: set, .. } = program[previous] {
-                        program[previous] = Op::Split {
-                            next: split,
-                            first: set,
-                        };
-                    }
-                }
-                program.push(Op::Split {
-                    next: NO_NEXT,
-                    first: firsts.len(),
-                });
-                firsts.push(*first);
-                previous_split = Some(split);
-                compile(alternative, program, firsts);
-                if index + 1 < alternatives.len() {
-                    jumps.push(program.len());
-                    program.push(Op::Jump(NO_NEXT));
-                }
-            }
-            let end = program.len();
-            for jump in jumps {
-                program[jump] = Op::Jump(end);
-            }
+            compile_alternatives(alternatives, sets, program, firsts);
         }
         Node::NotAhead(class) => program.push(Op::NotAhead(*class)),
         Node::End => program.push(Op::End),
@@ -2021,6 +2243,98 @@ fn compile(node: &Node, program: &mut Vec<Op>, firsts: &mut Vec<First>) {
     }
 }
 
+/// Lays out an alternation: each alternative behind a `Split` that names
+/// the next one, and a jump past the alternation at its end. The leading
+/// alternatives that begin with the same characters ([`leading_run`]) are
+/// laid out as one alternative, an alternation of their own: every attempt
+/// arrives at the first `Split`, and a character outside their set passes
+/// them all in one step instead of one step each (the GPT-2 pattern begins
+/// with seven clitics, each behind the apostrophe). They are tried in the
+/// same order and before the alternatives after them, so the matches are
+/// the same.
+fn compile_alternatives(
+    alternatives: &[Node],
+    sets: &[First],
+    program: &mut Vec<Op>,
+    firsts: &mut Vec<First>,
+) {
+    let mut jumps = Vec::new();
+    lay_out_alternatives(alternatives, sets, program, firsts, &mut jumps);
+    let end = program.len();
+    for jump in jumps {
+        program[jump] = Op::Jump(end);
+    }
+}
+
+/// The layout of [`compile_alternatives`] up to its jumps: `jumps` takes
+/// the place of the jump behind every alternative but the last, for the
+/// caller to point past the alternation. The leading run adds its own to
+/// the same list, so a match of one of its alternatives leaves by one
+/// jump, as it would in a flat layout.
+fn lay_out_alternatives(
+    alternatives: &[Node],
+    sets: &[First],
+    program: &mut Vec<Op>,
+    firsts: &mut Vec<First>,
+    jumps: &mut Vec<usize>,
+) {
+    let run = leading_run(sets);
+    let mut previous_split = None;
+    let mut index = 0;
+    while index < alternatives.len() {
+        let split = program.len();
+        if let Some(previous) = previous_split {
+            if let Op::Split { first: set, .. } = program[previous] {
+                program[previous] = Op::Split {
+                    next: split,
+                    first: set,
+                };
+            }
+        }
+        program.push(Op::Split {
+            next: NO_NEXT,
+            first: firsts.len(),
+        });
+        firsts.push(sets[index]);
+        previous_split = Some(split);
+        // The run's alternatives all begin with the set of its first one.
+        let taken = if index == 0 { run } else { 1 };
+        if taken > 1 {
+            lay_out_alternatives(
+                &alternatives[..taken],
+                &sets[..taken],
+                program,
+                firsts,
+                jumps,
+            );
+        } else {
+            compile(&alternatives[index], program, firsts);
+        }
+        index += taken;
+        if index < alternatives.len() {
+            jumps.push(program.len());
+            program.push(Op::Jump(NO_NEXT));
+        }
+    }
+}
+
+/// How many of an alternation's alternatives, counted from its first, stand
+/// behind one `Split` of their own: the leading ones that begin with the
+/// same characters, when there are at least two of them and others after
+/// them; one otherwise. A set that admits the empty match excludes no
+/// character, so its alternatives stay apart.
+fn leading_run(sets: &[First]) -> usize {
+    let run = match sets.first() {
+        Some(lead) if !lead.nullable => sets.iter().take_while(|set| *set == lead).count(),
+        _ => 1,
+    };
+    if run < sets.len() {
+        run
+    } else {
+        1
+    }
+}
+
 /// The most choices a match of `node` can hold at once: every run and every
 /// alternation on a path leaves one until the path is done or backs off.
 fn choices(node: &Node) -> usize {
@@ -2046,7 +2360,18 @@ fn choices(node: &Node) -> usize {
             }
         }
         Node::Concat(nodes) => nodes.iter().map(choices).sum(),
-        Node::Alt { alternatives, .. } => 1 + alternatives.iter().map(choices).max().unwrap_or(0),
+        Node::Alt {
+            alternatives,
+            firsts,
+        } => {
+            let deepest = |nodes: &[Node]| nodes.iter().map(choices).max().unwrap_or(0);
+            // The leading run stands behind a `Split` of its own
+            // ([`leading_run`]): one more choice on the paths through it.
+            match leading_run(firsts) {
+                1 => 1 + deepest(alternatives),
+                run => (2 + deepest(&alternatives[..run])).max(1 + deepest(&alternatives[run..])),
+            }
+        }
     }
 }
 
@@ -3733,6 +4058,86 @@ mod tests {
         assert!(matches!(parsed.program.last(), Some(Op::Match)));
     }
 
+    /// The leading alternatives that begin with the same characters stand
+    /// behind one choice: the seven clitics of the GPT-2 pattern, each
+    /// behind the apostrophe, are one alternative of the root's six, and a
+    /// character that is no apostrophe passes them in one step. They are
+    /// tried in the pattern's order all the same, and the matches are the
+    /// engine's. An alternation that is one such run from end to end, one
+    /// whose first two alternatives begin differently, and a run after the
+    /// first alternative are laid out as they are written.
+    #[test]
+    fn leading_alternatives_with_one_first_set_stand_behind_one_choice() {
+        let chain =
+            |pattern: &str, pc: usize| split_chain(&Pattern::parse(pattern).expect("parses"), pc);
+        // The root: the clitics as one, the letter and digit runs and the
+        // punctuation with their optional space, the two whitespace runs.
+        let root = chain(GPT2, 0);
+        assert_eq!(root.len(), 6);
+        assert!(root[0].may_start('\'') && !root[0].may_start('s') && !root[0].may_start(' '));
+        // The clitics in the pattern's order, right after the root's split.
+        let clitics = chain(GPT2, 1);
+        assert_eq!(clitics.len(), 7);
+        assert!(clitics.iter().all(|first| *first == root[0]));
+        // A run of two before a third alternative is one of the root's two.
+        assert_eq!(chain("ab|ac|[0-9]+", 0).len(), 2);
+        assert_eq!(chain("ab|ac|[0-9]+", 1).len(), 2);
+        // As written: one run from end to end, first alternatives that begin
+        // differently, and a run after the first alternative.
+        assert_eq!(chain(END_LETTERS, 0).len(), 2);
+        assert_eq!(chain("ab|[0-9]+|ac|\u{E9}+", 0).len(), 4);
+        assert_eq!(chain("[0-9]+|ab|ac|x", 0).len(), 4);
+        // A match of one of the run's alternatives leaves by one jump, past
+        // the whole alternation: no jump of the program lands on a jump.
+        let parsed = Pattern::parse("ab|ac|[0-9]+").expect("parses");
+        for op in &parsed.program {
+            if let Op::Jump(target) = op {
+                assert!(!matches!(parsed.program[*target], Op::Jump(_)));
+            }
+        }
+        // The run's own choice counts toward the bound: with the run's paths
+        // at the limit the pattern parses and matches, and with one more
+        // optional character it is declined.
+        let at_limit = |optionals: usize| {
+            let run = "a?".repeat(optionals);
+            format!("a{run}b|a{run}c|d")
+        };
+        let parsed = Pattern::parse(&at_limit(MAX_CHOICES - 2)).expect("parses");
+        let text = "a".repeat(MAX_CHOICES - 1) + "b";
+        assert_eq!(
+            parsed.find_iter(&text).collect::<Vec<_>>(),
+            vec![(0, text.len())]
+        );
+        assert!(Pattern::parse(&at_limit(MAX_CHOICES - 1)).is_none());
+
+        // The engine's matches where the run's alternatives nest prefixes,
+        // fail late, and give way to the alternatives after them.
+        const ALPHABET: [char; 12] = [
+            'a', 'b', 'c', 'd', 's', 't', '\'', ' ', '7', '!', '\n', '\u{E9}',
+        ];
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        for pattern in [
+            GPT2,
+            "ab|ac|[0-9]+",
+            "a+b|a+c|[a-d]+|'",
+            "'s|'t|'[a-d]+|[a-z ]+|'",
+            "ab|ab?c|a|[b-d]+",
+            "ab|[0-9]+|ac|\u{E9}+",
+        ] {
+            let parsed = Pattern::parse(pattern).expect("parses").program_only();
+            for round in 0..400 {
+                let text: String = (0..1 + round % 24)
+                    .map(|_| ALPHABET[(pseudo_random(&mut state) % ALPHABET.len() as u64) as usize])
+                    .collect();
+                assert_eq!(
+                    parsed.find_iter(&text).collect::<Vec<_>>(),
+                    oracle_matches(pattern, &text),
+                    "pattern {pattern:?} text {text:?}"
+                );
+            }
+        }
+    }
+
     /// The `\z` that ends a digit-grouping lookahead counts as an anchor, as
     /// the bare `\A`, `\z` and `\G` do; a lookahead ending in the word
     /// boundary does not.
@@ -4579,7 +4984,6 @@ mod tests {
         const TWO_OR_MORE: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{2,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
         const LEAD_IN_RUN: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]*\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
         for pattern in [
-            GPT2,
             DIGITS,
             CJK,
             DEEPSEEK,
@@ -4595,6 +4999,45 @@ mod tests {
                 ),
                 "{pattern}"
             );
+        }
+        // The byte-level split has a scanner of its own, not this one.
+        let split = Pattern::parse(GPT2).expect("parses");
+        assert!(matches!(split.matcher, Matcher::Program) && split.byte_split.is_some());
+    }
+
+    /// The byte-level split takes its scanner, and a pattern one step away
+    /// from it keeps the program: the clitics as a group, no clitic, a
+    /// clitic that begins with another character, the last two alternatives
+    /// the other way round, a bounded digit run, a digit or a letter run
+    /// without its lead-in, a lead-in run, a possessive run, a run after
+    /// the punctuation, and one alternative fewer.
+    #[test]
+    fn the_byte_level_split_takes_its_scanner_and_no_near_miss_does() {
+        let parsed = Pattern::parse(GPT2).expect("parses");
+        let scanner = parsed
+            .byte_split
+            .as_ref()
+            .expect("the byte-level split takes its scanner");
+        assert_eq!(scanner.clitics(), 7);
+        const CLITICS: &str = "'s|'t|'re|'ve|'m|'ll|'d";
+        const RUNS: &str = r" ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+";
+        assert_eq!(format!("{CLITICS}|{RUNS}"), GPT2);
+        for near_miss in [
+            format!("(?i:{CLITICS})|{RUNS}"),
+            RUNS.to_string(),
+            format!("{CLITICS}|`s|{RUNS}"),
+            GPT2.replace(r"\s+(?!\S)|\s+", r"\s+|\s+(?!\S)"),
+            GPT2.replace(r" ?\p{N}+", r" ?\p{N}{1,3}"),
+            GPT2.replace(r" ?\p{N}+", r"\p{N}+"),
+            GPT2.replace(r" ?\p{L}+", r"\p{L}+"),
+            GPT2.replace(r" ?\p{L}+", r" *\p{L}+"),
+            GPT2.replace(r" ?\p{L}+", r" ?\p{L}++"),
+            GPT2.replace(r"[^\s\p{L}\p{N}]+", r"[^\s\p{L}\p{N}]+[\r\n]*"),
+            GPT2.replace(r"|\s+(?!\S)", ""),
+        ] {
+            assert_ne!(near_miss, GPT2);
+            let parsed = Pattern::parse(&near_miss).expect("parses");
+            assert!(!parsed.has_scanner(), "{near_miss}");
         }
     }
 
@@ -4714,6 +5157,262 @@ mod tests {
         }
     }
 
+    /// The block pass cuts text as the scanner cuts it piece by piece (the
+    /// iterator never takes the pass), under every bound of the digit rule:
+    /// text shaped like JSON, code and prose; runs of one character, some
+    /// longer than a block, which carry every rule over a block's edge; and
+    /// both with characters beyond ASCII among them, which end one stretch
+    /// and begin the next. From any piece's start the pass cuts the
+    /// scanner's pieces, and on the shaped ASCII text every piece that ends
+    /// before the last whole block. A template with another class in a role
+    /// stays off the pass.
+    #[test]
+    fn the_block_pass_cuts_text_as_the_scanner_does() {
+        const PARTS: &[&str] = &[
+            " ",
+            "  ",
+            "   ",
+            "    ",
+            "\n",
+            "\n\n",
+            "\r\n",
+            "\t",
+            "\t\t",
+            "\x0B",
+            "\x0C",
+            "\"",
+            "'",
+            "'s",
+            "'S",
+            "'ll",
+            "'LL",
+            "'ve",
+            "'re",
+            "'d",
+            "'m",
+            "'t",
+            "'x",
+            "'r",
+            "'l",
+            "'v",
+            "'rex",
+            "'sox",
+            ":",
+            ",",
+            ".",
+            "{",
+            "}",
+            "[",
+            "]",
+            "(",
+            ")",
+            "-",
+            "_",
+            "a",
+            "Word",
+            "1",
+            "22",
+            "333",
+            "4444",
+            "55555",
+            "7777777",
+            "x",
+            "ABC",
+            "/",
+            "//",
+            ".../",
+            "\n/",
+            "I'M",
+            "WE'LL",
+            "don't",
+            " \n",
+            "  \n  ",
+            ".\n",
+            ".\n\n  ",
+            ",\n    \"k\": ",
+            "\n    ",
+            "\x01",
+            "\x7F",
+            " .",
+            " 's",
+            "\t.",
+            "\t's",
+            " a",
+            "\ta",
+            "\n a",
+            ". a",
+            ".a",
+            "..a",
+            " 1",
+            "1a",
+            "a1",
+        ];
+        const RUNS: &[u8] = b"aZ7 \t\n\r.'\"\x0B\x0Cstlrevmd\x01\x7F,";
+        const BEYOND: &[&str] = &["é", "中", "\u{A0}", "😀", "\u{2028}", "ſ"];
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut begun_inside = 0;
+        for pattern in [CL100K, QWEN2, QWEN35, TWO_DIGITS, ANY_DIGITS] {
+            let parsed = Pattern::parse(pattern).expect("parses");
+            let Matcher::Template(scanner) = &parsed.matcher else {
+                panic!("the template's scanner: {pattern}");
+            };
+            assert!(scanner.blocks, "{pattern}");
+            for round in 0..1000 {
+                let (shaped, ascii) = (round % 2 == 0, round % 3 != 0);
+                let mut text = String::new();
+                let len = block::MIN_BYTES + (pseudo_random(&mut state) % 1500) as usize;
+                while text.len() < len {
+                    let pick = pseudo_random(&mut state);
+                    // Nothing beyond ASCII in the first two blocks: the
+                    // encoder gets a reader only for a text one of whose
+                    // sampled places begins an ASCII stretch.
+                    if !ascii && pick.is_multiple_of(400) && text.len() >= 2 * block::BLOCK {
+                        text.push_str(BEYOND[(pick >> 8) as usize % BEYOND.len()]);
+                    } else if shaped {
+                        text.push_str(PARTS[(pick >> 8) as usize % PARTS.len()]);
+                    } else {
+                        let c = RUNS[(pick >> 8) as usize % RUNS.len()];
+                        let run = match pseudo_random(&mut state) % 32 {
+                            0..=19 => 1,
+                            20..=25 => 2,
+                            26..=29 => 3 + pseudo_random(&mut state) % 6,
+                            30 => 20 + pseudo_random(&mut state) % 50,
+                            _ => 60 + pseudo_random(&mut state) % 90,
+                        };
+                        text.extend(std::iter::repeat_n(char::from(c), run as usize));
+                    }
+                }
+                let by_scanner: Vec<(usize, usize)> = parsed.find_iter(&text).collect();
+                let mut by_blocks = Vec::new();
+                let reader = parsed.by_blocks(&text).expect("a reader by blocks");
+                let words = round % 4 == 1;
+                reader.for_each_match(&text, words, |s, e| by_blocks.push((s, e)));
+                assert_eq!(by_blocks, by_scanner, "pattern {pattern:?} text {text:?}");
+                let inside = pseudo_random(&mut state) % by_scanner.len() as u64;
+                for first in [0, inside as usize] {
+                    let from = by_scanner[first].0;
+                    let mut cut = Vec::new();
+                    let open = block::pieces(
+                        text.as_bytes(),
+                        from,
+                        scanner.digit_cap,
+                        |pos| clitic_match(&parsed.classes, &text, pos, &scanner.clitics),
+                        &mut |start, end| cut.push((start, end)),
+                    );
+                    assert_eq!(
+                        (cut.as_slice(), open),
+                        (
+                            &by_scanner[first..first + cut.len()],
+                            by_scanner[first + cut.len()].0
+                        ),
+                        "from {from}: pattern {pattern:?} text {text:?}"
+                    );
+                    if first == 0 && shaped && ascii {
+                        let whole = (text.len() / block::BLOCK - 1) * block::BLOCK;
+                        let within = by_scanner
+                            .iter()
+                            .filter(|(start, _)| (1..whole).contains(start));
+                        assert_eq!(
+                            cut.len(),
+                            within.count(),
+                            "pattern {pattern:?} text {text:?}"
+                        );
+                    }
+                    begun_inside += usize::from(first > 0 && !cut.is_empty());
+                }
+            }
+        }
+        assert!(
+            begun_inside > 500,
+            "the pass begins inside a text: {begun_inside}"
+        );
+        // The encoder gets a reader from the template alone, and for a text
+        // of the bound: not for a template with another class in a role,
+        // not for one whose letters end with ASCII (a letter beyond it is a
+        // gap between two matches), not for a pattern the program matches.
+        let text = "word ".repeat(block::MIN_BYTES);
+        let template = Pattern::parse(CL100K).expect("parses");
+        assert!(template.by_blocks(&text).is_some());
+        assert!(template.by_blocks(&text[..block::MIN_BYTES - 1]).is_none());
+        // And for a text one of whose sampled places begins an ASCII
+        // stretch. A text with none keeps the scanner's loop; one that opens
+        // beyond ASCII and has its stretch at the second place is cut the
+        // same from its first byte.
+        let cyrillic = "слово ".repeat(block::MIN_BYTES);
+        assert!(template.by_blocks(&cyrillic).is_none());
+        let late = format!("{}{text}", "я".repeat(block::SAMPLE / 2));
+        let reader = template
+            .by_blocks(&late)
+            .expect("a stretch at the second place");
+        let mut cut = Vec::new();
+        reader.for_each_match(&late, false, |s, e| cut.push((s, e)));
+        assert_eq!(cut, template.find_iter(&late).collect::<Vec<_>>());
+        // A text of more than `block::PLACES` steps is asked at that many
+        // places, further apart: here every second place of the short
+        // step. A stretch one of the others alone would begin is passed
+        // over, and the text keeps the scanner's loop. The stretch is the
+        // two blocks a place is asked for and no more, so it ends before
+        // the next place whatever the step.
+        let step = 2 * block::SAMPLE;
+        let stretch = &text[..2 * block::BLOCK];
+        let rest = "я".repeat((block::PLACES * step - stretch.len()) / 'я'.len_utf8());
+        let stretch_at = |at: usize| format!("{}{stretch}{}", &rest[..at], &rest[at..]);
+        assert!(template.by_blocks(&stretch_at(step)).is_some());
+        assert!(template.by_blocks(&stretch_at(block::SAMPLE)).is_none());
+        // A blank run behind a line break that runs through the whole next
+        // block, which no generated text is likely to hold. Where the run
+        // ends beyond ASCII the pass declines the block: that character may
+        // be whitespace too, and then the run goes on to a later break and
+        // the blank behind the first break starts no piece. The scanner
+        // says, and the text is cut the same.
+        let lead = "ab ".repeat(40);
+        let tail = " cd".repeat(200);
+        for beyond in ["\u{A0}", "\u{2028}", "é"] {
+            let declined = format!("{lead}\n{}{beyond}\n x{tail}", " ".repeat(140));
+            let reader = template
+                .by_blocks(&declined)
+                .expect("a stretch at the first place");
+            let mut cut = Vec::new();
+            reader.for_each_match(&declined, false, |s, e| cut.push((s, e)));
+            assert_eq!(
+                cut,
+                template.find_iter(&declined).collect::<Vec<_>>(),
+                "{beyond:?}"
+            );
+        }
+        // Where the run goes to the end of the text no break follows it:
+        // the blank behind the break starts the last piece, and the pass
+        // cuts every piece before it.
+        let to_the_end = format!("{}\n{}", "ab ".repeat(168), " ".repeat(140));
+        let by_scanner: Vec<(usize, usize)> = template.find_iter(&to_the_end).collect();
+        let Matcher::Template(scanner) = &template.matcher else {
+            panic!("the template's scanner");
+        };
+        let mut cut = Vec::new();
+        let open = block::pieces(
+            to_the_end.as_bytes(),
+            0,
+            scanner.digit_cap,
+            |pos| clitic_match(&template.classes, &to_the_end, pos, &scanner.clitics),
+            &mut |start, end| cut.push((start, end)),
+        );
+        let (last, before_last) = by_scanner.split_last().expect("pieces");
+        assert_eq!((cut.as_slice(), open), (before_last, last.0));
+        for other in [
+            CL100K.replace(r"[\r\n]*", r"[\r\n/]*"),
+            CL100K.replace(r"\p{L}+", "[A-Za-z]+"),
+        ] {
+            let parsed = Pattern::parse(&other).expect("parses");
+            let Matcher::Template(scanner) = &parsed.matcher else {
+                panic!("the template's scanner: {other}");
+            };
+            assert!(!scanner.blocks, "{other}");
+            assert!(parsed.by_blocks(&text).is_none(), "{other}");
+        }
+        let program = Pattern::parse(r"\s+").expect("parses");
+        assert!(program.by_blocks(&text).is_none());
+    }
+
     #[test]
     fn the_scanner_agrees_with_the_program_and_the_engine_on_shaped_text() {
         // Text shaped like JSON, code and prose: runs of spaces and line
@@ -4759,6 +5458,89 @@ mod tests {
                     "the engine; pattern {pattern:?} text {text:?}"
                 );
             }
+        }
+    }
+
+    /// The byte-level split's scanner cuts as its program and as the engine
+    /// do, the scanner through its own iterator: text built of
+    /// ASCII letters, digits and punctuation, of every kind of white space
+    /// in runs (last in the text and before a non-space among them), of
+    /// clitics in both cases, of letters and digits beyond ASCII and above
+    /// the plane, of marks and other characters no class but the
+    /// punctuation's holds; fixed texts where one rule gives way to the
+    /// next; and the empty text.
+    #[test]
+    fn the_byte_level_scanner_agrees_with_the_program_and_the_engine() {
+        const PARTS: &[&str] = &[
+            " ", "  ", "   ", "\t", "\t\t", "\n", "\n\n", "\r", "\r\n", " \n", "\n ", " \t ",
+            "\u{B}", "\u{C}", "\u{1C}", "\u{85}", "\u{A0}", "\u{1680}", "\u{2003}", "\u{2028}",
+            "\u{2029}", "\u{202F}", "\u{205F}", "\u{3000}", "'", "''", "'s", "'S", "'t", "'T",
+            "'re", "'RE", "'rE", "'ve", "'VE", "'m", "'M", "'ll", "'LL", "'l", "'d", "'D", "'x",
+            "'ſ", "a", "b", "s", "t", "I", "Word", "word", "ABC", "é", "ß", "ſ", "Ω", "中", "文",
+            "ก", "𐍈", "𝐀", "0", "1", "22", "333", "4444", "٣", "²", "½", "𝟗", ".", ",", "!", "?",
+            ":", ";", "-", "_", "\"", "(", ")", "[", "]", "{", "}", "/", "...", "\u{301}",
+            "\u{93E}", "😀", "\u{200D}", "\u{FE0F}",
+        ];
+        const TEXTS: &[&str] = &[
+            "", " ", "  ", "\n", "\t\n ", "a", " a", "  a", "a ", "a  ", "a \n", "a\n\n", "\t\ta",
+            " \ta", "a \t", "1", " 1", "  1", "1 ", " .", "  .", ". ", "'", "' ", " '", "'s",
+            " 's", "'S", "''s", "I'm", "x'ſ", "a1b2", " a1 b2 ", "é ٣ ½", "中 文", "𝐀𝟗", "😀 ",
+        ];
+        let parsed = Pattern::parse(GPT2).expect("parses");
+        let program = parsed.program_only();
+        let check = |text: &str| {
+            let expected = oracle_matches(GPT2, text);
+            assert_eq!(
+                program.find_iter(text).collect::<Vec<_>>(),
+                expected,
+                "the program; text {text:?}"
+            );
+            let scanned = parsed.split_matches(text).expect("the split's scanner");
+            assert_eq!(
+                scanned.collect::<Vec<_>>(),
+                expected,
+                "the scanner; text {text:?}"
+            );
+        };
+        for text in TEXTS {
+            check(text);
+        }
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        for round in 0..4000 {
+            let text: String = (0..1 + round % 40)
+                .map(|_| PARTS[(pseudo_random(&mut state) % PARTS.len() as u64) as usize])
+                .collect();
+            check(&text);
+        }
+    }
+
+    /// The same scanner under other classes, where a character holds
+    /// several roles: a lead-in that is also of its run, runs that share
+    /// characters, a lookahead class that holds characters of its own run,
+    /// and characters no class holds. The engine's order decides each time.
+    #[test]
+    fn the_byte_level_scanner_agrees_with_the_engine_where_classes_overlap() {
+        const OVERLAPPING: &str = "ab|ac|[ab]?[bc]+|[cd]?[de]+|[ef]?[fg]+|[gh]+(?![hi])|[hi]+";
+        const ALPHABET: [char; 11] = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', ' '];
+        let parsed = Pattern::parse(OVERLAPPING).expect("parses");
+        let program = parsed.program_only();
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        for round in 0..4000 {
+            let text: String = (0..1 + round % 24)
+                .map(|_| ALPHABET[(pseudo_random(&mut state) % ALPHABET.len() as u64) as usize])
+                .collect();
+            let expected = oracle_matches(OVERLAPPING, &text);
+            assert_eq!(
+                program.find_iter(&text).collect::<Vec<_>>(),
+                expected,
+                "the program; text {text:?}"
+            );
+            let scanned = parsed.split_matches(&text).expect("the scanner");
+            assert_eq!(
+                scanned.collect::<Vec<_>>(),
+                expected,
+                "the scanner; text {text:?}"
+            );
         }
     }
 

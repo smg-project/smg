@@ -33,6 +33,28 @@ fn a_template_that_concatenates_tool_call_arguments_takes_them_as_text() {
         .raw_tool_call_arguments());
 }
 
+/// A render without a template says what the model lacks and that no request
+/// can supply it: a render call carries no template of its own. The failure is
+/// not the template's refusal, so a caller does not read it as its input's.
+#[test]
+fn a_render_without_a_template_says_that_the_model_has_none() {
+    let messages = [serde_json::json!({"role": "user", "content": "hi"})];
+    for state in [
+        ChatTemplateState::empty(),
+        ChatTemplateState::new(None).unwrap(),
+    ] {
+        let error = state
+            .apply(&messages, ChatTemplateParams::default())
+            .expect_err("a render without a template");
+        assert_eq!(
+            error.to_string(),
+            "The model has no chat template. One must be configured for the model; \
+             a request cannot supply it."
+        );
+        assert!(!TemplateRefusal::is(&error), "{error:#}");
+    }
+}
+
 /// A replacement template answers for itself.
 #[test]
 fn a_replacement_template_refreshes_the_tool_call_arguments_answer() {
@@ -1644,6 +1666,43 @@ fn test_raise_exception_surfaces_template_validation_message() {
         .to_string();
 
     assert!(error.contains("reasoning_effort is invalid"), "{error}");
+}
+
+/// A template's own `raise_exception` is typed as the template's refusal, from
+/// inside a macro too, under the text every render failure reads; an operation
+/// the template could not run is a render failure and no refusal.
+#[test]
+fn a_templates_own_refusal_is_typed_and_another_render_failure_is_not() {
+    let failure = |template: &str| {
+        ChatTemplateState::new(Some(template.to_string()))
+            .unwrap()
+            .apply(
+                &[serde_json::json!({"role": "user", "content": []})],
+                ChatTemplateParams::default(),
+            )
+            .unwrap_err()
+    };
+
+    let refused = failure("{{ raise_exception('the roles must alternate') }}");
+    assert!(TemplateRefusal::is(&refused), "{refused:#}");
+    assert!(
+        refused
+            .to_string()
+            .starts_with("Failed to render template: invalid operation: the roles must alternate"),
+        "{refused}"
+    );
+    let in_a_macro =
+        failure("{% macro check() %}{{ raise_exception('no') }}{% endmacro %}{{ check() }}");
+    assert!(TemplateRefusal::is(&in_a_macro), "{in_a_macro:#}");
+
+    let failed = failure("{{ 'user: ' + messages[0]['content'] }}");
+    assert!(!TemplateRefusal::is(&failed), "{failed:#}");
+    assert!(
+        failed
+            .to_string()
+            .starts_with("Failed to render template: invalid operation: "),
+        "{failed}"
+    );
 }
 
 #[test]

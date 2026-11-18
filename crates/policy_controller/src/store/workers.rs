@@ -6,7 +6,7 @@ use std::{collections::BTreeMap, time::Instant};
 
 use crate::{
     lease::Membership,
-    store::GatewayId,
+    store::{encoding::EncodeOffer, pairing::PairingDescriptor, GatewayId},
     view::{fingerprint, Role, WireModes, WorkerId},
 };
 
@@ -133,11 +133,21 @@ pub struct WorkerFacts {
     /// descriptor's fields).
     pub labels: BTreeMap<String, String>,
     pub zone: Option<String>,
-    /// The prefill-decode pairing descriptor, when the worker has one.
-    pub pairing: Option<String>,
-    /// The pairing class, derived by the store at each membership change;
-    /// `0` outside any pairing.
-    pub pair_class: u32,
+    /// What the worker offers a prefill-decode partner, when the handshake
+    /// learned any of it. The store derives the pair classes from it, with
+    /// the engine kind as the runtime, where a membership write moves a
+    /// member or an offer and where a generation moves the pairing mode
+    /// ([`pairing`](super::pairing)): a registration hands no class in. The
+    /// door drops a blank value and reads a name past its blanks. Behind a
+    /// pointer: a worker that reports none holds one word for it.
+    pub pairing: Option<Box<PairingDescriptor>>,
+    /// The worker's end of the encode handoff, as the handshake learned it;
+    /// the default states none. The store derives the encode classes from
+    /// it, with the engine kind as the runtime, where a membership write
+    /// moves a member or an offer and where a generation moves the pairing
+    /// mode ([`encoding`](super::encoding)). The door drops a blank
+    /// connector and reads its name past its blanks.
+    pub encode: EncodeOffer,
     /// The engine's admission window (maximum running requests); `None`
     /// when it reports none.
     pub max_running: Option<u32>,
@@ -174,7 +184,9 @@ pub struct WorkerRow {
     pub status: WorkerStatus,
     /// Counts the row's stated facts: it moves on every write of them (a
     /// registration's refresh, a patch) and on no status change. The guard
-    /// a racing write names.
+    /// a racing write names. The world's writer carries a member's fields
+    /// under the view's lists while it stands, so a write of the facts must
+    /// move it.
     pub revision: u64,
     /// When the row was created on the host's clock.
     pub admitted_at: Instant,
