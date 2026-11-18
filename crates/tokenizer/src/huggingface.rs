@@ -144,6 +144,11 @@ pub struct HuggingFaceTokenizer {
     /// builds its control spellings was marked, read while the template is
     /// marked).
     special_tokens_marked: Option<SpecialTokens>,
+    /// The ids, in order, of the added tokens that keep their id where a
+    /// request types them, under templates marked for the control spellings
+    /// they build (see [`EncoderCore::kept`]); `None` when there is none,
+    /// and for any other template.
+    kept: Option<Box<[u32]>>,
 }
 
 /// Logs, once per load, which path a tokenizer's full decode takes: the
@@ -395,6 +400,32 @@ impl EncoderCore {
                 let flagged = token.lstrip || token.rstrip || token.single_word || token.normalized;
                 (token.content.as_str(), flagged)
             })
+    }
+
+    /// The ids, in order, of the added tokens that keep their id where a
+    /// request types them under templates that hold `written` between
+    /// marks: the ones the vocabulary does not flag special, that the
+    /// templates write nowhere as a control, and that the flat encode reads
+    /// alone and as they stand (no flag on the entry, as in
+    /// [`Self::added_entries`]). `None` when there is none.
+    fn kept(&self, written: &[String]) -> Option<Box<[u32]>> {
+        let mut kept: Vec<u32> = self
+            .tokenizer
+            .get_added_vocabulary()
+            .get_added_tokens_decoder()
+            .iter()
+            .filter(|(_, token)| {
+                let flagged = token.special
+                    || token.lstrip
+                    || token.rstrip
+                    || token.single_word
+                    || token.normalized;
+                !flagged && !written.contains(&token.content)
+            })
+            .map(|(&id, _)| id)
+            .collect();
+        kept.sort_unstable();
+        (!kept.is_empty()).then(|| kept.into_boxed_slice())
     }
 
     /// The matcher over the added vocabulary, built on first use.
@@ -965,6 +996,7 @@ impl HuggingFaceTokenizer {
         let structural_controls = tokenizer_path
             .parent()
             .is_some_and(|dir| dir.join("tekken.json").is_file());
+        let mut kept = None;
         let special_tokens_marked = if structural_controls {
             if let Some(controls) = core.added() {
                 chat_template.mark_controls(controls)?;
@@ -980,7 +1012,10 @@ impl HuggingFaceTokenizer {
                     || core.added(),
                     &special_tokens,
                 )
-                .then(|| marks::marked_special_tokens(&special_tokens))
+                .map(|written| {
+                    kept = core.kept(&written);
+                    marks::marked_special_tokens(&special_tokens)
+                })
         };
         Ok(HuggingFaceTokenizer {
             byte_level,
@@ -1003,6 +1038,7 @@ impl HuggingFaceTokenizer {
             byte_fallback_values,
             structural_controls,
             special_tokens_marked,
+            kept,
         })
     }
 
@@ -1320,6 +1356,7 @@ impl HuggingFaceTokenizer {
             byte_fallback_values,
             structural_controls: false,
             special_tokens_marked: None,
+            kept: None,
         }
     }
 
@@ -2394,10 +2431,23 @@ impl HuggingFaceTokenizer {
             marked.push_str(&marks::strip(prefix));
         }
         let (text, controls) = marks::flatten(&marked)?;
-        let encoding = if self.core.flat_encode_is_segment_encode(&text, &controls) {
+        // Under templates marked for the spellings they build, a typed added
+        // token of `kept` is cut out by the flat encode and by the segment
+        // encode alike.
+        let flat_encode_is_segment_encode = match &self.kept {
+            Some(kept) => self
+                .core
+                .added()
+                .is_some_and(|added| marks::flat_encode_keeps(added, kept, &text, &controls)),
+            None => self.core.flat_encode_is_segment_encode(&text, &controls),
+        };
+        let encoding = if flat_encode_is_segment_encode {
             PromptEncoding::FromText
         } else {
-            let segments = marks::segments(&marked)?;
+            let mut segments = marks::segments(&marked)?;
+            if let (Some(kept), Some(added)) = (&self.kept, self.core.added()) {
+                segments = marks::with_kept(segments, added, kept);
+            }
             let core = Arc::clone(&self.core);
             PromptEncoding::Deferred(EncodeJob::new(move || {
                 core.encode_segments(&segments).map(Encoding::Plain)
@@ -2672,16 +2722,18 @@ impl TokenizerTrait for HuggingFaceTokenizer {
         // checkpoint's own was at load: one that builds its control spellings
         // is marked, any other renders plain.
         let core = &self.core;
-        if !self.structural_controls
-            && self.chat_template.mark_built_controls(
+        if !self.structural_controls {
+            let written = self.chat_template.mark_built_controls(
                 &|text: &str| core.is_added(text),
                 || core.added_entries(),
                 || core.added(),
                 &self.special_tokens,
-            )
-            && self.special_tokens_marked.is_none()
-        {
-            self.special_tokens_marked = Some(marks::marked_special_tokens(&self.special_tokens));
+            );
+            self.kept = written.as_deref().and_then(|written| core.kept(written));
+            if written.is_some() && self.special_tokens_marked.is_none() {
+                self.special_tokens_marked =
+                    Some(marks::marked_special_tokens(&self.special_tokens));
+            }
         }
         if self.glm.is_some() {
             self.renderer = glm_renderer.map_or(Renderer::Jinja, Renderer::Glm53);

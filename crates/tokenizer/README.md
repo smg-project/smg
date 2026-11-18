@@ -69,7 +69,10 @@ as of `tokenizer/src/*`.
   token whole: it binds each to a name out of a constant of its own and writes the names). On
   `apply_chat_template_with_encoding` the template's tokens are tokens and a spelling typed into
   a message, a tool, a document or a template argument stays text, also when it is typed in two
-  parts the template joins. The second kind is recognised at load from the template itself, and
+  parts the template joins. Under the second kind a typed added token keeps its id when the
+  vocabulary does not flag it special, the template writes it nowhere as a control and the flat
+  `encode` reads it alone and as it stands. The second kind is recognised at load from the
+  template itself, and
   only when its syntax shows that every value it builds is only written (alone, in a join, or
   asked whether it is empty), each of those values is one control spelling or empty, and the
   marks cover every control it writes on a few probe conversations; any other checkpoint renders

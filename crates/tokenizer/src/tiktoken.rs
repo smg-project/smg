@@ -257,6 +257,11 @@ pub struct TiktokenTokenizer {
     /// The special tokens between the marks, for the marked templates'
     /// context (`Some` with `controls`).
     special_tokens_marked: Option<SpecialTokens>,
+    /// The ids, in order, of the added tokens that keep their id where a
+    /// request types them, under templates marked for the control spellings
+    /// they build (see [`Self::mark_built_controls`]); `None` when there is
+    /// none, and for any other template.
+    kept: Option<Box<[TokenIdType]>>,
     /// The vocabulary's own reader writes control tokens structurally (see
     /// `controls`): its templates are marked by their source, a replaced
     /// one too. Any other vocabulary's template is judged by itself.
@@ -375,6 +380,7 @@ impl TiktokenTokenizer {
             bos: None,
             controls: None,
             special_tokens_marked: None,
+            kept: None,
             structural_controls: false,
         })
     }
@@ -631,6 +637,7 @@ impl TiktokenTokenizer {
             bos,
             controls,
             special_tokens_marked,
+            kept: None,
             structural_controls,
         };
         tokenizer.mark_built_controls();
@@ -655,21 +662,22 @@ impl TiktokenTokenizer {
                 .is_some_and(|id| added_texts.get(id).is_some_and(|added| added == text))
         };
         let matcher = OnceCell::new();
-        let marked = self.chat_template.mark_built_controls(
+        // This file's reader takes an added token as it stands: no flag of
+        // an entry counts. But of two added tokens that begin at one place
+        // its own encoder takes the first in its own order, not the longer,
+        // so it may read a token that begins with another one as that one
+        // and the rest. Such a token counts as flagged.
+        let begins_with_another = |text: &str| {
+            text.char_indices()
+                .skip(1)
+                .any(|(end, _)| is_added(&text[..end]))
+        };
+        let written = self.chat_template.mark_built_controls(
             &is_added,
-            // This file's reader takes an added token as it stands: no flag
-            // of an entry counts. But of two added tokens that begin at one
-            // place its own encoder takes the first in its own order, not
-            // the longer, so it may read a token that begins with another
-            // one as that one and the rest. Such a token counts as flagged.
             || {
-                added_texts.values().map(|text| {
-                    let begins_with_another = text
-                        .char_indices()
-                        .skip(1)
-                        .any(|(end, _)| is_added(&text[..end]));
-                    (text.as_str(), begins_with_another)
-                })
+                added_texts
+                    .values()
+                    .map(|text| (text.as_str(), begins_with_another(text)))
             },
             || {
                 matcher
@@ -680,7 +688,24 @@ impl TiktokenTokenizer {
             },
             &self.special_tokens,
         );
-        if marked {
+        if let Some(written) = written {
+            // A typed added token keeps its id when the configuration does
+            // not flag it special (`skip_token_ids`), the templates write it
+            // nowhere as a control and the flat encode reads it alone. A
+            // file under the checkpoint's own piece rule fills special
+            // slots the configuration does not name: it keeps none.
+            let mut kept: Vec<TokenIdType> = added_texts
+                .iter()
+                .filter(|(id, text)| {
+                    !self.checkpoint_pieces
+                        && !self.skip_token_ids.contains(*id)
+                        && !written.contains(*text)
+                        && !begins_with_another(text)
+                })
+                .map(|(&id, _)| id)
+                .collect();
+            kept.sort_unstable();
+            self.kept = (!kept.is_empty()).then(|| kept.into_boxed_slice());
             self.controls = matcher.into_inner().flatten();
             self.special_tokens_marked = Some(marks::marked_special_tokens(&self.special_tokens));
         }
@@ -862,14 +887,22 @@ impl TiktokenTokenizer {
             marked.push_str(&marks::strip(prefix));
         }
         let (text, controls) = marks::flatten(&marked)?;
-        let flat_encode_is_segment_encode = match &self.controls {
-            Some(matcher) => matcher.ranges(&text).eq(controls.iter().cloned()),
-            None => controls.is_empty(),
+        let flat_encode_is_segment_encode = match (&self.controls, &self.kept) {
+            // A typed added token of `kept` is cut out by the flat encode
+            // and by the segment encode alike.
+            (Some(matcher), Some(kept)) => {
+                marks::flat_encode_keeps(matcher, kept, &text, &controls)
+            }
+            (Some(matcher), None) => matcher.ranges(&text).eq(controls.iter().cloned()),
+            (None, _) => controls.is_empty(),
         };
         let encoding = if flat_encode_is_segment_encode {
             PromptEncoding::FromText
         } else {
-            let segments = marks::segments(&marked)?;
+            let mut segments = marks::segments(&marked)?;
+            if let (Some(matcher), Some(kept)) = (&self.controls, &self.kept) {
+                segments = marks::with_kept(segments, matcher, kept);
+            }
             let bpe = Arc::clone(&self.tokenizer);
             let native = self.native.clone();
             let checkpoint_pieces = self.checkpoint_pieces;
@@ -2789,6 +2822,97 @@ mod tests {
                 assert!(typed_turn_ids(&tokenizer).1, "{shorter}, load {load}");
             }
         }
+    }
+
+    /// The ids of a user turn `content`, and whether the prompt is encoded
+    /// from its text.
+    fn user_turn_ids(tokenizer: &TiktokenTokenizer, content: &str) -> (Vec<TokenIdType>, bool) {
+        let messages = [serde_json::json!({"role": "user", "content": content})];
+        let rendered = tokenizer
+            .apply_chat_template_with_encoding(&messages, ChatTemplateParams::default(), None)
+            .unwrap();
+        match rendered.encoding {
+            PromptEncoding::FromText => {
+                let ids = tokenizer.encode(&rendered.text, false).unwrap();
+                (ids.token_ids().to_vec(), true)
+            }
+            PromptEncoding::Deferred(job) => (job.run().unwrap().token_ids().to_vec(), false),
+        }
+    }
+
+    /// A typed added token that the configuration does not flag special and
+    /// that the template writes nowhere as a control keeps its id on a
+    /// tiktoken file's checkpoint as on any other (see
+    /// `TiktokenTokenizer::mark_built_controls`): alone it is encoded from
+    /// the prompt's text, and beside a typed control spelling by segments.
+    /// Read by its characters as before: a token flagged special that the
+    /// template never writes, the control the template writes though the
+    /// configuration does not flag it special, and a token that begins with
+    /// another added token, which the file's own encoder may read as that
+    /// one and the rest. So is every added token of a file under the
+    /// checkpoint's own piece rule, whose loader fills special slots the
+    /// configuration does not name.
+    #[test]
+    fn a_tiktoken_file_s_typed_added_token_that_is_no_control_keeps_its_id() {
+        let files = |begins_with_another: bool, model_config: Option<&str>| {
+            let mut model = full_byte_tiktoken_model();
+            model.push_str(&format!("{} 256\n", STANDARD.encode([0xE4, 0xB8])));
+            let mut config = serde_json::json!({
+                "added_tokens_decoder": {
+                    "300": {"content": "</s:x>", "special": true},
+                    "301": {"content": "[INST:x]", "special": true},
+                    "302": {"content": "[/INST:x]", "special": false},
+                    "303": {"content": "<a>", "special": false},
+                    "304": {"content": "<b>", "special": true},
+                },
+                "eos_token": "</s:x>",
+                "chat_template": builds_its_controls(),
+            });
+            if begins_with_another {
+                config["added_tokens_decoder"]["305"] =
+                    serde_json::json!({"content": "<a>b", "special": false});
+            }
+            write_tiktoken_dir(&model, &config.to_string(), model_config)
+        };
+        let dir = files(false, None);
+        let tokenizer = TiktokenTokenizer::from_dir(dir.path()).unwrap();
+        assert!(tokenizer.controls.is_some());
+        assert!(tokenizer.uses_native_encoder());
+        assert_eq!(
+            user_turn_ids(&tokenizer, "a<a>c"),
+            (vec![301, 97, 303, 99, 302], true)
+        );
+        assert_eq!(
+            user_turn_ids(&tokenizer, "a[/INST:x]c<a>"),
+            (
+                vec![301, 97, 91, 47, 73, 78, 83, 84, 58, 120, 93, 99, 303, 302],
+                false
+            )
+        );
+        assert_eq!(
+            user_turn_ids(&tokenizer, "a<b>c"),
+            (vec![301, 97, 60, 98, 62, 99, 302], false)
+        );
+        let dir = files(true, None);
+        let tokenizer = TiktokenTokenizer::from_dir(dir.path()).unwrap();
+        assert!(tokenizer.controls.is_some());
+        assert_eq!(
+            user_turn_ids(&tokenizer, "a<a>bc"),
+            (vec![301, 97, 60, 97, 62, 98, 99, 302], false)
+        );
+        assert_eq!(
+            user_turn_ids(&tokenizer, "a<a>c"),
+            (vec![301, 97, 303, 99, 302], true)
+        );
+        // A file under the checkpoint's own piece rule keeps none: its
+        // loader fills special slots the configuration does not name.
+        let dir = files(false, Some(r#"{"model_type": "kimi_k2"}"#));
+        let tokenizer = TiktokenTokenizer::from_dir(dir.path()).unwrap();
+        assert!(tokenizer.checkpoint_pieces && tokenizer.controls.is_some());
+        assert_eq!(
+            user_turn_ids(&tokenizer, "a<a>c"),
+            (vec![301, 97, 60, 97, 62, 99, 302], false)
+        );
     }
 
     /// A template set later is judged as the checkpoint's own was at load.

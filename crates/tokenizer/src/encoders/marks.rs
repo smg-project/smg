@@ -194,6 +194,60 @@ pub(crate) fn flatten(marked: &str) -> Result<(String, Vec<Range<usize>>)> {
     Ok((text, controls))
 }
 
+/// Whether the flat encode of `text`, a prompt whose control tokens stand at
+/// `controls`, reads what the segment encode of that prompt reads under
+/// `kept`, the ids, in order, of the added tokens that keep their id where a
+/// request types them: every added token `added` finds in the text is the
+/// next control or a token of `kept`, and no control is left over. An added
+/// token of any other kind is a control spelling a request typed, which the
+/// segment encode reads as text ([`with_kept`]).
+pub(crate) fn flat_encode_keeps(
+    added: &AddedTokens,
+    kept: &[u32],
+    text: &str,
+    controls: &[Range<usize>],
+) -> bool {
+    let mut controls = controls.iter().peekable();
+    added.tokens(text).all(|(range, id)| {
+        controls.next_if(|control| **control == range).is_some() || kept.binary_search(&id).is_ok()
+    }) && controls.next().is_none()
+}
+
+/// `segments` with each token of `kept` that a plain segment holds as a
+/// control segment of its own, which the segment encode reads as its id.
+/// The added tokens of a plain segment are found as the flat encode finds
+/// them (`added`: leftmost, and the longest at one place). One that is not
+/// of `kept` is a control spelling a request typed: it stays text, whole,
+/// with the text around it, and no token is read inside it.
+pub(crate) fn with_kept(
+    segments: Vec<PromptSegment>,
+    added: &AddedTokens,
+    kept: &[u32],
+) -> Vec<PromptSegment> {
+    let mut cut = Vec::with_capacity(segments.len());
+    for segment in segments {
+        let mut cursor = 0;
+        if !segment.allow_special {
+            let text = segment.text.as_str();
+            for (range, id) in added.tokens(text) {
+                if kept.binary_search(&id).is_ok() {
+                    if cursor < range.start {
+                        cut.push(PromptSegment::text(&text[cursor..range.start]));
+                    }
+                    cut.push(PromptSegment::control(&text[range.start..range.end]));
+                    cursor = range.end;
+                }
+            }
+        }
+        if cursor == 0 {
+            cut.push(segment);
+        } else if cursor < segment.text.len() {
+            cut.push(PromptSegment::text(&segment.text[cursor..]));
+        }
+    }
+    cut
+}
+
 /// `source`, a chat template, with every control spelling `controls` knows
 /// written between the marks: compiled so, the template writes control
 /// tokens where it writes the spellings, while the same spellings in request

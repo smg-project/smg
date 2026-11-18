@@ -4292,20 +4292,23 @@ impl ChatTemplateState {
     /// alone and as it stands ([`contested`]), the templates stay as they
     /// are: a prompt with the marks would read that spelling as its own
     /// token everywhere.
-    /// Returns whether the templates are now marked.
+    /// Returns the spellings the templates now hold between marks, the
+    /// special tokens a render gives by name among them, so that the caller
+    /// can tell which added tokens a request may still type as tokens;
+    /// `None` when the templates stay as they are.
     pub(crate) fn mark_built_controls<'a, 'b, I>(
         &mut self,
         is_control: &dyn Fn(&str) -> bool,
         added: impl FnOnce() -> I,
         controls: impl FnOnce() -> Option<&'a AddedTokens>,
         special_tokens: &SpecialTokens,
-    ) -> bool
+    ) -> Option<Vec<String>>
     where
         I: Iterator<Item = (&'b str, bool)>,
     {
         let own = self.control_bindings(is_control, special_tokens);
         if own.is_empty() {
-            return false;
+            return None;
         }
         let nested: Vec<_> = [&self.tool_use, &self.processor]
             .into_iter()
@@ -4332,24 +4335,17 @@ impl ChatTemplateState {
                 "the chat template binds control spellings and stays unmarked: the flat encode \
                  may read one of them otherwise than alone"
             );
-            return false;
+            return None;
         }
-        let Some(controls) = controls() else {
-            return false;
-        };
-        let Some(own) = self.built_controls_marked(&own, controls, special_tokens) else {
-            return false;
-        };
+        let controls = controls()?;
+        let own = self.built_controls_marked(&own, controls, special_tokens)?;
         let mut envs = Vec::new();
         for (state, bindings) in [&self.tool_use, &self.processor]
             .into_iter()
             .flatten()
             .zip(&nested)
         {
-            let Some(env) = state.built_controls_marked(bindings, controls, special_tokens) else {
-                return false;
-            };
-            envs.push(env);
+            envs.push(state.built_controls_marked(bindings, controls, special_tokens)?);
         }
         self.env = Some(own);
         self.marked = true;
@@ -4365,7 +4361,7 @@ impl ChatTemplateState {
             "the chat template builds its control spellings: the control tokens it writes are \
              marked, and the same spellings in a request are encoded as text"
         );
-        true
+        Some(spellings.into_iter().map(str::to_owned).collect())
     }
 
     /// This template's state around `env`, without nested templates: a

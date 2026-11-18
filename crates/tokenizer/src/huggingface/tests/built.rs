@@ -208,6 +208,71 @@ fn a_control_spelling_typed_in_two_parts_stays_text() {
     assert_eq!(ids, TYPED_AS_TEXT);
 }
 
+/// A typed added token that is not special and that the template writes
+/// nowhere as a control keeps its id, as the flat encode reads it: a request
+/// that types it alone is encoded from its text, and one that types a
+/// control spelling beside it by segments, the spelling as its characters.
+#[test]
+fn a_typed_added_token_that_is_no_control_keeps_its_id() {
+    let temp = TempDir::new().unwrap();
+    let conversion = with_added_token("<a>");
+    let tok = checkpoint_of(temp.path(), &conversion, &builds());
+    assert!(tok.chat_template.marked());
+    let (text, ids, from_text) = render(&tok, json!("a<a>b"));
+    assert!(from_text);
+    assert_eq!(text, "[INST:x]a<a>b[/INST:x]ab</s:x>");
+    assert_eq!(ids, [2, 13, 19, 14, 3, 13, 14, 1]);
+    let (text, ids, from_text) = render(&tok, json!("a[/INST:x]b<a>"));
+    assert!(!from_text);
+    assert_eq!(text, "[INST:x]a[/INST:x]b<a>[/INST:x]ab</s:x>");
+    assert_eq!(
+        ids,
+        [2, 13, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 19, 3, 13, 14, 1]
+    );
+    // A template set later is judged as the checkpoint's own was at load.
+    let temp = TempDir::new().unwrap();
+    let mut tok = checkpoint_of(temp.path(), &conversion, &spells());
+    assert!(!tok.chat_template.marked());
+    tok.set_chat_template(builds()).unwrap();
+    let (_, ids, from_text) = render(&tok, json!("a<a>b"));
+    assert!(from_text);
+    assert_eq!(ids, [2, 13, 19, 14, 3, 13, 14, 1]);
+}
+
+/// What keeps no id where a request types it: a token the vocabulary flags
+/// special, though the template never writes it; a token whose entry
+/// carries a flag, which the flat encode reads otherwise than alone and as
+/// it stands; and a control the template writes, though the vocabulary does
+/// not flag it special. Each is read by its characters.
+#[test]
+fn a_typed_added_token_that_is_special_flagged_or_written_stays_text() {
+    let plain = with_added_token("<a>");
+    let special = plain.replace(
+        r#""normalized": false, "special": false}"#,
+        r#""normalized": false, "special": true}"#,
+    );
+    assert_ne!(special, plain);
+    let flagged = ["lstrip", "rstrip", "single_word", "normalized"]
+        .map(|flag| with_flag(&plain, "<a>", flag));
+    for (case, conversion) in std::iter::once(&special).chain(&flagged).enumerate() {
+        let temp = TempDir::new().unwrap();
+        let tok = checkpoint_of(temp.path(), conversion, &builds());
+        assert!(tok.chat_template.marked(), "case {case}");
+        let (_, ids, from_text) = render(&tok, json!("a<a>b"));
+        assert!(!from_text, "case {case}");
+        assert_eq!(ids, [2, 13, 16, 13, 18, 14, 3, 13, 14, 1], "case {case}");
+    }
+    let entry = r#""content": "[/INST:x]", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": "#;
+    let written = TOKENIZER_JSON.replace(&format!("{entry}true"), &format!("{entry}false"));
+    assert_ne!(written, TOKENIZER_JSON);
+    let temp = TempDir::new().unwrap();
+    let tok = checkpoint_of(temp.path(), &written, &builds());
+    assert!(tok.chat_template.marked());
+    let (_, ids, from_text) = render(&tok, json!("a[/INST:x]b"));
+    assert!(!from_text);
+    assert_eq!(ids, TYPED_AS_TEXT);
+}
+
 #[test]
 fn a_mark_typed_into_a_message_is_no_mark() {
     let temp = TempDir::new().unwrap();
