@@ -82,6 +82,36 @@ fn an_answer_or_a_record_that_names_the_rank_ends_its_mark() {
 }
 
 #[test]
+fn the_write_that_ends_the_last_mark_is_counted_as_a_verdict_moved() {
+    let (store, t0, zero, one) = two_ranks();
+    names_one_alone(&store, zero, one, t0);
+    assert_eq!(store.overload_flips(), 1, "the mark");
+    // An answer that names the rank again clears its bit.
+    names_both(&store, zero, one, t0);
+    assert_eq!(
+        (overloaded(&store, t0), store.overload_flips()),
+        (vec![], 2)
+    );
+    // So does a record.
+    names_one_alone(&store, zero, one, t0);
+    let t1 = t0 + Duration::from_secs(1);
+    store.record(zero, 0, load(1, 0), t1, LoadSource::Stream);
+    assert_eq!(
+        (overloaded(&store, t1), store.overload_flips()),
+        (vec![], 4)
+    );
+    // And so does the eviction of the marked member.
+    let t2 = t1 + Duration::from_secs(1);
+    names_one_alone(&store, zero, one, t2);
+    store.evict(zero);
+    store.publish(t2);
+    assert_eq!(
+        (overloaded(&store, t2), store.overload_flips()),
+        (vec![], 6)
+    );
+}
+
+#[test]
 fn a_rank_that_pushed_since_the_poll_began_takes_no_mark_beside_one_the_answer_leaves_out() {
     // Three ranks of one engine, each with a record on file from one answer.
     let store = MemoryStore::with_publish_window(Duration::ZERO);

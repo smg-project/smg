@@ -2222,8 +2222,10 @@ impl Writer {
     /// rows start with no bit, and an applied generation may hand any pool
     /// another pair or none: an engine that had a threshold is judged once
     /// more under what it has now, so a bit no threshold holds is cleared.
-    fn judge_every(&mut self) {
+    /// Whether a verdict moved.
+    fn judge_every(&mut self) -> bool {
         self.judging = false;
+        let mut moved = false;
         for index in 0..self.engines.len() {
             // A rank stands unnamed only while the writer judges: a record
             // reads a mark behind that one test.
@@ -2234,12 +2236,22 @@ impl Writer {
             };
             let had = mem::replace(&mut engine.judged, true);
             if had || has {
-                self.judge(index as u32);
+                moved |= self.judge(index as u32);
             }
             if let Some(engine) = self.engines.get_mut(index) {
                 engine.judged = has;
             }
         }
+        moved
+    }
+
+    /// The last mark went: every engine is judged once more, and one with
+    /// no threshold is judged at no write after it. The write that ended
+    /// the mark is counted here where that judgment moves a verdict: its
+    /// door's own judgment comes after and finds the bit cleared.
+    fn judge_unmarked(&mut self) {
+        let moved = self.judge_every();
+        self.flips += u64::from(moved);
     }
 
     /// Judge one engine over what is on file for its ranks and write the
@@ -2546,10 +2558,8 @@ impl Writer {
             }
             (Ok(at), false) => {
                 self.unnamed.remove(at);
-                // The last mark went: every engine is judged once more, and
-                // one with no threshold is judged at no write after it.
                 if self.unnamed.is_empty() {
-                    self.judge_every();
+                    self.judge_unmarked();
                 }
                 true
             }
@@ -2571,7 +2581,7 @@ impl Writer {
         self.unnamed.retain(|&(member, _)| member != id);
         let went = self.unnamed.len() != before;
         if went && self.unnamed.is_empty() {
-            self.judge_every();
+            self.judge_unmarked();
         }
         went
     }
