@@ -304,9 +304,11 @@ impl NemotronOmniProcessor {
                     let (mean, scale) = (mean[c], scale[c]);
                     for dy in 0..p {
                         let row = &pixels[(i * p + dy) * out_w + j * p..][..p];
-                        // One channel of a patch row is gathered, then normalized
-                        // as a block with that channel's mean and scale: the
-                        // resized image is passed over once, not twice.
+                        // One channel of a patch row is gathered into a fixed array,
+                        // then normalized there with that channel's mean and scale:
+                        // the resized image is read once, and the sixteen divisions
+                        // run as one vector block. Normalizing inside the gather
+                        // divides one value at a time and is slower.
                         let mut values = [0.0_f32; PATCH_SIZE];
                         for (value, pixel) in values.iter_mut().zip(row) {
                             *value = pixel[c];
