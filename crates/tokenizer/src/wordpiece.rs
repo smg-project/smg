@@ -356,8 +356,10 @@ impl WordPieceEncoder {
         text: &str,
         add_special_tokens: bool,
     ) -> Vec<u32> {
+        // A third of the bytes: text of words runs near one piece to four
+        // bytes, and a list that grows once is copied and twice as large.
         let mut ids =
-            Vec::with_capacity(self.prefix.len() + text.len() / 4 + self.suffix.len() + 4);
+            Vec::with_capacity(self.prefix.len() + text.len() / 3 + self.suffix.len() + 4);
         if add_special_tokens {
             ids.extend_from_slice(&self.prefix);
         }
