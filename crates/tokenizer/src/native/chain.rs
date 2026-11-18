@@ -1133,6 +1133,67 @@ mod tests {
         );
     }
 
+    /// A run of blanks behind a line break that fills the whole block behind
+    /// its first blank: whether that blank starts a piece hangs on the byte
+    /// that ends the run, and the pass then reads it past the next block
+    /// (`Edge::starts` of `block`). The generated texts above hold no run
+    /// that long. Here the break stands at every offset of a block, the run
+    /// is from just under one block to three blocks long, and it ends in
+    /// each kind of byte the pass can meet there: the text's end; a letter;
+    /// a digit, which the chain's template never sees, alone and before a
+    /// line break (the run ends at the digit all the same); a control
+    /// character, whose block is the scanner's; a line break of either
+    /// kind, with which the run is one piece from its first break on; and
+    /// beyond ASCII, where the pass declines, a letter, a digit, and
+    /// whitespace before a line break (the run goes on through it). The
+    /// scanner alone and the walk by blocks cut each text as the engine
+    /// does.
+    #[test]
+    fn a_block_of_blanks_behind_a_line_break_is_cut_as_the_engine_cuts_it() {
+        const ENDS: &[&str] = &[
+            "", "x", "1", "1\n", "\u{1}", "\n", "\r", "\u{e9}", "\u{663}", "\u{a0}\n",
+        ];
+        const BLANKS: [usize; 5] = [
+            block::BLOCK - 1,
+            block::BLOCK,
+            block::BLOCK + 1,
+            2 * block::BLOCK,
+            3 * block::BLOCK,
+        ];
+        let words = "word ".repeat(40);
+        for patterns in [[DIGITS, RUNS, TEMPLATE], [ONE_DIGIT, RUNS, TEMPLATE]] {
+            let scanner = Scanner::recognize(&chain(&patterns)).expect("the scanner");
+            assert!(scanner.blocks, "the chain reads plain ASCII by blocks");
+            for shift in 0..block::BLOCK {
+                let lead = &words[..2 * block::BLOCK + shift];
+                for blanks in BLANKS {
+                    let run = " ".repeat(blanks);
+                    for ends_in in ENDS {
+                        for tail in ["", words.as_str()] {
+                            let text = format!("{lead}\n{run}{ends_in}{tail}");
+                            let cut = engine(&patterns, &text);
+                            let mut alone = Vec::new();
+                            scanner.pieces_as::<false, _>(&text, &mut |start, end| {
+                                alone.push((start, end));
+                            });
+                            assert_eq!(alone, cut, "the scanner alone; text {text:?}");
+                            let mut by_blocks = Vec::new();
+                            scanner.pieces_by_blocks::<false, _>(&text, &mut |start, end| {
+                                by_blocks.push((start, end));
+                            });
+                            assert_eq!(by_blocks, cut, "by blocks; text {text:?}");
+                            by_blocks.clear();
+                            scanner.pieces_by_blocks::<true, _>(&text, &mut |start, end| {
+                                by_blocks.push((start, end));
+                            });
+                            assert_eq!(by_blocks, cut, "with the word scans; text {text:?}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// A text is read by blocks only where the pass serves it: from the
     /// pass's bound on, with an ASCII stretch at one of the places the text
     /// is asked at. A text in another script keeps the scanner's own loop,
