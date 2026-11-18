@@ -353,8 +353,8 @@ mod tests {
         sessions::{SessionRule, SessionVerdict},
         spec::{Assignment, Needs, OverloadSpec, PolicySpec, Recovery},
         view::{
-            Candidate, Constraints, Health, Identity, NamedAffinity, NamedHolder, Phase, PoolFacts,
-            RequestFacts, WorkerId,
+            Candidate, Constraints, Health, Identity, NamedAffinity, NamedHolder, Phase, PinSource,
+            PoolFacts, RequestFacts, Session, WorkerId,
         },
     };
 
@@ -2079,6 +2079,70 @@ mod tests {
         assert_eq!(dispatched(&engine, &pool, 3_000), ring[0], "the pin stood");
     }
 
+    /// The pins of record a case lends: one key's worker.
+    #[derive(Debug)]
+    struct Recorded(Session, WorkerId);
+
+    impl PinSource for Recorded {
+        fn pinned(&self, key: Session, _ttl_micros: Option<u64>) -> Option<WorkerId> {
+            (key == self.0).then_some(self.1)
+        }
+    }
+
+    /// A kept key the lifted pass puts back on its pin of record follows
+    /// that pin as it follows a pin the table holds. The table holds no pin
+    /// of the key, the host's record names the key's ring worker, and that
+    /// worker is over its thresholds: the read at a miss passes it over
+    /// under the veto as it stands, the ring names it with the veto lifted,
+    /// and the pin is written back with no claim. When the host dispatches
+    /// the decision to its alternate, the worker is still the key's first
+    /// pin, and the key returns there.
+    #[test]
+    fn a_kept_key_put_back_on_its_pin_of_record_claims_nothing() {
+        let engine = ring_under_a_rule(Assignment::Delegate);
+        let mut pool = [free(0, 4), free(1, 4), free(2, 4), free(3, 4)];
+        let ring = ring_order(&engine_of("consistent_hashing", false), &keyed("k1"), &pool);
+        let owner = ring[0] as usize;
+        let request = RequestFacts {
+            now_micros: 2_000,
+            ..keyed("k1")
+        };
+        // The table holds nothing of the key. The record names its worker,
+        // over its thresholds beside free workers.
+        let record = Recorded(request.session(), pool[owner].id);
+        pool[owner].health.overloaded = true;
+        let decision = engine.decide(
+            &request,
+            &PoolFacts::default(),
+            &pool,
+            &Constraints {
+                pins: Some(&record),
+                ..Constraints::default()
+            },
+            &mut Scratch::new(),
+        );
+        let pick = *decision.pick().expect("a pick");
+        assert_eq!(order(&decision)[..2], ring[..2], "the ring's order");
+        let verdict = pick.session_verdict;
+        // The host dispatches the decision to its alternate.
+        let alternate = *pick.targets.iter().nth(1).expect("an alternate");
+        let lease = Lease {
+            issued_micros: 2_000,
+            session: request.session(),
+            session_verdict: verdict,
+            ..Lease::default()
+        };
+        engine.on_dispatched(&lease, &alternate, Side::Single, 0);
+        // The worker is under its thresholds again: the key is still its.
+        pool[owner].health.overloaded = false;
+        let back = dispatched(&engine, &pool, 3_000);
+        assert_eq!(
+            (verdict, back),
+            (SessionVerdict::Pinned, ring[0]),
+            "no claim, and the pin stood"
+        );
+    }
+
     /// The rule's in-flight cap holds for a pin the lifted pass lands on as
     /// it holds for a pin read first: the lift is of the overload veto, and
     /// of no other limit. A pin that carries the cap's requests of the key
@@ -2130,6 +2194,132 @@ mod tests {
         let stays = decide(&engine, &request, &pool);
         assert_eq!(order(&stays)[0], ring[0], "no worker under the cap");
         assert_eq!(verdict(&stays), SessionVerdict::Pinned);
+    }
+
+    /// The rule's in-flight cap holds for a pin of record the lifted pass
+    /// lands on as it holds for a pin the table held. The record names the
+    /// key's ring worker, over its thresholds and carrying the cap's
+    /// requests of the key: the pin is written back and hands the key to
+    /// the ring's next worker, where a claim would have kept it.
+    #[test]
+    fn a_followed_pin_of_record_at_the_rules_cap_hands_the_key_on() {
+        let engine = ring_under_a_cap(2);
+        let mut pool = [free(0, 4), free(1, 4), free(2, 4), free(3, 4)];
+        let ring = ring_order(&engine_of("consistent_hashing", false), &keyed("k1"), &pool);
+        let owner = ring[0] as usize;
+        let request = RequestFacts {
+            now_micros: 2_000,
+            ..keyed("k1")
+        };
+        let record = Recorded(request.session(), pool[owner].id);
+        pool[owner].health.overloaded = true;
+        pool[owner].session_in_flight = 2;
+        let decision = engine.decide(
+            &request,
+            &PoolFacts::default(),
+            &pool,
+            &Constraints {
+                pins: Some(&record),
+                ..Constraints::default()
+            },
+            &mut Scratch::new(),
+        );
+        assert_eq!(order(&decision)[0], ring[1], "handed on at the cap");
+        assert_eq!(
+            decision.pick().expect("a pick").session_verdict,
+            SessionVerdict::Respill
+        );
+        assert_eq!(decision.trace().lifted, Lifted::None);
+    }
+
+    /// A pin of record on another worker than the ring's stands through a
+    /// pool over its thresholds on every worker. The ring's worker takes
+    /// the request with the veto lifted, a claim behind the record's pin
+    /// written back, and once the pool is under its thresholds the key
+    /// returns to its recorded worker (the manual preset's rule recovers
+    /// the original).
+    #[test]
+    fn a_pin_of_record_off_the_rings_worker_stands_through_a_pool_over_on_every_worker() {
+        let engine = ring_under_a_rule(Assignment::Delegate);
+        let mut pool = [over(0, 4), over(1, 4), over(2, 4), over(3, 4)];
+        let ring = ring_order(&engine_of("consistent_hashing", false), &keyed("k1"), &pool);
+        let request = RequestFacts {
+            now_micros: 2_000,
+            ..keyed("k1")
+        };
+        let recorded = pool[ring[1] as usize].id;
+        let record = Recorded(request.session(), recorded);
+        let lent = Constraints {
+            pins: Some(&record),
+            ..Constraints::default()
+        };
+        let mut scratch = Scratch::new();
+        let over_all = engine.decide(&request, &PoolFacts::default(), &pool, &lent, &mut scratch);
+        assert_eq!(
+            order(&over_all)[0],
+            ring[0],
+            "the ring's worker, by the lift"
+        );
+        assert_eq!(over_all.trace().lifted, Lifted::Overload);
+        assert_eq!(
+            engine
+                .sessions()
+                .pins(request.session())
+                .map(|pins| pins[0]),
+            Some(recorded),
+            "the record's pin is the key's first"
+        );
+        // The pool is under its thresholds again: the key is its record's.
+        for worker in &mut pool {
+            worker.health.overloaded = false;
+        }
+        let later = RequestFacts {
+            now_micros: 3_000,
+            ..keyed("k1")
+        };
+        let back = engine.decide(&later, &PoolFacts::default(), &pool, &lent, &mut scratch);
+        assert_eq!(order(&back)[0], ring[1], "the recorded worker");
+        assert_eq!(
+            back.pick().expect("a pick").session_verdict,
+            SessionVerdict::Pinned
+        );
+    }
+
+    /// A pin of record on a worker the lifted pass drops as well (it is not
+    /// ready) is passed over, as the plain form passes it: nothing is
+    /// written back, and the ring's worker takes the key as a fresh one.
+    #[test]
+    fn a_pin_of_record_the_lifted_pass_drops_is_passed_over() {
+        let engine = ring_under_a_rule(Assignment::Delegate);
+        let mut pool = [free(0, 4), free(1, 4), free(2, 4), free(3, 4)];
+        let ring = ring_order(&engine_of("consistent_hashing", false), &keyed("k1"), &pool);
+        let request = RequestFacts {
+            now_micros: 2_000,
+            ..keyed("k1")
+        };
+        let down = ring[1] as usize;
+        let record = Recorded(request.session(), pool[down].id);
+        pool[down].health.healthy = false;
+        let lent = Constraints {
+            pins: Some(&record),
+            ..Constraints::default()
+        };
+        let mut scratch = Scratch::new();
+        let decision = engine.decide(&request, &PoolFacts::default(), &pool, &lent, &mut scratch);
+        let taker = pool[ring[0] as usize].id;
+        assert_eq!(order(&decision)[0], ring[0], "the ring's worker");
+        assert_eq!(
+            decision.pick().expect("a pick").session_verdict,
+            SessionVerdict::Claimed(taker)
+        );
+        assert_eq!(
+            engine
+                .sessions()
+                .pins(request.session())
+                .map(|pins| pins[0]),
+            Some(taker),
+            "nothing is written back"
+        );
     }
 
     /// A key handed on at the cap reads the veto as it stands, from a pin
