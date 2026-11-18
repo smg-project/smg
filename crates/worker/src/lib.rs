@@ -25,7 +25,10 @@
 //!
 //! The `runtime` feature adds the worker's runtime, for the process that
 //! hosts the workers. Its first part is `connection`: the HTTP client factory
-//! and the cache of worker-directed clients.
+//! and the cache of worker-directed clients. Beside it stand the errors a
+//! worker operation reports (`identity::error`), `periodic_task`, a task on a
+//! thread of its own, and `load`, which merges the metrics scraped from the
+//! workers.
 
 /// Default model identifier used when no model is specified.
 ///
@@ -38,11 +41,15 @@ pub mod connection;
 pub mod health;
 pub mod identity;
 pub mod labels;
+#[cfg(feature = "runtime")]
+pub mod load;
 #[cfg(feature = "metrics")]
 pub mod metrics;
 pub mod metrics_labels;
 pub mod model_card;
 pub mod model_type;
 pub mod models;
+#[cfg(feature = "runtime")]
+pub mod periodic_task;
 pub mod settings;
 pub mod worker;

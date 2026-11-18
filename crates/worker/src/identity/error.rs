@@ -67,15 +67,26 @@ impl From<reqwest::Error> for WorkerError {
 
 #[cfg(test)]
 mod tests {
-    use std::error::Error;
+    use std::{
+        error::Error,
+        net::{Ipv4Addr, SocketAddr},
+    };
+
+    use tokio::net::TcpSocket;
 
     use super::*;
-    use crate::worker::{connection::http_client::LazyHttpClient, test_support::RefusedAddress};
+    use crate::connection::http_client::LazyHttpClient;
 
     #[tokio::test]
     async fn a_client_error_converts_without_the_clients_url() {
-        let refused = RefusedAddress::reserve();
-        let url = format!("{}/health?token=s3cret", refused.http_url());
+        // Bound and never listening: the host's own stack refuses every
+        // connection, and the port stays taken while the socket lives.
+        let refused = TcpSocket::new_v4().expect("a TCP socket");
+        refused
+            .bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .expect("a loopback port of the system's choice");
+        let addr = refused.local_addr().expect("the bound address");
+        let url = format!("http://{addr}/health?token=s3cret");
         let error: WorkerError = LazyHttpClient::deferred()
             .client()
             .get(&url)
@@ -85,11 +96,7 @@ mod tests {
             .into();
         let text = error.to_string();
         assert!(!text.contains("s3cret"), "{text}");
-        assert_eq!(
-            text.matches(&refused.addr().to_string()).count(),
-            1,
-            "{text}"
-        );
+        assert_eq!(text.matches(&addr.to_string()).count(), 1, "{text}");
     }
 
     #[test]

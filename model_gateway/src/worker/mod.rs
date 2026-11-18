@@ -7,7 +7,8 @@ pub mod kv;
 pub mod load;
 pub mod metrics;
 pub mod pd;
-pub(crate) mod periodic_task;
+// The worker crate's, at the path it had here.
+pub(crate) use smg_worker::periodic_task;
 pub mod registry;
 pub mod runtime;
 #[cfg(any(test, feature = "test-util"))]
