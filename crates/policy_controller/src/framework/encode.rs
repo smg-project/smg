@@ -21,7 +21,7 @@
 
 use super::{
     column_fits, debug_assert_indexed, run_profile, shed, Buffers, ClassBits, Engine, PairPools,
-    Plan, Scratch, Set,
+    Plan, Scratch, Set, AFFINITY_COLUMN,
 };
 use crate::{
     decision::{Decision, ShedReason, Target, Targets, Trace},
@@ -49,6 +49,13 @@ const ENCODE_MEDIA: &str = "encode-media";
 const DECODE_VISION: &str = "decode-vision";
 /// The stage named when a column of the encode pool is not one entry a row.
 const ENCODE_COLUMN: &str = "encode-column";
+/// The stage named when a request with items meets an encode profile that
+/// shows its rows to a plugin: no scope is opened over the encoders offered
+/// to a key.
+const ENCODE_SCOPE: &str = "encode-scope";
+/// The stage named when a mask stands beside a pool the encode side cut: a
+/// mask numbers the rows of the whole pool.
+const MASKED_ROWS: &str = "masked-rows";
 
 /// What the encode side reads of one encoder beside its candidate row, as
 /// the store holds it.
@@ -283,6 +290,16 @@ impl Engine {
     /// key is placed in the items' stead when the request carries it.
     /// `placed` holds each placed key's encoder; a request without items
     /// reads no encoder and places none.
+    ///
+    /// What this side cannot read truly is declined. A request with items
+    /// under an encode profile that shows its rows to a plugin names
+    /// `encode-scope`: no scope is opened over the encoders offered to a
+    /// key. A mask ([`Constraints::stalled`]) beside a pool this side cut
+    /// names `masked-rows`: a mask numbers the rows of the whole pool. A
+    /// pair column of another length than its pool names `affinity-column`
+    /// before a cut, as the pair entry names it. The encode side's stages
+    /// are handed no pin ([`RequestFacts::pinned_at`]): a pin is a position
+    /// in another pool.
     #[expect(
         clippy::too_many_arguments,
         reason = "the pair entry's inputs and the encode side's"
@@ -359,12 +376,28 @@ impl Engine {
         {
             return declined(ENCODE_COLUMN);
         }
+        // A cut copies the entries of the rows it keeps, so a column of
+        // another length could fit the rows a cut leaves: the pair's columns
+        // are refused before one, as the pair entry refuses them.
+        if !column_fits(pools.prefill_affinity, pools.prefills)
+            || !column_fits(pools.decode_affinity, pools.decodes)
+        {
+            return declined(AFFINITY_COLUMN);
+        }
         debug_assert_indexed(encode.encoders);
         let needs = !items.keys.is_empty();
+        // A profile that shows its rows to a plugin answers inside a scope
+        // opened over the rows of one decision. None is opened over the
+        // encoders offered to a key, so no stage of such a profile is asked.
+        if needs && self.marks[usize::from(index)].scoped() {
+            return declined(ENCODE_SCOPE);
+        }
         let images = facts.media.images != 0;
         let encode_facts = RequestFacts {
             phase: Phase::Encode,
             affinity: encode.affinity,
+            // A pin is a position in another pool: the encode side takes none.
+            pinned_at: 0,
             ..*facts
         };
         let takes = |row: &Candidate, of: &EncoderFacts| {
@@ -489,6 +522,11 @@ impl Engine {
                 .iter()
                 .all(|&class| open_class(class));
         if !every_prefill {
+            // A mask numbers the rows of the host's pool, and a cut numbers
+            // its rows anew: beside a cut pool a mask would name other rows.
+            if !cx.stalled.is_empty() {
+                return declined(MASKED_ROWS);
+            }
             side.prefills.clear();
             for (at, row) in pools.prefills.iter().enumerate() {
                 if open_class(class_of(at)) {
@@ -500,6 +538,9 @@ impl Engine {
         }
         let every_decode = !vision || pools.decodes.iter().all(|row| row.vision);
         if !every_decode {
+            if !decode_cx.stalled.is_empty() {
+                return declined(MASKED_ROWS);
+            }
             side.decodes.clear();
             for (at, row) in pools.decodes.iter().enumerate() {
                 if row.vision {
@@ -546,9 +587,12 @@ impl Engine {
                 side.offered.push(row, at, encode.affinity);
             }
         }
-        let _opened = self.marks[usize::from(index)]
-            .scoped()
-            .then(|| profile.open(&encode_facts, &side.offered.rows, pool));
+        // The offered encoders are numbered anew unless they are the whole
+        // pool, and the encode side's mask is refused beside them as beside
+        // a cut pool.
+        if !encode_cx.stalled.is_empty() && side.offered.rows.len() != encode.encoders.len() {
+            return declined(MASKED_ROWS);
+        }
         let one = items.one.filter(|_| pushes);
         placed.one = one.is_some();
         let keys = one.as_ref().map_or(items.keys, std::slice::from_ref);

@@ -3,6 +3,11 @@
 //! of another plan, the rows read back from the admitted pools, the
 //! affinity columns) and each gap by its stage.
 
+use std::sync::{
+    atomic::{AtomicU32, Ordering},
+    Arc,
+};
+
 use super::*;
 use crate::{
     framework::PairTable,
@@ -740,4 +745,243 @@ fn a_request_without_items_reads_no_membership() {
     let (decision, words) = decided_widths(&bed, PairTable::default());
     assert_eq!(decision, bed.pair(&engine()));
     assert_eq!(words, [0, 0, 0, 0]);
+}
+
+/// A stage that shows its rows to a plugin and counts each time it is
+/// asked: a scope to open, a row to keep.
+#[derive(Debug)]
+struct ShowsItsRows(Arc<AtomicU32>);
+
+impl crate::framework::Lifecycle for ShowsItsRows {}
+
+impl crate::framework::DecisionScope for ShowsItsRows {
+    fn open(&self, _: &RequestFacts<'_>, _: &[Candidate], _: &PoolFacts<'_>) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn close(&self) {}
+}
+
+impl crate::framework::Filter for ShowsItsRows {
+    fn name(&self) -> &'static str {
+        "shows-its-rows"
+    }
+
+    fn keep(&self, _: &RequestFacts<'_>, _: &Candidate, _: &Constraints<'_>) -> bool {
+        self.0.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
+    fn scope(&self) -> Option<&dyn crate::framework::DecisionScope> {
+        Some(self)
+    }
+}
+
+/// A filter that refuses an encoder to a request that carries a pin.
+#[derive(Debug)]
+struct NoEncoderUnderAPin;
+
+impl crate::framework::Filter for NoEncoderUnderAPin {
+    fn name(&self) -> &'static str {
+        "no-encoder-under-a-pin"
+    }
+
+    fn keep(&self, facts: &RequestFacts<'_>, row: &Candidate, _: &Constraints<'_>) -> bool {
+        !matches!(row.role, Role::Encode) || facts.pinned_at == 0
+    }
+}
+
+/// The bed's decision over `pools` under `facts` and each side's
+/// constraints: the prefill's, the decode's and the encode's.
+fn decide_under(
+    bed: &Bed,
+    engine: &Engine,
+    facts: &RequestFacts<'_>,
+    pools: PairPools<'_>,
+    sides: [&Constraints<'_>; 3],
+) -> (Decision, EncodePlaced) {
+    let (_, pool) = bed.asked();
+    let encode = EncodePool {
+        encoders: &bed.encoders,
+        facts: &bed.facts,
+        prefill_classes: &bed.prefill_classes,
+        affinity: &bed.encode_affinity,
+    };
+    let items = EncodeItems {
+        keys: &bed.keys,
+        one: bed.one,
+        references: bed.references,
+        decode_images: bed.decode_images,
+    };
+    let [cx, decode_cx, encode_cx] = sides;
+    let mut placed = EncodePlaced::new();
+    let decision = engine.decide_encode_pair(
+        facts,
+        &pool,
+        pools,
+        encode,
+        items,
+        cx,
+        decode_cx,
+        encode_cx,
+        &mut Scratch::new(),
+        &mut placed,
+    );
+    (decision, placed)
+}
+
+/// The reason and the stage of a shed.
+fn shed_of(decision: &Decision) -> (ShedReason, &'static str) {
+    match decision {
+        Decision::Shed(shed) => (shed.reason, shed.emptied_by),
+        other => panic!("a shed, not {other:?}"),
+    }
+}
+
+/// A request with items under an encode profile that shows its rows to a
+/// plugin is declined before a stage of the profile is asked. Without items
+/// the profile is not read, and the pair is decided.
+#[test]
+fn an_encode_profile_that_shows_its_rows_declines_a_request_with_items() {
+    let asked = Arc::new(AtomicU32::new(0));
+    let mut engine = engine();
+    let encode = engine
+        .binding("m", Phase::Prefill)
+        .and_then(|binding| match binding.plan {
+            Plan::Epd { encode } => Some(usize::from(encode)),
+            Plan::Single | Plan::PdPair => None,
+        })
+        .expect("the epd plan");
+    let shows = ShowsItsRows(Arc::clone(&asked));
+    engine.profiles[encode].filters.push(Box::new(shows));
+    engine.marks[encode] =
+        crate::framework::Marks::of(&engine.profiles[encode], engine.orders[encode]);
+
+    let (decision, placed) = Bed::new().decide_with(&engine);
+    assert_eq!(
+        shed_of(&decision),
+        (ShedReason::PolicyDeclined, "encode-scope")
+    );
+    assert!(placed.encoders().is_empty());
+    let mut bare = Bed::new();
+    bare.keys.clear();
+    let (decision, _) = bare.decide_with(&engine);
+    assert!(decision.pick().is_some(), "a pick, not {decision:?}");
+    assert_eq!(asked.load(Ordering::Relaxed), 0, "no stage is asked");
+}
+
+/// A pin is a position in another pool, and the encode side's stages are
+/// handed none.
+#[test]
+fn the_encode_side_is_handed_no_pin() {
+    let mut engine = engine();
+    for profile in &mut engine.profiles {
+        profile.filters.push(Box::new(NoEncoderUnderAPin));
+    }
+    let bed = Bed::new();
+    let pinned = RequestFacts {
+        pinned_at: 1,
+        ..bed.asked().0
+    };
+    let cx = Constraints::default();
+    let (decision, placed) = decide_under(&bed, &engine, &pinned, bed.pools(), [&cx; 3]);
+    assert!(decision.pick().is_some(), "a pick, not {decision:?}");
+    assert_eq!(placed.encoders().len(), 1);
+}
+
+/// A pair column of another length than its pool declines as the pair
+/// entry declines it, where a cut would leave a column that fits.
+#[test]
+fn a_pair_column_of_another_length_declines_before_a_cut() {
+    let engine = engine();
+    // The second prefill's class has no encoder and the second decode takes
+    // no image: each side is cut to its first row.
+    let mut bed = Bed::new();
+    bed.prefills = vec![row(0, Role::Prefill, 1, 0), row(1, Role::Prefill, 1, 0)];
+    bed.prefill_classes = vec![1, 2];
+    bed.decodes = vec![
+        row(0, Role::Decode, 1, 0),
+        Candidate {
+            vision: false,
+            ..row(1, Role::Decode, 1, 0)
+        },
+    ];
+    bed.decode_images = true;
+    let (facts, _) = bed.asked();
+    let cx = Constraints::default();
+    let none: &[AffinityFacts] = &[];
+    let short = [AffinityFacts::default(); 1];
+    let long = [AffinityFacts::default(); 3];
+    for (prefill_affinity, decode_affinity) in [
+        (&short[..], none),
+        (none, &short[..]),
+        (&long[..], none),
+        (none, &long[..]),
+    ] {
+        let pools = PairPools {
+            prefill_affinity,
+            decode_affinity,
+            ..bed.pools()
+        };
+        let (decision, _) = decide_under(&bed, &engine, &facts, pools, [&cx; 3]);
+        assert_eq!(
+            shed_of(&decision),
+            (ShedReason::PolicyDeclined, "affinity-column")
+        );
+    }
+}
+
+/// A mask numbers the rows of the pool it is handed with. Beside a pool
+/// this side cut it is declined, and beside a whole pool it is read.
+#[test]
+fn a_mask_beside_rows_numbered_anew_is_declined() {
+    let engine = engine();
+    let masked = Constraints {
+        stalled: &[0],
+        ..Constraints::default()
+    };
+    let open = Constraints::default();
+    let declined = (ShedReason::PolicyDeclined, "masked-rows");
+    // The first prefill's class has no encoder and the first decode takes
+    // no image: each side is cut to its second row, and the mask names the
+    // first.
+    let mut cut = Bed::new();
+    cut.prefills = vec![row(0, Role::Prefill, 1, 0), row(1, Role::Prefill, 1, 0)];
+    cut.prefill_classes = vec![2, 1];
+    cut.decodes = vec![
+        Candidate {
+            vision: false,
+            ..row(0, Role::Decode, 1, 0)
+        },
+        row(1, Role::Decode, 1, 0),
+    ];
+    cut.decode_images = true;
+    let (facts, _) = cut.asked();
+    for sides in [[&masked, &open, &open], [&open, &masked, &open]] {
+        let (decision, _) = decide_under(&cut, &engine, &facts, cut.pools(), sides);
+        assert_eq!(shed_of(&decision), declined);
+    }
+    // Two encode classes: the encoders offered to a key are the one of the
+    // pair's class, and the mask names the other.
+    let mut offered = Bed::new();
+    offered.encoders = vec![row(0, Role::Encode, 0, 0), row(1, Role::Encode, 0, 0)];
+    offered.facts = vec![pushing(1), pushing(2)];
+    let other = Constraints {
+        stalled: &[1],
+        ..Constraints::default()
+    };
+    let sides = [&open, &open, &other];
+    let (decision, _) = decide_under(&offered, &engine, &facts, offered.pools(), sides);
+    assert_eq!(shed_of(&decision), declined);
+    // No cut: the masked prefill is no candidate, and the pair is the
+    // other's.
+    let mut whole = Bed::new();
+    whole.prefills = vec![row(0, Role::Prefill, 1, 0), row(1, Role::Prefill, 1, 9)];
+    whole.prefill_classes = vec![1, 1];
+    let sides = [&masked, &open, &open];
+    let (decision, _) = decide_under(&whole, &engine, &facts, whole.pools(), sides);
+    let Decision::Pick(Pick { targets, .. }) = decision else {
+        panic!("a pick, not {decision:?}");
+    };
+    assert_eq!(targets.first().map(|target| target.position), Some(1));
 }
