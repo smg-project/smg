@@ -25,7 +25,7 @@ on:
       - model_gateway/src/config/**
       # What a discovered worker becomes: its endpoint, and the workflow that
       # registers it.
-      - model_gateway/src/worker/identity/endpoint.rs
+      - crates/worker/src/identity/endpoint.rs
       - model_gateway/src/workflow/**
       - crates/worker/src/worker.rs
       - crates/mock_worker/**

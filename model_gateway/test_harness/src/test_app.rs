@@ -9,11 +9,10 @@ use reqwest::Client;
 use smg::{
     app_context::AppContext,
     config::RouterConfig,
-    health,
     middleware::{AuthConfig, TokenBucket},
     policies::PolicyRegistry,
     routers::RouterTrait,
-    server::{build_app, build_apps, AppState, GatewayApps},
+    server::{build_app, build_apps, health, AppState, GatewayApps},
     worker::{
         BasicWorkerBuilder, ModelCard, RuntimeType, Worker, WorkerMonitor, WorkerRegistry,
         WorkerType,

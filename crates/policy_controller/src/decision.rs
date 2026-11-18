@@ -164,6 +164,22 @@ impl fmt::Debug for Survivors {
     }
 }
 
+/// The soft veto the all-vetoed rule lifted to make a pick, in the order the
+/// rule lifts them: the mark a host counts its steered picks from. A pick
+/// the profile's own stages made reads `None`, the default; the rule's pick
+/// alone writes another word, and one mark is the decision's, since the pick
+/// and its alternates are of the one lifted pool. The mark sits in a byte
+/// the record had spare: the trace is no larger for it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Lifted {
+    /// No veto was lifted.
+    #[default]
+    None,
+    /// The overload veto: every usable worker was over its thresholds.
+    Overload,
+}
+
 /// The decision's trace: what the trace header and an explain call print.
 /// This is the first step's subset of the record; per-filter drops,
 /// per-scorer contributions, the plan, the picker and the shadow pick join it
@@ -177,11 +193,20 @@ pub struct Trace {
     pub survivors: Survivors,
     /// The top candidates and their combined scores, best first: of the set
     /// the picker compared, which is every candidate the filters left unless
-    /// the picker narrows them.
+    /// the picker narrows them. Where a profile's ranks put rows in front
+    /// ([`Scorer::score_front`](crate::Scorer::score_front)) the scores are
+    /// those rows' sums among themselves: a stage asked of them alone
+    /// normalizes over them, so a score need not be the one the whole pass
+    /// gives its row. The rows are the whole pass's, and their order too
+    /// wherever its sums tell them apart: rows it rounds to one sum it
+    /// draws among, and the front's scores order them.
     pub top: [(WorkerId, f32); TRACE_TOP],
     pub top_len: u8,
     pub seed: u64,
     pub generation: u64,
+    /// The soft veto the all-vetoed rule lifted for this pick ([`Lifted`]):
+    /// `None` unless the rule made the pick.
+    pub lifted: Lifted,
 }
 
 impl Trace {
@@ -261,6 +286,15 @@ impl Decision {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The mark of a lifted veto costs the trace no byte: it sits in one the
+    /// record had spare, and a trace no rule wrote reads none.
+    #[test]
+    fn the_mark_of_a_lifted_veto_costs_the_trace_no_byte() {
+        assert_eq!(size_of::<Lifted>(), 1);
+        assert_eq!(size_of::<Trace>(), 72);
+        assert_eq!(Trace::default().lifted, Lifted::None);
+    }
 
     #[test]
     fn targets_keep_order_and_refuse_a_fifth() {

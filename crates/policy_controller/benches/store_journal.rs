@@ -5,8 +5,10 @@
 //! - `policy_store_journal/load_write/<plain|watched|journaled>/<n>`: one
 //!   load record's write inside the publication window; `watched` is a
 //!   journal of the watched kinds alone, which carries no load row;
-//! - `policy_store_journal/status_write/<plain|journaled>/<n>`: one status
-//!   flip of a member, published at once;
+//! - `policy_store_journal/status_write/<plain|journaled|told>/<n>`: one
+//!   status flip of a member, published at once; `told` is the journaled
+//!   write on a log with a listener of the watched kinds, as a controller
+//!   with a watch open has: the write's telling is in the cell;
 //! - `policy_store_journal/member_write/<plain|journaled>/<n>`: one refresh
 //!   of a member's facts, the pool derived again;
 //! - `policy_store_journal/view_build/<plain|journaled>/<n>`: one
@@ -15,9 +17,17 @@
 //!   clock cannot;
 //! - `policy_store_journal/read/<events>`: one reader's copy of a batch out
 //!   of the log, the longest the log's lock is held;
+//! - `policy_store_journal/read/watched_at_head`: a watch's read of the
+//!   watched kinds at their head, beside the load rows: nothing to copy,
+//!   the lock and the look at the log alone. The log of the three read
+//!   cells holds a full ring of the watched kinds;
 //! - `policy_store_journal/cut/<watched|every>/<n>`: one cut of the tables
 //!   of the watched kinds or of every kind: the copy a writer of those
-//!   tables waits for, and the sort after it.
+//!   tables waits for, and the sort after it;
+//! - `policy_store_journal/load_write_drained/<n>`: the journaled load
+//!   write while a reader on another thread drains the log, a batch a read
+//!   and never resting: the most a standby's stream asks of the log's
+//!   lock. For a run pinned to two cores; no gate reads it.
 //!
 //! Every member is ready with a record on file, in a store that leads a
 //! term as a serving controller's does. The journaled store's log
@@ -29,7 +39,11 @@
 
 use std::{
     hint::black_box,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    thread,
     time::{Duration, Instant},
 };
 
@@ -92,7 +106,15 @@ struct Pool {
 }
 
 fn pool_of(n: usize, loads: Option<usize>) -> Pool {
-    let log = loads.map(|loads| Arc::new(Log::new(WATCHED, loads)));
+    pool_on(n, loads.map(|loads| Log::new(WATCHED, loads)))
+}
+
+/// How a cell builds its pool of so many members.
+type PoolOf = fn(usize) -> Pool;
+
+/// [`pool_of`] on `log`.
+fn pool_on(n: usize, log: Option<Log>) -> Pool {
+    let log = log.map(Arc::new);
     let store = match &log {
         Some(log) => MemoryStore::journaled(Arc::clone(log) as _),
         None => MemoryStore::new(),
@@ -160,9 +182,18 @@ fn load_write(c: &mut Criterion) {
 
 fn status_write(c: &mut Criterion) {
     let mut group = c.benchmark_group("policy_store_journal/status_write");
-    for (kind, loads) in KINDS {
+    let pools: [(&str, PoolOf); 3] = [
+        ("plain", |n| pool_of(n, None)),
+        ("journaled", |n| pool_of(n, Some(LOADS))),
+        // The listener does nothing: the cell holds what the log's telling
+        // adds to the write, and none of a watch's work.
+        ("told", |n| {
+            pool_on(n, Some(Log::new(WATCHED, LOADS).on_watched(|| {})))
+        }),
+    ];
+    for (kind, build) in pools {
         for n in SIZES {
-            let pool = pool_of(n, loads);
+            let pool = build(n);
             let id = pool.ids[n / 2];
             let mut ready = true;
             group.bench_with_input(BenchmarkId::new(kind, n), &n, |b, _| {
@@ -232,6 +263,22 @@ fn read(c: &mut Criterion) {
     let mut group = c.benchmark_group("policy_store_journal/read");
     let pool = pool_of(64, Some(LOADS));
     let log = pool.log.as_ref().expect("the journaled pool's log");
+    // The watched ring full and written half over again, as a controller
+    // that ran a while holds it: the ring's buffer is wrapped at its
+    // middle, and a reader's search of it is the search of a full ring.
+    for turn in 0..WATCHED + WATCHED / 2 {
+        let status = if turn % 2 == 0 {
+            WorkerStatus::NotReady
+        } else {
+            WorkerStatus::Ready
+        };
+        let revision = WorkersStore::get(&pool.store, pool.ids[0])
+            .expect("the row")
+            .revision;
+        pool.store
+            .set_status(pool.ids[0], status, revision)
+            .expect("a flip");
+    }
     let at = pool.opened + Duration::from_millis(1);
     for turn in 0..4_096u64 {
         let index = (turn as usize).wrapping_mul(67) % 64;
@@ -263,6 +310,18 @@ fn read(c: &mut Criterion) {
             });
         });
     }
+    let head = log.head(Kinds::Watched);
+    let mut out = Vec::with_capacity(16);
+    log.read(Kinds::Watched, head, 16, &mut out)
+        .expect("retained");
+    assert!(out.is_empty(), "the reader is at the head");
+    group.bench_function("watched_at_head", |b| {
+        b.iter(|| {
+            log.read(Kinds::Watched, black_box(head), 16, &mut out)
+                .expect("retained");
+            black_box(out.len())
+        });
+    });
     group.finish();
 }
 
@@ -279,6 +338,63 @@ fn cut(c: &mut Criterion) {
     group.finish();
 }
 
+fn load_write_drained(c: &mut Criterion) {
+    let mut group = c.benchmark_group("policy_store_journal/load_write_drained");
+    for n in SIZES {
+        let pool = pool_of(n, Some(LOADS));
+        let log = Arc::clone(pool.log.as_ref().expect("the journaled pool's log"));
+        let stop = Arc::new(AtomicBool::new(false));
+        // The reader's start, taken before the first write: whatever the
+        // run writes stands after it.
+        let mut place = log.head(Kinds::All);
+        let reader = {
+            let stop = Arc::clone(&stop);
+            thread::spawn(move || {
+                let mut out = Vec::with_capacity(Log::BATCH);
+                let mut read = 0u64;
+                loop {
+                    // Asked before the read: one read follows the last
+                    // write, so a run of one write is read too.
+                    let asked = stop.load(Ordering::Relaxed);
+                    if log.read(Kinds::All, place, Log::BATCH, &mut out).is_err() {
+                        // The ring passed the reader: it starts again at
+                        // the head, as a standby does from a snapshot.
+                        place = log.head(Kinds::All);
+                    } else if let Some(last) = out.last() {
+                        place = last.at;
+                        read += out.len() as u64;
+                    } else {
+                        std::hint::spin_loop();
+                    }
+                    if asked {
+                        break read;
+                    }
+                }
+            })
+        };
+        let at = pool.opened + Duration::from_millis(1);
+        let mut turn = 0u64;
+        group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
+            b.iter(|| {
+                turn += 1;
+                let index = (turn as usize).wrapping_mul(67) % n;
+                pool.store.record(
+                    black_box(pool.ids[index]),
+                    0,
+                    record_of(index, turn),
+                    at,
+                    LoadSource::Stream,
+                );
+            });
+        });
+        stop.store(true, Ordering::Relaxed);
+        let read = reader.join().expect("the reader ends when asked");
+        // Held to what it claims: the reader read of what the writer wrote.
+        assert!(turn == 0 || read > 0, "nothing read of {turn} writes");
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     load_write,
@@ -286,6 +402,7 @@ criterion_group!(
     member_write,
     view_build,
     read,
-    cut
+    cut,
+    load_write_drained
 );
 criterion_main!(benches);

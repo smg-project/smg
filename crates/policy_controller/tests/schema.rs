@@ -6,7 +6,10 @@
 use std::{collections::BTreeSet, fs, path::Path};
 
 use serde_json::Value;
-use smg_policy_controller::{spec::MAX_HEADERS, Catalog, PolicySpec};
+use smg_policy_controller::{
+    spec::{MAX_BLOCK_HASHES, MAX_ENGINES, MAX_HEADERS, MAX_LABELS, MAX_ZONES},
+    Catalog, PolicySpec,
+};
 
 fn schema_path() -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("policyspec.schema.json")
@@ -179,4 +182,11 @@ fn the_schema_names_every_section_and_refuses_unknown_properties() {
     assert_eq!(field("IndexSpec", "ttl_s")["minimum"], 1);
     assert_eq!(field("ViewSpec", "block_size")["minimum"], 1);
     assert_eq!(field("ViewSpec", "headers")["maxItems"], MAX_HEADERS);
+    assert_eq!(field("ViewSpec", "labels")["maxItems"], MAX_LABELS);
+    assert_eq!(field("ViewSpec", "zones")["maxItems"], MAX_ZONES);
+    assert_eq!(field("ViewSpec", "engines")["maxItems"], MAX_ENGINES);
+    assert_eq!(
+        field("ViewSpec", "max_block_hashes")["maximum"],
+        MAX_BLOCK_HASHES
+    );
 }

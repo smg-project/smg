@@ -19,13 +19,11 @@ use openai_protocol::worker::{RuntimeType, WorkerType};
 use tokio::net::TcpStream;
 use tracing::{debug, info, warn};
 
-use crate::{
-    observability::metrics::Metrics,
-    worker::{
-        identity::{basic::WorkerTypeExt, endpoint::Endpoint},
-        pd::pairing::KvTransferProfile,
-        Worker, DEFAULT_BOOTSTRAP_PORT, MOONCAKE_CONNECTOR,
-    },
+use crate::worker::{
+    identity::{basic::WorkerTypeExt, endpoint::Endpoint},
+    metrics::Metrics,
+    pd::pairing::KvTransferProfile,
+    Worker, DEFAULT_BOOTSTRAP_PORT, MOONCAKE_CONNECTOR,
 };
 
 /// How long the probe waits for the connection: long enough for a far host,
@@ -89,9 +87,10 @@ fn is_store_prefill_worker(worker: &dyn Worker) -> bool {
 /// store (see [`is_store_prefill_worker`]). Without one, the request path
 /// applies [`DEFAULT_BOOTSTRAP_PORT`] to the workers whose partners rendezvous
 /// on a bootstrap server: an encode worker, and a prefill worker of every runtime
-/// whose rendezvous travels in the request (the SGLang-style bootstrap
-/// metadata and the KV bootstrap room), or of vLLM on the Mooncake connector,
-/// whose decode-side `remote_bootstrap_addr` is minted with it. A vLLM prefill
+/// whose rendezvous travels in the request (the bootstrap metadata
+/// and the KV bootstrap room), or of the runtime that names a KV
+/// connector, on the Mooncake connector, whose decode-side
+/// `remote_bootstrap_addr` is minted with it. That runtime's prefill
 /// worker on another connector (NIXL, MoRI-IO, a store, none) carries its own
 /// side channel or meets its partners in the store and is never handed a
 /// bootstrap port, and neither is a decode or a regular worker.
@@ -134,7 +133,8 @@ fn partners_bootstrap_address(worker: &dyn Worker) -> Option<(String, u16, Boots
 }
 
 /// Whether the port of [`effective_bootstrap_port`] is one the request path
-/// hands the decode partner of `worker`. A vLLM prefill side's is on the
+/// hands the decode partner of `worker`. Where the runtime
+/// names a KV connector, a prefill side's is on the
 /// Mooncake connector alone, whose decode-side `remote_bootstrap_addr` is
 /// minted with it: a port registered on a side whose connector carries its own
 /// side channel (NIXL, MoRI-IO) or meets its partners in a store plays no
@@ -265,7 +265,6 @@ mod tests {
 
     use super::*;
     use crate::{
-        observability::metrics::metrics_labels,
         routers::common::kv_transfer::{kv_connector_mode, KvConnectorMode},
         worker::{test_support::RefusedAddress, BasicWorkerBuilder},
     };
@@ -314,8 +313,8 @@ mod tests {
 
     /// A worker registered without a port whose partners are handed the default
     /// on the request path is probed on that default: a prefill worker of a
-    /// runtime whose rendezvous travels in the request, a vLLM prefill worker on
-    /// the Mooncake connector, an encode worker.
+    /// runtime whose rendezvous travels in the request, a prefill worker that
+    /// names the Mooncake connector, an encode worker.
     #[test]
     fn a_worker_without_a_bootstrap_port_is_probed_on_the_default_its_partners_are_handed() {
         for (worker_type, runtime, connector) in [
@@ -341,7 +340,7 @@ mod tests {
     }
 
     /// A worker no partner is handed a bootstrap port for is not probed: a
-    /// decode or regular worker, and a vLLM prefill worker whose connector
+    /// decode or regular worker, and a prefill worker whose connector
     /// carries its own side channel.
     #[test]
     fn a_worker_no_partner_is_handed_a_bootstrap_port_for_is_not_probed() {
@@ -416,7 +415,8 @@ mod tests {
         );
     }
 
-    /// For a vLLM prefill worker the probe's decision is the request path's: the
+    /// For a prefill worker of the runtime that names a KV
+    /// connector the probe's decision is the request path's: the
     /// default is probed exactly when the connector mode minted for the worker
     /// hands the decode worker a bootstrap address on that port.
     #[test]
@@ -455,7 +455,7 @@ mod tests {
             let _guard = metrics::set_default_local_recorder(&recorder);
             report_bootstrap_port_probe(
                 "http://127.0.0.1:8000",
-                metrics_labels::WORKER_PREFILL,
+                WorkerType::Prefill.as_str(),
                 "127.0.0.1",
                 port,
                 BootstrapPortSource::Registered,
@@ -513,7 +513,8 @@ mod tests {
 
     /// A port the request path does not hand the decode partner is not
     /// probed for a request, whatever port the side was registered with: a
-    /// vLLM prefill side on a connector with its own side channel, or on none.
+    /// prefill side of the runtime that names a KV connector,
+    /// on a connector with its own side channel or on none.
     /// The registration probe keeps the operator's port for it. The Mooncake
     /// side's port, and a runtime's whose rendezvous travels in the request,
     /// are probed.
@@ -622,7 +623,7 @@ mod tests {
             let _guard = metrics::set_default_local_recorder(&recorder);
             report_bootstrap_port_probe(
                 "http://127.0.0.1:8000",
-                metrics_labels::WORKER_PREFILL,
+                WorkerType::Prefill.as_str(),
                 "127.0.0.1",
                 port,
                 BootstrapPortSource::Default,

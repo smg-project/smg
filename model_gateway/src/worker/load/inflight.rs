@@ -5,12 +5,9 @@
 
 use std::{fmt, sync::Arc};
 
-// The stream is named only by the doc links of this module.
-#[cfg(doc)]
-use crate::routers::common::stream::GuardedStream;
-use crate::{
-    observability::metrics::Metrics,
-    worker::identity::{basic::Worker, endpoint::Endpoint},
+use crate::worker::{
+    identity::{basic::Worker, endpoint::Endpoint},
+    metrics::Metrics,
 };
 
 pub struct WorkerRoutingKeyLoad {
@@ -104,7 +101,7 @@ impl fmt::Debug for WorkerRoutingKeyLoad {
 ///
 /// Automatically decrements worker load when dropped. A streaming handler
 /// returns at once and keeps producing from a task, so it hands the guard
-/// to the response body's own stream ([`GuardedStream`]), which drops it
+/// to the response body's own stream (the routers' guarded stream), which drops it
 /// when the body is dropped: at the stream's end or the client's disconnect.
 pub struct WorkerLoadGuard {
     worker: Arc<dyn Worker>,

@@ -489,6 +489,79 @@ def test_a_host_with_no_free_publisher_port_is_a_named_exit_on_the_python_path_t
     launched.assert_not_called()
 
 
+@pytest.mark.parametrize("warmup", [None, "off"], ids=["warm-up on", "warm-up off"])
+def test_a_remainders_knob_it_cannot_read_is_a_named_exit_on_the_python_path_too(
+    monkeypatch, server_mod, caplog, warmup
+):
+    """The chunk-remainders knob is read before the engine launches, as the
+    Rust launcher reads it with its knobs: a value it does not take is one
+    ERROR line naming the variable and exit code 2, with the warm-up on or
+    off, not a start that serves without the planned warm-up."""
+    from smg_grpc_servicer.tokenspeed import warmup as tokenspeed_warmup
+
+    if warmup is not None:
+        monkeypatch.setenv(tokenspeed_warmup.WARMUP_ENV, warmup)
+    monkeypatch.setenv(tokenspeed_warmup.REMAINDERS_ENV, "sometimes")
+    server_args = _wire(monkeypatch, server_mod, [])
+    launched = Mock()
+    monkeypatch.setattr(server_mod, "launch_engine", launched)
+    caplog.set_level(logging.ERROR)
+    with pytest.raises(SystemExit) as raised:
+        asyncio.run(server_mod.serve_grpc(server_args))
+    assert raised.value.code == 2
+    assert "SMG_TOKENSPEED_SERVICER_WARMUP_REMAINDERS='sometimes'" in caplog.text
+    launched.assert_not_called()
+
+
+def test_the_planned_warm_up_off_builds_no_inputs_and_logs_no_remainders_warning(
+    monkeypatch, server_mod, caplog
+):
+    """With the warm-up off the Python servicer plans nothing and builds no
+    inputs, as the Rust launcher does, so remainders off on a four-process
+    engine logs no hazard WARNING for a pass that never runs."""
+    from smg_grpc_servicer.tokenspeed import warmup as tokenspeed_warmup
+
+    server_args = SimpleNamespace(
+        max_num_seqs=8,
+        chunked_prefill_size=4096,
+        max_model_len=1 << 20,
+        mapping=SimpleNamespace(world_size=4, attn=SimpleNamespace(dp_size=1)),
+    )
+    model_info = SimpleNamespace(max_context_length=1 << 20, vocab_size=129280)
+    caplog.set_level(logging.WARNING)
+    # Built, these inputs warn: the control for the assertion below.
+    tokenspeed_warmup.warmup_inputs(server_args, {"vocab_size": 129280}, remainders="off")
+    assert any("no chunk remainders" in r.getMessage() for r in caplog.records)
+    caplog.clear()
+    monkeypatch.setenv(tokenspeed_warmup.WARMUP_ENV, "off")
+    assert server_mod._planned_warmup(server_args, model_info, None, "off") is None
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+@pytest.mark.parametrize(("remainders", "planned"), [("auto", 4042), ("off", 0)])
+def test_the_python_servicer_plans_the_chunk_remainders_the_knob_asks_for(
+    monkeypatch, server_mod, remainders, planned
+):
+    """The setting read at start reaches the plan the Python servicer runs,
+    through ``planned_warmup``, whose catch-all would hide a dropped argument
+    as a failed pass."""
+    runs = []
+    monkeypatch.setattr(server_mod, "warmup_wire", lambda *_args, **_kwargs: "wire")
+    monkeypatch.setattr(
+        server_mod, "run_warmup", lambda plan, _wire, **_kwargs: runs.append(plan) or "report"
+    )
+    server_args = SimpleNamespace(
+        max_num_seqs=8,
+        chunked_prefill_size=4096,
+        max_model_len=1 << 20,
+        mapping=SimpleNamespace(world_size=4, attn=SimpleNamespace(dp_size=1)),
+    )
+    model_info = SimpleNamespace(max_context_length=1 << 20, vocab_size=129280)
+    assert server_mod.planned_warmup(server_args, model_info, Mock(), remainders) == "report"
+    [plan] = runs
+    assert sum(1 for step in plan.steps if step.kind == "remainder") == planned
+
+
 def test_a_failed_planned_warm_up_still_flips_the_worker_to_serving(
     monkeypatch, server_mod, caplog
 ):
@@ -517,14 +590,14 @@ def test_a_failed_planned_warm_up_still_flips_the_worker_to_serving(
         ),
     )
 
-    def broken(_server_args, _facts):
+    def broken(_server_args, _facts, *, remainders):
         raise AttributeError("no such argument on this engine release")
 
     monkeypatch.setattr(server_mod, "warmup_inputs", broken)
     health = SimpleNamespace(set_serving=Mock())
     server_args = SimpleNamespace(host="127.0.0.1", port=30000, disaggregation_mode="null")
 
-    server_mod._wait_and_warmup(server_args, health)
+    server_mod._wait_and_warmup(server_args, health, "auto")
 
     health.set_serving.assert_called_once_with()
     channel.close.assert_called_once()

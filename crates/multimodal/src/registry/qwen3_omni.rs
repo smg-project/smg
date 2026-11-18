@@ -103,10 +103,7 @@ impl ModelProcessorSpec for Qwen3OmniSpec {
             Modality::Image => Self::token(metadata, "image_token_id", IMAGE_PAD_TOKEN),
             Modality::Video => Self::token(metadata, "video_token_id", VIDEO_PAD_TOKEN),
             Modality::Audio => Self::token(metadata, "audio_token_id", AUDIO_PAD_TOKEN),
-            Modality::ImageEmbeds => Err(ModelRegistryError::UnsupportedModality {
-                spec: self.name(),
-                modality,
-            }),
+            Modality::ImageEmbeds => Err(ModelRegistryError::unsupported(self.name(), modality)),
         }
     }
 
@@ -119,10 +116,7 @@ impl ModelProcessorSpec for Qwen3OmniSpec {
             Modality::Image => Self::token_id(metadata, "image_token_id"),
             Modality::Video => Self::token_id(metadata, "video_token_id"),
             Modality::Audio => Self::token_id(metadata, "audio_token_id"),
-            Modality::ImageEmbeds => Err(ModelRegistryError::UnsupportedModality {
-                spec: self.name(),
-                modality,
-            }),
+            Modality::ImageEmbeds => Err(ModelRegistryError::unsupported(self.name(), modality)),
         }
     }
 
@@ -169,10 +163,7 @@ impl ModelProcessorSpec for Qwen3OmniSpec {
             Modality::Image | Modality::Video => Ok(Box::new(
                 Qwen3OmniVisionProcessor::from_config_for(preprocessor_config, modality),
             )),
-            _ => Err(ModelRegistryError::UnsupportedModality {
-                spec: self.name(),
-                modality,
-            }),
+            _ => Err(ModelRegistryError::unsupported(self.name(), modality)),
         }
     }
 
@@ -232,10 +223,7 @@ impl ModelProcessorSpec for Qwen3OmniSpec {
                 "audio_token_id",
                 AUDIO_PAD_TOKEN,
             ),
-            Modality::ImageEmbeds => Err(ModelRegistryError::UnsupportedModality {
-                spec: self.name(),
-                modality,
-            }),
+            Modality::ImageEmbeds => Err(ModelRegistryError::unsupported(self.name(), modality)),
         }
     }
 

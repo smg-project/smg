@@ -14,8 +14,9 @@ type PrometheusFamily = MetricFamily<PrometheusType, PrometheusValue>;
 ///
 /// `openmetrics_parser`'s Prometheus grammar requires metric names to start with
 /// a lowercase letter followed by `[a-z0-9_]`, while the Prometheus text format
-/// allows colons, and engines prefix their metrics with one (`sglang:`, `vllm:`).
-/// Colons are swapped for an escape sequence before parsing and restored in the
+/// allows colons, and engines prefix their metrics with one
+/// (the engine's name and a colon). Colons are swapped for
+/// an escape sequence before parsing and restored in the
 /// rendered output, so `/engine_metrics` exposes the exact metric names, HELP
 /// text, and label values the engines exported.
 pub fn aggregate_metrics(metric_packs: Vec<MetricPack>) -> anyhow::Result<String> {

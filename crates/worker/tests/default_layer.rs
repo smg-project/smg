@@ -4,7 +4,9 @@
 //! there, so it depends on this crate, and cargo refuses a dependency cycle
 //! even when an optional dependency closes it. A consumer that needs the
 //! worker's types alone must also not be handed the protocol crate through
-//! them. So nothing this crate links by default may link `openai-protocol`.
+//! them. So nothing this crate links by default may link `openai-protocol`,
+//! and nothing a feature of it links may either. The default layer itself is
+//! held too: no feature on, and the six crates the types need.
 //! The case reads the workspace's manifests through `cargo metadata` and
 //! walks what the default features link.
 
@@ -103,6 +105,22 @@ fn members(metadata: &Value) -> Outcome<BTreeMap<String, Member>> {
 /// manifest is not among the workspace's, and it cannot name a workspace
 /// crate by path.
 fn chain_to_protocol(members: &BTreeMap<String, Member>) -> Outcome<Option<Vec<String>>> {
+    chain_from(members, |this| &this.default_layer)
+}
+
+/// [`chain_to_protocol`] from everything a build of this crate can link,
+/// whatever features it switches on: the edges of `runtime` too.
+fn chain_to_protocol_under_any_feature(
+    members: &BTreeMap<String, Member>,
+) -> Outcome<Option<Vec<String>>> {
+    chain_from(members, |this| &this.linked)
+}
+
+/// The walk from the first hops of this crate that `first_hops` picks.
+fn chain_from(
+    members: &BTreeMap<String, Member>,
+    first_hops: fn(&Member) -> &Vec<String>,
+) -> Outcome<Option<Vec<String>>> {
     let this = members
         .get(THIS_CRATE)
         .ok_or("the workspace has no smg-worker")?;
@@ -110,8 +128,7 @@ fn chain_to_protocol(members: &BTreeMap<String, Member>) -> Outcome<Option<Vec<S
         return Err("the workspace has no openai-protocol".into());
     }
     let mut seen = BTreeSet::new();
-    let mut stack: Vec<Vec<String>> = this
-        .default_layer
+    let mut stack: Vec<Vec<String>> = first_hops(this)
         .iter()
         .map(|first| vec![THIS_CRATE.to_owned(), first.clone()])
         .collect();
@@ -137,8 +154,8 @@ fn chain_to_protocol(members: &BTreeMap<String, Member>) -> Outcome<Option<Vec<S
     Ok(None)
 }
 
-#[test]
-fn the_default_layer_links_nothing_that_links_the_protocol_crate() -> Outcome<()> {
+/// The workspace's manifests, as `cargo metadata --no-deps` reads them.
+fn workspace_metadata() -> Outcome<Value> {
     let output = Command::new(env!("CARGO"))
         .args(["metadata", "--no-deps", "--format-version", "1"])
         .current_dir(env!("CARGO_MANIFEST_DIR"))
@@ -148,8 +165,57 @@ fn the_default_layer_links_nothing_that_links_the_protocol_crate() -> Outcome<()
         "cargo metadata failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let metadata: Value = serde_json::from_slice(&output.stdout)?;
-    assert_eq!(chain_to_protocol(&members(&metadata)?)?, None);
+    Ok(serde_json::from_slice(&output.stdout)?)
+}
+
+#[test]
+fn the_default_layer_links_nothing_that_links_the_protocol_crate() -> Outcome<()> {
+    assert_eq!(chain_to_protocol(&members(&workspace_metadata()?)?)?, None);
+    Ok(())
+}
+
+/// The runtime lives in this crate behind `runtime`: what a feature links may
+/// not link the protocol crate either, or the two crates close a cycle.
+#[test]
+fn no_feature_links_anything_that_links_the_protocol_crate() -> Outcome<()> {
+    assert_eq!(
+        chain_to_protocol_under_any_feature(&members(&workspace_metadata()?)?)?,
+        None
+    );
+    Ok(())
+}
+
+/// The types alone: the default feature set switches nothing on, and the
+/// default layer links six crates and no other. A consumer of the types gains
+/// a package only when this case changes.
+#[test]
+fn the_default_feature_set_is_empty_and_its_layer_is_six_crates() -> Outcome<()> {
+    let metadata = workspace_metadata()?;
+    let this = metadata["packages"]
+        .as_array()
+        .and_then(|packages| {
+            packages
+                .iter()
+                .find(|package| package["name"].as_str() == Some(THIS_CRATE))
+        })
+        .ok_or("the workspace has no smg-worker")?;
+    assert_eq!(this["features"]["default"], json!([]));
+    let mut layer = members(&metadata)?
+        .remove(THIS_CRATE)
+        .ok_or("the workspace has no smg-worker")?
+        .default_layer;
+    layer.sort();
+    assert_eq!(
+        layer,
+        [
+            "bitflags",
+            "schemars",
+            "serde",
+            "serde_json",
+            "serde_with",
+            "url"
+        ]
+    );
     Ok(())
 }
 
@@ -186,6 +252,10 @@ fn the_walk_names_the_chain_that_reaches_the_protocol_crate() -> Outcome<()> {
         edge(PROTOCOL_CRATE, false),
     );
     assert_eq!(chain_to_protocol(&members(&behind_a_feature)?)?, None);
+    assert_eq!(
+        chain_to_protocol_under_any_feature(&members(&behind_a_feature)?)?,
+        chain
+    );
 
     let on_by_default = workspace(
         edge("middle", true),

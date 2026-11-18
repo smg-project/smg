@@ -30,9 +30,52 @@
 //!    with it where it states its wires, and the engine of the generation
 //!    those rows were published under;
 //! 5. the engine's decision, told what is left of the budget;
-//! 6. the fence again, and the budget at the same read: a decision whose
-//!    budget ended while it was made leaves as `Busy` under the reason a
-//!    late arrival is told, and under a count of its own ([`Counts`]).
+//! 6. the lease, for a pick: one a decision, a credit on the pick's first
+//!    target, minted and filed by the store under the term the first read
+//!    showed, at that read's instant ([`MemoryStore::issue_decided`]). The
+//!    engine that decided is told of it, and the answer carries it;
+//! 7. the fence again, and the budget at the same read, with the answer's
+//!    build alone behind it: a decision whose budget ended while it was
+//!    made, its lease's filing and the stages' hearing of it included,
+//!    leaves as `Busy` under the reason a late arrival is told, and under
+//!    a count of its own ([`Counts`]). So does a pick whose lease has
+//!    under a millisecond of its dispatch span left at that read: the span
+//!    counts from the first read, and the answer's lease carries what is
+//!    left of it. The lease of an answer that does not leave is given up
+//!    at once: the store's release door first, the one a `Released` frame
+//!    takes, then the engine told, as abandoned under a closed fence and
+//!    as a late decision past the budget or the span.
+//!
+//! A lease is what the next decisions read. The store counts the leases on
+//! file by the worker each books, and a decision whose profile declares
+//! the count ([`crate::Needs::in_flight`]) reads it on each row as the
+//! row's requests in flight: it is made over what the decisions before it
+//! left on file. The file is the one thing every decider writes, under
+//! one lock held for one lease's filing or its giving up. A lease leaves
+//! the file where its answer does not leave (step 7), at its gateway's
+//! word (a `Session`'s `Completed` or `Released` frame, the gateway's own
+//! end) or at its dispatch deadline: each issue ends the leases at the
+//! head of the store's deadline queue that no gateway named a dispatch
+//! for in time, two at most, and tells the engine of those its own
+//! generation issued. So a lease whose answer never reached its gateway
+//! (a stream that ended, a full queue, the stream's own fence at the
+//! send, a decision that panicked past its issue) stands until its
+//! deadline and the issues after it, and through a lull until the next
+//! issue: no timer ends one yet.
+//!
+//! What a lease does not do yet. A request sent twice under one id is
+//! issued two leases. A stage hears a lease's issue here, its dispatch,
+//! completion and release at its gateway's word and its end at the
+//! dispatch deadline, and not the end of a lease whose gateway was let go:
+//! a document that names a stage in need of the calls stays refused.
+//!
+//! A term mints 2^32 - 1 ids, and under every term but the last a leader
+//! leaves before they end. The first answer a term hands over with an id at
+//! or past its mark ([`past_mark`], three quarters of the ids) tells the
+//! election to hand the lease over ([`Deciders::leave_through`]), once a
+//! term whichever decider's it is: the next take brings a term whose ids
+//! start again. The counter's end stands as the last guard, where a pick is
+//! answered `Busy`: under the last term a replica can take no word is said.
 //!
 //! A gateway's wires are a fact before the profile, as its vetoes are: no
 //! filter of the catalog reads them, and no profile picks a member its
@@ -44,13 +87,14 @@
 //!
 //! What this build has no decision for is answered `Busy` with no reason,
 //! and its gateway decides it locally at once: a shed is a policy's word
-//! and reaches the client, and no policy spoke. Three arms, each counted
+//! and reaches the client, and no policy spoke. Four arms, each counted
 //! by its cause ([`Counts`]): a decision that panics, a request for a side
 //! of a pair plan (prefill or decode under either pair plan, encode under
 //! the plan that has an encode side: the pair door decides those, over
-//! the store's pair classes), and a request that carries its prompt as
-//! text (the controller is to hash it, and a decision made as if the
-//! request carried no prefix would be another request's). A text is said
+//! the store's pair classes), a request that carries its prompt as text
+//! (the controller is to hash it, and a decision made as if the request
+//! carried no prefix would be another request's), and a pick the store
+//! mints no lease for, its term's ids being spent. A text is said
 //! right after the fence and before the budget is read, so the count
 //! holds every text a leader took.
 //!
@@ -64,9 +108,8 @@
 //! to stop, since a leader that cannot decide for a model must not keep
 //! the lead.
 //!
-//! What this step leaves to the next ones. No lease is issued: an answer
-//! carries the engine's decision and nothing is recorded for it. A view
-//! reads no session pin of the store's.
+//! What this step leaves to the next ones. A view reads no session pin of
+//! the store's, and its two session counts read zero.
 
 use std::{
     io,
@@ -74,14 +117,14 @@ use std::{
     sync::{
         atomic::{AtomicU64, Ordering},
         mpsc::{sync_channel, Receiver, SyncSender, TrySendError},
-        Arc,
+        Arc, OnceLock,
     },
     thread,
     time::{Duration, Instant},
 };
 
 use tokio::sync::{mpsc, watch};
-use tracing::error;
+use tracing::{error, info, warn};
 
 use super::{
     election::Standing,
@@ -89,21 +132,29 @@ use super::{
 };
 use crate::{
     decision::{Decision, Shed, ShedReason, Trace},
-    elector::Fence,
+    elector::{term_said, Fence},
     framework::{release, Plan, Scratch},
+    lease::{Lease, LeaseId, LeaseKind, Lifecycle, ReleaseReason, Side},
     proto::{self, busy::Reason},
-    store::{Ask, GatewayId, MemoryStore, ViewBuffers, World},
-    view::{fingerprint, Candidate, Constraints, Phase, PoolFacts, RequestFacts, Role, WireModes},
+    sessions::SessionVerdict,
+    store::{
+        leases::DISPATCH_TTL, Ask, Built, GatewayId, LeaseRecord, LeaseRefused, LeaseState,
+        MemoryStore, Named, Naming, Picked, ViewBuffers, World,
+    },
+    view::{
+        fingerprint, AffinityFacts, Candidate, Constraints, Phase, PoolFacts, RequestFacts, Role,
+        Session, WireModes, WorkerId,
+    },
 };
 
 /// What the deciders and the streams count on the controller's own side,
 /// for its scrape to render: each `Busy` by its reason, the requests this
 /// build has no decision for by cause, the requests whose block hashes
 /// were cut, the answers no stream took, the candidates a gateway's wires
-/// took from its decisions, and the decisions whose budget ended while they
-/// were made. A request that is decided inside its budget, with its hashes
-/// inside the cap and every candidate one its gateway can dial, moves none
-/// of them.
+/// took from its decisions, and the decisions whose budget or lease's
+/// dispatch span ended while they were made. A request that is decided
+/// inside both, with its hashes inside the cap and every candidate one its
+/// gateway can dial, moves none of them.
 #[derive(Debug, Default)]
 pub(crate) struct Counts {
     /// `Busy` answers, each at its reason's number on the wire.
@@ -126,10 +177,14 @@ pub(crate) struct Counts {
     /// its own: read whole by [`Counts::undialed`] and
     /// [`Counts::hashes_cut`].
     parts: [Part; PARTS],
-    /// Decisions whose budget ended while they were made. Each leaves as
-    /// `Busy` under the reason a late arrival is told, and this count is
-    /// of them alone.
+    /// Decisions whose budget, or whose lease's dispatch span, ended while
+    /// they were made. Each leaves as `Busy` under the reason a late arrival
+    /// is told, and this count is of them alone.
     pub(crate) outlasted: AtomicU64,
+    /// Picks the store minted no lease for, its term's ids being spent or
+    /// the term past the width an id carries. Each leaves as `Busy` with
+    /// no reason: a pick with no lease is no answer.
+    pub(crate) unleased: AtomicU64,
 }
 
 /// The parts a made decision's counts are kept in. A decider adds to the
@@ -138,17 +193,17 @@ const PARTS: usize = 16;
 
 /// One decider's part of the counts that every decision can move, on cache
 /// lines of its own. Where a fleet's gateways speak fewer wires than its
-/// members, each decision counts the candidates it lost; where prompts run
-/// past the view's cap, each counts its request. One count for every
-/// decider would be a line they all write.
+/// members, each decision counts the candidates it lost; where a host
+/// hashes past what its generation reads, each counts its request. One
+/// count for every decider would be a line they all write.
 #[derive(Debug, Default)]
 #[repr(align(128))]
 pub(crate) struct Part {
     /// Candidates the wires of their decision's gateway took from its
     /// view, members that share no wire with it.
     pub(crate) undialed: AtomicU64,
-    /// Requests that carried more block hashes than their generation's
-    /// view reads.
+    /// Requests that carried more block hashes than their generation
+    /// reads of them.
     pub(crate) hashes_cut: AtomicU64,
 }
 
@@ -199,6 +254,36 @@ pub(crate) const QUEUE_DEPTH: usize = 128;
 
 /// The clock a decider reads, twice a decision.
 pub(crate) type Clock = Arc<dyn Fn() -> Instant + Send + Sync>;
+
+/// The counter at which a term's leader is told to leave: three quarters of
+/// the ids one term mints. A leader that leaves there takes its next term
+/// with the counter at its start, so no term reaches the counter's end; the
+/// quarter left is what the term still mints between the word and its
+/// fence's close.
+pub(crate) const TERM_MARK: u32 = 3 << 30;
+
+/// Whether `id` is at or past its term's mark ([`TERM_MARK`]): the counter
+/// is the id's low half, as the contract lays an id out. At or past, and
+/// not the mark's own id alone: the mint steps over an id on file, and a
+/// term's ids need not all pass through one decider.
+fn past_mark(id: LeaseId) -> bool {
+    (id.0 & u64::from(u32::MAX)) >= u64::from(TERM_MARK)
+}
+
+/// What a decider calls once it handed over a term's first answer at or
+/// past the mark: the election's planned hand-over, handed that term.
+pub(crate) type Leave = Box<dyn Fn(u64) + Send + Sync>;
+
+/// What the deciders share of a term's mark: the word, and the highest term
+/// it was said under, so one decider says it and once.
+#[derive(Default)]
+struct Mark {
+    /// The word ([`Deciders::leave_through`]): none until the election runs.
+    leave: OnceLock<Leave>,
+    /// The highest term whose word was said, or was found to have none to
+    /// say: the last term a replica can take.
+    said: AtomicU64,
+}
 
 /// What every decider reads.
 #[derive(Clone)]
@@ -265,6 +350,8 @@ pub(crate) struct Deciders {
     /// frame's receipt is stamped by and the term the reader's own answers
     /// carry.
     reads: Reads,
+    /// A term's mark, as every decider reads it.
+    mark: Arc<Mark>,
 }
 
 /// A decider's thread holds one: it tells when the thread unwinds. A thread
@@ -284,6 +371,7 @@ impl Deciders {
     /// at least one thread, and a queue of at least one.
     pub(crate) fn start(deciders: usize, depth: usize, reads: &Reads) -> io::Result<Self> {
         let told = Arc::new(watch::Sender::new(false));
+        let mark = Arc::new(Mark::default());
         let queues = (0..deciders.max(1))
             .map(|index| {
                 let (queue, jobs) = sync_channel(depth.max(1));
@@ -292,6 +380,8 @@ impl Deciders {
                     buffers: Buffers::default(),
                     faulted: false,
                     index,
+                    marked: None,
+                    mark: Arc::clone(&mark),
                 };
                 watched(index, &told, move || decider.run(&jobs)).map(|_running| queue)
             })
@@ -300,6 +390,7 @@ impl Deciders {
             queues,
             told,
             reads: reads.clone(),
+            mark,
         })
     }
 
@@ -309,6 +400,14 @@ impl Deciders {
     /// unwind has seen it.
     pub(crate) fn ended(&self) -> watch::Receiver<bool> {
         self.told.subscribe()
+    }
+
+    /// Hands the deciders the word a term's mark says: the decider that
+    /// hands over a term's first answer at or past the mark ([`past_mark`])
+    /// calls `leave` with that term once that answer is handed over. Set
+    /// once, when the election runs: a second call changes nothing.
+    pub(crate) fn leave_through(&self, leave: impl Fn(u64) + Send + Sync + 'static) {
+        let _ = self.mark.leave.set(Box::new(leave));
     }
 
     /// What a decider's thread tells at its unwind, told by a case.
@@ -363,6 +462,7 @@ struct Buffers {
     view: ViewBuffers,
     scratch: Scratch,
     lists: Lists,
+    named: Named,
 }
 
 /// Starts decider `index`'s thread. The thread holds the guard that tells
@@ -389,6 +489,11 @@ struct Decider {
     faulted: bool,
     /// Its place among the deciders, which names its part of a count.
     index: usize,
+    /// The term of the answer in hand where its lease's id is at or past
+    /// the term's mark: the word follows the answer's hand-over.
+    marked: Option<u64>,
+    /// The mark's word and its latch, shared by the deciders.
+    mark: Arc<Mark>,
 }
 
 impl Decider {
@@ -402,13 +507,56 @@ impl Decider {
                 answers,
             } = job;
             let answer = self.answer(request, gateway, received);
-            let dropped = match answers.try_send(answer) {
+            let sent = answers.try_send(answer);
+            // The answer is handed over, or dropped with its lease on file:
+            // the word of its term's mark follows it.
+            if let Some(term) = self.marked.take() {
+                self.leave_at(term);
+            }
+            let dropped = match sent {
                 Ok(()) => continue,
                 Err(mpsc::error::TrySendError::Full(_)) => &self.reads.counts.dropped_full,
                 Err(mpsc::error::TrySendError::Closed(_)) => &self.reads.counts.dropped_gone,
             };
             dropped.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    /// The word of `term`'s mark: the planned hand-over, so the next take
+    /// brings a term whose ids start again. Once a term: every answer past
+    /// the mark comes here, and the first alone goes on. Under the last
+    /// term below the ceiling no word is said: a hand-over there leaves no
+    /// term to take, and the counter runs on to its end, where a pick is
+    /// answered `Busy` ([`Counts::unleased`]).
+    #[cold]
+    fn leave_at(&self, term: u64) {
+        // A read first: past the mark every answer comes here until the
+        // hand-over lands, and a write each time would pass the line from
+        // decider to decider.
+        if self.mark.said.load(Ordering::Relaxed) >= term
+            || self.mark.said.fetch_max(term, Ordering::Relaxed) >= term
+        {
+            return;
+        }
+        if term_said(Some(term)).is_err() {
+            warn!(
+                term,
+                "the last term a replica can take passed the mark of its lease ids: no hand-over is said, and picks are answered Busy once the ids end"
+            );
+            return;
+        }
+        let Some(leave) = self.mark.leave.get() else {
+            warn!(
+                term,
+                "a term's lease ids passed their mark and no election listens: no hand-over is said, and picks are answered Busy once the ids end"
+            );
+            return;
+        };
+        info!(
+            term,
+            "the term's lease ids passed their mark: this leader hands the lease over, and the next take mints under a new term"
+        );
+        leave(term);
     }
 
     /// One request's answer: its decision, or `Busy`.
@@ -418,16 +566,24 @@ impl Decider {
         gateway: GatewayId,
         received: Instant,
     ) -> proto::DecideAnswer {
-        // What the claim rests on: a decision writes neither the fence nor
-        // the store, the engine closes an open scope where it unwinds, and
-        // the buffers a fault leaves are dropped whole below; nothing here
-        // holds a lock a panic poisons.
+        // What the claim rests on: a decision does not write the fence, and
+        // writes the store at its lease's issue and, where its last read
+        // fails, at that lease's release, each whole or not at all under a
+        // lock no panic poisons; the engine closes an open scope where it
+        // unwinds, and the buffers a fault leaves are dropped whole below.
         let decided = catch_unwind(AssertUnwindSafe(|| {
             self.decide(&request, gateway, received)
         }));
         let faulted = decided.is_err();
         let answer = match decided {
-            Ok(Ok((term, decision))) => wire::decided(request.into_id(), term, &decision),
+            Ok(Ok((term, decision, lease))) => {
+                // An id at or past the term's mark: the word follows this
+                // answer, where no answer of the term said it yet.
+                if lease.as_ref().is_some_and(|lease| past_mark(lease.id)) {
+                    self.marked = Some(term);
+                }
+                wire::decided(request.into_id(), term, &decision, lease.as_ref())
+            }
             Ok(Err(reason)) => self.reads.busy(request.into_id(), reason),
             Err(payload) => {
                 // A payload's own drop can panic, and that panic let out
@@ -453,14 +609,15 @@ impl Decider {
         answer
     }
 
-    /// One request's decision with the term both reads of the fence showed,
-    /// or the reason its answer is `Busy`.
+    /// One request's decision with the term both reads of the fence showed
+    /// and, where it is a pick, the lease issued for it with what is left
+    /// of its dispatch span, or the reason its answer is `Busy`.
     fn decide(
         &mut self,
         request: &Checked,
         gateway: GatewayId,
         received: Instant,
-    ) -> Result<(u64, Decision), Reason> {
+    ) -> Result<(u64, Decision, Option<wire::Leased>), Reason> {
         let Reads {
             store,
             fence,
@@ -479,26 +636,71 @@ impl Decider {
         let taken =
             Taken::at(request, gateway, received, now).ok_or(Reason::BudgetGoneOnArrival)?;
         let (buffers, own) = (&mut self.buffers, counts.part(self.index));
-        let decided = store.deciding(|world| decide_in(world, &taken, buffers, own));
-        let Some(decision) = decided else {
-            counts.pair_sides.fetch_add(1, Ordering::Relaxed);
-            return Err(Reason::Unspecified);
-        };
-        // The fence, read again where the answer is handed over: it leaves
-        // under the term it was made under, or `Busy` leaves in its place.
-        // The budget is judged at that read too, with no clock read more:
-        // a decision late by this clock since the receipt is late at its
-        // gateway, whose clock started earlier. It leaves as `Busy` under
-        // the reason a late arrival is told, and under a count of its own.
-        let handed = clock();
-        if fence.leader_term(handed) != Some(term) {
-            return Err(Reason::NotLeader);
-        }
-        if taken.outlasted(handed) {
-            counts.outlasted.fetch_add(1, Ordering::Relaxed);
-            return Err(Reason::BudgetGoneOnArrival);
-        }
-        Ok((term, decision))
+        // One load of the world for the decision and for its lease: the
+        // lease books the count that load laid beside its target's row,
+        // and the engine told of it is the one that decided.
+        store.deciding(|world| {
+            let Some((decision, booking)) = decide_in(world, &taken, buffers, own) else {
+                counts.pair_sides.fetch_add(1, Ordering::Relaxed);
+                return Err(Reason::Unspecified);
+            };
+            // The lease, for a pick: filed under the first read's term and
+            // at its instant, and the engine told, before the read that
+            // lets the answer leave. That read judges the store's write
+            // and a stage's call with the build before them.
+            let filed = booking
+                .map(|booking| issue(store, world, &taken, term, &decision, booking))
+                .transpose();
+            // The fence, read again where the answer is handed over, with
+            // the answer's build alone behind it: the answer leaves under
+            // the term it was made under, or `Busy` leaves in its place.
+            // The budget is judged at that read too, with no clock read
+            // more: a decision late by this clock since the receipt is
+            // late at its gateway, whose clock started earlier. It leaves
+            // as `Busy` under the reason a late arrival is told, and under
+            // a count of its own.
+            let handed = clock();
+            // The decision's length, one difference of its two reads, is
+            // what the budget and a lease's dispatch span are judged by.
+            // The span counts from the first read: the answer tells its
+            // gateway what is left of it, and a lease with under a
+            // millisecond left is none to hand over.
+            let since = taken.since(handed);
+            let left = DISPATCH_TTL.saturating_sub(since);
+            let spent = matches!(filed, Ok(Some(_))) && left < Duration::from_millis(1);
+            let failed = if fence.leader_term(handed) != Some(term) {
+                Some((Reason::NotLeader, ReleaseReason::Abandoned))
+            } else if taken.outlasted(since) || spent {
+                counts.outlasted.fetch_add(1, Ordering::Relaxed);
+                Some((Reason::BudgetGoneOnArrival, ReleaseReason::LateDecision))
+            } else {
+                None
+            };
+            let Some((busy, ended)) = failed else {
+                return match filed {
+                    Ok(lease) => Ok((
+                        term,
+                        decision,
+                        lease.map(|lease| wire::Leased { lease, left }),
+                    )),
+                    // The term mints no more ids. A pick with no lease is
+                    // no answer: its gateway decides it locally.
+                    Err(LeaseRefused::Unminted { lease, store }) if lease == store => {
+                        counts.unleased.fetch_add(1, Ordering::Relaxed);
+                        Err(Reason::Unspecified)
+                    }
+                    // The store stands under another term than the fence
+                    // showed: a take or a loss this decision straddled.
+                    Err(_) => Err(Reason::NotLeader),
+                };
+            };
+            // The answer does not leave, and the lease filed for it goes
+            // with it.
+            if let Ok(Some(lease)) = filed {
+                give_up(store, world, taken.gateway, &lease, ended);
+            }
+            Err(busy)
+        })
     }
 }
 
@@ -536,12 +738,17 @@ impl<'a> Taken<'a> {
         })
     }
 
-    /// Whether the budget is gone at `later`, a read of the clock after the
-    /// one the request was taken at: what was left then, less the time
-    /// since, under the same rule. One difference of two instants, where
-    /// taking the request again would read its budget and build it whole.
-    fn outlasted(&self, later: Instant) -> bool {
-        let since = later.saturating_duration_since(self.now);
+    /// The time since the request was taken at `later`, a read of the
+    /// clock after that one. One difference of two instants judges the
+    /// budget and a lease's dispatch span, where taking the request again
+    /// would read its budget and build it whole.
+    fn since(&self, later: Instant) -> Duration {
+        later.saturating_duration_since(self.now)
+    }
+
+    /// Whether the budget is gone `since` the request was taken: what was
+    /// left then, less that time, under the same rule.
+    fn outlasted(&self, since: Duration) -> bool {
         self.left.saturating_sub(since) < Duration::from_micros(1)
     }
 }
@@ -569,7 +776,7 @@ fn decide_in(
     taken: &Taken<'_>,
     buffers: &mut Buffers,
     own: &Part,
-) -> Option<Decision> {
+) -> Option<(Decision, Option<Booking>)> {
     let spec = world.spec();
     let engine = spec.engine();
     let (model, phase) = (taken.request.model(), taken.request.phase());
@@ -582,10 +789,10 @@ fn decide_in(
     {
         return None;
     }
-    if taken.request.hashes() > spec.max_block_hashes() {
+    if taken.request.hashes() > taken.request.hashes_read(spec) {
         own.hashes_cut.fetch_add(1, Ordering::Relaxed);
     }
-    Some(hand(
+    let ((decision, booking), built) = hand(
         world,
         taken,
         buffers,
@@ -600,16 +807,135 @@ fn decide_in(
                 } else {
                     WIRES
                 };
-                return shed(
+                let none = shed(
                     ShedReason::NoEndpoints,
                     emptied_by,
                     facts.seed,
                     pool.generation,
                 );
+                return (none, None);
             }
-            engine.decide(facts, pool, candidates, constraints, scratch)
+            let decision = engine.decide(facts, pool, candidates, constraints, scratch);
+            // What a pick's lease takes of its request, read where the
+            // request stands as the engine read it.
+            let booking = decision.pick().and_then(|pick| {
+                Some(Booking {
+                    target: pick.targets.first()?.id,
+                    picked: Picked::of(&pick.targets),
+                    verdict: pick.session_verdict,
+                    generation: pick.trace.generation,
+                    session: facts.session(),
+                    tokens: facts.prompt_tokens,
+                    now_micros: facts.now_micros,
+                    built: None,
+                })
+            });
+            (decision, booking)
         },
+    );
+    Some((
+        decision,
+        booking.map(|booking| Booking { built, ..booking }),
     ))
+}
+
+/// What a pick's lease takes of its decision's hand-over.
+#[derive(Clone, Copy)]
+struct Booking {
+    /// The pick's first target: the worker the lease books.
+    target: WorkerId,
+    /// The pick's other targets and the ranks, for a `Dispatched` that
+    /// names one by its index.
+    picked: Picked,
+    /// What the decision did with the request's session key.
+    verdict: SessionVerdict,
+    /// The generation that decided.
+    generation: u64,
+    /// The request's session; none for a request with no key.
+    session: Session,
+    /// The token-work the lease books: the prompt, as its host counted it.
+    tokens: u32,
+    /// The decision's instant in the rows' clock.
+    now_micros: u64,
+    /// The build the decision read: where its target's count stands.
+    built: Option<Built>,
+}
+
+/// Issues the lease of a pick, one a decision, ahead of the read that lets
+/// its answer leave: a credit on the pick's first target, minted and filed
+/// by the store under `term`, the fence's at the decision's first read, at
+/// that read's instant, from which [`DISPATCH_TTL`] runs for its gateway
+/// to name a dispatch. The lease books the count the decision's own world
+/// lays beside its target's row, and the engine that decided is told of
+/// it.
+///
+/// # Errors
+///
+/// The store's refusal: it stands under another term, or mints no id
+/// under this one.
+fn issue(
+    store: &MemoryStore,
+    world: &World,
+    taken: &Taken<'_>,
+    term: u64,
+    decision: &Decision,
+    booking: Booking,
+) -> Result<Lease, LeaseRefused> {
+    let lease = Lease {
+        // The store mints the id.
+        id: LeaseId::default(),
+        kind: LeaseKind::Credit,
+        side: Side::Single,
+        target_index: 0,
+        generation: booking.generation,
+        session: booking.session,
+        session_verdict: booking.verdict,
+        issued_micros: booking.now_micros,
+        tokens: booking.tokens,
+    };
+    let record = LeaseRecord {
+        lease,
+        gateway: taken.gateway,
+        request: fingerprint(taken.request.id()),
+        target: booking.target,
+        picked: booking.picked,
+        decode: None,
+        term,
+        issued_at: taken.now,
+        dispatch_deadline: taken.now + DISPATCH_TTL,
+        state: LeaseState::Issued,
+    };
+    let built = booking.built;
+    let booked = built.and_then(|built| world.booked(&built, booking.target));
+    let (lease, abandoned) = store.issue_decided(record, booked)?;
+    let (engine, generation) = (world.spec().engine(), world.spec().generation());
+    engine.on_decision_issued(&lease, decision);
+    // The leases this issue found past their dispatch deadline. The engine
+    // at hand is told of those its own generation issued: a later
+    // generation's stages never saw the issue.
+    for record in abandoned.into_iter().flatten() {
+        if record.lease.generation == generation {
+            engine.on_released(&record.lease, ReleaseReason::Abandoned);
+        }
+    }
+    Ok(lease)
+}
+
+/// Gives up the lease of a decision whose answer does not leave: the
+/// store's release door first ([`crate::store::LeasesStore::released`], the
+/// one a gateway's `Released` frame takes), then the engine that heard the
+/// issue, told once where the store held the lease. A lease the store no
+/// longer holds was ended by another hand, and nothing is told of it here.
+fn give_up(
+    store: &MemoryStore,
+    world: &World,
+    gateway: GatewayId,
+    lease: &Lease,
+    reason: ReleaseReason,
+) {
+    if crate::store::LeasesStore::released(store, gateway, lease.id, None, reason) {
+        world.spec().engine().on_released(lease, reason);
+    }
 }
 
 /// A shed the deciders say in the engine's place, in the shape of the
@@ -628,15 +954,42 @@ fn shed(reason: ShedReason, emptied_by: &'static str, seed: u64, generation: u64
     })
 }
 
+/// What [`hand`] reads of a pool for one request: the pool's facts, the
+/// decision's instant in the rows' clock, the rows, the mask of the asking
+/// gateway's vetoes beside lent rows, the affinity column, and the build
+/// the rows were read by.
+type Read<'a> = (
+    PoolFacts<'a>,
+    u64,
+    &'a [Candidate],
+    &'a [u32],
+    &'a [AffinityFacts],
+    Option<Built>,
+);
+
 /// Hands `decide` what the engine reads for one request: the request with
 /// what is left of its budget, the pool's facts under the generation its
 /// rows were published under, and those rows as the asking gateway reaches
-/// them at the decision's instant, less what the gateway states of itself
-/// takes ([`narrow`]), with the affinity column where the request's
-/// profile declares it. The rows its wires take are counted in `undialed`,
-/// the decider's own part, and the list they leave takes a name of its own
-/// ([`cut_reach`]). The request's block hashes are cut at that generation's
-/// cap.
+/// them at the decision's instant, with the affinity column where the
+/// request's profile declares it. A request that states no wires and no
+/// hint of 0 reads its pool by the store's one door ([`World::view`]): the
+/// rows where their publication left them, its gateway's standing vetoes
+/// beside them, or rows the door writes where the request's profile shows
+/// them to a plugin. One that states wires or a hint of 0 and one whose
+/// profile declares a worker's requests in flight are handed rows written
+/// for them ([`World::build`]), the last with what the leases on file book
+/// on each row's worker ([`World::count_in_flight`]), less what the
+/// gateway states of itself takes ([`narrow`]). The rows its wires take
+/// are counted in `undialed`, the decider's own part, and the list they
+/// leave takes a name of its own ([`cut_reach`]). The request's block
+/// hashes are cut at what that generation reads of them. `decide`'s answer
+/// comes back with the build its rows were read by, `None` where no member
+/// serves the model.
+///
+/// A request whose profile reads the affinity column and takes a sample is
+/// handed no column: the rows the store names for it stand in the column's
+/// place ([`World::name`]), at most that sample of each list
+/// ([`Engine::named_for`](crate::framework::Engine::named_for)).
 fn hand<R>(
     world: &World,
     taken: &Taken<'_>,
@@ -649,7 +1002,7 @@ fn hand<R>(
         &Constraints<'_>,
         &mut Scratch,
     ) -> R,
-) -> R {
+) -> (R, Option<Built>) {
     let Taken {
         request,
         gateway,
@@ -658,11 +1011,26 @@ fn hand<R>(
     } = *taken;
     let spec = world.spec();
     let (model, phase) = (request.model(), request.phase());
+    let engine = spec.engine();
+    // What the decision's profile reads, and whether it shows its rows to
+    // a plugin.
+    let (needs, shown) = engine.reads_for(model, phase);
+    // A profile whose picker takes a sample is handed the rows the store
+    // names in the column's place, capped by that sample, and no column.
+    // The deciding profile answers for itself: the needs are merged over
+    // a pair's two phases and a sessions rule, so they say only where to
+    // ask, and no other decision pays the second walk.
+    let cap = if needs.affinity && needs.sample > 0 {
+        engine.named_for(model, phase)
+    } else {
+        0
+    };
+    let names = cap > 0;
     let ask = Ask {
         gateway,
         now,
         pinned: None,
-        affinity: spec.engine().needs_for(model, phase).affinity,
+        affinity: needs.affinity && !names,
     };
     let role = match phase {
         Phase::Single => Role::Single,
@@ -674,42 +1042,95 @@ fn hand<R>(
         view,
         scratch,
         lists,
+        named,
     } = buffers;
-    let (pool, now_micros) = match world.build(model, role, &ask, view) {
-        Some(built) => {
-            // The pool's facts are of the rows before the request's own
-            // narrowing, all but the list's name: the rows the wires left
-            // are another list of the pool.
-            let mut pool = built.pool_facts();
-            let wires = request.wires();
-            let took = narrow(view, wires, request.subset());
-            if took > 0 {
-                undialed.fetch_add(took, Ordering::Relaxed);
-                if let Some(wires) = wires {
-                    pool.reach = cut_reach(pool.reach, wires);
-                }
-            }
-            (pool, built.now_micros)
-        }
-        // No member serves the model in the role: the engine answers over
-        // no candidate, as it answers any host that hands it none.
-        None => (
-            PoolFacts {
-                generation: spec.generation(),
-                ..PoolFacts::default()
-            },
-            world.micros(now),
-        ),
+    let wires = request.wires();
+    // No member serves the model in the role: the engine answers over no
+    // candidate, as it answers any host that hands it none.
+    let none = || PoolFacts {
+        generation: spec.generation(),
+        ..PoolFacts::default()
     };
+    // Nothing of the request's own is cut out of the rows the door hands:
+    // the publication's own, or a copy the door writes for a plugin, which
+    // is shown a row's bits and ages as the row's own fields. The count of
+    // the leases on file is written over rows built here, so a profile
+    // that declares it reads none of the door's.
+    let by_door = wires.is_none() && request.subset() != Some(0) && !needs.in_flight;
+    let (pool, now_micros, candidates, stalled, affinity, built): Read<'_> = if by_door {
+        match world.view(model, role, &ask, shown, view) {
+            Some(read) => (
+                read.built.pool_facts(),
+                read.built.now_micros,
+                read.candidates,
+                read.stalled,
+                read.affinity,
+                Some(read.built),
+            ),
+            None => (none(), world.micros(now), &[], &[], &[], None),
+        }
+    } else {
+        let built = world.build(model, role, &ask, view);
+        let (pool, now_micros) = match built {
+            Some(built) => {
+                // What the leases on file book on each row's worker, for a
+                // profile that declares the count, written before the
+                // request's own narrowing moves a row.
+                if needs.in_flight {
+                    world.count_in_flight(&built, &ask, &mut view.candidates);
+                }
+                // The pool's facts are of the rows before the request's own
+                // narrowing, all but the list's name: the rows the wires
+                // left are another list of the pool.
+                let mut pool = built.pool_facts();
+                let took = narrow(view, wires, request.subset());
+                if took > 0 {
+                    undialed.fetch_add(took, Ordering::Relaxed);
+                    if let Some(wires) = wires {
+                        pool.reach = cut_reach(pool.reach, wires);
+                    }
+                }
+                (pool, built.now_micros)
+            }
+            None => (none(), world.micros(now)),
+        };
+        (
+            pool,
+            now_micros,
+            &view.candidates,
+            &[],
+            &view.affinity,
+            built,
+        )
+    };
+    if names {
+        // A row is named by its place among the rows the decision is made
+        // over: the lent rows, or the built ones after their narrowing.
+        let hashes = request.block_hashes();
+        let naming = Naming {
+            gateway,
+            // The first hashes, as many as the generation reads of them:
+            // the engine's request takes the same count.
+            block_hashes: hashes.get(..request.hashes_read(spec)).unwrap_or(hashes),
+            seed: request.seed(),
+            cap,
+            wires,
+            now_micros,
+        };
+        world.name(model, role, &naming, candidates, named);
+    }
     let viewed = Viewed {
         now_micros,
         budget_micros: u32::try_from(left.as_micros()).unwrap_or(u32::MAX),
-        affinity: &view.affinity,
-        max_block_hashes: spec.max_block_hashes(),
+        affinity,
+        stalled,
+        max_block_hashes: request.hashes_read(spec),
+        named: names.then(|| named.affinity()),
     };
-    request.read(lists, viewed, |facts, constraints| {
-        decide(facts, &pool, &view.candidates, constraints, scratch)
-    })
+    let answer = request.read(lists, viewed, |facts, constraints| {
+        decide(facts, &pool, candidates, constraints, scratch)
+    });
+    (answer, built)
 }
 
 /// Narrows a built view by what the request's gateway states of itself,
@@ -776,25 +1197,29 @@ pub(crate) mod tests {
 
     use super::{
         cut_reach, hand, narrow, watched, Buffers, Clock, Counts, Decider, Deciders, Job, Part,
-        Reads, Refused, Taken, PARTS,
+        Reads, Refused, Taken, PARTS, TERM_MARK,
     };
     use crate::{
+        builtins::Random,
+        catalog::Catalog,
         controller::{
             election::Standing,
             gateways::tests::PATIENT,
             wire::{self, Checked},
         },
-        elector::{Elector, Tick},
-        framework::Scratch,
+        decision::{Decision, Targets},
+        elector::{Elector, Tick, TERM_CEILING},
+        framework::{DecisionScope, Filter, Picker, Scratch, TieBand},
+        lease::{Lease, LeaseId, Lifecycle, ReleaseReason},
         proto::{self, busy::Reason, decide_answer::Answer, decision::Outcome},
-        spec::{AppliedSpec, PolicySpec},
+        spec::{AppliedSpec, PolicySpec, PowerOfTwoMetric},
         store::{
-            Ask, GatewayId, HealthSink, MemoryStore, ViewBuffers, WorkerFacts, WorkerStatus,
-            WorkersStore,
+            leases::DISPATCH_TTL, Ask, Dispatch, GatewayId, HealthSink, LeaseState, LeasesStore,
+            MemoryStore, ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore,
         },
         view::{
-            AffinityFacts, Candidate, Constraints, PoolFacts, RequestFacts, Role, WireModes,
-            WorkerId,
+            fingerprint, AffinityFacts, Candidate, Constraints, PoolFacts, RequestFacts, Role,
+            WireModes, WorkerId,
         },
     };
 
@@ -958,6 +1383,9 @@ pub(crate) mod tests {
         if leads {
             let tick = elector.tick(taken).expect("the take");
             assert_eq!(tick, Tick::Acquired { term: 1 });
+            // The election's report tells the store the term it took: a
+            // lease is minted under the store's own term.
+            store.set_term(1);
         }
         let script = Arc::new(Script {
             taken,
@@ -1015,6 +1443,13 @@ pub(crate) mod tests {
 
     pub(crate) fn frame(id: u8, seed: u64) -> proto::DecideRequest {
         frame_for(MODEL, id, seed)
+    }
+
+    /// `frame` with `budget` in place of the case's.
+    fn budgeted(mut frame: proto::DecideRequest, budget: Duration) -> proto::DecideRequest {
+        let facts = frame.facts.as_mut().expect("the case's frame has facts");
+        facts.budget_micros = u32::try_from(budget.as_micros()).expect("a budget of seconds");
+        frame
     }
 
     /// `frame` in `phase`.
@@ -1102,7 +1537,7 @@ pub(crate) mod tests {
                     &mut Scratch::new(),
                 )
             });
-            wire::decided(frame.request_id.clone(), term, &decision)
+            wire::decided(frame.request_id.clone(), term, &decision, None)
         }
     }
 
@@ -1133,6 +1568,25 @@ pub(crate) mod tests {
         }
     }
 
+    /// The one lease a pick's answer carries.
+    fn lease_of(answer: &proto::DecideAnswer) -> &proto::Lease {
+        match &answer.answer {
+            Some(Answer::Decision(decision)) => match decision.leases.as_slice() {
+                [lease] => lease,
+                other => panic!("one lease: {other:?}"),
+            },
+            other => panic!("a decision: {other:?}"),
+        }
+    }
+
+    /// `answer` less the lease it carries: what the engine alone decided.
+    fn unleased(mut answer: proto::DecideAnswer) -> proto::DecideAnswer {
+        if let Some(Answer::Decision(decision)) = &mut answer.answer {
+            decision.leases.clear();
+        }
+        answer
+    }
+
     /// A shed as the engine declines: its reason beside its stage.
     fn declined(reason: proto::ShedReason, stage: &str) -> Outcome {
         Outcome::Shed(proto::Shed {
@@ -1152,8 +1606,681 @@ pub(crate) mod tests {
             assert_eq!((answer.request_id.as_slice(), answer.term), (&[id][..], 1));
             assert!(bed.workers.contains(&picked(&answer)), "{answer:?}");
             // The answer is the engine's own decision over the store's
-            // view, under the generation that view was published under.
-            assert_eq!(answer, bed.engines(&frame, 1));
+            // view, under the generation that view was published under,
+            // with its lease.
+            assert_eq!(unleased(answer), bed.engines(&frame, 1));
+        }
+    }
+
+    /// A member's requests in flight are the leases on file that book it:
+    /// a decision by the fewest requests goes where the decisions before
+    /// it left the fewest, and a lease that ends gives its worker the next.
+    #[tokio::test]
+    async fn a_decision_by_the_fewest_requests_reads_the_leases_the_decisions_before_it_left() {
+        let mut document = PolicySpec::power_of_two(PowerOfTwoMetric::LeastRequests)
+            .expect("a form of this build's preset");
+        document.generation = 1;
+        let mut bed = bed(Some(applied(&document)), true, (2, 8), []);
+        // Nine decisions and no word from their gateway: each round of
+        // three names each of the three members once.
+        let mut held = Vec::new();
+        for round in 0..3u8 {
+            let mut named = BTreeSet::new();
+            for turn in 1..=3u8 {
+                let id = round * 3 + turn;
+                let answer = bed.ask(frame(id, u64::from(id))).await;
+                named.insert(picked(&answer));
+                held.push((picked(&answer), LeaseId(lease_of(&answer).id)));
+            }
+            assert_eq!(named.len(), 3, "round {round} named {named:?}");
+        }
+        // One member's three leases end at their gateway's word: the next
+        // three decisions are that member's.
+        let (freed, _) = held[0];
+        for &(_, lease) in held.iter().filter(|(worker, _)| *worker == freed) {
+            let ended = bed
+                .store
+                .released(GATEWAY, lease, None, ReleaseReason::ClientGone);
+            assert!(ended, "{lease:?} was on file");
+        }
+        for id in 10..=12u8 {
+            let answer = bed.ask(frame(id, u64::from(id))).await;
+            assert_eq!(picked(&answer), freed, "request {id}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_picks_answer_carries_the_lease_the_store_filed_under_the_fences_term() {
+        let mut bed = leading([]);
+        let answer = bed.ask(frame(7, 7)).await;
+        let lease = *lease_of(&answer);
+        assert_eq!(lease.id, 1 << 32 | 1, "the term over its first count");
+        assert_eq!(
+            (lease.term, lease.origin(), lease.kind(), lease.side()),
+            (
+                answer.term,
+                proto::LeaseOrigin::Controller,
+                proto::LeaseKind::Credit,
+                proto::Side::Single
+            )
+        );
+        assert_eq!(
+            (lease.target_index, lease.generation, lease.session_key),
+            (0, 1, 0)
+        );
+        assert_eq!(u128::from(lease.dispatch_ttl_ms), DISPATCH_TTL.as_millis());
+        let store: &dyn LeasesStore = bed.store.as_ref();
+        let filed = store
+            .get(GATEWAY, LeaseId(lease.id))
+            .expect("the lease is on file");
+        assert_eq!(
+            (filed.target, filed.term, filed.state, filed.request),
+            (picked(&answer), 1, LeaseState::Issued, fingerprint(&[7]))
+        );
+        assert_eq!(filed.dispatch_deadline, filed.issued_at + DISPATCH_TTL);
+        // The next decision's id is the term's next count, its lease
+        // carries its request's prompt tokens, and both leases stand for
+        // their gateway alone.
+        assert_eq!(lease.tokens, 0, "a request that states no prompt");
+        let mut prompted = frame(8, 8);
+        let facts = prompted.facts.as_mut();
+        let facts = facts.expect("the case's frame has facts");
+        facts.prompt_tokens = 48;
+        facts.session_key = Some(proto::Identity {
+            form: Some(proto::identity::Form::Hash(17)),
+        });
+        let next = bed.ask(prompted).await;
+        assert_eq!(
+            (lease_of(&next).id, lease_of(&next).tokens),
+            (1 << 32 | 2, 48)
+        );
+        let store: &dyn LeasesStore = bed.store.as_ref();
+        assert_eq!((store.live(GATEWAY), store.live(OTHER)), (2, 0));
+        // The lease carries its request's session, on the wire as on file:
+        // never zero for a request that states one.
+        let session = lease_of(&next).session_key;
+        let filed = store.get(GATEWAY, LeaseId(1 << 32 | 2));
+        let filed = filed.expect("the lease is on file").lease;
+        assert_ne!(session, 0);
+        assert_eq!(filed.session.get(), session);
+    }
+
+    #[tokio::test]
+    async fn an_answer_that_names_no_worker_or_does_not_leave_files_no_lease() {
+        // A shed: no member serves the model.
+        let mut bed = leading([]);
+        let answer = bed.ask(frame_for("model-none", 1, 1)).await;
+        assert!(matches!(outcome(&answer), Outcome::Shed(_)), "{answer:?}");
+        assert_eq!(unleased(answer.clone()), answer, "a shed carries no lease");
+        assert_eq!(bed.store.live(GATEWAY), 0);
+        // A decision whose fence closed at its hand-over, and one whose
+        // budget ended while it was made: `Busy`, and nothing on file.
+        for (second_read, reason) in [
+            (FENCED, Reason::NotLeader),
+            (BUDGET, Reason::BudgetGoneOnArrival),
+        ] {
+            let mut bed = leading([Step::At(Duration::ZERO), Step::At(second_read)]);
+            assert_eq!(busy(&bed.ask(frame(2, 2)).await), reason);
+            assert_eq!(bed.store.live(GATEWAY), 0, "{reason:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_pick_the_store_mints_no_lease_for_leaves_as_busy() {
+        // The term's last id, then none: `Busy` with no reason, counted.
+        let mut bed = leading([]);
+        bed.store.spend_ids(1);
+        let last = bed.ask(frame(1, 1)).await;
+        assert_eq!(lease_of(&last).id, 1 << 32 | u64::from(u32::MAX));
+        for id in 2..=3 {
+            assert_eq!(busy(&bed.ask(frame(id, 1)).await), Reason::Unspecified);
+        }
+        assert_eq!(bed.counts.unleased.load(Ordering::Relaxed), 2);
+        assert_eq!(bed.store.live(GATEWAY), 1, "the last id's lease alone");
+        // A store that stands under a later term than the fence showed:
+        // not this leader's to answer, and no lease.
+        let mut bed = leading([]);
+        bed.store.set_term(2);
+        assert_eq!(busy(&bed.ask(frame(4, 1)).await), Reason::NotLeader);
+        assert_eq!(bed.counts.unleased.load(Ordering::Relaxed), 0);
+        assert_eq!(bed.store.live(GATEWAY), 0);
+    }
+
+    /// Sixteen requests of one stream in flight at once, and their answers:
+    /// a pick's lease id, or the reason of a `Busy`.
+    pub(crate) async fn burst(
+        deciders: &Deciders,
+        sender: &mpsc::Sender<proto::DecideAnswer>,
+        answers: &mut mpsc::Receiver<proto::DecideAnswer>,
+    ) -> Vec<Result<u64, Reason>> {
+        for id in 0..16 {
+            let job = Job {
+                request: checked(frame(id, u64::from(id))),
+                gateway: GATEWAY,
+                received: Instant::now(),
+                answers: sender.clone(),
+            };
+            assert!(deciders.submit(job).is_none(), "the queue takes sixteen");
+        }
+        let mut read = Vec::new();
+        for _ in 0..16 {
+            let answer = timeout(PATIENCE, answers.recv())
+                .await
+                .expect("an answer within the case's patience")
+                .expect("the case holds a sender");
+            read.push(match &answer.answer {
+                Some(Answer::Decision(decision)) => match decision.leases.as_slice() {
+                    [lease] => Ok(lease.id),
+                    other => panic!("one lease a pick: {other:?}"),
+                },
+                _ => Err(busy(&answer)),
+            });
+        }
+        read
+    }
+
+    /// The word a term's mark says, as a case hears it: each call tells the
+    /// case, then waits for its go.
+    fn heard(bed: &Bed) -> (std_mpsc::Receiver<()>, std_mpsc::SyncSender<()>) {
+        let (reached, words) = std_mpsc::sync_channel(8);
+        let (go, held) = std_mpsc::sync_channel::<()>(8);
+        let held = Mutex::new(held);
+        bed.deciders.leave_through(move |_term| {
+            reached.send(()).expect("the case hears the word");
+            held.lock().recv().expect("the case lets the decider go");
+        });
+        (words, go)
+    }
+
+    /// The answer that carries the id at a term's mark says the word to
+    /// leave, only once it is handed over, and no id past it says another.
+    #[tokio::test]
+    async fn the_id_at_a_terms_mark_says_the_word_once_its_answer_is_handed_over() {
+        let mut bed = leading([]);
+        let (words, go) = heard(&bed);
+        // The mark is three quarters of a term's ids. The id under it, the
+        // mark's, and three past it.
+        assert_eq!(u64::from(TERM_MARK) * 4, 3 << 32);
+        bed.store.spend_ids(u32::MAX - TERM_MARK + 2);
+        let under = bed.ask(frame(1, 1)).await;
+        assert_eq!(lease_of(&under).id, 1 << 32 | u64::from(TERM_MARK - 1));
+        // The decider is held inside the word: an answer that reaches the
+        // case was handed over before the word was said.
+        let at = bed.ask(frame(2, 1)).await;
+        assert_eq!(lease_of(&at).id, 1 << 32 | u64::from(TERM_MARK));
+        words
+            .recv_timeout(PATIENCE)
+            .expect("the mark's decider says the word");
+        // A later word finds its go waiting. The ids past the mark say
+        // none: the answer after each shows its decider said nothing.
+        for _ in 0..8 {
+            go.send(()).expect("the decider holds the other end");
+        }
+        for (id, past) in [(3, 1), (4, 2), (5, 3)] {
+            let answer = bed.ask(frame(id, 1)).await;
+            assert_eq!(lease_of(&answer).id, 1 << 32 | u64::from(TERM_MARK + past));
+        }
+        assert!(words.try_recv().is_err(), "one answer a term says the word");
+        assert_eq!(bed.counts.unleased.load(Ordering::Relaxed), 0);
+    }
+
+    /// The mark's own id need not be one an answer carries: the mint steps
+    /// over an id on file. The first answer past the mark says the word
+    /// then, and once.
+    #[tokio::test]
+    async fn an_id_past_a_terms_mark_says_the_word_the_marks_own_never_said() {
+        let mut bed = leading([]);
+        let (words, go) = heard(&bed);
+        for _ in 0..8 {
+            go.send(()).expect("the decider holds the other end");
+        }
+        // The term's counter stands two ids past its mark.
+        bed.store.spend_ids(u32::MAX - TERM_MARK - 2);
+        let first = bed.ask(frame(1, 1)).await;
+        assert_eq!(lease_of(&first).id, 1 << 32 | u64::from(TERM_MARK + 3));
+        words
+            .recv_timeout(PATIENCE)
+            .expect("the first answer past the mark says the word");
+        // The answer after each shows its decider said nothing.
+        for (id, past) in [(2, 4), (3, 5)] {
+            let answer = bed.ask(frame(id, 1)).await;
+            assert_eq!(lease_of(&answer).id, 1 << 32 | u64::from(TERM_MARK + past));
+        }
+        assert!(words.try_recv().is_err(), "one answer a term says the word");
+    }
+
+    /// Each term says its own word: a leader past its mark under one term,
+    /// then under the next, hands the lease over twice.
+    #[tokio::test]
+    async fn two_terms_in_a_row_each_say_the_word_at_their_mark() {
+        let mut bed = leading([]);
+        let (words, go) = heard(&bed);
+        let taken = bed.script.taken;
+        for term in 1..=2 {
+            go.send(()).expect("the decider holds the other end");
+            if term > 1 {
+                // The bed's candidate, alone over its lease, leaves and
+                // takes again at one instant, as its election would.
+                let left = bed.elector.step_down(None, taken);
+                assert!(left.expect("a planned hand-over"));
+                let took = bed.elector.tick(taken).expect("the take");
+                assert_eq!(took, Tick::Acquired { term });
+                bed.store.set_term(term);
+            }
+            bed.store.spend_ids(u32::MAX - TERM_MARK + 1);
+            let at = bed.ask(frame(1, 1)).await;
+            assert_eq!(lease_of(&at).id, term << 32 | u64::from(TERM_MARK));
+            // The answer after the mark's shows its decider said its word.
+            let past = bed.ask(frame(2, 1)).await;
+            assert_eq!(lease_of(&past).id, term << 32 | u64::from(TERM_MARK + 1));
+            assert!(words.try_recv().is_ok(), "the word under term {term}");
+            assert!(words.try_recv().is_err(), "one word under term {term}");
+        }
+    }
+
+    /// Under the last term a replica can take, the mark says no word: a
+    /// hand-over there leaves no term to take. The term before it says its
+    /// own.
+    #[tokio::test]
+    async fn the_mark_of_the_last_term_says_no_word() {
+        let mut bed = leading([]);
+        let (words, go) = heard(&bed);
+        go.send(()).expect("the decider holds the other end");
+        // The bed's candidate, alone over its lease, leaves and takes again
+        // at one instant, twice: above a term said, the term before the
+        // last; then at a planned hand-over, the last under the ceiling.
+        let (last, taken) = (TERM_CEILING - 1, bed.script.taken);
+        for (term, above, says) in [(last - 1, Some(last - 2), true), (last, None, false)] {
+            let left = bed.elector.step_down(above, taken);
+            assert!(left.expect("a term that leaves one to take"));
+            let took = bed.elector.tick(taken).expect("the take");
+            assert_eq!(took, Tick::Acquired { term });
+            bed.store.set_term(term);
+            bed.store.spend_ids(u32::MAX - TERM_MARK + 1);
+            let at = bed.ask(frame(1, 1)).await;
+            assert_eq!(lease_of(&at).id, term << 32 | u64::from(TERM_MARK));
+            // The answer after the mark's shows its decider said what it
+            // had to say.
+            let past = bed.ask(frame(2, 1)).await;
+            assert_eq!(lease_of(&past).id, term << 32 | u64::from(TERM_MARK + 1));
+            assert_eq!(words.try_recv().is_ok(), says, "under term {term}");
+        }
+    }
+
+    /// What the engine told a stage of leases: an issue by its id, a release
+    /// by its id and reason.
+    type Calls = Vec<(u64, Option<ReleaseReason>)>;
+
+    /// The `random` picker, keeping what the engine tells it of leases.
+    #[derive(Debug)]
+    struct Told(Arc<Mutex<Calls>>);
+
+    impl Lifecycle for Told {
+        fn on_decision_issued(&self, lease: &Lease, _: &Decision) {
+            self.0.lock().push((lease.id.0, None));
+        }
+
+        fn on_released(&self, lease: &Lease, reason: ReleaseReason) {
+            self.0.lock().push((lease.id.0, Some(reason)));
+        }
+    }
+
+    impl Picker for Told {
+        fn name(&self) -> &'static str {
+            "told"
+        }
+
+        fn pick(
+            &self,
+            facts: &RequestFacts<'_>,
+            candidates: &[Candidate],
+            kept: &[u32],
+            scores: &[f32],
+            band: TieBand,
+            out: &mut Targets,
+        ) {
+            Random.pick(facts, candidates, kept, scores, band, out);
+        }
+    }
+
+    /// [`Told`], whose issue call waits for its case: what falls while a
+    /// stage's own call runs is the case's to say.
+    #[derive(Debug)]
+    struct Waits {
+        told: Told,
+        reached: std_mpsc::SyncSender<()>,
+        go: Arc<Mutex<std_mpsc::Receiver<()>>>,
+    }
+
+    impl Lifecycle for Waits {
+        fn on_decision_issued(&self, lease: &Lease, decision: &Decision) {
+            self.told.on_decision_issued(lease, decision);
+            self.reached.send(()).expect("the case waits for this call");
+            let word = self.go.lock().recv_timeout(PATIENCE);
+            word.expect("the case lets the call go on");
+        }
+
+        fn on_released(&self, lease: &Lease, reason: ReleaseReason) {
+            self.told.on_released(lease, reason);
+        }
+    }
+
+    impl Picker for Waits {
+        fn name(&self) -> &'static str {
+            "waits"
+        }
+
+        fn pick(
+            &self,
+            facts: &RequestFacts<'_>,
+            candidates: &[Candidate],
+            kept: &[u32],
+            scores: &[f32],
+            band: TieBand,
+            out: &mut Targets,
+        ) {
+            Random.pick(facts, candidates, kept, scores, band, out);
+        }
+    }
+
+    /// A leader whose one picker waits inside its issue call: the bed, what
+    /// the engine told the stage of leases, and the case's two ends of the
+    /// wait, the call reached and the word that lets it go on.
+    fn waiting() -> (
+        Bed,
+        Arc<Mutex<Calls>>,
+        std_mpsc::Receiver<()>,
+        std_mpsc::SyncSender<()>,
+    ) {
+        let told = Arc::new(Mutex::new(Vec::new()));
+        let (reached, at_issue) = std_mpsc::sync_channel(1);
+        let (word, go) = std_mpsc::sync_channel(1);
+        let (kept, go) = (Arc::clone(&told), Arc::new(Mutex::new(go)));
+        let mut catalog = Catalog::builtin();
+        catalog
+            .picker("waits", move || {
+                Box::new(Waits {
+                    told: Told(Arc::clone(&kept)),
+                    reached: reached.clone(),
+                    go: Arc::clone(&go),
+                })
+            })
+            .expect("a free name");
+        let mut document = PolicySpec::preset("random").expect("a preset of this build");
+        let profile = document.profiles.get_mut("random");
+        profile.expect("the preset's profile").pick = "waits".into();
+        let digest = document.digest().expect("the document digests");
+        let spec = AppliedSpec::validate_digested(&document, digest, &catalog)
+            .expect("the catalog holds the stage");
+        (bed(Some(spec), true, (2, 8), []), told, at_issue, word)
+    }
+
+    /// The budget is judged behind the lease's issue: what a stage's issue
+    /// call takes is the decision's time too. A decision that call outlasts
+    /// leaves as `Busy`, its lease is off the file, and the engine that
+    /// heard the issue hears the release.
+    #[tokio::test]
+    async fn a_decision_its_stages_issue_call_outlasts_leaves_as_busy_and_gives_its_lease_up() {
+        let (mut bed, told, at_issue, word) = waiting();
+        assert_eq!(bed.submit(frame(1, 1)), None);
+        at_issue
+            .recv_timeout(PATIENCE)
+            .expect("the stage's issue call");
+        assert_eq!(bed.store.live(GATEWAY), 1, "filed before the call");
+        // The call took the budget: the next read of the clock, the
+        // decision's last, shows the hour past it.
+        bed.script.steps.lock().push_back(Step::At(BUDGET));
+        word.send(()).expect("the stage waits for the case");
+        let answer = bed.answer().await;
+        assert_eq!(busy(&answer), Reason::BudgetGoneOnArrival);
+        assert_eq!(bed.counts.outlasted.load(Ordering::Relaxed), 1);
+        assert_eq!(bed.store.live(GATEWAY), 0);
+        let (id, late) = (1 << 32 | 1, Some(ReleaseReason::LateDecision));
+        assert_eq!(*told.lock(), [(id, None), (id, late)]);
+        // Two reads of the clock, as for a decision that leaves.
+        assert_eq!(bed.script.readers.lock().len(), 2);
+    }
+
+    /// The fence is judged behind the lease's issue too: a word that closes
+    /// it while a stage's issue call runs stops the answer, and the lease
+    /// filed for it is given up as abandoned.
+    #[tokio::test]
+    async fn a_fence_closed_by_a_word_inside_a_stages_issue_call_stops_the_answer_and_its_lease() {
+        let (mut bed, told, at_issue, word) = waiting();
+        assert_eq!(bed.submit(frame(1, 1)), None);
+        at_issue
+            .recv_timeout(PATIENCE)
+            .expect("the stage's issue call");
+        // The candidate gives the lead up while the call runs. A successor
+        // takes at once on that word: no answer made under the term leaves
+        // after it.
+        assert!(bed.elector.release().expect("the release"));
+        word.send(()).expect("the stage waits for the case");
+        let answer = bed.answer().await;
+        assert_eq!(busy(&answer), Reason::NotLeader);
+        assert_eq!(bed.counts.outlasted.load(Ordering::Relaxed), 0);
+        assert_eq!(bed.store.live(GATEWAY), 0);
+        let (id, abandoned) = (1 << 32 | 1, Some(ReleaseReason::Abandoned));
+        assert_eq!(*told.lock(), [(id, None), (id, abandoned)]);
+    }
+
+    /// A lease another hand ended while its decision ran is not the
+    /// decision's to tell of: the give-up finds none on file, and the
+    /// engine hears the issue alone.
+    #[tokio::test]
+    async fn a_lease_another_hand_ended_is_told_nothing_at_the_give_up() {
+        let (mut bed, told, at_issue, word) = waiting();
+        assert_eq!(bed.submit(frame(1, 1)), None);
+        at_issue
+            .recv_timeout(PATIENCE)
+            .expect("the stage's issue call");
+        // Its gateway gives the lease up while the stage's call runs.
+        let id = LeaseId(1 << 32 | 1);
+        let store: &dyn LeasesStore = bed.store.as_ref();
+        assert!(store.released(GATEWAY, id, None, ReleaseReason::ClientGone));
+        bed.script.steps.lock().push_back(Step::At(BUDGET));
+        word.send(()).expect("the stage waits for the case");
+        let answer = bed.answer().await;
+        assert_eq!(busy(&answer), Reason::BudgetGoneOnArrival);
+        assert_eq!(*told.lock(), [(id.0, None)]);
+    }
+
+    /// A lease's dispatch span counts from its decision's first read, and
+    /// its answer says what is left of the span at the last. A decision
+    /// inside its budget that leaves under a millisecond of the span has no
+    /// lease to hand over: it leaves as `Busy`, late, its lease given up.
+    /// One with no lease has no span to end, and leaves.
+    #[tokio::test]
+    async fn a_slow_decisions_lease_says_what_is_left_of_its_span_and_none_left_is_no_answer() {
+        // A budget of twice the span: the span ends first.
+        let slow = |id: u8| budgeted(frame(id, 1), DISPATCH_TTL * 2);
+        let (mut bed, told, at_issue, word) = waiting();
+        let id = |count: u64| 1 << 32 | count;
+        // The first decision's stage leaves a millisecond of the span.
+        let first = DISPATCH_TTL - Duration::from_millis(1);
+        assert_eq!(bed.submit(slow(1)), None);
+        at_issue
+            .recv_timeout(PATIENCE)
+            .expect("the stage's issue call");
+        bed.script.steps.lock().push_back(Step::At(first));
+        word.send(()).expect("the stage waits for the case");
+        let answer = bed.answer().await;
+        assert_eq!(lease_of(&answer).dispatch_ttl_ms, 1);
+        let store: &dyn LeasesStore = bed.store.as_ref();
+        let filed = store.get(GATEWAY, LeaseId(id(1)));
+        let filed = filed.expect("the lease is on file");
+        assert_eq!(filed.dispatch_deadline, bed.script.taken + DISPATCH_TTL);
+        // The second is taken where the first left the clock, and its
+        // stage leaves under a millisecond of the span, half its budget.
+        let second = first + DISPATCH_TTL - Duration::from_micros(999);
+        assert_eq!(bed.submit_at(slow(2), GATEWAY, first), None);
+        at_issue
+            .recv_timeout(PATIENCE)
+            .expect("the stage's issue call");
+        bed.script.steps.lock().push_back(Step::At(second));
+        word.send(()).expect("the stage waits for the case");
+        let answer = bed.answer().await;
+        assert_eq!(busy(&answer), Reason::BudgetGoneOnArrival);
+        assert_eq!(bed.counts.outlasted.load(Ordering::Relaxed), 1);
+        // A third of the same length, which the wires shed: no lease, so
+        // no span to end, and it leaves as its shed.
+        let third = second + DISPATCH_TTL - Duration::from_micros(999);
+        let reads = [second, third].map(Step::At);
+        bed.script.steps.lock().extend(reads);
+        let wireless = constrained(slow(3), 0b010, None);
+        assert_eq!(bed.submit_at(wireless, GATEWAY, second), None);
+        let shed = declined(proto::ShedReason::NoEndpoints, "wires");
+        assert_eq!(outcome(&bed.answer().await), &shed);
+        assert_eq!(bed.counts.outlasted.load(Ordering::Relaxed), 1);
+        let late = (id(2), Some(ReleaseReason::LateDecision));
+        assert_eq!(*told.lock(), [(id(1), None), (id(2), None), late]);
+        assert_eq!(bed.store.live(GATEWAY), 1, "the first decision's lease");
+    }
+
+    #[tokio::test]
+    async fn the_engine_that_decided_is_told_of_a_lease_and_of_its_end_at_the_dispatch_deadline() {
+        let told = Arc::new(Mutex::new(Vec::new()));
+        let kept = Arc::clone(&told);
+        let mut catalog = Catalog::builtin();
+        catalog
+            .picker("told", move || Box::new(Told(Arc::clone(&kept))))
+            .expect("a free name");
+        let mut document = PolicySpec::preset("random").expect("a preset of this build");
+        let profile = document.profiles.get_mut("random");
+        profile.expect("the preset's profile").pick = "told".into();
+        let digest = document.digest().expect("the document digests");
+        let spec = AppliedSpec::validate_digested(&document, digest, &catalog)
+            .expect("the catalog holds the stage");
+        let mut bed = bed(Some(spec), true, (2, 8), []);
+        let id = |count: u64| 1 << 32 | count;
+        // Two leases at the take, the second dispatched.
+        for request in 1..=2 {
+            bed.ask(frame(request, 1)).await;
+        }
+        let store: &dyn LeasesStore = bed.store.as_ref();
+        assert!(store.dispatched(
+            GATEWAY,
+            LeaseId(id(2)),
+            Dispatch::default(),
+            bed.script.taken
+        ));
+        assert_eq!(*told.lock(), [(id(1), None), (id(2), None)]);
+        // A decision past the dispatch deadline ends the first as
+        // abandoned, and its engine is told; the dispatched lease stands.
+        let late = DISPATCH_TTL + Duration::from_secs(1);
+        bed.script.steps.lock().push_back(Step::At(late));
+        assert_eq!(bed.submit_at(frame(3, 1), GATEWAY, late), None);
+        bed.answer().await;
+        let abandoned = (id(1), Some(ReleaseReason::Abandoned));
+        assert_eq!(told.lock()[2..], [(id(3), None), abandoned]);
+        let store: &dyn LeasesStore = bed.store.as_ref();
+        assert_eq!(store.get(GATEWAY, LeaseId(id(1))), None);
+        assert_eq!(store.live(GATEWAY), 2);
+    }
+
+    /// An abandoned lease is told to the engine whose generation issued it
+    /// and to no later one: a later generation's stages never saw the
+    /// issue. The lease is ended all the same.
+    #[tokio::test]
+    async fn a_later_generations_engine_is_not_told_of_a_lease_it_did_not_issue() {
+        let told = Arc::new(Mutex::new(Vec::new()));
+        let kept = Arc::clone(&told);
+        let mut catalog = Catalog::builtin();
+        catalog
+            .picker("told", move || Box::new(Told(Arc::clone(&kept))))
+            .expect("a free name");
+        let spec = |generation: u64| {
+            let mut document = PolicySpec::preset("random").expect("a preset of this build");
+            document.generation = generation;
+            let profile = document.profiles.get_mut("random");
+            profile.expect("the preset's profile").pick = "told".into();
+            let digest = document.digest().expect("the document digests");
+            AppliedSpec::validate_digested(&document, digest, &catalog)
+                .expect("the catalog holds the stage")
+        };
+        let mut bed = bed(Some(spec(1)), true, (2, 8), []);
+        let id = |count: u64| 1 << 32 | count;
+        bed.ask(frame(1, 1)).await;
+        // The next generation stands when the first lease's deadline is
+        // past: its engine is told of its own issue and of nothing else.
+        bed.store.apply(spec(2)).expect("a later generation");
+        let late = DISPATCH_TTL + Duration::from_secs(1);
+        bed.script.steps.lock().push_back(Step::At(late));
+        assert_eq!(bed.submit_at(frame(2, 1), GATEWAY, late), None);
+        bed.answer().await;
+        assert_eq!(*told.lock(), [(id(1), None), (id(2), None)]);
+        let store: &dyn LeasesStore = bed.store.as_ref();
+        assert_eq!(store.get(GATEWAY, LeaseId(id(1))), None);
+        assert_eq!(store.live(GATEWAY), 1);
+    }
+
+    /// The `random` picker, keeping each row's requests in flight as every
+    /// decision handed them, under a count it declares or does not.
+    #[derive(Debug)]
+    struct Seen {
+        declares: bool,
+        rows: Arc<Mutex<Vec<Vec<u32>>>>,
+    }
+
+    impl Lifecycle for Seen {}
+
+    impl Picker for Seen {
+        fn name(&self) -> &'static str {
+            "seen"
+        }
+
+        fn pick(
+            &self,
+            facts: &RequestFacts<'_>,
+            candidates: &[Candidate],
+            kept: &[u32],
+            scores: &[f32],
+            band: TieBand,
+            out: &mut Targets,
+        ) {
+            let counts = candidates.iter().map(|row| row.in_flight);
+            self.rows.lock().push(counts.collect());
+            Random.pick(facts, candidates, kept, scores, band, out);
+        }
+
+        fn needs(&self) -> crate::Needs {
+            crate::Needs {
+                in_flight: self.declares,
+                ..crate::Needs::default()
+            }
+        }
+    }
+
+    /// The count is a declared need: a profile with a stage that declares a
+    /// worker's requests in flight is handed rows that read the leases on
+    /// file, and a profile that declares none is handed rows that read the
+    /// publication's zero, whatever stands on file.
+    #[tokio::test]
+    async fn a_decision_reads_the_leases_count_where_its_profile_declares_it_and_nowhere_else() {
+        for declares in [true, false] {
+            let rows = Arc::new(Mutex::new(Vec::new()));
+            let kept = Arc::clone(&rows);
+            let mut catalog = Catalog::builtin();
+            let seen = move || -> Box<dyn Picker> {
+                let rows = Arc::clone(&kept);
+                Box::new(Seen { declares, rows })
+            };
+            catalog.picker("seen", seen).expect("a free name");
+            let mut document = PolicySpec::preset("random").expect("a preset of this build");
+            let profile = document.profiles.get_mut("random");
+            profile.expect("the preset's profile").pick = "seen".into();
+            let digest = document.digest().expect("the document digests");
+            let spec = AppliedSpec::validate_digested(&document, digest, &catalog)
+                .expect("the catalog holds the stage");
+            let mut bed = bed(Some(spec), true, (2, 8), []);
+            // Three decisions and no word from their gateway: three leases
+            // stand on file when the fourth is made.
+            for request in 1..=4u8 {
+                bed.ask(frame(request, u64::from(request))).await;
+            }
+            let rows = rows.lock();
+            let on_file: u32 = rows[3].iter().sum();
+            assert_eq!(on_file, if declares { 3 } else { 0 }, "{rows:?}");
         }
     }
 
@@ -1342,6 +2469,8 @@ pub(crate) mod tests {
         assert!(bed.elector.release().expect("the release"));
         let tick = bed.elector.tick(bed.script.taken).expect("the take");
         assert_eq!(tick, Tick::Acquired { term: 2 });
+        // The election's report tells the store the term of each take.
+        bed.store.set_term(2);
         release.send(()).expect("the decider waits for the case");
         let answer = bed.answer().await;
         assert_eq!((busy(&answer), answer.term), (Reason::NotLeader, 2));
@@ -1376,6 +2505,7 @@ pub(crate) mod tests {
             queues: Box::new([queue]),
             told: Arc::new(watch::Sender::new(false)),
             reads: reads.clone(),
+            mark: Arc::default(),
         }
     }
 
@@ -1428,6 +2558,183 @@ pub(crate) mod tests {
         );
     }
 
+    /// A request that states nothing of its gateway reads the rows where
+    /// their publication left them, and the decider's buffers take no row.
+    /// One that states wires, or a hint of 0, is handed rows written into
+    /// those buffers, which its narrowing cuts. No decider's facts pin a
+    /// row.
+    #[test]
+    fn a_request_that_states_nothing_of_its_gateway_reads_the_published_rows() {
+        const SPOKEN: &str = "model-http";
+        let store = MemoryStore::new();
+        ready(&store, "h0", SPOKEN, Role::Single, WireModes::HTTP);
+        ready(&store, "g0", SPOKEN, Role::Single, WireModes::GRPC);
+        // The rows the engine is handed, and the rows written into the
+        // decider's buffers for them.
+        let read = |frame: proto::DecideRequest| {
+            let request = checked(frame);
+            let now = Instant::now();
+            let taken = Taken::at(&request, GATEWAY, now, now).expect("budget is left");
+            let mut buffers = Buffers::default();
+            let handed = store.deciding(|world| {
+                hand(
+                    world,
+                    &taken,
+                    &mut buffers,
+                    &AtomicU64::new(0),
+                    |facts, _, rows, _, _| {
+                        assert_eq!(facts.pinned_at, 0);
+                        rows.len()
+                    },
+                )
+                .0
+            });
+            (handed, buffers.view.candidates.len())
+        };
+        let plain = frame_for(SPOKEN, 1, 1);
+        assert_eq!(read(plain), (2, 0), "no constraints: lent");
+        let hinted = constrained(frame_for(SPOKEN, 2, 2), 0, Some(7));
+        assert_eq!(read(hinted), (2, 0), "a positive hint: lent");
+        let wired = constrained(frame_for(SPOKEN, 3, 3), 0b001, None);
+        assert_eq!(read(wired), (1, 1), "wires: written and cut");
+        let both = constrained(frame_for(SPOKEN, 4, 4), 0b011, None);
+        assert_eq!(read(both), (2, 2), "wires that cut none: written");
+        let none = constrained(frame_for(SPOKEN, 5, 5), 0, Some(0));
+        assert_eq!(read(none), (0, 0), "a hint of 0");
+    }
+
+    /// A profile that shows its rows to a plugin is handed rows the door
+    /// wrote for it, under a veto of its gateway as under none: the vetoed
+    /// row carries its own bit, no mask stands beside the rows, and the
+    /// engine decides where it declines lent rows.
+    #[test]
+    fn a_profile_that_shows_its_rows_is_handed_written_rows_and_decides_under_a_veto() {
+        #[derive(Debug)]
+        struct Shown;
+
+        impl Lifecycle for Shown {}
+
+        impl DecisionScope for Shown {
+            fn open(&self, _: &RequestFacts<'_>, _: &[Candidate], _: &PoolFacts<'_>) {}
+
+            fn close(&self) {}
+        }
+
+        impl Filter for Shown {
+            fn name(&self) -> &'static str {
+                "shown"
+            }
+
+            fn keep(&self, _: &RequestFacts<'_>, _: &Candidate, _: &Constraints<'_>) -> bool {
+                true
+            }
+
+            fn scope(&self) -> Option<&dyn DecisionScope> {
+                Some(self)
+            }
+        }
+
+        let mut catalog = Catalog::builtin();
+        catalog
+            .filter("shown", || Box::new(Shown))
+            .expect("a free name");
+        let mut document = PolicySpec::preset("random").expect("a preset of this build");
+        document.generation = 1;
+        for profile in document.profiles.values_mut() {
+            profile.filter.push("shown".to_string());
+        }
+        let digest = document.digest().expect("the document digests");
+        let spec = AppliedSpec::validate_digested(&document, digest, &catalog)
+            .expect("the catalog holds every stage the document names");
+        let store = MemoryStore::new();
+        let (mut singles, _) = fleet(&store);
+        singles.sort_unstable();
+        store.apply(spec).expect("above the unbound start");
+        let taken = Instant::now();
+        let now = taken + Duration::from_secs(3);
+        // The rows whose own bit says stalled, the mask's length, whether
+        // the engine picked, and the rows written into the decider's
+        // buffers.
+        let decided = || {
+            let request = checked(frame(1, 1));
+            let taken = Taken::at(&request, GATEWAY, now, now).expect("budget is left");
+            let mut buffers = Buffers::default();
+            let (stalled, masked, picked) = store.deciding(|world| {
+                hand(
+                    world,
+                    &taken,
+                    &mut buffers,
+                    &AtomicU64::new(0),
+                    |facts, pool, rows, cx, scratch| {
+                        let stalled: Vec<WorkerId> = rows
+                            .iter()
+                            .filter(|row| row.health.stalled)
+                            .map(|row| row.id)
+                            .collect();
+                        let engine = world.spec().engine();
+                        let decision = engine.decide(facts, pool, rows, cx, scratch);
+                        (stalled, cx.stalled.len(), decision.pick().is_some())
+                    },
+                )
+                .0
+            });
+            (stalled, masked, picked, buffers.view.candidates.len())
+        };
+        assert_eq!(decided(), (Vec::new(), 0, true, 3), "no veto");
+        let vetoed = singles[1];
+        store.gateway_veto(GATEWAY, vetoed, Some(taken + Duration::from_secs(60)));
+        assert_eq!(decided(), (vec![vetoed], 0, true, 3), "a veto");
+    }
+
+    /// Rows written for a request that states its wires carry the leases'
+    /// count for a profile that declares it and none for a profile that
+    /// does not: a fact a decision may not read is not written into its
+    /// rows.
+    #[test]
+    fn rows_written_for_a_request_carry_the_count_its_profile_declares_alone() {
+        const SPOKEN: &str = "model-http";
+        for (name, declares) in [("random", false), ("least_load", true)] {
+            let store = MemoryStore::new();
+            store
+                .apply(preset(name, 1))
+                .expect("above the unbound start");
+            let member = ready(&store, "h0", SPOKEN, Role::Single, WireModes::HTTP);
+            let leases: &dyn LeasesStore = &store;
+            leases.set_term(1);
+            let now = Instant::now();
+            let filed = leases.issue(crate::store::LeaseRecord {
+                lease: Lease {
+                    id: LeaseId(1 << 63 | 1),
+                    ..Lease::default()
+                },
+                gateway: GATEWAY,
+                request: 1,
+                target: member,
+                picked: crate::store::Picked::default(),
+                decode: None,
+                term: 1,
+                issued_at: now,
+                dispatch_deadline: now + DISPATCH_TTL,
+                state: LeaseState::Issued,
+            });
+            assert_eq!(filed, Ok(()));
+            let request = checked(constrained(frame_for(SPOKEN, 1, 1), 0b001, None));
+            let taken = Taken::at(&request, GATEWAY, now, now).expect("budget is left");
+            let mut buffers = Buffers::default();
+            let counts = store.deciding(|world| {
+                hand(
+                    world,
+                    &taken,
+                    &mut buffers,
+                    &AtomicU64::new(0),
+                    |_, _, rows, _, _| rows.iter().map(|row| row.in_flight).collect::<Vec<_>>(),
+                )
+                .0
+            });
+            assert_eq!(counts, [u32::from(declares)], "{name}");
+        }
+    }
+
     /// What the engine is handed for one request, copied out of the
     /// hand-over.
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1436,6 +2743,9 @@ pub(crate) mod tests {
         budget_micros: u32,
         /// The affinity column's length.
         column: usize,
+        /// The rows named in the column's place: how many holders and how
+        /// many warming rows, where the request carries any list.
+        named: Option<(usize, usize)>,
         candidates: Vec<WorkerId>,
         stalled: Vec<WorkerId>,
         /// The pool's size and its generation.
@@ -1462,19 +2772,26 @@ pub(crate) mod tests {
                 &taken,
                 &mut buffers,
                 &AtomicU64::new(0),
-                |facts, pool, rows, _, _| Handed {
+                |facts, pool, rows, cx, _| Handed {
                     now_micros: facts.now_micros,
                     budget_micros: facts.budget_micros,
                     column: facts.affinity.len(),
+                    named: facts
+                        .named
+                        .map(|named| (named.holders.len(), named.warming.len())),
                     candidates: rows.iter().map(|row| row.id).collect(),
+                    // By the row's own bit where the rows were written, and
+                    // by the mask beside them where they were lent.
                     stalled: rows
                         .iter()
-                        .filter(|row| row.health.stalled)
-                        .map(|row| row.id)
+                        .zip(0..)
+                        .filter(|(row, at)| row.health.stalled || cx.masks(*at))
+                        .map(|(row, _)| row.id)
                         .collect(),
                     pool: (pool.pool_size, pool.generation),
                 },
             )
+            .0
         })
     }
 
@@ -1493,6 +2810,7 @@ pub(crate) mod tests {
             now_micros: store.micros(now),
             budget_micros: 1_234,
             column: 0,
+            named: None,
             candidates: singles.clone(),
             stalled: Vec::new(),
             pool: (3, 1),
@@ -1537,13 +2855,367 @@ pub(crate) mod tests {
         let frame_nobody = frame_for("model-nobody-serves", 1, 1);
         assert_eq!(handed(&store, frame_nobody, GATEWAY, now), nobody);
 
-        // A profile that declares the affinity column is handed one entry
-        // a candidate, and no other profile is.
+        // A profile whose picker takes a sample is handed the rows the
+        // store names in the column's place, and no column. Here no row
+        // holds a block and the three, admitted together, are all young:
+        // nobody is named.
         store
             .apply(preset("cache_aware", 2))
             .expect("above the standing one");
+        let named = handed(&store, frame(1, 1), OTHER, now);
+        assert_eq!(
+            (named.column, named.named, named.pool),
+            (0, Some((0, 0)), (3, 2))
+        );
+        // A profile that declares the column and takes no sample is handed
+        // one entry a candidate, and no other profile is.
+        let mut document = PolicySpec::preset("cache_aware").expect("a preset of this build");
+        document.generation = 3;
+        for profile in document.profiles.values_mut() {
+            profile.pick = "best".into();
+        }
+        store
+            .apply(applied(&document))
+            .expect("above the standing one");
         let column = handed(&store, frame(1, 1), OTHER, now);
-        assert_eq!((column.column, column.pool), (3, (3, 2)));
+        assert_eq!(
+            (column.column, column.named, column.pool),
+            (3, None, (3, 3))
+        );
+    }
+
+    /// A member of `role` whose signals ask for events, holding the chain
+    /// of `contents`.
+    fn holding(store: &MemoryStore, name: &str, role: Role, wires: WireModes, contents: &[u64]) {
+        let facts = WorkerFacts {
+            role,
+            wire_modes: wires,
+            ..WorkerFacts::default()
+        };
+        held_by(store, name, facts, contents);
+    }
+
+    /// A member of the role, the wires and the reach of `facts` whose
+    /// signals ask for events, holding the chain of `contents`: its id.
+    fn held_by(store: &MemoryStore, name: &str, facts: WorkerFacts, contents: &[u64]) -> WorkerId {
+        use kv_index::chain_prefix_hash;
+
+        use crate::store::{
+            BatchFacts, BatchOutcome, ContentHash, KvEvent, KvEventSink, SequenceHash, Signals,
+            StoredBlock,
+        };
+
+        let facts = WorkerFacts {
+            key: name.to_owned(),
+            engine: name.to_owned(),
+            incarnation: 1,
+            models: vec![MODEL.to_owned()],
+            dp_size: 1,
+            signals: Signals {
+                events: true,
+                ..Signals::default()
+            },
+            ..facts
+        };
+        let id = store.upsert(facts).id();
+        let mut blocks: Vec<StoredBlock> = Vec::with_capacity(contents.len());
+        for &content in contents {
+            let seq_hash = match blocks.last() {
+                Some(parent) => chain_prefix_hash(parent.seq_hash, ContentHash(content)),
+                None => SequenceHash(content),
+            };
+            blocks.push(StoredBlock {
+                seq_hash,
+                content_hash: ContentHash(content),
+            });
+        }
+        let batch = BatchFacts {
+            sequence: 1,
+            ..BatchFacts::default()
+        };
+        let events = [KvEvent::Stored {
+            parent: None,
+            blocks,
+        }];
+        assert_eq!(store.admit(id, 0, batch, &events), BatchOutcome::Applied);
+        id
+    }
+
+    /// The hand names for the gateway its request came from: a holder
+    /// behind the asking gateway's own socket is named, and one behind
+    /// another gateway's is no row of its view.
+    #[test]
+    fn the_hand_names_for_the_gateway_its_request_came_from() {
+        use crate::store::Reachability;
+
+        let store = MemoryStore::new();
+        store
+            .apply(preset("cache_aware", 1))
+            .expect("above the unbound start");
+        let member = |name: &str, reach: Reachability, contents: &[u64]| {
+            let facts = WorkerFacts {
+                reachable_from: reach,
+                ..WorkerFacts::default()
+            };
+            held_by(&store, name, facts, contents)
+        };
+        // Three members hold the request's block: one every gateway dials
+        // and one behind each of two gateways' sockets. A fourth holds
+        // another block, so the head is not the whole pool's.
+        let any = member("any", Reachability::Any, &[1]);
+        let mine = member("mine", Reachability::Gateway(GATEWAY), &[1]);
+        let theirs = member("theirs", Reachability::Gateway(OTHER), &[1]);
+        member("cold", Reachability::Any, &[9]);
+        let holders = |gateway: GatewayId| {
+            let mut frame = frame(1, 7);
+            let facts = frame.facts.as_mut().expect("the case's frame has facts");
+            facts.block_hashes = vec![1];
+            facts.hash_kind = proto::HashKind::Text.into();
+            let request = checked(frame);
+            let now = Instant::now() + Duration::from_secs(3);
+            let taken = Taken::at(&request, gateway, now, now).expect("budget is left");
+            let mut buffers = Buffers::default();
+            store.deciding(|world| {
+                let none = AtomicU64::new(0);
+                hand(
+                    world,
+                    &taken,
+                    &mut buffers,
+                    &none,
+                    |facts, _, rows, _, _| {
+                        let named = facts.named.expect("a sampling profile names its rows");
+                        let holders = named.holders.iter();
+                        let mut ids: Vec<WorkerId> =
+                            holders.map(|holder| rows[holder.row as usize].id).collect();
+                        ids.sort_unstable();
+                        ids
+                    },
+                )
+                .0
+            })
+        };
+        let sorted = |mut ids: Vec<WorkerId>| {
+            ids.sort_unstable();
+            ids
+        };
+        assert_eq!(holders(GATEWAY), sorted(vec![any, mine]));
+        assert_eq!(holders(OTHER), sorted(vec![any, theirs]));
+    }
+
+    /// The rows a decider's hand names are the store's own naming of the
+    /// request: by the frame's first hashes up to the generation's cap, its
+    /// seed, the sample of its profile's picker as the cap, its gateway's
+    /// wires, and the instant its view was built at. Each is read off a
+    /// fleet where it moves the rows named.
+    #[test]
+    fn the_hand_names_a_requests_rows_by_the_frames_own_facts() {
+        use std::collections::BTreeSet;
+
+        use crate::{
+            store::{Named, Naming},
+            view::NamedAffinity,
+        };
+
+        /// The lists by worker: the holders with their depths, the warming
+        /// rows, the bit.
+        fn lists(
+            named: &NamedAffinity<'_>,
+            rows: &[Candidate],
+        ) -> (Vec<(WorkerId, u32)>, Vec<WorkerId>, bool) {
+            let id = |row: u32| rows[row as usize].id;
+            let holders = named.holders.iter();
+            (
+                holders
+                    .map(|holder| (id(holder.row), holder.overlap_blocks))
+                    .collect(),
+                named.warming.iter().map(|&row| id(row)).collect(),
+                named.thin,
+            )
+        }
+
+        let store = MemoryStore::new();
+        // The sampling preset, its view cut at two block hashes.
+        let mut document = PolicySpec::preset("cache_aware").expect("a preset of this build");
+        document.generation = 1;
+        document.view.max_block_hashes = 2;
+        store
+            .apply(applied(&document))
+            .expect("above the unbound start");
+        let member = |name: &str, wires: WireModes, contents: &[u64]| {
+            holding(&store, name, Role::Single, wires, contents);
+        };
+        // One member past its first blocks, so the fleet is not all young;
+        // seventeen more that speak gRPC and two that speak HTTP alone, each
+        // holding the request's three blocks and young.
+        let both = WireModes::HTTP.union(WireModes::GRPC);
+        let filled: Vec<u64> = (1..=1_100).collect();
+        member("big", both, &filled);
+        for n in 0..17 {
+            member(&format!("g{n:02}"), both, &[1, 2, 3]);
+        }
+        for n in 0..2 {
+            member(&format!("h{n}"), WireModes::HTTP, &[1, 2, 3]);
+        }
+        // What the decider's hand gives the engine for a frame of three
+        // block hashes from a gateway that speaks gRPC alone.
+        let by_hand = |seed: u64, at: Instant| {
+            let mut frame = frame(1, seed);
+            let facts = frame.facts.as_mut().expect("the case's frame has facts");
+            facts.block_hashes = vec![1, 2, 3];
+            facts.hash_kind = proto::HashKind::Text.into();
+            let frame = constrained(frame, u32::from(WireModes::GRPC.bits()), None);
+            let request = checked(frame);
+            let taken = Taken::at(&request, GATEWAY, at, at).expect("budget is left");
+            let mut buffers = Buffers::default();
+            store.deciding(|world| {
+                let none = AtomicU64::new(0);
+                hand(
+                    world,
+                    &taken,
+                    &mut buffers,
+                    &none,
+                    |facts, _, rows, _, _| facts.named.map(|named| lists(&named, rows)),
+                )
+                .0
+            })
+        };
+        // What the store names for that request by its own door: the view
+        // built and narrowed as the decider narrows it, then named.
+        let by_store = |seed: u64, at: Instant| {
+            let mut view = ViewBuffers::default();
+            let mut named = Named::default();
+            store.deciding(|world| {
+                let ask = Ask {
+                    gateway: GATEWAY,
+                    now: at,
+                    pinned: None,
+                    affinity: false,
+                };
+                let built = world
+                    .build(MODEL, Role::Single, &ask, &mut view)
+                    .expect("the pool");
+                view.candidates
+                    .retain(|row| row.wire_modes.intersects(WireModes::GRPC));
+                let naming = Naming {
+                    gateway: GATEWAY,
+                    block_hashes: &[1, 2],
+                    seed,
+                    cap: 16,
+                    wires: Some(WireModes::GRPC),
+                    now_micros: built.now_micros,
+                };
+                world.name(MODEL, Role::Single, &naming, &view.candidates, &mut named);
+            });
+            lists(&named.affinity(), &view.candidates)
+        };
+        let taken = Instant::now();
+        let now = taken + Duration::from_secs(3);
+        // Eighteen holders the gateway dials under a cap of sixteen: the
+        // draw is the seed's, and the depth the generation's cap of hashes.
+        let mut drawn = BTreeSet::new();
+        for seed in 1..=8 {
+            let named = by_hand(seed, now).expect("a sampling profile names its rows");
+            assert_eq!(named, by_store(seed, now), "seed {seed}");
+            assert_eq!(named.0.len(), 16, "seed {seed}");
+            assert!(named.0.iter().all(|holder| holder.1 == 2), "seed {seed}");
+            assert!(!named.1.is_empty(), "the young rows warm: seed {seed}");
+            drawn.insert(named.0);
+        }
+        assert!(drawn.len() > 1, "each seed draws its own sixteen");
+        // Sixty-one seconds on, with no window published between, the young
+        // rows' namings are over.
+        let later = taken + Duration::from_secs(61);
+        let named = by_hand(1, later).expect("a sampling profile names its rows");
+        assert_eq!(named, by_store(1, later));
+        assert!(named.1.is_empty());
+    }
+
+    /// A decode decision of a model that also pairs is decided by its own
+    /// profile, and the hand reads that profile's sample: it caps the rows
+    /// it names by it, and a profile that takes none keeps its column. So
+    /// does one whose own stages read no column, and one whose warm-up
+    /// stages rule by different numbers. The needs of its workers' stream
+    /// carry the pair's decode side, which reads the column and samples
+    /// sixteen here.
+    #[test]
+    fn the_hand_caps_the_rows_it_names_by_the_profile_that_decides() {
+        use crate::Phase;
+
+        // What the hand gives a decode request asked alone under `pick`:
+        // the holders named with the rows handed, and the column's length.
+        let handed = |score: &str, pick: &str, (own, named, ruled): (u32, u32, bool)| {
+            let document: PolicySpec = serde_json::from_str(&format!(
+                r#"{{
+                  "apiVersion": "smg.policy/v1",
+                  "generation": 1,
+                  "profiles": {{
+                    "alone": {{ "score": [{score}], "pick": {pick} }},
+                    "wide": {{ "score": ["prefix-affinity"], "pick": {{ "best": {{ "sample": 16 }} }} }}
+                  }},
+                  "bindings": [
+                    {{ "match": {{ "phase": ["decode"] }}, "profile": "alone" }},
+                    {{ "plan": "pd-pair", "profiles": {{ "prefill": "wide", "decode": "wide" }} }}
+                  ]
+                }}"#
+            ))
+            .expect("a document of this build");
+            let store = MemoryStore::new();
+            store
+                .apply(applied(&document))
+                .expect("above the unbound start");
+            store.deciding(|world| {
+                let engine = world.spec().engine();
+                assert_eq!(engine.needs_for(MODEL, Phase::Decode).sample, 16);
+                assert_eq!(engine.sample_for(MODEL, Phase::Decode), own);
+                assert_eq!(engine.named_for(MODEL, Phase::Decode), named);
+                let rule = engine.warm_rule_for(MODEL, Phase::Decode);
+                assert_eq!(rule.is_some(), ruled);
+            });
+            // Twenty decode members hold the request's one block.
+            for n in 0..20 {
+                let name = format!("d{n:02}");
+                holding(&store, &name, Role::Decode, WireModes::NONE, &[1]);
+            }
+            let mut frame = phased(frame(1, 7), proto::Phase::Decode);
+            let facts = frame.facts.as_mut().expect("the case's frame has facts");
+            facts.block_hashes = vec![1];
+            facts.hash_kind = proto::HashKind::Text.into();
+            let request = checked(frame);
+            let now = Instant::now() + Duration::from_secs(3);
+            let taken = Taken::at(&request, GATEWAY, now, now).expect("budget is left");
+            let mut buffers = Buffers::default();
+            store.deciding(|world| {
+                let none = AtomicU64::new(0);
+                hand(
+                    world,
+                    &taken,
+                    &mut buffers,
+                    &none,
+                    |facts, _, rows, _, _| {
+                        let named = facts.named.map(|named| (named.holders.len(), rows.len()));
+                        (named, facts.affinity.len())
+                    },
+                )
+                .0
+            })
+        };
+        // A sample of four names four of the twenty holders, and no column.
+        let affinity = r#""prefix-affinity""#;
+        let four = r#"{ "best": { "sample": 4 } }"#;
+        assert_eq!(handed(affinity, four, (4, 4, false)), (Some((4, 20)), 0));
+        // No sample: the column, an entry a row, and no row named. Lists
+        // capped at the pair's sample would hide holders from its pass.
+        assert_eq!(handed(affinity, r#""best""#, (0, 0, false)), (None, 20));
+        // A sample and no stage of its own that reads the column: the
+        // pair's needs alone ask for it, and the profile is named no row.
+        assert_eq!(handed(r#""least-load""#, four, (4, 0, false)), (None, 20));
+        // One warm-up ruling names. Two that rule by different numbers do
+        // not: a pool's warming rows are named by one ruling, which is none
+        // for such a profile, and over the column each stage rules for itself.
+        let one = r#"{ "warmup-slice": { "secs": 30 } }, "prefix-affinity""#;
+        assert_eq!(handed(one, four, (4, 4, true)), (Some((4, 20)), 0));
+        let two = r#"{ "warmup-slice": { "secs": 30 } }, { "warmup-slice": { "secs": 90 } }"#;
+        assert_eq!(handed(two, four, (4, 0, false)), (None, 20));
     }
 
     #[tokio::test]
@@ -1753,6 +3425,8 @@ pub(crate) mod tests {
             buffers: Buffers::default(),
             faulted: false,
             index: 0,
+            marked: None,
+            mark: Arc::default(),
         };
         let lines = Logged::default();
         let writer = lines.clone();
@@ -1772,6 +3446,9 @@ pub(crate) mod tests {
                 decider.answer(checked(frame(id, 1)), GATEWAY, bed.script.taken)
             };
             for id in 1..=3 {
+                // The buffers hold something when the fault comes: a lent
+                // view writes nothing into them.
+                decider.buffers.view.candidates.reserve(1);
                 assert_eq!(busy(&ask(&mut decider, id)), Reason::Unspecified);
                 assert_eq!(
                     decider.buffers.view.candidates.capacity(),
@@ -1782,6 +3459,7 @@ pub(crate) mod tests {
             assert_eq!(written(), 1, "one line for the streak");
             // A decision that does not fault ends the streak and keeps its
             // buffers.
+            decider.buffers.view.candidates.reserve(1);
             let answer = ask(&mut decider, 4);
             assert!(bed.workers.contains(&picked(&answer)), "{answer:?}");
             assert!(decider.buffers.view.candidates.capacity() > 0);
@@ -1824,47 +3502,117 @@ pub(crate) mod tests {
         assert!(late.wait_for(|ended| *ended).await.is_ok());
     }
 
-    /// The engine is handed its generation's cap of a request's block
-    /// hashes, the first ones, and a request that carried more is counted.
+    /// A frame that carries `hashes` block hashes, `1` the first.
+    fn hashed(id: u8, hashes: u64) -> proto::DecideRequest {
+        let mut frame = frame(id, 1);
+        frame
+            .facts
+            .as_mut()
+            .expect("the case's frame has facts")
+            .block_hashes = (1..=hashes).collect();
+        frame
+    }
+
+    /// What the engine is handed of each frame's block hashes with
+    /// `applied` as the standing generation.
+    fn handed_hashes(applied: AppliedSpec, frames: Vec<proto::DecideRequest>) -> Vec<Vec<u64>> {
+        let bed = bed(Some(applied), true, (2, 8), []);
+        let now = bed.script.taken;
+        frames
+            .into_iter()
+            .map(|frame| {
+                let request = checked(frame);
+                let taken = Taken::at(&request, GATEWAY, now, now).expect("budget is left");
+                let mut buffers = Buffers::default();
+                bed.store.deciding(|world| {
+                    hand(
+                        world,
+                        &taken,
+                        &mut buffers,
+                        &AtomicU64::new(0),
+                        |facts, _, _, _, _| facts.block_hashes.to_vec(),
+                    )
+                    .0
+                })
+            })
+            .collect()
+    }
+
+    /// The engine is handed as many of a request's block hashes as its
+    /// generation reads of them, the first ones, and a request that carried
+    /// more is counted.
     #[tokio::test]
-    async fn the_block_hashes_past_the_generations_cap_are_cut_and_the_request_is_counted() {
-        let mut document = PolicySpec::preset("random").expect("a preset of this build");
-        document.generation = 1;
-        document.view.max_block_hashes = 4;
-        let mut bed = bed(Some(applied(&document)), true, (2, 8), []);
-        let hashed = |id, hashes: u64| {
-            let mut frame = frame(id, 1);
+    async fn the_block_hashes_past_what_the_generation_reads_are_cut_and_the_request_is_counted() {
+        let first = |count: u64| (1..=count).collect::<Vec<u64>>();
+        // A prefix key 256 tokens deep reads 16 blocks of 16 tokens. The
+        // blocks are the request's own: 32 of a request counted by 8, 4 of
+        // one counted by 64, and of a text 64 blocks of 16 characters.
+        let sized = |id, hashes, block_size| {
+            let mut frame = hashed(id, hashes);
             frame
                 .facts
                 .as_mut()
                 .expect("the case's frame has facts")
-                .block_hashes = (1..=hashes).collect();
+                .block_size = block_size;
             frame
         };
-        let now = bed.script.taken;
-        let read = |frame| {
-            let request = checked(frame);
-            let taken = Taken::at(&request, GATEWAY, now, now).expect("budget is left");
-            let mut buffers = Buffers::default();
-            bed.store.deciding(|world| {
-                hand(
-                    world,
-                    &taken,
-                    &mut buffers,
-                    &AtomicU64::new(0),
-                    |facts, _, _, _, _| facts.block_hashes.to_vec(),
-                )
-            })
-        };
-        assert_eq!(read(hashed(1, 6)), [1, 2, 3, 4]);
-        assert_eq!(read(hashed(2, 4)), [1, 2, 3, 4]);
-        assert_eq!(read(hashed(3, 2)), [1, 2]);
-        // Never refused: each is decided, and the one that was cut counted.
-        for (id, hashes) in [(4, 6), (5, 4), (6, 0)] {
-            let answer = bed.ask(hashed(id, hashes)).await;
-            assert!(bed.workers.contains(&picked(&answer)), "{answer:?}");
+        let mut text = hashed(6, 80);
+        text.facts
+            .as_mut()
+            .expect("the case's frame has facts")
+            .hash_kind = proto::HashKind::Text.into();
+        assert_eq!(
+            handed_hashes(
+                preset("prefix_hash", 1),
+                vec![
+                    hashed(1, 20),
+                    hashed(2, 16),
+                    hashed(3, 2),
+                    sized(4, 40, 8),
+                    sized(5, 10, 64),
+                    text,
+                ],
+            ),
+            [
+                first(16),
+                first(16),
+                first(2),
+                first(32),
+                first(4),
+                first(64)
+            ]
+        );
+        // A stage with no depth of its own reads to its view's cap.
+        let mut held = PolicySpec::preset("cache_aware").expect("a preset of this build");
+        held.generation = 1;
+        held.view.max_block_hashes = 4;
+        assert_eq!(
+            handed_hashes(
+                applied(&held),
+                vec![hashed(1, 6), hashed(2, 4), hashed(3, 2)]
+            ),
+            [first(4), first(4), first(2)]
+        );
+        // No stage of the random preset reads the hashes, and none are
+        // handed on.
+        assert_eq!(
+            handed_hashes(preset("random", 1), vec![hashed(1, 6)]),
+            [first(0)]
+        );
+        // Never refused: each request is decided, and each that carried
+        // more than its generation reads is counted.
+        let mut unread = leading([]);
+        for (id, hashes) in [(4, 6), (5, 1), (6, 0)] {
+            let answer = unread.ask(hashed(id, hashes)).await;
+            assert!(unread.workers.contains(&picked(&answer)), "{answer:?}");
         }
-        assert_eq!(bed.counts.hashes_cut(), 1);
+        assert_eq!(unread.counts.hashes_cut(), 2);
+        let mut keyed = bed(Some(preset("prefix_hash", 1)), true, (2, 8), []);
+        for (id, hashes) in [(7, 20), (8, 16)] {
+            let answer = keyed.ask(hashed(id, hashes)).await;
+            assert!(keyed.workers.contains(&picked(&answer)), "{answer:?}");
+        }
+        assert_eq!(keyed.counts.hashes_cut(), 1);
     }
 
     #[tokio::test]
@@ -1877,7 +3625,10 @@ pub(crate) mod tests {
         assert_eq!(answer.request_id, [1]);
         assert_eq!(bed.counts.faults.load(Ordering::Relaxed), 1);
         let frame = frame(2, 2);
-        assert_eq!(bed.ask(frame.clone()).await, bed.engines(&frame, 1));
+        assert_eq!(
+            unleased(bed.ask(frame.clone()).await),
+            bed.engines(&frame, 1)
+        );
     }
 
     /// A panic's payload can panic at its own drop. The decider frees it
@@ -1892,7 +3643,10 @@ pub(crate) mod tests {
         assert_eq!((busy(&answer), answer.term), (Reason::Unspecified, 1));
         assert_eq!(bed.counts.faults.load(Ordering::Relaxed), 1);
         let frame = frame(2, 2);
-        assert_eq!(bed.ask(frame.clone()).await, bed.engines(&frame, 1));
+        assert_eq!(
+            unleased(bed.ask(frame.clone()).await),
+            bed.engines(&frame, 1)
+        );
         assert!(!*ended.borrow(), "the thread stands");
     }
 
@@ -2110,35 +3864,38 @@ pub(crate) mod tests {
     /// read the fence takes there and with no clock read more. A decision
     /// with a microsecond left leaves. One whose budget ended while it was
     /// made leaves as `Busy` under the reason a late arrival is told, and
-    /// is counted apart from one.
+    /// is counted apart from one. The case's budget is half the dispatch
+    /// span, so no lease's span ends where its decision's budget does.
     #[tokio::test]
     async fn a_decision_whose_budget_ended_while_it_was_made_leaves_as_busy_and_is_counted_apart() {
-        let short = BUDGET - Duration::from_micros(1);
-        let under = BUDGET - Duration::from_nanos(999);
+        let budget = DISPATCH_TTL / 2;
+        let halved = |id, seed| budgeted(frame(id, seed), budget);
+        let short = budget - Duration::from_micros(1);
+        let under = budget - Duration::from_nanos(999);
         let steps = [
             Duration::ZERO,
             short,
             Duration::ZERO,
             under,
             Duration::ZERO,
-            BUDGET,
-            BUDGET,
+            budget,
+            budget,
         ]
         .map(Step::At);
         let mut bed = leading(steps);
-        let answer = bed.ask(frame(1, 1)).await;
+        let answer = bed.ask(halved(1, 1)).await;
         assert!(bed.workers.contains(&picked(&answer)), "{answer:?}");
         assert_eq!(bed.counts.outlasted.load(Ordering::Relaxed), 0);
         // Under one microsecond left is gone, as where a request is taken.
         for (id, count) in [(2, 1), (3, 2)] {
-            let answer = bed.ask(frame(id, 2)).await;
+            let answer = bed.ask(halved(id, 2)).await;
             assert_eq!(busy(&answer), Reason::BudgetGoneOnArrival);
             assert_eq!((answer.request_id.as_slice(), answer.term), (&[id][..], 1));
             assert_eq!(bed.counts.outlasted.load(Ordering::Relaxed), count);
         }
         // A request that arrived late is told the same reason at its
         // decider's first read, and is none of the count.
-        let answer = bed.ask(frame(4, 4)).await;
+        let answer = bed.ask(halved(4, 4)).await;
         assert_eq!(busy(&answer), Reason::BudgetGoneOnArrival);
         assert_eq!(bed.counts.outlasted.load(Ordering::Relaxed), 2);
         assert_eq!(bed.script.readers.lock().len(), 7);

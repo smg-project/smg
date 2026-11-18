@@ -11,7 +11,7 @@ use wfaas::{
 
 use crate::{
     worker::{ConnectionMode, Worker},
-    workflow::data::WorkerRegistrationData,
+    workflow::data::{require_app_context, WorkerRegistrationData},
 };
 
 /// Final step in any worker registration workflow: flip Pending → Ready.
@@ -33,11 +33,7 @@ fn activation_status(worker: &Arc<dyn Worker>) -> Option<WorkerStatus> {
 #[async_trait]
 impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for ActivateWorkersStep {
     async fn execute(&self, context: &mut WorkflowContext<D>) -> WorkflowResult<StepResult> {
-        let app_context = context
-            .data
-            .get_app_context()
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?
-            .clone();
+        let app_context = require_app_context(context.data.get_app_context())?.clone();
 
         let workers = context
             .data

@@ -427,7 +427,8 @@ policyController:
     tag: ""
 
   # -- Replicas. With the election off every replica is a controller of its
-  #    own and two would each lead alone: the chart refuses more than one.
+  #    own and two would each lead alone: the chart refuses more than one,
+  #    and an upgrade tells the old pod to stop before it makes the new one.
   #    With it on, run two or more: one leads and the others stand by.
   replicas: 1
 
@@ -452,6 +453,55 @@ policyController:
   election:
     enabled: false
     leaseName: ""
+
+  # -- The policy spec document the controller runs, as a map: a document of
+  #    apiVersion smg.policy/v1. With the controller on it is required,
+  #    unless specStoreClaim names a spec store: the controller refuses a
+  #    start that names no source of its spec, and the chart refuses an
+  #    empty document at render. The chart writes it as the one key
+  #    spec.yaml of a ConfigMap under the controller's name, mounts that
+  #    whole and read-only at /etc/smg/policy-spec and passes --spec-file
+  #    /etc/smg/policy-spec/spec.yaml: the controller reads the file at its
+  #    start and watches it from then on. The chart reads no line of the
+  #    document and writes none: whether a document runs is the controller's
+  #    word.
+  #    A changed document moves no pod. The kubelet turns the mounted file,
+  #    and the running controller applies the document in place, or rejects
+  #    one that does not run and keeps the generation it runs. A document
+  #    that writes a generation line raises it at every change, a rollback's
+  #    too: the running controller refuses a line at or under the one it
+  #    runs, and a pod that starts takes it. A pod that starts on a document
+  #    that does not run refuses to start: dry-run a document before an
+  #    upgrade that moves the pods for another reason. With the election on
+  #    each pod watches its own mount: until the kubelets have turned both,
+  #    two pods hold two documents.
+  spec: {}
+
+  # -- A spec store in place of the document: the name of a
+  #    PersistentVolumeClaim of yours in the release's namespace, or empty,
+  #    the default, for the document above. Named, the chart renders no
+  #    ConfigMap, mounts the claim at /var/lib/smg/spec and passes
+  #    --spec-store on it: the controller starts on the newest generation on
+  #    file, and ApplyPolicySpec on the operators' listener writes each
+  #    applied generation there before it runs, the last eight kept. A store
+  #    with nothing on file starts ready and sheds every decision until its
+  #    first apply: smg_policy_spec_generation reads 0 until then.
+  #    The claim is yours and the chart renders none: a claim a release owns
+  #    goes with the release, and the generations on file are the only copy
+  #    of an applied document. It is ReadWriteOncePod where the cluster
+  #    offers that mode, else ReadWriteOnce, on a file system that links a
+  #    file under a second name, as the store's write does, and it holds
+  #    eight documents. One pod at a time opens the store: an upgrade
+  #    recreates the pod, the old one gone before the new one is made. A pod
+  #    replaced otherwise, after an eviction, may start while the old one
+  #    stops unless the claim is ReadWriteOncePod, and can then run a
+  #    generation the old pod has passed: see the README.
+  #    The chart refuses at render what the controller refuses at start
+  #    beside a store: a document in spec, since a start names one source of
+  #    its spec, and the election, since a standby does not follow an
+  #    applied generation yet. More than one replica is refused by the
+  #    chart's own rule: each would lead alone.
+  specStoreClaim: ""
 
   # -- The listeners' container ports, each passed as its --*-listen flag: the
   #    gateways and the relays (gateway), the operators (control), the standbys
@@ -525,11 +575,15 @@ policyController:
   # -- Security context of the controller container: the router's. The image
   #    built from docker/policy-controller.Dockerfile runs as UID 65532 and
   #    names it by number; for an image built with another user set
-  #    runAsUser as for the router. The controller writes no file, so the
-  #    read-only root filesystem needs no volume. With the controller on the
-  #    schema refuses a null here: to run with none, set each member to null.
-  #    Reused values hold no default under it: the map given there is the
-  #    whole context, and an empty one runs the container with none.
+  #    runAsUser as for the router. The controller writes no file but a spec
+  #    store's, on the store's own volume, so the read-only root filesystem
+  #    needs no volume. Beside a store the pod's fsGroup is this runAsUser:
+  #    the user the image runs as writes the claim. With runAsUser null no
+  #    group is named, and the claim must then be writable by the user the
+  #    container runs as. With the controller on the schema refuses a null
+  #    here: to run with none, set each member to null. Reused values hold
+  #    no default under it: the map given there is the whole context, and
+  #    an empty one runs the container with none.
   securityContext:
     readOnlyRootFilesystem: true
     runAsNonRoot: true

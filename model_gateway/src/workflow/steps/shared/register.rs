@@ -15,8 +15,12 @@ use wfaas::{
 use super::{pool_group, refresh_worker_pool_sizes, PoolGroups};
 use crate::{
     routers::{common::pd_admission, grpc::regular::symphony::telemetry},
-    worker::{health::bootstrap_probe, registry::WorkerId, Worker, WorkerRegistry},
-    workflow::data::{WorkerRegistrationData, WorkerRegistrationMode},
+    worker::{
+        health::bootstrap_probe,
+        registry::{worker_model_ids, WorkerId},
+        Worker, WorkerRegistry,
+    },
+    workflow::data::{require_app_context, WorkerRegistrationData, WorkerRegistrationMode},
 };
 
 /// Unified step to register workers in the registry.
@@ -217,11 +221,7 @@ pub(crate) mod registration_hold {
 #[async_trait]
 impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for RegisterWorkersStep {
     async fn execute(&self, context: &mut WorkflowContext<D>) -> WorkflowResult<StepResult> {
-        let app_context = context
-            .data
-            .get_app_context()
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?
-            .clone();
+        let app_context = require_app_context(context.data.get_app_context())?.clone();
 
         let workers = context
             .data
@@ -299,7 +299,7 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for RegisterWorke
             if has_retry_overrides {
                 let resolved = worker.resilience();
                 let retry_config = resolved.retry.clone();
-                for model_id in WorkerRegistry::worker_model_ids(worker) {
+                for model_id in worker_model_ids(worker) {
                     app_context.worker_registry.set_model_retry_config(
                         &model_id,
                         retry_config.clone(),

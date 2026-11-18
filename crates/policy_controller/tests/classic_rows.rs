@@ -11,19 +11,31 @@
 //! The sheets live beside this target, in `tests/classic/sheets`, with the
 //! notes on their rows, and each recorder is a test module of the gateway
 //! crate beside the code it runs. Every run of the suite with the `ingest`
-//! feature replays every row of every sheet. A few rows of each form are
-//! copied into the policy's module from its sheet as well, and the replay
-//! holds every copied row to the sheet's row of its name. A row's reports
-//! reach the view through that feature's row builder, so a bare test run
-//! of the crate builds no part of this target and replays no recorded row.
+//! feature replays every row of each sheet that has a module here. A few
+//! rows of each form are copied into the policy's module from its sheet as
+//! well, and the replay holds every copied row to the sheet's row of its
+//! name. A row's reports reach the view through that feature's row
+//! builder, so a bare test run of the crate builds no part of this target
+//! and replays no recorded row.
 //!
 //! A sequence row must replay pick for pick. A drawn row must give each
 //! worker the recorded share within the spread of two samples of that size,
 //! and a worker never picked on one side must never be picked on the other.
 //! A pair-index row picks nothing: it holds what the gateway's pair index
 //! made of a prefill pool and a decode pool, and must replay whole.
-//! No row is decided differently. A row whose form this crate does not
-//! build yet is owed: [`OWED`] names it with the validator's words and the
+//! An encode-pair row holds the gateway's answers to requests that carry
+//! encode items. The store's part of each answer replays: the encoders a
+//! prefill is handed items by.
+//! An overload row picks nothing: it holds whether the gateway read one
+//! worker as overloaded after each write of its loads, and must replay
+//! verdict for verdict.
+//! No row is decided differently but where its module names it. The store
+//! judges an engine by rules of its own, and the overload module holds a
+//! recorded row they decide apart from the gateway to the verdicts its
+//! entry gives. The prefix hash module holds a recorded row that a key of
+//! whole blocks cannot decide as recorded to the outcome its entry gives.
+//! A row whose form this crate does not build yet is owed: [`OWED`] names
+//! it with the validator's words and the
 //! change that builds it, and the replay fails once the row is no longer
 //! refused in those words. A sheet whose module has not landed here is owed
 //! too: [`OWED_SHEETS`] names its policy and the change that brings the
@@ -39,9 +51,14 @@ use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::{Map, Value};
 
 mod classic {
+    pub mod all_vetoed;
+    pub mod bucket;
+    pub mod encode_pair;
     pub mod manual;
+    pub mod overload;
     pub mod pair_index;
     pub mod power_of_two;
+    pub mod prefix_hash;
 }
 
 /// What a row recorded, and what its replay gives in the same shape: the
@@ -72,18 +89,44 @@ struct Owed {
 }
 
 /// The owed rows. The classic manual policy keeps a key's pins apart under
-/// each role of a pair; here a sessions rule runs under the single plan.
-const OWED: &[Owed] = &[Owed {
-    row: "manual-one-key-pins-apart-under-the-prefill-and-the-decode-role",
-    refused: "sessions run under the single plan",
-    by: "sessions on the sides of a pair, which read the pair's partner lists",
-}];
+/// each role of a pair; here a sessions rule runs under the single plan. A
+/// request placed by its routing key on the hash ring keeps its worker over
+/// the thresholds there; its rows are refused by their module until a key
+/// keeps its ring worker here ([`ring`]). Those entries do not expire by
+/// themselves, since the module refuses a ring row before it builds an
+/// engine: the change that keeps a key on its ring worker deletes them
+/// together with that guard.
+const OWED: &[Owed] = &[
+    Owed {
+        row: "manual-one-key-pins-apart-under-the-prefill-and-the-decode-role",
+        refused: "sessions run under the single plan",
+        by: "sessions on the sides of a pair, which read the pair's partner lists",
+    },
+    ring("consistent-hashing-a-key-keeps-its-worker-over-its-thresholds-beside-free-workers"),
+    ring("consistent-hashing-a-key-keeps-its-worker-with-every-worker-over"),
+    ring("consistent-hashing-a-key-leaves-its-worker-over-its-thresholds-under-shedding"),
+    ring("consistent-hashing-a-key-is-shed-with-every-worker-over-under-shedding"),
+    ring("consistent-hashing-a-key-passes-to-the-next-member-when-its-worker-is-down"),
+    ring("consistent-hashing-a-retry-that-tried-the-keys-worker-passes-the-key-on"),
+    ring("consistent-hashing-a-key-keeps-its-worker-when-the-next-member-is-over-too"),
+    ring("consistent-hashing-a-key-passes-to-a-next-member-over-its-thresholds-when-its-worker-is-down"),
+];
+
+/// A ring row of the all-vetoed sheet, owed in its module's words.
+const fn ring(row: &'static str) -> Owed {
+    Owed {
+        row,
+        refused: classic::all_vetoed::RING_ROW,
+        by: "the change that keeps a session key on its ring worker",
+    }
+}
 
 /// A sheet of the directory whose module has not landed here: `policy`
 /// is its head's, and `by` names the change that brings the module. The
 /// sheet replays no row and answers for no defect while no
 /// module replays its policy, and the suite fails the day one does, so an
-/// entry cannot outlive its debt.
+/// entry cannot outlive its debt; the whole replay holds the directory to
+/// one sheet of each entry's policy ([`owed_sheet_defects`]).
 struct OwedSheet {
     policy: &'static str,
     by: &'static str,
@@ -91,24 +134,10 @@ struct OwedSheet {
 
 /// The owed sheets: each was recorded before the change that replays it
 /// landed here.
-const OWED_SHEETS: &[OwedSheet] = &[
-    OwedSheet {
-        policy: "all_vetoed",
-        by: "the rule that answers a pool the overload veto empties",
-    },
-    OwedSheet {
-        policy: "encode_pair",
-        by: "the placement of a request's encode items beside its pair",
-    },
-    OwedSheet {
-        policy: "overload",
-        by: "the replay of the overload verdict and the rule that ends a sample by its age",
-    },
-    OwedSheet {
-        policy: "pair-select",
-        by: "the placement of a prefill and decode pair",
-    },
-];
+const OWED_SHEETS: &[OwedSheet] = &[OwedSheet {
+    policy: "pair-select",
+    by: "the placement of a prefill and decode pair",
+}];
 
 /// The owed sheet of a policy, when one is owed.
 fn owed_sheet(policy: &str) -> Option<&'static OwedSheet> {
@@ -215,16 +244,6 @@ fn replay_rows<R: Recorded>(text: &str, source: &str) -> (usize, Vec<String>) {
     (sheet.rows.len(), defects)
 }
 
-/// The names of the rows of one policy's sheet.
-fn row_names<R: Recorded>(text: &str) -> Vec<String> {
-    let sheet: Rows<R> = serde_json::from_str(text).expect("a sheet of rows");
-    sheet
-        .rows
-        .iter()
-        .map(|row| row.name().to_string())
-        .collect()
-}
-
 /// A sheet's head: the commit its rows were recorded from, and the classic
 /// policy they record, which names the module that replays them.
 #[derive(Debug, Deserialize)]
@@ -258,11 +277,30 @@ const fn module<R: Recorded>(inline: &'static str) -> Module {
 
 /// Every module that replays, the one list. A sheet finds its module here
 /// ([`replay_sheet`]), and each entry is held to one sheet and to its copied
-/// rows ([`replay_sheets`]): a module added here has both. The pair index's
-/// rows pick nothing, so its module brings its own replay and its own rule
-/// for a copied row.
-const MODULES: [Module; 3] = [
+/// rows ([`replay_sheets`]): a module added here has both. The overload
+/// rows and the pair index's rows pick nothing, so each of the two modules
+/// brings its own replay and its own rule for a copied row. The prefix
+/// hash module brings its own replay too, which holds the rows it names
+/// apart to its entries.
+/// An encode-pair row is replayed in its store part by its own module;
+/// its copied rows name no runtime either, and the pair index's rule
+/// holds them.
+const MODULES: [Module; 8] = [
+    module::<classic::all_vetoed::Row>(classic::all_vetoed::INLINE),
+    module::<classic::bucket::Row>(classic::bucket::INLINE),
+    Module {
+        policy: classic::encode_pair::POLICY,
+        inline: classic::encode_pair::INLINE,
+        replay: classic::encode_pair::replay_rows,
+        copied: classic::pair_index::copied_row_defects,
+    },
     module::<classic::manual::Row>(classic::manual::INLINE),
+    Module {
+        policy: classic::overload::POLICY,
+        inline: classic::overload::INLINE,
+        replay: classic::overload::replay_rows,
+        copied: classic::overload::copied_row_defects,
+    },
     Module {
         policy: classic::pair_index::POLICY,
         inline: classic::pair_index::INLINE,
@@ -270,6 +308,12 @@ const MODULES: [Module; 3] = [
         copied: classic::pair_index::copied_row_defects,
     },
     module::<classic::power_of_two::Row>(classic::power_of_two::INLINE),
+    Module {
+        policy: classic::prefix_hash::POLICY,
+        inline: classic::prefix_hash::INLINE,
+        replay: classic::prefix_hash::replay_rows,
+        copied: copied_row_defects,
+    },
 ];
 
 /// The number of rows replayed and what did not replay; a text that is no
@@ -389,6 +433,27 @@ fn sheets_of(policy: &str, sheets: &[(String, String)]) -> Vec<usize> {
         .collect()
 }
 
+/// What the directory owes the owed sheets: an entry of [`OWED_SHEETS`]
+/// with no sheet of its policy among them, or with more than one. An entry
+/// whose sheet left the directory would otherwise stand with nothing to
+/// answer for.
+fn owed_sheet_defects(sheets: &[(String, String)]) -> Vec<String> {
+    OWED_SHEETS
+        .iter()
+        .filter_map(|owed| match sheets_of(owed.policy, sheets).len() {
+            1 => None,
+            0 => Some(format!(
+                "no sheet of {}: an owed sheet stays in the directory",
+                owed.policy
+            )),
+            more => Some(format!(
+                "{more} sheets of {}: one sheet a policy",
+                owed.policy
+            )),
+        })
+        .collect()
+}
+
 /// Every sheet replayed and every module's copied rows held to its sheet:
 /// a sheet's rows and what did not hold of it, in the order given, then
 /// what no one sheet answers for: a policy with a module here and no sheet
@@ -484,6 +549,13 @@ fn sheets_under(dir: &Path) -> Vec<(String, String)> {
 }
 
 #[test]
+fn the_classic_bucket_rows_replay_pick_for_pick_and_share_for_share() {
+    let (rows, defects) = replay_sheet(classic::bucket::INLINE, "the inline rows");
+    assert!(rows >= 8, "{rows} inline rows");
+    assert!(defects.is_empty(), "{defects:#?}");
+}
+
+#[test]
 fn the_classic_power_of_two_rows_replay_pick_for_pick_and_share_for_share() {
     let (rows, defects) = replay_sheet(classic::power_of_two::INLINE, "the inline rows");
     assert!(rows >= 8, "{rows} inline rows");
@@ -491,8 +563,36 @@ fn the_classic_power_of_two_rows_replay_pick_for_pick_and_share_for_share() {
 }
 
 #[test]
+fn the_classic_all_vetoed_rows_replay_pick_for_pick_and_share_for_share() {
+    let (rows, defects) = replay_sheet(classic::all_vetoed::INLINE, "the inline rows");
+    assert!(rows >= 8, "{rows} inline rows");
+    assert!(defects.is_empty(), "{defects:#?}");
+}
+
+#[test]
+fn the_classic_encode_pair_rows_replay_the_stores_part_list_for_list() {
+    let (rows, defects) = replay_sheet(classic::encode_pair::INLINE, "the inline rows");
+    assert!(rows >= 8, "{rows} inline rows");
+    assert!(defects.is_empty(), "{defects:#?}");
+}
+
+#[test]
 fn the_classic_manual_rows_replay_pick_for_pick_and_share_for_share() {
     let (rows, defects) = replay_sheet(classic::manual::INLINE, "the inline rows");
+    assert!(rows >= 8, "{rows} inline rows");
+    assert!(defects.is_empty(), "{defects:#?}");
+}
+
+#[test]
+fn the_classic_overload_rows_replay_verdict_for_verdict() {
+    let (rows, defects) = replay_sheet(classic::overload::INLINE, "the inline rows");
+    assert!(rows >= 8, "{rows} inline rows");
+    assert!(defects.is_empty(), "{defects:#?}");
+}
+
+#[test]
+fn the_classic_prefix_hash_rows_replay_pick_for_pick_and_share_for_share() {
+    let (rows, defects) = replay_sheet(classic::prefix_hash::INLINE, "the inline rows");
     assert!(rows >= 8, "{rows} inline rows");
     assert!(defects.is_empty(), "{defects:#?}");
 }
@@ -514,10 +614,18 @@ fn a_sheet_owed_its_module_replays_no_row_and_is_no_defect() {
         );
         assert_eq!(replay_sheet(&text, "owed.json"), (0, Vec::new()));
     }
+    // The table's first entry, whichever sheet it is: a module that lands
+    // takes its entry out and moves no line of this case.
+    let Some(owed) = OWED_SHEETS.first() else {
+        return;
+    };
     let mut sheets = copied_sheets();
     sheets.push((
         "owed.json".to_string(),
-        r#"{"recorded_from": "a commit", "policy": "all_vetoed", "rows": []}"#.to_string(),
+        format!(
+            r#"{{"recorded_from": "a commit", "policy": "{}", "rows": []}}"#,
+            owed.policy
+        ),
     ));
     let (lines, defects) = replay_report(&sheets);
     assert_eq!(defects, Vec::<String>::new());
@@ -530,11 +638,14 @@ fn a_sheet_owed_its_module_replays_no_row_and_is_no_defect() {
     assert!(
         lines
             .iter()
-            .any(|line| line.starts_with("owed all_vetoed: owed.json waits for ")),
+            .any(|line| line.starts_with(&format!("owed {}: owed.json waits for ", owed.policy))),
         "{lines:#?}"
     );
-    let unnamed = r#"{"recorded_from": "", "policy": "all_vetoed", "rows": []}"#;
-    let (_, defects) = replay_sheet(unnamed, "owed.json");
+    let unnamed = format!(
+        r#"{{"recorded_from": "", "policy": "{}", "rows": []}}"#,
+        owed.policy
+    );
+    let (_, defects) = replay_sheet(&unnamed, "owed.json");
     assert!(
         matches!(defects.as_slice(), [one] if one.contains("no commit")),
         "{defects:#?}"
@@ -548,11 +659,52 @@ fn the_classic_pair_index_rows_replay_verdict_for_verdict_and_list_for_list() {
     assert!(defects.is_empty(), "{defects:#?}");
 }
 
+/// Every entry of the owed sheets has its one sheet in the directory: an
+/// entry whose sheet is gone is a defect, and so is a second sheet of its
+/// policy.
+#[test]
+fn an_owed_policy_with_no_sheet_is_a_defect_and_so_is_a_second_sheet() {
+    let sheet = |policy: &str, name: &str| {
+        let text = format!(r#"{{"recorded_from": "a commit", "policy": "{policy}", "rows": []}}"#);
+        (name.to_string(), text)
+    };
+    let mut sheets: Vec<(String, String)> = OWED_SHEETS
+        .iter()
+        .map(|owed| sheet(owed.policy, owed.policy))
+        .collect();
+    assert_eq!(owed_sheet_defects(&sheets), Vec::<String>::new());
+    let Some(first) = OWED_SHEETS.first() else {
+        return;
+    };
+    sheets.push(sheet(first.policy, "again.json"));
+    let defects = owed_sheet_defects(&sheets);
+    let twice = format!("2 sheets of {}", first.policy);
+    assert!(
+        matches!(defects.as_slice(), [one] if one.starts_with(&twice)),
+        "{defects:#?}"
+    );
+    sheets.retain(|(name, _)| name != first.policy && name != "again.json");
+    let defects = owed_sheet_defects(&sheets);
+    let none = format!("no sheet of {}", first.policy);
+    assert!(
+        matches!(defects.as_slice(), [one] if one.starts_with(&none)),
+        "{defects:#?}"
+    );
+}
+
 /// Every owed row is in an inline subset, so every run of the suite checks
 /// that it is still refused, the copied rows' replay beside the whole one.
 #[test]
 fn every_owed_row_is_an_inline_row() {
-    let inline = row_names::<classic::manual::Row>(classic::manual::INLINE);
+    // The names as written: a module's rows need not pick to be named.
+    let inline: Vec<String> = MODULES
+        .iter()
+        .flat_map(|module| {
+            let written: Written = serde_json::from_str(module.inline).expect("inline rows");
+            written.rows
+        })
+        .filter_map(|row| row.get("name").and_then(Value::as_str).map(str::to_string))
+        .collect();
     for owed in OWED {
         assert!(inline.iter().any(|name| name == owed.row), "{}", owed.row);
     }
@@ -713,18 +865,20 @@ fn a_policy_with_no_sheet_is_a_defect_and_so_is_a_second_sheet() {
         "{of_sheet:#?}"
     );
     assert_eq!(unheld, Vec::<String>::new());
-    let (_, unheld) = replay_sheets(sheets.get(..1).expect("the first sheet"));
+    // The table's first and last policies, whichever modules it holds.
+    let first = MODULES.first().expect("a module").policy;
+    let last = MODULES.last().expect("a module").policy;
+    let (_, kept) = sheets.split_last().expect("a sheet a module");
+    let (_, unheld) = replay_sheets(kept);
     assert!(
-        matches!(unheld.as_slice(), [one, other]
-            if one.starts_with("no sheet of pair-index")
-                && other.starts_with("no sheet of power_of_two")),
+        matches!(unheld.as_slice(), [one] if one.starts_with(&format!("no sheet of {last}"))),
         "{unheld:#?}"
     );
     let mut twice = sheets.clone();
     twice.extend(sheets.first().cloned());
     let (_, unheld) = replay_sheets(&twice);
     assert!(
-        matches!(unheld.as_slice(), [one] if one.starts_with("2 sheets of manual")),
+        matches!(unheld.as_slice(), [one] if one.starts_with(&format!("2 sheets of {first}"))),
         "{unheld:#?}"
     );
     // A sheet that lacks a copied row answers for it.
@@ -770,6 +924,82 @@ fn a_sheet_of_a_policy_no_module_replays_is_a_defect() {
         matches!(defects.as_slice(), [one] if one.contains("which no module replays")),
         "{defects:#?}"
     );
+}
+
+/// An encode-pair row reads red on a list that is not the store's and on
+/// an answer that is not the decision's. An offered list that leaves the
+/// class's ready encoders out is a defect of the store's part, and so is an
+/// encoder offered to a request that carries no item. An offered encoder
+/// that is not ready, and a permanent gap's refusal beside a class that
+/// serves the request, are a defect of each part. A copied row is its
+/// sheet's row under one renaming of its runtimes: other names in the same
+/// order are no defect, two names made one are.
+#[test]
+fn an_encode_pair_row_is_held_to_the_stores_lists_and_the_decision() {
+    let inline = classic::encode_pair::INLINE;
+    let defects_of = |name: &str, change: &dyn Fn(&mut Value)| {
+        let mut sheet: Value = serde_json::from_str(inline).expect("the inline sheet");
+        let rows = sheet.get_mut("rows").and_then(Value::as_array_mut);
+        let row = rows
+            .expect("its rows")
+            .iter_mut()
+            .find(|row| row.get("name").and_then(Value::as_str) == Some(name));
+        change(row.expect("the row of that name"));
+        let (_, defects) = replay_sheet(&sheet.to_string(), "sheet");
+        defects
+    };
+    let placed = "two-runtimes-the-items-go-to-the-encoders-of-the-pushing-pair";
+    let unoffered = defects_of(placed, &|row| {
+        let offered = row.pointer_mut("/outcome/sequence/0/placed/offered");
+        *offered.expect("the offered encoders") = Value::Array(Vec::new());
+    });
+    assert!(
+        matches!(unoffered.as_slice(), [one] if one.contains("was offered the encoders []")),
+        "{unoffered:#?}"
+    );
+    let unready = defects_of(placed, &|row| {
+        let open = row.pointer_mut("/encoders/1/open");
+        *open.expect("the second encoder") = Value::from(false);
+    });
+    assert!(
+        matches!(unready.as_slice(), [store, decision]
+            if store.contains("of which [0] are ready")
+                && decision.contains("replayed [0, 0, 0]")),
+        "{unready:#?}"
+    );
+    let refused = "push-a-producer-and-a-consumer-on-two-connectors-are-refused";
+    let served = defects_of(refused, &|row| {
+        let connector = row.pointer("/encoders/0/connector").cloned();
+        let of_prefill = row.pointer_mut("/prefills/0/connector");
+        *of_prefill.expect("the prefill's connector") = connector.expect("the encoder's");
+    });
+    assert!(
+        matches!(served.as_slice(), [store, decision]
+            if store.contains("yet the class of prefill 0 holds encoder 0")
+                && decision.contains("refused as ec_incompatible, replayed")),
+        "{served:#?}"
+    );
+    let bare = "an-encoder-whose-runtime-states-no-handoff-serves-no-item";
+    let read = defects_of(bare, &|row| {
+        let offered = row.pointer_mut("/outcome/sequence/2/placed/offered");
+        *offered.expect("the offered encoders") = Value::from(vec![0]);
+    });
+    assert!(
+        matches!(read.as_slice(), [one] if one.contains("carries no item")),
+        "{read:#?}"
+    );
+
+    let held = classic::pair_index::copied_row_defects;
+    assert_eq!(held(inline, inline, "sheet"), Vec::<String>::new());
+    let renamed = inline.replace("\"sigma\"", "\"m-second\"");
+    assert_ne!(renamed, inline);
+    assert_eq!(held(inline, &renamed, "sheet"), Vec::<String>::new());
+    let merged = inline.replace("\"sigma\"", "\"zeta\"");
+    let defects = held(inline, &merged, "sheet");
+    assert!(!defects.is_empty());
+    assert!(defects
+        .iter()
+        .all(|defect| defect.contains("under one renaming")));
 }
 
 /// A sheet whose head names no commit it was recorded from is a defect by
@@ -826,10 +1056,15 @@ fn every_json_file_of_the_directory_is_a_sheet_to_answer_for() {
         names,
         [
             "a_second_name.json",
+            "all_vetoed.json",
             "broken.json",
+            "bucket.json",
+            "encode_pair.json",
             "manual.json",
+            "overload.json",
             "pair-index.json",
             "power_of_two.json",
+            "prefix_hash.json",
             "stray.json",
         ]
     );
@@ -856,57 +1091,79 @@ fn every_json_file_of_the_directory_is_a_sheet_to_answer_for() {
 #[test]
 fn the_report_holds_a_line_a_sheet_a_line_a_module_and_every_defect() {
     let sheets = copied_sheets();
-    let (manual, _) = replay_sheet(classic::manual::INLINE, "the inline rows");
-    let (pair_index, _) = replay_sheet(classic::pair_index::INLINE, "the inline rows");
-    let (power_of_two, _) = replay_sheet(classic::power_of_two::INLINE, "the inline rows");
+    // Each module's policy and the rows of its copied sheet, in the table's
+    // order: a module more moves no line of this case.
+    let counted: Vec<(&str, usize)> = MODULES
+        .iter()
+        .map(|module| {
+            let (rows, _) = replay_sheet(module.inline, "the inline rows");
+            (module.policy, rows)
+        })
+        .collect();
+    let (first, _) = *counted.first().expect("a module");
+    let (last, kept_counted) = counted.split_last().expect("a module");
+    // The sheet this case changes last is the manual policy's, wherever the
+    // table holds it.
+    let manual_at = counted
+        .iter()
+        .position(|(policy, _)| *policy == "manual")
+        .expect("the manual module");
+    // The report's lines over the copied sheets, that sheet answering
+    // for `found` defects and every other for none.
+    let lines_with = |found: usize| -> Vec<String> {
+        let of = |at: usize| if at == manual_at { found } else { 0 };
+        let sheet_lines = counted
+            .iter()
+            .enumerate()
+            .map(|(at, (policy, rows))| format!("{policy}.json: {rows} rows, {} defects", of(at)));
+        let policy_lines = counted.iter().enumerate().map(|(at, (policy, rows))| {
+            format!("policy {policy}: {rows} rows, {} defects", of(at))
+        });
+        sheet_lines.chain(policy_lines).collect()
+    };
     let (lines, defects) = replay_report(&sheets);
-    assert_eq!(
-        lines,
-        [
-            format!("manual.json: {manual} rows, 0 defects"),
-            format!("pair-index.json: {pair_index} rows, 0 defects"),
-            format!("power_of_two.json: {power_of_two} rows, 0 defects"),
-            format!("policy manual: {manual} rows, 0 defects"),
-            format!("policy pair-index: {pair_index} rows, 0 defects"),
-            format!("policy power_of_two: {power_of_two} rows, 0 defects"),
-        ]
-    );
+    assert_eq!(lines, lines_with(0));
     assert_eq!(defects, Vec::<String>::new());
 
-    let (lines, defects) = replay_report(sheets.get(..1).expect("the first sheet"));
-    assert_eq!(
-        lines,
-        [
-            format!("manual.json: {manual} rows, 0 defects"),
-            format!("policy manual: {manual} rows, 0 defects"),
-            "policy pair-index: no sheet".to_string(),
-            "policy power_of_two: no sheet".to_string(),
-        ]
+    // Without its sheet the table's last policy has none.
+    let (_, kept) = sheets.split_last().expect("a sheet a module");
+    let (lines, defects) = replay_report(kept);
+    let mut expected: Vec<String> = kept_counted
+        .iter()
+        .map(|(policy, rows)| format!("{policy}.json: {rows} rows, 0 defects"))
+        .collect();
+    expected.extend(
+        kept_counted
+            .iter()
+            .map(|(policy, rows)| format!("policy {policy}: {rows} rows, 0 defects")),
     );
+    expected.push(format!("policy {}: no sheet", last.0));
+    assert_eq!(lines, expected);
     assert!(
-        matches!(defects.as_slice(), [one, other]
-            if one.starts_with("no sheet of pair-index")
-                && other.starts_with("no sheet of power_of_two")),
+        matches!(defects.as_slice(), [one] if one.starts_with(&format!("no sheet of {}", last.0))),
         "{defects:#?}"
     );
 
+    // A second sheet of the first policy: its line is the first policy line,
+    // behind a line a sheet.
     let mut twice = sheets.clone();
     twice.extend(sheets.first().cloned());
     let (lines, defects) = replay_report(&twice);
     assert_eq!(
-        lines.get(4).map(String::as_str),
-        Some("policy manual: 2 sheets")
+        lines.get(twice.len()).map(String::as_str),
+        Some(format!("policy {first}: 2 sheets").as_str())
     );
     assert!(
-        matches!(defects.as_slice(), [one] if one.starts_with("2 sheets of manual")),
+        matches!(defects.as_slice(), [one] if one.starts_with(&format!("2 sheets of {first}"))),
         "{defects:#?}"
     );
 
+    // A text that is no sheet has the last sheet line.
     let mut broken = sheets.clone();
     broken.push(("broken.json".to_string(), "no sheet".to_string()));
     let (lines, defects) = replay_report(&broken);
     assert_eq!(
-        lines.get(3).map(String::as_str),
+        lines.get(sheets.len()).map(String::as_str),
         Some("broken.json: 0 rows, 1 defects")
     );
     assert!(
@@ -914,9 +1171,11 @@ fn the_report_holds_a_line_a_sheet_a_line_a_module_and_every_defect() {
         "{defects:#?}"
     );
 
-    // The first pick of a sequence row that is not owed, moved by one.
+    // The first pick of a sequence row that is not owed, moved by one, in
+    // the manual sheet.
     let mut changed = sheets.clone();
-    for (_, text) in changed.iter_mut().take(1) {
+    let manual_sheet = |(name, _): &&mut (String, String)| name == "manual.json";
+    for (_, text) in changed.iter_mut().filter(manual_sheet) {
         let mut sheet: Value = serde_json::from_str(text).expect("the inline sheet");
         let rows = sheet.get_mut("rows").and_then(Value::as_array_mut);
         let pick = rows
@@ -941,25 +1200,16 @@ fn the_report_holds_a_line_a_sheet_a_line_a_module_and_every_defect() {
                 .all(|defect| defect.starts_with("manual.json")),
         "{defects:#?}"
     );
-    let found = defects.len();
-    assert_eq!(
-        lines,
-        [
-            format!("manual.json: {manual} rows, {found} defects"),
-            format!("pair-index.json: {pair_index} rows, 0 defects"),
-            format!("power_of_two.json: {power_of_two} rows, 0 defects"),
-            format!("policy manual: {manual} rows, {found} defects"),
-            format!("policy pair-index: {pair_index} rows, 0 defects"),
-            format!("policy power_of_two: {power_of_two} rows, 0 defects"),
-        ]
-    );
+    assert_eq!(lines, lines_with(defects.len()));
 }
 
-/// The whole replay, over the sheets beside this target: every row of every
-/// sheet under `tests/classic/sheets`. It fails when a policy with a module
-/// here has no sheet in the directory, when a row copied into a module is
-/// not its sheet's row, and when a policy's line counts no row, so a run
-/// that replays nothing cannot pass.
+/// The whole replay, over the sheets beside this target: every row of each
+/// sheet under `tests/classic/sheets` that has a module here, and no row
+/// of an owed sheet. It fails when a policy with a module here has no
+/// sheet in the directory, when an owed policy has no sheet
+/// there or a second one, when a row copied into a module is not its
+/// sheet's row, and when a policy's line counts no row, so a run that
+/// replays nothing cannot pass.
 #[test]
 #[expect(
     clippy::print_stdout,
@@ -974,6 +1224,8 @@ fn every_recorded_classic_row_replays() {
         println!("{line}");
     }
     assert!(defects.is_empty(), "{defects:#?}");
+    let owed = owed_sheet_defects(&sheets);
+    assert!(owed.is_empty(), "{owed:#?}");
     let policies: Vec<&String> = lines
         .iter()
         .filter(|line| line.starts_with("policy "))

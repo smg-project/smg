@@ -4,7 +4,7 @@
 //! budget or an invalid answer drops it and counts on the breaker, the
 //! breaker bypasses, the fallbacks and the closed policy), one resource per
 //! decision and per side of a pair, the lifecycle once per engine build, and
-//! the instances kept per thread.
+//! the instances kept per decider.
 #![cfg(feature = "wasm")]
 #![expect(
     clippy::expect_used,
@@ -22,10 +22,11 @@ use std::sync::{
 
 use smg_policy_controller::{
     builtins::{Best, Healthy, LeastRequests, PowerOfTwo},
+    decider::Decider,
     plugins::OpenDecisions,
     wasm::{
-        Abi, Bound, BreakerSpec, Failure, LoadError, Plugin, PluginSpec, Reveal, Runtime,
-        WasmFilter, WasmPicker, WasmScorer, World,
+        Abi, Bound, BreakerSpec, EventKind, EventSet, Failure, LoadError, Plugin, PluginSpec,
+        Reveal, Runtime, WasmFilter, WasmPicker, WasmScorer, World,
     },
     Binding, Candidate, Constraints, Decision, Draw, Engine, Health, Identity, Lease, Lifecycle,
     Needs, PairPools, Pick, Plan, PoolFacts, Profile, RequestFacts, Scratch, ShedReason, Side,
@@ -75,6 +76,9 @@ fn spec(name: &str, component: Vec<u8>, mode: u8) -> PluginSpec {
     spec.config = vec![mode];
     spec.budget_micros = FRAME_MICROS;
     spec.metrics = COUNTERS.iter().map(|s| s.to_string()).collect();
+    // Every kind of event: the lifecycle's cases tell them, and a decision
+    // reads none of it.
+    spec.observes = EventSet::ALL;
     spec
 }
 
@@ -128,6 +132,9 @@ fn loaded(runtime: &Arc<Runtime>, spec: PluginSpec) -> Arc<Plugin> {
 
 /// [`loaded`] over the load it makes: the rule apart from the host.
 fn loaded_by(mut load: impl FnMut() -> Result<Arc<Plugin>, LoadError>) -> Arc<Plugin> {
+    // The host's warnings are kept from a case's first load on: a case reads
+    // there what the host said of its plugin's rebuild.
+    said();
     let mut loads = 0;
     loop {
         let made = load();
@@ -806,9 +813,7 @@ fn an_invalid_answer_is_a_fault_of_the_plugin() {
     ];
     for (mode, name) in cases {
         let case = format!("an invalid answer, {name}");
-        let mut made = 0;
-        loop {
-            made += 1;
+        tried(|made| {
             let plugin = load(&runtime, name, guest::record_guest(), mode);
             let engine = plugin_engine(&plugin);
             let (wall, cpu) = (std::time::Instant::now(), bound_clock());
@@ -820,11 +825,12 @@ fn an_invalid_answer_is_a_fault_of_the_plugin() {
             );
             let stats = plugin.stats();
             assert_eq!(stats.invalid, 1, "{name}");
-            if the_close_rebuilt(&case, &plugin, held, made) {
-                assert_eq!(plugin.stats().lazy_instantiations, 1, "{name}");
-                break;
+            if !the_close_rebuilt(&case, &plugin, held, made) {
+                return false;
             }
-        }
+            assert_eq!(plugin.stats().lazy_instantiations, 1, "{name}");
+            true
+        });
     }
 }
 
@@ -1197,6 +1203,60 @@ fn the_memory_cap_is_the_specs_and_a_growth_past_it_traps() {
     );
 }
 
+/// A module's view carries the request's block hashes where its row
+/// declares them, in the token form or the text form, and none where it
+/// declares neither: a guest of each world counts the hashes its decisions
+/// handed it.
+#[test]
+fn a_view_carries_block_hashes_to_a_row_that_declares_them_alone() {
+    let hashes: Vec<u64> = (1..=300).collect();
+    let token = Needs {
+        token_hashes: true,
+        ..Needs::default()
+    };
+    let text = Needs {
+        text_hashes: true,
+        ..Needs::default()
+    };
+    let candidates = pool(4);
+    for (world, component) in guest::hash_counting_guests() {
+        for (needs, handed) in [(Needs::default(), 0), (token, 300), (text, 300)] {
+            let runtime = runtime();
+            let mut row = spec("counting", component.clone(), mode::LEAST_IN_FLIGHT);
+            row.metrics.push("hashes".to_string());
+            row.needs = needs;
+            let plugin = loaded(&runtime, row);
+            let engine = plugin_engine(&plugin);
+            let decision = engine.decide(
+                &RequestFacts {
+                    block_hashes: &hashes,
+                    ..facts(1)
+                },
+                &PoolFacts {
+                    pool_size: 4,
+                    generation: 1,
+                    ..PoolFacts::default()
+                },
+                &candidates,
+                &Constraints::default(),
+                &mut Scratch::new(),
+            );
+            assert!(decision.pick().is_some(), "{world} {needs:?}: {decision:?}");
+            // The guest ran: a plugin the host passed by would count nothing too.
+            assert_eq!(
+                plugin.stats().answered,
+                4,
+                "the {world} world, {needs:?}: the constructor, the filter, the score and the pick"
+            );
+            assert_eq!(
+                counter_value(&plugin, counter::HASHES),
+                handed,
+                "the {world} world, {needs:?}"
+            );
+        }
+    }
+}
+
 #[test]
 fn the_lifecycle_reaches_the_plugin_once_per_profile_on_the_hosts_clock() {
     let runtime =
@@ -1503,9 +1563,7 @@ fn a_second_memory_and_a_table_past_the_cap_are_refused() {
     assert!(matches!(err, LoadError::Trap { .. }), "{err}");
 
     // The close's rebuild is an `init`, on the wall clock.
-    let mut made = 0;
-    loop {
-        made += 1;
+    tried(|made| {
         let plugin = load(
             &runtime,
             "table-grower",
@@ -1523,10 +1581,8 @@ fn a_second_memory_and_a_table_past_the_cap_are_refused() {
             (1, 1),
             "the constructor answered, the filter trapped"
         );
-        if the_close_rebuilt("a table past the cap", &plugin, held, made) {
-            break;
-        }
-    }
+        the_close_rebuilt("a table past the cap", &plugin, held, made)
+    });
 
     let err = Plugin::load(
         &runtime,
@@ -1751,6 +1807,64 @@ fn a_plugin_bound_into_a_later_engine_observes_through_it() {
     drop(first);
     assert_eq!(dispatch(&second), 4, "and once the first is gone");
     assert_eq!(counter_value(&plugin, counter::OBSERVED), 4);
+}
+
+/// A row lists the kinds of event its module hears, none by default. A
+/// module whose row lists none is never told: no call is made, and a thread
+/// that only tells makes no instance. One whose row lists some is told
+/// those kinds alone. A loaded module says the kinds its row lists.
+#[test]
+fn a_module_hears_the_kinds_of_event_its_row_lists_and_no_other() {
+    let tell = |engine: &Engine| {
+        let lease = Lease::default();
+        engine.on_dispatched(&lease, &Target::default(), Side::Single, 3);
+        engine.on_released(&lease, smg_policy_controller::ReleaseReason::ClientGone);
+        engine.on_membership(&smg_policy_controller::Membership::Snapshot(&[
+            WorkerId(1),
+            WorkerId(2),
+        ]));
+        engine.on_signal(&smg_policy_controller::Signal::GatewayVeto {
+            worker: WorkerId(1),
+            until_micros: 500_000,
+        });
+    };
+    let runtime = runtime();
+    // The default row lists nothing.
+    let mut unlisted = spec("unlisted", guest::record_guest(), mode::LEAST_IN_FLIGHT);
+    unlisted.observes = PluginSpec::new("default", Vec::new()).observes;
+    assert_eq!(unlisted.observes, EventSet::NONE);
+    let plugin = loaded(&runtime, unlisted);
+    assert_eq!(plugin.observes(), EventSet::NONE);
+    let engine = plugin_engine(&plugin);
+    assert!(!engine.needs_lifecycle());
+    // Told on a thread that never decided, then on the loading thread.
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| tell(&engine))
+            .join()
+            .expect("the telling thread");
+    });
+    tell(&engine);
+    let stats = plugin.stats();
+    assert_eq!(
+        (stats.observed, stats.lazy_instantiations),
+        (0, 0),
+        "nothing told, and no instance made by a thread that only tells: {stats:?}"
+    );
+    assert_eq!(counter_value(&plugin, counter::OBSERVED), 0);
+
+    let mut listed = spec("listed", guest::record_guest(), mode::LEAST_IN_FLIGHT);
+    listed.observes = EventSet::of([EventKind::Released, EventKind::Signal]);
+    let plugin = loaded(&runtime, listed);
+    assert_eq!(
+        plugin.observes(),
+        EventSet::of([EventKind::Released, EventKind::Signal])
+    );
+    let engine = plugin_engine(&plugin);
+    assert!(engine.needs_lifecycle());
+    tell(&engine);
+    assert_eq!(plugin.stats().observed, 2);
+    assert_eq!(counter_value(&plugin, counter::OBSERVED), 2);
 }
 
 /// A loop of whole-memory fills under a calibration that underprices it:
@@ -2026,8 +2140,8 @@ fn a_spent_budget_drops_no_healthy_instance() {
 /// The decision's own deadline is the wall clock's: where the runner holds
 /// the thread past the budget inside the first call, the remainder is spent
 /// and the second is never made. The case names both worlds, and in both
-/// the decision ends at its budget on the clock its bound counts. In both
-/// the decision's budget is spent and the breaker is told nothing: the long
+/// the calls end at the budget on the clock the bound counts. In both the
+/// decision's budget is spent and the breaker is told nothing: the long
 /// call answered with no reading, so by its fuel the run-out under what it
 /// left is the budget's and by the time it took the plugin's, and nothing
 /// says which. It is the budget's, counted with the calls nothing read, and
@@ -2052,12 +2166,19 @@ fn the_decisions_cpu_is_bounded_by_its_budget_whatever_the_fuel() {
         spec.budget_micros = 1_000_000;
         let plugin = loaded(&runtime, spec);
         // A filter of the host's own behind the plugin's: it is first asked
-        // when the plugin's filter, the long fill, has ended.
+        // when the plugin's filter, the long fill, has ended. A scorer of the
+        // host's own behind the plugin's: it is asked when the plugin's score,
+        // the endless fill, has ended, and reads this thread's clock there.
         let asked = Arc::new(std::sync::OnceLock::new());
+        let scored = Arc::new(std::sync::OnceLock::new());
         let mut profile = plugin_profile(&plugin, None, None, None);
         profile
             .filters
             .push(Box::new(SaysWhenAsked(Arc::clone(&asked))));
+        profile.scorers.push(Weighted {
+            scorer: Box::new(ReadsTheClockWhenAsked(Arc::clone(&scored))),
+            weight: 1.0,
+        });
         let engine = single_engine(profile);
         let cpu_before = bound_clock();
         let started = std::time::Instant::now();
@@ -2128,16 +2249,24 @@ fn the_decisions_cpu_is_bounded_by_its_budget_whatever_the_fuel() {
         );
         // Eight hundred fills take two to four hundred milliseconds, by the
         // host, and answer; the endless fill then gets what the second has
-        // left, plus a tick and the fill in flight, so the decision ends within
-        // milliseconds of its budget. A whole-frame bound would run the endless
+        // left, plus a tick and the fill in flight, so the two calls end within
+        // milliseconds of the budget. A whole-frame bound would run the endless
         // fill the frame's whole second on top: a fifth of a second past the
         // budget at the least. The line is the budget and a tenth. The bound
         // counts the time this thread had the CPU, so the case reads the clock
         // the bound counts: on a starved runner the wall clock reads more, by
-        // the share of the CPU the thread was given.
+        // the share of the CPU the thread was given. It reads that clock where
+        // the endless fill ended, in the host's own scorer, and not at the
+        // decision's end: the close behind the calls drops the instance and
+        // rebuilds the slot, memory work no budget of the decision bounds, and
+        // a loaded runner slows it on this thread's own clock.
+        let calls = scored
+            .get()
+            .expect("the host's scorer is asked behind the plugin's")
+            .saturating_sub(cpu_before);
         assert!(
-            cpu < std::time::Duration::from_millis(1_100),
-            "the decision ended at its budget on the clock its bound counts: {cpu:?}, {elapsed:?} on the wall"
+            calls < std::time::Duration::from_millis(1_100),
+            "the two calls ended at the budget on the clock its bound counts: {calls:?}; the decision whole {cpu:?}, {elapsed:?} on the wall"
         );
         true
     });
@@ -2158,6 +2287,35 @@ impl smg_policy_controller::Filter for SaysWhenAsked {
     fn keep(&self, _: &RequestFacts<'_>, _: &Candidate, _: &Constraints<'_>) -> bool {
         self.0.get_or_init(std::time::Instant::now);
         true
+    }
+}
+
+/// A scorer of the host's own that scores every candidate alike and reads
+/// its thread's clock when it is first asked: behind a plugin's scorer, what
+/// the thread had when that scorer's call ended.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug)]
+struct ReadsTheClockWhenAsked(Arc<std::sync::OnceLock<std::time::Duration>>);
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl Lifecycle for ReadsTheClockWhenAsked {}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl smg_policy_controller::Scorer for ReadsTheClockWhenAsked {
+    fn name(&self) -> &'static str {
+        "reads-the-clock-when-asked"
+    }
+
+    fn score(
+        &self,
+        _: &RequestFacts<'_>,
+        _: &[Candidate],
+        _: &[u32],
+        out: &mut [f32],
+    ) -> smg_policy_controller::TieBand {
+        self.0.get_or_init(bound_clock);
+        out.fill(0.0);
+        smg_policy_controller::TieBand::NORMALIZED
     }
 }
 
@@ -5027,26 +5185,38 @@ fn held_counts_are_made_again(
 /// Makes a case its tries: `once` is one try, told its number, and says
 /// whether it stood. A try a hold of the runner reached says so (see
 /// [`made_again`]) and did not stand. The last try asserts whatever its
-/// witness says: one try stands, or the case fails.
+/// witness says: one try stands, or the case fails. A try reads the host's
+/// lines from where it began ([`warnings`]).
 fn tried(once: impl Fn(u32) -> bool) {
     assert!(
-        (1..=TRIES).any(once),
+        (1..=TRIES).any(|made| {
+            TRY_BEGAN.set(said().lock().expect("the kept lines").len());
+            once(made)
+        }),
         "the last try asserts, so one try stands"
     );
 }
 
+thread_local! {
+    /// How many lines were kept when this thread's try began.
+    static TRY_BEGAN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Whether the close rebuilt the instance a fault dropped: asserted, unless
 /// the decision is to be made again. The rebuild is an `init`, on the wall
-/// clock: a runner that kept the decision's thread off the CPU half the init
-/// frame (`held`, read over the decision) can have ended it. Such a decision
-/// says so and is made again, [`TRIES`] at most (`made` counts them). A
-/// rebuild that fails with its thread on the CPU is the host's, and so is
-/// one that fails in the last try.
+/// clock, and the `init` the load made inside the same frame. One the host
+/// ended at that frame's deadline was ended by the runner, with the thread
+/// off the CPU or slowed on its core, and the host says so in a warning
+/// ([`the_frame_ended_the_rebuild`]). Such a decision says so and is made
+/// again, [`TRIES`] at most (`made` counts them), whatever the thread's
+/// clock read: a thread slowed on its core reads there as on the CPU, and
+/// `held` is what it read, for the message. A rebuild that fails another
+/// way is the host's, and so is one that fails in the last try.
 fn the_close_rebuilt(case: &str, plugin: &Plugin, held: std::time::Duration, made: u32) -> bool {
-    if !plugin.is_warm() && held >= INIT_FRAME / 2 && made < TRIES {
+    if !plugin.is_warm() && the_frame_ended_the_rebuild(plugin.name()) && made < TRIES {
         made_again(
             case,
-            "the decision's thread was off the CPU half the init frame, the bound of the close's rebuild",
+            "the host ended the rebuild's init at the init frame's deadline, on the wall clock",
         );
         return false;
     }
@@ -5060,17 +5230,61 @@ fn the_close_rebuilt(case: &str, plugin: &Plugin, held: std::time::Duration, mad
     true
 }
 
-/// The warnings the host wrote that name `plugin`, where a case installed
-/// the process's subscriber before them: what a failed rebuild said.
+/// Whether the host said that it ended a rebuild of `plugin`'s dropped
+/// instance at the init frame's deadline, and of no rebuild of that plugin
+/// that it failed another way. The lines are those kept since the try
+/// began: a case's tries load one name, and an earlier try's ended rebuild
+/// is not this one's.
+fn the_frame_ended_the_rebuild(plugin: &str) -> bool {
+    let rebuilds: Vec<String> = warnings(plugin)
+        .into_iter()
+        .filter(|line| line.contains("the rebuild of a dropped instance failed"))
+        .collect();
+    !rebuilds.is_empty()
+        && rebuilds
+            .iter()
+            .all(|line| line.contains("wasm trap: interrupt"))
+}
+
+/// The warnings the host wrote that name `plugin` since the thread's try
+/// began (all of them, on a thread that makes no try), where a case
+/// installed the process's subscriber before them: what a failed rebuild
+/// said.
 fn warnings(plugin: &str) -> Vec<String> {
     let named = format!("plugin=\"{plugin}\"");
     said()
         .lock()
         .expect("the kept lines")
         .iter()
+        .skip(TRY_BEGAN.get())
         .filter(|line| line.contains(&named))
         .cloned()
         .collect()
+}
+
+/// A try reads the lines the host wrote since it began: an ended rebuild
+/// that an earlier try's line tells of is not this try's, so the second
+/// try here reads none.
+#[test]
+fn a_try_reads_the_hosts_lines_since_it_began() {
+    const NAME: &str = "a-name-no-case-loads";
+    let ended =
+        format!("plugin=\"{NAME}\" the rebuild of a dropped instance failed: wasm trap: interrupt");
+    tried(|made| {
+        if made == 1 {
+            said().lock().expect("the kept lines").push(ended.clone());
+            assert!(
+                the_frame_ended_the_rebuild(NAME),
+                "the first try's own line"
+            );
+            return false;
+        }
+        assert!(
+            !the_frame_ended_the_rebuild(NAME),
+            "a line of the first try, read in the second"
+        );
+        true
+    });
 }
 
 /// Decides once, and says with the decision whether its thread kept the
@@ -6664,9 +6878,7 @@ fn an_observe_fault_leaves_no_mark_for_a_decision_that_never_touched_the_slot() 
 /// waits there and ticks all the same.
 #[test]
 fn a_destructors_bound_is_its_own_not_the_decisions_frame() {
-    let mut made = 0;
-    loop {
-        made += 1;
+    tried(|made| {
         let (runtime, born) = runtime_and_the_threads_born_with_it();
         let mut filler = spec("fill-dtor", guest::record_guest(), mode::FILL_IN_DESTRUCTOR);
         // The frame is the request's 100 ms, and the calibration makes the
@@ -6711,10 +6923,10 @@ fn a_destructors_bound_is_its_own_not_the_decisions_frame() {
                     waited.unwrap_or_default()
                 ),
             );
-            continue;
+            return false;
         }
         if !the_close_rebuilt("a destructor's bound", &plugin, held, made) {
-            continue;
+            return false;
         }
         let s = plugin.stats();
         assert_eq!(
@@ -6727,8 +6939,8 @@ fn a_destructors_bound_is_its_own_not_the_decisions_frame() {
             (1, 0, 0, 1),
             "the destructor ran out, the instance went, the close rebuilt it: {s:?}"
         );
-        break;
-    }
+        true
+    });
 }
 
 /// Under an operator frame below the budget, the charge is per call. A
@@ -7447,4 +7659,524 @@ fn a_plugin_stages_fallback_counts_in_the_stages_needs() {
     for (bound_as, needs) in over {
         assert!(needs.affinity, "the fallback's needs, bound as {bound_as}");
     }
+}
+
+/// A named decider's kept instance is its name's, on whichever thread acts
+/// as it. Three threads act as one decider in turn: the first decides, the
+/// second is told a dispatch and decides, the third decides, and each pick
+/// names the row at the count the instance heard. A second name has an
+/// instance of its own, which heard nothing. The apply's own instance went
+/// to the first decider that needed one: the instances made are the deciders.
+#[test]
+fn a_named_deciders_instance_is_its_names_on_whichever_thread_acts_as_it() {
+    let runtime = runtime();
+    let plugin = load(
+        &runtime,
+        "named",
+        guest::record_guest(),
+        mode::COUNT_DISPATCHES,
+    );
+    let engine = plugin_engine(&plugin);
+    // One thread a call, acting as the decider of that number.
+    let acting = |number: u8, dispatch: bool| {
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let _turn = Decider::new(number).enter();
+                    if dispatch {
+                        engine.on_dispatched(
+                            &Lease::default(),
+                            &Target::default(),
+                            Side::Single,
+                            3,
+                        );
+                    }
+                    pick_ids(&decide(&engine, &pool(4), 1)).first().copied()
+                })
+                .join()
+                .expect("the acting thread")
+        })
+    };
+    assert_eq!(acting(0, false), Some(100), "nothing told yet");
+    assert_eq!(
+        acting(0, true),
+        Some(101),
+        "told on a second thread, to the instance the first decided on"
+    );
+    assert_eq!(
+        acting(0, false),
+        Some(101),
+        "and a third thread decides on it"
+    );
+    assert_eq!(
+        acting(1, false),
+        Some(100),
+        "another name's instance heard nothing"
+    );
+    let stats = plugin.stats();
+    assert_eq!(
+        (
+            stats.instantiations,
+            stats.lazy_instantiations,
+            stats.observed,
+            stats.events_dropped
+        ),
+        (2, 1, 1, 0),
+        "two deciders, two instances, the apply's own among them: {stats:?}"
+    );
+    assert!(!plugin.is_warm(), "the loading thread kept none");
+}
+
+/// A thread that decides under no name and also acts as a named decider
+/// keeps the two apart: its own instance stands aside while it acts, and is
+/// as it left it after.
+#[test]
+fn a_threads_own_instance_stands_aside_while_it_acts_as_a_named_decider() {
+    let runtime = runtime();
+    let plugin = load(
+        &runtime,
+        "aside",
+        guest::record_guest(),
+        mode::COUNT_DISPATCHES,
+    );
+    let engine = plugin_engine(&plugin);
+    let pick = || pick_ids(&decide(&engine, &pool(4), 1)).first().copied();
+    let dispatch = || engine.on_dispatched(&Lease::default(), &Target::default(), Side::Single, 3);
+    dispatch();
+    assert_eq!(pick(), Some(101), "the thread's own instance heard it");
+    {
+        let _turn = Decider::new(5).enter();
+        assert_eq!(pick(), Some(100), "the named decider's heard nothing");
+        dispatch();
+        dispatch();
+        assert_eq!(pick(), Some(102), "and hears what is told as it");
+    }
+    assert_eq!(pick(), Some(101), "the thread's own is as it left it");
+    assert_eq!(plugin.stats().instantiations, 2);
+}
+
+/// A thread that names no decider and never decided with the plugin only
+/// tells: its lease event has no instance to reach and makes none. The
+/// event is dropped and counted, and the plugin's first drop writes its one
+/// warning. The thread that loaded is told as before: the apply's instance
+/// is its own.
+#[test]
+fn a_thread_that_only_tells_makes_no_instance_and_its_events_are_dropped() {
+    let runtime = runtime();
+    let plugin = load(
+        &runtime,
+        "only-told",
+        guest::record_guest(),
+        mode::COUNT_DISPATCHES,
+    );
+    let engine = plugin_engine(&plugin);
+    let tell = || engine.on_dispatched(&Lease::default(), &Target::default(), Side::Single, 3);
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                tell();
+                tell();
+            })
+            .join()
+            .expect("the telling thread");
+    });
+    let stats = plugin.stats();
+    assert_eq!(
+        (stats.events_dropped, stats.observed, stats.instantiations),
+        (2, 0, 1),
+        "dropped, and no instance made: {stats:?}"
+    );
+    let said = warnings(plugin.name());
+    assert_eq!(
+        said.iter()
+            .filter(|line| line.contains("names no decider"))
+            .count(),
+        1,
+        "one warning a plugin, at its first drop: {said:?}"
+    );
+    tell();
+    let stats = plugin.stats();
+    assert_eq!(
+        (stats.events_dropped, stats.observed, stats.instantiations),
+        (2, 1, 1),
+        "the loading thread is told: {stats:?}"
+    );
+    assert_eq!(
+        pick_ids(&decide(&engine, &pool(4), 1)).first().copied(),
+        Some(101),
+        "and decides on the instance that heard"
+    );
+}
+
+/// A thread that decided or warmed under no name is a decider of its own:
+/// what it tells reaches the instance it decides on.
+#[test]
+fn a_thread_that_decided_or_warmed_under_no_name_hears_what_it_tells() {
+    let runtime = runtime();
+    // On a thread that did not load: the pick before the dispatch (none
+    // where the thread warmed first), the pick after it, the drops.
+    let heard_by = |name: &str, warm_first: bool| {
+        let plugin = load(
+            &runtime,
+            name,
+            guest::record_guest(),
+            mode::COUNT_DISPATCHES,
+        );
+        let engine = plugin_engine(&plugin);
+        let picks = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let pick = || pick_ids(&decide(&engine, &pool(4), 1)).first().copied();
+                    let before = if warm_first {
+                        plugin.warm().expect("it warms");
+                        None
+                    } else {
+                        pick()
+                    };
+                    engine.on_dispatched(&Lease::default(), &Target::default(), Side::Single, 3);
+                    (before, pick())
+                })
+                .join()
+                .expect("the thread")
+        });
+        (picks, plugin.stats().events_dropped)
+    };
+    assert_eq!(
+        heard_by("own-decided", false),
+        ((Some(100), Some(101)), 0),
+        "it decided first"
+    );
+    assert_eq!(
+        heard_by("own-warmed", true),
+        ((None, Some(101)), 0),
+        "it warmed first"
+    );
+}
+
+/// A pair decided as a named decider keeps the decider's instance on the
+/// thread until the plugin's last close of the decision: each side's
+/// resource is dropped on it. So two pairs decided by two threads that act
+/// as one decider use the fuel two pairs use under no name, to the unit, on
+/// one instance.
+#[test]
+fn a_named_pair_decision_keeps_its_instance_to_the_plugins_last_close() {
+    let runtime = runtime();
+    // The fuel of two pair decisions, one after the other, and the
+    // instances made: on this thread under no name, or on two threads that
+    // act as one decider in turn.
+    let two_pairs = |name: &str, named: bool| {
+        let plugin = load(&runtime, name, guest::record_guest(), mode::LEAST_IN_FLIGHT);
+        let prefill = plugin_profile(&plugin, None, None, None);
+        let decode = plugin_profile(&plugin, None, None, None);
+        let engine = pair_engine(vec![prefill, decode], 1);
+        let loaded = plugin.stats().fuel_used;
+        let pair = || {
+            let decision = pair_decide(&engine);
+            assert!(decision.pick().is_some(), "a pair pick, not {decision:?}");
+            plugin.stats().fuel_used
+        };
+        let acting = || {
+            std::thread::scope(|scope| {
+                scope
+                    .spawn(|| {
+                        let _turn = Decider::new(4).enter();
+                        pair()
+                    })
+                    .join()
+                    .expect("the acting thread")
+            })
+        };
+        let first = if named { acting() } else { pair() };
+        let second = if named { acting() } else { pair() };
+        (
+            first - loaded,
+            second - first,
+            plugin.stats().instantiations,
+        )
+    };
+    let under_no_name = two_pairs("pair-own", false);
+    assert_eq!(under_no_name.2, 1);
+    assert_eq!(
+        two_pairs("pair-named", true),
+        under_no_name,
+        "the same calls, the two destructors of each pair among them, on one instance"
+    );
+}
+
+/// The membership is fed to every instance of a plugin whose row lists it.
+/// A change is told once, on a thread that only tells, and makes no guest
+/// call there and no instance; each decider's instance hears it before its
+/// next decision, one call a change. An instance made after a telling hears
+/// the list as it stands first.
+#[test]
+fn a_membership_told_once_reaches_every_deciders_instance_before_it_decides() {
+    use smg_policy_controller::Membership;
+    let runtime = runtime();
+    let plugin = load(&runtime, "fed", guest::record_guest(), mode::COUNT_MEMBERS);
+    let engine = plugin_engine(&plugin);
+    // The guest's pick names the row at the count of members its instance
+    // heard: on a thread of its own, acting as the decider of that number.
+    let acting = |number: u8| {
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let _turn = Decider::new(number).enter();
+                    pick_ids(&decide(&engine, &pool(4), 1)).first().copied()
+                })
+                .join()
+                .expect("the acting thread")
+        })
+    };
+    // Told on a thread that names no decider and never decides.
+    let tell = |change: Membership<'_>| {
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| engine.on_membership(&change))
+                .join()
+                .expect("the telling thread");
+        });
+    };
+    assert_eq!(acting(0), Some(100), "no member told yet");
+    tell(Membership::Snapshot(&[WorkerId(100), WorkerId(101)]));
+    let told = plugin.stats();
+    assert_eq!(
+        (told.observed, told.instantiations, told.events_dropped),
+        (0, 1, 0),
+        "a telling calls no guest, makes no instance and drops nothing: {told:?}"
+    );
+    assert_eq!(acting(0), Some(102), "the first decider's instance heard");
+    assert_eq!(
+        acting(1),
+        Some(102),
+        "an instance made after the telling hears the list as it stands"
+    );
+    tell(Membership::Added(WorkerId(102)));
+    assert_eq!((acting(1), acting(0)), (Some(103), Some(103)));
+    tell(Membership::Removed(WorkerId(100)));
+    tell(Membership::Removed(WorkerId(101)));
+    assert_eq!((acting(0), acting(1)), (Some(101), Some(101)));
+    let stats = plugin.stats();
+    assert_eq!(
+        (stats.observed, stats.instantiations),
+        (8, 2),
+        "one call a decider a change, the snapshot among them: {stats:?}"
+    );
+}
+
+/// An instance new to the feed hears the membership as it stands, as one
+/// snapshot, whatever the host told: the first instance where only changes
+/// were told, an instance remade after a fault, which then counts what one
+/// that heard every change counts, and an instance made at the warm-up,
+/// which hears there and not at its first decision. A change told before a
+/// lease's event is heard before it.
+#[test]
+fn an_instance_made_anew_hears_the_membership_as_it_stands() {
+    use smg_policy_controller::Membership;
+    let runtime = runtime();
+    let plugin = load(&runtime, "anew", guest::record_guest(), mode::COUNT_MEMBERS);
+    let engine = plugin_engine(&plugin);
+    let pick = || pick_ids(&decide(&engine, &pool(4), 1)).first().copied();
+    // Five workers come, one change each, and no snapshot was ever told: an
+    // instance new to the feed still hears them as one snapshot.
+    for id in 100..105 {
+        engine.on_membership(&Membership::Added(WorkerId(id)));
+    }
+    // Five members over four rows: the guest's pick names no row, an answer
+    // outside the contract, and its instance is dropped.
+    let _ = pick();
+    let faulted = plugin.stats();
+    assert_eq!((faulted.invalid, faulted.observed), (1, 1), "{faulted:?}");
+    engine.on_membership(&Membership::Removed(WorkerId(104)));
+    engine.on_membership(&Membership::Removed(WorkerId(103)));
+    assert_eq!(pick(), Some(103), "three members stand");
+    let remade = plugin.stats();
+    assert_eq!(
+        remade.observed - faulted.observed,
+        1,
+        "one snapshot, not the two changes: {remade:?}"
+    );
+    let (at_the_warm_up, at_its_decision) = std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                plugin.warm().expect("it warms");
+                let warmed = plugin.stats().observed;
+                assert_eq!(pick(), Some(103), "the warmed instance counts three");
+                (warmed - remade.observed, plugin.stats().observed - warmed)
+            })
+            .join()
+            .expect("the warming thread")
+    });
+    assert_eq!((at_the_warm_up, at_its_decision), (1, 0));
+    // A change, then a lease's event with no decision between: the instance
+    // hears the change first, then the event.
+    let before = plugin.stats().observed;
+    engine.on_membership(&Membership::Removed(WorkerId(102)));
+    engine.on_dispatched(&Lease::default(), &Target::default(), Side::Single, 3);
+    assert_eq!(plugin.stats().observed - before, 2);
+    assert_eq!(pick(), Some(102), "two members stand");
+}
+
+/// The feed keeps its last 64 changes. An instance behind that many hears
+/// each, one call a change; one further behind, or behind a snapshot, hears
+/// the list as it stands, as one snapshot.
+#[test]
+fn an_instance_behind_more_than_the_feed_keeps_hears_one_snapshot() {
+    use smg_policy_controller::Membership;
+    let runtime = runtime();
+    let plugin = load(
+        &runtime,
+        "behind",
+        guest::record_guest(),
+        mode::COUNT_MEMBERS,
+    );
+    let engine = plugin_engine(&plugin);
+    // The row the guest picks, and the `observe` calls the decision's
+    // catch-up made.
+    let pick = || {
+        let before = plugin.stats().observed;
+        let row = pick_ids(&decide(&engine, &pool(4), 1)).first().copied();
+        (row, plugin.stats().observed - before)
+    };
+    let come_and_go = |times: u32| {
+        for _ in 0..times {
+            engine.on_membership(&Membership::Added(WorkerId(300)));
+            engine.on_membership(&Membership::Removed(WorkerId(300)));
+        }
+    };
+    engine.on_membership(&Membership::Snapshot(&[WorkerId(100)]));
+    assert_eq!(pick(), (Some(101), 1), "new to the feed: the snapshot");
+    come_and_go(32);
+    assert_eq!(pick(), (Some(101), 64), "sixty-four behind: each change");
+    come_and_go(32);
+    engine.on_membership(&Membership::Added(WorkerId(301)));
+    assert_eq!(pick(), (Some(102), 1), "sixty-five behind: one snapshot");
+    engine.on_membership(&Membership::Added(WorkerId(302)));
+    engine.on_membership(&Membership::Snapshot(&[WorkerId(100), WorkerId(101)]));
+    engine.on_membership(&Membership::Added(WorkerId(303)));
+    assert_eq!(
+        pick(),
+        (Some(103), 1),
+        "behind a snapshot: the list as it stands"
+    );
+    assert_eq!(pick(), (Some(103), 0), "level: no call");
+    // A replacement is folded into the list: an instance made after it
+    // counts what stands.
+    engine.on_membership(&Membership::Replaced {
+        old: WorkerId(303),
+        new: WorkerId(304),
+    });
+    engine.on_membership(&Membership::Removed(WorkerId(304)));
+    plugin.forget_instance();
+    assert_eq!(
+        pick(),
+        (Some(102), 1),
+        "the two that stand, as one snapshot"
+    );
+}
+
+/// A warm-up whose telling faults the instance leaves no mark for a decision:
+/// the next decision on that thread makes an instance at its open and is the
+/// plugin's own, not the fallback's.
+#[test]
+fn a_warm_up_whose_telling_faults_leaves_the_next_decision_the_plugins_own() {
+    use smg_policy_controller::Membership;
+    let runtime = runtime();
+    let plugin = load(
+        &runtime,
+        "cold-warm",
+        guest::record_guest(),
+        mode::TRAP_ON_FIVE_MEMBERS,
+    );
+    let engine = plugin_engine(&plugin);
+    let five: Vec<WorkerId> = (100..105).map(WorkerId).collect();
+    engine.on_membership(&Membership::Snapshot(&five));
+    // The warm-up tells the snapshot of five and this guest traps on it: the
+    // fault is the breaker's, and the slot is cold.
+    plugin.warm().expect("the warm-up's own work is done");
+    let warmed = plugin.stats();
+    assert_eq!((warmed.traps, warmed.observed), (1, 1), "{warmed:?}");
+    assert!(!plugin.is_warm(), "the faulted instance is gone");
+    // Three members go. The decision makes an instance at its open, which
+    // hears the two that stand, and its pick names the row at that count:
+    // neither the first row nor the least loaded.
+    for id in [104, 103, 102] {
+        engine.on_membership(&Membership::Removed(WorkerId(id)));
+    }
+    let picked = pick_ids(&decide(&engine, &pool(4), 1)).first().copied();
+    let decided = plugin.stats();
+    assert_eq!(picked, Some(102), "the plugin's own pick: {decided:?}");
+    assert_eq!(
+        decided.observed - warmed.observed,
+        1,
+        "the instance made at the open hears one snapshot: {decided:?}"
+    );
+    assert!(decided.answered > warmed.answered, "{decided:?}");
+}
+
+/// A thread under no name that came by its first instance at a close's
+/// rebuild (its first `init` ended by the decision's clamp) is a decider of
+/// its own from there: a lease's event it tells is heard, not dropped.
+#[test]
+fn a_thread_whose_first_instance_the_close_rebuilt_hears_what_it_tells() {
+    tried(a_thread_whose_first_instance_the_close_rebuilt_hears_what_it_tells_in_a_try);
+}
+
+/// One try of the case above, told its number: whether it stood.
+fn a_thread_whose_first_instance_the_close_rebuilt_hears_what_it_tells_in_a_try(made: u32) -> bool {
+    const CASE: &str = "a first instance the close rebuilt";
+    // The host's warnings are kept from here on: a rebuild that fails says why.
+    said();
+    let began = TRY_BEGAN.get();
+    let runtime = runtime();
+    let heavy = load(
+        &runtime,
+        "rebuilt-first",
+        guest::record_guest(),
+        mode::BURN_IN_INIT,
+    );
+    let engine = plugin_engine(&heavy);
+    // A thread that did not load and was not warmed: the load's instance is
+    // not its to take, and its first `init` runs under a decision's clamp.
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                TRY_BEGAN.set(began);
+                let (wall, cpu) = (std::time::Instant::now(), bound_clock());
+                let _ = engine.decide(
+                    &RequestFacts {
+                        budget_micros: 200,
+                        ..facts(1)
+                    },
+                    &four(),
+                    &pool(4),
+                    &Constraints::default(),
+                    &mut Scratch::new(),
+                );
+                let held = off_cpu_since(wall, cpu);
+                if !the_close_rebuilt(CASE, &heavy, held, made) {
+                    return false;
+                }
+                let rebuilt = heavy.stats();
+                assert_eq!(rebuilt.budget_spent, 1, "the clamp ended it: {rebuilt:?}");
+                // Three tellings: after the rebuild, after a second decision
+                // on that instance, and after a warm-up there.
+                let tell = || {
+                    engine.on_dispatched(&Lease::default(), &Target::default(), Side::Single, 3);
+                };
+                tell();
+                let _ = decide(&engine, &pool(4), 2);
+                tell();
+                heavy.warm().expect("the thread is warm already");
+                tell();
+                let told = heavy.stats();
+                assert_eq!(
+                    (told.observed - rebuilt.observed, told.events_dropped),
+                    (3, 0),
+                    "the thread is a decider of its own: {told:?}"
+                );
+                true
+            })
+            .join()
+            .expect("the thread that did not load")
+    })
 }

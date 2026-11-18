@@ -11,7 +11,10 @@ use std::sync::{
 use futures::FutureExt as _;
 use tokio::sync::watch;
 
-use crate::worker::{registry::WorkerRegistry, Worker};
+use crate::worker::{
+    registry::{Generation, WorkerRegistry},
+    Worker,
+};
 
 /// Which precedence tier produced the most recently computed capacity value.
 /// Exposed as a Prometheus gauge so operators can debug capacity decisions.
@@ -151,7 +154,10 @@ impl WorkerCapacity {
     /// (and an owned copy of the settings). When the caller drops their
     /// last `Arc<WorkerCapacity>` or the registry is dropped, the task
     /// exits on the next iteration — no Arc cycle.
-    pub fn spawn(registry: Arc<WorkerRegistry>, settings: CapacityTrackerSettings) -> Arc<Self> {
+    pub fn spawn<G: Generation>(
+        registry: Arc<WorkerRegistry<G>>,
+        settings: CapacityTrackerSettings,
+    ) -> Arc<Self> {
         // Initial compute: synchronous over the current registry state,
         // so callers see a valid `current()` immediately after spawn.
         let workers = healthy_workers(&registry);
@@ -208,7 +214,7 @@ impl WorkerCapacity {
 
 /// Filter the registry to healthy workers only. Allocates a Vec so we
 /// don't hold the registry's internal locks while iterating.
-fn healthy_workers(registry: &WorkerRegistry) -> Vec<Arc<dyn Worker>> {
+fn healthy_workers<G: Generation>(registry: &WorkerRegistry<G>) -> Vec<Arc<dyn Worker>> {
     registry
         .get_all()
         .into_iter()
@@ -216,9 +222,9 @@ fn healthy_workers(registry: &WorkerRegistry) -> Vec<Arc<dyn Worker>> {
         .collect()
 }
 
-async fn run_event_loop(
+async fn run_event_loop<G: Generation>(
     tracker: Weak<WorkerCapacity>,
-    registry: Weak<WorkerRegistry>,
+    registry: Weak<WorkerRegistry<G>>,
     settings: CapacityTrackerSettings,
 ) {
     use tokio::sync::broadcast::error::RecvError;

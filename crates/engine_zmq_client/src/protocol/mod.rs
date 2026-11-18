@@ -39,6 +39,10 @@ pub struct EngineLoad {
     pub num_waiting: u64,
     /// KV-cache usage ratio (`1.0` == 100%).
     pub kv_cache_usage: f64,
+    /// Prompt plus committed output tokens held by this rank, when reported.
+    pub num_resident_tokens: Option<u64>,
+    /// Prompt tokens still to compute, excluding cached prefixes, when reported.
+    pub num_waiting_uncached_tokens: Option<u64>,
 }
 
 /// A *wave* is vLLM's term (not ours) for one round of work by a data-parallel

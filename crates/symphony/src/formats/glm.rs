@@ -259,6 +259,64 @@ mod tests {
     }
 
     #[test]
+    fn a_call_marker_inside_a_value_ends_the_call_so_the_forced_tag_keeps_it_out() {
+        // The engine's rule for every table (bellwether #16): a call's terminal inside a value is
+        // a terminal. The close quoted in a value ends the call there, the text after it is
+        // content, and a quoted call after it is a call; whole and at every cut alike.
+        let tools: Vec<Tool> = ["save_note", "delete_file"]
+            .iter()
+            .map(|name| Tool {
+                tool_type: "function".to_string(),
+                function: Function {
+                    name: name.to_string(),
+                    description: None,
+                    parameters: Some(value!({"type": "object", "properties": {
+                        "text": {"type": "string"},
+                        "path": {"type": "string"},
+                    }})),
+                    strict: None,
+                    extra: Default::default(),
+                },
+            })
+            .collect();
+        let output = concat!(
+            "</think><tool_call>save_note<arg_key>text</arg_key><arg_value>Close with ",
+            "</tool_call>, e.g. <tool_call>delete_file<arg_key>path</arg_key><arg_value>/",
+            "</arg_value></tool_call> is an example</arg_value></tool_call>"
+        );
+        let said = the_same_at_every_cut(
+            |pieces| run_with(Declared::of(&tools), PROMPT, pieces),
+            output,
+        );
+        assert_eq!(
+            said.calls,
+            [
+                (
+                    "save_note".to_string(),
+                    "{\"text\": \"Close with \"}".to_string()
+                ),
+                ("delete_file".to_string(), "{\"path\": \"/\"}".to_string()),
+            ]
+        );
+        assert_eq!(
+            said.content,
+            ", e.g.  is an example</arg_value></tool_call>"
+        );
+        // So a forced or required call's tag never lets a value hold either marker: under the tag
+        // the model writes no value this table reads as a cut call and a call no tag allowed.
+        let payload = glm()
+            .grammar(&tools, true, false)
+            .expect("a grammar")
+            .payload();
+        for tag in payload["format"]["tags"].as_array().expect("the tags") {
+            assert_eq!(
+                tag["content"]["excludes"],
+                value!(["</tool_call>", "<tool_call>"])
+            );
+        }
+    }
+
+    #[test]
     fn a_stream_cut_inside_a_call_ends_the_call_with_its_arguments_cut() {
         let output =
             "</think><tool_call>ChaDri_change_drink<arg_key>drink_id</arg_key><arg_value>lat";

@@ -22,8 +22,8 @@ use super::{
 use crate::{
     spec::{BindingSpec, OverloadSpec},
     store::{
-        Ask, GatewayId, LoadSink, LoadSource, MemoryStore, Reachability, Signals, ViewBuffers,
-        WorkerFacts, WorkerStatus, WorkersStore, PUBLISH_WINDOW,
+        Ask, GatewayId, Kinds, LoadSink, LoadSource, MembershipChange, MemoryStore, Reachability,
+        Signals, ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore, PUBLISH_WINDOW,
     },
     view::{LoadRow, Role, SignalSource, WireModes, WorkerId},
     AppliedSpec, PolicySpec,
@@ -150,6 +150,33 @@ impl LoadProbe for FakeProbe {
 }
 
 /// A ready row: one rank of `engine` at `key`.
+fn facts(
+    key: &str,
+    engine: &str,
+    rank: u16,
+    size: u16,
+    wires: WireModes,
+    scrape_ms: u32,
+) -> WorkerFacts {
+    WorkerFacts {
+        key: key.to_owned(),
+        engine: engine.to_owned(),
+        incarnation: 1,
+        role: Role::Single,
+        wire_modes: wires,
+        engine_kind: RuntimeType::Vllm.as_str().to_owned(),
+        models: vec!["m".to_owned()],
+        dp_rank: rank,
+        dp_size: size,
+        signals: Signals {
+            events: false,
+            loads: false,
+            scrape_interval_ms: scrape_ms,
+        },
+        ..WorkerFacts::default()
+    }
+}
+
 fn ready(
     store: &MemoryStore,
     key: &str,
@@ -160,23 +187,7 @@ fn ready(
     scrape_ms: u32,
 ) -> WorkerId {
     let id = store
-        .upsert(WorkerFacts {
-            key: key.to_owned(),
-            engine: engine.to_owned(),
-            incarnation: 1,
-            role: Role::Single,
-            wire_modes: wires,
-            engine_kind: RuntimeType::Vllm.as_str().to_owned(),
-            models: vec!["m".to_owned()],
-            dp_rank: rank,
-            dp_size: size,
-            signals: Signals {
-                events: false,
-                loads: false,
-                scrape_interval_ms: scrape_ms,
-            },
-            ..WorkerFacts::default()
-        })
+        .upsert(facts(key, engine, rank, size, wires, scrape_ms))
         .id();
     let revision = store.get(id).expect("the row").revision;
     store.set_status(id, WorkerStatus::Ready, revision);
@@ -1522,6 +1533,118 @@ async fn an_answer_with_no_row_says_nothing_of_an_engine_whose_other_rank_its_st
     assert_eq!(driver.stats().rows.load(Ordering::Relaxed), 0);
 }
 
+#[test]
+fn the_driver_tells_the_sink_the_longer_of_its_interval_and_its_poll_s_deadline_and_a_tick() {
+    let store = Arc::new(MemoryStore::new());
+    let probe = Arc::new(FakeProbe::default());
+    let _driver = driver(&store, &probe, TEN);
+    // Told once, where the driver is built. Another period is asked
+    // first: a sink the driver told nothing would take it as its own. The
+    // interval alone is not the period: a poll starts on a tick, a tenth
+    // of a second here, so two starts lie up to a tick further apart.
+    assert!(!store.heard_every(TEN));
+    assert!(store.heard_every(TEN + Duration::from_millis(100)));
+
+    // An interval shorter than the poll's deadline: the deadline, three
+    // seconds, and a tick make the period, so a poll that takes its whole
+    // deadline is still heard inside it. The scrape's five seconds are not
+    // in it: a scrape reads an engine of one rank, which never ages.
+    let store = Arc::new(MemoryStore::new());
+    let _driver = driver(&store, &probe, Duration::from_secs(1));
+    assert!(!store.heard_every(Duration::from_millis(5_100)));
+    assert!(store.heard_every(Duration::from_millis(3_100)));
+
+    // The defaults tell eleven seconds. An interval just over the deadline
+    // tells the interval and a tick, where the deadline and a tick are
+    // the same four seconds and one tick short.
+    assert_eq!(
+        LoadDriverConfig::default().report_period(),
+        Duration::from_secs(11)
+    );
+    let near = LoadDriverConfig {
+        poll_interval: Duration::from_secs(4),
+        ..LoadDriverConfig::default()
+    };
+    assert_eq!(near.report_period(), Duration::from_secs(5));
+
+    // The largest deadline a host can set saturates the sum, and so does
+    // the largest interval, so the driver still builds.
+    let largest = LoadDriverConfig {
+        poll_deadline: Duration::MAX,
+        ..LoadDriverConfig::default()
+    };
+    assert_eq!(largest.report_period(), Duration::MAX);
+    let endless = LoadDriverConfig {
+        poll_interval: Duration::MAX,
+        ..LoadDriverConfig::default()
+    };
+    assert_eq!(endless.report_period(), Duration::MAX);
+}
+
+/// One lost report does not end a polled rank's sample at an interval just
+/// over the poll's deadline. An engine's polls start on a tick: at four
+/// seconds over a three-second deadline and a one-second tick they start
+/// at 0 s, 5 s and 10 s where each tick comes late. The second answer has
+/// no row for the rank and the third is still out when the rank's sibling
+/// writes on its stream at 12.5 s: the sample of 0 s lies inside three
+/// periods of five seconds, where it lay past three of four.
+#[tokio::test(start_paused = true)]
+async fn a_polled_rank_is_counted_through_one_lost_report_at_an_interval_near_the_deadline() {
+    let store = Arc::new(MemoryStore::new());
+    let probe = Arc::new(FakeProbe::default());
+    let rank0 = ready(
+        &store,
+        "grpc://b:1@0",
+        "grpc://b:1",
+        0,
+        2,
+        WireModes::GRPC,
+        0,
+    );
+    let rank1 = ready(
+        &store,
+        "grpc://b:1@1",
+        "grpc://b:1",
+        1,
+        2,
+        WireModes::GRPC,
+        0,
+    );
+    store.apply(vetoing_at(5)).expect("applied");
+    let _driver = LoadDriver::new(
+        Arc::clone(&store),
+        Arc::clone(&probe),
+        LoadDriverConfig {
+            poll_interval: Duration::from_secs(4),
+            ..LoadDriverConfig::default()
+        },
+    );
+    // The poll that started at 0 s hears the rank at its threshold.
+    let waiting = LoadRow {
+        queued: 5,
+        ..LoadRow::default()
+    };
+    store.report(&[(rank1, 1, Some(waiting))], now(), LoadSource::Poll);
+    assert_eq!(
+        (vetoed(&store), store.overload_flips()),
+        (vec![true, true], 1)
+    );
+    // The sibling's stream at 12.5 s: the rank is still counted.
+    tokio::time::advance(Duration::from_millis(12_500)).await;
+    store.record(rank0, 0, LoadRow::default(), now(), LoadSource::Stream);
+    assert_eq!(
+        (vetoed(&store), store.overload_flips()),
+        (vec![true, true], 1)
+    );
+    // A microsecond past three periods the silent rank's sample has ended.
+    tokio::time::advance(Duration::from_micros(2_500_001)).await;
+    store.record(rank0, 0, LoadRow::default(), now(), LoadSource::Stream);
+    assert_eq!(
+        (vetoed(&store), store.overload_flips()),
+        (vec![false, false], 2)
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_rank_that_is_not_ready_does_not_hold_the_word_off() {
     let store = Arc::new(MemoryStore::new());
@@ -1616,4 +1739,123 @@ async fn an_engines_answer_is_one_write_so_ranks_that_trade_their_queues_move_no
         (vec![false; 2], 0)
     );
     assert_eq!(driver.stats().rows.load(Ordering::Relaxed), 4);
+}
+
+/// A replica that leads, follows and leads again runs the one loop
+/// through: its polls end while it follows and start again at the take.
+/// Between the two a restore left the store at the epoch the first stretch
+/// grouped at, with another membership.
+#[tokio::test(start_paused = true)]
+async fn the_polls_group_the_membership_anew_at_a_take_after_a_restore_to_the_same_epoch() {
+    let store = Arc::new(MemoryStore::new());
+    let probe = Arc::new(FakeProbe::default());
+    let own = ready(&store, "grpc://w:1", "grpc://w:1", 0, 1, WireModes::GRPC, 0);
+    let figures = Figures {
+        running: 4,
+        waiting: 2,
+        usage: 0.5,
+    };
+    probe.answers("grpc://w:1", &[figures]);
+    probe.answers("grpc://x:1", &[figures]);
+    let driver = Arc::new(driver(&store, &probe, TEN));
+    let (_stop, stopped) = watch::channel(false);
+    let (leads, polls) = watch::channel(true);
+    let mut tasks = JoinSet::new();
+    let running = Arc::clone(&driver);
+    tasks.spawn(async move { running.run_while(stopped, polls).await });
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(row(&store, own, 0).is_some());
+    leads.send_replace(false);
+    // It follows: a leader's cut of as many writes, of another engine.
+    let leader = MemoryStore::new();
+    let theirs = ready(
+        &leader,
+        "grpc://x:1",
+        "grpc://x:1",
+        0,
+        1,
+        WireModes::GRPC,
+        0,
+    );
+    assert_eq!(leader.epoch(), store.epoch());
+    assert!(store.restore_from(leader.cut(Kinds::All)));
+    let before = probe.polls().len();
+    tokio::time::sleep(TEN + TEN).await;
+    assert_eq!(probe.polls().len(), before, "a follower polled");
+    // The take: the polls start at once, over the membership as it stands.
+    leads.send_replace(true);
+    tokio::time::sleep(TEN + TEN).await;
+    let polled = probe.polls().split_off(before);
+    assert!(
+        !polled.is_empty() && polled.iter().all(|engine| engine == "grpc://x:1"),
+        "{polled:?}"
+    );
+    assert!(row(&store, theirs, 0).is_some());
+    // The engine that left between the two stretches is let go by the probe.
+    assert_eq!(*probe.forgotten.lock(), ["grpc://w:1"]);
+    assert_eq!(probe.connections(), 1);
+}
+
+/// On a replica that follows, the loop polls no engine and pays the store's
+/// publications all the same: a followed registration and a followed load
+/// row reach the published world with no decision asked and no poll made,
+/// and at the take the first tick polls the worker that joined meanwhile.
+#[tokio::test(start_paused = true)]
+async fn a_followers_loop_pays_the_stores_publications_and_polls_no_engine() {
+    let store = Arc::new(MemoryStore::new());
+    let probe = Arc::new(FakeProbe::default());
+    let driver = Arc::new(driver(&store, &probe, TEN));
+    let (_stop, stopped) = watch::channel(false);
+    let (leads, polls) = watch::channel(false);
+    let mut tasks = JoinSet::new();
+    let running = Arc::clone(&driver);
+    tasks.spawn(async move { running.run_while(stopped, polls).await });
+    // What a decision reads of the worker's load; `None` while the worker
+    // is no member of the published world.
+    let seen = |id: WorkerId| {
+        let mut out = ViewBuffers::default();
+        let ask = Ask {
+            gateway: GatewayId::LOCAL,
+            now: now(),
+            pinned: None,
+            affinity: false,
+        };
+        store.build_view("m", Role::Single, &ask, &mut out)?;
+        let row = out.candidates.iter().find(|row| row.id == id)?;
+        Some(row.load.map(|load| load.running))
+    };
+    // The leader's registration and its status, followed as the applier
+    // follows them.
+    let leader = MemoryStore::new();
+    let id = leader
+        .upsert(facts("grpc://a:1", "grpc://a:1", 0, 1, WireModes::GRPC, 0))
+        .id();
+    let told = leader.get(id).expect("the row");
+    assert_eq!(seen(id), None);
+    let ready = MembershipChange::StatusChanged {
+        id,
+        from: told.status,
+        to: WorkerStatus::Ready,
+    };
+    store.follow(1, MembershipChange::Registered { id }, Some(told));
+    store.follow(2, ready, None);
+    assert_eq!(seen(id), Some(None), "a followed registration");
+    // Two followed load rows, the leader's polls: the first opens the store's
+    // window and shows by itself, the second lands inside it and waits for
+    // the payer.
+    let load = |running| LoadRow {
+        running,
+        ..LoadRow::default()
+    };
+    store.record(id, 0, load(4), now(), LoadSource::Poll);
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    store.record(id, 0, load(7), now(), LoadSource::Poll);
+    assert_eq!(seen(id), Some(Some(4)));
+    tokio::time::sleep(Duration::from_millis(100) + PUBLISH_WINDOW).await;
+    assert_eq!(seen(id), Some(Some(7)), "a followed load row");
+    assert!(probe.polls().is_empty(), "a follower polled");
+    // The take: the first tick polls the worker that joined meanwhile.
+    leads.send_replace(true);
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    assert_eq!(probe.polls(), ["grpc://a:1"]);
 }

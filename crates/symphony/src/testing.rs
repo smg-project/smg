@@ -355,6 +355,181 @@ pub(crate) fn an_invoke_outside_a_block_reads_as_the_engines_do(
     assert_eq!(said.reasoning, format!("Let me add.{invoke}"));
 }
 
+/// Every shape of an invoke whose arguments the model wrote as one JSON object in place of the
+/// parameter tags, on a DSML table whose `run` reads an output after a prompt, read whole, one
+/// character at a time and at every two-way cut as one serving engine's own parser for the family
+/// reads them (it takes the object as the arguments, as written, and the structural tag that
+/// engine builds for a call writes the object between the invoke tag and its close): right after
+/// the tag, on lines of its own, two such invokes after a preamble, and an invoke outside a block.
+/// `invoke` is the invoke tag up to the name's quote, `close` its closing tag, `open` and
+/// `block_close` the block's tags, `chat` the prompt that closed the thought. Nothing is
+/// malformed, every byte lands in one event, and a chat client reads the calls.
+pub(crate) fn an_invoke_whose_arguments_are_json_reads_as_the_engines_do(
+    run: impl Fn(&str, &[&str]) -> Vec<Event<'static>>,
+    invoke: &str,
+    close: &str,
+    open: &str,
+    block_close: &str,
+    chat: &str,
+) {
+    let call = |arguments: &str| ("get_weather".to_string(), arguments.to_string());
+    let compact = r#"{"location": "Paris", "days": 3}"#;
+    let on_lines = "{\n    \"location\": \"Paris\"\n}";
+    // A shape's name, the output, the content and the calls it gives.
+    type Shape<'a> = (&'a str, String, &'a str, Vec<(String, String)>);
+    let shapes: [Shape; 4] = [
+        (
+            "right after the tag",
+            format!("\n\n{open}\n{invoke}get_weather\">{compact}{close}\n{block_close}"),
+            "",
+            vec![call(compact)],
+        ),
+        (
+            "on lines of its own",
+            format!("{open}\n{invoke}get_weather\">\n{on_lines}\n{close}\n{block_close}"),
+            "",
+            vec![call(on_lines)],
+        ),
+        (
+            "two after a preamble",
+            format!(
+                "Let me check.\n\n{open}\n{invoke}get_weather\">\n{compact}\n{close}\n\
+                 {invoke}get_weather\">\n{on_lines}\n{close}\n{block_close}"
+            ),
+            "Let me check.",
+            vec![call(compact), call(on_lines)],
+        ),
+        (
+            "outside a block",
+            format!("{invoke}get_weather\">\n{compact}\n{close}"),
+            "",
+            vec![call(compact)],
+        ),
+    ];
+    for (name, output, content, calls) in shapes {
+        let events = run(chat, &[&output]);
+        assert_eq!(bytes(&events), output, "{name}");
+        assert!(malformed(&events).is_empty(), "{name}: {events:?}");
+        let said = the_same_at_every_cut(|pieces| run(chat, pieces), &output);
+        assert_eq!(said.content, content, "{name}");
+        assert_eq!(said.calls, calls, "{name}");
+        assert_eq!(
+            said.finish.map(|(_, count)| count),
+            Some(calls.len() as u32),
+            "{name}"
+        );
+        let choice = adapt::chat::message(0, &events);
+        assert_eq!(
+            choice.finish_reason.as_deref(),
+            Some("tool_calls"),
+            "{name}"
+        );
+    }
+}
+
+/// What ends an invoke whose arguments are one JSON object, on a DSML table whose `run` reads an
+/// output after a prompt, the same whole, one character at a time and at every two-way cut. The
+/// two parameter tags inside one of the object's strings are its text; the invoke's close, the
+/// next invoke's opening and the block's close are the table's terminals, and any of them ends
+/// the call where it stands, inside one of the object's strings too, as it does inside a
+/// parameter's value. The object such a tag cuts stays as written, no whole value, under one
+/// `Malformed` event of no bytes, the output's first report, whose reason is the engine's for a
+/// call a marker closed, `BlockWithoutACompleteCall`; where the stream ends inside the same
+/// object the report keeps the reader's own reason, `UnterminatedRegion`. What the model wrote
+/// after the tag is read where the table then stands: after the invoke's close it is text
+/// between calls, which a chat client reads as content, after the next invoke's opening it is
+/// the next call, from its name on, and after the block's close it is content. Every byte lands
+/// in one event. `invoke` is the invoke tag up to the name's quote, `close` its closing tag,
+/// `open` and `block_close` the block's tags, `chat` the prompt that closed the thought.
+pub(crate) fn a_call_terminal_ends_an_invoke_whose_arguments_are_json(
+    run: impl Fn(&str, &[&str]) -> Vec<Event<'static>>,
+    invoke: &str,
+    close: &str,
+    open: &str,
+    block_close: &str,
+    chat: &str,
+) {
+    let cut = r#"{"location": "x "#;
+    let next = r#"{"zone": "utc"}"#;
+    let head = format!("{open}\n{invoke}get_weather\">{cut}");
+    let first = ("get_weather".to_string(), cut.to_string());
+    // A shape's name, the output, its calls, the reasons of its reports in order (a reason that
+    // repeats said once), the content the table reads and the content a chat client reads.
+    let shapes = [
+        (
+            "the invoke's close",
+            format!("{head}{close} y\", \"days\": 3}}{close}\n{block_close}"),
+            vec![first.clone()],
+            vec![
+                MalformedReason::BlockWithoutACompleteCall,
+                MalformedReason::TextBetweenCalls,
+            ],
+            String::new(),
+            Some(format!("y\", \"days\": 3}}{close}")),
+        ),
+        (
+            "the next invoke's opening",
+            format!("{head}{invoke}get_time\">{next}{close}\n{block_close}"),
+            vec![first.clone(), ("get_time".to_string(), next.to_string())],
+            vec![MalformedReason::BlockWithoutACompleteCall],
+            String::new(),
+            None,
+        ),
+        (
+            "the block's close",
+            format!("{head}{block_close} y\"}}{close}\n{block_close}"),
+            vec![first],
+            vec![
+                MalformedReason::BlockWithoutACompleteCall,
+                MalformedReason::MarkerOutOfPlace,
+            ],
+            format!(" y\"}}{close}\n{block_close}"),
+            Some(format!(" y\"}}{close}\n{block_close}")),
+        ),
+    ];
+    for (name, output, calls, reasons, content, shown) in shapes {
+        let events = run(chat, &[&output]);
+        assert_eq!(bytes(&events), output, "{name}");
+        // The object's report comes first and carries no bytes; the reports after it are of what
+        // the model wrote after the tag.
+        let reports = malformed(&events);
+        assert_eq!(
+            reports.first().map(|(text, _)| text.as_str()),
+            Some(""),
+            "{name}: {events:?}"
+        );
+        let mut said_why: Vec<MalformedReason> = reports.into_iter().map(|(_, why)| why).collect();
+        said_why.dedup();
+        assert_eq!(said_why, reasons, "{name}: {events:?}");
+        let said = the_same_at_every_cut(|pieces| run(chat, pieces), &output);
+        assert_eq!(
+            said.finish.map(|(_, count)| count),
+            u32::try_from(calls.len()).ok(),
+            "{name}"
+        );
+        assert_eq!(said.calls, calls, "{name}");
+        assert_eq!(said.content, content, "{name}");
+        let choice = adapt::chat::message(0, &events);
+        assert_eq!(
+            choice.finish_reason.as_deref(),
+            Some("tool_calls"),
+            "{name}"
+        );
+        assert_eq!(
+            choice.message.content.as_deref(),
+            shown.as_deref(),
+            "{name}"
+        );
+    }
+    // Where the stream ends inside the object the report keeps the reader's own reason.
+    let events = run(chat, &[&head]);
+    assert_eq!(
+        malformed(&events),
+        [(String::new(), MalformedReason::UnterminatedRegion)],
+        "the end of the stream: {events:?}"
+    );
+}
+
 /// The structural tag of a forced call on `format`, a table whose layout writes `after` after
 /// the thought's close (`close`), in every configuration a request and an engine present:
 /// `tool_choice` naming a function (the first of `tools`) and `required` (all of them), the

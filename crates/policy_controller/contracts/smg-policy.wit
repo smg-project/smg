@@ -14,7 +14,7 @@
 /// on. The loader's error names the module's version and the accepted range.
 ///
 /// Sandbox (design 4.5): no WASI, the only imports are `host` below. One
-/// instance per module per shard thread, created at apply and kept; the call
+/// instance per module per decider, created at apply and kept; the call
 /// runs under fuel metering with a memory cap. A trap, an exhausted budget or
 /// a decline falls back to the configured stage; a trap or an exhausted
 /// budget re-instantiates the instance, a decline keeps it.
@@ -114,6 +114,8 @@ interface types {
   /// into the spec's `view.headers` list with the value (unlike the one-based
   /// `zone`, `engine-kind` and `connector`); `budget-micros` is relative to
   /// the host's receipt; `seed` is the only randomness (see `host`).
+  /// `block-hashes` is empty unless the plugin's row declares `token_hashes` or
+  /// `text_hashes` among its needs.
   record request {
     model: string,
     namespace-seed: u64,
@@ -264,6 +266,17 @@ interface plugin {
     pick: func(scores: list<f32>) -> result<option<u32>, decline>;
   }
 
+  /// Called with the kinds of event the plugin's row lists
+  /// (`plugins[].observes`), none by default: a module whose row lists none
+  /// is never called. An instance is one decider's: it hears what is told
+  /// as that decider, and a lease's event or a signal told where no decider
+  /// stands (a thread that neither decides nor names one) reaches no
+  /// instance. The membership reaches every instance: an instance hears it
+  /// as it stands as its first membership event (a `snapshot`), then each
+  /// change once, or a snapshot that holds the changes it fell behind. What
+  /// passed is not replayed: an instance may hear the end of a lease it
+  /// never heard issued, and a signal comes again with its worker's next
+  /// report.
   observe: func(event: lifecycle-event);
 }
 
@@ -316,10 +329,11 @@ interface plugin {
 ///   nothing past it. The three counts are bounded by the engine's caps, far
 ///   below u16: hash-count by the spec's `view.max_block_hashes` (default
 ///   256; the view holds the first N hashes in every form, record and packed
-///   alike), header-count by the allow-list (at most 256 names), tried-count
-///   by the attempt counter (u8) times the four targets of a decision; a spec
-///   whose cap exceeds 65,535 is refused at apply when a packed plugin is
-///   configured, never a truncated block. The string lengths are u16 as
+///   alike, and none for a plugin whose row declares neither token hashes
+///   nor text hashes among its needs), header-count by the allow-list (at
+///   most 256 names), tried-count by the attempt counter (u8) times the four
+///   targets of a decision. A hash cap above 8,190 is refused at apply, and a
+///   longer list is cut to its first 8,190. The string lengths are u16 as
 ///   well: a request whose model name, header value or plain identity
 ///   exceeds 65,535 bytes is not packed; the host skips the packed plugin
 ///   for that decision (its stages take their fallbacks, as for a
@@ -349,6 +363,17 @@ interface plugin-packed {
     pick: func(scores: list<f32>) -> result<option<u32>, decline>;
   }
 
+  /// Called with the kinds of event the plugin's row lists
+  /// (`plugins[].observes`), none by default: a module whose row lists none
+  /// is never called. An instance is one decider's: it hears what is told
+  /// as that decider, and a lease's event or a signal told where no decider
+  /// stands (a thread that neither decides nor names one) reaches no
+  /// instance. The membership reaches every instance: an instance hears it
+  /// as it stands as its first membership event (a `snapshot`), then each
+  /// change once, or a snapshot that holds the changes it fell behind. What
+  /// passed is not replayed: an instance may hear the end of a lease it
+  /// never heard issued, and a signal comes again with its worker's next
+  /// report.
   observe: func(event: lifecycle-event);
 }
 

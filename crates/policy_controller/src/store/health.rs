@@ -10,6 +10,20 @@ use crate::{
     view::WorkerId,
 };
 
+/// What a noted write of a gateway's veto found
+/// ([`HealthSink::gateway_veto_noted`]).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VetoWrite {
+    /// The end is written, or the veto cleared.
+    Written,
+    /// The note says an end stands and the store shows none: the worker's
+    /// row left since the note was written and took its vetoes with it.
+    /// Nothing is written.
+    Left,
+    /// A veto for a worker without a row: nothing is written.
+    NoRow,
+}
+
 /// Where health is written. The pool's view is the prober's and the reports';
 /// a gateway's breaker and liveness vetoes are its own and mask the worker
 /// for that gateway alone.
@@ -42,9 +56,33 @@ pub trait HealthSink: Send + Sync {
     /// A gateway's standing veto on a worker until `until`; `None` clears
     /// it. The breaker's open window and the liveness veto travel this way,
     /// and a veto standing across a reconnect is re-asserted in the gateway's
-    /// `Hello` pages. A veto for a worker without a row (never registered,
-    /// or removed) writes nothing; the clear needs no such guard.
+    /// `Hello`. A veto for a worker without a row (never registered, or
+    /// removed) writes nothing; the clear needs no such guard. A gateway
+    /// gone past its grace period takes its vetoes with it
+    /// ([`LeasesStore::drop_gateways`](super::LeasesStore::drop_gateways)).
+    /// The controller's presence table alone writes a gateway's vetoes,
+    /// through the note it keeps of them: a write that goes around the
+    /// table is not seen by the gateway's ceiling of vetoes until the next
+    /// membership write.
     fn gateway_veto(&self, gateway: GatewayId, id: WorkerId, until: Option<Instant>);
+
+    /// [`gateway_veto`](Self::gateway_veto) for a caller that keeps a note
+    /// of the gateway's vetoes on the worker: the note's check and the
+    /// write under one hold of the store, so no row leaves or comes back
+    /// between them. `stands` says the note holds an end that stands at
+    /// `now` apart from this write. Where it does and the store shows no
+    /// veto of the gateway on the worker at `now`, the worker's row left
+    /// since the note was written, with its vetoes: nothing is written and
+    /// the caller is told. A row registered again under the same id is
+    /// never written an end of the row before it.
+    fn gateway_veto_noted(
+        &self,
+        gateway: GatewayId,
+        id: WorkerId,
+        until: Option<Instant>,
+        stands: bool,
+        now: Instant,
+    ) -> VetoWrite;
 
     /// Whether `gateway` vetoes the worker at `now`.
     fn vetoed(&self, gateway: GatewayId, id: WorkerId, now: Instant) -> bool;

@@ -446,7 +446,9 @@ async fn regular_budget_beyond_the_window_is_a_400_on_every_route() {
             ),
             (
                 "messages",
-                router.route_messages(None, &tenant, messages, MODEL).await,
+                router
+                    .route_messages(None, &tenant, Arc::new(messages), MODEL)
+                    .await,
             ),
             (
                 "responses",

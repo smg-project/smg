@@ -1,6 +1,11 @@
 //! The parts of a plugin's row that are not about its kind: what of the
-//! request it may read, what a stage does when it cannot answer, when the
-//! breaker bypasses it, and the frame budget of one call.
+//! request it may read, which lifecycle events it hears, what a stage does
+//! when it cannot answer, when the breaker bypasses it, and the frame budget
+//! of one call.
+
+// A row lists the kinds of lifecycle event its plugin hears in the
+// lifecycle's own set.
+pub use crate::lease::{EventKind, EventSet};
 
 /// How a tenant or a session key reaches the plugin: withheld, as its
 /// fingerprint (the default), or in the clear when the host holds it so.

@@ -6,7 +6,9 @@
 
 use std::{fmt, path::PathBuf};
 
-pub use crate::plugins::config::{BreakerSpec, Exposure, Failure, FrameBudget, HeaderSet, Reveal};
+pub use crate::plugins::config::{
+    BreakerSpec, EventKind, EventSet, Exposure, Failure, FrameBudget, HeaderSet, Reveal,
+};
 use crate::spec::Needs;
 
 /// The client side of mutual TLS: the authority that signed the plugin's
@@ -69,10 +71,23 @@ pub struct GrpcPluginSpec {
     pub connect_micros: u32,
     pub view: Exposure,
     /// What the host must feed for the plugin's stages to mean anything;
-    /// the plugin declares it, the host cannot read it off a server.
+    /// the plugin declares it, the host cannot read it off a server. A frame
+    /// carries the request's block hashes where these declare them, in the
+    /// token form or the text form: eight bytes a hash, the first
+    /// [`MAX_BLOCK_HASHES`](crate::spec::MAX_BLOCK_HASHES) of a
+    /// longer list. Where they declare neither it carries none, whatever
+    /// the other stages of the profile read.
     pub needs: Needs,
     /// The counters the plugin may add to, by id; a name per id.
     pub metrics: Vec<String>,
+    /// The kinds of lifecycle event the plugin's `Observe` stream carries,
+    /// none by default: a row that lists none is told nothing, and no such
+    /// stream is opened. A row that lists any has the plugin's scorer and
+    /// picker say they need the lifecycle's calls
+    /// ([`crate::Lifecycle::needs_lifecycle`]). Bound as a filter alone a
+    /// plugin hears nothing, whatever this lists: the engine forwards the
+    /// lifecycle to scorers and pickers.
+    pub observes: EventSet,
     pub failure: Failure,
     pub breaker: BreakerSpec,
     /// The most candidates one frame carries. A larger pool is never
@@ -83,7 +98,8 @@ pub struct GrpcPluginSpec {
 
 impl GrpcPluginSpec {
     /// The default candidate bound: a frame is 1.5 KB on the wire at 64
-    /// candidates and 12.6 KB at 512.
+    /// candidates and 12.6 KB at 512, before the block hashes of a row that
+    /// declares them.
     pub const DEFAULT_MAX_CANDIDATES: u32 = 128;
 
     /// The default connect frame: the WebAssembly host's `init` frame.
@@ -100,6 +116,7 @@ impl GrpcPluginSpec {
             view: Exposure::default(),
             needs: Needs::default(),
             metrics: Vec::new(),
+            observes: EventSet::default(),
             failure: Failure::default(),
             breaker: BreakerSpec::default(),
             max_candidates: Self::DEFAULT_MAX_CANDIDATES,

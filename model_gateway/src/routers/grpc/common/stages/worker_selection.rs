@@ -2441,7 +2441,7 @@ mod tests {
         routers::{
             common::{
                 attempt_ledger::{mark_upstream_answer, AttemptLedger},
-                prefill_admission::PrefillReservation,
+                prefill_admission::{test_support::select_worker, PrefillReservation},
                 retry::is_retryable_response,
             },
             grpc::{
@@ -2455,8 +2455,8 @@ mod tests {
         },
         tenant::TenantKey,
         worker::{
-            test_support::{no_health_check, select_worker},
-            BasicWorkerBuilder, ConnectionMode, ModelCard, WorkerLoadGuard,
+            test_support::no_health_check, BasicWorkerBuilder, ConnectionMode, ModelCard,
+            WorkerLoadGuard,
         },
     };
 

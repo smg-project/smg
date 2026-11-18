@@ -739,7 +739,7 @@ impl GrpcRouter {
     /// per hop.
     fn messages_request_for_pipeline(
         &self,
-        body: CreateMessageRequest,
+        mut body: Arc<CreateMessageRequest>,
         model_id: &str,
     ) -> (Arc<CreateMessageRequest>, String, MessagesTools) {
         debug!("Processing messages request for model: {}", model_id);
@@ -748,14 +748,16 @@ impl GrpcRouter {
         // doc comment. Rewrite the body's `model` field to match; see
         // `chat_request_for_pipeline`.
         let model_id_cloned = self.resolve_canonical_model_id(model_id);
-        let mut canonical_body = body;
+        // The handler's `Arc` is the only handle at this point, so this
+        // borrows the request in place.
+        let canonical_body = Arc::make_mut(&mut body);
         canonical_body.model.clone_from(&model_id_cloned);
-        // The tools leave the request here, while it is still owned: converted
-        // once, by value, into the chat tools the pipeline carries beside the
-        // request; the request's own `tools` reads `None` from here on, and
-        // whether it was set travels with them.
-        let tools = MessagesTools::take_from(&mut canonical_body);
-        (Arc::new(canonical_body), model_id_cloned, tools)
+        // The tools leave the request here, before the pipeline shares it:
+        // converted once, by value, into the chat tools the pipeline carries
+        // beside the request; the request's own `tools` reads `None` from
+        // here on, and whether it was set travels with them.
+        let tools = MessagesTools::take_from(canonical_body);
+        (body, model_id_cloned, tools)
     }
 
     /// Main route_messages implementation, over the request
@@ -1309,7 +1311,7 @@ impl RouterTrait for GrpcRouter {
         &self,
         headers: Option<&HeaderMap>,
         tenant_meta: &TenantRequestMeta,
-        body: CreateMessageRequest,
+        body: Arc<CreateMessageRequest>,
         model_id: &str,
     ) -> Response {
         let (body, model_id, tools) = self.messages_request_for_pipeline(body, model_id);

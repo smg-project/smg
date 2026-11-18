@@ -33,7 +33,7 @@ use crate::{
         create_worker_workflow_data, note_tokenizer_load_outcome, note_tokenizer_removed,
         registered_entries, registered_in, McpServerConfigRequest, TokenizerConfigRequest,
         TokenizerRemovalRequest, WasmModuleConfigRequest, WasmModuleRemovalRequest,
-        WorkerRegistrationMode,
+        WorkerRegistrationMode, WorkflowEngines,
     },
 };
 
@@ -930,6 +930,15 @@ impl JobQueue {
         })
     }
 
+    /// The workflow engines, or the refusal a job answers while they are not
+    /// built yet.
+    fn workflow_engines(context: &AppContext) -> Result<&WorkflowEngines, String> {
+        context
+            .workflow_engines
+            .get()
+            .ok_or_else(|| "Workflow engines not initialized".to_string())
+    }
+
     /// Cancels the `POST /workers` registration workflows the store holds for
     /// `worker_url`: the active ones are cancelled, a cancelled one counts, one
     /// that ended between the listing and the cancel is skipped. Says how many
@@ -939,11 +948,7 @@ impl JobQueue {
         context: &AppContext,
         worker_url: &str,
     ) -> Result<(usize, bool), String> {
-        let engine = &context
-            .workflow_engines
-            .get()
-            .ok_or_else(|| "Workflow engines not initialized".to_string())?
-            .worker_registration;
+        let engine = &Self::workflow_engines(context)?.worker_registration;
         let states = engine
             .state_store()
             .list_all()
@@ -1192,10 +1197,7 @@ impl JobQueue {
                 if Self::take_mark(cancelled_before_start, own_id) {
                     return Err("Registration cancelled before it started".to_string());
                 }
-                let engines = context
-                    .workflow_engines
-                    .get()
-                    .ok_or_else(|| "Workflow engines not initialized".to_string())?;
+                let engines = Self::workflow_engines(context)?;
 
                 let timeout_duration =
                     Duration::from_secs(context.router_config.worker_startup_timeout_secs + 30);
@@ -1280,10 +1282,7 @@ impl JobQueue {
                 }
             }
             Job::UpdateWorker { url, update } => {
-                let engines = context
-                    .workflow_engines
-                    .get()
-                    .ok_or_else(|| "Workflow engines not initialized".to_string())?;
+                let engines = Self::workflow_engines(context)?;
 
                 let workflow_data = create_worker_update_workflow_data(
                     url.to_string(),
@@ -1302,10 +1301,7 @@ impl JobQueue {
                 .await
             }
             Job::RefreshWorkerLabels { url } => {
-                let engines = context
-                    .workflow_engines
-                    .get()
-                    .ok_or_else(|| "Workflow engines not initialized".to_string())?;
+                let engines = Self::workflow_engines(context)?;
 
                 let mut workflow_data = create_worker_update_workflow_data(
                     url.to_string(),
@@ -1334,10 +1330,7 @@ impl JobQueue {
                 url,
                 expected_revisions,
             } => {
-                let engines = context
-                    .workflow_engines
-                    .get()
-                    .ok_or_else(|| "Workflow engines not initialized".to_string())?;
+                let engines = Self::workflow_engines(context)?;
 
                 let workflow_data = create_worker_removal_workflow_data(
                     url.to_string(),
@@ -1385,10 +1378,7 @@ impl JobQueue {
                 result
             }
             Job::AddWasmModule { config } => {
-                let engines = context
-                    .workflow_engines
-                    .get()
-                    .ok_or_else(|| "Workflow engines not initialized".to_string())?;
+                let engines = Self::workflow_engines(context)?;
 
                 let workflow_data =
                     create_wasm_registration_workflow_data(*config.clone(), Arc::clone(context));
@@ -1404,10 +1394,7 @@ impl JobQueue {
                 .await
             }
             Job::RemoveWasmModule { request } => {
-                let engines = context
-                    .workflow_engines
-                    .get()
-                    .ok_or_else(|| "Workflow engines not initialized".to_string())?;
+                let engines = Self::workflow_engines(context)?;
 
                 let workflow_data =
                     create_wasm_removal_workflow_data(*request.clone(), Arc::clone(context));
@@ -1556,10 +1543,7 @@ impl JobQueue {
                 Ok(format!("Submitted {server_count} RegisterMcpServer jobs"))
             }
             Job::RegisterMcpServer { config } => {
-                let engines = context
-                    .workflow_engines
-                    .get()
-                    .ok_or_else(|| "Workflow engines not initialized".to_string())?;
+                let engines = Self::workflow_engines(context)?;
 
                 let workflow_data =
                     create_mcp_workflow_data((**config).clone(), Arc::clone(context));
@@ -1579,10 +1563,7 @@ impl JobQueue {
                 // noted for the model (a failure of the model's last load
                 // answers its requests 503 tokenizer_load_failed).
                 let result = async {
-                    let engines = context
-                        .workflow_engines
-                        .get()
-                        .ok_or_else(|| "Workflow engines not initialized".to_string())?;
+                    let engines = Self::workflow_engines(context)?;
 
                     let workflow_data =
                         create_tokenizer_workflow_data(*config.clone(), Arc::clone(context));
@@ -2749,6 +2730,69 @@ mod tests {
         assert_eq!(
             status.status, "failed",
             "the kept job ran once the holder ended"
+        );
+    }
+
+    /// The queue as the worker's health manager holds it ([`WorkerJobs`]): a
+    /// label refresh asked through the trait is the queue's own refresh job.
+    /// With nothing in flight under the address it is submitted under its
+    /// kind; behind a job that holds the address it is kept, the holder's
+    /// status left to it, and runs under its own kind when the holder ends.
+    #[tokio::test]
+    async fn a_refresh_asked_through_the_workers_trait_is_the_queues_refresh() {
+        use crate::service_discovery::testing::create_test_app_context;
+        let context = create_test_app_context();
+        let queue = JobQueue::new(JobQueueConfig::default(), Arc::downgrade(&context));
+        let jobs: Arc<dyn WorkerJobs> = queue.clone();
+
+        let free = "http://free:8000";
+        assert_eq!(jobs.refresh_worker_labels(free.to_string()).await, Ok(true));
+        assert_eq!(
+            queue
+                .get_status(free)
+                .expect("the refresh's status")
+                .job_type,
+            "RefreshWorkerLabels"
+        );
+
+        let held = "http://held:8000";
+        queue.hold_url_for_tests(held, "AddWorker");
+        assert_eq!(
+            jobs.refresh_worker_labels(held.to_string()).await,
+            Ok(false)
+        );
+        assert!(queue.kept_for(held), "kept behind the job that holds it");
+        assert_eq!(
+            queue
+                .get_status(held)
+                .expect("the holder's status")
+                .job_type,
+            "AddWorker",
+            "the holder's status is left to it"
+        );
+        JobQueue::record_job_completion(
+            "AddWorker",
+            held,
+            Duration::ZERO,
+            &Ok("done".to_string()),
+            &queue.status_map,
+        );
+        JobQueue::run_kept(
+            held,
+            &context,
+            &queue.status_map,
+            &queue.kept,
+            &queue.cancelled_before_start,
+        )
+        .await;
+        assert!(!queue.kept_for(held));
+        assert_eq!(
+            queue
+                .get_status(held)
+                .expect("the kept job's status")
+                .job_type,
+            "RefreshWorkerLabels",
+            "the kept job is the refresh"
         );
     }
 
