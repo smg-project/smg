@@ -4517,6 +4517,40 @@ fn a_row_names_its_engine_family_and_zone_by_position_and_holds_a_bit_a_label() 
 }
 
 #[test]
+fn a_worker_of_two_models_reads_the_lists_in_each_of_its_rows() {
+    let store = MemoryStore::new();
+    let zones = ["east", "west"];
+    let engines = ["alpha", "beta"];
+    store
+        .apply(generation_listing(1, &["tier=gold"], &zones, &engines))
+        .expect("applied");
+    let both = WorkerFacts {
+        engine_kind: "beta".to_string(),
+        zone: Some("west".to_string()),
+        labels: [("tier".to_string(), "gold".to_string())].into(),
+        ..facts("both", Role::Single, &[MODEL, "second"])
+    };
+    let id = store.upsert(both).id();
+    // One row a model, and each row reads the member's three fields.
+    let read = |world: &World, model: &str| {
+        let rows = rows_of(world, model);
+        let row = rows.iter().find(|row| row.id == id);
+        let row = row.expect("the member's row");
+        (row.engine_kind, row.zone, row.labels)
+    };
+    let world = store.world();
+    assert_eq!(read(&world, MODEL), (2, 2, 0b1));
+    assert_eq!(read(&world, "second"), (2, 2, 0b1));
+    // An apply whose lists differ reads both rows again.
+    store
+        .apply(generation_listing(2, &["tier=gold"], &["west"], &["beta"]))
+        .expect("applied");
+    let world = store.world();
+    assert_eq!(read(&world, MODEL), (1, 1, 0b1));
+    assert_eq!(read(&world, "second"), (1, 1, 0b1));
+}
+
+#[test]
 fn an_apply_whose_lists_differ_reads_every_member_again_in_its_first_world() {
     let store = MemoryStore::new();
     let west = listed_member(&store, "w", "beta", Some("west"), &[("tier", "gold")]);
