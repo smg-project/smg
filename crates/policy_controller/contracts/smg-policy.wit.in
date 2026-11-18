@@ -14,7 +14,7 @@
 /// on. The loader's error names the module's version and the accepted range.
 ///
 /// Sandbox (design 4.5): no WASI, the only imports are `host` below. One
-/// instance per module per shard thread, created at apply and kept; the call
+/// instance per module per decider, created at apply and kept; the call
 /// runs under fuel metering with a memory cap. A trap, an exhausted budget or
 /// a decline falls back to the configured stage; a trap or an exhausted
 /// budget re-instantiates the instance, a decline keeps it.
@@ -63,7 +63,15 @@ interface plugin {
 
   /// Called with the kinds of event the plugin's row lists
   /// (`plugins[].observes`), none by default: a module whose row lists none
-  /// is never called.
+  /// is never called. An instance is one decider's: it hears what is told
+  /// as that decider, and a lease's event or a signal told where no decider
+  /// stands (a thread that neither decides nor names one) reaches no
+  /// instance. The membership reaches every instance: an instance hears it
+  /// as it stands as its first membership event (a `snapshot`), then each
+  /// change once, or a snapshot that holds the changes it fell behind. What
+  /// passed is not replayed: an instance may hear the end of a lease it
+  /// never heard issued, and a signal comes again with its worker's next
+  /// report.
   observe: func(event: lifecycle-event);
 }
 
@@ -152,7 +160,15 @@ interface plugin-packed {
 
   /// Called with the kinds of event the plugin's row lists
   /// (`plugins[].observes`), none by default: a module whose row lists none
-  /// is never called.
+  /// is never called. An instance is one decider's: it hears what is told
+  /// as that decider, and a lease's event or a signal told where no decider
+  /// stands (a thread that neither decides nor names one) reaches no
+  /// instance. The membership reaches every instance: an instance hears it
+  /// as it stands as its first membership event (a `snapshot`), then each
+  /// change once, or a snapshot that holds the changes it fell behind. What
+  /// passed is not replayed: an instance may hear the end of a lease it
+  /// never heard issued, and a signal comes again with its worker's next
+  /// report.
   observe: func(event: lifecycle-event);
 }
 

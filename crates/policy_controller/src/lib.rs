@@ -61,7 +61,7 @@
 //!
 //! - Section 9, the WebAssembly plugin host (the `wasm` module, behind the `wasm`
 //!   feature): user policies as components of the committed `smg:policy`
-//!   package, one kept instance per deciding thread, every call under fuel,
+//!   package, one kept instance per decider, every call under fuel,
 //!   bound to a profile as the framework's own stages. What every plugin
 //!   kind shares (the breaker, the counters, the stage adapters) is the
 //!   `plugins` module.
@@ -97,6 +97,7 @@ pub mod catalog;
 pub mod client;
 #[cfg(feature = "controller")]
 pub mod controller;
+pub mod decider;
 pub mod decision;
 pub mod elector;
 pub mod framework;
