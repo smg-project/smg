@@ -52,11 +52,27 @@ KUBE_VERSION = "1.30.0"
 BINARY_VARIABLE = "SMG_POLICY_CONTROLLER_BIN"
 COMPONENT = "policy-controller"
 NAME = "smg-policy-controller"
-# The block turned on. The switch is all it takes: every other value holds a
-# default, and the image's is the router's.
-ON = ("policyController.enabled=true",)
+# The controller's switch alone: the chart refuses it, for the document. A
+# case that gives a document of its own, in a values file, turns the
+# controller on with this: helm joins maps key by key, and a document set
+# beside it would join the file's.
+SWITCH = "policyController.enabled=true"
+# The block turned on. A controller refuses a start that names no source of
+# its policy spec and the chart refuses that render, so the switch comes
+# with a document: the one value with no default. Every other value holds
+# one, and the image's is the router's. The chart reads no line of the
+# document. The controller does: this one is the smallest that runs, one
+# profile that picks at random.
+ON = (
+    SWITCH,
+    "policyController.spec.apiVersion=smg.policy/v1",
+    "policyController.spec.profiles.default.pick=random",
+)
+# The document those switches hold.
+DOCUMENT = {"apiVersion": "smg.policy/v1", "profiles": {"default": {"pick": "random"}}}
 # The block with the election turned on.
-ELECTED = (*ON, "policyController.election.enabled=true")
+ELECTION = "policyController.election.enabled=true"
+ELECTED = (*ON, ELECTION)
 # The spellings of an election that is off.
 OFF = ((), ("policyController.election.enabled=false",), ("policyController.election=null",))
 # The strategy of a controller with the election off: no pod more at a
@@ -257,8 +273,12 @@ def answered_as_the_schema_names(chart: Path) -> tuple[list[set[str]], str, dict
                 given[parent][name] = defaults[parent][name]
             else:
                 # An object with required members is named member by member
-                # in the next round.
-                given[name] = {} if "required" in lists.get(name, {}) else defaults[name]
+                # in the next round. The spec document has no default: it is
+                # the one value an operator says.
+                if name == "spec":
+                    given[name] = DOCUMENT
+                else:
+                    given[name] = {} if "required" in lists.get(name, {}) else defaults[name]
     raise AssertionError(f"the controller did not render after {rounds}")
 
 
@@ -338,7 +358,7 @@ def test_the_image_follows_the_routers(router):
     repository = path.rpartition(":")[0]
 
     def image(*settings: str) -> str:
-        documents = render("policyController.enabled=true", *router, *settings)
+        documents = render(*ON, *router, *settings)
         assert router_image(documents) == of_the_router
         return container(documents)["image"]
 
@@ -354,7 +374,7 @@ def test_the_image_follows_the_routers(router):
 def test_a_release_names_the_image_it_publishes():
     """The chart's own values at a release: the router's image on Docker Hub
     and the controller's beside it, under the suffixed tag."""
-    documents = render("policyController.enabled=true", "global.image.tag=1.16.0")
+    documents = render(*ON, "global.image.tag=1.16.0")
     assert router_image(documents) == "docker.io/lightseekorg/smg:1.16.0"
     assert container(documents)["image"] == "docker.io/lightseekorg/smg:1.16.0-policy-controller"
 
@@ -366,12 +386,12 @@ def test_a_router_on_its_slurm_variant_takes_the_releases_controller():
     the chart's own Slurm example, with the controller on. The variant's
     suffix ends a tag: the same letters inside one are the tag's own."""
     example = EXAMPLES / "with-slurm-discovery.yaml"
-    documents = render("policyController.enabled=true", files=(example,))
+    documents = render(*ON, files=(example,))
     of_the_router = router_image(documents)
     assert of_the_router.endswith("-slurm")
     release = of_the_router.removesuffix("-slurm")
     assert container(documents)["image"] == release + "-policy-controller"
-    inside = render("policyController.enabled=true", "global.image.tag=1.16.0-slurm-rc.1")
+    inside = render(*ON, "global.image.tag=1.16.0-slurm-rc.1")
     assert container(inside)["image"] == router_image(inside) + "-policy-controller"
 
 
@@ -416,7 +436,7 @@ def test_every_published_router_tag_names_a_published_controller(run: str, tmp_p
         path, _, tag = reference.rpartition(":")
         registry, repository = path.split("/", 1) if path.count("/") == 2 else ("docker.io", path)
         documents = render(
-            "policyController.enabled=true",
+            *ON,
             f"global.image.registry={registry}",
             f"global.image.repository={repository}",
             f"global.image.tag={tag}",
@@ -431,14 +451,13 @@ def test_an_image_the_suffix_cannot_name_is_refused():
     """The default tag belongs to the router's repository and stands on the
     router's tag: a repository of the operator's own needs its tag, and a
     router named by a digest leaves the suffix nothing to stand on."""
-    on = "policyController.enabled=true"
-    error = render_error(on, "policyController.image.repository=example/controller")
+    error = render_error(*ON, "policyController.image.repository=example/controller")
     assert "policyController.image.repository needs policyController.image.tag" in error
     digest = "global.image.tag=1.16.0@sha256:" + "0" * 64
-    error = render_error(on, digest)
+    error = render_error(*ON, digest)
     assert "policyController.image.tag is needed" in error
     assert "global.image.tag" in error
-    named = render(on, digest, "policyController.image.tag=1.16.0-policy-controller")
+    named = render(*ON, digest, "policyController.image.tag=1.16.0-policy-controller")
     assert container(named)["image"] == "docker.io/lightseekorg/smg:1.16.0-policy-controller"
 
 
@@ -452,33 +471,37 @@ def test_a_release_older_than_the_first_with_a_controller_image_is_refused():
     default stands, and under a tag that is no release's: only the three
     numbers a release tag starts with are compared, so no tag fails the
     render for its spelling."""
-    on = "policyController.enabled=true"
     row = r"-policy-controller`, beside every release image from (\S+) on"
     (first,) = re.findall(row, (CHART / "README.md").read_text())
     for older in ("1.15.2", "1.15.2-slurm", "1.15.99-rc.1", "1.9.0", "0.9.0", "1.15.2-my_build"):
         router = f"global.image.tag={older}"
-        error = render_error(on, router)
+        error = render_error(*ON, router)
         assert f"image.tag is needed: global.image.tag {older} is older than {first}" in error
-        named = render(on, router, "policyController.image.tag=mine")
+        named = render(*ON, router, "policyController.image.tag=mine")
         assert container(named)["image"] == "docker.io/lightseekorg/smg:mine"
         assert not of_the_controller(render(router))
     newer = (first, f"{first}-rc.1", f"{first}-dev", f"{first}-my_build", f"{first}-0115")
     no_release = ("nightly", "v1.15.2", "1.15", "1.15.2.1", "build-1.15.2", "9" * 20 + ".0.0")
     for tag in newer + ("1.100.0", "2.0.0") + no_release:
-        documents = render(on, f"global.image.tag={tag}")
+        documents = render(*ON, f"global.image.tag={tag}")
         assert container(documents)["image"] == router_image(documents) + "-policy-controller", tag
 
 
 @needs_helm
-def test_the_block_renders_two_objects_and_the_election_four_more():
-    """No ConfigMap without a spec document. The election's four objects
-    stand behind the election's switch."""
+def test_the_block_renders_three_objects_and_the_election_four_more():
+    """The Deployment, its Service and the spec document's ConfigMap. The
+    election's four objects stand behind the election's switch."""
     documents = of_the_controller(render(*ON))
-    assert sorted(document["kind"] for document in documents) == ["Deployment", "Service"]
+    assert sorted(document["kind"] for document in documents) == [
+        "ConfigMap",
+        "Deployment",
+        "Service",
+    ]
     assert {document["metadata"]["name"] for document in documents} == {NAME}
 
     elected = of_the_controller(render(*ELECTED))
     assert sorted(document["kind"] for document in elected) == [
+        "ConfigMap",
         "Deployment",
         "Lease",
         "Role",
@@ -496,6 +519,7 @@ def test_the_block_renders_two_objects_and_the_election_four_more():
         )
     )
     assert sorted(document["kind"] for document in switched) == [
+        "ConfigMap",
         "Deployment",
         "PodDisruptionBudget",
         "Service",
@@ -507,9 +531,8 @@ def test_the_block_renders_two_objects_and_the_election_four_more():
 def test_a_spec_document_renders_its_configmap_its_mount_and_its_flag(tmp_path):
     """A document in the values is the one key of one ConfigMap under the
     controller's name. The pod mounts that ConfigMap whole and read-only,
-    and the controller is passed the key's file under the mount. A null and
-    an empty map are no document: none of the three is rendered."""
-    documents = render(*ON, files=(spec_values(tmp_path, LEAST_LOAD),))
+    and the controller is passed the key's file under the mount."""
+    documents = render(SWITCH, files=(spec_values(tmp_path, LEAST_LOAD),))
     assert sorted(document["kind"] for document in of_the_controller(documents)) == [
         "ConfigMap",
         "Deployment",
@@ -532,13 +555,25 @@ def test_a_spec_document_renders_its_configmap_its_mount_and_its_flag(tmp_path):
     assert found["args"].count("--spec-file") == 1
     # The read-only root filesystem stands: the mount is a volume of its own.
     assert found["securityContext"]["readOnlyRootFilesystem"] is True
-    # A null and an empty map are no document: the render is the one of no
-    # spec value, byte for byte.
-    plain = helm_template(ON)
-    assert plain.returncode == 0, plain.stderr
-    assert helm_template((*ON, "policyController.spec=null")).stdout == plain.stdout
-    no_document = spec_values(tmp_path, {}, "empty.yaml")
-    assert helm_template(ON, files=(no_document,)).stdout == plain.stdout
+
+
+@needs_helm
+def test_a_controller_with_no_spec_document_is_refused_by_name(tmp_path):
+    """The controller refuses a start that names no source of its policy
+    spec, and the document is the one source the chart passes: values that
+    hold none are refused at render, where a pod would only fail to start.
+    The switch alone, a null and an empty map are each no document. The
+    schema names the value, and with its check skipped the helper does."""
+    nothing = spec_values(tmp_path, {}, "empty.yaml")
+    cells = {
+        "the switch alone": ((SWITCH,), (), "policyController.spec: Must have at least 1"),
+        "a null": ((*ON, "policyController.spec=null"), (), "policyController: spec is required"),
+        "an empty map": ((SWITCH,), (nothing,), "policyController.spec: Must have at least 1"),
+    }
+    for name, (settings, files, of_the_schema) in cells.items():
+        assert of_the_schema in render_error(*settings, files=files), name
+        of_the_helper = render_error(*settings, files=files, skip_schema=True)
+        assert "policyController.spec holds no document: the controller refuses" in of_the_helper
 
 
 def without_the_document(documents: list[dict]) -> list[dict]:
@@ -548,19 +583,17 @@ def without_the_document(documents: list[dict]) -> list[dict]:
 
 
 @needs_helm
-@pytest.mark.parametrize("switches", [ON, ELECTED], ids=["alone", "elected"])
+@pytest.mark.parametrize("switches", [(SWITCH,), (SWITCH, ELECTION)], ids=["alone", "elected"])
 def test_a_changed_document_changes_its_configmap_and_no_pod(switches, tmp_path):
     """The pod template holds no checksum of the document. An upgrade to
     another document renders another ConfigMap and every other object as it
     was, so it moves no pod: the kubelet turns the mounted file and the
-    running controller reads it. A first document does move the pod: the
-    mount and the flag arrive with it."""
+    running controller reads it."""
     first = render(*switches, files=(spec_values(tmp_path, LEAST_LOAD, "first.yaml"),))
     second = render(*switches, files=(spec_values(tmp_path, RANDOM, "second.yaml"),))
     assert one(first, "ConfigMap")["data"] != one(second, "ConfigMap")["data"]
     assert without_the_document(first) == without_the_document(second)
     assert "annotations" not in one(first, "Deployment")["spec"]["template"]["metadata"]
-    assert one(first, "Deployment") != one(render(*switches), "Deployment")
 
 
 @needs_helm
@@ -588,7 +621,7 @@ def test_the_document_reaches_the_file_as_the_values_hold_it(tmp_path):
     }
 
     def file(document: dict) -> str:
-        documents = render(*ON, files=(spec_values(tmp_path, document),))
+        documents = render(SWITCH, files=(spec_values(tmp_path, document),))
         return one(documents, "ConfigMap")["data"]["spec.yaml"]
 
     written = file(carried)
@@ -607,15 +640,15 @@ def test_a_document_that_is_no_map_is_refused_though_it_reads_as_empty(
     written: str, tmp_path: Path
 ):
     """With the schema's check skipped, a document that is no map is refused
-    as it was written. One that reads as empty never renders as no document,
+    as it was written. One that reads as empty is not told as no document,
     and a document handed as one text is not written into the file as a
     text: null and the empty map alone are no document."""
     values = tmp_path / "values.yaml"
     values.write_text(f"policyController:\n  spec: {written}\n")
-    refused = render_error(*ON, files=(values,), skip_schema=True)
+    refused = render_error(SWITCH, files=(values,), skip_schema=True)
     assert f"policyController.spec is {written}: the policy spec document as a map" in refused
     # The schema refuses each first, by its type.
-    assert "policyController.spec: Invalid type" in render_error(*ON, files=(values,))
+    assert "policyController.spec: Invalid type" in render_error(SWITCH, files=(values,))
 
 
 @needs_helm
@@ -707,7 +740,9 @@ def test_the_pod_runs_under_the_routers_security_context_and_its_own_probes():
     # The controller calls no Kubernetes API: no token is mounted.
     assert pod["automountServiceAccountToken"] is False
     assert "serviceAccountName" not in pod
-    assert "volumes" not in pod and "volumeMounts" not in found
+    # The one volume is the spec document's.
+    assert [volume["name"] for volume in pod["volumes"]] == ["policy-spec"]
+    assert [mount["name"] for mount in found["volumeMounts"]] == ["policy-spec"]
     assert found["livenessProbe"]["httpGet"] == {"path": "/liveness", "port": "admin"}
     assert found["readinessProbe"]["httpGet"] == {"path": "/readiness", "port": "admin"}
     assert {port["name"]: port["containerPort"] for port in found["ports"]} == {
@@ -737,6 +772,8 @@ def test_the_arguments_follow_the_values():
         "2",
         "--log-level",
         "info",
+        "--spec-file",
+        SPEC_FILE,
     ]
     documents = render(
         *ON,
@@ -773,6 +810,8 @@ def test_the_arguments_follow_the_values():
         "--log-level",
         "debug",
         "--log-json",
+        "--spec-file",
+        SPEC_FILE,
         "--ingestion-listen",
         "0.0.0.0:31104",
         "--load-monitor-interval",
@@ -917,11 +956,13 @@ def test_the_election_names_its_lease_and_the_pods_own_address():
     """On, the controller is passed the Lease's name and its pod's address;
     the variable the address is read from is the chart's, ahead of the
     operator's. No flag names a namespace: the controller's is its pod's."""
-    assert controller_args("policyController.election.enabled=true")[-4:] == [
+    assert controller_args("policyController.election.enabled=true")[-6:] == [
         "--lease-name",
         NAME,
         "--advertise-address",
         "$(POD_IP)",
+        "--spec-file",
+        SPEC_FILE,
     ]
     found = container(
         render(
@@ -932,11 +973,13 @@ def test_the_election_names_its_lease_and_the_pods_own_address():
             "policyController.extraArgs={--lease-duration-ms,2000}",
         )
     )
-    assert found["args"][-6:] == [
+    assert found["args"][-8:] == [
         "--lease-name",
         "routing",
         "--advertise-address",
         "$(POD_IP)",
+        "--spec-file",
+        SPEC_FILE,
         "--lease-duration-ms",
         "2000",
     ]
@@ -1108,7 +1151,7 @@ def test_with_the_election_off_nothing_of_it_is_rendered():
     for off in OFF:
         documents = render(*ON, *off)
         kinds = sorted(document["kind"] for document in of_the_controller(documents))
-        assert kinds == ["Deployment", "Service"], off
+        assert kinds == ["ConfigMap", "Deployment", "Service"], off
         deployment = one(documents, "Deployment")["spec"]
         assert deployment["replicas"] == 1, off
         assert deployment["strategy"] == LONE_STRATEGY, off
@@ -1370,8 +1413,6 @@ SAME_AS_THE_DEFAULT = {
     "extraEnv",
     "identityAsTold",
     "shutdownSettleSeconds",
-    # No document: the controller runs no spec.
-    "spec",
     # The election off, and the Lease under the controller's own name.
     "election",
     "election.enabled",
@@ -1514,7 +1555,6 @@ ARGUMENT_SETS = {
     "extra-arguments": (
         "policyController.extraArgs={--ingestion-listen,0.0.0.0:30104,--load-monitor-interval,2}",
     ),
-    "a-spec-document": ("policyController.spec.apiVersion=smg.policy/v1",),
     "an-election": ("policyController.election.enabled=true", "policyController.replicas=2"),
     "an-election-over-a-named-lease": (
         "policyController.election.enabled=true",
@@ -1667,17 +1707,26 @@ def refusal(binary: str, args: list[str]) -> str:
     return completed.stdout + completed.stderr
 
 
-def test_the_binary_refuses_at_start_what_the_chart_refuses_at_render(binary):
+def test_the_binary_refuses_at_start_what_the_chart_refuses_at_render(binary, tmp_path):
     """The refusals of the chart, as the controller words them: the rule, the
-    default window and the listeners' names are the controller's, not the
-    chart's guess."""
+    default window, the listeners' names and the spec's source are the
+    controller's, not the chart's guess."""
+    # A start that names no source of its spec is refused by the two flags'
+    # names: the chart passes the document's file, and refuses to render
+    # without the document.
+    unsourced = refusal(binary, [])
+    assert "--spec-file" in unsourced and "--spec-store" in unsourced
+    # Every other start here names one, an empty store: its own refusal is
+    # the one read.
+    source = ["--spec-store", str(tmp_path)]
     port = free_ports(1)[0]
     shared = refusal(
-        binary, ["--gateway-listen", f"127.0.0.1:{port}", "--control-listen", f"127.0.0.1:{port}"]
+        binary,
+        [*source, "--gateway-listen", f"127.0.0.1:{port}", "--control-listen", f"127.0.0.1:{port}"],
     )
     assert "share the address" in shared
     grace = 2 * DEFAULT_SETTLE_SECONDS - 1
-    over = refusal(binary, ["--shutdown-grace-period-secs", str(grace)])
+    over = refusal(binary, [*source, "--shutdown-grace-period-secs", str(grace)])
     assert f"settle window of {DEFAULT_SETTLE_SECONDS}s is over half the grace period" in over
     # A name the schema refuses is no listener of the controller's. The
     # controller binds its listeners before it reads the name, so they take
@@ -1687,6 +1736,7 @@ def test_the_binary_refuses_at_start_what_the_chart_refuses_at_render(binary):
     unknown = refusal(
         binary,
         [
+            *source,
             "--gateway-listen",
             f"127.0.0.1:{gateway}",
             "--control-listen",
@@ -1703,11 +1753,11 @@ def test_the_binary_refuses_at_start_what_the_chart_refuses_at_render(binary):
 
 
 @needs_helm
-def test_the_binary_starts_on_the_rendered_arguments(binary):
+def test_the_binary_starts_on_the_rendered_arguments(binary, tmp_path):
     """The controller started with exactly what the Deployment passes (on
     ports free here, a short grace period, each gRPC listener named to take
-    identities as told) answers its readiness probe and stops clean on
-    SIGTERM."""
+    identities as told, the spec document's ConfigMap mounted) answers its
+    readiness probe and stops clean on SIGTERM."""
     gateway, control, replication, admin, ingestion = free_ports(5)
     documents = render(
         *ON,
@@ -1744,8 +1794,9 @@ def test_the_binary_starts_on_the_rendered_arguments(binary):
     # Under Kubernetes HOSTNAME is the pod's name.
     environment = {k: v for k, v in os.environ.items() if k not in LOG_VARIABLES}
     environment["HOSTNAME"] = "smg-policy-controller-6d5f7c9b8-x2x4z"
+    _, arguments = mounted(documents, tmp_path / "mount")
     process = subprocess.Popen(
-        [binary, *found["args"]],
+        [binary, *arguments],
         env=environment,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -1960,26 +2011,27 @@ class ElectedPod:
     """The controller as one pod of the elected Deployment: exactly the
     arguments the Deployment passes, on ports free here and a short grace
     period, with the pod's address written where the kubelet writes it, the
-    pod's name in HOSTNAME, and the client configuration of its account."""
+    pod's name in HOSTNAME, the client configuration of its account, and
+    the spec document's ConfigMap mounted: each pod's own mount."""
 
     def __init__(self, binary: str, configuration: Path, name: str):
         gateway, control, replication, admin = free_ports(4)
-        found = container(
-            render(
-                *ELECTED,
-                "policyController.replicas=2",
-                f"policyController.ports.gateway={gateway}",
-                f"policyController.ports.control={control}",
-                f"policyController.ports.replication={replication}",
-                f"policyController.ports.admin={admin}",
-                "policyController.shutdownGracePeriodSeconds=4",
-                "policyController.shutdownSettleSeconds=1",
-            )
+        documents = render(
+            *ELECTED,
+            "policyController.replicas=2",
+            f"policyController.ports.gateway={gateway}",
+            f"policyController.ports.control={control}",
+            f"policyController.ports.replication={replication}",
+            f"policyController.ports.admin={admin}",
+            "policyController.shutdownGracePeriodSeconds=4",
+            "policyController.shutdownSettleSeconds=1",
         )
+        found = container(documents)
+        _, passed = mounted(documents, configuration.parent / name)
         # The kubelet expands a variable the container itself names.
         assert "POD_IP" in [variable["name"] for variable in found["env"]]
-        arguments = [argument.replace("$(POD_IP)", "127.0.0.1") for argument in found["args"]]
-        assert arguments != found["args"], "the arguments name no pod address"
+        arguments = [argument.replace("$(POD_IP)", "127.0.0.1") for argument in passed]
+        assert arguments != passed, "the arguments name no pod address"
         environment = {
             key: value
             for key, value in os.environ.items()
@@ -2237,6 +2289,23 @@ class Mount:
             shutil.rmtree(self.directory / f"..version-{self._versions - 1}")
 
 
+def mounted(documents: list[dict], directory: Path) -> tuple[Mount, list[str]]:
+    """The spec document's ConfigMap laid out at ``directory`` as the kubelet
+    mounts it, and the container's arguments with that directory in place of
+    the mount's path: nothing else of the arguments is another."""
+    found = container(documents)
+    (volume,) = found["volumeMounts"]
+    mount = Mount(directory, one(documents, "ConfigMap"))
+    arguments = [
+        argument.replace(volume["mountPath"], str(directory), 1)
+        if argument.startswith(volume["mountPath"] + "/")
+        else argument
+        for argument in found["args"]
+    ]
+    assert arguments != found["args"], "no argument names a file under the mount"
+    return mount, arguments
+
+
 class DocumentedPod:
     """The controller as the Deployment's one pod under a spec document:
     exactly the arguments the Deployment passes, on ports free here and a
@@ -2247,7 +2316,7 @@ class DocumentedPod:
     def __init__(self, binary: str, directory: Path, values: Path):
         gateway, control, replication, admin = free_ports(4)
         self._settings = (
-            *ON,
+            SWITCH,
             f"policyController.ports.gateway={gateway}",
             f"policyController.ports.control={control}",
             f"policyController.ports.replication={replication}",
@@ -2257,16 +2326,7 @@ class DocumentedPod:
         )
         documents = render(*self._settings, files=(values,))
         self._deployment = one(documents, "Deployment")
-        found = container(documents)
-        (mounted,) = found["volumeMounts"]
-        self._mount = Mount(directory / "mount", one(documents, "ConfigMap"))
-        self.arguments = [
-            argument.replace(mounted["mountPath"], str(self._mount.directory), 1)
-            if argument.startswith(mounted["mountPath"] + "/")
-            else argument
-            for argument in found["args"]
-        ]
-        assert self.arguments != found["args"], "no argument names a file under the mount"
+        self._mount, self.arguments = mounted(documents, directory / "mount")
         self._metrics = f"http://127.0.0.1:{admin}/metrics"
         environment = {key: value for key, value in os.environ.items() if key not in LOG_VARIABLES}
         environment["HOSTNAME"] = POD_NAMES[0]
