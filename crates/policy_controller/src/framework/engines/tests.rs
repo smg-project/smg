@@ -261,10 +261,15 @@ fn rule(seed: u64, rows: &[Candidate], engines: Engines<'_>) -> Option<Ruled> {
     };
     let (mut ranked, band) = (Targets::new(), TieBand::NORMALIZED);
     SampledBest::new(1).order_drawn(&by_ties, rows, &kept, &scores, band, &mut ranked);
+    // The taken engine's least rank and then the other engine's row; one
+    // engine alone hands its least rank and its next.
     let mut targets = positions(&ranked);
-    if let Some(other) = other {
-        targets.truncate(MAX_TARGETS - 1);
-        targets.push(other);
+    match other {
+        Some(other) => {
+            targets.truncate(1);
+            targets.push(other);
+        }
+        None => targets.truncate(2),
     }
     Some(Ruled {
         targets,
@@ -354,7 +359,7 @@ fn a_decision_by_engines_reads_no_more_rows_in_a_larger_fleet() {
 }
 
 #[test]
-fn a_pool_of_one_engine_is_its_rows_best_first_and_draws_no_engine() {
+fn a_pool_of_one_engine_hands_its_least_rank_and_its_next_and_draws_no_engine() {
     let engine = engine_with(Box::new(PowerOfTwo));
     let (mut rows, listed, ends) = pool_of(&[8], 3);
     for (row, in_flight) in rows.iter_mut().zip([5, 3, 9, 1, 7, 2, 8, 6]) {
@@ -364,7 +369,11 @@ fn a_pool_of_one_engine_is_its_rows_best_first_and_draws_no_engine() {
     rows[3].health.healthy = false;
     let decision = decide(&engine, 11, &rows, Engines::new(&listed, &ends));
     let pick = decision.pick().expect("a pick");
-    assert_eq!(positions(&pick.targets), [5, 1, 0, 7], "the fewest first");
+    assert_eq!(
+        positions(&pick.targets),
+        [5, 1],
+        "the fewest, then the next"
+    );
     let (asked, handed) = read();
     assert_eq!(
         asked,
@@ -379,7 +388,7 @@ fn a_pool_of_one_engine_is_its_rows_best_first_and_draws_no_engine() {
 }
 
 #[test]
-fn the_other_engines_row_is_the_last_alternate() {
+fn the_alternate_of_a_pick_by_engines_is_another_engines_row() {
     let engine = engine_with(Box::new(PowerOfTwo));
     let (mut rows, listed, ends) = pool_of(&[8, 8], 5);
     for row in &mut rows {
@@ -391,8 +400,33 @@ fn the_other_engines_row_is_the_last_alternate() {
         let seed = Draw::new(seed).next_u64();
         let decision = decide(&engine, seed, &rows, Engines::new(&listed, &ends));
         let targets = positions(&decision.pick().expect("a pick").targets);
-        assert_eq!(targets[..3], [0, 1, 2], "the taken engine's best three");
-        assert!(targets[3] >= 8, "then the other engine's row: {targets:?}");
+        assert_eq!(targets.len(), 2, "{targets:?}");
+        assert_eq!(targets[0], 0, "the taken engine's least rank");
+        assert!(targets[1] >= 8, "then the other engine's row: {targets:?}");
+    }
+    // Wherever a pool holds two engines with a row kept in each, over
+    // drawn shapes: a commit that loses the first target's engine finds
+    // another behind it.
+    for (case, &shape) in SHAPES
+        .iter()
+        .enumerate()
+        .filter(|(_, shape)| shape.len() > 1)
+    {
+        let (mut rows, listed, ends) = pool_of(shape, case as u64);
+        for row in &mut rows {
+            row.health.healthy = true;
+        }
+        let engines = Engines::new(&listed, &ends);
+        let of = |position: u32| {
+            (0..engines.len()).find(|&engine| engines.rows(engine).contains(&position))
+        };
+        for seed in 0..100 {
+            let seed = Draw::new(seed ^ 0x51).next_u64();
+            let decision = decide(&engine, seed, &rows, engines);
+            let targets = positions(&decision.pick().expect("a pick").targets);
+            assert_eq!(targets.len(), 2, "shape {case} seed {seed}");
+            assert_ne!(of(targets[0]), of(targets[1]), "shape {case} seed {seed}");
+        }
     }
 }
 

@@ -19,6 +19,10 @@ use crate::{
     Draw,
 };
 
+/// The targets a pick by engines hands out: the taken engine's least rank
+/// and one alternate.
+const ENGINE_TARGETS: usize = 2;
+
 /// A single-plan decision by a picker whose unit is the engine
 /// ([`Picker::unit`]) over a pool whose host lists its engines
 /// ([`PoolFacts::engines`]), in front of the draw and at any pool size.
@@ -31,10 +35,11 @@ use crate::{
 /// rows among themselves and the picker orders them: the engine of the row
 /// it puts first is taken. Then the taken engine's rows are read, and no
 /// other engine's: the filters are asked about each, the stages cost the
-/// rows kept among themselves, and they are handed out best first, equal
-/// scores drawn. The other engine's row follows them as the last
-/// alternate, so a commit that loses the taken engine has another to go
-/// to. A pool of one engine draws nothing and is that engine's rows.
+/// rows kept among themselves, and the least of them is handed out
+/// first, equal scores drawn. The alternate is the other engine's row:
+/// the ranks of one engine are lost together, so a commit that loses the
+/// taken engine goes to another. A pool of one engine draws nothing and
+/// hands that engine's least rank and its next ([`ENGINE_TARGETS`]).
 ///
 /// The stream is read in this order and no value twice: an engine and its
 /// row for each of the two, again for each row refused; then one value,
@@ -184,6 +189,11 @@ fn by_engines(
     mut keep: impl FnMut(&Candidate) -> bool,
 ) -> Option<Decision> {
     let engines = pool.engines;
+    // The list names rows by their place among those handed.
+    debug_assert!(candidates
+        .iter()
+        .enumerate()
+        .all(|(place, row)| row.position as usize == place));
     let mut refused = 0;
     let first = if engines.len() > 1 {
         Some(stand_in(
@@ -236,12 +246,13 @@ fn by_engines(
     }
     let (kept, scores) = (&buf.kept, &mut buf.scores);
     let band = combine(profile, &after, candidates, kept, scores, &mut buf.stage);
-    // The slots the answer carries, and no more: the taken engine's best
-    // rows, with the last slot left to the other engine's row where one
-    // was drawn. The trace names the rows in the order they are handed out.
+    // The slots the answer carries, and no more: the taken engine's least
+    // row, and its next where no other engine's row was drawn. The trace
+    // names the taken engine's rows as they are handed out; the other
+    // engine's row was costed beside another and is not named.
     let other = other.and_then(|row| candidates.get(row as usize));
-    let mut best = [0; MAX_TARGETS];
-    let slots = MAX_TARGETS - usize::from(other.is_some());
+    let mut best = [0; ENGINE_TARGETS];
+    let slots = ENGINE_TARGETS - usize::from(other.is_some());
     let filled = draw_best(ties, scores, band, &mut best[..slots]);
     let best = &best[..filled];
     let mut targets = Targets::new();
