@@ -113,11 +113,15 @@ impl WordArena {
         &self.words(at, 1)[0]
     }
 
-    /// A freed block of `list`, for its next life. A release fence ahead of that life's first
-    /// store: a reader that still holds the block from its last life, reads a store of this one
-    /// and then passes its acquire fence reads, in its check of its run's version, the step that
-    /// took the block off that run. That step stands ahead of the block's push, and the list
-    /// hands the block from its push to this pop in order.
+    /// A freed block of `list`, for its next life. A release fence ahead of the first store this
+    /// thread makes in it: a reader that still holds the block from its last life, reads one of
+    /// those stores and then passes its acquire fence reads, in its check of its run's version,
+    /// the step that took the block off that run. That step stands ahead of the block's push:
+    /// in its own thread, or through the count's decrement, which acquires and releases, where
+    /// two runs shared an array. The list hands the block from its push to this pop in order.
+    /// A later holder's stores are not this fence's, and at least two of them stand behind no
+    /// release: the hash words of an append in place, and the shape word of a partial put in
+    /// place.
     fn freed(list: &SegQueue<u32>) -> Option<u32> {
         let block = list.pop()?;
         fence(Ordering::Release);
