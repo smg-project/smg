@@ -1186,8 +1186,11 @@ fn hand<R>(
             Some(built) => {
                 // What the leases on file book on each row's worker,
                 // written before the request's own narrowing moves a row:
-                // rows that are written carry their counts.
-                world.count_in_flight(&built, &ask, &mut view.candidates);
+                // rows that are written carry their counts. A request that
+                // keeps no row is counted nothing.
+                if keeps_a_row(wires, request.subset()) {
+                    world.count_in_flight(&built, &ask, &mut view.candidates);
+                }
                 // The pool's facts are of the rows before the request's own
                 // narrowing, all but the list's name: the rows the wires
                 // left are another list of the pool.
@@ -1243,6 +1246,12 @@ fn hand<R>(
         decide(facts, &pool, candidates, constraints, scratch)
     });
     (answer, built)
+}
+
+/// Whether the request's own narrowing can leave a row: a subset of none
+/// and a mask of no wire clear every row ([`narrow`]).
+fn keeps_a_row(wires: Option<WireModes>, subset: Option<u32>) -> bool {
+    subset != Some(0) && wires != Some(WireModes::NONE)
 }
 
 /// Narrows a built view by what the request's gateway states of itself,
@@ -1308,8 +1317,8 @@ pub(crate) mod tests {
     };
 
     use super::{
-        cut_reach, hand, narrow, watched, Buffers, Clock, Counts, Deciders, Deciding, Job, Part,
-        Reads, Refused, Taken, PARTS, TERM_MARK,
+        cut_reach, hand, keeps_a_row, narrow, watched, Buffers, Clock, Counts, Deciders, Deciding,
+        Job, Part, Reads, Refused, Taken, PARTS, TERM_MARK,
     };
     use crate::{
         builtins::Random,
@@ -4650,5 +4659,36 @@ pub(crate) mod tests {
             now: t0.checked_sub(Duration::from_micros(5)).unwrap_or(t0),
         };
         assert_eq!(behind.pinned(key, Some(1)), Some(WorkerId(7)));
+    }
+
+    /// The count pass is skipped where the request's own narrowing clears
+    /// every row, and nowhere else: a subset of none, a mask of no wire.
+    #[test]
+    fn a_request_is_counted_nothing_only_where_its_narrowing_keeps_no_row() {
+        let narrowed = |wires: Option<WireModes>, subset: Option<u32>| {
+            let mut view = ViewBuffers::default();
+            let row = Candidate {
+                wire_modes: WireModes::HTTP,
+                ..Candidate::default()
+            };
+            view.candidates.extend([row; 3]);
+            narrow(&mut view, wires, subset);
+            view.candidates.len()
+        };
+        let none = [
+            (None, Some(0)),
+            (Some(WireModes::NONE), None),
+            (Some(WireModes::NONE), Some(2)),
+            (Some(WireModes::HTTP), Some(0)),
+        ];
+        for (wires, subset) in none {
+            assert!(!keeps_a_row(wires, subset), "{wires:?} {subset:?}");
+            assert_eq!(narrowed(wires, subset), 0, "{wires:?} {subset:?}");
+        }
+        let some = [(None, None), (None, Some(2)), (Some(WireModes::HTTP), None)];
+        for (wires, subset) in some {
+            assert!(keeps_a_row(wires, subset), "{wires:?} {subset:?}");
+            assert_eq!(narrowed(wires, subset), 3, "{wires:?} {subset:?}");
+        }
     }
 }
