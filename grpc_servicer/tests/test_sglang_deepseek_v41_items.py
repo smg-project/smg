@@ -8,6 +8,7 @@ sees it, and refuses a batch whose counts disagree.
 """
 
 import importlib.util
+import math
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -28,11 +29,16 @@ servicer = _fixture.servicer
 _TENSOR_WIRE = Path(__file__).parents[1] / "smg_grpc_servicer" / "tensor_wire.py"
 
 # Two images: a 2x3 and a 1x2 patch grid, 6 + 2 patches of 3x2x2, filling
-# token spans of 5 and 4 positions in a 12-token prompt.
+# token spans of 5 and 4 positions in a 12-token prompt. The served model takes
+# 2x2 patches and merges 2x2 of them per token: the grids make 1*(2+1)+2 = 5
+# and 1*(1+1)+2 = 4 tokens.
 GRIDS = [(2, 3), (1, 2)]
 PATCHES = [6, 2]
 SPANS = [(1, 5), (7, 4)]
 PROMPT_LEN = 12
+V41_CONFIG = SimpleNamespace(
+    model_type="deepseek_v41", vision_patch_size=2, vision_downsample_ratio=2
+)
 
 
 @pytest.fixture
@@ -56,6 +62,7 @@ def v41_converter(monkeypatch, servicer):
         normalize=lambda tokenizer=None: None
     )
     servicer.tokenizer = None
+    servicer.model_config = SimpleNamespace(hf_config=V41_CONFIG)
     return servicer, pb
 
 
@@ -198,6 +205,64 @@ def test_placeholders_that_touch_are_two_items(v41_converter):
     servicer, pb = v41_converter
     result = _convert(servicer, pb, _v41_batch(pb, spans=[(1, 5), (6, 4)]))
     assert [item.offsets for item in result.mm_items] == [[(1, 5)], [(6, 9)]]
+
+
+def _with_pixel_rows(pb, batch, row_shape):
+    """``batch`` with each of its patch rows holding a ``row_shape`` of zeros."""
+    shape = (batch.pixel_values.shape[0], *row_shape)
+    batch.pixel_values.CopyFrom(_tensor(pb, [0.0] * math.prod(shape), shape, torch.float32))
+    return batch
+
+
+@pytest.mark.parametrize(
+    "row_shape, values", [((3, 2, 3), 18), ((1,), 1)], ids=["3x2x3", "one-value"]
+)
+def test_patch_rows_must_fit_the_models_patches(v41_converter, row_shape, values):
+    """SGLang's V4.1 patch embedding takes rows of 3 x patch_size x patch_size values
+    and fails on any other width, in the scheduler."""
+    servicer, pb = v41_converter
+    batch = _with_pixel_rows(pb, _v41_batch(pb), row_shape)
+    message = f"each patch row holds {values} values, but the model's 2x2 patches take 3x2x2 = 12"
+    with pytest.raises(ValueError, match=message):
+        _convert(servicer, pb, batch)
+
+
+@pytest.mark.parametrize("types_per_image", [True, False])
+def test_span_length_must_match_the_grid(v41_converter, types_per_image):
+    """SGLang sizes an image's embedding from its grid alone. A span of another length
+    is refused, also when the token counts agree with the spans or are absent."""
+    servicer, pb = v41_converter
+    batch = _v41_batch(pb, grids=[(2, 3), (2, 3)], patches=[6, 6], types_per_image=types_per_image)
+    with pytest.raises(
+        ValueError, match="image 1 fills 4 prompt positions but its 2x3 grid makes 5 tokens"
+    ):
+        _convert(servicer, pb, batch)
+
+
+def test_a_one_patch_image_fills_four_positions(v41_converter):
+    """A 1x1 grid makes a start, one token, a newline and an end."""
+    servicer, pb = v41_converter
+    batch = _v41_batch(pb, grids=[(1, 1)], patches=[1], spans=[(2, 4)])
+    (item,) = _convert(servicer, pb, batch).mm_items
+    assert item.offsets == [(2, 5)]
+
+
+@pytest.mark.parametrize(
+    "hf_config",
+    [
+        SimpleNamespace(model_type="deepseek_v41"),
+        SimpleNamespace(model_type="other", vision_patch_size=2, vision_downsample_ratio=2),
+    ],
+    ids=["no-vision-fields", "another-model"],
+)
+def test_without_the_models_vision_config_its_checks_are_skipped(v41_converter, hf_config):
+    """The width and grid checks need the served V4.1 model's patch size and
+    downsample ratio; without them the batch converts as before."""
+    servicer, pb = v41_converter
+    servicer.model_config = SimpleNamespace(hf_config=hf_config)
+    batch = _v41_batch(pb, grids=[(2, 3), (2, 3)], patches=[6, 6])
+    batch = _with_pixel_rows(pb, batch, (3, 2, 3))
+    assert len(_convert(servicer, pb, batch).mm_items) == 2
 
 
 @pytest.mark.parametrize(

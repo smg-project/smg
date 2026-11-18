@@ -10,7 +10,7 @@
 //! the Python servicer's rule (`_deepseek_v41_items`). A batch whose counts
 //! disagree is refused before the scheduler, where it would stop the engine.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, path::Path};
 
 use bytes::Bytes;
 use engine_zmq_client::{
@@ -31,14 +31,76 @@ pub(crate) fn is_v41_batch(tensors: &BTreeMap<String, SglangWireTensor>) -> bool
     tensors.contains_key(MARKER)
 }
 
+/// The served DeepSeek-V4.1 model's patch size and downsample ratio, as its
+/// SGLang model reads them (`vision_patch_size`, `vision_downsample_ratio`).
+/// The Python servicer takes them from SGLang's loaded config; this servicer
+/// reads the model directory's `config.json`, as SGLang's V4.1 config does
+/// (`configs/deepseek_v41.py`): a top-level field first, else the
+/// `vision_config` one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct V41Vision {
+    patch_size: u64,
+    downsample_ratio: u64,
+}
+
+impl V41Vision {
+    /// From `dir/config.json`: `None` without one, for another model, or when
+    /// a field is missing (SGLang has no default for either).
+    pub(crate) async fn from_model_dir(dir: &Path) -> Option<Self> {
+        let text = tokio::fs::read_to_string(dir.join("config.json"))
+            .await
+            .ok()?;
+        Self::from_config(&serde_json::from_str(&text).ok()?)
+    }
+
+    fn from_config(config: &serde_json::Value) -> Option<Self> {
+        if config.get("model_type")?.as_str()? != "deepseek_v41" {
+            return None;
+        }
+        let field = |top_level: &str, nested: &str| {
+            config
+                .get(top_level)
+                .or_else(|| config.get("vision_config")?.get(nested))?
+                .as_u64()
+                .filter(|&value| value > 0)
+        };
+        Some(Self {
+            patch_size: field("vision_patch_size", "patch_size")?,
+            downsample_ratio: field("vision_downsample_ratio", "downsample_ratio")?,
+        })
+    }
+
+    /// The values one patch row holds: three channels of a square patch. The
+    /// model's patch embedding is a `Linear(3 * patch_size^2, ..)` over each
+    /// flattened row.
+    fn row_values(self) -> u64 {
+        3u64.saturating_mul(self.patch_size)
+            .saturating_mul(self.patch_size)
+    }
+
+    /// How many prompt positions SGLang's V4.1 model fills for a patch grid:
+    /// the length of its `image_token_types` for the downsampled grid, a start
+    /// token, each line's tokens and a newline, and an end token.
+    fn image_tokens(self, height: u64, width: u64) -> u64 {
+        let lines = height.div_ceil(self.downsample_ratio);
+        let tokens_per_line = width.div_ceil(self.downsample_ratio);
+        lines
+            .saturating_mul(tokens_per_line.saturating_add(1))
+            .saturating_add(2)
+    }
+}
+
 /// One item per image: its rows of the feature (viewed, not copied), its
 /// placeholder range, and its grid as the 0-d integers `n_vit_h` and
 /// `n_vit_w`. The batch's hash named every image's bytes at once, so the items
-/// carry none: the scheduler, or the opt-in hasher, hashes each.
+/// carry none: the scheduler, or the opt-in hasher, hashes each. With the
+/// served model's `vision`, a batch whose patch rows or spans do not fit that
+/// model is refused as well.
 pub(crate) fn deepseek_v41_items(
     feature: Option<SglangWireTensor>,
     tensors: &BTreeMap<String, SglangWireTensor>,
     offsets: &[(u64, u64)],
+    vision: Option<V41Vision>,
 ) -> Result<Vec<SglangWireMmItem>, String> {
     let feature = feature
         .ok_or_else(|| format!("{PREFIX} no pixel_values to cut its per-image items from"))?;
@@ -86,6 +148,20 @@ pub(crate) fn deepseek_v41_items(
             total.map_or_else(|| "more than u64".to_string(), |sum| sum.to_string())
         ));
     }
+    if let Some(vision) = vision {
+        let values = row_dims
+            .iter()
+            .try_fold(1u64, |product, &dim| product.checked_mul(dim));
+        if values != Some(vision.row_values()) {
+            let size = vision.patch_size;
+            return Err(format!(
+                "{PREFIX} each patch row holds {} values, but the model's {size}x{size} patches \
+                 take 3x{size}x{size} = {}",
+                values.map_or_else(|| "more than u64".to_string(), |n| n.to_string()),
+                vision.row_values()
+            ));
+        }
+    }
     let bytes = feature
         .data
         .as_raw_view()
@@ -121,6 +197,15 @@ pub(crate) fn deepseek_v41_items(
                 return Err(format!(
                     "{PREFIX} image {index} fills {span} prompt positions but has {} tokens",
                     tokens[index]
+                ));
+            }
+        }
+        if let Some(vision) = vision {
+            let grid_tokens = vision.image_tokens(height, width);
+            if span != grid_tokens {
+                return Err(format!(
+                    "{PREFIX} image {index} fills {span} prompt positions but its \
+                     {height}x{width} grid makes {grid_tokens} tokens"
                 ));
             }
         }
@@ -188,17 +273,45 @@ fn scalar(value: u64) -> SglangWireTensor {
 
 #[cfg(test)]
 mod tests {
+    use engine_zmq_client::protocol::sglang::multimodal::SglangWireMmInputs;
+    use serde_json::json;
     use smg_grpc_client::sglang_proto;
 
+    use super::V41Vision;
     use crate::sglang::translate_sglang_multimodal;
 
     /// Two images: a 2x3 and a 1x2 patch grid, 6 + 2 patches of 3x2x2 floats,
-    /// filling token spans of 5 and 4 positions in a 12-token prompt.
+    /// filling token spans of 5 and 4 positions in a 12-token prompt. The
+    /// served model takes 2x2 patches and merges 2x2 of them per token
+    /// (`VISION`): the grids make 1*(2+1)+2 = 5 and 1*(1+1)+2 = 4 tokens.
     const GRIDS: [(i64, i64); 2] = [(2, 3), (1, 2)];
     const PATCHES: [i64; 2] = [6, 2];
     const SPANS: [(u32, u32); 2] = [(1, 5), (7, 4)];
     const PROMPT_LEN: usize = 12;
     const ROW_FLOATS: usize = 3 * 2 * 2;
+    const VISION: V41Vision = V41Vision {
+        patch_size: 2,
+        downsample_ratio: 2,
+    };
+
+    /// The batch alone, translated for the served model `VISION`.
+    fn translate(batch: sglang_proto::MultimodalInputs) -> Result<SglangWireMmInputs, String> {
+        translate_sglang_multimodal(batch, Vec::new(), PROMPT_LEN, Some(VISION))
+    }
+
+    /// `batch` with `rows` patch rows of zeros, each of `row_shape`.
+    fn with_pixel_rows(
+        mut batch: sglang_proto::MultimodalInputs,
+        rows: u32,
+        row_shape: &[u32],
+    ) -> sglang_proto::MultimodalInputs {
+        let shape: Vec<u32> = std::iter::once(rows)
+            .chain(row_shape.iter().copied())
+            .collect();
+        let floats: u32 = shape.iter().product();
+        batch.pixel_values = Some(tensor("float32", shape, vec![0; floats as usize * 4]));
+        batch
+    }
 
     fn tensor(dtype: &str, shape: Vec<u32>, data: Vec<u8>) -> sglang_proto::TensorData {
         sglang_proto::TensorData {
@@ -269,7 +382,7 @@ mod tests {
     fn each_image_is_its_own_item() {
         let batch = v41_batch(&GRIDS, &PATCHES, &SPANS);
         let pixels_ptr = batch.pixel_values.as_ref().unwrap().data.as_ptr();
-        let output = translate_sglang_multimodal(batch, Vec::new(), PROMPT_LEN).unwrap();
+        let output = translate(batch).unwrap();
         assert_eq!(output.im_token_id, Some(9));
         assert_eq!(output.mm_items.len(), 2);
         let row_bytes = ROW_FLOATS * 4;
@@ -309,7 +422,7 @@ mod tests {
     #[test]
     fn counts_that_disagree_are_refused() {
         let refused = |batch: sglang_proto::MultimodalInputs, needle: &str| {
-            let error = translate_sglang_multimodal(batch, Vec::new(), PROMPT_LEN).unwrap_err();
+            let error = translate(batch).unwrap_err();
             assert!(error.contains(needle), "{error:?} does not name {needle:?}");
         };
         refused(
@@ -391,13 +504,104 @@ mod tests {
             ),
         ] {
             let batch = v41_batch(&GRIDS, &PATCHES, &spans);
-            let error = translate_sglang_multimodal(batch, Vec::new(), PROMPT_LEN).unwrap_err();
+            let error = translate(batch).unwrap_err();
             assert!(error.contains(needle), "{error:?} does not name {needle:?}");
         }
         let touching = v41_batch(&GRIDS, &PATCHES, &[(1, 5), (6, 4)]);
-        let output = translate_sglang_multimodal(touching, Vec::new(), PROMPT_LEN).unwrap();
+        let output = translate(touching).unwrap();
         let offsets: Vec<_> = output.mm_items.iter().map(|item| &item.offsets).collect();
         assert_eq!(offsets, [&Some(vec![(1, 5)]), &Some(vec![(6, 9)])]);
+    }
+
+    /// SGLang's V4.1 patch embedding takes rows of 3 x patch_size x
+    /// patch_size values and fails on any other width, in the scheduler.
+    #[test]
+    fn patch_rows_must_fit_the_models_patches() {
+        for (row_shape, values) in [(&[3, 2, 3][..], 18), (&[1][..], 1)] {
+            let batch = with_pixel_rows(v41_batch(&GRIDS, &PATCHES, &SPANS), 8, row_shape);
+            let error = translate(batch).unwrap_err();
+            let needle = format!(
+                "each patch row holds {values} values, but the model's 2x2 patches take 3x2x2 = 12"
+            );
+            assert!(
+                error.contains(&needle),
+                "{error:?} does not name {needle:?}"
+            );
+        }
+    }
+
+    /// SGLang sizes an image's embedding from its grid alone. A span of
+    /// another length is refused, also when the token counts agree with the
+    /// spans or are absent. A 1x1 grid makes a start, one token, a newline
+    /// and an end.
+    #[test]
+    fn span_length_must_match_the_grid() {
+        let twins = with_pixel_rows(
+            v41_batch(&[(2, 3), (2, 3)], &[6, 6], &SPANS),
+            12,
+            &[3, 2, 2],
+        );
+        let mut without_counts = twins.clone();
+        without_counts
+            .model_specific_tensors
+            .remove("types_per_image");
+        for batch in [twins, without_counts] {
+            let error = translate(batch).unwrap_err();
+            let needle = "image 1 fills 4 prompt positions but its 2x3 grid makes 5 tokens";
+            assert!(error.contains(needle), "{error:?} does not name {needle:?}");
+        }
+        let one_patch = with_pixel_rows(v41_batch(&[(1, 1)], &[1], &[(2, 4)]), 1, &[3, 2, 2]);
+        let output = translate(one_patch).unwrap();
+        assert_eq!(output.mm_items[0].offsets, Some(vec![(2, 5)]));
+    }
+
+    /// Without the served model's geometry (its model id is not a local
+    /// directory, or it is not a V4.1) the width and grid checks are skipped.
+    #[test]
+    fn without_the_models_vision_its_checks_are_skipped() {
+        let batch = with_pixel_rows(
+            v41_batch(&[(2, 3), (2, 3)], &[6, 6], &SPANS),
+            12,
+            &[3, 2, 3],
+        );
+        let output = translate_sglang_multimodal(batch, Vec::new(), PROMPT_LEN, None).unwrap();
+        assert_eq!(output.mm_items.len(), 2);
+    }
+
+    /// The geometry as SGLang's V4.1 config takes it from `config.json`: a
+    /// top-level field first, else the `vision_config` one; none for another
+    /// model or a missing field.
+    #[test]
+    fn the_models_vision_is_read_as_sglang_reads_it() {
+        let read = |config: serde_json::Value| V41Vision::from_config(&config);
+        let expected = Some(V41Vision {
+            patch_size: 14,
+            downsample_ratio: 3,
+        });
+        let top_level = json!({
+            "model_type": "deepseek_v41",
+            "vision_patch_size": 14,
+            "vision_downsample_ratio": 3,
+        });
+        let nested = json!({
+            "model_type": "deepseek_v41",
+            "vision_config": {"patch_size": 14, "downsample_ratio": 3},
+        });
+        let both = json!({
+            "model_type": "deepseek_v41",
+            "vision_patch_size": 14,
+            "vision_config": {"patch_size": 16, "downsample_ratio": 3},
+        });
+        assert_eq!(read(top_level), expected);
+        assert_eq!(read(nested), expected);
+        assert_eq!(read(both), expected);
+        let missing = json!({"model_type": "deepseek_v41", "vision_config": {"patch_size": 14}});
+        let other = json!({
+            "model_type": "qwen2_vl",
+            "vision_config": {"patch_size": 14, "downsample_ratio": 3},
+        });
+        assert_eq!(read(missing), None);
+        assert_eq!(read(other), None);
     }
 
     /// Empty grids make no items. Refused alone, and refused, not a panic,
@@ -406,7 +610,7 @@ mod tests {
     #[test]
     fn a_batch_without_images_is_refused() {
         let empty = v41_batch(&[], &[], &[]);
-        let error = translate_sglang_multimodal(empty.clone(), Vec::new(), PROMPT_LEN).unwrap_err();
+        let error = translate(empty.clone()).unwrap_err();
         assert!(
             error.contains("DeepSeek-V4.1 image batch: no images"),
             "{error:?}"
@@ -421,7 +625,8 @@ mod tests {
             }],
             ..Default::default()
         };
-        let error = translate_sglang_multimodal(video, vec![empty], PROMPT_LEN).unwrap_err();
+        let error =
+            translate_sglang_multimodal(video, vec![empty], PROMPT_LEN, Some(VISION)).unwrap_err();
         assert!(error.contains("no images"), "{error:?}");
     }
 
@@ -432,7 +637,7 @@ mod tests {
         let mut batch = v41_batch(&GRIDS, &PATCHES, &SPANS);
         batch.model_specific_tensors.remove("types_per_image");
         batch.feature_hash = Some(7);
-        let output = translate_sglang_multimodal(batch, Vec::new(), PROMPT_LEN).unwrap();
+        let output = translate(batch).unwrap();
         assert_eq!(output.mm_items.len(), 2);
         assert!(output.mm_items.iter().all(|item| item.hash.is_none()));
     }
@@ -451,7 +656,7 @@ mod tests {
         for tensors in [qwen.to_vec(), glm53_flash] {
             let mut batch = v41_batch(&GRIDS, &PATCHES, &SPANS);
             batch.model_specific_tensors = tensors.iter().cloned().collect();
-            let output = translate_sglang_multimodal(batch, Vec::new(), PROMPT_LEN).unwrap();
+            let output = translate(batch).unwrap();
             assert_eq!(output.mm_items.len(), 1);
             assert_eq!(output.mm_items[0].offsets, Some(vec![(1, 5), (7, 10)]));
             assert!(tensors

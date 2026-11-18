@@ -33,9 +33,20 @@ model encodes one image per item and reads that image's grid as `n_vit_h` /
 shape SGLang's own processor builds: the image's patch rows, its placeholder
 range and its grid. A batch is a V4.1 batch when it carries `vit_grid`, which no
 other family sends (GLM-5.3 Flash sends `patches_per_image` too). A V4.1 batch
-whose grids, patch counts, token counts and placeholders disagree, or that
-carries no images, no patch counts or no pixels, is refused with
-`INVALID_ARGUMENT` before the scheduler.
+is refused with `INVALID_ARGUMENT` before the scheduler when:
+
+- its grids, patch counts, token counts and placeholders disagree;
+- it carries no images, no patch counts or no pixels;
+- its placeholders are out of prompt order or overlap (SGLang writes the items'
+  embeddings over the placeholders in prompt order);
+- its patch rows or spans do not fit the served model: each row must hold
+  3 x `vision_patch_size`^2 values, and each span must be as long as SGLang's
+  V4.1 model makes the image's grid with `vision_downsample_ratio`.
+
+The Python servicer reads those two values from SGLang's loaded model config.
+The Rust servicer reads them from `config.json` in the model directory, a
+top-level `vision_*` field first, else the `vision_config` one, as SGLang does.
+When the model id is not a local directory, it skips these two checks.
 Other families keep one item per batch.
 
 ## Mixed images and videos

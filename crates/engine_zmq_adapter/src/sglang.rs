@@ -29,7 +29,7 @@ use crate::{
     fanout::fan_out_n,
     pin_yield::PinYieldNote,
     sglang_encode::EncodeMediaRefs,
-    sglang_v41_items::{deepseek_v41_items, is_v41_batch},
+    sglang_v41_items::{deepseek_v41_items, is_v41_batch, V41Vision},
     stream::{
         finish, map_slim_output, matched_stop_of, poll_mapped, FinishParts, MappedGenerateStream,
         StreamState,
@@ -417,13 +417,15 @@ pub(crate) fn fan_out_sglang_requests(
 /// engine's own frontend places it ([`routed_dp_rank`]), or, on the prefill
 /// side of a disaggregated pair, by its room's residue
 /// ([`room_residue_rank`]), a pin's yield to the room logged on `yields`, the
-/// connection's note, at WARN once and at DEBUG after.
+/// connection's note, at WARN once and at DEBUG after. `v41_vision` is the
+/// served DeepSeek-V4.1 model's patch geometry, when the connection read it.
 pub(crate) fn translate_request_sglang(
     req: sglang_proto::GenerateRequest,
     max_model_len: u64,
     ranks: usize,
     placement: RankPlacement,
     yields: &PinYieldNote,
+    v41_vision: Option<V41Vision>,
 ) -> Result<TokenizedGenerateReqInput, String> {
     let tokenized = req
         .tokenized
@@ -456,6 +458,7 @@ pub(crate) fn translate_request_sglang(
                 *mm,
                 req.extra_mm_inputs,
                 input_ids.len(),
+                v41_vision,
             )?),
             None,
         ),
@@ -554,10 +557,11 @@ pub(crate) fn translate_sglang_multimodal(
     mm: sglang_proto::MultimodalInputs,
     extras: Vec<sglang_proto::MultimodalInputs>,
     prompt_len: usize,
+    v41_vision: Option<V41Vision>,
 ) -> Result<SglangWireMmInputs, String> {
-    let mut output = translate_sglang_batch(mm, prompt_len)?;
+    let mut output = translate_sglang_batch(mm, prompt_len, v41_vision)?;
     for batch in extras {
-        let translated = translate_sglang_batch(batch, prompt_len)?;
+        let translated = translate_sglang_batch(batch, prompt_len, v41_vision)?;
         if output
             .mm_items
             .iter()
@@ -581,6 +585,7 @@ pub(crate) fn translate_sglang_multimodal(
 fn translate_sglang_batch(
     mm: sglang_proto::MultimodalInputs,
     prompt_len: usize,
+    v41_vision: Option<V41Vision>,
 ) -> Result<SglangWireMmInputs, String> {
     let modality = if mm.modalities.iter().all(|name| name == "image") {
         // Empty metadata and repeated image labels are accepted by the
@@ -653,7 +658,7 @@ fn translate_sglang_batch(
     if modality == SglangWireModality::Image && is_v41_batch(&model_specific_data) {
         let offsets = offsets.as_deref().unwrap_or_default();
         return Ok(SglangWireMmInputs {
-            mm_items: deepseek_v41_items(feature, &model_specific_data, offsets)?,
+            mm_items: deepseek_v41_items(feature, &model_specific_data, offsets, v41_vision)?,
             im_token_id: mm.im_token_id,
             video_token_id: None,
         });
@@ -1043,6 +1048,7 @@ mod tests {
             1,
             RankPlacement::Pin,
             &PinYieldNote::default(),
+            None,
         )
     }
 
@@ -1098,7 +1104,7 @@ mod tests {
             (image.clone(), video.clone()),
             (video.clone(), image.clone()),
         ] {
-            let output = translate_sglang_multimodal(first, vec![second], 9).unwrap();
+            let output = translate_sglang_multimodal(first, vec![second], 9, None).unwrap();
             assert_eq!(output.im_token_id, Some(7));
             assert_eq!(output.video_token_id, Some(8));
             assert_eq!(output.mm_items.len(), 2);
@@ -1113,9 +1119,11 @@ mod tests {
                 assert!(item.model_specific_data.contains_key(key));
             }
         }
-        assert!(translate_sglang_multimodal(image.clone(), vec![image], 9)
-            .unwrap_err()
-            .contains("one batch per modality"));
+        assert!(
+            translate_sglang_multimodal(image.clone(), vec![image], 9, None)
+                .unwrap_err()
+                .contains("one batch per modality")
+        );
     }
 
     fn media_request(mm: sglang_proto::MultimodalInputs) -> sglang_proto::GenerateRequest {
@@ -1180,13 +1188,13 @@ mod tests {
         mm.modalities = vec!["video".to_string()];
         let mut missing_id = mm.clone();
         missing_id.im_token_id = None;
-        assert!(translate_sglang_multimodal(missing_id, Vec::new(), 5)
+        assert!(translate_sglang_multimodal(missing_id, Vec::new(), 5, None)
             .unwrap_err()
             .contains("placeholder token id"));
         let grid = mm.model_specific_tensors.remove("image_grid_thw").unwrap();
         mm.model_specific_tensors
             .insert("video_grid_thw".into(), grid.clone());
-        let output = translate_sglang_multimodal(mm, Vec::new(), 5).unwrap();
+        let output = translate_sglang_multimodal(mm, Vec::new(), 5, None).unwrap();
         let item = &output.mm_items[0];
         assert_eq!(item.modality, SglangWireModality::Video);
         assert_eq!(output.video_token_id, Some(7));
@@ -1221,7 +1229,7 @@ mod tests {
         let mut references = media_payload();
         references.pixel_values = None;
         references.image_urls = vec!["http://example.test/a.png".to_string()];
-        let error = translate_sglang_multimodal(references, Vec::new(), 5).unwrap_err();
+        let error = translate_sglang_multimodal(references, Vec::new(), 5, None).unwrap_err();
         assert!(
             error.contains("media references but no preprocessed tensors"),
             "{error}"
@@ -1657,6 +1665,7 @@ mod tests {
                 ranks,
                 RankPlacement::Pin,
                 &PinYieldNote::default(),
+                None,
             )
         };
         assert_eq!(translate_among(None, 2).unwrap().routed_dp_rank, None);
@@ -1719,6 +1728,7 @@ mod tests {
                 ranks,
                 placement,
                 &PinYieldNote::default(),
+                None,
             )
             .map(|wire| wire.routed_dp_rank)
         };
@@ -1778,6 +1788,7 @@ mod tests {
             2,
             RoomResidue,
             &PinYieldNote::default(),
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -1810,6 +1821,7 @@ mod tests {
                 ranks,
                 placement,
                 &PinYieldNote::default(),
+                None,
             )
             .unwrap();
             (wire.routed_dp_rank, wire.disagg_prefill_dp_rank)
@@ -1907,6 +1919,7 @@ mod tests {
                     1,
                     RankPlacement::Pin,
                     &PinYieldNote::default(),
+                    None,
                 );
                 assert_eq!(
                     result.is_ok(),

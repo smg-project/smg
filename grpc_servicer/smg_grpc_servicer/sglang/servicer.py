@@ -8,6 +8,7 @@ for orchestration without tokenization.
 import asyncio
 import json
 import logging
+import math
 import os
 import time
 from collections.abc import AsyncIterator
@@ -98,14 +99,39 @@ V41_MARKER = "vit_grid"
 V41_PREFIX = "DeepSeek-V4.1 image batch:"
 
 
-def _deepseek_v41_items(feature, tensors: dict, offsets: list) -> list:
+def _v41_vision(hf_config) -> tuple[int, int] | None:
+    """The served DeepSeek-V4.1 model's patch size and downsample ratio, as its
+    SGLang model reads them (``vision_patch_size``, ``vision_downsample_ratio``);
+    None for another model, or a config without them."""
+    if getattr(hf_config, "model_type", None) != "deepseek_v41":
+        return None
+    patch_size = getattr(hf_config, "vision_patch_size", None)
+    ratio = getattr(hf_config, "vision_downsample_ratio", None)
+    if not (isinstance(patch_size, int) and isinstance(ratio, int)):
+        return None
+    if patch_size < 1 or ratio < 1:
+        return None
+    return patch_size, ratio
+
+
+def _v41_image_tokens(height: int, width: int, ratio: int) -> int:
+    """How many prompt positions SGLang's V4.1 model fills for a patch grid: the
+    length of its ``image_token_types`` for the downsampled grid, a start token,
+    each line's tokens and a newline, and an end token."""
+    lines, tokens_per_line = (height + ratio - 1) // ratio, (width + ratio - 1) // ratio
+    return lines * (tokens_per_line + 1) + 2
+
+
+def _deepseek_v41_items(feature, tensors: dict, offsets: list, vision=None) -> list:
     """One item per image, the shape SGLang's own DeepSeek-V4.1 processor builds.
 
     The Router sends every image's patches in one tensor, with each image's
     patch grid (``vit_grid``), patch count and token count alongside. SGLang's
     V4.1 model encodes one image per item and reads its grid as ``n_vit_h`` /
     ``n_vit_w``; a batch whose counts disagree is refused here, before the
-    scheduler, where it would stop the engine.
+    scheduler, where it would stop the engine. With the served model's patch
+    size and downsample ratio (``vision``, from ``_v41_vision``), so is a batch
+    whose patch rows or spans do not fit that model.
     """
     prefix = V41_PREFIX
     if "patches_per_image" not in tensors:
@@ -143,6 +169,17 @@ def _deepseek_v41_items(feature, tensors: dict, offsets: list) -> list:
     rows = feature.shape[0]
     if sum(patches) != rows:
         raise ValueError(f"{prefix} {sum(patches)} patches but the pixel tensor has {rows} rows")
+    if vision is not None:
+        patch_size = vision[0]
+        # The model's patch embedding is a Linear(3 * patch_size**2, ...) over
+        # each flattened row.
+        row_values = math.prod(feature.shape[1:])
+        if row_values != 3 * patch_size**2:
+            raise ValueError(
+                f"{prefix} each patch row holds {row_values} values, but the model's "
+                f"{patch_size}x{patch_size} patches take 3x{patch_size}x{patch_size} = "
+                f"{3 * patch_size**2}"
+            )
     items = []
     start = 0
     previous_last = None
@@ -165,6 +202,13 @@ def _deepseek_v41_items(feature, tensors: dict, offsets: list) -> list:
                 f"{prefix} image {index} fills {span} prompt positions but has "
                 f"{tokens[index]} tokens"
             )
+        if vision is not None:
+            grid_tokens = _v41_image_tokens(height, width, vision[1])
+            if span != grid_tokens:
+                raise ValueError(
+                    f"{prefix} image {index} fills {span} prompt positions but its "
+                    f"{height}x{width} grid makes {grid_tokens} tokens"
+                )
         pixels = feature[start : start + count]
         items.append(
             MultimodalDataItem(
@@ -1185,7 +1229,8 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                 for key, value in batch.model_specific_tensors.items()
             }
             if modality == Modality.IMAGE and V41_MARKER in tensors:
-                mm_items.extend(_deepseek_v41_items(feature, tensors, offsets))
+                vision = _v41_vision(self.model_config.hf_config)
+                mm_items.extend(_deepseek_v41_items(feature, tensors, offsets, vision))
                 continue
             mm_items.append(
                 MultimodalDataItem(
