@@ -173,8 +173,9 @@ pub struct Ring {
     /// The ids pruned within [`FENCE`].
     fence: Fence,
     /// The pools shown whole ([`Ring::show`]) under `shown_epoch`, by their
-    /// host's number in rising order, each with whether its rows stood in
-    /// the order of their ids.
+    /// host's number in rising order, each with whether it may be walked:
+    /// its rows stood in the order of their ids, and each was a member
+    /// behind the showing.
     shown: Vec<(u32, bool)>,
     /// The newest membership epoch a pool was shown under.
     shown_epoch: u64,
@@ -272,18 +273,25 @@ impl Ring {
 
     /// [`Ring::learn`] for every row of the pool its host numbers `pool`
     /// under the membership epoch `epoch`, and the note that the pool was
-    /// shown whole, with whether its rows stood in the order of their ids.
-    /// The pools of an earlier epoch are dropped at the first of a later
-    /// one, and a pool of an epoch behind the one held is not noted.
+    /// shown, with whether a walk may find its rows: they stood in the
+    /// order of their ids (`ordered`) and each is a member now. A row the
+    /// fence left out is the whole pass's to place, so its pool is not
+    /// walked until it is shown again: at the next epoch, or after the
+    /// feed names an id ([`Ring::admit`], [`Ring::remove`],
+    /// [`Ring::retain_only`]), which drops every note. The pools of an
+    /// earlier epoch are dropped at the first of a later one, and a pool
+    /// of an epoch behind the one held is not noted.
     pub fn show(
         &mut self,
         epoch: u64,
         pool: u32,
         ordered: bool,
-        members: impl IntoIterator<Item = (WorkerId, u32)>,
+        members: impl Iterator<Item = (WorkerId, u32)> + Clone,
         now: Instant,
     ) {
-        self.learn(members, now);
+        self.learn(members.clone(), now);
+        let mut members = members;
+        let ordered = ordered && members.all(|(id, _)| self.contains(id));
         if epoch < self.shown_epoch {
             return;
         }
@@ -301,9 +309,9 @@ impl Ring {
     }
 
     /// What [`Ring::show`] noted of the pool numbered `pool` under `epoch`:
-    /// whether a walk may find its rows by their ids. `None` for a pool
-    /// not shown yet, and `Some(false)` under an epoch behind the one held,
-    /// whose pools are shown no more.
+    /// whether a walk may find its rows. `None` for a pool not shown yet,
+    /// or not since the feed last named an id, and `Some(false)` under an
+    /// epoch behind the one held, whose pools are shown no more.
     pub fn shown(&self, epoch: u64, pool: u32) -> Option<bool> {
         match epoch.cmp(&self.shown_epoch) {
             Ordering::Less => Some(false),
@@ -326,12 +334,14 @@ impl Ring {
     /// Lift the fence on `id`: the feed named it as a member again.
     pub fn admit(&mut self, id: WorkerId) {
         self.fence.admit(id);
+        self.shown.clear();
     }
 
     /// Remove a member at `now`, fencing its id for [`FENCE`]; `false` when
     /// it was none.
     pub fn remove(&mut self, id: WorkerId, now: Instant) -> bool {
         self.fence.retire(id, now);
+        self.shown.clear();
         let Some(gone) = self.index.remove(&id) else {
             return false;
         };
@@ -356,6 +366,7 @@ impl Ring {
     /// carries its key. A ring that holds no member reads the names for no
     /// leaver, and one that holds no fence admits none.
     pub fn retain_only(&mut self, ids: &[WorkerId], now: Instant) {
+        self.shown.clear();
         // A fence a named id holds stood before the pruning, which fences
         // the ids the snapshot does not name.
         let fenced = !self.fence.is_empty();
@@ -734,7 +745,8 @@ impl Scorer for ConsistentHash {
     /// takes on trust: the rows are a pool's own under a membership epoch,
     /// in the order of their ids, and the pool is numbered. `false`, with
     /// what `kept` holds to be dropped, where the host does not say so,
-    /// where the request has no routing key, once [`DRAW_BOUND`] rows were
+    /// where the request has no routing key, where the pool was shown
+    /// with a row the ring does not hold, once [`DRAW_BOUND`] rows were
     /// refused, which says nothing of the rows behind them, where the walk
     /// came round the ring short of the rows handed, one of which the ring
     /// does not hold, and for a pool that holds under a quarter of the
@@ -1889,7 +1901,7 @@ mod tests {
         assert_eq!(ring.shown(3, 0), None);
         for pool in 0..9 {
             let member = (WorkerId(u64::from(pool) + 1), pool);
-            ring.show(3, pool, pool != 4, [member], now);
+            ring.show(3, pool, pool != 4, [member].into_iter(), now);
         }
         // Nine pools under one epoch: none forgotten, each with its word.
         for pool in 0..9 {
@@ -1900,14 +1912,29 @@ mod tests {
         // A later epoch: its pools are shown anew, and the earlier one's
         // are shown no more.
         assert_eq!(ring.shown(4, 0), None);
-        ring.show(4, 0, true, [], now);
+        ring.show(4, 0, true, [].into_iter(), now);
         assert_eq!(ring.shown(4, 0), Some(true));
         assert_eq!(ring.shown(4, 1), None);
         assert_eq!(ring.shown(3, 1), Some(false), "an epoch behind");
         // A pool of a passed epoch is learned and not noted.
-        ring.show(3, 7, true, [(WorkerId(77), 77)], now);
+        ring.show(3, 7, true, [(WorkerId(77), 77)].into_iter(), now);
         assert!(ring.contains(WorkerId(77)));
         assert_eq!(ring.shown(3, 7), Some(false));
         assert_eq!(ring.shown(4, 7), None);
+        // The feed names an id: every note is dropped. A pool shown while
+        // the fence leaves a row of it out is not walked, until the feed
+        // names the row again and the pool is shown with it.
+        let row = [(WorkerId(1), 0)];
+        ring.remove(WorkerId(1), now);
+        assert_eq!(ring.shown(4, 0), None, "a tell drops the notes");
+        ring.show(4, 0, true, row.into_iter(), now);
+        assert!(!ring.contains(WorkerId(1)));
+        assert_eq!(ring.shown(4, 0), Some(false), "a row left out");
+        ring.admit(WorkerId(1));
+        assert_eq!(ring.shown(4, 0), None);
+        ring.show(4, 0, true, row.into_iter(), now);
+        assert_eq!(ring.shown(4, 0), Some(true));
+        ring.retain_only(&[WorkerId(1)], now);
+        assert_eq!(ring.shown(4, 0), None, "a snapshot drops the notes");
     }
 }

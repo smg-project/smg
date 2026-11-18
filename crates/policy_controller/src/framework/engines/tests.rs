@@ -49,6 +49,20 @@ impl Filter for Asked {
     }
 }
 
+/// [`Asked`], as a filter that does not say it answers row by row.
+#[derive(Debug)]
+struct AskedWhole;
+
+impl Filter for AskedWhole {
+    fn name(&self) -> &'static str {
+        "asked-whole"
+    }
+
+    fn keep(&self, facts: &RequestFacts<'_>, c: &Candidate, cx: &Constraints<'_>) -> bool {
+        Asked.keep(facts, c, cx)
+    }
+}
+
 /// A row's score under the scorer of this file: exact levels, the fewer
 /// requests in flight the better.
 fn level(c: &Candidate) -> f32 {
@@ -550,13 +564,19 @@ fn ring_engine() -> Engine {
 
 /// `ring` under `best` and the filter of this file.
 fn ring_engine_of(ring: ConsistentHash) -> Engine {
+    let scorer = Weighted {
+        scorer: Box::new(ring),
+        weight: 1.0,
+    };
+    engine_of(vec![Box::new(Asked)], vec![scorer])
+}
+
+/// One profile of `filters` and `scorers` under `best`.
+fn engine_of(filters: Vec<Box<dyn Filter>>, scorers: Vec<Weighted>) -> Engine {
     let profile = Profile {
         name: "ring".into(),
-        filters: vec![Box::new(Asked)],
-        scorers: vec![Weighted {
-            scorer: Box::new(ring),
-            weight: 1.0,
-        }],
+        filters,
+        scorers,
         picker: Box::new(Best),
     };
     let binding = Binding {
@@ -857,7 +877,10 @@ fn a_row_the_ring_does_not_hold_is_the_whole_passes_to_place() {
     assert_eq!(targets, by_pass);
     assert_eq!(targets.len(), 3, "{targets:?}");
     assert_eq!(targets[2], owner, "the row the ring lost, last");
-    assert!(!by_walk, "a walk that came round short leaves the pool");
+    assert!(
+        !by_walk,
+        "a pool shown with a row the ring fenced is not walked"
+    );
 }
 
 #[test]
@@ -927,4 +950,141 @@ fn a_pool_that_is_a_small_share_of_its_ring_is_read_whole() {
     // Alone on a ring it is walked.
     let of_small = walked_as(&ring_engine(), &ring_engine(), &small, engines);
     assert_eq!(of_small, 64);
+}
+
+#[test]
+fn a_row_the_fence_left_out_of_a_shown_pool_owns_its_keys_once_the_feed_names_it() {
+    let (mut rows, listed, ends) = fleet(&[8; 8], 5);
+    for row in &mut rows {
+        row.health.healthy = true;
+    }
+    let engines = Engines::new(0, &listed, &ends);
+    let (ring, whole) = (ring_engine(), ring_engine());
+    walked(&ring, &whole, &rows, &listed, &ends);
+    let owner = keyed(&ring, "conv-9", &rows, engines, 1)[0];
+    // The feed takes the owner away, and the next epoch's rows hold it
+    // again before the feed says so: the pool is shown with the row inside
+    // the fence, and is the whole pass's while the row is left out.
+    let id = rows[owner as usize].id;
+    for engine in [&ring, &whole] {
+        engine.on_membership(&Membership::Removed(id));
+    }
+    let (targets, by_walk) = keyed_by(&ring, "conv-9", &rows, engines, 2);
+    assert_eq!(
+        targets,
+        keyed(&whole, "conv-9", &rows, Engines::default(), 2)
+    );
+    assert!(!targets.contains(&owner) && !by_walk, "{targets:?}");
+    // The feed names it: the next decision shows the pool with the row,
+    // which owns its keys again, and the walk places them from then on.
+    for engine in [&ring, &whole] {
+        engine.on_membership(&Membership::Added(id));
+    }
+    for _ in 0..2 {
+        let (targets, by_walk) = keyed_by(&ring, "conv-9", &rows, engines, 2);
+        assert_eq!(
+            targets,
+            keyed(&whole, "conv-9", &rows, Engines::default(), 2)
+        );
+        assert_eq!(targets[0], owner, "the row owns its key again");
+        assert!(by_walk);
+    }
+}
+
+#[test]
+fn a_ring_with_a_stage_behind_it_is_its_profiles_run() {
+    // The second stage moves the order, so no walk alone places a request.
+    let both = || {
+        let ring = Weighted {
+            scorer: Box::new(ConsistentHash::new(None)),
+            weight: 1.0,
+        };
+        let cost = Weighted {
+            scorer: Box::new(Handed),
+            weight: 4.0,
+        };
+        engine_of(vec![Box::new(Asked)], vec![ring, cost])
+    };
+    let (mut rows, listed, ends) = fleet(&[8; 8], 6);
+    for row in &mut rows {
+        row.health.healthy = true;
+        // Levels far enough apart to outweigh a step of the ring's order.
+        row.in_flight = row.position * 37 % 90;
+    }
+    let engines = Engines::new(0, &listed, &ends);
+    let (profile, unlisted, alone) = (both(), both(), ring_engine());
+    let mut moved = 0;
+    for i in 0..64 {
+        let key = format!("conv-{i}");
+        read();
+        let (targets, by_walk) = keyed_by(&profile, &key, &rows, engines, 1);
+        assert!(!by_walk, "{key}");
+        assert!(read().0.len() >= rows.len(), "the pool is read whole");
+        let by_pass = keyed(&unlisted, &key, &rows, Engines::default(), 1);
+        assert_eq!(targets, by_pass, "{key}");
+        moved += usize::from(targets != keyed(&alone, &key, &rows, engines, 1));
+    }
+    assert!(moved > 0, "the second stage moves the order");
+}
+
+#[test]
+fn a_ring_beside_a_filter_that_reads_its_pool_whole_is_its_profiles_run() {
+    let ring = Weighted {
+        scorer: Box::new(ConsistentHash::new(None)),
+        weight: 1.0,
+    };
+    let engine = engine_of(vec![Box::new(AskedWhole)], vec![ring]);
+    let (mut rows, listed, ends) = fleet(&[8; 8], 6);
+    for row in &mut rows {
+        row.health.healthy = true;
+    }
+    let engines = Engines::new(0, &listed, &ends);
+    for i in 0..8 {
+        let key = format!("conv-{i}");
+        read();
+        let (targets, by_walk) = keyed_by(&engine, &key, &rows, engines, 1);
+        assert!(!by_walk, "{key}");
+        assert!(read().0.len() >= rows.len(), "the pool is read whole");
+        let by_pass = keyed(&ring_engine(), &key, &rows, Engines::default(), 1);
+        assert_eq!(targets, by_pass, "{key}");
+    }
+}
+
+#[test]
+fn a_pick_the_whole_pass_makes_behind_the_unit_reads_the_stream_on() {
+    // Three level rows kept in a pool of fifteen, below the size a draw
+    // starts at: with no list the same profile is the whole pass.
+    let engine = engine_with(Box::new(PowerOfTwo));
+    let (mut rows, listed, ends) = pool_of(&[3; 5], 1);
+    for row in &mut rows {
+        row.health.healthy = [1, 7, 12].contains(&row.position);
+        row.in_flight = 0;
+    }
+    let engines = Engines::new(0, &listed, &ends);
+    let pick = |seed, engines| {
+        let decision = decide(&engine, seed, &rows, engines);
+        positions(&decision.pick().expect("a row is kept").targets)
+    };
+    let (mut widened, mut apart) = (0, 0);
+    for seed in 1..=400 {
+        // The unit's draws, as the rule draws them: this case reads the
+        // seeds whose every draw is refused.
+        let mut draw = Draw::new(seed);
+        let refused = (0..DRAW_BOUND).all(|_| {
+            let of = engines.rows(draw.below(engines.len()));
+            !rows[of[draw.below(of.len())] as usize].health.healthy
+        });
+        if !refused {
+            continue;
+        }
+        // The whole pass picks by the stream where the draws left it, and
+        // reads no value of it twice.
+        assert_eq!(pick(seed, engines), pick(draw.state(), Engines::default()));
+        widened += 1;
+        apart += usize::from(pick(seed, engines) != pick(seed, Engines::default()));
+    }
+    assert!(
+        widened >= 20 && apart > 0,
+        "{widened} widened, {apart} apart"
+    );
 }
