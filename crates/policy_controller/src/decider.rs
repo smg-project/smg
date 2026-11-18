@@ -34,7 +34,7 @@ thread_local! {
     /// The decider the thread acts as: the name of its newest live guard.
     static ACTING: Cell<Option<Decider>> = const { Cell::new(None) };
     /// The thread's live guards, oldest first, each by its number and name.
-    static LIVE: RefCell<Vec<(u32, Decider)>> = const { RefCell::new(Vec::new()) };
+    static LIVE: RefCell<Vec<(u64, Decider)>> = const { RefCell::new(Vec::new()) };
 }
 
 /// One of a host's deciders, by the number the host gave it: a byte, so a
@@ -105,8 +105,12 @@ impl Decider {
 /// ```
 #[derive(Debug)]
 pub struct Acting {
-    /// The guard's number among its thread's live guards.
-    number: u32,
+    /// The guard's number among its thread's live guards: one more than the
+    /// newest one's at its entry, so it grows by one a renewal for as long
+    /// as any guard lives. No two guards of the list share a number: a `u64`
+    /// does not come round. A guard entered past the list takes zero, which
+    /// nothing reads.
+    number: u64,
     /// A raw pointer is not `Send`, so the guard is not.
     thread: PhantomData<*const ()>,
 }
@@ -133,7 +137,7 @@ impl Drop for Acting {
 mod tests {
     use std::{cell::RefCell, sync::mpsc};
 
-    use super::{Acting, Decider};
+    use super::{Acting, Decider, LIVE};
 
     #[test]
     fn a_thread_acts_as_the_decider_it_entered_until_the_guard_drops() {
@@ -188,6 +192,30 @@ mod tests {
         }
         drop(held);
         assert_eq!(Decider::acting(), None);
+    }
+
+    /// A guard's number is one more than the newest live guard's, so it
+    /// grows by one a renewal while any guard lives, and no two live guards
+    /// share one. Here a guard has outlived the renewals a `u32` counts: the
+    /// next renewal takes a number of its own, and the old guard's drop
+    /// leaves the renewed name acting.
+    #[test]
+    fn a_guard_that_outlives_the_renewals_a_u32_counts_shares_no_number() {
+        let old = Decider::new(1).enter();
+        let mut renewed = Decider::new(2).enter();
+        // What that many renewals leave: the renewed guard's number.
+        renewed.number = u32::MAX.into();
+        LIVE.with_borrow_mut(|live| live.last_mut().expect("two guards live").0 = renewed.number);
+        let next = Decider::new(2).enter();
+        drop(renewed);
+        drop(old);
+        assert_eq!(
+            Decider::acting(),
+            Some(Decider::new(2)),
+            "the old guard took its own number out, not the renewed one's"
+        );
+        drop(next);
+        assert_eq!(Decider::acting(), None, "no guard is left");
     }
 
     /// The name acting once the kept guard dropped, then the names acting
