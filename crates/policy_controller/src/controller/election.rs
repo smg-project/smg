@@ -393,8 +393,10 @@ impl Running {
     /// thread counts the term among the terms this replica saw. Where it
     /// leads under a lower term, or no term is said, it closes the fence,
     /// releases the lease under the highest term it saw and takes nothing
-    /// for one lease duration; a replica that holds no lease, or leads at
-    /// or above the term said, keeps on as it is. A word may not spend the
+    /// for one lease duration; a replica that leads at or above the term
+    /// said keeps on as it is. So does one that holds no lease: where it
+    /// saw the lease released under a lower term, it writes that release
+    /// again under the highest term it saw. A word may not spend the
     /// last term: a term whose next is not below the ceiling
     /// ([`crate::elector::TERM_CEILING`]) is the term error, and no word is
     /// said.
@@ -807,7 +809,10 @@ fn report(
 /// term; a holder under a lower term, or one told no term, closes its fence,
 /// releases the lease and holds its takes back. `Some(true)` when this
 /// replica held the lease and left it: a release that failed is tried again
-/// at every step, in place of a renewal. `None` when the elector refused
+/// at every step, in place of a renewal. `Some(false)` when it left none: a
+/// replica that saw the lease released under a term below the highest its
+/// run saw writes that release again under that highest, and a write that
+/// failed is logged and not tried again. `None` when the elector refused
 /// the word, a term that leaves none to take: nothing was counted.
 fn step_down(elector: &mut Elector, above: Option<u64>) -> Option<bool> {
     match elector.step_down(above, Instant::now()) {
@@ -838,7 +843,7 @@ fn step_down(elector: &mut Elector, above: Option<u64>) -> Option<bool> {
             );
             None
         }
-        Err(error) => {
+        Err(error) if elector.is_holder() => {
             warn!(
                 identity = elector.identity(),
                 above,
@@ -846,6 +851,17 @@ fn step_down(elector: &mut Elector, above: Option<u64>) -> Option<bool> {
                 "stepped down; the release failed and is tried again at the next step"
             );
             Some(true)
+        }
+        // No lease is held here: the term was counted, and its write over
+        // a release this replica saw failed.
+        Err(error) => {
+            warn!(
+                identity = elector.identity(),
+                above,
+                %error,
+                "a term said over a released lease was counted and not written; a take below it is left again at its gateway's word"
+            );
+            Some(false)
         }
     }
 }
