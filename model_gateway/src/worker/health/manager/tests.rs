@@ -407,15 +407,13 @@ fn labels_follow_the_engine_for_local_self_hosted_workers_only() {
     let zmq_id = registry.register(zmq.clone()).unwrap();
     assert!(labels_follow_the_engine(&registry, &zmq_id, &zmq));
 
-    registry.on_remote_worker_state(&smg_mesh::WorkerState {
+    registry.on_remote_worker_state(&crate::worker::RemoteWorkerState {
         worker_id: "peer-w1".to_string(),
         model_id: "m".to_string(),
         url: "http://remote:1".to_string(),
         health: true,
-        load: 0.0,
         version: 1,
         spec: vec![],
-        owner: "peer".to_string(),
     });
     let mesh_id = registry.get_id_by_url("http://remote:1").unwrap();
     let mesh = registry.get(&mesh_id).unwrap();
@@ -426,13 +424,8 @@ fn labels_follow_the_engine_for_local_self_hosted_workers_only() {
 /// with no removal queue (the shape of `remove_unhealthy = false`).
 #[tokio::test]
 async fn a_transition_into_ready_submits_a_label_refresh() {
-    use crate::{
-        service_discovery::testing::create_test_app_context,
-        workflow::{JobQueue, JobQueueConfig},
-    };
-    let app_context = create_test_app_context();
-    let registry = Arc::clone(&app_context.worker_registry);
-    let job_queue = JobQueue::new(JobQueueConfig::default(), Arc::downgrade(&app_context));
+    let registry = Arc::new(WorkerRegistry::new());
+    let job_queue = Arc::new(RecordedQueue::default());
 
     let worker = discovered_worker("http://local:7");
     worker.set_status(WorkerStatus::NotReady);
@@ -459,13 +452,8 @@ async fn a_transition_into_ready_submits_a_label_refresh() {
 /// transition into service is then what fills them in.
 #[tokio::test]
 async fn a_worker_registered_without_labels_is_refreshed_when_it_comes_into_service() {
-    use crate::{
-        service_discovery::testing::create_test_app_context,
-        workflow::{JobQueue, JobQueueConfig},
-    };
-    let app_context = create_test_app_context();
-    let registry = Arc::clone(&app_context.worker_registry);
-    let job_queue = JobQueue::new(JobQueueConfig::default(), Arc::downgrade(&app_context));
+    let registry = Arc::new(WorkerRegistry::new());
+    let job_queue = Arc::new(RecordedQueue::default());
 
     let worker = make_worker("http://local:8", 1, 1);
     assert!(worker.metadata().discovered_labels.is_empty());
@@ -481,6 +469,65 @@ async fn a_worker_registered_without_labels_is_refreshed_when_it_comes_into_serv
         job_queue.get_status("http://local:8").is_some(),
         "a worker whose registration discovered nothing is refreshed all the same"
     );
+}
+
+/// The job a [`RecordedQueue`] holds for an address.
+struct HeldJob {
+    job_type: &'static str,
+}
+
+/// A `WorkerJobs` in the job queue's place, for a case that reads what the
+/// manager asked of it: it holds one job an address, takes a label refresh
+/// as the job of a free address and keeps it behind the job of a held one,
+/// as the trait says of the queue.
+#[derive(Default)]
+struct RecordedQueue {
+    /// The job in flight for each address, by its type.
+    held: parking_lot::Mutex<HashMap<String, &'static str>>,
+    /// The addresses whose refresh waits behind the job in flight.
+    kept: parking_lot::Mutex<Vec<String>>,
+}
+
+impl RecordedQueue {
+    /// Hold `url` for a job of `job_type`, as a job in flight does.
+    fn hold_url_for_tests(&self, url: &str, job_type: &'static str) {
+        self.held.lock().insert(url.to_string(), job_type);
+    }
+
+    /// Whether a refresh waits behind the job that holds `url`.
+    fn kept_for(&self, url: &str) -> bool {
+        self.kept.lock().iter().any(|kept| kept == url)
+    }
+
+    /// The job that holds `url`.
+    fn get_status(&self, url: &str) -> Option<HeldJob> {
+        self.held
+            .lock()
+            .get(url)
+            .map(|&job_type| HeldJob { job_type })
+    }
+}
+
+#[async_trait]
+impl WorkerJobs for RecordedQueue {
+    async fn remove_worker(
+        &self,
+        _url: String,
+        _worker_id: &WorkerId,
+        _revision: u64,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    async fn refresh_worker_labels(&self, url: String) -> Result<bool, String> {
+        let mut held = self.held.lock();
+        if held.contains_key(&url) {
+            self.kept.lock().push(url);
+            return Ok(false);
+        }
+        held.insert(url, "RefreshWorkerLabels");
+        Ok(true)
+    }
 }
 
 /// What a recorded removal names: the address, the worker's id and its revision.
@@ -853,15 +900,13 @@ fn the_probe_slot_follows_the_status_and_the_health_settings() {
 #[tokio::test]
 async fn a_failed_mesh_import_under_removal_keeps_its_probe_slot() {
     let registry = Arc::new(WorkerRegistry::new());
-    registry.on_remote_worker_state(&smg_mesh::WorkerState {
+    registry.on_remote_worker_state(&crate::worker::RemoteWorkerState {
         worker_id: "peer-w1".to_string(),
         model_id: "m".to_string(),
         url: "http://remote:1".to_string(),
         health: true,
-        load: 0.0,
         version: 1,
         spec: vec![],
-        owner: "peer".to_string(),
     });
     let worker_id = registry.get_id_by_url("http://remote:1").unwrap();
     let worker = registry.get(&worker_id).unwrap();
@@ -1440,13 +1485,8 @@ fn apply_connect_signal_reports_the_promoted_worker() {
 /// the label refresh is submitted for a locally registered worker.
 #[tokio::test]
 async fn a_connect_signal_promotion_submits_a_label_refresh() {
-    use crate::{
-        service_discovery::testing::create_test_app_context,
-        workflow::{JobQueue, JobQueueConfig},
-    };
-    let app_context = create_test_app_context();
-    let registry = Arc::clone(&app_context.worker_registry);
-    let job_queue = JobQueue::new(JobQueueConfig::default(), Arc::downgrade(&app_context));
+    let registry = Arc::new(WorkerRegistry::new());
+    let job_queue = Arc::new(RecordedQueue::default());
 
     let worker = discovered_worker_with(
         "http://local:11",
@@ -1486,13 +1526,8 @@ async fn a_connect_signal_promotion_submits_a_label_refresh() {
 /// transition to retry on. The registration's status stays its own.
 #[tokio::test]
 async fn a_connect_signal_during_the_registration_job_keeps_the_refresh() {
-    use crate::{
-        service_discovery::testing::create_test_app_context,
-        workflow::{JobQueue, JobQueueConfig},
-    };
-    let app_context = create_test_app_context();
-    let registry = Arc::clone(&app_context.worker_registry);
-    let job_queue = JobQueue::new(JobQueueConfig::default(), Arc::downgrade(&app_context));
+    let registry = Arc::new(WorkerRegistry::new());
+    let job_queue = Arc::new(RecordedQueue::default());
 
     let worker = discovered_worker_with(
         "http://local:12",
@@ -2063,15 +2098,13 @@ fn a_failed_workers_removal_follows_the_scope() {
             .build(),
     );
     let discovered_id = registry.register(discovered).unwrap();
-    registry.on_remote_worker_state(&smg_mesh::WorkerState {
+    registry.on_remote_worker_state(&crate::worker::RemoteWorkerState {
         worker_id: "peer-w1".to_string(),
         model_id: "m".to_string(),
         url: "http://remote:1".to_string(),
         health: true,
-        load: 0.0,
         version: 1,
         spec: vec![],
-        owner: "peer".to_string(),
     });
     let mesh_id = registry.get_id_by_url("http://remote:1").unwrap();
 

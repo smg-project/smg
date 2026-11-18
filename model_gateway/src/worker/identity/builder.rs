@@ -184,7 +184,7 @@ impl<D: ConnectorDefault> BasicWorkerBuilder<D> {
         self
     }
 
-    /// Set the runtime type (SGLang or vLLM)
+    /// Set the runtime type
     pub fn runtime_type(mut self, runtime_type: RuntimeType) -> Self {
         self.spec.runtime_type = runtime_type;
         self
@@ -338,7 +338,7 @@ impl<D: ConnectorDefault> BasicWorkerBuilder<D> {
         self
     }
 
-    /// Set KV transfer engine id (vLLM `kv_transfer_config.engine_id`)
+    /// Set KV transfer engine id (the engine's `kv_transfer_config.engine_id`)
     pub fn kv_engine_id(mut self, engine_id: impl Into<String>) -> Self {
         self.spec.kv_engine_id = Some(engine_id.into());
         self
@@ -538,7 +538,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use crate::{server::http_client, worker::identity::basic::Worker};
+    use crate::worker::{connection::client_factory::http_client, identity::basic::Worker};
 
     /// The builder without a default connector, as this module has it.
     type BasicWorkerBuilder = super::BasicWorkerBuilder;

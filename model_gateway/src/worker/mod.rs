@@ -56,8 +56,8 @@ pub use openai_protocol::{
 };
 pub(crate) use pd::pair_index::{PdPairIndex, PdWire};
 pub use pd::pairing::{PairingMismatch, PdPairing, PdPairingMode};
-pub use registry::{service::WorkerService, WorkerOrigin, WorkerRegistry};
 pub(crate) use registry::{ModelLabels, ModelWorkerSnapshot, RoutingPool, WindowFloor};
+pub use registry::{RemoteWorkerState, WorkerOrigin, WorkerRegistry};
 
 // The gateway's connector, for the gateway's name for the builder below.
 use crate::routers::grpc::backend_client::BackendConnector;

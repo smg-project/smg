@@ -137,10 +137,7 @@ pub fn resolve_resilience(
 
 #[cfg(test)]
 mod tests {
-    use axum::http::StatusCode;
-
     use super::*;
-    use crate::routers::common::retry::is_retryable_status;
 
     #[test]
     fn test_default_resilience() {
@@ -278,6 +275,16 @@ mod tests {
         assert!(!resolved.capacity_status_codes.contains(&429));
         assert_eq!(resolved.capacity_status_codes.len(), 1);
     }
+}
+
+/// The gateway's case over the worker's resolved sets: it reads the routers'
+/// retry rule beside them, so it stays with the gateway.
+#[cfg(test)]
+mod gateway_tests {
+    use axum::http::StatusCode;
+
+    use super::*;
+    use crate::routers::common::retry::is_retryable_status;
 
     #[test]
     fn partial_retryable_override_leaves_capacity_pushback_retryable() {

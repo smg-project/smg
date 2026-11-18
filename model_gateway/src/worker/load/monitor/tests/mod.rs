@@ -9,23 +9,20 @@ use openai_protocol::{
 };
 
 use super::*;
-use crate::{
-    config::types::PolicyConfig,
-    observability::metrics::test_support::render_with_recorder,
-    policies::PolicyRegistry,
-    worker::{
-        health::overload::OverloadThresholds, runtime::StallReason, test_support::ready_worker,
-        BasicWorkerBuilder, ConnectionMode, WorkerType,
-    },
+use crate::worker::{
+    health::overload::OverloadThresholds,
+    runtime::StallReason,
+    test_support::{ready_worker, render_with_recorder, LoadReaders},
+    BasicWorkerBuilder, ConnectionMode, WorkerType,
 };
 
-/// Build an isolated monitor and registry with round-robin routing for tests.
+/// Build an isolated monitor and registry beside a routing side that reads
+/// no loads.
 fn build_monitor() -> (Arc<WorkerRegistry>, Arc<WorkerMonitor>) {
     let registry = Arc::new(WorkerRegistry::new());
-    let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
     let monitor = Arc::new(WorkerMonitor::new(
         registry.clone(),
-        policy_registry,
+        Arc::new(LoadReaders::Blind),
         5,
         false,
         false,

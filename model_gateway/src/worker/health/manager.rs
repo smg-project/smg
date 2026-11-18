@@ -1408,8 +1408,8 @@ impl WorkerManager {
             .iter()
             .filter(|w| matches!(w.connection_mode(), ConnectionMode::Http))
             .count();
-        // A ZMQ engine flushes when its wire carries control calls (an SGLang
-        // scheduler, a TokenSpeed one that declares them); fan out only to
+        // A ZMQ engine flushes when its wire carries control
+        // calls (a scheduler that declares them); fan out only to
         // workers that can succeed instead of reporting the others as failed.
         let mut workers = Vec::with_capacity(all_workers.len());
         for worker in all_workers {

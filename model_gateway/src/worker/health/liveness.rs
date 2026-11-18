@@ -105,8 +105,8 @@
 //!   waits on; on that shape a decode side's first output counts as an
 //!   answer of its prefill worker's too (the decode engine produces it from
 //!   the KV the worker handed off, and the prefill engine may answer only an
-//!   engine step later: a TokenSpeed prefill worker answers once it has
-//!   polled the transfer's success after its next forward), for at most a
+//!   engine step later: a prefill worker that polls the transfer's success
+//!   answers after its next forward), for at most a
 //!   bound past where its answers leave the side, and not for one that has
 //!   never answered; a side in flight when the longest prompt yet lands behind
 //!   it is given what is left of the cold-shape grace since its dispatch;
@@ -221,8 +221,8 @@ fn bound_over(wedge: Duration, eta: Duration) -> Duration {
 /// already prefilling ([`WorkerRuntime::prefill_eta`]) at twice the time the
 /// worker's rate gives, as the engine-reported rule allows for the prefill
 /// in hand ([`silence_allowance`]): the rate is an estimate, the answer can
-/// come an engine step after the prefill (a TokenSpeed prefill worker
-/// answers once it has polled the KV transfer, after its next forward), and
+/// come an engine step after the prefill (a prefill worker that
+/// polls the KV transfer answers after its next forward), and
 /// a side's verdict fails its request where that rule's veto only steers.
 /// So a long prompt on a busy worker gets twice the time its measured rate
 /// says it needs, a short one the configured threshold, a prompt longer
@@ -409,8 +409,8 @@ impl SideReprieve {
 /// On the parallel dispatch shape a decode side's first output is the
 /// decode engine producing from the KV the worker handed off
 /// ([`Worker::prefill_handed_off_ago`]), and it may come an engine step
-/// before the prefill side's own response (a TokenSpeed prefill worker
-/// answers once it has polled the transfer's success, after its next
+/// before the prefill side's own response (a prefill worker
+/// that polls the transfer's success answers after its next
 /// forward). The rule above takes it for the worker's answer, until two
 /// bounds after the later of the side's dispatch and the worker's latest
 /// answer, so an engine that keeps handing off while its answers never
@@ -1610,8 +1610,8 @@ mod tests {
     /// its first tokens bunched (two 90k prompts answered together after
     /// 10 s beside a 2k prompt a second; once read as 92k tokens/s), takes
     /// a 90k uncached side: 4.5 s of prefill at its rate, and its answer
-    /// may come later still (on the parallel shape a TokenSpeed prefill
-    /// worker answers once it has polled the transfer, after its next
+    /// may come later still (on the parallel shape a prefill
+    /// worker that polls the transfer answers after its next
     /// forward). The side gets twice the 4.5 s, as the engine-reported rule
     /// allows the prefill in hand: a healthy worker still prefilling past
     /// the 3 s the bunched rate gave keeps the side, a frozen one is given
@@ -2928,8 +2928,8 @@ mod tests {
     #[test]
     fn a_token_batch_wires_silence_is_judged_against_the_servicers_pending_prefill() {
         // The review's case: a lightly loaded single worker on a wire that
-        // sends nothing for a request still in chunked prefill (SGLang,
-        // TokenSpeed) takes one long prompt. Its servicer reports a growing
+        // sends nothing for a request still in chunked prefill
+        // takes one long prompt. Its servicer reports a growing
         // silence from the dispatch on, and beside it the prompt tokens it
         // holds with no output yet; the silence is judged against that
         // prefill at the rate this gateway has measured on the worker (twice

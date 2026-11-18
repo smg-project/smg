@@ -542,6 +542,25 @@ impl Drop for QueueTicket {
     }
 }
 
+/// Admission helpers for tests elsewhere in the crate.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::sync::Arc;
+
+    use super::{PrefillAdmissionAttempt, PrefillSelectionContext};
+    use crate::worker::Worker;
+
+    /// The attempt a test makes when it wants exactly `worker`: it is selected,
+    /// with a unit payload, whenever it has capacity.
+    pub(crate) fn select_worker(
+        worker: &Arc<dyn Worker>,
+    ) -> impl for<'a> FnMut(&PrefillSelectionContext<'a>) -> PrefillAdmissionAttempt<()> + Send
+    {
+        let worker = Arc::clone(worker);
+        move |capacity| capacity.select(Arc::clone(&worker), ())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{
@@ -555,10 +574,8 @@ mod tests {
         task::JoinHandle,
     };
 
-    use super::*;
-    use crate::worker::{
-        test_support::select_worker, BasicWorkerBuilder, CircuitBreakerConfig, WorkerType,
-    };
+    use super::{test_support::select_worker, *};
+    use crate::worker::{BasicWorkerBuilder, CircuitBreakerConfig, WorkerType};
 
     fn worker(url: &str) -> Arc<dyn Worker> {
         Arc::new(

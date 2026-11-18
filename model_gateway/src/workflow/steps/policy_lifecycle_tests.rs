@@ -422,15 +422,13 @@ async fn a_mesh_import_removed_here_leaves_the_local_workers_policy() {
     .await;
     app_context
         .worker_registry
-        .on_remote_worker_state(&smg_mesh::WorkerState {
+        .on_remote_worker_state(&crate::worker::RemoteWorkerState {
             worker_id: "peer-w1".to_string(),
             model_id: "llama".to_string(),
             url: "http://remote:8080".to_string(),
             health: true,
-            load: 0.0,
             version: 1,
             spec: vec![],
-            owner: "peer".to_string(),
         });
     let import = app_context
         .worker_registry

@@ -69,16 +69,16 @@ async fn connect_zmq_backend(
     })
 }
 
-/// Default bootstrap port for PD disaggregation (used by SGLang and vLLM Mooncake)
+/// Default bootstrap port for PD disaggregation (a bootstrap server's, and the Mooncake connector's)
 pub const DEFAULT_BOOTSTRAP_PORT: u16 = 8998;
 
-/// vLLM Mooncake KV connector name
+/// The Mooncake KV connector's name
 pub const MOONCAKE_CONNECTOR: &str = "MooncakeConnector";
 
-/// vLLM NIXL KV connector name
+/// The NIXL KV connector's name
 pub const NIXL_CONNECTOR: &str = "NixlConnector";
 
-/// vLLM MoRI-IO KV connector name
+/// The MoRI-IO KV connector's name
 pub const MORIIO_CONNECTOR: &str = "MoRIIOConnector";
 
 /// Worker label naming a MoRI-IO engine's transfer mode, `read` or `write`.
@@ -380,13 +380,13 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// worker hasn't reported a value or reports zero (zero is meaningless
     /// for capacity accounting).
     ///
-    /// Engines spell the same window two ways — TokenSpeed and vLLM
-    /// advertise `max_num_seqs`, SGLang advertises `max_running_requests` —
-    /// and both are the count of requests the scheduler will run at once, so
-    /// both are read here rather than leaving TokenSpeed workers looking like
-    /// non-reporters. `max_num_seqs` wins when a worker reports both: it is
-    /// the authoritative name for the engines that use it, and it is the
-    /// order `smg_grpc_servicer.tokenspeed.loads::running_window` reports in,
+    /// Engines spell the same window two ways, `max_num_seqs` and
+    /// `max_running_requests`, and both are the count of requests the
+    /// scheduler will run at once, so both are read here rather than
+    /// leaving the workers of one spelling looking like
+    /// non-reporters. `max_num_seqs` wins when a worker reports both:
+    /// it is the authoritative name for the engines that use it, and
+    /// it is the order the servicer's load report reads them in,
     /// so the label and the `GetLoads` report cannot disagree.
     ///
     /// `WorkerCapacity` uses this to derive total fleet capacity when

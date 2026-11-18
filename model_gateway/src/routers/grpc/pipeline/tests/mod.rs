@@ -48,7 +48,10 @@ use super::*;
 use crate::{
     config::types::PolicyConfig,
     routers::{
-        common::{openai_bridge::FormatRegistry, test_support::fast_retry_config},
+        common::{
+            openai_bridge::FormatRegistry, prefill_admission::test_support::select_worker,
+            test_support::fast_retry_config,
+        },
         grpc::{
             client::ModelInfo,
             common::responses::{
@@ -74,7 +77,6 @@ use crate::{
     tenant::TenantKey,
     worker::{
         health::circuit_breaker::{CircuitBreakerConfig, CircuitState},
-        test_support::select_worker,
         BasicWorkerBuilder, ConnectionMode, RequestCompletionSink, RuntimeType, Worker, WorkerType,
     },
 };
