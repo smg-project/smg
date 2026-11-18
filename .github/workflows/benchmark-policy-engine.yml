@@ -7,12 +7,14 @@ on:
     branches: [ main ]
     paths:
       - '.github/bench-gates/policy-engine-affinity.toml'
+      - '.github/bench-gates/policy-engine-bucket.toml'
       - '.github/bench-gates/policy-engine-power-of-two.toml'
       - '.github/bench-gates/policy-engine-prefix-hash.toml'
       - '.github/bench-gates/policy-engine.toml'
       - '.github/workflows/benchmark-policy-engine.yml'
       - 'crates/policy_controller/Cargo.toml'
       - 'crates/policy_controller/benches/affinity.rs'
+      - 'crates/policy_controller/benches/bucket.rs'
       - 'crates/policy_controller/benches/common/column.rs'
       - 'crates/policy_controller/benches/common/mod.rs'
       - 'crates/policy_controller/benches/common/placed.rs'
@@ -28,12 +30,14 @@ on:
     branches: [ main, release/** ]
     paths:
       - '.github/bench-gates/policy-engine-affinity.toml'
+      - '.github/bench-gates/policy-engine-bucket.toml'
       - '.github/bench-gates/policy-engine-power-of-two.toml'
       - '.github/bench-gates/policy-engine-prefix-hash.toml'
       - '.github/bench-gates/policy-engine.toml'
       - '.github/workflows/benchmark-policy-engine.yml'
       - 'crates/policy_controller/Cargo.toml'
       - 'crates/policy_controller/benches/affinity.rs'
+      - 'crates/policy_controller/benches/bucket.rs'
       - 'crates/policy_controller/benches/common/column.rs'
       - 'crates/policy_controller/benches/common/mod.rs'
       - 'crates/policy_controller/benches/common/placed.rs'
@@ -81,6 +85,9 @@ jobs:
           - bench: prefix_hash
             gates: policy-engine-prefix-hash.toml
             artifact: policy-engine-prefix-hash-results
+          - bench: bucket
+            gates: policy-engine-bucket.toml
+            artifact: policy-engine-bucket-results
     env:
       BENCH: ${{ matrix.bench }}
       GATES: ${{ matrix.gates }}

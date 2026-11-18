@@ -9,7 +9,9 @@
 //! the `decision` bench decides over, and the first ids are the rows that
 //! bench times for every other preset. They stand here because that binary
 //! runs at its gate's bound: a preset's rows there are three rows more in
-//! every pull request's gate.
+//! every pull request's gate. This file is a pull-request gate's too
+//! (`.github/bench-gates/policy-engine-bucket.toml` runs the whole binary
+//! three times a side).
 #![expect(
     clippy::expect_used,
     reason = "a bench's setup has no caller to answer; a preset that fails to validate is a bug the unit tests catch"
