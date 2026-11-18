@@ -1257,7 +1257,7 @@ fn hand<R>(
     let (pool, now_micros, candidates, stalled, affinity, counts, built): Read<'_> = if by_door {
         match world.view(model, role, &ask, shown, view) {
             Some(read) => (
-                read.built.pool_facts(),
+                read.pool_facts(),
                 read.built.now_micros,
                 read.candidates,
                 read.stalled,
@@ -1281,13 +1281,18 @@ fn hand<R>(
                 // The pool's facts are of the rows before the request's own
                 // narrowing, all but the list's name: the rows the wires
                 // left are another list of the pool.
-                let mut pool = built.pool_facts();
+                let mut pool: PoolFacts<'_> = built.pool_facts();
                 let took = narrow(view, wires, request.subset());
                 if took > 0 {
                     undialed.fetch_add(took, Ordering::Relaxed);
                     if let Some(wires) = wires {
                         pool.reach = cut_reach(pool.reach, wires);
                     }
+                } else {
+                    // Every row stands where the build left it, so the
+                    // pool's engines name these rows as they name the
+                    // publication's: a key is placed alike over both.
+                    pool.engines = world.engines(&built);
                 }
                 (pool, built.now_micros)
             }
@@ -3309,6 +3314,63 @@ pub(crate) mod tests {
         assert_eq!(read(both), (2, 2), "wires that cut none: written");
         let none = constrained(frame_for(SPOKEN, 5, 5), 0, Some(0));
         assert_eq!(read(none), (0, 0), "a hint of 0");
+    }
+
+    /// A decision over the publication's own rows is handed the pool's
+    /// engines beside them: the ranks of one data-parallel engine as one
+    /// engine of the list, and a worker alone as another. So is a decision
+    /// over rows written for its request while no row is cut from them. A
+    /// row the request's narrowing takes moves the rows behind it from the
+    /// places the list names, and those rows are handed none.
+    #[test]
+    fn a_decision_over_the_published_rows_is_handed_the_pools_engines() {
+        const SPOKEN: &str = "model-ranks";
+        let store = MemoryStore::new();
+        for rank in 0..2 {
+            store.upsert(WorkerFacts {
+                key: format!("grpc://e:9000#{rank}"),
+                engine: "grpc://e:9000".to_owned(),
+                incarnation: 1,
+                wire_modes: WireModes::GRPC,
+                models: vec![SPOKEN.to_owned()],
+                dp_rank: rank,
+                dp_size: 2,
+                ..WorkerFacts::default()
+            });
+        }
+        ready(&store, "h0", SPOKEN, Role::Single, WireModes::HTTP);
+        // The engines the engine is handed, each as its rows' ranks.
+        let engines = |frame: proto::DecideRequest| {
+            let request = checked(frame);
+            let now = Instant::now();
+            let taken = Taken::at(&request, GATEWAY, now, now).expect("budget is left");
+            let (mut buffers, undialed) = (Buffers::default(), AtomicU64::new(0));
+            store.deciding(|world| {
+                let handed = hand(
+                    world,
+                    &taken,
+                    &mut buffers,
+                    &undialed,
+                    |_, pool, rows, _, _| {
+                        let ranks = |engine| {
+                            let listed = pool.engines.rows(engine).iter();
+                            listed.map(|&row| rows[row as usize].dp_rank).collect()
+                        };
+                        let mut engines: Vec<Vec<u16>> =
+                            (0..pool.engines.len()).map(ranks).collect();
+                        engines.sort();
+                        engines
+                    },
+                );
+                handed.0
+            })
+        };
+        let lent = engines(frame_for(SPOKEN, 1, 1));
+        assert_eq!(lent, [vec![0], vec![0, 1]], "lent: one engine of two ranks");
+        let wired = constrained(frame_for(SPOKEN, 2, 2), 0b011, None);
+        assert_eq!(engines(wired), lent, "written and whole: the same list");
+        let cut = constrained(frame_for(SPOKEN, 3, 3), 0b001, None);
+        assert_eq!(engines(cut), Vec::<Vec<u16>>::new(), "a row cut: no list");
     }
 
     /// A profile that shows its rows to a plugin is handed rows the door
