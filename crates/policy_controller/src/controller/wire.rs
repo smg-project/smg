@@ -58,7 +58,7 @@ use crate::{
     store::leases::DISPATCH_TTL,
     view::{
         fingerprint, key_of_session, AffinityFacts, Constraints, HashKind, Header, Identity,
-        MediaCounts, ModelFingerprint, Phase, RequestFacts, WireModes, WorkerId,
+        MediaCounts, ModelFingerprint, NamedAffinity, Phase, RequestFacts, WireModes, WorkerId,
     },
 };
 
@@ -178,6 +178,11 @@ impl Checked {
         self.phase
     }
 
+    /// The decision's seed, which its trace carries and its naming draws from.
+    pub(crate) const fn seed(&self) -> u64 {
+        self.facts.seed
+    }
+
     /// The time the request gives its decision, counted from its frame's
     /// receipt.
     pub(crate) fn budget(&self) -> Duration {
@@ -228,6 +233,11 @@ impl Checked {
     /// present 0 is a decision over no candidates.
     pub(crate) const fn subset(&self) -> Option<u32> {
         self.constraints.subset_hint
+    }
+
+    /// The request's block hashes, in order from its first block.
+    pub(crate) fn block_hashes(&self) -> &[u64] {
+        &self.facts.block_hashes
     }
 
     /// Hands `decide` the request as the engine reads it, with what the
@@ -294,8 +304,8 @@ impl Checked {
                 block_size: facts.block_size,
                 now_micros: view.now_micros,
                 affinity: view.affinity,
-                // In-process only: a host names rows where it holds them.
-                named: None,
+                // In-process only: the rows the deciding host named.
+                named: view.named,
                 // The wire carries the name: each read of the request's
                 // session fingerprints it.
                 model_fingerprint: ModelFingerprint::NONE,
@@ -334,6 +344,9 @@ pub(crate) struct Viewed<'a> {
     /// How many of the request's block hashes the deciding generation
     /// reads.
     pub(crate) max_block_hashes: usize,
+    /// The rows the deciding host named in the column's place, where the
+    /// request's profile takes them.
+    pub(crate) named: Option<NamedAffinity<'a>>,
 }
 
 /// The lists of one request in the engine's form, on buffers their decider
@@ -614,6 +627,7 @@ mod tests {
             affinity: &affinity,
             stalled: &[],
             max_block_hashes: 256,
+            named: None,
         };
         checked.read(lists, view, check)
     }
@@ -935,6 +949,7 @@ mod tests {
                 affinity: &[],
                 stalled: &[],
                 max_block_hashes,
+                named: None,
             };
             checked.read(&mut Lists::default(), view, |facts, _| {
                 facts.block_hashes.to_vec()

@@ -596,6 +596,131 @@ impl Scorer for KvPressure {
 
 // ---------------------------------------------------------------- warm-up slice
 
+/// How a host reads the rows a ruling named ([`WarmRule::name`]) at an
+/// instant of the ruling's clock.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Warming {
+    /// The rows named are the thin.
+    pub thin: bool,
+    /// The instant from which the rows are named: `0`, unless every row
+    /// was young. Such a fleet has nobody to catch up to until the first
+    /// of its rows is young no more.
+    pub from: u64,
+}
+
+/// The warm-up stage's ruling of who warms, as its three numbers: what the
+/// stage rules a host's column by, and what a host that names a pool's
+/// warming rows enters ([`WarmRule::name`]). The ruling has this one home: a
+/// host hands it the pool's sizes and admissions and never restates it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WarmRule {
+    /// How long after its admission a worker is young, in microseconds; `0`
+    /// keeps nobody young.
+    window_micros: u64,
+    /// The level from which a fleet holds a cache worth catching up to, and
+    /// the growth a young worker is short of, in blocks.
+    blocks: u32,
+    /// The share of the fleet's level under which an index is thin; `0`
+    /// keeps nobody thin.
+    thin_ratio: f32,
+}
+
+impl WarmRule {
+    /// Whether an index of `indexed` blocks is thin against the fleet's
+    /// `level`: empty, or below the ratio of the level, once the fleet holds
+    /// a cache worth catching up to.
+    #[inline]
+    fn is_thin(&self, indexed: u32, level: u32) -> bool {
+        self.thin_ratio > 0.0
+            && level >= self.blocks
+            && (indexed == 0 || f64::from(indexed) < f64::from(level) * f64::from(self.thin_ratio))
+    }
+
+    /// Whether a worker admitted `age_micros` ago whose index grew by
+    /// `growth` blocks since is young: within the window and short of its
+    /// first blocks.
+    #[inline]
+    fn is_young(&self, age_micros: u64, growth: u32) -> bool {
+        age_micros < self.window_micros && growth < self.blocks
+    }
+
+    /// The fleet's index level: the upper median of the rows' index sizes,
+    /// so one emptied worker does not drag it down. Reorders `sizes`.
+    #[inline]
+    fn level(sizes: &mut [u32]) -> u32 {
+        if sizes.is_empty() {
+            return 0;
+        }
+        let mid = sizes.len() / 2;
+        let (_, level, _) = sizes.select_nth_unstable(mid);
+        *level
+    }
+
+    /// The pool's warming rows by this ruling, for a host that names them
+    /// ([`NamedAffinity::warming`]). `sizes` holds each row's index size
+    /// and `admitted` each row's admission, on the clock `now` is read on,
+    /// in microseconds; `scratch` is the host's, for the level. The rows go
+    /// to `out`, emptied first, ascending, each with the instant its naming
+    /// ends: the thin whatever the fleet's age, with no end (`u64::MAX`),
+    /// else the young, each until its window is over, as the stage rules a
+    /// column of the same sizes and ages. A row is admitted with nothing
+    /// indexed, so its growth since admission is its size.
+    ///
+    /// The rows stand for every later instant of that clock while the sizes
+    /// do: at an instant a host names the rows whose end is past it, and
+    /// nobody before [`Warming::from`]. So a host that reads the sizes at
+    /// its own pace still ends a young row's naming on time.
+    pub fn name(
+        &self,
+        sizes: &[u32],
+        admitted: &[u64],
+        now: u64,
+        scratch: &mut Vec<u32>,
+        out: &mut Vec<(u32, u64)>,
+    ) -> Warming {
+        out.clear();
+        let young = |size: u32, admitted: u64| self.is_young(now.saturating_sub(admitted), size);
+        let any_indexed = sizes.iter().any(|&size| size > 0);
+        let youngs = sizes
+            .iter()
+            .zip(admitted)
+            .filter(|&(&size, &admitted)| young(size, admitted))
+            .count();
+        if !any_indexed && youngs == 0 {
+            return Warming::default();
+        }
+        let level = if any_indexed {
+            scratch.clear();
+            scratch.extend_from_slice(sizes);
+            Self::level(scratch)
+        } else {
+            0
+        };
+        let rows = (0u32..).zip(sizes.iter().zip(admitted));
+        out.extend(
+            rows.clone()
+                .filter(|&(_, (&size, _))| self.is_thin(size, level))
+                .map(|(row, _)| (row, u64::MAX)),
+        );
+        if !out.is_empty() {
+            return Warming {
+                thin: true,
+                from: 0,
+            };
+        }
+        let window = self.window_micros;
+        out.extend(
+            rows.filter(|&(_, (&size, &admitted))| young(size, admitted))
+                .map(|(row, (_, &admitted))| (row, admitted.saturating_add(window))),
+        );
+        // A fleet that is all young has nobody to catch up to, until the
+        // first of its rows is young no more.
+        let first_end = out.iter().map(|&(_, until)| until).min();
+        let from = first_end.filter(|_| youngs == sizes.len()).unwrap_or(0);
+        Warming { thin: false, from }
+    }
+}
+
 /// The warm-up slice. One miss in `1 / share` goes to the least-loaded
 /// warming worker (one with a thin index against the fleet's level, or a
 /// young one short of its first blocks), so a returned, new or emptied worker
@@ -647,6 +772,16 @@ impl WarmupSlice {
         }
     }
 
+    /// The stage's ruling of who warms, as a host enters it.
+    #[inline]
+    fn rule(&self) -> WarmRule {
+        WarmRule {
+            window_micros: self.secs_micros,
+            blocks: self.blocks,
+            thin_ratio: self.thin_ratio,
+        }
+    }
+
     /// Every how many misses one goes to a warming worker.
     fn period(&self) -> u64 {
         if self.share <= 0.0 {
@@ -659,16 +794,14 @@ impl WarmupSlice {
     /// `level`: empty, or below the ratio of the level, once the fleet holds
     /// a cache worth catching up to.
     fn is_thin(&self, indexed: u32, level: u32) -> bool {
-        self.thin_ratio > 0.0
-            && level >= self.blocks
-            && (indexed == 0 || f64::from(indexed) < f64::from(level) * f64::from(self.thin_ratio))
+        self.rule().is_thin(indexed, level)
     }
 
     /// Whether a worker is young: admitted within the window and short of
     /// its first blocks.
     fn is_young(&self, held: AffinityFacts) -> bool {
-        u64::from(held.admitted_age_ms).saturating_mul(1_000) < self.secs_micros
-            && held.indexed_growth < self.blocks
+        let age = u64::from(held.admitted_age_ms).saturating_mul(1_000);
+        self.rule().is_young(age, held.indexed_growth)
     }
 
     /// The fleet's index level: the upper median of the index sizes in the
@@ -677,12 +810,7 @@ impl WarmupSlice {
         let mut sizes = self.sizes.lock();
         sizes.clear();
         sizes.extend(column.iter().map(|held| held.indexed_blocks));
-        if sizes.is_empty() {
-            return 0;
-        }
-        let mid = sizes.len() / 2;
-        let (_, level, _) = sizes.select_nth_unstable(mid);
-        *level
+        WarmRule::level(&mut sizes)
     }
 
     /// The stage over the rows a host named: it ruled the warming rows
@@ -969,6 +1097,10 @@ impl Scorer for WarmupSlice {
             loads: true,
             ..Needs::default()
         }
+    }
+
+    fn warm_rule(&self) -> Option<WarmRule> {
+        Some(self.rule())
     }
 }
 
@@ -2164,6 +2296,105 @@ mod tests {
         assert_eq!(by_search.0, by_walk.0);
         assert!(by_walk.1 > 0, "the walk looks behind");
         assert_eq!(by_search.1, 0, "a search keeps no cursor");
+    }
+
+    /// A host that names a pool's warming rows enters the stage's own
+    /// ruling: for fleets of every kind the rows it is handed, and the bit,
+    /// are what the stage's pass rules over a column of the same sizes and
+    /// ages; a young row leaves the rows named with its window; and a
+    /// parameter of the stage moves the rows named.
+    #[test]
+    fn a_host_that_names_warming_rows_enters_the_stages_own_ruling() {
+        const NOW: u64 = 600_000_000;
+        let stage = warmup(0.25, 8);
+        let rule = stage.warm_rule().expect("the stage rules who warms");
+        // A row: its index size and how many seconds ago it was admitted.
+        let fleets: [&[(u32, u64)]; 8] = [
+            &[(40, 500), (40, 500), (4, 500), (40, 500)],
+            &[(40, 500), (40, 10), (0, 10), (40, 500)],
+            &[(6, 500), (2, 10), (7, 500), (3, 20)],
+            &[(0, 10), (0, 20), (0, 30)],
+            &[(0, 500), (0, 500)],
+            &[(50, 500), (50, 500)],
+            &[(40, 10), (40, 500), (5, 10)],
+            &[(9, 10), (3, 10), (6, 500), (7, 500)],
+        ];
+        // The rows a host names at `now` from the ruling's entry at `read`.
+        let read_at = |rule: &WarmRule, fleet: &[(u32, u64)], read: u64, now: u64| {
+            let sizes: Vec<u32> = fleet.iter().map(|row| row.0).collect();
+            let admitted: Vec<u64> = fleet.iter().map(|row| NOW - row.1 * 1_000_000).collect();
+            let (mut scratch, mut rows) = (Vec::new(), vec![(99, 0)]);
+            let warming = rule.name(&sizes, &admitted, read, &mut scratch, &mut rows);
+            let named = rows
+                .iter()
+                .filter(|&&(_, until)| warming.from <= now && now < until);
+            (
+                named.map(|&(row, _)| row).collect::<Vec<u32>>(),
+                warming.thin,
+            )
+        };
+        let named_by =
+            |rule: &WarmRule, fleet: &[(u32, u64)], now: u64| read_at(rule, fleet, now, now);
+        let mut seen = Vec::new();
+        for fleet in fleets {
+            let column: Vec<AffinityFacts> = fleet
+                .iter()
+                .map(|&(size, age)| AffinityFacts {
+                    admitted_age_ms: (age * 1_000) as u32,
+                    indexed_growth: size,
+                    indexed_blocks: size,
+                    ..AffinityFacts::default()
+                })
+                .collect();
+            let by_stage = stage.ruled(&column).map_or((Vec::new(), false), |warm| {
+                let mut warming = stage.warming::<false>(warm, Feed::Column(&column));
+                let rows: Vec<u32> = (0..column.len() as u32)
+                    .filter(|&row| warming(row))
+                    .collect();
+                (rows, warm.thin())
+            });
+            let named = named_by(&rule, fleet, NOW);
+            assert_eq!(named, by_stage, "{fleet:?}");
+            seen.push(named);
+        }
+        // The fleets hold each kind: the thin, the young, and nobody.
+        assert_eq!(seen[0], (vec![2], true));
+        assert_eq!(seen[2], (vec![1, 3], false));
+        assert_eq!(seen[3], (vec![], false));
+        // A young row is named until its window ends: sixty seconds from its
+        // admission.
+        assert_eq!(named_by(&rule, fleets[2], 639_999_999).0, vec![1, 3]);
+        assert_eq!(named_by(&rule, fleets[2], 640_000_000).0, vec![1]);
+        // The rows of one entry stand for every later instant while the
+        // sizes do: read then, they are the ruling's own of that instant.
+        let laters = [
+            1, 29_999_999, 30_000_000, 39_999_999, 40_000_000, 49_999_999, 50_000_000, 70_000_000,
+        ];
+        for fleet in fleets {
+            for later in laters {
+                let now = NOW + later;
+                let stood = read_at(&rule, fleet, NOW, now);
+                assert_eq!(stood, named_by(&rule, fleet, now), "{fleet:?} +{later}");
+            }
+        }
+        // A fleet that is all young names nobody until its first row is
+        // young no more, then the rest, each until its own end.
+        let all_young = |later: u64| read_at(&rule, fleets[3], NOW, NOW + later).0;
+        assert_eq!(all_young(29_999_999), Vec::<u32>::new());
+        assert_eq!(all_young(30_000_000), vec![0, 1]);
+        assert_eq!(all_young(40_000_000), vec![0]);
+        assert_eq!(all_young(50_000_000), Vec::<u32>::new());
+        // A parameter of the stage moves the rows named.
+        let fleet = [(40, 500), (40, 500), (15, 500), (40, 500)];
+        assert_eq!(named_by(&rule, &fleet, NOW).0, vec![2]);
+        let narrow = WarmupSliceParams {
+            thin_ratio: Some(0.25),
+            blocks: Some(8),
+            ..WarmupSliceParams::default()
+        };
+        let narrow = WarmupSlice::new(&narrow, Gates::of(None, None, Some(16)));
+        let narrow = narrow.warm_rule().expect("the stage rules who warms");
+        assert_eq!(named_by(&narrow, &fleet, NOW).0, Vec::<u32>::new());
     }
 
     #[test]

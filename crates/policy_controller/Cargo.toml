@@ -354,6 +354,10 @@ name = "store_journal"
 harness = false
 
 [[bench]]
+name = "store_named"
+harness = false
+
+[[bench]]
 name = "power_of_two"
 harness = false
 

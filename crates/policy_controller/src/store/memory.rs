@@ -66,8 +66,9 @@ pub struct MemoryStore {
     loads: Mutex<Loads>,
     /// The KV lanes and the indexes they write, behind locks of their own
     /// ([`KvTables`]): a membership write takes the table's after the
-    /// workers lock, a batch takes it alone.
-    kv: KvTables,
+    /// workers lock, a batch takes it alone. The writer holds the same
+    /// tables and reads each pool's standing in them.
+    kv: Arc<KvTables>,
     reservations: Mutex<Reservations>,
     sessions: Mutex<FxHashMap<u64, Pin>>,
     leases: Mutex<Leases>,
@@ -141,7 +142,8 @@ impl MemoryStore {
         // that far: a sample older than the store keeps an instant of its
         // own.
         let origin = now.checked_sub(Duration::from_secs(3_600)).unwrap_or(now);
-        let writer = Writer::new(window, origin);
+        let kv = Arc::new(KvTables::default());
+        let writer = Writer::new(window, origin).over(Arc::clone(&kv));
         let world = ArcSwap::new(writer.world());
         // The leases' file writes the counts the writer's shapes name.
         let leases = Leases {
@@ -155,7 +157,7 @@ impl MemoryStore {
                 ranks: FxHashMap::default(),
                 writer,
             }),
-            kv: KvTables::default(),
+            kv,
             reservations: Mutex::default(),
             sessions: Mutex::default(),
             leases: Mutex::new(leases),

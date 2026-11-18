@@ -84,7 +84,9 @@ mod tests;
 
 pub use encoding::{EncodeClasses, EncodeHandoff, EncodeOffer};
 pub use health::{HealthSink, VetoWrite};
-pub use index::{ContentHash, KvEvent, LaneCounts, SequenceHash, StoredBlock, INDEX_WORKERS};
+pub use index::{
+    ContentHash, KvEvent, LaneCounts, Named, SequenceHash, StoredBlock, INDEX_WORKERS,
+};
 pub use journal::{Journal, Kinds, Position};
 pub use kv_events::{
     Admission, BatchFacts, BatchOutcome, KvCursor, KvEventSink, RankCursor, ResyncReason,
@@ -101,7 +103,7 @@ pub use workers::{
     Signals, WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus, WorkersStore,
 };
 pub use world::{
-    Ask, Built, OutsideLists, PairBuffers, PoolView, StaleGeneration, ViewBuffers, World,
+    Ask, Built, Naming, OutsideLists, PairBuffers, PoolView, StaleGeneration, ViewBuffers, World,
     PUBLISH_WINDOW,
 };
 

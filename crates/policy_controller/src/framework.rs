@@ -6,6 +6,7 @@
 use std::{any::Any, collections::HashMap, fmt::Debug};
 
 use crate::{
+    affinity::WarmRule,
     builtins::{target_of, Best, FewestSessions, LeastRequests, Random, RowTests},
     decision::{
         Decision, Pair, Pick, Shed, ShedReason, Survivors, Target, Targets, Trace, MAX_TARGETS,
@@ -149,6 +150,13 @@ pub trait Scorer: Lifecycle + Debug {
 
     /// The per-decision scope this stage reads, if it holds one.
     fn scope(&self) -> Option<&dyn DecisionScope> {
+        None
+    }
+
+    /// The warm-up ruling this stage applies, where it applies one: what a
+    /// host that names a pool's warming rows enters
+    /// ([`WarmRule::name`]). No other stage holds one.
+    fn warm_rule(&self) -> Option<WarmRule> {
         None
     }
 }
@@ -383,6 +391,13 @@ impl Profile {
             sample: if draws_first(self) { needs.sample } else { 0 },
             ..needs
         }
+    }
+
+    /// The rulings of this profile's warm-up stages ([`Scorer::warm_rule`]),
+    /// in the stages' order.
+    fn warm_rules(&self) -> impl Iterator<Item = WarmRule> + '_ {
+        let stages = self.scorers.iter();
+        stages.filter_map(|stage| stage.scorer.warm_rule())
     }
 
     /// Whether any stage holds a [`DecisionScope`].
@@ -2268,6 +2283,45 @@ impl Engine {
     pub fn profile_for(&self, model: &str, phase: Phase) -> Option<(u16, &Profile)> {
         self.resolve(model, phase)
             .map(|(_, index, profile)| (index, profile))
+    }
+
+    /// The warm-up ruling a decision of `phase` for `model` applies: the one
+    /// its profile's warm-up stages rule by, `None` where that profile holds
+    /// no such stage, where two of them rule by different numbers, or no
+    /// binding matches. A host that names a pool's warming rows enters it
+    /// ([`WarmRule::name`]): it names a pool by one ruling, and a profile
+    /// that applies two is named no rows ([`Self::named_for`]). A binding
+    /// is found by model and phase alone, so a pool is decided by one
+    /// profile and has one ruling.
+    pub fn warm_rule_for(&self, model: &str, phase: Phase) -> Option<WarmRule> {
+        let (_, _, profile) = self.resolve(model, phase)?;
+        let mut rules = profile.warm_rules();
+        let first = rules.next()?;
+        rules.all(|rule| rule == first).then_some(first)
+    }
+
+    /// The cap of each list of rows a host names in the affinity column's
+    /// place for a decision of `phase` for `model`: the sample of the
+    /// profile that decision resolves to ([`Self::sample_for`]) where that
+    /// profile's own stages read the column and its warm-up stages rule by
+    /// one ruling. `0` otherwise, and where no binding matches: such a
+    /// decision is handed the column where its needs declare it. The
+    /// profile answers for itself here: [`Self::needs_for`] is merged over
+    /// a pair's two phases and a binding's sessions rule, and says where to
+    /// ask.
+    pub fn named_for(&self, model: &str, phase: Phase) -> u32 {
+        let Some((_, _, profile)) = self.resolve(model, phase) else {
+            return 0;
+        };
+        let needs = profile.needs();
+        let mut rules = profile.warm_rules();
+        let first = rules.next();
+        let one = first.is_none_or(|first| rules.all(|rule| rule == first));
+        if needs.affinity && one {
+            needs.sample
+        } else {
+            0
+        }
     }
 
     /// The binding a request resolves to, with its profile for the phase: one
@@ -8431,9 +8485,9 @@ mod tests {
     }
 
     /// A draw's read of the best scores is the whole pass's, slot for slot:
-    /// ties, scores without an order and every count of rows around the
-    /// count kept. The keys' own read is held to the pass's at every count,
-    /// under the count a draw reads by keys too.
+    /// ties, scores under zero, scores without an order and every count of
+    /// rows around the count kept. The keys' own read is held to the pass's
+    /// at every count, under the count a draw reads by keys too.
     #[test]
     fn the_best_scores_of_a_draw_are_the_best_scores_of_a_pass() {
         fn bits<const K: usize>(
@@ -8470,6 +8524,18 @@ mod tests {
             f32::INFINITY,
             f32::NAN,
         ];
+        // Scores under zero alone, a tiny one among them: their order is the
+        // keys' turn of every bit under a set sign.
+        let under = [
+            -0.0f32,
+            -1.0e-40,
+            -0.25,
+            -0.25,
+            -1.0,
+            -3.5,
+            f32::MIN,
+            f32::NEG_INFINITY,
+        ];
         let mut state = 0x9e37_79b9_7f4a_7c15u64;
         for round in 0..4_000usize {
             let scores: Vec<f32> = (0..round % 41)
@@ -8477,8 +8543,13 @@ mod tests {
                     state = state
                         .wrapping_mul(6_364_136_223_846_793_005)
                         .wrapping_add(1_442_695_040_888_963_407);
-                    // Every second list holds no score without an order.
-                    values[(state >> 33) as usize % (values.len() - round % 2)]
+                    let pick = (state >> 33) as usize;
+                    match round % 4 {
+                        // Every fourth list holds scores under zero alone.
+                        3 => under[pick % under.len()],
+                        // Every second list holds no score without an order.
+                        _ => values[pick % (values.len() - round % 2)],
+                    }
                 })
                 .collect();
             held::<1>(&scores);
@@ -8487,14 +8558,36 @@ mod tests {
         }
     }
 
+    /// A list past the keys' places is read as the pass reads it, and a list
+    /// that ends at their last place by keys: its last row's place is zero.
+    #[test]
+    fn a_list_past_the_keys_places_is_read_as_the_pass_reads_it() {
+        let last = 1usize << PLACE_BITS;
+        for len in [last - 1, last, last + 1, last + 7] {
+            // One score everywhere but at both ends: the best rows stand at
+            // the first place and at the last ones, ties among them.
+            let mut scores = vec![0.25f32; len];
+            scores[0] = 1.0;
+            for (back, score) in [1.0f32, 0.5, 0.75, 1.0, 0.5].into_iter().enumerate() {
+                scores[len - 1 - back] = score;
+            }
+            let mut drawn = [(usize::MAX, f32::NEG_INFINITY); 5];
+            let mut pass = drawn;
+            assert_eq!(top_drawn(&scores, &mut drawn), top_pass(&scores, &mut pass));
+            assert_eq!(drawn, pass, "{len} rows");
+        }
+    }
+
     /// A draw's trace names the best of its rows as a pass's trace does,
     /// equal scores among them, and does not count its survivors.
     #[test]
     fn a_draws_trace_names_its_best_rows_as_a_passes_trace_does() {
-        let pool = pool_of(40, |_| false);
+        let pool = pool_of(60, |_| false);
         let facts = request(7);
-        // A draw's order, and scores that tie.
-        let kept: Vec<u32> = (0..40u32).rev().step_by(3).collect();
+        // A draw's order, and scores that tie: twenty rows, which a draw
+        // reads by keys.
+        let kept: Vec<u32> = (0..60u32).rev().step_by(3).collect();
+        assert!(kept.len() >= KEYED_FROM);
         let scores: Vec<f32> = kept.iter().map(|&row| (row % 7) as f32 / 8.0).collect();
         let pass = trace_of(3, &facts, &PoolFacts::default(), &pool, &kept, &scores);
         let draw = trace_drawn(3, &facts, &PoolFacts::default(), &pool, &kept, &scores);

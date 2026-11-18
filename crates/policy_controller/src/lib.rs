@@ -156,7 +156,10 @@ pub use view::{
 /// - the seed under the alternates' mask: the order of equal counts among
 ///   the workers the count-first picker passed over;
 /// - the first value of the seed's stream: the seed a pair plan hands its
-///   decode side, whose stages derive their streams from it as above.
+///   decode side, whose stages derive their streams from it as above;
+/// - the seed under the store's two naming masks: where the store names a
+///   decision's rows and cuts a list at the profile's sample, the holders'
+///   draw and the warming rows' draw.
 #[derive(Clone, Copy, Debug)]
 pub struct Draw(u64);
 
