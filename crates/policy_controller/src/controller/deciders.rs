@@ -520,7 +520,8 @@ impl Deciding {
     /// Decides until the last handle of the queue is dropped. With a job
     /// at hand the decider is at work at the leases' file: what the
     /// sessions hand is left to it, applied before each decision reads
-    /// its rows' counts and at each issue. It leaves that work before it
+    /// its rows' counts, where the file's turn is free, and at each
+    /// issue. It leaves that work before it
     /// waits on an empty queue: what is handed meanwhile is applied by
     /// the session that hands it.
     fn run(mut self, jobs: &Receiver<Job>) {
@@ -684,7 +685,7 @@ impl Deciding {
             .lent(&pins);
         let (buffers, own) = (&mut self.buffers, counts.part(self.index));
         // What the sessions handed is applied before the rows' counts are
-        // read: two loads where nothing is handed.
+        // read, where the turn is free.
         if let Some(at_work) = &self.working {
             at_work.apply();
         }

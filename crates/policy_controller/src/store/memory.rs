@@ -2079,7 +2079,9 @@ struct Held {
     booked: Option<Slot>,
     /// The decider that issued the lease, as its thread named itself
     /// ([`Decider::acting`]): the name its events are told under. None for
-    /// a lease another door filed and for a thread that names none.
+    /// a lease another door filed, a restored one among them, and for a
+    /// thread that names none: its events are told under the name the
+    /// thread that applies them acts as, a decider's or none.
     by: Option<Decider>,
 }
 

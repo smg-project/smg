@@ -2408,6 +2408,43 @@ fn a_frame_handed_while_a_thread_is_at_work_is_left_to_that_thread() {
     );
 }
 
+/// A decider looks at what is handed before a decision reads its rows'
+/// counts, and that look never waits: a turn it finds held is its holder's.
+#[test]
+fn a_thread_at_work_does_not_wait_for_a_held_turn_before_its_reads() {
+    let store = Arc::new(MemoryStore::new());
+    let a = ready(&store, "http://a:1");
+    LeasesStore::set_term(&*store, 1);
+    let (t0, world) = (Instant::now(), store.world());
+    let (reached, parked) = mpsc::sync_channel(1);
+    let (go, word) = mpsc::sync_channel::<()>(1);
+    let (looked, seen) = mpsc::sync_channel(1);
+    let store = &store;
+    std::thread::scope(|scope| {
+        // An issuer is parked in its tell, under the turn.
+        scope.spawn(move || {
+            let record = booking(GatewayId(1), 0, a, t0);
+            let issued = store.issue_decided(record, world.booked_of(a), |_| {
+                reached.send(()).expect("the case hears the tell");
+                word.recv().expect("the case lets the issuer go");
+            });
+            issued.expect("minted under the store's term");
+        });
+        parked.recv().expect("the issue tells");
+        // A thread at work looks and reads on; it takes the turn as it
+        // leaves its work, once the issuer let it go.
+        scope.spawn(move || {
+            let at_work = store.at_work();
+            at_work.apply();
+            looked.send(()).expect("the case waits for the look");
+        });
+        let early = seen.recv_timeout(Duration::from_secs(2));
+        go.send(()).expect("the issuer holds the other end");
+        assert!(early.is_ok(), "the look waited for the turn");
+    });
+    assert!(store.unlocked());
+}
+
 #[test]
 fn a_dispatch_handed_in_time_saves_its_lease_from_the_deadlines_end() {
     let t0 = Instant::now();

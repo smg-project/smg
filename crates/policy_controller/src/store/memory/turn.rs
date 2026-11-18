@@ -13,12 +13,15 @@
 //! grows.
 //!
 //! Who applies. A decider with a job at hand is at work at the file
-//! ([`MemoryStore::at_work`]): it applies before each decision reads its
-//! rows' counts and at each issue, and once more before it waits for its
-//! next job. While any is at work a session leaves what it handed to
-//! them, so the file's lines stay with the threads that read them. With
-//! none at work the session takes the turn and applies. So no handed
-//! frame waits on a lull.
+//! ([`MemoryStore::at_work`]): it tries the turn once before each
+//! decision reads its rows' counts, takes it at each issue, and takes it
+//! once more before it waits for its next job. A turn it finds held is
+//! its holder's to apply under: a decider never waits for the turn ahead
+//! of a decision. While any is at work a session leaves what it handed
+//! to them, so the file's lines stay with the threads that read them: a
+//! handed frame waits for the next take of a thread at work, a
+//! decision's try or its issue. With none at work the session takes the
+//! turn and applies. So no handed frame waits on a lull.
 //!
 //! The lock order, written here once: the turn is taken first or not at
 //! all. Under it come the world's load (no lock), a stage's own lock, the
@@ -37,10 +40,7 @@ use std::{
     fmt,
     ops::{Deref, DerefMut},
     sync::{
-        atomic::{
-            AtomicUsize,
-            Ordering::{Relaxed, Release, SeqCst},
-        },
+        atomic::{fence, AtomicUsize, Ordering::SeqCst},
         mpsc::{sync_channel, Receiver, SyncSender, TrySendError},
         Arc, OnceLock,
     },
@@ -87,13 +87,6 @@ pub(super) struct File {
     turn: Mutex<Behind>,
     /// The ring's writing end: each hand holds one of its own.
     hands: SyncSender<Handed>,
-    /// The frames handed, counted by a hand before it writes its frame:
-    /// never under what the ring holds.
-    handed: Apart,
-    /// The frames taken off the ring, counted under the turn. Where it
-    /// differs from [`Self::handed`] a frame waits or is about to be
-    /// written: a holder with nothing handed pays two loads.
-    applied: Apart,
     /// The threads at work at the file: the deciders with a job at hand.
     /// Each applies what is handed while it works, and once more as it
     /// leaves.
@@ -111,8 +104,6 @@ impl File {
         Self {
             turn: Mutex::new(Behind { leases, ring }),
             hands,
-            handed: Apart::default(),
-            applied: Apart::default(),
             at_work: Apart::default(),
             teller: OnceLock::new(),
             #[cfg(debug_assertions)]
@@ -146,8 +137,17 @@ impl File {
     }
 
     /// Whether a frame waits in the ring or is about to be written.
-    fn waits(&self) -> bool {
-        self.handed.0.load(SeqCst) != self.applied.0.load(Relaxed)
+    /// The turn where it is free. `None` where a thread holds it: that
+    /// thread's take applied what was handed before it.
+    pub(super) fn try_take(&self) -> Option<Turn<'_>> {
+        let behind = self.turn.try_lock()?;
+        #[cfg(debug_assertions)]
+        self.holder.store(me(), SeqCst);
+        Some(Turn {
+            behind,
+            #[cfg(debug_assertions)]
+            file: self,
+        })
     }
 }
 
@@ -188,17 +188,20 @@ impl DerefMut for Turn<'_> {
 
 /// A thread at work at the leases' file ([`MemoryStore::at_work`]): while
 /// it stands, the sessions leave what they hand to this thread, which
-/// applies it before each read of the counts ([`AtWork::apply`]) and at
-/// each issue. Dropped, it looks once more: what was handed behind its
-/// last take is applied before the thread waits.
+/// applies it where it finds the turn free before a read of the counts
+/// ([`AtWork::apply`]) and at each issue. Dropped, it takes the turn once
+/// more: what was handed behind its last take is applied before the
+/// thread waits.
 pub struct AtWork(Arc<MemoryStore>);
 
 impl AtWork {
-    /// Applies what is handed, before a decision reads its rows' counts:
-    /// two loads where nothing is handed.
+    /// Applies what is handed, before a decision reads its rows' counts,
+    /// where the turn is free. A turn that is held was taken by a thread
+    /// that applied what was handed before it: the decision reads on and
+    /// its issue takes the turn.
     pub fn apply(&self) {
-        if self.0.file.waits() {
-            drop(self.0.turn());
+        if let Some(mut turn) = self.0.file.try_take() {
+            self.0.apply_handed(&mut turn.behind);
         }
     }
 }
@@ -210,6 +213,8 @@ impl Drop for AtWork {
     fn drop(&mut self) {
         self.0.file.at_work.0.fetch_sub(1, SeqCst);
         if !thread::panicking() {
+            // The leaver's half of the hand-over ([`MemoryStore::settle`]).
+            fence(SeqCst);
             self.0.settle();
         }
     }
@@ -270,25 +275,21 @@ impl MemoryStore {
         AtWork(Arc::clone(self))
     }
 
-    /// The turn, with everything handed applied: two loads say whether
-    /// the ring is read.
+    /// The turn, with everything handed applied.
     pub(super) fn turn(&self) -> Turn<'_> {
         let mut turn = self.file.take();
-        if self.file.waits() {
-            self.apply_handed(&mut turn.behind);
-        }
+        self.apply_handed(&mut turn.behind);
         turn
     }
 
     /// Applies what waits where the caller found no thread at work. A
-    /// hand counts its frame, writes it and then reads who is at work; a
-    /// thread that leaves work says so and then comes here: one of the
-    /// two sees the other, so the frame is applied by the thread at work
-    /// or by its hand.
+    /// hand writes its frame and then reads who is at work; a thread that
+    /// leaves work says so and then comes here. Each puts a fence between
+    /// its write and its read, so one of the two sees the other whatever
+    /// the ring's own orderings are: the frame is applied by the thread
+    /// at work or by its hand.
     fn settle(&self) {
-        if self.file.waits() {
-            drop(self.turn());
-        }
+        drop(self.turn());
     }
 
     /// Opens a stream's hand at the leases' file for `gateway`'s frames.
@@ -316,9 +317,6 @@ impl MemoryStore {
     /// turn's.
     pub fn hand(&self, hand: &Hand, lease: LeaseId, said: Said) {
         let file = self.file_of(lease);
-        // Counted before it is written: the count is never under what the
-        // ring holds.
-        file.handed.0.fetch_add(1, SeqCst);
         let mut frame = (hand.gateway, lease, said);
         loop {
             match hand.ring.try_send(frame) {
@@ -329,26 +327,22 @@ impl MemoryStore {
                 }
                 // The hand is another store's, whose file is gone: no
                 // lease is on file there.
-                Err(TrySendError::Disconnected(_)) => {
-                    file.handed.0.fetch_sub(1, SeqCst);
-                    return;
-                }
+                Err(TrySendError::Disconnected(_)) => return,
             }
         }
+        // The hand's half of the hand-over ([`Self::settle`]).
+        fence(SeqCst);
         if file.at_work.0.load(SeqCst) == 0 {
             self.settle();
         }
     }
 
     /// Reads the ring and applies what was handed, under the turn, in the
-    /// order it was handed. A frame is counted as it is taken: a tell that
-    /// unwinds leaves the count true and the rest in the ring.
+    /// order it was handed. A tell that unwinds leaves the rest in the
+    /// ring.
     fn apply_handed(&self, behind: &mut Behind) {
         let Behind { leases, ring } = behind;
-        let applied = &self.file.applied.0;
         while let Ok((gateway, lease, said)) = ring.try_recv() {
-            // Written under the turn alone: a plain add.
-            applied.store(applied.load(Relaxed).wrapping_add(1), Release);
             self.apply_frame(leases, (gateway, lease), said);
         }
     }
