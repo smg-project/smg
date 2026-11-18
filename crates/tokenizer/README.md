@@ -67,7 +67,8 @@ as of `tokenizer/src/*`.
   kinds of checkpoint: one that ships its own vocabulary file beside the conversion, and one
   whose template builds its control spellings (it writes no control
   token whole by itself: it binds each to a name, out of a constant of its own or spelled whole
-  in that one statement, and writes the names). On
+  in that one statement, and writes the names; a control may also be kept in an attribute of a
+  namespace that the top level makes once, and written by that attribute). On
   `apply_chat_template_with_encoding` the template's tokens are tokens and a spelling typed into
   a message, a tool, a document or a template argument stays text, also when it is typed in two
   parts the template joins, and so does a text that only the pipeline's normalizer makes an
