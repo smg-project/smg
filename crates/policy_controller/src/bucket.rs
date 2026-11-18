@@ -45,10 +45,11 @@
 //! prefill decision, and takes that guard alone where its view matches the
 //! listing; a booking takes the guards of the partitions that list its
 //! worker. Deciders of two models share no lock there. A decision that
-//! lists reads the stage's one fence for its view's rows and lets it go
-//! before it lists. A lease names no model, so a worker two models list is
-//! booked in both partitions. A model whose last worker left takes its
-//! partition with it: the table keeps no partition that lost its listing.
+//! lists holds the stage's one fence for that pass over its view's rows
+//! and lets it go before it seats. A lease names no model, so a worker
+//! two models list is booked in both partitions. A model whose last worker
+//! left takes its partition with it: the table keeps no partition that lost
+//! its listing.
 //!
 //! Any other phase scores every survivor equal, and so does a prefill
 //! decision whose size no listed survivor owns a range for: the picker's
@@ -108,7 +109,8 @@ pub struct Bucket {
     /// stage: the feed names an id and not its pool, and a partition made
     /// after a leave must see it. It is taken under a partition's guard or
     /// under none, and no partition's guard is taken under it. A decision
-    /// holds it for one read of its view's rows and for nothing after.
+    /// holds it for the one pass that lists its view's rows and for nothing
+    /// after.
     fence: Mutex<Fence>,
 }
 
@@ -142,6 +144,11 @@ struct Pool {
     /// Per member, the place among the kept of the candidate it is in the
     /// decision in progress, or [`NONE`]. Reused from decision to decision.
     seats: Vec<u32>,
+    /// The rows of the view in the decision in progress that the partition
+    /// does not list and the fence names, each by its place in the view and
+    /// its worker's id, in the view's order. Written where the decision
+    /// lists and reused from decision to decision.
+    fenced: Vec<(u32, WorkerId)>,
     /// The window's sizes in ascending order, for the cut. Reused.
     sizes: Vec<u32>,
 }
@@ -257,6 +264,7 @@ impl Pool {
             by_id: FxHashMap::default(),
             left: false,
             seats: Vec::new(),
+            fenced: Vec::new(),
             sizes: Vec::new(),
         }
     }
@@ -283,21 +291,30 @@ impl Pool {
 
     /// Seat the decision's survivors, each at its member, and read their
     /// loads in the kept order. A survivor that is not listed ends the pass
-    /// with `None`, but for one `fenced` names: it is seated nowhere, and
-    /// `None` then says that no survivor is seated.
-    fn seat(
+    /// with `None`. `LISTED` is the pass behind a listing ([`Self::list`]):
+    /// a survivor the fence names is seated nowhere, and `None` then says
+    /// that no survivor is seated. A row behind fenced rows of the view is
+    /// looked for that many places nearer the listing's head, where it
+    /// stands when the view is older than their leave.
+    fn seat<const LISTED: bool>(
         &mut self,
         candidates: &[Candidate],
         kept: &[u32],
-        fenced: impl Fn(WorkerId) -> bool,
     ) -> Option<Loads> {
         self.seats.clear();
         self.seats.resize(self.members.len(), NONE);
         let mut loads: Option<Loads> = None;
+        // How many of the view's fenced rows stand before the row at hand.
+        let mut behind = 0;
         for (place, &row) in kept.iter().enumerate() {
             let id = candidates[row as usize].id;
-            let Some(member) = self.member_of(row, id) else {
-                if fenced(id) {
+            if LISTED {
+                while self.fenced.get(behind).is_some_and(|&(at, _)| at < row) {
+                    behind += 1;
+                }
+            }
+            let Some(member) = self.member_of(row.wrapping_sub(behind as u32), id) else {
+                if LISTED && self.fenced.iter().any(|&(_, fenced)| fenced == id) {
                     continue;
                 }
                 return None;
@@ -329,12 +346,21 @@ impl Pool {
     /// view's order, but for a worker `fenced` names: the lifecycle pruned
     /// it a moment ago, and a view that still shows it is older than its
     /// leave. A changed listing keeps the loads of the workers it held and
-    /// splits the span evenly among all of it.
+    /// splits the span evenly among all of it. The rows `fenced` names are
+    /// kept for the seating, each with its place in the view: a row behind
+    /// them is looked for that many places nearer the listing's head.
     fn list(&mut self, candidates: &[Candidate], fenced: impl Fn(WorkerId) -> bool) {
         let listed = self.members.len();
+        self.fenced.clear();
         for candidate in candidates {
-            let unlisted = self.member_of(candidate.position, candidate.id).is_none();
-            if unlisted && !fenced(candidate.id) {
+            let behind = self.fenced.len() as u32;
+            let place = candidate.position.wrapping_sub(behind);
+            if self.member_of(place, candidate.id).is_some() {
+                continue;
+            }
+            if fenced(candidate.id) {
+                self.fenced.push((candidate.position, candidate.id));
+            } else {
                 self.by_id.insert(candidate.id, self.members.len() as u32);
                 self.members.push(Member {
                     id: candidate.id,
@@ -720,7 +746,7 @@ impl Scorer for Bucket {
             if pool.left {
                 continue;
             }
-            let loads = match pool.seat(candidates, kept, |_| false) {
+            let loads = match pool.seat::<false>(candidates, kept) {
                 Some(loads) => loads,
                 None => {
                     // A survivor the partition does not list: the view's
@@ -729,30 +755,27 @@ impl Scorer for Bucket {
                     // nowhere: the view is older than its leave, so it is
                     // seated nowhere and scores zero, and the others are
                     // placed as if the view did not show it.
-                    // The fence is read once for the view's rows and let
-                    // go before the listing. The partition's guard, which
-                    // the feed's walk needs, is what keeps a leave behind
-                    // this decision.
-                    let fenced: Vec<WorkerId> = {
+                    // The fence is held for the listing's one pass, which
+                    // asks it of each row the partition does not list, and
+                    // let go before the seating; an empty fence is let go
+                    // before the pass. The partition's guard, which the
+                    // feed's walk needs, is what keeps a leave behind this
+                    // decision.
+                    let listed = pool.members.len();
+                    {
                         let mut fence = self.fence.lock();
                         fence.expire(Instant::now());
                         if fence.is_empty() {
-                            Vec::new()
+                            drop(fence);
+                            pool.list(candidates, |_| false);
                         } else {
-                            candidates
-                                .iter()
-                                .map(|row| row.id)
-                                .filter(|&id| fence.holds(id))
-                                .collect()
+                            pool.list(candidates, |id| fence.holds(id));
                         }
-                    };
-                    let fenced = |id: WorkerId| fenced.contains(&id);
-                    let listed = pool.members.len();
-                    pool.list(candidates, fenced);
+                    }
                     if pool.members.len() != listed {
                         self.relist(&partition, &pool.members);
                     }
-                    match pool.seat(candidates, kept, fenced) {
+                    match pool.seat::<true>(candidates, kept) {
                         Some(loads) => loads,
                         None => {
                             // A view of fenced rows alone lists nobody. The
