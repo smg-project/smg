@@ -103,9 +103,11 @@ pub const DECIDE_BUDGET_OUTLASTED_TOTAL: &str =
 pub const MEMBERS_OUTSIDE_LIST: &str = "smg_policy_controller_members_outside_list";
 /// Writes to the load table that moved an overload verdict.
 pub const OVERLOAD_FLIPS_TOTAL: &str = "smg_policy_controller_overload_flips_total";
-/// Lifecycle calls of a lease that panicked: each is held where it is
-/// made, so it costs no request its decision and ends no thread. Counted
-/// apart from the requests with no decision.
+/// Lifecycle calls that panicked as a lease's event was applied (a
+/// dispatch, a completion, a release a frame brings, a dispatch
+/// deadline's end): each is held there, so it ends no thread. A call that
+/// panics inside a decision (the issue's, the release of a lease the
+/// decision gives up) counts with the requests that got no decision.
 pub const LIFECYCLE_FAULTS_TOTAL: &str = "smg_policy_controller_lifecycle_faults_total";
 
 /// The controller's series and the handle that renders them.
@@ -263,7 +265,7 @@ impl Metrics {
         recorder.describe_counter(
             KeyName::from_const_str(LIFECYCLE_FAULTS_TOTAL),
             None,
-            "Lifecycle calls of a lease that panicked, each held where it is made".into(),
+            "Lifecycle calls that panicked as a lease's event was applied, each held there".into(),
         );
         recorder.describe_gauge(
             KeyName::from_const_str(MEMBERS_OUTSIDE_LIST),

@@ -390,7 +390,9 @@ impl Drop for Unwound {
 
 impl Deciders {
     /// Starts `deciders` threads, each behind a queue of `depth` requests:
-    /// at least one thread, and a queue of at least one.
+    /// at least one thread and at most `Decider::COUNT`, and a queue of at
+    /// least one. Refused over a store whose files were laid for another
+    /// count of deciders.
     pub(crate) fn start(deciders: usize, depth: usize, reads: &Reads) -> io::Result<Self> {
         // A decider issues into a file of its own: the store was made for
         // this count of deciders, or its one file would have two writers.
@@ -2814,8 +2816,8 @@ pub(crate) mod tests {
     }
 
     /// A decider's thread acts as its decider while it decides, and a
-    /// lease's event is told under the name of the decider that issued it,
-    /// whichever thread applies the frame.
+    /// lease's event is told under the name of the decider whose file holds
+    /// the lease, whichever thread applies the frame.
     #[tokio::test]
     async fn a_decision_and_its_leases_events_act_as_the_leases_decider() {
         let named = Arc::new(Mutex::new(Vec::new()));
