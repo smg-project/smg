@@ -64,14 +64,23 @@ impl Decider {
     /// thread that enters again acts as the later name. Guards drop in any
     /// order: the thread acts as the name of its newest guard still alive,
     /// so a guard kept in a field and renewed by assignment keeps its name,
-    /// and the thread acts as none once its last guard is gone.
+    /// and the thread acts as none once its last guard is gone. At its
+    /// thread's end, once the thread's list of guards is gone, a guard
+    /// entered by another thread-local's destructor names the thread until
+    /// a guard drops there, its own or another's: with no list no older
+    /// guard is known, and the thread then acts as none.
     #[must_use = "the thread acts as the decider only while the guard lives"]
     pub fn enter(self) -> Acting {
-        let number = LIVE.with_borrow_mut(|live| {
-            let number = live.last().map_or(0, |(newest, _)| newest + 1);
-            live.push((number, self));
-            number
-        });
+        // A guard entered once the list is gone joins none: its number is
+        // not read again.
+        let number = LIVE
+            .try_with(|live| {
+                let mut live = live.borrow_mut();
+                let number = live.last().map_or(0, |(newest, _)| newest + 1);
+                live.push((number, self));
+                number
+            })
+            .unwrap_or(0);
         ACTING.set(Some(self));
         Acting {
             number,
@@ -105,22 +114,26 @@ pub struct Acting {
 impl Drop for Acting {
     fn drop(&mut self) {
         // The guard leaves the thread's list wherever it stands in it, and
-        // the newest one left names the thread. A guard that outlives the
-        // list (one kept in another thread-local, at its thread's end) has
-        // nothing to end.
-        let _ = LIVE.try_with(|live| {
+        // the newest one left names the thread. Where the list is gone (a
+        // guard kept in another thread-local, or entered by one's
+        // destructor, at its thread's end) no older guard is known, and the
+        // thread acts as none.
+        let left = LIVE.try_with(|live| {
             let mut live = live.borrow_mut();
             if let Some(at) = live.iter().rposition(|(number, _)| *number == self.number) {
                 live.remove(at);
             }
-            ACTING.set(live.last().map(|(_, name)| *name));
+            live.last().map(|(_, name)| *name)
         });
+        ACTING.set(left.ok().flatten());
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::Decider;
+    use std::{cell::RefCell, sync::mpsc};
+
+    use super::{Acting, Decider};
 
     #[test]
     fn a_thread_acts_as_the_decider_it_entered_until_the_guard_drops() {
@@ -175,5 +188,62 @@ mod tests {
         }
         drop(held);
         assert_eq!(Decider::acting(), None);
+    }
+
+    /// The name acting once the kept guard dropped, then the names acting
+    /// under and after a guard entered there: `None` where the entry
+    /// panicked.
+    type AtEndReport = (Option<Decider>, Option<(Option<Decider>, Option<Decider>)>);
+
+    /// A value a thread keeps to its end: it drops the guard it kept, then
+    /// enters and drops another, and reports what the thread acted as.
+    struct AtEnd {
+        kept: Option<Acting>,
+        report: mpsc::Sender<AtEndReport>,
+    }
+
+    impl Drop for AtEnd {
+        fn drop(&mut self) {
+            drop(self.kept.take());
+            let after_kept = Decider::acting();
+            let entered = std::panic::catch_unwind(|| {
+                let turn = Decider::new(5).enter();
+                let under = Decider::acting();
+                drop(turn);
+                (under, Decider::acting())
+            });
+            let _ = self.report.send((after_kept, entered.ok()));
+        }
+    }
+
+    thread_local! {
+        static AT_END: RefCell<Option<AtEnd>> = const { RefCell::new(None) };
+    }
+
+    /// At a thread's end its thread-locals go one after another, and one
+    /// first used ahead of the thread's first guard outlives the thread's
+    /// list of guards. A guard it kept drops there and leaves no name
+    /// acting, and a guard entered there names the thread until it drops.
+    #[test]
+    fn a_guard_kept_or_entered_past_its_threads_list_names_the_thread_while_it_lives() {
+        let (report, reported) = mpsc::channel();
+        std::thread::spawn(move || {
+            // Used first: the thread's list is gone when this value goes.
+            AT_END.with_borrow_mut(|at_end| *at_end = Some(AtEnd { kept: None, report }));
+            let kept = Decider::new(4).enter();
+            AT_END.with_borrow_mut(|at_end| {
+                at_end.as_mut().expect("set above").kept = Some(kept);
+            });
+            assert_eq!(Decider::acting(), Some(Decider::new(4)));
+        })
+        .join()
+        .expect("the thread ends");
+        let (after_kept, entered) = reported.recv().expect("the value's report");
+        assert_eq!(after_kept, None, "the kept guard's name went with it");
+        assert_eq!(
+            entered,
+            Some((Some(Decider::new(5)), None)),
+            "a guard entered there names the thread until it drops"
+        );
     }
 }
