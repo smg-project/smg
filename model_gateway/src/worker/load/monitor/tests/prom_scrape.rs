@@ -3,6 +3,7 @@
 //! module, tested there.
 
 use super::super::*;
+use crate::worker::WorkerMonitor;
 
 #[test]
 fn metric_derived_snapshot_has_no_absolute_token_data() {

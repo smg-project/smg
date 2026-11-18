@@ -36,7 +36,8 @@ use serde::Serialize;
 
 use super::*;
 use crate::worker::{
-    health::overload::OverloadThresholds, test_support::LoadReaders, BasicWorkerBuilder, WorkerType,
+    health::overload::OverloadThresholds, test_support::LoadReaders, BasicWorkerBuilder,
+    WorkerMonitor, WorkerRegistry, WorkerType,
 };
 
 const URL: &str = "http://w0:8000";

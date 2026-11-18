@@ -1190,6 +1190,42 @@ mod tests {
         panic!("registry did not see the remote worker");
     }
 
+    /// The record's health is the import's status. Every other case here
+    /// sends a healthy record, so the field the conversion moves is read
+    /// here: an unhealthy record is imported not ready, and the owner's
+    /// next record, healthy, makes the import ready.
+    #[tokio::test]
+    async fn a_remote_records_health_is_the_imports_status() {
+        let mesh = MeshKV::new("node-a".into());
+        let ns = worker_namespace(&mesh);
+
+        let registry = Arc::new(WorkerRegistry::new());
+        let subscriber = adapter(ns.clone(), registry.clone());
+        subscriber.start();
+
+        let publisher = adapter(ns, Arc::new(WorkerRegistry::new()));
+        let unhealthy = WorkerState {
+            health: false,
+            ..sample_state("w1", "http://remote:8080")
+        };
+        publisher.on_worker_changed("w1", &unhealthy);
+        let status = || {
+            registry
+                .get_by_url("http://remote:8080")
+                .map(|worker| worker.status())
+        };
+        assert!(
+            wait_for(|| matches!(status(), Some(WorkerStatus::NotReady))).await,
+            "an unhealthy record is imported not ready"
+        );
+
+        publisher.on_worker_changed("w1", &sample_state("w1", "http://remote:8080"));
+        assert!(
+            wait_for(|| matches!(status(), Some(WorkerStatus::Ready))).await,
+            "the owner's healthy record makes the import ready"
+        );
+    }
+
     #[tokio::test]
     async fn start_ignores_malformed_payload() {
         // A bad payload should not propagate into the registry and

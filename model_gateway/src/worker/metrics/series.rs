@@ -71,8 +71,8 @@ pub(crate) fn installed_or_default() -> &'static Arc<WorkerSeries> {
 
 #[cfg(test)]
 impl WorkerSeries {
-    /// A store as a test builds one: the exporter's default quantiles and
-    /// no buckets.
+    /// A store as a test builds one: a copy of the exporter's default
+    /// quantiles, spelled here, and no buckets.
     pub(crate) fn with_exporter_quantiles() -> Self {
         Self::new(DistributionBuilder::new(
             metrics_util::parse_quantiles(&[0.0, 0.5, 0.9, 0.95, 0.99, 0.999, 1.0]),

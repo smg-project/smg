@@ -2,13 +2,13 @@
 //! worker was built with, refused without one, kept by a rebuild. The builder
 //! named here is the one without a default connector.
 
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 
-use openai_protocol::worker::{ConnectionMode, RuntimeType, WorkerType};
+use openai_protocol::worker::ConnectionMode;
 
 use crate::worker::{
-    connection::engine::{EngineConnector, ZmqLink, NO_ENGINE_CONNECTOR},
-    identity::{basic::connect_zmq_backend, builder::BasicWorkerBuilder},
+    connection::engine::{EngineConnector, NO_ENGINE_CONNECTOR},
+    identity::builder::BasicWorkerBuilder,
     test_support::{no_health_check, CountingConnector, NoEngine},
     Worker, WorkerError,
 };
@@ -61,23 +61,18 @@ async fn a_grpc_worker_built_without_a_connector_refuses_its_connect() {
     assert!(worker.engine_connection_if_initialized().is_none());
 }
 
-/// A ZMQ worker built without a connector refuses its connect as well. The
-/// connect is the handshake driver's: the refusal is the driver's error, the
-/// caller that starts the driver reads that the handshake has not completed,
-/// and the slot stays empty.
+/// A ZMQ worker built without a connector refuses its connect as well, at
+/// once and in the same words. No handshake driver starts, for an
+/// acquisition or for a probe, and the slot stays empty.
 #[tokio::test]
 async fn a_zmq_worker_built_without_a_connector_refuses_its_connect() {
-    let link = ZmqLink {
-        base_url: "ipc://engine.ipc".to_string(),
-        model_id: "m".to_string(),
-        runtime: RuntimeType::Vllm,
-        worker_type: WorkerType::Regular,
-        handshake_address: None,
-        engine_count: None,
-        startup: Duration::from_secs(1),
-        request_timeout: None,
-    };
-    let refusal = connect_zmq_backend(None, link)
+    let worker = <BasicWorkerBuilder>::new("ipc://engine.ipc")
+        .connection_mode(ConnectionMode::Zmq)
+        .health_config(no_health_check())
+        .build();
+
+    let refusal = worker
+        .engine_connection()
         .await
         .err()
         .expect("no connector, no connect");
@@ -89,23 +84,10 @@ async fn a_zmq_worker_built_without_a_connector_refuses_its_connect() {
         ),
         "{refusal}"
     );
-
-    let worker = <BasicWorkerBuilder>::new("ipc://engine.ipc")
-        .connection_mode(ConnectionMode::Zmq)
-        .health_config(no_health_check())
-        .build();
-    let answer = worker
-        .engine_connection()
-        .await
-        .err()
-        .expect("the handshake is the driver's");
+    assert!(!worker.zmq_health_check(), "a probe reads not ready");
     assert!(
-        matches!(
-            &answer,
-            WorkerError::ConnectionFailed { reason, .. }
-                if reason == "ZMQ backend handshake has not completed yet"
-        ),
-        "{answer}"
+        worker.zmq_connect_abort.load_full().is_none(),
+        "no driver starts without a connector"
     );
     assert!(worker.engine_connection_if_initialized().is_none());
 }

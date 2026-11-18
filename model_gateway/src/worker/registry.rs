@@ -238,7 +238,7 @@ pub(crate) struct ModelLabels {
 /// separate registry lookups can straddle a concurrent membership change and
 /// pair workers that never coexisted.
 #[derive(Debug)]
-pub(crate) struct ModelWorkerSnapshot {
+pub struct ModelWorkerSnapshot {
     all: WorkerSnapshot,
     pools: [LazyRoutingPool; RoutingPool::COUNT],
     /// The compatible prefill/decode pairs per wire and pairing mode, built
@@ -380,6 +380,98 @@ impl Deref for ModelWorkerSnapshot {
     }
 }
 
+/// The gateway's value of a generation: the members, and the cells that
+/// keep what its routers derive from them.
+impl Generation for ModelWorkerSnapshot {
+    fn of(members: Arc<[Arc<dyn Worker>]>) -> Self {
+        Self::new(members)
+    }
+
+    fn members(&self) -> &Arc<[Arc<dyn Worker>]> {
+        &self.all
+    }
+}
+
+/// The routing readers. They are the gateway's, over the registry's readers
+/// of a generation, and stay with it when the registry moves into the worker
+/// crate.
+impl WorkerRegistry<ModelWorkerSnapshot> {
+    /// Return a shared route-specific candidate snapshot for a model.
+    ///
+    /// The first lookup after a membership change builds the projection once;
+    /// subsequent requests only clone the outer `Arc`. Dynamic availability is
+    /// intentionally checked by the policy so health, circuit-breaker and
+    /// overload changes never require rebuilding this snapshot. The wildcard
+    /// model ID uses the global registry snapshot.
+    pub(crate) fn get_routing_pool(
+        &self,
+        model_id: &str,
+        pool: RoutingPool,
+    ) -> Arc<[Arc<dyn Worker>]> {
+        if model_id == UNKNOWN_MODEL_ID {
+            return Arc::clone(self.global_generation().pool(pool));
+        }
+        self.get_model_routing_pool(model_id, pool)
+    }
+
+    /// Like [`Self::get_routing_pool`] but never widens to the global
+    /// snapshot: the wildcard id resolves through the literal `"unknown"`
+    /// model-index entry (untagged workers index there), yielding an empty
+    /// slice when no such entry exists. The HTTP PD router uses this to keep
+    /// its conditional wildcard fallback — untagged workers win when present,
+    /// and only an empty entry widens to the global pool.
+    pub(crate) fn get_model_routing_pool(
+        &self,
+        model_id: &str,
+        pool: RoutingPool,
+    ) -> Arc<[Arc<dyn Worker>]> {
+        self.model_routing_snapshot(model_id).map_or_else(
+            || Arc::from(Self::EMPTY_WORKERS),
+            |snapshot| Arc::clone(snapshot.pool(pool)),
+        )
+    }
+
+    /// One membership snapshot for a model (alias-aware), from which several
+    /// role pools can be derived atomically: a PD/EPD selection must draw all
+    /// its roles from a single generation, and two separate pool lookups could
+    /// straddle a concurrent membership change.
+    pub(crate) fn model_routing_snapshot(
+        &self,
+        model_id: &str,
+    ) -> Option<Arc<ModelWorkerSnapshot>> {
+        self.model_generation(model_id)
+    }
+
+    /// One membership snapshot for multi-role selection, with the wildcard
+    /// model mapping to the global snapshot and an unknown model to a shared
+    /// empty one.
+    pub(crate) fn get_routing_snapshot(&self, model_id: &str) -> Arc<ModelWorkerSnapshot> {
+        self.generation(model_id)
+    }
+}
+
+/// What a host keeps of one membership generation.
+///
+/// The registry ends a generation at every membership change: a
+/// registration, a removal, a property rebuild and a refresh of a worker's
+/// cards each publish a new one, and so does the first read of the
+/// model-less generation after any of them. At each publish it builds the
+/// host's value from the generation's members, and a reader that asks for a
+/// generation gets that value. What a host derives from one generation
+/// lives in its value and falls with it, and a selection of several roles
+/// reads every role from the one value it took.
+pub trait Generation: std::fmt::Debug + Send + Sync + 'static {
+    /// The value of the generation with `members`.
+    ///
+    /// Runs at every publish, under the model index's guard: it makes empty
+    /// cells and returns. It takes no lock, calls nothing of the registry
+    /// and reads no member.
+    fn of(members: Arc<[Arc<dyn Worker>]>) -> Self;
+
+    /// The generation's members, as [`Self::of`] took them.
+    fn members(&self) -> &Arc<[Arc<dyn Worker>]>;
+}
+
 /// The global membership snapshot together with the epoch it was built at.
 ///
 /// Carrying the epoch inside the published object makes the read fast path
@@ -387,14 +479,14 @@ impl Deref for ModelWorkerSnapshot {
 /// A bump installs a marker with `epoch: usize::MAX`, which can never match
 /// and therefore can never be served.
 #[derive(Debug)]
-struct GlobalRoutingSnapshot {
+struct GlobalRoutingSnapshot<G> {
     epoch: usize,
-    snapshot: Arc<ModelWorkerSnapshot>,
+    snapshot: Arc<G>,
 }
 
 /// Model index using immutable snapshots for lock-free reads.
-/// Updates create new snapshots (copy-on-write semantics); route projections
-/// are cached lazily inside each immutable snapshot.
+/// Updates create new snapshots (copy-on-write semantics), each with its
+/// host's value of the generation ([`Generation`]).
 ///
 /// The maps a request's model id or a worker's URL is looked up in hash with
 /// [`FxBuildHasher`]: the keys are the server's own (registration and
@@ -403,7 +495,7 @@ struct GlobalRoutingSnapshot {
 /// SipHash-1-3 over a 20-40 byte key was 0.7-1.5 % of a request's user
 /// instructions with the map lookups on top. The kv index hashes its tenant
 /// and node maps the same way.
-type ModelIndex = Arc<DashMap<String, Arc<ModelWorkerSnapshot>, FxBuildHasher>>;
+type ModelIndex<G> = Arc<DashMap<String, Arc<G>, FxBuildHasher>>;
 
 /// Model alias to canonical model ID.
 type ModelAliasIndex = Arc<DashMap<String, Arc<str>, FxBuildHasher>>;
@@ -431,13 +523,13 @@ struct TransitionTestHooks {
 
 /// Worker registry with model-based indexing
 #[derive(Debug)]
-pub struct WorkerRegistry {
+pub struct WorkerRegistry<G> {
     /// All workers indexed by ID
     workers: Arc<DashMap<WorkerId, Arc<dyn Worker>>>,
 
     /// Model index for O(1) lookups using immutable snapshots.
     /// Uses `Arc<[T]>` instead of `Arc<RwLock<Vec<T>>>` for lock-free reads.
-    model_index: ModelIndex,
+    model_index: ModelIndex<G>,
 
     /// Immutable snapshot spanning every registered worker, tagged with the
     /// `global_epoch` it was built at. Model-less routes use its lazy route
@@ -449,7 +541,12 @@ pub struct WorkerRegistry {
     /// after a change rebuilds once from the worker map. A registration or
     /// removal storm therefore costs one rebuild total, not one full-fleet
     /// copy per worker.
-    global_routing_snapshot: ArcSwap<GlobalRoutingSnapshot>,
+    global_routing_snapshot: ArcSwap<GlobalRoutingSnapshot<G>>,
+
+    /// The generation without a member: what an unknown model reads, and
+    /// what the marker of a stale `global_routing_snapshot` carries. Built
+    /// once, with the registry.
+    empty_generation: Arc<G>,
 
     /// Monotonic membership generation; bumped on every register / replace /
     /// remove.
@@ -561,7 +658,7 @@ pub struct WorkerRegistry {
     engine_connector: Option<Arc<dyn EngineConnector>>,
 }
 
-impl WorkerRegistry {
+impl<G: Generation> WorkerRegistry<G> {
     // ───────────────────────────────────────────────────────────────────
     // 1. Construction & subscription
     // ───────────────────────────────────────────────────────────────────
@@ -575,13 +672,15 @@ impl WorkerRegistry {
         // busy manager; signals are one-per-connect and rare, so the queue
         // cannot grow without bound in practice.
         let (connect_signal_tx, connect_signal_rx) = mpsc::unbounded_channel();
+        let empty_generation = Arc::new(G::of(Arc::from(Self::EMPTY_WORKERS)));
         Self {
             workers: Arc::new(DashMap::new()),
             model_index: Arc::new(DashMap::with_hasher(FxBuildHasher)),
             global_routing_snapshot: ArcSwap::from_pointee(GlobalRoutingSnapshot {
                 epoch: 0,
-                snapshot: Self::empty_routing_snapshot(),
+                snapshot: Arc::clone(&empty_generation),
             }),
+            empty_generation,
             global_epoch: AtomicUsize::new(0),
             global_membership_order: parking_lot::RwLock::new(()),
             global_routing_update: parking_lot::Mutex::new(()),
@@ -645,7 +744,7 @@ impl WorkerRegistry {
         let Some(indexed) = self
             .model_index
             .get(model_id)
-            .map(|workers| Arc::clone(&workers.all))
+            .map(|workers| Arc::clone(workers.members()))
         else {
             return false;
         };
@@ -827,66 +926,27 @@ impl WorkerRegistry {
     /// slice when the model is unknown.
     pub fn get_by_model(&self, model_id: &str) -> Arc<[Arc<dyn Worker>]> {
         if let Some(workers) = self.model_index.get(model_id) {
-            return Arc::clone(&workers.all);
+            return Arc::clone(workers.members());
         }
         self.model_alias_index
             .get(model_id)
             .and_then(|canonical_id| {
                 self.model_index
                     .get(canonical_id.as_ref())
-                    .map(|workers| Arc::clone(&workers.all))
+                    .map(|workers| Arc::clone(workers.members()))
             })
             .unwrap_or_else(|| Arc::from(Self::EMPTY_WORKERS))
     }
 
-    /// Return a shared route-specific candidate snapshot for a model.
-    ///
-    /// The first lookup after a membership change builds the projection once;
-    /// subsequent requests only clone the outer `Arc`. Dynamic availability is
-    /// intentionally checked by the policy so health, circuit-breaker and
-    /// overload changes never require rebuilding this snapshot. The wildcard
-    /// model ID uses the global registry snapshot.
-    pub(crate) fn get_routing_pool(
-        &self,
-        model_id: &str,
-        pool: RoutingPool,
-    ) -> Arc<[Arc<dyn Worker>]> {
-        if model_id == UNKNOWN_MODEL_ID {
-            return Arc::clone(self.current_global_routing_snapshot().pool(pool));
-        }
-        self.get_model_routing_pool(model_id, pool)
-    }
-
-    /// Like [`Self::get_routing_pool`] but never widens to the global
-    /// snapshot: the wildcard id resolves through the literal `"unknown"`
-    /// model-index entry (untagged workers index there), yielding an empty
-    /// slice when no such entry exists. The HTTP PD router uses this to keep
-    /// its conditional wildcard fallback — untagged workers win when present,
-    /// and only an empty entry widens to the global pool.
-    pub(crate) fn get_model_routing_pool(
-        &self,
-        model_id: &str,
-        pool: RoutingPool,
-    ) -> Arc<[Arc<dyn Worker>]> {
-        self.model_routing_snapshot(model_id).map_or_else(
-            || Arc::from(Self::EMPTY_WORKERS),
-            |snapshot| Arc::clone(snapshot.pool(pool)),
-        )
-    }
-
-    /// One membership snapshot for a model (alias-aware), from which several
-    /// role pools can be derived atomically: a PD/EPD selection must draw all
-    /// its roles from a single generation, and two separate pool lookups could
-    /// straddle a concurrent membership change.
-    pub(crate) fn model_routing_snapshot(
-        &self,
-        model_id: &str,
-    ) -> Option<Arc<ModelWorkerSnapshot>> {
+    /// One generation for a model (alias-aware). A selection of several
+    /// roles derives every role from the one value it took: two separate
+    /// lookups could straddle a concurrent membership change.
+    pub fn model_generation(&self, model_id: &str) -> Option<Arc<G>> {
         // Bind the clone via a `let` so the shard `Ref` drops at the end of
         // the statement (edition 2021 keeps `if let` scrutinee temporaries
-        // alive through the body): the caller's first post-change `pool()`
-        // call does an O(workers) projection build that must not run under
-        // the shard read guard.
+        // alive through the body): what a host builds from the value on its
+        // first read after a change can walk every member, and must not run
+        // under the shard read guard.
         let snapshot = self
             .model_index
             .get(model_id)
@@ -905,24 +965,14 @@ impl WorkerRegistry {
         })
     }
 
-    /// One membership snapshot for multi-role selection, with the wildcard
-    /// model mapping to the global snapshot and an unknown model to a shared
-    /// empty one.
-    pub(crate) fn get_routing_snapshot(&self, model_id: &str) -> Arc<ModelWorkerSnapshot> {
+    /// One generation for a model, with the wildcard model mapping to the
+    /// global generation and an unknown model to the shared empty one.
+    pub fn generation(&self, model_id: &str) -> Arc<G> {
         if model_id == UNKNOWN_MODEL_ID {
-            return self.current_global_routing_snapshot();
+            return self.global_generation();
         }
-        self.model_routing_snapshot(model_id)
-            .unwrap_or_else(Self::empty_routing_snapshot)
-    }
-
-    /// Shared empty snapshot for unknown models.
-    fn empty_routing_snapshot() -> Arc<ModelWorkerSnapshot> {
-        static EMPTY: OnceLock<Arc<ModelWorkerSnapshot>> = OnceLock::new();
-        Arc::clone(
-            EMPTY
-                .get_or_init(|| Arc::new(ModelWorkerSnapshot::new(Arc::from(Self::EMPTY_WORKERS)))),
-        )
+        self.model_generation(model_id)
+            .unwrap_or_else(|| Arc::clone(&self.empty_generation))
     }
 
     /// Return the immutable global membership snapshot used by routing paths
@@ -931,7 +981,7 @@ impl WorkerRegistry {
     /// readiness recompute): one pointer load while the fleet is stable,
     /// where an iteration of the worker map locks every shard.
     pub(crate) fn get_routing_workers(&self) -> Arc<[Arc<dyn Worker>]> {
-        Arc::clone(&self.current_global_routing_snapshot().all)
+        Arc::clone(self.global_generation().members())
     }
 
     /// Whether an all-overloaded candidate pool is refused (`true`) or
@@ -965,7 +1015,7 @@ impl WorkerRegistry {
         // on one model can land their gauge writes in the reverse order and
         // pin a stale value until the next transition. Counter GC re-locks a
         // `model_overloaded` shard, so it stays outside.
-        let model_ids = Self::worker_model_ids(worker);
+        let model_ids = worker_model_ids(worker);
         let mut updates = Vec::with_capacity(model_ids.len());
         {
             let _edge = self.overload_transitions.lock();
@@ -1075,13 +1125,11 @@ impl WorkerRegistry {
     /// other is pinned — and substituting one for the other would silently run
     /// a model the client did not ask for.
     ///
-    /// External workers reach only the provider routers
-    /// ([`Gateway::select_router_for_model`] gives them priority, and
-    /// single-router mode picks by routing mode), none of which rewrite the
-    /// outbound model. Keep it that way: canonicalize registry lookups there
-    /// if needed, never the request body.
-    ///
-    /// [`Gateway::select_router_for_model`]: crate::routers::gateway::Gateway
+    /// External workers reach only the provider routers (the gateway's
+    /// router selection gives them priority, and single-router mode picks by
+    /// routing mode), none of which rewrite the outbound model. Keep it that
+    /// way: canonicalize registry lookups there if needed, never the request
+    /// body.
     pub fn resolve_model_alias(&self, model_id: &str) -> Option<Arc<str>> {
         if model_id == UNKNOWN_MODEL_ID || self.model_index.contains_key(model_id) {
             return None;
@@ -1270,7 +1318,7 @@ impl WorkerRegistry {
     pub fn get_models(&self) -> Vec<String> {
         self.model_index
             .iter()
-            .filter(|entry| !entry.value().is_empty())
+            .filter(|entry| !entry.value().members().is_empty())
             .map(|entry| entry.key().clone())
             .collect()
     }
@@ -1280,7 +1328,7 @@ impl WorkerRegistry {
     pub fn model_count(&self) -> usize {
         self.model_index
             .iter()
-            .filter(|entry| !entry.value().is_empty())
+            .filter(|entry| !entry.value().members().is_empty())
             .count()
     }
 
@@ -1303,7 +1351,7 @@ impl WorkerRegistry {
     fn model_has_workers(&self, canonical_id: &str) -> bool {
         self.model_index
             .get(canonical_id)
-            .is_some_and(|workers| !workers.is_empty())
+            .is_some_and(|workers| !workers.members().is_empty())
     }
 
     /// The value of the `model` label on the request metric families for a
@@ -1344,7 +1392,7 @@ impl WorkerRegistry {
         let total_models = self
             .model_index
             .iter()
-            .filter(|entry| !entry.value().is_empty())
+            .filter(|entry| !entry.value().members().is_empty())
             .count();
 
         let mut healthy_count = 0;
@@ -1674,8 +1722,8 @@ impl WorkerRegistry {
             }
         }
 
-        let old_models: HashSet<String> = Self::worker_model_ids(&old_worker).into_iter().collect();
-        let new_models: HashSet<String> = Self::worker_model_ids(&new_worker).into_iter().collect();
+        let old_models: HashSet<String> = worker_model_ids(&old_worker).into_iter().collect();
+        let new_models: HashSet<String> = worker_model_ids(&new_worker).into_iter().collect();
 
         // URL changes are not supported via replace — use remove + register instead
         if old_worker.url() != new_worker.url() {
@@ -1730,7 +1778,7 @@ impl WorkerRegistry {
             let model_empty = self
                 .model_index
                 .get(removed_model)
-                .is_none_or(|workers| workers.is_empty());
+                .is_none_or(|workers| workers.members().is_empty());
             if model_empty {
                 self.model_retry_configs.remove(removed_model);
             }
@@ -1995,9 +2043,9 @@ impl WorkerRegistry {
     /// a refresh that repeats them leaves every answer a snapshot keeps as
     /// it is. Other cards are stored in place, so rotations and tables keyed
     /// by the handle stand, and each model snapshot that holds the worker is
-    /// published again over the same list, with the global one: an answer a
-    /// snapshot keeps from its workers' cards
-    /// ([`ModelWorkerSnapshot::harmony`]) is read again by the next request.
+    /// published again over the same list, with the global one: what a host's
+    /// value of a generation keeps from its workers' cards is read again by
+    /// the next request.
     /// The model index stays as the registration wrote it, so the worker is
     /// found by its handle, not by its cards.
     ///
@@ -2012,7 +2060,12 @@ impl WorkerRegistry {
         let holding: Vec<String> = self
             .model_index
             .iter()
-            .filter(|entry| entry.iter().any(|member| Arc::ptr_eq(member, worker)))
+            .filter(|entry| {
+                entry
+                    .members()
+                    .iter()
+                    .any(|member| Arc::ptr_eq(member, worker))
+            })
             .map(|entry| entry.key().clone())
             .collect();
         // As in add_worker_to_model_index: a replaced snapshot drops after
@@ -2020,11 +2073,8 @@ impl WorkerRegistry {
         let mut previous = Vec::with_capacity(holding.len());
         for model_id in &holding {
             if let Some(mut entry) = self.model_index.get_mut(model_id) {
-                let members = Arc::clone(&entry.all);
-                previous.push(std::mem::replace(
-                    &mut *entry,
-                    Arc::new(ModelWorkerSnapshot::new(members)),
-                ));
+                let members = Arc::clone(entry.members());
+                previous.push(std::mem::replace(&mut *entry, Arc::new(G::of(members))));
             }
         }
         drop(previous);
@@ -2162,10 +2212,13 @@ impl WorkerRegistry {
             self.worker_origins.remove(worker_id);
             self.import_records.remove(worker_id);
 
-            for model_id in Self::worker_model_ids(&worker) {
+            for model_id in worker_model_ids(&worker) {
                 self.remove_worker_from_model_index(&model_id, worker.url());
                 // Drop the per-model retry config when the last worker leaves.
-                let model_empty = self.model_index.get(&model_id).is_none_or(|w| w.is_empty());
+                let model_empty = self
+                    .model_index
+                    .get(&model_id)
+                    .is_none_or(|w| w.members().is_empty());
                 if model_empty {
                     self.model_retry_configs.remove(&model_id);
                 }
@@ -2252,38 +2305,15 @@ impl WorkerRegistry {
     // 8. Internal helpers
     // ───────────────────────────────────────────────────────────────────
 
-    /// Collect the unique model IDs advertised by a worker.
-    ///
-    /// Public so workflow steps can share the same de-duplication rule
-    /// the registry uses internally when building the model index. Falls
-    /// back to the worker's primary `model_id()` if the richer
-    /// `models()` list is empty. Does not touch the registry; emits no
-    /// events.
-    pub fn worker_model_ids(worker: &Arc<dyn Worker>) -> Vec<String> {
-        let mut seen = HashSet::new();
-        let mut model_ids: Vec<String> = worker
-            .models()
-            .into_iter()
-            .map(|model| model.id)
-            .filter(|model_id| seen.insert(model_id.clone()))
-            .collect();
-
-        if model_ids.is_empty() {
-            model_ids.push(worker.model_id().to_string());
-        }
-
-        model_ids
-    }
-
     /// The models whose policy `worker` keeps: every model it serves
-    /// ([`Self::worker_model_ids`]), every model its registration listed,
+    /// ([`worker_model_ids`]), every model its registration listed,
     /// which a refresh of its model list can leave out while the model
     /// index keeps them, and its primary model, which names the policy its
     /// registration built. A model's policy goes once no worker of this node
     /// serves it (see [`Self::serves_model_locally`]), so a workflow that
     /// takes `worker` away asks after each of them.
     pub fn policy_model_ids(worker: &Arc<dyn Worker>) -> Vec<String> {
-        let mut model_ids = Self::worker_model_ids(worker);
+        let mut model_ids = worker_model_ids(worker);
         let registered = worker.metadata().spec.models.all().iter();
         for model_id in registered
             .map(|card| card.id.as_str())
@@ -2342,7 +2372,7 @@ impl WorkerRegistry {
         }
 
         let worker_type = *worker.worker_type();
-        for model_id in Self::worker_model_ids(worker) {
+        for model_id in worker_model_ids(worker) {
             let values = self.sampling_defaults_values_for_group(&model_id, worker_type);
             if values.len() > 1 {
                 tracing::warn!(
@@ -2429,7 +2459,7 @@ impl WorkerRegistry {
         Metrics::init_worker_requests(worker.url(), worker.model_id());
 
         // Update model index for O(1) lookups using copy-on-write.
-        for model_id in Self::worker_model_ids(&worker) {
+        for model_id in worker_model_ids(&worker) {
             self.add_worker_to_model_index(&model_id, worker.clone());
             self.rebuild_hash_ring(&model_id);
             // Run after the model index so `add_model_alias` below sees the
@@ -2501,7 +2531,7 @@ impl WorkerRegistry {
         match workers {
             Some(workers) => {
                 let previous = self.hash_rings.get(model_id).map(|ring| Arc::clone(&ring));
-                let urls = workers.iter().map(|w| w.url());
+                let urls = workers.members().iter().map(|w| w.url());
                 let ring = match previous {
                     Some(previous) => previous.updated(urls),
                     None => HashRing::new(urls),
@@ -2548,7 +2578,7 @@ impl WorkerRegistry {
             _ => {
                 let mut urls: HashSet<String> = HashSet::new();
                 for entry in self.model_index.iter() {
-                    urls.extend(entry.value().iter().map(|w| w.url().to_string()));
+                    urls.extend(entry.value().members().iter().map(|w| w.url().to_string()));
                 }
                 let previous = self
                     .hash_rings
@@ -2576,6 +2606,7 @@ impl WorkerRegistry {
             .entry(model_id.to_string())
             .and_modify(|existing| {
                 let mut new_workers: Vec<Arc<dyn Worker>> = existing
+                    .members()
                     .iter()
                     .filter(|w| w.url() != worker.url())
                     .cloned()
@@ -2583,16 +2614,10 @@ impl WorkerRegistry {
                 new_workers.push(worker.clone());
                 previous = Some(std::mem::replace(
                     existing,
-                    Arc::new(ModelWorkerSnapshot::new(Arc::from(
-                        new_workers.into_boxed_slice(),
-                    ))),
+                    Arc::new(G::of(Arc::from(new_workers.into_boxed_slice()))),
                 ));
             })
-            .or_insert_with(|| {
-                Arc::new(ModelWorkerSnapshot::new(Arc::from(
-                    vec![worker].into_boxed_slice(),
-                )))
-            });
+            .or_insert_with(|| Arc::new(G::of(Arc::from(vec![worker].into_boxed_slice()))));
         drop(previous);
     }
 
@@ -2613,13 +2638,13 @@ impl WorkerRegistry {
             .global_routing_snapshot
             .swap(Arc::new(GlobalRoutingSnapshot {
                 epoch: usize::MAX,
-                snapshot: Self::empty_routing_snapshot(),
+                snapshot: Arc::clone(&self.empty_generation),
             }));
         drop(previous);
     }
 
-    /// The current global membership snapshot, rebuilt first when membership
-    /// changed since it was last published.
+    /// The global generation, over every registered worker, rebuilt first
+    /// when membership changed since it was last published.
     ///
     /// The fast path is self-validating: the published object carries the
     /// epoch it was built at, so a snapshot superseded between the counter
@@ -2628,7 +2653,7 @@ impl WorkerRegistry {
     /// `global_membership_order` write side, so every published snapshot is
     /// a membership state that truly existed at one instant — never a
     /// mixture of generations from interleaved shard reads.
-    fn current_global_routing_snapshot(&self) -> Arc<ModelWorkerSnapshot> {
+    pub fn global_generation(&self) -> Arc<G> {
         let published = self.global_routing_snapshot.load_full();
         if published.epoch == self.global_epoch.load(Ordering::Acquire) {
             return Arc::clone(&published.snapshot);
@@ -2650,9 +2675,7 @@ impl WorkerRegistry {
                 .iter()
                 .map(|entry| Arc::clone(entry.value()))
                 .collect();
-            let fresh = Arc::new(ModelWorkerSnapshot::new(Arc::from(
-                members.into_boxed_slice(),
-            )));
+            let fresh = Arc::new(G::of(Arc::from(members.into_boxed_slice())));
             (epoch, fresh)
         };
         let previous = self
@@ -2677,6 +2700,7 @@ impl WorkerRegistry {
 
         if let Some(mut entry) = self.model_index.get_mut(model_id) {
             let new_workers: Vec<Arc<dyn Worker>> = entry
+                .members()
                 .iter()
                 .filter(|w| w.url() != worker_url)
                 .cloned()
@@ -2685,7 +2709,7 @@ impl WorkerRegistry {
             if new_workers.is_empty() {
                 previous = Some(std::mem::replace(
                     &mut *entry,
-                    Arc::new(ModelWorkerSnapshot::new(Arc::from(
+                    Arc::new(G::of(Arc::from(
                         Vec::<Arc<dyn Worker>>::new().into_boxed_slice(),
                     ))),
                 ));
@@ -2693,9 +2717,7 @@ impl WorkerRegistry {
             } else {
                 previous = Some(std::mem::replace(
                     &mut *entry,
-                    Arc::new(ModelWorkerSnapshot::new(Arc::from(
-                        new_workers.into_boxed_slice(),
-                    ))),
+                    Arc::new(G::of(Arc::from(new_workers.into_boxed_slice()))),
                 ));
             }
         }
@@ -2703,7 +2725,7 @@ impl WorkerRegistry {
 
         if should_remove_entry {
             self.model_index
-                .remove_if(model_id, |_, workers| workers.is_empty());
+                .remove_if(model_id, |_, workers| workers.members().is_empty());
         }
 
         self.rebuild_hash_ring(model_id);
@@ -2821,6 +2843,7 @@ impl WorkerRegistry {
     fn model_declares_alias(&self, canonical_id: &str, alias: &str) -> bool {
         self.model_index.get(canonical_id).is_some_and(|workers| {
             workers
+                .members()
                 .iter()
                 .any(|worker| Self::worker_declares_alias(worker, canonical_id, alias))
         })
@@ -2835,6 +2858,7 @@ impl WorkerRegistry {
             }
             entry
                 .value()
+                .members()
                 .iter()
                 .any(|worker| Self::worker_declares_alias(worker, canonical_id, alias))
                 .then(|| canonical_id.clone())
@@ -2889,7 +2913,7 @@ impl WorkerRegistry {
 }
 
 #[cfg(test)]
-impl WorkerRegistry {
+impl<G: Generation> WorkerRegistry<G> {
     /// Test support for the interleaving proofs. Runs `transition` on its
     /// own thread and pauses it at the next status transition's seam: after
     /// whatever the caller did outside the worker's mutation lock, before
@@ -2899,8 +2923,8 @@ impl WorkerRegistry {
     /// No sleep determines the ordering.
     pub(crate) fn with_another_write_before_the_lock<R: Send>(
         &self,
-        transition: impl FnOnce(&WorkerRegistry) -> R + Send,
-        other_write: impl FnOnce(&WorkerRegistry),
+        transition: impl FnOnce(&Self) -> R + Send,
+        other_write: impl FnOnce(&Self),
     ) -> R {
         use std::time::Duration;
 
@@ -2926,7 +2950,7 @@ impl WorkerRegistry {
 // We cannot `#[derive(Default)]` on `WorkerRegistry` because
 // `broadcast::Sender` has no `Default` impl — it needs an explicit
 // capacity.
-impl Default for WorkerRegistry {
+impl<G: Generation> Default for WorkerRegistry<G> {
     fn default() -> Self {
         Self::new()
     }
@@ -2981,7 +3005,7 @@ pub struct RemoteWorkerState {
     pub spec: Vec<u8>,
 }
 
-impl WorkerRegistry {
+impl<G: Generation> WorkerRegistry<G> {
     /// Sink for inbound mesh worker-state updates. The v2
     /// `WorkerSyncAdapter` calls this for each entry it pulls from
     /// the `worker:` CRDT namespace. A state for a URL this registry
@@ -3354,6 +3378,44 @@ impl WorkerRegistry {
     }
 }
 
+/// The registry as a peer that asks one thing of it holds it: the worker
+/// registered under a URL. Such a holder reads no generation, so it names
+/// no value of the registry's host.
+pub(crate) trait WorkerLookup: Send + Sync {
+    /// The worker registered under `url`, as [`WorkerRegistry::get_by_url`]
+    /// reads it.
+    fn get_by_url(&self, url: &str) -> Option<Arc<dyn Worker>>;
+}
+
+impl<G: Generation> WorkerLookup for WorkerRegistry<G> {
+    fn get_by_url(&self, url: &str) -> Option<Arc<dyn Worker>> {
+        Self::get_by_url(self, url)
+    }
+}
+
+/// Collect the unique model IDs advertised by a worker.
+///
+/// Public so workflow steps can share the same de-duplication rule
+/// the registry uses internally when building the model index. Falls
+/// back to the worker's primary `model_id()` if the richer
+/// `models()` list is empty. Does not touch the registry; emits no
+/// events.
+pub fn worker_model_ids(worker: &Arc<dyn Worker>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut model_ids: Vec<String> = worker
+        .models()
+        .into_iter()
+        .map(|model| model.id)
+        .filter(|model_id| seen.insert(model_id.clone()))
+        .collect();
+
+    if model_ids.is_empty() {
+        model_ids.push(worker.model_id().to_string());
+    }
+
+    model_ids
+}
+
 /// Statistics for the worker registry
 #[derive(Debug, Clone)]
 pub struct WorkerRegistryStats {
@@ -3387,5 +3449,7 @@ pub struct WorkerRegistryStats {
     pub circuit_breaker_half_open: usize,
 }
 
+#[cfg(test)]
+mod generation_tests;
 #[cfg(test)]
 mod tests;

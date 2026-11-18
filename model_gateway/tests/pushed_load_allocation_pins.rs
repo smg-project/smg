@@ -29,8 +29,8 @@ use smg::{
     observability::metrics::{start_prometheus, PrometheusConfig},
     policies::PolicyRegistry,
     worker::{
-        load::monitor::WorkerMonitor, metrics::Metrics, registry::WorkerRegistry,
-        BasicWorkerBuilder, ConnectionMode, Worker, WorkerType,
+        metrics::Metrics, BasicWorkerBuilder, ConnectionMode, Worker, WorkerMonitor,
+        WorkerRegistry, WorkerType,
     },
 };
 use smg_grpc_client::common_proto::EngineLoad;
