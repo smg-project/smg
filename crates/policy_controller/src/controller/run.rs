@@ -522,14 +522,12 @@ enum SpecSource {
 }
 
 impl Cli {
-    /// The spec's source. The parser takes one of the two flags and refuses
-    /// the two together, so one is set. The store's arm stands for the state
-    /// the parser rules out too, under a path no directory is at.
-    fn spec_source(&self) -> SpecSource {
-        match &self.spec_file {
-            Some(file) => SpecSource::File(file.clone()),
-            None => SpecSource::Store(self.spec_store.clone().unwrap_or_default()),
-        }
+    /// The spec's source: the one flag the parser took. The parser refuses
+    /// a command line that names neither, so `None` is a state it rules
+    /// out, and a start that meets it all the same refuses in its own words.
+    fn spec_source(&self) -> Option<SpecSource> {
+        let file = self.spec_file.clone().map(SpecSource::File);
+        file.or_else(|| self.spec_store.clone().map(SpecSource::Store))
     }
 }
 
@@ -575,9 +573,10 @@ pub fn run(catalog: Catalog) -> ExitCode {
     run_with(cli, catalog)
 }
 
-/// [`run`] from its parsed command line on, the log set: configure, then
-/// the runtime, bind and serve on it. Apart from the parse, which reads the
-/// process's own arguments, and from the log, which a process sets once.
+/// [`run`] from its parsed command line on, the log set: configure, take
+/// the spec's source, then the runtime, bind and serve on it. Apart from
+/// the parse, which reads the process's own arguments, and from the log,
+/// which a process sets once.
 fn run_with(cli: Cli, catalog: Catalog) -> ExitCode {
     let config = match cli.config() {
         Ok(config) => config,
@@ -585,6 +584,13 @@ fn run_with(cli: Cli, catalog: Catalog) -> ExitCode {
             error!(%error, "configuration refused");
             return ExitCode::FAILURE;
         }
+    };
+    let Some(spec) = cli.spec_source() else {
+        error!(
+            error = "no spec source is named: a start takes --spec-file or --spec-store",
+            "start refused"
+        );
+        return ExitCode::FAILURE;
     };
     let runtime = match runtime(cli.runtime_worker_threads) {
         Ok(runtime) => runtime,
@@ -594,7 +600,7 @@ fn run_with(cli: Cli, catalog: Catalog) -> ExitCode {
         }
     };
     served(runtime, async {
-        let bound = bind(config, catalog, &cli.identity_as_told, cli.spec_source());
+        let bound = bind(config, catalog, &cli.identity_as_told, spec);
         let controller = match bound.await {
             Ok(controller) => controller,
             Err(error) => {
@@ -1192,7 +1198,7 @@ mod tests {
                     config,
                     Catalog::builtin(),
                     &cli.identity_as_told,
-                    cli.spec_source(),
+                    cli.spec_source().expect("the flags name a store"),
                 )
                 .await
                 .map(drop)
@@ -1394,13 +1400,13 @@ mod tests {
 
         let dir = PathBuf::from("/var/lib/smg/spec");
         let stored = parse(&with_identity(&["--spec-store", "/var/lib/smg/spec"]));
-        assert_eq!(stored.spec_source(), SpecSource::Store(dir));
+        assert_eq!(stored.spec_source(), Some(SpecSource::Store(dir)));
         let file = PathBuf::from("/etc/smg/policy/policy.yaml");
         let filed = parse(&with_identity(&[
             "--spec-file",
             "/etc/smg/policy/policy.yaml",
         ]));
-        assert_eq!(filed.spec_source(), SpecSource::File(file));
+        assert_eq!(filed.spec_source(), Some(SpecSource::File(file)));
 
         let mut argv = vec!["smg-policy-controller", "--controller-id", "controller-0"];
         argv.extend(with_identity(&[]));
@@ -1418,6 +1424,17 @@ mod tests {
                 "{told}"
             );
         }
+    }
+
+    /// A command line that names neither source is the state the parser
+    /// rules out. Past the parser it has no source, and the start refuses
+    /// it before a runtime is built.
+    #[test]
+    fn a_command_line_past_the_parser_with_no_spec_source_is_refused() {
+        let mut cli = parse(&[]);
+        cli.spec_store = None;
+        assert_eq!(cli.spec_source(), None);
+        assert_eq!(super::run_with(cli, Catalog::builtin()), ExitCode::FAILURE);
     }
 
     /// A spec store starts the controller on the newest generation on file,

@@ -38,7 +38,6 @@ use std::{
     collections::BTreeSet,
     ffi::OsStr,
     fs,
-    future::Future,
     path::Path,
     process::{Command, Stdio},
     thread,
@@ -55,7 +54,8 @@ use smg_policy_controller::{
     },
 };
 use spec::{
-    answers, apply, apply_over, as_operator, control, page, read, until, LEAST_LOAD, PACE, RANDOM,
+    answers, apply, apply_over, as_operator, control, inside, page, read, until, LEAST_LOAD, PACE,
+    RANDOM,
 };
 use tokio::sync::mpsc;
 use tonic::{
@@ -92,12 +92,6 @@ fn as_gateway<T>(frames: mpsc::Receiver<T>) -> Request<ReceiverStream<T>> {
         AsciiMetadataValue::from_static("gateway-a"),
     );
     request
-}
-
-/// `wait`'s answer inside the room: a wait that outlasts it fails the case,
-/// by `what` it waited for.
-async fn inside<T>(what: &str, wait: impl Future<Output = T>) -> T {
-    tokio::time::timeout(ROOM, wait).await.expect(what)
 }
 
 /// What one `Decide` is answered on the gateway listener: asked as
@@ -163,9 +157,9 @@ async fn decide(replica: &Replica) -> Option<decide_answer::Answer> {
 
 /// One `RollbackPolicySpec` call on the control listener, as `operator-a`.
 async fn rollback(replica: &Replica, generation: u64) -> Result<ApplyResult, Status> {
-    control(replica)
-        .await?
-        .rollback_policy_spec(as_operator(RollbackRequest { generation }))
+    let mut client = control(replica).await?;
+    let call = client.rollback_policy_spec(as_operator(RollbackRequest { generation }));
+    inside("the rollback call's answer", call)
         .await
         .map(Response::into_inner)
 }
