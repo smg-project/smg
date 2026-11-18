@@ -19,11 +19,13 @@
 //! it hands back and for no other peer, and adds what it reads to
 //! [`Shared`], which [`Shared::new`] alone builds.
 //!
-//! The spec source is a file, which no call writes, so the controller
-//! takes neither write: `ApplyPolicySpec` answers a dry run's verdict with
-//! nothing applied and an enforce `read_only`, and `RollbackPolicySpec`
-//! answers `read_only`. One dry run runs at a time, and a call past the
-//! ones that wait their turn is told to ask again.
+//! A spec source that is a file takes no write, since no call writes a
+//! file: `ApplyPolicySpec` answers a dry run's verdict with nothing applied
+//! and an enforce `read_only`, and `RollbackPolicySpec` answers
+//! `read_only`. A spec store takes an enforce: the document is persisted,
+//! then applied as the next generation. One dry run runs at a time and one
+//! apply, and a call past the ones that wait their turn is told to ask
+//! again.
 
 use std::{
     io,
@@ -47,7 +49,10 @@ use super::{
     deciders::{self, Deciders, Reads},
     election::{split_identity, Standing},
     gateways::Gateways,
-    generations::{DryRun, Format, Generations, Unanswered, DRY_RUNS_WAITING},
+    generations::{
+        DryRun, Enforced, Format, Generations, SpecRejected, Unanswered, DRY_RUNS_WAITING,
+        WRITES_WAITING,
+    },
     membership::Door,
     principal::{self, Layer, Principal},
     replication::{Batches, Replication},
@@ -63,6 +68,7 @@ use crate::{
         policy_controller_server::{PolicyController, PolicyControllerServer},
     },
     replication::Unled,
+    spec::Digest,
     store::MemoryStore,
 };
 
@@ -496,7 +502,7 @@ impl Service {
     fn sourceless<T, R>(&self, call: Call, request: &Request<T>) -> Result<R, Status> {
         self.admit(call, request)?;
         Err(Status::unimplemented(format!(
-            "{} is not served by a controller started with no spec file",
+            "{} is not served by a controller started with no spec source",
             call.name()
         )))
     }
@@ -589,19 +595,24 @@ fn read_only(generations: &Generations) -> proto::ApplyResult {
     }
 }
 
-/// A dry run's verdict as the call answers it: accepted, with the number
-/// the document would run under now and its digest, or refused, with the
-/// standing number and digest and one issue by its field. The source is a
-/// file, so either answer reads `read_only`.
-fn verdict(dry_run: DryRun) -> proto::ApplyResult {
-    let (standing, standing_digest) = dry_run.standing;
-    match dry_run.would_run {
+/// A document's verdict as a write call answers it, a dry run's or an
+/// enforce's: accepted, with the number the document runs under (a dry
+/// run's: would run under now) and its digest, or refused, with the
+/// standing number and digest and one issue by its field. `read_only` is
+/// whether the source takes no write: a file takes none.
+fn verdict(
+    (standing, standing_digest): (u64, Option<Digest>),
+    outcome: Result<(u64, Digest), SpecRejected>,
+    needs: Option<proto::NeedsDiff>,
+    read_only: bool,
+) -> proto::ApplyResult {
+    match outcome {
         Ok((generation, digest)) => proto::ApplyResult {
             accepted: true,
             generation,
             digest: digest.to_string(),
-            needs: dry_run.needs,
-            read_only: true,
+            needs,
+            read_only,
             ..proto::ApplyResult::default()
         },
         Err(rejected) => proto::ApplyResult {
@@ -615,14 +626,14 @@ fn verdict(dry_run: DryRun) -> proto::ApplyResult {
                 message: rejected.to_string(),
                 plugin: String::new(),
             }],
-            read_only: true,
+            read_only,
             ..proto::ApplyResult::default()
         },
     }
 }
 
-/// The status of a dry run that gave no verdict: a guard's by the standing
-/// generation, and a full wait's as one to ask again.
+/// The status of a dry run or an apply that gave no verdict: a guard's by
+/// the standing generation, and a full wait's as one to ask again.
 fn unanswered(unanswered: Unanswered) -> Status {
     match unanswered {
         Unanswered::Guarded(standing, digest) => {
@@ -635,6 +646,10 @@ fn unanswered(unanswered: Unanswered) -> Status {
             "{DRY_RUNS_WAITING} dry runs wait their turn: ask again later"
         )),
         Unanswered::Unended(join) => Status::internal(format!("the dry run did not end: {join}")),
+        Unanswered::Waiting => Status::resource_exhausted(format!(
+            "{WRITES_WAITING} applies wait their turn: ask again later"
+        )),
+        Unanswered::Unwritten(join) => Status::internal(format!("the apply did not end: {join}")),
     }
 }
 
@@ -761,12 +776,16 @@ impl PolicyController for Service {
     /// one order: the scope, the lead, the mode, the source, the guard, the
     /// document. A replica that does not lead refuses by the leader's name.
     /// A write states its mode: none is refused by its field, and audit is
-    /// not served by this build. The source is a file, which no call
-    /// writes: an enforce answers `read_only` with the standing number and
-    /// digest, whatever its guard and its document. A dry run whose
-    /// `expected_digest` is not the standing one is refused; any other
-    /// answers its document's verdict and applies nothing, one dry run at a
-    /// time ([`Generations::dry_run_in_turn`]).
+    /// not served by this build. Under a file, which no call writes, an
+    /// enforce answers `read_only` with the standing number and digest,
+    /// whatever its guard and its document. Under a spec store an enforce
+    /// whose `expected_digest` is not the standing one is refused: another
+    /// apply landed first. Any other is persisted, then applied as the next
+    /// generation, one apply at a time ([`Generations::enforce_in_turn`]),
+    /// and answers the number it runs under, or the one issue it was
+    /// refused by. A dry run is guarded alike and answers its document's
+    /// verdict with nothing applied, one dry run at a time
+    /// ([`Generations::dry_run_in_turn`]).
     async fn apply_policy_spec(
         &self,
         request: Request<proto::ApplyRequest>,
@@ -778,8 +797,9 @@ impl PolicyController for Service {
         self.admit(Call::ApplyPolicySpec, &request)?;
         self.leading(Instant::now())?;
         let apply = request.into_inner();
-        match proto::ApplyMode::try_from(apply.mode) {
-            Ok(proto::ApplyMode::DryRun) => {}
+        let enforce = match proto::ApplyMode::try_from(apply.mode) {
+            Ok(proto::ApplyMode::DryRun) => false,
+            Ok(proto::ApplyMode::Enforce) if generations.writable() => true,
             Ok(proto::ApplyMode::Enforce) => return Ok(Response::new(read_only(generations))),
             Ok(proto::ApplyMode::Audit) => {
                 return Err(Status::unimplemented(
@@ -791,7 +811,7 @@ impl PolicyController for Service {
                     "mode: a write states its mode, enforce, audit or dry-run",
                 ));
             }
-        }
+        };
         let format = match apply.format.as_str() {
             "yaml" => Format::Yaml,
             "json" => Format::Json,
@@ -805,11 +825,29 @@ impl PolicyController for Service {
             }
         };
         // The guard is the door's to read, behind the turn its pass waits.
-        let dry_run = generations
-            .dry_run_in_turn(apply.expected_digest, apply.document, format)
-            .await
-            .map_err(unanswered)?;
-        Ok(Response::new(verdict(dry_run)))
+        let (expected, document) = (apply.expected_digest, apply.document);
+        let answer = if enforce {
+            let Enforced {
+                standing,
+                ran,
+                needs,
+            } = generations
+                .enforce_in_turn(expected, document, format)
+                .await
+                .map_err(unanswered)?;
+            verdict(standing, ran, needs, false)
+        } else {
+            let DryRun {
+                standing,
+                would_run,
+                needs,
+            } = generations
+                .dry_run_in_turn(expected, document, format)
+                .await
+                .map_err(unanswered)?;
+            verdict(standing, would_run, needs, !generations.writable())
+        };
+        Ok(Response::new(answer))
     }
 
     /// The standing generation's document as its source wrote it, with the
@@ -832,8 +870,8 @@ impl PolicyController for Service {
     }
 
     /// `RollbackPolicySpec` by a controller with a spec source: the scope,
-    /// the lead, then the source, which is a file and which no call writes.
-    /// The answer is `read_only`, with the standing number and digest.
+    /// the lead, then the source. Under a file, which no call writes, the
+    /// answer is `read_only`, with the standing number and digest.
     async fn rollback_policy_spec(
         &self,
         request: Request<proto::RollbackRequest>,
@@ -844,6 +882,11 @@ impl PolicyController for Service {
         }
         self.admit(Call::RollbackPolicySpec, &request)?;
         self.leading(Instant::now())?;
+        if generations.writable() {
+            return Err(Status::unimplemented(
+                "RollbackPolicySpec is not served under a spec store by this build",
+            ));
+        }
         Ok(Response::new(read_only(generations)))
     }
 
@@ -912,12 +955,13 @@ mod tests {
             config::Scope,
             election::{self, LeasePlace, Standing},
             gateways::tests::PATIENT,
-            generations::{tests::LEAST_LOAD, Format},
+            generations::{tests::LEAST_LOAD, Format, Unanswered},
             principal::{
                 tests::{stating, told, NO_PRINCIPAL},
                 Layer,
             },
             replication::journaled_from,
+            spec_store::SpecStore,
             PROTOCOL_VERSION,
         },
         elector::{
@@ -1196,7 +1240,7 @@ mod tests {
         assert_eq!(unserved.code(), Code::Unimplemented);
         assert_eq!(
             unserved.message(),
-            "GetPolicySpec is not served by a controller started with no spec file"
+            "GetPolicySpec is not served by a controller started with no spec source"
         );
         // A caller no layer placed is refused before the call is named
         // unserved: no call body is reached without a principal.
@@ -1500,7 +1544,9 @@ mod tests {
                 {
                     (
                         Code::Unimplemented,
-                        format!("{method} is not served by a controller started with no spec file"),
+                        format!(
+                            "{method} is not served by a controller started with no spec source"
+                        ),
                     )
                 } else if layer == Layer::AsTold && stated && *method == "Decide" {
                     // The stream opens, and the call itself refuses the
@@ -1811,10 +1857,9 @@ mod tests {
     }
 
     /// A control listener's service over an election no case outlasts (an
-    /// hour's deadline), its spec source bound to `LEAST_LOAD` as generation
-    /// 1: the leader where `leads`, else a follower whose last look saw
-    /// `controller-1` hold the lease.
-    fn sourced(leads: bool) -> (Elector, watch::Sender<Standing>, Service) {
+    /// hour's deadline), with no spec source: the leader where `leads`,
+    /// else a follower whose last look saw `controller-1` hold the lease.
+    fn electing(leads: bool) -> (Elector, watch::Sender<Standing>, Service) {
         let hour = Duration::from_secs(3600);
         let settings = ElectionSettings {
             duration: 2 * hour,
@@ -1832,6 +1877,13 @@ mod tests {
         } else {
             standing.send_replace(saw("controller-1@10.0.0.8:30100", 4));
         }
+        (elector, standing, control)
+    }
+
+    /// [`electing`]'s service, its spec source a file's document:
+    /// `LEAST_LOAD`, applied as generation 1.
+    fn sourced(leads: bool) -> (Elector, watch::Sender<Standing>, Service) {
+        let (elector, standing, control) = electing(leads);
         control
             .shared
             .generations
@@ -2308,6 +2360,160 @@ mod tests {
         assert_eq!(
             full.message(),
             "32 dry runs wait their turn: ask again later"
+        );
+    }
+
+    /// [`electing`]'s service, its spec source a store over a new, empty
+    /// directory, handed back beside it.
+    fn stored(leads: bool) -> (tempfile::TempDir, Elector, watch::Sender<Standing>, Service) {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let (elector, standing, control) = electing(leads);
+        let opened = SpecStore::open(dir.path().to_owned()).expect("the directory opens");
+        control
+            .shared
+            .generations
+            .bind_store(opened)
+            .expect("the store binds");
+        (dir, elector, standing, control)
+    }
+
+    /// An enforce under a spec store, on the leader: the document is
+    /// persisted and runs as the next generation, and the answer says so:
+    /// accepted, the number, the digest, the feed before and after, and not
+    /// `read_only`. The read call answers the bytes. A document that does
+    /// not run answers the standing number and one issue, a guard that
+    /// names another digest is refused, and a dry run answers what an
+    /// enforce would with nothing applied.
+    #[tokio::test]
+    async fn an_enforce_under_a_spec_store_runs_as_the_next_generation() {
+        let (dir, _elector, _standing, control) = stored(true);
+        let on_file = || {
+            std::fs::read_dir(dir.path())
+                .expect("the directory")
+                .count()
+        };
+        let read = || {
+            let standing = proto::GetPolicySpecRequest::default();
+            control.get_policy_spec(from("operator-a", standing))
+        };
+        let write = |mode: proto::ApplyMode, document: &'static str, expected: &str| {
+            control.apply_policy_spec(apply(mode, document, "yaml", expected))
+        };
+        // No generation yet: the spec calls are served, and the read has
+        // no document to answer.
+        let none = read().await.expect_err("no document yet");
+        assert_eq!(none.code(), Code::NotFound);
+
+        let first = write(proto::ApplyMode::Enforce, RANDOM, "")
+            .await
+            .expect("an answer")
+            .into_inner();
+        assert!(first.accepted && !first.read_only, "{first:?}");
+        assert_eq!(first.generation, 1);
+        assert!(first.digest.starts_with("sha256:"), "{first:?}");
+        assert!(first.issues.is_empty(), "{first:?}");
+        let nothing = Some(proto::NeedsSummary::default());
+        let feed = first.needs.clone().expect("the needs diff");
+        assert_eq!((&feed.before, &feed.after), (&nothing, &nothing));
+        assert_eq!((control.shared.generations.generation(), on_file()), (1, 1));
+        let standing = read().await.expect("the standing document").into_inner();
+        assert_eq!(
+            (standing.generation, standing.document.as_slice()),
+            (1, RANDOM.as_bytes())
+        );
+        assert_eq!(standing.digest, first.digest);
+
+        // A document that does not run: the standing number and digest,
+        // and one issue by its field.
+        let refused = write(proto::ApplyMode::Enforce, NOWHERE, &first.digest)
+            .await
+            .expect("an answer")
+            .into_inner();
+        assert!(!refused.accepted && !refused.read_only, "{refused:?}");
+        assert_eq!((refused.generation, &refused.digest), (1, &first.digest));
+        let [issue] = refused.issues.as_slice() else {
+            panic!("one issue: {refused:?}")
+        };
+        assert!(!issue.field_path.is_empty(), "{issue:?}");
+        assert!(issue.message.contains("nowhere"), "{issue:?}");
+        assert!(refused.needs.is_none(), "{refused:?}");
+
+        // A guard that names another digest than the standing one: another
+        // apply landed first.
+        let other = format!("sha256:{}", "0".repeat(64));
+        let late = write(proto::ApplyMode::Enforce, LEAST_LOAD, &other)
+            .await
+            .expect_err("guarded");
+        assert_eq!(late.code(), Code::FailedPrecondition);
+        assert_eq!(
+            late.message(),
+            format!(
+                "expected_digest: generation 1 stands with digest {}",
+                first.digest
+            )
+        );
+
+        // A dry run answers what an enforce would and applies nothing.
+        let dry = write(proto::ApplyMode::DryRun, LEAST_LOAD, &first.digest)
+            .await
+            .expect("a verdict")
+            .into_inner();
+        assert!(dry.accepted && !dry.read_only, "{dry:?}");
+        assert_eq!(dry.generation, 2);
+        assert_eq!((control.shared.generations.generation(), on_file()), (1, 1));
+
+        let second = write(proto::ApplyMode::Enforce, LEAST_LOAD, &first.digest)
+            .await
+            .expect("an answer")
+            .into_inner();
+        assert!(second.accepted, "{second:?}");
+        assert_eq!((second.generation, on_file()), (2, 2));
+        let feed = second.needs.expect("the needs diff");
+        assert_eq!(feed.before, nothing);
+        assert!(
+            feed.after.is_some_and(|after| !after.models.is_empty()),
+            "the standing document reads the loads"
+        );
+    }
+
+    /// A follower takes no write under a spec store either: it refuses by
+    /// the leader's name, and nothing is on file.
+    #[tokio::test]
+    async fn a_follower_refuses_an_enforce_under_a_spec_store() {
+        let (dir, _elector, _standing, control) = stored(false);
+        let refused = control
+            .apply_policy_spec(apply(proto::ApplyMode::Enforce, RANDOM, "yaml", ""))
+            .await
+            .expect_err("a follower");
+        assert_eq!(refused.code(), Code::FailedPrecondition);
+        assert_eq!(refused.message(), "this replica does not lead");
+        let on_file = std::fs::read_dir(dir.path()).expect("the directory");
+        assert_eq!(on_file.count(), 0);
+        assert_eq!(control.shared.generations.generation(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_rollback_under_a_spec_store_is_refused_by_name() {
+        let (_dir, _elector, _standing, control) = stored(true);
+        let rollback = from("operator-a", proto::RollbackRequest { generation: 1 });
+        let refused = control
+            .rollback_policy_spec(rollback)
+            .await
+            .expect_err("not served");
+        assert_eq!(refused.code(), Code::Unimplemented);
+        assert_eq!(
+            refused.message(),
+            "RollbackPolicySpec is not served under a spec store by this build"
+        );
+    }
+
+    #[test]
+    fn a_write_call_that_found_no_place_is_told_to_ask_again() {
+        let full = unanswered(Unanswered::Waiting);
+        assert_eq!(full.code(), Code::ResourceExhausted);
+        assert_eq!(
+            full.message(),
+            "32 applies wait their turn: ask again later"
         );
     }
 }
