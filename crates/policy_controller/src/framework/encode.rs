@@ -328,6 +328,15 @@ fn far_holds(far: &[u32], class: u32) -> bool {
     far.binary_search(&class).is_ok()
 }
 
+/// A shed of the encode entry. Cold and out of line: the entry declines
+/// ahead of its passes, and built in place at each of its early returns a
+/// shed left the passes' helpers out of line.
+#[cold]
+#[inline(never)]
+fn turned_away(reason: ShedReason, stage: &'static str, bare: Trace) -> Decision {
+    shed(reason, stage, bare)
+}
+
 impl Engine {
     /// The `epd` plan in one decision: the pair, then each encode item over
     /// the encoders of the chosen prefill's encode class.
@@ -428,8 +437,8 @@ impl Engine {
             generation: pool.generation,
             ..Trace::default()
         };
-        let declined = |stage| shed(ShedReason::PolicyDeclined, stage, bare);
-        let gap = |stage| shed(ShedReason::NoEndpoints, stage, bare);
+        let declined = |stage| turned_away(ShedReason::PolicyDeclined, stage, bare);
+        let gap = |stage| turned_away(ShedReason::NoEndpoints, stage, bare);
         // The prefill's lookup names the plan: a binding of another plan
         // declines, as a pair decision under a single binding is declined.
         let epd = self
@@ -473,6 +482,12 @@ impl Engine {
             return declined(ENCODE_SCOPE);
         }
         let images = facts.media.images != 0;
+        // A request with no item that asks no images of its decode is the
+        // pair's alone: the pair entry answers it over the pools as handed,
+        // and no pass of the encode side is laid for it.
+        if !needs && !items.decode_images && !(items.references && images) {
+            return self.decide_pair(facts, pool, pools, cx, decode_cx, scratch);
+        }
         let encode_facts = RequestFacts {
             phase: Phase::Encode,
             affinity: encode.affinity,
@@ -522,7 +537,7 @@ impl Engine {
                 if let Some((reason, stage)) =
                     saturation(profile, &encode_facts, encode_cx, &encode, &items, images)
                 {
-                    return shed(reason, stage, bare);
+                    return turned_away(reason, stage, bare);
                 }
                 return gap(encode_gap(&encode, &items, images, any_member));
             }
