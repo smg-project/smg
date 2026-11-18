@@ -214,8 +214,8 @@ pub(crate) fn all() -> Vec<Probe> {
         probe!("zone-capacity", before [], ZoneCapacity { zone, healthy, total } host [], &zone),
         probe!("pool", before [], PoolFacts {
             pool_size, membership_epoch, ring_epoch, regime, generation, zones, reach,
-            rated,
-        } host [reach, rated], &pool),
+            reported,
+        } host [reach, reported], &pool),
         // The lease's session crosses under the name both contracts still
         // spell, `session-key`: the change that first reads a lease from the
         // wire renames the field in both and takes this pair out.

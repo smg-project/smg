@@ -2346,18 +2346,6 @@ fn a_store_starts_under_the_unbound_generation_which_binds_nothing() {
     assert_eq!((built.generation, built.pool_facts().generation), (0, 0));
 }
 
-/// No store says yet that every row of a pool holds a rate
-/// ([`PoolFacts::rated`]): the engine asks a served decision whole, whatever
-/// its rows report.
-#[test]
-fn a_build_does_not_say_yet_that_every_row_holds_a_rate() {
-    let store = MemoryStore::new();
-    let t0 = Instant::now();
-    member(&store, "http://a:8000");
-    let built = view(&store, &ask(t0)).2;
-    assert!(!built.pool_facts().rated);
-}
-
 #[test]
 fn a_generation_is_applied_above_the_standing_one_and_no_other() {
     let store = MemoryStore::new();
@@ -4347,6 +4335,105 @@ fn the_deciding_door_hands_the_rows_and_the_engine_of_one_publication() {
         )
     });
     assert_eq!(next, (2, Some(2)));
+}
+
+/// How many rows of a pool hold no report ([`Built::unreported`]), kept by
+/// the writes and shown where the rows are published: a member before its
+/// first report and a member whose report was dropped each count, and a
+/// report without a rate does not. The build and the lent view read one
+/// number, and the pool facts say that every row holds a report where it
+/// is 0 ([`PoolFacts::reported`]).
+#[test]
+fn a_publication_counts_the_rows_of_a_pool_that_hold_no_report() {
+    let store = MemoryStore::new();
+    let t0 = Instant::now();
+    let at = |turn: u32| t0 + PUBLISH_WINDOW * turn;
+    let rated = |live_rate: u32| LoadRow {
+        live_rate,
+        ..load(1, 0)
+    };
+    let unreported = |now: Instant| {
+        let (asked, mut out) = (ask(now), ViewBuffers::default());
+        let built = store
+            .build_view(MODEL, Role::Single, &asked, &mut out)
+            .expect("the pool");
+        let lent = store.with_world(|world| {
+            let view = world.view(MODEL, Role::Single, &asked, false, &mut out);
+            view.expect("the pool").built.unreported
+        });
+        assert_eq!(built.unreported, lent);
+        assert_eq!(built.pool_facts().reported, lent == 0);
+        lent
+    };
+    let first = member(&store, "http://a:8000");
+    let second = member(&store, "http://b:8000");
+    // A membership write counts its rows: two members, no report yet.
+    assert_eq!(unreported(t0), 2);
+    store.record(first, 0, rated(1_900), at(1), LoadSource::Stream);
+    assert_eq!(unreported(at(1)), 1);
+    // A report without a rate is a report: the pool's last row holds one,
+    // and the next with a rate changes nothing.
+    store.record(second, 0, rated(0), at(2), LoadSource::Stream);
+    assert_eq!(unreported(at(2)), 0);
+    store.record(second, 0, rated(1_900), at(3), LoadSource::Stream);
+    assert_eq!(unreported(at(3)), 0);
+    assert_eq!(unreported(at(4)), 0);
+    // A member whose report is dropped holds none from the next window on.
+    store.evict(first);
+    store.publish(at(5));
+    assert_eq!(unreported(at(5)), 1);
+    // A member that joins is counted beside the rows that were there.
+    member(&store, "http://c:8000");
+    assert_eq!(unreported(at(5)), 2);
+}
+
+/// The count is each pool's own, moved by the row a write folds and taken
+/// again where a membership write builds the rows. A member of two models
+/// moves both pools by its one report; a report on a row that holds one and
+/// a drop on a row that holds none move nothing; a membership write counts
+/// the reports its rows carry. No publication takes a pass for it: a debug
+/// build holds each publication's count to a pass over its rows.
+#[test]
+fn a_report_moves_the_count_of_each_pool_its_row_stands_in() {
+    const OTHER: &str = "n";
+    let store = MemoryStore::new();
+    let t0 = Instant::now();
+    let at = |turn: u32| t0 + PUBLISH_WINDOW * turn;
+    let counts = |now: Instant| {
+        let count = |model: &str| {
+            let (asked, mut out) = (ask(now), ViewBuffers::default());
+            let built = store.build_view(model, Role::Single, &asked, &mut out);
+            built.expect("the pool").unreported
+        };
+        (count(MODEL), count(OTHER))
+    };
+    let both = admit(
+        &store,
+        facts("http://a:8000", Role::Single, &[MODEL, OTHER]),
+    );
+    let one = member(&store, "http://b:8000");
+    assert_eq!(counts(t0), (2, 1));
+    store.record(both, 0, load(1, 0), at(1), LoadSource::Stream);
+    assert_eq!(counts(at(1)), (1, 0));
+    // A report on a row that holds one moves nothing.
+    store.record(both, 0, load(2, 0), at(2), LoadSource::Stream);
+    assert_eq!(counts(at(2)), (1, 0));
+    store.record(one, 0, load(1, 0), at(3), LoadSource::Stream);
+    assert_eq!(counts(at(3)), (0, 0));
+    // A dropped report leaves both pools, once.
+    store.evict(both);
+    store.publish(at(4));
+    assert_eq!(counts(at(4)), (1, 1));
+    store.evict(both);
+    store.publish(at(5));
+    assert_eq!(counts(at(5)), (1, 1));
+    // A membership write builds every pool's rows again and counts the
+    // reports they carry: the member that joins the second model holds
+    // none, and the first model's one report stands.
+    admit(&store, facts("http://c:8000", Role::Single, &[OTHER]));
+    assert_eq!(counts(at(5)), (1, 2));
+    store.record(both, 0, load(1, 0), at(6), LoadSource::Stream);
+    assert_eq!(counts(at(6)), (0, 1));
 }
 
 /// Where the published rows of the model's single pool stand.

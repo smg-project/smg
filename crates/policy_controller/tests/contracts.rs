@@ -218,7 +218,7 @@ fn pool_record() -> &'static [&'static str] {
             generation,
             zones,
             reach,
-            rated,
+            reported,
         }
     )
 }
@@ -687,7 +687,7 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
         ProtoMirror {
             message: "PoolFacts",
             record: pool_record(),
-            host_only: &["reach", "rated"],
+            host_only: &["reach", "reported"],
             wire_only: &[],
             wire: &[
                 ("pool_size", Type::Uint32),
@@ -896,7 +896,7 @@ fn wit_mirrors() -> Vec<WitMirror> {
         WitMirror {
             record: "pool",
             crate_record: pool_record(),
-            host_only: &["reach", "rated"],
+            host_only: &["reach", "reported"],
             before: &[],
             beside: &[],
         },

@@ -115,7 +115,7 @@ fn a_decision_after_the_first_allocates_nothing_for_any_preset() {
 /// A decision asked by rank allocates nothing after the thread's first of
 /// its size, whatever that first was: by rank where no row holds the
 /// request's prefix, a draw for a request that names rows, or the whole
-/// pass over a pool not said to hold a rate on every row. The second
+/// pass over a pool not said to hold a report on every row. The second
 /// decision puts the holders in front: one row in eight, each running one
 /// request at a rate a token a second from the next, with a long queue on
 /// one row behind them. Its targets are the four fastest holders in their
@@ -199,14 +199,14 @@ fn a_decision_by_rank_after_the_first_allocates_nothing() {
             ),
         ];
         let said = PoolFacts {
-            rated: true,
+            reported: true,
             ..pool(n)
         };
         let unsaid = pool(n);
         let cx = Constraints::default();
-        for (order, (first, rated)) in firsts.iter().enumerate() {
+        for (order, (first, reported)) in firsts.iter().enumerate() {
             let mut scratch = Scratch::new();
-            let of_first = if *rated { &said } else { &unsaid };
+            let of_first = if *reported { &said } else { &unsaid };
             engine
                 .decide(first, of_first, &view, &cx, &mut scratch)
                 .pick()
@@ -225,7 +225,7 @@ fn a_decision_by_rank_after_the_first_allocates_nothing() {
             );
             // A whole pass sizes no list of the rows in front: without a
             // soft filter the first decision by rank takes that room.
-            let lists_late = !soft && !*rated;
+            let lists_late = !soft && !*reported;
             assert_eq!(
                 allocations,
                 usize::from(lists_late),

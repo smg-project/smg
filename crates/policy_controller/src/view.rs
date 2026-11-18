@@ -1083,28 +1083,27 @@ pub struct PoolFacts<'a> {
     /// rotation does, keys it by this too. In-process only: a plugin reads
     /// the rows it is handed.
     pub reach: u64,
-    /// Whether every row of the pool holds a rate: a report whose
-    /// `live_rate` is above zero. A host says so where it knows it of the
-    /// rows it wrote, and a decision reads it once: a profile decided by
-    /// rank ([`Scorer::spread`](crate::Scorer::spread)) is asked by rank
-    /// only where it is on, since the load stage costs a row without a
-    /// report from every row that holds one. By rank the targets are the
-    /// whole pass's wherever its sums tell the rows in front apart: rows it
-    /// rounds to one sum it draws among, and by rank they are ordered. Off
-    /// by default: a host that does not say it gets the whole pass. A host
-    /// that says it of a pool that holds a row without a rate is answered
-    /// by what the row lacks. A report without a rate among the rows in
-    /// front drains as in the whole pass, at the mean rate of the rows
-    /// that pass costs: the load stage folds it over them, and the
-    /// decision is the one by rank. A row without a report there makes the
-    /// stage say that it must be asked whole
-    /// ([`Front::Whole`](crate::Front::Whole)): the decision is the whole
-    /// pass's, and it paid for its ranks' reading. Behind the rows in
-    /// front neither is costed where they decide alone, and the decision
-    /// is the one by rank. Where they cannot, their band being wider than
-    /// the ranks leave room for, every row is asked, that row with them,
-    /// and the decision is the whole pass's. In-process only.
-    pub rated: bool,
+    /// Whether every row of the pool holds a report. A host says so where
+    /// it knows it of the rows it wrote, and a decision reads it once: a
+    /// profile decided by rank ([`Scorer::spread`](crate::Scorer::spread))
+    /// is asked by rank only where it is on, since the load stage costs a
+    /// row without a report from every row that holds one. By rank the
+    /// targets are the whole pass's wherever its sums tell the rows in
+    /// front apart: rows it rounds to one sum it draws among, and by rank
+    /// they are ordered. Off by default: a host that does not say it gets
+    /// the whole pass. A report without a rate is a report: among the rows
+    /// in front it drains as in the whole pass, at the mean rate of the
+    /// rows that pass costs, which the load stage folds over them, and the
+    /// decision is the one by rank. A host that says the fact of a pool
+    /// that holds a row without a report is answered by what the row
+    /// lacks: in front it makes the stage say that it must be asked whole
+    /// ([`Front::Whole`](crate::Front::Whole)), and the decision is the
+    /// whole pass's, which paid for its ranks' reading. Behind the rows in
+    /// front it is not costed where they decide alone, and the decision is
+    /// the one by rank. Where they cannot, their band being wider than the
+    /// ranks leave room for, every row is asked, that row with them, and
+    /// the decision is the whole pass's. In-process only.
+    pub reported: bool,
 }
 
 #[cfg(test)]
