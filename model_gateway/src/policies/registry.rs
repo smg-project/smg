@@ -2877,7 +2877,9 @@ mod tests {
         ];
         registry.reconcile_in_flight(decode.as_ref());
         drop(held);
-        registry.reconcile_in_flight(decode.as_ref());
+        // The second time as the worker's monitor asks it: through the trait.
+        let consumer: &dyn LoadConsumer = registry.as_ref();
+        consumer.reconcile_in_flight(decode.as_ref());
         assert_eq!(
             decode_policy.reconciled.lock().unwrap().as_slice(),
             [
