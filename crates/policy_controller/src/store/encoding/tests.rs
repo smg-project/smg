@@ -297,6 +297,7 @@ fn the_classes_hold_exactly_the_handoffs_the_rule_makes_worker_by_worker() {
                             producer,
                             consumer,
                             connector: connector.map(str::to_string),
+                            references: false,
                         },
                     });
                 }

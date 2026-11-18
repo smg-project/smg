@@ -1,6 +1,7 @@
 //! The policy spec's calls as a test binary makes them on a replica's
-//! control listener, the two documents its cases hand over, and the wait
-//! they share: on an answer, never on a clock, and no longer than its room.
+//! control listener, the two documents its cases hand over, and the waits
+//! they share: on an answer, never on a clock, and no longer than the room.
+//! A call's connection and its answer each end inside the room too.
 
 use std::{fmt::Debug, future::Future, time::Duration};
 
@@ -26,11 +27,18 @@ pub const LEAST_LOAD: &str = "apiVersion: smg.policy/v1\nprofiles:\n  default:\n
 pub const RANDOM: &str =
     "apiVersion: smg.policy/v1\nprofiles:\n  default:\n    filter: [healthy]\n    pick: random\n";
 
+/// `wait`'s answer inside the room: a wait that outlasts it fails the case,
+/// by `what` it waited for.
+pub async fn inside<T>(what: &str, wait: impl Future<Output = T>) -> T {
+    time::timeout(ROOM, wait).await.expect(what)
+}
+
 /// A client of the replica's control listener.
 pub async fn control(
     replica: &Replica,
 ) -> Result<PolicyControllerClient<tonic::transport::Channel>, Status> {
-    PolicyControllerClient::connect(format!("http://{}", replica.control))
+    let dial = PolicyControllerClient::connect(format!("http://{}", replica.control));
+    inside("the control listener's connection", dial)
         .await
         .map_err(|error| Status::unavailable(error.to_string()))
 }
@@ -47,9 +55,9 @@ pub fn as_operator<T>(message: T) -> Request<T> {
 
 /// One `GetPolicySpec` call on the control listener, as `operator-a`.
 pub async fn read(replica: &Replica, generation: u64) -> Result<PolicySpecDocument, Status> {
-    control(replica)
-        .await?
-        .get_policy_spec(as_operator(GetPolicySpecRequest { generation }))
+    let mut client = control(replica).await?;
+    let call = client.get_policy_spec(as_operator(GetPolicySpecRequest { generation }));
+    inside("the read call's answer", call)
         .await
         .map(Response::into_inner)
 }
@@ -78,9 +86,9 @@ pub async fn apply_over(
         mode: mode.into(),
         expected_digest: expected.to_owned(),
     };
-    control(replica)
-        .await?
-        .apply_policy_spec(as_operator(request))
+    let mut client = control(replica).await?;
+    let call = client.apply_policy_spec(as_operator(request));
+    inside("the apply call's answer", call)
         .await
         .map(Response::into_inner)
 }

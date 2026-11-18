@@ -3377,21 +3377,6 @@ impl<G: Generation> WorkerRegistry<G> {
     }
 }
 
-/// The registry as a peer that asks one thing of it holds it: the worker
-/// registered under a URL. Such a holder reads no generation, so it names
-/// no value of the registry's host.
-pub(crate) trait WorkerLookup: Send + Sync {
-    /// The worker registered under `url`, as [`WorkerRegistry::get_by_url`]
-    /// reads it.
-    fn get_by_url(&self, url: &str) -> Option<Arc<dyn Worker>>;
-}
-
-impl<G: Generation> WorkerLookup for WorkerRegistry<G> {
-    fn get_by_url(&self, url: &str) -> Option<Arc<dyn Worker>> {
-        Self::get_by_url(self, url)
-    }
-}
-
 /// Collect the unique model IDs advertised by a worker.
 ///
 /// Public so workflow steps can share the same de-duplication rule

@@ -61,7 +61,7 @@
 //!
 //! - Section 9, the WebAssembly plugin host (the `wasm` module, behind the `wasm`
 //!   feature): user policies as components of the committed `smg:policy`
-//!   package, one kept instance per deciding thread, every call under fuel,
+//!   package, one kept instance per decider, every call under fuel,
 //!   bound to a profile as the framework's own stages. What every plugin
 //!   kind shares (the breaker, the counters, the stage adapters) is the
 //!   `plugins` module.
@@ -90,12 +90,14 @@
 //! report's sample instant); the wire carries durations only.
 
 pub mod affinity;
+pub mod bucket;
 pub mod builtins;
 pub mod catalog;
 #[cfg(feature = "client")]
 pub mod client;
 #[cfg(feature = "controller")]
 pub mod controller;
+pub mod decider;
 pub mod decision;
 pub mod elector;
 pub mod framework;
@@ -124,9 +126,9 @@ pub use decision::{
     MAX_TARGETS, TRACE_TOP,
 };
 pub use framework::{
-    Binding, DecisionScope, Engine, Filter, Front, Narrowed, PairPools, PairTable, PairTableError,
-    Picker, Plan, Profile, Scorer, Scratch, Spread, TieBand, Weighted, DRAW_BOUND, DRAW_FROM,
-    RANK_FROM,
+    Binding, DecisionScope, EncodeItems, EncodePlaced, EncodePool, EncoderFacts, Engine, Filter,
+    Front, Narrowed, PairPools, PairTable, PairTableError, Picker, Plan, Profile, Scorer, Scratch,
+    Spread, TieBand, Weighted, DRAW_BOUND, DRAW_FROM, RANK_FROM,
 };
 pub use lease::{
     EventKind, EventSet, Lease, LeaseId, LeaseKind, Lifecycle, Membership, Outcome, ReleaseReason,

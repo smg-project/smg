@@ -28,7 +28,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use replicas::{Lease, Record, Replica};
+use replicas::{Lease, Record, Replica, ROOM};
 use smg_policy_controller::{
     elector::ElectionSettings,
     proto::{
@@ -398,8 +398,17 @@ async fn a_watcher_learns_the_fleet_in_the_logs_order_and_resumes_by_its_place()
             .expect_err("a status ends the stream");
         assert_eq!(ended.code(), Code::Aborted, "{ended:?}");
     }
+    // The follower takes the lease at the leader's release. A release that
+    // did not land inside the leader's grace period leaves the lease to run
+    // out, and the follower leads once it has: the wait is the lease's own
+    // timing and the kit's room.
+    let timing = settings();
     let promoted = record
-        .promoted(&mut replicas, term, Duration::from_secs(30))
+        .promoted(
+            &mut replicas,
+            term,
+            timing.duration + timing.renew_period + ROOM,
+        )
         .await
         .expect("the follower leads");
 

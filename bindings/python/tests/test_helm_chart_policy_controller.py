@@ -75,9 +75,10 @@ ELECTION = "policyController.election.enabled=true"
 ELECTED = (*ON, ELECTION)
 # The spellings of an election that is off.
 OFF = ((), ("policyController.election.enabled=false",), ("policyController.election=null",))
-# The strategy of a controller with the election off: no pod more at a
-# time, so the old pod is told to stop before the new one is made. The type
-# is the rolling update's, as with the election on.
+# The strategy of a controller on a document with the election off: no pod
+# more at a time, so the old pod is told to stop before the new one is made.
+# The type is the rolling update's, as with the election on. A controller on
+# a spec store recreates its pod instead.
 LONE_STRATEGY = {"type": "RollingUpdate", "rollingUpdate": {"maxSurge": 0, "maxUnavailable": 1}}
 # The variable the elected controller's address is read from: the kubelet
 # writes the pod's address in place of $(POD_IP).
@@ -102,6 +103,14 @@ UNKNOWN_FILTER = {
 # the controller is passed.
 SPEC_MOUNT = "/etc/smg/policy-spec"
 SPEC_FILE = f"{SPEC_MOUNT}/spec.yaml"
+# The claim a spec store's cases name, the controller turned on over that
+# store, and where the pod mounts the claim: the directory the controller is
+# passed.
+CLAIM = "smg-policy-spec"
+STORED = (SWITCH, f"policyController.specStoreClaim={CLAIM}")
+STORE_MOUNT = "/var/lib/smg/spec"
+# The example on a spec store: it names its own source.
+STORE_EXAMPLE = "with-policy-controller-spec-store.yaml"
 # The started controller is read on a loopback port: a proxy named in the
 # environment is not asked for it.
 DIRECT = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -290,7 +299,10 @@ def test_turned_on_over_values_with_no_block_renders_a_fresh_install(chart_with_
     chart's own values until it renders, the upgrade renders a fresh install,
     byte for byte: nothing is left to another default."""
     rounds, answered, given = answered_as_the_schema_names(chart_with_no_block)
-    assert rounds[0] == set(schema_block()["then"]["required"])
+    # With no spec store named the document is required too, by the
+    # condition under the block's own.
+    turned_on = schema_block()["then"]
+    assert rounds[0] == {*turned_on["required"], *turned_on["else"]["required"]}
     fresh = helm_template(ON)
     assert fresh.returncode == 0, fresh.stderr
     assert answered == fresh.stdout
@@ -311,11 +323,11 @@ def test_turned_on_over_values_with_no_block_renders_a_fresh_install(chart_with_
 
 
 @needs_helm
-def test_only_its_own_example_turns_the_controller_on():
+def test_only_its_own_examples_turn_the_controller_on():
     examples = sorted(EXAMPLES.glob("*.yaml"))
     assert examples, "the chart has examples"
     on = [example.name for example in examples if of_the_controller(render(files=(example,)))]
-    assert on == ["with-policy-controller.yaml"]
+    assert on == [STORE_EXAMPLE, "with-policy-controller.yaml"]
 
 
 @needs_helm
@@ -324,10 +336,13 @@ def test_an_example_on_a_release_with_no_controller_image_needs_the_tag_named():
     tag, or the example pins the router at a release with no controller
     image and the chart says so until the controller's tag is named."""
     for example in sorted(EXAMPLES.glob("*.yaml")):
-        completed = helm_template(ON, files=(example,))
+        # The store's example names its source: a document beside it is
+        # refused, so the switch alone turns it on.
+        switches = (SWITCH,) if example.name == STORE_EXAMPLE else ON
+        completed = helm_template(switches, files=(example,))
         if completed.returncode != 0:
             assert "policyController.image.tag is needed" in completed.stderr, example.name
-            named = render(*ON, "policyController.image.tag=mine", files=(example,))
+            named = render(*switches, "policyController.image.tag=mine", files=(example,))
             assert container(named)["image"].endswith(":mine"), example.name
 
 
@@ -574,6 +589,127 @@ def test_a_controller_with_no_spec_document_is_refused_by_name(tmp_path):
         assert of_the_schema in render_error(*settings, files=files), name
         of_the_helper = render_error(*settings, files=files, skip_schema=True)
         assert "policyController.spec holds no document: the controller refuses" in of_the_helper
+
+
+@needs_helm
+def test_a_spec_store_renders_its_claim_its_mount_and_its_flag(tmp_path):
+    """A claim named as the spec store's is the pod's one volume, mounted for
+    writing where the controller is passed --spec-store. No ConfigMap is
+    rendered: the controller runs what an operator applies. The pod's
+    fsGroup hands the volume to the container's user: it follows runAsUser
+    and is left out with it."""
+    documents = render(*STORED)
+    assert sorted(document["kind"] for document in of_the_controller(documents)) == [
+        "Deployment",
+        "Service",
+    ]
+    deployment = one(documents, "Deployment")["spec"]
+    pod = deployment["template"]["spec"]
+    found = container(documents)
+    assert pod["volumes"] == [
+        {"name": "policy-spec-store", "persistentVolumeClaim": {"claimName": CLAIM}}
+    ]
+    assert found["volumeMounts"] == [{"name": "policy-spec-store", "mountPath": STORE_MOUNT}]
+    # The store's flag stands where the file's stood, and nothing else of
+    # the arguments is another.
+    assert found["args"][-2:] == ["--spec-store", STORE_MOUNT]
+    assert found["args"][:-2] == controller_args()[:-2]
+    assert "--spec-file" not in found["args"]
+    # One pod at a time opens the store: the old pod is gone before the new
+    # one is made, where the document's form waits for its stop signal
+    # alone. The rolling update's fields are named as nothing, which takes
+    # them off a live object.
+    assert deployment["strategy"] == {"type": "Recreate", "rollingUpdate": None}
+    assert one(render(*ON), "Deployment")["spec"]["strategy"] == LONE_STRATEGY
+    # The read-only root filesystem stands: the store is a volume of its own.
+    assert found["securityContext"]["readOnlyRootFilesystem"] is True
+    assert pod["securityContext"] == {"fsGroup": 65532}
+    other = render(*STORED, "policyController.securityContext.runAsUser=1000")
+    assert one(other, "Deployment")["spec"]["template"]["spec"]["securityContext"] == {
+        "fsGroup": 1000
+    }
+    unnamed = render(*STORED, "policyController.securityContext.runAsUser=null")
+    assert "securityContext" not in one(unnamed, "Deployment")["spec"]["template"]["spec"]
+    # A number of a values file is a float there: the group is written digit
+    # for digit, as the container's user is.
+    wide = tmp_path / "wide.yaml"
+    user = {"securityContext": {"runAsUser": 1000680000}}
+    wide.write_text(yaml.safe_dump({"policyController": user}))
+    written = helm_template(STORED, files=(wide,))
+    assert written.returncode == 0, written.stderr
+    assert "fsGroup: 1000680000\n" in written.stdout
+    assert "runAsUser: 1000680000\n" in written.stdout
+    # The document's form names no group: its mount is read-only.
+    assert "securityContext" not in one(render(*ON), "Deployment")["spec"]["template"]["spec"]
+    # A name of digits alone stays text in the manifest.
+    digits = tmp_path / "digits.yaml"
+    digits.write_text(yaml.safe_dump({"policyController": {"specStoreClaim": "123"}}))
+    (volume,) = one(render(SWITCH, files=(digits,)), "Deployment")["spec"]["template"]["spec"][
+        "volumes"
+    ]
+    assert volume["persistentVolumeClaim"] == {"claimName": "123"}
+
+
+@needs_helm
+def test_a_spec_store_is_refused_beside_what_the_controller_refuses(tmp_path):
+    """What the controller refuses at start beside a spec store is refused at
+    render, in its reasons: a document, since a start names one source of
+    its spec, and the election, since a standby does not follow an applied
+    generation. A second replica is refused with the one way out: a store
+    takes no election. A claim that is no text, or no name a claim can
+    have, is refused by the schema, and the first by the helper where the
+    schema's check is skipped."""
+    both = render_error(*STORED, "policyController.spec.apiVersion=smg.policy/v1")
+    assert (
+        f"policyController.specStoreClaim names {CLAIM} and policyController.spec holds a"
+        " document: the controller refuses a start that names two sources of its policy spec"
+    ) in both
+    # Over reused values an empty map clears nothing: the refusal says the
+    # null that does.
+    assert "Set policyController.spec to null" in both
+    document = spec_values(tmp_path, LEAST_LOAD)
+    assert "names two sources of its policy spec" in render_error(*STORED, files=(document,))
+    for settings in ((ELECTION,), (ELECTION, "policyController.replicas=2")):
+        elected = render_error(*STORED, *settings)
+        assert (
+            f"policyController.specStoreClaim names {CLAIM} with"
+            " policyController.election.enabled on: another replica can take the controller's"
+            " lease, and a standby does not follow an applied generation in this build"
+        ) in elected, settings
+    pair = render_error(*STORED, "policyController.replicas=2")
+    assert (
+        "policyController.replicas is 2 beside policyController.specStoreClaim: each replica"
+        " would lead alone, and a spec store holds one controller's generations. Keep one"
+        " replica"
+    ) in pair
+    assert "Turn the election on" not in pair
+    number = "policyController.specStoreClaim=5"
+    assert "policyController.specStoreClaim: Invalid type" in render_error(SWITCH, number)
+    assert (
+        "policyController.specStoreClaim is 5: the name of a PersistentVolumeClaim, as text"
+    ) in render_error(SWITCH, number, skip_schema=True)
+    assert "policyController.specStoreClaim: Does not match pattern" in render_error(
+        SWITCH, "policyController.specStoreClaim=Not_A_Name"
+    )
+
+
+def test_the_chart_says_how_many_generations_a_store_keeps():
+    """A spec store keeps its last generations by the crate's own count. The
+    values, the README and the store's example each say that count in words:
+    a count that moves fails here until the three follow."""
+    store = REPO / "crates" / "policy_controller" / "src" / "controller" / "spec_store.rs"
+    (retained,) = re.findall(
+        r"^pub\(crate\) const RETAINED: usize = (\d+);$", store.read_text(), re.M
+    )
+    word = {"8": "eight"}[retained]
+    said = {
+        surface.name: " ".join(surface.read_text().replace("#", " ").split())
+        for surface in (VALUES, CHART / "README.md", EXAMPLES / STORE_EXAMPLE)
+    }
+    for name, text in said.items():
+        assert f"holds {word} documents" in text, name
+    for name in (VALUES.name, "README.md"):
+        assert f"the last {word} " in said[name], name
 
 
 def without_the_document(documents: list[dict]) -> list[dict]:
@@ -1107,12 +1243,15 @@ def test_the_rollout_follows_the_election():
 def test_with_the_election_off_an_upgrade_tells_the_old_pod_to_stop_first():
     """Off, every pod leads alone, and the server's own strategy starts the
     new pod beside the old one: two leaders until the new one is ready. The
-    lone controller rolls with no pod more at a time. Its strategy keeps the
-    rolling update's type and names both of its fields, as the elected one
-    does. The API refuses those fields beside Recreate, and a server-side
-    apply takes off a live object only what it put there: the server's own,
-    on a Deployment that named no strategy, would stay. So no upgrade
-    between the three strategies has a field to take off."""
+    lone controller on a document rolls with no pod more at a time. Its
+    strategy keeps the rolling update's type and names both of its fields,
+    as the elected one does. The API refuses those fields beside Recreate,
+    and a server-side apply takes off a live object only what it put there:
+    the server's own, on a Deployment that named no strategy, would stay. So
+    no upgrade between these three strategies has a field to take off. The
+    fourth, a spec store's, recreates and names the rolling update's fields
+    as nothing: an upgrade to it takes them off, and its case is the store's
+    render."""
     for off in OFF:
         assert one(render(*ON, *off), "Deployment")["spec"]["strategy"] == LONE_STRATEGY, off
     served = {
@@ -1417,6 +1556,8 @@ SAME_AS_THE_DEFAULT = {
     "election",
     "election.enabled",
     "election.leaseName",
+    # No spec store: the document's form.
+    "specStoreClaim",
 }
 # These are legal too: each is a switch, and its null turns it off.
 SWITCHED_OFF_BY_A_NULL = {
@@ -1574,6 +1715,15 @@ def test_the_binary_parses_every_rendered_argument(binary, name):
 
 
 @needs_helm
+def test_the_binary_parses_a_spec_stores_rendered_arguments(binary):
+    """The store's form passes one flag no set above does: the binary reads
+    it where the file's flag stood."""
+    args = container(render(*STORED))["args"]
+    parsed = parse(binary, args)
+    assert parsed.returncode == 0, f"the controller refuses {args}: {parsed.stderr}"
+
+
+@needs_helm
 def test_the_binary_refuses_a_rendered_flag_spelled_wrong(binary):
     """The parse above has teeth: one flag of the rendered arguments spelled
     wrong, or one value the flag cannot read, and the binary refuses."""
@@ -1633,9 +1783,10 @@ def test_the_image_job_starts_on_what_these_cases_read():
     """The job that runs these cases on the image's binary starts when
     something they read changes: this file, what configures its run and
     every file of the chart a render reads. The chart's alert rule tests are
-    read by no case, so they start nothing. The chart's README and the two
-    publishing workflows are each read by one render case and by no binary
-    case: the unit job, which starts on every pull request, runs those. The
+    read by no case, so they start nothing. The chart's README is read by one
+    render case and, as text, by the case of the store's count, and the two
+    publishing workflows by one render case each. No binary case reads
+    them: the unit job, which starts on every pull request, runs those. The
     binary the cases run is built by the image's file from the crate's
     manifest, build script, source and contracts under the pinned toolchain,
     and from the engine wire's messages the protocol imports: the job starts
@@ -1657,6 +1808,9 @@ def test_the_image_job_starts_on_what_these_cases_read():
         crate / "Cargo.toml",
         crate / "build.rs",
         crate / "src" / "bin" / "smg-policy-controller.rs",
+        # The store's own count of the generations it keeps, which the
+        # chart's texts say in words.
+        crate / "src" / "controller" / "spec_store.rs",
         crate / "contracts" / "smg-policy.wit",
         # The engine wire's messages the controller's protocol imports: the
         # build script reads them beside the contract.
@@ -1719,6 +1873,11 @@ def test_the_binary_refuses_at_start_what_the_chart_refuses_at_render(binary, tm
     # Every other start here names one, an empty store: its own refusal is
     # the one read.
     source = ["--spec-store", str(tmp_path)]
+    # A start that names both sources is refused by the two flags' names as
+    # well: the chart refuses a document beside a spec store's claim.
+    doubled = refusal(binary, ["--spec-file", str(tmp_path / "spec.yaml"), *source])
+    assert "--spec-file" in doubled and "--spec-store" in doubled
+    assert "cannot be used with" in doubled
     port = free_ports(1)[0]
     shared = refusal(
         binary,
@@ -1750,6 +1909,24 @@ def test_the_binary_refuses_at_start_what_the_chart_refuses_at_render(binary, tm
         ],
     )
     assert 'no listener is named "admin"' in unknown
+
+
+def first_ready(process: subprocess.Popen, url: str) -> dict | None:
+    """The body of the first 200 the readiness probe's address answers, asked
+    for twenty seconds, and ``None`` where none came. A controller that
+    exits meanwhile fails the case with its output."""
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            output = process.stdout.read() if process.stdout else ""
+            raise AssertionError(f"the controller exited: {output}")
+        try:
+            with DIRECT.open(url, timeout=2) as response:
+                assert response.status == 200
+                return json.load(response)
+        except (urllib.error.URLError, ConnectionError):
+            time.sleep(0.1)
+    return None
 
 
 @needs_helm
@@ -1803,18 +1980,8 @@ def test_the_binary_starts_on_the_rendered_arguments(binary, tmp_path):
         text=True,
     )
     try:
-        body = None
-        deadline = time.monotonic() + 20
-        while body is None and time.monotonic() < deadline:
-            assert process.poll() is None, f"the controller exited: {process.stdout.read()}"
-            try:
-                with DIRECT.open(url, timeout=2) as response:
-                    assert response.status == 200
-                    body = json.load(response)
-            except (urllib.error.URLError, ConnectionError):
-                time.sleep(0.1)
         # One replica with no lease flag leads itself.
-        assert body == {"status": "ready", "role": "leader"}
+        assert first_ready(process, url) == {"status": "ready", "role": "leader"}
         for other in others:
             with DIRECT.open(other, timeout=2) as response:
                 assert response.status == 200, other
@@ -1836,6 +2003,58 @@ def test_the_binary_starts_on_the_rendered_arguments(binary, tmp_path):
         for listener in ("gateway", "control", "replication", "ingestion"):
             assert any(f"listener={listener}" in line for line in told), (listener, output)
         assert "\x1b" not in output, f"an escape byte with no terminal: {output!r}"
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+
+
+@needs_helm
+def test_the_binary_starts_on_a_spec_stores_rendered_arguments(binary, tmp_path):
+    """The controller started with exactly what the Deployment passes on a
+    spec store's claim (ports free here, a short grace period, a directory of
+    the case's in place of the claim's mount) answers its readiness probe
+    with nothing on file, reads generation 0 on its series, writes nothing
+    before an apply and stops clean on SIGTERM."""
+    gateway, control, replication, admin = free_ports(4)
+    documents = render(
+        *STORED,
+        f"policyController.ports.gateway={gateway}",
+        f"policyController.ports.control={control}",
+        f"policyController.ports.replication={replication}",
+        f"policyController.ports.admin={admin}",
+        "policyController.shutdownGracePeriodSeconds=4",
+        "policyController.shutdownSettleSeconds=1",
+    )
+    found = container(documents)
+    (mount,) = found["volumeMounts"]
+    store = tmp_path / "store"
+    store.mkdir()
+    arguments = [
+        str(store) if argument == mount["mountPath"] else argument for argument in found["args"]
+    ]
+    assert arguments != found["args"], "no argument names the claim's mount"
+    probe = found["readinessProbe"]["httpGet"]
+    # Under Kubernetes HOSTNAME is the pod's name.
+    environment = {k: v for k, v in os.environ.items() if k not in LOG_VARIABLES}
+    environment["HOSTNAME"] = "smg-policy-controller-6d5f7c9b8-x2x4z"
+    process = subprocess.Popen(
+        [binary, *arguments],
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    try:
+        ready = first_ready(process, f"http://127.0.0.1:{admin}{probe['path']}")
+        assert ready == {"status": "ready", "role": "leader"}
+        with DIRECT.open(f"http://127.0.0.1:{admin}/metrics", timeout=2) as response:
+            series = response.read().decode().splitlines()
+        assert "smg_policy_spec_generation 0" in series
+        assert list(store.iterdir()) == []
+        process.send_signal(signal.SIGTERM)
+        output, _ = process.communicate(timeout=15)
+        assert process.returncode == 0, output
     finally:
         if process.poll() is None:
             process.kill()
@@ -2097,6 +2316,50 @@ def one_leads_and_one_follows(pods: list[ElectedPod]) -> None:
         assert time.monotonic() < deadline, f"no leader and follower in 20 s: {roles}"
         time.sleep(0.2)
         roles = [pod.readiness()[1].get("role", "") for pod in pods]
+
+
+@needs_helm
+def test_the_binary_refuses_a_spec_store_beside_the_charts_election(binary, tmp_path):
+    """The chart refuses a spec store's claim beside the election, in the
+    controller's reason. The controller says it here: the elected
+    Deployment's own arguments over the chart's Lease, with a store named in
+    the document's place, are refused at start, and nothing is written."""
+    gateway, control, replication, admin = free_ports(4)
+    documents = render(
+        *ELECTED,
+        "policyController.replicas=2",
+        f"policyController.ports.gateway={gateway}",
+        f"policyController.ports.control={control}",
+        f"policyController.ports.replication={replication}",
+        f"policyController.ports.admin={admin}",
+    )
+    (rule,) = one(documents, "Role")["rules"]
+    stand_in = LeaseStandIn([rule])
+    try:
+        stand_in.apply(one(documents, "Lease"))
+        store = tmp_path / "store"
+        store.mkdir()
+        arguments = [
+            argument.replace("$(POD_IP)", "127.0.0.1") for argument in container(documents)["args"]
+        ]
+        at = arguments.index("--spec-file")
+        arguments[at : at + 2] = ["--spec-store", str(store)]
+        environment = {
+            key: value
+            for key, value in os.environ.items()
+            if key not in LOG_VARIABLES and key not in AMBIENT
+        }
+        environment["HOSTNAME"] = POD_NAMES[0]
+        environment["KUBECONFIG"] = str(client_configuration(tmp_path, stand_in.url))
+        completed = subprocess.run(
+            [binary, *arguments], capture_output=True, text=True, timeout=30, env=environment
+        )
+        said = completed.stdout + completed.stderr
+        assert completed.returncode != 0, f"the controller started on a store and a lease: {said}"
+        assert "another replica can take this controller's lease" in said
+        assert list(store.iterdir()) == []
+    finally:
+        stand_in.close()
 
 
 @needs_helm

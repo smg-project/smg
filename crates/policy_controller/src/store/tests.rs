@@ -8,11 +8,13 @@ use super::{
     leases::{Counts, Slot},
     Ask, BatchFacts, BatchOutcome, ContentHash, Dispatch, GatewayId, HealthSink, KvEvent,
     KvEventSink, LeaseRecord, LeaseRefused, LeaseState, LeasesStore, LoadSink, LoadSource,
-    MembershipChange, MembershipTail, MemoryStore, Pin, PollMode, Reachability, ReservationKind,
-    ReservationStore, ResyncReason, SequenceHash, SessionsStore, Signals, SnapshotChunk,
-    StoredBlock, VetoWrite, ViewBuffers, WorkerFacts, WorkerPatch, WorkerStatus, WorkersStore,
+    MembershipChange, MembershipTail, MemoryStore, Picked, Pin, PollMode, Reachability,
+    ReservationKind, ReservationStore, ResyncReason, SequenceHash, SessionsStore, Signals,
+    SnapshotChunk, StoredBlock, VetoWrite, ViewBuffers, WorkerFacts, WorkerPatch, WorkerStatus,
+    WorkersStore,
 };
 use crate::{
+    decision::{Target, Targets},
     lease::{Lease, LeaseId, Membership, Outcome, ReleaseReason, Side, TransportClass},
     view::{fingerprint, LoadRow, Role, SignalSource, WorkerId},
 };
@@ -62,6 +64,7 @@ fn lease(gateway: GatewayId, id: u64, term: u64, now: Instant) -> LeaseRecord {
         gateway,
         request: id,
         target: WorkerId(7),
+        picked: Picked::default(),
         decode: None,
         term,
         issued_at: now,
@@ -1150,6 +1153,51 @@ fn two_gateways_sharing_a_lease_number_hold_separate_reservations() {
     assert_eq!(rooms.held(id, ReservationKind::Room), 0);
 }
 
+#[cfg(feature = "controller")]
+#[test]
+fn the_pins_sweep_drops_the_pins_past_the_rules_ttl_once_an_interval() {
+    use crate::spec::{AppliedSpec, PolicySpec};
+
+    let store = MemoryStore::new();
+    let now = Instant::now();
+    let t = |seconds: u64| now + Duration::from_secs(seconds);
+    let sessions: &dyn SessionsStore = &store;
+    // No sessions rule stands: no pass runs, whatever the age of a pin.
+    sessions.pin(1, WorkerId(1), now);
+    assert_eq!(store.sweep_pins(t(1_000_000)), 0);
+    // The manual preset, its keys pinned for `ttl_s` and swept every
+    // `sweep_s`.
+    let ruled = |generation: u64, ttl_s: u32, sweep_s: u32| {
+        let mut document = PolicySpec::preset("manual").expect("a preset of this build");
+        document.generation = generation;
+        let rule = document.bindings[0].sessions.as_mut();
+        let rule = rule.expect("the preset's rule");
+        (rule.ttl_s, rule.sweep_s) = (ttl_s, sweep_s);
+        AppliedSpec::validate(&document).expect("the document validates")
+    };
+    store.apply(ruled(1, 60, 30)).expect("a first generation");
+    for key in 2..=1_001 {
+        sessions.pin(key, WorkerId(1), t(10));
+    }
+    assert_eq!(sessions.len(), 1_001);
+    // The first pass: the pin of second 0 is past the TTL at second 61.
+    assert_eq!(store.sweep_pins(t(61)), 1);
+    // A tick inside the interval walks nothing, though every pin is old.
+    assert_eq!(store.sweep_pins(t(80)), 0);
+    assert_eq!(sessions.len(), 1_000);
+    // The next pass due: the thousand pins of second 10 leave together,
+    // so the table holds the keys of one TTL and one interval at most.
+    assert_eq!(store.sweep_pins(t(91)), 1_000);
+    assert!(sessions.is_empty());
+    // A rule that keeps its keys for ever: no pass runs.
+    store
+        .apply(ruled(2, u32::MAX, u32::MAX))
+        .expect("a later generation");
+    sessions.pin(1, WorkerId(1), now);
+    assert_eq!(store.sweep_pins(t(1_000_000)), 0);
+    assert_eq!(sessions.len(), 1);
+}
+
 #[test]
 fn a_pin_is_written_at_the_commit_and_leaves_with_its_worker_or_its_age() {
     let store = MemoryStore::new();
@@ -1691,6 +1739,55 @@ fn a_sweeps_one_write_gives_back_the_counts_of_every_gateway_that_goes() {
     assert_eq!(leases.drop_gateways(&[GatewayId(3), GatewayId(1)]), [1, 2]);
     assert_eq!(in_flight(&store), of(2, 0));
     assert_eq!(leases.live(GatewayId(2)), 2);
+}
+
+#[test]
+fn a_dispatch_on_another_target_of_the_pick_moves_the_leases_count() {
+    let store = MemoryStore::new();
+    let (a, b) = (ready(&store, "http://a:1"), ready(&store, "http://b:1"));
+    let (gateway, now) = (GatewayId(1), Instant::now());
+    store.set_term(1);
+    let of = |a_holds, b_holds| {
+        let mut rows = [(a, a_holds), (b, b_holds)];
+        rows.sort_unstable();
+        rows
+    };
+    // A pick of a, then b: the lease books a.
+    let mut targets = Targets::new();
+    for id in [a, b] {
+        targets.push(Target {
+            id,
+            ..Target::default()
+        });
+    }
+    let picked = |id: u64| LeaseRecord {
+        picked: Picked::of(&targets),
+        ..booking(gateway, id, a, now)
+    };
+    let leases: &dyn LeasesStore = &store;
+    leases.issue(picked(1)).expect("filed");
+    assert_eq!(in_flight(&store), of(1, 0));
+    // The gateway dispatched to the pick's second target: the count is b's.
+    let on = |target_index| Dispatch {
+        target_index,
+        ..Dispatch::default()
+    };
+    assert!(leases.dispatched(gateway, LeaseId(1), on(1), now));
+    assert_eq!(in_flight(&store), of(0, 1));
+    let filed = leases.get(gateway, LeaseId(1)).expect("on file");
+    assert_eq!((filed.target, filed.lease.target_index), (b, 1));
+    // A second dispatch of one lease, on the first target, moves nothing.
+    assert!(leases.dispatched(gateway, LeaseId(1), on(0), now));
+    assert_eq!(in_flight(&store), of(0, 1));
+    // The lease ends on the count it books now.
+    assert!(leases.released(gateway, LeaseId(1), None, ReleaseReason::ClientGone));
+    assert_eq!(in_flight(&store), of(0, 0));
+    // An index the pick holds no target at moves the state and no count.
+    leases.issue(picked(2)).expect("filed");
+    assert!(leases.dispatched(gateway, LeaseId(2), on(2), now));
+    assert_eq!(in_flight(&store), of(1, 0));
+    let state = leases.get(gateway, LeaseId(2)).map(|record| record.state);
+    assert_eq!(state, Some(LeaseState::Dispatched { at: now }));
 }
 
 #[test]

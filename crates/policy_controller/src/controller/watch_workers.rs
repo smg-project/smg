@@ -1205,7 +1205,11 @@ pub(crate) mod tests {
         // The log starts again at a lower number and the store takes a
         // later term: an entry there is under the last one logged by its
         // number and past it by its term.
-        leader.feed.log.restart(Position { seq: 1, term: 2 });
+        leader
+            .feed
+            .log
+            .restart(Position { seq: 1, term: 2 })
+            .expect("a place the log takes");
         leader.store.set_term(3);
         let mut later = leader.watch(Start::Snapshot, &[]);
         next(&mut later).await;
@@ -1829,7 +1833,11 @@ pub(crate) mod tests {
             seq: kept.seq,
             term: kept.term + 1,
         };
-        leader.feed.log.restart(restored);
+        leader
+            .feed
+            .log
+            .restart(restored)
+            .expect("a place the log takes");
         let mut second = leader.watch(Start::Snapshot, &[]);
         let later = next(&mut second).await;
         assert_eq!((later.seq, later.term), (restored.seq, restored.term));

@@ -31,7 +31,7 @@ serde_json = { workspace = true }
 sha2 = "0.11"
 thiserror = { workspace = true }
 # The WebAssembly plugin host (`wasm`): the runtime and one kept instance per
-# module per deciding thread. The log lines a plugin writes go through the
+# module per decider. The log lines a plugin writes go through the
 # optional tracing declared with the controller's dependencies below; this
 # feature turns it on too.
 thread_local = { version = "1.1", optional = true }
@@ -326,6 +326,10 @@ name = "epd"
 harness = false
 
 [[bench]]
+name = "encode_pair"
+harness = false
+
+[[bench]]
 name = "contention"
 harness = false
 
@@ -363,6 +367,12 @@ harness = false
 
 [[bench]]
 name = "prefix_hash"
+harness = false
+
+# The `bucket` preset's rows. Apart from `decision`, as `spec_index` is:
+# that binary runs at its gate's bound.
+[[bench]]
+name = "bucket"
 harness = false
 
 [[bench]]

@@ -9,7 +9,11 @@
 //!   it had, every pool derived again, the classes carried, and published;
 //! - `policy_encodes/moved_write/<fleet>/<n>`: the same write where the
 //!   registration states another runtime each time: the model's classes,
-//!   the pair classes and the encode classes, are derived.
+//!   the pair classes and the encode classes, are derived;
+//! - `policy_encodes/build/pair/<fleet>/<n>` and
+//!   `policy_encodes/build/encode_pair/<fleet>/<n>`: one decision's build
+//!   through the pair's door, and through the encode pair's, which adds
+//!   the encode pool and its two columns.
 //!
 //! The fleets, each of one runtime and one wire:
 //!
@@ -29,13 +33,13 @@
     reason = "a bench's setup has no caller to answer"
 )]
 
-use std::hint::black_box;
+use std::{hint::black_box, time::Instant};
 
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
 use smg_policy_controller::{
     store::{
-        encoding::EncodeMember, EncodeClasses, EncodeHandoff, EncodeOffer, MemoryStore,
-        WorkerFacts, WorkersStore,
+        encoding::EncodeMember, Ask, EncodeClasses, EncodeHandoff, EncodeOffer, EncodePairBuffers,
+        GatewayId, MemoryStore, PairBuffers, WorkerFacts, WorkersStore,
     },
     Role, WireModes,
 };
@@ -52,6 +56,7 @@ fn offer(fleet: &str, role: Role, index: usize, stage: usize) -> EncodeOffer {
         producer: role == Role::Encode,
         consumer: role == Role::Prefill,
         connector: Some(format!("c{connector}")),
+        ..EncodeOffer::default()
     };
     match (fleet, role) {
         ("none" | "silent", _) | (_, Role::Decode | Role::Single) => EncodeOffer::default(),
@@ -199,5 +204,44 @@ fn moved_write(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, derivation, membership_write, moved_write);
+/// One decision's build through each pair door of a store that holds the
+/// fleet: the pair's door, and the encode pair's, which adds the encode
+/// pool and its two columns.
+fn doors(c: &mut Criterion) {
+    let mut group = c.benchmark_group("policy_encodes/build");
+    for name in FLEETS {
+        for n in SIZES {
+            let store = store_of(&fleet(name, n));
+            let ask = Ask {
+                gateway: GatewayId(1),
+                now: Instant::now(),
+                pinned: None,
+                affinity: false,
+            };
+            let mut pair = PairBuffers::default();
+            assert!(
+                store.build_pair(MODEL, &ask, &mut pair).is_some(),
+                "the fleet holds both sides of a pair"
+            );
+            group.bench_function(BenchmarkId::new(format!("pair/{name}"), n), |b| {
+                b.iter(|| {
+                    store
+                        .build_pair(MODEL, black_box(&ask), &mut pair)
+                        .is_some()
+                });
+            });
+            let mut out = EncodePairBuffers::default();
+            group.bench_function(BenchmarkId::new(format!("encode_pair/{name}"), n), |b| {
+                b.iter(|| {
+                    store
+                        .build_encode_pair(MODEL, black_box(&ask), &mut out)
+                        .is_some()
+                });
+            });
+        }
+    }
+    group.finish();
+}
+
+criterion_group!(benches, derivation, membership_write, moved_write, doors);
 criterion_main!(benches);

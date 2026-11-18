@@ -12,8 +12,13 @@
 //! `policy_wasm/decide_held/<world>/<n>`,
 //! `policy_wasm/decide_fresh/<world>/<n>`, `policy_wasm/fuel_exhausted/<n>`,
 //! `policy_wasm/observe/<world>`, `policy_wasm/unheard/<world>` (an event of a
-//! kind the row does not list) and `policy_wasm/native/<n>`. The guests
-//! are the test guests, assembled at bench start.
+//! kind the row does not list), `policy_wasm/decide_named/<world>/<n>` (the
+//! decision made as a named decider), `policy_wasm/membership/told/<world>`
+//! (the host's telling of one change over a list of 64 members),
+//! `policy_wasm/membership/heard/<world>`
+//! (a decision whose instance hears one change first) and
+//! `policy_wasm/native/<n>`. The guests are the test guests, assembled at
+//! bench start.
 #![expect(
     clippy::expect_used,
     reason = "a bench's setup has no caller to answer; a guest that fails to load is a bug the tests catch"
@@ -40,11 +45,12 @@ use common::{build_view, fleet};
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
 use smg_policy_controller::{
     builtins::{Best, Healthy, LeastRequests},
+    decider::Decider,
     plugins::OpenDecisions,
     spec::MAX_BLOCK_HASHES,
     wasm::{EventSet, Plugin, PluginSpec, Runtime, WasmFilter, WasmPicker, WasmScorer},
-    Binding, Constraints, Engine, Lease, Lifecycle, Needs, Plan, PoolFacts, Profile, RequestFacts,
-    Scratch, Side, Target, Weighted,
+    Binding, Constraints, Engine, Lease, Lifecycle, Membership, Needs, Plan, PoolFacts, Profile,
+    RequestFacts, Scratch, Side, Target, Weighted, WorkerId,
 };
 
 const SIZES: [usize; 3] = [8, 64, 512];
@@ -471,15 +477,120 @@ fn native(c: &mut Criterion) {
     group.finish();
 }
 
+/// The kept-instance decision at 64 candidates made as a named decider: the
+/// decider's instance is brought to the thread at the decision's first open
+/// and given back at its last close.
+fn decide_named(c: &mut Criterion) {
+    let runtime = Arc::new(Runtime::new(&OpenDecisions::new()).expect("a runtime"));
+    let mut group = c.benchmark_group("policy_wasm/decide_named");
+    let n = 64;
+    for (world, component) in worlds() {
+        let plugin = plugin(
+            &runtime,
+            world,
+            component,
+            vec![guest::mode::LEAST_IN_FLIGHT],
+        );
+        let engine = plugin_engine(&plugin);
+        let fleet = fleet(n);
+        let mut view = Vec::with_capacity(n);
+        build_view(&fleet, &mut view);
+        let mut scratch = Scratch::new();
+        let pool = PoolFacts {
+            pool_size: n as u32,
+            generation: 1,
+            ..PoolFacts::default()
+        };
+        let cx = Constraints::default();
+        let turn = Decider::new(0).enter();
+        group.throughput(Throughput::Elements(n as u64));
+        group.bench_with_input(BenchmarkId::new(world, n), &n, |b, _| {
+            let mut seed = 0u64;
+            b.iter(|| {
+                seed += 1;
+                engine.decide(&facts(seed), &pool, black_box(&view), &cx, &mut scratch)
+            });
+        });
+        drop(turn);
+        answered(world, &plugin);
+        assert_eq!(
+            plugin.stats().instantiations,
+            1,
+            "{world}: the named decider decided on the apply's own instance"
+        );
+    }
+    group.finish();
+}
+
+/// The membership feed of a plugin whose row lists the kind, over the pool
+/// of 64 the decisions read, told first as one snapshot. `told`: the host
+/// tells one change, a worker that comes or goes, which is folded into the
+/// feed's list of 64 and kept; no guest call is made. `heard`: one change is
+/// told and a decision at 64 candidates is made, whose instance hears the
+/// change first, in one `observe` call.
+fn membership(c: &mut Criterion) {
+    let runtime = Arc::new(Runtime::new(&OpenDecisions::new()).expect("a runtime"));
+    let mut group = c.benchmark_group("policy_wasm/membership");
+    let n = 64;
+    // A worker the pool does not hold: its coming and its going each read
+    // the feed's whole list.
+    let other = WorkerId(u64::MAX);
+    let (comes, goes) = (Membership::Added(other), Membership::Removed(other));
+    for (world, component) in worlds() {
+        let plugin = plugin(
+            &runtime,
+            world,
+            component,
+            vec![guest::mode::LEAST_IN_FLIGHT],
+        );
+        let engine = plugin_engine(&plugin);
+        let fleet = fleet(n);
+        let mut view = Vec::with_capacity(n);
+        build_view(&fleet, &mut view);
+        let mut scratch = Scratch::new();
+        let pool = PoolFacts {
+            pool_size: n as u32,
+            generation: 1,
+            ..PoolFacts::default()
+        };
+        let cx = Constraints::default();
+        let members: Vec<WorkerId> = view.iter().map(|row| row.id).collect();
+        engine.on_membership(&Membership::Snapshot(&members));
+        let mut came = false;
+        let mut tell = || {
+            came = !came;
+            engine.on_membership(black_box(if came { &comes } else { &goes }));
+        };
+        group.bench_function(BenchmarkId::new("told", world), |b| b.iter(&mut tell));
+        assert_eq!(
+            plugin.stats().observed,
+            0,
+            "{world}: a telling calls no guest"
+        );
+        group.bench_function(BenchmarkId::new("heard", world), |b| {
+            let mut seed = 0u64;
+            b.iter(|| {
+                seed += 1;
+                tell();
+                engine.decide(&facts(seed), &pool, black_box(&view), &cx, &mut scratch)
+            });
+        });
+        answered(world, &plugin);
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     decide,
+    decide_named,
     prompt,
     decide_held,
     decide_fresh,
     fuel_exhausted,
     observe,
     unheard,
+    membership,
     native
 );
 criterion_main!(benches);

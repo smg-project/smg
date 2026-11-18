@@ -17,12 +17,15 @@ use parking_lot::Mutex;
 use super::{Entry, Event, Log, Lost};
 use crate::{
     lease::TransportClass,
+    spec::{AppliedSpec, PolicySpec},
     store::{
-        identity, Cut, GatewayId, HealthSink, Journal, Kinds, LeasesStore, LoadSample, LoadSink,
-        LoadSource, MembershipChange, MemoryStore, Position, WorkerFacts, WorkerPatch, WorkerRow,
+        identity, Ask, BatchFacts, BatchOutcome, ContentHash, Cut, GatewayId, HealthSink, Journal,
+        Kinds, KvEvent, KvEventSink, LeasesStore, LoadSample, LoadSink, LoadSource,
+        MembershipChange, MembershipTail, MemoryStore, OutsideLists, PairingDescriptor, Position,
+        SequenceHash, Signals, StoredBlock, ViewBuffers, WorkerFacts, WorkerPatch, WorkerRow,
         WorkerStatus, WorkersStore,
     },
-    view::{LoadRow, WorkerId},
+    view::{Health, LoadRow, Role, WireModes, WorkerId},
 };
 
 /// A store whose log carries every kind, `events` of each retained.
@@ -425,6 +428,10 @@ impl Journal for Told {
     fn followed(&self) -> Option<u64> {
         None
     }
+
+    fn restart(&self, _: Position) -> bool {
+        true
+    }
 }
 
 #[test]
@@ -789,7 +796,8 @@ fn a_reader_of_a_restarted_store_starts_at_its_cut_and_reads_on() {
     // it, and the store writes on under no term. A reader starts from a
     // cut, which stands at the store's own write, and reads what followed:
     // the cut with that tail is the next cut.
-    log.restart(Position { seq: 2, term: 2 });
+    log.restart(Position { seq: 2, term: 2 })
+        .expect("a place the log takes");
     store.upsert(facts("http://a:8000", 1));
     let first = store.cut(Kinds::All);
     assert_eq!(first.at, Position { seq: 3, term: 0 });
@@ -807,7 +815,8 @@ fn a_reader_of_a_restarted_store_starts_at_its_cut_and_reads_on() {
     assert_eq!(twin, Twin::of(&next));
     // A restart below those numbers: the first reader's place is gone for
     // good, and the cut after the next write stands past it.
-    log.restart(Position { seq: 2, term: 3 });
+    log.restart(Position { seq: 2, term: 3 })
+        .expect("a place the log takes");
     store.upsert(facts("http://c:8000", 1));
     assert_eq!(log.read(Kinds::All, first.at, 64, &mut out), Err(Lost));
     let again = store.cut(Kinds::All);
@@ -868,4 +877,902 @@ fn a_workers_load_rows_stand_between_its_registration_and_its_leaving() {
     assert!(load_rows > 0, "no load row was written to a member");
     let gone = live.values().filter(|live| !**live).count();
     assert!(gone > 0, "no worker left under the load writers");
+}
+
+/// One of a leader's entries applied to a standby's store under the guard
+/// of its position, the way the standby's applier does.
+fn follows(standby: &MemoryStore, log: &Log, entry: &Entry) {
+    let adopting = log.adopt(entry.at).expect("the next position");
+    match &entry.event {
+        Event::Member {
+            epoch, change, row, ..
+        } => {
+            let (change, row) = told(*change, row.as_deref());
+            standby.follow(*epoch, change, row);
+        }
+        Event::Load { id, rank, sample } => {
+            standby.record(*id, *rank, sample.row, sample.received_at, sample.source);
+        }
+        Event::Term => standby.set_term(entry.at.term),
+    }
+    assert!(adopting.landed(), "{entry:?}");
+}
+
+/// A membership change as the replication stream tells it: no row for a
+/// removal or a status change, and a resize told as a relabel.
+fn told(
+    change: MembershipChange,
+    row: Option<&WorkerRow>,
+) -> (MembershipChange, Option<WorkerRow>) {
+    match change {
+        MembershipChange::Removed { .. } | MembershipChange::StatusChanged { .. } => (change, None),
+        MembershipChange::Resized { id } => (MembershipChange::Relabelled { id }, row.cloned()),
+        _ => (change, row.cloned()),
+    }
+}
+
+/// The leader's writes of a few rounds: membership churn, then load rows.
+fn rounds(leader: &MemoryStore, lives: &[AtomicU64], count: u64) {
+    for round in 0..count {
+        churn(leader, lives, 5);
+        loads(leader, lives, round, 8);
+    }
+}
+
+/// A standby's tables are the leader's: the place, the epoch, every row
+/// under its key and every load row.
+fn twins(standby: &MemoryStore, leader: &MemoryStore) {
+    let (ours, theirs) = (standby.cut(Kinds::All), leader.cut(Kinds::All));
+    assert_eq!((ours.at, ours.epoch), (theirs.at, theirs.epoch));
+    assert_eq!(ours.rows, theirs.rows);
+    for row in &ours.rows {
+        let found = standby.by_key(&row.facts.key).map(|found| found.id);
+        assert_eq!(found, Some(row.id), "{}", row.facts.key);
+    }
+    assert_eq!(ours.loads, theirs.loads);
+    let at = later();
+    assert_eq!(pool(standby, at), pool(leader, at));
+}
+
+/// An instant past the window any earlier read of a pool opened: a second
+/// after the last one handed out, so each read publishes what waits.
+fn later() -> Instant {
+    static READS: AtomicU64 = AtomicU64::new(0);
+    Instant::now() + Duration::from_secs(READS.fetch_add(1, Ordering::SeqCst) + 1)
+}
+
+/// What a decision of gateway 1 reads of the pool at `at`, once every
+/// folded load row is published: each row's id, width, health bits and load
+/// row. The row's age is set aside: a store counts it from its own origin,
+/// so two stores publish one report a millisecond apart.
+fn pool(store: &MemoryStore, at: Instant) -> Vec<(WorkerId, u16, Health, Option<LoadRow>)> {
+    store.publish(at);
+    let ask = Ask {
+        gateway: GatewayId(1),
+        now: at,
+        pinned: None,
+        affinity: false,
+    };
+    let mut out = ViewBuffers::default();
+    if store
+        .build_view("m", Role::Single, &ask, &mut out)
+        .is_none()
+    {
+        return Vec::new();
+    }
+    out.candidates
+        .iter()
+        .map(|row| {
+            let load = row.load.map(|load| LoadRow {
+                report_age_ms: 0,
+                ..load
+            });
+            (row.id, row.dp_size, row.health, load)
+        })
+        .collect()
+}
+
+#[test]
+fn a_standby_that_follows_holds_the_leaders_tables_and_its_log() {
+    let (leader, led) = journaled(4_096);
+    let (standby, followed) = journaled(4_096);
+    leader.set_term(3);
+    let lives: Vec<AtomicU64> = (0..KEYS).map(|_| AtomicU64::new(0)).collect();
+    // Each read finds the change before it the last one the standby
+    // followed: none leans on a later write to be shown.
+    let mut told = 0;
+    let mut reads = |leader: &MemoryStore| {
+        let entries = all(&led);
+        for entry in entries.iter().skip(told) {
+            follows(&standby, &followed, entry);
+        }
+        told = entries.len();
+        twins(&standby, leader);
+    };
+    rounds(&leader, &lives, 40);
+    reads(&leader);
+    let wide = leader.upsert(facts("http://wide:8000", 1)).id();
+    let revision = WorkersStore::get(&leader, wide).expect("the row").revision;
+    leader.set_status(wide, WorkerStatus::Ready, revision);
+    leader.record(wide, 0, running(3), Instant::now(), LoadSource::Stream);
+    reads(&leader);
+    // A width change, which the stream tells as a relabel.
+    let wider = WorkerFacts {
+        dp_size: 2,
+        ..facts("http://wide:8000", 1)
+    };
+    assert!(matches!(
+        leader.upsert(wider),
+        MembershipChange::Resized { .. }
+    ));
+    reads(&leader);
+    // The worker leaves: its row, its key and its load row leave the
+    // standby.
+    let left = leader.by_key("http://wide:8000").expect("the row");
+    assert!(leader.remove(left.id, left.revision).is_some());
+    reads(&leader);
+    assert!(standby.by_key("http://wide:8000").is_none());
+    assert!(standby.load(wide, 0).is_none());
+    // It comes back under its key, which the removal freed.
+    assert!(matches!(
+        leader.upsert(facts("http://wide:8000", 1)),
+        MembershipChange::Registered { .. }
+    ));
+    reads(&leader);
+    let entries = all(&led);
+    assert!(entries.len() > 300, "{} entries", entries.len());
+    assert_eq!(all(&followed), entries);
+    assert!(!pool(&standby, later()).is_empty());
+    assert_eq!(standby.term(), 3, "the leader's term, told under its guard");
+    assert_eq!(followed.followed(), Some(3));
+}
+
+#[test]
+fn a_standbys_index_holds_a_lane_for_each_row_that_asks_for_events() {
+    let asks = |key: &str, incarnation| WorkerFacts {
+        signals: Signals {
+            events: true,
+            ..Signals::default()
+        },
+        ..facts(key, incarnation)
+    };
+    let (leader, led) = journaled(256);
+    let (standby, followed) = journaled(256);
+    leader.set_term(1);
+    let a = leader.upsert(asks("http://a:8000", 1)).id();
+    let b = leader.upsert(asks("http://b:8000", 1)).id();
+    let quiet = leader.upsert(facts("http://quiet:8000", 1)).id();
+    let lanes = |store: &MemoryStore, ids: &[WorkerId]| -> Vec<bool> {
+        let lane = |id: &WorkerId| store.lane_counts(*id, 0).is_some();
+        ids.iter().map(lane).collect()
+    };
+    // Each read: the standby follows what the leader wrote since the last,
+    // and both hold a lane for exactly the rows that ask.
+    let mut told = 0;
+    let mut reads = |ids: &[WorkerId], want: &[bool]| {
+        let entries = all(&led);
+        for entry in entries.iter().skip(told) {
+            follows(&standby, &followed, entry);
+        }
+        told = entries.len();
+        assert_eq!(lanes(&leader, ids), want, "the leader");
+        assert_eq!(lanes(&standby, ids), want, "the standby");
+    };
+    reads(&[a, b, quiet], &[true, true, false]);
+    // A relabel that stops asking retires the lane, one that asks makes it.
+    leader.upsert(facts("http://a:8000", 1));
+    leader.upsert(asks("http://quiet:8000", 1));
+    reads(&[a, b, quiet], &[false, true, true]);
+    // A replaced row's lane leaves with it and the new row takes its own.
+    let again = leader.upsert(asks("http://b:8000", 2)).id();
+    reads(&[b, again], &[false, true]);
+    // A removed row's lane leaves with it.
+    let left = leader.by_key("http://quiet:8000").expect("the row");
+    assert!(leader.remove(left.id, left.revision).is_some());
+    reads(&[quiet, again], &[false, true]);
+    // A restore: the lanes are the cut's rows', and a row that left gave
+    // its lane up.
+    let (other, _) = journaled(256);
+    let own = other.upsert(asks("http://own:8000", 1)).id();
+    assert_eq!(lanes(&other, &[own, again]), [true, false]);
+    assert!(other.restore_from(leader.cut(Kinds::All)));
+    assert_eq!(lanes(&other, &[own, again, a]), [false, true, false]);
+    // A row that stays through a restore keeps what this replica heard for
+    // it: its lane's blocks are the replica's own, in no cut.
+    let heard: &dyn KvEventSink<Batch = [KvEvent]> = &other;
+    let block = [KvEvent::Stored {
+        parent: None,
+        blocks: vec![StoredBlock {
+            seq_hash: SequenceHash(1),
+            content_hash: ContentHash(2),
+        }],
+    }];
+    let first = BatchFacts {
+        sequence: 1,
+        ..BatchFacts::default()
+    };
+    assert_eq!(heard.admit(again, 0, first, &block), BatchOutcome::Applied);
+    assert_eq!(other.indexed_blocks(again, 0), 1);
+    assert!(other.restore_from(leader.cut(Kinds::All)));
+    assert_eq!(other.indexed_blocks(again, 0), 1, "the lane was made again");
+}
+
+#[test]
+fn a_restore_and_the_tail_after_it_are_the_leaders_tables() {
+    let (leader, led) = journaled(4_096);
+    leader.set_term(3);
+    let lives: Vec<AtomicU64> = (0..KEYS).map(|_| AtomicU64::new(0)).collect();
+    rounds(&leader, &lives, 20);
+    // The standby held a row of its own, written under no term.
+    let (standby, followed) = journaled(4_096);
+    standby.upsert(facts("http://stale:8000", 1));
+    let cut = leader.cut(Kinds::All);
+    let at = cut.at;
+    assert!(standby.restore_from(cut));
+    assert_eq!(standby.term(), 3);
+    assert_eq!(followed.head(Kinds::All), at);
+    assert!(standby.by_key("http://stale:8000").is_none());
+    twins(&standby, &leader);
+    rounds(&leader, &lives, 20);
+    for entry in all(&led).iter().filter(|entry| entry.at.seq > at.seq) {
+        follows(&standby, &followed, entry);
+    }
+    twins(&standby, &leader);
+}
+
+/// A standby's two doors tell the journal's listener as a leader's writes
+/// do, once the store has let its locks go: a restore restarts the journal
+/// inside its locks, and a followed write is journaled under the membership
+/// lock.
+#[test]
+fn a_restore_and_a_followed_write_are_told_once_the_store_let_its_locks_go() {
+    let (leader, led) = journaled(64);
+    leader.set_term(3);
+    leader.upsert(facts("http://a:8000", 1));
+    // Whether the standby's locks were free, at each telling.
+    let told = Arc::new(Mutex::new(Vec::new()));
+    let written: Arc<OnceLock<Weak<MemoryStore>>> = Arc::default();
+    let followed = {
+        let (told, written) = (Arc::clone(&told), Arc::clone(&written));
+        Arc::new(Log::new(64, 64).on_watched(move || {
+            let store = written.get().and_then(Weak::upgrade);
+            told.lock()
+                .push(store.expect("the store that wrote").unlocked());
+        }))
+    };
+    let journal: Arc<dyn Journal> = Arc::<Log>::clone(&followed);
+    let standby = Arc::new(MemoryStore::journaled(journal));
+    assert!(written.set(Arc::downgrade(&standby)).is_ok());
+    let cut = leader.cut(Kinds::All);
+    let at = cut.at;
+    assert!(standby.restore_from(cut));
+    assert_eq!(*told.lock(), [true], "a restore");
+    leader.upsert(facts("http://b:8000", 1));
+    for entry in all(&led).iter().filter(|entry| entry.at.seq > at.seq) {
+        follows(&standby, &followed, entry);
+    }
+    assert_eq!(*told.lock(), [true, true], "a followed registration");
+}
+
+/// A replica restored from a leader's cut serves its log in three shapes:
+/// before its first follow, leading alone under a term it took, and alone
+/// under no term. In each a reader that stood at the replica's own write
+/// before the restore is lost for good, and a reader that starts again
+/// from a cut reads on: the cut with the tail after it is the next cut.
+#[test]
+fn a_reader_of_a_restored_replica_recovers_at_a_cut_in_every_shape_it_serves_in() {
+    for shape in [
+        "before its first follow",
+        "leading alone",
+        "alone under no term",
+    ] {
+        let (leader, led) = journaled(64);
+        leader.set_term(3);
+        leader.upsert(facts("http://a:8000", 1));
+        // Three writes of the replica's own, under no term: a reader
+        // stands at the last.
+        let (replica, log) = journaled(64);
+        for key in ["http://x:8000", "http://y:8000", "http://z:8000"] {
+            replica.upsert(facts(key, 1));
+        }
+        let stale = replica.cut(Kinds::All).at;
+        assert_eq!(stale, Position { seq: 3, term: 0 }, "{shape}");
+        // The restore stands at the leader's second position.
+        assert!(replica.restore_from(leader.cut(Kinds::All)), "{shape}");
+        match shape {
+            "before its first follow" => {}
+            "leading alone" => {
+                replica.set_term(4);
+            }
+            _ => {
+                replica.upsert(facts("http://late:8000", 1));
+            }
+        }
+        let mut out = Vec::new();
+        assert_eq!(
+            log.read(Kinds::All, stale, 64, &mut out),
+            Err(Lost),
+            "{shape}"
+        );
+        let cut = replica.cut(Kinds::All);
+        assert_eq!(
+            log.read(Kinds::All, cut.at, 64, &mut out),
+            Ok(()),
+            "{shape}"
+        );
+        assert!(out.is_empty(), "{shape}");
+        // One more write in the replica's shape: the leader's, followed, or
+        // its own.
+        if shape == "before its first follow" {
+            leader.upsert(facts("http://b:8000", 1));
+            let entries = all(&led);
+            follows(&replica, &log, entries.last().expect("the leader's write"));
+        } else {
+            replica.upsert(facts("http://b:8000", 1));
+        }
+        assert_eq!(
+            log.read(Kinds::All, stale, 64, &mut out),
+            Err(Lost),
+            "{shape}"
+        );
+        assert_eq!(
+            log.read(Kinds::All, cut.at, 64, &mut out),
+            Ok(()),
+            "{shape}"
+        );
+        assert_eq!(out.len(), 1, "{shape}");
+        let mut twin = Twin::of(&cut);
+        for entry in &out {
+            twin.apply(&entry.event);
+        }
+        assert_eq!(twin, Twin::of(&replica.cut(Kinds::All)), "{shape}");
+    }
+}
+
+#[test]
+fn a_restore_the_journal_refuses_changes_nothing() {
+    // The store leads term 3 with a row of its own.
+    let (store, log) = journaled(64);
+    store.set_term(3);
+    store.upsert(facts("http://own:8000", 1));
+    let held = |store: &MemoryStore| {
+        let cut = store.cut(Kinds::All);
+        (cut.at, cut.epoch, Twin::of(&cut), store.term())
+    };
+    let before = (held(&store), all(&log));
+    // A cut under no term, under a term below its own and under the term
+    // it leads: none is a history ahead of its own.
+    for term in [0, 2, 3] {
+        let (other, _) = journaled(64);
+        other.set_term(term);
+        other.upsert(facts("http://theirs:8000", 1));
+        other.upsert(facts("http://more:8000", 1));
+        assert!(!store.restore_from(other.cut(Kinds::All)), "term {term}");
+        assert_eq!((held(&store), all(&log)), before, "term {term}");
+    }
+    // A store under no term takes no cut under no term: no leader wrote it.
+    let (fresh, fresh_log) = journaled(64);
+    let (other, _) = journaled(64);
+    other.upsert(facts("http://theirs:8000", 1));
+    assert!(!fresh.restore_from(other.cut(Kinds::All)));
+    assert!(fresh.by_key("http://theirs:8000").is_none());
+    assert!(all(&fresh_log).is_empty());
+    // A term above its own is a leader's.
+    let (leader, _) = journaled(64);
+    leader.set_term(4);
+    leader.upsert(facts("http://theirs:8000", 1));
+    assert!(store.restore_from(leader.cut(Kinds::All)));
+    assert_eq!(store.term(), 4);
+    assert_eq!(log.followed(), Some(4));
+}
+
+#[test]
+fn a_restore_never_lowers_the_stores_term() {
+    // A store with no journal has no log to refuse a cut under a term below
+    // its own.
+    let store = MemoryStore::new();
+    store.set_term(5);
+    let (leader, _) = journaled(64);
+    leader.set_term(3);
+    leader.upsert(facts("http://theirs:8000", 1));
+    assert!(store.restore_from(leader.cut(Kinds::All)));
+    assert!(store.by_key("http://theirs:8000").is_some());
+    assert_eq!(store.term(), 5);
+}
+
+#[test]
+fn a_restore_leaves_nothing_of_the_tables_it_replaces() {
+    const ASKER: GatewayId = GatewayId(1);
+    let (leader, _led) = journaled(64);
+    leader.set_term(1);
+    let kept = leader.upsert(facts("http://kept:8000", 1)).id();
+    // The store held the row that stays and one of its own, each with what
+    // lives as long as a row.
+    let (store, _log) = journaled(64);
+    let gone = store.upsert(facts("http://gone:8000", 1)).id();
+    store.upsert(facts("http://kept:8000", 1));
+    let now = Instant::now();
+    store.record(gone, 0, running(1), now, LoadSource::Stream);
+    HealthSink::completed(&store, ASKER, kept, TransportClass::Ok, now);
+    store.gateway_veto(ASKER, kept, Some(now + Duration::from_secs(3_600)));
+    let stalled = |store: &MemoryStore| {
+        let rows = pool(store, later());
+        rows.iter()
+            .any(|(id, _, health, _)| *id == kept && health.stalled)
+    };
+    assert!(stalled(&store));
+    assert!(store.restore_from(leader.cut(Kinds::All)));
+    assert!(WorkersStore::get(&store, gone).is_none());
+    assert!(store.load(gone, 0).is_none());
+    assert!(!store.vetoed(ASKER, kept, now), "the veto in the table");
+    assert!(!stalled(&store), "the veto in the world");
+    assert!(!store.completed_ok_since(ASKER, kept, now));
+    // A watcher of the store that was reads no change across the restore.
+    assert_eq!(store.changes_since(0), MembershipTail::SnapshotRequired);
+    // And the key that left is free: its next registration is a first one.
+    assert_eq!(
+        store.upsert(facts("http://gone:8000", 1)),
+        MembershipChange::Registered { id: gone }
+    );
+}
+
+#[test]
+fn a_restore_reads_each_row_it_brings_under_the_lists_and_carries_no_field() {
+    // A generation that lists one zone: a member outside it is counted.
+    let listing = || {
+        let mut document = PolicySpec::preset("round_robin").expect("a preset of this build");
+        document.generation = 1;
+        document.view.zones = vec!["east".to_owned()];
+        AppliedSpec::validate(&document).expect("the document validates")
+    };
+    // Two leaders admit one key in two zones: each mints the same id at
+    // the same revision.
+    let lead = |zone: &str| {
+        let (leader, _led) = journaled(64);
+        leader.set_term(1);
+        let member = WorkerFacts {
+            zone: Some(zone.to_owned()),
+            ..facts("http://a:8000", 1)
+        };
+        let id = leader.upsert(member).id();
+        let at = revision(&leader, id);
+        (leader, id, at)
+    };
+    let (inside, id, at) = lead("east");
+    let (outside, again, revised) = lead("west");
+    assert_eq!((again, revised), (id, at));
+    let (standby, _log) = journaled(64);
+    standby.apply(listing()).expect("applied");
+    assert!(standby.restore_from(inside.cut(Kinds::All)));
+    assert_eq!(standby.outside_lists(), OutsideLists::default());
+    // The next cut brings a row at the id and the revision the standby's
+    // world read one at, in the other zone. No field of the row that left
+    // is carried: the row is read under the lists again.
+    assert!(standby.restore_from(outside.cut(Kinds::All)));
+    let counted = OutsideLists {
+        engines: 0,
+        zones: 1,
+    };
+    assert_eq!(standby.outside_lists(), counted);
+}
+
+#[test]
+fn a_cut_beside_restores_is_one_restore_whole() {
+    const RESTORES: usize = 2_000;
+    // Two cuts of one leader, a few writes apart.
+    let (leader, _led) = journaled(4_096);
+    leader.set_term(1);
+    let lives: Vec<AtomicU64> = (0..KEYS).map(|_| AtomicU64::new(0)).collect();
+    rounds(&leader, &lives, 10);
+    let first = leader.cut(Kinds::All);
+    rounds(&leader, &lives, 10);
+    let second = leader.cut(Kinds::All);
+    let whole = |cut: &Cut| (cut.at, cut.epoch, Twin::of(cut));
+    let cuts = [whole(&first), whole(&second)];
+    assert_ne!(cuts[0], cuts[1]);
+    let (standby, _followed) = journaled(4_096);
+    assert!(standby.restore_from(first.clone()));
+    thread::scope(|scope| {
+        let restorer = scope.spawn(|| {
+            for turn in 0..RESTORES {
+                let cut = if turn % 2 == 0 { &second } else { &first };
+                assert!(standby.restore_from(cut.clone()));
+            }
+        });
+        // The place, the epoch and the tables of a cut are one restore's.
+        loop {
+            let seen = whole(&standby.cut(Kinds::All));
+            assert!(
+                cuts.contains(&seen),
+                "a cut between two restores, at {:?}",
+                seen.0
+            );
+            if restorer.is_finished() {
+                break;
+            }
+        }
+    });
+}
+
+#[test]
+fn a_change_that_does_not_fit_the_tables_is_not_applied_and_takes_no_place() {
+    use MembershipChange::{Registered, Relabelled, Removed, Replaced, StatusChanged};
+    let (leader, led) = journaled(64);
+    leader.set_term(1);
+    let a = leader.upsert(facts("http://a:8000", 1)).id();
+    let c = leader.upsert(facts("http://c:8000", 1)).id();
+    let (standby, followed) = journaled(64);
+    for entry in &all(&led) {
+        follows(&standby, &followed, entry);
+    }
+    let held = WorkersStore::get(&standby, a).expect("the row");
+    let b = identity("http://b:8000", 1);
+    let other = WorkerRow {
+        id: b,
+        facts: facts("http://b:8000", 1),
+        ..held.clone()
+    };
+    let again = WorkerRow {
+        id: identity("http://b:8000", 2),
+        ..other.clone()
+    };
+    let next = standby.epoch() + 1;
+    let (pending, ready) = (WorkerStatus::Pending, WorkerStatus::Ready);
+    let misfits = [
+        (
+            "an epoch that is not the next",
+            next + 1,
+            Registered { id: b },
+            Some(other.clone()),
+        ),
+        (
+            "a registration of a held id",
+            next,
+            Registered { id: a },
+            Some(held.clone()),
+        ),
+        (
+            "a registration of a held id under another key",
+            next,
+            Registered { id: a },
+            Some(WorkerRow {
+                id: a,
+                ..other.clone()
+            }),
+        ),
+        (
+            "a registration under a held key",
+            next,
+            Registered { id: b },
+            Some(WorkerRow {
+                id: b,
+                ..held.clone()
+            }),
+        ),
+        (
+            "a registration that tells no row",
+            next,
+            Registered { id: b },
+            None,
+        ),
+        (
+            "a row that is not the change's",
+            next,
+            Registered { id: b },
+            Some(again.clone()),
+        ),
+        (
+            "a relabel of a row not held",
+            next,
+            Relabelled { id: b },
+            Some(other.clone()),
+        ),
+        (
+            "a replacement of a row not held",
+            next,
+            Replaced {
+                old: b,
+                new: again.id,
+            },
+            Some(again),
+        ),
+        (
+            "a replacement under another key",
+            next,
+            Replaced { old: a, new: b },
+            Some(other.clone()),
+        ),
+        (
+            "a relabel that carries another row",
+            next,
+            Relabelled { id: a },
+            Some(WorkerRow {
+                id: b,
+                ..held.clone()
+            }),
+        ),
+        (
+            "a relabel under another key",
+            next,
+            Relabelled { id: a },
+            Some(WorkerRow {
+                facts: facts("http://b:8000", 1),
+                ..held.clone()
+            }),
+        ),
+        (
+            "a replacement that carries another row",
+            next,
+            Replaced { old: a, new: b },
+            Some(WorkerRow {
+                id: identity("http://a:8000", 9),
+                ..held.clone()
+            }),
+        ),
+        (
+            "a replacement by a held id",
+            next,
+            Replaced { old: a, new: c },
+            Some(WorkerRow {
+                id: c,
+                ..held.clone()
+            }),
+        ),
+        ("a removal of a row not held", next, Removed { id: b }, None),
+        (
+            "a removal that tells a row",
+            next,
+            Removed { id: a },
+            Some(held),
+        ),
+        (
+            "a status change of a row not held",
+            next,
+            StatusChanged {
+                id: b,
+                from: pending,
+                to: ready,
+            },
+            None,
+        ),
+        (
+            "a status change from another status",
+            next,
+            StatusChanged {
+                id: a,
+                from: ready,
+                to: pending,
+            },
+            None,
+        ),
+    ];
+    let stands = |standby: &MemoryStore| {
+        let cut = standby.cut(Kinds::All);
+        (cut.at, cut.epoch, Twin::of(&cut), all(&followed))
+    };
+    let before = stands(&standby);
+    let at = Position {
+        seq: before.0.seq + 1,
+        term: 1,
+    };
+    for (misfit, epoch, change, row) in misfits {
+        let adopting = followed.adopt(at).expect("the next position");
+        standby.follow(epoch, change, row);
+        assert!(!adopting.landed(), "{misfit}");
+        drop(adopting);
+        assert_eq!(stands(&standby), before, "{misfit}");
+    }
+    // The change that fits takes the place.
+    let adopting = followed.adopt(at).expect("the next position");
+    standby.follow(next, Registered { id: b }, Some(other));
+    assert!(adopting.landed());
+    assert_eq!(standby.epoch(), next);
+}
+
+#[test]
+fn a_followed_row_keeps_the_instant_it_was_admitted_at() {
+    let (standby, followed) = journaled(64);
+    let at = |seq| Position { seq, term: 1 };
+    let row = WorkerRow {
+        id: identity("http://a:8000", 1),
+        facts: facts("http://a:8000", 1),
+        status: WorkerStatus::Pending,
+        revision: 1,
+        admitted_at: Instant::now(),
+    };
+    let id = row.id;
+    let adopting = followed.adopt(at(1)).expect("the next position");
+    standby.set_term(1);
+    drop(adopting);
+    let adopting = followed.adopt(at(2)).expect("the next position");
+    standby.follow(1, MembershipChange::Registered { id }, Some(row.clone()));
+    drop(adopting);
+    // An event's row crosses with the instant of its apply: the instant
+    // the row was admitted at stays.
+    let relabelled = WorkerRow {
+        revision: 2,
+        admitted_at: row.admitted_at + Duration::from_secs(5),
+        ..row.clone()
+    };
+    let adopting = followed.adopt(at(3)).expect("the next position");
+    standby.follow(2, MembershipChange::Relabelled { id }, Some(relabelled));
+    assert!(adopting.landed());
+    let held = WorkersStore::get(&standby, id).expect("the row");
+    assert_eq!((held.revision, held.admitted_at), (2, row.admitted_at));
+}
+
+/// A prefill or a decode of the model on one runtime's gRPC side, which
+/// names its KV transport or none.
+fn pair_facts(key: &str, role: Role, transport: Option<&str>) -> WorkerFacts {
+    WorkerFacts {
+        role,
+        wire_modes: WireModes::GRPC,
+        engine_kind: "rt-a".to_owned(),
+        pairing: transport.map(|transport| {
+            Box::new(PairingDescriptor {
+                transport: Some(transport.to_owned()),
+                ..PairingDescriptor::default()
+            })
+        }),
+        ..facts(key, 1)
+    }
+}
+
+/// The id and the pair class of every prefill row and then every decode row
+/// of the model, as views of the store's world read them.
+fn pair_rows(store: &MemoryStore) -> Vec<(WorkerId, u32)> {
+    let ask = Ask {
+        gateway: GatewayId(1),
+        now: Instant::now(),
+        pinned: None,
+        affinity: false,
+    };
+    let mut out = ViewBuffers::default();
+    let mut rows = Vec::new();
+    for role in [Role::Prefill, Role::Decode] {
+        if store.build_view("m", role, &ask, &mut out).is_some() {
+            rows.extend(out.candidates.iter().map(|row| (row.id, row.pair_class)));
+        }
+    }
+    rows
+}
+
+#[test]
+fn a_followed_relabel_carries_the_pair_classes_unless_the_offer_moved() {
+    // Two prefills of two transports and three decodes, one of each
+    // transport and one that names none: two classes.
+    let fleet = [
+        ("grpc://pa:9000", Role::Prefill, Some("tx-a")),
+        ("grpc://pb:9000", Role::Prefill, Some("tx-b")),
+        ("grpc://da:9000", Role::Decode, Some("tx-a")),
+        ("grpc://db:9000", Role::Decode, Some("tx-b")),
+        ("grpc://dn:9000", Role::Decode, None),
+    ];
+    let first = || pair_facts("grpc://pa:9000", Role::Prefill, Some("tx-a"));
+    // Each fact that places a worker in its pools or makes its offer.
+    let moved = [
+        (
+            "the descriptor",
+            pair_facts("grpc://pa:9000", Role::Prefill, Some("tx-b")),
+        ),
+        (
+            "the runtime",
+            WorkerFacts {
+                engine_kind: "rt-b".to_owned(),
+                ..first()
+            },
+        ),
+        (
+            "the wires",
+            WorkerFacts {
+                wire_modes: WireModes::HTTP,
+                ..first()
+            },
+        ),
+        (
+            "the role",
+            WorkerFacts {
+                role: Role::Decode,
+                ..first()
+            },
+        ),
+        (
+            "the models",
+            WorkerFacts {
+                models: vec!["other".to_owned()],
+                ..first()
+            },
+        ),
+    ];
+    for (what, facts) in moved {
+        let (leader, led) = journaled(64);
+        let (standby, followed) = journaled(64);
+        leader.set_term(1);
+        let mut told = 0;
+        let mut follow = || {
+            let entries = all(&led);
+            for entry in entries.iter().skip(told) {
+                follows(&standby, &followed, entry);
+            }
+            told = entries.len();
+        };
+        for (key, role, transport) in fleet {
+            leader.upsert(pair_facts(key, role, transport));
+        }
+        follow();
+        let before = pair_rows(&standby);
+        assert_eq!(before, pair_rows(&leader), "{what}");
+        // The world is kept, so its classes stand where they are: one
+        // address in a later world is those classes carried.
+        let world = standby.world();
+        let derived = world.pairs("m").expect("the model's classes");
+        // A row told again with a fact no pair reads moves no class.
+        leader.upsert(WorkerFacts {
+            zone: Some("z".to_owned()),
+            ..first()
+        });
+        follow();
+        let carried = standby.world();
+        let pairs = carried.pairs("m").expect("the model's classes");
+        assert!(std::ptr::eq(derived, pairs), "{what}: derived again");
+        assert_eq!(pair_rows(&standby), before, "{what}");
+        // The offer moves: the standby derives its leader's classes.
+        leader.upsert(facts);
+        follow();
+        assert_eq!(pair_rows(&standby), pair_rows(&leader), "{what}");
+        let (ours, theirs) = (standby.world(), leader.world());
+        assert_eq!(ours.pairs("m"), theirs.pairs("m"), "{what}");
+        assert_ne!(pair_rows(&standby), before, "{what}: the classes moved");
+    }
+}
+
+#[test]
+fn a_standbys_pair_classes_follow_each_membership_write_and_a_restore() {
+    let (leader, led) = journaled(64);
+    let (standby, followed) = journaled(64);
+    leader.set_term(1);
+    let mut told = 0;
+    // The standby follows what the leader wrote since, and reads the pair
+    // classes its leader reads.
+    let mut alike = |what: &str| {
+        let entries = all(&led);
+        for entry in entries.iter().skip(told) {
+            follows(&standby, &followed, entry);
+        }
+        told = entries.len();
+        assert_eq!(pair_rows(&standby), pair_rows(&leader), "{what}");
+        let (ours, theirs) = (standby.world(), leader.world());
+        assert_eq!(ours.pairs("m"), theirs.pairs("m"), "{what}");
+        pair_rows(&standby)
+    };
+    let prefill = |transport| pair_facts("grpc://pa:9000", Role::Prefill, Some(transport));
+    leader.upsert(prefill("tx-a"));
+    leader.upsert(pair_facts("grpc://pb:9000", Role::Prefill, Some("tx-b")));
+    leader.upsert(pair_facts("grpc://da:9000", Role::Decode, Some("tx-a")));
+    let pair = alike("a pair");
+    // A member joins, one comes back as a new incarnation with another
+    // offer, one leaves: each write moves the classes.
+    leader.upsert(pair_facts("grpc://db:9000", Role::Decode, Some("tx-b")));
+    let joined = alike("a member joined");
+    assert_ne!(joined, pair);
+    leader.upsert(WorkerFacts {
+        incarnation: 2,
+        ..prefill("tx-b")
+    });
+    let replaced = alike("a new incarnation");
+    assert_ne!(replaced, joined);
+    let left = leader.by_key("grpc://pb:9000").expect("the row");
+    assert!(leader.remove(left.id, left.revision).is_some());
+    let fewer = alike("a member left");
+    assert_ne!(fewer, replaced);
+    // A store that derived other classes takes the leader's cut: its
+    // classes are those of the cut's membership.
+    let (other, _log) = journaled(64);
+    other.upsert(prefill("tx-a"));
+    other.upsert(pair_facts("grpc://dz:9000", Role::Decode, Some("tx-a")));
+    assert_ne!(pair_rows(&other), fewer);
+    assert!(other.restore_from(leader.cut(Kinds::All)));
+    assert_eq!(pair_rows(&other), fewer);
+    let (ours, theirs) = (other.world(), leader.world());
+    assert_eq!(ours.pairs("m"), theirs.pairs("m"));
 }

@@ -132,9 +132,9 @@ V4.1's, and the registry reads each checkpoint with its own. Beyond that:
   closes nothing. The structural tag is unchanged: the grammar takes the block from a row into the
   invoke from the wrapping state alone, so a forced call is still written as the block.
 - **An invoke's arguments may be one JSON object** in place of the parameter tags
-  (`Tags::DSML_V4.json_arguments`; `docs/assemblers.md`, the attributed assembler), as the serving
-  engines' own parser for the family reads it: SGLang's DSML detector takes the object as the
-  call's arguments, as written, and the structural tag it builds for a call writes the object
+  (`Tags::DSML_V4.json_arguments`; `docs/assemblers.md`, the attributed assembler), as one serving
+  engine's own parser for the family reads it: that parser takes the object as the call's
+  arguments, as written, and the structural tag the engine builds for a call writes the object
   between the invoke tag and its close, so an engine that constrains a call that way gets the
   shape back. The family's reference encoder writes parameter tags alone and its parser refuses
   the shape (`Tool name format error`), so it reads no call there. Before, the table read the call

@@ -1781,7 +1781,9 @@ mod tests {
             };
             let (store, feed) = journaled_from(&LeasePlace::Process, 0);
             if followed {
-                feed.log.restart(Position { seq: 9, term: 5 });
+                feed.log
+                    .restart(Position { seq: 9, term: 5 })
+                    .expect("a place the log takes");
             }
             let candidate = Elector::new(Box::new(MemoryLease::new()), name, settings)
                 .expect("the settings are in order");

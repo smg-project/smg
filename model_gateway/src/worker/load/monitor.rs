@@ -57,12 +57,12 @@ use std::{
 use dashmap::DashMap;
 use futures::future;
 use openai_protocol::worker::{
-    RuntimeType, SchedulerLoadSnapshot, WorkerGroupKey, WorkerLoadResponse, WorkerStatus,
+    LoadRecord, LoadTelemetry, RuntimeType, SchedulerLoadSnapshot, WorkerGroupKey,
+    WorkerLoadResponse, WorkerStatus,
 };
 use parking_lot::{Mutex, RwLock};
 use reqwest::StatusCode;
 use rustc_hash::FxHashMap;
-use smg_grpc_client::common_proto::EngineLoad;
 use tokio::{
     sync::{broadcast, Notify},
     task::JoinHandle,
@@ -407,28 +407,29 @@ impl PollMode {
 /// last record that carried it said, so the gauges and `GET /loads` keep
 /// the engine's figures between heartbeats. Absent is absent: a section the
 /// engine never reports stays unset. `previous` is the rank's entry the
-/// record replaces; what it keeps moves out of it.
+/// record replaces; what it keeps moves out of it. `carried` is the
+/// record's own word on what it carries.
 fn keep_telemetry(
     fresh: &mut SchedulerLoadSnapshot,
     previous: SchedulerLoadSnapshot,
-    record: &EngineLoad,
+    carried: LoadTelemetry,
 ) {
-    if record.cache_hit_rate.is_none() {
+    if !carried.contains(LoadTelemetry::CACHE_HIT_RATE) {
         fresh.cache_hit_rate = previous.cache_hit_rate;
     }
-    if record.num_used_tokens.is_none() {
+    if !carried.contains(LoadTelemetry::USED_TOKENS) {
         fresh.num_used_tokens = previous.num_used_tokens;
     }
-    if record.max_total_num_tokens.is_none() {
+    if !carried.contains(LoadTelemetry::TOTAL_TOKENS) {
         fresh.max_total_num_tokens = previous.max_total_num_tokens;
     }
-    if record.memory.is_none() {
+    if !carried.contains(LoadTelemetry::MEMORY) {
         fresh.memory = previous.memory;
     }
-    if record.queues.is_none() {
+    if !carried.contains(LoadTelemetry::QUEUES) {
         fresh.queues = previous.queues;
     }
-    if record.disaggregation.is_none() {
+    if !carried.contains(LoadTelemetry::DISAGGREGATION) {
         fresh.kv_transfer_latency_ms = previous.kv_transfer_latency_ms;
         fresh.kv_transfer_speed_gb_s = previous.kv_transfer_speed_gb_s;
         fresh.prefill_queue_reqs = previous.prefill_queue_reqs;
@@ -551,12 +552,12 @@ impl<G: Generation> WorkerMonitor<G> {
     /// age and the one-way margin, what a policy releases its dispatch credit
     /// against. Negative ranks and records for another virtual worker's rank
     /// are ignored before updating freshness, liveness, metrics or routing
-    /// state.
-    pub fn apply_pushed_load(
+    /// state, and before any reader of the record is called.
+    pub fn apply_pushed_load<R: LoadRecord>(
         self: &Arc<Self>,
         worker: &Arc<dyn Worker>,
         dp_rank: i32,
-        record: &EngineLoad,
+        record: &R,
         received_at: Instant,
     ) {
         if dp_rank < 0
@@ -566,7 +567,7 @@ impl<G: Generation> WorkerMonitor<G> {
         {
             return;
         }
-        let age = Duration::from_millis(u64::from(record.age_ms)) + PUSHED_ONE_WAY_MARGIN;
+        let age = record.age() + PUSHED_ONE_WAY_MARGIN;
         let sampled_at = received_at.checked_sub(age).unwrap_or(received_at);
         let url = worker.url();
         // The stream pushes: silence from this worker is judged by the
@@ -597,7 +598,7 @@ impl<G: Generation> WorkerMonitor<G> {
         // What a poll would have put in the rank's entry, with the telemetry
         // the record left out (an event batch's record is the core only)
         // kept from the last record that carried it.
-        let mut fresh = SchedulerLoadSnapshot::from(record);
+        let mut fresh = record.snapshot();
         fresh.dp_rank = dp_rank;
         let at = match report
             .loads
@@ -605,7 +606,7 @@ impl<G: Generation> WorkerMonitor<G> {
         {
             Ok(at) => {
                 let previous = std::mem::replace(&mut report.loads[at], fresh);
-                keep_telemetry(&mut report.loads[at], previous, record);
+                keep_telemetry(&mut report.loads[at], previous, record.telemetry());
                 at
             }
             Err(at) => {
@@ -620,11 +621,9 @@ impl<G: Generation> WorkerMonitor<G> {
         liveness::on_load_report(
             worker,
             report.total_waiting_reqs(),
-            record
-                .engine_silence_ms
-                .map(|ms| Duration::from_millis(u64::from(ms))),
-            record.engine_reports_steps.unwrap_or(false),
-            record.prefill_pending_tokens.map(u64::from),
+            record.engine_silence(),
+            record.reports_every_step(),
+            record.prefill_pending(),
         );
         // The record feeds its own rank's `smg_engine_*` series through the
         // handles kept for it; a poll's report feeds every rank's.
@@ -1471,33 +1470,6 @@ impl<G: Generation> WorkerMonitor<G> {
     }
 }
 
-/// Where a load record pushed on a worker's event stream goes: the load
-/// monitor, as the KV event monitor's streams hold it. Held by this name,
-/// the sink brings nothing of the registry the monitor is built over.
-pub(crate) trait PushedLoadSink: Send + Sync {
-    /// Take the record of `dp_rank` received at `received_at`
-    /// ([`WorkerMonitor::apply_pushed_load`]).
-    fn push_load(
-        self: Arc<Self>,
-        worker: &Arc<dyn Worker>,
-        dp_rank: i32,
-        record: &EngineLoad,
-        received_at: Instant,
-    );
-}
-
-impl<G: Generation> PushedLoadSink for WorkerMonitor<G> {
-    fn push_load(
-        self: Arc<Self>,
-        worker: &Arc<dyn Worker>,
-        dp_rank: i32,
-        record: &EngineLoad,
-        received_at: Instant,
-    ) {
-        self.apply_pushed_load(worker, dp_rank, record, received_at);
-    }
-}
-
 impl<G> Drop for WorkerMonitor<G> {
     fn drop(&mut self) {
         if let Some(handle) = self.event_task.get_mut().take() {
@@ -1998,6 +1970,7 @@ mod native_loads_tests {
         model_card::ModelCard,
         worker::{HealthCheckConfig, OverloadUpdate},
     };
+    use smg_grpc_client::common_proto::EngineLoad;
 
     use super::*;
     use crate::worker::{
