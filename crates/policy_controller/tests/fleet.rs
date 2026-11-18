@@ -787,8 +787,8 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
 
         // A session stays where its key was first placed. Under the manual
         // preset a key's first decision places it at random and its later
-        // asks name that row whatever their seeds; 64 keys do not share
-        // one row.
+        // asks name that row whatever their seeds; 63 more keys do not
+        // share one row.
         harness
             .apply("manual")
             .expect("a preset of this build applies");
@@ -813,7 +813,8 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
         }
         assert!(
             homes.len() > 1,
-            "{ASKS} session keys do not share one worker: {homes:?}"
+            "{} session keys do not share one worker: {homes:?}",
+            ASKS - 1
         );
 
         // The session is where the gateway sent its request. A key's first
@@ -838,6 +839,13 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             .dispatch_at(sent_lease, 1)
             .await
             .expect("the store reads the lease dispatched");
+        // The pin of record is written after the engine's table moved: once
+        // it names the row, the next decision reads the dispatch.
+        within("the pin of record names the row sent to", ROOM, || {
+            harness.pinned(pin) == Some((sent.engine, sent.rank))
+        })
+        .await
+        .expect("a keyed dispatch writes the pin of record");
         for n in 1..8 {
             let again = picked(&mut harness, keyed(nth("sent", n), sticky))
                 .await

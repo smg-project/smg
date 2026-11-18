@@ -29,7 +29,7 @@ use tonic::Status;
 use crate::{
     decision::Target,
     framework::Engine,
-    lease::{LeaseId, Lifecycle, Outcome, ReleaseReason, Side, TransportClass},
+    lease::{Lease, LeaseId, Lifecycle, Outcome, ReleaseReason, Side, TransportClass},
     proto::{
         self,
         completed::Class,
@@ -129,8 +129,9 @@ enum Said<'a> {
 /// The engine told is the one of the lease's own generation, where that
 /// generation still stands: a later generation's stages never saw the
 /// issue and hear nothing of it. A dispatch is told on the target its
-/// frame names by index, as the record holds the pick; a frame that names
-/// no target of the pick tells nothing.
+/// frame names by index, as the record holds the pick, and the lease told
+/// names that index: the record was read before the door wrote it. A
+/// frame that names no target of the pick tells nothing.
 fn told(store: &MemoryStore, record: &LeaseRecord, said: Said<'_>) {
     store.with_world(|world| {
         let spec = world.spec();
@@ -146,8 +147,15 @@ fn told(store: &MemoryStore, record: &LeaseRecord, said: Said<'_>) {
                     ..Target::default()
                 };
                 if let Some(engine) = engine {
+                    // The record was read before the door wrote the
+                    // dispatched index: the lease told carries it, for a
+                    // stage that reads the index off the lease.
+                    let lease = Lease {
+                        target_index: dispatch.target_index,
+                        ..record.lease
+                    };
                     engine.on_dispatched(
-                        &record.lease,
+                        &lease,
                         &target,
                         dispatch.side,
                         dispatch.since_decision_micros,
@@ -393,13 +401,18 @@ pub(crate) mod tests {
     /// the worker the call named.
     type Heard = Vec<(&'static str, u64, WorkerId)>;
 
+    /// The index each dispatch's lease named, as a stage reads it off the
+    /// lease it is handed.
+    type Indexes = Arc<Mutex<Vec<u8>>>;
+
     /// The `random` picker, keeping what the engine tells it of leases.
     #[derive(Debug)]
-    struct Hears(Arc<Mutex<Heard>>);
+    struct Hears(Arc<Mutex<Heard>>, Indexes);
 
     impl Lifecycle for Hears {
         fn on_dispatched(&self, lease: &Lease, target: &Target, _: Side, _: u32) {
             self.0.lock().push(("dispatched", lease.id.0, target.id));
+            self.1.lock().push(lease.target_index);
         }
 
         fn on_completed(&self, lease: &Lease, outcome: &Outcome) {
@@ -434,11 +447,19 @@ pub(crate) mod tests {
     /// Applies `generation` of a document whose picker keeps what it hears,
     /// and hands back what that generation's stage heard.
     fn hearing(store: &MemoryStore, generation: u64) -> Arc<Mutex<Heard>> {
+        hearing_indexes(store, generation).0
+    }
+
+    /// [`hearing`], with the index each dispatch's lease named.
+    fn hearing_indexes(store: &MemoryStore, generation: u64) -> (Arc<Mutex<Heard>>, Indexes) {
         let heard = Arc::new(Mutex::new(Vec::new()));
-        let kept = Arc::clone(&heard);
+        let indexes = Indexes::default();
+        let kept = (Arc::clone(&heard), Arc::clone(&indexes));
         let mut catalog = Catalog::builtin();
         catalog
-            .picker("hears", move || Box::new(Hears(Arc::clone(&kept))))
+            .picker("hears", move || {
+                Box::new(Hears(Arc::clone(&kept.0), Arc::clone(&kept.1)))
+            })
             .expect("a free name");
         let mut document = PolicySpec::preset("random").expect("a preset of this build");
         document.generation = generation;
@@ -448,7 +469,7 @@ pub(crate) mod tests {
         let spec = AppliedSpec::validate_digested(&document, digest, &catalog)
             .expect("the catalog holds the stage");
         store.apply(spec).expect("a later generation");
-        heard
+        (heard, indexes)
     }
 
     /// Files the lease `id` of [`A`] as `generation` issued it.
@@ -544,7 +565,7 @@ pub(crate) mod tests {
     fn a_dispatch_on_another_target_of_the_pick_is_told_on_that_target() {
         let store = MemoryStore::new();
         let t0 = Instant::now();
-        let heard = hearing(&store, 1);
+        let (heard, indexes) = hearing_indexes(&store, 1);
         let session = Session::from_raw(41);
         let mut record = lease(A, 1, t0);
         record.lease.generation = 1;
@@ -556,6 +577,10 @@ pub(crate) mod tests {
         second_target.target_index = 1;
         dispatched(&store, A, &second_target, t0).expect("the frame reads");
         assert_eq!(*heard.lock(), [("dispatched", 1, WorkerId(9))]);
+        // The lease told names the dispatched index, which the door wrote
+        // after the record was read: a stage that reads the index off the
+        // lease is told the second target.
+        assert_eq!(*indexes.lock(), [1]);
         // The key's pin follows the dispatch, and so does the lease.
         let pins = store.with_world(|world| world.spec().engine().sessions().pins(session));
         assert_eq!(pins, Some([WorkerId(9), WorkerId(0)]));
