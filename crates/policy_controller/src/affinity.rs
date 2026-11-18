@@ -26,7 +26,7 @@ use parking_lot::Mutex;
 use rustc_hash::FxHashMap;
 
 use crate::{
-    framework::{Scorer, TieBand},
+    framework::{Front, Scorer, Spread, TieBand},
     lease::{Lifecycle, Membership},
     spec::{AffinitySource, KvPressureParams, Needs, PrefixAffinityParams, WarmupSliceParams},
     view::{
@@ -520,6 +520,28 @@ impl Scorer for PrefixAffinity {
         !self.gates.kv_configured()
     }
 
+    /// A holder of the deepest match, a row under the gate, a row over it.
+    fn spread(&self) -> Spread {
+        Spread::Levels(0.5)
+    }
+
+    /// [`Self::score`], and the word its scores read as ([`Front::of`]):
+    /// the stage's own pass counts nothing for it. The rows a host named
+    /// say nothing.
+    fn score_front(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &[u32],
+        out: &mut [f32],
+    ) -> (TieBand, Front) {
+        let band = self.score(facts, candidates, kept, out);
+        if facts.named_alone().is_some() {
+            return (band, Front::Unsaid);
+        }
+        (band, Front::of(self.spread(), out))
+    }
+
     fn score(
         &self,
         facts: &RequestFacts<'_>,
@@ -579,6 +601,12 @@ impl Scorer for KvPressure {
     /// profile's affinity stages, which answer for it.
     fn row_wise(&self) -> bool {
         true
+    }
+
+    /// Every row reads alike: the stage configures the gate and orders
+    /// nothing.
+    fn spread(&self) -> Spread {
+        Spread::Alike
     }
 
     fn score(&self, _: &RequestFacts<'_>, _: &[Candidate], _: &[u32], out: &mut [f32]) -> TieBand {
@@ -924,6 +952,28 @@ impl Scorer for WarmupSlice {
     /// warms) comes from the host's feed, never from the rows handed.
     fn row_wise(&self) -> bool {
         !self.gates.kv_configured()
+    }
+
+    /// The row that takes the request scores alone, or every row alike.
+    fn spread(&self) -> Spread {
+        Spread::Levels(1.0)
+    }
+
+    /// [`Self::score`], and the word its scores read as ([`Front::of`]):
+    /// the stage's own pass counts nothing for it. The rows a host named
+    /// say nothing.
+    fn score_front(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &[u32],
+        out: &mut [f32],
+    ) -> (TieBand, Front) {
+        let band = self.score(facts, candidates, kept, out);
+        if facts.named_alone().is_some() {
+            return (band, Front::Unsaid);
+        }
+        (band, Front::of(self.spread(), out))
     }
 
     fn score(

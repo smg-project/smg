@@ -238,6 +238,7 @@ impl Built {
             generation: self.generation,
             zones: &[],
             reach: self.reach,
+            rated: false,
         }
     }
 }

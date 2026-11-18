@@ -1583,6 +1583,7 @@ mod tests {
             generation: 7,
             zones: &zones,
             reach: 0,
+            rated: false,
         };
         let mut packed = Packed::default();
         packed.fill_pool(&pool);

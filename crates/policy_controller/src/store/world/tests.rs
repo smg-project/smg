@@ -2297,6 +2297,18 @@ fn a_store_starts_under_the_unbound_generation_which_binds_nothing() {
     assert_eq!((built.generation, built.pool_facts().generation), (0, 0));
 }
 
+/// No store says yet that every row of a pool holds a rate
+/// ([`PoolFacts::rated`]): the engine asks a served decision whole, whatever
+/// its rows report.
+#[test]
+fn a_build_does_not_say_yet_that_every_row_holds_a_rate() {
+    let store = MemoryStore::new();
+    let t0 = Instant::now();
+    member(&store, "http://a:8000");
+    let built = view(&store, &ask(t0)).2;
+    assert!(!built.pool_facts().rated);
+}
+
 #[test]
 fn a_generation_is_applied_above_the_standing_one_and_no_other() {
     let store = MemoryStore::new();

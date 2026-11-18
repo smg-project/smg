@@ -19,7 +19,9 @@ use rustc_hash::{FxHashMap, FxHasher};
 
 use crate::{
     decision::{Target, Targets, MAX_TARGETS},
-    framework::{top_drawn, top_pass, Filter, Narrowed, Picker, Scorer, TieBand, DRAW_BOUND},
+    framework::{
+        top_drawn, top_pass, Filter, Front, Narrowed, Picker, Scorer, TieBand, DRAW_BOUND,
+    },
     lease::{Lease, Lifecycle, Membership, Side},
     spec::Needs,
     view::{Candidate, Constraints, LoadRow, ModelFingerprint, PoolFacts, RequestFacts, WorkerId},
@@ -909,6 +911,13 @@ impl Scorer for LeastLoad {
         true
     }
 
+    /// The rows a rank put in front are costed alone where each reports a
+    /// rate, and the stage says where one does not
+    /// ([`Self::score_front`]).
+    fn front_wise(&self) -> bool {
+        true
+    }
+
     fn score(
         &self,
         _: &RequestFacts<'_>,
@@ -984,6 +993,31 @@ impl Scorer for LeastLoad {
         } else {
             TieBand::NORMALIZED
         }
+    }
+
+    /// As [`Self::score`], with one word more. A row without a report is
+    /// costed from its reporting peers' baseline, and a report without a
+    /// rate drains at the rows' mean rate: either reads rows the stage may
+    /// not have been handed. So where one stands among the rows handed, the
+    /// stage says it must be asked whole ([`Front::Whole`]) before it costs
+    /// any: the rows a rank put in front are costed alone only where each
+    /// reports a rate, and then as they are among every row.
+    fn score_front(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &[u32],
+        out: &mut [f32],
+    ) -> (TieBand, Front) {
+        let alone = kept.iter().all(|&i| {
+            candidates[i as usize]
+                .load
+                .is_some_and(|report| report.live_rate > 0)
+        });
+        if !alone {
+            return (TieBand::NORMALIZED, Front::Whole);
+        }
+        (self.score(facts, candidates, kept, out), Front::Unsaid)
     }
 
     fn needs(&self) -> Needs {
@@ -2285,6 +2319,23 @@ impl Picker for RoundRobin {
     }
 }
 
+/// The five filters of this file a set names, by bit: what the cases of the
+/// folded test walk, here and in the engine's.
+#[cfg(test)]
+pub(crate) fn filters_of(set: u8) -> Vec<Box<dyn Filter>> {
+    let all: [fn() -> Box<dyn Filter>; 5] = [
+        || Box::new(Healthy),
+        || Box::new(NotOverloaded),
+        || Box::new(HasCapacity),
+        || Box::new(HasRoom),
+        || Box::new(NotTried),
+    ];
+    (0..all.len())
+        .filter(|bit| set & (1 << bit) != 0)
+        .map(|bit| all[bit]())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     /// The dispatches that waited for a retirement in progress; the retire
@@ -2763,6 +2814,43 @@ mod tests {
         pool[1].load = Some(row(500, 500, 0));
         scorer.score(&facts, &pool, &kept(2), &mut scores);
         assert!(scores[0] > scores[1], "{scores:?}");
+    }
+
+    /// What the load stage says of the rows it is handed
+    /// ([`Scorer::score_front`]): its scores and no word where each reports
+    /// a rate, and that it must be asked whole where one has no rate or no
+    /// report, before it costs any.
+    #[test]
+    fn least_load_must_be_asked_whole_of_a_row_without_a_rate_or_a_report() {
+        let ll = LeastLoad::new(0.15, 1024, 2000.0);
+        let mut pool = [candidate(0, 0), candidate(1, 0), candidate(2, 0)];
+        for (row, running) in pool.iter_mut().zip([1, 3, 2]) {
+            row.load = Some(report(running, 0));
+        }
+        let facts = RequestFacts::default();
+        let (mut said, mut plain) = ([0.0f32; 3], [0.0f32; 3]);
+        let band = ll.score(&facts, &pool, &kept(3), &mut plain);
+        assert_eq!(
+            ll.score_front(&facts, &pool, &kept(3), &mut said),
+            (band, Front::Unsaid)
+        );
+        assert_eq!(said, plain);
+        // A report without a rate drains at the rows' mean rate.
+        pool[1].load = Some(LoadRow {
+            live_rate: 0,
+            ..report(3, 0)
+        });
+        let mut untouched = [-1.0f32; 3];
+        let word = ll.score_front(&facts, &pool, &kept(3), &mut untouched).1;
+        assert_eq!(word, Front::Whole);
+        assert_eq!(untouched, [-1.0; 3], "nothing is costed");
+        // A row without a report is costed from its reporting peers.
+        pool[1].load = None;
+        let word = ll.score_front(&facts, &pool, &kept(3), &mut untouched).1;
+        assert_eq!(word, Front::Whole);
+        // Handed the rows that report a rate alone, it answers for them.
+        let word = ll.score_front(&facts, &pool, &[0, 2], &mut said[..2]).1;
+        assert_eq!(word, Front::Unsaid);
     }
 
     #[test]
@@ -4290,21 +4378,6 @@ mod tests {
         };
         assert!(!NotTried.keep(&facts, &c, &excluded));
         assert!(NotTried.soft() && HasRoom.soft() && !Healthy.soft() && !HasCapacity.soft());
-    }
-
-    /// The five filters of this file a set names, by bit.
-    fn filters_of(set: u8) -> Vec<Box<dyn Filter>> {
-        let all: [fn() -> Box<dyn Filter>; 5] = [
-            || Box::new(Healthy),
-            || Box::new(NotOverloaded),
-            || Box::new(HasCapacity),
-            || Box::new(HasRoom),
-            || Box::new(NotTried),
-        ];
-        (0..all.len())
-            .filter(|bit| set & (1 << bit) != 0)
-            .map(|bit| all[bit]())
-            .collect()
     }
 
     #[test]
