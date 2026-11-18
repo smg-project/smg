@@ -845,6 +845,14 @@ impl Controller {
             gateways.run(sweep_stop).await;
             Ok(())
         });
+        // The restores' clock: a leader lets go of a snapshot's cut whose
+        // standby took no part of it for the bound.
+        let restores = shared.replication.clone();
+        let restores_stop = stop.subscribe();
+        tasks.spawn(async move {
+            restores.run(restores_stop).await;
+            Ok(())
+        });
         if let Some(file) = spec_file {
             let file_stop = stop.subscribe();
             tasks.spawn(async move {

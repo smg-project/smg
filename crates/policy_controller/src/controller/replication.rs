@@ -13,7 +13,9 @@
 //! write of the store waits for the copy of one batch under the log's lock
 //! and for nothing else. A snapshot is one cut of the store, taken under
 //! the store's locks for the copy of its rows and held by the stream while
-//! it sends ([`Parts`]): no lock is held across a send.
+//! it sends ([`Parts`]): no lock is held across a send. A leader holds
+//! [`RESTORES`] restores at once, and lets go of the cut of one whose
+//! stream took no part for [`STALLED`] ([`Hold`]).
 //!
 //! The load rows are journaled where the lease is shared, and nowhere else
 //! ([`journaled`]): a controller that leads itself over a lease in its own
@@ -32,7 +34,10 @@ use std::{
 
 use parking_lot::Mutex;
 use prost::{encoding::message, Message as _};
-use tokio::time::{interval, Interval, MissedTickBehavior};
+use tokio::{
+    sync::watch,
+    time::{interval, Interval, MissedTickBehavior},
+};
 use tonic::{codegen::tokio_stream::Stream, Code, Status, Streaming};
 use tracing::info;
 
@@ -268,6 +273,47 @@ impl Replication {
         }
         Ok(cut)
     }
+
+    /// A restore that starts at `now`, admitted under `term`: the parts of
+    /// the cut at the head ([`Replication::cut`]), held for its stream
+    /// ([`Hold`]), beside the cut itself for the caller's word of it. `None`
+    /// where this leader holds [`RESTORES`] already: the restore waits for
+    /// one to end. The holds that ended leave first, and the ones whose
+    /// streams took no part for [`STALLED`]. The room is counted under the
+    /// holds' lock and the cut is made with that lock let go: a cut at a
+    /// new head copies the store.
+    fn restore(&self, term: u64, now: Instant) -> Result<Option<(Parts, Arc<Cut>)>, Status> {
+        let parts = {
+            let mut holds = self.cuts.holds.lock();
+            holds.retain(|hold| hold.keeps(now));
+            if holds.len() >= RESTORES {
+                // Refused as its cut would be, where the term is not served.
+                return self.serves(term).map(|()| None);
+            }
+            let hold = Arc::new(Hold::default());
+            holds.push(Arc::clone(&hold));
+            Parts::held(hold)
+        };
+        // A cut that is refused gives the room back: the parts end their
+        // hold where they are dropped.
+        let cut = self.cut(term)?;
+        parts.hold.fill(Arc::clone(&cut), now);
+        Ok(Some((parts, cut)))
+    }
+
+    /// The restores' clock: a pass a beat until `stop`, on no stream's
+    /// path. A hold whose stream took no part for [`STALLED`] is let go
+    /// here though the transport no longer polls that stream.
+    pub(crate) async fn run(&self, mut stop: watch::Receiver<bool>) {
+        let mut tick = interval(BEAT);
+        tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                at = tick.tick() => self.cuts.sweep(at.into_std()),
+                _ = stop.wait_for(|stop| *stop) => break,
+            }
+        }
+    }
 }
 
 /// The cut of every kind at one place of the log: taken by the first stream
@@ -277,12 +323,97 @@ impl Replication {
 /// ([`watch_workers::Source`]): standbys that lose their place together
 /// hold the store's writers once. Nothing is kept past the last stream that
 /// holds it.
+///
+/// The restores under way are counted here ([`Hold`]): a leader holds
+/// [`RESTORES`] of them at once, and lets go of one whose stream took no
+/// part for [`STALLED`].
 #[derive(Debug, Default)]
-struct Kept(Mutex<Weak<Cut>>);
+struct Kept {
+    /// The cut at the log's head, while a stream still sends it.
+    head: Mutex<Weak<Cut>>,
+    /// The restores under way: each stream's hold of its cut.
+    holds: Mutex<Vec<Arc<Hold>>>,
+}
+
+/// How many restores a leader holds at once: each holds a cut of the whole
+/// store while its stream sends it. A restore past them waits, the word
+/// said, for one to end.
+const RESTORES: usize = 4;
+
+/// How long a restore stands with no part taken before the leader lets its
+/// cut go. A part is at most [`MESSAGE_BYTES`]: a stream that takes none in
+/// this long moves under a megabit a second, or has stopped.
+const STALLED: Duration = Duration::from_secs(60);
+
+/// One stream's hold of the cut it is restored from, and when the stream
+/// last took a part of it. The stream lets the cut go at its last part and
+/// at its end. The leader lets it go where the stream took no part for
+/// [`STALLED`], whether the transport still polls that stream or not: its
+/// next look, if one comes, ends it.
+#[derive(Debug, Default)]
+struct Hold(Mutex<Held>);
+
+/// What a hold holds: room among the restores while its cut is made, then
+/// the cut and the instant its stream last took a part, then nothing.
+#[derive(Debug, Default)]
+enum Held {
+    #[default]
+    Room,
+    Cut(Arc<Cut>, Instant),
+    Gone,
+}
+
+impl Hold {
+    /// A hold of `cut` from `now`, with no room taken first: a case's own.
+    #[cfg(test)]
+    fn of(cut: Arc<Cut>, now: Instant) -> Self {
+        Self(Mutex::new(Held::Cut(cut, now)))
+    }
+
+    /// The cut made for the room taken, held from `now`.
+    fn fill(&self, cut: Arc<Cut>, now: Instant) {
+        *self.0.lock() = Held::Cut(cut, now);
+    }
+
+    /// The cut for one more part, taken at `now`; `None` once it was let
+    /// go.
+    fn take(&self, now: Instant) -> Option<Arc<Cut>> {
+        match &mut *self.0.lock() {
+            Held::Cut(cut, taken) => {
+                *taken = now;
+                Some(Arc::clone(cut))
+            }
+            Held::Room | Held::Gone => None,
+        }
+    }
+
+    /// Lets the cut go, and its room with it.
+    fn end(&self) {
+        *self.0.lock() = Held::Gone;
+    }
+
+    /// Lets the cut go where its stream took no part for [`STALLED`] at
+    /// `now`, and says whether the leader still keeps the hold.
+    fn keeps(&self, now: Instant) -> bool {
+        let mut held = self.0.lock();
+        if let Held::Cut(_, taken) = &*held {
+            if now.saturating_duration_since(*taken) >= STALLED {
+                *held = Held::Gone;
+            }
+        }
+        !matches!(*held, Held::Gone)
+    }
+}
 
 impl Kept {
+    /// Lets go, at `now`, of the holds whose streams took no part for
+    /// [`STALLED`], and forgets the ones that ended.
+    fn sweep(&self, now: Instant) {
+        self.holds.lock().retain(|hold| hold.keeps(now));
+    }
+
     fn at_head(&self, store: &MemoryStore, log: &Log) -> Arc<Cut> {
-        let mut kept = self.0.lock();
+        let mut kept = self.head.lock();
         let head = log.head(Kinds::All);
         if let Some(cut) = kept.upgrade().filter(|cut| cut.at == head) {
             return cut;
@@ -298,10 +429,10 @@ impl Kept {
 /// paged as a watch's snapshot is ([`watch_workers::fill`]), then the load
 /// rows' within the same bytes. The part that ends both is marked the last,
 /// and an empty store is one empty part. The stream holds the cut while it
-/// sends, and no lock.
+/// sends ([`Hold`]), and no lock.
 #[derive(Debug)]
 struct Parts {
-    cut: Arc<Cut>,
+    hold: Arc<Hold>,
     /// The rows and the load rows sent.
     rows: usize,
     loads: usize,
@@ -309,22 +440,35 @@ struct Parts {
     part: u32,
 }
 
+impl Drop for Parts {
+    fn drop(&mut self) {
+        self.hold.end();
+    }
+}
+
 impl Parts {
-    const fn of(cut: Arc<Cut>) -> Self {
+    /// The parts of `cut` from `now`, counted by no leader: a case's own.
+    #[cfg(test)]
+    fn of(cut: Arc<Cut>, now: Instant) -> Self {
+        Self::held(Arc::new(Hold::of(cut, now)))
+    }
+
+    const fn held(hold: Arc<Hold>) -> Self {
         Self {
-            cut,
+            hold,
             rows: 0,
             loads: 0,
             part: 0,
         }
     }
 
-    /// The next part as sent at `now`, and whether it is the last. Every
-    /// part says the snapshot's place as a heartbeat says the head: the
-    /// position after it, under its term. A row's admission crosses as its
-    /// age at `now`, as a load row's sample does.
-    fn next(&mut self, now: Instant) -> (proto::ReplicationBatch, bool) {
-        let cut = &*self.cut;
+    /// The next part as sent at `now`, and the snapshot's place where the
+    /// part is the last. Every part says that place as a heartbeat says
+    /// the head: the position after it, under its term. A row's admission
+    /// crosses as its age at `now`, as a load row's sample does. `None`
+    /// where the leader let the cut go ([`Hold`]).
+    fn next(&mut self, now: Instant) -> Option<(proto::ReplicationBatch, Option<Position>)> {
+        let cut = self.hold.take(now)?;
         let mut part = proto::ReplicationSnapshot {
             part: self.part,
             membership_epoch: cut.epoch,
@@ -349,7 +493,10 @@ impl Parts {
             snapshot: Some(part),
             ..proto::ReplicationBatch::default()
         };
-        (batch, last)
+        if last {
+            self.hold.end();
+        }
+        Some((batch, last.then_some(cut.at)))
     }
 }
 
@@ -377,15 +524,15 @@ fn load_rows(loads: &[(WorkerId, u16, LoadSample)], now: Instant) -> Vec<proto::
 /// leader.
 #[cfg(test)]
 pub(super) fn parts(cut: Arc<Cut>, now: Instant) -> Vec<proto::ReplicationBatch> {
-    let mut parts = Parts::of(cut);
+    let mut parts = Parts::of(cut, now);
     let mut sent = Vec::new();
-    loop {
-        let (batch, last) = parts.next(now);
+    while let Some((batch, ends)) = parts.next(now) {
         sent.push(batch);
-        if last {
-            return sent;
+        if ends.is_some() {
+            break;
         }
     }
+    sent
 }
 
 /// An instant's age at `now`, in milliseconds: what crosses in its place.
@@ -542,9 +689,11 @@ impl Feed {
 
     /// The word to re-sync, for `why`: a batch that says it and nothing
     /// else. The standby starts again from a snapshot, whose cut the next
-    /// look takes.
-    fn resync(&mut self, why: Why) -> Step {
+    /// look takes. The word is a frame of the stream, made at `now`: the
+    /// beat counts from it.
+    fn resync(&mut self, why: Why, now: Instant) -> Step {
         self.restore = Restore::Cut(why);
+        self.beat = now;
         Step::Batch(proto::ReplicationBatch {
             resync_required: true,
             head_seq: self.head(),
@@ -572,8 +721,8 @@ impl Feed {
             self.restore = Restore::Cut(why);
             return Step::Idle;
         }
-        match self.source.cut(self.term) {
-            Ok(cut) => {
+        match self.source.restore(self.term, now) {
+            Ok(Some((parts, cut))) => {
                 info!(
                     standby = %self.standby,
                     seq = cut.at.seq,
@@ -583,7 +732,19 @@ impl Feed {
                     why = %why,
                     "restoring a standby from a snapshot"
                 );
-                self.part(Parts::of(cut), now)
+                // The hold alone keeps the cut from here.
+                drop(cut);
+                self.part(parts, now)
+            }
+            // The leader holds as many restores as it may, and the cut
+            // waits for one of them to end. The word is said again a beat
+            // after the stream's last frame: a standby ends a stream that
+            // is silent for its quiet bound, and no part was sent, so the
+            // word starts nothing over.
+            Ok(None) if now.saturating_duration_since(self.beat) >= BEAT => self.resync(why, now),
+            Ok(None) => {
+                self.restore = Restore::Cut(why);
+                Step::Idle
             }
             Err(status) => Step::Close(status),
         }
@@ -591,13 +752,19 @@ impl Feed {
 
     /// The snapshot's next part at `now`. After the last the standby stands
     /// at the snapshot's place and owes no acknowledgement: the next look
-    /// reads the log from there.
+    /// reads the log from there. A stream whose cut the leader let go
+    /// ([`Hold`]) ends `DEADLINE_EXCEEDED`: its standby asks again.
     fn part(&mut self, mut parts: Parts, now: Instant) -> Step {
-        let (mut batch, last) = parts.next(now);
+        let Some((mut batch, ends)) = parts.next(now) else {
+            return Step::Close(Status::deadline_exceeded(format!(
+                "this standby took no part of its snapshot for {} s: the leader let the cut go",
+                STALLED.as_secs()
+            )));
+        };
         batch.head_seq = self.head();
-        if last {
-            self.place = parts.cut.at;
-            self.acked = self.place.seq;
+        if let Some(at) = ends {
+            self.place = at;
+            self.acked = at.seq;
             self.restored = Some(now);
         } else {
             self.restore = Restore::Parts(parts);
@@ -623,7 +790,7 @@ impl Feed {
         }
         match std::mem::replace(&mut self.restore, Restore::No) {
             Restore::No => {}
-            Restore::Word(why) => return self.resync(why),
+            Restore::Word(why) => return self.resync(why, now),
             Restore::Cut(why) => return self.cut(why, now),
             Restore::Parts(parts) => return self.part(parts, now),
         }
@@ -636,7 +803,7 @@ impl Feed {
             if now.saturating_duration_since(since) < BEAT {
                 return Step::Idle;
             }
-            return self.resync(Why::Backlog(self.backlog));
+            return self.resync(Why::Backlog(self.backlog), now);
         }
         self.full = None;
         let most = usize::try_from(room).map_or(Log::BATCH, |room| room.min(Log::BATCH));
@@ -646,7 +813,7 @@ impl Feed {
             .read(Kinds::All, self.place, most, &mut self.entries)
             .is_err()
         {
-            return self.resync(Why::Place(self.place));
+            return self.resync(Why::Place(self.place), now);
         }
         let Some(first) = self.entries.first().map(|entry| entry.at) else {
             if now.saturating_duration_since(self.beat) < BEAT {
@@ -668,13 +835,13 @@ impl Feed {
         if first.term == 0 {
             // Written before any term: no standby adopts it. The standby
             // re-syncs from a snapshot, which stands under a term.
-            return self.resync(Why::NoTerm);
+            return self.resync(Why::NoTerm, now);
         }
         // A batch on the wire names its first position alone: its events
         // stand at the positions after the place, one each, or the place is
         // no longer the log's.
         if !follows(self.place, &self.entries) {
-            return self.resync(Why::Place(self.place));
+            return self.resync(Why::Place(self.place), now);
         }
         // The head is read after the batch, by the log's own door: it is
         // never short of the batch's end, and a write between the two
@@ -825,6 +992,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use parking_lot::Mutex;
+    use tokio::task::JoinSet;
     use tonic::Code;
 
     use super::*;
@@ -1741,6 +1909,138 @@ mod tests {
         let short = at + BEAT - Duration::from_millis(1);
         assert!(matches!(feed.look(short), Step::Idle));
         assert!(batch(feed.look(at + BEAT)).snapshot.is_some());
+    }
+
+    #[test]
+    fn a_leader_holds_four_restores_and_the_next_waits_for_one_to_end() {
+        let leader = Leader::leading();
+        let source = leader.replication();
+        let (term, at) = (leader.term, leader.at);
+        let restore = |now| {
+            let admitted = source.restore(term, now).expect("the term is served");
+            admitted.map(|(parts, _)| parts)
+        };
+        // A cut that is refused gives its room back: five refusals leave
+        // the leader's four rooms free.
+        for _ in 0..5 {
+            assert!(source.restore(term + 1, at).is_err());
+        }
+        // Four restores under way, each at a head of its own: four by the
+        // case's own count, the number the contract tells a standby.
+        let mut held = Vec::new();
+        for _ in 0..4 {
+            leader.writes(1);
+            held.push(restore(at).expect("room for a restore"));
+        }
+        // One more waits, and the leader cuts nothing for it. A term that
+        // is not served is refused there as its cut would be.
+        assert!(restore(at).is_none());
+        assert!(source.restore(term + 1, at).is_err());
+        // A stream that ends inside its restore gives its room up,
+        drop(held.pop());
+        let mut fifth = restore(at).expect("room once a restore ended");
+        assert!(restore(at).is_none());
+        // and so does one that took its last part.
+        while let Some((_, ends)) = fifth.next(at) {
+            if ends.is_some() {
+                break;
+            }
+        }
+        assert!(fifth.next(at).is_none(), "nothing follows the last part");
+        assert!(
+            restore(at).is_some(),
+            "room once a restore's last part left"
+        );
+    }
+
+    /// A restore past the four waits on its stream, and the word is said
+    /// again a beat after the stream's last frame: the standby's quiet
+    /// bound, three beats, does not lapse while the cut waits.
+    #[test]
+    fn a_restore_that_waits_for_room_is_told_the_word_again_each_beat() {
+        let leader = Leader::leading();
+        leader.writes(3);
+        let (term, at) = (leader.term, leader.at);
+        let lost = past_the_head(&leader);
+        let mut feed = leader.feed(lost, RING);
+        let source = feed.source.clone();
+        // Four restores under way: the leader holds as many as it may.
+        let mut held = Vec::new();
+        for _ in 0..4 {
+            held.push(source.restore(term, at).expect("the term is served"));
+        }
+        assert!(held.iter().all(Option::is_some));
+        // The fifth standby is told the word half a beat after its
+        // stream's last frame, and its cut waits in silence short of a
+        // beat from the word: the word is the frame the beat counts from.
+        let said = at + BEAT / 2;
+        assert_eq!(resync(&mut feed, said), Why::Place(lost));
+        assert!(matches!(feed.look(said), Step::Idle));
+        let short = said + BEAT - Duration::from_millis(1);
+        assert!(matches!(feed.look(short), Step::Idle));
+        // A beat from the word it is said again, and the cut waits on. The
+        // looks stay inside the lead's window, which ends two beats after
+        // the take.
+        assert_eq!(resync(&mut feed, said + BEAT), Why::Place(lost));
+        assert!(matches!(feed.look(said + BEAT), Step::Idle));
+        // Room: the next look makes the cut and sends its first part.
+        held.pop();
+        assert!(batch(feed.look(said + BEAT)).snapshot.is_some());
+    }
+
+    #[test]
+    fn a_restore_whose_stream_took_no_part_for_the_bound_lets_its_cut_go() {
+        let leader = Leader::leading();
+        leader.writes(3);
+        let at = leader.at;
+        let lost = past_the_head(&leader);
+        // A stream inside its restore: the word, the cut and its first part.
+        let mut feed = leader.feed(lost, RING);
+        let source = feed.source.clone();
+        assert_eq!(resync(&mut feed, at), Why::Place(lost));
+        assert!(batch(feed.look(at)).snapshot.is_some());
+        assert!(matches!(feed.restore, Restore::Parts(_)));
+        let held = || source.cuts.holds.lock().len();
+        // Short of the bound the leader's clock leaves the hold,
+        source.cuts.sweep(at + STALLED - Duration::from_millis(1));
+        assert_eq!(held(), 1);
+        // and at the bound it lets the cut go, though no look came.
+        source.cuts.sweep(at + STALLED);
+        assert_eq!(held(), 0);
+        // The stream ends at its next look, where the transport asks one.
+        match feed.look(at) {
+            Step::Close(status) => assert_eq!(status.code(), Code::DeadlineExceeded),
+            other => panic!("the stream's end, not {other:?}"),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_restores_clock_lets_a_stalled_cut_go_with_no_look() {
+        let leader = Leader::leading();
+        leader.writes(3);
+        let source = leader.replication();
+        let now = tokio::time::Instant::now().into_std();
+        let (mut parts, _) = source
+            .restore(leader.term, now)
+            .expect("the term is served")
+            .expect("room");
+        let (stop, stopped) = watch::channel(false);
+        let mut task = JoinSet::new();
+        let clock = source.clone();
+        task.spawn(async move { clock.run(stopped).await });
+        // A beat short of the bound the hold stands: its stream took a part.
+        tokio::time::sleep(STALLED - BEAT).await;
+        let taken = tokio::time::Instant::now().into_std();
+        assert!(parts.next(taken).is_some());
+        // The bound from that part on, and a beat for the clock's pass.
+        tokio::time::sleep(STALLED + BEAT).await;
+        let late = tokio::time::Instant::now().into_std();
+        assert!(parts.next(late).is_none(), "the cut was let go");
+        stop.send_replace(true);
+        task.join_next()
+            .await
+            .expect("one task")
+            .expect("the clock ends at the stop");
     }
 
     #[test]
