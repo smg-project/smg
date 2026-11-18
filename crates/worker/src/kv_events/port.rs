@@ -54,20 +54,21 @@ pub enum BatchOutcome {
     /// A duplicate below the cursor, or a batch for an id the sink holds
     /// nothing for: not taken, and the cursor stays where it was.
     Skipped,
-    /// A gap with no replay asked yet: the caller reconnects asking for a
-    /// replay from `expected`; the batch is not applied (the replay resends
-    /// it). A second gap on the same rank is applied as lost history (see
-    /// [`KvCursor::degraded`]).
+    /// A gap with no replay asked yet: `expected` is the first sequence the
+    /// batch's own rank is missing. The collector subscribes again from rank
+    /// 0's cursor (the servicers replay rank 0's publisher), and the batch
+    /// is not applied (the replay resends it). A second gap on the same rank
+    /// is applied as lost history (see [`KvCursor::degraded`]).
     Gap { expected: u64, received: u64 },
 }
 
 /// Why a rank's cursor was reset or its blocks replaced, and the label the
 /// resync is counted under. This crate's collector says four: `OutOfRange`
 /// and `DataLoss`, the server's own status codes, and a snapshot's two ends,
-/// `Snapshot` and `SnapshotAbandoned`. Its sink finds two with its cursor,
-/// `PublisherRestart` and `GapCleared`, and counts a `Snapshot` where it
-/// clears for one. The store's statement holds three more, a relay's
-/// frames, which no stream of this crate carries.
+/// `Snapshot` and `SnapshotAbandoned`. The gateway's sink finds two with its
+/// cursor, `PublisherRestart` and `GapCleared`, and counts a `Snapshot`
+/// where it clears for one. The store's statement holds three more, a
+/// relay's frames, which no stream of this crate carries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ResyncReason {
     /// The server's history no longer reaches the cursor.

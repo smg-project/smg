@@ -307,6 +307,9 @@ impl KvEventMonitor {
         if batch.dp_rank.is_none() {
             state.saw_unranked = true;
         }
+        // Read once, from the facts the collector said: the first chunk's
+        // line and the cursor's mark stand on one answer.
+        let unknown_before = facts.snapshot.is_some_and(|said| said.unknown_before);
         if chunk.index == 0 || state.snapshot.is_none() {
             if chunk.index != 0 {
                 warn!(
@@ -325,7 +328,7 @@ impl KvEventMonitor {
                 through = batch.sequence_number + u64::from(chunk.count.saturating_sub(chunk.index + 1)),
                 "KV event relay served a state snapshot; replacing the worker's index state"
             );
-            if chunk.unknown_before > 0 {
+            if unknown_before {
                 warn!(
                     worker_url = %Endpoint::redacted_str(worker_url),
                     rank,
@@ -348,7 +351,7 @@ impl KvEventMonitor {
         }
         let cursor = state.ranks.entry(rank).or_default();
         cursor.resync_to(facts.sequence);
-        if facts.snapshot.is_some_and(|said| said.unknown_before) {
+        if unknown_before {
             cursor.mark_degraded();
         }
         on_batch(batch);

@@ -717,9 +717,10 @@ impl KvEventCollector {
     }
 
     /// Process batches from a single stream connection: every batch that is
-    /// more than a load record goes to the sink with its header facts, a
-    /// snapshot's start said ahead of its first chunk. A batch the sink took
-    /// is `on_batch`'s; a gap ends the stream, for a replay.
+    /// more than a load record goes to the sink with its rank and its header
+    /// facts, a snapshot's start said ahead of its first chunk; a batch whose
+    /// rank fits none goes to no sink. A batch the sink took is `on_batch`'s;
+    /// a gap ends the stream, for a replay.
     async fn process_stream<S: KvEventSink<Batch = KvEventBatch>>(
         mut stream: tonic::Streaming<KvEventBatch>,
         worker_url: &str,
@@ -743,12 +744,19 @@ impl KvEventCollector {
                     continue;
                 }
             }
+            // A rank that fits no `u16` is no rank of an engine: its batch
+            // goes to no sink, as a load record of a negative rank goes to
+            // no monitor.
+            let Some(rank) = batch_rank(&batch) else {
+                Metrics::record_kv_event_batch(worker_url, "not_indexed");
+                continue;
+            };
             if let Some(chunk) = &batch.snapshot {
                 if count_snapshot_chunk(snapshot, chunk) {
                     sink.resync(id, None, ResyncReason::Snapshot);
                 }
             }
-            match sink.admit(id, batch_rank(&batch), batch_facts(&batch), &batch) {
+            match sink.admit(id, rank, batch_facts(&batch), &batch) {
                 BatchOutcome::Applied => on_batch(),
                 BatchOutcome::Skipped => {}
                 BatchOutcome::Gap { expected, received } => {
@@ -780,12 +788,12 @@ pub fn batch_facts(batch: &KvEventBatch) -> BatchFacts {
     }
 }
 
-/// The rank a batch names, 0 for a batch that names none.
-pub fn batch_rank(batch: &KvEventBatch) -> u16 {
+/// The rank a batch names, 0 for a batch that names none; `None` for a rank
+/// that fits no `u16`, which is no rank of an engine.
+pub fn batch_rank(batch: &KvEventBatch) -> Option<u16> {
     batch
         .dp_rank
-        .and_then(|rank| u16::try_from(rank).ok())
-        .unwrap_or(0)
+        .map_or(Some(0), |rank| u16::try_from(rank).ok())
 }
 
 /// Count one chunk of a relay's snapshot on its stream. `open` is the chunks
@@ -1722,5 +1730,82 @@ mod tests {
             sequence_number: 9,
             ..Default::default()
         }));
+    }
+
+    /// A batch whose rank fits no `u16` names no rank of an engine: it is
+    /// said to no sink, where rank 0's cursor would have taken it, and the
+    /// batches around it are said as they come.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_batch_of_a_rank_that_fits_none_is_said_to_no_sink() {
+        let ranked = |sequence_number, dp_rank| KvEventBatch {
+            sequence_number,
+            dp_rank,
+            ..stored_batch(&[(1, 16)])
+        };
+        assert_eq!(batch_rank(&ranked(1, None)), Some(0));
+        assert_eq!(batch_rank(&ranked(1, Some(65_535))), Some(65_535));
+        assert_eq!(batch_rank(&ranked(1, Some(65_536))), None);
+        assert_eq!(batch_rank(&ranked(1, Some(-1))), None);
+
+        let script = vec![
+            Ok(ranked(5, Some(1))),
+            Ok(ranked(6, Some(-1))),
+            Ok(ranked(7, Some(65_536))),
+            Ok(ranked(8, None)),
+        ];
+        let (worker, _engine) = connected(Script::Stream(script));
+        let sink = Said::default();
+        let sub = said_subscription(&worker, &sink);
+        let (_keep, mut shutdown_rx) = oneshot::channel::<()>();
+        let round =
+            KvEventCollector::subscription_round(&sub, &mut Backoff::new(), &mut shutdown_rx).await;
+        assert!(matches!(round, Round::Backoff));
+        let said: Vec<String> = sink
+            .calls()
+            .into_iter()
+            .filter(|call| !call.starts_with("cursor"))
+            .collect();
+        assert_eq!(
+            said,
+            [
+                "reconnected 7",
+                "admit 7 rank 1 seq 5",
+                "admit 7 rank 0 seq 8"
+            ]
+        );
+    }
+
+    /// The count of a relay snapshot's chunks, rule by rule: a first chunk
+    /// opens a snapshot of its count, inside an open one too; a chunk that
+    /// comes without its first opens one as well; a later chunk counts down
+    /// and the one that fills the count closes it; a count of zero is one
+    /// chunk.
+    #[test]
+    fn a_snapshots_chunks_are_counted_by_these_rules() {
+        let chunk = |index, count| KvSnapshotChunk {
+            index,
+            count,
+            ..Default::default()
+        };
+        // The count before the chunk, the chunk, whether it opens a
+        // snapshot, the count after it.
+        let rows = [
+            (None, chunk(0, 3), true, Some(2)),
+            (Some(2), chunk(1, 3), false, Some(1)),
+            (Some(1), chunk(2, 3), false, None),
+            (None, chunk(1, 3), true, Some(2)),
+            (Some(2), chunk(0, 2), true, Some(1)),
+            (None, chunk(0, 1), true, None),
+            (None, chunk(0, 0), true, None),
+        ];
+        for (before, chunk, opens, after) in rows {
+            let mut open = before;
+            assert_eq!(
+                count_snapshot_chunk(&mut open, &chunk),
+                opens,
+                "{before:?} {chunk:?}"
+            );
+            assert_eq!(open, after, "{before:?} {chunk:?}");
+        }
     }
 }

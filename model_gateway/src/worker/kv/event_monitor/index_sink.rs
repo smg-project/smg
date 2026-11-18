@@ -400,7 +400,8 @@ mod tests {
 
     /// Say `batch` to the sink as the collector does.
     fn admit(sink: &IndexSink, id: RowId, batch: &KvEventBatch) -> BatchOutcome {
-        sink.admit(id, batch_rank(batch), batch_facts(batch), batch)
+        let rank = batch_rank(batch).expect("the case's rank is a rank");
+        sink.admit(id, rank, batch_facts(batch), batch)
     }
 
     fn applied(sink: &IndexSink, id: RowId, rank: u16) -> Option<u64> {
