@@ -15,27 +15,30 @@
 //! store's entry, one apply at a time: one process writes the directory,
 //! under the door's lock alone.
 //!
-//! One process holds a directory: a store takes the lock of a file it
-//! keeps there (`.lock`) before it reads a name, and holds it until it is
+//! One process holds a directory: a store takes the lock of a file it keeps
+//! there (`.lock`) before it reads a name, and holds it until it is
 //! dropped; the system lets it go at any exit. The store holds the
-//! directory itself, its path resolved once at the open: the lock file,
-//! the names, every read, every write and every removal go through that
+//! directory itself, its path resolved once at the open: the lock file, the
+//! names, every read, every write and every removal go through that
 //! directory, wherever the path leads later, and a write is refused where
 //! the path leads to another one as it begins. A start that finds the lock
 //! held waits a bound for its holder to stop and takes the directory then.
-//! One still held at the bound's end is refused by name, and one whose
-//! lock the system does not give is refused in the system's own words: the
-//! lock asks that its file is there or can be made, and no write of it on
-//! a file system that locks as a local one does. So a start reads the
-//! directory once the process before it writes no more, and runs that
-//! one's last apply. The lock is on the file, not on its name: the file is
-//! made once and never removed, and one removed under a running store lets
-//! a second one in. It is the open file's, too: a child the process forks
-//! holds a copy until it runs its program, so the lock may outlast a drop
-//! by that moment, and a start that follows a drop in one process waits
-//! like any other. The directory stands on a file system that links and
-//! locks. Where no link is made, every write is refused at the link in the
-//! system's own words, and nothing of it stays on file.
+//! One whose directory was renamed under that wait is refused once the lock
+//! is held: by name where another is laid at its path, which a new start
+//! takes, and as a path to no directory where its path leads to none. One
+//! still held at the bound's end is refused by name, and one whose lock the
+//! system does not give is refused in the system's own words: the lock asks
+//! that its file is there or can be made, and no write of it on a file
+//! system that locks as a local one does. So a start reads the directory
+//! once the process before it writes no more, and runs that one's last
+//! apply. The lock is on the file, not on its name: the file is made once
+//! and never removed, and one removed under a running store lets a second
+//! one in. It is the open file's, too: a child the process forks holds a
+//! copy until it runs its program, so the lock may outlast a drop by that
+//! moment, and a start that follows a drop in one process waits like any
+//! other. The directory stands on a file system that links and locks. Where
+//! no link is made, every write is refused at the link in the system's own
+//! words, and nothing of it stays on file.
 //!
 //! The lock holds two apart as far as the file system's locks reach:
 //! between two hosts of a network file system only where it carries them.
@@ -57,15 +60,14 @@
 //!
 //! A start reads the directory: the highest number is the generation to
 //! run, and a file a write left under its temporary name is removed, or
-//! left in place where this user may not remove it. Any other name is
-//! left alone, the lock file's among them. Two files under one number, a
-//! directory another process holds, one with no lock file where none can
-//! be made, or a path that leads to no directory, refuse the start by
-//! name. The [`RETAINED`]
-//! highest numbers are kept; an apply removes the files under them. A
-//! generation on file is read by the read call and by a rollback; the read
-//! call reads its file through the directory itself ([`read_at`]), under
-//! no lock of the door.
+//! left in place where this user may not remove it. Any other name is left
+//! alone, the lock file's among them. Two files under one number, a
+//! directory another process holds, one renamed under the start's wait, one
+//! with no lock file where none can be made, or a path that leads to no
+//! directory, refuse the start by name. The [`RETAINED`] highest numbers
+//! are kept; an apply removes the files under them. A generation on file is
+//! read by the read call and by a rollback; the read call reads its file
+//! through the directory itself ([`read_at`]), under no lock of the door.
 //!
 //! [`Generations`]: super::generations::Generations
 
@@ -135,6 +137,13 @@ pub enum StoreRefused {
         "no lock file, and none can be made: {0}: a store's first start needs a directory it may write"
     )]
     Unmade(String),
+    /// The directory moved while the start waited for its lock: by the
+    /// time the lock is held the path leads to another one, which a new
+    /// start takes.
+    #[error(
+        "the directory moved while this start waited for its lock: the path leads to another one, which a new start takes"
+    )]
+    Moved,
     /// Two files, one in each form, are named by one number.
     #[error("generation {0} stands under two names")]
     TwoNames(u64),
@@ -307,15 +316,19 @@ impl SpecStore {
     /// Takes the directory at `dir` and reads it: the generations on file.
     /// A file left under a temporary name is removed, its write never
     /// ended, or left in place where this user may not remove it. Where
-    /// another process holds the directory's lock it is tried
-    /// again every [`HELD_PACE`]: the directory is taken once the holder
-    /// lets go, and a start still held when `wait` has passed is refused by
-    /// name. A process that stops lets the lock go at its exit, so a start
-    /// given the time a stop takes reads the directory after that process's
-    /// last write.
+    /// another process holds the directory's lock it is tried again every
+    /// [`HELD_PACE`]: the directory is taken once the holder lets go, and
+    /// a start still held when `wait` has passed is refused by name. A
+    /// process that stops lets the lock go at its exit, so a start given
+    /// the time a stop takes reads the directory after that process's last
+    /// write. A directory renamed while the start waited is refused once
+    /// the lock is held: by name where another is laid at its path
+    /// ([`StoreRefused::Moved`]), which a new start takes, and as a path to
+    /// no directory where none is.
     pub(crate) fn open_within(dir: PathBuf, wait: Duration) -> Result<Self, StoreRefused> {
         let (dir, root) = Self::rooted(&dir)?;
         let held = Self::hold(&dir, &root, wait)?;
+        Self::named_still(&dir, &root)?;
         Self::read_under(dir, root, held)
     }
 
@@ -485,13 +498,36 @@ impl SpecStore {
     /// one it holds, or to none: an apply there would stand on file where
     /// no start by that path reads it.
     fn same(&self) -> io::Result<()> {
-        use std::os::unix::fs::MetadataExt as _;
-
-        let (path, held) = (fs::metadata(&self.dir)?, self.root.metadata()?);
-        if (path.dev(), path.ino()) == (held.dev(), held.ino()) {
+        if Self::leads(&self.dir, &self.root)? {
             Ok(())
         } else {
             Err(io::Error::other(MOVED))
+        }
+    }
+
+    /// Whether the path `dir` leads to the directory `root`, by the
+    /// system's own identity of the two. A path that leads nowhere says
+    /// so in the system's words.
+    fn leads(dir: &Path, root: &fs::File) -> io::Result<bool> {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let (path, held) = (fs::metadata(dir)?, root.metadata()?);
+        Ok((path.dev(), path.ino()) == (held.dev(), held.ino()))
+    }
+
+    /// Refuses a start whose path leads to another directory than the one
+    /// it locked, or to none, once the lock is held: the directory was
+    /// renamed or removed while the start waited, and the one held is no
+    /// longer the one its path names. A link in the path that turned
+    /// passes: the path was resolved once, before the wait.
+    fn named_still(dir: &Path, root: &fs::File) -> Result<(), StoreRefused> {
+        match Self::leads(dir, root) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(StoreRefused::Moved),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                Err(StoreRefused::NotADirectory)
+            }
+            Err(error) => Err(StoreRefused::Unreadable(error.to_string())),
         }
     }
 
@@ -1100,13 +1136,51 @@ pub(crate) mod tests {
         assert_eq!(refused.kind(), io::ErrorKind::NotFound);
     }
 
-    /// A directory replaced at the store's path while a start waits leaves
-    /// that start the directory it holds, whole: the generations it lists
-    /// there are the ones it reads, bytes and times, and a write is
-    /// refused, since the path leads to the other directory by then.
+    /// A directory replaced at the path of an open store leaves that store
+    /// the directory it holds, whole: the generations it listed there are
+    /// the ones it reads, the bytes and the time of the file held, and a
+    /// write is refused, since the path leads to the other directory by
+    /// then.
     #[cfg(unix)]
     #[test]
-    fn a_directory_replaced_under_a_waiting_start_is_read_where_it_is_held() {
+    fn a_directory_replaced_under_an_open_store_is_read_where_it_is_held() {
+        let base = tempfile::tempdir().expect("a temp dir");
+        let (dir, moved) = (base.path().join("store"), base.path().join("moved"));
+        fs::create_dir(&dir).expect("the directory");
+        let mut store = SpecStore::open(dir.clone()).expect("the store");
+        store.persist(at(1, YAML), b"held").expect("a write");
+        fs::rename(&dir, &moved).expect("the directory moves");
+        fs::create_dir(&dir).expect("another stands at its path");
+        let other = dir.join(name_of(1, "yaml"));
+        fs::write(&other, "other").expect("the other's first");
+        fs::write(dir.join(name_of(2, "yaml")), "newer").expect("the other's second");
+        // The other's file under the same name is of another time.
+        let apart = UNIX_EPOCH + Duration::from_secs(86_400);
+        fs::File::options()
+            .write(true)
+            .open(&other)
+            .and_then(|file| file.set_modified(apart))
+            .expect("the other's time");
+        assert_eq!(store.kept(), [at(1, YAML)], "the directory it holds");
+        assert_eq!(store.read(at(1, YAML)).expect("it reads"), b"held");
+        let held = fs::metadata(moved.join(name_of(1, "yaml")))
+            .and_then(|file| file.modified())
+            .expect("the held file's time");
+        assert_ne!(held, apart);
+        assert_eq!(store.written(at(1, YAML)).expect("its time"), held);
+        let refused = store
+            .persist(at(2, YAML), b"two")
+            .expect_err("the path leads elsewhere");
+        assert_eq!(refused.to_string(), MOVED);
+    }
+
+    /// A directory renamed while a start waits for its lock, another laid
+    /// at its path, refuses that start by name once the lock is held: the
+    /// directory it locked is no longer the one its path names. A new
+    /// start takes the one that is, whole.
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_replaced_under_a_waiting_start_refuses_that_start() {
         let base = tempfile::tempdir().expect("a temp dir");
         let (dir, moved) = (base.path().join("store"), base.path().join("moved"));
         fs::create_dir(&dir).expect("the directory");
@@ -1120,18 +1194,36 @@ pub(crate) mod tests {
         fs::write(dir.join(name_of(1, "yaml")), "other").expect("the other's first");
         fs::write(dir.join(name_of(2, "yaml")), "newer").expect("the other's second");
         drop(holder);
-        let mut store = waiter
+        let refused = waiter
             .start
             .join()
             .expect("the waiter")
-            .expect("the directory is taken");
-        assert_eq!(store.kept(), [at(1, YAML)], "the directory it holds");
-        assert_eq!(store.read(at(1, YAML)).expect("it reads"), b"held");
-        store.written(at(1, YAML)).expect("its time");
-        let refused = store
-            .persist(at(2, YAML), b"two")
-            .expect_err("the path leads elsewhere");
-        assert_eq!(refused.to_string(), MOVED);
+            .expect_err("the directory moved under the wait");
+        assert_eq!(refused, StoreRefused::Moved);
+        let store = SpecStore::open(dir.clone()).expect("a new start");
+        assert_eq!(store.kept(), [at(1, YAML), at(2, YAML)]);
+        assert_eq!(store.read(at(2, YAML)).expect("it reads"), b"newer");
+        assert_eq!(names(&moved), BTreeSet::from([name_of(1, "yaml")]));
+    }
+
+    /// A directory renamed while a start waits for its lock, with nothing
+    /// laid at its path, refuses that start as a path to no directory.
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_gone_under_a_waiting_start_refuses_that_start() {
+        let base = tempfile::tempdir().expect("a temp dir");
+        let (dir, moved) = (base.path().join("store"), base.path().join("moved"));
+        fs::create_dir(&dir).expect("the directory");
+        let holder = SpecStore::open(dir.clone()).expect("the holder");
+        let waiter = Waiter::held_off(dir.clone());
+        fs::rename(&dir, &moved).expect("the directory moves");
+        drop(holder);
+        let refused = waiter
+            .start
+            .join()
+            .expect("the waiter")
+            .expect_err("the path leads nowhere");
+        assert_eq!(refused, StoreRefused::NotADirectory);
     }
 
     /// A removal goes through the directory the store holds. Where the
