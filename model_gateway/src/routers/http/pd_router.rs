@@ -96,7 +96,8 @@ use crate::{
     },
     worker::{
         identity::endpoint::Endpoint, metrics::Metrics as WorkerMetrics, PdPairIndex, PdWire,
-        RoutingPool, RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry, UNKNOWN_MODEL_ID,
+        RoutingPool, RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry, WorkerRegistryExt,
+        UNKNOWN_MODEL_ID,
     },
 };
 

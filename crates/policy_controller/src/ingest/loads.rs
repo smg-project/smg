@@ -34,7 +34,9 @@
 //!
 //! The loop also keeps the instant the store names for its publication
 //! ([`LoadSink::publish_due`]): a row that lands inside the store's window
-//! is shown to decisions at the window's end, with no later write.
+//! is shown to decisions at the window's end, with no later write. The
+//! build a membership write owes is paid at the same instant: the write is
+//! another task's, so the store wakes the loop ([`LoadSink::wake_with`]).
 
 use std::{
     collections::{BTreeMap, HashSet},
@@ -49,7 +51,7 @@ use std::{
 use openai_protocol::worker::{RuntimeType, WorkerLoadResponse};
 use parking_lot::Mutex;
 use tokio::{
-    sync::watch,
+    sync::{watch, Notify},
     task::{JoinError, JoinSet},
     time::MissedTickBehavior,
 };
@@ -473,6 +475,14 @@ where
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut schedule = Schedule::default();
         let mut polling = *polls.borrow_and_update();
+        // A write of another task can leave the store an instant this loop
+        // read none of (a registration's build): the store wakes the loop,
+        // which reads the instant again.
+        let woken = Arc::new(Notify::new());
+        self.store.wake_with(Box::new({
+            let woken = Arc::clone(&woken);
+            move || woken.notify_one()
+        }));
         loop {
             // The instant the store names for the rows its publication
             // window still holds, read after every write of this loop: the
@@ -495,6 +505,7 @@ where
                     }
                 }
                 Some(joined) = schedule.calls.join_next() => self.land(&mut schedule.due, joined),
+                () = woken.notified() => {}
                 () = at(due) => self.store.publish(now()),
                 _ = ticker.tick() => {
                     if polling {

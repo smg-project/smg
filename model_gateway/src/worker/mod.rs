@@ -5,12 +5,20 @@ pub mod health;
 pub mod identity;
 pub mod kv;
 pub mod load;
-pub mod metrics;
+/// The worker crate's metric writers and their series store, at the paths
+/// they had here.
+pub mod metrics {
+    pub use smg_worker::metrics::{series, writers::*};
+
+    #[cfg(test)]
+    mod gateway_tests;
+}
 pub mod pd;
 // The worker crate's, at the path it had here.
 pub(crate) use smg_worker::periodic_task;
-pub mod registry;
-pub mod runtime;
+// The worker crate's, at the paths they had here.
+pub use smg_worker::{registry, runtime};
+pub(crate) mod snapshot;
 #[cfg(any(test, feature = "test-util"))]
 pub mod test_support;
 
@@ -57,21 +65,24 @@ pub use openai_protocol::{
 };
 pub(crate) use pd::pair_index::{PdPairIndex, PdWire};
 pub use pd::pairing::{PairingMismatch, PdPairing, PdPairingMode};
-pub(crate) use registry::{ModelLabels, ModelWorkerSnapshot, RoutingPool, WindowFloor};
 pub use registry::{RemoteWorkerState, WorkerOrigin};
+pub(crate) use snapshot::{
+    ModelLabels, ModelWorkerSnapshot, RoutingPool, WindowFloor, WorkerRegistryExt,
+};
 
 // The gateway's connector, for the gateway's name for the builder below.
 use crate::routers::grpc::backend_client::BackendConnector;
 
 /// The worker builder as the gateway names it: a worker it builds connects
 /// through the gateway's client unless the builder is handed another
-/// connector. The two lines are the gateway's, and stay with it when the
-/// runtime moves into the worker crate.
+/// connector. The builder is the worker crate's; this name for it is the
+/// gateway's.
 pub type BasicWorkerBuilder = identity::builder::BasicWorkerBuilder<BackendConnector>;
 
 /// The registry as the gateway names it: its value of a membership
 /// generation is the model snapshot that keeps the routers' projections.
-/// The load monitor holds that registry. The two lines are the gateway's,
-/// and stay with it when the registry moves into the worker crate.
+/// The load monitor holds that registry. The registry is the worker crate's;
+/// this name for it is the gateway's.
 pub type WorkerRegistry = registry::WorkerRegistry<ModelWorkerSnapshot>;
+/// The load monitor over that registry.
 pub type WorkerMonitor = load::monitor::WorkerMonitor<ModelWorkerSnapshot>;

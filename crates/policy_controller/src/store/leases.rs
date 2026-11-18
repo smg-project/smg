@@ -88,7 +88,9 @@ impl LeaseRecord {
     /// The worker and the rank a `Dispatched` names by its target `index`:
     /// the target the lease books at the lease's own index, else the
     /// pick's target at that index. `None` for an index the pick holds no
-    /// target at.
+    /// target at, and for the pick's first target once a dispatch moved
+    /// the lease: the record keeps the target it books in that one's
+    /// place. No caller asks then, since a lease moves once.
     pub fn target_at(&self, index: u8) -> Option<(WorkerId, u16)> {
         let place = usize::from(index);
         let rank = *self.picked.ranks.get(place)?;
@@ -110,6 +112,19 @@ pub struct Dispatch {
     pub side: Side,
     /// Decision to dispatch on the gateway's clock, in microseconds.
     pub since_decision_micros: u32,
+}
+
+/// What is said of a lease, as a session hands a frame's word and a
+/// `Decide` stream a release to the leases' file
+/// ([`MemoryStore::hand`](super::MemoryStore::hand)).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Said {
+    /// The dispatch the frame names, and the instant the frame was read.
+    Dispatched(Dispatch, Instant),
+    /// The outcome of the side that ended.
+    Completed(Outcome),
+    /// The side given up, where the frame names one, and the reason.
+    Released(Option<Side>, ReleaseReason),
 }
 
 /// Why a lease was not recorded.
@@ -149,7 +164,8 @@ pub trait LeasesStore: Send + Sync {
     /// The gateway dispatched the lease as `dispatch` says, at `at`;
     /// `false` when the lease is unknown. A first dispatch that names
     /// another target of the pick moves the lease to it: the record's
-    /// target and index, and the count the lease books.
+    /// index, and where that target is another worker the record's target
+    /// and the count the lease books.
     fn dispatched(
         &self,
         gateway: GatewayId,

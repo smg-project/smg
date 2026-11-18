@@ -224,9 +224,16 @@ impl Row {
         let mut held = 0;
         let mut next_end = None;
         self.vetoes.retain(|_, ends| {
-            ends.retain(|&(_, end)| end > now);
+            // One pass over a worker's ends drops the ends past and keeps
+            // the earliest end left: one more compare an end kept.
+            ends.retain(|&(_, end)| {
+                let stands = end > now;
+                if stands && next_end.is_none_or(|next: Instant| end < next) {
+                    next_end = Some(end);
+                }
+                stands
+            });
             held += ends.len();
-            next_end = ends.iter().map(|&(_, end)| end).chain(next_end).min();
             !ends.is_empty()
         });
         self.held = held;
@@ -756,9 +763,10 @@ pub(crate) mod tests {
         },
         elector::{ElectionSettings, Elector, Tick},
         lease::{Lease, LeaseId},
+        spec::{AppliedSpec, PolicySpec},
         store::{
             GatewayId, HealthSink, LeaseRecord, LeaseState, LeasesStore, MemoryStore, Picked,
-            WorkersStore,
+            SessionsStore, WorkersStore,
         },
         view::WorkerId,
     };
@@ -914,8 +922,13 @@ pub(crate) mod tests {
         let gone = welcomed(&gateways, A, "gateway-a", TERM, t0);
         let _stands = welcomed(&gateways, B, "gateway-b", TERM, t0);
         for gateway in [A, B] {
-            lifecycle::completed(&store, gateway, &a_completed(1, served), t0)
-                .expect("the frame reads");
+            lifecycle::completed(
+                &store,
+                &lifecycle::open(&store, gateway),
+                &a_completed(1, served),
+                t0,
+            )
+            .expect("the frame reads");
         }
         gone.end(t0);
 
@@ -943,7 +956,13 @@ pub(crate) mod tests {
         let (_elector, store, gateways, t0) = leading(GRACE);
         let served = worker(&store, "http://a:8000");
         let gone = welcomed(&gateways, A, "gateway-a", TERM, t0);
-        lifecycle::completed(&store, A, &a_completed(1, served), t0).expect("the frame reads");
+        lifecycle::completed(
+            &store,
+            &lifecycle::open(&store, A),
+            &a_completed(1, served),
+            t0,
+        )
+        .expect("the frame reads");
         gone.end(t0);
 
         let _anew = welcomed(&gateways, A, "gateway-a", TERM, t0 + GRACE);
@@ -973,8 +992,13 @@ pub(crate) mod tests {
         drop(second);
         assert_eq!(gateways.sweep(t0 + GRACE), 0, "a replaced session runs");
         // Its late frame, then its end.
-        lifecycle::completed(&store, A, &a_completed(1, served), t0 + GRACE)
-            .expect("the frame reads");
+        lifecycle::completed(
+            &store,
+            &lifecycle::open(&store, A),
+            &a_completed(1, served),
+            t0 + GRACE,
+        )
+        .expect("the frame reads");
         drop(first);
         assert_eq!(gateways.sweep(t0 + GRACE), 1);
         assert!(
@@ -1042,8 +1066,13 @@ pub(crate) mod tests {
                 let gateway = GatewayId(100 + wave * 8 + n);
                 let subject = format!("gateway-{wave}-{n}");
                 let seat = welcomed(&gateways, gateway, &subject, TERM, now);
-                lifecycle::completed(&store, gateway, &a_completed(1, served), now)
-                    .expect("the frame reads");
+                lifecycle::completed(
+                    &store,
+                    &lifecycle::open(&store, gateway),
+                    &a_completed(1, served),
+                    now,
+                )
+                .expect("the frame reads");
                 seat.end(now);
             }
             assert_eq!(store.health_entries(), 8, "a completion a gateway");
@@ -1378,6 +1407,39 @@ pub(crate) mod tests {
             ended.elapsed()
         );
 
+        stop.send_replace(true);
+        timeout(Duration::from_secs(20), task.join_next())
+            .await
+            .expect("the task ends within 20 s of its stop")
+            .expect("one task")
+            .expect("it ended by itself");
+    }
+
+    /// The pins of record ride the sweeps' task: a pin past its end leaves
+    /// by the task's own tick, which no other caller of the pins' sweep
+    /// stands in for.
+    #[tokio::test]
+    async fn the_sweeps_task_drops_a_pin_of_record_past_its_end() {
+        let (_elector, store, gateways, t0) = leading(Duration::from_millis(60));
+        // A standing sessions rule: without one no pass of the pins runs.
+        let mut document = PolicySpec::preset("manual").expect("a preset of this build");
+        document.generation = 1;
+        let spec = AppliedSpec::validate(&document).expect("the document validates");
+        store.apply(spec).expect("a first generation");
+        SessionsStore::pin(&*store, 7, WorkerId(1), t0, Some(store.micros(t0)));
+        assert_eq!(SessionsStore::len(&*store), 1);
+        let (stop, stopped) = watch::channel(false);
+        let mut task = JoinSet::new();
+        let sweeper = Arc::clone(&gateways);
+        task.spawn(async move { sweeper.run(stopped).await });
+        let started = Instant::now();
+        while SessionsStore::len(&*store) > 0 {
+            assert!(
+                started.elapsed() < Duration::from_secs(20),
+                "the task swept no pin in 20 s"
+            );
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
         stop.send_replace(true);
         timeout(Duration::from_secs(20), task.join_next())
             .await

@@ -77,7 +77,11 @@ pub const SPEC_APPLY_TOTAL: &str = "smg_policy_spec_apply_total";
 pub const DECIDE_BUSY_TOTAL: &str = "smg_policy_controller_decide_busy_total";
 /// Decide requests this build had no decision for, by `cause` (`fault`,
 /// `pair_side`, `prompt_text`, `decider_gone`, `lease_ids_spent`): the
-/// `Busy` answers with no reason, each under what took its decision.
+/// `Busy` answers with no reason, each under what took its decision. A
+/// lease's lifecycle call that panics as its decider leaves its work is a
+/// `fault` too, and answered no request. So is one that panics as a decider
+/// gives up an answer its stream refused: that request was decided, and
+/// its answer is counted with the answers no stream took as well.
 pub const DECIDE_NO_DECISION_TOTAL: &str = "smg_policy_controller_decide_no_decision_total";
 /// Decide requests that carried more block hashes than their generation
 /// reads of them: decided over the first ones, the rest hashed for nothing.
@@ -90,9 +94,11 @@ pub const DECIDE_ANSWERS_DROPPED_TOTAL: &str = "smg_policy_controller_decide_ans
 /// share no wire with the gateway that asked.
 pub const DECIDE_CANDIDATES_UNDIALED_TOTAL: &str =
     "smg_policy_controller_decide_candidates_undialed_total";
-/// Decisions whose budget, or whose lease's dispatch span, ended while they
-/// were made: each is answered `Busy` under `budget_gone_on_arrival`, and
-/// counted here apart from a request that arrived late.
+/// Decisions cut at their last read, with under a microsecond of the budget
+/// or under a millisecond of the lease's dispatch span left: each is
+/// answered `Busy` under `budget_gone_on_arrival`, and counted here apart
+/// from a request that arrived late and from a pick whose span ended while
+/// it waited to be sent.
 pub const DECIDE_BUDGET_OUTLASTED_TOTAL: &str =
     "smg_policy_controller_decide_budget_outlasted_total";
 /// Members whose engine family or zone the standing generation's list does
@@ -250,7 +256,7 @@ impl Metrics {
         recorder.describe_counter(
             KeyName::from_const_str(DECIDE_BUDGET_OUTLASTED_TOTAL),
             None,
-            "Decisions whose budget or lease's dispatch span ended while they were made, of the Busy answers under budget_gone_on_arrival"
+            "Decisions cut at their last read with under a microsecond of budget or under a millisecond of the lease's dispatch span left, of the Busy answers under budget_gone_on_arrival"
                 .into(),
         );
         recorder.describe_gauge(

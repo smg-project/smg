@@ -135,7 +135,9 @@ pub struct Health {
     pub stalled: bool,
     /// Being drained; nothing new goes there.
     pub draining: bool,
-    /// The latched overload verdict of the last load report.
+    /// The latched overload verdict of the last load report: the engine
+    /// is at a threshold, or its last answer named another of its ranks
+    /// and not this one.
     pub overloaded: bool,
 }
 
@@ -809,6 +811,13 @@ pub struct RequestFacts<'a> {
     /// pool, and a pair's rows carry what counts their host wrote.
     /// In-process only.
     pub lent_in_flight: Option<&'a crate::counts::LentCounts<'a>>,
+    /// The host wrote each row's count of this request's session key
+    /// ([`Candidate::session_in_flight`]). A sessions rule's in-flight cap
+    /// reads the count either way. A key kept on its worker over the
+    /// overload veto is kept under a capped rule only where this is set:
+    /// with the count unwritten the cap could not hand the key on, so the
+    /// veto stands for it as for any request. In-process only.
+    pub session_counted: bool,
     /// The candidates' affinity facts, by index in the candidate slice the
     /// decision is made over: the one column the affinity stages read, in
     /// the candidates' own order. It is EMPTY or holds exactly one entry a
@@ -982,6 +991,18 @@ impl<'a> RequestFacts<'a> {
     }
 }
 
+/// A table of session pins that outlives an engine's own (design 5.1, the
+/// sessions row), lent by the deciding host among a decision's
+/// [`Constraints`]. A sessions rule asks it once a decision, for a key its
+/// engine's table holds no pin of: the table goes with its generation, the
+/// pins of record do not.
+pub trait PinSource: std::fmt::Debug + Sync {
+    /// The worker `key` is pinned to, where that pin has not ended by the
+    /// host's record and was last used less than `ttl_micros` ago (`None`:
+    /// a pin of any age). The host answers by its own clock.
+    fn pinned(&self, key: Session, ttl_micros: Option<u64>) -> Option<WorkerId>;
+}
+
 /// What only the deciding host knows now: its standing vetoes, the wires it
 /// speaks and the request-level lifts around the profile. The admission bits
 /// of a prefill window and a decode room ride the candidate rows.
@@ -991,8 +1012,12 @@ pub struct Constraints<'a> {
     pub excluded: &'a [WorkerId],
     /// The wires this host speaks.
     pub wire_modes: WireModes,
-    /// The overload veto does not apply to this decision (a pool whose
-    /// policy balances load against affinity itself, a session owner).
+    /// The overload veto does not apply to this decision: the host's
+    /// override, for a pool whose policy balances load against affinity
+    /// itself. An engine built from a document lifts the veto itself for a
+    /// keyed request of a profile that places by the session key, where the
+    /// binding steers. An engine built by hand does not: its host says so
+    /// here.
     pub overload_lifted: bool,
     /// A subset hint: decide over at most this many candidates.
     pub subset_hint: Option<u32>,
@@ -1002,6 +1027,12 @@ pub struct Constraints<'a> {
     /// stalled bit asks both ([`Constraints::masks`]). Empty where the rows
     /// were written for the decision. In-process only.
     pub stalled: &'a [u32],
+    /// The pins of record, where the host keeps a table that outlives the
+    /// engine's ([`PinSource`]): a sessions rule asks it for a key its own
+    /// table holds no pin of, and no other stage reads it. `None` where
+    /// the engine's table is the only one, as in a host that embeds the
+    /// engine. In-process only.
+    pub pins: Option<&'a dyn PinSource>,
 }
 
 impl Constraints<'_> {
@@ -1057,8 +1088,11 @@ pub struct PoolFacts<'a> {
     /// stage say that it must be asked whole
     /// ([`Front::Whole`](crate::Front::Whole)): the decision is the whole
     /// pass's, and it paid for its ranks' reading. Behind them it is not
-    /// read: each row in front is costed from its own report, and the
-    /// decision is the one by rank. In-process only.
+    /// read where the rows in front decide alone: each is costed from its
+    /// own report, and the decision is the one by rank. Where they cannot,
+    /// their band being wider than the ranks leave room for, every row is
+    /// asked, that row with them, and the decision is the whole pass's.
+    /// In-process only.
     pub rated: bool,
 }
 

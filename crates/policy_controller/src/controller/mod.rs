@@ -13,7 +13,12 @@
 //! answers `GetPolicySpec` and a dry run of `ApplyPolicySpec`
 //! ([`Controller::spec_file`]). A controller given a spec store runs the
 //! newest generation on file, takes its document through the apply call and
-//! rolls back to a generation on file ([`Controller::spec_store`]).
+//! rolls back to a generation on file ([`Controller::spec_store`]). A host
+//! that embeds the controller hands its document to the store's entry
+//! itself ([`Controller::store`], then [`MemoryStore::apply`]): it names no
+//! source and serves no spec call. That a controller that took a source is
+//! applied through that source alone is the host's rule to keep: the entry
+//! refuses a stale number and nothing else.
 //!
 //! A controller is bound first and served second ([`Controller::bind`], then
 //! [`Controller::serve`]): the bind takes every address (port `0` for an
@@ -331,8 +336,9 @@ impl Controller {
     /// lifecycle's calls ([`crate::Lifecycle::needs_lifecycle`]) is refused
     /// as not in this build: the controller makes the membership call, and a
     /// stage hears a lease's issue, its dispatch, completion and release at
-    /// its gateway's word and its end at the dispatch deadline here, and not
-    /// yet the end of a lease whose gateway was let go.
+    /// its gateway's word and its end at the dispatch deadline or where its
+    /// answer does not leave here, and not yet the end of a lease whose
+    /// gateway was let go.
     pub async fn bind_with(config: Config, catalog: Catalog) -> Result<Self, Error> {
         config.validate()?;
         tls::install_crypto_provider();
@@ -347,10 +353,10 @@ impl Controller {
         );
         // The store makes the membership call. A served decision tells a
         // stage of its lease, a gateway's frame of the lease's dispatch,
-        // completion or release and the dispatch deadline of its end; no
-        // line tells one of a lease that left with its gateway yet: a stage
-        // that needs the calls is refused by name, never run on state half
-        // kept.
+        // completion or release, and the dispatch deadline or an answer
+        // that does not leave of its end; no line tells one of a lease
+        // that left with its gateway yet: a stage that needs the calls is
+        // refused by name, never run on state half kept.
         let catalog = Arc::new(catalog.without_lifecycle());
         let mut listeners = Vec::with_capacity(config.listeners.len());
         for listener in &config.listeners {
@@ -581,12 +587,20 @@ impl Controller {
     /// file by its number. A directory with no generation on file starts
     /// the controller with no document, until the first apply.
     ///
+    /// One controller holds the directory, under a lock on a file it keeps
+    /// there. A start beside another that holds it waits for that one to
+    /// stop, for the grace period at most ([`Config::shutdown_grace`]), and
+    /// reads the directory once it holds it: it runs that one's last apply.
+    ///
     /// Refused here, before anything serves ([`StoreRefused`]): a path that
-    /// leads to no directory, a directory that is not read, two files under
-    /// one number, a newest generation that does not run, a spec source
-    /// taken before this one, and a lease another replica can take
-    /// ([`LeasePlace`]). A standby does not follow an applied generation in
-    /// this build, so a promoted one would run without it.
+    /// leads to no directory, a directory another controller still holds at
+    /// the end of that wait, a lock the system does not give (a directory
+    /// with no lock file, where the controller may make none, has none), a
+    /// directory that is not read, two files under one number, a newest
+    /// generation that does not run, a spec source taken before this one,
+    /// and a lease another replica can take ([`LeasePlace`]). A standby does
+    /// not follow an applied generation in this build, so a promoted one
+    /// would run without it.
     pub async fn spec_store(&mut self, dir: impl Into<PathBuf>) -> Result<(), Error> {
         let path = dir.into();
         let refused = |source| Error::SpecStore {
@@ -596,10 +610,21 @@ impl Controller {
         if self.config.election.lease.is_shared() {
             return Err(refused(StoreRefused::BesideASharedLease));
         }
+        // Asked before the directory is: a first source may hold it, and a
+        // second one does not wait on this controller's own lock. The door
+        // refuses a second source under its lock all the same.
+        if self.shared.generations.bound() {
+            return Err(refused(StoreRefused::SecondSource));
+        }
         let generations = Arc::clone(&self.shared.generations);
         let bound = {
             let path = path.clone();
-            tokio::task::spawn_blocking(move || generations.bind_store(SpecStore::open(path)?))
+            // A controller that stops lets the directory go inside its
+            // grace period: a start waits that long for one before it.
+            let wait = self.config.shutdown_grace;
+            tokio::task::spawn_blocking(move || {
+                generations.bind_store(SpecStore::open_within(path, wait)?)
+            })
         };
         match bound.await {
             Ok(Ok(())) => {}

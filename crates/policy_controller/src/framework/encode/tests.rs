@@ -10,6 +10,7 @@ use std::sync::{
 
 use super::*;
 use crate::{
+    counts::tests::Lent,
     framework::PairTable,
     spec::PolicySpec,
     view::{Health, MediaCounts, Role, WorkerId},
@@ -141,6 +142,16 @@ impl Bed {
 
     fn decide_with(&self, engine: &Engine) -> (Decision, EncodePlaced) {
         let (facts, pool) = self.asked();
+        self.decide_asked(engine, &facts, &pool)
+    }
+
+    /// The encode entry's answer to `facts` over the bed's pools.
+    fn decide_asked(
+        &self,
+        engine: &Engine,
+        facts: &RequestFacts<'_>,
+        pool: &PoolFacts<'_>,
+    ) -> (Decision, EncodePlaced) {
         let pools = self.pools();
         let encode = EncodePool {
             encoders: &self.encoders,
@@ -157,8 +168,8 @@ impl Bed {
         let cx = Constraints::default();
         let mut placed = EncodePlaced::new();
         let decision = engine.decide_encode_pair(
-            &facts,
-            &pool,
+            facts,
+            pool,
             pools,
             encode,
             items,
@@ -212,6 +223,25 @@ fn an_item_is_placed_on_an_encoder_of_the_chosen_prefills_class() {
     bed.facts = vec![pushing(1), pushing(2), pushing(2)];
     bed.keys = vec![Identity::hashed(11), Identity::hashed(12)];
     assert_eq!(bed.placed(), ((1, 0), vec![2, 2], false));
+}
+
+/// A lent table numbers the rows of the request's own pool, and the encoders
+/// are numbered again from zero: the encode side reads each encoder's own
+/// count and nothing of the table.
+#[test]
+fn the_encode_side_reads_no_count_lent_for_another_pool() {
+    let mut bed = Bed::new();
+    // The first encoder holds five requests and the second none.
+    bed.encoders = vec![row(0, Role::Encode, 0, 5), row(1, Role::Encode, 0, 0)];
+    bed.facts = vec![pushing(1), pushing(1)];
+    // Another pool's table says the opposite of those two positions.
+    let mut others = vec![row(0, Role::Prefill, 1, 0), row(1, Role::Prefill, 1, 9)];
+    let lent = Lent::take(&mut others);
+    let (facts, pool) = bed.asked();
+    let (decision, placed) = bed.decide_asked(&engine(), &lent.beside(&facts), &pool);
+    assert!(matches!(decision, Decision::Pick(_)), "{decision:?}");
+    let encoders: Vec<u32> = placed.encoders().iter().map(|t| t.position).collect();
+    assert_eq!(encoders, vec![1]);
 }
 
 #[test]
@@ -317,6 +347,104 @@ fn a_gap_no_retry_closes_is_named_by_membership() {
     assert_eq!(bed.stage(), "decode-vision");
 }
 
+/// A hard filter that refuses one row, by its id.
+#[derive(Debug)]
+struct RefusesOne(WorkerId);
+
+impl crate::framework::Filter for RefusesOne {
+    fn name(&self) -> &'static str {
+        "refuses-one"
+    }
+
+    fn keep(&self, _: &RequestFacts<'_>, row: &Candidate, _: &Constraints<'_>) -> bool {
+        row.id != self.0
+    }
+}
+
+/// A row over its thresholds.
+fn overloaded(row: Candidate) -> Candidate {
+    Candidate {
+        health: Health {
+            overloaded: true,
+            ..row.health
+        },
+        ..row
+    }
+}
+
+/// Encoders the overload veto left none of are a saturated fleet: the shed
+/// names the veto's stage and its reason is saturation, as a pair's side
+/// sheds its own rows. A stage ahead of the veto that leaves none is a
+/// missing endpoint as before, and so is one behind it that refuses an
+/// encoder the veto kept. An encoder that does not take the request is not
+/// counted, and under a veto its host lifted the encoders serve.
+#[test]
+fn encoders_the_veto_left_none_of_shed_as_saturation() {
+    let stock = engine();
+    let saturated = (ShedReason::Saturated, "not-overloaded");
+    let missing = (ShedReason::NoEndpoints, "encoders");
+    // Every encoder that takes the request is over its thresholds.
+    let mut bed = Bed::new();
+    bed.encoders = vec![
+        overloaded(row(0, Role::Encode, 0, 0)),
+        overloaded(row(1, Role::Encode, 0, 0)),
+    ];
+    bed.facts = vec![pushing(1), pushing(1)];
+    assert_eq!(shed_of(&bed.decide().0), saturated);
+    // A pair's side says the same of its own rows.
+    let mut side = Bed::new();
+    side.decodes = vec![overloaded(row(0, Role::Decode, 1, 0))];
+    assert_eq!(shed_of(&side.pair(&stock)), saturated);
+    // The host lifted the veto on the encode side: the item is placed.
+    let (facts, _) = bed.asked();
+    let cx = Constraints::default();
+    let lifted = Constraints {
+        overload_lifted: true,
+        ..Constraints::default()
+    };
+    let sides = [&cx, &cx, &lifted];
+    let (decision, placed) = decide_under(&bed, &stock, &facts, bed.pools(), sides);
+    assert!(matches!(decision, Decision::Pick(_)), "{decision:?}");
+    assert_eq!(placed.encoders().len(), 1);
+
+    // An unready encoder beside one over its thresholds was refused ahead
+    // of the veto: the veto still left none.
+    bed.encoders[1] = unready(row(1, Role::Encode, 0, 0));
+    assert_eq!(shed_of(&bed.decide().0), saturated);
+    // No encoder reached the veto: a missing endpoint.
+    bed.encoders[0] = unready(row(0, Role::Encode, 0, 0));
+    assert_eq!(shed_of(&bed.decide().0), missing);
+
+    // An encoder the veto kept, refused by a hard filter listed behind it:
+    // a missing endpoint, as a pair's side names rows so filtered.
+    bed.encoders = vec![
+        overloaded(row(0, Role::Encode, 0, 0)),
+        row(1, Role::Encode, 0, 0),
+    ];
+    let mut behind = engine();
+    for profile in &mut behind.profiles {
+        profile
+            .filters
+            .push(Box::new(RefusesOne(bed.encoders[1].id)));
+    }
+    assert_eq!(shed_of(&bed.decide_with(&behind).0), missing);
+
+    // An encoder over its thresholds that takes no image is not counted:
+    // the one that takes it was refused ahead of the veto.
+    bed.encoders = vec![
+        unready(row(0, Role::Encode, 0, 0)),
+        Candidate {
+            vision: false,
+            ..overloaded(row(1, Role::Encode, 0, 0))
+        },
+    ];
+    assert_eq!(shed_of(&bed.decide().0), missing);
+    // Nor is one over its thresholds that states no end.
+    bed.encoders[1] = overloaded(row(1, Role::Encode, 0, 0));
+    bed.facts[1] = pushing(0);
+    assert_eq!(shed_of(&bed.decide().0), missing);
+}
+
 #[test]
 fn a_shed_of_the_pair_is_returned_as_the_pair_gave_it() {
     let mut bed = Bed::new();
@@ -372,14 +500,7 @@ fn the_pairs_own_answers_read_the_same_through_both_entries() {
     let mut shed = Bed::new();
     shed.prefills = vec![unready(row(0, Role::Prefill, 1, 0))];
     let mut vetoed = Bed::new();
-    vetoed.decodes = vec![Candidate {
-        health: Health {
-            healthy: true,
-            overloaded: true,
-            ..Health::default()
-        },
-        ..row(0, Role::Decode, 1, 0)
-    }];
+    vetoed.decodes = vec![overloaded(row(0, Role::Decode, 1, 0))];
     // The beds are what they are named for.
     assert!(
         matches!(alternates.pair(&engine), Decision::Pick(pick) if pick.targets.len() == 2),
@@ -452,6 +573,44 @@ fn references_with_images_take_a_decode_with_vision_when_a_pair_has_one() {
     bed.images = 1;
     bed.decodes = vec![blind(0, 0), blind(1, 9)];
     assert_eq!(bed.placed(), ((0, 0), vec![0], false));
+}
+
+/// A request with no item still asks what it asks of its decode. Images
+/// asked of the decode keep it off the encode entry's early answer: the pair
+/// is picked among the decodes that take images, and where none takes one
+/// the shed names the stage.
+#[test]
+fn a_request_without_items_that_asks_images_of_its_decode_takes_a_decode_with_vision() {
+    let blind = |at: u32, in_flight: u32| Candidate {
+        vision: false,
+        ..row(at, Role::Decode, 1, in_flight)
+    };
+    let mut bed = Bed::new();
+    bed.keys.clear();
+    bed.decode_images = true;
+    // The idle decode takes no image, the busy one does.
+    bed.decodes = vec![blind(0, 0), row(1, Role::Decode, 1, 9)];
+    assert_eq!(bed.placed(), ((0, 1), vec![], false));
+    bed.decodes = vec![blind(0, 0), blind(1, 9)];
+    assert_eq!(bed.stage(), "decode-vision");
+}
+
+/// References that carry images ask a decode with vision of a request
+/// with no item too, and nothing of one that carries no image.
+#[test]
+fn references_with_images_and_no_item_take_a_decode_with_vision() {
+    let blind = Candidate {
+        vision: false,
+        ..row(0, Role::Decode, 1, 0)
+    };
+    let mut bed = Bed::new();
+    bed.keys.clear();
+    bed.references = true;
+    // The idle decode takes no image, the busy one does.
+    bed.decodes = vec![blind, row(1, Role::Decode, 1, 9)];
+    assert_eq!(bed.placed(), ((0, 1), vec![], false));
+    bed.images = 0;
+    assert_eq!(bed.placed(), ((0, 0), vec![], false));
 }
 
 #[test]
@@ -870,6 +1029,39 @@ fn an_encode_profile_that_shows_its_rows_declines_a_request_with_items() {
     assert_eq!(asked.load(Ordering::Relaxed), 0, "no stage is asked");
 }
 
+/// The pair entry declines a mask beside the rows a side shows a plugin
+/// (`written-rows`), and it reads the mask as this entry hands it: numbered
+/// with the rows a cut leaves. A mask on a row the cut left out masks none
+/// of them and declines nothing.
+#[test]
+fn a_mask_on_a_row_cut_out_declines_nothing_for_a_side_that_shows_its_rows() {
+    let mut engine = engine();
+    let binding = engine.binding("m", Phase::Prefill).expect("the binding");
+    let prefill = usize::from(binding.profile);
+    let shows = ShowsItsRows(Arc::new(AtomicU32::new(0)));
+    engine.profiles[prefill].filters.push(Box::new(shows));
+    engine.marks[prefill] =
+        crate::framework::Marks::of(&engine.profiles[prefill], engine.orders[prefill]);
+    // The first prefill's class holds no encoder: the pair is decided over
+    // the second alone.
+    let mut bed = Bed::new();
+    bed.prefills = vec![row(0, Role::Prefill, 1, 0), row(1, Role::Prefill, 1, 0)];
+    bed.prefill_classes = vec![2, 1];
+    let (facts, _) = bed.asked();
+    let cx = Constraints::default();
+    let decide = |mask: &[u32]| {
+        let masked = masking(mask);
+        decide_under(&bed, &engine, &facts, bed.pools(), [&masked, &cx, &cx]).0
+    };
+    // The mask names the row the cut left out.
+    assert_eq!(pair_of(&decide(&[0])), (1, 0));
+    // It names the row admitted: a mask beside the rows shown.
+    assert_eq!(
+        shed_of(&decide(&[1])),
+        (ShedReason::PolicyDeclined, "written-rows")
+    );
+}
+
 /// A pin is a position in another pool, and the encode side's stages are
 /// handed none.
 #[test]
@@ -929,6 +1121,65 @@ fn a_pair_column_of_another_length_declines_before_a_cut() {
             (ShedReason::PolicyDeclined, "affinity-column")
         );
     }
+}
+
+/// A hard filter that counts what it is asked and keeps every row.
+#[derive(Debug)]
+struct CountsItsAsks(Arc<AtomicU32>);
+
+impl crate::framework::Filter for CountsItsAsks {
+    fn name(&self) -> &'static str {
+        "counts-its-asks"
+    }
+
+    fn keep(&self, _: &RequestFacts<'_>, _: &Candidate, _: &Constraints<'_>) -> bool {
+        self.0.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+}
+
+/// A request that carries a column of its own, or names rows, declines as
+/// the pair entry declines it, before a stage of the encode side is asked.
+#[test]
+fn a_request_with_a_column_or_named_rows_declines_before_a_stage_is_asked() {
+    let asked = Arc::new(AtomicU32::new(0));
+    let mut engine = engine();
+    for profile in &mut engine.profiles {
+        let counts = CountsItsAsks(Arc::clone(&asked));
+        profile.filters.push(Box::new(counts));
+    }
+    let bed = Bed::new();
+    let cx = Constraints::default();
+    let holders = [crate::NamedHolder {
+        row: 1,
+        overlap_blocks: 8,
+        predicted_blocks: 0,
+    }];
+    let named = RequestFacts {
+        named: Some(crate::NamedAffinity {
+            holders: &holders,
+            ..crate::NamedAffinity::default()
+        }),
+        ..bed.asked().0
+    };
+    let column = [AffinityFacts::default()];
+    let carried = RequestFacts {
+        affinity: &column,
+        ..bed.asked().0
+    };
+    for facts in [&named, &carried] {
+        let (decision, placed) = decide_under(&bed, &engine, facts, bed.pools(), [&cx; 3]);
+        assert_eq!(
+            shed_of(&decision),
+            (ShedReason::PolicyDeclined, "affinity-column")
+        );
+        assert!(placed.encoders().is_empty());
+        assert_eq!(asked.load(Ordering::Relaxed), 0, "no stage is asked");
+    }
+    // The same engine decides a request that carries neither, and asks.
+    let (decision, _) = bed.decide_with(&engine);
+    assert!(decision.pick().is_some(), "a pick, not {decision:?}");
+    assert_ne!(asked.load(Ordering::Relaxed), 0);
 }
 
 /// The constraints of a host whose standing veto masks the rows `at`.

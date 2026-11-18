@@ -20,8 +20,8 @@
 //! reads no membership: it pays the pair entry's cost alone.
 
 use super::{
-    column_fits, debug_assert_indexed, run_profile, shed, Buffers, ClassBits, Engine, PairPools,
-    Plan, Scratch, Set, AFFINITY_COLUMN,
+    carries_a_column, column_fits, debug_assert_indexed, reason_of, run_profile, shed, Buffers,
+    ClassBits, Engine, PairPools, Plan, Profile, Scratch, Set, AFFINITY_COLUMN,
 };
 use crate::{
     decision::{Decision, ShedReason, Target, Targets, Trace},
@@ -34,7 +34,8 @@ mod tests;
 
 /// The stage named when no encoder is open for the request though one that
 /// takes it is registered, or when none is registered at all: a retry may
-/// find one.
+/// find one. Where the overload veto left none open, the veto's own stage,
+/// `not-overloaded`, is named in its stead ([`saturation`]).
 const ENCODERS: &str = "encoders";
 /// The stage named when the request carries images and the registered
 /// encoders that would take it otherwise take none.
@@ -144,7 +145,8 @@ struct Admitted {
     from: Vec<u32>,
     affinity: Vec<AffinityFacts>,
     /// The rows here that a mask over the pool names, by their index here:
-    /// empty until a mask is numbered anew ([`Admitted::renumber`]).
+    /// empty until a mask is numbered anew ([`Admitted::renumber`]). Its
+    /// room is taken with the rows ([`Admitted::take_room`]).
     masked: Vec<u32>,
 }
 
@@ -167,6 +169,13 @@ impl Admitted {
                 self.masked.push(index);
             }
         }
+    }
+
+    /// Takes the room a mask numbered anew fills at most, one place a row
+    /// admitted: a decision under a mask then allocates nothing that a
+    /// decision under none did not.
+    fn take_room(&mut self) {
+        self.masked.reserve(self.rows.len());
     }
 
     /// Admits the pool's row `at`; its position becomes its index here.
@@ -262,6 +271,46 @@ fn encode_gap(
     ENCODERS
 }
 
+/// Whether an encoder takes the request's media: references when its items
+/// are references, an image when it carries one. Inlined by force: each
+/// pass asks it once an encoder, and its two tests cost less than a call.
+#[inline(always)]
+fn takes_media(items: &EncodeItems<'_>, images: bool, row: &Candidate, of: &EncoderFacts) -> bool {
+    (!items.references || of.references) && (!images || row.vision)
+}
+
+/// The stage that left no encoder open, when its reason is saturation:
+/// the overload veto's stage. The encoders that take the
+/// request are put to the profile's hard filters in their order, as a
+/// pair's side puts its rows: the stage that refuses the last of them left
+/// none. A stage ahead of the veto that leaves none is no saturation, and
+/// neither is one behind it that refuses an encoder the veto kept.
+///
+/// Cold and out of line: a request an encoder is open for never comes here.
+#[cold]
+#[inline(never)]
+fn saturation(
+    profile: &Profile,
+    facts: &RequestFacts<'_>,
+    cx: &Constraints<'_>,
+    encode: &EncodePool<'_>,
+    items: &EncodeItems<'_>,
+    images: bool,
+) -> Option<&'static str> {
+    let hard = || profile.filters.iter().filter(|f| !f.soft());
+    // Where each of them is refused, counted over the hard filters: the
+    // farthest of those places is the stage that left none.
+    let last = encode
+        .encoders
+        .iter()
+        .zip(encode.facts)
+        .filter(|(row, of)| of.class != 0 && takes_media(items, images, row, of))
+        .filter_map(|(row, _)| hard().position(|f| !f.keep(facts, row, cx)))
+        .max()?;
+    let stage = hard().nth(last)?.name();
+    (reason_of(stage) == ShedReason::Saturated).then_some(stage)
+}
+
 /// Whether a set holds `class`: by its bit, or by `far`, the ascending list
 /// of the numbers the bits do not hold. The bit's read is inlined into each
 /// pass; the list's stays a call.
@@ -277,6 +326,15 @@ fn holds(classes: &ClassBits, far: &[u32], class: u32) -> bool {
 #[inline(never)]
 fn far_holds(far: &[u32], class: u32) -> bool {
     far.binary_search(&class).is_ok()
+}
+
+/// A shed of the encode entry. Cold and out of line: the entry declines
+/// ahead of its passes, and built in place at each of its early returns a
+/// shed left the passes' helpers out of line.
+#[cold]
+#[inline(never)]
+fn turned_away(reason: ShedReason, stage: &'static str, bare: Trace) -> Decision {
+    shed(reason, stage, bare)
 }
 
 impl Engine {
@@ -296,7 +354,10 @@ impl Engine {
     /// `encode-media`), none hands to a prefill of a pair (`ec-compatible`),
     /// no decode of a served pair takes the images asked of it
     /// (`decode-vision`). With an encoder registered and none open the stage
-    /// is `encoders`.
+    /// is `encoders`. Where the overload veto is the stage that left none
+    /// open, the encoders are saturated: the shed names `not-overloaded` and
+    /// its reason is saturation, as a pair's side sheds its own rows. This
+    /// entry does not enter the all-vetoed rule, as the pair entry does not.
     ///
     /// The items are placed by the binding's encode profile over the open
     /// encoders of the chosen prefill's class that take the media, each
@@ -309,8 +370,9 @@ impl Engine {
     /// under an encode profile that shows its rows to a plugin names
     /// `encode-scope`: no scope is opened over the encoders offered to a
     /// key. A pair column of another length than its pool names
-    /// `affinity-column` before a cut, as the pair entry names it. The
-    /// encode side's stages are handed no pin
+    /// `affinity-column` before a cut, as the pair entry names it. So does
+    /// a column on the request, or rows named on it, before a stage of the
+    /// encode side is asked. The encode side's stages are handed no pin
     /// ([`RequestFacts::pinned_at`]): a pin is a position in another pool.
     ///
     /// A list this side hands on in a pool's stead (the prefills or the
@@ -375,8 +437,8 @@ impl Engine {
             generation: pool.generation,
             ..Trace::default()
         };
-        let declined = |stage| shed(ShedReason::PolicyDeclined, stage, bare);
-        let gap = |stage| shed(ShedReason::NoEndpoints, stage, bare);
+        let declined = |stage| turned_away(ShedReason::PolicyDeclined, stage, bare);
+        let gap = |stage| turned_away(ShedReason::NoEndpoints, stage, bare);
         // The prefill's lookup names the plan: a binding of another plan
         // declines, as a pair decision under a single binding is declined.
         let epd = self
@@ -405,6 +467,12 @@ impl Engine {
         {
             return declined(AFFINITY_COLUMN);
         }
+        // A column on the request, or rows named on it, name neither pool.
+        // The pair entry refuses them: here they are refused before a stage
+        // of the encode side is asked.
+        if carries_a_column(facts) {
+            return declined(AFFINITY_COLUMN);
+        }
         debug_assert_indexed(encode.encoders);
         let needs = !items.keys.is_empty();
         // A profile that shows its rows to a plugin answers inside a scope
@@ -414,16 +482,22 @@ impl Engine {
             return declined(ENCODE_SCOPE);
         }
         let images = facts.media.images != 0;
+        // A request with no item that asks no images of its decode is the
+        // pair's alone: the pair entry answers it over the pools as handed,
+        // and no pass of the encode side is laid for it.
+        if !needs && !items.decode_images && !(items.references && images) {
+            return self.decide_pair(facts, pool, pools, cx, decode_cx, scratch);
+        }
         let encode_facts = RequestFacts {
             phase: Phase::Encode,
             affinity: encode.affinity,
-            // A pin is a position in another pool: the encode side takes none.
+            // A pin and lent counts are positions in another pool: the
+            // encode side takes neither.
             pinned_at: 0,
+            lent_in_flight: None,
             ..*facts
         };
-        let takes = |row: &Candidate, of: &EncoderFacts| {
-            (!items.references || of.references) && (!images || row.vision)
-        };
+        let takes = |row: &Candidate, of: &EncoderFacts| takes_media(&items, images, row, of);
         let open = |row: &Candidate| {
             let hard = profile.filters.iter().filter(|f| !f.soft());
             hard.into_iter()
@@ -459,15 +533,22 @@ impl Engine {
                 }
             }
             if !any_open {
+                // Encoders the overload veto left none of are a saturated
+                // fleet, and the shed says so as a pair's side says it of
+                // its own rows.
+                if let Some(stage) =
+                    saturation(profile, &encode_facts, encode_cx, &encode, &items, images)
+                {
+                    return turned_away(ShedReason::Saturated, stage, bare);
+                }
                 return gap(encode_gap(&encode, &items, images, any_member));
             }
             side.far_open.sort_unstable();
             side.far_member.sort_unstable();
         }
         // The pairs by membership: one at all, one an encoder serves, and
-        // one whose decode takes images. They are read only where an answer
-        // is asked: a request without items that asks no images of its
-        // decode pays the pair entry's cost alone.
+        // one whose decode takes images. Every request that comes here asks
+        // one of them: the request that asks none left by the early answer.
         //
         // The decodes' classes stand in sets of bits no wider than the
         // fleet. Under a table the width is the table's own, as the pair
@@ -477,49 +558,47 @@ impl Engine {
         // numbers above it, which a dense numbering never names.
         let class_of = |at: usize| encode.prefill_classes.get(at).copied().unwrap_or(0);
         let (mut any_pair, mut any_served, mut any_vision) = (false, false, false);
-        if needs || items.decode_images || (items.references && images) {
-            let tabled = !pools.table.is_empty();
-            let width = if tabled {
-                pools.table.width()
-            } else {
-                pools.decodes.len() + 1
-            };
-            side.decodes_of.reset(width);
-            side.vision_of.reset(width);
-            side.far.clear();
-            side.far_vision.clear();
-            for row in pools.decodes.iter().filter(|row| row.pair_class != 0) {
-                if side.decodes_of.insert(row.pair_class) {
-                    if row.vision {
-                        side.vision_of.insert(row.pair_class);
-                    }
-                } else if !tabled {
-                    side.far.push(row.pair_class);
-                    if row.vision {
-                        side.far_vision.push(row.pair_class);
-                    }
+        let tabled = !pools.table.is_empty();
+        let width = if tabled {
+            pools.table.width()
+        } else {
+            pools.decodes.len() + 1
+        };
+        side.decodes_of.reset(width);
+        side.vision_of.reset(width);
+        side.far.clear();
+        side.far_vision.clear();
+        for row in pools.decodes.iter().filter(|row| row.pair_class != 0) {
+            if side.decodes_of.insert(row.pair_class) {
+                if row.vision {
+                    side.vision_of.insert(row.pair_class);
+                }
+            } else if !tabled {
+                side.far.push(row.pair_class);
+                if row.vision {
+                    side.far_vision.push(row.pair_class);
                 }
             }
-            side.far.sort_unstable();
-            side.far_vision.sort_unstable();
-            // The three answers only rise: the pass ends at the prefill
-            // that gives the last of them.
-            for (at, row) in pools.prefills.iter().enumerate() {
-                let listed = pools.table.of(&row.pair_class);
-                if listed
-                    .iter()
-                    .any(|&class| holds(&side.decodes_of, &side.far, class))
-                {
-                    any_pair = true;
-                    if !needs || holds(&side.member, &side.far_member, class_of(at)) {
-                        any_served = true;
-                        if listed
-                            .iter()
-                            .any(|&class| holds(&side.vision_of, &side.far_vision, class))
-                        {
-                            any_vision = true;
-                            break;
-                        }
+        }
+        side.far.sort_unstable();
+        side.far_vision.sort_unstable();
+        // The three answers only rise: the pass ends at the prefill
+        // that gives the last of them.
+        for (at, row) in pools.prefills.iter().enumerate() {
+            let listed = pools.table.of(&row.pair_class);
+            if listed
+                .iter()
+                .any(|&class| holds(&side.decodes_of, &side.far, class))
+            {
+                any_pair = true;
+                if !needs || holds(&side.member, &side.far_member, class_of(at)) {
+                    any_served = true;
+                    if listed
+                        .iter()
+                        .any(|&class| holds(&side.vision_of, &side.far_vision, class))
+                    {
+                        any_vision = true;
+                        break;
                     }
                 }
             }
@@ -554,6 +633,7 @@ impl Engine {
                     side.prefills.push(row, at, pools.prefill_affinity);
                 }
             }
+            side.prefills.take_room();
             if !cx.stalled.is_empty() {
                 side.prefills.renumber(cx.stalled);
                 prefill_mask = Constraints {
@@ -573,6 +653,7 @@ impl Engine {
                     side.decodes.push(row, at, pools.decode_affinity);
                 }
             }
+            side.decodes.take_room();
             if !decode_cx.stalled.is_empty() {
                 side.decodes.renumber(decode_cx.stalled);
                 decode_mask = Constraints {
@@ -621,6 +702,7 @@ impl Engine {
                 side.offered.push(row, at, encode.affinity);
             }
         }
+        side.offered.take_room();
         // The offered encoders are numbered anew unless they are the whole
         // pool, and the encode side's mask is numbered with them.
         let offered_mask;

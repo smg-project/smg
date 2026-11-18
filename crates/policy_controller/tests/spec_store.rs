@@ -7,8 +7,10 @@
 //! process is then killed and started again on the same directory: it runs
 //! generation 2 before any call, under the bytes its caller sent, rolls
 //! back to a generation the process before it wrote, and answers each
-//! generation on file by its number. A start the store refuses exits,
-//! naming why, and so does a start that names no source of its spec.
+//! generation on file by its number. A start beside a controller that
+//! holds the directory waits for that one to stop and runs its last apply,
+//! or exits at its wait's end. A start the store refuses exits, naming
+//! why, and so does a start that names no source of its spec.
 //!
 //! The cases wait on an answer, never on a clock: a wait that outlasts its
 //! room fails with the last answer it saw, or names the answer that never
@@ -64,6 +66,12 @@ use tonic::{
 };
 
 const BIN: &str = env!("CARGO_BIN_EXE_smg-policy-controller");
+
+/// The name of the lock file a store keeps in its directory.
+const LOCK: &str = ".lock";
+
+/// What a start writes once when it finds its directory held.
+const WAITS: &str = "spec store held by another controller: waiting for it to stop";
 
 /// `LEAST_LOAD` under a weight the validator refuses.
 fn unweighed() -> String {
@@ -164,12 +172,13 @@ async fn rollback(replica: &Replica, generation: u64) -> Result<ApplyResult, Sta
         .map(Response::into_inner)
 }
 
-/// The names in the store's directory.
+/// The names in the store's directory, the store's own lock file apart.
 fn on_file(dir: &Path) -> BTreeSet<String> {
     fs::read_dir(dir)
         .expect("the directory")
         .map(|entry| entry.expect("an entry").file_name())
         .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| name != LOCK)
         .collect()
 }
 
@@ -360,6 +369,77 @@ async fn an_enforce_on_a_spec_store_runs_and_a_start_runs_it_again() {
     assert_eq!(gone.code(), Code::NotFound, "{gone:?}");
     let four = BTreeSet::from([name(1), name(2), name(3), name(4)]);
     assert_eq!(on_file(dir.path()), four);
+}
+
+/// A start on a directory another controller holds waits for that one to
+/// stop, as a pod replaced outside an upgrade starts beside the one it
+/// replaces. One still held at the end of its wait exits, naming why, and
+/// nothing on file moves. One whose holder stops inside the wait reads the
+/// directory only then: it runs what the holder applied while it waited,
+/// and its own apply is the next number.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_start_on_a_held_spec_store_waits_for_its_holder_and_runs_its_last_apply() {
+    let dir = tempfile::tempdir().expect("a directory");
+    let mut holder = start("store-holder", dir.path());
+    let led = until(
+        || apply(&holder, ApplyMode::Enforce, LEAST_LOAD),
+        Result::is_ok,
+    );
+    let first = led.await.expect("the leader answers").expect("a verdict");
+    assert_eq!(first.generation, 1, "{first:?}");
+    assert!(dir.path().join(LOCK).is_file(), "the holder made its lock");
+
+    // A start whose wait is one second: held at its end, it exits.
+    let mut short = vec![OsStr::new("--spec-store"), dir.path().as_os_str()];
+    short.extend(["--shutdown-settle-secs", "0"].map(OsStr::new));
+    short.extend(["--shutdown-grace-period-secs", "1"].map(OsStr::new));
+    let (code, log) = refused(&short);
+    assert_eq!(code, Some(1), "{log}");
+    assert!(log.contains("start refused"), "{log}");
+    assert!(
+        log.contains("another controller holds the directory, waited on for 1s"),
+        "{log}"
+    );
+    assert_eq!(on_file(dir.path()), BTreeSet::from([name(1)]));
+
+    // A start whose wait is thirty seconds, beside the holder: it says
+    // once that it waits, having read no name yet.
+    let flags = [
+        OsStr::new("--identity-as-told"),
+        OsStr::new("gateway,control"),
+        OsStr::new("--spec-store"),
+        dir.path().as_os_str(),
+    ];
+    let settings = ElectionSettings::default();
+    let waiter = Replica::start_with("store-waiter", Lease::Own, settings, 15, &flags)
+        .expect("the replica starts");
+    assert!(
+        waiter.logs(|replica| replica.logged(WAITS)).await,
+        "{}",
+        waiter.log()
+    );
+    // The holder applies once more while the other waits, then stops.
+    let second = apply(&holder, ApplyMode::Enforce, RANDOM)
+        .await
+        .expect("a verdict");
+    assert_eq!(second.generation, 2, "{second:?}");
+    holder.terminate().expect("SIGTERM");
+    let status = holder.exited().expect("the holder exits");
+    assert!(status.success(), "read {status}:\n{}", holder.log());
+
+    // The waiter holds the directory now. It runs the holder's last apply,
+    // and its own is the next number.
+    let stands = answers(&waiter, 2).await;
+    assert_eq!(stands.document, RANDOM.as_bytes());
+    assert_eq!(stands.digest, second.digest);
+    let led = until(
+        || apply(&waiter, ApplyMode::Enforce, LEAST_LOAD),
+        Result::is_ok,
+    );
+    let third = led.await.expect("the leader answers").expect("a verdict");
+    assert_eq!(third.generation, 3, "{third:?}");
+    let three = BTreeSet::from([name(1), name(2), name(3)]);
+    assert_eq!(on_file(dir.path()), three);
 }
 
 /// A start that names no source of the policy spec is refused by the

@@ -26,11 +26,11 @@
 //! id order, so two stores that hold one membership number its classes
 //! alike.
 //!
-//! A membership write of one worker derives for that worker alone: the
-//! store's writer keeps each model's offers and the rule's verdicts on
-//! them from one write to the next, moves the written worker in them and
-//! runs the rule again only on an offer no worker of its pool held. The
-//! classes it hands back are the whole derivation's.
+//! A membership build of one worker's writes derives for that worker
+//! alone: the store's writer keeps each model's offers and the rule's
+//! verdicts on them from one build to the next, moves the written worker in
+//! them and runs the rule again only on an offer no worker of its pool
+//! held. The classes it hands back are the whole derivation's.
 //!
 //! Every value here is opaque text: a runtime, a transport and a layout
 //! fact are compared for equality and never interpreted. Deriving a
@@ -68,7 +68,7 @@ pub const LAYOUT_FACTS: [(&str, &str); 4] = [
 /// its runtime (the row's engine kind). A field left `None` is one the
 /// worker does not report. A blank value is no report either, and the rule
 /// never meets one: the store's door hands it a normalized descriptor
-/// ([`PairingDescriptor::normalized`]), as the gateway's own derive drops a
+/// ([`PairingDescriptor::normalize`]), as the gateway's own derive drops a
 /// blank label where it makes a worker's descriptor.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct PairingDescriptor {
@@ -84,16 +84,9 @@ pub struct PairingDescriptor {
 }
 
 impl PairingDescriptor {
-    /// The descriptor as the rule reads it: every blank value dropped and
-    /// every name read past the blanks around it. The store's door makes a
-    /// worker's descriptor so, once a write.
-    #[must_use]
-    pub fn normalized(mut self) -> Self {
-        self.normalize();
-        self
-    }
-
-    /// [`PairingDescriptor::normalized`], in place.
+    /// Make the descriptor what the rule reads, in place: every blank value
+    /// dropped and every name read past the blanks around it. The store's
+    /// door makes a worker's descriptor so, once a write.
     pub fn normalize(&mut self) {
         normalize(&mut self.protocol);
         normalize(&mut self.transport);
@@ -102,7 +95,7 @@ impl PairingDescriptor {
     }
 
     /// Whether no value is blank or stands between blanks.
-    fn is_normalized(&self) -> bool {
+    pub(super) fn is_normalized(&self) -> bool {
         [&self.protocol, &self.transport, &self.version]
             .into_iter()
             .chain(&self.kv_layout)
@@ -818,7 +811,7 @@ struct Work {
 }
 
 /// One model's derivation as the store's writer keeps it from one
-/// membership write to the next: each pool's distinct offers, which worker
+/// membership build to the next: each pool's distinct offers, which worker
 /// holds which, and the rule's verdict on every pair of offers. A write of
 /// one worker moves that worker alone in it ([`Derivation::written`]), and
 /// the rule runs again only on an offer no worker of its pool held. What is

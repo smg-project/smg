@@ -1130,7 +1130,7 @@ schema's check is skipped.
 {{- end -}}
 {{- if $claim -}}
 {{- if (.Values.policyController).spec -}}
-{{- fail (printf "policyController.specStoreClaim names %s and policyController.spec holds a document: the controller refuses a start that names two sources of its policy spec. Set policyController.spec to null (an empty map does not clear a reused document), or leave the claim unnamed" $claim) -}}
+{{- fail (printf "policyController.specStoreClaim names %s and policyController.spec holds a document: the controller refuses a start that names two sources of its policy spec. Set policyController.spec to null and upgrade with --reset-then-reuse-values or --reset-values (an empty map does not clear a reused document, and under --reuse-values a null does not either), or leave the claim unnamed" $claim) -}}
 {{- end -}}
 {{- if include "smg.policyControllerElection" . -}}
 {{- fail (printf "policyController.specStoreClaim names %s with policyController.election.enabled on: another replica can take the controller's lease, and a standby does not follow an applied generation in this build. Turn the election off, or keep the spec document" $claim) -}}
@@ -1239,4 +1239,41 @@ place: the claim's mount.
 {{- range $controller.extraArgs }}
 - {{ . | quote }}
 {{- end }}
+{{- end }}
+
+{{/*
+Policy controller replication as told -- "true" when the controller's
+arguments name the replication listener among those that take identities as
+told; empty when they do not. A replica that does not lead follows its
+leader only where they do. The arguments are read whole, as the controller
+reads them: policyController.identityAsTold and an --identity-as-told flag
+of policyController.extraArgs name alike. The flag's value is the next
+argument or stands behind an equals sign, one name or several between
+commas.
+*/}}
+{{- define "smg.policyControllerReplicationAsTold" -}}
+{{- $told := list -}}
+{{- $value := false -}}
+{{- range $argument := include "smg.policyControllerArgs" . | fromYamlArray -}}
+{{- if $value -}}
+{{- $told = concat $told (splitList "," $argument) -}}
+{{- else if hasPrefix "--identity-as-told=" $argument -}}
+{{- $told = concat $told (splitList "," (trimPrefix "--identity-as-told=" $argument)) -}}
+{{- end -}}
+{{- $value = eq $argument "--identity-as-told" -}}
+{{- end -}}
+{{- if has "replication" $told -}}true{{- end -}}
+{{- end }}
+
+{{/*
+Policy controller TLS -- "true" when the controller's arguments hand its
+gRPC listeners a server certificate (--tls-cert, its value the next
+argument or behind an equals sign); empty when they do not. A standby's
+dial has no credential yet, so a replica whose replication listener serves
+TLS follows no leader.
+*/}}
+{{- define "smg.policyControllerServesTls" -}}
+{{- range $argument := include "smg.policyControllerArgs" . | fromYamlArray -}}
+{{- if or (eq $argument "--tls-cert") (hasPrefix "--tls-cert=" $argument) -}}true{{- end -}}
+{{- end -}}
 {{- end }}

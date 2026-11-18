@@ -1,10 +1,12 @@
 # Regression gate for `cargo bench -p smg-policy-controller --bench decision`, run by
 # .github/workflows/benchmark-policy-engine.yml on pull requests through scripts/bench_gate.py. It is the
-# first row of that workflow's matrix; policy-engine-power-of-two.toml, policy-engine-affinity.toml and
-# policy-engine-prefix-hash.toml gate the second, the third and the fourth row's binaries.
+# first row of that workflow's matrix; policy-engine-power-of-two.toml, policy-engine-affinity.toml,
+# policy-engine-prefix-hash.toml and policy-engine-bucket.toml gate the second, the third, the fourth and the
+# fifth row's binaries.
 #
 # The gate runs the whole file: the view build at 8, 64 and 512 workers (`policy_engine/view_build/<n>`),
-# the decision per preset at the same sizes (`policy_engine/decide/<preset>/<n>`), the least-load decision
+# the decision per preset at the same sizes (`policy_engine/decide/<preset>/<n>`; the `bucket` preset's rows
+# are the fifth row's), the least-load decision
 # with a credit held per row (`policy_engine/decide/least_load_credited/<n>`), the steer of a pool over its
 # thresholds on every row (`policy_engine/decide/all_vetoed/<n>`), a keyed decision under the
 # manual preset on its pin and off it at 8 workers (`policy_engine/decide/manual_keyed_hit/8`,
@@ -143,12 +145,15 @@ filter = "^policy_engine/"
 
 # The files that feed this binary beyond the measured crate: the base side is built with them as the
 # pull request has them (bench_gate.py build --sources-from), so a row added here cannot move the
-# gated rows through the binary's inlining (symphony.toml records the case). A new row goes to a
-# bench target of its own.
+# gated rows through the binary's inlining (symphony.toml records the case). A row joins this binary, in
+# the pull request whose change it measures, only when it calls nothing the base branch's crate lacks. A
+# row that times an answer only the change gives is listed only where the engine gives it (the
+# `all_vetoed` rows), so the base side lists none. Any other row goes to a bench target of its own.
 sources = [
     "crates/policy_controller/benches/decision.rs",
     "crates/policy_controller/benches/common/mod.rs",
     "crates/policy_controller/benches/common/placed.rs",
+    "crates/policy_controller/benches/common/preset.rs",
 ]
 
 # The first gate whose pattern matches an id decides its threshold.

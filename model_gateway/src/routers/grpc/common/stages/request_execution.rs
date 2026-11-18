@@ -5987,3 +5987,7 @@ pub(crate) mod tests {
         assert_eq!(batch_breaker_status(&answers, &capacity_503), Some(500));
     }
 }
+
+#[cfg(test)]
+#[expect(clippy::print_stdout, reason = "a recorder says where its sheet went")]
+mod classic_sticky_rank_rows;

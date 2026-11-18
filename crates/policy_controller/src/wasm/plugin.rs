@@ -800,6 +800,13 @@ impl Rest {
 /// One named decider's place of rest: empty until the decider first acts.
 type Resting = Mutex<Option<Box<Rest>>>;
 
+thread_local! {
+    /// How many plugins' named deciders the thread holds the kept state of,
+    /// from a bring to its give-back: what a thread under no name reads
+    /// before it acts as itself.
+    static HOLDS: Cell<u32> = const { Cell::new(0) };
+}
+
 /// What a thread is to a plugin, beside what stands in its working slots.
 #[derive(Clone, Copy, Default)]
 struct Standing {
@@ -817,7 +824,8 @@ struct Standing {
 /// takes it at its first need, as if it had stood in its slot since the
 /// load, and a named decider that needs an instance takes it where it asks
 /// first. So a host that names its deciders makes as many instances as it
-/// has deciders, whichever thread loads.
+/// has deciders, whichever thread loads, where it warms them before the
+/// loading thread tells anything ([`Plugin::warm`]).
 struct Spare {
     instance: Mutex<Option<Instance>>,
     /// Whether the instance still waits: read before the lock.
@@ -910,6 +918,11 @@ pub struct Plugin {
     /// and the time of a lazy `init` the decision paid at its two ends (part
     /// of its sample, not of its own spend).
     decision_opens: ThreadLocal<Cell<(Part, OwnTime)>>,
+    /// Per thread: the decision, by its number on this thread, whose open
+    /// caught the thread's instance up with the membership feed. A decision
+    /// does so once, at the plugin's first open of it that reaches the
+    /// instance. Zero: none yet, and no decision's number.
+    heard_in: ThreadLocal<Cell<u64>>,
 }
 
 impl fmt::Debug for Plugin {
@@ -1036,6 +1049,7 @@ impl Plugin {
             spent: ThreadLocal::new(),
             latency: ThreadLocal::new(),
             decision_opens: ThreadLocal::new(),
+            heard_in: ThreadLocal::new(),
         });
         // The apply's own instance: `init` runs here, and its failure is the
         // apply's. It waits apart for the first decider that needs one.
@@ -1062,7 +1076,11 @@ impl Plugin {
     /// Creates the kept instance of the decider the calling thread acts as
     /// (the thread's own where it names none) when it has none: the apply
     /// calls it as every decider, so no decision pays the instantiation. The
-    /// first to ask takes the apply's own instance where it may.
+    /// first to ask takes the apply's own instance where it may. A host that
+    /// names its deciders warms as each of them before it tells anything on
+    /// the thread that loaded: an event told there first takes the apply's
+    /// own instance for that thread, one more than the host has deciders,
+    /// and no decision reads what that instance hears.
     pub fn warm(&self) -> Result<(), LoadError> {
         let _lent = self.lent_here();
         let slot = self.slot();
@@ -1071,8 +1089,7 @@ impl Plugin {
                 Some(instance) => instance,
                 None => self.instantiate(self.init_fuel())?,
             };
-            *slot.borrow_mut() = Some(instance);
-            self.stand();
+            self.seat(&mut slot.borrow_mut(), instance);
         }
         // A plugin fed the membership hears it as it stands here, not at
         // the decider's first decision. A telling that faults the instance
@@ -1085,15 +1102,18 @@ impl Plugin {
     }
 
     /// Whether the decider the calling thread acts as (the thread itself
-    /// where it names none) holds a kept instance, or would take the apply's
-    /// own: its next decision makes none.
+    /// where it names none) holds a kept instance: its next decision makes
+    /// none. The thread that loaded is warm under no name by the apply's own
+    /// instance too, which it alone takes there. Under a name that instance
+    /// counts for no decider: the first to warm or decide takes it, so a
+    /// warm-up that asks here first still warms every decider.
     pub fn is_warm(&self) -> bool {
         let _lent = self.lent_here();
         let kept = self
             .instances
             .get()
             .is_some_and(|slot| slot.borrow().is_some());
-        kept || self.spare_is_mine()
+        kept || (Decider::acting().is_none() && self.spare_is_mine())
     }
 
     /// Forgets the kept instance of the decider the calling thread acts as
@@ -1103,7 +1123,11 @@ impl Plugin {
     #[doc(hidden)]
     pub fn forget_instance(&self) {
         let _lent = self.lent_here();
-        drop(self.adopt());
+        if self.adopt().is_some() {
+            // The load's instance was this thread's to take: it is
+            // forgotten as one that stood here.
+            self.stand();
+        }
         *self.slot().borrow_mut() = None;
     }
 
@@ -1207,9 +1231,16 @@ impl Plugin {
         let taken = self.spare.instance.lock().take();
         if taken.is_some() {
             self.spare.left.store(false, Ordering::Relaxed);
-            self.stand();
         }
         taken
+    }
+
+    /// Puts `instance` in the thread's working slot: the one place an
+    /// instance comes to stand in one, whoever made it (the load, a warm-up,
+    /// a cold open, a told event, a close's rebuild).
+    fn seat(&self, slot: &mut Option<Instance>, instance: Instance) {
+        *slot = Some(instance);
+        self.stand();
     }
 
     /// An instance came to stand in this thread's working slot. Under no
@@ -1238,11 +1269,17 @@ impl Plugin {
     /// hold it already, and says whether it did. A decision's first open
     /// brings it and the plugin's last close of the decision gives it back;
     /// a told event holds it for its one call. What the thread never gave
-    /// back (a close that did not return) goes back first, at its next bring
-    /// under a name: until then a decision the thread makes under no name
-    /// runs on what stands in its slots.
+    /// back (a close that did not return) goes back first, under another
+    /// name or under none: a thread decides on no instance but the one of
+    /// the decider it acts as.
     fn lend(&self) -> bool {
         let Some(decider) = Decider::acting() else {
+            // Under no name the thread acts as itself. One count says
+            // whether it holds any named decider's state, so a host that
+            // names none pays one load here.
+            if HOLDS.get() != 0 {
+                self.rest();
+            }
             return false;
         };
         let standing = self.standing.get_or_default();
@@ -1264,6 +1301,7 @@ impl Plugin {
         std::mem::swap(&mut rest.ring, &mut *self.ring().borrow_mut());
         now.lent = Some(decider);
         standing.set(now);
+        HOLDS.set(HOLDS.get() + 1);
         true
     }
 
@@ -1285,6 +1323,7 @@ impl Plugin {
     /// a second thread acting as the decider at the same time, against the
     /// turn's rule: it is dropped here.
     fn give_back(&self, decider: Decider) {
+        HOLDS.set(HOLDS.get().saturating_sub(1));
         let mut rest = self.rest_of(decider).lock();
         let rest = rest.get_or_insert_with(Rest::new);
         let mut slot = self.slot().borrow_mut();
@@ -1915,14 +1954,15 @@ impl Plugin {
             return;
         }
         if guard.is_none() {
-            *guard = self.adopt();
+            if let Some(instance) = self.adopt() {
+                self.seat(&mut guard, instance);
+            }
         }
         if guard.is_none() {
             match self.instantiate(self.init_fuel()) {
                 Ok(instance) => {
                     bump(&self.tally.lazy_instantiations);
-                    *guard = Some(instance);
-                    self.stand();
+                    self.seat(&mut guard, instance);
                 }
                 Err(_) => {
                     self.report(now);
@@ -2254,7 +2294,9 @@ impl Bound {
             }
             // The apply's own instance, where it still waits for this
             // decider: no `init` runs and nothing is charged.
-            *guard = plugin.adopt();
+            if let Some(instance) = plugin.adopt() {
+                plugin.seat(&mut guard, instance);
+            }
         }
         if guard.is_none() {
             // A cold slot: `init` runs under what the decision has left (a
@@ -2290,8 +2332,7 @@ impl Bound {
                     bump(&plugin.tally.lazy_instantiations);
                     budget.remaining_micros = budget.remaining_micros.saturating_sub(charged);
                     plugin.note_init(decision, own);
-                    *guard = Some(instance);
-                    plugin.stand();
+                    plugin.seat(&mut guard, instance);
                 }
                 Err(LoadError::Trap { .. })
                     if left < init_fuel && charged >= budget.remaining_micros =>
@@ -2333,12 +2374,21 @@ impl Bound {
         }
         // What the membership feed told since this instance last heard comes
         // before the decision reads the instance, as told events: outside
-        // the decision's sums. A change that faults it ends the plugin's
-        // part in the decision, and the close rebuilds the slot.
-        plugin.catch_up(&mut guard);
-        if guard.is_none() {
-            open.bypass = true;
-            return;
+        // the decision's sums. Once a decision, at the first of the plugin's
+        // opens that reaches the instance: a later one (a pair's other side,
+        // another profile) finds a resource of the decision live on the
+        // instance, so a change handed between them waits for the decider's
+        // next decision or told event. An open the breaker turned away
+        // above reached no instance and is not that first: the instance the
+        // decision's next open reaches, or makes, still hears.
+        // A change that faults the instance ends the plugin's part in the
+        // decision, and the close rebuilds the slot.
+        if plugin.feed.is_some() && plugin.heard_in.get_or_default().replace(decision) != decision {
+            plugin.catch_up(&mut guard);
+            if guard.is_none() {
+                open.bypass = true;
+                return;
+            }
         }
         if let Some(inst) = guard.as_mut() {
             match &inst.exports {
@@ -2496,11 +2546,7 @@ impl Bound {
                     match plugin.instantiate(plugin.init_fuel()) {
                         Ok(instance) => {
                             bump(&plugin.tally.lazy_instantiations);
-                            *guard = Some(instance);
-                            // An instance came to stand here as at every
-                            // other place that makes one: under no name the
-                            // thread is a decider of its own from this close.
-                            plugin.stand();
+                            plugin.seat(&mut guard, instance);
                         }
                         Err(error) => {
                             tracing::warn!(plugin = plugin.name, %error, "the rebuild of a dropped instance failed");

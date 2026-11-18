@@ -105,6 +105,13 @@ pub mod mode {
     /// As `COUNT_MEMBERS`, and `observe` traps on a snapshot of five
     /// members: a telling that faults one instance and not the next.
     pub const TRAP_ON_FIVE_MEMBERS: u8 = 33;
+    /// `observe` counts members as `COUNT_MEMBERS` does and, at a dispatch,
+    /// keeps the count as it stood then; `pick` names the row at that count:
+    /// whether a change told ahead of a dispatch was heard ahead of it.
+    pub const MEMBERS_AT_A_DISPATCH: u8 = 34;
+    /// `observe` counts one up a relabelling and two up a resize, and `pick`
+    /// names the row at that count: the kinds one instance heard.
+    pub const COUNT_KINDS: u8 = 35;
     /// A second config byte: `init` asks the host's live clock once. An
     /// answer of zero lets it go on, of one makes it refuse, of two spin
     /// without end, of three trap at once.
@@ -566,7 +573,7 @@ fn guest_wat(guest: Guest) -> String {
       (then
         (i32.store8 offset=4 (local.get $r) (i32.const 0))
         (return (local.get $r))))
-    (if (i32.eq (global.get $mode) (i32.const {count_dispatches}))
+    (if (i32.or (i32.eq (global.get $mode) (i32.const {count_dispatches})) (i32.or (i32.eq (global.get $mode) (i32.const {members_at_a_dispatch})) (i32.eq (global.get $mode) (i32.const {count_kinds}))))
       (then
         (i32.store8 offset=4 (local.get $r) (i32.const 1))
         (i32.store offset=8 (local.get $r) (global.get $heard))
@@ -623,10 +630,19 @@ fn guest_wat(guest: Guest) -> String {
         (if (i64.eq (local.get 1) (i64.const 0))
           (then (global.set $members (i32.add (global.get $members) (i32.const 1)))))
         (if (i64.eq (local.get 1) (i64.const 1))
-          (then (global.set $members (i32.sub (global.get $members) (i32.const 1)))))))
+          (then (global.set $members (i32.sub (global.get $members) (i32.const 1)))))
+        (if (i32.eq (global.get $mode) (i32.const {count_kinds}))
+          (then
+            (if (i64.eq (local.get 1) (i64.const 3))
+              (then (global.set $heard (i32.add (global.get $heard) (i32.const 1)))))
+            (if (i64.eq (local.get 1) (i64.const 4))
+              (then (global.set $heard (i32.add (global.get $heard) (i32.const 2)))))))))
     ;; A dispatch is the outer case 1 of the event: counted on this instance.
     (if (i32.eq (local.get 0) (i32.const 1))
-      (then (global.set $heard (i32.add (global.get $heard) (i32.const 1)))))
+      (then
+        (if (i32.eq (global.get $mode) (i32.const {members_at_a_dispatch}))
+          (then (global.set $heard (global.get $members)))
+          (else (global.set $heard (i32.add (global.get $heard) (i32.const 1)))))))
     (call $counter (i32.const 0) (i64.const 1))
     (call $counter (i32.const 3) (call $now))
     (call $counter (i32.const 4) (local.get 6))
@@ -689,6 +705,8 @@ fn guest_wat(guest: Guest) -> String {
         count_dispatches = mode::COUNT_DISPATCHES,
         count_members = mode::COUNT_MEMBERS,
         trap_on_five_members = mode::TRAP_ON_FIVE_MEMBERS,
+        members_at_a_dispatch = mode::MEMBERS_AT_A_DISPATCH,
+        count_kinds = mode::COUNT_KINDS,
     )
 }
 

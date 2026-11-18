@@ -1459,6 +1459,7 @@ mod tests {
             now_micros: 0,
             pinned_at: 0,
             lent_in_flight: None,
+            session_counted: false,
             // Host-only: the request block carries no affinity column and
             // no rows named in its place.
             affinity: &[],

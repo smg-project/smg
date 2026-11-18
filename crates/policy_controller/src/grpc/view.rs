@@ -7,7 +7,7 @@
 
 use crate::{
     counts::with_counts,
-    decision::{Decision, Lifted, Target, Trace},
+    decision::{Decision, Target, Trace},
     lease::{Lease, LeaseKind, Membership, Outcome, ReleaseReason, Side, Signal, TransportClass},
     plugins::{
         config::{Exposure, Reveal},
@@ -375,15 +375,7 @@ fn trace(t: &Trace) -> proto::Trace {
         fallback: false,
         affinity_source: 0,
         drew_first: t.drew_first(),
-        lifted: lifted(t.lifted) as i32,
-    }
-}
-
-/// The contract's word for the veto the all-vetoed rule lifted.
-const fn lifted(mark: Lifted) -> proto::LiftedVeto {
-    match mark {
-        Lifted::None => proto::LiftedVeto::None,
-        Lifted::Overload => proto::LiftedVeto::Overload,
+        lifted: proto::LiftedVeto::from(t.lifted) as i32,
     }
 }
 

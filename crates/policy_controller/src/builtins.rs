@@ -1015,11 +1015,14 @@ impl Scorer for LeastLoad {
     /// stage says it must be asked whole ([`Front::Whole`]) before it costs
     /// any: the rows a rank put in front are costed alone only where each
     /// reports a rate, and then as they are among every row. Their costs
-    /// are spread over their own span and not the pool's, so two of them
-    /// further apart than the tie's microsecond are told apart whatever the
-    /// rows behind them cost. Among every row, a difference that is a small
-    /// enough share of the pool's span falls under the last bit of a
-    /// profile's sum, and the rows are drawn among.
+    /// are spread over their own span and not the pool's, so the front can
+    /// tell two of its rows apart where the whole pass cannot, whatever
+    /// the rows behind them cost: a difference past the tie's microsecond
+    /// stands wherever it is a large enough share of the front's own span
+    /// for a profile's sum to hold. A long queue on a row in front widens that
+    /// span, as one behind the front widens the pool's. Among every row, a
+    /// difference that is a small enough share of the pool's span falls
+    /// under the last bit of a profile's sum, and the rows are drawn among.
     fn score_front(
         &self,
         facts: &RequestFacts<'_>,
@@ -1327,11 +1330,11 @@ fn alone(
 
 /// The rows of a ranked pick, by their places in `scores`, handed to `pick`
 /// in slot order: `slots` of them at most, and `slots` no more than a
-/// target list holds. Per slot the rows within the band of the best
-/// remaining score are one tie, drawn from uniformly with the values of
-/// `draw`: one value a slot while two rows of its band are left, none for a
-/// row alone, the pick counted from the band's last row in scan order
-/// ([`draw_in_band`]).
+/// target list holds or `scores` holds. Per slot the rows within the band
+/// of the best remaining score are one tie, drawn from uniformly with the
+/// values of `draw`: one value a slot while two rows of its band are left,
+/// none for a row alone, the pick counted from the band's last row in scan
+/// order ([`draw_in_band`]).
 ///
 /// One pass keeps the five best scores (equal scores in scan order), and a
 /// band that ends among them is read off them: an entry below the band
@@ -1364,6 +1367,13 @@ fn draw_ranked<const DRAWN: bool>(
     slots: usize,
     mut pick: impl FnMut(usize),
 ) {
+    // Past either bound a slot would be handed a place no row stands at.
+    // The push asks for its list's room over the kept rows, so a debug
+    // build alone asserts it.
+    debug_assert!(
+        slots <= MAX_TARGETS.min(scores.len()),
+        "a ranked draw fills no more slots than its list and its scores hold"
+    );
     let mut best_five = [(usize::MAX, f32::NEG_INFINITY); MAX_TARGETS + 1];
     let len = if DRAWN {
         top_drawn(scores, &mut best_five)
@@ -3850,6 +3860,31 @@ mod tests {
             held::<false>(case, &scores, band, slots, seed);
             held::<true>(case, &scores, band, slots, seed);
         }
+    }
+
+    /// A ranked draw asked for a slot its scores do not reach is its
+    /// caller's fault: a debug build stops there, before a place past the
+    /// scores is handed out.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "no more slots than its list and its scores hold")]
+    fn a_slot_past_the_scores_stops_a_ranked_draw_in_a_debug_build() {
+        draw_ranked::<false>(&mut Draw::new(1), &[0.3, 0.2, 0.1], TieBand(0.0), 4, |_| {});
+    }
+
+    /// And so is a slot past a target list's room, whatever the scores hold.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "no more slots than its list and its scores hold")]
+    fn a_slot_past_the_list_stops_a_ranked_draw_in_a_debug_build() {
+        let scores = [0.6, 0.5, 0.4, 0.3, 0.2, 0.1];
+        draw_ranked::<false>(
+            &mut Draw::new(1),
+            &scores,
+            TieBand(0.0),
+            MAX_TARGETS + 1,
+            |_| {},
+        );
     }
 
     /// Count-first orders no more of the workers it passed over than the

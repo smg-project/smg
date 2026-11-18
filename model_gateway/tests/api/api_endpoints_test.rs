@@ -1530,6 +1530,23 @@ mod cache_tests {
         serde_json::from_slice(&body).unwrap()
     }
 
+    /// The body names the gateway's own package on both routes: the code
+    /// that builds it lives in the worker crate, which has a version of its
+    /// own.
+    #[tokio::test]
+    async fn the_loads_routes_name_the_gateways_own_version() {
+        let ctx = AppTestContext::new(vec![]).await;
+        for uri in ["/loads", "/get_loads"] {
+            let body = loads_body(&ctx, uri).await;
+            assert_eq!(
+                body["version"],
+                concat!("smg-", env!("CARGO_PKG_VERSION")),
+                "{uri}"
+            );
+        }
+        ctx.shutdown().await;
+    }
+
     #[tokio::test]
     async fn test_get_loads() {
         let ctx = AppTestContext::new(vec![

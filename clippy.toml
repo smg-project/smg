@@ -48,3 +48,9 @@ avoid-breaking-exported-api = false
 
 # Warn on paths with 4+ segments — encourages use statements over deep inline paths
 absolute-paths-max-segments = 3
+
+# A decider's name is one thread's for one turn: a wait that resumes on the same
+# thread would hold it over work that is not the decider's.
+await-holding-invalid-types = [
+    { path = "smg_policy_controller::decider::Acting", reason = "Drop the decider's guard before a wait: the name is held for one turn on one thread" },
+]

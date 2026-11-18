@@ -21,6 +21,7 @@ pub mod stream;
 mod token_text;
 pub mod traits;
 mod unigram;
+mod unigram_scores;
 #[cfg(feature = "tokenizers-v1")]
 mod v1;
 mod word_cache;

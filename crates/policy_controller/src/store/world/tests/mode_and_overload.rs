@@ -4,10 +4,14 @@
 
 use std::time::{Duration, Instant};
 
-use super::{block, member, overloaded, pressure, rank_of, REPORT_PERIOD};
+use super::{
+    ask, block, facts, member, overloaded, pressure, rank_of, view, MODEL, PUBLISH_WINDOW,
+    REPORT_PERIOD,
+};
 use crate::{
     spec::{BindingSpec, OverloadSpec, Pairing},
-    store::{LoadSink, LoadSource, MemoryStore},
+    store::{LoadSink, LoadSource, MemoryStore, WorkersStore},
+    view::Role,
     AppliedSpec, PolicySpec,
 };
 
@@ -92,4 +96,29 @@ fn a_generation_of_another_mode_ages_each_sample_from_its_own_receipt() {
     assert_eq!(overloaded(&store, at(100)), []);
     store.record(one, 1, pressure(9, 0), at(101), LoadSource::Stream);
     assert_eq!(overloaded(&store, at(101)), [zero, one]);
+}
+
+/// A generation of another mode builds the membership as it stands, at the
+/// store's epoch: a registration whose build was owed is in the world the
+/// apply publishes, and nothing is left for the window's end to build.
+#[test]
+fn a_generation_of_another_mode_pays_the_build_a_registration_owes() {
+    let store = MemoryStore::new();
+    let t0 = Instant::now();
+    member(&store, "http://a:8000");
+    store.upsert(facts("http://b:8000", Role::Single, &[MODEL]));
+    let builds = store.membership_builds();
+    assert!(store.publish_due().is_some());
+    assert!(store.world().epoch() < WorkersStore::epoch(&store));
+    store
+        .apply(generation_of(1, Pairing::Strict, block(8, 1.0)))
+        .expect("applied");
+    assert_eq!(store.world().epoch(), WorkersStore::epoch(&store));
+    assert_eq!(view(&store, &ask(t0)).0.len(), 2);
+    assert_eq!(
+        (store.membership_builds(), store.publish_due()),
+        (builds + 1, None)
+    );
+    store.publish(t0 + PUBLISH_WINDOW);
+    assert_eq!(store.membership_builds(), builds + 1);
 }

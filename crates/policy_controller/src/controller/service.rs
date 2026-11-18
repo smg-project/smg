@@ -1027,7 +1027,7 @@ mod tests {
                 Layer,
             },
             replication::journaled_from,
-            spec_store::SpecStore,
+            spec_store::{tests::names, SpecStore},
             PROTOCOL_VERSION,
         },
         elector::{
@@ -2780,11 +2780,7 @@ mod tests {
     #[tokio::test]
     async fn an_enforce_under_a_spec_store_runs_as_the_next_generation() {
         let (dir, _elector, _standing, control) = stored(true);
-        let on_file = || {
-            std::fs::read_dir(dir.path())
-                .expect("the directory")
-                .count()
-        };
+        let on_file = || names(dir.path()).len();
         let read = || {
             let standing = proto::GetPolicySpecRequest::default();
             control.get_policy_spec(from("operator-a", standing))
@@ -2887,8 +2883,7 @@ mod tests {
             .expect_err("a follower");
         assert_eq!(refused.code(), Code::FailedPrecondition);
         assert_eq!(refused.message(), "this replica does not lead");
-        let on_file = std::fs::read_dir(dir.path()).expect("the directory");
-        assert_eq!(on_file.count(), 0);
+        assert_eq!(names(dir.path()).len(), 0);
         assert_eq!(control.shared.generations.generation(), 0);
     }
 
@@ -2927,8 +2922,7 @@ mod tests {
         );
         assert_eq!(feed.after, Some(proto::NeedsSummary::default()));
         assert_eq!(control.shared.generations.generation(), 3);
-        let on_file = std::fs::read_dir(dir.path()).expect("the directory");
-        assert_eq!(on_file.count(), 3);
+        assert_eq!(names(dir.path()).len(), 3);
 
         for (asked, answered, document, digest) in [
             (1, 1, RANDOM, &first.digest),

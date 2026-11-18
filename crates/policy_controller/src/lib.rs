@@ -144,7 +144,8 @@ pub use spec::{
 pub use view::{
     fingerprint, AffinityFacts, Candidate, Constraints, HashKind, Header, Health, Identity,
     LoadRow, MediaCounts, ModelFingerprint, NamedAffinity, NamedHolder, OverloadRegime, Phase,
-    PoolFacts, RequestFacts, Role, Session, SignalSource, WireModes, WorkerId, ZoneCapacity,
+    PinSource, PoolFacts, RequestFacts, Role, Session, SignalSource, WireModes, WorkerId,
+    ZoneCapacity,
 };
 
 /// SplitMix64 over a decision's seed: the only randomness a stage gets, so a
@@ -164,7 +165,9 @@ pub use view::{
 ///   decode side, whose stages derive their streams from it as above;
 /// - the seed under the store's two naming masks: where the store names a
 ///   decision's rows and cuts a list at the profile's sample, the holders'
-///   draw and the warming rows' draw.
+///   draw and the warming rows' draw;
+/// - the first value of the holders' stream, and of each stream so seeded:
+///   the seed of each lookup a naming makes again, a stream a round.
 #[derive(Clone, Copy, Debug)]
 pub struct Draw(u64);
 

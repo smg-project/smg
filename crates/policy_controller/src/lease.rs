@@ -102,10 +102,12 @@ pub struct Outcome {
 /// Why a lease was released before its completion.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReleaseReason {
-    /// The host gave up before dispatch.
+    /// The lease ended before a dispatch: its host gave up, no dispatch
+    /// was named by its deadline, or its answer was stopped for the fence
+    /// (its controller no longer led the term that minted it).
     Abandoned,
     /// A late decision: it arrived after a fallback dispatch, or was cut
-    /// before it left.
+    /// before it left, for its request's budget or its dispatch span.
     LateDecision,
     /// The client went away.
     ClientGone,
@@ -117,7 +119,9 @@ pub enum ReleaseReason {
     WorkerRemoved,
 }
 
-/// A membership change the host reports.
+/// A membership change the host reports. A host tells a join when it takes
+/// it, and a view that lists the row may follow: a stage that lists by the
+/// feed treats a member its candidates do not hold as one a filter took.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Membership<'a> {
     Added(WorkerId),
@@ -234,6 +238,11 @@ impl fmt::Debug for EventSet {
 
 /// The lifecycle a stateful stage implements. Every hook defaults to a
 /// no-op, so a stateless stage implements nothing.
+///
+/// A served controller tells a lease's issue, its dispatch, its completion
+/// and its release while it holds the turn of its leases' file, and the
+/// release of a lease its decision gives up right after that turn: those
+/// hooks are bounded, and call no door of the leases' store.
 pub trait Lifecycle: Send + Sync {
     /// The engine issued `decision` under `lease`. In the embedded mode the
     /// commit follows at once and the accounting happens at dispatch; a
@@ -273,12 +282,12 @@ pub trait Lifecycle: Send + Sync {
     /// workers it lists or the bookings it learns from. The standalone
     /// controller makes the membership call and tells a stage of a lease's
     /// issue, of its dispatch, completion and release at its gateway's word
-    /// and of its end at the dispatch deadline, and not yet of the end of a
-    /// lease whose gateway was let go: it refuses a document that names such
-    /// a stage as not in this build ([`crate::SpecError::NotInBuild`]). A
-    /// host that embeds the engine makes every call. `false` by default: a
-    /// stage that takes a call to shed state early decides the same without
-    /// it.
+    /// and of its end at the dispatch deadline or where its answer does not
+    /// leave, and not yet of the end of a lease whose gateway was let go: it
+    /// refuses a document that names such a stage as not in this build
+    /// ([`crate::SpecError::NotInBuild`]). A host that embeds the engine
+    /// makes every call. `false` by default: a stage that takes a call to
+    /// shed state early decides the same without it.
     fn needs_lifecycle(&self) -> bool {
         false
     }

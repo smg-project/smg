@@ -113,6 +113,9 @@ fn fleet(n: usize) -> (MemoryStore, Vec<WorkerId>) {
             id
         })
         .collect();
+    // The build the registrations owe, asked once: a decision reads the
+    // fleet whole.
+    store.publish_now();
     for (p, id) in ids.iter().enumerate() {
         stores(&store, *id, 1, &prompt(p));
         stores(&store, *id, 2, &prompt(SHARED));

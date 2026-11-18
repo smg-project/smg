@@ -299,10 +299,12 @@ impl Bed {
         }
     }
 
-    /// Whether the worker reads as overloaded to a decision at `now`: the
-    /// verdict every rank's row carries, or `None` when the rows of the one
-    /// engine carry two.
-    fn verdict(&self, now: Instant) -> Option<bool> {
+    /// Whether the worker reads as overloaded to a decision at `now`: every
+    /// rank's row carries the bit, so the overload veto leaves no rank of
+    /// it. A rank its engine's last answer left out beside a named one
+    /// carries the bit alone: that is the store's avoidance of the rank and
+    /// no verdict of the engine, and the worker reads as its named ranks do.
+    fn verdict(&self, now: Instant) -> bool {
         let mut out = ViewBuffers::default();
         let ask = Ask {
             gateway: GatewayId(1),
@@ -313,19 +315,17 @@ impl Bed {
         self.store
             .build_view(MODEL, Role::Single, &ask, &mut out)
             .expect("the pool");
-        let mut rows = out.candidates.iter().map(|row| row.health.overloaded);
-        let first = rows.next()?;
-        rows.all(|row| row == first).then_some(first)
+        !out.candidates.is_empty() && out.candidates.iter().all(|row| row.health.overloaded)
     }
 }
 
-/// This crate's verdict after each step of the row, or why the row has
-/// none: the validator's words for a form this crate does not build, or
-/// the step after which the rows of the one engine carried two verdicts.
+/// This crate's verdict after each step of the row, or the validator's
+/// words for a form this crate does not build.
 fn replay(row: &Row) -> Result<Vec<bool>, String> {
     let bed = Bed::new(row)?;
     let start = Instant::now();
-    row.steps
+    let verdicts = row
+        .steps
         .iter()
         .enumerate()
         .map(|(at, step)| {
@@ -335,9 +335,9 @@ fn replay(row: &Row) -> Result<Vec<bool>, String> {
             let now = start + PERIOD * (at as u32 + 1);
             bed.step(step, now);
             bed.verdict(now)
-                .ok_or_else(|| format!("after step {at} the rows of one engine carry two verdicts"))
         })
-        .collect()
+        .collect();
+    Ok(verdicts)
 }
 
 /// `None` when a row's verdicts here are the recorded ones, or its entry's

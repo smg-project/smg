@@ -1,7 +1,5 @@
-pub mod capacity;
-pub mod inflight;
-pub mod monitor;
-pub mod state;
+#[cfg(test)]
+mod gateway_tests;
 
-// The worker crate's, at the path it had here.
-pub use smg_worker::load::metrics_aggregator;
+// The worker crate's, at the paths they had here.
+pub use smg_worker::load::{capacity, inflight, metrics_aggregator, monitor, state};

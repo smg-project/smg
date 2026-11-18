@@ -21,27 +21,56 @@ axum = ["dep:axum"]
 # The mechanism the worker's metric writers share with a host's: the bounded
 # label set, the model labels' one set and the handles a record keeps.
 metrics = ["dep:dashmap", "dep:rustc-hash"]
-# The worker's runtime, for the process that hosts the workers: the HTTP
-# client factory and the cache of worker-directed clients, the worker errors,
-# the periodic task and the merge of scraped metrics.
+# The worker's runtime, for the process that hosts the workers: the worker
+# with its builder, its registry, its health, its load monitor and its metric
+# writers, the engine handle, the HTTP client factory and the cache of
+# worker-directed clients, the worker errors, the periodic task and the merge
+# of scraped metrics.
 runtime = [
+    "metrics",
     "dep:anyhow",
+    "dep:arc-swap",
+    "dep:async-trait",
+    "dep:blake3",
+    "dep:chrono",
+    "dep:futures",
+    "dep:metrics",
+    "dep:metrics-exporter-prometheus",
+    "dep:metrics-util",
+    "dep:once_cell",
     "dep:openmetrics-parser",
+    "dep:parking_lot",
+    "dep:quanta",
     "dep:reqwest",
     "dep:rustls",
     "dep:thiserror",
+    "dep:tokio",
+    "dep:tonic",
     "dep:tracing",
+    "dep:uuid",
 ]
-# The runtime's test support, for the tests of a crate that hosts it.
+# The runtime's test support, with its test readers and hooks, for the tests
+# of a crate that hosts it.
 test-util = ["runtime"]
 
 [dependencies]
 anyhow = { workspace = true, optional = true }
+arc-swap = { version = "1.9.1", optional = true }
+async-trait = { workspace = true, optional = true }
 axum = { workspace = true, optional = true }
 bitflags.workspace = true
+blake3 = { workspace = true, optional = true }
+chrono = { workspace = true, optional = true }
 dashmap = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
+metrics = { version = "0.24.6", optional = true }
+metrics-exporter-prometheus = { version = "0.18.3", default-features = false, optional = true }
+metrics-util = { version = "0.20.4", default-features = false, features = ["registry"], optional = true }
+once_cell = { version = "1.21.4", optional = true }
 openmetrics-parser = { version = "0.4.4", optional = true }
-reqwest = { workspace = true, optional = true, features = ["blocking", "http2", "rustls-no-provider"] }
+parking_lot = { workspace = true, optional = true }
+quanta = { version = "0.12", optional = true }
+reqwest = { workspace = true, optional = true, features = ["blocking", "http2", "json", "rustls-no-provider"] }
 rustc-hash = { version = "2", optional = true }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"], optional = true }
 schemars.workspace = true
@@ -49,15 +78,20 @@ serde = { workspace = true, features = ["derive", "rc"] }
 serde_json = { workspace = true, features = ["preserve_order"] }
 serde_with.workspace = true
 thiserror = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true, features = ["macros", "net", "rt", "sync", "time"] }
+tonic = { workspace = true, optional = true }
 tracing = { workspace = true, optional = true }
 url = "2.5"
+uuid = { workspace = true, optional = true }
 
 [dev-dependencies]
 # The test servers speak HTTP/2 to the prior-knowledge clients.
 axum = { workspace = true, features = ["http2"] }
+base64 = "0.23"
 http.workspace = true
 openssl = "0.10.81"
-tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "sync", "test-util", "time"] }
+tracing-test = "0.2"
 
 [lints]
 workspace = true

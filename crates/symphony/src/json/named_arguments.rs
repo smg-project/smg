@@ -75,17 +75,22 @@ impl Object {
         self.done && !self.fragments.refused() && self.fragments.whole()
     }
 
-    /// Give back the text of an object that closed: nothing reads it after the closing brace, so
-    /// a reader kept to the call's end ([`Self::cut`]) holds none of the call's bytes meanwhile.
+    /// Give back what was read of an object that closed, its text and the scanner, which keeps a
+    /// decoded copy of a top-level name: nothing reads either after the closing brace, so a
+    /// reader kept to the call's end ([`Self::cut`]) holds none of the call's bytes meanwhile.
+    /// What the close decided stays: that the object closed, and what the fragments said of it.
     pub(crate) fn give_back(&mut self) {
         debug_assert!(self.done, "only a closed object gives its text back");
         self.text = String::new();
+        self.scanner = Scanner::default();
     }
 
-    /// How many bytes the reader holds for the object's text.
+    /// How many bytes the reader holds of the object: its text, and the decoded copy the scanner
+    /// keeps of a top-level name.
     #[cfg(test)]
     pub(crate) fn held(&self) -> usize {
-        self.text.capacity()
+        let name = self.scanner.found().name.as_ref();
+        self.text.capacity() + name.map_or(0, String::capacity)
     }
 
     /// [`Self::feed`] without the call's end: the fragments the bytes complete, and at the

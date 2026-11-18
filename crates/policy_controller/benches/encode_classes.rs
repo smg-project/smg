@@ -10,6 +10,12 @@
 //! - `policy_encodes/moved_write/<fleet>/<n>`: the same write where the
 //!   registration states another runtime each time: the model's classes,
 //!   the pair classes and the encode classes, are derived;
+//! - `policy_encodes/decode_write/<fleet>/<n>`: the same write where the
+//!   first decode states another runtime each time: the pair classes are
+//!   derived for that decode and the encode classes are carried;
+//! - `policy_encodes/models_write/apart/<models>`: the moved write over
+//!   that many models, each of the fleet `apart` at 64: one model's
+//!   classes are derived and the others' are carried;
 //! - `policy_encodes/build/pair/<fleet>/<n>` and
 //!   `policy_encodes/build/encode_pair/<fleet>/<n>`: one decision's build
 //!   through the pair's door, and through the encode pair's, which adds
@@ -32,6 +38,9 @@
     clippy::expect_used,
     reason = "a bench's setup has no caller to answer"
 )]
+
+#[path = "common/filled.rs"]
+mod filled;
 
 use std::{hint::black_box, time::Instant};
 
@@ -111,6 +120,16 @@ fn store_of(fleet: &[WorkerFacts]) -> MemoryStore {
     for facts in fleet {
         store.upsert(facts.clone());
     }
+    store.publish_now();
+    // The first row's pool: its own model's, where a fleet holds several.
+    if let Some(first) = fleet.first() {
+        let model = first.models.first().map_or(MODEL, String::as_str);
+        let rows = fleet
+            .iter()
+            .filter(|facts| facts.role == first.role && facts.models == first.models)
+            .count();
+        filled::filled(&store, model, first.role, rows);
+    }
     store
 }
 
@@ -162,7 +181,11 @@ fn membership_write(c: &mut Criterion) {
             group.bench_function(BenchmarkId::new(name, n), |b| {
                 b.iter_batched(
                     || refreshed.clone(),
-                    |facts| store.upsert(black_box(facts)),
+                    |facts| {
+                        let change = store.upsert(black_box(facts));
+                        store.publish_now();
+                        change
+                    },
                     BatchSize::SmallInput,
                 );
             });
@@ -195,7 +218,11 @@ fn moved_write(c: &mut Criterion) {
                             first.clone()
                         }
                     },
-                    |facts| store.upsert(black_box(facts)),
+                    |facts| {
+                        let change = store.upsert(black_box(facts));
+                        store.publish_now();
+                        change
+                    },
                     BatchSize::SmallInput,
                 );
             });
@@ -243,5 +270,100 @@ fn doors(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, derivation, membership_write, moved_write, doors);
+/// A membership write that moves an offer the encode handoff does not read:
+/// the first decode registers with another runtime each time, so the
+/// model's encode classes are carried.
+fn decode_write(c: &mut Criterion) {
+    let mut group = c.benchmark_group("policy_encodes/decode_write");
+    for name in FLEETS {
+        for n in SIZES {
+            let fleet = fleet(name, n);
+            let store = store_of(&fleet);
+            let mut decodes = fleet.iter().filter(|facts| facts.role == Role::Decode);
+            let first = decodes.next().expect("a decode").clone();
+            let other = WorkerFacts {
+                engine_kind: "rt-b".to_string(),
+                ..first.clone()
+            };
+            let mut turn = false;
+            group.bench_function(BenchmarkId::new(name, n), |b| {
+                b.iter_batched(
+                    || {
+                        turn = !turn;
+                        if turn {
+                            other.clone()
+                        } else {
+                            first.clone()
+                        }
+                    },
+                    |facts| {
+                        let change = store.upsert(black_box(facts));
+                        store.publish_now();
+                        change
+                    },
+                    BatchSize::SmallInput,
+                );
+            });
+        }
+    }
+    group.finish();
+}
+
+/// A membership write that moves an offer in one model of several: the
+/// first prefill of the first model registers with another runtime each
+/// time. Every model holds the fleet `apart` at 64, so the write derives
+/// one model's encode classes and carries the others'.
+fn models_write(c: &mut Criterion) {
+    let mut group = c.benchmark_group("policy_encodes/models_write");
+    for models in [1, 8] {
+        let mut all = Vec::new();
+        for model in 0..models {
+            for facts in fleet("apart", 64) {
+                let key = format!("{}#{model}", facts.key);
+                all.push(WorkerFacts {
+                    key: key.clone(),
+                    engine: key,
+                    models: vec![format!("m{model}")],
+                    ..facts
+                });
+            }
+        }
+        let store = store_of(&all);
+        let first = all.first().expect("a prefill").clone();
+        let other = WorkerFacts {
+            engine_kind: "rt-b".to_string(),
+            ..first.clone()
+        };
+        let mut turn = false;
+        group.bench_function(BenchmarkId::new("apart", models), |b| {
+            b.iter_batched(
+                || {
+                    turn = !turn;
+                    if turn {
+                        other.clone()
+                    } else {
+                        first.clone()
+                    }
+                },
+                |facts| {
+                    let change = store.upsert(black_box(facts));
+                    store.publish_now();
+                    change
+                },
+                BatchSize::SmallInput,
+            );
+        });
+    }
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    derivation,
+    membership_write,
+    moved_write,
+    decode_write,
+    models_write,
+    doors
+);
 criterion_main!(benches);

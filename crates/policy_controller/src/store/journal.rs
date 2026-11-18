@@ -53,9 +53,10 @@ pub enum Kinds {
 /// What a store tells at each replicated write.
 ///
 /// Every call but [`Journal::released`] arrives under a lock of the store
-/// (the membership lock, the load lock or the lease lock), so an
-/// implementation returns at once: it takes no lock a reader may hold for
-/// long, it never waits on a standby and it calls nothing of the store.
+/// (the membership lock, the load lock or the turn of the leases' file),
+/// so an implementation returns at once: it takes no lock a reader may
+/// hold for long, it never waits on a standby and it calls nothing of the
+/// store.
 pub trait Journal: Send + Sync {
     /// A membership or status write: the epoch it made, the change, the
     /// row it is about as the write left it in the table (`None` for a

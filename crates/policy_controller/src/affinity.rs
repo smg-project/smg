@@ -401,7 +401,10 @@ impl PrefixAffinity {
     /// reader of its own: a column's is a read by index, and the rows a
     /// host named are walked beside the kept rows. One body a feed, the
     /// feed chosen where the body is entered. The rows of a draw are
-    /// scored by [`Self::rank_drawn`].
+    /// scored by [`Self::rank_drawn`]. The count of the rows written the
+    /// ceiling comes back beside the band: the entry that says the stage's
+    /// word reads it ([`Scorer::score_front`]), and an entry that does not
+    /// carries no count.
     #[inline(always)]
     fn rank<R: FnMut(u32) -> AffinityFacts>(
         &self,
@@ -411,7 +414,7 @@ impl PrefixAffinity {
         out: &mut [f32],
         feed: Feed<'_>,
         reads: impl Fn() -> R,
-    ) -> TieBand {
+    ) -> (TieBand, u32) {
         let request_blocks = self.gates.request_blocks(facts);
         let holds = !feed.is_empty();
         // Nobody holding anything, the deepest match is zero without a
@@ -435,6 +438,7 @@ impl PrefixAffinity {
             0.0
         };
         let mut entry = reads();
+        let mut ceilings = 0u32;
         with_counts!(facts, |counts| {
             for (o, &i) in out.iter_mut().zip(kept) {
                 let c = &candidates[i as usize];
@@ -444,6 +448,9 @@ impl PrefixAffinity {
                     && self.matched(entry(i), request_blocks) == best
                     && !self.gates.over(load, avg, held)
                 {
+                    // Counted where it is written: a row under the ceiling
+                    // adds nothing to the pass.
+                    ceilings += 1;
                     1.0
                 } else if !self.gates.over(load, avg, 0.0) {
                     0.5
@@ -452,7 +459,7 @@ impl PrefixAffinity {
                 };
             }
         });
-        TieBand(0.0)
+        (TieBand(0.0), ceilings)
     }
 
     /// The stage's scores behind a draw, as [`Self::rank`] says them over
@@ -526,6 +533,7 @@ impl PrefixAffinity {
             let mut walk = named.walk();
             move |i: u32| walk.entry(i)
         })
+        .0
     }
 }
 
@@ -547,9 +555,10 @@ impl Scorer for PrefixAffinity {
         Spread::Levels(0.5)
     }
 
-    /// [`Self::score`], and the word its scores read as ([`Front::of`]):
-    /// the stage's own pass counts nothing for it. The rows a host named
-    /// say nothing.
+    /// [`Self::score`] with the word of its scores, said by the pass that
+    /// writes them: it counts the rows it writes the ceiling, and no pass
+    /// reads the scores again. Under the fleet's KV gate every row stands
+    /// alike. The rows a host named say nothing.
     fn score_front(
         &self,
         facts: &RequestFacts<'_>,
@@ -557,11 +566,25 @@ impl Scorer for PrefixAffinity {
         kept: &[u32],
         out: &mut [f32],
     ) -> (TieBand, Front) {
-        let band = self.score(facts, candidates, kept, out);
         if facts.named_alone().is_some() {
-            return (band, Front::Unsaid);
+            return (self.score(facts, candidates, kept, out), Front::Unsaid);
         }
-        (band, Front::of(self.spread(), out))
+        if self.gates.kv_imbalanced(candidates, kept) {
+            return (neutral(out), Front::Alike);
+        }
+        let column = facts.affinity;
+        let (band, ceilings) =
+            self.rank(facts, candidates, kept, out, Feed::Column(column), || {
+                |i: u32| column[i as usize]
+            });
+        // The values are the ceiling, a half and nothing: every row not
+        // counted stands a level or more under the rows that are.
+        let said = if ceilings as usize == out.len() {
+            Front::Alike
+        } else {
+            Front::At(ceilings)
+        };
+        (band, said)
     }
 
     fn score(
@@ -585,6 +608,7 @@ impl Scorer for PrefixAffinity {
         self.rank(facts, candidates, kept, out, Feed::Column(column), || {
             |i: u32| column[i as usize]
         })
+        .0
     }
 
     fn needs(&self) -> Needs {
@@ -1116,9 +1140,11 @@ impl Scorer for WarmupSlice {
         Spread::Levels(1.0)
     }
 
-    /// [`Self::score`], and the word its scores read as ([`Front::of`]):
-    /// the stage's own pass counts nothing for it. The rows a host named
-    /// say nothing.
+    /// [`Self::score`], and the word of its scores read off two of them.
+    /// The pass writes every row the ceiling, or one row the ceiling and
+    /// every other nothing: the first two rows tell the answers apart, and
+    /// no pass reads the scores again. A lone row stands at the ceiling
+    /// either way, which reads alike. The rows a host named say nothing.
     fn score_front(
         &self,
         facts: &RequestFacts<'_>,
@@ -1130,7 +1156,11 @@ impl Scorer for WarmupSlice {
         if facts.named_alone().is_some() {
             return (band, Front::Unsaid);
         }
-        (band, Front::of(self.spread(), out))
+        let alike = match *out {
+            [first, second, ..] => first >= 1.0 && second >= 1.0,
+            _ => true,
+        };
+        (band, if alike { Front::Alike } else { Front::At(1) })
     }
 
     fn score(
@@ -2533,5 +2563,143 @@ mod tests {
             );
         }
         assert!(KvPressure.row_wise());
+    }
+
+    /// The two ranks say the word their scores read as ([`Front::of`]), and
+    /// score a row alike by either entry. Seeded pools of one to forty
+    /// rows, a part of them kept: nobody, some or every row holds the
+    /// request, rows stand over and under the spill gate, and some rows
+    /// warm. Two builds of each stage are asked side by side, one by each
+    /// entry, so the slice's counters turn alike.
+    #[test]
+    fn the_ranks_say_the_word_their_scores_read_as() {
+        let spill = || {
+            Some(SpillParams {
+                abs: Some(64),
+                rel: Some(1.5),
+                ..SpillParams::default()
+            })
+        };
+        let plain: [Box<dyn Scorer>; 2] = [Box::new(affinity(spill())), Box::new(warmup(0.25, 3))];
+        let said: [Box<dyn Scorer>; 2] = [Box::new(affinity(spill())), Box::new(warmup(0.25, 3))];
+        let mut draw = Draw::new(0x51ce);
+        // The words said, a stage: alike, no row at the ceiling, one, more.
+        let mut words = [[0u32; 4]; 2];
+        for round in 0..4_000u64 {
+            let n = 1 + draw.below(40) as u32;
+            let odds = [0, 1, 2, 8][draw.below(4)];
+            let pool: Vec<Held> = (0..n)
+                .map(|i| {
+                    let holds = odds != 0 && draw.below(odds) == 0;
+                    let indexed = [0, 64][draw.below(2)];
+                    sized(i, draw.below(12) as u32, if holds { 8 } else { 0 }, indexed)
+                })
+                .collect();
+            let (rows, column) = (rows(&pool), column(&pool));
+            // One row in four is left out, and never every row.
+            let mut kept: Vec<u32> = (0..n).filter(|_| draw.below(4) != 0).collect();
+            if kept.is_empty() {
+                kept.push(draw.below(n as usize) as u32);
+            }
+            let facts = RequestFacts {
+                affinity: &column,
+                seed: round,
+                ..facts(16)
+            };
+            for (stage, (plain, said)) in plain.iter().zip(&said).enumerate() {
+                let mut by_score = vec![0.0; kept.len()];
+                let mut by_front = vec![0.0; kept.len()];
+                let band = plain.score(&facts, &rows, &kept, &mut by_score);
+                let (front_band, word) = said.score_front(&facts, &rows, &kept, &mut by_front);
+                let name = plain.name();
+                assert_eq!(by_front, by_score, "{name}, round {round}");
+                assert_eq!(front_band, band, "{name}, round {round}");
+                assert_eq!(
+                    word,
+                    Front::of(plain.spread(), &by_score),
+                    "{name}, round {round}: {by_score:?}"
+                );
+                let which = match word {
+                    Front::Alike => 0,
+                    Front::At(0) => 1,
+                    Front::At(1) => 2,
+                    _ => 3,
+                };
+                words[stage][which] += 1;
+            }
+        }
+        // Each stage said each of its words in some rounds: the holders'
+        // stage every one, the slice alike and its one row.
+        assert!(words[0].iter().all(|&rounds| rounds > 50), "{words:?}");
+        assert!(words[1][0] > 50 && words[1][2] > 50, "{words:?}");
+        assert_eq!((words[1][1], words[1][3]), (0, 0), "{words:?}");
+        // A lone kept row that takes the request stands at the ceiling,
+        // which reads alike.
+        let pool = [sized(0, 3, 0, 64), sized(1, 2, 0, 64), sized(2, 5, 0, 0)];
+        let (three, held) = (rows(&pool), column(&pool));
+        let fed = RequestFacts {
+            affinity: &held,
+            ..facts(16)
+        };
+        let mut lone = [0.0];
+        let (_, word) = warmup(0.25, 0).score_front(&fed, &three, &[2], &mut lone);
+        assert_eq!((lone, word), ([1.0], Front::Alike));
+        // A decision fed no column: the slice stands alike, and no row
+        // holds the request.
+        let unfed = facts(16);
+        let (mut slices, mut holds) = ([0.0; 3], [0.0; 3]);
+        let (_, word) = warmup(0.25, 0).score_front(&unfed, &three, &kept(3), &mut slices);
+        assert_eq!((slices, word), ([1.0; 3], Front::Alike));
+        let (_, word) = affinity(None).score_front(&unfed, &three, &kept(3), &mut holds);
+        assert_eq!((holds, word), ([0.5; 3], Front::At(0)));
+        // The rows a host named say nothing, and score as by the plain
+        // entry: the second row holds the request and the third warms.
+        let holders = [holder(1, 8)];
+        let naming = RequestFacts {
+            named: Some(named(&holders, &[2], true)),
+            ..facts(16)
+        };
+        let pairs: [[Box<dyn Scorer>; 2]; 2] = [
+            [Box::new(affinity(None)), Box::new(affinity(None))],
+            [Box::new(warmup(0.25, 0)), Box::new(warmup(0.25, 0))],
+        ];
+        for [plain, said] in &pairs {
+            let (mut by_score, mut by_front) = ([0.0; 3], [0.0; 3]);
+            let band = plain.score(&naming, &three, &kept(3), &mut by_score);
+            assert_eq!(
+                said.score_front(&naming, &three, &kept(3), &mut by_front),
+                (band, Front::Unsaid),
+                "{}",
+                plain.name()
+            );
+            assert_eq!(by_front, by_score, "{}", plain.name());
+        }
+        // Under the fleet's KV gate both ranks stand alike.
+        let kv = KvPressureParams {
+            spread: Some(0.3),
+            ceiling: Some(0.9),
+            ..KvPressureParams::default()
+        };
+        let params = PrefixAffinityParams::default();
+        let gates = Gates::of(Some(&params), Some(&kv), Some(16));
+        let slicing = WarmupSliceParams {
+            share: Some(0.25),
+            ..WarmupSliceParams::default()
+        };
+        let gated: [Box<dyn Scorer>; 2] = [
+            Box::new(PrefixAffinity::new(&params, gates)),
+            Box::new(WarmupSlice::new(&slicing, gates)),
+        ];
+        let ceiling = [reporting(0, 0, 8, 950), reporting(1, 0, 0, 900)];
+        let (two, usage) = (rows(&ceiling), column(&ceiling));
+        let pressed = RequestFacts {
+            affinity: &usage,
+            ..facts(16)
+        };
+        for stage in &gated {
+            let mut out = [0.0; 2];
+            let (_, word) = stage.score_front(&pressed, &two, &kept(2), &mut out);
+            assert_eq!((out, word), ([1.0, 1.0], Front::Alike), "{}", stage.name());
+        }
     }
 }

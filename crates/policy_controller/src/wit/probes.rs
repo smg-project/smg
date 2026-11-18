@@ -205,8 +205,11 @@ pub(crate) fn all() -> Vec<Probe> {
             model, namespace_seed, tenant, priority, streaming, max_output_tokens,
             prompt_tokens, block_hashes, hash_kind, session_key, phase, attempt, tried,
             budget_micros, headers, media, seed, block_size, now_micros, pinned_at,
-            lent_in_flight, affinity, named, model_fingerprint,
-        } host [now_micros, pinned_at, lent_in_flight, affinity, named, model_fingerprint],
+            lent_in_flight, session_counted, affinity, named, model_fingerprint,
+        } host [
+            now_micros, pinned_at, lent_in_flight, session_counted, affinity, named,
+            model_fingerprint
+        ],
         &request),
         probe!("zone-capacity", before [], ZoneCapacity { zone, healthy, total } host [], &zone),
         probe!("pool", before [], PoolFacts {
