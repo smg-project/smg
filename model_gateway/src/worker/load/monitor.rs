@@ -2005,7 +2005,7 @@ mod native_loads_tests {
         WorkerMonitor, WorkerRegistry, WorkerType,
     };
 
-    const VLLM_METRICS: &str = "vllm:num_requests_running{m=\"a\"} 7.0\n\
+    const ENGINE_METRICS: &str = "vllm:num_requests_running{m=\"a\"} 7.0\n\
          vllm:num_requests_waiting{m=\"a\"} 11.0\n\
          vllm:kv_cache_usage_perc{m=\"a\"} 0.5\n";
 
@@ -2066,7 +2066,7 @@ mod native_loads_tests {
         let app = axum::Router::new()
             .route("/loads", route(&gateway_probes, &gateway_query, gateway))
             .route("/v1/loads", route(&probes, &engine_query, engine))
-            .route("/metrics", axum::routing::get(|| async { VLLM_METRICS }));
+            .route("/metrics", axum::routing::get(|| async { ENGINE_METRICS }));
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -2195,9 +2195,9 @@ mod native_loads_tests {
 
     /// Every poll hands the routing side each polled worker, with the
     /// router's live in-flight count on it: the safety net for a completion
-    /// that never reached the worker's policy.
+    /// the routing side never saw.
     #[tokio::test]
-    async fn load_poll_reconciles_in_flight_with_the_workers_policy() {
+    async fn load_poll_reconciles_in_flight_with_the_routing_side() {
         let stub = spawn_engine(StatusCode::OK, NATIVE_BODY).await;
         let registry = Arc::new(WorkerRegistry::new());
         let recorder = Arc::new(ReconcileRecorder::default());
@@ -2225,7 +2225,7 @@ mod native_loads_tests {
         registry.register(Arc::clone(&worker)).unwrap();
         monitor.start_event_loop();
 
-        wait_until("the poll to reconcile the worker's policy", || {
+        wait_until("the poll to reconcile the routing side", || {
             recorder
                 .0
                 .lock()
@@ -2402,10 +2402,10 @@ mod native_loads_tests {
         assert_eq!(registry.overloaded_worker_count("a"), 0);
     }
 
-    /// A load-aware policy must still be fed with the opt-out set — the
+    /// A load-aware reader must still be fed with the opt-out set — the
     /// conditional gate is "poll when needed", never "never poll".
     #[tokio::test]
-    async fn pressure_configured_cache_aware_starts_load_polling() {
+    async fn a_load_aware_reader_starts_load_polling_under_the_conditional_gate() {
         let stub = spawn_engine(StatusCode::OK, NATIVE_BODY).await;
         let (registry, monitor) = monitor_with(LoadReaders::Aware, true);
         let worker = gauge_worker(&stub.url);
@@ -2428,7 +2428,7 @@ mod native_loads_tests {
             }
         })
         .await
-        .expect("cache_aware with overlap_decay must trigger load polling");
+        .expect("a load-aware reader must trigger load polling under the conditional gate");
     }
 
     /// The one predicate behind the poll tick and the load stream: wanted

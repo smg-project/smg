@@ -1125,13 +1125,11 @@ impl<G: Generation> WorkerRegistry<G> {
     /// other is pinned — and substituting one for the other would silently run
     /// a model the client did not ask for.
     ///
-    /// External workers reach only the provider routers
-    /// ([`Gateway::select_router_for_model`] gives them priority, and
-    /// single-router mode picks by routing mode), none of which rewrite the
-    /// outbound model. Keep it that way: canonicalize registry lookups there
-    /// if needed, never the request body.
-    ///
-    /// [`Gateway::select_router_for_model`]: crate::routers::gateway::Gateway
+    /// External workers reach only the provider routers (the gateway's
+    /// router selection gives them priority, and single-router mode picks by
+    /// routing mode), none of which rewrite the outbound model. Keep it that
+    /// way: canonicalize registry lookups there if needed, never the request
+    /// body.
     pub fn resolve_model_alias(&self, model_id: &str) -> Option<Arc<str>> {
         if model_id == UNKNOWN_MODEL_ID || self.model_index.contains_key(model_id) {
             return None;
