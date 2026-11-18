@@ -7140,8 +7140,21 @@ fn a_fuel_fast_spinner_is_sampled_by_its_charge_not_its_clock() {
     let frame_fuel = u64::from(FRAME_MICROS) * SLOW_CALIBRATION;
     assert!(
         s.fuel_used <= decisions * (frame_fuel + init_fuel) + init_fuel,
-        "the fuel ended the calls early, not their bound: {s:?} over {decisions} decisions"
+        "a decision granted past its frame or built twice: {s:?} over {decisions} decisions"
     );
+    // That bound is the grant's cap and holds however a call ended. Which
+    // bound ended the calls is read from below: a spin its fuel ended burnt
+    // its whole grant, the remainder behind the honest scorer, and one its
+    // clock bound ended first burnt a part of it. On a quiet run the
+    // remainder is past half the frame's fuel: a hold under a quarter of
+    // the budget is the most that came off it.
+    if quiet {
+        let spun = s.fuel_used.saturating_sub(s.instantiations * init_fuel);
+        assert!(
+            spun >= decisions * frame_fuel / 2,
+            "the spins burnt {spun} units over {decisions} decisions, short of their grants: {s:?}"
+        );
+    }
 }
 
 /// A plugin that spins in its constructor, behind another plugin's
