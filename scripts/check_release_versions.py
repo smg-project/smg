@@ -5,7 +5,7 @@ For every component (a workspace crate or a Python package), since the given tag
 whether its files changed, whether its version was bumped, and, for a crate, whether
 the workspace root's dependency entry agrees. A component's files include what the
 symlinks under its path point at: a package that ships another directory's files through
-a link (the proto package ships crates/grpc_client/proto that way) ships their changes
+a link (the proto package ships both proto directories' files that way) ships their changes
 too, so they move its version. A version is bumped when no release tag
 ``v<x.y.z>`` (the given tag, or one another release line made) carries it with other
 code: the registries take a version once. A crate held at its published version is

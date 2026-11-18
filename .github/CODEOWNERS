@@ -30,7 +30,7 @@
 /crates/data_connector @key4ng @zhoug9127 @smg-project-bot
 /crates/grpc_client @CatherineSue @slin1237 @smg-project-bot @Moersity
 /crates/grpc_client/proto/vllm_engine.proto @njhill @CatherineSue @slin1237 @smg-project-bot @Moersity
-/crates/grpc_client/proto/common.proto @njhill @CatherineSue @slin1237 @smg-project-bot @Moersity
+/crates/worker/proto/common.proto @njhill @CatherineSue @slin1237 @smg-project-bot @Moersity
 /crates/kv_index @slin1237 @smg-project-bot
 /crates/mcp @key4ng @CatherineSue @slin1237 @zhoug9127 @smg-project-bot
 /crates/mesh @tonyluj @llfl @slin1237 @smg-project-bot
