@@ -316,7 +316,7 @@ mod tests {
                     .source,
                 card_path
                     .filter(|path| !path.is_empty())
-                    .unwrap_or(router_tokenizer.to_str().unwrap())
+                    .unwrap_or_else(|| router_tokenizer.to_str().unwrap())
             );
         }
     }
