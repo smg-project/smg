@@ -3288,7 +3288,7 @@ impl PolicySpec {
         // Noted by name: the built vector lines up with the document's
         // positions only once nothing is deferred.
         let mut by_assignment = Vec::new();
-        // The built profiles a stage of which places a request by its
+        // The built profiles the plain ring alone places by a request's
         // session key, by their place in `profiles`.
         let mut keyed = Vec::new();
         for (name, profile) in &self.profiles {

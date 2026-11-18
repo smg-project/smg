@@ -2299,7 +2299,7 @@ impl Marks {
         self.0 & Self::KEYED_SCOPE != 0
     }
 
-    /// The marks of a profile a stage of which places by the session key.
+    /// The marks of a profile the plain ring alone places by the session key.
     /// A picker that leaves the placement to its rule asks no stage where a
     /// key goes, so its marks stand as they are.
     const fn with_key(self) -> Self {
@@ -3321,7 +3321,9 @@ impl Engine {
     /// profile with the veto lifted. Where the pass with the veto standing
     /// kept nobody, that placement says the lifted veto in its trace
     /// ([`Lifted::Overload`]). A placement that lands on one of the key's
-    /// pins again follows that pin: nothing is claimed.
+    /// pins again follows that pin under the rule's in-flight cap
+    /// ([`Self::respill`]): nothing is claimed, and a key handed on reads
+    /// the veto as it stands before the lifted pass's survivors.
     #[expect(
         clippy::too_many_arguments,
         reason = "the profile run's inputs, as run_profile takes them"
@@ -3383,23 +3385,13 @@ impl Engine {
         });
         if let Some(i) = owner {
             let c = &candidates[i as usize];
-            let under_cap = rule.inflight_cap == 0 || c.session_in_flight < rule.inflight_cap;
-            if !under_cap {
+            if Self::at_cap(rule, c) {
                 // Over the cap: the candidates under it decide; with none
                 // under it the key stays on its pin.
-                if buf
-                    .kept
-                    .iter()
-                    .any(|&k| candidates[k as usize].session_in_flight < rule.inflight_cap)
+                if let Some(respilled) =
+                    self.respill(profile, index, rule, placing, facts, pool, candidates, buf)
                 {
-                    buf.kept
-                        .retain(|&k| candidates[k as usize].session_in_flight < rule.inflight_cap);
-                    let mut decision =
-                        self.place(profile, index, placing, facts, pool, candidates, buf);
-                    if let Decision::Pick(pick) = &mut decision {
-                        pick.session_verdict = SessionVerdict::Respill;
-                    }
-                    return decision;
+                    return respilled;
                 }
             }
             let mut targets = Targets::new();
@@ -3450,6 +3442,37 @@ impl Engine {
                 // withdraw it. The plain form never names a pin here, and
                 // carries no test for one.
                 if KEPT && pins.contains(&first) {
+                    // The followed pin is put to the rule's cap as the pin
+                    // read first is: the lift is of the overload veto alone.
+                    let capped = buf
+                        .kept
+                        .iter()
+                        .find(|&&i| candidates[i as usize].id == first)
+                        .is_some_and(|&i| Self::at_cap(rule, &candidates[i as usize]));
+                    if capped {
+                        // The hand-on reads the veto as it stands, as the
+                        // pin read first does: that pass's survivors under
+                        // the cap decide.
+                        if !all_vetoed && filter(profile, facts, cx, buf, set).is_none() {
+                            if let Some(respilled) = self.respill(
+                                profile, index, rule, placing, facts, pool, candidates, buf,
+                            ) {
+                                return respilled;
+                            }
+                        }
+                        // It keeps none under the cap: the lifted pass's
+                        // survivors decide, and the trace says the lift.
+                        if vetoed::lifted(profile, index, facts, pool, set, cx, buf).is_none() {
+                            if let Some(mut respilled) = self.respill(
+                                profile, index, rule, placing, facts, pool, candidates, buf,
+                            ) {
+                                if let Decision::Pick(pick) = &mut respilled {
+                                    pick.trace.lifted = Lifted::Overload;
+                                }
+                                return respilled;
+                            }
+                        }
+                    }
                     return decision;
                 }
                 let owner = match self.sessions.claim(key, pins, first) {
@@ -3507,6 +3530,48 @@ impl Engine {
             return answer;
         }
         self.place(profile, index, assignment, facts, pool, candidates, buf)
+    }
+
+    /// Whether a pin carries its rule's in-flight cap of the key's requests.
+    /// A cap of zero is none.
+    const fn at_cap(rule: &SessionRule, pin: &Candidate) -> bool {
+        rule.inflight_cap != 0 && pin.session_in_flight >= rule.inflight_cap
+    }
+
+    /// A pin at its rule's in-flight cap ([`Self::at_cap`]) hands the key
+    /// on: the survivors under the cap decide, and this is their placement,
+    /// marked [`SessionVerdict::Respill`]. `None` where no survivor is under
+    /// the cap: the key stays on its pin. One home for the pin a decision
+    /// reads first and for the pin a kept key's lifted pass lands on.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the placement's inputs, as place takes them"
+    )]
+    fn respill(
+        &self,
+        profile: &Profile,
+        index: u16,
+        rule: &SessionRule,
+        placing: Assignment,
+        facts: &RequestFacts<'_>,
+        pool: &PoolFacts<'_>,
+        candidates: &[Candidate],
+        buf: &mut Buffers,
+    ) -> Option<Decision> {
+        if !buf
+            .kept
+            .iter()
+            .any(|&k| candidates[k as usize].session_in_flight < rule.inflight_cap)
+        {
+            return None;
+        }
+        buf.kept
+            .retain(|&k| candidates[k as usize].session_in_flight < rule.inflight_cap);
+        let mut decision = self.place(profile, index, placing, facts, pool, candidates, buf);
+        if let Decision::Pick(pick) = &mut decision {
+            pick.session_verdict = SessionVerdict::Respill;
+        }
+        Some(decision)
     }
 
     /// The stages of an assignment over the survivors in `buf.kept`: the

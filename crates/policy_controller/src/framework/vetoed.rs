@@ -140,8 +140,8 @@ impl Engine {
 
 /// Whether a keyed request keeps its key's worker over the overload veto:
 /// a request of the single plan that carries a session key, under a binding
-/// that steers ([`AllVetoed::Steer`]). A decision asks it for a profile a
-/// stage of which places by that key ([`Engine::places_by_key`]) and then
+/// that steers ([`AllVetoed::Steer`]). A decision asks it for a profile the
+/// plain ring alone places ([`Engine::places_by_key`]) and then
 /// decides the request with the veto lifted ([`Engine::keep`]). The key's
 /// worker takes the request while it is over its thresholds, beside free
 /// workers too, as a session keeps its owner. A binding that sheds keeps
@@ -1436,6 +1436,16 @@ mod tests {
     /// header that rule reads admitted by the view. No gateway composes the
     /// two: the composition is this engine's own.
     fn ring_under_a_rule(assignment: Assignment) -> Engine {
+        ring_under(assignment, None)
+    }
+
+    /// The same composition under a rule that delegates, with the rule's
+    /// in-flight cap set: the manual preset's own rule has none.
+    fn ring_under_a_cap(cap: u16) -> Engine {
+        ring_under(Assignment::Delegate, Some(cap))
+    }
+
+    fn ring_under(assignment: Assignment, cap: Option<u16>) -> Engine {
         let mut spec = PolicySpec::preset("consistent_hashing").expect("the preset's form");
         let manual = PolicySpec::preset("manual").expect("the preset's form");
         let mut rule = manual
@@ -1444,6 +1454,9 @@ mod tests {
             .and_then(|binding| binding.sessions.clone())
             .expect("the manual preset's rule");
         rule.assignment = assignment;
+        if let Some(cap) = cap {
+            rule.inflight_cap = cap;
+        }
         spec.view.headers = manual.view.headers.clone();
         spec.bindings
             .first_mut()
@@ -2052,6 +2065,96 @@ mod tests {
         // The worker is under its thresholds again: the key is still its.
         pool[owner].health.overloaded = false;
         assert_eq!(dispatched(&engine, &pool, 3_000), ring[0], "the pin stood");
+    }
+
+    /// The rule's in-flight cap holds for a pin the lifted pass lands on as
+    /// it holds for a pin read first: the lift is of the overload veto, and
+    /// of no other limit. A pin that carries the cap's requests of the key
+    /// hands the key to the ring's next worker, over its thresholds as under
+    /// them. With every worker at the cap the key stays on its pin.
+    #[test]
+    fn a_followed_pin_at_the_rules_cap_hands_the_key_on() {
+        let engine = ring_under_a_cap(2);
+        let mut pool = [free(0, 4), free(1, 4), free(2, 4), free(3, 4)];
+        let ring = ring_order(&engine_of("consistent_hashing", false), &keyed("k1"), &pool);
+        let owner = ring[0] as usize;
+        assert_eq!(dispatched(&engine, &pool, 1_000), ring[0], "the pin");
+        let request = RequestFacts {
+            now_micros: 2_000,
+            ..keyed("k1")
+        };
+        let verdict = |decision: &Decision| decision.pick().expect("a pick").session_verdict;
+        // Under the cap a pin over its thresholds keeps the key.
+        pool[owner].session_in_flight = 1;
+        pool[owner].health.overloaded = true;
+        let kept = decide(&engine, &request, &pool);
+        assert_eq!(order(&kept)[0], ring[0], "under the cap");
+        assert_eq!(verdict(&kept), SessionVerdict::Pinned);
+        // The pin carries two requests of the key, the rule's cap.
+        pool[owner].session_in_flight = 2;
+        pool[owner].health.overloaded = false;
+        // Under its thresholds the pin hands the key on.
+        let under = decide(&engine, &request, &pool);
+        assert_eq!(order(&under)[0], ring[1], "under its thresholds");
+        assert_eq!(verdict(&under), SessionVerdict::Respill);
+        // Over them it hands the key on as well.
+        pool[owner].health.overloaded = true;
+        let over = decide(&engine, &request, &pool);
+        assert_eq!(order(&over)[0], ring[1], "over its thresholds");
+        assert_eq!(verdict(&over), SessionVerdict::Respill);
+        assert_eq!(over.trace().lifted, Lifted::None);
+        // Every worker over its thresholds: the placement stands by the lift.
+        for candidate in &mut pool {
+            candidate.health.overloaded = true;
+        }
+        let all = decide(&engine, &request, &pool);
+        assert_eq!(order(&all)[0], ring[1], "every worker over");
+        assert_eq!(verdict(&all), SessionVerdict::Respill);
+        assert_eq!(all.trace().lifted, Lifted::Overload);
+        // Every worker at the cap: the key stays on its pin.
+        for candidate in &mut pool {
+            candidate.session_in_flight = 2;
+        }
+        let stays = decide(&engine, &request, &pool);
+        assert_eq!(order(&stays)[0], ring[0], "no worker under the cap");
+        assert_eq!(verdict(&stays), SessionVerdict::Pinned);
+    }
+
+    /// A key handed on at the cap reads the veto as it stands, from a pin
+    /// over its thresholds as from one under them: it passes the ring's next
+    /// worker where that worker is over its thresholds beside free ones.
+    /// Where the standing veto keeps no worker under the cap, the lifted
+    /// pass's survivors decide, and the trace says the lift.
+    #[test]
+    fn a_key_handed_on_at_the_cap_passes_a_worker_over_its_thresholds() {
+        let engine = ring_under_a_cap(2);
+        let mut pool = [free(0, 4), free(1, 4), free(2, 4), free(3, 4)];
+        let ring = ring_order(&engine_of("consistent_hashing", false), &keyed("k1"), &pool);
+        let (owner, next) = (ring[0] as usize, ring[1] as usize);
+        assert_eq!(dispatched(&engine, &pool, 1_000), ring[0], "the pin");
+        let request = RequestFacts {
+            now_micros: 2_000,
+            ..keyed("k1")
+        };
+        // The pin carries the cap's two requests of the key, and the ring's
+        // next worker is over its thresholds beside two free ones.
+        pool[owner].session_in_flight = 2;
+        pool[next].health.overloaded = true;
+        let under = decide(&engine, &request, &pool);
+        assert_eq!(order(&under)[0], ring[2], "the pin under its thresholds");
+        pool[owner].health.overloaded = true;
+        let over = decide(&engine, &request, &pool);
+        assert_eq!(order(&over)[0], ring[2], "the pin over its thresholds");
+        assert_eq!(over.trace().lifted, Lifted::None);
+        // The free workers carry the cap too: the one worker under it is
+        // over its thresholds, and the key goes there by the lift.
+        pool[ring[2] as usize].session_in_flight = 2;
+        pool[ring[3] as usize].session_in_flight = 2;
+        let lifted = decide(&engine, &request, &pool);
+        assert_eq!(order(&lifted)[0], ring[1], "one worker under the cap");
+        let pick = lifted.pick().expect("a pick");
+        assert_eq!(pick.session_verdict, SessionVerdict::Respill);
+        assert_eq!(lifted.trace().lifted, Lifted::Overload);
     }
 
     /// A profile the engine does not hold cannot be marked: the index is
