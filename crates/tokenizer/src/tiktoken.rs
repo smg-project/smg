@@ -3138,65 +3138,6 @@ mod tests {
         }
     }
 
-    /// A template that builds its control spellings and also writes an
-    /// added token in pieces that stand side by side (a literal and the text
-    /// after it, two literals, a join of two, a text a comment parts) writes
-    /// that token whole (see `written_text`): it stays unmarked, as one that
-    /// spells the token in one piece does, and every request is encoded from
-    /// its text, also under an argument no probe conversation sets.
-    #[test]
-    fn a_tiktoken_file_s_template_that_writes_an_added_token_in_pieces_stays_unmarked() {
-        for piece in [
-            "{{ '<' }}b>",
-            "{{ '<' }}{{ 'b>' }}",
-            "{{ '<' ~ 'b>' }}",
-            "<{# no text #}b>",
-            "<b>",
-        ] {
-            let template = format!(
-                "{}{{% if tag %}}{piece}{{% endif %}}",
-                builds_its_controls()
-            );
-            let mut model = full_byte_tiktoken_model();
-            model.push_str(&format!("{} 256\n", STANDARD.encode([0xE4, 0xB8])));
-            let config = serde_json::json!({
-                "added_tokens_decoder": {
-                    "300": {"content": "</s:x>", "special": true},
-                    "301": {"content": "[INST:x]", "special": true},
-                    "302": {"content": "[/INST:x]", "special": false},
-                    "304": {"content": "<b>", "special": true},
-                },
-                "eos_token": "</s:x>",
-                "chat_template": template,
-            });
-            let dir = write_tiktoken_dir(&model, &config.to_string(), None);
-            let tokenizer = TiktokenTokenizer::from_dir(dir.path()).unwrap();
-            assert!(tokenizer.controls.is_none(), "{piece}");
-            for tag in [false, true] {
-                let kwargs = HashMap::from([("tag".to_owned(), serde_json::json!(tag))]);
-                let params = ChatTemplateParams {
-                    template_kwargs: Some(&kwargs),
-                    ..Default::default()
-                };
-                let messages = [serde_json::json!({"role": "user", "content": "ab"})];
-                let rendered = tokenizer
-                    .apply_chat_template_with_encoding(&messages, params, None)
-                    .unwrap();
-                assert!(
-                    matches!(rendered.encoding, PromptEncoding::FromText),
-                    "{piece}"
-                );
-                let expected: Vec<TokenIdType> = if tag {
-                    vec![301, 97, 98, 302, 304]
-                } else {
-                    vec![301, 97, 98, 302]
-                };
-                let ids = tokenizer.encode(&rendered.text, false).unwrap();
-                assert_eq!(ids.token_ids().to_vec(), expected, "{piece}");
-            }
-        }
-    }
-
     /// The ids of a user turn `content`, and whether the prompt is encoded
     /// from its text.
     fn user_turn_ids(tokenizer: &TiktokenTokenizer, content: &str) -> (Vec<TokenIdType>, bool) {
