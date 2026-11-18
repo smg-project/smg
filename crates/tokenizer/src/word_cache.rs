@@ -362,14 +362,16 @@ impl<'de> Deserialize<'de> for LateBoundModel {
 /// [`unigram_scores::section`], for the scores the reference reads, in any
 /// order of its keys (`type`, `unk_id`, `vocab`, `byte_fallback`): the
 /// entries are read until one tells the kind, which is the value of `type`,
-/// the key `unk_id` (no other kind has it) or a vocabulary that is a list
-/// of pieces with their scores; it leaves the read of its pieces
-/// ([`ReadBpe::of_pieces`]). A WordPiece section streams as well, with
-/// `type` or, as the older files are, without it ([`wordpiece_section`]).
-/// Any other section (another model kind, a BPE section with `type` later,
-/// a section that shows a key no Unigram section has before any of those)
-/// goes to the crate's own reader, which streams it as before with the
-/// entries already read put back in front.
+/// a key of another kind of section (`unk_token`, `dropout`, `merges` and
+/// the like) or a vocabulary that is a list of pieces with their scores;
+/// it leaves the read of its pieces ([`ReadBpe::of_pieces`]). Any other
+/// entry is held until then (`unk_id`, `byte_fallback`, a key no section
+/// has), so the place of such a key does not decide which reader takes the
+/// section. A WordPiece section streams as well, with `type` or, as the
+/// older files are, without it ([`wordpiece_section`]). Any other section
+/// (another model kind, a BPE section with `type` later) goes to the
+/// crate's own reader, which streams it as before with the entries already
+/// read put back in front.
 struct ModelSection;
 
 impl<'de> Visitor<'de> for ModelSection {
@@ -402,12 +404,6 @@ impl<'de> Visitor<'de> for ModelSection {
                     }
                     break;
                 }
-                // Only a Unigram section has this key.
-                "unk_id" => {
-                    read.push((key, map.next_value()?));
-                    return unigram_scores::section(None, Replay::new(read, None, map))
-                        .map(LateBoundModel::of_unigram);
-                }
                 // A list of pieces with their scores is a Unigram section's.
                 "vocab" => match map.next_value_seed(unigram_scores::VocabShape)? {
                     unigram_scores::Vocab::Scored(vocab) => {
@@ -419,8 +415,6 @@ impl<'de> Visitor<'de> for ModelSection {
                         break;
                     }
                 },
-                // A Unigram section has this key, and so has a BPE section.
-                "byte_fallback" => read.push((key, map.next_value()?)),
                 // A WordPiece section opens with one of these when `type`
                 // is not its first key, and so may a BPE or WordLevel one.
                 "unk_token" | "continuing_subword_prefix" | "max_input_chars_per_word"
@@ -429,11 +423,27 @@ impl<'de> Visitor<'de> for ModelSection {
                     read.push((key, map.next_value()?));
                     return wordpiece_section(read, map);
                 }
-                // No Unigram section has this key.
-                _ => {
+                // A key of another kind of section, which no Unigram section
+                // has: the crate's reader takes the section from here, the
+                // value of this key unread, so an older file of another
+                // kind, written without `type`, loads at the cost it had.
+                "dropout"
+                | "unk_token"
+                | "continuing_subword_prefix"
+                | "end_of_word_suffix"
+                | "fuse_unk"
+                | "ignore_merges"
+                | "merges"
+                | "max_input_chars_per_word" => {
                     pending = Some(key);
                     break;
                 }
+                // No other entry tells the kind: `unk_id`, which a section
+                // of another kind may carry (the crate's reader skips it
+                // there), `byte_fallback`, which a BPE section has too, or a
+                // key no section has. Each is held, so where it stands does
+                // not decide which reader takes the section.
+                _ => read.push((key, map.next_value()?)),
             }
         }
         crate_section(read, pending, map)
@@ -1076,6 +1086,37 @@ mod tests {
     }
 
     #[test]
+    fn a_section_of_another_kind_that_carries_unk_id_takes_the_crate_reader() {
+        // Only a Unigram section has `unk_id`, but the crate's reader skips
+        // a key it does not know: the key does not claim the section.
+        let json = r#"{"unk_id":0,"type":"BPE","vocab":{"a":0},"merges":[]}"#;
+        assert_eq!(loading_reading(json), crate_reading(json));
+    }
+
+    #[test]
+    fn a_key_of_another_kind_hands_the_section_to_the_crate_reader() {
+        // Each is a key of a BPE, WordPiece or WordLevel section, and no
+        // Unigram section has it. The scores behind it are the tie of
+        // `unigram_scores`, which the crate's reader and the section's own
+        // read one bit apart: the reading is the crate's.
+        for entry in [
+            r#""dropout":null"#,
+            r#""unk_token":"<unk>""#,
+            r#""continuing_subword_prefix":"""#,
+            r#""end_of_word_suffix":"""#,
+            r#""fuse_unk":false"#,
+            r#""ignore_merges":false"#,
+            r#""merges":[]"#,
+            r#""max_input_chars_per_word":100"#,
+        ] {
+            let json = format!(
+                r#"{{{entry},"unk_id":0,"vocab":[["<unk>",0.0],["a",-1.1695698339729451],["aa",-2.3391396679458905]]}}"#
+            );
+            assert_eq!(loading_reading(&json), crate_reading(&json), "{json}");
+        }
+    }
+
+    #[test]
     fn another_model_kind_or_a_type_key_later_reads_as_the_crate_reads_it() {
         let mut words = Vocab::default();
         for (id, token) in ["[UNK]", "a", "b"].into_iter().enumerate() {
@@ -1498,13 +1539,13 @@ mod tests {
     }
 
     #[test]
-    fn a_unigram_section_with_a_key_of_no_kind_first_takes_the_crate_reader() {
+    fn a_unigram_section_reports_past_a_key_of_no_kind_and_not_behind_a_key_of_another_kind() {
         let entries = unigram_entries();
         let json = section_of(&entries);
-        // A key no section has. In front, the section goes to the crate's
-        // reader and the model is the crate's, with no report. After the
-        // entry that tells the kind, this reader skips the key as the
-        // crate's does, and reports.
+        // A key no section has: in front it is held until an entry tells
+        // the kind, behind that entry this reader skips it as the crate's
+        // does. The model is the crate's and the section reports, wherever
+        // the key stands.
         for at in 0..=entries.len() {
             let mut with = entries.clone();
             with.insert(at, r#""future":{"x":[1,2]}"#.to_string());
@@ -1515,7 +1556,21 @@ mod tests {
                 Ok(&json),
                 "{text}"
             );
-            assert_eq!(in_one_pass(&text), at > 0, "{text}");
+            assert!(in_one_pass(&text), "{text}");
+        }
+        // A key of another kind of section in front: the section goes to
+        // the crate's reader and the model is the crate's, with no report.
+        for key in [r#""unk_token":"<unk>""#, r#""dropout":null"#] {
+            let mut with = entries.clone();
+            with.insert(0, key.to_string());
+            let text = section_of(&with);
+            assert_eq!(outcome::<ModelWrapper>(&text).as_ref(), Ok(&json), "{text}");
+            assert_eq!(
+                outcome::<LateBoundModel>(&text).as_ref(),
+                Ok(&json),
+                "{text}"
+            );
+            assert!(!in_one_pass(&text), "{text}");
         }
     }
 }

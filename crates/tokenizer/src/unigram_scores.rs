@@ -396,6 +396,23 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_key_no_section_has_does_not_change_the_scores_wherever_it_stands() {
+        let in_front = TIED.replacen('{', r#"{"metadata":{},"#, 1);
+        let behind = TIED.replacen(
+            r#""type":"Unigram","#,
+            r#""type":"Unigram","metadata":{},"#,
+            1,
+        );
+        let in_front_of_an_old_file = TIED_OLD.replacen('{', r#"{"metadata":{},"#, 1);
+        for section in [in_front, behind, in_front_of_an_old_file] {
+            assert!(section.contains("metadata"), "{section}");
+            let tokenizer = load(&section).expect("the file loads");
+            assert_eq!(ids(&tokenizer, "aa"), [2], "{section}");
+            assert_eq!(ids(&tokenizer, "aaa"), [1, 2], "{section}");
+        }
+    }
+
     /// The entries of [`TIED`], one by one.
     const ENTRIES: [&str; 4] = [
         r#""type":"Unigram""#,
