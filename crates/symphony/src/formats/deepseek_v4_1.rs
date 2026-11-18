@@ -1090,8 +1090,8 @@ mod tests {
         );
     }
 
-    /// The invoke's close or the block's close inside a string of an invoke's JSON object ends
-    /// the call there, as it does inside a parameter's value: the shared
+    /// The invoke's close, the next invoke's opening or the block's close inside a string of an
+    /// invoke's JSON object ends the call there, as it does inside a parameter's value: the shared
     /// [`a_call_terminal_ends_an_invoke_whose_arguments_are_json`] says what is read.
     #[test]
     fn a_call_terminal_inside_a_string_of_an_invokes_json_object_ends_the_call_there() {

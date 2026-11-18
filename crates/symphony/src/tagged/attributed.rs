@@ -356,11 +356,11 @@ enum Stage {
     Value(ValueState),
     /// Inside the arguments written as one JSON object ([`Tags::json_arguments`]), from its `{`
     /// to its closing brace: the bytes are the object's, the two parameter tags among them, the
-    /// only tags the assembler scans for. The invoke's close and the block's close are the
-    /// table's terminals, and either ends the call where it stands, inside one of the object's
-    /// strings too ([`Assembler::close`]). The object's reader stands beside the stage
-    /// (`Assembler::json`), so a change of stage drops no more than a call of parameter tags
-    /// drops.
+    /// only tags the assembler scans for. The invoke's close, the next invoke's opening and the
+    /// block's close are the table's terminals, and any of them ends the call where it stands,
+    /// inside one of the object's strings too ([`Assembler::close`]). The object's reader stands
+    /// beside the stage (`Assembler::json`), so a change of stage drops no more than a call of
+    /// parameter tags drops.
     Json,
     /// After the JSON object's closing brace: only whitespace, the template's, before the
     /// invoke's close.
@@ -987,11 +987,11 @@ impl Assembler {
         self.scratch = scratch;
     }
 
-    /// The call's end after arguments written as one JSON object: the invoke's close
-    /// (`terminal`, whose bytes the call's end carries), the block's close, or the stream's cut or
-    /// the model's stop inside the call (no bytes). The bytes held inside the object are its
-    /// text. An object the end found open stays as the model wrote it, as the JSON family's
-    /// reader leaves one ([`named_arguments::Object::cut`]): the word it held, then one
+    /// The call's end after arguments written as one JSON object: the invoke's close (`terminal`,
+    /// whose bytes the call's end carries), the next invoke's opening or the block's close, or the
+    /// stream's cut or the model's stop inside the call (no bytes). The bytes held inside the
+    /// object are its text. An object the end found open stays as the model wrote it, as the JSON
+    /// family's reader leaves one ([`named_arguments::Object::cut`]): the word it held, then one
     /// `Malformed` event of no bytes that says the arguments are no whole value, no brace made up
     /// for the model. An object that closed whole, with nothing refused after it, is whole as
     /// the model wrote it: its closing brace, held back since it arrived, is the last fragment,

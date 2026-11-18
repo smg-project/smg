@@ -1932,8 +1932,8 @@ const DSML_OUTPUTS: &[&str] = &[
      </｜DSML｜ calls>",
     // An invoke whose arguments are one JSON object in place of the parameter tags, as one
     // serving engine's parser reads it: whole, with a parameter's closing tag inside a string, cut
-    // short, with a fault inside it and after it, and with the invoke's close or the block's close
-    // inside a string, which ends the call there.
+    // short, with a fault inside it and after it, and with the invoke's close, the next invoke's
+    // opening or the block's close inside a string, which ends the call there.
     "</think>\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"get_weather\">\n{\"city\": \"Paris\", \
      \"days\": 3}\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
     "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">{\"a\": \"x </｜DSML｜ parameter> <｜DSML｜\"}\
@@ -1947,6 +1947,8 @@ const DSML_OUTPUTS: &[&str] = &[
      </｜DSML｜ calls>",
     "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">{\"a\": \"x </｜DSML｜ invoke> y\", \"b\": 3}\
      </｜DSML｜ invoke>\n</｜DSML｜ calls>",
+    "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">{\"a\": \"x <｜DSML｜ invoke name=\"g\">\
+     {\"b\": 3}</｜DSML｜ invoke>\n</｜DSML｜ calls>",
     "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">{\"a\": \"x </｜DSML｜ calls> y\"}\
      </｜DSML｜ invoke>\n</｜DSML｜ calls>",
 ];
