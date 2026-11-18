@@ -861,10 +861,14 @@ impl Standby {
     /// under no term. The next stream opens at once, unless this event
     /// follows a restore with no event landed between: two in a row are
     /// two restores a streak's wait apart, never a loop at the stream's
-    /// speed.
+    /// speed. The sync is forgotten here: a standby an event did not land
+    /// on holds less than its leader does, whatever its last frame said.
+    /// The restore's last part sets it again, or the frame that brings the
+    /// restore's tail.
     fn lost(&self, leader: &Leader, at: Position, landed: bool) -> Ended {
         self.asks.store(true, Ordering::Relaxed);
         self.shared.lag.asked();
+        self.shared.lag.forget();
         warn!(
             controller_id = %self.shared.controller_id,
             leader = %leader.controller_id,
@@ -2097,6 +2101,40 @@ mod tests {
         let (ended, ()) = tokio::join!(standby.stream(&named, &applied), script);
         assert_eq!((ended.next, ended.applied), (Next::Lease, true));
         assert_eq!(held(&standby.shared.store), held(&leader.0));
+    }
+
+    #[tokio::test]
+    async fn a_standby_whose_event_did_not_land_reads_not_synced() {
+        let mut bed = Bed::new().await;
+        let (_elector, standing, standby) = standing_by(&bed, FIVE);
+        let leader = led();
+        let now = Instant::now();
+        follow(&standby.follower, &leader.1, now);
+        let place = standby.follower.place();
+        // The leader's event after the next: past a gap, it does not land.
+        leader.0.upsert(facts("http://b:8000", 1));
+        leader.0.upsert(facts("http://c:8000", 1));
+        let past = entries(&leader.1, place).pop().expect("the leader wrote");
+        standing.send_replace(bed.holds("leader-1", 1));
+        let named = standby.shared.leader(None);
+        let applied = AtomicBool::new(false);
+        let mut turns = standby.shared.lag.turns();
+        let synced = || standby.shared.lag.age(Instant::now()).is_some();
+        let script = async {
+            let mut opened = bed.opened().await;
+            assert!(matches!(opened.frame().await, Some(Frame::Hello(_))));
+            // A heartbeat that states no head: the standby reads synced.
+            let _ = turns.borrow_and_update();
+            opened.says(proto::ReplicationBatch::default()).await;
+            let turned = timeout(FIVE, turns.changed()).await;
+            assert!(matches!(turned, Ok(Ok(()))), "the heartbeat's turn");
+            assert!(synced(), "at the heartbeat");
+            opened.says(batch(&past, now)).await;
+            opened
+        };
+        let (ended, _opened) = tokio::join!(standby.stream(&named, &applied), script);
+        assert_eq!(ended.next, Next::Join);
+        assert!(!synced(), "the sync outlived an event that did not land");
     }
 
     #[tokio::test]
