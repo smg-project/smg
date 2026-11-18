@@ -75,7 +75,7 @@ use tracing::info;
 
 use super::{
     generations::{Format, SpecRejected, MAX_DOCUMENT_BYTES},
-    spec_file::open_regular,
+    spec_file::{open_regular, NOT_A_FILE},
 };
 
 /// How many generations a store keeps: the standing one and the seven
@@ -92,6 +92,10 @@ const HELD: &str = ".lock";
 
 /// Between two tries of a lock another process holds.
 const HELD_PACE: Duration = Duration::from_millis(50);
+
+/// What a write is refused by where the store's path leads to another
+/// directory than the one it holds.
+const MOVED: &str = "the path leads to another directory than the one this store holds";
 
 /// How many digits a generation's file name writes its number in: the
 /// widest number's.
@@ -232,7 +236,13 @@ fn unsynced(generation: u64, failed: &io::Error, left: &io::Error) -> io::Error 
 /// The store: the directory and the generations on file in it.
 #[derive(Debug)]
 pub(crate) struct SpecStore {
+    /// The directory's path, resolved once at the open: a link in it that
+    /// turns later leads this store nowhere else.
     dir: PathBuf,
+    /// The directory itself, open: the lock file is opened and the names
+    /// are read through it, and a write is refused where the path leads
+    /// to another directory by then.
+    root: fs::File,
     /// The lock file, open: the directory's lock is held until the store
     /// is dropped.
     _held: fs::File,
@@ -265,9 +275,9 @@ impl SpecStore {
     /// given the time a stop takes reads the directory after that process's
     /// last write.
     pub(crate) fn open_within(dir: PathBuf, wait: Duration) -> Result<Self, StoreRefused> {
-        Self::found(&dir)?;
-        let held = Self::hold(&dir, wait)?;
-        Self::read_under(dir, held)
+        let (dir, root) = Self::rooted(&dir)?;
+        let held = Self::hold(&dir, &root, wait)?;
+        Self::read_under(dir, root, held)
     }
 
     /// A second store on a directory another holds, its lock file open and
@@ -275,9 +285,9 @@ impl SpecStore {
     /// hosts lets one in: the cases of two writers open theirs so.
     #[cfg(test)]
     pub(crate) fn open_beside(dir: PathBuf) -> Result<Self, StoreRefused> {
-        Self::found(&dir)?;
-        let unheld = Self::lock_file(&dir)?;
-        Self::read_under(dir, unheld)
+        let (dir, root) = Self::rooted(&dir)?;
+        let unheld = Self::lock_file(&root)?;
+        Self::read_under(dir, root, unheld)
     }
 
     /// Refuses a path that leads to no directory.
@@ -292,6 +302,21 @@ impl SpecStore {
         }
     }
 
+    /// The directory at `dir`, its path resolved and itself open: what the
+    /// store locks, reads and writes from here on. A link in the path that
+    /// turns while a start waits leads that start nowhere else.
+    fn rooted(dir: &Path) -> Result<(PathBuf, fs::File), StoreRefused> {
+        use rustix::fs::{Mode, OFlags};
+
+        Self::found(dir)?;
+        let unreadable = |error: io::Error| StoreRefused::Unreadable(error.to_string());
+        let dir = fs::canonicalize(dir).map_err(unreadable)?;
+        let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
+        let root = rustix::io::retry_on_intr(|| rustix::fs::open(&dir, flags, Mode::empty()))
+            .map_err(|errno| unreadable(errno.into()))?;
+        Ok((dir, root.into()))
+    }
+
     /// Whether an open to read serves where the open to read and write was
     /// refused as `refused`: the user's bits and a file system mounted to
     /// read alone refuse the write alone, and the lock asks none.
@@ -302,29 +327,39 @@ impl SpecStore {
         )
     }
 
-    /// The lock file of `dir`, open: made empty where it is not there, and
-    /// never truncated, since what stands in it is no part of the lock. On
-    /// a file system that locks as a local one does, the lock asks no write
-    /// of the file either: one that stands under bits this user may not
-    /// write, as after a change of the controller's user, or on a file
-    /// system mounted to read alone, is opened to read, without waiting
-    /// and as a regular file alone: a pipe there holds no start. Where a
-    /// lock is made of a byte-range lock, as a network file system's
-    /// client may make it, it asks a file opened to write: the lock of a
-    /// file this user may not write is not given there, and the refusal is
-    /// the system's for the lock. Where the file may not be made and that
-    /// open fails too, the file not there or no regular file, the refusal
-    /// is the system's for the making.
-    fn lock_file(dir: &Path) -> Result<fs::File, StoreRefused> {
-        let path = dir.join(HELD);
-        let made = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path);
+    /// The lock file of the directory `root`, open: made empty where it is
+    /// not there, and never truncated, since what stands in it is no part
+    /// of the lock. It is opened through the directory the store holds, so
+    /// the lock is that directory's, whatever its path leads to by then.
+    /// Neither open waits, and what is no regular file is refused by its
+    /// kind: a pipe under the name holds no start and takes no lock. On a
+    /// file system that locks as a local one does, the lock asks no write
+    /// of the file: one that stands under bits this user may not write, as
+    /// after a change of the controller's user, or on a file system
+    /// mounted to read alone, is opened to read. Where a lock is made of a
+    /// byte-range lock, as a network file system's client may make it, it
+    /// asks a file opened to write: the lock of a file this user may not
+    /// write is not given there, and the refusal is the system's for the
+    /// lock. Where the file may not be made and the open to read fails
+    /// too, the file not there or no regular file, the refusal is the
+    /// system's for the making.
+    fn lock_file(root: &fs::File) -> Result<fs::File, StoreRefused> {
+        use rustix::fs::{Mode, OFlags};
+
+        let open = |flags: OFlags, mode: Mode| -> io::Result<fs::File> {
+            let quiet = flags | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC;
+            let opened = rustix::io::retry_on_intr(|| rustix::fs::openat(root, HELD, quiet, mode))?;
+            let file = fs::File::from(opened);
+            if !file.metadata()?.is_file() {
+                return Err(io::Error::other(NOT_A_FILE));
+            }
+            Ok(file)
+        };
+        let made = open(OFlags::RDWR | OFlags::CREATE, Mode::from_raw_mode(0o666));
         match made {
-            Err(denied) if Self::read_serves(&denied) => open_regular(&path).map_err(|_| denied),
+            Err(denied) if Self::read_serves(&denied) => {
+                open(OFlags::RDONLY, Mode::empty()).map_err(|_| denied)
+            }
             opened => opened,
         }
         .map_err(|error| StoreRefused::Unlocked(error.to_string()))
@@ -333,8 +368,8 @@ impl SpecStore {
     /// The directory's lock: an exclusive advisory lock on the lock file,
     /// tried every [`HELD_PACE`] until `wait` has passed. The system lets
     /// the lock go when the file is dropped, and at any exit.
-    fn hold(dir: &Path, wait: Duration) -> Result<fs::File, StoreRefused> {
-        let lock = Self::lock_file(dir)?;
+    fn hold(dir: &Path, root: &fs::File, wait: Duration) -> Result<fs::File, StoreRefused> {
+        let lock = Self::lock_file(root)?;
         let started = Instant::now();
         let mut told = false;
         loop {
@@ -361,15 +396,20 @@ impl SpecStore {
         }
     }
 
-    /// Reads the directory at `dir` under `held`, its lock file.
-    fn read_under(dir: PathBuf, held: fs::File) -> Result<Self, StoreRefused> {
+    /// Reads the directory `root`, whose path is `dir`, under `held`, its
+    /// lock file. The names are read through the directory itself.
+    fn read_under(dir: PathBuf, root: fs::File, held: fs::File) -> Result<Self, StoreRefused> {
         let unreadable = |error: io::Error| StoreRefused::Unreadable(error.to_string());
         let mut kept = Vec::new();
-        for entry in fs::read_dir(&dir).map_err(unreadable)? {
-            let name = entry.map_err(unreadable)?.file_name();
-            let Some(name) = name.to_str() else { continue };
+        let names = rustix::fs::Dir::read_from(&root).map_err(|errno| unreadable(errno.into()))?;
+        for entry in names {
+            let entry = entry.map_err(|errno| unreadable(errno.into()))?;
+            let Ok(name) = entry.file_name().to_str() else {
+                continue;
+            };
             if name.starts_with(WRITING) {
-                fs::remove_file(dir.join(name)).map_err(unreadable)?;
+                rustix::fs::unlinkat(&root, name, rustix::fs::AtFlags::empty())
+                    .map_err(|errno| unreadable(errno.into()))?;
             } else if let Some(persisted) = named(name) {
                 kept.push(persisted);
             }
@@ -386,11 +426,25 @@ impl SpecStore {
             .map_or(0, |since| since.as_nanos());
         Ok(Self {
             dir,
+            root,
             _held: held,
             kept,
             opened,
             writes: 0,
         })
+    }
+
+    /// Refuses where the store's path leads to another directory than the
+    /// one it holds, or to none: a write there would land beside its lock.
+    fn same(&self) -> io::Result<()> {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let (path, held) = (fs::metadata(&self.dir)?, self.root.metadata()?);
+        if (path.dev(), path.ino()) == (held.dev(), held.ino()) {
+            Ok(())
+        } else {
+            Err(io::Error::other(MOVED))
+        }
     }
 
     /// The directory's path.
@@ -450,6 +504,7 @@ impl SpecStore {
             generation,
             format: other_form(format),
         });
+        self.same()?;
         if name.try_exists()? || other.try_exists()? {
             // Another process wrote the directory, or a refused
             // generation stayed on file.
@@ -508,6 +563,7 @@ impl SpecStore {
     /// Takes the newest generation off file again: the store's entry
     /// refused it after it was persisted.
     pub(crate) fn forget(&mut self) -> io::Result<()> {
+        self.same()?;
         let Some(newest) = self.kept.pop() else {
             return Ok(());
         };
@@ -519,6 +575,10 @@ impl SpecStore {
     /// their numbers with what a removal failed by. A file that stays is
     /// tried again at the next apply.
     pub(crate) fn prune(&mut self) -> Vec<(u64, io::Result<()>)> {
+        if self.same().is_err() {
+            // The path leads elsewhere: nothing there is this store's.
+            return Vec::new();
+        }
         let over = self.kept.len().saturating_sub(RETAINED);
         let mut pruned = Vec::with_capacity(over);
         let mut stays = Vec::new();
@@ -672,48 +732,79 @@ pub(crate) mod tests {
         assert_eq!(fs::read(&lock).expect("the lock file"), b"a note");
     }
 
+    /// A start in a thread of its own, with the lines it says.
+    struct Waiter {
+        start: thread::JoinHandle<Result<SpecStore, StoreRefused>>,
+        lines: Logged,
+        /// A second subscriber registered beside the thread's own for as
+        /// long as a case reads the lines, as in the door's audit case.
+        _beside: tracing::Dispatch,
+    }
+
+    impl Waiter {
+        /// The room a case gives a waiting start, and its line.
+        const ROOM: Duration = Duration::from_secs(30);
+
+        /// A start on `path` whose thread's own subscriber keeps its
+        /// lines. Returns once the start said that it waits: it holds its
+        /// directory, found it locked, and has read no name yet.
+        fn held_off(path: PathBuf) -> Self {
+            let lines = Logged::default();
+            let beside = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+            let writer = lines.clone();
+            let start = thread::spawn(move || {
+                let subscriber = tracing_subscriber::fmt()
+                    .with_ansi(false)
+                    .with_writer(move || writer.clone())
+                    .finish();
+                tracing::subscriber::with_default(subscriber, || {
+                    SpecStore::open_within(path, Self::ROOM)
+                })
+            });
+            let asked = Instant::now();
+            while Self::said(&lines) == 0 {
+                assert!(
+                    asked.elapsed() < Self::ROOM,
+                    "the waiter never said it waits"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+            Self {
+                start,
+                lines,
+                _beside: beside,
+            }
+        }
+
+        /// How often a start said in `lines` that it waits.
+        fn said(lines: &Logged) -> usize {
+            let text = String::from_utf8(lines.0.lock().clone()).expect("the lines are text");
+            text.matches("held by another controller: waiting for it to stop")
+                .count()
+        }
+    }
+
     /// A start that waits reads the directory only once it holds it: what
     /// the holder wrote while the start waited is on file for it. The wait
     /// is said in one line.
     #[test]
     fn a_waiting_start_reads_the_directory_once_its_holder_let_go() {
-        const ROOM: Duration = Duration::from_secs(30);
         let dir = tempfile::tempdir().expect("a temp dir");
         let mut first = SpecStore::open(dir.path().to_owned()).expect("it opens");
-        // The waiter's own subscriber keeps its thread's lines, a second
-        // one registered beside it, as in the door's audit case.
-        let lines = Logged::default();
-        let _beside = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
-        let (path, writer) = (dir.path().to_owned(), lines.clone());
-        let waiter = thread::spawn(move || {
-            let subscriber = tracing_subscriber::fmt()
-                .with_ansi(false)
-                .with_writer(move || writer.clone())
-                .finish();
-            tracing::subscriber::with_default(subscriber, || SpecStore::open_within(path, ROOM))
-        });
-        let said = || {
-            let text = String::from_utf8(lines.0.lock().clone()).expect("the lines are text");
-            text.matches("held by another controller: waiting for it to stop")
-                .count()
-        };
         // The waiter found the directory held, and has read no name yet.
-        let asked = Instant::now();
-        while said() == 0 {
-            assert!(asked.elapsed() < ROOM, "the waiter never said it waits");
-            thread::sleep(Duration::from_millis(5));
-        }
+        let waiter = Waiter::held_off(dir.path().to_owned());
         // Three more tries pass under the lock: a line at every try would
         // be said again.
         thread::sleep(3 * HELD_PACE);
         first.persist(at(1, YAML), b"first").expect("it persists");
         drop(first);
         let second = waiter
+            .start
             .join()
             .expect("the waiter's thread")
             .expect("the directory is free");
         assert_eq!(second.kept(), [at(1, YAML)]);
-        assert_eq!(said(), 1, "one line for the wait");
+        assert_eq!(Waiter::said(&waiter.lines), 1, "one line for the wait");
     }
 
     /// On a file system that locks as a local one does, the lock asks no
@@ -846,6 +937,84 @@ pub(crate) mod tests {
         assert!(SpecStore::read_serves(&refused(Errno::ROFS)));
         assert!(!SpecStore::read_serves(&refused(Errno::ISDIR)));
         assert!(!SpecStore::read_serves(&refused(Errno::NOENT)));
+    }
+
+    /// A link in the store's path that turns while a start waits leads
+    /// that start nowhere else: the path is resolved once, and the store
+    /// reads and writes the directory it locked.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_turned_under_a_waiting_start_leaves_it_the_directory_it_locked() {
+        let base = tempfile::tempdir().expect("a temp dir");
+        let (first, second) = (base.path().join("first"), base.path().join("second"));
+        let link = base.path().join("store");
+        fs::create_dir(&first).expect("the first directory");
+        fs::create_dir(&second).expect("the second directory");
+        symlink(&first, &link).expect("the link");
+        let mut holder = SpecStore::open(first.clone()).expect("the holder");
+        // The waiter holds its directory and found it locked: the link
+        // turns under it, and the holder writes once more and lets go.
+        let waiter = Waiter::held_off(link.clone());
+        fs::remove_file(&link).expect("the link goes");
+        symlink(&second, &link).expect("the link turns");
+        holder
+            .persist(at(1, YAML), b"one")
+            .expect("the holder's write");
+        drop(holder);
+        let mut store = waiter
+            .start
+            .join()
+            .expect("the waiter")
+            .expect("the directory is taken");
+        assert_eq!(store.dir(), fs::canonicalize(&first).expect("its path"));
+        assert_eq!(store.kept(), [at(1, YAML)], "the directory it locked");
+        store.persist(at(2, YAML), b"two").expect("a write");
+        let both = BTreeSet::from([name_of(1, "yaml"), name_of(2, "yaml")]);
+        assert_eq!(names(&first), both);
+        assert!(
+            names(&second).is_empty(),
+            "nothing lands where the link leads"
+        );
+    }
+
+    /// A store whose path leads to another directory by the time of a
+    /// write refuses the write, and nothing lands there: the directory it
+    /// holds is the one it locked. A path that leads nowhere refuses the
+    /// write in the system's words.
+    #[cfg(unix)]
+    #[test]
+    fn a_write_under_a_path_that_leads_elsewhere_is_refused() {
+        let base = tempfile::tempdir().expect("a temp dir");
+        let (dir, moved) = (base.path().join("store"), base.path().join("moved"));
+        fs::create_dir(&dir).expect("the directory");
+        let mut store = SpecStore::open(dir.clone()).expect("the store");
+        store.persist(at(1, YAML), b"one").expect("a write");
+        fs::rename(&dir, &moved).expect("the directory moves");
+        fs::create_dir(&dir).expect("another stands at its path");
+        let refused = store
+            .persist(at(2, YAML), b"two")
+            .expect_err("the path leads elsewhere");
+        assert_eq!(refused.to_string(), MOVED);
+        assert!(names(&dir).is_empty(), "nothing lands in the other");
+        assert_eq!(names(&moved), BTreeSet::from([name_of(1, "yaml")]));
+        fs::remove_dir(&dir).expect("the other goes");
+        let refused = store
+            .persist(at(2, YAML), b"two")
+            .expect_err("the path leads nowhere");
+        assert_eq!(refused.kind(), io::ErrorKind::NotFound);
+    }
+
+    /// A pipe its user may write under the lock file's name takes no lock:
+    /// the open to read and write does not wait on it either, and what is
+    /// no regular file is refused by its kind.
+    #[cfg(unix)]
+    #[test]
+    fn a_pipe_under_the_locks_name_takes_no_lock() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        pipe_at(&dir.path().join(HELD));
+        let refused = SpecStore::open_within(dir.path().to_owned(), Duration::ZERO)
+            .expect_err("no lock on a pipe");
+        assert_eq!(refused, StoreRefused::Unlocked(NOT_A_FILE.to_owned()));
     }
 
     /// A lock the system does not give refuses the start in the system's

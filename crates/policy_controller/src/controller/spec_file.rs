@@ -59,7 +59,7 @@ const START_READS: usize = 3;
 const RESTLESS_LOOKS: u32 = 5;
 
 /// What a look or a read says of a path that leads to no regular file.
-const NOT_A_FILE: &str = "the path leads to no regular file";
+pub(super) const NOT_A_FILE: &str = "the path leads to no regular file";
 
 /// What one look at the path found.
 #[derive(Clone, Debug, Eq, PartialEq)]
