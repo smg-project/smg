@@ -54,7 +54,7 @@ use crate::{
     },
     worker::{
         ConnectionMode, ModelWorkerSnapshot, PdPairIndex, PdWire, RoutingPool, RuntimeType, Worker,
-        WorkerRegistry, WorkerType,
+        WorkerRegistry, WorkerRegistryExt, WorkerType,
     },
 };
 

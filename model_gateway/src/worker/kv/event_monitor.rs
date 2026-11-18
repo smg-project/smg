@@ -42,7 +42,7 @@ use super::index_backend::KvIndex;
 use crate::worker::{
     identity::endpoint::Endpoint,
     load::monitor::WorkerMonitor,
-    metrics::Metrics,
+    metrics::{KvIndexChainStats, Metrics},
     periodic_task::PeriodicTask,
     registry::{Generation, WorkerRegistry},
     ConnectionMode, Worker, UNKNOWN_MODEL_ID,
@@ -283,6 +283,22 @@ impl KvEventMonitor {
         }
     }
 
+    /// The chain index's counters its gauges publish, as the worker's
+    /// writers take them.
+    fn chain_counters(stats: &kv_index::ChainIndexStats) -> KvIndexChainStats {
+        KvIndexChainStats {
+            runs_live: stats.runs_live,
+            blocks_live: stats.blocks_live,
+            arena_bytes: stats.arena_bytes,
+            arena_free_bytes: stats.arena_free_bytes,
+            arena_chunk_bytes: stats.arena_chunk_bytes,
+            slab_bytes: stats.slab_bytes,
+            moved_hashes: stats.moved_hashes,
+            engine_conflicts: stats.engine_conflicts,
+            cap_refusals: stats.cap_refusals,
+        }
+    }
+
     /// One model's index size and chain shape as gauges: the periodic
     /// publication's unit, and what a new index publishes at once, so the
     /// model's series exist (at zero) from its first worker rather than
@@ -290,7 +306,7 @@ impl KvEventMonitor {
     fn publish_index(model_id: &str, index: &KvIndex) {
         Metrics::set_kv_index_size(model_id, index.current_size(), index.entry_count());
         if let Some(stats) = index.chain_stats() {
-            Metrics::set_kv_index_chain_stats(model_id, &stats);
+            Metrics::set_kv_index_chain_stats(model_id, &Self::chain_counters(&stats));
         }
     }
 
@@ -302,7 +318,7 @@ impl KvEventMonitor {
     /// to zero).
     fn publish_dropped_index(model_id: &str) {
         Metrics::set_kv_index_size(model_id, 0, 0);
-        Metrics::set_kv_index_chain_stats(model_id, &kv_index::ChainIndexStats::default());
+        Metrics::set_kv_index_chain_stats(model_id, &KvIndexChainStats::default());
         // The size went with the model's last subscription: 0, a size no
         // block has, says none is known.
         Metrics::set_kv_block_size(model_id, 0);

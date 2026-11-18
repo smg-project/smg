@@ -684,6 +684,32 @@ pub(crate) fn describe_series() {
     );
 }
 
+/// The chain index's shape and memory as
+/// [`Metrics::set_kv_index_chain_stats`] publishes them. The index's holder
+/// copies them from the index's own counters, so the writers name no index
+/// type.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KvIndexChainStats {
+    /// Runs linked in the tree.
+    pub runs_live: usize,
+    /// Content hashes held by live runs.
+    pub blocks_live: usize,
+    /// Bytes of the word arena handed out so far.
+    pub arena_bytes: usize,
+    /// Bytes of the word arena sitting in free lists.
+    pub arena_free_bytes: usize,
+    /// Bytes the word arena holds from the process allocator.
+    pub arena_chunk_bytes: usize,
+    /// Bytes the run slab holds from the process allocator.
+    pub slab_bytes: usize,
+    /// Blocks a store moved to another place for their worker.
+    pub moved_hashes: usize,
+    /// Stored blocks whose engine hash differed from the index's own.
+    pub engine_conflicts: usize,
+    /// Stores declined at the arena's caps.
+    pub cap_refusals: usize,
+}
+
 /// The worker's metric writers. A dynamic label is interned once per value,
 /// and the records a request or a stream repeats go through kept handles.
 pub struct Metrics;
@@ -1144,10 +1170,10 @@ impl Metrics {
         gauge!("smg_kv_index_entries", "model" => model).set(entries as f64);
     }
 
-    /// Publish the chain index's shape and memory for a model, from its own
-    /// counters: live runs and blocks, arena and slab bytes, moved hashes and
-    /// engine conflicts.
-    pub fn set_kv_index_chain_stats(model_id: &str, stats: &kv_index::ChainIndexStats) {
+    /// Publish the chain index's shape and memory for a model, from the
+    /// counters its holder copied: live runs and blocks, arena and slab bytes,
+    /// moved hashes and engine conflicts.
+    pub fn set_kv_index_chain_stats(model_id: &str, stats: &KvIndexChainStats) {
         let model = intern_string(model_id);
         gauge!("smg_kv_index_runs_live", "model" => model.clone()).set(stats.runs_live as f64);
         gauge!("smg_kv_index_blocks_live", "model" => model.clone()).set(stats.blocks_live as f64);
@@ -1517,5 +1543,7 @@ impl Metrics {
     }
 }
 
+#[cfg(test)]
+mod gateway_tests;
 #[cfg(test)]
 mod tests;

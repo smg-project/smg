@@ -1685,7 +1685,7 @@ async fn liveness_sweep_loop<G: Generation>(monitor: Weak<WorkerMonitor<G>>) {
         let Some(monitor) = monitor.upgrade() else {
             return;
         };
-        for worker in monitor.worker_registry.get_routing_workers().iter() {
+        for worker in monitor.worker_registry.global_generation().members().iter() {
             liveness::sweep(worker);
         }
     }

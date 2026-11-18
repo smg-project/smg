@@ -203,6 +203,21 @@ impl PdPairing {
         self.version.as_deref()
     }
 
+    /// The runtime the worker registered with.
+    pub fn runtime(&self) -> RuntimeType {
+        self.runtime
+    }
+
+    /// The KV layout facts the worker reported, each under its label, in the
+    /// facts' own order.
+    pub fn kv_layout(&self) -> impl Iterator<Item = (&'static str, &str)> + '_ {
+        LAYOUT_FACTS.iter().filter_map(|(short, label, _)| {
+            self.kv_layout
+                .get(short)
+                .map(|value| (*label, value.as_str()))
+        })
+    }
+
     /// The group a worker pairs in: the explicit protocol, else
     /// `runtime/transport/layout` with `?` for an unknown component. Version
     /// is left out: it only counts under strict mode, and a rolling upgrade
@@ -798,7 +813,3 @@ mod tests {
         );
     }
 }
-
-#[cfg(test)]
-#[expect(clippy::print_stdout, reason = "a recorder says where its sheet went")]
-mod classic_pair_rows;

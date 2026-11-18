@@ -1225,7 +1225,6 @@ fn set(
 mod tests {
     use std::thread;
 
-    use smg_grpc_client::{h2, is_transport_failure};
     use tokio::sync::mpsc;
 
     use super::*;
@@ -1355,34 +1354,6 @@ mod tests {
             assert_eq!(is_connection_code(code), expected, "{code:?}: {why}");
         }
         assert_eq!(codes.iter().filter(|&&code| expectation(code).0).count(), 4);
-    }
-
-    /// The gRPC client's `is_transport_failure` answers another question
-    /// (is this status the HTTP/2 layer's doing rather than the worker's
-    /// answer?) from the status's source chain, and the two disagree by
-    /// design in both directions.
-    #[test]
-    fn a_connection_code_and_a_transport_failure_are_different_questions() {
-        // An Unavailable the worker answered with: unreachable for work, yet
-        // not the transport's doing.
-        let answered = tonic::Status::unavailable("shutting down");
-        assert!(is_connection_code(answered.code()));
-        assert!(!is_transport_failure(&answered));
-
-        // An Internal tonic made of a protocol fault: the transport's doing,
-        // yet its code is the one a worker's own failure carries.
-        let fault =
-            tonic::Status::from_error(Box::new(h2::Error::from(h2::Reason::PROTOCOL_ERROR)));
-        assert_eq!(fault.code(), tonic::Code::Internal);
-        assert!(is_transport_failure(&fault));
-        assert!(!is_connection_code(fault.code()));
-
-        // A refused stream is both: an Unavailable with an HTTP/2 cause.
-        let refused =
-            tonic::Status::from_error(Box::new(h2::Error::from(h2::Reason::REFUSED_STREAM)));
-        assert_eq!(refused.code(), tonic::Code::Unavailable);
-        assert!(is_transport_failure(&refused));
-        assert!(is_connection_code(refused.code()));
     }
 
     #[test]

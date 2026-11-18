@@ -38,7 +38,7 @@ model_gateway/src/         each recorder, a test module beside the code it runs
   policies/classic_manual_rows.rs                                           manual.json
   policies/classic_prefix_hash_rows.rs                                      prefix_hash.json
   policies/classic_all_vetoed_rows.rs                                       all_vetoed.json
-  worker/pd/pairing/classic_pair_rows.rs                                    pair_index.json
+  worker/pd/pair_index/classic_pair_rows.rs                                 pair_index.json
   routers/grpc/common/stages/worker_selection/classic_encode_pair_rows.rs   encode_pair.json
   routers/common/classic_pair_select_rows.rs                                pair_select.json
   worker/load/monitor/classic_overload_rows.rs                              overload.json
@@ -210,13 +210,13 @@ CLASSIC_ROWS_OUT=$PWD/crates/policy_controller/tests/classic/sheets CLASSIC_ROWS
 | `manual.json` | `policies::classic_manual_rows` |
 | `prefix_hash.json` | `policies::classic_prefix_hash_rows` |
 | `all_vetoed.json` | `policies::classic_all_vetoed_rows` |
-| `pair_index.json` | `worker::pd::pairing::classic_pair_rows` |
+| `pair_index.json` | `worker::pd::pair_index::classic_pair_rows` |
 | `encode_pair.json` | `worker_selection::classic_encode_pair_rows` |
 | `pair_select.json` | `routers::common::classic_pair_select_rows` |
 | `overload.json` | `worker::load::monitor::classic_overload_rows` |
 | `bucket.json` | `policies::bucket::classic_bucket_rows` |
 
-The pair sheet's recorder is a child of the module that derives a worker's pairing descriptor, so it records the
+The pair sheet's recorder is a child of the pair index and reads a pairing descriptor by its readers, so it records the
 descriptor the gateway derived and never a second reading of the registration. The encode sheet's recorder is a
 child of the gateway's worker selection stage: it runs the stage's own selection, and it wraps the encode policy to
 write down each call (the encoders offered and the key) and passes every call on unchanged. The pair placement

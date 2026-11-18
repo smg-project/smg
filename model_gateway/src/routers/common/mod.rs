@@ -223,7 +223,7 @@ pub mod bench_support {
     use crate::{
         observability::cache_trace,
         policies::PolicyRegistry,
-        worker::{PdPairIndex, PdWire, RoutingPool, Worker, WorkerRegistry},
+        worker::{PdPairIndex, PdWire, RoutingPool, Worker, WorkerRegistry, WorkerRegistryExt},
     };
 
     /// Whether a process switch captures every request's cache trace

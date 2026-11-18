@@ -16,22 +16,17 @@
 use std::sync::mpsc as test_mpsc;
 use std::{
     collections::{BTreeSet, HashSet},
-    ops::Deref,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
-        Arc, OnceLock,
+        Arc,
     },
 };
 
 use arc_swap::ArcSwap;
 use dashmap::{mapref::entry::Entry, DashMap};
-use openai_protocol::{
-    model_card::ModelCard,
-    worker::{TagVocabulary, WorkerStatus},
-};
+use openai_protocol::{model_card::ModelCard, worker::WorkerStatus};
 use rustc_hash::FxBuildHasher;
 use smg_worker::{metrics_labels, settings::RetryConfig};
-use symphony::grammar::GrammarStart;
 use tokio::sync::{broadcast, mpsc};
 use uuid::Uuid;
 
@@ -43,10 +38,6 @@ use crate::worker::{
         endpoint::Endpoint,
     },
     metrics::Metrics,
-    pd::{
-        pair_index::{PdPairIndex, PdWire},
-        pairing::PdPairingMode,
-    },
     registry::{
         event::{WorkerConnected, WorkerEvent},
         hash_ring::HashRing,
@@ -100,354 +91,6 @@ pub struct WorkerDescriptor {
     pub status: WorkerStatus,
     pub disable_health_check: bool,
     pub check_interval_secs: u64,
-}
-
-/// Static routing pool inside a model snapshot.
-///
-/// Availability is deliberately not encoded here: health, circuit-breaker and
-/// overload state change independently of membership and remain lock-free on
-/// each worker. Policies validate that live state while selecting.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RoutingPool {
-    HttpRegular,
-    GrpcPipelineRegular,
-    /// gRPC workers, and direct-ZMQ engines whose wire carries the
-    /// KV-transfer rendezvous, unlike [`Self::GrpcPipelineRegular`]'s every
-    /// ZMQ worker: the other ZMQ wires carry none, so such a worker must
-    /// never join a PD pool even though it rides the gRPC pipeline elsewhere.
-    GrpcPrefill,
-    /// The members [`Self::GrpcPrefill`] admits.
-    GrpcDecode,
-    /// The members [`Self::GrpcPrefill`] admits: a direct-ZMQ encode server
-    /// takes its encode request on the ZMQ lane; a gRPC one's encode
-    /// dispatch is a gRPC encoder RPC.
-    GrpcEncode,
-    /// HTTP-transport prefill pool for the HTTP PD router: it proxies plain
-    /// HTTP to the selected worker's URL, so a gRPC or ZMQ worker must never
-    /// be selectable (the same rule `select_first_worker` follows).
-    HttpPrefill,
-    /// HTTP-transport decode pool (same contract as [`Self::HttpPrefill`]).
-    HttpDecode,
-    /// Workers that front a third-party provider, whatever their type.
-    External,
-}
-
-type WorkerSnapshot = Arc<[Arc<dyn Worker>]>;
-type LazyRoutingPool = OnceLock<WorkerSnapshot>;
-
-impl RoutingPool {
-    const COUNT: usize = 8;
-
-    const fn index(self) -> usize {
-        match self {
-            Self::HttpRegular => 0,
-            Self::GrpcPipelineRegular => 1,
-            Self::GrpcPrefill => 2,
-            Self::GrpcDecode => 3,
-            Self::GrpcEncode => 4,
-            Self::HttpPrefill => 5,
-            Self::HttpDecode => 6,
-            Self::External => 7,
-        }
-    }
-
-    fn matches(self, worker: &Arc<dyn Worker>) -> bool {
-        match self {
-            Self::HttpRegular => {
-                *worker.worker_type() == WorkerType::Regular
-                    && *worker.connection_mode() == ConnectionMode::Http
-            }
-            Self::GrpcPipelineRegular => {
-                *worker.worker_type() == WorkerType::Regular
-                    && worker.connection_mode().uses_grpc_pipeline()
-            }
-            Self::GrpcPrefill => {
-                *worker.worker_type() == WorkerType::Prefill && serves_disaggregated_role(worker)
-            }
-            Self::GrpcDecode => {
-                *worker.worker_type() == WorkerType::Decode && serves_disaggregated_role(worker)
-            }
-            Self::GrpcEncode => {
-                *worker.worker_type() == WorkerType::Encode && serves_disaggregated_role(worker)
-            }
-            Self::HttpPrefill => {
-                *worker.worker_type() == WorkerType::Prefill
-                    && *worker.connection_mode() == ConnectionMode::Http
-            }
-            Self::HttpDecode => {
-                *worker.worker_type() == WorkerType::Decode
-                    && *worker.connection_mode() == ConnectionMode::Http
-            }
-            Self::External => worker.metadata().spec.runtime_type == RuntimeType::External,
-        }
-    }
-}
-
-/// Whether a worker of a disaggregated role rides the gRPC pipeline's
-/// encode/prefill/decode dispatch: a gRPC worker, or a direct-ZMQ
-/// engine whose wire carries the rendezvous and the encode request (the
-/// other ZMQ wires carry neither, and registration refuses them a role).
-fn serves_disaggregated_role(worker: &Arc<dyn Worker>) -> bool {
-    match worker.connection_mode() {
-        ConnectionMode::Grpc => true,
-        ConnectionMode::Zmq => worker.metadata().spec.runtime_type == RuntimeType::TokenSpeed,
-        ConnectionMode::Http => false,
-    }
-}
-
-/// The narrowest known context windows of a pool for one model id, as a
-/// membership snapshot keeps them ([`ModelWorkerSnapshot::window_floor`]):
-/// `budget` over the workers that hold a request's completion budget,
-/// `prefill` over the prefill workers, which are held to the input alone.
-/// `None` where no worker of the class is bound by a window.
-///
-/// The figure depends on the pool and on the model id as spelled, never on
-/// a request.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct WindowFloor {
-    pub(crate) budget: Option<u32>,
-    pub(crate) prefill: Option<u32>,
-}
-
-/// What a model's workers say together to a request, before one of them is
-/// selected: the parser names their cards set for the model, where their
-/// engines start a grammar, and the structural-tag vocabulary their grammar
-/// compilers take. The stage that prepares a request's reading holds the
-/// rule that reads each from the workers; a snapshot keeps the answers
-/// ([`ModelWorkerSnapshot::labels`]).
-///
-/// The answers depend on the membership and on the model id as spelled,
-/// never on a request.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ModelLabels {
-    /// The tool-call parser the cards name, when one does.
-    pub(crate) tool_parser: Option<String>,
-    /// The reasoning parser the cards name, when one does.
-    pub(crate) reasoning_parser: Option<String>,
-    /// Where the workers' engines start a grammar, taken together.
-    pub(crate) grammar_start: GrammarStart,
-    /// The structural-tag vocabulary every worker's compiler takes.
-    pub(crate) vocabulary: TagVocabulary,
-}
-
-/// Immutable membership snapshot. Route-specific projections are populated
-/// lazily once and then shared by every request until membership changes
-/// publish a replacement snapshot.
-///
-/// Multi-role selection (PD/EPD) must derive every role from ONE snapshot: two
-/// separate registry lookups can straddle a concurrent membership change and
-/// pair workers that never coexisted.
-#[derive(Debug)]
-pub struct ModelWorkerSnapshot {
-    all: WorkerSnapshot,
-    pools: [LazyRoutingPool; RoutingPool::COUNT],
-    /// The compatible prefill/decode pairs per wire and pairing mode, built
-    /// once from the pools above (see [`PdPairIndex`]).
-    pd_pairs: [[OnceLock<Arc<PdPairIndex>>; PdPairingMode::COUNT]; PdWire::COUNT],
-    /// Whether a worker of this generation serves a Harmony model, kept from
-    /// the first request's reading (see [`Self::harmony`]).
-    harmony: OnceLock<bool>,
-    /// The pools' window floors, each kept with the model id it was read
-    /// for (see [`Self::window_floor`]).
-    window_floors: [OnceLock<(Box<str>, WindowFloor)>; RoutingPool::COUNT],
-    /// What the workers of this generation say together, kept with the
-    /// model id it was read for (see [`Self::labels`]).
-    labels: OnceLock<(Box<str>, ModelLabels)>,
-}
-
-impl ModelWorkerSnapshot {
-    fn new(all: WorkerSnapshot) -> Self {
-        Self {
-            all,
-            pools: std::array::from_fn(|_| OnceLock::new()),
-            pd_pairs: std::array::from_fn(|_| std::array::from_fn(|_| OnceLock::new())),
-            harmony: OnceLock::new(),
-            window_floors: std::array::from_fn(|_| OnceLock::new()),
-            labels: OnceLock::new(),
-        }
-    }
-
-    /// Whether a worker of this membership generation serves a Harmony
-    /// model: `decide` reads the snapshot's workers on the first request
-    /// after the membership change, every request after it reads the kept
-    /// answer. A registration, a removal and a property rebuild each publish
-    /// a new snapshot, and so does a model refresh that changes a worker's
-    /// cards in place ([`WorkerRegistry::refresh_models`]), so the
-    /// per-worker card scans run once, not per request. The rule itself
-    /// stays with the router's detector.
-    pub(crate) fn harmony(&self, decide: impl FnOnce(&[Arc<dyn Worker>]) -> bool) -> bool {
-        *self.harmony.get_or_init(|| decide(&self.all))
-    }
-
-    /// The window floor of `pool` for `model_id`: `read` reads the pool's
-    /// workers on the first request after the membership change, every
-    /// request after it reads the kept figure. Whatever changes a card
-    /// publishes a new snapshot (see [`Self::harmony`]). The rule that reads
-    /// a worker's window stays with the pipeline's context check, as
-    /// `harmony`'s stays with the router's detector.
-    ///
-    /// The figure is kept with the model id it was read for, as spelled: a
-    /// worker answers an id by the card that matches it and, with none, by
-    /// its primary card, so another spelling can read other windows. `None`
-    /// for another spelling than the kept one: the caller then asks the
-    /// workers themselves. The gRPC router resolves an alias to its
-    /// canonical id before it selects, so a model's snapshot is read under
-    /// one spelling.
-    pub(crate) fn window_floor(
-        &self,
-        pool: RoutingPool,
-        model_id: &str,
-        read: impl FnOnce(&[Arc<dyn Worker>]) -> WindowFloor,
-    ) -> Option<WindowFloor> {
-        let workers = self.pool(pool);
-        if workers.is_empty() {
-            // Nothing to keep, whatever the spelling: the snapshot shared by
-            // every unknown model keeps no client's model id.
-            return Some(WindowFloor::default());
-        }
-        let (spelling, floor) =
-            self.window_floors[pool.index()].get_or_init(|| (model_id.into(), read(workers)));
-        (**spelling == *model_id).then_some(*floor)
-    }
-
-    /// What the snapshot's workers say together for `model_id`: `read` reads
-    /// them on the first request after the membership change, every request
-    /// after it reads the kept answers, so preparing a request walks no
-    /// worker, whatever the size of the fleet. Whatever changes a card
-    /// publishes a new snapshot (see [`Self::harmony`]), and a worker's
-    /// labels are read once, at its construction. The rules stay with the
-    /// stage that prepares a request's reading, as `harmony`'s stays with
-    /// the router's detector.
-    ///
-    /// The answers are kept with the model id they were read for, as
-    /// spelled, like a window floor ([`Self::window_floor`]). `None` for
-    /// another spelling than the kept one, and for a snapshot without a
-    /// worker (the one every unknown model shares keeps no client's model
-    /// id): the caller then reads the workers itself.
-    pub(crate) fn labels(
-        &self,
-        model_id: &str,
-        read: impl FnOnce(&[Arc<dyn Worker>]) -> ModelLabels,
-    ) -> Option<&ModelLabels> {
-        if self.all.is_empty() {
-            return None;
-        }
-        let (spelling, labels) = self
-            .labels
-            .get_or_init(|| (model_id.into(), read(&self.all)));
-        (**spelling == *model_id).then_some(labels)
-    }
-
-    /// The compatible prefill/decode pairs of `wire` under `mode`: descriptor
-    /// comparisons happen here, once per membership snapshot, never on the
-    /// request path.
-    pub(crate) fn pd_pairs(&self, wire: PdWire, mode: PdPairingMode) -> Arc<PdPairIndex> {
-        self.pd_pairs[wire.index()][mode.index()]
-            .get_or_init(|| {
-                let (prefill, decode) = wire.pools();
-                Arc::new(PdPairIndex::build(
-                    Arc::clone(self.pool(prefill)),
-                    Arc::clone(self.pool(decode)),
-                    wire,
-                    mode,
-                ))
-            })
-            .clone()
-    }
-
-    /// The workers of `pool`, projected once per snapshot and borrowed from
-    /// it: a length or membership read costs no refcount step. A caller that
-    /// keeps the pool past the snapshot clones the `Arc` itself.
-    pub(crate) fn pool(&self, pool: RoutingPool) -> &WorkerSnapshot {
-        self.pools[pool.index()].get_or_init(|| {
-            if self.all.iter().all(|worker| pool.matches(worker)) {
-                return Arc::clone(&self.all);
-            }
-            self.all
-                .iter()
-                .filter(|worker| pool.matches(worker))
-                .cloned()
-                .collect()
-        })
-    }
-}
-
-impl Deref for ModelWorkerSnapshot {
-    type Target = [Arc<dyn Worker>];
-
-    fn deref(&self) -> &Self::Target {
-        &self.all
-    }
-}
-
-/// The gateway's value of a generation: the members, and the cells that
-/// keep what its routers derive from them.
-impl Generation for ModelWorkerSnapshot {
-    fn of(members: Arc<[Arc<dyn Worker>]>) -> Self {
-        Self::new(members)
-    }
-
-    fn members(&self) -> &Arc<[Arc<dyn Worker>]> {
-        &self.all
-    }
-}
-
-/// The routing readers. They are the gateway's, over the registry's readers
-/// of a generation, and stay with it when the registry moves into the worker
-/// crate.
-impl WorkerRegistry<ModelWorkerSnapshot> {
-    /// Return a shared route-specific candidate snapshot for a model.
-    ///
-    /// The first lookup after a membership change builds the projection once;
-    /// subsequent requests only clone the outer `Arc`. Dynamic availability is
-    /// intentionally checked by the policy so health, circuit-breaker and
-    /// overload changes never require rebuilding this snapshot. The wildcard
-    /// model ID uses the global registry snapshot.
-    pub(crate) fn get_routing_pool(
-        &self,
-        model_id: &str,
-        pool: RoutingPool,
-    ) -> Arc<[Arc<dyn Worker>]> {
-        if model_id == UNKNOWN_MODEL_ID {
-            return Arc::clone(self.global_generation().pool(pool));
-        }
-        self.get_model_routing_pool(model_id, pool)
-    }
-
-    /// Like [`Self::get_routing_pool`] but never widens to the global
-    /// snapshot: the wildcard id resolves through the literal `"unknown"`
-    /// model-index entry (untagged workers index there), yielding an empty
-    /// slice when no such entry exists. The HTTP PD router uses this to keep
-    /// its conditional wildcard fallback — untagged workers win when present,
-    /// and only an empty entry widens to the global pool.
-    pub(crate) fn get_model_routing_pool(
-        &self,
-        model_id: &str,
-        pool: RoutingPool,
-    ) -> Arc<[Arc<dyn Worker>]> {
-        self.model_routing_snapshot(model_id).map_or_else(
-            || Arc::from(Self::EMPTY_WORKERS),
-            |snapshot| Arc::clone(snapshot.pool(pool)),
-        )
-    }
-
-    /// One membership snapshot for a model (alias-aware), from which several
-    /// role pools can be derived atomically: a PD/EPD selection must draw all
-    /// its roles from a single generation, and two separate pool lookups could
-    /// straddle a concurrent membership change.
-    pub(crate) fn model_routing_snapshot(
-        &self,
-        model_id: &str,
-    ) -> Option<Arc<ModelWorkerSnapshot>> {
-        self.model_generation(model_id)
-    }
-
-    /// One membership snapshot for multi-role selection, with the wildcard
-    /// model mapping to the global snapshot and an unknown model to a shared
-    /// empty one.
-    pub(crate) fn get_routing_snapshot(&self, model_id: &str) -> Arc<ModelWorkerSnapshot> {
-        self.generation(model_id)
-    }
 }
 
 /// What a host keeps of one membership generation.
@@ -980,15 +623,6 @@ impl<G: Generation> WorkerRegistry<G> {
         }
         self.model_generation(model_id)
             .unwrap_or_else(|| Arc::clone(&self.empty_generation))
-    }
-
-    /// Return the immutable global membership snapshot used by routing paths
-    /// whose model/provider filters are evaluated dynamically, and by the
-    /// periodic readers that visit every worker (the liveness sweep, the
-    /// readiness recompute): one pointer load while the fleet is stable,
-    /// where an iteration of the worker map locks every shard.
-    pub(crate) fn get_routing_workers(&self) -> Arc<[Arc<dyn Worker>]> {
-        Arc::clone(self.global_generation().members())
     }
 
     /// Whether an all-overloaded candidate pool is refused (`true`) or
@@ -2949,6 +2583,64 @@ impl<G: Generation> WorkerRegistry<G> {
                 .expect("the paused transition is waiting");
             paused.join().expect("the transition did not panic")
         })
+    }
+
+    /// Test support for the ring's interleaving proofs. Pauses one real
+    /// membership operation after its model snapshot, then lets another
+    /// operation reach the rebuild, and says whether that one waited for the
+    /// first to publish. No sleep determines the ordering.
+    pub(crate) fn overlapping_hash_ring_updates(
+        self: &Arc<Self>,
+        first: impl FnOnce(&Self) + Send + 'static,
+        second: impl FnOnce(&Self) + Send + 'static,
+    ) -> bool {
+        use std::time::Duration;
+
+        let (snapshot_tx, snapshot_rx) = test_mpsc::channel();
+        let (resume_tx, resume_rx) = test_mpsc::channel();
+        self.hash_ring_test_hooks.lock().after_snapshot = Some((snapshot_tx, resume_rx));
+
+        let (first_done_tx, first_done_rx) = test_mpsc::channel();
+        let first_registry = Arc::clone(self);
+        let first_thread = std::thread::spawn(move || {
+            first(&first_registry);
+            first_done_tx.send(()).expect("first completion receiver");
+        });
+        snapshot_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("first update reaches its snapshot");
+
+        let (started_tx, started_rx) = test_mpsc::channel();
+        self.hash_ring_test_hooks.lock().before_rebuild = Some(started_tx);
+        let (second_done_tx, second_done_rx) = test_mpsc::channel();
+        let second_registry = Arc::clone(self);
+        let second_thread = std::thread::spawn(move || {
+            second(&second_registry);
+            second_done_tx.send(()).expect("second completion receiver");
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("second update changes membership and reaches the rebuild");
+
+        // The unfixed implementation completes the second publication here,
+        // before the first overwrites it with its stale snapshot. The fixed
+        // implementation must wait for the first publication to finish.
+        let blocked = matches!(
+            second_done_rx.recv_timeout(Duration::from_secs(1)),
+            Err(test_mpsc::RecvTimeoutError::Timeout)
+        );
+        resume_tx.send(()).expect("release first update");
+        first_done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("first membership operation completes");
+        if blocked {
+            second_done_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("second membership operation completes");
+        }
+        first_thread.join().expect("first update did not panic");
+        second_thread.join().expect("second update did not panic");
+        blocked
     }
 }
 

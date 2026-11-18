@@ -50,7 +50,10 @@ use super::*;
 use crate::{
     config::types::PolicyConfig,
     policies::PolicyFactory,
-    worker::{test_support::no_health_check, BasicWorkerBuilder, ConnectionMode, ModelCard},
+    worker::{
+        test_support::no_health_check, BasicWorkerBuilder, ConnectionMode, ModelCard,
+        WorkerRegistryExt,
+    },
 };
 
 const MODEL: &str = "m";

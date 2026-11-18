@@ -5,5 +5,8 @@ pub mod basic;
 pub(in crate::worker) mod builder;
 pub mod metadata;
 
+#[cfg(test)]
+mod gateway_tests;
+
 // The worker crate's, at the paths they had here.
 pub use smg_worker::identity::{endpoint, error, sampling_defaults};

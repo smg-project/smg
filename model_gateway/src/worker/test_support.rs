@@ -57,6 +57,23 @@ pub fn ready_worker(url: &str, model: &str) -> Arc<dyn Worker> {
     Arc::new(worker)
 }
 
+/// A worker of `worker_type` at `url` serving `canonical_id` under `aliases`
+/// too, with no health checker behind it.
+pub fn worker_with_model_aliases(
+    url: &str,
+    canonical_id: &str,
+    aliases: &[&str],
+    worker_type: WorkerType,
+) -> Arc<dyn Worker> {
+    Arc::new(
+        BasicWorkerBuilder::new(url)
+            .model(ModelCard::new(canonical_id).with_aliases(aliases.iter().copied()))
+            .worker_type(worker_type)
+            .health_config(no_health_check())
+            .build(),
+    )
+}
+
 /// A worker of `worker_type` at `url` with no health checker behind it: what
 /// a test fills a pool with when no health checker may run.
 pub fn worker_of(url: &str, worker_type: WorkerType) -> Arc<dyn Worker> {

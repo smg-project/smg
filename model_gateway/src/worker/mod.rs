@@ -11,6 +11,7 @@ pub mod pd;
 pub(crate) use smg_worker::periodic_task;
 pub mod registry;
 pub mod runtime;
+pub(crate) mod snapshot;
 #[cfg(any(test, feature = "test-util"))]
 pub mod test_support;
 
@@ -57,8 +58,10 @@ pub use openai_protocol::{
 };
 pub(crate) use pd::pair_index::{PdPairIndex, PdWire};
 pub use pd::pairing::{PairingMismatch, PdPairing, PdPairingMode};
-pub(crate) use registry::{ModelLabels, ModelWorkerSnapshot, RoutingPool, WindowFloor};
 pub use registry::{RemoteWorkerState, WorkerOrigin};
+pub(crate) use snapshot::{
+    ModelLabels, ModelWorkerSnapshot, RoutingPool, WindowFloor, WorkerRegistryExt,
+};
 
 // The gateway's connector, for the gateway's name for the builder below.
 use crate::routers::grpc::backend_client::BackendConnector;

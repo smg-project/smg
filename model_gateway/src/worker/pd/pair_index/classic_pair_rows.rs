@@ -16,11 +16,12 @@
 //!
 //! ```text
 //! CLASSIC_ROWS_OUT=<dir> CLASSIC_ROWS_COMMIT=<commit> \
-//!   cargo test -p smg --lib worker::pd::pairing::classic_pair_rows -- --ignored --nocapture
+//!   cargo test -p smg --lib worker::pd::pair_index::classic_pair_rows -- --ignored --nocapture
 //! ```
 //!
-//! It is a child of the descriptor's module, so it records the descriptor the
-//! gateway derived, field by field, and never a second reading of the labels.
+//! It is a child of the pair index's module and reads the descriptor the
+//! gateway derived through the descriptor's own readers, field by field,
+//! never a second reading of the labels.
 //! Nothing in a row draws: the recorder builds each row twice and stops if the
 //! two builds differ.
 
@@ -29,9 +30,11 @@ use std::{fs, path::PathBuf, sync::Arc};
 use openai_protocol::worker::WorkerSpec;
 use serde::Serialize;
 
-use super::{PdPairing, PdPairingMode, LAYOUT_FACTS};
 use crate::worker::{
-    pd::pair_index::{PdPairIndex, PdWire},
+    pd::{
+        pair_index::{PdPairIndex, PdWire},
+        pairing::{PdPairing, PdPairingMode},
+    },
     test_support::no_health_check,
     BasicWorkerBuilder, ConnectionMode, ModelCard, RuntimeType, Worker, WorkerType,
 };
@@ -118,20 +121,15 @@ impl Descriptor {
     fn of(pairing: &PdPairing) -> Self {
         Self {
             runtime: pairing
-                .runtime
+                .runtime()
                 .is_specified()
-                .then(|| pairing.runtime.as_str()),
-            protocol: pairing.explicit.clone(),
-            transport: pairing.transport.clone(),
-            version: pairing.version.clone(),
-            kv_layout: LAYOUT_FACTS
-                .iter()
-                .filter_map(|(short, label, _)| {
-                    pairing
-                        .kv_layout
-                        .get(short)
-                        .map(|value| (*label, value.clone()))
-                })
+                .then(|| pairing.runtime().as_str()),
+            protocol: pairing.explicit().map(str::to_owned),
+            transport: pairing.transport().map(str::to_owned),
+            version: pairing.version().map(str::to_owned),
+            kv_layout: pairing
+                .kv_layout()
+                .map(|(label, value)| (label, value.to_owned()))
                 .collect(),
             key: pairing.key(),
         }
