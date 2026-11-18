@@ -41,15 +41,18 @@
 //! that books it.
 //!
 //! The lock order, written here once: a file's turn is taken first or not
-//! at all, and one turn at a time. The term's rise alone holds every
-//! turn, in the files' order (`set_term`, `follow_term`). Under a
-//! turn come the world's load (no lock), a stage's own lock, the engine's
-//! sessions table, the store's pins and the journal's word of a term. No
-//! path takes one of those and then a turn. A lifecycle call of a served
-//! controller therefore runs under a turn, or after it where a decision
-//! gives its own lease up: it is bounded and calls no door of the leases.
-//! A debug build marks the thread that holds a turn and refuses a second
-//! take of it by that thread.
+//! at all, and one turn at a time. The term's rise holds every turn, in
+//! the files' order (`set_term`, `follow_term`), and so does a standby's
+//! restore, from its start until it has read the ids on file
+//! ([`MemoryStore::restore_from`]). Under a turn come the world's load
+//! (no lock), a stage's own lock, the engine's sessions table, the store's
+//! pins and the journal's word of a term. A standby's restore takes the
+//! store's tables under its turns too: the workers', the health's and the
+//! loads', in that order. No path takes one of those and then a turn. A
+//! lifecycle call of a served controller therefore runs under a turn, or
+//! after it where a decision gives its own lease up: it is bounded and
+//! calls no door of the leases. A debug build marks the thread that holds
+//! a turn and refuses a second take of it by that thread.
 
 use std::{
     fmt,
