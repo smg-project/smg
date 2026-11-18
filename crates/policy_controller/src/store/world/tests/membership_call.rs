@@ -548,4 +548,66 @@ mod held {
             ]
         );
     }
+
+    /// A new incarnation under a key that comes back with a model less, or
+    /// under another role, names the models its predecessor left for its
+    /// own id, behind the replacement's word: at the leader's write and
+    /// at a standby's follow. One that comes back with the offer it had
+    /// says no such word.
+    #[test]
+    fn a_new_incarnation_names_the_models_its_predecessor_left() {
+        let stores = [Arc::new(MemoryStore::new()), Arc::new(MemoryStore::new())];
+        let told = [Told::default(), Told::default()];
+        for (store, told) in stores.iter().zip(&told) {
+            let ring = Arc::new(ConsistentHash::new(None));
+            store
+                .apply(generation(1, store, &ring, told))
+                .expect("applied");
+        }
+        let [leader, standby] = &stores;
+        let write = |incarnation, role, models: &[&str]| {
+            let facts = facts("http://w:8000", role, models);
+            leader.upsert(WorkerFacts {
+                incarnation,
+                ..facts
+            })
+        };
+        let mut ids = vec![write(1, Role::Single, &[MODEL, "second"]).id()];
+        assert!(standby.restore_from(leader.cut(Kinds::All)));
+        for told in &told {
+            told.lock().clear();
+        }
+        let at = WorkersStore::epoch(&**leader);
+        // The offer it had, a model less, then another role.
+        let offers: [(Role, &[&str]); 3] = [
+            (Role::Single, &[MODEL, "second"]),
+            (Role::Single, &[MODEL]),
+            (Role::Prefill, &[MODEL]),
+        ];
+        let unjournaled = Position::default();
+        for (incarnation, (role, models)) in (2..).zip(offers) {
+            let change = write(incarnation, role, models);
+            let row = WorkersStore::get(&**leader, change.id()).expect("the row");
+            standby.follow(
+                unjournaled,
+                WorkersStore::epoch(&**leader),
+                change,
+                Some(row),
+            );
+            ids.push(change.id());
+        }
+        let replaced = |index: usize| {
+            let (old, new) = (ids[index - 1], ids[index]);
+            format!("{:?}", Membership::Replaced { old, new })
+        };
+        let expected = [
+            (at + 1, replaced(1)),
+            (at + 2, replaced(2)),
+            (at + 2, left(ids[2], &["second"])),
+            (at + 3, replaced(3)),
+            (at + 3, left(ids[3], &[MODEL])),
+        ];
+        assert_eq!(*told[0].lock(), expected);
+        assert_eq!(*told[1].lock(), expected);
+    }
 }

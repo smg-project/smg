@@ -30,17 +30,22 @@
 //! list joins at its first decision, with every other row of that view, and
 //! a changed listing splits [`SPAN`] evenly among all of it until the next
 //! cut. The lifecycle prunes: a removed worker's range goes to the range
-//! below it, and a replaced handle keeps its predecessor's place. A worker
-//! a registration took off a model leaves that model's listing alone. A
-//! handle a view listed before the word of its replacement keeps its own
-//! place and takes its predecessor's load and bookings, and the
-//! predecessor's place leaves as a removed worker's does. A pruned worker
-//! is fenced for a while ([`FENCE`](crate::ring::FENCE)): a view captured
-//! before its leave still shows it, and a decision over such a view lists
-//! it nowhere, seats it nowhere and places the others. The feed naming the
-//! worker again lifts the fence at once. All of it is soft state, which a
-//! new process learns again within one window, and so does a newly applied
-//! document, whose generation builds its own scorer.
+//! below it, and a replaced handle keeps its predecessor's place. A new
+//! incarnation that left a model is unlisted there by a second word: until
+//! it the new handle is listed under that model, no view shows it there,
+//! its range goes to the seated owner below and no request is placed by
+//! it. A worker a registration took off a model is unlisted under that
+//! model alone. A handle a view listed before the word of its replacement
+//! keeps its own place and takes its predecessor's load and bookings, and
+//! the predecessor's place leaves as a removed worker's does. A pruned
+//! worker is fenced for a while ([`FENCE`](crate::ring::FENCE)): a view
+//! captured before its leave still shows it, and a decision over such a
+//! view lists it nowhere, seats it nowhere and places the others. The feed
+//! naming the worker again lifts the fence at once. A worker that left a
+//! model is not fenced: it serves on, and the fence names no model, so a
+//! view older than the word may list it there again. All of it is soft
+//! state, which a new process learns again within one window, and so does
+//! a newly applied document, whose generation builds its own scorer.
 //!
 //! A model's partition stands behind its own guard. A decision finds its
 //! model's by the name's hash, in a map replaced whole at a model's first
@@ -728,8 +733,8 @@ impl Lifecycle for Bucket {
                     false
                 }
                 // A worker a registration took off this partition's model
-                // leaves its listing. The partitions of the models it still
-                // serves keep its place, its range and its load.
+                // leaves its listing. The partitions of the models the word
+                // does not name keep its place, its range and its load.
                 Membership::Left { id, models } => {
                     if models.iter().any(|left| **left == **model) {
                         pool.remove(id);
@@ -975,6 +980,26 @@ mod tests {
             .iter()
             .map(|range| (range.member, range.lower, range.upper))
             .collect()
+    }
+
+    /// Each member with its load, each range, and the window's total.
+    type Listing = (Vec<(WorkerId, u64)>, Vec<(u32, u32, u32)>, u64);
+
+    /// The listing of `model`'s partition.
+    fn listing_of(scorer: &Bucket, model: &str) -> Listing {
+        let partition = of(scorer, model);
+        let held = partition.lock();
+        let members = held
+            .members
+            .iter()
+            .map(|member| (member.id, member.load))
+            .collect();
+        let ranges = held
+            .ranges
+            .iter()
+            .map(|range| (range.member, range.lower, range.upper))
+            .collect();
+        (members, ranges, held.total)
     }
 
     /// The booked tokens of model `m`'s members, in the listing's order, and
@@ -1418,14 +1443,15 @@ mod tests {
         assert_eq!(loads(&scorer), (vec![0, 0, 0], 0));
     }
 
-    /// A worker a registration took off a model leaves that model's
-    /// listing and keeps its place, its range and its load under the model
-    /// it still serves, where its next booking alone lands. The words of a
-    /// row's facts unlist nobody, and a model whose last worker left this
-    /// way takes its partition with it. The word fences nobody: a model
-    /// that never listed the two lists them from its first view.
+    /// A worker a registration took off a model is unlisted under that
+    /// model alone and keeps its place, its range and its load under the
+    /// models the word does not name, where its next booking alone lands.
+    /// The words of a row's facts unlist nobody, and a model whose last
+    /// worker left this way takes its partition with it. The word fences
+    /// nobody: a model that never listed the two lists them from its first
+    /// view.
     #[test]
-    fn a_worker_a_registration_took_off_a_model_leaves_that_model_s_listing_alone() {
+    fn a_worker_a_registration_took_off_a_model_is_unlisted_under_that_model_alone() {
         let scorer = scorer(NEVER, 1.5, 5);
         let (pool_a, pool_b) = (pool(2), pool(4));
         for (model, pool) in [("a", &pool_a), ("b", &pool_b)] {
@@ -1433,22 +1459,7 @@ mod tests {
         }
         let moved = pool_a[1].id;
         book(&scorer, &pool_a, 1, 30, SECOND);
-        // Each member with its load, each range, and the window's total.
-        let listing = |model: &str| {
-            let partition = of(&scorer, model);
-            let held = partition.lock();
-            let members: Vec<(WorkerId, u64)> = held
-                .members
-                .iter()
-                .map(|member| (member.id, member.load))
-                .collect();
-            let ranges: Vec<(u32, u32, u32)> = held
-                .ranges
-                .iter()
-                .map(|range| (range.member, range.lower, range.upper))
-                .collect();
-            (members, ranges, held.total)
-        };
+        let listing = |model: &str| listing_of(&scorer, model);
         let (a, b) = (listing("a"), listing("b"));
         assert_eq!(a.0, [(pool_a[0].id, 0), (moved, 30)]);
         // A row's facts changed: nobody is unlisted.
@@ -1466,7 +1477,7 @@ mod tests {
             models: &["a".into(), "c".into()],
         });
         assert_eq!(listing("a").0, [(pool_a[0].id, 0)]);
-        assert_eq!(listing("b"), b, "the model it still serves moved");
+        assert_eq!(listing("b"), b, "a model the word does not name moved");
         // Its next booking lands under the model it serves, and there alone.
         book(&scorer, &pool_b, 1, 5, SECOND);
         assert_eq!(listing("a").2, 30, "booked under the model it left");
@@ -1489,6 +1500,67 @@ mod tests {
             &all(&pool_a),
         );
         assert_eq!(listing("d").0.len(), 2);
+    }
+
+    /// A new incarnation that comes back with a model less is unlisted
+    /// under that model, by the word said for it behind its replacement's,
+    /// and takes its predecessor's place, range and load under the rest. A
+    /// decision of that model over an older view, between the two words
+    /// and behind them, lists the old handle nowhere.
+    #[test]
+    fn a_new_incarnation_off_a_model_takes_its_predecessor_s_place_under_the_rest() {
+        let scorer = scorer(NEVER, 1.5, 5);
+        let (pool_a, pool_b) = (pool(2), pool(4));
+        for (model, pool) in [("a", &pool_a), ("b", &pool_b)] {
+            led_by(&scorer, &prefill(model, 3_000, SECOND), pool, &all(pool));
+        }
+        let (old, new) = (pool_a[1].id, WorkerId(900));
+        book(&scorer, &pool_a, 1, 30, SECOND);
+        let b = listing_of(&scorer, "b");
+        assert_eq!(b.0[1], (old, 30));
+        // The replacement's word, then the word for the new handle. The
+        // older view shows the old handle, which is fenced by the first.
+        let older = |at| led_by(&scorer, &prefill("a", 3_000, at), &pool_a, &all(&pool_a));
+        scorer.on_membership(&Membership::Replaced { old, new });
+        older(2 * SECOND);
+        let between = listing_of(&scorer, "a").0;
+        assert!(between.iter().all(|&(id, _)| id != old), "{between:?}");
+        scorer.on_membership(&Membership::Left {
+            id: new,
+            models: &["a".into()],
+        });
+        older(3 * SECOND);
+        assert_eq!(listing_of(&scorer, "a").0, [(pool_a[0].id, 0)]);
+        let after = listing_of(&scorer, "b");
+        assert_eq!(after.0[1], (new, 30), "its predecessor's place and load");
+        assert_eq!((after.0.len(), after.1, after.2), (4, b.1, b.2));
+    }
+
+    /// A new incarnation under another role left every model of its
+    /// predecessor's list. The word names them all, so the replacement has
+    /// no place to carry: the new handle is listed nowhere until a view of
+    /// its own pool names it, and no place passes from one role to another.
+    #[test]
+    fn a_new_incarnation_under_another_role_takes_no_place_of_its_predecessor() {
+        let scorer = scorer(NEVER, 1.5, 5);
+        let (pool_a, pool_b) = (pool(2), pool(4));
+        for (model, pool) in [("a", &pool_a), ("b", &pool_b)] {
+            led_by(&scorer, &prefill(model, 3_000, SECOND), pool, &all(pool));
+        }
+        let (old, new) = (pool_a[1].id, WorkerId(900));
+        book(&scorer, &pool_a, 1, 30, SECOND);
+        // The replacement's word, then the word for the new handle with
+        // both models.
+        scorer.on_membership(&Membership::Replaced { old, new });
+        scorer.on_membership(&Membership::Left {
+            id: new,
+            models: &["a".into(), "b".into()],
+        });
+        let (a, b) = (listing_of(&scorer, "a").0, listing_of(&scorer, "b").0);
+        assert_eq!((a.len(), b.len()), (1, 3));
+        for (id, _) in a.iter().chain(&b) {
+            assert!(*id != old && *id != new, "neither handle is listed");
+        }
     }
 
     #[test]

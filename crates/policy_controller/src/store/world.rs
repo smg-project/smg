@@ -17,7 +17,8 @@
 //! once ([`MemoryStore::publish_now`](crate::store::MemoryStore::publish_now)).
 //! A removal and a replaced incarnation pay the build before they answer:
 //! the worker that left is in no pool from there on, and a storm of
-//! removals builds once a removal.
+//! removals builds once a removal. So does a registration that takes its
+//! worker off a model, for the pools it leaves.
 //!
 //! What a membership build derives (where each pool stands, each pool's
 //! shape) is built once and shared by every world until the next membership
