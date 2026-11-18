@@ -52,6 +52,7 @@ use serde_json::{Map, Value};
 
 mod classic {
     pub mod all_vetoed;
+    pub mod bucket;
     pub mod encode_pair;
     pub mod manual;
     pub mod overload;
@@ -88,9 +89,7 @@ struct Owed {
 }
 
 /// The owed rows. The classic manual policy keeps a key's pins apart under
-/// each role of a pair; here a sessions rule runs under the single plan. The
-/// gateway answers a pool over its thresholds on every worker by one rule
-/// under each of its policies; one of them has no preset here yet. A
+/// each role of a pair; here a sessions rule runs under the single plan. A
 /// request placed by its routing key on the hash ring keeps its worker over
 /// the thresholds there; its rows are refused by their module until a key
 /// keeps its ring worker here ([`ring`]). Those entries do not expire by
@@ -102,16 +101,6 @@ const OWED: &[Owed] = &[
         row: "manual-one-key-pins-apart-under-the-prefill-and-the-decode-role",
         refused: "sessions run under the single plan",
         by: "sessions on the sides of a pair, which read the pair's partner lists",
-    },
-    Owed {
-        row: "bucket-a-pool-over-on-every-worker-goes-to-the-fewest-in-flight",
-        refused: r#"unknown preset "bucket""#,
-        by: "the bucket preset",
-    },
-    Owed {
-        row: "bucket-a-pool-over-on-every-worker-is-shed-under-shedding",
-        refused: r#"unknown preset "bucket""#,
-        by: "the bucket preset",
     },
     ring("consistent-hashing-a-key-keeps-its-worker-over-its-thresholds-beside-free-workers"),
     ring("consistent-hashing-a-key-keeps-its-worker-with-every-worker-over"),
@@ -296,8 +285,9 @@ const fn module<R: Recorded>(inline: &'static str) -> Module {
 /// An encode-pair row is replayed in its store part by its own module;
 /// its copied rows name no runtime either, and the pair index's rule
 /// holds them.
-const MODULES: [Module; 7] = [
+const MODULES: [Module; 8] = [
     module::<classic::all_vetoed::Row>(classic::all_vetoed::INLINE),
+    module::<classic::bucket::Row>(classic::bucket::INLINE),
     Module {
         policy: classic::encode_pair::POLICY,
         inline: classic::encode_pair::INLINE,
@@ -556,6 +546,13 @@ fn sheets_under(dir: &Path) -> Vec<(String, String)> {
             (path.to_string_lossy().into_owned(), text)
         })
         .collect()
+}
+
+#[test]
+fn the_classic_bucket_rows_replay_pick_for_pick_and_share_for_share() {
+    let (rows, defects) = replay_sheet(classic::bucket::INLINE, "the inline rows");
+    assert!(rows >= 8, "{rows} inline rows");
+    assert!(defects.is_empty(), "{defects:#?}");
 }
 
 #[test]
@@ -1038,6 +1035,7 @@ fn every_json_file_of_the_directory_is_a_sheet_to_answer_for() {
             "a_second_name.json",
             "all_vetoed.json",
             "broken.json",
+            "bucket.json",
             "encode_pair.json",
             "manual.json",
             "overload.json",

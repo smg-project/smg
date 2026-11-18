@@ -90,6 +90,7 @@
 //! report's sample instant); the wire carries durations only.
 
 pub mod affinity;
+pub mod bucket;
 pub mod builtins;
 pub mod catalog;
 #[cfg(feature = "client")]

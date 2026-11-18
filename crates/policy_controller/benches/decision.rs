@@ -13,7 +13,8 @@
 //! decision runs with a fresh seed per iteration so the drawing pickers draw.
 //! This file is the pull-request gate's (`.github/bench-gates/policy-engine.toml`
 //! runs the whole binary three times a side): the `epd` plan's encode
-//! decisions and the ring's membership costs are the `epd` bench target.
+//! decisions and the ring's membership costs are the `epd` bench target, and
+//! the `bucket` preset's rows the `bucket` bench target.
 #![expect(
     clippy::expect_used,
     reason = "a bench's setup has no caller to answer; a preset that fails to validate is a bug the unit tests catch"
@@ -60,7 +61,10 @@ fn view_build(c: &mut Criterion) {
 
 fn decide(c: &mut Criterion) {
     let mut group = c.benchmark_group("policy_engine/decide");
-    for preset in PRESETS {
+    // The `bucket` preset's rows stand in the `bucket` bench target with the
+    // rest of its cells. This binary runs at its gate's bound, and a preset
+    // more here is three rows more in every pull request's gate.
+    for &preset in PRESETS.iter().filter(|&&preset| preset != "bucket") {
         let engine = engine_of(preset);
         for &n in &SIZES {
             let fleet = fleet(n);

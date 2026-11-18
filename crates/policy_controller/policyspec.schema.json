@@ -627,7 +627,7 @@
       "additionalProperties": false
     },
     "BucketParams": {
-      "description": "The bucket scorer: prefill placement by request-size buckets whose\nboundaries a periodic task adjusts.",
+      "description": "The bucket scorer: prefill placement by request size, over ranges of\nsizes. A cut of the ranges falls due each interval and is made, from the\ntokens booked on the workers, where a worker's share of them moved by\nmore than a factor of two since the last cut or the listing changed.",
       "type": "object",
       "properties": {
         "weight": {
@@ -638,7 +638,7 @@
           "exclusiveMinimum": 0
         },
         "abs_threshold": {
-          "description": "The absolute part of the balance rule, in requests (default 64).",
+          "description": "The absolute part of the balance rule, in booked tokens (default 64).",
           "type": [
             "integer",
             "null"
@@ -656,7 +656,7 @@
           "minimum": 1.0
         },
         "adjust_interval_s": {
-          "description": "The boundary task's cadence, in seconds; above zero (default 5).",
+          "description": "The bookings' window and the cut's cadence, in seconds; above zero\n(default 5).",
           "type": [
             "integer",
             "null"
