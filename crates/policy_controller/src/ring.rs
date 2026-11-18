@@ -89,6 +89,69 @@ pub enum Probe<T> {
     Stop,
 }
 
+/// The ids a lifecycle pruned within [`FENCE`], fenced against relearning
+/// from a view older than the pruning. A stage that learns its members from
+/// a decision's view holds one.
+#[derive(Debug, Default)]
+pub struct Fence {
+    /// The retirements within [`FENCE`], oldest first. Those of an id the
+    /// feed named since stay until they lapse and lift nothing.
+    retired: VecDeque<(WorkerId, Instant)>,
+    /// Each fenced id with its last retirement, the one whose lapse lifts
+    /// the fence.
+    fenced: FxHashMap<WorkerId, Instant>,
+}
+
+impl Fence {
+    /// Whether no id holds a fence.
+    pub fn is_empty(&self) -> bool {
+        self.fenced.is_empty()
+    }
+
+    /// Whether `id` holds a fence the last [`Fence::expire`] left standing.
+    pub fn holds(&self, id: WorkerId) -> bool {
+        self.fenced.contains_key(&id)
+    }
+
+    /// Whether `id` was pruned within [`FENCE`] of `now` and is fenced
+    /// against relearning.
+    pub fn is_retired(&self, id: WorkerId, now: Instant) -> bool {
+        self.fenced
+            .get(&id)
+            .is_some_and(|&at| now.saturating_duration_since(at) < FENCE)
+    }
+
+    /// Lift the fence on `id`: the feed named it as a member again.
+    pub fn admit(&mut self, id: WorkerId) {
+        // Its retirements stay in the list: none is its last any more, so
+        // their lapses lift nothing.
+        self.fenced.remove(&id);
+    }
+
+    /// Forget the retirements older than [`FENCE`] at `now`.
+    pub fn expire(&mut self, now: Instant) {
+        while let Some(&(old, at)) = self.retired.front() {
+            if now.saturating_duration_since(at) < FENCE {
+                break;
+            }
+            self.retired.pop_front();
+            // The fence lifts with the id's last retirement. The map says
+            // whether this entry is it: no pass over the list for a lapse.
+            if self.fenced.get(&old) == Some(&at) {
+                self.fenced.remove(&old);
+            }
+        }
+    }
+
+    /// Fence `id` for [`FENCE`] from `now`: a lifecycle pruned it.
+    pub fn retire(&mut self, id: WorkerId, now: Instant) {
+        self.expire(now);
+        let last = self.fenced.entry(id).or_insert(now);
+        *last = (*last).max(now);
+        self.retired.push_back((id, now));
+    }
+}
+
 /// The ring: its members, each at [`VIRTUAL_NODES`] sorted positions hashed
 /// from the member's stable key and indexed by the handle id; the ids pruned
 /// within [`FENCE`], fenced against relearning from a stale view.
@@ -99,12 +162,8 @@ pub struct Ring {
     index: FxHashMap<WorkerId, u32>,
     /// `(position, member index)`, sorted by position.
     entries: Vec<(u64, u32)>,
-    /// The retirements within [`FENCE`], oldest first. Those of an id the
-    /// feed named since stay until they lapse and lift nothing.
-    retired: VecDeque<(WorkerId, Instant)>,
-    /// Each fenced id with its last retirement, the one whose lapse lifts
-    /// the fence.
-    fenced: FxHashMap<WorkerId, Instant>,
+    /// The ids pruned within [`FENCE`].
+    fence: Fence,
 }
 
 impl Ring {
@@ -188,11 +247,11 @@ impl Ring {
         members: impl IntoIterator<Item = (WorkerId, u32)>,
         now: Instant,
     ) -> usize {
-        self.expire(now);
-        let fenced = &self.fenced;
+        self.fence.expire(now);
+        let fence = &self.fence;
         let fresh: Vec<(WorkerId, u32)> = members
             .into_iter()
-            .filter(|(id, _)| !fenced.contains_key(id))
+            .filter(|&(id, _)| !fence.holds(id))
             .collect();
         self.add_many(fresh)
     }
@@ -200,44 +259,18 @@ impl Ring {
     /// Whether `id` was pruned within [`FENCE`] of `now` and is fenced
     /// against relearning.
     pub fn is_retired(&self, id: WorkerId, now: Instant) -> bool {
-        self.fenced
-            .get(&id)
-            .is_some_and(|&at| now.saturating_duration_since(at) < FENCE)
+        self.fence.is_retired(id, now)
     }
 
     /// Lift the fence on `id`: the feed named it as a member again.
     pub fn admit(&mut self, id: WorkerId) {
-        // Its retirements stay in the list: none is its last any more, so
-        // their lapses lift nothing.
-        self.fenced.remove(&id);
-    }
-
-    /// Forget the retirements older than [`FENCE`] at `now`.
-    fn expire(&mut self, now: Instant) {
-        while let Some(&(old, at)) = self.retired.front() {
-            if now.saturating_duration_since(at) < FENCE {
-                break;
-            }
-            self.retired.pop_front();
-            // The fence lifts with the id's last retirement. The map says
-            // whether this entry is it: no pass over the list for a lapse.
-            if self.fenced.get(&old) == Some(&at) {
-                self.fenced.remove(&old);
-            }
-        }
-    }
-
-    fn retire(&mut self, id: WorkerId, now: Instant) {
-        self.expire(now);
-        let last = self.fenced.entry(id).or_insert(now);
-        *last = (*last).max(now);
-        self.retired.push_back((id, now));
+        self.fence.admit(id);
     }
 
     /// Remove a member at `now`, fencing its id for [`FENCE`]; `false` when
     /// it was none.
     pub fn remove(&mut self, id: WorkerId, now: Instant) -> bool {
-        self.retire(id, now);
+        self.fence.retire(id, now);
         let Some(gone) = self.index.remove(&id) else {
             return false;
         };
@@ -264,7 +297,7 @@ impl Ring {
     pub fn retain_only(&mut self, ids: &[WorkerId], now: Instant) {
         // A fence a named id holds stood before the pruning, which fences
         // the ids the snapshot does not name.
-        let fenced = !self.fenced.is_empty();
+        let fenced = !self.fence.is_empty();
         if !self.members.is_empty() {
             let keep: FxHashSet<WorkerId> = ids.iter().copied().collect();
             self.prune(&keep, now);
@@ -332,7 +365,7 @@ impl Ring {
                     to[at - 1] != LEFT
                 });
                 for &id in &gone {
-                    self.retire(id, now);
+                    self.fence.retire(id, now);
                 }
             }
         }

@@ -32,23 +32,29 @@
 //! cut. The lifecycle prunes: a removed worker's range goes to the range
 //! below it, and a replaced handle keeps its predecessor's place. A handle
 //! a view listed before the word of its replacement keeps its own place,
-//! and its predecessor's leaves as a removed worker's does. All of it is
-//! soft state, which a new process learns again within one window, and so
-//! does a newly applied document, whose generation builds its own scorer.
+//! and its predecessor's leaves as a removed worker's does. A pruned worker
+//! is fenced for a while ([`FENCE`](crate::ring::FENCE)): a view captured
+//! before its leave still shows it, and a decision over such a view lists
+//! it nowhere, seats it nowhere and places the others. The feed naming the
+//! worker again lifts the fence at once. All of it is soft state, which a
+//! new process learns again within one window, and so does a newly applied
+//! document, whose generation builds its own scorer.
 //!
 //! A model's partition stands behind its own guard. A decision finds its
 //! model's by the name's hash, in a map replaced whole at a model's first
-//! prefill decision, and takes that guard alone; a booking takes the guards
-//! of the partitions that list its worker. Deciders of two models share no
-//! lock. A lease names no model, so a worker two models list is booked in
-//! both partitions. A model whose last worker left takes its partition
-//! with it: the table holds no model that lists nobody.
+//! prefill decision, and takes that guard alone where its view matches the
+//! listing; a booking takes the guards of the partitions that list its
+//! worker. Deciders of two models share no lock there. A decision that
+//! lists reads the stage's one fence for its view's rows and lets it go
+//! before it lists. A lease names no model, so a worker two models list is
+//! booked in both partitions. A model whose last worker left takes its
+//! partition with it: the table keeps no partition that lost its listing.
 //!
 //! Any other phase scores every survivor equal, and so does a prefill
 //! decision whose size no listed survivor owns a range for: the picker's
 //! draw places those.
 
-use std::{cmp::Ordering, collections::VecDeque, sync::Arc};
+use std::{cmp::Ordering, collections::VecDeque, sync::Arc, time::Instant};
 
 use arc_swap::ArcSwap;
 use parking_lot::Mutex;
@@ -58,6 +64,7 @@ use crate::{
     decision::Decision,
     framework::{Scorer, TieBand},
     lease::{Lease, Lifecycle, Membership, Side},
+    ring::Fence,
     spec::BucketParams,
     view::{Candidate, Phase, RequestFacts, WorkerId},
 };
@@ -96,6 +103,13 @@ pub struct Bucket {
     /// One writer of `listed` at a time. It is taken under a partition's
     /// guard and takes none itself.
     relisting: Mutex<()>,
+    /// The workers the lifecycle pruned a moment ago, fenced against a
+    /// listing from a view older than the pruning. One fence serves the
+    /// stage: the feed names an id and not its pool, and a partition made
+    /// after a leave must see it. It is taken under a partition's guard or
+    /// under none, and no partition's guard is taken under it. A decision
+    /// holds it for one read of its view's rows and for nothing after.
+    fence: Mutex<Fence>,
 }
 
 /// One model's partition behind its guard, shared with the workers' index.
@@ -172,6 +186,7 @@ impl Bucket {
             partitions: ArcSwap::from_pointee(FxHashMap::default()),
             listed: ArcSwap::from_pointee(FxHashMap::default()),
             relisting: Mutex::new(()),
+            fence: Mutex::new(Fence::default()),
         }
     }
 
@@ -250,13 +265,27 @@ impl Pool {
     }
 
     /// Seat the decision's survivors, each at its member, and read their
-    /// loads in the kept order; `None` when a survivor is not listed.
-    fn seat(&mut self, candidates: &[Candidate], kept: &[u32]) -> Option<Loads> {
+    /// loads in the kept order. A survivor that is not listed ends the pass
+    /// with `None`, but for one `fenced` names: it is seated nowhere, and
+    /// `None` then says that no survivor is seated.
+    fn seat(
+        &mut self,
+        candidates: &[Candidate],
+        kept: &[u32],
+        fenced: impl Fn(WorkerId) -> bool,
+    ) -> Option<Loads> {
         self.seats.clear();
         self.seats.resize(self.members.len(), NONE);
         let mut loads: Option<Loads> = None;
         for (place, &row) in kept.iter().enumerate() {
-            let member = self.member_of(row, candidates[row as usize].id)? as usize;
+            let id = candidates[row as usize].id;
+            let Some(member) = self.member_of(row, id) else {
+                if fenced(id) {
+                    continue;
+                }
+                return None;
+            };
+            let member = member as usize;
             self.seats[member] = place as u32;
             let load = self.members[member].load;
             loads = Some(match loads {
@@ -280,12 +309,15 @@ impl Pool {
     }
 
     /// List every row of the view the partition does not list, in the
-    /// view's order. A changed listing keeps the loads of the workers it
-    /// held and splits the span evenly among all of it.
-    fn list(&mut self, candidates: &[Candidate]) {
+    /// view's order, but for a worker `fenced` names: the lifecycle pruned
+    /// it a moment ago, and a view that still shows it is older than its
+    /// leave. A changed listing keeps the loads of the workers it held and
+    /// splits the span evenly among all of it.
+    fn list(&mut self, candidates: &[Candidate], fenced: impl Fn(WorkerId) -> bool) {
         let listed = self.members.len();
         for candidate in candidates {
-            if self.member_of(candidate.position, candidate.id).is_none() {
+            let unlisted = self.member_of(candidate.position, candidate.id).is_none();
+            if unlisted && !fenced(candidate.id) {
                 self.by_id.insert(candidate.id, self.members.len() as u32);
                 self.members.push(Member {
                     id: candidate.id,
@@ -374,17 +406,13 @@ impl Pool {
         true
     }
 
-    /// Forget every listed worker `ids` does not name.
-    fn retain(&mut self, ids: &[WorkerId]) {
-        let gone: Vec<WorkerId> = self
-            .members
+    /// The listed workers `ids` does not name.
+    fn unnamed(&self, ids: &[WorkerId]) -> Vec<WorkerId> {
+        self.members
             .iter()
             .map(|member| member.id)
             .filter(|id| !ids.contains(id))
-            .collect();
-        for id in gone {
-            self.remove(id);
-        }
+            .collect()
     }
 
     /// Book `tokens` on a member at `at_micros`. The bookings older than the
@@ -558,6 +586,28 @@ impl Lifecycle for Bucket {
     }
 
     fn on_membership(&self, change: &Membership<'_>) {
+        // The fence takes the word first. A leaver is fenced before any
+        // partition forgets it, so no decision finds it unlisted and
+        // unfenced, and a worker the feed names is admitted at once.
+        let now = Instant::now();
+        match *change {
+            Membership::Added(id) => self.fence.lock().admit(id),
+            Membership::Removed(id) => self.fence.lock().retire(id, now),
+            Membership::Replaced { old, new } => {
+                let mut fence = self.fence.lock();
+                fence.retire(old, now);
+                fence.admit(new);
+            }
+            Membership::Snapshot(ids) => {
+                let mut fence = self.fence.lock();
+                if !fence.is_empty() {
+                    for &id in ids {
+                        fence.admit(id);
+                    }
+                }
+            }
+            Membership::Relabelled(_) | Membership::Resized(_) => {}
+        }
         for (model, partition) in self.partitions.load().iter() {
             let mut pool = partition.lock();
             let listed = pool.members.len();
@@ -568,7 +618,18 @@ impl Lifecycle for Bucket {
                 }
                 Membership::Replaced { old, new } => pool.rename(old, new),
                 Membership::Snapshot(ids) => {
-                    pool.retain(ids);
+                    // The workers the snapshot does not name leave, each
+                    // fenced before its partition forgets it.
+                    let gone = pool.unnamed(ids);
+                    if !gone.is_empty() {
+                        let mut fence = self.fence.lock();
+                        for &id in &gone {
+                            fence.retire(id, now);
+                        }
+                    }
+                    for id in gone {
+                        pool.remove(id);
+                    }
                     false
                 }
                 // A worker joins from a view of its pool: the feed names an
@@ -629,14 +690,39 @@ impl Scorer for Bucket {
             if pool.left {
                 continue;
             }
-            let loads = match pool.seat(candidates, kept) {
+            let loads = match pool.seat(candidates, kept, |_| false) {
                 Some(loads) => loads,
                 None => {
-                    // A survivor the partition never listed: the view's rows
-                    // join, and the listing is split again before the cut.
-                    pool.list(candidates);
-                    self.relist(&partition, &pool.members);
-                    match pool.seat(candidates, kept) {
+                    // A survivor the partition does not list: the view's
+                    // rows join, and the listing is split again before the
+                    // cut. A worker the lifecycle pruned a moment ago joins
+                    // nowhere: the view is older than its leave, so it is
+                    // seated nowhere and scores zero, and the others are
+                    // placed as if the view did not show it.
+                    // The fence is read once for the view's rows and let
+                    // go before the listing. The partition's guard, which
+                    // the feed's walk needs, is what keeps a leave behind
+                    // this decision.
+                    let fenced: Vec<WorkerId> = {
+                        let mut fence = self.fence.lock();
+                        fence.expire(Instant::now());
+                        if fence.is_empty() {
+                            Vec::new()
+                        } else {
+                            candidates
+                                .iter()
+                                .map(|row| row.id)
+                                .filter(|&id| fence.holds(id))
+                                .collect()
+                        }
+                    };
+                    let fenced = |id: WorkerId| fenced.contains(&id);
+                    let listed = pool.members.len();
+                    pool.list(candidates, fenced);
+                    if pool.members.len() != listed {
+                        self.relist(&partition, &pool.members);
+                    }
+                    match pool.seat(candidates, kept, fenced) {
                         Some(loads) => loads,
                         None => return TieBand::NORMALIZED,
                     }
@@ -663,6 +749,7 @@ mod tests {
     use super::*;
     use crate::{
         decision::{Pair, Pick, Target, Targets},
+        ring::FENCE,
         view::Health,
         Catalog, Constraints, PolicySpec, PoolFacts, Scratch, SpecError,
     };
@@ -1194,8 +1281,15 @@ mod tests {
         assert!(scorer.partitions.load().is_empty());
         assert!(scorer.listed.load().is_empty());
         assert!(held.lock().left, "a decision that holds it takes the next");
-        // The model's next decision lists again from an even split.
-        assert_eq!(led(&scorer, &pool, 3_000, 16 * SECOND), Some(2));
+        // The three are fenced: a view that still shows them lists none.
+        assert_eq!(led(&scorer, &pool, 3_000, 16 * SECOND), None);
+        assert_eq!(loads(&scorer), (vec![], 0));
+        // The feed names them again, and the model's next decision lists
+        // them from an even split.
+        for worker in &pool {
+            scorer.on_membership(&Membership::Added(worker.id));
+        }
+        assert_eq!(led(&scorer, &pool, 3_000, 17 * SECOND), Some(2));
         assert_eq!(loads(&scorer), (vec![0, 0, 0], 0));
     }
 
@@ -1556,5 +1650,122 @@ mod tests {
         });
         assert_eq!(loads(&scorer), (vec![100, 70], 210));
         assert_eq!(ranges(&scorer), [(0, 0, 2_729), (1, 2_730, u32::MAX)]);
+    }
+
+    #[test]
+    fn a_view_older_than_a_leave_lists_nobody_splits_nothing_and_places_the_others() {
+        let (scorer, pool) = three_classes();
+        led(&scorer, &pool, 0, 15 * SECOND);
+        scorer.on_membership(&Membership::Removed(pool[1].id));
+        assert_eq!(ranges(&scorer), [(0, 0, 400), (1, 401, u32::MAX)]);
+        // A decision whose view was captured before the leave still shows
+        // the worker. It joins nowhere, the ranges stand, and each size
+        // goes to the worker that owns it, at the row the view shows it in.
+        assert_eq!(led(&scorer, &pool, 300, 16 * SECOND), Some(0));
+        assert_eq!(led(&scorer, &pool, 2_000, 16 * SECOND), Some(2));
+        assert_eq!(ranges(&scorer), [(0, 0, 400), (1, 401, u32::MAX)]);
+        assert_eq!(loads(&scorer), (vec![1_000, 3_000], 6_000));
+        assert_eq!(scorer.listed.load().len(), 2, "the index names the two");
+        // The leaver alone among the survivors: nobody is seated, and the
+        // picker's draw places the request.
+        assert_eq!(
+            led_by(&scorer, &prefill("m", 300, 16 * SECOND), &pool, &[1]),
+            None
+        );
+        assert_eq!(ranges(&scorer).len(), 2);
+    }
+
+    #[test]
+    fn a_partition_first_seen_through_a_view_older_than_a_leave_lists_the_others() {
+        let scorer = scorer(NEVER, 1.5, 5);
+        let pool = pool(3);
+        // The worker left before the model's first prefill decision, whose
+        // view was captured before the leave.
+        scorer.on_membership(&Membership::Removed(pool[1].id));
+        assert_eq!(led(&scorer, &pool, 3_000, SECOND), Some(2));
+        assert_eq!(ranges(&scorer), [(0, 0, 2_047), (1, 2_048, u32::MAX)]);
+        assert_eq!(loads(&scorer), (vec![0, 0], 0));
+    }
+
+    #[test]
+    fn the_feed_naming_a_worker_again_lifts_its_fence() {
+        // Added: the worker joins from the next view that shows it.
+        let (scorer, pool) = booked(NEVER, 1.5, &[100, 40]);
+        let gone = pool[1].id;
+        scorer.on_membership(&Membership::Removed(gone));
+        led(&scorer, &pool, 0, 2 * SECOND);
+        assert_eq!(loads(&scorer), (vec![100], 140), "fenced");
+        scorer.on_membership(&Membership::Added(gone));
+        led(&scorer, &pool, 0, 2 * SECOND);
+        assert_eq!(loads(&scorer), (vec![100, 0], 140), "named again");
+
+        // A replacing handle: the id comes back as the new handle of a
+        // worker this model never listed.
+        let (scorer, pool) = booked(NEVER, 1.5, &[100, 40]);
+        scorer.on_membership(&Membership::Removed(gone));
+        scorer.on_membership(&Membership::Replaced {
+            old: WorkerId(7),
+            new: gone,
+        });
+        led(&scorer, &pool, 0, 2 * SECOND);
+        assert_eq!(loads(&scorer), (vec![100, 0], 140));
+
+        // A snapshot that names it.
+        let (scorer, pool) = booked(NEVER, 1.5, &[100, 40]);
+        scorer.on_membership(&Membership::Removed(gone));
+        scorer.on_membership(&Membership::Snapshot(&[pool[0].id, gone]));
+        led(&scorer, &pool, 0, 2 * SECOND);
+        assert_eq!(loads(&scorer), (vec![100, 0], 140));
+    }
+
+    #[test]
+    fn a_replaced_handle_and_a_snapshot_s_leavers_are_fenced_as_a_removed_worker_is() {
+        // The old handle of a replacement: a view older than the word still
+        // shows it, and it joins as nobody.
+        let (scorer, pool) = booked(NEVER, 1.5, &[100, 40]);
+        let fresh = WorkerId(900);
+        scorer.on_membership(&Membership::Replaced {
+            old: pool[1].id,
+            new: fresh,
+        });
+        led(&scorer, &pool, 0, 2 * SECOND);
+        assert_eq!(loads(&scorer), (vec![100, 40], 140), "it stands once");
+        // A replacement by the same handle fences nothing.
+        scorer.on_membership(&Membership::Replaced {
+            old: fresh,
+            new: fresh,
+        });
+        assert!(!scorer.fence.lock().is_retired(fresh, Instant::now()));
+
+        // The workers a snapshot does not name.
+        let (scorer, pool) = three_classes();
+        scorer.on_membership(&Membership::Snapshot(&[pool[2].id]));
+        assert_eq!(led(&scorer, &pool, 300, 12 * SECOND), Some(2));
+        assert_eq!(loads(&scorer), (vec![3_000], 6_000));
+    }
+
+    #[test]
+    fn the_fence_lapses_after_its_window_and_the_worker_joins_from_a_view_again() {
+        let now = Instant::now();
+        // A leave as the membership call makes it, dated half a fence back.
+        let (scorer, pool) = booked(NEVER, 1.5, &[100, 40]);
+        let gone = pool[1].id;
+        let half = now.checked_sub(FENCE / 2).expect("half a fence back");
+        scorer.fence.lock().retire(gone, half);
+        of(&scorer, "m").lock().remove(gone);
+        led(&scorer, &pool, 0, 2 * SECOND);
+        assert_eq!(loads(&scorer), (vec![100], 140), "still fenced");
+
+        // The same leave a whole fence back: the id may be a new worker's.
+        let (scorer, pool) = booked(NEVER, 1.5, &[100, 40]);
+        let whole = now.checked_sub(FENCE).expect("a whole fence back");
+        scorer.fence.lock().retire(gone, whole);
+        of(&scorer, "m").lock().remove(gone);
+        led(&scorer, &pool, 0, 2 * SECOND);
+        assert_eq!(loads(&scorer), (vec![100, 0], 140), "lapsed");
+        assert!(
+            scorer.fence.lock().is_empty(),
+            "the decision that listed forgot the lapsed retirement"
+        );
     }
 }
