@@ -224,9 +224,16 @@ impl Row {
         let mut held = 0;
         let mut next_end = None;
         self.vetoes.retain(|_, ends| {
-            ends.retain(|&(_, end)| end > now);
+            // One pass over a worker's ends drops the ends past and keeps
+            // the earliest end left: one more compare an end kept.
+            ends.retain(|&(_, end)| {
+                let stands = end > now;
+                if stands && next_end.is_none_or(|next: Instant| end < next) {
+                    next_end = Some(end);
+                }
+                stands
+            });
             held += ends.len();
-            next_end = ends.iter().map(|&(_, end)| end).chain(next_end).min();
             !ends.is_empty()
         });
         self.held = held;
