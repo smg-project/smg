@@ -53,7 +53,7 @@
   ],
   "$defs": {
     "ViewSpec": {
-      "description": "What the host builds into every decision's view beyond the facts it\nderives itself: the request headers a stage may read, and the hashing\ninputs a host keeps until it learns them from its engines.",
+      "description": "What the host builds into every decision's view beyond the facts it\nderives itself: the request headers a stage may read, the hashing\ninputs a host keeps until it learns them from its engines, and the\nlists a worker's row names its labels, its zone and its engine family\nby.",
       "type": "object",
       "properties": {
         "headers": {
@@ -91,6 +91,30 @@
           "minimum": 1,
           "maximum": 8190,
           "default": 256
+        },
+        "labels": {
+          "description": "The worker labels a stage may read, each a selector of one label\nkey: `key` (the worker carries the label, whatever its value) or\n`key=value` (it carries the label with that value), split at the\nfirst `=`. A worker's row holds one bit for each selector it meets,\nin this order. At most 64; empty for none.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 64
+        },
+        "zones": {
+          "description": "The zones a stage may tell apart. A worker's row names its zone by\nits position in this list, from 1; a worker with no zone reads 0,\nand so does one whose zone this list does not name. At most 256;\nempty for none, where every row reads 0.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 256
+        },
+        "engines": {
+          "description": "The engine families a stage may tell apart, spelled as a worker's\nregistration spells its own. A worker's row names its family by its\nposition in this list, from 1; a worker whose family this list does\nnot name reads 0. At most 64; empty for none, where every row reads\n0.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 64
         }
       },
       "additionalProperties": false

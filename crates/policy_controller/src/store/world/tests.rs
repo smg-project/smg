@@ -10,7 +10,7 @@ use std::{
 };
 
 use super::{
-    run_of, seek, Ask, Built, Classes, GatewayRun, PairBuffers, PoolVeto, PoolVetoes,
+    run_of, seek, Ask, Built, Classes, GatewayRun, OutsideLists, PairBuffers, PoolVeto, PoolVetoes,
     StaleGeneration, ViewBuffers, World, Writer, PUBLISH_WINDOW, WALKED_RUNS,
 };
 use crate::{
@@ -1392,10 +1392,9 @@ fn a_row_carries_its_registrations_fixed_facts_and_reads_its_own_rank() {
         (0, 0, 0)
     );
     assert!(!row.has_capacity && !row.has_room && !row.health.overloaded);
-    assert_eq!(
-        (row.zone, row.labels, row.engine_kind, row.connector),
-        (0, 0, 0, 0)
-    );
+    assert_eq!(row.connector, 0);
+    // Under a generation that declares no list the listed fields read 0.
+    assert_eq!((row.zone, row.labels, row.engine_kind), (0, 0, 0));
     assert!(!row.vision && !row.ec_compatible && !row.session_hit);
 
     // The row reads the record of its own rank, never another rank's.
@@ -4435,4 +4434,203 @@ fn a_dropped_gateways_vetoes_leave_in_one_publication_and_every_other_stands() {
     store.drop_gateway(ASKER);
     store.drop_gateway(GatewayId(3));
     assert!(Arc::ptr_eq(&lifted, &store.world()));
+}
+
+/// A generation that declares the view's three lists.
+fn generation_listing(
+    number: u64,
+    labels: &[&str],
+    zones: &[&str],
+    engines: &[&str],
+) -> AppliedSpec {
+    let mut document = PolicySpec::preset("round_robin").expect("a preset of this build");
+    document.generation = number;
+    let owned = |list: &[&str]| list.iter().map(|name| (*name).to_string()).collect();
+    document.view.labels = owned(labels);
+    document.view.zones = owned(zones);
+    document.view.engines = owned(engines);
+    AppliedSpec::validate(&document).expect("the document validates")
+}
+
+/// A worker of the model that names an engine family, a zone and labels.
+fn listed_member(
+    store: &MemoryStore,
+    key: &str,
+    engine: &str,
+    zone: Option<&str>,
+    labels: &[(&str, &str)],
+) -> WorkerId {
+    let labels = labels.iter();
+    let facts = WorkerFacts {
+        engine_kind: engine.to_string(),
+        zone: zone.map(str::to_string),
+        labels: labels
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect(),
+        ..facts(key, Role::Single, &[MODEL])
+    };
+    store.upsert(facts).id()
+}
+
+/// What a member's row reads in the three listed fields: its engine family,
+/// its zone, its labels.
+fn listed(world: &World, id: WorkerId) -> (u16, u16, u64) {
+    let rows = rows_of(world, MODEL);
+    let row = rows.iter().find(|row| row.id == id);
+    let row = row.expect("the member's row");
+    (row.engine_kind, row.zone, row.labels)
+}
+
+#[test]
+fn a_row_names_its_engine_family_and_zone_by_position_and_holds_a_bit_a_label() {
+    let store = MemoryStore::new();
+    let lists = generation_listing(
+        1,
+        &["tier", "tier=gold", "pool=a"],
+        &["east", "west"],
+        &["alpha", "beta"],
+    );
+    store.apply(lists).expect("applied");
+    let gold = listed_member(&store, "gold", "beta", Some("west"), &[("tier", "gold")]);
+    let labels = [("tier", "silver"), ("pool", "a")];
+    let silver = listed_member(&store, "silver", "alpha", None, &labels);
+    // A position counts from 1 in the list's order. A bit a selector, in
+    // the list's order: a key alone is met by any value of it.
+    let world = store.world();
+    assert_eq!(listed(&world, gold), (2, 2, 0b011));
+    assert_eq!(listed(&world, silver), (1, 0, 0b101));
+    assert_eq!(store.outside_lists(), OutsideLists::default());
+    // A family or a zone the lists do not name is admitted, reads 0 and is
+    // counted under its list. A worker that names neither is not counted.
+    let stray = listed_member(&store, "stray", "gamma", Some("north"), &[("pool", "b")]);
+    let bare = listed_member(&store, "bare", "", None, &[]);
+    let world = store.world();
+    assert_eq!(listed(&world, stray), (0, 0, 0));
+    assert_eq!(listed(&world, bare), (0, 0, 0));
+    assert_eq!(listed(&world, gold), (2, 2, 0b011));
+    let outside = OutsideLists {
+        engines: 1,
+        zones: 1,
+    };
+    assert_eq!(store.outside_lists(), outside);
+}
+
+#[test]
+fn an_apply_whose_lists_differ_reads_every_member_again_in_its_first_world() {
+    let store = MemoryStore::new();
+    let west = listed_member(&store, "w", "beta", Some("west"), &[("tier", "gold")]);
+    let north = listed_member(&store, "n", "beta", Some("north"), &[]);
+    // No generation, no list: every field reads 0 and nothing is outside.
+    assert_eq!(listed(&store.world(), west), (0, 0, 0));
+    assert_eq!(store.outside_lists(), OutsideLists::default());
+    let zones = ["east", "west"];
+    let engines = ["alpha", "beta"];
+    store
+        .apply(generation_listing(1, &["tier=gold"], &zones, &engines))
+        .expect("applied");
+    // The apply's own world holds the rows of its own lists.
+    let first = store.world();
+    assert_eq!(first.spec().generation(), 1);
+    assert_eq!(listed(&first, west), (2, 2, 0b1));
+    assert_eq!(listed(&first, north), (2, 0, 0));
+    let outside = OutsideLists {
+        engines: 0,
+        zones: 1,
+    };
+    assert_eq!(store.outside_lists(), outside);
+    // The same lists under the next number: no member is read again, and
+    // the pool's rows are the ones the last world listed.
+    store
+        .apply(generation_listing(2, &["tier=gold"], &zones, &engines))
+        .expect("applied");
+    let second = store.world();
+    assert_eq!(second.spec().generation(), 2);
+    assert!(Arc::ptr_eq(
+        &rows_of(&first, MODEL),
+        &rows_of(&second, MODEL)
+    ));
+    assert_eq!(store.outside_lists(), outside);
+    // Other lists: the positions and the bits move with them.
+    store
+        .apply(generation_listing(
+            3,
+            &["zone", "tier=gold"],
+            &["north", "west"],
+            &["beta"],
+        ))
+        .expect("applied");
+    let third = store.world();
+    assert_eq!(listed(&third, west), (1, 2, 0b10));
+    assert_eq!(listed(&third, north), (1, 1, 0));
+    assert_eq!(store.outside_lists(), OutsideLists::default());
+    // A generation that declares none: every field reads 0 again.
+    store.apply(generation(4)).expect("applied");
+    let fourth = store.world();
+    assert_eq!(listed(&fourth, west), (0, 0, 0));
+    assert_eq!(listed(&fourth, north), (0, 0, 0));
+    assert_eq!(store.outside_lists(), OutsideLists::default());
+}
+
+/// A generation that declares zones and engine families under the pairing
+/// `mode`.
+fn generation_listing_pairing(
+    number: u64,
+    mode: Pairing,
+    zones: &[&str],
+    engines: &[&str],
+) -> AppliedSpec {
+    let mut document = PolicySpec::preset("round_robin").expect("a preset of this build");
+    document.generation = number;
+    document.plans.pd_pair.pairing = mode;
+    let owned = |list: &[&str]| list.iter().map(|name| (*name).to_string()).collect();
+    document.view.zones = owned(zones);
+    document.view.engines = owned(engines);
+    AppliedSpec::validate(&document).expect("the document validates")
+}
+
+#[test]
+fn an_apply_that_derives_the_classes_again_reads_every_member_under_its_own_lists() {
+    let store = MemoryStore::new();
+    let west = listed_member(&store, "w", "beta", Some("west"), &[]);
+    let north = listed_member(&store, "n", "gamma", Some("north"), &[]);
+    let lenient = Pairing::default();
+    store
+        .apply(generation_listing_pairing(1, lenient, &["west"], &["beta"]))
+        .expect("applied");
+    assert_eq!(listed(&store.world(), west), (1, 1, 0));
+    let outside = OutsideLists {
+        engines: 1,
+        zones: 1,
+    };
+    assert_eq!(store.outside_lists(), outside);
+    // Another mode and other lists in one generation: the classes are
+    // derived by the membership write's door, whose rows are new, and its
+    // one world holds them under the generation's own lists.
+    let zones = ["north", "west"];
+    store
+        .apply(generation_listing_pairing(
+            2,
+            Pairing::Off,
+            &zones,
+            &["gamma"],
+        ))
+        .expect("applied");
+    let second = store.world();
+    assert_eq!(second.spec().generation(), 2);
+    assert_eq!(listed(&second, north), (1, 1, 0));
+    assert_eq!(listed(&second, west), (0, 2, 0));
+    let outside = OutsideLists {
+        engines: 1,
+        zones: 0,
+    };
+    assert_eq!(store.outside_lists(), outside);
+    // Another mode and no list: every field reads 0, and the member the
+    // last generation counted outside a list is counted no more.
+    store
+        .apply(generation_pairing(3, Pairing::Strict))
+        .expect("applied");
+    let third = store.world();
+    assert_eq!(listed(&third, north), (0, 0, 0));
+    assert_eq!(listed(&third, west), (0, 0, 0));
+    assert_eq!(store.outside_lists(), OutsideLists::default());
 }

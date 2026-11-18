@@ -33,8 +33,8 @@ use crate::{
             WorkerStatus, WorkersStore,
         },
         world::{
-            micros, same_offer, Ask, Built, Classes, PairBuffers, StaleGeneration, ViewBuffers,
-            World, Writer, PUBLISH_WINDOW,
+            micros, same_offer, Ask, Built, Classes, OutsideLists, PairBuffers, StaleGeneration,
+            ViewBuffers, World, Writer, PUBLISH_WINDOW,
         },
         GatewayId,
     },
@@ -227,8 +227,9 @@ impl MemoryStore {
     }
 
     /// Apply a generation: every world from here on is published under
-    /// `spec`, the first at once, with the standing membership. The store's
-    /// one entry for a generation; a store starts under
+    /// `spec`, the first at once, with the standing membership, each row's
+    /// engine family, zone and labels read under the generation's own
+    /// lists. The store's one entry for a generation; a store starts under
     /// [`AppliedSpec::unbound`].
     ///
     /// The number only rises. A generation whose number is not above the
@@ -443,6 +444,14 @@ impl MemoryStore {
     /// nothing.
     pub fn overload_flips(&self) -> u64 {
         self.loads.lock().writer.flips()
+    }
+
+    /// How many members of the standing membership name an engine family
+    /// or a zone that the standing generation's list does not hold, by the
+    /// list. Such a worker is admitted and reads position 0 in that field;
+    /// a generation that declares no list counts none.
+    pub fn outside_lists(&self) -> OutsideLists {
+        self.loads.lock().writer.outside()
     }
 
     /// How many workers the load table holds an entry for.
