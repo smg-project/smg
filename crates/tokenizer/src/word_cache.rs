@@ -719,6 +719,32 @@ mod tests {
         serde_json::to_string(&late).expect("the model serializes")
     }
 
+    /// The entries read before the kind is known go back in front, in the
+    /// file's order, for the crate's reader: a BPE section with its keys
+    /// sorted (`byte_fallback`, then a key no Unigram section has),
+    /// `byte_fallback` then `type`, and a map vocabulary before `type`.
+    #[test]
+    fn the_entries_read_before_the_kind_is_known_reach_the_crate_reader() {
+        let fields: std::collections::BTreeMap<String, Value> =
+            serde_json::from_str(&full_bpe_json()).expect("a BPE section");
+        let section = |first: &[&str]| {
+            let entry = |key: &str| format!("{}:{}", Value::from(key), fields[key]);
+            let rest = fields
+                .keys()
+                .filter(|key| !first.contains(&key.as_str()))
+                .map(|key| entry(key));
+            let entries: Vec<String> = first.iter().map(|key| entry(key)).chain(rest).collect();
+            format!("{{{}}}", entries.join(","))
+        };
+        for json in [
+            section(&[]),
+            section(&["byte_fallback", "type"]),
+            section(&["vocab", "byte_fallback"]),
+        ] {
+            assert_eq!(loading_reading(&json), crate_reading(&json), "{json}");
+        }
+    }
+
     /// A BPE with every field off its default: what the one-pass read must
     /// carry through to the builder.
     fn full_bpe_json() -> String {
