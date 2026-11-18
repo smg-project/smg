@@ -1603,6 +1603,8 @@ struct Replica {
 
 /// The leader's address and the standby's: one host, two addresses, so
 /// both listen on one replication port as replicas configured alike do.
+/// Linux routes the second with no alias. Another host refuses its bind:
+/// a case that binds it is ignored there, with that reason.
 const LEADER: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
 const FOLLOWER: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2));
 
@@ -1769,6 +1771,10 @@ async fn promoted(addr: SocketAddr) -> proto::Snapshot {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "the follower binds 127.0.0.2: off Linux that takes a loopback alias"
+)]
 async fn a_promoted_standby_holds_every_row_and_load_row_of_its_leader() {
     let dir = tempfile::tempdir().expect("a temp dir");
     let mut leader = Replica::serve("replication-0", LEADER, 0, shared(&dir)).await;
@@ -1845,6 +1851,10 @@ async fn a_promoted_standby_holds_every_row_and_load_row_of_its_leader() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "the follower binds 127.0.0.2: off Linux that takes a loopback alias"
+)]
 async fn a_standby_that_joins_late_is_restored_whole_from_a_snapshot_past_one_message() {
     let dir = tempfile::tempdir().expect("a temp dir");
     let mut leader = Replica::serve("replication-0", LEADER, 0, shared(&dir)).await;
@@ -1893,6 +1903,10 @@ async fn a_standby_that_joins_late_is_restored_whole_from_a_snapshot_past_one_me
 /// reader that holds nothing is fed it whole, then the new term's start. A
 /// standby restored from a snapshot tells such a reader to start again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "the follower binds 127.0.0.2: off Linux that takes a loopback alias"
+)]
 async fn a_promoted_standby_feeds_a_reader_that_holds_nothing_from_its_leaders_first_write() {
     let dir = tempfile::tempdir().expect("a temp dir");
     let mut leader = Replica::serve("replication-0", LEADER, 0, shared(&dir)).await;
@@ -2041,6 +2055,10 @@ async fn sample(admin: SocketAddr, series: &str) -> String {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "the follower binds 127.0.0.2: off Linux that takes a loopback alias"
+)]
 async fn a_standby_passes_its_probes_only_while_it_is_synced_with_its_leader() {
     let dir = tempfile::tempdir().expect("a temp dir");
     let mut leader = Replica::serve("replication-0", LEADER, 0, shared(&dir)).await;
