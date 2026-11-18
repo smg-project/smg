@@ -570,8 +570,29 @@ mod tests {
         assert!(!blocks.settled(id(10, 1), 4));
     }
 
+    /// A block's number is past a byte. A block behind the first 256 names
+    /// its file as any block does: by the leading table, by the table a
+    /// rise keeps, and by its own number once no table holds its term.
+    #[test]
+    fn a_block_past_the_first_256_names_its_file_as_any_block_does() {
+        let blocks = Blocks::default();
+        // The first file holds the blocks up to 300 and the second claims
+        // block 301, which a byte would read as block 45, the first's.
+        let [held, next] = [300_u32, 301].map(|block| block << BLOCK_BITS);
+        let mut first = blocks.spend(0, u32::MAX - held + 1, 0);
+        let mut second = Minted::default();
+        let minted = [first.mint(&blocks, 0, 0), second.mint(&blocks, 0, 2)];
+        assert_eq!(minted, [Some(held), Some(next)]);
+        let lease = id(0, next);
+        assert_eq!(blocks.file_of(lease, 3), 2, "the leading table");
+        blocks.rise(1, [lease].into_iter());
+        assert_eq!(blocks.file_of(lease, 3), 2, "the kept table");
+        blocks.rise(2, std::iter::empty());
+        assert_eq!(blocks.file_of(lease, 3), 1, "its number, 301, among 3");
+    }
+
     /// A claim is one atomic step of the block count: two files that claim
-    /// at once take the 256 blocks of a term between them, each block
+    /// at once take the blocks of a term between them, each block
     /// once, whichever of them takes it. Every wait ends at the case's
     /// bound and a file claims no more than two terms' blocks: a claim
     /// that never fails, or a claimer that leaves, fails the case.
