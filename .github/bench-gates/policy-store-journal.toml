@@ -1,13 +1,13 @@
 # Regression gate for `cargo bench -p smg-policy-controller --bench store_journal`, run by
 # .github/workflows/benchmark-policy-store-journal.yml on pull requests through scripts/bench_gate.py.
 #
-# The gate runs the twenty-nine single-threaded rows of the store's journal. Twenty-seven are at 8, 64 and 512
+# The gate runs the thirty-three single-threaded rows of the store's journal. Thirty are at 8, 64 and 512
 # workers, each beside its twin on a store with no journal (`plain`): one load record's write with a journal of
 # every kind (`policy_store_journal/load_write/journaled/<n>`) and with one of the watched kinds alone
-# (`.../load_write/watched/<n>`), one status write (`.../status_write/<kind>/<n>`), one membership write
-# (`.../member_write/<kind>/<n>`) and a decision's view build beside a journaled store
-# (`.../view_build/<kind>/<n>`). Two read a batch out of the log, 16 and 256 events
-# (`policy_store_journal/read/<events>`).
+# (`.../load_write/watched/<n>`), one status write (`.../status_write/<kind>/<n>`, `told` the journaled write
+# on a log with a listener), one membership write (`.../member_write/<kind>/<n>`) and a decision's view build
+# beside a journaled store (`.../view_build/<kind>/<n>`). Three read the log: a batch of 16 and of 256 events
+# (`policy_store_journal/read/<events>`) and a watch's read at the head (`.../read/watched_at_head`).
 #
 # The filter leaves out the binary's other rows: the cut's rows (`policy_store_journal/cut/`) and the write beside
 # a draining reader (`policy_store_journal/load_write_drained/`), which is for a run pinned to two cores.

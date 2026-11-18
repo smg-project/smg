@@ -117,6 +117,12 @@ impl Kept {
         self.events.range(from..)
     }
 
+    /// None of the ring's events: what a reader of the other ring's kinds
+    /// takes of this one, with no look at it.
+    fn none(&self) -> vec_deque::Iter<'_, Entry> {
+        self.events.range(self.events.len()..)
+    }
+
     /// The last event's place; the floor while none is retained.
     fn head(&self) -> Position {
         self.events.back().map_or(self.floor, |entry| entry.at)
@@ -488,15 +494,13 @@ impl Log {
             return Err(Lost);
         }
         let mut watched = ring.watched.after(after.seq).peekable();
-        // No position is after the last: a reader of the watched kinds
-        // reads no load row.
-        let mut loads = ring
-            .loads
-            .after(match kinds {
-                Kinds::All => after.seq,
-                Kinds::Watched => u64::MAX,
-            })
-            .peekable();
+        // A reader of the watched kinds reads no load row, and its read
+        // looks at none: that ring is written at the load rows' pace.
+        let mut loads = match kinds {
+            Kinds::All => ring.loads.after(after.seq),
+            Kinds::Watched => ring.loads.none(),
+        }
+        .peekable();
         let mut batch_term = None;
         let mut ended = false;
         while out.len() < at_most {
