@@ -614,9 +614,12 @@ def test_a_spec_store_renders_its_claim_its_mount_and_its_flag(tmp_path):
     assert found["args"][-2:] == ["--spec-store", STORE_MOUNT]
     assert found["args"][:-2] == controller_args()[:-2]
     assert "--spec-file" not in found["args"]
-    # One pod at a time holds the claim: the old pod stops before the new
-    # one is made.
-    assert deployment["strategy"] == LONE_STRATEGY
+    # One pod at a time opens the store: the old pod is gone before the new
+    # one is made, where the document's form waits for its stop signal
+    # alone. The rolling update's fields are named as nothing, which takes
+    # them off a live object.
+    assert deployment["strategy"] == {"type": "Recreate", "rollingUpdate": None}
+    assert one(render(*ON), "Deployment")["spec"]["strategy"] == LONE_STRATEGY
     # The read-only root filesystem stands: the store is a volume of its own.
     assert found["securityContext"]["readOnlyRootFilesystem"] is True
     assert pod["securityContext"] == {"fsGroup": 65532}
@@ -626,6 +629,15 @@ def test_a_spec_store_renders_its_claim_its_mount_and_its_flag(tmp_path):
     }
     unnamed = render(*STORED, "policyController.securityContext.runAsUser=null")
     assert "securityContext" not in one(unnamed, "Deployment")["spec"]["template"]["spec"]
+    # A number of a values file is a float there: the group is written digit
+    # for digit, as the container's user is.
+    wide = tmp_path / "wide.yaml"
+    user = {"securityContext": {"runAsUser": 1000680000}}
+    wide.write_text(yaml.safe_dump({"policyController": user}))
+    written = helm_template(STORED, files=(wide,))
+    assert written.returncode == 0, written.stderr
+    assert "fsGroup: 1000680000\n" in written.stdout
+    assert "runAsUser: 1000680000\n" in written.stdout
     # The document's form names no group: its mount is read-only.
     assert "securityContext" not in one(render(*ON), "Deployment")["spec"]["template"]["spec"]
     # A name of digits alone stays text in the manifest.
@@ -651,6 +663,9 @@ def test_a_spec_store_is_refused_beside_what_the_controller_refuses(tmp_path):
         f"policyController.specStoreClaim names {CLAIM} and policyController.spec holds a"
         " document: the controller refuses a start that names two sources of its policy spec"
     ) in both
+    # Over reused values an empty map clears nothing: the refusal says the
+    # null that does.
+    assert "Set policyController.spec to null" in both
     document = spec_values(tmp_path, LEAST_LOAD)
     assert "names two sources of its policy spec" in render_error(*STORED, files=(document,))
     for settings in ((ELECTION,), (ELECTION, "policyController.replicas=2")):
@@ -675,6 +690,25 @@ def test_a_spec_store_is_refused_beside_what_the_controller_refuses(tmp_path):
     assert "policyController.specStoreClaim: Does not match pattern" in render_error(
         SWITCH, "policyController.specStoreClaim=Not_A_Name"
     )
+
+
+def test_the_chart_says_how_many_generations_a_store_keeps():
+    """A spec store keeps its last generations by the crate's own count. The
+    values, the README and the store's example each say that count in words:
+    a count that moves fails here until the three follow."""
+    store = REPO / "crates" / "policy_controller" / "src" / "controller" / "spec_store.rs"
+    (retained,) = re.findall(
+        r"^pub\(crate\) const RETAINED: usize = (\d+);$", store.read_text(), re.M
+    )
+    word = {"8": "eight"}[retained]
+    said = {
+        surface.name: " ".join(surface.read_text().replace("#", " ").split())
+        for surface in (VALUES, CHART / "README.md", EXAMPLES / STORE_EXAMPLE)
+    }
+    for name, text in said.items():
+        assert f"holds {word} documents" in text, name
+    for name in (VALUES.name, "README.md"):
+        assert f"the last {word} " in said[name], name
 
 
 def without_the_document(documents: list[dict]) -> list[dict]:
@@ -1769,6 +1803,9 @@ def test_the_image_job_starts_on_what_these_cases_read():
         crate / "Cargo.toml",
         crate / "build.rs",
         crate / "src" / "bin" / "smg-policy-controller.rs",
+        # The store's own count of the generations it keeps, which the
+        # chart's texts say in words.
+        crate / "src" / "controller" / "spec_store.rs",
         crate / "contracts" / "smg-policy.wit",
         # The engine wire's messages the controller's protocol imports: the
         # build script reads them beside the contract.

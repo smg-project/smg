@@ -1,14 +1,17 @@
 # Router with the standalone policy controller on a spec store: the
 # controller runs the document an operator applies, kept on a claim of
 # yours, and no document of the values.
-# Make the claim first, in the release's namespace: ReadWriteOnce, on a file
-# system that links a file under a second name. It holds eight documents.
+# Make the claim first, in the release's namespace, on a file system that
+# links a file under a second name. It holds eight documents. One pod at a
+# time opens the store: ReadWriteOncePod keeps a second pod off the claim
+# while the first still stops. Where the cluster offers no such mode, write
+# ReadWriteOnce.
 #   apiVersion: v1
 #   kind: PersistentVolumeClaim
 #   metadata:
 #     name: smg-policy-spec
 #   spec:
-#     accessModes: [ReadWriteOnce]
+#     accessModes: [ReadWriteOncePod]
 #     resources:
 #       requests:
 #         storage: 64Mi
