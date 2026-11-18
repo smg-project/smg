@@ -1993,7 +1993,8 @@ mod tests {
             assert_eq!(by_old, by_new, "{tokens} tokens");
             assert!(by_old.is_some(), "{tokens} tokens have an owner");
         }
-        assert_eq!(loads(&scorer), (vec![10, 30, 50, 60], 150));
+        // The leavers' bookings stay in the window and on no worker.
+        assert_eq!(loads(&scorer), (vec![10, 30, 50, 60], 210));
     }
 
     /// The fenced rows a partition keeps are its last listing's alone: the
