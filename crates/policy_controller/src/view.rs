@@ -1062,6 +1062,73 @@ pub struct ZoneCapacity {
     pub total: u32,
 }
 
+/// The engines of a pool, as its host lists them beside the rows: each
+/// engine's rows by position, the ranks of a data-parallel engine together
+/// and in their ranks' order, a single-rank worker alone. A stage that
+/// takes the engine as the unit of its pick
+/// draws over the list and reads the rows of the engine it takes, so a
+/// decision it makes does not grow with the ranks of the engines it passes
+/// by. Empty where the host lists none: a pool with no engine of several
+/// rows, or rows whose positions are not the list's. In-process only.
+///
+/// A host that lists a pool's engines hands the pool's own rows with the
+/// list, in the order of their ids and under a membership epoch
+/// ([`PoolFacts::membership_epoch`]). A stage that finds a member's row by
+/// its id, with no pool read whole, takes the list as that word.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Engines<'a> {
+    rows: &'a [u32],
+    ends: &'a [u32],
+}
+
+impl<'a> Engines<'a> {
+    /// The list over `rows`, the positions engine after engine, and `ends`,
+    /// each engine's end in `rows` in rising order. A list whose last end
+    /// is not the count of its rows is no list, and reads as empty.
+    pub fn new(rows: &'a [u32], ends: &'a [u32]) -> Self {
+        if ends.last().is_some_and(|&end| end as usize == rows.len()) {
+            Self { rows, ends }
+        } else {
+            Self::default()
+        }
+    }
+
+    /// What tells this list from another of one host under one membership
+    /// epoch: where its rows stand in memory and how many engines it holds.
+    /// A stage that keeps what it derived of a list keys it by this and the
+    /// epoch.
+    pub fn place(&self) -> (usize, usize) {
+        (self.rows.as_ptr() as usize, self.ends.len())
+    }
+
+    /// How many engines the pool holds.
+    pub const fn len(&self) -> usize {
+        self.ends.len()
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.ends.is_empty()
+    }
+
+    /// The rows of the engine at `engine`, by position; none for a place
+    /// past the list.
+    #[inline]
+    pub fn rows(&self, engine: usize) -> &'a [u32] {
+        let from = match engine.checked_sub(1) {
+            Some(before) => self.ends.get(before).copied(),
+            None => Some(0),
+        };
+        let to = self.ends.get(engine).copied();
+        match (from, to) {
+            (Some(from), Some(to)) => self
+                .rows
+                .get(from as usize..to as usize)
+                .unwrap_or_default(),
+            _ => &[],
+        }
+    }
+}
+
 /// Pool-wide facts beside the candidates.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PoolFacts<'a> {
@@ -1104,6 +1171,10 @@ pub struct PoolFacts<'a> {
     /// ranks leave room for, every row is asked, that row with them, and
     /// the decision is the whole pass's. In-process only.
     pub reported: bool,
+    /// The pool's engines, where the host lists them ([`Engines`]): the
+    /// candidates are then the rows the list's positions name. Empty by
+    /// default, and every decision then reads rows alone.
+    pub engines: Engines<'a>,
 }
 
 #[cfg(test)]

@@ -119,8 +119,8 @@ use crate::{
         GatewayId,
     },
     view::{
-        fingerprint, AffinityFacts, Candidate, Health, OverloadRegime, Phase, PoolFacts, Role,
-        WireModes, WorkerId,
+        fingerprint, AffinityFacts, Candidate, Engines, Health, OverloadRegime, Phase, PoolFacts,
+        Role, WireModes, WorkerId,
     },
     EncodePool, EncoderFacts,
 };
@@ -329,6 +329,7 @@ impl Built {
             zones: &[],
             reach: self.reach,
             reported: self.unreported == 0,
+            engines: Engines::default(),
         }
     }
 }
@@ -358,8 +359,23 @@ pub struct PoolView<'a> {
     /// [`RequestFacts::lent_in_flight`](crate::RequestFacts::lent_in_flight)
     /// takes. `None` where the rows carry their counts.
     pub in_flight: Option<LentCounts<'a>>,
+    /// The pool's engines ([`Engines`]), where it holds one of several
+    /// rows and the candidates stand at the pool's own positions: a pool
+    /// that holds a host-local row hands none.
+    pub engines: Engines<'a>,
     /// What the view read beside the rows.
     pub built: Built,
+}
+
+impl<'a> PoolView<'a> {
+    /// The pool facts of the decision ([`Built::pool_facts`]) with the
+    /// pool's engines beside them.
+    pub fn pool_facts(&self) -> PoolFacts<'a> {
+        PoolFacts {
+            engines: self.engines,
+            ..self.built.pool_facts()
+        }
+    }
 }
 
 /// One pool's shape: what a membership build derives of it and no
@@ -390,6 +406,34 @@ struct PoolShape {
     /// row, in the rows' order, counted and carried as the classes are.
     /// `None` on every other pool.
     encoders: Option<Arc<[EncoderFacts]>>,
+    /// The pool's engines, where one of them holds several rows.
+    engines: PoolEngines,
+}
+
+/// One pool's engines: each engine's rows by position, the ranks of a
+/// data-parallel engine together and in their ranks' order, a single-rank
+/// worker alone. Empty, and unallocated, for a pool no engine of which
+/// holds two rows: a fleet of single-rank workers lists none.
+#[derive(Default)]
+struct PoolEngines {
+    /// The rows by position, engine after engine.
+    rows: Box<[u32]>,
+    /// Each engine's end in `rows`.
+    ends: Box<[u32]>,
+}
+
+impl PoolShape {
+    /// The pool's engines as a decision reads them, for rows that stand at
+    /// the pool's own positions: a pool that holds a host-local row hands
+    /// each gateway a list of its own, whose positions are not these, and
+    /// no engines with it.
+    fn engines(&self) -> Engines<'_> {
+        if self.locals.is_empty() {
+            Engines::new(&self.engines.rows, &self.engines.ends)
+        } else {
+            Engines::default()
+        }
+    }
 }
 
 /// The roles a model's pools are derived for: one slot each.
@@ -945,6 +989,18 @@ impl World {
         }
     }
 
+    /// The engines of the pool `built` read ([`Engines`]), for a decision
+    /// over the rows a build wrote ([`World::build`]) as the build left
+    /// them: a narrowing moves a row from the position the list names.
+    /// None for a pool that holds a host-local row, and for a pool no
+    /// engine of which holds two rows. `built` is a build of this world.
+    pub fn engines(&self, built: &Built) -> Engines<'_> {
+        self.derived
+            .pools
+            .get(built.pool as usize)
+            .map_or_else(Engines::default, PoolShape::engines)
+    }
+
     /// Build one decision's view of the pool serving `model` in `role` into
     /// `out`; `None`, with the buffers cleared, when no member serves it.
     ///
@@ -1121,6 +1177,7 @@ impl World {
                 pinned_at: 0,
                 affinity: &out.affinity,
                 in_flight: None,
+                engines: shape.engines(),
                 built,
             });
         }
@@ -1159,6 +1216,7 @@ impl World {
             pinned_at,
             affinity: &out.affinity,
             in_flight: Some(self.derived.counts.lend(&shape.booked, &mut out.kept)),
+            engines: shape.engines(),
             built: Built {
                 pool: index as u32,
                 pool_size: rows.len() as u32,
@@ -1483,6 +1541,90 @@ struct Entry<'a> {
     own: Overload,
     /// Its member's slot in the store's counts.
     booked: Slot,
+}
+
+/// The engines of the pool `entries` list, which stand by id: the ranks of
+/// one data-parallel engine share its group in `ranked`, and every other
+/// member is an engine alone. `placed` holds a slot a group, each free on
+/// entry and on return. Nothing is listed, and nothing allocated, where no
+/// engine of the pool holds two rows.
+fn engines_of(
+    entries: &[Entry<'_>],
+    ranked: &[(WorkerId, u32, u64)],
+    placed: &mut [u32],
+) -> PoolEngines {
+    if ranked.is_empty() {
+        return PoolEngines::default();
+    }
+    // Each row's engine, the engines numbered as they first appear, and
+    // each engine's count of rows.
+    let mut of = Vec::with_capacity(entries.len());
+    let mut sizes: Vec<u32> = Vec::new();
+    let mut next = 0;
+    for entry in entries {
+        let group = ranked_at(ranked, &mut next, entry.row.id)
+            .and_then(|(group, _)| placed.get_mut(group as usize));
+        let engine = match group {
+            Some(place) if *place != u32::MAX => *place,
+            free => {
+                let engine = sizes.len() as u32;
+                sizes.push(0);
+                if let Some(place) = free {
+                    *place = engine;
+                }
+                engine
+            }
+        };
+        if let Some(size) = sizes.get_mut(engine as usize) {
+            *size += 1;
+        }
+        of.push(engine);
+    }
+    // The groups' slots are freed for the next pool.
+    next = 0;
+    for entry in entries {
+        let group = ranked_at(ranked, &mut next, entry.row.id);
+        if let Some(place) = group.and_then(|(group, _)| placed.get_mut(group as usize)) {
+            *place = u32::MAX;
+        }
+    }
+    if sizes.len() == entries.len() {
+        return PoolEngines::default();
+    }
+    // Each engine's end, then its rows written from its start.
+    let mut ends = sizes;
+    let mut end = 0;
+    for size in &mut ends {
+        end += *size;
+        *size = end;
+    }
+    let mut at: Vec<u32> = std::iter::once(0)
+        .chain(ends.iter().copied())
+        .take(ends.len())
+        .collect();
+    let mut rows = vec![0_u32; entries.len()];
+    for (position, &engine) in (0_u32..).zip(&of) {
+        let Some(slot) = at.get_mut(engine as usize) else {
+            continue;
+        };
+        if let Some(row) = rows.get_mut(*slot as usize) {
+            *row = position;
+        }
+        *slot += 1;
+    }
+    // An engine's rows stand in its ranks' order: by id they need not.
+    let rank_of = |row: &u32| entries.get(*row as usize).map(|entry| entry.facts.dp_rank);
+    let mut from = 0;
+    for &end in &ends {
+        if let Some(engine) = rows.get_mut(from as usize..end as usize) {
+            engine.sort_unstable_by_key(rank_of);
+        }
+        from = end;
+    }
+    PoolEngines {
+        rows: rows.into_boxed_slice(),
+        ends: ends.into_boxed_slice(),
+    }
 }
 
 /// The list a membership build fills for a pool that stood at `standing`
@@ -2882,6 +3024,9 @@ impl Writer {
         self.places.clear();
         let mut by_model = FxHashMap::default();
         let mut pools = Vec::new();
+        // Each data-parallel engine's place among the engines of the pool
+        // being derived: a slot a group, free between two pools.
+        let mut placed = vec![u32::MAX; by_key.len()];
         for (model, mut sides) in groups {
             // Every side stands in id order, as the walk above pushed it,
             // before a class is derived: the classes are numbered in it, and
@@ -2952,6 +3097,7 @@ impl Writer {
                     } else {
                         None
                     },
+                    engines: engines_of(&entries, &ranked, &mut placed),
                 });
                 self.spares.push(None);
                 self.working.push(Working {

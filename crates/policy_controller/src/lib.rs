@@ -144,9 +144,9 @@ pub use spec::{
     AppliedSpec, Needs, PolicySpec, PowerOfTwoMetric, SessionsSpec, SpecError, API_VERSION, PRESETS,
 };
 pub use view::{
-    fingerprint, AffinityFacts, Candidate, Constraints, HashKind, Header, Health, Identity,
-    LoadRow, MediaCounts, ModelFingerprint, NamedAffinity, NamedHolder, OverloadRegime, Phase,
-    PinSource, PoolFacts, RequestFacts, Role, Session, SignalSource, WireModes, WorkerId,
+    fingerprint, AffinityFacts, Candidate, Constraints, Engines, HashKind, Header, Health,
+    Identity, LoadRow, MediaCounts, ModelFingerprint, NamedAffinity, NamedHolder, OverloadRegime,
+    Phase, PinSource, PoolFacts, RequestFacts, Role, Session, SignalSource, WireModes, WorkerId,
     ZoneCapacity,
 };
 

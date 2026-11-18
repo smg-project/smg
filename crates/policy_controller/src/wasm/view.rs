@@ -1666,6 +1666,7 @@ mod tests {
             zones: &zones,
             reach: 0,
             reported: false,
+            ..PoolFacts::default()
         };
         let mut packed = Packed::default();
         packed.fill_pool(&pool);
