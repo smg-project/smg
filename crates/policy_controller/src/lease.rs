@@ -104,7 +104,8 @@ pub struct Outcome {
 pub enum ReleaseReason {
     /// The host gave up before dispatch.
     Abandoned,
-    /// A late decision arrived after a fallback dispatch.
+    /// A late decision: it arrived after a fallback dispatch, or was cut
+    /// before it left.
     LateDecision,
     /// The client went away.
     ClientGone,
