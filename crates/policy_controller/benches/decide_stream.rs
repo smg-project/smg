@@ -54,13 +54,14 @@
 //! whose slot of the ring a later request took while it waited. Every
 //! decision of a row or a count cell is a pick over its fleet, or the
 //! bench stops: a setup that drifted to another outcome would print
-//! another path's numbers. A stream ends the lease an answer carries at
-//! the store's leases door as it reads the answer, as a gateway's frame
-//! ends one, so a wire row holds as many leases as it has decisions in
-//! flight and its numbers hold a lease's issue and its end. A build that
-//! files no lease answers with none: its rows run the same, and every wire
-//! row prints the leases its measured picks carried (`leases`). A row
-//! whose picks carry a lease for some and none for others stops the bench.
+//! another path's numbers. A stream ends each answer's lease through its
+//! hand at the leases' file as it reads the answer, as a session hands a
+//! gateway's frame, so a wire row holds as many leases as it has
+//! decisions in flight and its numbers hold a lease's issue and its end.
+//! A build that files no lease answers with none: its rows run the same,
+//! and every wire row prints the leases its measured picks carried
+//! (`leases`). A row whose picks carry a lease for some and none for
+//! others stops the bench.
 //! `DECIDE_STREAM_ROWS=round_trip`, `offered` or `rate` runs one kind
 //! alone, and `--test` runs every row for a moment. A run with no
 //! `--bench` is a test too, as criterion reads one: `cargo bench` passes
@@ -128,8 +129,8 @@ use smg_policy_controller::{
         GatewayFrame, Hello, RequestFacts as WireFacts,
     },
     store::{
-        Ask, GatewayId, LeaseRecord, LeaseState, LeasesStore, LoadSink, LoadSource, MemoryStore,
-        Picked, ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore,
+        Ask, GatewayId, Hand, LeaseRecord, LeaseState, LeasesStore, LoadSink, LoadSource,
+        MemoryStore, Picked, Said, ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore,
     },
     AppliedSpec, Constraints, Lease, LeaseId, LoadRow, PolicySpec, PoolFacts, ReleaseReason,
     RequestFacts, Role, Scratch,
@@ -654,24 +655,22 @@ fn gateway() -> GatewayId {
 
 /// Every decision of a row is a pick over its fleet. Another outcome means
 /// the setup drifted, and the row would print another path's numbers. The
-/// lease the pick's answer carries ends here, at the store's leases door,
-/// as a gateway's frame ends one when its request is over: a row holds as
-/// many leases as it has decisions in flight. Returns the decision's place
-/// in a stream's tally of ties ([`Tally::ties`]), by its trace's three best
-/// rows (two score alike where their scores are one value, bit for bit),
-/// and whether its answer carried a lease.
-fn picked(decision: &Decision, store: &MemoryStore, gateway: GatewayId) -> (usize, bool) {
+/// lease the pick's answer carries ends here, through the hand a session's
+/// frames go through at the leases' file, as a gateway's frame ends one
+/// when its request is over: a row holds as many leases as it has
+/// decisions in flight and frames not yet applied. Returns the decision's
+/// place in a stream's tally of ties ([`Tally::ties`]), by its trace's
+/// three best rows (two score alike where their scores are one value, bit
+/// for bit), and whether its answer carried a lease.
+fn picked(decision: &Decision, store: &MemoryStore, hand: &Hand) -> (usize, bool) {
     assert!(
         matches!(decision.outcome, Some(Outcome::Pick(_))),
         "a pick over the fleet: {decision:?}"
     );
     let lease = decision.leases.first();
     if let Some(lease) = lease {
-        let ended = store.released(gateway, LeaseId(lease.id), None, ReleaseReason::ClientGone);
-        assert!(
-            ended,
-            "a lease an answer carries is one the store filed: {decision:?}"
-        );
+        let ended = Said::Released(None, ReleaseReason::ClientGone);
+        store.hand(hand, LeaseId(lease.id), ended);
     }
     let top = decision.trace.as_ref().map_or(&[][..], |trace| &trace.top);
     let place = match top {
@@ -733,7 +732,7 @@ async fn hand(
 /// One stream of the shape: `in_flight` requests kept in flight until the
 /// warm and the measured decisions are answered.
 async fn ask(addr: SocketAddr, shape: Shape, store: &MemoryStore) -> Tally {
-    let gateway = gateway();
+    let ends = store.handover(gateway());
     let models: Vec<String> = (0..shape.models).map(model).collect();
     let mut client = connect(addr).await;
     let (requests, sent) = mpsc::channel(256);
@@ -772,7 +771,7 @@ async fn ask(addr: SocketAddr, shape: Shape, store: &MemoryStore) -> Tally {
             .expect("an answer, not the stream's end");
         let received = Instant::now();
         let pick = match &answer.answer {
-            Some(Answer::Decision(decision)) => Some(picked(decision, store, gateway)),
+            Some(Answer::Decision(decision)) => Some(picked(decision, store, &ends)),
             Some(Answer::Busy(_)) => {
                 tally.busy += 1;
                 None
@@ -836,7 +835,7 @@ async fn ask(addr: SocketAddr, shape: Shape, store: &MemoryStore) -> Tally {
 /// since a timer's millisecond is coarser than the gaps, and yields to its
 /// runtime each turn so the connection is read and written.
 async fn offer(addr: SocketAddr, shape: Shape, store: &MemoryStore) -> Tally {
-    let gateway = gateway();
+    let ends = store.handover(gateway());
     let models: Vec<String> = (0..shape.models).map(model).collect();
     let mut client = connect(addr).await;
     let (requests, sent) = mpsc::channel(256);
@@ -895,7 +894,7 @@ async fn offer(addr: SocketAddr, shape: Shape, store: &MemoryStore) -> Tally {
             .expect("an answer, not the stream's end");
         let received = Instant::now();
         let pick = match &answer.answer {
-            Some(Answer::Decision(decision)) => Some(picked(decision, store, gateway)),
+            Some(Answer::Decision(decision)) => Some(picked(decision, store, &ends)),
             Some(Answer::Busy(_)) => {
                 tally.busy += 1;
                 None

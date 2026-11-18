@@ -114,6 +114,19 @@ pub struct Dispatch {
     pub since_decision_micros: u32,
 }
 
+/// What is said of a lease, as a session hands a frame's word and a
+/// `Decide` stream a release to the leases' file
+/// ([`MemoryStore::hand`](super::MemoryStore::hand)).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Said {
+    /// The dispatch the frame names, and the instant the frame was read.
+    Dispatched(Dispatch, Instant),
+    /// The outcome of the side that ended.
+    Completed(Outcome),
+    /// The side given up, where the frame names one, and the reason.
+    Released(Option<Side>, ReleaseReason),
+}
+
 /// Why a lease was not recorded.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LeaseRefused {

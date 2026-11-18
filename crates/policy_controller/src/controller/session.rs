@@ -62,7 +62,7 @@ use super::{
 };
 use crate::{
     proto::{self, controller_frame, gateway_frame::Frame},
-    store::{leases::DISPATCH_TTL, GatewayId},
+    store::{leases::DISPATCH_TTL, Hand},
     view::WorkerId,
 };
 
@@ -384,6 +384,9 @@ async fn session(
         "a gateway is welcomed"
     );
 
+    // The session's hand-over at the leases' file: what its frames say of
+    // a lease is handed there, and applied before the session leaves.
+    let hand = lifecycle::open(&shared.store, gateway);
     let status = loop {
         tokio::select! {
             frame = inbound.message() => {
@@ -392,7 +395,7 @@ async fn session(
                     Ok(None) => break None,
                     Err(status) => break Some(unread("a Session frame", status)),
                 };
-                if let Some(status) = judge(shared, &principal.subject, gateway, term, &seat, &frame, answers).await {
+                if let Some(status) = judge(shared, &principal.subject, &hand, term, &seat, &frame, answers).await {
                     break Some(status);
                 }
             }
@@ -409,6 +412,7 @@ async fn session(
         }
     };
     debug!(gateway = %principal.subject, term, ended = ?status.as_ref().map(Status::code), "a gateway's session ended");
+    shared.store.hand_back(hand);
     // The seat's drop starts the gateway's grace period.
     drop(seat);
     status
@@ -558,7 +562,7 @@ fn vetoed(seat: &Seat, veto: &proto::GatewayVeto, now: Instant) -> Option<Status
 async fn judge(
     shared: &Shared,
     subject: &str,
-    gateway: GatewayId,
+    hand: &Hand,
     term: u64,
     seat: &Seat,
     frame: &proto::GatewayFrame,
@@ -585,14 +589,12 @@ async fn judge(
             "a session stands on this stream: a second Hello needs a new stream",
         )),
         Some(Frame::Dispatched(dispatched)) => {
-            lifecycle::dispatched(&shared.store, gateway, dispatched, now).err()
+            lifecycle::dispatched(&shared.store, hand, dispatched, now).err()
         }
         Some(Frame::Completed(completed)) => {
-            lifecycle::completed(&shared.store, gateway, completed, now).err()
+            lifecycle::completed(&shared.store, hand, completed, now).err()
         }
-        Some(Frame::Released(released)) => {
-            lifecycle::released(&shared.store, gateway, released).err()
-        }
+        Some(Frame::Released(released)) => lifecycle::released(&shared.store, hand, released).err(),
         Some(Frame::Veto(veto)) => vetoed(seat, veto, now),
         Some(unserved @ (Frame::HelloPage(_) | Frame::SpecAck(_))) => Some(Status::unimplemented(
             format!("{} is not served by this build", kind(unserved)),
@@ -1537,7 +1539,7 @@ mod tests {
         assert!(judge(
             &bed.shared,
             GATEWAY,
-            gateway,
+            &super::lifecycle::open(&bed.shared.store, gateway),
             1,
             &seat,
             &report,
@@ -1553,9 +1555,17 @@ mod tests {
             .welcome(gateway, GATEWAY, 1, now)
             .expect("a seat");
         let late = frame(1, Some(Frame::Completed(a_completed(1, second))));
-        let status = judge(&bed.shared, GATEWAY, gateway, 1, &seat, &late, &mut answers)
-            .await
-            .expect("the replaced session ends");
+        let status = judge(
+            &bed.shared,
+            GATEWAY,
+            &super::lifecycle::open(&bed.shared.store, gateway),
+            1,
+            &seat,
+            &late,
+            &mut answers,
+        )
+        .await
+        .expect("the replaced session ends");
         assert_eq!(
             (status.code(), status.message()),
             (
@@ -1574,7 +1584,7 @@ mod tests {
         assert!(judge(
             &bed.shared,
             GATEWAY,
-            gateway,
+            &super::lifecycle::open(&bed.shared.store, gateway),
             1,
             &newer,
             &report,

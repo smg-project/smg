@@ -1,7 +1,11 @@
 //! The contract tests of the store ingress, run over [`MemoryStore`] through
 //! the trait objects: what every implementation of a trait promises.
 
-use std::time::{Duration, Instant};
+use std::{
+    cell::RefCell,
+    sync::{mpsc, Arc, Mutex},
+    time::{Duration, Instant},
+};
 
 use super::{
     identity, identity_of,
@@ -9,11 +13,12 @@ use super::{
     Ask, BatchFacts, BatchOutcome, ContentHash, Dispatch, GatewayId, HealthSink, KvEvent,
     KvEventSink, LeaseRecord, LeaseRefused, LeaseState, LeasesStore, LoadSink, LoadSource,
     MembershipChange, MembershipTail, MemoryStore, Picked, Pin, PollMode, Reachability,
-    ReservationKind, ReservationStore, ResyncReason, SequenceHash, SessionsStore, Signals,
+    ReservationKind, ReservationStore, ResyncReason, Said, SequenceHash, SessionsStore, Signals,
     SnapshotChunk, StoredBlock, VetoWrite, ViewBuffers, WorkerFacts, WorkerPatch, WorkerStatus,
     WorkersStore,
 };
 use crate::{
+    decider::Decider,
     decision::{Target, Targets},
     lease::{Lease, LeaseId, Membership, Outcome, ReleaseReason, Side, TransportClass},
     view::{fingerprint, LoadRow, Role, SignalSource, WorkerId},
@@ -2074,8 +2079,8 @@ fn the_store_mints_a_decisions_lease_under_its_own_term_alone() {
             term,
             ..booking(gateway, 0, a, now)
         };
-        let issued = store.issue_decided(record, world.booked_of(a));
-        issued.map(|(lease, _)| lease.id.0)
+        let issued = store.issue_decided(record, world.booked_of(a), |_| ());
+        issued.map(|lease| lease.id.0)
     };
     leases.set_term(3);
     assert_eq!(decided(3), Ok(3 << 32 | 1), "the term over its first count");
@@ -2115,8 +2120,33 @@ fn the_store_mints_a_decisions_lease_under_its_own_term_alone() {
     assert_eq!(decided(1 << 31), Err(wide));
 }
 
+thread_local! {
+    /// What the store told of leases on this thread, in the order told.
+    static TOLD: RefCell<Vec<(LeaseRecord, Said)>> = const { RefCell::new(Vec::new()) };
+    /// The decider each of those tells named, in the same order.
+    static TOLD_BY: RefCell<Vec<Option<Decider>>> = const { RefCell::new(Vec::new()) };
+}
+
+/// A teller that keeps its word for [`told`]: the record a frame found on
+/// file and what the frame said, and for [`told_by`] the decider named.
+fn heard(_: &MemoryStore, record: &LeaseRecord, said: Said, by: Option<Decider>) {
+    TOLD.with(|told| told.borrow_mut().push((*record, said)));
+    TOLD_BY.with(|told| told.borrow_mut().push(by));
+}
+
+/// The deciders [`heard`] was told since the last call, taken.
+fn told_by() -> Vec<Option<Decider>> {
+    TOLD_BY.with(|told| std::mem::take(&mut *told.borrow_mut()))
+}
+
+/// What [`heard`] kept on this thread since the last call, taken.
+fn told() -> Vec<(LeaseRecord, Said)> {
+    TOLD.with(|told| std::mem::take(&mut *told.borrow_mut()))
+}
+
 /// An issue at `at` on `target` with five seconds to its dispatch: the
-/// counter of its id, and the counters of the leases it ended.
+/// counter of its id, and the counters of the leases it ended, as the
+/// store told their end.
 fn issued_at(store: &MemoryStore, target: WorkerId, at: Instant) -> (u64, Vec<u64>) {
     let counter = |id: LeaseId| id.0 & 0xffff_ffff;
     let record = LeaseRecord {
@@ -2124,12 +2154,19 @@ fn issued_at(store: &MemoryStore, target: WorkerId, at: Instant) -> (u64, Vec<u6
         ..booking(GatewayId(1), 0, target, at)
     };
     let world = store.world();
-    let (lease, ended) = store
-        .issue_decided(record, world.booked_of(target))
+    store.tell_through(heard);
+    let before = told();
+    let lease = store
+        .issue_decided(record, world.booked_of(target), |_| ())
         .expect("minted under the store's term");
-    let abandoned = LeaseState::Released(ReleaseReason::Abandoned);
-    let ended = ended.iter().flatten().map(|record| {
-        assert_eq!(record.state, abandoned);
+    // What the issue told: the ends of the leases it found past their
+    // deadline, taken here, and the frames it applied, kept for the case.
+    let abandoned = Said::Released(None, ReleaseReason::Abandoned);
+    let (ended, applied): (Vec<_>, Vec<_>) =
+        told().into_iter().partition(|(_, said)| *said == abandoned);
+    TOLD.with(|told| told.borrow_mut().extend(before.into_iter().chain(applied)));
+    let ended = ended.iter().map(|(record, _)| {
+        assert_eq!(record.state, LeaseState::Released(ReleaseReason::Abandoned));
         counter(record.lease.id)
     });
     (counter(lease.id), ended.collect())
@@ -2292,4 +2329,517 @@ fn a_removal_and_a_sweep_reach_the_pins_of_every_shard() {
     }
     assert_eq!(sessions.expire(store.micros(later) + 1_000_000), keys / 2);
     assert!(sessions.is_empty());
+}
+
+/// A gateway's release of a lease: what the frames of these cases say.
+const GONE: Said = Said::Released(None, ReleaseReason::ClientGone);
+
+/// A store under term 1 with one ready worker and the teller that keeps
+/// its word, and `leases` leases issued on that worker at `now`: the
+/// store, the worker and the leases' ids.
+fn handed_bed(leases: u64, now: Instant) -> (Arc<MemoryStore>, WorkerId, Vec<LeaseId>) {
+    let store = Arc::new(MemoryStore::new());
+    let a = ready(&store, "http://a:1");
+    LeasesStore::set_term(&*store, 1);
+    let ids = (0..leases).map(|_| LeaseId(1 << 32 | issued_at(&store, a, now).0));
+    let ids = ids.collect();
+    drop(told());
+    (store, a, ids)
+}
+
+/// What [`heard`] was told since the last call: each lease's counter and
+/// what was said of it.
+fn told_ids() -> Vec<(u64, Said)> {
+    let told = told().into_iter();
+    told.map(|(record, said)| (record.lease.id.0 & 0xffff_ffff, said))
+        .collect()
+}
+
+#[test]
+fn a_frame_handed_where_nobody_is_at_work_is_applied_by_its_hand() {
+    let now = Instant::now();
+    let (store, a, ids) = handed_bed(2, now);
+    let hand = store.handover(GatewayId(1));
+    let dispatch = Said::Dispatched(Dispatch::default(), now);
+    store.hand(&hand, ids[0], dispatch);
+    // Told before any other take of the turn, with the record as the frame
+    // found it.
+    let kept = told();
+    assert_eq!(kept.len(), 1);
+    assert_eq!(
+        (kept[0].0.lease.id, kept[0].0.state, kept[0].1),
+        (ids[0], LeaseState::Issued, dispatch)
+    );
+    // A second dispatch, a second release and a lease not on file tell
+    // nothing.
+    store.hand(&hand, ids[0], dispatch);
+    store.hand(&hand, ids[0], GONE);
+    store.hand(&hand, ids[0], GONE);
+    store.hand(&hand, LeaseId(99), GONE);
+    assert_eq!(told_ids(), [(1, GONE)]);
+    assert_eq!(in_flight(&store), [(a, 1)]);
+}
+
+#[test]
+fn a_frame_handed_while_a_thread_is_at_work_is_left_to_that_thread() {
+    let now = Instant::now();
+    let (store, a, ids) = handed_bed(3, now);
+    let hand = store.handover(GatewayId(1));
+    let at_work = store.at_work();
+    store.hand(&hand, ids[0], GONE);
+    assert_eq!((told_ids(), in_flight(&store)), (vec![], vec![(a, 3)]));
+    // The thread at work applies it before it reads the counts,
+    at_work.apply();
+    assert_eq!(
+        (told_ids(), in_flight(&store)),
+        (vec![(1, GONE)], vec![(a, 2)])
+    );
+    // at its next issue,
+    store.hand(&hand, ids[1], GONE);
+    let (_, ended) = issued_at(&store, a, now);
+    assert_eq!((ended, told_ids()), (vec![], vec![(2, GONE)]));
+    // and once more as it leaves its work.
+    store.hand(&hand, ids[2], GONE);
+    assert_eq!(told_ids(), []);
+    drop(at_work);
+    assert_eq!(
+        (told_ids(), in_flight(&store)),
+        (vec![(3, GONE)], vec![(a, 1)])
+    );
+}
+
+/// A decider looks at what is handed before a decision reads its rows'
+/// counts, and that look never waits: a turn it finds held is its holder's.
+#[test]
+fn a_thread_at_work_does_not_wait_for_a_held_turn_before_its_reads() {
+    let store = Arc::new(MemoryStore::new());
+    let a = ready(&store, "http://a:1");
+    LeasesStore::set_term(&*store, 1);
+    let (t0, world) = (Instant::now(), store.world());
+    let (reached, parked) = mpsc::sync_channel(1);
+    let (go, word) = mpsc::sync_channel::<()>(1);
+    let (looked, seen) = mpsc::sync_channel(1);
+    let store = &store;
+    std::thread::scope(|scope| {
+        // An issuer is parked in its tell, under the turn.
+        scope.spawn(move || {
+            let record = booking(GatewayId(1), 0, a, t0);
+            let issued = store.issue_decided(record, world.booked_of(a), |_| {
+                reached.send(()).expect("the case hears the tell");
+                word.recv().expect("the case lets the issuer go");
+            });
+            issued.expect("minted under the store's term");
+        });
+        parked.recv().expect("the issue tells");
+        // A thread at work looks and reads on; it takes the turn as it
+        // leaves its work, once the issuer let it go.
+        scope.spawn(move || {
+            let at_work = store.at_work();
+            at_work.apply();
+            looked.send(()).expect("the case waits for the look");
+        });
+        let early = seen.recv_timeout(Duration::from_secs(2));
+        go.send(()).expect("the issuer holds the other end");
+        assert!(early.is_ok(), "the look waited for the turn");
+    });
+    assert!(store.unlocked());
+}
+
+#[test]
+fn a_dispatch_handed_in_time_saves_its_lease_from_the_deadlines_end() {
+    let t0 = Instant::now();
+    let (store, a, ids) = handed_bed(2, t0);
+    let hand = store.handover(GatewayId(1));
+    let _at_work = store.at_work();
+    let in_time = t0 + Duration::from_secs(1);
+    store.hand(
+        &hand,
+        ids[0],
+        Said::Dispatched(Dispatch::default(), in_time),
+    );
+    // An issue past both deadlines applies what is handed before it ends
+    // a deadline: the dispatched lease stands, the other is abandoned.
+    let late = t0 + Duration::from_secs(6);
+    assert_eq!(issued_at(&store, a, late).1, [2]);
+    let state = |id| LeasesStore::get(&*store, GatewayId(1), id).map(|record| record.state);
+    assert_eq!(state(ids[0]), Some(LeaseState::Dispatched { at: in_time }));
+    assert_eq!(state(ids[1]), None);
+}
+
+#[test]
+fn a_full_ring_makes_its_caller_apply_and_no_frame_is_dropped() {
+    let now = Instant::now();
+    let room = u64::try_from(MemoryStore::HANDOVER).expect("the ring's room is a count");
+    let (store, a, ids) = handed_bed(room + 1, now);
+    let hand = store.handover(GatewayId(1));
+    // A thread at work that does not come by: the frames wait in the ring.
+    let at_work = store.at_work();
+    for id in &ids {
+        store.hand(&hand, *id, GONE);
+    }
+    // The last found the ring full and applied it, in the order the frames
+    // were handed; its own frame waits.
+    let applied = told_ids();
+    assert_eq!(applied.len(), MemoryStore::HANDOVER);
+    assert!(applied.iter().map(|(lease, _)| *lease).eq(1..=room));
+    drop(at_work);
+    assert_eq!(
+        (told_ids(), in_flight(&store)),
+        (vec![(room + 1, GONE)], vec![(a, 0)])
+    );
+}
+
+#[test]
+fn a_streams_end_applies_what_it_handed() {
+    let now = Instant::now();
+    let (store, a, ids) = handed_bed(2, now);
+    let at_work = store.at_work();
+    let hand = store.handover(GatewayId(1));
+    store.hand(&hand, ids[0], GONE);
+    store.hand(&hand, ids[1], GONE);
+    assert_eq!(told_ids(), []);
+    // The stream's end does not wait for the thread at work.
+    store.hand_back(hand);
+    assert_eq!(
+        (told_ids(), in_flight(&store)),
+        (vec![(1, GONE), (2, GONE)], vec![(a, 0)])
+    );
+    drop(at_work);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "taken first or not at all")]
+fn a_tell_that_takes_a_door_of_the_leases_is_refused_in_a_debug_build() {
+    fn takes_a_door(store: &MemoryStore, _: &LeaseRecord, _: Said, _: Option<Decider>) {
+        let _live = LeasesStore::live(store, GatewayId(1));
+    }
+    let store = MemoryStore::new();
+    let a = ready(&store, "http://a:1");
+    LeasesStore::set_term(&store, 1);
+    store.tell_through(takes_a_door);
+    let record = booking(GatewayId(1), 0, a, Instant::now());
+    let issued = store.issue_decided(record, store.world().booked_of(a), |_| ());
+    let hand = store.handover(GatewayId(1));
+    store.hand(&hand, issued.expect("minted").id, GONE);
+}
+
+/// One hand against one thread that leaves its work, the two started
+/// together by a spin and moved a little each round. When both have ended
+/// no door of the leases is asked: the handed frame is told by then, by the
+/// thread that left or by the hand. A leaver that looked before it said it
+/// leaves would let a frame wait on a lull.
+#[test]
+fn a_frame_handed_as_a_thread_leaves_its_work_is_applied_by_one_of_the_two() {
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::SeqCst};
+    static HEARD: AtomicUsize = AtomicUsize::new(0);
+    fn counted(_: &MemoryStore, _: &LeaseRecord, _: Said, _: Option<Decider>) {
+        HEARD.fetch_add(1, SeqCst);
+    }
+    const ROUNDS: usize = 100_000;
+    const BOUND: Duration = Duration::from_secs(60);
+    /// Tells the case's two threads to end, where the case unwinds too.
+    struct Ends<'a>(&'a AtomicUsize);
+    impl Drop for Ends<'_> {
+        fn drop(&mut self) {
+            self.0.store(usize::MAX, SeqCst);
+        }
+    }
+    let store = Arc::new(MemoryStore::new());
+    let a = ready(&store, "http://a:1");
+    LeasesStore::set_term(&*store, 1);
+    store.tell_through(counted);
+    let (gateway, now, world) = (GatewayId(1), Instant::now(), store.world());
+    let marks = [const { AtomicUsize::new(0) }; 4];
+    let lease = AtomicU64::new(0);
+    let (mut short, mut ran) = (0_usize, 0_usize);
+    std::thread::scope(|scope| {
+        let (store, [round, set, go, done], lease) = (&store, &marks, &lease);
+        let next = move |seen: usize| loop {
+            let asked = round.load(SeqCst);
+            if asked != seen {
+                break asked;
+            }
+            std::hint::spin_loop();
+        };
+        let start = move |asked: usize, spins: usize| {
+            set.fetch_add(1, SeqCst);
+            // The case's end is a word to go, too.
+            while go.load(SeqCst) != asked && round.load(SeqCst) != usize::MAX {
+                std::hint::spin_loop();
+            }
+            for _ in 0..spins {
+                std::hint::spin_loop();
+            }
+        };
+        scope.spawn(move || {
+            let mut asked = next(0);
+            while asked != usize::MAX {
+                let at_work = store.at_work();
+                start(asked, asked / 24 % 24);
+                drop(at_work);
+                done.fetch_add(1, SeqCst);
+                asked = next(asked);
+            }
+        });
+        scope.spawn(move || {
+            let hand = store.handover(gateway);
+            let mut asked = next(0);
+            while asked != usize::MAX {
+                let id = LeaseId(lease.load(SeqCst));
+                start(asked, asked % 24);
+                store.hand(&hand, id, GONE);
+                done.fetch_add(1, SeqCst);
+                asked = next(asked);
+            }
+        });
+        // A round's waits are bounded and the two threads end where this
+        // one unwinds: a failure ends the case.
+        let _ends = Ends(round);
+        let wait = |count: &AtomicUsize, asked: usize| {
+            while count.load(SeqCst) != 2 * asked {
+                assert!(now.elapsed() < BOUND, "a thread of the case stopped");
+                std::hint::spin_loop();
+            }
+        };
+        for asked in 1..=ROUNDS {
+            if now.elapsed() > Duration::from_secs(20) {
+                break;
+            }
+            let record = booking(gateway, 0, a, now);
+            let issued = store.issue_decided(record, world.booked_of(a), |_| ());
+            lease.store(issued.expect("minted under the store's term").id.0, SeqCst);
+            let before = HEARD.load(SeqCst);
+            round.store(asked, SeqCst);
+            wait(set, asked);
+            go.store(asked, SeqCst);
+            wait(done, asked);
+            short += usize::from(HEARD.load(SeqCst) == before);
+            ran = asked;
+        }
+    });
+    assert!(ran > 0, "no round ran");
+    assert_eq!(short, 0, "of {ran} rounds, a handed frame waited on a lull");
+}
+
+/// A frame handed while another thread holds the turn is left to the
+/// thread at work, and that thread waits for the turn as it leaves: the
+/// frame is told once the holder lets go, with no door of the leases
+/// asked behind it.
+#[test]
+fn a_thread_that_leaves_its_work_waits_for_a_held_turn() {
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    static HEARD: AtomicUsize = AtomicUsize::new(0);
+    fn counted(_: &MemoryStore, _: &LeaseRecord, _: Said, _: Option<Decider>) {
+        HEARD.fetch_add(1, SeqCst);
+    }
+    let store = Arc::new(MemoryStore::new());
+    let a = ready(&store, "http://a:1");
+    LeasesStore::set_term(&*store, 1);
+    store.tell_through(counted);
+    let (gateway, now) = (GatewayId(1), Instant::now());
+    let first = store
+        .issue_decided(
+            booking(gateway, 0, a, now),
+            store.world().booked_of(a),
+            |_| (),
+        )
+        .expect("minted under the store's term");
+    let (reached, parked) = mpsc::sync_channel(1);
+    let (go, word) = mpsc::sync_channel::<()>(1);
+    let (left, gone) = mpsc::sync_channel(1);
+    let (early, before) = std::thread::scope(|scope| {
+        let store = &store;
+        // An issuer is parked in its issue's hook, under the turn.
+        scope.spawn(move || {
+            let record = booking(gateway, 0, a, now);
+            let issued = store.issue_decided(record, store.world().booked_of(a), |_| {
+                reached.send(()).expect("the case hears the issue");
+                word.recv().expect("the case lets the issuer go");
+            });
+            issued.expect("minted under the store's term");
+        });
+        parked.recv().expect("the issue tells");
+        // One thread is at work: a frame handed now is left to it.
+        let at_work = store.at_work();
+        let hand = store.handover(gateway);
+        let before = HEARD.load(SeqCst);
+        store.hand(&hand, first.id, GONE);
+        // It leaves its work on a thread of its own, and is not through
+        // while the turn is held.
+        scope.spawn(move || {
+            drop(at_work);
+            left.send(()).expect("the case waits for the leaver");
+        });
+        let early = gone.recv_timeout(Duration::from_millis(250)).is_ok();
+        go.send(()).expect("the issuer holds the other end");
+        (early, before)
+    });
+    assert!(!early, "the leaver was through under a held turn");
+    let told = HEARD.load(SeqCst) - before;
+    assert_eq!(
+        told, 1,
+        "the leaver applies what was handed under the held turn"
+    );
+}
+
+/// A line that prints the store from under the turn, a tell's or a panic's,
+/// does not take the turn again: it reads no count of the leases there.
+#[test]
+fn the_store_is_printed_from_under_its_leases_turn() {
+    thread_local!(static PRINTED: RefCell<String> = const { RefCell::new(String::new()) });
+    fn prints(store: &MemoryStore, _: &LeaseRecord, _: Said, _: Option<Decider>) {
+        PRINTED.with(|printed| *printed.borrow_mut() = format!("{store:?}"));
+    }
+    let store = MemoryStore::new();
+    let a = ready(&store, "http://a:1");
+    LeasesStore::set_term(&store, 1);
+    store.tell_through(prints);
+    let record = booking(GatewayId(1), 0, a, Instant::now());
+    let issued = store.issue_decided(record, store.world().booked_of(a), |_| ());
+    let hand = store.handover(GatewayId(1));
+    store.hand(&hand, issued.expect("minted").id, GONE);
+    let under = PRINTED.with(|printed| printed.borrow().clone());
+    assert!(under.contains("leases: under the turn"), "{under}");
+    let free = format!("{store:?}");
+    assert!(free.contains("leases: 0"), "{free}");
+}
+
+#[test]
+fn frames_handed_from_other_threads_are_all_applied_whoever_is_at_work() {
+    const STREAMS: usize = 4;
+    const ROUNDS: usize = 2_000;
+    let store = Arc::new(MemoryStore::new());
+    let a = ready(&store, "http://a:1");
+    LeasesStore::set_term(&*store, 1);
+    let (gateway, t0) = (GatewayId(1), Instant::now());
+    std::thread::scope(|scope| {
+        let mut streams = Vec::new();
+        for _ in 0..STREAMS {
+            let (issued, ids) = mpsc::channel::<LeaseId>();
+            let store = &store;
+            scope.spawn(move || {
+                let hand = store.handover(gateway);
+                for id in ids {
+                    store.hand(&hand, id, Said::Dispatched(Dispatch::default(), t0));
+                    store.hand(&hand, id, GONE);
+                }
+                store.hand_back(hand);
+            });
+            streams.push(issued);
+        }
+        // The deciding thread: at work for two rounds of three, away for
+        // the third, so both the thread at work and the hands apply.
+        let world = store.world();
+        for round in 0..ROUNDS {
+            let _at_work = (round % 3 != 0).then(|| store.at_work());
+            for stream in &streams {
+                let record = booking(gateway, 0, a, t0);
+                let lease = store
+                    .issue_decided(record, world.booked_of(a), |_| ())
+                    .expect("minted under the store's term");
+                stream.send(lease.id).expect("its stream reads on");
+            }
+        }
+    });
+    // Every stream applied its ring before it left: no lease stands.
+    assert_eq!(LeasesStore::live(&*store, gateway), 0);
+    assert_eq!(in_flight(&store), [(a, 0)]);
+}
+
+#[test]
+fn a_leases_events_are_told_with_the_decider_that_issued_it() {
+    let store = MemoryStore::new();
+    let a = ready(&store, "http://a:1");
+    LeasesStore::set_term(&store, 1);
+    store.tell_through(heard);
+    let (now, world) = (Instant::now(), store.world());
+    let issue = || {
+        let record = booking(GatewayId(1), 0, a, now);
+        let issued = store.issue_decided(record, world.booked_of(a), |_| ());
+        issued.expect("minted under the store's term").id
+    };
+    // One lease issued by a thread that acts as the fourth decider, one by
+    // a thread that names none.
+    let named = {
+        let _acting = Decider::new(3).enter();
+        issue()
+    };
+    let unnamed = issue();
+    // Their ends are applied by a thread that names none.
+    let hand = store.handover(GatewayId(1));
+    store.hand(&hand, named, GONE);
+    store.hand(&hand, unnamed, GONE);
+    assert_eq!(told_by(), [Some(Decider::new(3)), None]);
+}
+
+/// What a store told on any thread, by the store's address, in the order
+/// told: a lease's counter, and what was said of it or none for its issue.
+static TOLD_ACROSS: Mutex<Vec<(usize, u64, Option<Said>)>> = Mutex::new(Vec::new());
+
+fn told_across(store: &MemoryStore, lease: LeaseId, said: Option<Said>) {
+    let entry = (
+        std::ptr::from_ref(store).addr(),
+        lease.0 & 0xffff_ffff,
+        said,
+    );
+    TOLD_ACROSS
+        .lock()
+        .expect("no case fails under it")
+        .push(entry);
+}
+
+#[test]
+fn a_lease_is_told_issued_before_any_holder_ends_it() {
+    fn ended(store: &MemoryStore, record: &LeaseRecord, said: Said, _: Option<Decider>) {
+        told_across(store, record.lease.id, Some(said));
+    }
+    let store = MemoryStore::new();
+    let a = ready(&store, "http://a:1");
+    LeasesStore::set_term(&store, 1);
+    store.tell_through(ended);
+    let (t0, world) = (Instant::now(), store.world());
+    let issue = |at: Instant, parked: &dyn Fn()| {
+        let record = LeaseRecord {
+            dispatch_deadline: t0 + Duration::from_millis(1),
+            ..booking(GatewayId(1), 0, a, at)
+        };
+        let issued = store.issue_decided(record, world.booked_of(a), |lease| {
+            told_across(&store, lease.id, None);
+            parked();
+        });
+        issued.expect("minted under the store's term");
+    };
+    let issue = &issue;
+    let (reached, parked) = mpsc::sync_channel(1);
+    let (go, word) = mpsc::sync_channel::<()>(1);
+    let (done, swept) = mpsc::sync_channel(1);
+    std::thread::scope(|scope| {
+        // The first issuer is parked in its tell, under the turn.
+        scope.spawn(move || {
+            issue(t0, &|| {
+                reached.send(()).expect("the case hears the tell");
+                word.recv().expect("the case lets the issuer go");
+            });
+        });
+        parked.recv().expect("the first issue tells");
+        // A second issue past the first lease's deadline would end it: it
+        // waits for the turn, so it has swept nothing a moment later.
+        scope.spawn(move || {
+            issue(t0 + Duration::from_secs(1), &|| ());
+            done.send(()).expect("the case waits for the sweep");
+        });
+        let early = swept.recv_timeout(Duration::from_millis(100));
+        assert!(early.is_err(), "the sweep waits for the issue's tell");
+        go.send(()).expect("the issuer holds the other end");
+        swept.recv().expect("the second issue ends");
+    });
+    let me = std::ptr::from_ref(&store).addr();
+    let told = TOLD_ACROSS.lock().expect("no case fails under it");
+    let mine = told.iter().filter(|(by, ..)| *by == me);
+    let mine: Vec<_> = mine.map(|(_, lease, said)| (*lease, *said)).collect();
+    let abandoned = Some(Said::Released(None, ReleaseReason::Abandoned));
+    // The second lease is due as it is filed: its own issue ends it, and
+    // tells it issued first.
+    assert_eq!(mine, [(1, None), (2, None), (1, abandoned), (2, abandoned)]);
 }

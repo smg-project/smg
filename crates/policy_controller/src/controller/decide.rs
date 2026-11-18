@@ -36,7 +36,8 @@
 //! leader that is elsewhere leaves in its place, and with under a
 //! millisecond of the span left, the `Busy` a late decision is told. The
 //! lease of a decision stopped there does not wait for its dispatch
-//! deadline: the stream gives it up ([`lifecycle::given_up`]). A decision
+//! deadline: the stream gives it up, by a release handed to the leases'
+//! file as a `Released` frame's is ([`MemoryStore::hand`]). A decision
 //! waits in the queue as it was made ([`wire::Decided`]), and its frame is
 //! built at the send, on the thread that encodes it, with what the span
 //! has left there.
@@ -93,7 +94,7 @@ use super::{
 use crate::{
     lease::ReleaseReason,
     proto::{self, busy::Reason},
-    store::GatewayId,
+    store::{GatewayId, Hand, MemoryStore, Said},
 };
 
 /// The requests a decide stream may have unanswered: its credit at the
@@ -179,6 +180,9 @@ impl Drop for Place {
 pub(crate) struct Answers<S = Streaming<proto::DecideRequest>> {
     shared: Arc<Shared>,
     gateway: GatewayId,
+    /// The stream's hand at the leases' file: a decision stopped at the
+    /// send gives its lease up through it.
+    hand: Hand,
     /// The gateway's frames; `None` once it closed its side.
     inbound: Option<S>,
     /// The deciders' answers, and the handle each request carries to its
@@ -254,9 +258,11 @@ pub(crate) fn serve<S>(
         let _ = word.wait_for(|stop| *stop).await;
     }));
     let (sender, decided) = mpsc::channel(WINDOW as usize);
+    let hand = lifecycle::open(&shared.store, gateway);
     Ok(Answers {
         shared,
         gateway,
+        hand,
         inbound: Some(inbound),
         decided,
         sender,
@@ -328,8 +334,10 @@ impl<S> Answers<S> {
             return wire::decided(id, term, &decision, lease.as_ref());
         };
         if let Some(leased) = lease {
-            let store = &self.shared.store;
-            lifecycle::given_up(store, self.gateway, leased.lease.id, None, release);
+            // Handed as a `Released` frame's word is: whoever holds the
+            // file's turn next ends the lease and tells its engine.
+            let store: &MemoryStore = &self.shared.store;
+            store.hand(&self.hand, leased.lease.id, Said::Released(None, release));
         }
         deciders.busy(id, reason)
     }
@@ -1553,9 +1561,10 @@ mod tests {
     /// A decision its stream stops for the fence keeps no lease. A lease
     /// stands on file while its decision waits in the queue, its engine
     /// told of the issue, and a decision that leaves keeps its own. The
-    /// stream that stops one gives its lease up where it would send it:
-    /// off the file at that send, the engine that issued it told once, as
-    /// of a lease whose answer never left.
+    /// stream that stops one hands its lease's release where it would send
+    /// it. With no decider at work the lease is off the file at that send,
+    /// the engine that issued it told once, as of a lease whose answer
+    /// never left.
     #[tokio::test]
     async fn a_decision_stopped_for_the_fence_gives_its_lease_up_at_the_send() {
         let (step, at_read, release) = hold();

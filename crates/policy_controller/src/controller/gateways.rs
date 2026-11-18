@@ -922,8 +922,13 @@ pub(crate) mod tests {
         let gone = welcomed(&gateways, A, "gateway-a", TERM, t0);
         let _stands = welcomed(&gateways, B, "gateway-b", TERM, t0);
         for gateway in [A, B] {
-            lifecycle::completed(&store, gateway, &a_completed(1, served), t0)
-                .expect("the frame reads");
+            lifecycle::completed(
+                &store,
+                &lifecycle::open(&store, gateway),
+                &a_completed(1, served),
+                t0,
+            )
+            .expect("the frame reads");
         }
         gone.end(t0);
 
@@ -951,7 +956,13 @@ pub(crate) mod tests {
         let (_elector, store, gateways, t0) = leading(GRACE);
         let served = worker(&store, "http://a:8000");
         let gone = welcomed(&gateways, A, "gateway-a", TERM, t0);
-        lifecycle::completed(&store, A, &a_completed(1, served), t0).expect("the frame reads");
+        lifecycle::completed(
+            &store,
+            &lifecycle::open(&store, A),
+            &a_completed(1, served),
+            t0,
+        )
+        .expect("the frame reads");
         gone.end(t0);
 
         let _anew = welcomed(&gateways, A, "gateway-a", TERM, t0 + GRACE);
@@ -981,8 +992,13 @@ pub(crate) mod tests {
         drop(second);
         assert_eq!(gateways.sweep(t0 + GRACE), 0, "a replaced session runs");
         // Its late frame, then its end.
-        lifecycle::completed(&store, A, &a_completed(1, served), t0 + GRACE)
-            .expect("the frame reads");
+        lifecycle::completed(
+            &store,
+            &lifecycle::open(&store, A),
+            &a_completed(1, served),
+            t0 + GRACE,
+        )
+        .expect("the frame reads");
         drop(first);
         assert_eq!(gateways.sweep(t0 + GRACE), 1);
         assert!(
@@ -1050,8 +1066,13 @@ pub(crate) mod tests {
                 let gateway = GatewayId(100 + wave * 8 + n);
                 let subject = format!("gateway-{wave}-{n}");
                 let seat = welcomed(&gateways, gateway, &subject, TERM, now);
-                lifecycle::completed(&store, gateway, &a_completed(1, served), now)
-                    .expect("the frame reads");
+                lifecycle::completed(
+                    &store,
+                    &lifecycle::open(&store, gateway),
+                    &a_completed(1, served),
+                    now,
+                )
+                .expect("the frame reads");
                 seat.end(now);
             }
             assert_eq!(store.health_entries(), 8, "a completion a gateway");
