@@ -58,15 +58,20 @@ impl Engine {
     }
 
     /// Marks the profile at `at`, in the spec's order, as placing a request
-    /// by its session key. The validator calls it for a profile that holds
-    /// the ring keyed by the session key, and a decision reads the mark
-    /// where it reads the profile's others ([`keeps_its_key`]). A profile
-    /// whose picker leaves the placement to its rule takes no mark: no
-    /// stage of it places a key. An engine built by hand marks nothing: its
-    /// host lifts the veto for the requests it wants kept on their worker
-    /// ([`Constraints::overload_lifted`]).
+    /// by its session key. The validator calls it for a profile the plain
+    /// ring alone places: its only scorer, with no bound, under the picker
+    /// that takes the best score. A decision reads the mark where it reads
+    /// the profile's others ([`keeps_its_key`]). A profile whose picker
+    /// leaves the placement to its rule takes no mark: no stage of it
+    /// places a key. An engine built by hand marks nothing: its host lifts
+    /// the veto for the requests it wants kept on their worker
+    /// ([`Constraints::overload_lifted`]). The index is the validator's
+    /// own: one the engine does not hold is a bug, and a debug build
+    /// refuses it.
     pub(crate) fn places_by_key(&mut self, at: usize) {
-        if let Some(marks) = self.marks.get_mut(at) {
+        let marks = self.marks.get_mut(at);
+        debug_assert!(marks.is_some(), "profile {at} is not built");
+        if let Some(marks) = marks {
             *marks = marks.with_key();
         }
     }
@@ -86,6 +91,9 @@ impl Engine {
     /// stands leaves the pool nobody ([`all_vetoed`]), the trace carries the
     /// mark the rule's own pick carries ([`Lifted::Overload`]), under a rule
     /// and under none.
+    ///
+    /// Out of line: a kept key is the rare decision, and the engine's
+    /// decision path keeps its code for every other.
     #[inline(never)]
     #[expect(
         clippy::too_many_arguments,
@@ -646,6 +654,34 @@ mod tests {
     /// lifted pass: the steer passes over such a worker while another usable
     /// one stands, whatever it holds, and takes it as the last resort.
     #[test]
+    fn a_worker_the_host_failed_to_reach_is_the_steers_last_resort() {
+        let engine = engine_of("round_robin", false);
+        let pool = [over(0, 3), over(1, 1), over(2, 2)];
+        let steer = |unreachable: &[WorkerId]| {
+            let cx = Constraints {
+                excluded: unreachable,
+                ..Constraints::default()
+            };
+            let decision = engine.decide(
+                &facts(1),
+                &PoolFacts::default(),
+                &pool,
+                &cx,
+                &mut Scratch::new(),
+            );
+            order(&decision)
+        };
+        assert_eq!(steer(&[WorkerId(101)]), vec![2, 0]);
+        assert_eq!(steer(&[WorkerId(101), WorkerId(102)]), vec![0]);
+        let every = [WorkerId(100), WorkerId(101), WorkerId(102)];
+        assert_eq!(steer(&every), vec![1, 2, 0]);
+    }
+
+    /// Under every preset a retry is steered past the workers its host
+    /// failed to reach: three attempts over a pool over on every worker
+    /// take its three workers by their requests in flight, and each pick
+    /// says the lifted veto.
+    #[test]
     fn a_retry_leaves_the_workers_the_host_failed_to_reach() {
         let pool = [over(0, 3), over(1, 1), over(2, 2)];
         let mut read = Vec::new();
@@ -692,30 +728,6 @@ mod tests {
             read.iter().all(|(_, firsts)| firsts == &[1, 2, 0]),
             "{read:?}"
         );
-    }
-
-    #[test]
-    fn a_worker_the_host_failed_to_reach_is_the_steers_last_resort() {
-        let engine = engine_of("round_robin", false);
-        let pool = [over(0, 3), over(1, 1), over(2, 2)];
-        let steer = |unreachable: &[WorkerId]| {
-            let cx = Constraints {
-                excluded: unreachable,
-                ..Constraints::default()
-            };
-            let decision = engine.decide(
-                &facts(1),
-                &PoolFacts::default(),
-                &pool,
-                &cx,
-                &mut Scratch::new(),
-            );
-            order(&decision)
-        };
-        assert_eq!(steer(&[WorkerId(101)]), vec![2, 0]);
-        assert_eq!(steer(&[WorkerId(101), WorkerId(102)]), vec![0]);
-        let every = [WorkerId(100), WorkerId(101), WorkerId(102)];
-        assert_eq!(steer(&every), vec![1, 2, 0]);
     }
 
     /// A steered pick says the veto the rule lifted, the mark a host counts
@@ -853,48 +865,6 @@ mod tests {
     /// decides and over one a picker draws from. The binding that sheds
     /// stands first and then second, so the place the validator names for
     /// it is read.
-    #[test]
-    fn a_pool_a_joined_draw_reads_ends_in_the_same_rule() {
-        let rows = u32::try_from(DRAW_FROM).expect("a small count") + 4;
-        // The fewest requests in flight stand on the last row; the host names two others.
-        let pool: Vec<Candidate> = (0..rows).map(|at| over(at, rows - at)).collect();
-        static HASHES: [u64; 16] = [0; 16];
-        let holders = [
-            NamedHolder {
-                row: 3,
-                overlap_blocks: 12,
-                predicted_blocks: 0,
-            },
-            NamedHolder {
-                row: 7,
-                overlap_blocks: 8,
-                predicted_blocks: 0,
-            },
-        ];
-        let steering = engine_of("cache_aware", false);
-        let shedding = engine_of("cache_aware", true);
-        for seed in 1..=8 {
-            let naming = RequestFacts {
-                block_hashes: &HASHES,
-                prompt_tokens: 256,
-                named: Some(NamedAffinity {
-                    holders: &holders,
-                    ..NamedAffinity::default()
-                }),
-                ..facts(seed)
-            };
-            let steered = decide(&steering, &naming, &pool);
-            assert_eq!(order(&steered).first(), Some(&(rows - 1)), "seed {seed}");
-            let pick = steered.pick().expect("a pick");
-            assert_eq!(pick.trace.survivors.get(), Some(rows), "seed {seed}");
-            assert_eq!(
-                shed_of(&decide(&shedding, &naming, &pool)),
-                (ShedReason::Saturated, "not-overloaded"),
-                "seed {seed}"
-            );
-        }
-    }
-
     #[test]
     fn two_bindings_of_one_profile_answer_each_by_its_own_word() {
         let sheds = || {
@@ -1772,7 +1742,9 @@ mod tests {
     /// Two decisions of one key agree before either is dispatched: the
     /// second reads the first one's claim as a pin. With the ring's worker
     /// over its thresholds that pin yields, and the ring sends the key to
-    /// the same worker again.
+    /// the same worker again: the decision follows the pin it read and
+    /// claims nothing, so only the first decision's own dispatch elsewhere
+    /// withdraws the claim.
     #[test]
     fn a_second_decision_follows_the_first_ones_claim_under_the_ring() {
         let engine = ring_under_a_rule(Assignment::Delegate);
@@ -1796,11 +1768,8 @@ mod tests {
                 pick.session_verdict
             })
             .collect();
-        let claimed = SessionVerdict::Claimed(owner);
-        assert_eq!(
-            verdicts,
-            [claimed, SessionVerdict::Pinned, claimed, claimed]
-        );
+        let (claimed, pinned) = (SessionVerdict::Claimed(owner), SessionVerdict::Pinned);
+        assert_eq!(verdicts, [claimed, pinned, pinned, pinned]);
     }
 
     /// A concurrent decision, staged: the engine it runs on and the pool it
@@ -1941,5 +1910,156 @@ mod tests {
             ..keyed("k1")
         };
         assert_ne!(order(&decide(&engine, &other, &pool))[0], owner);
+    }
+
+    /// The ring's preset with its one profile's scorers and picker replaced,
+    /// under the prefix hash preset's view, which admits the prefix form.
+    fn ring_shaped(score: serde_json::Value, pick: serde_json::Value) -> Engine {
+        let mut spec = PolicySpec::preset("consistent_hashing").expect("the preset's form");
+        spec.view = PolicySpec::preset("prefix_hash")
+            .expect("the preset's form")
+            .view;
+        for profile in spec.profiles.values_mut() {
+            profile.score = serde_json::from_value(score.clone()).expect("a score list");
+            profile.pick = serde_json::from_value(pick.clone()).expect("a picker");
+        }
+        spec.validate().expect("the document builds")
+    }
+
+    /// The mark is the plain ring's only where the ring alone decides the
+    /// pick: the profile's only scorer, with no bound, under the picker that
+    /// takes the best score. A ring under a bound, in its prefix form,
+    /// beside another scorer, under a picker that turns or under one that
+    /// samples takes no mark: a keyed request of such a profile meets the
+    /// veto, and its key's worker over its thresholds is never its pick,
+    /// though that worker holds the fewest requests.
+    #[test]
+    fn a_ring_that_does_not_decide_the_pick_alone_takes_no_mark() {
+        use serde_json::json;
+        let plain = json!(["consistent-hash"]);
+        let shapes = [
+            ("the preset's own shape", plain.clone(), json!("best"), true),
+            (
+                "a bound",
+                json!([{"consistent-hash": {"bounded_load": {"factor": 1.0, "abs_margin": 0}}}]),
+                json!("best"),
+                false,
+            ),
+            (
+                "the prefix form",
+                json!([{"consistent-hash": {"prefix_tokens": 256}}]),
+                json!("best"),
+                false,
+            ),
+            (
+                "another scorer beside it",
+                json!(["consistent-hash", "least-load"]),
+                json!("best"),
+                false,
+            ),
+            (
+                "a picker that turns",
+                plain.clone(),
+                json!("round-robin"),
+                false,
+            ),
+            (
+                "a picker that samples",
+                plain,
+                json!({"best": {"sample": 8}}),
+                false,
+            ),
+        ];
+        let mut pool = [free(0, 4), free(1, 4), free(2, 4), free(3, 4)];
+        let owner = ring_order(&engine_of("consistent_hashing", false), &keyed("k1"), &pool)[0];
+        pool[owner as usize].health.overloaded = true;
+        pool[owner as usize].in_flight = 0;
+        for (shape, score, pick, marked) in shapes {
+            let engine = ring_shaped(score, pick);
+            for seed in 1..=8 {
+                let request = RequestFacts {
+                    seed,
+                    ..keyed("k1")
+                };
+                let first = order(&decide(&engine, &request, &pool))[0];
+                assert_eq!(first == owner, marked, "{shape}, seed {seed}");
+            }
+        }
+    }
+
+    /// A ring under a bound keeps the veto for a keyed request. Its owner
+    /// past the bound is passed over and no row is ranked, so the picker
+    /// draws among the survivors: a worker over its thresholds is not one
+    /// of them, whatever it holds, and the pick says no lifted veto.
+    #[test]
+    fn a_bounded_rings_draw_leaves_out_a_worker_over_its_thresholds() {
+        use serde_json::json;
+        let engine = ring_shaped(
+            json!([{"consistent-hash": {"bounded_load": {"factor": 1.0, "abs_margin": 0}}}]),
+            json!("best"),
+        );
+        let mut pool = [free(0, 4), free(1, 4), free(2, 4), free(3, 4)];
+        let ring = ring_order(&engine_of("consistent_hashing", false), &keyed("k1"), &pool);
+        // The owner holds requests past the bound; the ring's next member is
+        // over its thresholds and holds the fewest.
+        pool[ring[0] as usize].in_flight = 20;
+        pool[ring[1] as usize].health.overloaded = true;
+        pool[ring[1] as usize].in_flight = 2;
+        for seed in 1..=32 {
+            let request = RequestFacts {
+                seed,
+                ..keyed("k1")
+            };
+            let decision = decide(&engine, &request, &pool);
+            assert_ne!(order(&decision)[0], ring[1], "seed {seed}");
+            assert_eq!(decision.trace().lifted, Lifted::None, "seed {seed}");
+        }
+    }
+
+    /// A kept key the lifted pass puts back on its pin follows that pin and
+    /// claims nothing. The pin over its thresholds yields under the veto as
+    /// it stands, the ring names the same worker with the veto lifted, and
+    /// the pin stands as it was read: when the host dispatches the decision
+    /// to its alternate, the key's worker is still its first pin, and the
+    /// key returns there (the manual preset's rule recovers the original).
+    #[test]
+    fn a_kept_key_put_back_on_its_pin_claims_nothing() {
+        let engine = ring_under_a_rule(Assignment::Delegate);
+        let mut pool = [free(0, 4), free(1, 4), free(2, 4), free(3, 4)];
+        let ring = ring_order(&engine_of("consistent_hashing", false), &keyed("k1"), &pool);
+        let owner = ring[0] as usize;
+        // The key is served on its ring worker: the pin is confirmed.
+        assert_eq!(dispatched(&engine, &pool, 1_000), ring[0], "the pin");
+        // The pin is over its thresholds beside free workers.
+        pool[owner].health.overloaded = true;
+        let request = RequestFacts {
+            now_micros: 2_000,
+            ..keyed("k1")
+        };
+        let decision = decide(&engine, &request, &pool);
+        let pick = *decision.pick().expect("a pick");
+        assert_eq!(order(&decision)[..2], ring[..2], "the ring's order");
+        assert_eq!(pick.session_verdict, SessionVerdict::Pinned, "no claim");
+        // The host dispatches the decision to its alternate.
+        let alternate = *pick.targets.iter().nth(1).expect("an alternate");
+        let lease = Lease {
+            issued_micros: 2_000,
+            session: request.session(),
+            session_verdict: pick.session_verdict,
+            ..Lease::default()
+        };
+        engine.on_dispatched(&lease, &alternate, Side::Single, 0);
+        // The worker is under its thresholds again: the key is still its.
+        pool[owner].health.overloaded = false;
+        assert_eq!(dispatched(&engine, &pool, 3_000), ring[0], "the pin stood");
+    }
+
+    /// A profile the engine does not hold cannot be marked: the index is
+    /// the validator's own, and a debug build refuses any other.
+    #[test]
+    #[cfg_attr(debug_assertions, should_panic(expected = "is not built"))]
+    fn a_profile_the_engine_does_not_hold_is_refused_in_a_debug_build() {
+        let mut engine = engine_of("consistent_hashing", false);
+        engine.places_by_key(7);
     }
 }

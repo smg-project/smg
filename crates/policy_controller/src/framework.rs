@@ -2222,10 +2222,10 @@ impl Marks {
     /// ([`Self::JOINED`]) that request is the draw's, and every other is
     /// the ranks'.
     const RANKED: u8 = 1 << 4;
-    /// A stage places a keyed request by its session key: under a binding
-    /// that steers, such a request keeps its key's worker over the overload
-    /// veto ([`Engine::keep`]). The validator sets it, no stage does
-    /// ([`Self::with_key`]).
+    /// The plain ring alone places a keyed request by its session key:
+    /// under a binding that steers, such a request keeps its key's worker
+    /// over the overload veto ([`Engine::keep`]). The validator sets it for
+    /// that one shape of profile, no stage does ([`Self::with_key`]).
     const KEYED: u8 = 1 << 5;
     /// The scope of a profile under the key's mark: its [`Self::SCOPED`]
     /// word stands here. A decision's opening then asks the scope's and the
@@ -3320,7 +3320,8 @@ impl Engine {
     /// overload veto as it stands, and a key no pin takes is placed by the
     /// profile with the veto lifted. Where the pass with the veto standing
     /// kept nobody, that placement says the lifted veto in its trace
-    /// ([`Lifted::Overload`]).
+    /// ([`Lifted::Overload`]). A placement that lands on one of the key's
+    /// pins again follows that pin: nothing is claimed.
     #[expect(
         clippy::too_many_arguments,
         reason = "the profile run's inputs, as run_profile takes them"
@@ -3443,6 +3444,14 @@ impl Engine {
             // claimed at the decision, so concurrent requests agree on the
             // first claim when its worker is among this decision's survivors.
             if let Some(first) = pick.targets.first().map(|t| t.id) {
+                // A kept key the lifted pass put back on one of its pins is
+                // no claim: the pin stands as it was read. A claim would
+                // mark it provisional, and an alternate's dispatch would
+                // withdraw it. The plain form never names a pin here, and
+                // carries no test for one.
+                if KEPT && pins.contains(&first) {
+                    return decision;
+                }
                 let owner = match self.sessions.claim(key, pins, first) {
                     Claim::Made(id) => {
                         pick.session_verdict = SessionVerdict::Claimed(id);

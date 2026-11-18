@@ -1161,7 +1161,7 @@
           "exclusiveMinimum": 0
         },
         "shed_when_all_vetoed": {
-          "description": "Shed with a 503 when every usable worker is vetoed, instead of\nfalling back to the least-vetoed one. The same word decides what a\nsession key does under consistent hashing while its own worker is\nvetoed: set, the key moves to the ring's next worker; unset, the\nkey stays on its worker over the veto.",
+          "description": "Shed with a 503 when every usable worker is vetoed, instead of\nfalling back to the least-vetoed one. The same word decides what a\nsession key does while its own worker is vetoed, where the ring\nalone places the request: under the single plan, in a profile whose\nonly scorer is `consistent-hash` with no `prefix_tokens` and no\n`bounded_load`, picked by `best` with no parameters, under no\nsessions rule or one that delegates. Set, the key moves to the\nring's next worker; unset, the key stays on its worker over the\nveto. Everywhere else a keyed request keeps the veto.",
           "type": "boolean",
           "default": false
         }

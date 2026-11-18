@@ -1301,9 +1301,13 @@ pub struct OverloadSpec {
     pub token_usage: Option<f32>,
     /// Shed with a 503 when every usable worker is vetoed, instead of
     /// falling back to the least-vetoed one. The same word decides what a
-    /// session key does under consistent hashing while its own worker is
-    /// vetoed: set, the key moves to the ring's next worker; unset, the
-    /// key stays on its worker over the veto.
+    /// session key does while its own worker is vetoed, where the ring
+    /// alone places the request: under the single plan, in a profile whose
+    /// only scorer is `consistent-hash` with no `prefix_tokens` and no
+    /// `bounded_load`, picked by `best` with no parameters, under no
+    /// sessions rule or one that delegates. Set, the key moves to the
+    /// ring's next worker; unset, the key stays on its worker over the
+    /// veto. Everywhere else a keyed request keeps the veto.
     pub shed_when_all_vetoed: bool,
 }
 
@@ -2435,10 +2439,9 @@ impl HashDepth {
 }
 
 /// One profile's stages, built when this build carries every one of them,
-/// and whether one of them keeps a session key on its worker over the
-/// overload veto: the ring stage in its plain form, not in its prefix form.
-/// `depth` is deepened to what the built stages read of a request's block
-/// hashes.
+/// and whether the profile keeps a session key on its worker over the
+/// overload veto: the plain ring alone decides its pick. `depth` is
+/// deepened to what the built stages read of a request's block hashes.
 fn check_profile(
     name: &str,
     p: &ProfileSpec,
@@ -2462,7 +2465,7 @@ fn check_profile(
     }
     let mut scorers = Vec::with_capacity(p.score.len());
     let mut complete = true;
-    let mut by_key = false;
+    let mut plain_ring = false;
     for (i, entry) in p.score.iter().enumerate() {
         let entry_at = At::new(format!("{}.score[{i}]", at.0));
         let stage = match scored(entry, name, &entry_at, catalog)? {
@@ -2480,11 +2483,11 @@ fn check_profile(
             Resolved::Built(scorer) => {
                 let read = HashDepth::of_scorer(&stage, &view.boundaries, scorer.needs());
                 depth.deepen(read);
-                // The ring's prefix form takes no mark, though a request's
-                // key leads its prefix there: the gateway's prefix hash
-                // moves a key off a worker over its thresholds.
-                by_key |=
-                    matches!(&stage, ScoreStage::ConsistentHash(p) if p.prefix_tokens.is_none());
+                plain_ring |= matches!(
+                    &stage,
+                    ScoreStage::ConsistentHash(ring)
+                        if ring.prefix_tokens.is_none() && ring.bounded_load.is_none()
+                );
                 scorers.push(Weighted {
                     scorer,
                     weight: stage.weight(),
@@ -2503,6 +2506,20 @@ fn check_profile(
             None
         }
     };
+    // The key's mark: the plain ring alone decides the profile's pick. It
+    // is the only scorer, with no bound, under `best` named bare, so the
+    // key's owner holds the best score and the picker takes it. The engine
+    // lifts the overload veto for the whole run of a marked profile, and
+    // only in this shape does that run keep the key on its owner. A bound
+    // passes an owner over and ranks no row, another scorer can outweigh
+    // the owner, and a picker that draws, turns or samples does not follow
+    // the ring: each keeps the veto for a keyed request. The prefix form
+    // takes no mark either, though a request's key leads its prefix there:
+    // the gateway's prefix hash moves a key off a worker over its
+    // thresholds.
+    let by_key = plain_ring
+        && p.score.len() == 1
+        && matches!(&p.pick, PickSpec::Name(picker) if picker == "best");
     // A host that makes some lifecycle calls only holds no stage that needs
     // them: it would decide on state nothing keeps. Every entry of a
     // complete profile is built, so a scorer stands at its entry's place.
