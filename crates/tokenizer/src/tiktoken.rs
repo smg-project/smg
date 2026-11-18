@@ -533,9 +533,35 @@ impl TiktokenTokenizer {
             structural_controls,
         } = vocabulary;
 
-        // Build special tokens encoder for CoreBPE (needs FxHashMap)
-        let special_tokens_encoder: FxHashMap<String, Rank> =
-            specials.iter().map(|(k, &v)| (k.clone(), v)).collect();
+        // The added tokens by text: the order the direct encoder takes them
+        // in, and the one that shows a token that begins with another.
+        let mut by_text: Vec<(String, TokenIdType)> = specials
+            .iter()
+            .map(|(token, &id)| (token.clone(), id))
+            .collect();
+        by_text.sort();
+        let one_begins_another = by_text
+            .windows(2)
+            .any(|pair| pair[1].0.starts_with(pair[0].0.as_str()));
+
+        // Build special tokens encoder for CoreBPE (needs FxHashMap). Of two
+        // special tokens that begin at one place the file's own encoder takes
+        // the one this map walks first, and the walk follows the order the
+        // tokens go in. Where one token begins with another they go in by
+        // ascending id, the order the format's own loader hands them over,
+        // so every load reads the same way. No other vocabulary reads by the
+        // order, and its map is filled as it comes.
+        let special_tokens_encoder: FxHashMap<String, Rank> = if one_begins_another {
+            let mut by_id: Vec<(Rank, &String)> =
+                specials.iter().map(|(text, &id)| (id, text)).collect();
+            by_id.sort_unstable();
+            by_id
+                .into_iter()
+                .map(|(id, text)| (text.clone(), id))
+                .collect()
+        } else {
+            specials.iter().map(|(k, &v)| (k.clone(), v)).collect()
+        };
 
         // Calculate true vocab size from max token ID (handles sparse/reserved IDs),
         // build the text-to-id map (borrowing the ranks) and the added tokens' texts
@@ -552,7 +578,7 @@ impl TiktokenTokenizer {
             .iter()
             .map(|(text, &id)| (id, text.clone()))
             .collect();
-        let native = Self::native_encoder(&ranks, &pattern, &specials);
+        let native = Self::native_encoder(&ranks, &pattern, &by_text);
         let tokenizer = Arc::new(CoreBPE::new(ranks, special_tokens_encoder, &pattern)?);
         // Counted and announced once the file's own encoder has loaded too,
         // the point the Hugging Face path counts at as well (before the chat
@@ -718,14 +744,9 @@ impl TiktokenTokenizer {
     fn native_encoder(
         ranks: &FxHashMap<Vec<u8>, Rank>,
         pattern: &str,
-        added_tokens: &HashMap<String, TokenIdType>,
+        specials: &[(String, TokenIdType)],
     ) -> Option<Arc<NativeEncoder>> {
-        let mut specials: Vec<(String, TokenIdType)> = added_tokens
-            .iter()
-            .map(|(token, &id)| (token.clone(), id))
-            .collect();
-        specials.sort();
-        match NativeEncoder::from_ranks(ranks, pattern, &specials) {
+        match NativeEncoder::from_ranks(ranks, pattern, specials) {
             Ok(native) => Some(Arc::new(native)),
             Err(declined) => {
                 tracing::info!(
@@ -2801,6 +2822,40 @@ mod tests {
             kimi.encode(&short, false).unwrap().token_ids(),
             other.encode(&short, false).unwrap().token_ids()
         );
+    }
+
+    /// The byte vocabulary with three controls and one more added token,
+    /// `extra`, that is the beginning of one of them.
+    fn begins_another_dir(extra: &str) -> tempfile::TempDir {
+        let config = serde_json::json!({"added_tokens_decoder": {
+            "300": {"content": "</s:x>", "special": true},
+            "301": {"content": "[INST:x]", "special": true},
+            "302": {"content": "[/INST:x]", "special": false},
+            "303": {"content": extra, "special": false},
+        }});
+        write_tiktoken_dir(&full_byte_tiktoken_model(), &config.to_string(), None)
+    }
+
+    /// Of two added tokens that begin at one place the file's own encoder
+    /// takes the one its map of them walks first. The tokens go into that
+    /// map by ascending id, so every load of the same files reads the same
+    /// way: the way the format's reference package reads them when it is
+    /// handed the tokens in that order.
+    #[test]
+    fn two_added_tokens_that_begin_at_one_place_read_the_same_at_every_load() {
+        for (extra, end, open) in [
+            ("</s:", &[303, 120, 62][..], &[301][..]),
+            ("[INST:x", &[300][..], &[301][..]),
+        ] {
+            let dir = begins_another_dir(extra);
+            for load in 0..32 {
+                let tokenizer = TiktokenTokenizer::from_dir(dir.path()).unwrap();
+                assert!(!tokenizer.uses_native_encoder());
+                let ids = |text: &str| tokenizer.encode(text, false).unwrap().token_ids().to_vec();
+                assert_eq!(ids("</s:x>"), end, "{extra}, load {load}");
+                assert_eq!(ids("[INST:x]"), open, "{extra}, load {load}");
+            }
+        }
     }
 
     /// A file whose ranks give a complete merge table and whose pattern
