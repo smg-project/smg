@@ -75,9 +75,10 @@ ELECTION = "policyController.election.enabled=true"
 ELECTED = (*ON, ELECTION)
 # The spellings of an election that is off.
 OFF = ((), ("policyController.election.enabled=false",), ("policyController.election=null",))
-# The strategy of a controller with the election off: no pod more at a
-# time, so the old pod is told to stop before the new one is made. The type
-# is the rolling update's, as with the election on.
+# The strategy of a controller on a document with the election off: no pod
+# more at a time, so the old pod is told to stop before the new one is made.
+# The type is the rolling update's, as with the election on. A controller on
+# a spec store recreates its pod instead.
 LONE_STRATEGY = {"type": "RollingUpdate", "rollingUpdate": {"maxSurge": 0, "maxUnavailable": 1}}
 # The variable the elected controller's address is read from: the kubelet
 # writes the pod's address in place of $(POD_IP).
@@ -1242,12 +1243,15 @@ def test_the_rollout_follows_the_election():
 def test_with_the_election_off_an_upgrade_tells_the_old_pod_to_stop_first():
     """Off, every pod leads alone, and the server's own strategy starts the
     new pod beside the old one: two leaders until the new one is ready. The
-    lone controller rolls with no pod more at a time. Its strategy keeps the
-    rolling update's type and names both of its fields, as the elected one
-    does. The API refuses those fields beside Recreate, and a server-side
-    apply takes off a live object only what it put there: the server's own,
-    on a Deployment that named no strategy, would stay. So no upgrade
-    between the three strategies has a field to take off."""
+    lone controller on a document rolls with no pod more at a time. Its
+    strategy keeps the rolling update's type and names both of its fields,
+    as the elected one does. The API refuses those fields beside Recreate,
+    and a server-side apply takes off a live object only what it put there:
+    the server's own, on a Deployment that named no strategy, would stay. So
+    no upgrade between these three strategies has a field to take off. The
+    fourth, a spec store's, recreates and names the rolling update's fields
+    as nothing: an upgrade to it takes them off, and its case is the store's
+    render."""
     for off in OFF:
         assert one(render(*ON, *off), "Deployment")["spec"]["strategy"] == LONE_STRATEGY, off
     served = {
@@ -1779,9 +1783,10 @@ def test_the_image_job_starts_on_what_these_cases_read():
     """The job that runs these cases on the image's binary starts when
     something they read changes: this file, what configures its run and
     every file of the chart a render reads. The chart's alert rule tests are
-    read by no case, so they start nothing. The chart's README and the two
-    publishing workflows are each read by one render case and by no binary
-    case: the unit job, which starts on every pull request, runs those. The
+    read by no case, so they start nothing. The chart's README is read by one
+    render case and, as text, by the case of the store's count, and the two
+    publishing workflows by one render case each. No binary case reads
+    them: the unit job, which starts on every pull request, runs those. The
     binary the cases run is built by the image's file from the crate's
     manifest, build script, source and contracts under the pinned toolchain,
     and from the engine wire's messages the protocol imports: the job starts
