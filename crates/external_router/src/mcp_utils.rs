@@ -1412,6 +1412,97 @@ mod tests {
         );
     }
 
+    /// A refreshed tool is never in the inventory without the argument
+    /// mapping its configuration sets: the listing's tools take their
+    /// mappings before they go in. Two thousand tools are configured with a
+    /// mapping each, and a reader on its own thread reads the first of them
+    /// in a loop through one whole refresh. The second refresh's listing
+    /// reaches the server only after the first's write-back, and ends the
+    /// read.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refreshed_tool_keeps_its_argument_mapping() {
+        let names: &'static [&'static str] = (0..2000)
+            .map(|n| &*format!("tool-{n}").leak())
+            .collect::<Vec<_>>()
+            .leak();
+        let changed = Arc::new(Notify::new());
+        let arrived = Arc::new(Notify::new());
+        let url = serve_local_mcp_server(LocalServer {
+            tools: Some(names),
+            changed: Some(Arc::clone(&changed)),
+            arrived: Some(Arc::clone(&arrived)),
+            ..Default::default()
+        })
+        .await;
+        let with_mapping = || ToolConfig {
+            arg_mapping: Some(smg_mcp::ArgMappingConfig {
+                defaults: HashMap::from([("limit".to_string(), json!(5))]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let orchestrator = Arc::new(McpOrchestrator::new(McpConfig::default()).await.unwrap());
+        orchestrator
+            .connect_static_server(&McpServerConfig {
+                name: "conf".to_string(),
+                transport: McpTransport::Streamable {
+                    url,
+                    token: None,
+                    headers: HashMap::new(),
+                },
+                proxy: None,
+                required: false,
+                tools: Some(
+                    names
+                        .iter()
+                        .map(|name| (name.to_string(), with_mapping()))
+                        .collect(),
+                ),
+                builtin_type: None,
+                builtin_tool_name: None,
+                internal: false,
+            })
+            .await
+            .expect("the server connects");
+        // The first load's listing.
+        arrived.notified().await;
+
+        let (spinning, spins) = oneshot::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let reader = tokio::task::spawn_blocking({
+            let (orchestrator, stop) = (Arc::clone(&orchestrator), Arc::clone(&stop));
+            move || {
+                let inventory = orchestrator.tool_inventory();
+                let mapped = || {
+                    inventory
+                        .get_entry("conf", names[0])
+                        .is_some_and(|entry| entry.arg_mapping.is_some())
+                };
+                let mut always = mapped();
+                let _ = spinning.send(());
+                // Its own end: were a wait below to time out, a reader still
+                // looping would hold the runtime open and hang the test.
+                let end = std::time::Instant::now() + Duration::from_secs(30);
+                while !stop.load(Ordering::SeqCst) && std::time::Instant::now() < end {
+                    always &= mapped();
+                }
+                always
+            }
+        });
+        spins.await.expect("the reader runs");
+        for _ in 0..2 {
+            changed.notify_one();
+            tokio::time::timeout(Duration::from_secs(10), arrived.notified())
+                .await
+                .expect("a refresh's listing reaches the server");
+        }
+        stop.store(true, Ordering::SeqCst);
+        assert!(
+            reader.await.expect("the reader ends"),
+            "a reader found the tool with its argument mapping at every read through a refresh"
+        );
+    }
+
     /// Waits for one of the local server's signals, ten seconds at most;
     /// `step` names what did not happen.
     async fn reached(signal: &Notify, step: &str) {

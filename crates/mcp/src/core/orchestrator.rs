@@ -55,7 +55,8 @@ use tracing::{debug, error, info, warn};
 
 use super::{
     config::{
-        BuiltinToolType, McpConfig, McpProxyConfig, McpServerConfig, McpTransport, Prompt, Resource,
+        ArgMappingConfig, BuiltinToolType, McpConfig, McpProxyConfig, McpServerConfig,
+        McpTransport, Prompt, Resource,
     },
     handler::{HandlerRequestContext, RefreshRequest, SmgClientHandler},
     metrics::McpMetrics,
@@ -154,20 +155,46 @@ async fn resources_of<S: rmcp::service::Service<RoleClient>>(
     }
 }
 
+/// The argument mapping a tool config sets.
+fn arg_mapping_of(config: &ArgMappingConfig) -> ArgMapping {
+    let mut mapping = ArgMapping::new();
+    for (from, to) in &config.renames {
+        mapping = mapping.with_rename(from, to);
+    }
+    for (key, value) in &config.defaults {
+        mapping = mapping.with_default(key, value.clone());
+    }
+    for (key, value) in &config.overrides {
+        mapping = mapping.with_override(key, value.clone());
+    }
+    mapping
+}
+
 /// Puts a server's tool listing into the inventory in place: the listing
 /// goes in (a tool of the same name is overwritten), then what the server no
 /// longer lists goes out with the aliases that target it. A reader finds
 /// every tool both listings hold at every moment; an empty listing leaves
-/// the server without tools.
-fn swap_server_tools(inventory: &ToolInventory, server_key: &str, tools: Vec<ToolEntry>) {
+/// the server without tools. A tool goes in with the argument mapping
+/// `config` sets on the tool itself, so a call never finds it without; a
+/// tool with an alias carries its mapping on the alias.
+fn swap_server_tools(inventory: &ToolInventory, config: &McpServerConfig, tools: Vec<ToolEntry>) {
     let listed: HashSet<String> = tools
         .iter()
         .map(|entry| entry.tool_name().to_string())
         .collect();
-    for entry in tools {
+    for mut entry in tools {
+        let direct = config
+            .tools
+            .as_ref()
+            .and_then(|configs| configs.get(entry.tool_name()))
+            .filter(|tool_config| tool_config.alias.is_none())
+            .and_then(|tool_config| tool_config.arg_mapping.as_ref());
+        if let Some(mapping) = direct {
+            entry.arg_mapping = Some(arg_mapping_of(mapping));
+        }
         inventory.insert_entry(entry);
     }
-    inventory.retain_server_tool_entries(server_key, &listed);
+    inventory.retain_server_tool_entries(&config.name, &listed);
 }
 
 /// Puts a server's prompts into the inventory.
@@ -229,8 +256,9 @@ fn register_alias(
     Ok(())
 }
 
-/// Applies a server config's tool settings (aliases and argument mappings) to
-/// the server's entries in the inventory.
+/// Applies a server config's aliases, each with its argument mapping, to the
+/// server's entries in the inventory. A tool without an alias took its
+/// mapping when its listing went in (`swap_server_tools`).
 fn apply_tool_configs(inventory: &ToolInventory, config: &McpServerConfig) {
     let Some(tools) = &config.tools else {
         return;
@@ -244,21 +272,9 @@ fn apply_tool_configs(inventory: &ToolInventory, config: &McpServerConfig) {
             );
             continue;
         }
-        let arg_mapping = tool_config.arg_mapping.as_ref().map(|cfg| {
-            let mut mapping = ArgMapping::new();
-            for (from, to) in &cfg.renames {
-                mapping = mapping.with_rename(from, to);
-            }
-            for (key, value) in &cfg.defaults {
-                mapping = mapping.with_default(key, value.clone());
-            }
-            for (key, value) in &cfg.overrides {
-                mapping = mapping.with_override(key, value.clone());
-            }
-            mapping
-        });
         // If there's an alias, register it
         if let Some(alias_name) = &tool_config.alias {
+            let arg_mapping = tool_config.arg_mapping.as_ref().map(arg_mapping_of);
             if let Err(e) =
                 register_alias(inventory, alias_name, &config.name, tool_name, arg_mapping)
             {
@@ -271,12 +287,6 @@ fn apply_tool_configs(inventory: &ToolInventory, config: &McpServerConfig) {
                     "Registered alias '{}' → '{}:{}'",
                     alias_name, config.name, tool_name
                 );
-            }
-        } else if let Some(mapping) = arg_mapping {
-            // No alias but has arg_mapping - update entry directly
-            if let Some(mut entry) = inventory.get_entry(&config.name, tool_name) {
-                entry.arg_mapping = Some(mapping);
-                inventory.insert_entry(entry);
             }
         }
     }
@@ -748,7 +758,7 @@ impl McpOrchestrator {
 
         // The write-back: nothing awaits between the guard and the entry.
         let slot = self.static_servers.entry(config.name.clone());
-        swap_server_tools(&self.tool_inventory, key, tools);
+        swap_server_tools(&self.tool_inventory, config, tools);
         self.tool_inventory.clear_server_prompts(key);
         if let Some(prompts) = prompts {
             install_prompts(&self.tool_inventory, key, prompts);
@@ -772,7 +782,7 @@ impl McpOrchestrator {
         Ok(())
     }
 
-    /// Apply tool configurations from server config (aliases and arg mappings).
+    /// Apply tool configurations from server config (aliases with their arg mappings).
     fn apply_tool_configs(&self, config: &McpServerConfig) {
         apply_tool_configs(&self.tool_inventory, config);
     }
@@ -867,9 +877,10 @@ impl McpOrchestrator {
                             // made. Prompts and resources are cleared only
                             // when their own listing succeeded, so one that
                             // fails keeps what the server had. The tools are
-                            // swapped in place, so a reader finds every tool
-                            // both listings hold. The config's aliases and
-                            // argument mappings go over the result, as at a
+                            // swapped in place, each with the argument
+                            // mapping its config sets, so a reader finds
+                            // every tool both listings hold, whole. The
+                            // config's aliases go over the result, as at a
                             // connect.
                             let key = request.server_key.as_str();
                             let Ok(tools) =
@@ -892,7 +903,7 @@ impl McpOrchestrator {
                                 Some(entry) if Arc::ptr_eq(&entry.client, &client) => entry,
                                 _ => continue,
                             };
-                            swap_server_tools(&tool_inventory, key, tools);
+                            swap_server_tools(&tool_inventory, &config, tools);
                             if let Some(prompts) = prompts {
                                 tool_inventory.clear_server_prompts(key);
                                 install_prompts(&tool_inventory, key, prompts);
@@ -2686,14 +2697,8 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_tool_configs_sets_direct_arg_mapping() {
+    fn a_listed_tool_goes_in_with_its_direct_arg_mapping() {
         let orchestrator = McpOrchestrator::new_test();
-        orchestrator
-            .tool_inventory
-            .insert_entry(ToolEntry::from_server_tool(
-                "web-search",
-                create_test_tool("search_web"),
-            ));
 
         let mut tools = HashMap::new();
         tools.insert(
@@ -2720,7 +2725,14 @@ mod tests {
             ..sse_server("web-search", "http://localhost:8080/sse")
         };
 
-        orchestrator.apply_tool_configs(&config);
+        swap_server_tools(
+            &orchestrator.tool_inventory,
+            &config,
+            vec![ToolEntry::from_server_tool(
+                "web-search",
+                create_test_tool("search_web"),
+            )],
+        );
 
         let entry = orchestrator
             .tool_inventory
@@ -2731,6 +2743,64 @@ mod tests {
             mapping.defaults,
             vec![("enable_source".to_string(), serde_json::json!(true))]
         );
+        assert_eq!(
+            mapping.overrides,
+            vec![("enable_brave".to_string(), serde_json::json!(false))]
+        );
+    }
+
+    #[test]
+    fn an_aliased_tool_keeps_its_arg_mapping_on_the_alias() {
+        let orchestrator = McpOrchestrator::new_test();
+
+        let mut tools = HashMap::new();
+        tools.insert(
+            "search_web".to_string(),
+            ToolConfig {
+                alias: Some("web_search".to_string()),
+                response_format: None,
+                arg_mapping: Some(ArgMappingConfig {
+                    renames: HashMap::new(),
+                    defaults: HashMap::new(),
+                    overrides: HashMap::from([(
+                        "enable_brave".to_string(),
+                        serde_json::json!(false),
+                    )]),
+                }),
+            },
+        );
+
+        let config = McpServerConfig {
+            tools: Some(tools),
+            ..sse_server("web-search", "http://localhost:8080/sse")
+        };
+
+        swap_server_tools(
+            &orchestrator.tool_inventory,
+            &config,
+            vec![ToolEntry::from_server_tool(
+                "web-search",
+                create_test_tool("search_web"),
+            )],
+        );
+        orchestrator.apply_tool_configs(&config);
+
+        let own = orchestrator
+            .tool_inventory
+            .get_entry("web-search", "search_web")
+            .expect("tool entry should exist");
+        assert!(
+            own.arg_mapping.is_none(),
+            "the tool's own entry takes no mapping: the alias carries it"
+        );
+        let alias = orchestrator
+            .tool_inventory
+            .get_entry(ALIAS_SERVER_KEY, "web_search")
+            .expect("alias entry should exist");
+        let mapping = alias
+            .alias_target
+            .and_then(|target| target.arg_mapping)
+            .expect("the alias carries the arg mapping");
         assert_eq!(
             mapping.overrides,
             vec![("enable_brave".to_string(), serde_json::json!(false))]
