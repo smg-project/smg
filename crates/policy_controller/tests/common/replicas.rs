@@ -179,7 +179,15 @@ pub struct Replica {
     /// Where its admin endpoints listen.
     pub admin: SocketAddr,
     client: Option<PolicyControllerClient<Channel>>,
+    /// The directory of the spec source it was given where its flags named
+    /// none, kept as long as the process.
+    _spec: Option<tempfile::TempDir>,
 }
+
+/// A document of one plain profile: what a replica runs where its flags
+/// name no spec source and a store is refused.
+const PLAIN_SPEC: &str =
+    "apiVersion: smg.policy/v1\nprofiles:\n  default:\n    filter: [healthy]\n    pick: random\n";
 
 impl Replica {
     /// Starts the binary as `id` over `lease`, every listener on an
@@ -236,6 +244,7 @@ impl Replica {
         for variable in AMBIENT {
             command.env_remove(variable);
         }
+        let alone = matches!(lease, Lease::Own);
         match lease {
             Lease::File(path) => {
                 command.arg("--lease-file").arg(path);
@@ -250,6 +259,30 @@ impl Replica {
         if let Some(address) = advertise {
             command.args(["--advertise-address", address]);
         }
+        // A start names its spec's source. A replica whose flags name none
+        // takes one that changes nothing it runs where it can: a store on an
+        // empty directory, alone. Beside a lease another replica can take a
+        // store is refused, so there it takes a file of one plain profile.
+        let named = flags.iter().any(|flag| {
+            ["--spec-file", "--spec-store"]
+                .map(OsStr::new)
+                .contains(flag)
+        });
+        let spec = if named {
+            None
+        } else {
+            let dir =
+                tempfile::tempdir().map_err(|error| format!("{id}: a spec directory: {error}"))?;
+            if alone {
+                command.arg("--spec-store").arg(dir.path());
+            } else {
+                let file = dir.path().join("policy.yaml");
+                std::fs::write(&file, PLAIN_SPEC)
+                    .map_err(|error| format!("{id}: a spec file: {error}"))?;
+                command.arg("--spec-file").arg(file);
+            }
+            Some(dir)
+        };
         command
             .args(["--controller-id", id])
             .args(["--gateway-listen", "127.0.0.1:0"])
@@ -303,6 +336,7 @@ impl Replica {
             replication: unbound(),
             admin: unbound(),
             client: None,
+            _spec: spec,
         };
         let started = Instant::now();
         loop {

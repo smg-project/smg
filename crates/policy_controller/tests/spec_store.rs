@@ -1,12 +1,14 @@
 //! The policy spec's store source end to end (design 4.6): this package's
 //! binary started on a spec store, an empty directory, on ephemeral ports,
 //! and handed its document by the generated client on the control listener.
-//! An enforce is on file and runs as generation 1, the read call answers its
+//! Before any apply the start reads ready and a decision is shed, declined
+//! by the binding. An enforce is on file and runs as generation 1, the read call answers its
 //! bytes, and the next one runs as generation 2. The process is then killed
 //! and started again on the same directory: it runs generation 2 before any
 //! call, under the bytes its caller sent, rolls back to a generation the
 //! process before it wrote, and answers each generation on file by its
-//! number. A start the store refuses exits, naming why.
+//! number. A start the store refuses exits, naming why, and so does a start
+//! that names no source of its spec.
 //!
 //! The cases wait on an answer, never on a clock: a wait that outlasts its
 //! room fails with the last answer it saw.
@@ -44,12 +46,20 @@ use std::{
 use replicas::{Lease, Replica, ROOM};
 use smg_policy_controller::{
     elector::ElectionSettings,
-    proto::{ApplyMode, ApplyResult, RollbackRequest},
+    proto::{
+        controller_frame, decide_answer, decision, gateway_frame,
+        policy_controller_client::PolicyControllerClient, ApplyMode, ApplyResult, DecideRequest,
+        Decision, GatewayFrame, Hello, RequestFacts, RollbackRequest, ShedReason,
+    },
 };
 use spec::{
     answers, apply, apply_over, as_operator, control, page, read, until, LEAST_LOAD, PACE, RANDOM,
 };
-use tonic::{Code, Response, Status};
+use tokio::sync::mpsc;
+use tonic::{
+    codegen::tokio_stream::wrappers::ReceiverStream, metadata::AsciiMetadataValue, Code, Request,
+    Response, Status,
+};
 
 const BIN: &str = env!("CARGO_BIN_EXE_smg-policy-controller");
 
@@ -58,17 +68,88 @@ fn unweighed() -> String {
     LEAST_LOAD.replace("[least-load]", "[{ least-load: { weight: -1.0 } }]")
 }
 
-/// A replica that leads itself, its lease in its own process, its control
-/// listener taking the name a call states, on the spec store at `dir`.
+/// A replica that leads itself, its lease in its own process, its gateway
+/// and control listeners taking the name a call states, on the spec store
+/// at `dir`.
 fn start(id: &str, dir: &Path) -> Replica {
     let flags = [
         OsStr::new("--identity-as-told"),
-        OsStr::new("control"),
+        OsStr::new("gateway,control"),
         OsStr::new("--spec-store"),
         dir.as_os_str(),
     ];
     Replica::start_with(id, Lease::Own, ElectionSettings::default(), 0, &flags)
         .expect("the replica starts")
+}
+
+/// `frames` as a stream `gateway-a` opens.
+fn as_gateway<T>(frames: mpsc::Receiver<T>) -> Request<ReceiverStream<T>> {
+    let mut request = Request::new(ReceiverStream::new(frames));
+    request.metadata_mut().insert(
+        "x-smg-principal",
+        AsciiMetadataValue::from_static("gateway-a"),
+    );
+    request
+}
+
+/// What one `Decide` is answered on the gateway listener: asked as
+/// `gateway-a`, behind that gateway's `Hello` on a session held open.
+async fn decide(replica: &Replica) -> Option<decide_answer::Answer> {
+    let mut client = PolicyControllerClient::connect(format!("http://{}", replica.gateway))
+        .await
+        .expect("the gateway listener takes a connection");
+    let (frames, sent) = mpsc::channel(1);
+    let mut session = client
+        .session(as_gateway(sent))
+        .await
+        .expect("a session opens")
+        .into_inner();
+    let hello = Hello {
+        gateway_id: "gateway-a".to_owned(),
+        protocol_min: 1,
+        protocol_max: 1,
+        ..Hello::default()
+    };
+    frames
+        .send(GatewayFrame {
+            seq: 0,
+            term_floor: 0,
+            frame: Some(gateway_frame::Frame::Hello(hello)),
+        })
+        .await
+        .expect("the session takes the Hello");
+    let welcome = session.message().await.expect("a frame, not a status");
+    assert!(
+        matches!(
+            welcome.as_ref().and_then(|frame| frame.frame.as_ref()),
+            Some(controller_frame::Frame::Welcome(_))
+        ),
+        "{welcome:?}"
+    );
+    let (requests, sent) = mpsc::channel(1);
+    let mut answers = client
+        .decide(as_gateway(sent))
+        .await
+        .expect("a present gateway's stream opens")
+        .into_inner();
+    requests
+        .send(DecideRequest {
+            request_id: vec![1],
+            facts: Some(RequestFacts {
+                model: "model-a".to_owned(),
+                budget_micros: 5_000_000,
+                ..RequestFacts::default()
+            }),
+            constraints: None,
+        })
+        .await
+        .expect("the stream takes the request");
+    tokio::time::timeout(ROOM, answers.message())
+        .await
+        .expect("an answer inside the room")
+        .expect("an answer, not a status")
+        .expect("an answer, not the stream's end")
+        .answer
 }
 
 /// One `RollbackPolicySpec` call on the control listener, as `operator-a`.
@@ -141,9 +222,24 @@ fn refused(flags: &[&OsStr]) -> (Option<i32>, String) {
 async fn an_enforce_on_a_spec_store_runs_and_a_start_runs_it_again() {
     let dir = tempfile::tempdir().expect("a directory");
     let mut replica = start("store-0", dir.path());
-    page(&replica, "/readiness", None).await;
+    // An empty store is a source: the start reads ready before any apply,
+    // and no generation stands.
+    let ready = page(&replica, "/readiness", None).await;
+    assert!(ready.contains(r#""status":"ready""#), "{ready}");
     let nothing = read(&replica, 0).await.expect_err("nothing stands");
     assert_eq!(nothing.code(), Code::NotFound, "{nothing:?}");
+    // A decision there is generation 0's, which binds no model: a shed
+    // the binding declines, never a pick by a document nobody wrote.
+    match decide(&replica).await {
+        Some(decide_answer::Answer::Decision(Decision {
+            outcome: Some(decision::Outcome::Shed(shed)),
+            ..
+        })) => {
+            assert_eq!(shed.reason(), ShedReason::PolicyDeclined, "{shed:?}");
+            assert_eq!(shed.emptied_by, "binding", "{shed:?}");
+        }
+        other => panic!("a shed answers a decision before the first apply: {other:?}"),
+    }
 
     // A write is the leader's: the replica answers once it leads its lease.
     let led = until(
@@ -261,6 +357,20 @@ async fn an_enforce_on_a_spec_store_runs_and_a_start_runs_it_again() {
     assert_eq!(gone.code(), Code::NotFound, "{gone:?}");
     let four = BTreeSet::from([name(1), name(2), name(3), name(4)]);
     assert_eq!(on_file(dir.path()), four);
+}
+
+/// A start that names no source of the policy spec is refused by the
+/// command line, which names the two flags it takes one of. Nothing is
+/// served.
+#[test]
+fn a_start_that_names_no_spec_source_is_refused_naming_both_flags() {
+    let (code, log) = refused(&[]);
+    assert_eq!(code, Some(2), "{log}");
+    assert!(log.contains("required"), "{log}");
+    assert!(
+        log.contains("--spec-file") && log.contains("--spec-store"),
+        "{log}"
+    );
 }
 
 /// A start the store refuses exits with the refusal in its log: beside a

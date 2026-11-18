@@ -3,11 +3,10 @@
      points the router at it. With the election on the pod runs under the
      controller's own service account and mounts its token, for the one
      Lease; with it off the pod mounts none: the controller then calls no
-     Kubernetes API. With a spec document the pod mounts the document's
-     ConfigMap, read-only. */}}
+     Kubernetes API. The pod mounts the spec document's ConfigMap,
+     read-only. */}}
 {{- $controller := .Values.policyController }}
 {{- $elected := include "smg.policyControllerElection" . }}
-{{- $spec := include "smg.policyControllerSpec" . }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -125,13 +124,11 @@ spec:
             {{- toYaml . | nindent 12 }}
             {{- end }}
           {{- end }}
-          {{- if $spec }}
           {{- /* The directory of the file --spec-file names. */}}
           volumeMounts:
             - name: policy-spec
               mountPath: /etc/smg/policy-spec
               readOnly: true
-          {{- end }}
       {{- with $controller.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
@@ -156,7 +153,6 @@ spec:
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- if $spec }}
       {{- /* The spec document's ConfigMap, whole: when the document changes
            the kubelet turns a link under the mount, which the controller's
            watch follows; a file mounted by subPath is never turned. No
@@ -169,5 +165,4 @@ spec:
         - name: policy-spec
           configMap:
             name: {{ include "smg.policyControllerName" . }}
-      {{- end }}
 {{- end }}

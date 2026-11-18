@@ -7,8 +7,7 @@
 //! read call answers the next generation; a changed document under the
 //! standing line is rejected, counted once, and the running generation keeps
 //! answering. A start on a document the validator refuses exits, naming the
-//! file and the field. A start with no spec file runs as it always did: no
-//! spec call is served and no spec series rendered.
+//! file and the field.
 //!
 //! The cases wait on an answer, never on a clock: the watch looks once a
 //! second, and a wait that outlasts its room fails with the last answer it
@@ -93,12 +92,14 @@ impl Mount {
 }
 
 /// A replica that leads itself over a lease file of its own, its control
-/// listener taking the name a call states, on `file` when one is given.
-fn start(id: &str, lease: &TempDir, file: Option<&Path>) -> Replica {
-    let mut flags = vec![OsStr::new("--identity-as-told"), OsStr::new("control")];
-    if let Some(file) = file {
-        flags.extend([OsStr::new("--spec-file"), file.as_os_str()]);
-    }
+/// listener taking the name a call states, on the spec file `file`.
+fn start(id: &str, lease: &TempDir, file: &Path) -> Replica {
+    let flags = [
+        OsStr::new("--identity-as-told"),
+        OsStr::new("control"),
+        OsStr::new("--spec-file"),
+        file.as_os_str(),
+    ];
     Replica::start_with(
         id,
         Lease::File(&lease.path().join("lease")),
@@ -143,7 +144,7 @@ async fn a_probe_never_met_ends_its_wait_by_its_last_answer() {
 async fn a_replica_started_on_a_spec_file_answers_its_document() {
     let lease = tempfile::tempdir().expect("a directory");
     let mount = Mount::new(LEAST_LOAD);
-    let replica = start("spec-0", &lease, Some(&mount.file()));
+    let replica = start("spec-0", &lease, &mount.file());
 
     let first = answers(&replica, 1).await;
     assert_eq!(first.document, LEAST_LOAD.as_bytes());
@@ -159,7 +160,7 @@ async fn a_replica_started_on_a_spec_file_answers_its_document() {
     let lease = tempfile::tempdir().expect("a directory");
     let numbered = format!("generation: 41\n{LEAST_LOAD}");
     let numbered_mount = Mount::new(&numbered);
-    let replica = start("spec-1", &lease, Some(&numbered_mount.file()));
+    let replica = start("spec-1", &lease, &numbered_mount.file());
     let written = answers(&replica, 41).await;
     assert_eq!(written.document, numbered.as_bytes());
     assert_eq!(
@@ -177,7 +178,7 @@ async fn a_replica_started_on_a_spec_file_answers_its_document() {
 async fn a_swapped_link_under_a_running_replica_is_the_next_generation() {
     let lease = tempfile::tempdir().expect("a directory");
     let mut mount = Mount::new(LEAST_LOAD);
-    let replica = start("spec-watch", &lease, Some(&mount.file()));
+    let replica = start("spec-watch", &lease, &mount.file());
     let first = answers(&replica, 1).await;
 
     mount.publish(RANDOM);
@@ -224,7 +225,7 @@ async fn a_swapped_link_under_a_running_replica_is_the_next_generation() {
 async fn a_dry_run_on_a_running_replica_answers_its_verdict_and_writes_nothing() {
     let lease = tempfile::tempdir().expect("a directory");
     let mount = Mount::new(LEAST_LOAD);
-    let replica = start("spec-dry", &lease, Some(&mount.file()));
+    let replica = start("spec-dry", &lease, &mount.file());
     let first = answers(&replica, 1).await;
 
     // A write is the leader's: the replica answers once it leads its lease.
@@ -310,22 +311,4 @@ fn a_start_on_a_document_the_validator_refuses_exits_naming_the_field() {
         log.contains("profiles.default.score[0]"),
         "the field is named by its path: {log}"
     );
-}
-
-/// With no spec file a replica runs as it always did: ready, no spec call
-/// served, no spec series rendered.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_replica_with_no_spec_file_runs_as_it_did() {
-    let lease = tempfile::tempdir().expect("a directory");
-    let replica = start("spec-none", &lease, None);
-    page(&replica, "/readiness", None).await;
-
-    let unserved = read(&replica, 0).await.expect_err("no spec call is served");
-    assert_eq!(unserved.code(), Code::Unimplemented, "{unserved:?}");
-    assert_eq!(
-        unserved.message(),
-        "GetPolicySpec is not served by a controller started with no spec source"
-    );
-    let metrics = page(&replica, "/metrics", None).await;
-    assert!(!metrics.contains("smg_policy_spec"), "{metrics}");
 }

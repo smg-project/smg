@@ -8,9 +8,12 @@ const BIN: &str = env!("CARGO_BIN_EXE_smg-policy-controller");
 
 /// A start the controller refuses: the settle window is over half the grace
 /// period. It writes one line through the logger, binds nothing and exits 1.
-const REFUSED_START: [&str; 8] = [
+/// It names a spec source, as every start does, and opens none.
+const REFUSED_START: [&str; 10] = [
     "--controller-id",
     "controller-0",
+    "--spec-store",
+    "spec",
     "--runtime-worker-threads",
     "1",
     "--shutdown-settle-secs",
