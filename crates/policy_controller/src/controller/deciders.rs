@@ -1475,7 +1475,11 @@ pub(crate) mod tests {
         assert_eq!(lease.tokens, 0, "a request that states no prompt");
         let mut prompted = frame(8, 8);
         let facts = prompted.facts.as_mut();
-        facts.expect("the case's frame has facts").prompt_tokens = 48;
+        let facts = facts.expect("the case's frame has facts");
+        facts.prompt_tokens = 48;
+        facts.session_key = Some(proto::Identity {
+            form: Some(proto::identity::Form::Hash(17)),
+        });
         let next = bed.ask(prompted).await;
         assert_eq!(
             (lease_of(&next).id, lease_of(&next).tokens),
@@ -1483,6 +1487,13 @@ pub(crate) mod tests {
         );
         let store: &dyn LeasesStore = bed.store.as_ref();
         assert_eq!((store.live(GATEWAY), store.live(OTHER)), (2, 0));
+        // The lease carries its request's session, on the wire as on file:
+        // never zero for a request that states one.
+        let session = lease_of(&next).session_key;
+        let filed = store.get(GATEWAY, LeaseId(1 << 32 | 2));
+        let filed = filed.expect("the lease is on file").lease;
+        assert_ne!(session, 0);
+        assert_eq!(filed.session.get(), session);
     }
 
     #[tokio::test]
