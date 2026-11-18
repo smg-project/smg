@@ -7083,6 +7083,8 @@ fn a_fuel_fast_spinner_is_sampled_by_its_charge_not_its_clock() {
     let mut slow_calibration = spec("fuel-fast", guest::record_guest(), mode::SPIN_IN_SCORE);
     slow_calibration.fuel_per_micro = SLOW_CALIBRATION;
     let spinner = loaded(&runtime, slow_calibration);
+    // What one `init` of the spinner costs: the load made one instance.
+    let init_fuel = spinner.stats().fuel_used;
     let scorer = |plugin: &Arc<Plugin>| Weighted {
         scorer: Box::new(WasmScorer::new(plugin.bind(), None)),
         weight: 1.0,
@@ -7093,7 +7095,6 @@ fn a_fuel_fast_spinner_is_sampled_by_its_charge_not_its_clock() {
         scorers: vec![scorer(&honest), scorer(&spinner)],
         picker: Box::new(Best),
     });
-    let started = bound_clock();
     let (decisions, on_the_cpu) = decide_until_open(&spinner, |seed| {
         engine.decide(
             &timed(seed),
@@ -7103,7 +7104,6 @@ fn a_fuel_fast_spinner_is_sampled_by_its_charge_not_its_clock() {
             &mut Scratch::new(),
         )
     });
-    let had = bound_clock().saturating_sub(started);
     let s = spinner.stats();
     assert_eq!(
         (s.traps, s.breaker_opens),
@@ -7130,13 +7130,17 @@ fn a_fuel_fast_spinner_is_sampled_by_its_charge_not_its_clock() {
         );
     }
     the_neighbour_stays("a fuel-fast spinner", quiet, &honest);
-    // A decision that ran to its bound would have had its whole budget of
-    // this thread's CPU: the spinner's fuel ran out long before, in under
-    // five eighths of it a decision. Read on the clock the bound counts: a
-    // hold of the runner adds to the wall clock, never to this one.
+    // The spinner is fast by its charge, whatever a clock reads: a decision
+    // grants its calls at most the frame's fuel at the slow calibration,
+    // ten thousand units, and its rebuild one `init`. A spin burns that in
+    // microseconds, so its fuel ended each call long before its bound. The
+    // thread's CPU clock is no witness of it: on a loaded runner it read
+    // 1.57 s over 64 decisions with no call late, where a quiet one reads
+    // 6 ms.
+    let frame_fuel = u64::from(FRAME_MICROS) * SLOW_CALIBRATION;
     assert!(
-        had < std::time::Duration::from_micros(decisions * u64::from(FRAME_MICROS) * 5 / 8),
-        "the fuel ended the calls early, not their bound: {had:?} over {decisions} decisions"
+        s.fuel_used <= decisions * (frame_fuel + init_fuel) + init_fuel,
+        "the fuel ended the calls early, not their bound: {s:?} over {decisions} decisions"
     );
 }
 
