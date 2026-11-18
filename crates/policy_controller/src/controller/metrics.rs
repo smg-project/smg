@@ -45,6 +45,12 @@ pub const REPLICATION_SYNCED: &str = "smg_policy_controller_replication_synced";
 /// leader. `0` while it leads and before any frame, where
 /// [`REPLICATION_SYNCED`] is `0` too.
 pub const REPLICATION_LAG_SECONDS: &str = "smg_policy_controller_replication_lag_seconds";
+/// How many times this replica asked its leader to be restored from a
+/// snapshot: an event of the leader's did not land on its tables or its
+/// log. The leader cannot tell such an ask from a place it does not hold,
+/// so the count is the standby's.
+pub const REPLICATION_RESTORES_ASKED_TOTAL: &str =
+    "smg_policy_controller_replication_restores_asked_total";
 /// Load polls by the arbitration's decision (`mode`: `poll`, `fallback`,
 /// `suppressed`; a suppressed one made no call), each counted once per
 /// engine and poll interval.
@@ -104,6 +110,8 @@ pub(crate) struct Metrics {
     /// The standby's sync and its lag, from the same sample as the state.
     synced: Gauge,
     lag: Gauge,
+    /// The restores this replica asked of its leader, from that sample too.
+    restores: Counter,
     loads: LoadCounters,
     decides: DecideCounters,
     /// The members outside a list: `engines`, then `zones`.
@@ -185,6 +193,11 @@ impl Metrics {
             "Seconds since the last frame applied from the leader, 0 while this replica leads and before any frame".into(),
         );
         recorder.describe_counter(
+            KeyName::from_const_str(REPLICATION_RESTORES_ASKED_TOTAL),
+            None,
+            "Restores from a snapshot this replica asked of its leader after an event that did not land".into(),
+        );
+        recorder.describe_counter(
             KeyName::from_const_str(LOAD_POLLS_TOTAL),
             None,
             "Load polls by the arbitration's decision (poll, fallback, suppressed), one per engine and poll interval".into(),
@@ -257,6 +270,8 @@ impl Metrics {
         let start = recorder.register_gauge(&Key::from_name(START_TIME_SECONDS), &metadata);
         let synced = recorder.register_gauge(&Key::from_name(REPLICATION_SYNCED), &metadata);
         let lag = recorder.register_gauge(&Key::from_name(REPLICATION_LAG_SECONDS), &metadata);
+        let restores =
+            recorder.register_counter(&Key::from_name(REPLICATION_RESTORES_ASKED_TOTAL), &metadata);
         let counter = |name: &'static str, label: &'static str, value: &'static str| {
             recorder.register_counter(
                 &Key::from_parts(name, vec![Label::new(label, value)]),
@@ -313,6 +328,7 @@ impl Metrics {
             state,
             synced,
             lag,
+            restores,
             loads,
             decides,
             outside,
@@ -376,6 +392,7 @@ impl Metrics {
         self.synced.set(if sample.synced { 1.0 } else { 0.0 });
         self.lag
             .set(sample.lag.map_or(0.0, |lag| lag.as_secs_f64()));
+        self.restores.absolute(sample.restores);
         self.observe_loads(loads);
         if let Some(spec) = self.spec.get() {
             let counts = spec.generations.counts();
@@ -463,7 +480,8 @@ mod tests {
 
     use super::{
         Generations, Metrics, StoreCounts, MEMBERS_OUTSIDE_LIST, REPLICATION_LAG_SECONDS,
-        REPLICATION_SYNCED, SPEC_APPLY_TOTAL, SPEC_GENERATION, START_TIME_SECONDS, STATE,
+        REPLICATION_RESTORES_ASKED_TOTAL, REPLICATION_SYNCED, SPEC_APPLY_TOTAL, SPEC_GENERATION,
+        START_TIME_SECONDS, STATE,
     };
     use crate::{
         controller::{
@@ -880,7 +898,12 @@ mod tests {
         let metrics = Metrics::new();
         let scrape = |state, lag, synced| {
             let rendered = metrics.render(
-                || Sample { state, lag, synced },
+                || Sample {
+                    state,
+                    lag,
+                    synced,
+                    restores: 0,
+                },
                 &Stats::default(),
                 &Counts::default(),
                 StoreCounts::default,
@@ -924,5 +947,41 @@ mod tests {
         );
         assert!(rendered.contains("# HELP smg_policy_controller_replication_synced "));
         assert!(rendered.contains("# HELP smg_policy_controller_replication_lag_seconds "));
+    }
+
+    #[test]
+    fn a_scrape_tells_the_restores_this_replica_asked_of_its_leader() {
+        let metrics = Metrics::new();
+        let scrape = |restores| {
+            let rendered = metrics.render(
+                || Sample {
+                    restores,
+                    ..Sample::from(State::Syncing)
+                },
+                &Stats::default(),
+                &Counts::default(),
+                StoreCounts::default,
+            );
+            line(&rendered, REPLICATION_RESTORES_ASKED_TOTAL, "")
+        };
+        let read = |asked: u64| {
+            Some(format!(
+                "smg_policy_controller_replication_restores_asked_total {asked}"
+            ))
+        };
+        // The series is there before any ask.
+        assert_eq!(scrape(0), read(0));
+        // A scrape tells the standby's own count: it is set, never added.
+        assert_eq!(scrape(2), read(2));
+        assert_eq!(scrape(2), read(2));
+        assert_eq!(scrape(3), read(3));
+        let rendered = metrics.render(
+            || State::Leader,
+            &Stats::default(),
+            &Counts::default(),
+            StoreCounts::default,
+        );
+        assert!(rendered
+            .contains("# TYPE smg_policy_controller_replication_restores_asked_total counter"));
     }
 }

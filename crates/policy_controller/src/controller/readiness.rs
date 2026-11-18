@@ -102,6 +102,8 @@ pub(crate) struct Sample {
     pub(crate) lag: Option<Duration>,
     /// Whether this replica does not lead and is synced with its leader.
     pub(crate) synced: bool,
+    /// How many times this replica asked its leader to be restored.
+    pub(crate) restores: u64,
 }
 
 impl From<State> for Sample {
@@ -110,6 +112,7 @@ impl From<State> for Sample {
             state,
             lag: None,
             synced: false,
+            restores: 0,
         }
     }
 }
@@ -150,7 +153,14 @@ impl Readiness {
             Phase::Serving if self.lag.follows() && !synced => State::Syncing,
             Phase::Serving => State::Follower,
         };
-        (Sample { state, lag, synced }, lapse)
+        let restores = self.lag.asks();
+        let sample = Sample {
+            state,
+            lag,
+            synced,
+            restores,
+        };
+        (sample, lapse)
     }
 
     /// Resolves with `wanted` once the state is `wanted`, at once when it
@@ -411,7 +421,12 @@ pub(crate) mod tests {
         phase.send_replace(Phase::Serving);
         let lag = &readiness.lag;
         let read = |at| readiness.sample_at(at).0;
-        let sample = |state, lag, synced| Sample { state, lag, synced };
+        let sample = |state, lag, synced| Sample {
+            state,
+            lag,
+            synced,
+            restores: 0,
+        };
 
         // No standby runs: a follower is ready, as before one existed.
         let start = Instant::now();
@@ -521,5 +536,25 @@ pub(crate) mod tests {
         // With no lapse the waiter sleeps on.
         let woke = tokio::time::timeout(HOUR, reader.moved_by(None)).await;
         assert!(woke.is_err(), "{woke:?}");
+    }
+
+    #[test]
+    fn a_sample_tells_the_restores_the_standby_asked_whatever_the_state() {
+        let (mut elector, phase, _steps, readiness) = fenced();
+        phase.send_replace(Phase::Serving);
+        let lag = &readiness.lag;
+        lag.follow();
+        let asked = |at| readiness.sample_at(at).0.restores;
+        assert_eq!(asked(Instant::now()), 0);
+        lag.asked();
+        lag.asked();
+        assert_eq!(asked(Instant::now()), 2);
+        // The count is the replica's since its start: a take keeps it.
+        assert_eq!(
+            elector.tick(Instant::now()).expect("the take"),
+            Tick::Acquired { term: 1 }
+        );
+        let sample = readiness.sample_at(Instant::now()).0;
+        assert_eq!((sample.state, sample.restores), (State::Leader, 2));
     }
 }
