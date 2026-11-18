@@ -1319,12 +1319,13 @@ pub struct OverloadSpec {
     /// sessions rule or one that delegates. A rule with an in-flight cap
     /// keeps the key only under a host that counts the key's requests,
     /// which the controller's own service does not yet. A rule with
-    /// `inflight_cap: 65535` has no cap. Set, the key moves to the ring's
-    /// next worker; unset, the key stays on its worker over the veto.
-    /// Everywhere else a keyed request keeps the veto. The word is the
-    /// overload veto's alone: a worker the liveness check doubts still
-    /// takes a request no other worker can, unless it is over its
-    /// thresholds too.
+    /// `inflight_cap: 65535` has no cap. Set, the key moves on: under a
+    /// sessions rule to its next routable pin, and to the ring's next
+    /// worker where no pin stands or no rule does. Unset, the key stays
+    /// on its worker over the veto. Everywhere else a keyed request
+    /// keeps the veto. The word is the overload veto's alone: a worker
+    /// the liveness check doubts still takes a request no other worker
+    /// can, unless it is over its thresholds too.
     pub shed_when_all_vetoed: bool,
 }
 
