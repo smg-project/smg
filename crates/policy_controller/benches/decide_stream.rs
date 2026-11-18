@@ -1226,7 +1226,7 @@ impl Ends {
         match self {
             Self::Door(store, hand) => {
                 if let Some(lease) = pick.lease {
-                    let hand = hand.get_or_insert_with(|| store.handover(gateway));
+                    let hand = hand.get_or_insert_with(|| Hand::new(gateway));
                     let ended = Said::Released(None, ReleaseReason::ClientGone);
                     store.hand(hand, LeaseId(lease), ended);
                 }

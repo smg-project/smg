@@ -104,13 +104,13 @@ pub(crate) fn released(
     Ok(())
 }
 
-/// Opens a hand at the leases' file, a session's or a `Decide` stream's:
+/// Opens a hand at the leases' files, a session's or a `Decide` stream's:
 /// what it says of `gateway`'s leases is handed through it, and the store
 /// is given the word to the engine that whoever applies it tells with
 /// ([`tells`]).
 pub(crate) fn open(store: &MemoryStore, gateway: GatewayId) -> Hand {
     tells(store);
-    store.handover(gateway)
+    Hand::new(gateway)
 }
 
 /// Gives the store the word to the engine of a frame applied to a lease.
@@ -130,10 +130,8 @@ pub(crate) fn tells(store: &MemoryStore) {
 ///
 /// Its caller is whoever applies the frame, under the turn of the leases'
 /// file: what it calls is bounded and takes no door of the leases. It
-/// enters as the decider that issued the lease on whichever thread applies.
-/// While the deciders share one file its turn is no decider's own: a
-/// stage that keeps state a decider is served these calls no earlier
-/// than a file a decider.
+/// enters as the decider whose file the lease is on, on whichever thread
+/// applies.
 fn told(store: &MemoryStore, record: &LeaseRecord, said: Said, by: Option<Decider>) {
     // The lease's own decider acts while its event is told, whichever
     // thread applies the frame.

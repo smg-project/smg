@@ -1027,7 +1027,7 @@ mod tests {
                 tests::{stating, told, NO_PRINCIPAL},
                 Layer,
             },
-            replication::journaled_from,
+            replication::{journaled_for, journaled_from},
             spec_store::{tests::names, SpecStore},
             PROTOCOL_VERSION,
         },
@@ -1073,7 +1073,7 @@ mod tests {
                 ADDRESS.to_owned(),
                 &elector,
                 stood,
-                journaled_from(&LeasePlace::Process, 0),
+                journaled_for(&LeasePlace::Process, 0, 2),
                 Arc::new(Catalog::builtin()),
                 2,
             )
@@ -1398,7 +1398,7 @@ mod tests {
         let elector = Elector::new(Box::new(FileLease::new(&path)), IDENTITY, settings)
             .expect("the settings are in order");
         let (standing, stood) = watch::channel(Standing::default());
-        let (store, feed) = journaled_from(&LeasePlace::Process, 0);
+        let (store, feed) = journaled_for(&LeasePlace::Process, 0, 2);
         let shared = Arc::new(
             Shared::new(
                 ID.to_owned(),
@@ -1968,7 +1968,7 @@ mod tests {
         )
         .expect("the settings are in order");
         let (standing, stood) = watch::channel(Standing::default());
-        let (store, feed) = journaled_from(&LeasePlace::Process, 0);
+        let (store, feed) = journaled_for(&LeasePlace::Process, 0, 2);
         let service = Service::new(
             vec![Scope::Gateway],
             Arc::new(

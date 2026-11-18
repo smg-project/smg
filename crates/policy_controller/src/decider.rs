@@ -9,10 +9,15 @@
 //! whose it is: [`Decider::enter`] names the decider the calling thread acts
 //! as until the guard drops, and a kind reads [`Decider::acting`].
 //!
-//! One place of a host enters, where it takes a turn: no stage, no plugin
-//! kind and no door of a store does. This is the one naming of a decider in
-//! the crate. A host that names none decides as before: a thread that names
-//! no decider is a decider of its own.
+//! A host enters where it takes a decider's turn: no stage, no plugin kind
+//! and no door of a store does. The served controller enters at two
+//! places. A decider's own thread enters for each request it decides. And
+//! whoever applies a lease's event enters as the decider whose file of
+//! leases the lease is on, under that file's turn: the decider's thread
+//! itself, or another thread while that decider waits for a request, never
+//! beside it. So the calls made under one decider's name run one at a
+//! time. A host that names none decides as before: a thread that names no
+//! decider is a decider of its own.
 //!
 //! ```
 //! use smg_policy_controller::decider::Decider;

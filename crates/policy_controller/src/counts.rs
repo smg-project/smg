@@ -91,10 +91,9 @@ impl Counts {
     }
 
     /// One lease more books the worker of `slot`, in one atomic step. The
-    /// turn of a leases' file orders that file's writers alone. The file
-    /// is one today; with a file a decider, two files book one worker
-    /// where it serves two models, and neither write is lost under the
-    /// other. No reader waits on the line.
+    /// turn of a leases' file orders that file's writers alone, and two
+    /// files book one worker where it serves two models: neither write is
+    /// lost under the other. No reader waits on the line.
     pub(crate) fn book(&self, slot: Slot) {
         if let Some(cell) = self.cell(slot) {
             let one_more = |held: u32| held.saturating_add(1);

@@ -541,7 +541,7 @@ mod tests {
             election::{LeasePlace, Standing},
             gateways::{tests::PATIENT, Seat},
             principal::{tests::told, Layer, ENTRY},
-            replication::journaled_from,
+            replication::journaled_for,
             service::{Service, Shared},
             session::GRACE_PERIOD,
             watch_workers::tests::Woken,
@@ -601,16 +601,17 @@ mod tests {
     ) -> Bed {
         let start =
             |reads: &Reads| Deciders::start(deciders, depth, reads).expect("the deciders start");
-        bed_over(start, cap, steps).await
+        bed_over(start, deciders, cap, steps).await
     }
 
     /// [`bed_with`] over the deciders `start` makes of what they read.
     async fn bed_over(
         start: impl FnOnce(&Reads) -> Deciders,
+        deciders: usize,
         cap: Option<u32>,
         steps: impl IntoIterator<Item = Step>,
     ) -> Bed {
-        let (store, feed) = journaled_from(&LeasePlace::Process, 0);
+        let (store, feed) = journaled_for(&LeasePlace::Process, 0, deciders);
         let (workers, _sides) = fleet(&store);
         store
             .apply(preset("random", 1))
@@ -655,7 +656,7 @@ mod tests {
             stood.clone(),
             (Arc::clone(&store), feed),
             Arc::new(crate::Catalog::builtin()),
-            1,
+            deciders,
         )
         .expect("the deciders start");
         let reads = Reads {
@@ -1651,7 +1652,7 @@ mod tests {
     /// stands.
     #[tokio::test]
     async fn a_request_whose_deciders_thread_ended_is_answered_busy_with_no_reason_and_counted() {
-        let bed = bed_over(gone, None, []).await;
+        let bed = bed_over(gone, 1, None, []).await;
         let _seat = bed.welcomed(NAME, 1);
         let mut stream = bed.opened(NAME).await;
         for id in 1..=HALF {

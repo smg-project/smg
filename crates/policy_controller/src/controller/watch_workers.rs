@@ -1261,7 +1261,7 @@ pub(crate) mod tests {
     fn a_runs_log_starts_at_a_place_drawn_below_the_bound_and_apart_from_another_runs() {
         let starts: Vec<u64> = (0..64)
             .map(|_| {
-                journaled(&LeasePlace::Process)
+                journaled(&LeasePlace::Process, 1)
                     .1
                     .log
                     .head(Kinds::Watched)
@@ -2137,7 +2137,7 @@ pub(crate) mod tests {
     #[test]
     fn the_draw_is_made_wherever_the_lease_lives() {
         for place in [LeasePlace::Process, LeasePlace::File("lease".into())] {
-            let first = journaled(&place).1.log.head(Kinds::Watched);
+            let first = journaled(&place, 1).1.log.head(Kinds::Watched);
             assert!(
                 first.seq != 0 && first.term == 0,
                 "a drawn start: {first:?}"

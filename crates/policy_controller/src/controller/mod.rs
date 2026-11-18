@@ -436,7 +436,7 @@ impl Controller {
         );
         let (standing, stood) = watch::channel(Standing::default());
         let steps = stood.clone();
-        let journal = replication::journaled(&config.election.lease);
+        let journal = replication::journaled(&config.election.lease, config.decide_shards);
         let mut shared = Shared::new(
             config.controller_id.clone(),
             address.unwrap_or_default(),

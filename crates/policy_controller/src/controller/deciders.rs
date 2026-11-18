@@ -51,26 +51,32 @@
 //! row's requests in flight ([`crate::RequestFacts::in_flight`]): beside
 //! the rows where the store lent them, in the row where they were written
 //! for the request. A decision is made over what the decisions before it
-//! left on file. The file is the one thing every decider writes, under its
-//! turn, held for an apply and for one lease's filing or its giving up,
-//! never across a decision. What a gateway's frame says of a lease is
-//! handed to the file by its session and applied by a decider at work:
-//! before a decision reads its rows' counts, at its issue, and once more
-//! before the decider waits on an empty queue. Where no decider is at work
-//! the session applies it. A lease leaves the file where its answer does
-//! not leave (step 7), at its gateway's word (a `Session`'s `Completed` or
-//! `Released` frame, the gateway's own end) or at its dispatch deadline:
-//! each issue ends the leases at the head of the store's deadline queue
-//! that no gateway named a dispatch for in time, two at most, and their
-//! engine is told under the turn where its generation still stands. So a
-//! lease whose answer never reached its gateway (an answer in the queue
-//! of a stream that then ended, a decision that panicked past its issue)
-//! stands until its deadline and the issues after it, and through a lull
-//! until the next issue: no timer ends one yet. A decision its stream
-//! stops at the send is none of them: the stream hands its lease's
-//! release there, as a session hands a frame's ([`super::decide`]). Nor
-//! is an answer its stream's queue does not take, full or closed: its
-//! decider hands the release where the queue refuses it.
+//! left on file. Each decider issues into a file of leases of its own,
+//! under that file's turn, held for an apply and for one lease's filing or
+//! its giving up, never across a decision. A worker's count is one atomic
+//! a row, whichever file books it. What a gateway's frame says of a lease
+//! is handed by its session to the file the lease's id names and applied
+//! by that file's decider at work: as it takes up its work, before a
+//! decision reads its rows' counts, at its issue, and once more before
+//! the decider waits on an empty queue. So a decision reads its own file
+//! behind everything handed to it, and a row another file books lags by
+//! that file's next take. Where a file's decider waits for a job the
+//! session applies what it hands. A lease leaves its file where its
+//! answer does not leave (step 7), at its gateway's word (a `Session`'s
+//! `Completed` or `Released` frame, the gateway's own end) or at its
+//! dispatch deadline: each issue ends the leases at the head of its
+//! file's deadline queue that no gateway named a dispatch for in time,
+//! two at most, and the gateways' sweep ends them in a file whose decider
+//! waits for a job. Their engine is told under the turn where its
+//! generation still stands. So a lease whose answer never reached its
+//! gateway (an answer in the queue of a stream that then ended, a
+//! decision that panicked past its issue) stands until its deadline and
+//! then the next issue of its file or the sweep's next tick. A decision
+//! its stream stops at the send is none of them: the stream hands its
+//! lease's release there, as a session hands a frame's
+//! ([`super::decide`]). Nor is an answer its stream's queue does not
+//! take, full or closed: its decider hands the release where the queue
+//! refuses it.
 //!
 //! What a lease does not do yet. A request sent twice under one id is
 //! issued two leases. A stage hears a lease's issue here, its release
@@ -385,10 +391,17 @@ impl Deciders {
     /// Starts `deciders` threads, each behind a queue of `depth` requests:
     /// at least one thread, and a queue of at least one.
     pub(crate) fn start(deciders: usize, depth: usize, reads: &Reads) -> io::Result<Self> {
+        // A decider issues into a file of its own: the store was made for
+        // this count of deciders, or its one file would have two writers.
+        let deciders = deciders.clamp(1, Decider::COUNT);
+        if reads.store.deciders() != deciders {
+            let files = "the store's files of leases are not one a decider";
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, files));
+        }
         lifecycle::tells(&reads.store);
         let told = Arc::new(watch::Sender::new(false));
         let mark = Arc::new(Mark::default());
-        let queues = (0..deciders.max(1))
+        let queues = (0..deciders)
             .map(|index| {
                 let (queue, jobs) = sync_channel(depth.max(1));
                 let decider = Deciding {
@@ -513,8 +526,8 @@ struct Deciding {
     marked: Option<u64>,
     /// The mark's word and its latch, shared by the deciders.
     mark: Arc<Mark>,
-    /// Its place among the threads at work at the leases' file, while it
-    /// has a job at hand ([`MemoryStore::at_work`]).
+    /// Its seat at its own file of leases, taken at its first job
+    /// ([`MemoryStore::at_work`]): at work while it has a job at hand.
     working: Option<AtWork>,
     /// Its name among the host's deciders, which its thread acts as while
     /// it decides ([`Decider::enter`]): none past the names a host gives.
@@ -523,11 +536,11 @@ struct Deciding {
 
 impl Deciding {
     /// Decides until the last handle of the queue is dropped. With a job
-    /// at hand the decider is at work at the leases' file: what the
-    /// sessions hand is left to it, applied before each decision reads
-    /// its rows' counts, where the file's turn is free, and at each
-    /// issue. It leaves that work before it
-    /// waits on an empty queue: what is handed meanwhile is applied by
+    /// at hand the decider is at work at its own file of leases: what the
+    /// sessions hand to that file is left to it, applied as it takes up
+    /// its work, before each decision reads its rows' counts, where the
+    /// file's turn is free, and at each issue. It leaves that work before
+    /// it waits on an empty queue: what is handed meanwhile is applied by
     /// the session that hands it.
     fn run(mut self, jobs: &Receiver<Job>) {
         loop {
@@ -540,12 +553,15 @@ impl Deciding {
                     job
                 }
             };
-            if self.working.is_none() {
-                self.working = Some(self.reads.store.at_work());
-            }
             // The thread acts as its decider for this job: a local, so the
             // name is let go where the job ends.
             let _acting = self.name.map(Decider::enter);
+            // Its seat is at the file its name finds. It says it works and
+            // takes its turn before its first decision.
+            match &mut self.working {
+                Some(seat) => seat.work(),
+                None => self.working = Some(self.reads.store.at_work()),
+            }
             let Job {
                 request,
                 gateway,
@@ -580,22 +596,23 @@ impl Deciding {
     /// behind its last take is applied here, and the engine's lifecycle
     /// calls run with it, outside any decision ([`Self::held`]).
     fn rest(&mut self) {
-        let Some(leaving) = self.working.take() else {
+        let Some(mut seat) = self.working.take() else {
             return;
         };
         self.held(
             "a lease's lifecycle call panicked as its decider left its work: what it left is applied at the decider's next take",
-            |_| drop(leaving),
+            |_| seat.rest(),
         );
+        self.working = Some(seat);
     }
 
     /// Gives up the lease of an answer its stream did not take: the queue
     /// was full, or the stream had ended. No gateway will name a dispatch
     /// for it, and it would book its worker to its dispatch deadline. The
-    /// decider hands its release to the leases' file as abandoned, as a
-    /// stream does for a decision it stops at the send, and whoever takes
-    /// the turn next applies it: this decider, before its next decision
-    /// reads a count. A full ring makes the hand apply in place, outside
+    /// decider hands its release to its own file as abandoned, as a
+    /// stream does for a decision it stops at the send, and applies it at
+    /// its next take: before its next decision reads a count, or as it
+    /// rests. A full ring makes the hand apply in place, outside
     /// any decision ([`Self::held`]). A call that panics there unwinds the
     /// hand before its frame is in the ring, and that call's own frame is
     /// out of it: the release is handed once more. A second panic there
@@ -1587,7 +1604,7 @@ pub(crate) mod tests {
         (deciders, depth): (usize, usize),
         steps: impl IntoIterator<Item = Step>,
     ) -> Bed {
-        let store = Arc::new(MemoryStore::new());
+        let store = Arc::new(MemoryStore::new().with_deciders(deciders));
         let (workers, _sides) = fleet(&store);
         if let Some(spec) = spec {
             store.apply(spec).expect("above the unbound start");
@@ -1636,6 +1653,17 @@ pub(crate) mod tests {
             sender,
             answers,
         }
+    }
+
+    /// A decider issues into a file of leases of its own: the deciders do
+    /// not start over a store made for another count of them.
+    #[tokio::test]
+    async fn the_deciders_do_not_start_over_a_store_made_for_another_count() {
+        let bed = leading([]);
+        assert_eq!(bed.store.deciders(), 2);
+        let refused = Deciders::start(3, 8, &bed.reads).err();
+        let refused = refused.expect("two files of leases, three deciders");
+        assert_eq!(refused.kind(), io::ErrorKind::InvalidInput);
     }
 
     /// The bed most cases stand on: the `random` preset as generation 1, a

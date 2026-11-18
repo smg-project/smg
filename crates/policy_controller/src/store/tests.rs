@@ -10,9 +10,9 @@ use std::{
 use super::{
     identity, identity_of,
     leases::{Counts, Slot},
-    Ask, BatchFacts, BatchOutcome, ContentHash, Dispatch, GatewayId, HealthSink, Kinds, KvEvent,
-    KvEventSink, LeaseRecord, LeaseRefused, LeaseState, LeasesStore, LoadSink, LoadSource,
-    MembershipChange, MembershipTail, MemoryStore, Picked, Pin, PollMode, Reachability,
+    Ask, BatchFacts, BatchOutcome, ContentHash, Dispatch, GatewayId, Hand, HealthSink, Kinds,
+    KvEvent, KvEventSink, LeaseRecord, LeaseRefused, LeaseState, LeasesStore, LoadSink, LoadSource,
+    MembershipChange, MembershipTail, MemoryStore, Picked, Pin, PollMode, Position, Reachability,
     ReservationKind, ReservationStore, ResyncReason, Said, SequenceHash, SessionsStore, Signals,
     SnapshotChunk, StoredBlock, VetoWrite, ViewBuffers, WorkerFacts, WorkerPatch, WorkerStatus,
     WorkersStore,
@@ -1810,11 +1810,11 @@ fn a_restore_empties_the_lease_file_and_a_hello_books_what_it_lists_once() {
     assert_eq!(in_flight(&store), of(0, 1));
 }
 
-/// A restore tells each lease's end under the decider that issued the
-/// lease, as a frame's end is told, whichever thread restores.
+/// A restore tells each lease's end under the decider whose file holds
+/// the lease, as a frame's end is told, whichever thread restores.
 #[test]
-fn a_restore_tells_each_end_under_the_decider_that_issued_its_lease() {
-    let store = MemoryStore::new();
+fn a_restore_tells_each_end_under_the_decider_whose_file_holds_its_lease() {
+    let store = MemoryStore::new().with_deciders(4);
     let a = ready(&store, "http://a:1");
     LeasesStore::set_term(&store, 1);
     store.tell_through(heard);
@@ -1825,7 +1825,7 @@ fn a_restore_tells_each_end_under_the_decider_that_issued_its_lease() {
         issued.expect("minted under the store's term").id
     };
     // One lease issued by a thread that acts as the fourth decider, one by
-    // a thread that names none.
+    // a thread that names none: the first file's.
     let named = {
         let _acting = Decider::new(3).enter();
         issue()
@@ -1842,7 +1842,8 @@ fn a_restore_tells_each_end_under_the_decider_that_issued_its_lease() {
         .zip(told_by())
         .collect();
     ended.sort_unstable();
-    let mut issued = [(named.0, Some(Decider::new(3))), (unnamed.0, None)];
+    let first = Some(Decider::new(0));
+    let mut issued = [(named.0, Some(Decider::new(3))), (unnamed.0, first)];
     issued.sort_unstable();
     assert_eq!(ended, issued);
 }
@@ -2333,7 +2334,7 @@ fn a_restore_that_raises_the_term_starts_the_blocks_under_it() {
     let (gateway, now) = (GatewayId(1), Instant::now());
     let held = standby.issue_decided(lease(gateway, 0, 3, now), None, |_| ());
     held.expect("minted under the term the standby stood at");
-    let mut cut = MemoryStore::new().cut(super::Kinds::All);
+    let mut cut = MemoryStore::new().cut(Kinds::All);
     cut.at.term = 7;
     assert!(standby.restore_from(cut));
     assert_eq!(term.term(), 7);
@@ -2585,7 +2586,7 @@ fn told_ids() -> Vec<(u64, Said)> {
 fn a_frame_handed_where_nobody_is_at_work_is_applied_by_its_hand() {
     let now = Instant::now();
     let (store, a, ids) = handed_bed(2, now);
-    let hand = store.handover(GatewayId(1));
+    let hand = Hand::new(GatewayId(1));
     let dispatch = Said::Dispatched(Dispatch::default(), now);
     store.hand(&hand, ids[0], dispatch);
     // Told before any other take of the turn, with the record as the frame
@@ -2610,7 +2611,7 @@ fn a_frame_handed_where_nobody_is_at_work_is_applied_by_its_hand() {
 fn a_frame_handed_while_a_thread_is_at_work_is_left_to_that_thread() {
     let now = Instant::now();
     let (store, a, ids) = handed_bed(3, now);
-    let hand = store.handover(GatewayId(1));
+    let hand = Hand::new(GatewayId(1));
     let at_work = store.at_work();
     store.hand(&hand, ids[0], GONE);
     assert_eq!((told_ids(), in_flight(&store)), (vec![], vec![(a, 3)]));
@@ -2635,19 +2636,31 @@ fn a_frame_handed_while_a_thread_is_at_work_is_left_to_that_thread() {
 }
 
 /// A decider looks at what is handed before a decision reads its rows'
-/// counts, and that look never waits: a turn it finds held is its holder's.
+/// counts, and that look never waits: a turn it finds held it reads past.
 #[test]
 fn a_thread_at_work_does_not_wait_for_a_held_turn_before_its_reads() {
     let store = Arc::new(MemoryStore::new());
     let a = ready(&store, "http://a:1");
     LeasesStore::set_term(&*store, 1);
     let (t0, world) = (Instant::now(), store.world());
+    let (began, working) = mpsc::sync_channel(1);
+    let (look, asked) = mpsc::sync_channel::<()>(1);
     let (reached, parked) = mpsc::sync_channel(1);
     let (go, word) = mpsc::sync_channel::<()>(1);
     let (looked, seen) = mpsc::sync_channel(1);
     let store = &store;
     std::thread::scope(|scope| {
-        // An issuer is parked in its tell, under the turn.
+        // A thread is at work: its first step took the turn while it was
+        // free. It takes it once more as it leaves, once the holder let go.
+        scope.spawn(move || {
+            let at_work = store.at_work();
+            began.send(()).expect("the case waits for the seat");
+            asked.recv().expect("the case asks for the look");
+            at_work.apply();
+            looked.send(()).expect("the case waits for the look");
+        });
+        working.recv().expect("the thread is at work");
+        // Another holder is parked under the turn, in an issue's tell.
         scope.spawn(move || {
             let record = booking(GatewayId(1), 0, a, t0);
             let issued = store.issue_decided(record, world.booked_of(a), |_| {
@@ -2657,13 +2670,9 @@ fn a_thread_at_work_does_not_wait_for_a_held_turn_before_its_reads() {
             issued.expect("minted under the store's term");
         });
         parked.recv().expect("the issue tells");
-        // A thread at work looks and reads on; it takes the turn as it
-        // leaves its work, once the issuer let it go.
-        scope.spawn(move || {
-            let at_work = store.at_work();
-            at_work.apply();
-            looked.send(()).expect("the case waits for the look");
-        });
+        // The thread at work looks and reads on.
+        look.send(())
+            .expect("the thread at work waits for the word");
         let early = seen.recv_timeout(Duration::from_secs(2));
         go.send(()).expect("the issuer holds the other end");
         assert!(early.is_ok(), "the look waited for the turn");
@@ -2675,7 +2684,7 @@ fn a_thread_at_work_does_not_wait_for_a_held_turn_before_its_reads() {
 fn a_dispatch_handed_in_time_saves_its_lease_from_the_deadlines_end() {
     let t0 = Instant::now();
     let (store, a, ids) = handed_bed(2, t0);
-    let hand = store.handover(GatewayId(1));
+    let hand = Hand::new(GatewayId(1));
     let _at_work = store.at_work();
     let in_time = t0 + Duration::from_secs(1);
     store.hand(
@@ -2697,7 +2706,7 @@ fn a_full_ring_makes_its_caller_apply_and_no_frame_is_dropped() {
     let now = Instant::now();
     let room = u64::try_from(MemoryStore::HANDOVER).expect("the ring's room is a count");
     let (store, a, ids) = handed_bed(room + 1, now);
-    let hand = store.handover(GatewayId(1));
+    let hand = Hand::new(GatewayId(1));
     // A thread at work that does not come by: the frames wait in the ring.
     let at_work = store.at_work();
     for id in &ids {
@@ -2720,7 +2729,7 @@ fn a_streams_end_applies_what_it_handed() {
     let now = Instant::now();
     let (store, a, ids) = handed_bed(2, now);
     let at_work = store.at_work();
-    let hand = store.handover(GatewayId(1));
+    let hand = Hand::new(GatewayId(1));
     store.hand(&hand, ids[0], GONE);
     store.hand(&hand, ids[1], GONE);
     assert_eq!(told_ids(), []);
@@ -2746,7 +2755,7 @@ fn a_tell_that_takes_a_door_of_the_leases_is_refused_in_a_debug_build() {
     store.tell_through(takes_a_door);
     let record = booking(GatewayId(1), 0, a, Instant::now());
     let issued = store.issue_decided(record, store.world().booked_of(a), |_| ());
-    let hand = store.handover(GatewayId(1));
+    let hand = Hand::new(GatewayId(1));
     store.hand(&hand, issued.expect("minted").id, GONE);
 }
 
@@ -2809,7 +2818,7 @@ fn a_frame_handed_as_a_thread_leaves_its_work_is_applied_by_one_of_the_two() {
             }
         });
         scope.spawn(move || {
-            let hand = store.handover(gateway);
+            let hand = Hand::new(gateway);
             let mut asked = next(0);
             while asked != usize::MAX {
                 let id = LeaseId(lease.load(SeqCst));
@@ -2871,12 +2880,25 @@ fn a_thread_that_leaves_its_work_waits_for_a_held_turn() {
             |_| (),
         )
         .expect("minted under the store's term");
+    let (began, working) = mpsc::sync_channel(1);
+    let (leave, asked) = mpsc::sync_channel::<()>(1);
     let (reached, parked) = mpsc::sync_channel(1);
     let (go, word) = mpsc::sync_channel::<()>(1);
     let (left, gone) = mpsc::sync_channel(1);
     let (early, before) = std::thread::scope(|scope| {
         let store = &store;
-        // An issuer is parked in its issue's hook, under the turn.
+        // One thread is at work: a frame handed from here on is left to
+        // it. It leaves its work at the case's word, and is not through
+        // while the turn is held.
+        scope.spawn(move || {
+            let at_work = store.at_work();
+            began.send(()).expect("the case waits for the seat");
+            asked.recv().expect("the case says when to leave");
+            drop(at_work);
+            left.send(()).expect("the case waits for the leaver");
+        });
+        working.recv().expect("the thread is at work");
+        // Another holder is parked under the turn, in an issue's hook.
         scope.spawn(move || {
             let record = booking(gateway, 0, a, now);
             let issued = store.issue_decided(record, store.world().booked_of(a), |_| {
@@ -2886,17 +2908,12 @@ fn a_thread_that_leaves_its_work_waits_for_a_held_turn() {
             issued.expect("minted under the store's term");
         });
         parked.recv().expect("the issue tells");
-        // One thread is at work: a frame handed now is left to it.
-        let at_work = store.at_work();
-        let hand = store.handover(gateway);
+        let hand = Hand::new(gateway);
         let before = HEARD.load(SeqCst);
         store.hand(&hand, first.id, GONE);
-        // It leaves its work on a thread of its own, and is not through
-        // while the turn is held.
-        scope.spawn(move || {
-            drop(at_work);
-            left.send(()).expect("the case waits for the leaver");
-        });
+        leave
+            .send(())
+            .expect("the thread at work waits for the word");
         let early = gone.recv_timeout(Duration::from_millis(250)).is_ok();
         go.send(()).expect("the issuer holds the other end");
         (early, before)
@@ -2923,7 +2940,7 @@ fn the_store_is_printed_from_under_its_leases_turn() {
     store.tell_through(prints);
     let record = booking(GatewayId(1), 0, a, Instant::now());
     let issued = store.issue_decided(record, store.world().booked_of(a), |_| ());
-    let hand = store.handover(GatewayId(1));
+    let hand = Hand::new(GatewayId(1));
     store.hand(&hand, issued.expect("minted").id, GONE);
     let under = PRINTED.with(|printed| printed.borrow().clone());
     assert!(under.contains("leases: under the turn"), "{under}");
@@ -2945,7 +2962,7 @@ fn frames_handed_from_other_threads_are_all_applied_whoever_is_at_work() {
             let (issued, ids) = mpsc::channel::<LeaseId>();
             let store = &store;
             scope.spawn(move || {
-                let hand = store.handover(gateway);
+                let hand = Hand::new(gateway);
                 for id in ids {
                     store.hand(&hand, id, Said::Dispatched(Dispatch::default(), t0));
                     store.hand(&hand, id, GONE);
@@ -2973,30 +2990,43 @@ fn frames_handed_from_other_threads_are_all_applied_whoever_is_at_work() {
     assert_eq!(in_flight(&store), [(a, 0)]);
 }
 
+/// A lease's events are told under the decider whose file the lease is on,
+/// whichever thread applies them: its issuer's, where the store's host
+/// named its deciders. A store of one file that no decider is named for
+/// tells under no name.
 #[test]
-fn a_leases_events_are_told_with_the_decider_that_issued_it() {
-    let store = MemoryStore::new();
+fn a_leases_events_are_told_under_its_files_decider() {
+    let issue = |store: &MemoryStore, a| {
+        let record = booking(GatewayId(1), 0, a, Instant::now());
+        let issued = store.issue_decided(record, store.world().booked_of(a), |_| ());
+        issued.expect("minted under the store's term").id
+    };
+    let store = MemoryStore::new().with_deciders(4);
     let a = ready(&store, "http://a:1");
     LeasesStore::set_term(&store, 1);
     store.tell_through(heard);
-    let (now, world) = (Instant::now(), store.world());
-    let issue = || {
-        let record = booking(GatewayId(1), 0, a, now);
-        let issued = store.issue_decided(record, world.booked_of(a), |_| ());
-        issued.expect("minted under the store's term").id
-    };
     // One lease issued by a thread that acts as the fourth decider, one by
-    // a thread that names none.
+    // a thread that names none: the first file's.
+    let fourth = {
+        let _acting = Decider::new(3).enter();
+        issue(&store, a)
+    };
+    let first = issue(&store, a);
+    // Their ends are applied by a thread that names none.
+    let hand = Hand::new(GatewayId(1));
+    store.hand(&hand, fourth, GONE);
+    store.hand(&hand, first, GONE);
+    assert_eq!(told_by(), [Some(Decider::new(3)), Some(Decider::new(0))]);
+    let plain = MemoryStore::new();
+    let a = ready(&plain, "http://a:1");
+    LeasesStore::set_term(&plain, 1);
+    plain.tell_through(heard);
     let named = {
         let _acting = Decider::new(3).enter();
-        issue()
+        issue(&plain, a)
     };
-    let unnamed = issue();
-    // Their ends are applied by a thread that names none.
-    let hand = store.handover(GatewayId(1));
-    store.hand(&hand, named, GONE);
-    store.hand(&hand, unnamed, GONE);
-    assert_eq!(told_by(), [Some(Decider::new(3)), None]);
+    plain.hand(&Hand::new(GatewayId(1)), named, GONE);
+    assert_eq!(told_by(), [None]);
 }
 
 /// What a store told on any thread, by the store's address, in the order
@@ -3068,4 +3098,369 @@ fn a_lease_is_told_issued_before_any_holder_ends_it() {
     // The second lease is due as it is filed: its own issue ends it, and
     // tells it issued first.
     assert_eq!(mine, [(1, None), (2, None), (1, abandoned), (2, abandoned)]);
+}
+
+/// A store made for its deciders holds a file of leases each. A decider
+/// issues into its own file under its own turn and the id it mints names
+/// that file: what is handed of a lease is applied there, under that
+/// decider's name, while another decider's turn is held.
+#[test]
+fn a_decider_issues_into_its_own_file_and_a_leases_id_names_it() {
+    static NAMES: Mutex<Vec<(LeaseId, Option<Decider>)>> = Mutex::new(Vec::new());
+    fn named(_: &MemoryStore, record: &LeaseRecord, _: Said, by: Option<Decider>) {
+        let mut names = NAMES.lock().expect("no case fails under it");
+        names.push((record.lease.id, by));
+    }
+    let store = Arc::new(MemoryStore::new().with_deciders(3));
+    assert_eq!(store.deciders(), 3);
+    let a = ready(&store, "http://a:1");
+    LeasesStore::set_term(&*store, 1);
+    store.tell_through(named);
+    let (gateway, now) = (GatewayId(1), Instant::now());
+    let issue = |decider: u8| {
+        let _acting = Decider::new(decider).enter();
+        let record = booking(gateway, 0, a, now);
+        let lease = store.issue_decided(record, store.world().booked_of(a), |_| ());
+        lease.expect("minted under the store's term").id
+    };
+    let (second, third) = (issue(1), issue(2));
+    assert_ne!(
+        second.0 >> 24,
+        third.0 >> 24,
+        "a file mints in blocks of its own"
+    );
+    let (reached, parked) = mpsc::sync_channel(1);
+    let (go, word) = mpsc::sync_channel::<()>(1);
+    std::thread::scope(|scope| {
+        // The case's own ends go with it where it fails: the issuer's
+        // wait ends, and the case with it.
+        let (parked, go) = (parked, go);
+        let store = &store;
+        // The third decider holds its own turn, parked in an issue's hook.
+        scope.spawn(move || {
+            let _acting = Decider::new(2).enter();
+            let record = booking(gateway, 0, a, now);
+            let issued = store.issue_decided(record, store.world().booked_of(a), |_| {
+                reached.send(()).expect("the case hears the issue");
+                word.recv().expect("the case lets the issuer go");
+            });
+            issued.expect("minted under the store's term");
+        });
+        parked.recv().expect("the issue tells");
+        // The second's lease is read and ended at its own file meanwhile.
+        let on_file = LeasesStore::get(&**store, gateway, second);
+        assert_eq!(on_file.map(|record| record.lease.id), Some(second));
+        store.hand(&Hand::new(gateway), second, GONE);
+        assert_eq!(LeasesStore::get(&**store, gateway, second), None);
+        go.send(()).expect("the issuer holds the other end");
+    });
+    store.hand(&Hand::new(gateway), third, GONE);
+    let names = NAMES.lock().expect("no case fails under it");
+    let (second, third) = ((second, Decider::new(1)), (third, Decider::new(2)));
+    assert_eq!(*names, [second, third].map(|(lease, by)| (lease, Some(by))));
+    drop(names);
+    assert_eq!(LeasesStore::live(&*store, gateway), 1);
+}
+
+/// A restore hands each lease's end to its file. Where the file's decider
+/// is at work the restore returns with the lease on file and nothing
+/// told: that decider tells the end once, at its next take. A frame
+/// handed ahead of the restore for a lease is told in its order, and the
+/// restore's end of that lease then tells nothing.
+#[test]
+fn a_restore_leaves_a_working_deciders_leases_to_its_next_take() {
+    let now = Instant::now();
+    let (store, a, ids) = handed_bed(2, now);
+    let leader = MemoryStore::new();
+    assert_eq!(ready(&leader, "http://a:1"), a);
+    let cut = leader.cut(Kinds::All);
+    let (began, working) = mpsc::sync_channel(1);
+    let (look, asked) = mpsc::sync_channel::<()>(1);
+    let (looked, seen) = mpsc::sync_channel(1);
+    std::thread::scope(|scope| {
+        // The case's own ends go with it where it fails: the thread at
+        // work's wait ends, and the case with it.
+        let (working, look, seen) = (working, look, seen);
+        let store = &store;
+        scope.spawn(move || {
+            let at_work = store.at_work();
+            began.send(()).expect("the case waits for the seat");
+            asked.recv().expect("the case asks for the look");
+            at_work.apply();
+            looked
+                .send(told_ids())
+                .expect("the case waits for the look");
+        });
+        working.recv().expect("the thread is at work");
+        // A gateway's frame for the first lease, ahead of the restore.
+        store.hand(&Hand::new(GatewayId(1)), ids[0], GONE);
+        assert!(store.restore_from(cut));
+        // The restore is back: both leases stand and nothing is told.
+        assert_eq!(LeasesStore::live(&**store, GatewayId(1)), 2);
+        assert_eq!(told_ids(), []);
+        look.send(())
+            .expect("the thread at work waits for the word");
+        let removed = Said::Released(None, ReleaseReason::WorkerRemoved);
+        assert_eq!(seen.recv().expect("the look"), [(1, GONE), (2, removed)]);
+    });
+    assert_eq!(LeasesStore::live(&*store, GatewayId(1)), 0);
+    assert_eq!(store.queued(), 0);
+    assert_eq!(in_flight(&store), [(a, 0)]);
+}
+
+/// While a decider is at work no other thread acts at its file: a
+/// stream's end, the sweep of the due leases and a door each find it at
+/// work under the turn and apply nothing. What waits is the decider's.
+#[test]
+fn no_thread_acts_at_a_file_beside_the_thread_at_work() {
+    let now = Instant::now();
+    let (store, _, ids) = handed_bed(2, now);
+    let (began, working) = mpsc::sync_channel(1);
+    let (look, asked) = mpsc::sync_channel::<()>(1);
+    let (looked, seen) = mpsc::sync_channel(1);
+    std::thread::scope(|scope| {
+        // The case's own ends go with it where it fails: the thread at
+        // work's wait ends, and the case with it.
+        let (working, look, seen) = (working, look, seen);
+        let store = &store;
+        scope.spawn(move || {
+            let at_work = store.at_work();
+            began.send(()).expect("the case waits for the seat");
+            asked.recv().expect("the case asks for the look");
+            at_work.apply();
+            looked
+                .send(told_ids())
+                .expect("the case waits for the look");
+        });
+        working.recv().expect("the thread is at work");
+        let hand = Hand::new(GatewayId(1));
+        store.hand(&hand, ids[0], GONE);
+        // The stream's end, the sweep past every deadline and a door's read.
+        store.hand_back(hand);
+        let late = now + Duration::from_secs(60);
+        assert!(LeasesStore::expire(&**store, late).is_empty());
+        assert_eq!(LeasesStore::live(&**store, GatewayId(1)), 2);
+        assert_eq!(told_ids(), []);
+        // The thread at work applies what was handed at its next look.
+        look.send(())
+            .expect("the thread at work waits for the word");
+        assert_eq!(seen.recv().expect("the look"), [(1, GONE)]);
+    });
+    assert_eq!(LeasesStore::live(&*store, GatewayId(1)), 1);
+}
+
+/// A full ring stops its hand until a holder applied: the thread at work
+/// at the file, which the hand yields to. No frame is dropped, and none is
+/// applied by the hand beside that thread.
+#[test]
+fn a_full_ring_stops_its_hand_until_the_thread_at_work_applied() {
+    let now = Instant::now();
+    let room = u64::try_from(MemoryStore::HANDOVER).expect("the ring's room is a count");
+    let (store, a, ids) = handed_bed(room + 1, now);
+    let (began, working) = mpsc::sync_channel(1);
+    let (look, asked) = mpsc::sync_channel::<()>(1);
+    let (looked, seen) = mpsc::sync_channel(1);
+    let (handed, through) = mpsc::sync_channel(1);
+    std::thread::scope(|scope| {
+        // The case's own ends go with it where it fails: the thread at
+        // work's wait ends, and the case with it.
+        let (working, look, seen, through) = (working, look, seen, through);
+        let (store, ids) = (&store, &ids);
+        // A thread at work that does not come by until it is asked.
+        scope.spawn(move || {
+            let at_work = store.at_work();
+            began.send(()).expect("the case waits for the seat");
+            asked.recv().expect("the case asks for the look");
+            at_work.apply();
+            drop(at_work);
+            looked
+                .send(told_ids())
+                .expect("the case waits for the look");
+        });
+        working.recv().expect("the thread is at work");
+        // A hand fills the ring and stops at the frame past it.
+        scope.spawn(move || {
+            let hand = Hand::new(GatewayId(1));
+            for id in ids {
+                store.hand(&hand, *id, GONE);
+            }
+            handed
+                .send(told_ids())
+                .expect("the case waits for the hand");
+        });
+        let early = through.recv_timeout(Duration::from_millis(250));
+        assert!(early.is_err(), "the hand was through a full ring");
+        look.send(())
+            .expect("the thread at work waits for the word");
+        let by_hand = through.recv_timeout(Duration::from_secs(20));
+        let by_hand = by_hand.expect("the hand is through");
+        // The ring was the thread at work's to apply. The frame past it
+        // is that thread's too, or its hand's once the thread had left:
+        // every frame is told once, in the order it was handed.
+        let mut applied = seen.recv().expect("the look");
+        assert!(applied.len() >= MemoryStore::HANDOVER);
+        applied.extend(by_hand);
+        assert!(applied.iter().map(|(lease, _)| *lease).eq(1..=room + 1));
+    });
+    assert_eq!(in_flight(&store), [(a, 0)]);
+}
+
+/// A file whose decider rests ends no lease at an issue: the sweep ends
+/// its leases past their dispatch deadline, each told under the file's
+/// decider. A file whose decider is at work is left to it.
+#[test]
+fn the_sweep_ends_a_resting_files_due_leases_under_its_deciders_name() {
+    static NAMES: Mutex<Vec<(LeaseId, Option<Decider>)>> = Mutex::new(Vec::new());
+    fn named(_: &MemoryStore, record: &LeaseRecord, _: Said, by: Option<Decider>) {
+        let mut names = NAMES.lock().expect("no case fails under it");
+        names.push((record.lease.id, by));
+    }
+    let store = Arc::new(MemoryStore::new().with_deciders(2));
+    let a = ready(&store, "http://a:1");
+    LeasesStore::set_term(&*store, 1);
+    store.tell_through(named);
+    let (gateway, now) = (GatewayId(1), Instant::now());
+    let issue = |decider: u8| {
+        let _acting = Decider::new(decider).enter();
+        let record = booking(gateway, 0, a, now);
+        let lease = store.issue_decided(record, store.world().booked_of(a), |_| ());
+        lease.expect("minted under the store's term").id
+    };
+    let (first, second) = (issue(0), issue(1));
+    let late = now + Duration::from_secs(60);
+    let ended = |store: &MemoryStore| {
+        let ended = LeasesStore::expire(store, late);
+        ended
+            .iter()
+            .map(|record| record.lease.id)
+            .collect::<Vec<_>>()
+    };
+    let (began, working) = mpsc::sync_channel(1);
+    let (leave, asked) = mpsc::sync_channel::<()>(1);
+    std::thread::scope(|scope| {
+        // The case's own ends go with it where it fails: the decider's
+        // wait ends, and the case with it.
+        let (working, leave) = (working, leave);
+        let store = &store;
+        // The first decider is at work: the sweep leaves its file to it.
+        scope.spawn(move || {
+            let _acting = Decider::new(0).enter();
+            let _at_work = store.at_work();
+            began.send(()).expect("the case waits for the seat");
+            asked.recv().expect("the case says when to leave");
+        });
+        working.recv().expect("the decider is at work");
+        assert_eq!(ended(store), [second]);
+        leave.send(()).expect("the decider waits for the word");
+    });
+    assert_eq!(ended(&store), [first]);
+    let names = NAMES.lock().expect("no case fails under it");
+    let told = [(second, Decider::new(1)), (first, Decider::new(0))];
+    assert_eq!(*names, told.map(|(lease, by)| (lease, Some(by))));
+    drop(names);
+    assert_eq!(in_flight(&store), [(a, 0)]);
+}
+
+/// A gateway's leases stand in the files of the deciders that issued them:
+/// its live count, its restore and its end reach every file.
+#[test]
+fn a_gateways_doors_reach_its_leases_in_every_file() {
+    let store = MemoryStore::new().with_deciders(3);
+    let a = ready(&store, "http://a:1");
+    LeasesStore::set_term(&store, 1);
+    let (ours, theirs, now) = (GatewayId(1), GatewayId(2), Instant::now());
+    let issue = |decider: u8, gateway| {
+        let _acting = Decider::new(decider).enter();
+        let record = booking(gateway, 0, a, now);
+        let lease = store.issue_decided(record, store.world().booked_of(a), |_| ());
+        lease.expect("minted under the store's term").id
+    };
+    let leases = [issue(0, ours), issue(1, ours), issue(2, ours)];
+    let other = issue(1, theirs);
+    let doors: &dyn LeasesStore = &store;
+    assert_eq!((doors.live(ours), doors.live(theirs)), (3, 1));
+    assert_eq!(in_flight(&store), [(a, 4)]);
+    // A restore keeps the leases its gateway presents, each in the file
+    // its id names, and ends the gateway's others in every file.
+    let kept = doors.get(ours, leases[2]).expect("on its decider's file");
+    assert_eq!(doors.restore(ours, &[kept]), 1);
+    let on_file = leases.map(|lease| doors.get(ours, lease).is_some());
+    assert_eq!(on_file, [false, false, true]);
+    assert_eq!(in_flight(&store), [(a, 2)]);
+    // The gateways' end takes each one's leases out of every file.
+    assert_eq!(doors.drop_gateways(&[ours, theirs]), [1, 1]);
+    assert_eq!(doors.get(theirs, other), None);
+    assert_eq!(in_flight(&store), [(a, 0)]);
+}
+
+/// The start of a term the store follows raises the term on every file
+/// and tells the blocks, as the term's own door does: the table of a
+/// term that holds a lease is kept, and each file mints under the
+/// followed term. A start told again, or an older term's, raises nothing.
+#[test]
+fn a_followed_terms_start_raises_every_file_and_starts_the_blocks_under_it() {
+    let standby = MemoryStore::new().with_deciders(2);
+    let term: &dyn LeasesStore = &standby;
+    term.set_term(3);
+    let (gateway, now) = (GatewayId(1), Instant::now());
+    let issue = |decider: u8, under: u64| {
+        let _acting = Decider::new(decider).enter();
+        standby.issue_decided(lease(gateway, 0, under, now), None, |_| ())
+    };
+    issue(1, 3).expect("minted under the term the standby stood at");
+    standby.follow_term(Position { seq: 1, term: 7 });
+    assert_eq!(term.term(), 7);
+    assert_eq!(
+        standby.kept_terms(),
+        [3],
+        "the rise is told the ids on file"
+    );
+    for decider in [0, 1] {
+        let minted = issue(decider, 7).map(|lease| lease.id.0 >> 32);
+        assert_eq!(minted, Ok(7), "the file of decider {decider}");
+    }
+    standby.follow_term(Position { seq: 2, term: 5 });
+    assert_eq!(term.term(), 7);
+}
+
+/// A lease's id names its file for as long as the lease can be on file. A
+/// frame for a lease of the term before reaches the file of the decider
+/// that issued it, behind a rise under which another decider claimed the
+/// same block.
+#[test]
+fn a_lease_of_the_term_before_is_found_in_its_file_behind_a_rise() {
+    static NAMES: Mutex<Vec<(LeaseId, Option<Decider>)>> = Mutex::new(Vec::new());
+    fn named(_: &MemoryStore, record: &LeaseRecord, _: Said, by: Option<Decider>) {
+        let mut names = NAMES.lock().expect("no case fails under it");
+        names.push((record.lease.id, by));
+    }
+    let store = MemoryStore::new().with_deciders(3);
+    let a = ready(&store, "http://a:1");
+    LeasesStore::set_term(&store, 1);
+    store.tell_through(named);
+    let (gateway, now) = (GatewayId(1), Instant::now());
+    let issue = |decider: u8, term: u64| {
+        let _acting = Decider::new(decider).enter();
+        let record = LeaseRecord {
+            target: a,
+            ..lease(gateway, 0, term, now)
+        };
+        let lease = store.issue_decided(record, store.world().booked_of(a), |_| ());
+        lease.expect("minted under the store's term").id
+    };
+    // The third decider claims the first block of term 1, the second
+    // decider the first block of term 2.
+    let before = issue(2, 1);
+    LeasesStore::set_term(&store, 2);
+    let after = issue(1, 2);
+    assert_eq!(before.0 & 0xffff_ffff, after.0 & 0xffff_ffff);
+    assert_eq!(store.kept_terms(), [1]);
+    let hand = Hand::new(gateway);
+    store.hand(&hand, before, GONE);
+    store.hand(&hand, after, GONE);
+    let names = NAMES.lock().expect("no case fails under it");
+    let told = [(before, Decider::new(2)), (after, Decider::new(1))];
+    assert_eq!(*names, told.map(|(lease, by)| (lease, Some(by))));
+    drop(names);
+    assert_eq!(LeasesStore::live(&store, gateway), 0);
 }
