@@ -20,10 +20,10 @@ mod net;
 use std::{
     collections::BTreeMap,
     future::Future,
-    io::Write as _,
+    io::{ErrorKind, Write as _},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
     },
     thread,
@@ -33,7 +33,9 @@ use std::{
 use net::{http_get, loopback};
 use prost::Message as _;
 use smg_policy_controller::{
-    controller::{Config, Controller, Election, LeasePlace, Listener, Readiness, Scope, State},
+    controller::{
+        Config, Controller, Election, Error, LeasePlace, Listener, Readiness, Scope, State,
+    },
     elector::{ElectionSettings, Elector, FileLease, Tick},
     proto::{
         self, policy_controller_client::PolicyControllerClient, replica_frame::Frame,
@@ -1608,9 +1610,36 @@ struct Replica {
 const LEADER: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
 const FOLLOWER: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2));
 
+/// The numbers a pair's replication port is drawn from. The leader of a
+/// pair binds one, and its standby binds the same number on its own
+/// address. A bind of port `0` by any other case or process could have
+/// been handed that number there, so these lie below the range the host
+/// hands such a bind from. Each draw of this process takes the next
+/// number, a leader's and another address's from ranges apart: a replica
+/// served alone on the standby's address takes no number a leader holds.
+fn pair_ports(ip: IpAddr) -> impl Iterator<Item = u16> {
+    const SPAN: usize = 4096;
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    // Linux says where the range starts. A host that does not is taken to
+    // start it at 32,768, Linux's own default.
+    let low = std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range")
+        .ok()
+        .and_then(|range| range.split_whitespace().next()?.parse::<usize>().ok())
+        .filter(|low| *low > 3 * SPAN)
+        .unwrap_or(32_768);
+    let base = low - if ip == LEADER { 2 * SPAN } else { SPAN };
+    let start = usize::try_from(std::process::id()).unwrap_or(0);
+    (0..SPAN).map(move |_| {
+        let drawn = start.wrapping_add(NEXT.fetch_add(1, Ordering::Relaxed)) % SPAN;
+        u16::try_from(base + drawn).expect("a port below the host's range")
+    })
+}
+
 impl Replica {
     /// Binds a replica of the lease at `place` on `ip`, its replication
-    /// listener at `port` (`0` takes one), and serves it.
+    /// listener at `port`, and serves it. `0` takes a number of the pairs'
+    /// own ([`pair_ports`]), the next one free on `ip`: the number a
+    /// standby of this replica then binds on its own address.
     async fn serve(id: &str, ip: IpAddr, port: u16, place: LeasePlace) -> Self {
         let listener = |name: &str, scopes: &[Scope], port| Listener {
             name: name.to_owned(),
@@ -1618,7 +1647,7 @@ impl Replica {
             scopes: scopes.to_vec(),
             tls: None,
         };
-        let mut controller = Controller::bind(Config {
+        let config = |port| Config {
             controller_id: id.to_owned(),
             listeners: vec![
                 listener("gateway", &[Scope::Gateway, Scope::Ingestion], 0),
@@ -1631,13 +1660,27 @@ impl Replica {
             load_poll_interval: Config::DEFAULT_LOAD_POLL_INTERVAL,
             decide_shards: 2,
             election: Election {
-                lease: place,
+                lease: place.clone(),
                 settings: settings(),
                 advertise: None,
             },
-        })
-        .await
-        .expect("bind");
+        };
+        let mut controller = if port == 0 {
+            let mut bound = None;
+            for drawn in pair_ports(ip) {
+                match Controller::bind(config(drawn)).await {
+                    // In use on this address: the next number.
+                    Err(Error::Bind { source, .. }) if source.kind() == ErrorKind::AddrInUse => {}
+                    other => {
+                        bound = Some(other.expect("bind"));
+                        break;
+                    }
+                }
+            }
+            bound.expect("a free port among the pairs' own")
+        } else {
+            Controller::bind(config(port)).await.expect("bind")
+        };
         for name in ["control", "replication"] {
             controller
                 .identity_as_told(name)
