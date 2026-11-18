@@ -1212,6 +1212,47 @@ mod tests {
         false
     }
 
+    #[tokio::test]
+    async fn a_peer_cannot_fill_an_equivalent_local_reservation() {
+        for (reserved_url, published_url) in [
+            ("reserved:8080", "grpc://reserved:8080"),
+            ("grpc://reserved:8080", "reserved:8080"),
+            ("reserved:8080", "http://reserved:8080"),
+            ("http://reserved:8080", "reserved:8080"),
+            ("grpc://reserved:8080", "grpc://reserved:8080"),
+        ] {
+            let mesh = MeshKV::new("node-a".into());
+            let ns = worker_namespace(&mesh);
+            let registry = Arc::new(WorkerRegistry::new());
+            let app = app_context_for_tests(
+                RouterConfig::builder()
+                    .wait_for_tokenizer(true)
+                    .build_unchecked(),
+                Arc::clone(&registry),
+                None,
+            );
+            let adapter = WorkerSyncAdapter::new_with_context(
+                ns,
+                Arc::clone(&registry),
+                "node-a".into(),
+                cluster_with(&[("node-b", NodeStatus::Alive)]),
+                Arc::downgrade(&app),
+            );
+            let reservation = registry.reserve_id_for_url(reserved_url);
+            adapter
+                .import_prepared_state("peer-worker", sample_state("peer-worker", published_url));
+            assert!(
+                registry.get_by_url(published_url).is_none(),
+                "{reserved_url} must block {published_url}"
+            );
+            assert!(adapter.preparing.lock().is_empty());
+            assert_eq!(
+                registry.get_id_by_url_or_reservation(reserved_url),
+                Some(reservation)
+            );
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_slotless_replacement_releases_its_claim_when_its_key_stops_being_importable() {
         for (empty_payload_id, cleanup) in [false, true].into_iter().flat_map(|empty| {

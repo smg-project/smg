@@ -9,8 +9,9 @@ use wfaas::WorkflowResult;
 use super::{remote_worker_state, WorkerSyncAdapter, PREFIX};
 use crate::{
     worker::{
+        identity::endpoint::Scheme,
         registry::{worker_model_ids, WorkerId},
-        Worker,
+        Worker, WorkerRegistry,
     },
     workflow::{
         steps::local::ReleaseTokenizerStep,
@@ -57,7 +58,7 @@ impl WorkerSyncAdapter {
             .upgrade()
             .filter(|app| app.router_config.wait_for_tokenizer)
         {
-            for model in worker_model_ids(worker) {
+            for model in WorkerRegistry::policy_model_ids(worker) {
                 ReleaseTokenizerStep::release_if_unserved(&app_context, &model);
             }
         }
@@ -84,11 +85,22 @@ impl WorkerSyncAdapter {
         }
         // A pending local REST registration owns its reserved UUID. A peer
         // must not fill it while its local preparation is still running.
-        if self
-            .worker_registry
-            .get_id_by_url_or_reservation(&state.url)
-            .is_some_and(|id| self.worker_registry.get(&id).is_none())
-        {
+        let reserved = |url: &str| {
+            self.worker_registry
+                .get_id_by_url_or_reservation(url)
+                .is_some_and(|id| self.worker_registry.get(&id).is_none())
+        };
+        let pending_registration = reserved(&state.url)
+            || match Scheme::split_from(&state.url) {
+                Some((Scheme::Http | Scheme::Https | Scheme::Grpc | Scheme::Grpcs, bare)) => {
+                    reserved(bare)
+                }
+                None => ["http://", "grpc://"]
+                    .iter()
+                    .any(|scheme| reserved(&format!("{scheme}{}", state.url))),
+                _ => false,
+            };
+        if pending_registration {
             return;
         }
         // The first live publisher preparing this endpoint owns its pending

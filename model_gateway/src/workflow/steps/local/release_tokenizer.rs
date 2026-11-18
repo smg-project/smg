@@ -9,7 +9,7 @@ use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowRe
 
 use crate::{
     app_context::AppContext,
-    worker::{registry::worker_model_ids, Worker},
+    worker::{Worker, WorkerRegistry},
     workflow::data::{require_app_context, WorkerRemovalWorkflowData},
 };
 
@@ -78,14 +78,15 @@ impl StepExecutor<WorkerRemovalWorkflowData> for ReleaseTokenizerStep {
 
 impl ReleaseTokenizerStep {
     /// Worker-owned entries of unserved models, selected by the same model
-    /// scope as autoload: primary only by default, all cards with preparation.
+    /// scope as autoload: primary only by default, current and registered
+    /// cards with preparation, including cards omitted by a later refresh.
     /// The inspected entry ID protects a concurrent operator replacement.
     fn candidates(app_context: &AppContext, removed: &[&Arc<dyn Worker>]) -> Vec<(String, String)> {
         let mut asked: HashSet<String> = HashSet::new();
         let mut candidates = Vec::new();
         for worker in removed {
             let models = if app_context.router_config.wait_for_tokenizer {
-                worker_model_ids(worker)
+                WorkerRegistry::policy_model_ids(worker)
             } else {
                 vec![worker.model_id().to_string()]
             };
@@ -480,6 +481,14 @@ mod tests {
             );
             worker_tokenizer(&app_context, "a", "/tok/shared").await;
             worker_tokenizer(&app_context, "b", "/tok/shared").await;
+            worker_tokenizer(&app_context, "c", "/tok/shared").await;
+            app_context
+                .worker_registry
+                .refresh_models(&endpoint, vec![ModelCard::new("a"), ModelCard::new("c")]);
+            assert!(
+                app_context.worker_registry.contains_model("b"),
+                "a refresh keeps the registered model index"
+            );
 
             remove(&app_context, endpoint).await;
             assert!(
@@ -490,6 +499,11 @@ mod tests {
                 app_context.tokenizer_registry.contains("b"),
                 !wait_for_tokenizer,
                 "preparation owns listed models; default autoload owns the primary only"
+            );
+            assert_eq!(
+                app_context.tokenizer_registry.contains("c"),
+                !wait_for_tokenizer,
+                "current cards remain release candidates too"
             );
         }
     }

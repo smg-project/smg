@@ -1586,6 +1586,23 @@ impl<G: Generation> WorkerRegistry<G> {
         self.transition_under_lock(worker_id, Some(expected_revision), f)
     }
 
+    /// Read the revision only while this exact worker is the registered
+    /// entry. Replacements share revision state, so both reads must hold
+    /// the mutation lock before a cleanup caller can pin the incarnation.
+    pub fn revision_if_current(
+        &self,
+        worker_id: &WorkerId,
+        expected: &Arc<dyn Worker>,
+    ) -> Option<u64> {
+        self.transition_under_lock(worker_id, None, |worker| {
+            (
+                Arc::ptr_eq(worker, expected).then(|| worker.revision()),
+                None,
+            )
+        })?
+        .0
+    }
+
     /// The one place a registered worker's status transitions. Under the
     /// worker's mutation lock: the worker is looked up (gone -> `None`), its
     /// revision checked when the caller names one (moved on -> `None`), `f`
@@ -1859,7 +1876,7 @@ impl<G: Generation> WorkerRegistry<G> {
             self.worker_origins.remove(worker_id);
             self.import_records.remove(worker_id);
 
-            for model_id in worker_model_ids(&worker) {
+            for model_id in Self::policy_model_ids(&worker) {
                 self.remove_worker_from_model_index(&model_id, worker.url());
                 // Drop the per-model retry config when the last worker leaves.
                 let model_empty = self

@@ -199,7 +199,9 @@ pub(crate) async fn prepare_worker_tokenizers(
                         router
                             .tokenizer_path
                             .as_deref()
+                            .filter(|source| !source.is_empty())
                             .or(router.model_path.as_deref())
+                            .filter(|source| !source.is_empty())
                     }
                 })
                 .unwrap_or(&card.id);
@@ -250,8 +252,74 @@ pub(crate) fn tokenizer_source<'a>(
 
 #[cfg(test)]
 mod tests {
-    use super::tokenizer_source;
-    use crate::workflow::steps::local::test_support::labels_of;
+    use super::*;
+    use crate::{
+        app_context::testing::app_context_for_tests,
+        config::RouterConfig,
+        worker::{BasicWorkerBuilder, ConnectionMode, WorkerRegistry},
+        workflow::steps::local::test_support::labels_of,
+    };
+
+    #[tokio::test]
+    async fn secondary_sources_skip_empty_router_paths_and_keep_card_precedence() {
+        let directory = tempfile::tempdir().unwrap();
+        let tokenizer = directory.path().join("tokenizer.json");
+        std::fs::write(
+            &tokenizer,
+            serde_json::json!({
+                "version":"1.0", "truncation":null, "padding":null, "added_tokens":[],
+                "normalizer":null, "pre_tokenizer":null, "post_processor":null, "decoder":null,
+                "model":{"type":"BPE", "vocab":{"hello":0}, "merges":[]}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let router_tokenizer = directory.path().join("router-tokenizer.json");
+        std::fs::copy(&tokenizer, &router_tokenizer).unwrap();
+        for card_path in [None, Some(""), tokenizer.to_str()] {
+            let app = app_context_for_tests(
+                RouterConfig::builder()
+                    .wait_for_tokenizer(true)
+                    .tokenizer_path("")
+                    .model_path(router_tokenizer.to_str().unwrap())
+                    .build_unchecked(),
+                Arc::new(WorkerRegistry::new()),
+                None,
+            );
+            // The primary is already prepared; a secondary must use the real
+            // router path, or its own nonempty card path, without gRPC fallback.
+            let mut secondary = ModelCard::new("secondary");
+            secondary.tokenizer_path = card_path.map(str::to_string);
+            let worker: Arc<dyn Worker> = Arc::new(
+                BasicWorkerBuilder::new("ipc:///fixture")
+                    .connection_mode(ConnectionMode::Zmq)
+                    .models(vec![ModelCard::new("primary"), secondary])
+                    .build(),
+            );
+            assert_eq!(worker.model_id(), "primary");
+            assert_eq!(worker.models().len(), 2);
+            app.tokenizer_registry
+                .load("primary-tokenizer", "primary", "warm", || async {
+                    Ok(Arc::new(llm_tokenizer::mock::MockTokenizer::default())
+                        as Arc<dyn llm_tokenizer::traits::Tokenizer>)
+                })
+                .await
+                .unwrap();
+            let preparation = TokenizerPreparation::new(&app);
+            prepare_worker_tokenizers(&app, &[worker], &preparation)
+                .await
+                .unwrap();
+            assert_eq!(
+                app.tokenizer_registry
+                    .get_by_name("secondary")
+                    .unwrap()
+                    .source,
+                card_path
+                    .filter(|path| !path.is_empty())
+                    .unwrap_or(router_tokenizer.to_str().unwrap())
+            );
+        }
+    }
 
     /// A worker that names its model by id only, with neither a path label
     /// nor a router flag: the id is the source (a local load that fails on

@@ -231,20 +231,7 @@ pub fn create_worker_registration_workflow(
             .depends_on(&["discover_models"]),
         )
         // Prepare local tokenizers before the serving registry can see the workers.
-        .add_step(
-            StepDefinition::new(
-                "prepare_tokenizer",
-                "Prepare Tokenizer",
-                Arc::new(PrepareTokenizerStep),
-            )
-            .with_timeout(Duration::from_secs(300))
-            .with_retry(RetryPolicy {
-                max_attempts: 3,
-                backoff: BackoffStrategy::Fixed(Duration::from_secs(2)),
-            })
-            .with_failure_action(FailureAction::FailWorkflow)
-            .depends_on(&["ensure_harmony_encoding"]),
-        )
+        .add_step(PrepareTokenizerStep::definition())
         // === SHARED (both branches converge) ===
         // Step 4: Register workers
         .add_step(

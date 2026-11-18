@@ -562,17 +562,29 @@ async fn fetch_tokenizer_from_worker(
 ) -> Result<Arc<dyn Tokenizer>, String> {
     // A preparing worker is reachable but deliberately absent from the serving
     // registry. Try it directly, then any healthy replica already serving here.
+    // A preparing card already names a canonical model, even when its new
+    // name currently aliases another serving model in the registry.
+    let preparing_canonical = candidates.iter().any(|worker| {
+        worker.model_id() == model_id || worker.models().iter().any(|card| card.id == model_id)
+    });
+    let canonical_model_id = if preparing_canonical {
+        None
+    } else {
+        app_context.worker_registry.resolve_model_alias(model_id)
+    };
+    let canonical_model_id = canonical_model_id.as_deref().unwrap_or(model_id);
     let mut workers: Vec<_> = candidates
         .iter()
         .filter(|worker| {
-            *worker.connection_mode() == ConnectionMode::Grpc && worker.model_id() == model_id
+            *worker.connection_mode() == ConnectionMode::Grpc
+                && worker.model_id() == canonical_model_id
         })
         .cloned()
         .collect();
     let mut endpoints = std::collections::HashSet::new();
     workers.retain(|worker| endpoints.insert(worker.base_url().to_owned()));
     for worker in app_context.worker_registry.get_workers_filtered(
-        Some(model_id),
+        Some(canonical_model_id),
         None,
         Some(ConnectionMode::Grpc),
         None,
@@ -580,7 +592,7 @@ async fn fetch_tokenizer_from_worker(
     ) {
         // GetTokenizer has no model selector: a multi-model worker's primary
         // bundle is not evidence for an unrelated secondary model.
-        if app_context.router_config.wait_for_tokenizer && worker.model_id() != model_id {
+        if app_context.router_config.wait_for_tokenizer && worker.model_id() != canonical_model_id {
             continue;
         }
         if !app_context.router_config.wait_for_tokenizer
@@ -811,6 +823,93 @@ mod tests {
         config::RouterConfig,
         worker::{test_support::no_health_check, BasicWorkerBuilder},
     };
+
+    #[tokio::test]
+    async fn an_alias_can_fetch_only_its_canonical_primary_workers_bundle() {
+        for primary in [true, false] {
+            let registry = Arc::new(WorkerRegistry::new());
+            let mut canonical = ModelCard::new("canonical");
+            canonical.aliases = vec!["alias".into()];
+            let models = if primary {
+                vec![canonical]
+            } else {
+                vec![ModelCard::new("unrelated"), canonical]
+            };
+            let worker: Arc<dyn Worker> = Arc::new(
+                BasicWorkerBuilder::new("grpc://127.0.0.1:1")
+                    .connection_mode(ConnectionMode::Grpc)
+                    .health_config(no_health_check())
+                    .models(models)
+                    .build(),
+            );
+            assert_eq!(
+                worker.model_id(),
+                if primary { "canonical" } else { "unrelated" }
+            );
+            assert_eq!(worker.models().len(), if primary { 1 } else { 2 });
+            registry.register(worker).unwrap();
+            let app = app_context_for_tests(
+                RouterConfig::builder()
+                    .wait_for_tokenizer(true)
+                    .build_unchecked(),
+                registry,
+                None,
+            );
+            let failure = fetch_tokenizer_from_worker(&app, "tokenizer-id", "alias", None, &[])
+                .await
+                .err()
+                .expect("the unreachable worker cannot return a bundle");
+            if primary {
+                assert!(
+                    failure.contains("for model 'alias' from 1 healthy gRPC worker(s)"),
+                    "{failure}"
+                );
+                for prepared_primary in [true, false] {
+                    let models = if prepared_primary {
+                        vec![ModelCard::new("alias")]
+                    } else {
+                        vec![ModelCard::new("preparing-other"), ModelCard::new("alias")]
+                    };
+                    let candidate: Arc<dyn Worker> = Arc::new(
+                        BasicWorkerBuilder::new("grpc://127.0.0.1:2")
+                            .connection_mode(ConnectionMode::Grpc)
+                            .models(models)
+                            .build(),
+                    );
+                    let failure = fetch_tokenizer_from_worker(
+                        &app,
+                        "new-tokenizer",
+                        "alias",
+                        None,
+                        &[candidate],
+                    )
+                    .await
+                    .err()
+                    .expect("the unreachable preparing worker cannot return a bundle");
+                    assert!(
+                        !failure.contains("grpc://127.0.0.1:1"),
+                        "the serving alias must not supply the new canonical model: {failure}"
+                    );
+                    if prepared_primary {
+                        assert!(
+                            failure.contains("grpc://127.0.0.1:2"),
+                            "the exact preparing primary was attempted: {failure}"
+                        );
+                    } else {
+                        assert!(
+                            failure.contains("No healthy or preparing gRPC worker available"),
+                            "a secondary has no primary bundle: {failure}"
+                        );
+                    }
+                }
+            } else {
+                assert!(
+                    failure.contains("No healthy or preparing gRPC worker available"),
+                    "{failure}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn worker_tokenizer_bundle_preserves_configured_template() {

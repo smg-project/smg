@@ -1820,6 +1820,47 @@ async fn a_cancelled_workflow_s_terminal_state_waits_for_a_step_past_its_cancel_
     );
 }
 
+/// A deadline read can precede completion while the cancellation update
+/// follows it. That stale timeout must not overwrite the settled outcome.
+#[tokio::test]
+async fn completion_after_the_deadline_read_wins_over_late_cancellation() {
+    let engine = WorkflowEngine::<TestWorkflowData>::new();
+    let running = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let workflow = WorkflowDefinition::new("deadline_completion_race", "Deadline Completion Race")
+        .add_step(StepDefinition::new(
+            "held",
+            "Held",
+            Arc::new(HeldSucceedingStep {
+                running: Arc::clone(&running),
+                release: Arc::clone(&release),
+            }),
+        ));
+    let instance_id = started(&engine, workflow).await.unwrap();
+    timeout(Duration::from_secs(5), running.notified())
+        .await
+        .unwrap();
+    assert!(engine
+        .wait_for_terminal_state(instance_id, "deadline", Duration::ZERO)
+        .await
+        .is_err());
+    release.notify_one();
+    timeout(Duration::from_secs(5), async {
+        while engine.get_status(instance_id).await.unwrap().status != WorkflowStatus::Completed {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!engine.cancel_workflow_if_active(instance_id).await.unwrap());
+    let settled = engine
+        .wait_for_terminal_state(instance_id, "deadline", Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(settled.status, WorkflowStatus::Completed);
+    assert!(wfaas::completion_outcome(&settled, "deadline").is_ok());
+}
+
 /// A step whose attempt skips.
 struct AttemptSkipStep;
 

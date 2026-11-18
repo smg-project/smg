@@ -533,6 +533,7 @@ async fn a_mesh_tombstone_cancels_preparation_without_resurrecting_the_import() 
     let owner = Gateway::start("owner", None, true).await;
     let peer = Gateway::start("peer", Some(owner.mesh_port), true).await;
     seed_a(&owner).await;
+    peer.wait_ready().await;
     let (url, gate) = worker("model-b", &[2]).await;
     let id = owner.create(&url, "model-b").await;
     owner.ready_worker(&id).await;
@@ -692,6 +693,19 @@ async fn a_slow_put_keeps_the_old_worker_and_cannot_overwrite_a_newer_put() {
     let id = gateway.create(&url, "model-a").await;
     gateway.ready_worker(&id).await;
     gateway.wait_ready().await;
+    let registration_instance = |log: &str| {
+        log.lines()
+            .rev()
+            .find(|line| {
+                line.contains("Workflow started")
+                    && line.contains("definition_id=worker_registration")
+            })
+            .and_then(|line| line.split("instance_id=").nth(1))
+            .and_then(|tail| tail.split_whitespace().next())
+            .map(str::to_owned)
+    };
+    gateway_launch::log_with_line(&gateway.log, "definition_id=worker_registration", WAIT).unwrap();
+    let initial_post = registration_instance(&gateway.logs()).unwrap();
     let response = gateway
         .client
         .put(format!("{}/workers/{id}", gateway.http))
@@ -701,6 +715,21 @@ async fn a_slow_put_keeps_the_old_worker_and_cannot_overwrite_a_newer_put() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::ACCEPTED);
     gate.wait_for_calls(2).await;
+    // Capture B's workflow before submitting C: URL and job type are shared,
+    // while the workflow instance identifies this particular PUT.
+    let started = Instant::now();
+    let older_put = loop {
+        if let Some(instance) =
+            registration_instance(&gateway.logs()).filter(|id| id != &initial_post)
+        {
+            break instance;
+        }
+        assert!(
+            started.elapsed() < WAIT,
+            "the older PUT did not log its workflow instance"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
     gateway.stays_ready().await;
     let response = gateway
         .client
@@ -724,7 +753,21 @@ async fn a_slow_put_keeps_the_old_worker_and_cannot_overwrite_a_newer_put() {
         tokio::time::sleep(Duration::from_millis(30)).await;
     }
     gate.release();
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let started = Instant::now();
+    loop {
+        if gateway.logs().lines().any(|line| {
+            line.contains("Failed job: type=AddWorker")
+                && line.contains(&format!("(instance: {older_put})"))
+        }) {
+            break;
+        }
+        assert!(
+            started.elapsed() < WAIT,
+            "the older PUT did not finish: {}",
+            gateway.logs()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     let (_, current) = gateway.json(&format!("/workers/{id}")).await;
     assert_eq!(current["models"][0]["id"], "model-c");
     assert_eq!(current["status"], "ready");

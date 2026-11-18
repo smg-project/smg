@@ -64,8 +64,8 @@ pub fn registered_entries<D: WorkerRegistrationData>(
         .flatten()
         .filter_map(|worker| {
             let id = registry.get_id_by_url(worker.url())?;
-            let entry = registry.get(&id)?;
-            Arc::ptr_eq(&entry, worker).then(|| (id.as_str().to_string(), entry.revision()))
+            let revision = registry.revision_if_current(&id, worker)?;
+            Some((id.as_str().to_string(), revision))
         })
         .collect()
 }
@@ -408,6 +408,31 @@ mod tests {
             registered_entries(&registry, &state),
             HashMap::from([(id.as_str().to_string(), worker.revision())]),
             "the registration's worker is the entry under its URL"
+        );
+        let entries = registry.with_another_write_before_the_lock(
+            |registry| registered_entries(registry, &state),
+            |_| {
+                worker.raise_revision_to(worker.revision() + 1);
+            },
+        );
+        assert_eq!(
+            entries,
+            HashMap::from([(id.as_str().to_string(), worker.revision())]),
+            "an in-place revision raise keeps the exact worker eligible for cleanup"
+        );
+        let entries = registry.with_another_write_before_the_lock(
+            |registry| registered_entries(registry, &state),
+            |registry| {
+                registry.register_or_replace(Arc::new(BasicWorkerBuilder::new(url).build()));
+            },
+        );
+        assert!(
+            entries.is_empty(),
+            "a same-ID replacement cannot donate its revision to the old worker's removal pin"
+        );
+        assert!(
+            registered_entries(&registry, &state).is_empty(),
+            "the replaced worker shares the new revision but not the registry entry's identity"
         );
         registry.remove(&id);
         let other: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new(url).build());
