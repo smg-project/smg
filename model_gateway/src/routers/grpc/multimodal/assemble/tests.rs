@@ -929,6 +929,125 @@ fn media_the_engine_would_not_read_in_full_is_refused() {
 }
 
 #[test]
+fn nemotron_audio_reaches_vllm_with_native_lengths_and_prompt_bindings() {
+    use llm_multimodal::{ModelMetadata, ModelRegistry, PreProcessorConfig, Tokenizer};
+
+    struct AudioTokenizer;
+    impl Tokenizer for AudioTokenizer {
+        fn token_to_id(&self, token: &str) -> Option<u32> {
+            (token == "<|audio|>").then_some(131072)
+        }
+        fn id_to_token(&self, _id: u32) -> Option<String> {
+            None
+        }
+        fn encode_text(&self, _text: &str) -> Option<Vec<u32>> {
+            None
+        }
+    }
+
+    let config = serde_json::json!({
+        "model_type": "nemotron3_5_transcribe",
+        "audio_config": {
+            "preprocessor": {"sample_rate": 16000, "hop_length": 160, "n_fft": 512},
+            "asr_encoder": {"subsampling_factor": 8}
+        }
+    });
+    let registry = ModelRegistry::new();
+    let metadata = ModelMetadata {
+        model_id: "nemotron-transcribe",
+        tokenizer: &AudioTokenizer,
+        config: &config,
+    };
+    let spec = registry.lookup(&metadata).unwrap();
+    let processor = spec
+        .audio_processor(&config, &PreProcessorConfig::default())
+        .unwrap()
+        .unwrap();
+    let audios: Vec<_> = [(1, "short"), (1440, "long")]
+        .into_iter()
+        .map(|(length, hash)| {
+            Arc::new(AudioClip::new(
+                bytes::Bytes::new(),
+                DecodedAudio {
+                    samples: vec![0.25; length],
+                    sample_rate: 16000,
+                },
+                AudioSource::InlineBytes,
+                hash.to_string(),
+            ))
+        })
+        .collect();
+
+    // A vision worker's pixel-normalization setting must not reinterpret audio.
+    for device_normalizes in [false, true] {
+        let preprocessed = processor.preprocess(&audios).unwrap();
+        let bindings = preprocessed
+            .feature_token_counts
+            .iter()
+            .enumerate()
+            .map(|(item, &length)| PromptBinding {
+                item_index: item,
+                prompt_ordinal: item,
+                structural: PlaceholderRange {
+                    offset: 10 + item,
+                    length,
+                },
+                patches: vec![],
+            })
+            .collect();
+        let intermediate = PrecomputedMultimodalIntermediate {
+            preprocessed,
+            media: MediaBatch::Audios(audios.clone()),
+            bindings,
+            placeholder_token_id: Some(
+                spec.placeholder_token_id(&metadata)
+                    .unwrap()
+                    .try_into()
+                    .unwrap(),
+            ),
+            field_layouts: spec.encoder_field_layouts_for(Modality::Audio),
+            keep_on_cpu_keys: spec.keep_on_cpu_keys_for(Modality::Audio),
+            encoder_input_key: spec.encoder_input_key_for(Modality::Audio),
+        };
+        validate_precomputed_batch(&intermediate).unwrap();
+        let assembled = assemble_vllm(
+            intermediate,
+            &VllmAssembly {
+                encoder_dtype: "bfloat16".into(),
+                device_normalizes,
+                shm_enabled: false,
+                shm_min_bytes: 0,
+            },
+        )
+        .unwrap();
+        assert_eq!(assembled.modality, common::Modality::Audio);
+        assert_eq!(assembled.encoder_input_key.as_deref(), Some("audio_signal"));
+        assert_eq!(assembled.pixel_values_shape, [2, 1440]);
+        assert_eq!(assembled.pixel_values_dtype, "bfloat16");
+        assert_eq!(assembled.pixel_values.len(), 2 * 1440 * size_of::<u16>());
+        assert_eq!(assembled.mm_hashes, ["short", "long"]);
+        assert_eq!(assembled.mm_placeholders, [(10, 1), (11, 2)]);
+        assert_eq!(assembled.im_token_id, Some(131072));
+        assert_eq!(assembled.keep_on_cpu_keys, ["audio_signal_length"]);
+        assert!(assembled
+            .batched_keys
+            .iter()
+            .any(|key| key == "audio_signal"));
+        assert!(assembled
+            .batched_keys
+            .iter()
+            .any(|key| key == "audio_signal_length"));
+        let lengths = &assembled.model_specific_tensors["audio_signal_length"];
+        assert_eq!(lengths.dtype, "int64");
+        assert_eq!(lengths.shape, [2]);
+        assert_eq!(
+            lengths.data,
+            [160i64.to_le_bytes(), 1440i64.to_le_bytes()].concat()
+        );
+    }
+}
+
+#[test]
 fn assemble_tokenspeed_splits_audio_items_as_bfloat16_by_default() {
     let mut model_specific = HashMap::new();
     model_specific.insert(
