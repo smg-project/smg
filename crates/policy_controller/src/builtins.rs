@@ -1008,7 +1008,12 @@ impl Scorer for LeastLoad {
     /// not have been handed. So where one stands among the rows handed, the
     /// stage says it must be asked whole ([`Front::Whole`]) before it costs
     /// any: the rows a rank put in front are costed alone only where each
-    /// reports a rate, and then as they are among every row.
+    /// reports a rate, and then as they are among every row. Their costs
+    /// are spread over their own span and not the pool's, so two of them
+    /// further apart than the tie's microsecond are told apart whatever the
+    /// rows behind them cost. Among every row, a difference that is a small
+    /// enough share of the pool's span falls under the last bit of a
+    /// profile's sum, and the rows are drawn among.
     fn score_front(
         &self,
         facts: &RequestFacts<'_>,
@@ -1429,6 +1434,12 @@ impl Picker for Best {
         "best"
     }
 
+    /// The targets are the best of the rows handed: a rank may put rows in
+    /// front of this picker.
+    fn front_wise(&self) -> bool {
+        true
+    }
+
     fn pick(
         &self,
         facts: &RequestFacts<'_>,
@@ -1470,6 +1481,12 @@ impl Lifecycle for SampledBest {}
 impl Picker for SampledBest {
     fn name(&self) -> &'static str {
         "best"
+    }
+
+    /// The targets are the best of the rows handed: a rank may put rows in
+    /// front of this picker.
+    fn front_wise(&self) -> bool {
+        true
     }
 
     fn pick(
@@ -1919,6 +1936,12 @@ impl Lifecycle for CountFirst {}
 impl Picker for CountFirst {
     fn name(&self) -> &'static str {
         "count-first"
+    }
+
+    /// The targets are the best of the rows handed: a rank may put rows in
+    /// front of this picker.
+    fn front_wise(&self) -> bool {
+        true
     }
 
     fn narrow(

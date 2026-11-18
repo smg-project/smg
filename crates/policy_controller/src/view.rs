@@ -1011,11 +1011,17 @@ pub struct PoolFacts<'a> {
     /// rows it wrote, and a decision reads it once: a profile decided by
     /// rank ([`Scorer::spread`](crate::Scorer::spread)) is asked by rank
     /// only where it is on, since the load stage reads every row to cost a
-    /// row without a rate. Off by default: a host that does not say it gets
-    /// the whole pass. A host that says it of a pool that holds such a row
-    /// costs the decision its ranks' reading and changes no answer: the
-    /// stage says so itself of the rows it is handed
-    /// ([`Front::Whole`](crate::Front::Whole)). In-process only.
+    /// row without a rate. By rank the targets are the whole pass's
+    /// wherever its sums tell the rows in front apart: rows it rounds to
+    /// one sum it draws among, and by rank they are ordered. Off by
+    /// default: a host that does not say it gets the whole pass. A host
+    /// that says it of a pool that holds a row without a rate is answered
+    /// in one of two ways. Among the rows in front such a row makes the
+    /// stage say that it must be asked whole
+    /// ([`Front::Whole`](crate::Front::Whole)): the decision is the whole
+    /// pass's, and it paid for its ranks' reading. Behind them it is not
+    /// read: each row in front is costed from its own report, and the
+    /// decision is the one by rank. In-process only.
     pub rated: bool,
 }
 

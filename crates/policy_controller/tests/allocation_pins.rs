@@ -22,9 +22,9 @@ use smg_policy_controller::{
         Ask, GatewayId, HealthSink, LoadSink, LoadSource, MemoryStore, PairBuffers,
         PairingDescriptor, ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore, PUBLISH_WINDOW,
     },
-    Candidate, Constraints, Engine, Health, Lease, Lifecycle, LoadRow, PairPools, PolicySpec,
-    PoolFacts, RequestFacts, Role, Scratch, Side, SignalSource, Target, WireModes, WorkerId,
-    PRESETS,
+    AffinityFacts, Candidate, Constraints, Engine, Health, Lease, Lifecycle, LoadRow,
+    NamedAffinity, NamedHolder, PairPools, PolicySpec, PoolFacts, RequestFacts, Role, Scratch,
+    Side, SignalSource, Target, WireModes, WorkerId, PRESETS,
 };
 
 #[global_allocator]
@@ -105,6 +105,121 @@ fn a_decision_after_the_first_allocates_nothing_for_any_preset() {
                 allocations_during(|| engine.decide(&facts(2), &pool(n), &view, &cx, &mut scratch));
             assert!(decision.pick().is_some(), "{preset} at {n} routes");
             assert_eq!(allocations, 0, "{preset} at {n}: a decision allocated");
+        }
+    }
+}
+
+/// A decision asked by rank allocates nothing after the thread's first of
+/// its size, whatever that first was: by rank where no row holds the
+/// request's prefix, a draw for a request that names rows, or the whole
+/// pass over a pool not said to hold a rate on every row. The second
+/// decision puts the holders in front: one row in eight, each with nothing
+/// in flight. What it keeps of them stands in buffers every first decision
+/// sized: their sums in the stage's, their list in the soft filter's
+/// backup. The preset is read with its soft filters and without them. A
+/// profile without one takes the list's room at its first decision by
+/// rank: behind a whole pass that decision allocates once, and the next
+/// allocates nothing.
+#[test]
+fn a_decision_by_rank_after_the_first_allocates_nothing() {
+    let mut bare = PolicySpec::preset("cache_aware").expect("a preset");
+    for profile in bare.profiles.values_mut() {
+        profile
+            .filter
+            .retain(|name| name != "not-tried" && name != "has-room");
+    }
+    let engines = [
+        (true, engine_of("cache_aware")),
+        (false, bare.validate().expect("the document validates")),
+    ];
+    for (soft, engine, n) in engines
+        .iter()
+        .flat_map(|(soft, engine)| [(*soft, engine, 64u32), (*soft, engine, 512)])
+    {
+        let mut view = fleet(n);
+        for row in view.iter_mut().step_by(8) {
+            row.in_flight = 0;
+        }
+        let column = |blocks: u32| -> Vec<AffinityFacts> {
+            (0..n)
+                .map(|i| AffinityFacts {
+                    overlap_blocks: if i % 8 == 0 { blocks } else { 0 },
+                    ..AffinityFacts::default()
+                })
+                .collect()
+        };
+        let (cold, held) = (column(0), column(4));
+        let names = [NamedHolder {
+            row: 0,
+            overlap_blocks: 4,
+            predicted_blocks: 0,
+        }];
+        // Each first, and whether the host says the pool's fact of it.
+        let firsts = [
+            (
+                RequestFacts {
+                    affinity: &cold,
+                    ..facts(1)
+                },
+                true,
+            ),
+            (
+                RequestFacts {
+                    named: Some(NamedAffinity {
+                        holders: &names,
+                        ..NamedAffinity::default()
+                    }),
+                    ..facts(1)
+                },
+                true,
+            ),
+            (
+                RequestFacts {
+                    affinity: &cold,
+                    ..facts(1)
+                },
+                false,
+            ),
+        ];
+        let said = PoolFacts {
+            rated: true,
+            ..pool(n)
+        };
+        let unsaid = pool(n);
+        let cx = Constraints::default();
+        for (order, (first, rated)) in firsts.iter().enumerate() {
+            let mut scratch = Scratch::new();
+            let of_first = if *rated { &said } else { &unsaid };
+            engine
+                .decide(first, of_first, &view, &cx, &mut scratch)
+                .pick()
+                .expect("the fleet routes");
+            let second = RequestFacts {
+                affinity: &held,
+                ..facts(2)
+            };
+            let (decision, allocations) =
+                allocations_during(|| engine.decide(&second, &said, &view, &cx, &mut scratch));
+            let pick = decision.pick().expect("the fleet routes");
+            assert!(
+                pick.targets.iter().all(|target| target.position % 8 == 0),
+                "soft {soft} at {n}, order {order}, the targets are holders: {:?}",
+                pick.targets
+            );
+            // A whole pass sizes no list of the rows in front: without a
+            // soft filter the first decision by rank takes that room.
+            let lists_late = !soft && !*rated;
+            assert_eq!(
+                allocations,
+                usize::from(lists_late),
+                "soft {soft} at {n}, order {order}: a decision by rank allocated"
+            );
+            let (_, again) =
+                allocations_during(|| engine.decide(&second, &said, &view, &cx, &mut scratch));
+            assert_eq!(
+                again, 0,
+                "soft {soft} at {n}, order {order}: the next decision by rank allocated"
+            );
         }
     }
 }
