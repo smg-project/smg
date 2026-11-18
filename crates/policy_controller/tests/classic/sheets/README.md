@@ -307,7 +307,8 @@ fails once the reason no longer holds.
   holds (`an-answer-that-names-no-rank-takes-the-ranks-that-pushed-before-it-off-the-report`). Each of these five
   rows repeats the step that leaves a rank unheard, and replays as recorded from its fourth repeat on. A rank an
   answer leaves out beside a named one carries the overload bit alone, as the store's avoidance of that rank: the
-  replay reads a worker as overloaded when every rank row of it carries the bit. The other 19 rows replay.
+  replay reads a worker's verdict off the rows of the ranks its last answer named. It fails where those rows carry
+  two verdicts, and where a rank left out carries no bit. The other 19 rows replay.
 - `manual.json`: one row is owed, `manual-one-key-pins-apart-under-the-prefill-and-the-decode-role`. The gateway
   keeps a key's pins apart under each role of a prefill and decode pair. The crate refuses a sessions rule under a
   pair plan today, so it cannot build the row; the other 13 rows replay.
