@@ -67,14 +67,7 @@ impl ChatResponseProcessingStage {
                 .skip_special_tokens
                 .unwrap_or(chat_request.skip_special_tokens);
 
-            // Reserved (if tenant rate limiting is enabled): settled with real
-            // usage inside the streaming processor on success, or abandoned
-            // on early disconnect/error by the reservation's safety net the
-            // processor hands the response body (ReservationAttachment's Drop).
-            let reservation = ctx
-                .rate_limit_cell
-                .as_deref()
-                .and_then(RateLimitCell::take_for_streaming_handoff);
+            let reservation = RateLimitCell::stream_reservation(ctx.rate_limit_cell.as_deref());
 
             // Streaming: Use StreamingProcessor and return SSE response. The
             // reading consumes the spec, never the parsed request.

@@ -60,14 +60,7 @@ impl GenerateResponseProcessingStage {
         let tokenizer = stage_output(ctx.tokenizer_arc(), FUNCTION)?;
 
         if is_streaming {
-            // Reserved (if tenant rate limiting is enabled): settled with real
-            // usage inside the streaming processor on success, or abandoned
-            // on early disconnect/error by the reservation's safety net the
-            // processor hands the response body (ReservationAttachment's Drop).
-            let reservation = ctx
-                .rate_limit_cell
-                .as_deref()
-                .and_then(RateLimitCell::take_for_streaming_handoff);
+            let reservation = RateLimitCell::stream_reservation(ctx.rate_limit_cell.as_deref());
 
             // Streaming: Use StreamingProcessor and return SSE response
             let source = StreamSource::new(
