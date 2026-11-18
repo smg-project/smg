@@ -393,8 +393,10 @@ impl Running {
     /// thread counts the term among the terms this replica saw. Where it
     /// leads under a lower term, or no term is said, it closes the fence,
     /// releases the lease under the highest term it saw and takes nothing
-    /// for one lease duration; a replica that holds no lease, or leads at
-    /// or above the term said, keeps on as it is. A word may not spend the
+    /// for one lease duration; a replica that leads at or above the term
+    /// said keeps on as it is. So does one that holds no lease: where it
+    /// saw the lease released under a lower term, it writes that release
+    /// again under the highest term it saw. A word may not spend the
     /// last term: a term whose next is not below the ceiling
     /// ([`crate::elector::TERM_CEILING`]) is the term error, and no word is
     /// said.

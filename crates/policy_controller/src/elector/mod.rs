@@ -719,8 +719,9 @@ impl Elector {
     /// next look. A holder that leads at or above the term said keeps on as
     /// it is. A candidate keeps on too, and where it saw the lease released
     /// under a term below the highest its run saw, the term said counted,
-    /// it writes that release again under that highest: whoever takes next
-    /// takes above it. An elector alone ([`Elector::alone`])
+    /// it writes that release again under that highest, an empty record
+    /// and one gone for this run apart: whoever takes next takes above it.
+    /// An elector alone ([`Elector::alone`])
     /// holds nothing back: its next step takes its own lease again, above
     /// the term said.
     ///
@@ -758,8 +759,12 @@ impl Elector {
     /// the gateway that holds it. A record gone for this run, released under
     /// a term below the one it last saw held, stays as it is too: no
     /// holder's release made it so, that holder may still lead, and written
-    /// under a higher term the record would read as its release. Never
-    /// `true`: this call releases no lease.
+    /// under a higher term the record would read as its release. An empty
+    /// record, released under term zero, stays as it is for the same
+    /// reason: no holder wrote it, one this run never saw may still lead,
+    /// and the take over it opens its fence a renew deadline late, which a
+    /// take over a release under a higher term does not. Never `true`:
+    /// this call releases no lease.
     fn raise(&mut self, above: Option<u64>, now: Instant) -> Result<bool, ElectError> {
         let gone = self
             .gone(self.observed.as_ref().map(|seen| &seen.record))
@@ -769,7 +774,7 @@ impl Elector {
         };
         let term = self.highest_term;
         let seen = &observation.record;
-        if gone || !seen.is_released() || seen.term >= term {
+        if gone || !seen.is_released() || seen.term == 0 || seen.term >= term {
             return Ok(false);
         }
         let raised = LeaseRecord {
@@ -2706,6 +2711,44 @@ mod tests {
         assert!(!matches!(next, Tick::Acquired { .. }), "{next:?}");
         assert_eq!(c.fence().leader_term(at), None);
         assert_eq!(x.fence().leader_term(at), Some(said));
+    }
+
+    #[test]
+    fn a_term_said_over_an_empty_record_writes_nothing() {
+        // An empty record, released under term zero, is no holder's
+        // release: a manifest put under a live holder reads so, and the
+        // take over it opens its fence a renew deadline late for a holder
+        // the taker never saw. A candidate whose take over it failed is
+        // told a term: the term is counted and the record stays empty.
+        // Written under the term it would read as a release, and the next
+        // take would lead at once.
+        let mut lease = MemoryLease::new();
+        let empty = LeaseRecord::default();
+        assert_eq!(lease.write(None, &empty).expect("a write"), Written::Done);
+        let fails = Arc::new(AtomicU32::new(1));
+        let backend = Failing {
+            lease: lease.clone(),
+            fails: Arc::clone(&fails),
+        };
+        let mut c = Elector::new(Box::new(backend), "c@host:3", settings()).expect("settings");
+        let t0 = Instant::now() + AHEAD;
+        c.tick(t0).expect_err("the backend is away");
+        assert!(!c.step_down(Some(5), t0).expect("the word"));
+        assert_eq!(lease.clone().read().expect("read"), Some(empty));
+        assert_eq!(c.highest_term(), 5);
+        // The next take is still a take over an empty record: at once, and
+        // its fence a renew deadline late.
+        let mut d = candidate(&lease, "d@host:4");
+        assert_eq!(d.tick(t0).expect("take"), Tick::Acquired { term: 1 });
+        let fence = d.fence();
+        assert_eq!(fence.leader_term(t0), None);
+        assert_eq!(d.tick(t0 + S).expect("renew"), Tick::Renewed { term: 1 });
+        assert_eq!(fence.leader_term(t0 + S), None, "inside the renew deadline");
+        assert_eq!(
+            d.tick(t0 + 2 * S).expect("renew"),
+            Tick::Renewed { term: 1 }
+        );
+        assert_eq!(fence.leader_term(t0 + 2 * S), Some(1));
     }
 
     #[test]
