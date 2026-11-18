@@ -113,8 +113,12 @@ fn a_decision_after_the_first_allocates_nothing_for_any_preset() {
 /// its size, whatever that first was: by rank where no row holds the
 /// request's prefix, a draw for a request that names rows, or the whole
 /// pass over a pool not said to hold a rate on every row. The second
-/// decision puts the holders in front: one row in eight, each with nothing
-/// in flight. What it keeps of them stands in buffers every first decision
+/// decision puts the holders in front: one row in eight, each running one
+/// request at a rate a token a second from the next, with a long queue on
+/// one row behind them. Its targets are the four fastest holders in their
+/// order, which shows the front: the whole pass spreads the load over that
+/// queue, reads the holders alike and draws among them. What the decision
+/// keeps of the rows in front stands in buffers every first decision
 /// sized: their sums in the stage's, their list in the soft filter's
 /// backup. The preset is read with its soft filters and without them. A
 /// profile without one takes the list's room at its first decision by
@@ -137,9 +141,19 @@ fn a_decision_by_rank_after_the_first_allocates_nothing() {
         .flat_map(|(soft, engine)| [(*soft, engine, 64u32), (*soft, engine, 512)])
     {
         let mut view = fleet(n);
-        for row in view.iter_mut().step_by(8) {
+        for (step, row) in (0u32..).zip(view.iter_mut().step_by(8)) {
             row.in_flight = 0;
+            if let Some(load) = row.load.as_mut() {
+                load.running = 1;
+                load.queued = 0;
+                load.kv_usage_permille = 100;
+                load.live_rate = 20_000 + step;
+            }
         }
+        if let Some(load) = view[1].load.as_mut() {
+            load.queued = 200;
+        }
+        let fastest = [n - 8, n - 16, n - 24, n - 32];
         let column = |blocks: u32| -> Vec<AffinityFacts> {
             (0..n)
                 .map(|i| AffinityFacts {
@@ -201,10 +215,10 @@ fn a_decision_by_rank_after_the_first_allocates_nothing() {
             let (decision, allocations) =
                 allocations_during(|| engine.decide(&second, &said, &view, &cx, &mut scratch));
             let pick = decision.pick().expect("the fleet routes");
-            assert!(
-                pick.targets.iter().all(|target| target.position % 8 == 0),
-                "soft {soft} at {n}, order {order}, the targets are holders: {:?}",
-                pick.targets
+            let targets: Vec<u32> = pick.targets.iter().map(|target| target.position).collect();
+            assert_eq!(
+                targets, fastest,
+                "soft {soft} at {n}, order {order}: the fastest holders, in their order"
             );
             // A whole pass sizes no list of the rows in front: without a
             // soft filter the first decision by rank takes that room.

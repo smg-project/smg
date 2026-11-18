@@ -40,8 +40,13 @@
 # Count: `count = true`, as policy-engine.toml records it. Read on this file's 12 ids, one build against its
 # own copy: 10 count the same in every batch after the first, and the two passed-over rows at 512 workers
 # did not count steadily (12 instructions an iteration between two processes of one build, 0.02 %). They
-# keep the time's verdict. No row carries `whole_pass`, as in the power-of-two file: the mark follows a
-# row that read slower on a count a few instructions apart, and no row of this binary has.
+# keep the time's verdict. Every id times a whole decision and carries `whole_pass = true`, as
+# policy-engine.toml records it: the mark follows a row that read slower on a count a few instructions
+# apart. A pull request that takes two instructions off a decision read `passed_over/8` and
+# `levels_passed_over/8` 11.7 and 10.6 % slower on the hosted runner on 2 instructions fewer an iteration,
+# 0.06 and 0.05 % of their counts, and every other id 1.1 to 7.6 % slower. On a second host the same gate
+# read those two 1.1 and 0.8 % slower, and the same two sources built without the alignment read all 12
+# ids faster there, the four 64-row ids by 11.2 to 12.9 % (2026-11-18).
 repeats = 3
 count = true
 # The count ends 2,280 s into the run. The gate step's bound is 60 minutes, which the `decision` row needs,
@@ -60,4 +65,5 @@ sources = [
 [[gate]]
 pattern = "^policy_engine/prefix_hash/"
 threshold = 0.10
-note = "identical build 1.2 - 4.9 % on the build host; the hosted runner has not run this binary yet"
+whole_pass = true
+note = "identical build 1.2 - 4.9 % on the build host; a whole decision"
