@@ -2586,12 +2586,25 @@ impl Writer {
         went
     }
 
-    /// The marks of the members a membership write removed go with them.
+    /// The marks of the members a membership write removed go with them,
+    /// and so does a mark on a rank number its member no longer holds: a
+    /// refresh may move the number under one id, and no answer or record
+    /// names the old one again.
     fn forget_gone(&mut self) {
         let Self {
-            unnamed, places, ..
+            unnamed,
+            places,
+            working,
+            ..
         } = self;
-        unnamed.retain(|&(id, _)| places_of(places, id).next().is_some());
+        unnamed.retain(|&(id, rank)| {
+            places_of(places, id).any(|place| {
+                working
+                    .get(place.pool as usize)
+                    .and_then(|pool| pool.rows.get(place.row as usize))
+                    .is_some_and(|row| row.dp_rank == rank)
+            })
+        });
     }
 
     /// Whether an answer left a rank of the engine unnamed.

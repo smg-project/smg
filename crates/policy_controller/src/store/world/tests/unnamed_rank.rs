@@ -6,11 +6,12 @@
 use std::time::{Duration, Instant};
 
 use super::{
-    ask, block, generation_with, load, member, overloaded, pressure, rank_among, rank_of, view,
+    ask, block, facts, generation_with, load, member, overloaded, pressure, rank_among, rank_of,
+    view, MODEL,
 };
 use crate::{
-    store::{LoadSink, LoadSource, MemoryStore, WorkersStore},
-    view::WorkerId,
+    store::{LoadSink, LoadSource, MemoryStore, WorkerFacts, WorkersStore},
+    view::{Role, WorkerId},
 };
 
 const ENGINE: &str = "grpc://e:9000";
@@ -278,6 +279,28 @@ fn a_membership_write_keeps_the_mark_and_a_member_that_leaves_takes_its_own() {
     let revision = WorkersStore::get(&store, zero).expect("the row").revision;
     store.remove(zero, revision).expect("removed");
     assert_eq!(store.unnamed_ranks(), 0);
+}
+
+#[test]
+fn a_refresh_that_moves_a_member_s_rank_number_takes_the_mark_on_the_old_one() {
+    let (store, t0, zero, one) = two_ranks();
+    names_one_alone(&store, zero, one, t0);
+    assert_eq!((store.unnamed_ranks(), store.judges_writes()), (1, true));
+    // The member registers again under its key and incarnation as another
+    // rank of the engine: no answer or record names the old number again.
+    let refreshed = store
+        .upsert(WorkerFacts {
+            engine: ENGINE.to_string(),
+            dp_rank: 2,
+            dp_size: 3,
+            ..facts(&format!("{ENGINE}#0"), Role::Single, &[MODEL])
+        })
+        .id();
+    assert_eq!(refreshed, zero, "one id");
+    // The write leaves a build owed, and the mark goes with that build.
+    store.publish_now();
+    assert_eq!((store.unnamed_ranks(), store.judges_writes()), (0, false));
+    assert_eq!(overloaded(&store, t0), []);
 }
 
 #[test]
