@@ -510,19 +510,19 @@ impl MemoryStore {
             )?;
             writer.replaced(self.world.swap(world));
             drop(loads);
+            // The pins' sweep learns a generation's interval here, not at
+            // its first pass: a generation replaced between two ticks of
+            // the sweep still leaves its interval for the pins it ended.
+            // It is saved under the workers lock, so two applies save
+            // theirs in the order of their publications.
+            #[cfg(feature = "controller")]
+            if let Some(every) = spec.engine().pins_shortest_sweep() {
+                self.pins_swept.lock().every = Some(every);
+            }
             self.tell_members(&workers);
             before
         };
         drop(before);
-        // The pins' sweep learns a generation's interval here, not at its
-        // first pass: a generation replaced between two ticks of the sweep
-        // still leaves its interval for the pins it ended.
-        #[cfg(feature = "controller")]
-        {
-            if let Some(every) = spec.engine().pins_shortest_sweep() {
-                self.pins_swept.lock().every = Some(every);
-            }
-        }
         Ok(())
     }
 
