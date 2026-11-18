@@ -33,6 +33,10 @@
 //! engine that holds requests takes the next pick by the fewest requests,
 //! of two draws compared by count, and of a keyless ask under the prefix
 //! ring.
+//! A session stays where its key was first placed, and where the gateway
+//! sent it: a dispatch on a pick's second target moves the key and the
+//! lease's count there, a key served on its failover keeps its worker,
+//! and the store's pin of record follows the dispatch.
 //! A prompt returns to its worker as a key does: under the prefix preset a
 //! head of 256 tokens names one row whatever follows it, a routing key
 //! leads it, a retry walks to one next worker, and a boundary of the
@@ -293,17 +297,7 @@ async fn leased(harness: &mut Harness, ask: DecideRequest) -> Result<(Picked, Ve
     }
     let leases = leases.iter().map(|lease| lease.id).collect();
     let target = pick.targets.first().ok_or("a pick with no target")?;
-    match harness.named(target.id) {
-        Some((engine, rank)) if target.dp_rank == u32::from(rank) => {
-            let row = Picked {
-                engine,
-                rank,
-                id: target.id,
-            };
-            Ok((row, leases))
-        }
-        _ => Err(format!("a target that is no row of the fleet: {target:?}")),
-    }
+    Ok((row_of(harness, target.id, target.dp_rank)?, leases))
 }
 
 /// Gives `leases` up on the session, as a gateway whose client left, and
@@ -353,6 +347,42 @@ async fn kept(harness: &mut Harness, ask: DecideRequest) -> Result<(Picked, u64)
     };
     harness.dispatch(lease).await?;
     Ok((row, lease))
+}
+
+/// The row of the fleet a target names by its id and its rank.
+fn row_of(harness: &Harness, id: u64, dp_rank: u32) -> Result<Picked, String> {
+    match harness.named(id) {
+        Some((engine, rank)) if dp_rank == u32::from(rank) => Ok(Picked { engine, rank, id }),
+        _ => Err(format!(
+            "a target that is no row of the fleet: {id} at rank {dp_rank}"
+        )),
+    }
+}
+
+/// Asks, and reads every target of the pick as a row of the fleet, best
+/// first, with the one lease the answer carries: its id and the session it
+/// names. The lease is the caller's, to dispatch on a target and to give up.
+async fn offered(
+    harness: &mut Harness,
+    ask: DecideRequest,
+) -> Result<(Vec<Picked>, u64, u64), String> {
+    let answer = harness.client().decide(ask).await;
+    let Ok(Answer::Decision(Decision {
+        leases,
+        outcome: Some(Outcome::Pick(pick)),
+        ..
+    })) = &answer
+    else {
+        return Err(format!("no pick: {answer:?}"));
+    };
+    let [lease] = leases.as_slice() else {
+        return Err(format!("a pick to dispatch carries one lease: {leases:?}"));
+    };
+    let mut rows = Vec::with_capacity(pick.targets.len());
+    for target in &pick.targets {
+        rows.push(row_of(harness, target.id, target.dp_rank)?);
+    }
+    Ok((rows, lease.id, lease.session_key))
 }
 
 /// The whole case's bound: its waits sum to seconds on an idle host.
@@ -752,6 +782,167 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
         }
         let rest: Vec<u64> = booked.into_iter().map(|(_, lease)| lease).collect();
         given_up(&mut harness, &rest, 0)
+            .await
+            .expect("the leases given up leave the file");
+
+        // A session stays where its key was first placed. Under the manual
+        // preset a key's first decision places it at random and its later
+        // asks name that row whatever their seeds; 64 keys do not share
+        // one row.
+        harness
+            .apply("manual")
+            .expect("a preset of this build applies");
+        let stays = picked(&mut harness, keyed(nth("stay", 0), 1))
+            .await
+            .expect("a pick answers an ask over a ready fleet");
+        for n in 1..8 {
+            let again = picked(&mut harness, keyed(nth("stay", n), 1))
+                .await
+                .expect("a pick answers an ask over a ready fleet");
+            assert_eq!(
+                again, stays,
+                "a session key stays on the worker of its first decision"
+            );
+        }
+        let mut homes = HashSet::new();
+        for key in 2..=ASKS {
+            let pick = picked(&mut harness, keyed(nth("homes", key), key))
+                .await
+                .expect("a pick answers an ask over a ready fleet");
+            homes.insert(pick);
+        }
+        assert!(
+            homes.len() > 1,
+            "{ASKS} session keys do not share one worker: {homes:?}"
+        );
+
+        // The session is where the gateway sent its request. A key's first
+        // decision claims the first target of its pick; the gateway
+        // dispatches on the second, and the key's later asks name that
+        // row. The store's pin of record, which no decision writes, names
+        // it from that dispatch on.
+        let sticky = ASKS + 1;
+        let (offer, sent_lease, pin) = offered(&mut harness, keyed(nth("sent", 0), sticky))
+            .await
+            .expect("a pick answers an ask over a ready fleet");
+        let sent = offer
+            .get(1)
+            .copied()
+            .expect("a key's first placement offers a second target");
+        assert_eq!(
+            harness.pinned(pin),
+            None,
+            "a decision alone writes no pin of record"
+        );
+        harness
+            .dispatch_at(sent_lease, 1)
+            .await
+            .expect("the store reads the lease dispatched");
+        for n in 1..8 {
+            let again = picked(&mut harness, keyed(nth("sent", n), sticky))
+                .await
+                .expect("a pick answers an ask over a ready fleet");
+            assert_eq!(
+                again, sent,
+                "a key first sent to its second target stays where it was sent"
+            );
+        }
+        assert_eq!(
+            harness.pinned(pin),
+            Some((sent.engine, sent.rank)),
+            "a keyed dispatch writes the pin of record on the worker served"
+        );
+
+        // A key served on its failover keeps its worker. With its row
+        // excluded by the gateway the key is placed on another row and
+        // dispatched there; the exclusion over, it is back on its own row,
+        // which the pin of record never left, and excluded again it
+        // returns to that failover.
+        let away = |run: &str, n: u64| {
+            let mut ask = keyed(nth(run, n), sticky);
+            ask.constraints = Some(smg_policy_controller::proto::Constraints {
+                excluded: vec![sent.id],
+                ..Default::default()
+            });
+            ask
+        };
+        let (offer, away_lease, _) = offered(&mut harness, away("away", 0))
+            .await
+            .expect("a pick answers an ask over a ready fleet");
+        let failover = offer.first().copied().expect("a pick names a target");
+        assert_ne!(failover, sent, "a row the gateway excludes is no pick");
+        harness
+            .dispatch_at(away_lease, 0)
+            .await
+            .expect("the store reads the lease dispatched");
+        let back = picked(&mut harness, keyed(nth("back", 0), sticky))
+            .await
+            .expect("a pick answers an ask over a ready fleet");
+        assert_eq!(
+            back, sent,
+            "its own row routable again, a key is back on it"
+        );
+        assert_eq!(
+            harness.pinned(pin),
+            Some((sent.engine, sent.rank)),
+            "a dispatch on the failover leaves the preferred worker pinned"
+        );
+        for n in 1..8 {
+            let again = picked(&mut harness, away("away", n))
+                .await
+                .expect("a pick answers an ask over a ready fleet");
+            assert_eq!(
+                again, failover,
+                "a key away from its row returns to its failover"
+            );
+        }
+        given_up(&mut harness, &[sent_lease, away_lease], 0)
+            .await
+            .expect("the leases given up leave the file");
+
+        // A lease's count follows its dispatch. By the fewest requests a
+        // kept lease books the first target of its pick; dispatched on the
+        // second it books that row instead, and the asks after it, each
+        // kept, name every other row once: the first target among them.
+        // Its request brought a key that no sessions rule governs: the
+        // dispatch pins that session nowhere.
+        let fewest = PolicySpec::power_of_two(PowerOfTwoMetric::LeastRequests)
+            .expect("a form of this build's preset");
+        harness
+            .apply_document(fewest)
+            .expect("a form of this build's preset applies");
+        let (offer, moved, unruled) = offered(&mut harness, keyed(nth("moved", 0), sticky + 1))
+            .await
+            .expect("a pick answers an ask over a ready fleet");
+        let claimed = offer.first().copied().expect("a pick names a target");
+        let served = offer
+            .get(1)
+            .copied()
+            .expect("a pick by the fewest requests offers a second target");
+        harness
+            .dispatch_at(moved, 1)
+            .await
+            .expect("the store reads the lease dispatched");
+        let mut moved = vec![moved];
+        let mut round = HashSet::new();
+        for n in (1u64..).take(ranks - 1) {
+            let (row, lease) = kept(&mut harness, nth("moved", n))
+                .await
+                .expect("a pick answers an ask over a ready fleet");
+            moved.push(lease);
+            round.insert(row);
+        }
+        assert!(
+            round.len() == ranks - 1 && round.contains(&claimed) && !round.contains(&served),
+            "a lease dispatched on its second target books that row and frees the first: \
+             {claimed:?} then {served:?}, the round {round:?}"
+        );
+        assert_eq!(
+            harness.pinned(unruled),
+            None,
+            "a key no sessions rule governs is pinned by no dispatch"
+        );
+        given_up(&mut harness, &moved, 0)
             .await
             .expect("the leases given up leave the file");
 
