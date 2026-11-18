@@ -1689,6 +1689,20 @@ enum Said {
     Heard,
 }
 
+/// Note what an answer says of `engine`: the most it says stands. Inlined:
+/// the pass over an answer's rows runs it a row.
+#[inline]
+fn say(first: &mut Option<(u32, Said)>, others: &mut Vec<(u32, Said)>, engine: u32, said: Said) {
+    match first {
+        None => *first = Some((engine, said)),
+        Some(seen) if seen.0 == engine => seen.1 = seen.1.max(said),
+        Some(_) => match others.iter_mut().find(|seen| seen.0 == engine) {
+            Some(seen) => seen.1 = seen.1.max(said),
+            None => others.push((engine, said)),
+        },
+    }
+}
+
 /// The load table and the world's write side, behind one lock.
 struct Loads {
     ranks: FxHashMap<WorkerId, Ranks>,
@@ -1782,6 +1796,7 @@ impl LoadSink for MemoryStore {
         let mut first: Option<(u32, Said)> = None;
         let mut others: Vec<(u32, Said)> = Vec::new();
         let mut omits = false;
+        let mut passed = false;
         for &(id, rank, row) in answer {
             // A report that lands after its worker left (the poll was out
             // when the row went) finds no entry and is dropped.
@@ -1790,14 +1805,13 @@ impl LoadSink for MemoryStore {
             };
             // A rank that pushed since the poll began keeps its record,
             // and its stream is heard: no word of the poll stands over it.
-            // A row the answer brings for it is passed over, and names its
-            // engine all the same.
-            let pushed = ranks.pushed_since(rank, polled_at);
-            if pushed && row.is_none() {
+            // A row the answer brings for it is passed over. It names its
+            // engine all the same, which is read below where it matters.
+            if ranks.pushed_since(rank, polled_at) {
+                passed |= row.is_some();
                 continue;
             }
             let (engine, said) = match row {
-                Some(_) if pushed => (writer.engine_of(id), Said::Named),
                 Some(row) => {
                     let age = Duration::from_millis(u64::from(row.report_age_ms));
                     let sample = LoadSample {
@@ -1824,16 +1838,25 @@ impl LoadSink for MemoryStore {
                     (writer.engine_of(id), Said::Nothing)
                 }
             };
-            let Some(engine) = engine else {
-                continue;
-            };
-            match &mut first {
-                None => first = Some((engine, said)),
-                Some(seen) if seen.0 == engine => seen.1 = seen.1.max(said),
-                Some(_) => match others.iter_mut().find(|seen| seen.0 == engine) {
-                    Some(seen) => seen.1 = seen.1.max(said),
-                    None => others.push((engine, said)),
-                },
+            if let Some(engine) = engine {
+                say(&mut first, &mut others, engine, said);
+            }
+        }
+        // A row passed over names its engine as a written row does: the
+        // naming is the answer's, whichever sample stands. It moves a mark
+        // only beside a rank the answer left out, so the passed-over rows
+        // are read for their engines there and nowhere else.
+        if omits && passed {
+            for &(id, rank, row) in answer {
+                let pushed = table
+                    .get(&id)
+                    .is_some_and(|ranks| ranks.pushed_since(rank, polled_at));
+                if !pushed || row.is_none() {
+                    continue;
+                }
+                if let Some(engine) = writer.engine_of(id) {
+                    say(&mut first, &mut others, engine, Said::Named);
+                }
             }
         }
         let Some(first) = first else {
@@ -1844,9 +1867,7 @@ impl LoadSink for MemoryStore {
         // answer's engines are known and before any is judged. An answer
         // with no row for an engine is the word that none came, which
         // moves no mark, and a rank that pushed since the poll began
-        // named itself. A row passed over for such a rank names its engine
-        // as a written row does: the naming is the answer's, whichever
-        // sample stands.
+        // named itself.
         if omits || writer.any_unnamed() {
             for &(id, rank, row) in answer {
                 let pushed = table
@@ -1880,8 +1901,9 @@ impl LoadSink for MemoryStore {
                     true
                 }
                 // No row was written, and the answer named a rank that
-                // pushed since the poll began: no word that none came. A
-                // mark the answer moved is judged and shown with it.
+                // pushed since the poll began beside a rank it left out:
+                // no word that none came. The mark the answer moved is
+                // judged and shown with it.
                 Said::Named => writer.judged(engine, false),
                 // No row came for the engine: the word that none came,
                 // unless a rank of it pushed since the poll began. The
