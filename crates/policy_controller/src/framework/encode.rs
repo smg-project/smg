@@ -53,9 +53,6 @@ const ENCODE_COLUMN: &str = "encode-column";
 /// shows its rows to a plugin: no scope is opened over the encoders offered
 /// to a key.
 const ENCODE_SCOPE: &str = "encode-scope";
-/// The stage named when a mask stands beside a pool the encode side cut: a
-/// mask numbers the rows of the whole pool.
-const MASKED_ROWS: &str = "masked-rows";
 
 /// What the encode side reads of one encoder beside its candidate row, as
 /// the store holds it.
@@ -146,6 +143,9 @@ struct Admitted {
     /// Each row's index in the pool it was admitted from.
     from: Vec<u32>,
     affinity: Vec<AffinityFacts>,
+    /// The rows here that a mask over the pool names, by their index here:
+    /// empty until a mask is numbered anew ([`Admitted::renumber`]).
+    masked: Vec<u32>,
 }
 
 impl Admitted {
@@ -153,6 +153,20 @@ impl Admitted {
         self.rows.clear();
         self.from.clear();
         self.affinity.clear();
+        self.masked.clear();
+    }
+
+    /// Numbers a mask over the pool's rows by the rows admitted, each by
+    /// its index here: a masked row that was left out masks none. The mask
+    /// and the rows both ascend by the pool's index.
+    fn renumber(&mut self, stalled: &[u32]) {
+        let mut stalled = stalled.iter().copied().peekable();
+        for (index, &from) in (0u32..).zip(&self.from) {
+            while stalled.next_if(|&at| at < from).is_some() {}
+            if stalled.next_if_eq(&from).is_some() {
+                self.masked.push(index);
+            }
+        }
     }
 
     /// Admits the pool's row `at`; its position becomes its index here.
@@ -294,12 +308,19 @@ impl Engine {
     /// What this side cannot read truly is declined. A request with items
     /// under an encode profile that shows its rows to a plugin names
     /// `encode-scope`: no scope is opened over the encoders offered to a
-    /// key. A mask ([`Constraints::stalled`]) beside a pool this side cut
-    /// names `masked-rows`: a mask numbers the rows of the whole pool. A
-    /// pair column of another length than its pool names `affinity-column`
-    /// before a cut, as the pair entry names it. The encode side's stages
-    /// are handed no pin ([`RequestFacts::pinned_at`]): a pin is a position
-    /// in another pool.
+    /// key. A pair column of another length than its pool names
+    /// `affinity-column` before a cut, as the pair entry names it. The
+    /// encode side's stages are handed no pin
+    /// ([`RequestFacts::pinned_at`]): a pin is a position in another pool.
+    ///
+    /// A list this side hands on in a pool's stead (the prefills or the
+    /// decodes it admits, the encoders it offers a key) is numbered anew. A
+    /// mask ([`Constraints::stalled`]) numbers the rows of the host's pool,
+    /// so beside such a list it is numbered with the rows: a masked row that
+    /// was left out masks none. Each side's run and each key's is a whole
+    /// pass, where a rotation is turned by the rows kept: two such lists of
+    /// one size turn rotations apart, and none takes a name of its own
+    /// ([`PoolFacts::reach`]).
     #[expect(
         clippy::too_many_arguments,
         reason = "the pair entry's inputs and the encode side's"
@@ -521,31 +542,44 @@ impl Engine {
                 .prefill_classes
                 .iter()
                 .all(|&class| open_class(class));
+        // A list handed on in a pool's stead is numbered anew, and a mask
+        // numbers the rows of the host's pool: beside such a list the mask
+        // is numbered with the rows.
+        let (prefill_mask, decode_mask);
+        let (mut cx, mut decode_cx) = (cx, decode_cx);
         if !every_prefill {
-            // A mask numbers the rows of the host's pool, and a cut numbers
-            // its rows anew: beside a cut pool a mask would name other rows.
-            if !cx.stalled.is_empty() {
-                return declined(MASKED_ROWS);
-            }
             side.prefills.clear();
             for (at, row) in pools.prefills.iter().enumerate() {
                 if open_class(class_of(at)) {
                     side.prefills.push(row, at, pools.prefill_affinity);
                 }
             }
+            if !cx.stalled.is_empty() {
+                side.prefills.renumber(cx.stalled);
+                prefill_mask = Constraints {
+                    stalled: &side.prefills.masked,
+                    ..*cx
+                };
+                cx = &prefill_mask;
+            }
             admitted.prefills = &side.prefills.rows;
             admitted.prefill_affinity = &side.prefills.affinity;
         }
         let every_decode = !vision || pools.decodes.iter().all(|row| row.vision);
         if !every_decode {
-            if !decode_cx.stalled.is_empty() {
-                return declined(MASKED_ROWS);
-            }
             side.decodes.clear();
             for (at, row) in pools.decodes.iter().enumerate() {
                 if row.vision {
                     side.decodes.push(row, at, pools.decode_affinity);
                 }
+            }
+            if !decode_cx.stalled.is_empty() {
+                side.decodes.renumber(decode_cx.stalled);
+                decode_mask = Constraints {
+                    stalled: &side.decodes.masked,
+                    ..*decode_cx
+                };
+                decode_cx = &decode_mask;
             }
             admitted.decodes = &side.decodes.rows;
             admitted.decode_affinity = &side.decodes.affinity;
@@ -588,10 +622,16 @@ impl Engine {
             }
         }
         // The offered encoders are numbered anew unless they are the whole
-        // pool, and the encode side's mask is refused beside them as beside
-        // a cut pool.
+        // pool, and the encode side's mask is numbered with them.
+        let offered_mask;
+        let mut encode_cx = encode_cx;
         if !encode_cx.stalled.is_empty() && side.offered.rows.len() != encode.encoders.len() {
-            return declined(MASKED_ROWS);
+            side.offered.renumber(encode_cx.stalled);
+            offered_mask = Constraints {
+                stalled: &side.offered.masked,
+                ..*encode_cx
+            };
+            encode_cx = &offered_mask;
         }
         let one = items.one.filter(|_| pushes);
         placed.one = one.is_some();

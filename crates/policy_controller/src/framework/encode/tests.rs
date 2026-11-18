@@ -931,57 +931,267 @@ fn a_pair_column_of_another_length_declines_before_a_cut() {
     }
 }
 
-/// A mask numbers the rows of the pool it is handed with. Beside a pool
-/// this side cut it is declined, and beside a whole pool it is read.
-#[test]
-fn a_mask_beside_rows_numbered_anew_is_declined() {
-    let engine = engine();
-    let masked = Constraints {
-        stalled: &[0],
+/// The constraints of a host whose standing veto masks the rows `at`.
+fn masking(at: &[u32]) -> Constraints<'_> {
+    Constraints {
+        stalled: at,
         ..Constraints::default()
-    };
-    let open = Constraints::default();
-    let declined = (ShedReason::PolicyDeclined, "masked-rows");
-    // The first prefill's class has no encoder and the first decode takes
-    // no image: each side is cut to its second row, and the mask names the
-    // first.
-    let mut cut = Bed::new();
-    cut.prefills = vec![row(0, Role::Prefill, 1, 0), row(1, Role::Prefill, 1, 0)];
-    cut.prefill_classes = vec![2, 1];
-    cut.decodes = vec![
-        Candidate {
-            vision: false,
-            ..row(0, Role::Decode, 1, 0)
-        },
-        row(1, Role::Decode, 1, 0),
-    ];
-    cut.decode_images = true;
-    let (facts, _) = cut.asked();
-    for sides in [[&masked, &open, &open], [&open, &masked, &open]] {
-        let (decision, _) = decide_under(&cut, &engine, &facts, cut.pools(), sides);
-        assert_eq!(shed_of(&decision), declined);
     }
-    // Two encode classes: the encoders offered to a key are the one of the
-    // pair's class, and the mask names the other.
-    let mut offered = Bed::new();
-    offered.encoders = vec![row(0, Role::Encode, 0, 0), row(1, Role::Encode, 0, 0)];
-    offered.facts = vec![pushing(1), pushing(2)];
-    let other = Constraints {
-        stalled: &[1],
-        ..Constraints::default()
-    };
-    let sides = [&open, &open, &other];
-    let (decision, _) = decide_under(&offered, &engine, &facts, offered.pools(), sides);
-    assert_eq!(shed_of(&decision), declined);
-    // No cut: the masked prefill is no candidate, and the pair is the
-    // other's.
-    let mut whole = Bed::new();
-    whole.prefills = vec![row(0, Role::Prefill, 1, 0), row(1, Role::Prefill, 1, 9)];
-    whole.prefill_classes = vec![1, 1];
-    let sides = [&masked, &open, &open];
-    let (decision, _) = decide_under(&whole, &engine, &facts, whole.pools(), sides);
+}
+
+/// The prefill's and the decode's rows of a pick.
+fn pair_of(decision: &Decision) -> (u32, u32) {
     let Decision::Pick(Pick { targets, .. }) = decision else {
         panic!("a pick, not {decision:?}");
     };
-    assert_eq!(targets.first().map(|target| target.position), Some(1));
+    let target = targets.first().expect("a target");
+    (
+        target.position,
+        target.pair.expect("a pair").decode_position,
+    )
+}
+
+/// A mask numbers the rows of the pool it is handed with. Beside rows this
+/// side numbered anew it is read by where each row stood: a masked row that
+/// was left out masks none, and a masked row that was admitted is no
+/// candidate. Beside a whole pool it is read as it is handed.
+#[test]
+fn a_mask_is_read_by_where_each_row_stood() {
+    let engine = engine();
+    let open = Constraints::default();
+    let (first, second, third) = (masking(&[0]), masking(&[1]), masking(&[2]));
+    // The first prefill's class has no encoder and the first decode takes
+    // no image: each side is cut to its other two rows, the last the
+    // fuller.
+    let mut cut = Bed::new();
+    cut.prefills = (0..3)
+        .map(|at| row(at, Role::Prefill, 1, 9 * (at / 2)))
+        .collect();
+    cut.prefill_classes = vec![2, 1, 1];
+    cut.decodes = (0..3)
+        .map(|at| row(at, Role::Decode, 1, 9 * (at / 2)))
+        .collect();
+    cut.decodes[0].vision = false;
+    cut.decode_images = true;
+    let (facts, _) = cut.asked();
+    let pair = |sides: [&Constraints<'_>; 3]| {
+        pair_of(&decide_under(&cut, &engine, &facts, cut.pools(), sides).0)
+    };
+    assert_eq!(pair([&open; 3]), (1, 1));
+    // A masked row that was left out masks none.
+    assert_eq!(pair([&first, &open, &open]), (1, 1));
+    assert_eq!(pair([&open, &first, &open]), (1, 1));
+    // A masked row that was admitted is no candidate.
+    assert_eq!(pair([&second, &open, &open]), (2, 1));
+    assert_eq!(pair([&open, &second, &open]), (1, 2));
+    assert_eq!(pair([&third, &third, &open]), (1, 1));
+    // A mask of a row left out and of a row admitted masks the one admitted.
+    let both = masking(&[0, 1]);
+    assert_eq!(pair([&both, &both, &open]), (2, 2));
+    // Two encoders of the pair's class, the second the fuller, and one of
+    // another class: a mask leaves the key to the class's open encoder.
+    let mut offered = Bed::new();
+    offered.encoders = (0..3)
+        .map(|at| row(at, Role::Encode, 0, 9 * (at % 2)))
+        .collect();
+    offered.facts = vec![pushing(1), pushing(1), pushing(2)];
+    let encoder = |mask: &Constraints<'_>| {
+        let sides = [&open, &open, mask];
+        let (decision, placed) = decide_under(&offered, &engine, &facts, offered.pools(), sides);
+        assert!(decision.pick().is_some(), "a pick, not {decision:?}");
+        placed.encoders().first().map(|target| target.position)
+    };
+    assert_eq!(encoder(&open), Some(0));
+    assert_eq!(encoder(&first), Some(1));
+    assert_eq!(encoder(&second), Some(0));
+    assert_eq!(encoder(&third), Some(0));
+    // No cut: beside a whole pool a mask is read as it is handed, and the
+    // masked prefill or decode is no candidate.
+    let mut whole = Bed::new();
+    whole.prefills = vec![row(0, Role::Prefill, 1, 0), row(1, Role::Prefill, 1, 9)];
+    whole.prefill_classes = vec![1, 1];
+    whole.decodes = vec![row(0, Role::Decode, 1, 0), row(1, Role::Decode, 1, 9)];
+    for (sides, pair) in [
+        ([&first, &open, &open], (1, 0)),
+        ([&open, &first, &open], (0, 1)),
+    ] {
+        let (decision, _) = decide_under(&whole, &engine, &facts, whole.pools(), sides);
+        assert_eq!(pair_of(&decision), pair);
+    }
+}
+
+/// A mask numbered anew is the decision's own: the next decision of one
+/// scratch reads its own mask and no row of the last.
+#[test]
+fn a_mask_numbered_anew_is_forgotten_by_the_next_decision() {
+    let engine = engine();
+    // The first prefill's class has no encoder: the pool is cut to the
+    // other two, the last the fuller.
+    let mut bed = Bed::new();
+    bed.prefills = (0..3)
+        .map(|at| row(at, Role::Prefill, 1, 9 * (at / 2)))
+        .collect();
+    bed.prefill_classes = vec![2, 1, 1];
+    let (facts, pool) = bed.asked();
+    let encode = EncodePool {
+        encoders: &bed.encoders,
+        facts: &bed.facts,
+        prefill_classes: &bed.prefill_classes,
+        affinity: &bed.encode_affinity,
+    };
+    let items = EncodeItems {
+        keys: &bed.keys,
+        one: bed.one,
+        references: bed.references,
+        decode_images: bed.decode_images,
+    };
+    let open = Constraints::default();
+    let (mut scratch, mut placed) = (Scratch::new(), EncodePlaced::new());
+    let mut prefill = |mask: &[u32]| {
+        let (cx, pools) = (masking(mask), bed.pools());
+        let decision = engine.decide_encode_pair(
+            &facts,
+            &pool,
+            pools,
+            encode,
+            items,
+            &cx,
+            &open,
+            &open,
+            &mut scratch,
+            &mut placed,
+        );
+        pair_of(&decision).0
+    };
+    assert_eq!(prefill(&[1]), 2);
+    assert_eq!(prefill(&[2]), 1);
+    assert_eq!(prefill(&[]), 1);
+}
+
+/// A soft filter that reads the mask: the pass that opens the encoders asks
+/// the hard filters alone.
+#[derive(Debug)]
+struct MaskedSoftly;
+
+impl crate::framework::Filter for MaskedSoftly {
+    fn name(&self) -> &'static str {
+        "masked-softly"
+    }
+
+    fn keep(&self, _: &RequestFacts<'_>, row: &Candidate, cx: &Constraints<'_>) -> bool {
+        !cx.masks(row.position)
+    }
+
+    fn soft(&self) -> bool {
+        true
+    }
+}
+
+/// Where no hard filter reads the mask a masked encoder is offered, and a
+/// key's run reads the mask by the rows it is handed.
+#[test]
+fn a_mask_is_numbered_with_the_encoders_offered() {
+    let mut engine = engine();
+    let encode = engine
+        .binding("m", Phase::Prefill)
+        .and_then(|binding| match binding.plan {
+            Plan::Epd { encode } => Some(usize::from(encode)),
+            Plan::Single | Plan::PdPair => None,
+        })
+        .expect("the epd plan");
+    let filters = &mut engine.profiles[encode].filters;
+    filters.retain(|filter| filter.name() != "healthy");
+    filters.push(Box::new(MaskedSoftly));
+    engine.marks[encode] =
+        crate::framework::Marks::of(&engine.profiles[encode], engine.orders[encode]);
+    // The first encoder is of another class: the two offered stand at 0 and
+    // 1, the first of them masked and the second the fuller.
+    let mut bed = Bed::new();
+    bed.encoders = (0..3)
+        .map(|at| row(at, Role::Encode, 0, 9 * (at / 2)))
+        .collect();
+    bed.facts = vec![pushing(2), pushing(1), pushing(1)];
+    let (facts, _) = bed.asked();
+    let (open, masked) = (Constraints::default(), masking(&[1]));
+    let sides = [&open, &open, &masked];
+    let (decision, placed) = decide_under(&bed, &engine, &facts, bed.pools(), sides);
+    assert!(decision.pick().is_some(), "a pick, not {decision:?}");
+    assert_eq!(placed.encoders().first().map(|t| t.position), Some(2));
+}
+
+/// The `epd` plan with every side turning its pool's rotation.
+fn turning() -> Engine {
+    let spec = PolicySpec::epd_presets("round_robin", "round_robin", "round_robin");
+    spec.expect("the presets")
+        .validate()
+        .expect("the form validates")
+}
+
+/// The sizes a list is turned at: a small one, and the first at which a
+/// single decision draws before it reads its pool.
+const TURNED: [u32; 2] = [2, crate::framework::DRAW_FROM as u32];
+
+/// The encoders offered under two classes are two lists of one pool, and
+/// each turns a rotation of its own, also where they have one size: a pair
+/// that alternates between the classes reaches every encoder of each. A
+/// key's run is a whole pass, which turns a rotation by the rows it keeps.
+#[test]
+fn the_encoders_offered_under_two_classes_turn_rotations_apart() {
+    for size in TURNED {
+        let engine = turning();
+        // Two encode classes of `size` encoders each and a prefill of each,
+        // one item a request.
+        let mut bed = Bed::new();
+        bed.prefills = vec![row(0, Role::Prefill, 1, 0), row(1, Role::Prefill, 1, 0)];
+        bed.prefill_classes = vec![1, 2];
+        bed.encoders = (0..2 * size)
+            .map(|at| row(at, Role::Encode, 0, 0))
+            .collect();
+        bed.facts = (0..2 * size).map(|at| pushing(1 + at / size)).collect();
+        let mut reached = vec![0; bed.encoders.len()];
+        for _ in 0..4 * size {
+            let (decision, placed) = bed.decide_with(&engine);
+            assert!(decision.pick().is_some(), "a pick, not {decision:?}");
+            reached[placed.encoders()[0].position as usize] += 1;
+        }
+        assert!(
+            reached.iter().all(|&turns| turns == 2),
+            "{size}: {reached:?}"
+        );
+    }
+}
+
+/// Two cuts of the prefills are two lists of one pool: two kinds of media,
+/// each served by a class of its own, alternate, and each kind's requests
+/// reach every prefill of its class. A side's run is a whole pass too.
+#[test]
+fn two_cuts_of_the_prefills_turn_rotations_apart() {
+    for size in TURNED {
+        let engine = turning();
+        // The first encoder takes images and the second references.
+        let kind = |references: bool| {
+            let mut bed = Bed::new();
+            bed.prefills = (0..2 * size)
+                .map(|at| row(at, Role::Prefill, 1, 0))
+                .collect();
+            bed.prefill_classes = (0..2 * size).map(|at| 1 + at / size).collect();
+            bed.encoders = vec![row(0, Role::Encode, 0, 0), row(1, Role::Encode, 0, 0)];
+            bed.encoders[1].vision = false;
+            bed.facts = vec![pushing(1), pushing(2)];
+            bed.facts[1].references = true;
+            bed.references = references;
+            bed.images = u16::from(!references);
+            bed
+        };
+        let kinds = [kind(false), kind(true)];
+        let mut reached = vec![0; kinds[0].prefills.len()];
+        for bed in kinds.iter().cycle().take(4 * size as usize) {
+            let (decision, _) = bed.decide_with(&engine);
+            reached[pair_of(&decision).0 as usize] += 1;
+        }
+        assert!(
+            reached.iter().all(|&turns| turns == 2),
+            "{size}: {reached:?}"
+        );
+    }
 }
