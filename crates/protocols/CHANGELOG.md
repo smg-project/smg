@@ -207,9 +207,10 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   is the new `MessagesContainer`.
 - An Interactions input of steps reads its `user_input` and `model_output` steps, as the public API
   takes them and as the SDK sends every content list it builds: each keeps its type and content
-  and is forwarded as written, its text counts for routing and the tenant charge, and a replayed
-  conversation that also holds thought or tool steps validates. A list with such a step read as
-  role-less turns, which dropped each step's type, and a replay was refused as having empty turns.
+  and is forwarded as written, its text is in the request's routing text and in the tenant's
+  reserve-time estimate, and a replayed conversation that also holds thought or tool steps
+  validates. A list with such a step read as role-less turns, which dropped each step's type, and
+  a replay was refused as having empty turns.
   Breaking: `interactions::Content` gains `UserInput` and `ModelOutput`.
 - `PromptCacheRetention::InMemory` reads and writes `in_memory`, as the public API spells it
   (`PromptCacheRetentionEnum`), and still reads `in-memory`. The crate refused a Responses
