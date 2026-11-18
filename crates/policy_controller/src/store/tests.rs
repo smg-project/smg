@@ -2561,6 +2561,10 @@ fn a_removal_and_a_sweep_reach_the_pins_of_every_shard() {
 /// A gateway's release of a lease: what the frames of these cases say.
 const GONE: Said = Said::Released(None, ReleaseReason::ClientGone);
 
+/// How long a threaded case waits for a word of its other side: far over
+/// any run, so a wait that ends by it found a fault.
+const PATIENCE: Duration = Duration::from_secs(20);
+
 /// A store under term 1 with one ready worker and the teller that keeps
 /// its word, and `leases` leases issued on that worker at `now`: the
 /// store, the worker and the leases' ids.
@@ -2655,21 +2659,26 @@ fn a_thread_at_work_does_not_wait_for_a_held_turn_before_its_reads() {
         scope.spawn(move || {
             let at_work = store.at_work();
             began.send(()).expect("the case waits for the seat");
-            asked.recv().expect("the case asks for the look");
+            asked
+                .recv_timeout(PATIENCE)
+                .expect("the case asks for the look");
             at_work.apply();
             looked.send(()).expect("the case waits for the look");
         });
-        working.recv().expect("the thread is at work");
+        working
+            .recv_timeout(PATIENCE)
+            .expect("the thread is at work");
         // Another holder is parked under the turn, in an issue's tell.
         scope.spawn(move || {
             let record = booking(GatewayId(1), 0, a, t0);
             let issued = store.issue_decided(record, world.booked_of(a), |_| {
                 reached.send(()).expect("the case hears the tell");
-                word.recv().expect("the case lets the issuer go");
+                word.recv_timeout(PATIENCE)
+                    .expect("the case lets the issuer go");
             });
             issued.expect("minted under the store's term");
         });
-        parked.recv().expect("the issue tells");
+        parked.recv_timeout(PATIENCE).expect("the issue tells");
         // The thread at work looks and reads on.
         look.send(())
             .expect("the thread at work waits for the word");
@@ -2838,7 +2847,7 @@ fn a_frame_handed_as_a_thread_leaves_its_work_is_applied_by_one_of_the_two() {
             }
         };
         for asked in 1..=ROUNDS {
-            if now.elapsed() > Duration::from_secs(20) {
+            if now.elapsed() > PATIENCE {
                 break;
             }
             let record = booking(gateway, 0, a, now);
@@ -2893,21 +2902,26 @@ fn a_thread_that_leaves_its_work_waits_for_a_held_turn() {
         scope.spawn(move || {
             let at_work = store.at_work();
             began.send(()).expect("the case waits for the seat");
-            asked.recv().expect("the case says when to leave");
+            asked
+                .recv_timeout(PATIENCE)
+                .expect("the case says when to leave");
             drop(at_work);
             left.send(()).expect("the case waits for the leaver");
         });
-        working.recv().expect("the thread is at work");
+        working
+            .recv_timeout(PATIENCE)
+            .expect("the thread is at work");
         // Another holder is parked under the turn, in an issue's hook.
         scope.spawn(move || {
             let record = booking(gateway, 0, a, now);
             let issued = store.issue_decided(record, store.world().booked_of(a), |_| {
                 reached.send(()).expect("the case hears the issue");
-                word.recv().expect("the case lets the issuer go");
+                word.recv_timeout(PATIENCE)
+                    .expect("the case lets the issuer go");
             });
             issued.expect("minted under the store's term");
         });
-        parked.recv().expect("the issue tells");
+        parked.recv_timeout(PATIENCE).expect("the issue tells");
         let hand = Hand::new(gateway);
         let before = HEARD.load(SeqCst);
         store.hand(&hand, first.id, GONE);
@@ -3075,10 +3089,13 @@ fn a_lease_is_told_issued_before_any_holder_ends_it() {
         scope.spawn(move || {
             issue(t0, &|| {
                 reached.send(()).expect("the case hears the tell");
-                word.recv().expect("the case lets the issuer go");
+                word.recv_timeout(PATIENCE)
+                    .expect("the case lets the issuer go");
             });
         });
-        parked.recv().expect("the first issue tells");
+        parked
+            .recv_timeout(PATIENCE)
+            .expect("the first issue tells");
         // A second issue past the first lease's deadline would end it: it
         // waits for the turn, so it has swept nothing a moment later.
         scope.spawn(move || {
@@ -3088,7 +3105,7 @@ fn a_lease_is_told_issued_before_any_holder_ends_it() {
         let early = swept.recv_timeout(Duration::from_millis(100));
         assert!(early.is_err(), "the sweep waits for the issue's tell");
         go.send(()).expect("the issuer holds the other end");
-        swept.recv().expect("the second issue ends");
+        swept.recv_timeout(PATIENCE).expect("the second issue ends");
     });
     let me = std::ptr::from_ref(&store).addr();
     let told = TOLD_ACROSS.lock().expect("no case fails under it");
@@ -3141,11 +3158,12 @@ fn a_decider_issues_into_its_own_file_and_a_leases_id_names_it() {
             let record = booking(gateway, 0, a, now);
             let issued = store.issue_decided(record, store.world().booked_of(a), |_| {
                 reached.send(()).expect("the case hears the issue");
-                word.recv().expect("the case lets the issuer go");
+                word.recv_timeout(PATIENCE)
+                    .expect("the case lets the issuer go");
             });
             issued.expect("minted under the store's term");
         });
-        parked.recv().expect("the issue tells");
+        parked.recv_timeout(PATIENCE).expect("the issue tells");
         // The second's lease is read and ended at its own file meanwhile.
         let on_file = LeasesStore::get(&**store, gateway, second);
         assert_eq!(on_file.map(|record| record.lease.id), Some(second));
@@ -3184,13 +3202,17 @@ fn a_restore_leaves_a_working_deciders_leases_to_its_next_take() {
         scope.spawn(move || {
             let at_work = store.at_work();
             began.send(()).expect("the case waits for the seat");
-            asked.recv().expect("the case asks for the look");
+            asked
+                .recv_timeout(PATIENCE)
+                .expect("the case asks for the look");
             at_work.apply();
             looked
                 .send(told_ids())
                 .expect("the case waits for the look");
         });
-        working.recv().expect("the thread is at work");
+        working
+            .recv_timeout(PATIENCE)
+            .expect("the thread is at work");
         // A gateway's frame for the first lease, ahead of the restore.
         store.hand(&Hand::new(GatewayId(1)), ids[0], GONE);
         assert!(store.restore_from(cut));
@@ -3200,7 +3222,10 @@ fn a_restore_leaves_a_working_deciders_leases_to_its_next_take() {
         look.send(())
             .expect("the thread at work waits for the word");
         let removed = Said::Released(None, ReleaseReason::WorkerRemoved);
-        assert_eq!(seen.recv().expect("the look"), [(1, GONE), (2, removed)]);
+        assert_eq!(
+            seen.recv_timeout(PATIENCE).expect("the look"),
+            [(1, GONE), (2, removed)]
+        );
     });
     assert_eq!(LeasesStore::live(&*store, GatewayId(1)), 0);
     assert_eq!(store.queued(), 0);
@@ -3225,13 +3250,17 @@ fn no_thread_acts_at_a_file_beside_the_thread_at_work() {
         scope.spawn(move || {
             let at_work = store.at_work();
             began.send(()).expect("the case waits for the seat");
-            asked.recv().expect("the case asks for the look");
+            asked
+                .recv_timeout(PATIENCE)
+                .expect("the case asks for the look");
             at_work.apply();
             looked
                 .send(told_ids())
                 .expect("the case waits for the look");
         });
-        working.recv().expect("the thread is at work");
+        working
+            .recv_timeout(PATIENCE)
+            .expect("the thread is at work");
         let hand = Hand::new(GatewayId(1));
         store.hand(&hand, ids[0], GONE);
         // The stream's end, the sweep past every deadline and a door's read.
@@ -3243,7 +3272,7 @@ fn no_thread_acts_at_a_file_beside_the_thread_at_work() {
         // The thread at work applies what was handed at its next look.
         look.send(())
             .expect("the thread at work waits for the word");
-        assert_eq!(seen.recv().expect("the look"), [(1, GONE)]);
+        assert_eq!(seen.recv_timeout(PATIENCE).expect("the look"), [(1, GONE)]);
     });
     assert_eq!(LeasesStore::live(&*store, GatewayId(1)), 1);
 }
@@ -3261,7 +3290,8 @@ fn a_decider_takes_up_its_work_behind_a_hand_that_tells_at_its_file() {
         let ends = ENDS.lock().expect("no case fails under it").take();
         if let Some((reached, word)) = ends {
             reached.send(()).expect("the case hears the tell");
-            word.recv().expect("the case lets the teller go");
+            word.recv_timeout(PATIENCE)
+                .expect("the case lets the teller go");
         }
     }
     let store = Arc::new(MemoryStore::new().with_deciders(2));
@@ -3290,7 +3320,7 @@ fn a_decider_takes_up_its_work_behind_a_hand_that_tells_at_its_file() {
         scope.spawn(move || store.hand(&Hand::new(gateway), lease, GONE));
         // Bounded: where no tell is made the case fails, and does not
         // wait on an end the teller holds.
-        let told = parked.recv_timeout(Duration::from_secs(20));
+        let told = parked.recv_timeout(PATIENCE);
         told.expect("the hand's tell");
         // The file's decider takes up its work behind that turn.
         scope.spawn(move || {
@@ -3302,7 +3332,7 @@ fn a_decider_takes_up_its_work_behind_a_hand_that_tells_at_its_file() {
         let early = working.recv_timeout(Duration::from_millis(250));
         assert!(early.is_err(), "a decider worked beside a hand's tell");
         go.send(()).expect("the teller holds the other end");
-        let at_work = working.recv_timeout(Duration::from_secs(20));
+        let at_work = working.recv_timeout(PATIENCE);
         at_work.expect("the decider is at work behind the tell");
     });
     assert_eq!(LeasesStore::live(&*store, gateway), 0);
@@ -3329,14 +3359,18 @@ fn a_full_ring_stops_its_hand_until_the_thread_at_work_applied() {
         scope.spawn(move || {
             let at_work = store.at_work();
             began.send(()).expect("the case waits for the seat");
-            asked.recv().expect("the case asks for the look");
+            asked
+                .recv_timeout(PATIENCE)
+                .expect("the case asks for the look");
             at_work.apply();
             drop(at_work);
             looked
                 .send(told_ids())
                 .expect("the case waits for the look");
         });
-        working.recv().expect("the thread is at work");
+        working
+            .recv_timeout(PATIENCE)
+            .expect("the thread is at work");
         // A hand fills the ring and stops at the frame past it.
         scope.spawn(move || {
             let hand = Hand::new(GatewayId(1));
@@ -3351,12 +3385,12 @@ fn a_full_ring_stops_its_hand_until_the_thread_at_work_applied() {
         assert!(early.is_err(), "the hand was through a full ring");
         look.send(())
             .expect("the thread at work waits for the word");
-        let by_hand = through.recv_timeout(Duration::from_secs(20));
+        let by_hand = through.recv_timeout(PATIENCE);
         let by_hand = by_hand.expect("the hand is through");
         // The ring was the thread at work's to apply. The frame past it
         // is that thread's too, or its hand's once the thread had left:
         // every frame is told once, in the order it was handed.
-        let mut applied = seen.recv().expect("the look");
+        let mut applied = seen.recv_timeout(PATIENCE).expect("the look");
         assert!(applied.len() >= MemoryStore::HANDOVER);
         applied.extend(by_hand);
         assert!(applied.iter().map(|(lease, _)| *lease).eq(1..=room + 1));
@@ -3406,9 +3440,13 @@ fn the_sweep_ends_a_resting_files_due_leases_under_its_deciders_name() {
             let _acting = Decider::new(0).enter();
             let _at_work = store.at_work();
             began.send(()).expect("the case waits for the seat");
-            asked.recv().expect("the case says when to leave");
+            asked
+                .recv_timeout(PATIENCE)
+                .expect("the case says when to leave");
         });
-        working.recv().expect("the decider is at work");
+        working
+            .recv_timeout(PATIENCE)
+            .expect("the decider is at work");
         assert_eq!(ended(store), [second]);
         leave.send(()).expect("the decider waits for the word");
     });
