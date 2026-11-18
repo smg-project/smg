@@ -17,7 +17,7 @@ mod support {
 
 use std::sync::{
     atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering},
-    Arc,
+    mpsc, Arc,
 };
 
 use smg_policy_controller::{
@@ -952,7 +952,8 @@ fn the_breaker_opens_on_the_failure_threshold_and_bypasses_the_guest() {
 /// What the host says: a subscriber that keeps every warning of this crate
 /// as its level and its fields. It also takes a guest's own log lines (the
 /// plugin host writes them at their level), keeps none of them, and holds
-/// the calling thread in one where a case asked ([`hold`]).
+/// the calling thread in one where a case asked ([`hold`]), or panics in
+/// one ([`panic_in_a_line_of`]).
 struct Said(Arc<std::sync::Mutex<Vec<String>>>);
 
 /// The holds the cases asked: a plugin's name, how long, how many lines.
@@ -972,6 +973,21 @@ fn hold(plugin: &str, nap: std::time::Duration, lines: u32) {
         .lock()
         .expect("the holds")
         .push((format!("plugin=\"{plugin}\""), nap, lines));
+}
+
+/// The panics the cases asked: a plugin's name, as the host's line says it.
+static PANICS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Panics inside `plugin`'s next log line, once. The guest's log line is a
+/// host call, so the panic unwinds through a guest call and leaves its
+/// instance where it stood: a clock that panics behind a failed call finds
+/// the instance dropped.
+fn panic_in_a_line_of(plugin: &str) {
+    said();
+    PANICS
+        .lock()
+        .expect("the panics")
+        .push(format!("plugin=\"{plugin}\""));
 }
 
 impl tracing::Subscriber for Said {
@@ -1000,7 +1016,19 @@ impl tracing::Subscriber for Said {
             self.0.lock().expect("the kept lines").push(fields.0);
             return;
         }
-        // A guest's own line: held where a case asked, kept nowhere.
+        // A guest's own line: kept nowhere. It panics where a case asked,
+        // the list's lock given up first, and is held where a case asked.
+        let panics = {
+            let mut asked = PANICS.lock().expect("the panics");
+            asked
+                .iter()
+                .position(|named| fields.0.contains(named.as_str()))
+                .map(|at| asked.swap_remove(at))
+        };
+        assert!(
+            panics.is_none(),
+            "the host panics inside a guest's log line"
+        );
         let nap = HOLDS
             .lock()
             .expect("the holds")
@@ -3767,6 +3795,141 @@ fn a_plugins_close_that_stops_half_way_leaves_its_scope_closed() {
             ),
         );
     }
+}
+
+/// A thread under no name holds no instance but its own, where it takes the
+/// working place of a thread that exited with a named decider's state lent.
+/// The first thread, as decider 1, makes a decision whose close the host
+/// stops half-way, by a panic inside the destructor's log line: the close
+/// does not reach the give-back, and the thread exits with the decider's
+/// instance in its place. The thread that takes the place reads the mark
+/// the first left there: under no name it is not warm, and decider 1's
+/// state is at its rest again for the thread that next acts as decider 1.
+///
+/// `thread_local` hands a new thread the lowest id that is free. The second
+/// thread starts once the first's id is: a thread-local of the case's own,
+/// first used ahead of that crate's, goes behind it at the thread's end and
+/// says so. The suite's other threads take and free ids all the while, and
+/// that crate keys every map of its kind by the one id, so an entry of the
+/// case's own says whether the second thread stands in the first's place.
+/// A pair that shared none is made again, [`PLACES`] pairs at most, and the
+/// case asserts that one pair did.
+#[test]
+fn a_thread_under_no_name_gives_back_the_state_its_place_was_left_with() {
+    /// How many pairs of threads the case makes for one to share a place.
+    const PLACES: u32 = 64;
+    /// Says at its thread's end that the thread's id is free again.
+    struct SaysItsIdIsFree(mpsc::Sender<()>);
+    impl Drop for SaysItsIdIsFree {
+        fn drop(&mut self) {
+            let _ = self.0.send(());
+        }
+    }
+    thread_local! {
+        static AT_END: std::cell::RefCell<Option<SaysItsIdIsFree>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    // One pair: whether the second thread stood in the first's place, and
+    // whether it was warm there under no name, then as decider 1.
+    let pair = || {
+        let runtime = runtime();
+        let plugin = loaded(
+            &runtime,
+            spec("left-lent", guest::record_guest(), mode::LOG_IN_DESTRUCTOR),
+        );
+        let engine = single_engine(Profile {
+            name: "one-stage".into(),
+            filters: vec![],
+            scorers: vec![Weighted {
+                scorer: Box::new(WasmScorer::new(plugin.bind(), None)),
+                weight: 1.0,
+            }],
+            picker: Box::new(Best),
+        });
+        let candidates = pool(3);
+        let place = thread_local::ThreadLocal::<std::cell::Cell<bool>>::new();
+        panic_in_a_line_of("left-lent");
+        let (free, freed) = mpsc::channel();
+        let ended = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    AT_END.with(|at_end| *at_end.borrow_mut() = Some(SaysItsIdIsFree(free)));
+                    place.get_or_default().set(true);
+                    let _turn = Decider::new(1).enter();
+                    decide(&engine, &candidates, 1)
+                })
+                .join()
+        });
+        assert!(ended.is_err(), "the first thread's close panicked");
+        freed
+            .recv()
+            .expect("the first thread's end says its id is free");
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let shared = place.get_or_default().get();
+                    let own = plugin.is_warm();
+                    let _turn = Decider::new(1).enter();
+                    (shared, own, plugin.is_warm())
+                })
+                .join()
+                .expect("the second thread")
+        })
+    };
+    let shared = (0..PLACES).map(|_| pair()).find(|(shared, ..)| *shared);
+    assert_eq!(
+        shared,
+        Some((true, false, true)),
+        "a second thread stood in the first's place: under no name it held no instance there, and decider 1's state was at its rest behind it"
+    );
+}
+
+/// A warm-up under a name holds the decider's state for its own span: at
+/// its end the state is back at the decider's rest, for whichever thread
+/// acts as the decider next. The first thread lives until the second has
+/// read, so the second stands in a place of its own. The warm-up takes the
+/// apply's own instance: no thread here makes one.
+#[test]
+fn a_named_warm_up_leaves_the_state_at_its_deciders_rest() {
+    let runtime = runtime();
+    let plugin = load(
+        &runtime,
+        "warmed-as-one",
+        guest::record_guest(),
+        mode::LEAST_IN_FLIGHT,
+    );
+    let (warmed, first_warmed) = mpsc::channel();
+    let (read, second_read) = mpsc::channel::<()>();
+    let warm_behind_it = std::thread::scope(|scope| {
+        let plugin = &plugin;
+        scope.spawn(move || {
+            {
+                let _turn = Decider::new(1).enter();
+                plugin.warm().expect("decider 1 warms");
+            }
+            warmed.send(()).expect("the case waits for the warm-up");
+            // Alive, under no name, until the second thread has read.
+            let _ = second_read.recv();
+        });
+        first_warmed.recv().expect("the first thread warmed");
+        let warm = scope
+            .spawn(move || {
+                let _turn = Decider::new(1).enter();
+                plugin.is_warm()
+            })
+            .join();
+        drop(read);
+        warm.expect("the second thread")
+    });
+    assert!(
+        warm_behind_it,
+        "decider 1 is warm on the second thread: the first left its state at the rest"
+    );
+    assert_eq!(
+        plugin.stats().instantiations,
+        1,
+        "the warm-up took the load's own instance"
+    );
 }
 
 /// The plugin's own undo runs inside its open's unwinding too, by the walk
