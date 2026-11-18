@@ -265,6 +265,7 @@ pub(crate) mod tests {
         catalog::Catalog,
         controller::gateways::tests::lease,
         decision::{Pair, Target, Targets},
+        door::pinned,
         framework::{Picker, TieBand},
         lease::{Lease, LeaseId, Lifecycle, Outcome, ReleaseReason, Side, TransportClass},
         proto::{
@@ -528,15 +529,14 @@ pub(crate) mod tests {
                 target: d0,
                 picked: Picked::of_decodes(&targets),
                 session: Session::NONE,
-                state: LeaseState::Issued,
+                state: LeaseState::ISSUED,
                 tokens: 0,
                 target_index: 0,
             }),
             term: 0,
             issued_at: now,
             dispatch_deadline: now + Duration::from_secs(5),
-            state: LeaseState::Issued,
-            session_ttl_micros: None,
+            state: LeaseState::ISSUED,
         };
         LeasesStore::issue(&store, pair(1)).expect("the key is free");
         let frame = |side: proto::Side, index: u32| proto::Dispatched {
@@ -919,7 +919,7 @@ pub(crate) mod tests {
         record.lease.generation = 1;
         record.lease.session = KEY;
         record.lease.session_verdict = SessionVerdict::Claimed(WorkerId(7));
-        record.session_ttl_micros = ttl_micros;
+        record.state = LeaseState::issued(ttl_micros);
         record.lease.issued_micros = store.micros(now);
         record.target = WorkerId(7);
         store.issue(record).expect("a lease");
@@ -992,6 +992,33 @@ pub(crate) mod tests {
         dispatched(&store, &open(&store, A), &a_dispatched(1), at).expect("the frame reads");
         let pin = SessionsStore::lookup(&store, KEY.get()).expect("a pin");
         assert_eq!((pin.worker, pin.ends), (WorkerId(7), None));
+    }
+
+    /// The pin's writer reads its lease's rule off the issued state, and
+    /// the door tells a dispatch once, with the record as it stood
+    /// issued. A record past that state, were one told, would read as a
+    /// rule with no TTL: it pins nothing, and a pin that stands keeps
+    /// its end.
+    #[test]
+    fn a_record_past_its_issue_pins_nothing_by_its_leases_rule() {
+        let store = MemoryStore::new();
+        let t0 = Instant::now();
+        let mut record = lease(A, 1, t0);
+        record.lease.session = KEY;
+        record.lease.session_verdict = SessionVerdict::Claimed(WorkerId(7));
+        record.lease.issued_micros = store.micros(t0);
+        record.state = LeaseState::Dispatched { at: t0 };
+        pinned(&store, &record.lease, record.state, None, WorkerId(7), t0);
+        assert!(SessionsStore::lookup(&store, KEY.get()).is_none());
+        // As issued under a rule of a minute it pins to the minute's
+        // end; told once more as the door wrote it, it leaves that end.
+        record.state = LeaseState::issued(Some(60_000_000));
+        pinned(&store, &record.lease, record.state, None, WorkerId(7), t0);
+        record.state = LeaseState::Dispatched { at: t0 };
+        pinned(&store, &record.lease, record.state, None, WorkerId(7), t0);
+        let pin = SessionsStore::lookup(&store, KEY.get()).expect("a pin");
+        let ends = store.micros(t0) + 60_000_000;
+        assert_eq!((pin.worker, pin.ends), (WorkerId(7), Some(ends)));
     }
 
     /// Two leases of one key under a rule of a second, in flight at an
@@ -1110,7 +1137,7 @@ pub(crate) mod tests {
         dispatched(&store, &open(&store, A), &a_dispatched(2), t0).expect("no error");
         completed(&store, &open(&store, A), &a_completed(2, WorkerId(7)), t0).expect("no error");
         released(&store, &open(&store, A), &a_released(2)).expect("no error");
-        assert_eq!(state(&store, A, 1), Some(LeaseState::Issued));
+        assert_eq!(state(&store, A, 1), Some(LeaseState::ISSUED));
         assert_eq!(store.live(A), 1);
     }
 
@@ -1131,7 +1158,7 @@ pub(crate) mod tests {
             (None, None, ReleaseReason::ClientGone)
         );
         released(&store, &open(&store, A), &ticket).expect("no error");
-        assert_eq!(state(&store, A, 1), Some(LeaseState::Issued));
+        assert_eq!(state(&store, A, 1), Some(LeaseState::ISSUED));
 
         let no_reason = proto::Released {
             reason: 0,
@@ -1156,7 +1183,7 @@ pub(crate) mod tests {
         dispatched(&store, &open(&store, A), &a_dispatched(1), t0).expect("no error");
         completed(&store, &open(&store, A), &a_completed(1, WorkerId(7)), t0).expect("no error");
         released(&store, &open(&store, A), &a_released(1)).expect("no error");
-        assert_eq!(state(&store, B, 1), Some(LeaseState::Issued));
+        assert_eq!(state(&store, B, 1), Some(LeaseState::ISSUED));
     }
 
     #[test]
@@ -1348,7 +1375,7 @@ pub(crate) mod tests {
         );
         // Nothing was written: the lease stands as issued and no
         // completion is on file.
-        assert_eq!(state(&store, A, 1), Some(LeaseState::Issued));
+        assert_eq!(state(&store, A, 1), Some(LeaseState::ISSUED));
         assert!(!store.completed_ok_since(A, served, t0));
     }
 }

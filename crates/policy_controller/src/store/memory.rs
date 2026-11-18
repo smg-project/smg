@@ -2665,18 +2665,18 @@ impl Held {
 /// holds its one lease under any side.
 fn waits(record: &LeaseRecord, side: Side) -> bool {
     let side = record.side(side);
-    side.is_some_and(|(_, state)| state == LeaseState::Issued)
+    side.is_some_and(|(_, state)| state.is_issued())
 }
 
 /// `found`, a record the dispatch deadline's end took, as that end left
 /// it: each side that waited is released as abandoned.
 fn left(mut found: LeaseRecord) -> LeaseRecord {
     let abandoned = LeaseState::Released(ReleaseReason::Abandoned);
-    if found.state == LeaseState::Issued {
+    if found.state.is_issued() {
         found.state = abandoned;
     }
     if let Some(decode) = found.decode.as_mut() {
-        if decode.state == LeaseState::Issued {
+        if decode.state.is_issued() {
             decode.state = abandoned;
         }
     }
@@ -2764,10 +2764,10 @@ impl Leases {
         if held.record.decode.is_some() {
             let named = held.record.target_of(Side::Decode, dispatch.target_index);
             match (dispatch.side, held.record.decode.as_mut()) {
-                (Side::Prefill, _) if held.record.state == LeaseState::Issued => {
+                (Side::Prefill, _) if held.record.state.is_issued() => {
                     held.record.state = LeaseState::Dispatched { at };
                 }
-                (Side::Decode, Some(decode)) if decode.state == LeaseState::Issued => {
+                (Side::Decode, Some(decode)) if decode.state.is_issued() => {
                     decode.state = LeaseState::Dispatched { at };
                     if let Some((target, _)) = named {
                         if target != decode.target {
@@ -2782,7 +2782,7 @@ impl Leases {
             }
             return true;
         }
-        if held.record.state != LeaseState::Issued {
+        if !held.record.state.is_issued() {
             return true;
         }
         held.record.state = LeaseState::Dispatched { at };

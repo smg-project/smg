@@ -396,6 +396,13 @@ pub(crate) fn pair_in<A: Asked>(
         let booking = decision.pick().zip(built).and_then(|(pick, built)| {
             let first = pick.targets.first()?;
             let chosen = first.pair?;
+            // The pair's one decision: its rule's TTL as a single's
+            // booking carries it, in each side's issued state.
+            let ttl_micros = if pick.session_verdict == SessionVerdict::None {
+                None
+            } else {
+                scratch.session_ttl_micros()
+            };
             let decode = DecodeSide {
                 target: chosen.decode_id,
                 picked: Picked::of_decodes(&pick.targets),
@@ -404,7 +411,7 @@ pub(crate) fn pair_in<A: Asked>(
                     ..*facts
                 }
                 .session(),
-                state: LeaseState::Issued,
+                state: LeaseState::issued(ttl_micros),
                 tokens: facts.prompt_tokens,
                 target_index: 0,
             };
@@ -412,13 +419,7 @@ pub(crate) fn pair_in<A: Asked>(
                 target: first.id,
                 picked: Picked::of(&pick.targets),
                 verdict: pick.session_verdict,
-                // The pair's one decision: its rule's TTL as a single's
-                // booking carries it.
-                ttl_micros: if pick.session_verdict == SessionVerdict::None {
-                    None
-                } else {
-                    scratch.session_ttl_micros()
-                },
+                ttl_micros,
                 generation: pick.trace.generation,
                 session: facts.session(),
                 tokens: facts.prompt_tokens,
@@ -508,8 +509,7 @@ pub(crate) fn issue<A: Asked>(
         term,
         issued_at: taken.now,
         dispatch_deadline: taken.due(),
-        state: LeaseState::Issued,
-        session_ttl_micros: booking.ttl_micros,
+        state: LeaseState::issued(booking.ttl_micros),
     };
     let built = booking.built;
     let booked = [
@@ -879,7 +879,7 @@ fn tell(store: &MemoryStore, world: &World, record: &LeaseRecord, said: Said) {
         (Said::Dispatched(dispatch, at), engine) => {
             // The side the frame names: its lease, and its worker at
             // the index the frame names.
-            let Some((lease, _)) = record.side(dispatch.side) else {
+            let Some((lease, stood)) = record.side(dispatch.side) else {
                 return;
             };
             let named = record.target_of(dispatch.side, dispatch.target_index);
@@ -907,7 +907,7 @@ fn tell(store: &MemoryStore, world: &World, record: &LeaseRecord, said: Said) {
             if let Some(engine) = engine {
                 engine.dispatched_table(&lease, &target, dispatch.side);
             }
-            pinned(store, &lease, record.session_ttl_micros, engine, id, at);
+            pinned(store, &lease, stood, engine, id, at);
             if let Some(engine) = engine {
                 engine.dispatched_stages(
                     &lease,
@@ -941,7 +941,7 @@ fn tell(store: &MemoryStore, world: &World, record: &LeaseRecord, said: Said) {
 /// The pin ends where the engine's table forgets the key, and never under
 /// a rule without a TTL. Where the table holds no such key, or no engine
 /// was told, the lease's own rule ends it: the TTL its decision was made
-/// under, as its record on file carries it, counted from the lease's
+/// under, as its issued state carries it, counted from the lease's
 /// issue as the table counted it then. So it does where the dispatch
 /// itself made the table's entry anew and no decision has read it: that
 /// entry holds no instant yet. An end the lease's rule counts never moves
@@ -949,11 +949,12 @@ fn tell(store: &MemoryStore, world: &World, record: &LeaseRecord, said: Said) {
 /// key, or behind a dispatch whose table ended the pin later, leaves the
 /// later end standing. Either end stands on the decision clock: a
 /// dispatch converts no clock. The table's lock is let go before the
-/// store's pin is written: no lock is held across the two.
-fn pinned(
+/// store's pin is written: no lock is held across the two. `stood` is
+/// the dispatched side's state as it stood before this dispatch.
+pub(crate) fn pinned(
     store: &MemoryStore,
     lease: &Lease,
-    ttl_micros: Option<u64>,
+    stood: LeaseState,
     engine: Option<&Engine>,
     dispatched: WorkerId,
     at: Instant,
@@ -976,10 +977,34 @@ fn pinned(
         // The lease's own rule is the word of a decision that may be older
         // than the pin's last writer: it never moves the end earlier.
         Some((_, Forgets::Unread)) | None => {
-            let ends = ttl_micros.map(|ttl| lease.issued_micros.saturating_add(ttl));
-            SessionsStore::pin_no_earlier(store, key, worker, at, ends);
+            pinned_by_rule(store, key, worker, at, lease.issued_micros, stood);
         }
     }
+}
+
+/// The pin of a lease whose own rule ends it, [`pinned`]'s last arm. Few
+/// leases come here, so it stands out of the path every dispatch takes.
+/// The rule's word lives in a side's issued state alone, and the door
+/// tells a side's dispatch once, with the side as it stood issued. A side
+/// past that state would read as a rule with no TTL: it pins nothing by
+/// its lease's rule.
+#[cold]
+#[inline(never)]
+fn pinned_by_rule(
+    store: &MemoryStore,
+    key: u64,
+    worker: WorkerId,
+    at: Instant,
+    issued_micros: u64,
+    stood: LeaseState,
+) {
+    if !stood.is_issued() {
+        return;
+    }
+    let ends = stood
+        .session_ttl_micros()
+        .map(|ttl| issued_micros.saturating_add(ttl));
+    SessionsStore::pin_no_earlier(store, key, worker, at, ends);
 }
 
 /// The counter at which a term's leader is told to leave: three quarters of

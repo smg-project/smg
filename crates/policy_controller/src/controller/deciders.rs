@@ -1529,7 +1529,7 @@ pub(crate) mod tests {
             .expect("the lease is on file");
         assert_eq!(
             (filed.target, filed.term, filed.state, filed.request),
-            (picked(&answer), 1, LeaseState::Issued, fingerprint(&[7]))
+            (picked(&answer), 1, LeaseState::ISSUED, fingerprint(&[7]))
         );
         assert_eq!(filed.dispatch_deadline, filed.issued_at + DISPATCH_TTL);
         // The next decision's id is the term's next count, its lease
@@ -3213,8 +3213,7 @@ pub(crate) mod tests {
                 term: 1,
                 issued_at: now,
                 dispatch_deadline: now + DISPATCH_TTL,
-                state: LeaseState::Issued,
-                session_ttl_micros: None,
+                state: LeaseState::ISSUED,
             });
             assert_eq!(filed, Ok(()));
             let frame = frame_for(SPOKEN, 1, 1);
@@ -3262,8 +3261,7 @@ pub(crate) mod tests {
             term: 1,
             issued_at: now,
             dispatch_deadline: now + DISPATCH_TTL,
-            state: LeaseState::Issued,
-            session_ttl_micros: None,
+            state: LeaseState::ISSUED,
         });
         assert_eq!(filed, Ok(()));
     }
@@ -5221,14 +5219,14 @@ pub(crate) mod tests {
         let answer = bed.ask(keyed(1, 1_001)).await;
         let record = LeasesStore::get(&*bed.store, GATEWAY, LeaseId(lease_of(&answer).id))
             .expect("the lease is on file");
-        assert_eq!(record.session_ttl_micros, Some(kept));
+        assert_eq!(record.state.session_ttl_micros(), Some(kept));
         // An unkeyed decision behind it, on the scratch the keyed one left
         // its TTL on: no rule governed its pick, and its record carries
         // none.
         let answer = bed.ask(frame(2, 1_002)).await;
         let unkeyed = LeasesStore::get(&*bed.store, GATEWAY, LeaseId(lease_of(&answer).id))
             .expect("the lease is on file");
-        assert_eq!(unkeyed.session_ttl_micros, None);
+        assert_eq!(unkeyed.state.session_ttl_micros(), None);
         bed.store.apply(later).expect("a later generation");
         let lease = record.lease;
         let hand = lifecycle::open(&bed.store, GATEWAY);
