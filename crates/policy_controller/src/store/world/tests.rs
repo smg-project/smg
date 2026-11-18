@@ -1,8 +1,6 @@
 //! The cases of the world and of a decision's build from it, over
 //! [`MemoryStore`]: every instant is handed in, none is slept.
 
-mod pool_binding;
-
 use std::{
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -18,9 +16,9 @@ use super::{
 use crate::{
     spec::{BindingSpec, Match, OverloadSpec, Pairing},
     store::{
-        pairing::Refusal, GatewayId, HealthSink, LoadSink, LoadSource, MembershipTail, MemoryStore,
-        Overload, PairingDescriptor, Reachability, WorkerFacts, WorkerPatch, WorkerRow,
-        WorkerStatus, WorkersStore,
+        pairing::Refusal, GatewayId, HealthSink, LeasesStore, LoadSink, LoadSource, MembershipTail,
+        MemoryStore, Overload, PairingDescriptor, Reachability, VetoWrite, WorkerFacts,
+        WorkerPatch, WorkerRow, WorkerStatus, WorkersStore,
     },
     view::{
         fingerprint, AffinityFacts, Candidate, Constraints, LoadRow, Phase, RequestFacts, Role,
@@ -30,7 +28,10 @@ use crate::{
 };
 
 mod list_room;
+mod membership_call;
 mod mode_and_overload;
+mod pool_binding;
+mod repeated_models;
 mod written;
 
 const MODEL: &str = "m";
@@ -81,7 +82,45 @@ fn view(store: &MemoryStore, ask: &Ask) -> (Vec<Candidate>, Vec<AffinityFacts>, 
     let built = store
         .build_view(MODEL, Role::Single, ask, &mut out)
         .expect("the pool");
+    lent_agrees(store, ask);
     (out.candidates, out.affinity, built)
+}
+
+/// Holds the lent view to the build's, under one load of the world: the
+/// rows [`World::view`] hands, with what it hands beside them written in,
+/// are the rows [`World::build`] writes, field for field. Every case that
+/// builds its view through [`view`] holds the lent one to it here.
+fn lent_agrees(store: &MemoryStore, ask: &Ask) {
+    let (mut built, mut lent) = (ViewBuffers::default(), ViewBuffers::default());
+    store.with_world(|world| {
+        let read = world
+            .build(MODEL, Role::Single, ask, &mut built)
+            .expect("the pool");
+        let view = world
+            .view(MODEL, Role::Single, ask, false, &mut lent)
+            .expect("the pool");
+        let mut rows = view.candidates.to_vec();
+        for (index, row) in rows.iter_mut().enumerate() {
+            assert_eq!(row.position as usize, index);
+            // The age at the decision: its instant less the sample's.
+            let sampled_at = row.load_sampled_at_micros;
+            if let Some(load) = &mut row.load {
+                load.report_age_ms = super::age_ms(view.built.now_micros, sampled_at);
+            }
+        }
+        assert!(view.stalled.is_sorted(), "the mask is in the rows' order");
+        for &position in view.stalled {
+            rows[position as usize].health.stalled = true;
+        }
+        if let Some(at) = view.pinned_at.checked_sub(1) {
+            rows[at as usize].session_hit = true;
+        }
+        // A row is compared by its printed form: every field of it.
+        assert_eq!(format!("{rows:?}"), format!("{:?}", built.candidates));
+        let column = format!("{:?}", view.affinity);
+        assert_eq!(column, format!("{:?}", built.affinity));
+        assert_eq!(view.built, read);
+    });
 }
 
 /// What the pool's first row reads as running, when it has a record.
@@ -633,12 +672,13 @@ fn rows_a_reader_still_holds_are_left_whole_and_that_publication_allocates() {
     assert_eq!(counts(), (2, 1));
     assert_eq!(format!("{:?}", rows_of(&kept, MODEL)), read);
 
-    // The writer kept its own reference to the rows it left, so the
-    // reader dropping the last world that lists them frees no rows: two
-    // counts stay, the writer's and this case's.
+    // The writer kept its own reference to the rows it left and its own
+    // hold on the world that lists them, so the reader dropping its hold
+    // frees nothing: three counts stay, the writer's, that world's and
+    // this case's. The next publication lets the world go.
     let rows = rows_of(&kept, MODEL);
     drop(kept);
-    assert_eq!(Arc::strong_count(&rows), 2);
+    assert_eq!(Arc::strong_count(&rows), 3);
     publish(6);
     assert_eq!((counts(), Arc::strong_count(&rows)), ((2, 1), 2));
     // The publication that finds them alone frees them.
@@ -656,7 +696,7 @@ fn rows_a_reader_still_holds_are_left_whole_and_that_publication_allocates() {
     assert_eq!(counts(), (2, 2));
     let rows = rows_of(&kept, MODEL);
     drop(kept);
-    assert_eq!(Arc::strong_count(&rows), 2);
+    assert_eq!(Arc::strong_count(&rows), 3);
     drop(rows);
     publish(9);
     assert_eq!(counts(), (3, 0));
@@ -1118,6 +1158,32 @@ fn a_gateways_veto_masks_the_worker_for_that_gateway_until_its_end_or_its_clear(
     let again = member(&store, "http://b:8000");
     assert_eq!(again, other, "the same key and incarnation is the same id");
     assert_eq!(stalled(ASKER, t0), []);
+}
+
+/// The noted write shows the world what the plain one shows: a veto set
+/// with no note behind it masks the worker for its gateway alone, a later
+/// end behind a note that stands is the end shown, and a noted clear lifts
+/// the mask.
+#[test]
+fn a_noted_veto_is_shown_and_lifted_in_the_published_world() {
+    let store = MemoryStore::new();
+    let t0 = Instant::now();
+    let vetoed = member(&store, "http://a:8000");
+    let until = t0 + Duration::from_secs(1);
+    let written = store.gateway_veto_noted(ASKER, vetoed, Some(until), false, t0);
+    assert_eq!(written, VetoWrite::Written);
+    assert_eq!(stalled(&store, ASKER, t0), [vetoed]);
+    assert_eq!(stalled(&store, GatewayId(2), t0), []);
+    assert_eq!(stalled(&store, ASKER, until), []);
+
+    let later = until + Duration::from_secs(1);
+    let written = store.gateway_veto_noted(ASKER, vetoed, Some(later), true, t0);
+    assert_eq!(written, VetoWrite::Written);
+    assert_eq!(stalled(&store, ASKER, until), [vetoed]);
+
+    let written = store.gateway_veto_noted(ASKER, vetoed, None, true, t0);
+    assert_eq!(written, VetoWrite::Written);
+    assert_eq!(stalled(&store, ASKER, t0), []);
 }
 
 #[test]
@@ -2290,23 +2356,55 @@ fn a_generation_outlives_its_last_world_until_the_next_apply_hands_it_back() {
         .expect("above the unbound start");
     assert!(before.is_none(), "nothing was kept before the first apply");
     // A reader still holds a world of generation 1 when the next is
-    // applied; the unbound start, kept since the first apply, is handed
-    // back.
+    // applied and the cell lets that world go; the unbound start, kept
+    // since the first apply, is handed back.
+    let reader = Arc::clone(&world);
     let (_, before) = writer
         .apply(Arc::new(generation(2)), std::iter::empty(), |_, _| None)
         .expect("above the standing one");
     assert_eq!(before.map(|spec| spec.generation()), Some(0));
-    // The reader lets its world go: the writer keeps the generation, so
-    // the reader frees no engine.
-    drop(world);
-    assert_eq!(held.strong_count(), 1, "kept by the writer alone");
-    // The next apply hands it back, and the caller's drop is its end.
+    writer.replaced(world);
+    // The reader lets its world go: the writer keeps the generation, and
+    // the world too until a publication lets it go, so the reader frees
+    // no engine. Both holds are the writer's.
+    drop(reader);
+    assert_eq!(held.strong_count(), 2, "kept by the writer alone");
+    // The next apply lets the world go and hands the generation back, and
+    // the caller's drop is its end.
     let (_, before) = writer
         .apply(Arc::new(generation(3)), std::iter::empty(), |_, _| None)
         .expect("above the standing one");
     let before = before.expect("the generation before the last");
     assert_eq!((before.generation(), held.strong_count()), (1, 1));
     drop(before);
+    assert_eq!(held.strong_count(), 0);
+}
+
+#[test]
+fn a_world_held_across_two_applies_takes_its_generation_to_a_publication() {
+    let mut writer = Writer::new(PUBLISH_WINDOW, Instant::now());
+    let first = Arc::new(generation(1));
+    let held = Arc::downgrade(&first);
+    let (world, _) = writer
+        .apply(first, std::iter::empty(), |_, _| None)
+        .expect("above the unbound start");
+    // A reader holds the world the cell lets go at the next apply.
+    let reader = Arc::clone(&world);
+    let applied = writer.apply(Arc::new(generation(2)), std::iter::empty(), |_, _| None);
+    drop(applied.expect("above the standing one"));
+    writer.replaced(world);
+    let applied = writer.apply(Arc::new(generation(3)), std::iter::empty(), |_, _| None);
+    drop(applied.expect("above the standing one"));
+    // The second apply handed the generation back and its caller let it
+    // go: the reader's world alone holds it now.
+    assert_eq!(held.strong_count(), 1);
+    // The reader frees no engine all the same: the writer lists its world,
+    // and the engine goes with it at the publication that finds no reader
+    // holding it, here the next apply's.
+    drop(reader);
+    assert_eq!(held.strong_count(), 1);
+    let applied = writer.apply(Arc::new(generation(4)), std::iter::empty(), |_, _| None);
+    drop(applied.expect("above the standing one"));
     assert_eq!(held.strong_count(), 0);
 }
 
@@ -2370,9 +2468,11 @@ fn pair_facts(key: &str, role: Role, transport: Option<&str>) -> WorkerFacts {
     WorkerFacts {
         wire_modes: WireModes::GRPC,
         engine_kind: "rt-a".to_string(),
-        pairing: transport.map(|transport| PairingDescriptor {
-            transport: Some(transport.to_string()),
-            ..PairingDescriptor::default()
+        pairing: transport.map(|transport| {
+            Box::new(PairingDescriptor {
+                transport: Some(transport.to_string()),
+                ..PairingDescriptor::default()
+            })
         }),
         ..facts(key, role, &[MODEL])
     }
@@ -3151,12 +3251,12 @@ fn a_blank_value_of_a_descriptor_is_dropped_at_the_door() {
         .map(|&(key, role, transport)| {
             let transport = transport.map_or_else(|| " ".to_string(), |name| format!(" {name} "));
             let facts = WorkerFacts {
-                pairing: Some(PairingDescriptor {
+                pairing: Some(Box::new(PairingDescriptor {
                     protocol: Some(String::new()),
                     transport: Some(transport),
                     version: Some(String::new()),
                     kv_layout: [Some(" ".to_string()), None, None, None],
-                }),
+                })),
                 ..pair_facts(key, role, None)
             };
             blanked.upsert(facts).id()
@@ -3173,10 +3273,10 @@ fn a_blank_value_of_a_descriptor_is_dropped_at_the_door() {
     let row = WorkersStore::get(&blanked, first).expect("the row");
     assert_eq!(
         row.facts.pairing,
-        Some(PairingDescriptor {
+        Some(Box::new(PairingDescriptor {
             transport: Some("tx-a".to_string()),
             ..PairingDescriptor::default()
-        })
+        }))
     );
 }
 
@@ -3230,11 +3330,16 @@ fn overloaded(store: &MemoryStore, now: Instant) -> Vec<WorkerId> {
 
 /// One rank of the two-rank engine `engine`.
 fn rank_of(store: &MemoryStore, engine: &str, rank: u16) -> WorkerId {
+    rank_among(store, engine, rank, 2)
+}
+
+/// One rank of the engine `engine`, which says it has `size` ranks.
+fn rank_among(store: &MemoryStore, engine: &str, rank: u16, size: u16) -> WorkerId {
     store
         .upsert(WorkerFacts {
             engine: engine.to_string(),
             dp_rank: rank,
-            dp_size: 2,
+            dp_size: size,
             ..facts(&format!("{engine}#{rank}"), Role::Single, &[MODEL])
         })
         .id()
@@ -3922,6 +4027,35 @@ fn a_rank_exactly_three_periods_behind_is_counted_and_a_microsecond_past_it_ends
     assert_eq!(overloaded(&store, past), []);
 }
 
+/// Beside a rank past the bound, a rank exactly at it is still counted: the
+/// walk that leaves the ended rank out keeps the one three periods behind.
+#[test]
+fn a_rank_at_the_bound_is_counted_beside_one_past_it() {
+    let store = MemoryStore::with_publish_window(Duration::ZERO);
+    let t0 = Instant::now();
+    let zero = rank_among(&store, "grpc://e:9000", 0, 3);
+    let one = rank_among(&store, "grpc://e:9000", 1, 3);
+    let two = rank_among(&store, "grpc://e:9000", 2, 3);
+    store
+        .apply(generation_with(1, block(8, 1.0)))
+        .expect("applied");
+    assert!(store.heard_every(REPORT_PERIOD));
+    let bound = REPORT_PERIOD * 3;
+    let tick = Duration::from_micros(1);
+    // Rank two is heard a microsecond before rank one, which holds the queue
+    // that vetoes. Rank zero is heard three periods after rank one: rank two
+    // has ended, and rank one, exactly at the bound, still counts.
+    store.record(two, 2, pressure(0, 0), t0, LoadSource::Stream);
+    store.record(one, 1, pressure(9, 0), t0 + tick, LoadSource::Stream);
+    let now = t0 + tick + bound;
+    store.record(zero, 0, pressure(0, 0), now, LoadSource::Stream);
+    // The verdict is the engine's: every rank's row reads it, in the pool's
+    // order, the ended rank's too.
+    let mut ranks = [zero, one, two];
+    ranks.sort_unstable();
+    assert_eq!(overloaded(&store, now), ranks);
+}
+
 /// A membership write finds each rank's receipt among single-rank
 /// members: an engine's ranks do not stand together in the id order the
 /// write walks, and a single-rank member has no receipt.
@@ -4093,4 +4227,212 @@ fn the_deciding_door_hands_the_rows_and_the_engine_of_one_publication() {
         )
     });
     assert_eq!(next, (2, Some(2)));
+}
+
+/// Where the published rows of the model's single pool stand.
+fn published(world: &World) -> *const Candidate {
+    rows_of(world, MODEL).as_ptr()
+}
+
+#[test]
+fn a_pool_every_gateway_reaches_whole_is_lent_where_it_stands_and_copied_when_asked() {
+    let store = MemoryStore::new();
+    let now = Instant::now();
+    let first = member(&store, "http://a:8000");
+    let second = member(&store, "http://b:8000");
+    store.gateway_veto(ASKER, second, Some(now + Duration::from_secs(1)));
+    let asked = Ask {
+        pinned: Some(first),
+        ..ask(now)
+    };
+    let mut out = ViewBuffers::default();
+    store.with_world(|world| {
+        let view = world
+            .view(MODEL, Role::Single, &asked, false, &mut out)
+            .expect("the pool");
+        // The rows are the publication's own, and nothing of the decision
+        // is in them: the veto and the pin stand beside them.
+        assert_eq!(view.candidates.as_ptr(), published(world));
+        let own = |row: &Candidate| !row.health.stalled && !row.session_hit;
+        assert!(view.candidates.iter().all(own));
+        let at = |id: WorkerId| {
+            let found = view.candidates.iter().position(|row| row.id == id);
+            found.expect("a member") as u32
+        };
+        assert_eq!(view.stalled, [at(second)]);
+        assert_eq!(view.pinned_at, at(first) + 1);
+        assert_eq!(view.built.pool_size, 2);
+    });
+    assert!(out.candidates.is_empty(), "a lent view copies no row");
+
+    // A decision that asks for written rows is handed the build's copy:
+    // the bits are in the rows and nothing stands beside them.
+    store.with_world(|world| {
+        let view = world
+            .view(MODEL, Role::Single, &asked, true, &mut out)
+            .expect("the pool");
+        assert_ne!(view.candidates.as_ptr(), published(world));
+        assert!(view.stalled.is_empty());
+        assert_eq!(view.pinned_at, 0);
+        let bits = |id: WorkerId| {
+            let found = view.candidates.iter().find(|row| row.id == id);
+            let row = found.expect("a member");
+            (row.health.stalled, row.session_hit)
+        };
+        assert_eq!((bits(first), bits(second)), ((false, true), (true, false)));
+    });
+
+    // No member, no view, and the buffers are cleared.
+    store.with_world(|world| {
+        let none = world.view("another", Role::Single, &asked, false, &mut out);
+        assert!(none.is_none());
+    });
+    assert!(out.candidates.is_empty() && out.stalled.is_empty());
+    // A build that finds no pool clears the mask a lent view left too.
+    out.stalled.push(7);
+    store.with_world(|world| {
+        let none = world.build("another", Role::Single, &asked, &mut out);
+        assert!(none.is_none());
+    });
+    assert!(out.candidates.is_empty() && out.stalled.is_empty());
+}
+
+#[test]
+fn a_pin_that_names_no_member_of_the_pool_pins_no_lent_row() {
+    // Workers of another model stand among this pool's members in the
+    // store's order: the search for one of them over the pool's rows ends
+    // between two rows, and not past the last.
+    let store = MemoryStore::new();
+    let now = Instant::now();
+    let (mut members, mut others) = (Vec::new(), Vec::new());
+    for index in 0..4 {
+        members.push(member(&store, &format!("http://m{index}:8000")));
+        let other = facts(&format!("http://o{index}:8000"), Role::Single, &["another"]);
+        others.push(store.upsert(other).id());
+    }
+    let last = members.iter().copied().max().expect("four members");
+    assert!(
+        others.iter().any(|&id| id < last),
+        "a worker of the other model sorts among the members"
+    );
+    let mut out = ViewBuffers::default();
+    for outsider in others {
+        let asked = Ask {
+            pinned: Some(outsider),
+            ..ask(now)
+        };
+        // The lent rows with what stands beside them are the build's rows
+        // (the helper holds them to it), and the build wrote no session bit.
+        let (rows, _, _) = view(&store, &asked);
+        assert_eq!(rows.len(), 4);
+        assert!(rows.iter().all(|row| !row.session_hit));
+        store.with_world(|world| {
+            let view = world
+                .view(MODEL, Role::Single, &asked, false, &mut out)
+                .expect("the pool");
+            assert_eq!(view.candidates.as_ptr(), published(world));
+            assert_eq!(view.pinned_at, 0);
+        });
+    }
+}
+
+#[test]
+fn a_pool_that_holds_a_host_local_row_is_copied_for_every_gateway() {
+    let store = MemoryStore::new();
+    let now = Instant::now();
+    member(&store, "http://a:8000");
+    let local = store
+        .upsert(WorkerFacts {
+            reachable_from: Reachability::Gateway(GatewayId(2)),
+            ..facts("unix:///b", Role::Single, &[MODEL])
+        })
+        .id();
+    let mut out = ViewBuffers::default();
+    for (gateway, rows) in [(ASKER, 1), (GatewayId(2), 2)] {
+        let asked = Ask {
+            gateway,
+            ..ask(now)
+        };
+        store.with_world(|world| {
+            let view = world
+                .view(MODEL, Role::Single, &asked, false, &mut out)
+                .expect("the pool");
+            // The asking gateway's positions are its own here: its copy.
+            assert_ne!(view.candidates.as_ptr(), published(world));
+            assert_eq!(view.candidates.len(), rows);
+            let holds = view.candidates.iter().any(|row| row.id == local);
+            assert_eq!(holds, gateway == GatewayId(2));
+            assert!(view.stalled.is_empty() && view.pinned_at == 0);
+        });
+    }
+}
+
+#[test]
+fn a_lent_view_hands_its_own_gateways_standing_vetoes_in_the_rows_order() {
+    let store = MemoryStore::new();
+    let t0 = Instant::now();
+    let mut ids: Vec<WorkerId> = (0..6)
+        .map(|n| member(&store, &format!("http://w{n}:8000")))
+        .collect();
+    // The pool's order: a row's position is its worker's place by id.
+    ids.sort_unstable();
+    let end = t0 + Duration::from_secs(10);
+    let early = t0 + Duration::from_secs(1);
+    // Set in falling order, one that ends early, one of another gateway.
+    store.gateway_veto(ASKER, ids[4], Some(end));
+    store.gateway_veto(ASKER, ids[1], Some(end));
+    store.gateway_veto(ASKER, ids[2], Some(early));
+    store.gateway_veto(GatewayId(2), ids[0], Some(end));
+    let masked = |gateway: GatewayId, now: Instant| {
+        let mut out = ViewBuffers::default();
+        let asked = Ask {
+            gateway,
+            ..ask(now)
+        };
+        store.with_world(|world| {
+            let view = world.view(MODEL, Role::Single, &asked, false, &mut out);
+            view.expect("the pool").stalled.to_vec()
+        })
+    };
+    assert_eq!(masked(ASKER, t0), [1, 2, 4]);
+    // A veto past its end masks nothing, from its own instant on.
+    assert_eq!(masked(ASKER, early), [1, 4]);
+    assert!(masked(ASKER, end).is_empty());
+    // No other gateway's run is read.
+    assert_eq!(masked(GatewayId(2), t0), [0]);
+    assert!(masked(GatewayId(3), t0).is_empty());
+}
+
+#[test]
+fn a_dropped_gateways_vetoes_leave_in_one_publication_and_every_other_stands() {
+    let store = MemoryStore::new();
+    let t0 = Instant::now();
+    let until = t0 + Duration::from_secs(60);
+    let one = member(&store, "http://a:8000");
+    let two = member(&store, "http://b:8000");
+    let other = GatewayId(2);
+    store.gateway_veto(ASKER, one, Some(until));
+    store.gateway_veto(ASKER, two, Some(until));
+    store.gateway_veto(other, two, Some(until));
+    let mut both = [one, two];
+    both.sort_unstable();
+    assert_eq!(stalled(&store, ASKER, t0), both);
+
+    let before = store.world();
+    store.drop_gateway(ASKER);
+    assert_eq!(stalled(&store, ASKER, t0), []);
+    assert_eq!(
+        stalled(&store, other, t0),
+        [two],
+        "another gateway's stands"
+    );
+    // Dropped again, and a gateway that never vetoed: no world is made.
+    let lifted = store.world();
+    assert!(
+        !Arc::ptr_eq(&before, &lifted),
+        "the lifting is a publication"
+    );
+    store.drop_gateway(ASKER);
+    store.drop_gateway(GatewayId(3));
+    assert!(Arc::ptr_eq(&lifted, &store.world()));
 }

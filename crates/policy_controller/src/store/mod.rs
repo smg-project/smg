@@ -81,7 +81,7 @@ pub mod world;
 #[cfg(test)]
 mod tests;
 
-pub use health::HealthSink;
+pub use health::{HealthSink, VetoWrite};
 pub use index::{ContentHash, KvEvent, LaneCounts, SequenceHash, StoredBlock, INDEX_WORKERS};
 pub use journal::{Journal, Kinds, Position};
 pub use kv_events::{
@@ -98,7 +98,9 @@ pub use workers::{
     identity, identity_of, HealthPolicy, MembershipChange, MembershipTail, Overload, Reachability,
     Signals, WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus, WorkersStore,
 };
-pub use world::{Ask, Built, PairBuffers, StaleGeneration, ViewBuffers, World, PUBLISH_WINDOW};
+pub use world::{
+    Ask, Built, PairBuffers, PoolView, StaleGeneration, ViewBuffers, World, PUBLISH_WINDOW,
+};
 
 /// The verified identity of a gateway: the fingerprint of the subject its
 /// session was authenticated as, never a message field. Leases, vetoes and

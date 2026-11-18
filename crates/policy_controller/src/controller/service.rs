@@ -6,8 +6,10 @@
 //! with a principal or with none. `Session` and `Decide` are served to a
 //! gateway ([`session`], [`decide`]); the leader serves the control scope's
 //! three registration calls and the watch of the worker rows
-//! ([`watch_workers`]). `GetPolicySpec` is served on the control scope by a
-//! controller given a spec source. Every other call is refused:
+//! ([`watch_workers`]). A controller given a spec source serves
+//! `GetPolicySpec` on the control scope, and `ApplyPolicySpec` and
+//! `RollbackPolicySpec` beside it where it leads. Every other call is
+//! refused:
 //! `PERMISSION_DENIED` where the listener mounts none of the call's scopes
 //! (the contract: the scope does not cover the RPC), `UNAUTHENTICATED`
 //! where it does and the listener's layer placed no principal on the call
@@ -17,21 +19,27 @@
 //! it hands back and for no other peer, and adds what it reads to
 //! [`Shared`], which [`Shared::new`] alone builds.
 //!
-//! A controller given a spec source serves the spec's two writes beside the
-//! read, where it leads. Its source is a file, which no call writes, so it
-//! takes neither: `ApplyPolicySpec` answers a dry run's verdict with
+//! The spec source is a file, which no call writes, so the controller
+//! takes neither write: `ApplyPolicySpec` answers a dry run's verdict with
 //! nothing applied and an enforce `read_only`, and `RollbackPolicySpec`
-//! answers `read_only`.
+//! answers `read_only`. One dry run runs at a time, and a call past the
+//! ones that wait their turn is told to ask again.
 
 use std::{
     io,
     sync::Arc,
+    task::{Context, Poll},
     time::{Duration, Instant},
 };
 
 use prost::Message as _;
 use tokio::sync::watch;
-use tonic::{service::Routes, Code, Request, Response, Status, Streaming};
+use tonic::{
+    codegen::http,
+    server::NamedService,
+    service::{interceptor::InterceptedService, Routes},
+    Code, Request, Response, Status, Streaming,
+};
 
 use super::{
     config::Scope,
@@ -39,13 +47,13 @@ use super::{
     deciders::{self, Deciders, Reads},
     election::{split_identity, Standing},
     gateways::Gateways,
-    generations::{DryRun, Format, Generations},
+    generations::{DryRun, Format, Generations, Unanswered, DRY_RUNS_WAITING},
     membership::Door,
     principal::{self, Layer, Principal},
     replication::{Batches, Replication},
     session,
     watch_workers::{self, Feed, Source, Watchers, Watching},
-    PROTOCOL_VERSION,
+    wire, PROTOCOL_VERSION,
 };
 use crate::{
     catalog::Catalog,
@@ -63,6 +71,47 @@ const NOT_IN_TERM: &str = "this replica leads a term its store has not entered y
 
 /// A watch's refusal by a replica that does not lead.
 const FOLLOWS_NO_LOG: &str = "this replica does not lead and follows no leader's log";
+
+/// The path the transport routes the `Decide` call by.
+const DECIDE_PATH: &str = "/smg.policy.v1.PolicyController/Decide";
+
+/// The contract's service behind two bounds on a message as received: a
+/// `Decide` frame's own on that call ([`wire::MAX_FRAME`]), the
+/// transport's on every other.
+#[derive(Clone)]
+struct ByCall<S> {
+    decide: S,
+    rest: S,
+}
+
+impl<S, B> tonic::codegen::Service<http::Request<B>> for ByCall<S>
+where
+    S: tonic::codegen::Service<http::Request<B>>,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = S::Future;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        // Either side may take the next request: both are asked.
+        match self.decide.poll_ready(cx) {
+            Poll::Ready(Ok(())) => self.rest.poll_ready(cx),
+            other => other,
+        }
+    }
+
+    fn call(&mut self, request: http::Request<B>) -> Self::Future {
+        if request.uri().path() == DECIDE_PATH {
+            self.decide.call(request)
+        } else {
+            self.rest.call(request)
+        }
+    }
+}
+
+impl<S: NamedService> NamedService for ByCall<S> {
+    const NAME: &'static str = S::NAME;
+}
 
 /// What every listener's instance of the service reads. A step that serves
 /// a call adds its state here.
@@ -338,6 +387,27 @@ struct Any {
     value: Vec<u8>,
 }
 
+/// The refusal of a replica that does not lead, under `code` and `message`.
+/// Its details are a `google.rpc.Status`, the form every gRPC client decodes
+/// them as: it says both again and holds a `NotLeader` that names the
+/// holder's address; an empty one says no leader is known.
+pub(crate) fn not_leader(code: Code, message: impl Into<String>, leader_address: String) -> Status {
+    let message = message.into();
+    let named = proto::NotLeader {
+        leader_address,
+        successor_id: String::new(),
+    };
+    let details = RpcStatus {
+        code: code as i32,
+        message: message.clone(),
+        details: vec![Any {
+            type_url: "type.googleapis.com/smg.policy.v1.NotLeader".to_owned(),
+            value: named.encode_to_vec(),
+        }],
+    };
+    Status::with_details(code, message, details.encode_to_vec().into())
+}
+
 /// One listener's instance of the service.
 pub(crate) struct Service {
     /// The scopes this listener mounts.
@@ -353,12 +423,24 @@ impl Service {
     /// This instance as its listener mounts it: behind the listener's one
     /// layer, or behind none.
     pub(crate) fn routes(self, layer: Layer) -> Routes {
+        let service = Arc::new(self);
+        // A `Decide` frame is held to its bound as received: the transport
+        // refuses a longer one at its length. Every other message is under
+        // the transport's own limit.
+        let decide = PolicyControllerServer::from_arc(Arc::clone(&service))
+            .max_decoding_message_size(wire::MAX_FRAME);
+        let rest = PolicyControllerServer::from_arc(service);
         match layer {
-            Layer::Off => Routes::new(PolicyControllerServer::new(self)),
-            Layer::AsTold => Routes::new(PolicyControllerServer::with_interceptor(
-                self,
-                |request: Request<()>| Ok(principal::as_told(request)),
-            )),
+            Layer::Off => Routes::new(ByCall { decide, rest }),
+            Layer::AsTold => {
+                let told = |request: Request<()>| -> Result<Request<()>, Status> {
+                    Ok(principal::as_told(request))
+                };
+                Routes::new(ByCall {
+                    decide: InterceptedService::new(decide, told),
+                    rest: InterceptedService::new(rest, told),
+                })
+            }
         }
     }
 
@@ -441,23 +523,8 @@ impl Service {
             }
             return Err(Status::unavailable(NOT_IN_TERM));
         }
-        let named = proto::NotLeader {
-            leader_address: self.leader_info(now).address,
-            successor_id: String::new(),
-        };
-        let details = RpcStatus {
-            code: code as i32,
-            message: message.to_owned(),
-            details: vec![Any {
-                type_url: "type.googleapis.com/smg.policy.v1.NotLeader".to_owned(),
-                value: named.encode_to_vec(),
-            }],
-        };
-        Err(Status::with_details(
-            code,
-            message,
-            details.encode_to_vec().into(),
-        ))
+        let holder = self.leader_info(now).address;
+        Err(not_leader(code, message, holder))
     }
 
     /// The `Leader` call's answer at `now`: [`Shared::leader`] at one read
@@ -511,6 +578,7 @@ fn verdict(dry_run: DryRun) -> proto::ApplyResult {
             accepted: true,
             generation,
             digest: digest.to_string(),
+            needs: dry_run.needs,
             read_only: true,
             ..proto::ApplyResult::default()
         },
@@ -528,6 +596,23 @@ fn verdict(dry_run: DryRun) -> proto::ApplyResult {
             read_only: true,
             ..proto::ApplyResult::default()
         },
+    }
+}
+
+/// The status of a dry run that gave no verdict: a guard's by the standing
+/// generation, and a full wait's as one to ask again.
+fn unanswered(unanswered: Unanswered) -> Status {
+    match unanswered {
+        Unanswered::Guarded(standing, digest) => {
+            let digest = digest.map(|digest| digest.to_string()).unwrap_or_default();
+            Status::failed_precondition(format!(
+                "expected_digest: generation {standing} stands with digest {digest}"
+            ))
+        }
+        Unanswered::Full => Status::resource_exhausted(format!(
+            "{DRY_RUNS_WAITING} dry runs wait their turn: ask again later"
+        )),
+        Unanswered::Unended(join) => Status::internal(format!("the dry run did not end: {join}")),
     }
 }
 
@@ -685,22 +770,23 @@ impl PolicyController for Service {
                 ));
             }
         }
-        let (standing, digest) = generations.standing();
-        let digest = digest.map(|digest| digest.to_string()).unwrap_or_default();
-        if !apply.expected_digest.is_empty() && apply.expected_digest != digest {
-            return Err(Status::failed_precondition(format!(
-                "expected_digest: generation {standing} stands with digest {digest}"
-            )));
-        }
         let format = match apply.format.as_str() {
             "yaml" => Format::Yaml,
             "json" => Format::Json,
-            _ => return Err(Status::invalid_argument("format: name yaml or json")),
+            _ => {
+                // A form no one names takes no pass and no turn: the guard,
+                // then the form.
+                generations
+                    .guarded(&apply.expected_digest)
+                    .map_err(unanswered)?;
+                return Err(Status::invalid_argument("format: name yaml or json"));
+            }
         };
+        // The guard is the door's to read, behind the turn its pass waits.
         let dry_run = generations
-            .dry_run_in_turn(apply.document, format)
+            .dry_run_in_turn(apply.expected_digest, apply.document, format)
             .await
-            .map_err(|join| Status::internal(format!("the dry run did not end: {join}")))?;
+            .map_err(unanswered)?;
         Ok(Response::new(verdict(dry_run)))
     }
 
@@ -797,7 +883,7 @@ mod tests {
     };
     use tonic_prost::ProstCodec;
 
-    use super::{Call, RpcStatus, Service, Shared};
+    use super::{unanswered, Call, RpcStatus, Service, Shared};
     use crate::{
         catalog::Catalog,
         controller::{
@@ -1252,6 +1338,17 @@ mod tests {
             refused.message().starts_with("with_needs: "),
             "{}",
             refused.message()
+        );
+    }
+
+    /// The path the transport routes `Decide` by is the contract's: its
+    /// service's name, then its method's.
+    #[test]
+    fn the_decide_calls_path_is_the_contracts_services_and_its_methods() {
+        assert!(methods().contains(&"Decide"));
+        assert_eq!(
+            super::DECIDE_PATH,
+            format!("/{}/Decide", crate::controller::SERVICE_NAME)
         );
     }
 
@@ -1764,10 +1861,20 @@ mod tests {
         assert_eq!(would.generation, 2);
         assert!(would.digest.starts_with("sha256:"), "{would:?}");
         assert_ne!(would.digest, standing_digest);
+        assert!(would.issues.is_empty(), "{would:?}");
+        // The feed before and after: the standing document reads the loads
+        // in every role, and the offered one reads nothing.
+        let feed = would.needs.expect("the needs diff");
+        let before = feed.before.expect("the feed before");
+        assert_eq!(before.models.len(), 4, "{before:?}");
         assert!(
-            would.issues.is_empty() && would.needs.is_none(),
-            "{would:?}"
+            before
+                .models
+                .iter()
+                .all(|row| row.model == "*" && row.loads),
+            "{before:?}"
         );
+        assert_eq!(feed.after, Some(proto::NeedsSummary::default()));
 
         // A guard that names the standing digest passes, in JSON as in YAML.
         let json = br#"{"apiVersion":"smg.policy/v1","profiles":{"default":{"pick":"random"}}}"#;
@@ -1784,12 +1891,27 @@ mod tests {
         assert!(guarded.accepted, "{guarded:?}");
         assert_eq!(guarded.generation, 2, "the first dry run reserved nothing");
 
+        // A document sent as JSON is read as JSON: its refusal says so.
+        let unread = control
+            .apply_policy_spec(apply(proto::ApplyMode::DryRun, "{", "json", ""))
+            .await
+            .expect("a verdict")
+            .into_inner();
+        let [issue] = unread.issues.as_slice() else {
+            panic!("one issue: {unread:?}")
+        };
+        assert!(
+            issue.message.starts_with("not a policy spec in json: "),
+            "{issue:?}"
+        );
+
         let refused = control
             .apply_policy_spec(apply(proto::ApplyMode::DryRun, NOWHERE, "yaml", ""))
             .await
             .expect("a verdict")
             .into_inner();
         assert!(!refused.accepted && refused.read_only, "{refused:?}");
+        assert!(refused.needs.is_none(), "{refused:?}");
         assert_eq!(
             (refused.generation, refused.digest.as_str()),
             (1, standing_digest.as_str())
@@ -1835,6 +1957,51 @@ mod tests {
             .into_inner();
         assert_eq!(rollback, read_only);
         assert_eq!(control.shared.generations.standing().0, 1);
+    }
+
+    /// The lease is taken before the store is told its term. In between a
+    /// spec write, its dry run and a rollback are refused as a registration
+    /// is, `UNAVAILABLE`, and the standing generation does not move; each
+    /// answers once the store stands in the term.
+    #[tokio::test]
+    async fn a_spec_call_is_refused_until_the_store_stands_in_its_term() {
+        // The dry run's kit before the store enters the term: the take of a
+        // candidate alone, its fence open.
+        let (mut elector, standing, control) = sourced(false);
+        elector.lead_at(Instant::now());
+        standing.send_replace(saw(IDENTITY, 1));
+        let stands = control.shared.generations.standing();
+        let calls = async || {
+            [
+                control
+                    .apply_policy_spec(apply(proto::ApplyMode::Enforce, RANDOM, "yaml", ""))
+                    .await,
+                control
+                    .apply_policy_spec(apply(proto::ApplyMode::DryRun, RANDOM, "yaml", ""))
+                    .await,
+                control
+                    .rollback_policy_spec(from(
+                        "operator-a",
+                        proto::RollbackRequest { generation: 1 },
+                    ))
+                    .await,
+            ]
+        };
+        for early in calls().await {
+            let early = early.expect_err("refused");
+            assert_eq!(
+                (early.code(), early.message()),
+                (Code::Unavailable, super::NOT_IN_TERM)
+            );
+        }
+        assert_eq!(control.shared.generations.standing(), stands);
+
+        control.shared.store.set_term(1);
+        for answer in calls().await {
+            let answer = answer.expect("an answer").into_inner();
+            assert!(answer.read_only, "{answer:?}");
+        }
+        assert_eq!(control.shared.generations.standing(), stands);
     }
 
     /// The checks of a write call run in one order, each neighbour pair by
@@ -1938,5 +2105,49 @@ mod tests {
             .expect_err("refused");
         assert_eq!(form.code(), Code::InvalidArgument);
         assert_eq!(form.message(), "format: name yaml or json");
+    }
+
+    /// The call asks through the door's turn: while a dry run's pass stands
+    /// in the validator a second call's pass does not enter it, and both
+    /// are answered once the first ends.
+    #[tokio::test]
+    async fn a_second_call_of_a_dry_run_waits_its_turn() {
+        use crate::controller::generations::tests::{gate, gated, Gate, Gated};
+
+        gate!(Here);
+        let gate = Here::gate();
+        let (_elector, _standing, mut control) = sourced(true);
+        let door = gated::<Here>();
+        door.apply(LEAST_LOAD.into(), Format::Yaml)
+            .expect("a valid document");
+        Arc::get_mut(&mut control.shared)
+            .expect("the service alone holds it")
+            .generations = door;
+        let run = |document: &'static str| {
+            control.apply_policy_spec(apply(proto::ApplyMode::DryRun, document, "yaml", ""))
+        };
+        gate.arm();
+        let beside = async {
+            let entered = gate.entered_a_pace_on().await;
+            gate.release();
+            entered
+        };
+        let (first, second, entered) = tokio::join!(run(RANDOM), run(NOWHERE), beside);
+        assert_eq!(entered, 1, "a second call's pass ran beside the first");
+        assert!(first.expect("an answer").into_inner().accepted);
+        assert!(!second.expect("an answer").into_inner().accepted);
+    }
+
+    /// A dry run that no place is left for is told to ask again.
+    #[test]
+    fn a_dry_run_let_in_nowhere_is_told_to_ask_again() {
+        use crate::controller::generations::Unanswered;
+
+        let full = unanswered(Unanswered::Full);
+        assert_eq!(full.code(), Code::ResourceExhausted);
+        assert_eq!(
+            full.message(),
+            "32 dry runs wait their turn: ask again later"
+        );
     }
 }

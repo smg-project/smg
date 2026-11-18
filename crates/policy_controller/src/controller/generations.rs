@@ -28,7 +28,9 @@
 //! nothing: it answers what an apply would do against the generation that
 //! stands at that instant, and it reserves no number. One dry run runs at
 //! a time ([`Generations::dry_run_in_turn`]): the size bound budgets one
-//! pass beside an apply's, and a second call waits its turn.
+//! pass beside an apply's, and a second call waits its turn. Its guard is
+//! read behind that wait, from the one load its pass reads, and no more
+//! calls wait than [`DRY_RUNS_WAITING`].
 //!
 //! A source that keeps running hands a refusal back here
 //! ([`Generations::reject`]): it is one event and one count, and the
@@ -64,14 +66,16 @@ use std::{
 use parking_lot::Mutex;
 use serde::de::{self, DeserializeSeed, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde_json::{map::Entry, Map, Number, Value};
-use tokio::task::JoinError;
+use tokio::{sync::Semaphore, task::JoinError};
 use tracing::{info, warn};
 
 use crate::{
     catalog::Catalog,
+    framework::Engine,
     proto,
     spec::{AppliedSpec, Digest, PolicySpec, SpecError},
     store::{MemoryStore, StaleGeneration},
+    view::Phase,
 };
 
 /// The largest document a source hands over, in bytes: 128 KiB. What sets
@@ -172,12 +176,31 @@ impl Format {
 fn placed(values: Value) -> Result<PolicySpec, Refused> {
     serde_path_to_error::deserialize(values).map_err(|refused| {
         let path = refused.path().to_string();
+        let message = refused.into_inner().to_string();
+        // The document itself has no name.
+        let path = if path == "." { String::new() } else { path };
         Refused {
-            // The document itself has no name.
-            path: if path == "." { String::new() } else { path },
-            message: refused.into_inner().to_string(),
+            path: wanted(path, &message),
+            message,
         }
     })
+}
+
+/// `path` ended by the key a typed read found missing. The map that wants
+/// the key raises that refusal with no key in hand, so the read places it at
+/// the map, the document itself for a key of the root, and the reader's
+/// message names the key. A key a map does not know is placed at itself.
+fn wanted(mut path: String, message: &str) -> String {
+    let missing = message
+        .strip_prefix("missing field `")
+        .and_then(|rest| rest.split_once('`'));
+    if let Some((key, _)) = missing {
+        if !path.is_empty() {
+            path.push('.');
+        }
+        path.push_str(key);
+    }
+    path
 }
 
 /// Why a reader refused a document: the path of the field, where the
@@ -547,6 +570,62 @@ impl SpecRejected {
     }
 }
 
+/// What a host must feed under `engine`, as the contract writes it: a row
+/// for each of the engine's rows that has a flag to set
+/// ([`Engine::needs_rows`]), in their order. A need the contract's row has
+/// no flag for is not told here: the sessions in flight, a key's in-flight
+/// count and the affinity column are the controller's own to hold.
+pub(crate) fn needs_summary(engine: &Engine) -> proto::NeedsSummary {
+    let models = engine
+        .needs_rows()
+        .into_iter()
+        .filter(|(_, _, needs)| {
+            needs.text
+                || needs.token_hashes
+                || needs.text_hashes
+                || needs.loads
+                || needs.events
+                || needs.ring
+                || needs.headers
+                || needs.media
+        })
+        .map(|(model, phase, needs)| proto::ModelNeeds {
+            model: model.to_owned(),
+            role: role(phase).into(),
+            text: needs.text,
+            token_hashes: needs.token_hashes,
+            text_hashes: needs.text_hashes,
+            loads: needs.loads,
+            events: needs.events,
+            ring: needs.ring,
+            headers: needs.headers,
+            media: needs.media,
+        })
+        .collect();
+    proto::NeedsSummary { models }
+}
+
+/// The role a phase's decision places on, as the contract writes it.
+const fn role(phase: Phase) -> proto::Role {
+    match phase {
+        Phase::Single => proto::Role::Single,
+        Phase::Prefill => proto::Role::Prefill,
+        Phase::Decode => proto::Role::Decode,
+        Phase::Encode => proto::Role::Encode,
+    }
+}
+
+/// The number and the digest of the standing generation `spec`, where
+/// `expected` guards nothing against them: a guard is the digest its caller
+/// read as standing, and an empty one guards nothing.
+fn guard(spec: &AppliedSpec, expected: &str) -> Result<(u64, Option<Digest>), Unanswered> {
+    let (standing, digest) = (spec.generation(), spec.digest());
+    if !expected.is_empty() && digest.is_none_or(|digest| digest.to_string() != expected) {
+        return Err(Unanswered::Guarded(standing, digest));
+    }
+    Ok((standing, digest))
+}
+
 /// What a dry run of a document answers.
 #[derive(Debug)]
 pub(crate) struct DryRun {
@@ -555,6 +634,41 @@ pub(crate) struct DryRun {
     /// The number an apply would have run the document under at that
     /// instant, with the document's digest, or why it would not have run.
     pub(crate) would_run: Result<(u64, Digest), SpecRejected>,
+    /// What a host must feed under the standing generation and under the
+    /// document's: the diff an apply returns. None where the document
+    /// would not run.
+    pub(crate) needs: Option<proto::NeedsDiff>,
+}
+
+/// How many dry runs may wait their turn: a call past them is refused. What
+/// waits is bounded by count here, and by bytes before it waits: a document
+/// over the size bound takes no turn, and a guard longer than a digest's
+/// text ([`DIGEST_TEXT_LEN`]) takes none. 32 passes of the heaviest file the
+/// search finds, each under 40 ms at the median by run, are under a second
+/// and a half, and 32 documents of the size bound with their guards are
+/// 4 MiB. A waiting call that ends leaves the wait and frees its place.
+pub(crate) const DRY_RUNS_WAITING: usize = 32;
+
+/// The length of a digest's text: `sha256:` and 64 hex digits. No digest is
+/// written longer, so a longer guard names none.
+const DIGEST_TEXT_LEN: usize = "sha256:".len() + 64;
+
+/// Why a dry run gave no verdict.
+#[derive(Debug)]
+pub(crate) enum Unanswered {
+    /// The caller's guard names another digest than the standing one's: the
+    /// standing number and digest.
+    Guarded(u64, Option<Digest>),
+    /// As many dry runs wait their turn as may ([`DRY_RUNS_WAITING`]).
+    Full,
+    /// The pass's thread did not end.
+    Unended(JoinError),
+}
+
+/// A document's size, where it is over the bound.
+fn over_bound(document: &[u8]) -> Option<u64> {
+    let len = u64::try_from(document.len()).unwrap_or(u64::MAX);
+    (len > MAX_DOCUMENT_BYTES).then_some(len)
 }
 
 /// What a document's pass found it to be.
@@ -579,8 +693,7 @@ fn check(
     document: &[u8],
     format: Format,
 ) -> Result<Checked, SpecRejected> {
-    let len = u64::try_from(document.len()).unwrap_or(u64::MAX);
-    if len > MAX_DOCUMENT_BYTES {
+    if let Some(len) = over_bound(document) {
         return Err(SpecRejected::TooLarge(len));
     }
     let mut spec = format
@@ -643,6 +756,9 @@ pub(crate) struct Generations {
     /// One dry run at a time. A dry run takes neither lock of the door, and
     /// its pass holds what an apply's does: the pass holds this turn.
     dry_turn: Arc<tokio::sync::Mutex<()>>,
+    /// The dry runs let in: the one whose pass runs and the ones that wait
+    /// their turn.
+    dry_runs: Arc<Semaphore>,
     /// The standing generation's document. An apply swaps it under this
     /// lock with its call of the store's entry, so a reader sees the number
     /// and the document move together and waits on no validation. `None`
@@ -670,6 +786,7 @@ impl Generations {
             validate,
             applying: Mutex::new(()),
             dry_turn: Arc::default(),
+            dry_runs: Arc::new(Semaphore::new(DRY_RUNS_WAITING + 1)),
             held: Mutex::new(None),
             applied: AtomicU64::new(0),
             rejected: AtomicU64::new(0),
@@ -742,18 +859,40 @@ impl Generations {
         })
     }
 
+    /// The standing number and digest, from one load, where `expected`
+    /// guards nothing against them ([`guard`]).
+    pub(crate) fn guarded(&self, expected: &str) -> Result<(u64, Option<Digest>), Unanswered> {
+        guard(self.store.world().spec(), expected)
+    }
+
     /// What an apply of `document` would do at this instant, with nothing
-    /// applied, held or counted: the document's pass against the generation
-    /// that stands now, then the rule of the store's entry in its own words
-    /// (a number at or under the standing one is refused by naming it). The
-    /// number answered is the one an apply would run the document under
-    /// now. It reserves nothing: an apply that lands first takes it.
-    pub(crate) fn dry_run(&self, document: &[u8], format: Format) -> DryRun {
-        let standing = self.standing();
+    /// applied, held or counted: the caller's guard against the generation
+    /// that stands now ([`Generations::guarded`]), the document's pass
+    /// against that same generation, then the rule of the store's entry in
+    /// its own words (a number at or under the standing one is refused by
+    /// naming it), and what a host must feed before and after. One load
+    /// serves the four. The number answered is the one an apply would run
+    /// the document under now. It reserves nothing: an apply that lands
+    /// first takes it.
+    pub(crate) fn dry_run(
+        &self,
+        expected: &str,
+        document: &[u8],
+        format: Format,
+    ) -> Result<DryRun, Unanswered> {
+        let world = self.store.world();
+        let standing = guard(world.spec(), expected)?;
+        let mut needs = None;
         let would_run =
             self.pass(standing, document, format)
                 .and_then(|Checked { digest, next }| {
+                    let before = needs_summary(world.spec().engine());
                     let Some(next) = next else {
+                        // The standing document again: the feed stands.
+                        needs = Some(proto::NeedsDiff {
+                            before: Some(before.clone()),
+                            after: Some(before),
+                        });
                         return Ok((standing.0, digest));
                     };
                     let offered = next.generation();
@@ -763,32 +902,51 @@ impl Generations {
                             offered,
                         }));
                     }
+                    needs = Some(proto::NeedsDiff {
+                        before: Some(before),
+                        after: Some(needs_summary(next.engine())),
+                    });
                     Ok((offered, digest))
                 });
-        DryRun {
+        Ok(DryRun {
             standing,
             would_run,
-        }
+            needs,
+        })
     }
 
     /// [`Generations::dry_run`] off the runtime's workers, one at a time. A
     /// document at the bound validates for tens of milliseconds and holds
     /// tens of mebibytes, and the size bound budgets one pass beside an
-    /// apply's: a second call waits its turn, in the order the calls came.
-    /// The pass holds the turn, so a caller that leaves frees it no earlier
-    /// than its pass ends.
+    /// apply's: a second call waits its turn, in the order the calls came,
+    /// and a call past the [`DRY_RUNS_WAITING`] that wait is refused. The
+    /// pass holds the turn, so a caller that leaves frees it no earlier
+    /// than its pass ends. The guard is read behind the wait, with the
+    /// pass: a call that waited through an apply is judged against what
+    /// stands after it. A document over the bound takes no turn: it is
+    /// refused by its size, unread, and waits on no pass. A guard longer
+    /// than a digest's text takes none either: it names no digest, the
+    /// guard refuses it at once, and no wait holds it.
     pub(crate) async fn dry_run_in_turn(
         self: &Arc<Self>,
+        expected: String,
         document: Vec<u8>,
         format: Format,
-    ) -> Result<DryRun, JoinError> {
+    ) -> Result<DryRun, Unanswered> {
+        if over_bound(&document).is_some() || expected.len() > DIGEST_TEXT_LEN {
+            return self.dry_run(&expected, &document, format);
+        }
+        let Ok(place) = Arc::clone(&self.dry_runs).try_acquire_owned() else {
+            return Err(Unanswered::Full);
+        };
         let turn = Arc::clone(&self.dry_turn).lock_owned().await;
         let door = Arc::clone(self);
-        tokio::task::spawn_blocking(move || {
-            let _turn = turn;
-            door.dry_run(&document, format)
-        })
-        .await
+        let pass = tokio::task::spawn_blocking(move || {
+            let _held = (turn, place);
+            door.dry_run(&expected, &document, format)
+        });
+        pass.await
+            .unwrap_or_else(|join| Err(Unanswered::Unended(join)))
     }
 
     /// The number and the digest the store runs, from one load.
@@ -873,6 +1031,8 @@ pub(crate) mod tests {
         thread,
         time::{Duration, Instant},
     };
+
+    use tokio::task::JoinSet;
 
     use super::*;
     use crate::{Candidate, Constraints, Filter, RequestFacts};
@@ -1396,38 +1556,42 @@ pub(crate) mod tests {
         assert_eq!(*found.lock(), [true], "the first generation's end");
     }
 
-    /// One dry run at a time: while a pass stands in the validator a second
-    /// call's pass does not enter it, and both answer once the first ends.
-    #[tokio::test]
-    async fn a_second_dry_run_waits_its_turn() {
-        static ENTERED: AtomicU64 = AtomicU64::new(0);
-        static RELEASED: AtomicBool = AtomicBool::new(false);
-        /// Stands in the validator until the case releases it, ten seconds
-        /// at the most.
-        fn stalling(
-            document: &PolicySpec,
-            digest: Digest,
-            catalog: &Catalog,
-        ) -> Result<AppliedSpec, SpecError> {
-            ENTERED.fetch_add(1, Ordering::SeqCst);
-            for _ in 0..10_000 {
-                if RELEASED.load(Ordering::SeqCst) {
-                    break;
-                }
-                thread::sleep(Duration::from_millis(1));
+    /// A validator's gate: once armed, the next pass to enter stands at it
+    /// until the case releases it, and the gate counts the passes that
+    /// entered since.
+    pub(crate) struct Gate {
+        entered: AtomicU64,
+        armed: AtomicBool,
+        released: AtomicBool,
+    }
+
+    impl Gate {
+        pub(crate) const fn new() -> Self {
+            Self {
+                entered: AtomicU64::new(0),
+                armed: AtomicBool::new(false),
+                released: AtomicBool::new(false),
             }
-            AppliedSpec::validate_digested(document, digest, catalog)
         }
 
-        let store = Arc::new(MemoryStore::new());
-        let generations = Arc::new(Generations::validating(store, stock(), stalling));
-        let run = |document: &str| generations.dry_run_in_turn(document.into(), Format::Yaml);
-        // The first pass stands in the validator; a pace later the passes
-        // that entered are counted. The validator is released before the
-        // count is judged, so a count that fails ends the case.
-        let beside = async {
+        pub(crate) fn arm(&self) {
+            self.entered.store(0, Ordering::SeqCst);
+            self.armed.store(true, Ordering::SeqCst);
+        }
+
+        pub(crate) fn release(&self) {
+            self.released.store(true, Ordering::SeqCst);
+        }
+
+        pub(crate) fn entered(&self) -> u64 {
+            self.entered.load(Ordering::SeqCst)
+        }
+
+        /// The passes that entered a pace after the first did: the first
+        /// stands at the gate, and one beside it had the pace to enter.
+        pub(crate) async fn entered_a_pace_on(&self) -> u64 {
             let started = Instant::now();
-            while ENTERED.load(Ordering::SeqCst) == 0 {
+            while self.entered() == 0 {
                 assert!(
                     started.elapsed() < Duration::from_secs(10),
                     "no pass reached the validator"
@@ -1435,17 +1599,272 @@ pub(crate) mod tests {
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
-            let entered = ENTERED.load(Ordering::SeqCst);
-            RELEASED.store(true, Ordering::SeqCst);
+            self.entered()
+        }
+    }
+
+    /// A case's own gate. A validator is a plain function, so a case names
+    /// its gate by a type of its own ([`gate`]).
+    pub(crate) trait Gated {
+        fn gate() -> &'static Gate;
+    }
+
+    /// Declares `$name`, a type whose gate is the case's own.
+    macro_rules! gate {
+        ($name:ident) => {
+            struct $name;
+            impl Gated for $name {
+                fn gate() -> &'static Gate {
+                    static GATE: Gate = Gate::new();
+                    &GATE
+                }
+            }
+        };
+    }
+    pub(crate) use gate;
+
+    /// The stock validator behind `G`'s gate: a pass that finds the gate
+    /// armed stands there until it is released, ten seconds at the most.
+    fn stalling<G: Gated>(
+        document: &PolicySpec,
+        digest: Digest,
+        catalog: &Catalog,
+    ) -> Result<AppliedSpec, SpecError> {
+        let gate = G::gate();
+        gate.entered.fetch_add(1, Ordering::SeqCst);
+        if gate.armed.swap(false, Ordering::SeqCst) {
+            for _ in 0..10_000 {
+                if gate.released.load(Ordering::SeqCst) {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+        AppliedSpec::validate_digested(document, digest, catalog)
+    }
+
+    /// A door over a store of its own whose validator stands at `G`'s gate.
+    pub(crate) fn gated<G: Gated>() -> Arc<Generations> {
+        let store = Arc::new(MemoryStore::new());
+        Arc::new(Generations::validating(store, stock(), stalling::<G>))
+    }
+
+    /// One dry run at a time: while a pass stands in the validator a second
+    /// call's pass does not enter it, and both answer once the first ends.
+    #[tokio::test]
+    async fn a_second_dry_run_waits_its_turn() {
+        gate!(Here);
+        let (gate, generations) = (Here::gate(), gated::<Here>());
+        let run = |document: &str| {
+            generations.dry_run_in_turn(String::new(), document.into(), Format::Yaml)
+        };
+        gate.arm();
+        // The first pass stands in the validator; a pace later the passes
+        // that entered are counted. The validator is released before the
+        // count is judged, so a count that fails ends the case.
+        let beside = async {
+            let entered = gate.entered_a_pace_on().await;
+            gate.release();
             entered
         };
         let (first, second, entered) = tokio::join!(run(LEAST_LOAD), run(RANDOM), beside);
         assert_eq!(entered, 1, "a second dry run ran beside the first");
         for answer in [first, second] {
-            let answer = answer.expect("the pass ends");
+            let answer = answer.expect("a verdict");
             assert_eq!(answer.would_run.map(|(number, _)| number), Ok(1));
         }
-        assert_eq!(ENTERED.load(Ordering::SeqCst), 2);
+        assert_eq!(gate.entered(), 2);
+    }
+
+    /// The pass holds the turn, not its caller: a caller that leaves while
+    /// its pass stands in the validator frees no turn, and the next call's
+    /// pass enters once that one ends.
+    #[tokio::test]
+    async fn a_caller_that_leaves_frees_no_turn_before_its_pass_ends() {
+        gate!(Here);
+        let (gate, generations) = (Here::gate(), gated::<Here>());
+        let run = |document: &str| {
+            generations.dry_run_in_turn(String::new(), document.into(), Format::Yaml)
+        };
+        gate.arm();
+        // The first caller leaves a pace after its pass entered.
+        tokio::select! {
+            answer = run(LEAST_LOAD) => panic!("the first pass ended: {answer:?}"),
+            _ = gate.entered_a_pace_on() => {}
+        }
+        let beside = async {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let entered = gate.entered();
+            gate.release();
+            entered
+        };
+        let (second, entered) = tokio::join!(run(RANDOM), beside);
+        assert_eq!(entered, 1, "the turn was freed under a pass that still ran");
+        let second = second.expect("a verdict");
+        assert_eq!(second.would_run.map(|(number, _)| number), Ok(1));
+        assert_eq!(gate.entered(), 2);
+    }
+
+    /// The guard is read behind the wait: a guarded call that waits its turn
+    /// through an apply is refused by the generation that stands after it,
+    /// as the same call asked then is.
+    #[tokio::test]
+    async fn a_guard_is_read_once_the_turn_comes() {
+        gate!(Here);
+        let (gate, generations) = (Here::gate(), gated::<Here>());
+        assert_eq!(yaml(&generations, LEAST_LOAD), Ok(Applied::Generation(1)));
+        let (_, first) = generations.standing();
+        let first = first.expect("a digest stands").to_string();
+        let run = |expected: &str| {
+            generations.dry_run_in_turn(expected.to_owned(), RANDOM.into(), Format::Yaml)
+        };
+        gate.arm();
+        // While the first pass stands in the validator the source applies
+        // the next generation, and the guarded call waits through it.
+        let beside = async {
+            gate.entered_a_pace_on().await;
+            let applied = yaml(&generations, RANDOM);
+            gate.release();
+            applied
+        };
+        let (unguarded, guarded, applied) = tokio::join!(run(""), run(&first), beside);
+        assert_eq!(applied, Ok(Applied::Generation(2)));
+        // The first call read generation 1 before its pass stood.
+        let unguarded = unguarded.expect("a verdict");
+        assert_eq!(unguarded.would_run.map(|(number, _)| number), Ok(2));
+        assert!(
+            matches!(guarded, Err(Unanswered::Guarded(2, Some(_)))),
+            "{guarded:?}"
+        );
+    }
+
+    /// A document over the bound takes no turn: it is refused by its size
+    /// while another's pass stands in the validator.
+    #[tokio::test]
+    async fn a_document_over_the_bound_waits_on_no_pass() {
+        gate!(Here);
+        let (gate, generations) = (Here::gate(), gated::<Here>());
+        let over = MAX_DOCUMENT_BYTES + 1;
+        let document = vec![b'#'; usize::try_from(over).expect("the bound fits")];
+        gate.arm();
+        let beside = async {
+            gate.entered_a_pace_on().await;
+            let call = generations.dry_run_in_turn(String::new(), document, Format::Yaml);
+            let refused = tokio::time::timeout(Duration::from_secs(5), call).await;
+            gate.release();
+            refused
+        };
+        let first = generations.dry_run_in_turn(String::new(), LEAST_LOAD.into(), Format::Yaml);
+        let (first, refused) = tokio::join!(first, beside);
+        first.expect("a verdict");
+        let refused = refused
+            .expect("the refusal waits on no pass")
+            .expect("a verdict");
+        assert_eq!(refused.would_run, Err(SpecRejected::TooLarge(over)));
+        // The guard is read ahead of the size: where nothing stands a guard
+        // names no standing digest, under the bound and over it.
+        let guard = format!("sha256:{}", "0".repeat(64));
+        let small = generations.dry_run(&guard, LEAST_LOAD.as_bytes(), Format::Yaml);
+        assert!(
+            matches!(small, Err(Unanswered::Guarded(0, None))),
+            "{small:?}"
+        );
+        let document = vec![b'#'; usize::try_from(over).expect("the bound fits")];
+        let large = generations
+            .dry_run_in_turn(guard, document, Format::Yaml)
+            .await;
+        assert!(
+            matches!(large, Err(Unanswered::Guarded(0, None))),
+            "{large:?}"
+        );
+    }
+
+    /// A guard longer than a digest's text takes no turn: it names no
+    /// digest, and the guard refuses it while another's pass stands in the
+    /// validator.
+    #[tokio::test]
+    async fn a_guard_longer_than_a_digest_waits_on_no_pass() {
+        gate!(Here);
+        let (gate, generations) = (Here::gate(), gated::<Here>());
+        assert_eq!(yaml(&generations, LEAST_LOAD), Ok(Applied::Generation(1)));
+        let (_, standing) = generations.standing();
+        let standing = standing.expect("a digest stands").to_string();
+        assert_eq!(standing.len(), DIGEST_TEXT_LEN);
+        let longer = format!("{standing}0");
+        gate.arm();
+        let beside = async {
+            gate.entered_a_pace_on().await;
+            let call = generations.dry_run_in_turn(longer, RANDOM.into(), Format::Yaml);
+            let refused = tokio::time::timeout(Duration::from_secs(5), call).await;
+            gate.release();
+            refused
+        };
+        let first = generations.dry_run_in_turn(String::new(), RANDOM.into(), Format::Yaml);
+        let (first, refused) = tokio::join!(first, beside);
+        first.expect("a verdict");
+        let refused = refused.expect("the refusal waits on no pass");
+        assert!(
+            matches!(refused, Err(Unanswered::Guarded(1, Some(_)))),
+            "{refused:?}"
+        );
+    }
+
+    /// No more dry runs wait than [`DRY_RUNS_WAITING`]: the call past them
+    /// is refused at once, a waiting call that ends frees its place, and
+    /// the ones let in all answer.
+    #[tokio::test]
+    async fn a_dry_run_past_the_waiting_ones_is_refused() {
+        gate!(Here);
+        let (gate, generations) = (Here::gate(), gated::<Here>());
+        let run = |door: Arc<Generations>| async move {
+            door.dry_run_in_turn(String::new(), LEAST_LOAD.into(), Format::Yaml)
+                .await
+        };
+        // The places come to `free` once the calls let in were polled.
+        let places = |door: Arc<Generations>, free: usize| async move {
+            let started = Instant::now();
+            while door.dry_runs.available_permits() != free {
+                assert!(
+                    started.elapsed() < Duration::from_secs(10),
+                    "the places did not come to {free} free"
+                );
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        };
+        gate.arm();
+        let mut let_in = JoinSet::new();
+        for _ in 0..DRY_RUNS_WAITING {
+            let_in.spawn(run(Arc::clone(&generations)));
+        }
+        let last = let_in.spawn(run(Arc::clone(&generations)));
+        places(Arc::clone(&generations), 0).await;
+        let past = run(Arc::clone(&generations)).await;
+        assert!(matches!(past, Err(Unanswered::Full)), "{past:?}");
+        // A waiting call that ends leaves the wait: its place is one again.
+        last.abort();
+        places(Arc::clone(&generations), 1).await;
+        let_in.spawn(run(Arc::clone(&generations)));
+        places(Arc::clone(&generations), 0).await;
+        gate.release();
+        let (mut answered, mut left) = (0, 0);
+        while let Some(answer) = let_in.join_next().await {
+            match answer {
+                Ok(answer) => {
+                    answer.expect("a verdict");
+                    answered += 1;
+                }
+                Err(gone) => {
+                    assert!(gone.is_cancelled(), "{gone}");
+                    left += 1;
+                }
+            }
+        }
+        assert_eq!((answered, left), (DRY_RUNS_WAITING + 1, 1));
+        // A call that ran gave its place back, as one that left did.
+        assert_eq!(
+            generations.dry_runs.available_permits(),
+            DRY_RUNS_WAITING + 1
+        );
     }
 
     /// The validator's word comes before the digest's. A `kind` line is in
@@ -1709,7 +2128,7 @@ pub(crate) mod tests {
         };
         let (path, message) =
             unparsed(LEAST_LOAD.replace("    pick: best\n", "    colour: blue\n"));
-        assert!(path.starts_with("profiles.default"), "{path}");
+        assert_eq!(path, "profiles.default.colour");
         assert!(message.contains("colour"), "{message}");
         let (path, _) = unparsed(LEAST_LOAD.replace("pick: best", "pick: 1"));
         assert_eq!(path, "profiles.default.pick");
@@ -1730,7 +2149,8 @@ pub(crate) mod tests {
         let (_store, generations) = generations();
         let path = |document: &str, format| {
             generations
-                .dry_run(document.as_bytes(), format)
+                .dry_run("", document.as_bytes(), format)
+                .expect("no guard")
                 .would_run
                 .expect_err("refused")
                 .field_path()
@@ -1746,6 +2166,161 @@ pub(crate) mod tests {
         assert_eq!(path("{", Format::Json), "");
         let twice = r#"{"apiVersion":"smg.policy/v1","profiles":{"p":{"pick":"random"},"p":{"pick":"random"}}}"#;
         assert_eq!(path(twice, Format::Json), "");
+        // A key the root does not know, and one it wants, by their own
+        // names: the document that wants a key has no name of its own.
+        let unknown = format!("{LEAST_LOAD}colour: blue\n");
+        assert_eq!(path(&unknown, Format::Yaml), "colour");
+        assert_eq!(path("profiles: {}\n", Format::Yaml), "apiVersion");
+        let unknown = r#"{"apiVersion":"smg.policy/v1","profiles":{},"colour":1}"#;
+        assert_eq!(path(unknown, Format::Json), "colour");
+        let missing = r#"{"apiVersion":"smg.policy/v1"}"#;
+        assert_eq!(path(missing, Format::Json), "profiles");
+        // A key a nested map wants is joined to the map's own path.
+        let nested = r#"{"apiVersion":"smg.policy/v1","profiles":{"p":{}}}"#;
+        assert_eq!(path(nested, Format::Json), "profiles.p.pick");
+    }
+
+    /// A need the contract's row has no flag for writes no row: the engine
+    /// reads the affinity column of a host's own stage in every phase, and
+    /// the column is the controller's to hold.
+    #[test]
+    fn a_need_with_no_flag_in_the_contract_writes_no_row() {
+        #[derive(Debug)]
+        struct Held;
+
+        impl Filter for Held {
+            fn name(&self) -> &'static str {
+                "held"
+            }
+
+            fn keep(&self, _: &RequestFacts<'_>, _: &Candidate, _: &Constraints<'_>) -> bool {
+                true
+            }
+
+            fn needs(&self) -> crate::Needs {
+                crate::Needs {
+                    affinity: true,
+                    ..crate::Needs::default()
+                }
+            }
+        }
+
+        let mut stages = Catalog::builtin();
+        stages
+            .filter("held", || Box::new(Held))
+            .expect("a free name");
+        let document = LEAST_LOAD.replace("[healthy]", "[held]");
+        let spec: PolicySpec = serde_yaml::from_str(&document).expect("a document");
+        let engine = spec.validate_in(&stages, &[]).expect("validates");
+        let rows = needs_summary(&engine).models;
+        // The profile's scorer reads the loads: its rows stand, and say
+        // nothing of the column.
+        assert_eq!(rows.len(), 4, "{rows:?}");
+        let quiet = document
+            .replace("    score: [least-load]\n", "")
+            .replace("best", "random");
+        let spec: PolicySpec = serde_yaml::from_str(&quiet).expect("a document");
+        let engine = spec.validate_in(&stages, &[]).expect("validates");
+        assert_eq!(engine.needs_rows().len(), 4, "the column in every phase");
+        assert_eq!(needs_summary(&engine), proto::NeedsSummary::default());
+    }
+
+    /// The summary tells each row under its own role and each need under
+    /// its own flag: a pair's prefill row and its decode row part, a row of
+    /// media alone is told, and a sessions rule's key is a row of its
+    /// binding in every phase it covers.
+    #[test]
+    fn the_summary_tells_each_role_and_each_flag_apart() {
+        /// Keeps every worker and reads what it is built to read.
+        #[derive(Debug)]
+        struct Reads(&'static str, crate::Needs);
+
+        impl Filter for Reads {
+            fn name(&self) -> &'static str {
+                self.0
+            }
+
+            fn keep(&self, _: &RequestFacts<'_>, _: &Candidate, _: &Constraints<'_>) -> bool {
+                true
+            }
+
+            fn needs(&self) -> crate::Needs {
+                self.1
+            }
+        }
+
+        let tokens = crate::Needs {
+            token_hashes: true,
+            ..crate::Needs::default()
+        };
+        let media = crate::Needs {
+            media: true,
+            ..crate::Needs::default()
+        };
+        let mut stages = Catalog::builtin();
+        stages
+            .filter("tokens", move || Box::new(Reads("tokens", tokens)))
+            .expect("a free name")
+            .filter("media", move || Box::new(Reads("media", media)))
+            .expect("a free name");
+        let document = r#"{
+          "apiVersion": "smg.policy/v1",
+          "view": { "headers": ["x-session-id"] },
+          "profiles": {
+            "prefill": { "filter": ["tokens"], "pick": "random" },
+            "decode": { "filter": ["media"], "pick": "random" },
+            "quiet": { "pick": "random" }
+          },
+          "bindings": [
+            { "match": { "model": "pd/*", "phase": ["prefill", "decode"] }, "plan": "pd-pair", "profiles": { "prefill": "prefill", "decode": "decode" } },
+            { "match": { "model": "chat/*" }, "profile": "quiet", "sessions": { "sticky_header": "x-session-id", "ttl_s": 600 } },
+            { "match": { "model": "*" }, "profile": "quiet" }
+          ]
+        }"#;
+        let spec: PolicySpec = serde_json::from_str(document).expect("a document");
+        let engine = spec.validate_in(&stages, &[]).expect("validates");
+        let rows = needs_summary(&engine).models;
+        let row = |model: &str, role: proto::Role| {
+            rows.iter()
+                .find(|row| row.model == model && row.role == i32::from(role))
+                .cloned()
+        };
+        let told = |model: &str, role: proto::Role| proto::ModelNeeds {
+            model: model.to_owned(),
+            role: role.into(),
+            ..proto::ModelNeeds::default()
+        };
+        assert_eq!(
+            row("pd/*", proto::Role::Prefill),
+            Some(proto::ModelNeeds {
+                token_hashes: true,
+                ..told("pd/*", proto::Role::Prefill)
+            })
+        );
+        assert_eq!(
+            row("pd/*", proto::Role::Decode),
+            Some(proto::ModelNeeds {
+                media: true,
+                ..told("pd/*", proto::Role::Decode)
+            })
+        );
+        // The sessions rule reads its key under the view's headers, in
+        // every phase its binding covers.
+        for role in [
+            proto::Role::Single,
+            proto::Role::Prefill,
+            proto::Role::Decode,
+            proto::Role::Encode,
+        ] {
+            assert_eq!(
+                row("chat/*", role),
+                Some(proto::ModelNeeds {
+                    headers: true,
+                    ..told("chat/*", role)
+                })
+            );
+        }
+        assert_eq!(rows.len(), 6, "{rows:?}");
     }
 
     /// A dry run answers what an apply would do at that instant and applies,
@@ -1755,7 +2330,11 @@ pub(crate) mod tests {
     #[test]
     fn a_dry_run_answers_what_an_apply_would_and_applies_nothing() {
         let (store, generations) = generations();
-        let dry = |document: &[u8]| generations.dry_run(document, Format::Yaml);
+        let dry = |document: &[u8]| {
+            generations
+                .dry_run("", document, Format::Yaml)
+                .expect("no guard")
+        };
         let number = |run: DryRun| run.would_run.map(|(number, _)| number);
         let counts = |applied| Counts {
             applied,
@@ -1764,6 +2343,16 @@ pub(crate) mod tests {
 
         let first = dry(LEAST_LOAD.as_bytes());
         assert_eq!(first.standing, (0, None));
+        // The feed before and after: nothing stands, and the document's one
+        // profile reads the loads in every role.
+        let feed = first.needs.expect("the needs diff");
+        assert_eq!(feed.before, Some(proto::NeedsSummary::default()));
+        let after = feed.after.expect("the feed after");
+        assert_eq!(after.models.len(), 4, "{after:?}");
+        assert!(
+            after.models.iter().all(|row| row.model == "*" && row.loads),
+            "{after:?}"
+        );
         let (would, digest) = first.would_run.expect("it would run");
         assert_eq!(would, 1);
         assert_eq!(number(dry(LEAST_LOAD.as_bytes())), Ok(1), "not reserved");
@@ -1775,6 +2364,8 @@ pub(crate) mod tests {
         let again = dry(LEAST_LOAD.as_bytes());
         assert_eq!(again.standing, (1, Some(digest)));
         assert_eq!(again.would_run, Ok((1, digest)), "the standing document");
+        let feed = again.needs.expect("the needs diff");
+        assert_eq!(feed.before, feed.after, "the feed stands");
         assert_eq!(number(dry(RANDOM.as_bytes())), Ok(2));
         assert_eq!(number(dry(&with_line(RANDOM, 9))), Ok(9));
         assert_eq!(number(dry(&with_line(LEAST_LOAD, 9))), Ok(9));
@@ -1826,7 +2417,8 @@ pub(crate) mod tests {
             b"apiVersion: smg.policy/v1\nprofiles:\n  default:\n    score: [kept]\n    pick: best\n"
                 .to_vec();
         let refused = generations
-            .dry_run(&document, Format::Yaml)
+            .dry_run("", &document, Format::Yaml)
+            .expect("no guard")
             .would_run
             .expect_err("refused");
         assert_eq!(
@@ -1845,7 +2437,7 @@ pub(crate) mod tests {
     /// document under the standing line, a line under the standing one (the
     /// refusal of the store's entry, in its words), a document the validator
     /// refuses, one that is no document and one over the bound. Each names
-    /// its field.
+    /// its field, and the last two none: they are about the document.
     #[test]
     fn a_dry_run_refuses_what_an_apply_would_by_the_same_name() {
         let (_store, generations) = generations();
@@ -1866,18 +2458,22 @@ pub(crate) mod tests {
         ];
         for (document, path) in rows {
             let refused = generations
-                .dry_run(&document, Format::Yaml)
+                .dry_run("", &document, Format::Yaml)
+                .expect("no guard")
                 .would_run
                 .expect_err("refused");
             assert_eq!(refused.field_path(), path, "{refused}");
             assert_eq!(yaml(&generations, document), Err(refused));
         }
-        let lower = generations.dry_run(&with_line(RANDOM, 3), Format::Yaml);
+        let lower = generations
+            .dry_run("", &with_line(RANDOM, 3), Format::Yaml)
+            .expect("no guard");
         let stale = StaleGeneration {
             standing: 5,
             offered: 3,
         };
         assert_eq!(lower.would_run, Err(SpecRejected::Stale(stale)));
+        assert!(lower.needs.is_none(), "a refused document carries no diff");
         assert_eq!(
             generations.counts(),
             Counts {
@@ -2011,6 +2607,63 @@ pub(crate) mod tests {
         (text.into_bytes(), bindings)
     }
 
+    /// A JSON document of `bytes` at the most whose last binding writes its
+    /// profile as a list: the typed read refuses it there, at its end.
+    fn refused_json_of(bytes: usize) -> Vec<u8> {
+        let mut text = String::from(
+            r#"{"apiVersion":"smg.policy/v1","profiles":{"default":{"pick":"random"}},"bindings":["#,
+        );
+        let last = r#"{"match":{"model":"last"},"profile":["default"]}]}"#;
+        let mut bindings = 0;
+        while text.len() + 64 + last.len() < bytes {
+            let _ = write!(
+                text,
+                r#"{{"match":{{"model":"tenant-{bindings:06}/model"}},"profile":"default"}},"#
+            );
+            bindings += 1;
+        }
+        text.push_str(last);
+        text.into_bytes()
+    }
+
+    /// The Numbers table's dry-run row: one dry run that would run (parse,
+    /// digest, validate, the feed before and after) by the document's size,
+    /// with the bytes of the needs diff it answers.
+    #[test]
+    #[ignore = "a measurement for the Numbers table, run by name"]
+    fn a_dry_runs_time_by_the_documents_size() {
+        use prost::Message as _;
+
+        const ROUNDS: usize = 15;
+        let bound = usize::try_from(MAX_DOCUMENT_BYTES).expect("the bound fits");
+        let mut out = std::io::stdout().lock();
+        for size in [2 << 10, 64 << 10, bound - 128] {
+            let (document, bindings) = document_of(size);
+            let (_store, generations) = generations();
+            assert_eq!(yaml(&generations, LEAST_LOAD), Ok(Applied::Generation(1)));
+            let mut micros = Vec::with_capacity(ROUNDS);
+            let mut diff = 0;
+            for _ in 0..ROUNDS {
+                let began = Instant::now();
+                let dry = generations
+                    .dry_run("", &document, Format::Yaml)
+                    .expect("no guard");
+                micros.push(began.elapsed().as_micros());
+                assert_eq!(dry.would_run.map(|(number, _)| number), Ok(2));
+                diff = dry.needs.map_or(0, |needs| needs.encoded_len());
+            }
+            micros.sort_unstable();
+            writeln!(
+                out,
+                "DRY bytes={} bindings={bindings} rounds={ROUNDS} median_us={} worst_us={} diff_bytes={diff}",
+                document.len(),
+                micros[ROUNDS / 2],
+                micros[ROUNDS - 1]
+            )
+            .expect("stdout");
+        }
+    }
+
     /// The Numbers table's apply rows: one apply (parse, digest, validate,
     /// the store's entry) by the document's size, up to the bound.
     #[test]
@@ -2060,6 +2713,60 @@ pub(crate) mod tests {
             writeln!(
                 out,
                 "REFUSED bytes={} text={text} aliases={aliases} rounds={ROUNDS} median_us={} worst_us={}",
+                document.len(),
+                micros[ROUNDS / 2],
+                micros[ROUNDS - 1]
+            )
+            .expect("stdout");
+        }
+        // A JSON document the typed read refuses at its last binding is
+        // read three times: by the typed read, again as values, and by the
+        // typed read of those. The time to that refusal, by its size.
+        for size in [2 << 10, 64 << 10, bound - 128] {
+            let document = refused_json_of(size);
+            let mut micros = Vec::with_capacity(ROUNDS);
+            for _ in 0..ROUNDS {
+                let (_store, generations) = generations();
+                let document = document.clone();
+                let began = Instant::now();
+                let refused = generations.apply(document, Format::Json);
+                micros.push(began.elapsed().as_micros());
+                assert!(
+                    matches!(refused, Err(SpecRejected::Unparsed { format: "json", .. })),
+                    "{refused:?}"
+                );
+            }
+            micros.sort_unstable();
+            writeln!(
+                out,
+                "REFUSED_JSON bytes={} rounds={ROUNDS} median_us={} worst_us={}",
+                document.len(),
+                micros[ROUNDS / 2],
+                micros[ROUNDS - 1]
+            )
+            .expect("stdout");
+        }
+        // The heaviest file the search finds: the time of its pass, which
+        // ends at the validator's refusal with the document built.
+        #[cfg(target_os = "linux")]
+        {
+            let (document, names) = search::heaviest_file();
+            let mut micros = Vec::with_capacity(ROUNDS);
+            for _ in 0..ROUNDS {
+                let (_store, generations) = generations();
+                let document = document.clone();
+                let began = Instant::now();
+                let refused = yaml(&generations, document);
+                micros.push(began.elapsed().as_micros());
+                assert!(
+                    matches!(refused, Err(SpecRejected::Invalid(_))),
+                    "{refused:?}"
+                );
+            }
+            micros.sort_unstable();
+            writeln!(
+                out,
+                "HEAVIEST bytes={} names={names} rounds={ROUNDS} median_us={} worst_us={}",
                 document.len(),
                 micros[ROUNDS / 2],
                 micros[ROUNDS - 1]
@@ -2564,6 +3271,17 @@ pub(crate) mod tests {
             );
         }
 
+        /// The heaviest file the search finds, with its count of names:
+        /// bindings of nothing to the size bound, beside one profile of a
+        /// thousand scorers under the most names the bounds admit.
+        pub(super) fn heaviest_file() -> (Vec<u8>, usize) {
+            let len = usize::try_from(MAX_DOCUMENT_BYTES).expect("the bound fits");
+            let profile = scorers();
+            let file = |count: usize| beside_bindings(named(&profile, "*p", count), len);
+            let count = heaviest((len - 8192) / 40, &file);
+            (file(count), count)
+        }
+
         /// The budget holds in every run: the heaviest file the search finds
         /// (bindings of nothing to the size bound, beside one profile of a
         /// thousand scorers under the most names the bounds admit), applied
@@ -2573,13 +3291,10 @@ pub(crate) mod tests {
         /// at this case's edge, and the search tells it.
         #[test]
         fn the_heaviest_file_found_holds_no_more_than_an_applys_budget() {
-            let len = usize::try_from(MAX_DOCUMENT_BYTES).expect("the bound fits");
-            let profile = scorers();
-            let file = |count: usize| beside_bindings(named(&profile, "*p", count), len);
-            let count = heaviest((len - 8192) / 40, &file);
+            let (file, count) = heaviest_file();
             let dir = tempfile::tempdir().expect("a directory");
             let path = dir.path().join("spec.yaml");
-            fs::write(&path, file(count)).expect("the file");
+            fs::write(&path, file).expect("the file");
             let (_, said) = alone(&path);
             // The validator's refusal: the document was built and digested.
             assert!(said.contains("UnknownScorer"), "{count} names: {said}");

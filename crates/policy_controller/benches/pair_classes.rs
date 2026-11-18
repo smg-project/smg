@@ -204,7 +204,7 @@ fn fleet(fleet: &str) -> Vec<WorkerFacts> {
             engine_kind: runtime,
             models: vec![MODEL.to_string()],
             dp_size: 1,
-            pairing,
+            pairing: pairing.map(Box::new),
             ..WorkerFacts::default()
         }
     };
@@ -224,7 +224,7 @@ fn fleet(fleet: &str) -> Vec<WorkerFacts> {
 }
 
 /// One role's workers as the pairing rule reads them, in id order, as the
-/// store hands them to the derivation.
+/// store hands them to a derivation of the whole model.
 fn members(fleet: &[WorkerFacts], role: Role) -> Vec<Member<'_>> {
     let mut members: Vec<Member<'_>> = fleet
         .iter()
@@ -234,7 +234,7 @@ fn members(fleet: &[WorkerFacts], role: Role) -> Vec<Member<'_>> {
                 identity(&facts.key, facts.incarnation),
                 facts.wire_modes,
                 &facts.engine_kind,
-                facts.pairing.as_ref(),
+                facts.pairing.as_deref(),
             )
         })
         .collect();

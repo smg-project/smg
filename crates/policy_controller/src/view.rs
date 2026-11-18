@@ -128,7 +128,10 @@ pub struct Health {
     pub healthy: bool,
     /// The pool's circuit breaker refuses execution.
     pub breaker_open: bool,
-    /// The liveness veto: unreachable or wedged.
+    /// The liveness veto: unreachable or wedged. A host writes it into a
+    /// row it copies for the decision. Over a publication's own rows the
+    /// asking host's vetoes stand beside the rows instead, and a reader of
+    /// this bit asks both ([`Constraints::masks`]).
     pub stalled: bool,
     /// Being drained; nothing new goes there.
     pub draining: bool,
@@ -137,12 +140,15 @@ pub struct Health {
 }
 
 impl Health {
-    /// Every routing veto but the overload one.
+    /// Every routing veto but the overload one, as the row carries them: a
+    /// veto that stands beside lent rows is asked of the decision's
+    /// constraints ([`Constraints::masks`]).
     pub const fn routable_ignoring_overload(self) -> bool {
         self.healthy && !self.breaker_open && !self.stalled && !self.draining
     }
 
-    /// Every routing veto.
+    /// Every routing veto the row carries
+    /// ([`Self::routable_ignoring_overload`]).
     pub const fn routable(self) -> bool {
         self.routable_ignoring_overload() && !self.overloaded
     }
@@ -182,7 +188,10 @@ pub struct LoadRow {
     /// count them sends none, which is not a count of zero. The host's own
     /// reading of the report, in no plugin's view.
     pub resident_counted: bool,
-    /// Age of the report's sample at the decision, in milliseconds.
+    /// Age of the report's sample at the decision, in milliseconds. On a
+    /// row a store lends, it is the age the report carried when it was
+    /// recorded: the age at the decision is then the request's
+    /// `now_micros` less the row's `load_sampled_at_micros`.
     pub report_age_ms: u32,
     /// Where the row came from.
     pub source: SignalSource,
@@ -377,15 +386,26 @@ pub struct NamedHolder {
 impl<'a> NamedAffinity<'a> {
     /// Row `index`'s entry: what the host said the row holds when it is
     /// named, nothing held otherwise.
+    ///
+    /// The search ends on the first holder at or past the row, and the
+    /// entry is read from that holder or from a holder of nothing, by
+    /// whether it is the row: a choice between two places, where a branch
+    /// would tell a named row from another. Behind a draw the rows asked
+    /// come in the draw's order, and such a branch is one nothing predicts.
     #[inline]
     pub(crate) fn entry(&self, index: u32) -> AffinityFacts {
-        let Ok(at) = self
-            .holders
-            .binary_search_by_key(&index, |holder| holder.row)
-        else {
+        const NOBODY: NamedHolder = NamedHolder {
+            row: 0,
+            overlap_blocks: 0,
+            predicted_blocks: 0,
+        };
+        let Some(last) = self.holders.len().checked_sub(1) else {
             return AffinityFacts::default();
         };
-        self.holders[at].facts()
+        let at = self.holders.partition_point(|holder| holder.row < index);
+        let found = &self.holders[at.min(last)];
+        let holder = if found.row == index { found } else { &NOBODY };
+        holder.facts()
     }
 
     /// One pass's reads of the rows, walked beside the rows the pass asks.
@@ -627,7 +647,10 @@ pub struct Candidate {
     /// now and leave a load scorer's credit. In-process only; the wire carries
     /// the row's age.
     pub load_sampled_at_micros: u64,
-    /// The session key of the request is pinned to this worker.
+    /// The session key of the request is pinned to this worker. A host
+    /// writes it into a row it copies for the decision. Over a publication's
+    /// own rows the pin stands beside the rows instead
+    /// ([`RequestFacts::pinned_at`]).
     pub session_hit: bool,
     /// Requests of the request's session key in flight on this worker.
     pub session_in_flight: u16,
@@ -637,8 +660,11 @@ pub struct Candidate {
     /// prefill of the same class. The store derives the classes and their
     /// table where a membership write moves a member or an offer, and again
     /// under a generation of another pairing mode
-    /// ([`store::pairing`](crate::store::pairing)); a host that builds its
-    /// own rows keys it by the open prefill a decode partners with.
+    /// ([`store::pairing`](crate::store::pairing)). It numbers each side by
+    /// itself, so a store's class pairs through its table alone: a prefill
+    /// and a decode of one number are not a pair for that. A host that
+    /// builds its own rows keys it by the open prefill a decode partners
+    /// with.
     pub pair_class: u32,
     /// Host-supplied admission bit: the prefill capacity window has a slot.
     pub has_capacity: bool,
@@ -751,6 +777,15 @@ pub struct RequestFacts<'a> {
     /// The host's clock at the decision, in microseconds since its origin.
     /// In-process only; no absolute instant crosses the wire.
     pub now_micros: u64,
+    /// One more than the position of the row the request's session key is
+    /// pinned to, where the host did not write the session bit into the
+    /// row: a view of a publication's own rows hands the pin here. A reader
+    /// of one row's session bit asks both ([`RequestFacts::pins`]), and a
+    /// pass over the rows looks for the pinned position once, as the
+    /// session scorer does. Zero for no pin, and where the rows were written
+    /// for the decision. A pair takes none: a pin is a position in one
+    /// pool, and neither side reads it. In-process only.
+    pub pinned_at: u32,
     /// The candidates' affinity facts, by index in the candidate slice the
     /// decision is made over: the one column the affinity stages read, in
     /// the candidates' own order. It is EMPTY or holds exactly one entry a
@@ -848,6 +883,13 @@ impl<'a> RequestFacts<'a> {
         }
     }
 
+    /// Whether the request's session key is pinned to the row at
+    /// `position`, beside the row's own session bit.
+    #[inline]
+    pub fn pins(&self, position: u32) -> bool {
+        self.pinned_at != 0 && self.pinned_at - 1 == position
+    }
+
     /// The affinity facts of the candidate at `index` of the slice the
     /// decision is made over. An empty column reads as nothing held for
     /// every candidate. Any other column holds the candidate's own entry,
@@ -917,6 +959,22 @@ pub struct Constraints<'a> {
     pub overload_lifted: bool,
     /// A subset hint: decide over at most this many candidates.
     pub subset_hint: Option<u32>,
+    /// The rows a standing veto of this host masks, by position, in order,
+    /// where the host did not write them into the rows: a view of a
+    /// publication's own rows hands them here, and a reader of a row's
+    /// stalled bit asks both ([`Constraints::masks`]). Empty where the rows
+    /// were written for the decision. In-process only.
+    pub stalled: &'a [u32],
+}
+
+impl Constraints<'_> {
+    /// Whether a standing veto of this host masks the row at `position`,
+    /// beside the row's own stalled bit. A decision under no such veto pays
+    /// the first test alone.
+    #[inline]
+    pub fn masks(&self, position: u32) -> bool {
+        !self.stalled.is_empty() && self.stalled.binary_search(&position).is_ok()
+    }
 }
 
 /// Healthy capacity of one zone, by the zone's position.

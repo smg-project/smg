@@ -2081,7 +2081,9 @@ fn a_missed_frame_draws_its_grant_and_the_next_plugin_is_asked_under_the_rest() 
         SHORT_MICROS - SHORT_MICROS / 4
     );
     // The silent filter's frame named two budgets: its own quarter as the
-    // frame's deadline, the decision's remainder as the request's.
+    // frame's deadline, the decision's remainder as the request's. Its
+    // server records the frame on a thread of its own: the read waits.
+    assert!(eventually(|| silent.frames() == 1));
     let sent = silent.seen();
     assert_eq!(
         (
@@ -2689,7 +2691,12 @@ fn streams_that_end_together_are_one_failure_on_the_breaker() {
         let warmed = scope.spawn(|| plugin.warm()).join();
         assert!(matches!(warmed, Ok(Ok(()))), "the second thread's stream");
     });
-    assert_eq!(plugin.stats().connects, 2);
+    // The count moves on the I/O thread, just after the lane reads ready.
+    assert!(
+        eventually(|| plugin.stats().connects == 2),
+        "{:?}",
+        plugin.stats()
+    );
     served.stop();
     assert!(
         eventually(|| plugin.stats().failed_streams == 2),
@@ -2736,7 +2743,12 @@ fn the_applys_ask_does_not_wait_the_pause() {
         warmed.is_ok(),
         "the ask inside the pause was refused: {warmed:?}"
     );
-    assert_eq!(plugin.stats().connects, 2);
+    // The count moves on the I/O thread, just after the lane reads ready.
+    assert!(
+        eventually(|| plugin.stats().connects == 2),
+        "{:?}",
+        plugin.stats()
+    );
 }
 
 /// A broken stream's status is the plugin's words: the host's line carries
@@ -3282,45 +3294,69 @@ fn the_numbers_go_on_across_a_turn_that_panicked() {
     );
 }
 
-/// A turn of the `Observe` task that panics at every start says its line
-/// once. Here the host's line of a failed stream panics three times in a
-/// row, a pause apart, with no event sent between them: the host says one
-/// line of the task, and the line names the plugin.
+/// A telling that panics is told once an outage: the outage's line is held
+/// outside the task's turn. Here the host's line of a failed stream is armed
+/// to panic three times, and the first server goes with no event raised: a
+/// task that has sent nothing says its first panic. A second server takes
+/// the path, is sent events and goes, and a third is reached: the task went
+/// on, no call stood, and an event sent arms no line. The outage's line and
+/// the task's were each said once.
 #[test]
-fn a_streak_of_panicked_turns_says_its_line_once() {
+fn a_telling_that_panics_is_told_once_an_outage() {
+    let name = "panics-in-a-row";
     let mut first = TestPlugin::serve();
     let runtime = runtime();
-    let mut row = spec(&first, "panics-in-a-row");
+    let mut row = spec(&first, name);
     row.connect_micros = 1_000_000;
     let plugin = Plugin::load(&runtime, row).expect("the plugin loads");
     let engine = single_engine(profile(&plugin, ALL));
-    engine.on_dispatched(&Lease::default(), &Target::default(), Side::Single, 3);
-    assert!(eventually(|| first.seen().events.len() == 1));
-    panic_at("panics-in-a-row", "observe stream failed", 3);
+    assert!(eventually(|| first.seen().observe_hellos.len() == 1));
+    let path = first.socket.clone();
+    panic_at(name, "observe stream failed", 3);
     first.stop();
     assert!(
-        eventually(|| trap_spent("panics-in-a-row")),
-        "three tellings did not panic"
+        eventually(|| lines(name, "observe task panicked").len() == 1),
+        "the first panic of a task that sent nothing was not said"
     );
-    // The fourth turn tells the failure with no panic: the streak's lines
-    // are all said by then.
-    assert!(eventually(|| {
-        lines("panics-in-a-row", "observe stream failed").len() >= 4
-    }));
+    // A stopped server stays to the case's end: the path is in the first
+    // one's directory.
+    let reach = |served: &TestPlugin| {
+        std::fs::rename(&served.socket, &path).expect("the next server takes the path");
+        let mut raised = 0_u32;
+        while served.seen().events.is_empty() {
+            raised += 1;
+            assert!(raised <= 15_000, "no event reached the next server");
+            engine.on_dispatched(&Lease::default(), &Target::default(), Side::Single, 3);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    };
+    let mut second = TestPlugin::serve();
+    reach(&second);
+    second.stop();
+    let third = TestPlugin::serve();
+    reach(&third);
+    assert!(!trap_spent(name), "the outage was told again");
     assert_eq!(
-        lines("panics-in-a-row", "observe task panicked").len(),
+        lines(name, "observe stream failed").len(),
         1,
         "{:?}",
-        lines("panics-in-a-row", "observe task panicked")
+        lines(name, "observe stream failed")
+    );
+    assert_eq!(
+        lines(name, "observe task panicked").len(),
+        1,
+        "{:?}",
+        lines(name, "observe task panicked")
     );
 }
 
-/// A stream's end is said whichever side of the host's task saw it: the
-/// call's own outcome, or a send that found the stream gone. Events are
-/// raised here while each server goes, so a send can see the end first, and
-/// every end of a stream that carried an event is one line.
+/// The ends of calls that did not stand are one outage, whichever side of
+/// the host's task saw each: the call's own outcome, or a send that found
+/// the stream gone. Here four servers go one after another while events are
+/// raised, so every call carried events and a send can meet an end: an
+/// event carried arms no line, and the four ends say one.
 #[test]
-fn a_streams_end_is_said_whichever_side_saw_it() {
+fn ends_of_calls_that_did_not_stand_say_one_line() {
     const ENDS: usize = 4;
     said();
     let name = "ends-under-sends";
@@ -3330,101 +3366,41 @@ fn a_streams_end_is_said_whichever_side_saw_it() {
     row.connect_micros = 1_000_000;
     let plugin = Plugin::load(&runtime, row).expect("the plugin loads");
     let engine = single_engine(profile(&plugin, ALL));
-    let raise = || engine.on_dispatched(&Lease::default(), &Target::default(), Side::Single, 3);
     let path = served.socket.clone();
     let mut stopped = Vec::new();
-    for end in 1..=ENDS {
+    // The server after the last end is reached too: the task saw that end.
+    for server in 1..=ENDS + 1 {
         let mut raised = 0_u32;
         while served.seen().events.is_empty() {
             raised += 1;
-            assert!(raised <= 15_000, "no event reached server {end}");
-            raise();
+            assert!(raised <= 15_000, "no event reached server {server}");
+            engine.on_dispatched(&Lease::default(), &Target::default(), Side::Single, 3);
             std::thread::sleep(Duration::from_millis(1));
         }
-        let going = AtomicBool::new(true);
-        std::thread::scope(|scope| {
-            scope.spawn(|| {
-                while going.load(Ordering::Relaxed) {
-                    raise();
-                }
-            });
+        if server <= ENDS {
             served.stop();
-            let said = eventually(|| lines(name, "observe stream failed").len() >= end);
-            going.store(false, Ordering::Relaxed);
-            assert!(said, "end {end} of {ENDS} was not said");
-        });
-        assert_eq!(
-            lines(name, "observe stream failed").len(),
-            end,
-            "{:?}",
-            lines(name, "observe stream failed")
-        );
-        if end < ENDS {
             // A stopped server stays to the case's end: the path is in the
             // first one's directory.
             stopped.push(std::mem::replace(&mut served, TestPlugin::serve()));
             std::fs::rename(&served.socket, &path).expect("the next server takes the path");
         }
     }
-}
-
-/// A panic after an event was sent says the task's line again: a streak
-/// ends with an event sent. Here the host's line of a failed stream panics
-/// as the first server goes, before any event was raised: a task that has
-/// sent nothing says its first panic too. An event then reaches the second
-/// server, and the line panics again as that one goes: the host says the
-/// task's line twice.
-#[test]
-fn a_panic_after_an_event_was_sent_says_the_tasks_line_again() {
-    let name = "panics-over-an-event";
-    let mut first = TestPlugin::serve();
-    let runtime = runtime();
-    let mut row = spec(&first, name);
-    row.connect_micros = 1_000_000;
-    let plugin = Plugin::load(&runtime, row).expect("the plugin loads");
-    let engine = single_engine(profile(&plugin, ALL));
-    let raise = || engine.on_dispatched(&Lease::default(), &Target::default(), Side::Single, 3);
-    assert!(eventually(|| first.seen().observe_hellos.len() == 1));
-    let path = first.socket.clone();
-    panic_at(name, "observe stream failed", 1);
-    first.stop();
-    assert!(
-        eventually(|| trap_spent(name)),
-        "the line of the first end did not panic"
-    );
-    assert!(
-        eventually(|| lines(name, "observe task panicked").len() == 1),
-        "the first panic of a task that sent nothing was not said"
-    );
-    let mut second = TestPlugin::serve();
-    std::fs::rename(&second.socket, &path).expect("the second server takes the first's path");
-    let mut raised = 0_u32;
-    while second.seen().events.is_empty() {
-        raised += 1;
-        assert!(raised <= 15_000, "no event reached the second server");
-        raise();
-        std::thread::sleep(Duration::from_millis(1));
-    }
-    panic_at(name, "observe stream failed", 1);
-    second.stop();
-    assert!(
-        eventually(|| trap_spent(name)),
-        "the line of the second end did not panic"
-    );
-    assert!(
-        eventually(|| lines(name, "observe task panicked").len() == 2),
+    assert_eq!(
+        lines(name, "observe stream failed").len(),
+        1,
         "{:?}",
-        lines(name, "observe task panicked")
+        lines(name, "observe stream failed")
     );
 }
 
-/// A plugin that ends every `Observe` call at its hello is one outage: the
-/// calls that carried no event say one line between them. The server's word
-/// is set before the load and no event is raised, so the first call ends at
-/// its hello and says the line; the next two end at theirs, a connect frame
+/// A plugin that ends every `Observe` call is one outage, with events
+/// waiting or with none: a call that ends at its hello did not stand, and an
+/// event the host sent into it arms no line. The server's word is set before
+/// the load, so the first call ends at its hello and says the line. Events
+/// are raised from then on: the next calls end at theirs, a connect frame
 /// apart, and say nothing.
 #[test]
-fn calls_that_end_with_no_event_carried_say_one_line() {
+fn calls_that_end_at_their_hello_say_one_line() {
     said();
     let name = "ends-at-the-hello";
     let served = TestPlugin::serve();
@@ -3433,11 +3409,14 @@ fn calls_that_end_with_no_event_carried_say_one_line() {
     let mut row = spec(&served, name);
     row.connect_micros = 1_000_000;
     let plugin = Plugin::load(&runtime, row).expect("the plugin loads");
-    assert!(
-        eventually(|| served.seen().observe_hellos.len() >= 3),
-        "the stream was not asked for again: {:?}",
-        plugin.stats()
-    );
+    let engine = single_engine(profile(&plugin, ALL));
+    let mut raised = 0_u32;
+    while served.seen().observe_hellos.len() < 4 {
+        raised += 1;
+        assert!(raised <= 15_000, "no fourth call: {:?}", plugin.stats());
+        engine.on_dispatched(&Lease::default(), &Target::default(), Side::Single, 3);
+        std::thread::sleep(Duration::from_millis(1));
+    }
     assert_eq!(
         lines(name, "observe stream failed").len(),
         1,

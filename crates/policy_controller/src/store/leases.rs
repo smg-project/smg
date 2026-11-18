@@ -116,9 +116,9 @@ pub trait LeasesStore: Send + Sync {
     fn restore(&self, gateway: GatewayId, records: &[LeaseRecord]) -> usize;
 
     /// The gateway is gone past its grace: every lease of it released as
-    /// client gone. Returns how many. It is the store's one door for a
-    /// gone gateway: whatever else the store keeps under the gateway's key
-    /// leaves here too.
+    /// client gone, and with them what the store holds of the gateway's own
+    /// about a worker (its vetoes, its completed dispatches). Returns how
+    /// many leases. It is the store's one door for a gone gateway.
     fn drop_gateway(&self, gateway: GatewayId) -> usize;
 
     /// The leases of a gateway that are issued or dispatched.

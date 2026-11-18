@@ -63,6 +63,10 @@ pub trait EngineConnection: Any + Send + Sync {
     async fn subscribe_load_records(
         &self,
     ) -> Result<tonic::Streaming<common_proto::KvEventBatch>, tonic::Status>;
+
+    /// The KV transfer engine id the engine's server info reports; `None`
+    /// when it reports none.
+    async fn kv_engine_id(&self) -> Result<Option<String>, tonic::Status>;
 }
 
 impl dyn EngineConnection {

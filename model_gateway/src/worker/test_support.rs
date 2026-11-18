@@ -12,7 +12,7 @@ use std::{
     net::{Ipv4Addr, SocketAddr},
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc,
+        Arc, Weak,
     },
 };
 
@@ -246,6 +246,20 @@ impl RefusedAddress {
     }
 }
 
+/// A removed worker nothing holds any more: a dead witness for the series
+/// store's `retire`.
+pub fn gone(url: &str) -> Weak<dyn Worker> {
+    let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new(url).build());
+    Arc::downgrade(&worker)
+}
+
+/// A removed worker a handle still holds: the worker and its witness.
+pub fn held(url: &str) -> (Arc<dyn Worker>, Weak<dyn Worker>) {
+    let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new(url).build());
+    let witness = Arc::downgrade(&worker);
+    (worker, witness)
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::ErrorKind;
@@ -401,6 +415,10 @@ impl EngineConnection for NoEngine {
     async fn subscribe_load_records(
         &self,
     ) -> Result<tonic::Streaming<common_proto::KvEventBatch>, tonic::Status> {
+        no_engine()
+    }
+
+    async fn kv_engine_id(&self) -> Result<Option<String>, tonic::Status> {
         no_engine()
     }
 }

@@ -82,7 +82,7 @@
 //!   An elector alone over a store it made itself ([`Elector::alone`]) has
 //!   no other holder to wait for: its take leads at once.
 //!
-//! The elector keeps four private instants, each with one meaning. Before
+//! The elector keeps five private instants, each with one meaning. Before
 //! the first it writes no record that names it: it takes nothing, and a
 //! holder told to leave whose release has not landed tries that release
 //! again in place of a renewal. A step-down sets it one lease duration
@@ -92,7 +92,13 @@
 //! release before it hands on the wait left to it. The third is the end it
 //! stamped its fence with last: a renewal no later than it keeps the opening.
 //! The fourth is the latest instant a step or a word was handed: a call
-//! handed no instant reads the later of it and the clock.
+//! handed no instant reads the later of it and the clock. The fifth is
+//! this run's first sight of a record that is gone after one was seen
+//! held: the wait for that record counts from it. One more date of that
+//! kind is kept with the record this run read last: its first sight of
+//! the record as it stands, at a step's read or at the read after a write
+//! that came back moved. The wait for a record that stands still counts
+//! from it.
 //!
 //! The settings ([`ElectionSettings`]): duration 3 s, renew period 1 s, renew
 //! deadline 2 s by default; a deployment that prefers fewer leadership
@@ -571,6 +577,12 @@ impl Elector {
         self.observed.as_ref().map(|o| &o.record)
     }
 
+    /// The highest term this run saw in a record or was told: its next take
+    /// is above it, and the standing names no holder under a lower one.
+    pub fn highest_term(&self) -> u64 {
+        self.highest_term
+    }
+
     /// One step of the election at `now`: a holder renews, a candidate takes
     /// a free lease or keeps following. Call it every renew period. An error
     /// changes nothing: a holder keeps its record and its fence closes by
@@ -609,8 +621,9 @@ impl Elector {
     /// A release while this run's own take still waits to lead hands on
     /// what that wait still owed: the record says the time left to the
     /// take's opening as its duration, rounded up, and the next candidate
-    /// waits it out before it takes. It leads no later than this run would
-    /// have, by one look.
+    /// waits it out before it takes. It leads no earlier than this run
+    /// would have, and within two looks after: one to see the release, one
+    /// past its wait.
     pub fn release(&mut self) -> Result<bool, ElectError> {
         let Some(mine) = self.held.clone() else {
             return Ok(false);
@@ -664,6 +677,8 @@ impl Elector {
                 // The record is kept until the re-read settles what moved:
                 // a read error leaves a second call its retry.
                 let stored = self.backend.read()?;
+                // A sight as any other: the run counts its term.
+                self.observe_again(stored.as_ref());
                 self.held = None;
                 match (stored, self.attempted.take()) {
                     // This process's own renewal that landed and reported an
@@ -751,6 +766,12 @@ impl Elector {
         }
     }
 
+    /// A sight of the lease at `now`: a step's read, or the read after a
+    /// write that came back moved. The run counts the record's term and
+    /// keeps the record with the date of its first sight in that shape.
+    /// Inlined into the step, as it was while the step was its one caller;
+    /// a record read again goes through [`Elector::observe_again`].
+    #[inline(always)]
     fn observe(&mut self, current: Option<&LeaseRecord>, now: Instant) {
         // The first sight of a record that is gone dates the wait for it;
         // any other sight ends it.
@@ -792,6 +813,15 @@ impl Elector {
             record: record.clone(),
             since: now,
         });
+    }
+
+    /// The record read again after a write came back moved: a sight as any
+    /// other, dated at the latest instant this elector knows. Out of line:
+    /// a moved write is the rare end of a step.
+    #[cold]
+    #[inline(never)]
+    fn observe_again(&mut self, current: Option<&LeaseRecord>) {
+        self.observe(current, self.latest());
     }
 
     fn renew(
@@ -841,6 +871,9 @@ impl Elector {
             }
             Written::Moved => {
                 let current = self.backend.read()?;
+                // The record read again is a sight as any other: the run
+                // counts its term and the standing reads it.
+                self.observe_again(current.as_ref());
                 match (current, self.attempted.take()) {
                     // This process's own earlier attempt landed between this
                     // tick's read and its write: the record is its own,
@@ -1967,10 +2000,11 @@ mod tests {
     }
 
     /// A backend that lets another candidate write between this candidate's
-    /// read and its write: the race a compare-and-swap exists for.
+    /// read and its write: the race a compare-and-swap exists for. A case
+    /// may set the rival after the candidate's take.
     struct Interposed {
         lease: MemoryLease,
-        rival: Option<LeaseRecord>,
+        rival: Arc<Mutex<Option<LeaseRecord>>>,
     }
 
     impl LeaseBackend for Interposed {
@@ -1983,7 +2017,7 @@ mod tests {
             expected: Option<&LeaseRecord>,
             record: &LeaseRecord,
         ) -> Result<Written, ElectError> {
-            if let Some(rival) = self.rival.take() {
+            if let Some(rival) = self.rival.lock().take() {
                 assert_eq!(
                     self.lease
                         .write(expected, &rival)
@@ -2011,7 +2045,7 @@ mod tests {
         };
         let backend = Interposed {
             lease: lease.clone(),
-            rival: Some(rival.clone()),
+            rival: Arc::new(Mutex::new(Some(rival.clone()))),
         };
         let mut a = Elector::new(Box::new(backend), "a@host:1", settings()).expect("settings");
         let t0 = Instant::now() + AHEAD;
@@ -2027,6 +2061,117 @@ mod tests {
             }
         );
         assert_eq!(lease.clone().read().expect("read"), Some(rival));
+    }
+
+    /// A holder over a store where another replica's write lands between
+    /// its next read and its next write: `theirs` makes that record from
+    /// the holder's own, and it is stored one wall instant after it.
+    fn led_before_a_rivals_write(
+        t0: Instant,
+        theirs: impl FnOnce(LeaseRecord) -> LeaseRecord,
+    ) -> Elector {
+        let lease = MemoryLease::new();
+        let rival = Arc::new(Mutex::new(None));
+        let backend = Interposed {
+            lease: lease.clone(),
+            rival: Arc::clone(&rival),
+        };
+        let mut a = Elector::new(Box::new(backend), "a@host:1", settings()).expect("settings");
+        a.lead_at(t0);
+        let mine = lease.clone().read().expect("read").expect("the record");
+        *rival.lock() = Some(LeaseRecord {
+            renewed_at_micros: mine.renewed_at_micros + 1,
+            ..theirs(mine)
+        });
+        a
+    }
+
+    /// A holder over a store where another replica's release under term
+    /// nine lands between its next read and its next write.
+    fn led_before_a_rivals_release(t0: Instant) -> Elector {
+        led_before_a_rivals_write(t0, |mine| LeaseRecord {
+            holder: String::new(),
+            term: 9,
+            duration_ms: 0,
+            ..mine
+        })
+    }
+
+    #[test]
+    fn a_release_that_lands_under_a_renewals_write_is_observed_at_the_read_after_it() {
+        // The renewal's write comes back moved and the lease is read again.
+        // That record is a sight as any other: the run counts its term, so
+        // the standing reads it and the next take is above it.
+        let t0 = Instant::now() + AHEAD;
+        let mut a = led_before_a_rivals_release(t0);
+        assert_eq!(
+            a.tick(t0 + S).expect("the look that loses the lease"),
+            Tick::Lost {
+                term: 1,
+                holder: String::new()
+            }
+        );
+        assert_eq!(a.observed().map(|record| record.term), Some(9));
+        assert_eq!(a.highest_term(), 9);
+        assert_eq!(
+            a.tick(t0 + 2 * S).expect("take"),
+            Tick::Acquired { term: 10 }
+        );
+    }
+
+    #[test]
+    fn a_release_that_lands_under_a_stops_write_is_observed_at_the_read_after_it() {
+        // The same race at a stop: the release's write comes back moved, the
+        // lease read again is released under a term above this run's, and
+        // the run counts that term.
+        let t0 = Instant::now() + AHEAD;
+        let mut a = led_before_a_rivals_release(t0);
+        assert!(a.release().expect("the release"));
+        assert!(!a.is_holder());
+        assert_eq!(a.observed().map(|record| record.term), Some(9));
+        assert_eq!(a.highest_term(), 9);
+    }
+
+    #[test]
+    fn a_take_that_lands_under_a_renewals_write_is_observed_at_the_read_after_it() {
+        // The rival's write is a take, a held record under the next term.
+        // The look that loses the lease names its holder; the run counts
+        // its term and keeps the record, and its wait for that record
+        // counts from the read that found it.
+        let t0 = Instant::now() + AHEAD;
+        let mut a = led_before_a_rivals_write(t0, |mine| LeaseRecord {
+            holder: "b@host:2".to_owned(),
+            term: 2,
+            ..mine
+        });
+        assert_eq!(
+            a.tick(t0 + S).expect("the look that loses the lease"),
+            Tick::Lost {
+                term: 1,
+                holder: "b@host:2".to_owned()
+            }
+        );
+        assert_eq!(
+            a.observed()
+                .map(|record| (record.holder.as_str(), record.term)),
+            Some(("b@host:2", 2))
+        );
+        assert_eq!(a.highest_term(), 2);
+        // The rival's record stood still for its duration since that read:
+        // a look a microsecond under the wait's end still follows it, and
+        // the take at its end is above the term counted.
+        assert_eq!(
+            a.tick(t0 + 4 * S - Duration::from_micros(1))
+                .expect("a look inside the wait"),
+            Tick::Following {
+                holder: "b@host:2".to_owned(),
+                term: 2
+            }
+        );
+        assert_eq!(
+            a.tick(t0 + 4 * S).expect("the take after the wait"),
+            Tick::Acquired { term: 3 }
+        );
     }
 
     /// A backend whose writes fail while `fails` is above zero, as a stalled
@@ -2228,6 +2373,39 @@ mod tests {
             a.tick(word + 4 * S).expect("renew"),
             Tick::Renewed { term: 2 }
         );
+    }
+
+    #[test]
+    fn a_replica_whose_hold_ended_over_a_release_that_still_says_a_duration_reads_it_gone() {
+        // The waiting answer ends with the hold. A release another replica
+        // wrote inside the hold says a duration that outlasts it: from the
+        // hold's end this replica is a candidate as any other, and a record
+        // with no holder and a duration is the gone record's answer again.
+        let lease = MemoryLease::new();
+        let mut a = candidate(&lease, "a@host:1");
+        let t0 = Instant::now() + AHEAD;
+        a.lead_at(t0);
+        let word = t0 + S / 2;
+        assert!(a.step_down(None, word).expect("the release"));
+        let own = lease.clone().read().expect("read").expect("the record");
+        let later = LeaseRecord {
+            term: 2,
+            renewed_at_micros: own.renewed_at_micros + 1,
+            duration_ms: 60_000,
+            ..own.clone()
+        };
+        assert_eq!(
+            lease.clone().write(Some(&own), &later).expect("a write"),
+            Written::Done
+        );
+        assert_eq!(a.tick(word + S).expect("look"), Tick::Waiting { term: 2 });
+        assert_eq!(
+            a.tick(word + 3 * S - Duration::from_micros(1))
+                .expect("look"),
+            Tick::Waiting { term: 2 }
+        );
+        assert_eq!(a.tick(word + 3 * S).expect("look"), Tick::Gone { term: 2 });
+        assert!(!a.is_holder());
     }
 
     #[test]
@@ -2574,7 +2752,7 @@ mod tests {
         assert_eq!(lease.write(None, &free).expect("a write"), Written::Done);
         let mut b = candidate(&lease, "b@host:2");
         let refused = b
-            .tick(Instant::now() + S)
+            .tick(Instant::now() + AHEAD)
             .expect_err("no term is left to take");
         assert!(matches!(refused, ElectError::Term(u64::MAX)), "{refused}");
         assert!(!b.is_holder());
@@ -2589,7 +2767,7 @@ mod tests {
         // wait's reader answers by the latest instant a step was handed.
         let lease = MemoryLease::new();
         let mut a = candidate(&lease, "a@host:1");
-        let t0 = Instant::now() + S;
+        let t0 = Instant::now() + AHEAD;
         assert_eq!(a.tick(t0).expect("take"), Tick::Acquired { term: 1 });
         assert_eq!(a.tick(t0 + S).expect("renew"), Tick::Renewed { term: 1 });
         assert!(a.waits_to_lead());
@@ -2611,7 +2789,7 @@ mod tests {
         let lease = MemoryLease::new();
         let mut a = candidate(&lease, "a@host:1");
         let mut b = candidate(&lease, "b@host:2");
-        let t0 = Instant::now() + S;
+        let t0 = Instant::now() + AHEAD;
         assert_eq!(a.tick(t0).expect("take"), Tick::Acquired { term: 1 });
         // A microsecond past the second: the wait still owed has a
         // fraction, and the record's millisecond rounds it up.
@@ -2825,7 +3003,7 @@ mod tests {
         };
         let lease = MemoryLease::new();
         let mut a = Elector::new(Box::new(lease.clone()), "a@host:1", fine).expect("settings");
-        a.tick(Instant::now() + S).expect("acquire");
+        a.tick(Instant::now() + AHEAD).expect("acquire");
         let record = lease.clone().read().expect("read").expect("the record");
         assert_eq!(record.duration_ms, 2, "1.9 ms rounds up");
         assert!(record.duration() >= fine.duration);
@@ -3815,11 +3993,102 @@ mod tests {
         ));
     }
 
+    /// A holder whose renewal reported an error and lands at the store's
+    /// next write, before that write is judged; the lease comes with it.
+    fn led_with_a_late_renewal(t0: Instant) -> (Elector, MemoryLease) {
+        let lease = MemoryLease::new();
+        let delay = Arc::new(AtomicBool::new(false));
+        let backend = LandsLate {
+            lease: lease.clone(),
+            delay: Arc::clone(&delay),
+            pending: None,
+        };
+        let mut a = Elector::new(Box::new(backend), "a@host:1", settings()).expect("settings");
+        assert_eq!(a.tick(t0).expect("acquire"), Tick::Acquired { term: 1 });
+        delay.store(true, Ordering::Relaxed);
+        a.tick(t0 + S).expect_err("the answer was lost");
+        (a, lease)
+    }
+
+    #[test]
+    fn a_renewal_adopted_at_the_read_after_a_moved_write_is_no_stranger() {
+        // The late renewal lands under the next renewal's write, which
+        // comes back moved. The read after it observes that record with
+        // the attempt still kept: the record is this run's own.
+        let t0 = Instant::now() + AHEAD;
+        let (mut a, lease) = led_with_a_late_renewal(t0);
+        assert_eq!(
+            a.tick(t0 + 2 * S).expect("renew"),
+            Tick::Renewed { term: 1 }
+        );
+        // Another run under this name writes the record once: the first
+        // stranger, followed for the record's duration. A second would be
+        // refused.
+        let mine = lease.clone().read().expect("read").expect("the record");
+        let theirs = LeaseRecord {
+            renewed_at_micros: mine.renewed_at_micros + 1,
+            ..mine.clone()
+        };
+        assert_eq!(
+            lease.clone().write(Some(&mine), &theirs).expect("write"),
+            Written::Done
+        );
+        assert_eq!(
+            a.tick(t0 + 3 * S).expect("the look that loses the lease"),
+            Tick::Lost {
+                term: 1,
+                holder: "a@host:1".to_owned()
+            }
+        );
+        assert_eq!(
+            a.tick(t0 + 4 * S).expect("the first stranger"),
+            Tick::Following {
+                holder: "a@host:1".to_owned(),
+                term: 1
+            }
+        );
+    }
+
+    #[test]
+    fn a_renewal_adopted_at_a_releases_read_after_a_moved_write_is_no_stranger() {
+        // The same adoption at a word to leave: the release's write comes
+        // back moved over the late renewal, the read after it observes
+        // that record with the attempt still kept, and the release goes
+        // over it.
+        let t0 = Instant::now() + AHEAD;
+        let (mut a, lease) = led_with_a_late_renewal(t0);
+        assert!(a.step_down(None, t0 + S).expect("the release"));
+        let released = lease.clone().read().expect("read").expect("the record");
+        assert!(released.is_released());
+        // Another run under this name takes the lease: the first stranger.
+        let theirs = LeaseRecord {
+            holder: "a@host:1".to_owned(),
+            term: 2,
+            duration_ms: 3_000,
+            renewed_at_micros: released.renewed_at_micros + 1,
+            ..released.clone()
+        };
+        assert_eq!(
+            lease
+                .clone()
+                .write(Some(&released), &theirs)
+                .expect("write"),
+            Written::Done
+        );
+        assert_eq!(
+            a.tick(t0 + 2 * S).expect("the first stranger"),
+            Tick::Following {
+                holder: "a@host:1".to_owned(),
+                term: 2
+            }
+        );
+    }
+
     #[test]
     fn a_term_said_that_leaves_none_to_take_is_refused_before_it_is_counted() {
         let lease = MemoryLease::new();
         let mut a = candidate(&lease, "a@host:1");
-        let t0 = Instant::now() + 3 * S;
+        let t0 = Instant::now() + AHEAD;
         a.lead_at(t0);
         for said in [TERM_CEILING - 1, TERM_CEILING, u64::MAX] {
             let refused = a

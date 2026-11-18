@@ -183,6 +183,16 @@ impl Gates {
         load > avg * self.rel && load > avg + self.margin(avg, held_tokens)
     }
 
+    /// The spill gate at the mean `avg` for a candidate holding
+    /// `held_tokens` of the request, as [`Self::over`] tests it: the two
+    /// bounds a pass behind a draw takes once.
+    fn spill(&self, avg: f32, held_tokens: f32) -> Spill {
+        Spill {
+            rel: avg * self.rel,
+            abs: avg + self.margin(avg, held_tokens),
+        }
+    }
+
     /// The size of one of the request's blocks: the facts' own when the
     /// host counted with one (an index's learned size), else the view's.
     fn block_size_of(&self, facts: &RequestFacts<'_>) -> u32 {
@@ -220,6 +230,24 @@ impl Gates {
             HashKind::Token => units,
             HashKind::Text => units / CHARS_PER_TOKEN as f32,
         }
+    }
+}
+
+/// The spill gate at one mean and one held prefix ([`Gates::spill`]).
+#[derive(Clone, Copy, Debug)]
+struct Spill {
+    rel: f32,
+    abs: f32,
+}
+
+impl Spill {
+    /// Whether `load` requests in flight are over the gate, as
+    /// [`Gates::over`] answers. Both bounds are tested whatever the first
+    /// says: over rows a draw chose, a test that stops at the first is a
+    /// branch nothing predicts.
+    #[inline]
+    fn over(self, load: f32) -> bool {
+        (load > self.rel) & (load > self.abs)
     }
 }
 
@@ -353,9 +381,9 @@ impl PrefixAffinity {
     /// `feed` says whether anybody holds anything and carries the drawn
     /// rows' mean where the engine set one. `reads` hands each pass a
     /// reader of its own: a column's is a read by index, and the rows a
-    /// host named are walked beside the kept rows of a pool read whole and
-    /// searched a row behind a draw. One body a feed, the feed chosen
-    /// where the body is entered.
+    /// host named are walked beside the kept rows. One body a feed, the
+    /// feed chosen where the body is entered. The rows of a draw are
+    /// scored by [`Self::rank_drawn`].
     #[inline(always)]
     fn rank<R: FnMut(u32) -> AffinityFacts>(
         &self,
@@ -407,10 +435,57 @@ impl PrefixAffinity {
         TieBand(0.0)
     }
 
+    /// The stage's scores behind a draw, as [`Self::rank`] says them over
+    /// the rows a host named. The rows come in the draw's order, and no
+    /// test of a row is one a processor predicts: each row's entry is
+    /// found once, by a search (its match rides the row's score slot, bit
+    /// for bit, to the pass that scores), the spill gate's bounds are
+    /// taken once and both tested, and the score is chosen by a table. A
+    /// pool read whole keeps [`Self::rank`]: its rows come in the host's
+    /// order decision after decision, its tests are predicted, and this
+    /// body costs it more instructions a row.
+    fn rank_drawn(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &[u32],
+        out: &mut [f32],
+        named: NamedAffinity<'_>,
+    ) -> TieBand {
+        let request_blocks = self.gates.request_blocks(facts);
+        // Nobody holding anything, the deepest match is zero without a
+        // pass.
+        let mut best = 0;
+        if !named.holders.is_empty() {
+            for (o, &i) in out.iter_mut().zip(kept) {
+                let matched = self.matched(named.entry(i), request_blocks);
+                *o = f32::from_bits(matched);
+                best = best.max(matched);
+            }
+        }
+        let avg = spill_mean(named.mean_in_flight, candidates, kept);
+        let priced = self.gates.prefix_margin_tokens > 0 && facts.phase != Phase::Decode;
+        let held = if priced {
+            self.gates.tokens_of(best, facts)
+        } else {
+            0.0
+        };
+        let (holder, anyone) = (self.gates.spill(avg, held), self.gates.spill(avg, 0.0));
+        for (o, &i) in out.iter_mut().zip(kept) {
+            let load = candidates[i as usize].in_flight as f32;
+            // A match above zero was read into this slot.
+            let deepest = (best > 0) & (o.to_bits() == best);
+            let own = usize::from(deepest & !holder.over(load));
+            *o = [0.0, 0.5, 1.0, 1.0][own << 1 | usize::from(!anyone.over(load))];
+        }
+        TieBand(0.0)
+    }
+
     /// The stage's scores over the rows a host named: a holder reads its
     /// depth. Each pass walks the holders beside its kept rows where the
-    /// pool is read whole, and searches them a row behind a draw. Out of
-    /// line: see [`Scorer::score`] of this stage.
+    /// pool is read whole; behind a draw each row is searched once
+    /// ([`Self::rank_drawn`]). Out of line: see [`Scorer::score`] of this
+    /// stage.
     #[inline(never)]
     fn rank_named(
         &self,
@@ -422,10 +497,8 @@ impl PrefixAffinity {
     ) -> TieBand {
         if named.drawn() {
             // Behind a draw the rows stand in the draw's order: each is
-            // read by a search, and no cursor is kept.
-            return self.rank(facts, candidates, kept, out, Feed::Named(named), || {
-                move |i: u32| named.entry(i)
-            });
+            // read by a search, once, and no cursor is kept.
+            return self.rank_drawn(facts, candidates, kept, out, named);
         }
         self.rank(facts, candidates, kept, out, Feed::Named(named), || {
             let mut walk = named.walk();
@@ -1973,6 +2046,77 @@ mod tests {
             assert!(by_walk.1 > 0, "{}: a walk looks behind", stage.name());
             assert_eq!(by_search.1, 0, "{}: a search keeps no cursor", stage.name());
         }
+    }
+
+    /// The prefix stage's body behind a draw scores as the whole pass's
+    /// does: over pools, holders, loads and orders drawn at random, under
+    /// a plain gate, a relative one and one that prices the held prefix,
+    /// a decode phase among them. Both reads judge by one mean.
+    #[test]
+    fn behind_a_draw_the_prefix_stage_scores_as_the_whole_pass_does() {
+        let gate = |prefix_margin_tokens| {
+            affinity(Some(SpillParams {
+                rel: Some(1.1),
+                prefix_margin_tokens,
+                ..SpillParams::default()
+            }))
+        };
+        let stages = [affinity(None), gate(None), gate(Some(8))];
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = |below: u64| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 33) % below
+        };
+        let mut reached = [0u32; 3];
+        for round in 0..3_000u32 {
+            let n = 1 + next(24) as u32;
+            let pool: Vec<Candidate> = (0..n)
+                .map(|row| candidate(row, next(40) as u32, 0).0)
+                .collect();
+            // Every fourth round names nobody.
+            let mut holders = Vec::new();
+            for row in 0..n {
+                if round % 4 != 0 && next(3) == 0 {
+                    holders.push(holder(row, 1 + next(16) as u32));
+                }
+            }
+            // A draw's order: some of the rows, each once.
+            let mut order: Vec<u32> = (0..n).filter(|&row| row == 0 || next(4) != 0).collect();
+            for i in (1..order.len()).rev() {
+                order.swap(i, next(i as u64 + 1) as usize);
+            }
+            let whole = named(&holders, &[], false);
+            let drawn = NamedAffinity {
+                mean_in_flight: Some(mean_in_flight(&pool, &order)),
+                ..whole
+            };
+            let stage = &stages[round as usize % stages.len()];
+            let [by_pass, by_draw] = [whole, drawn].map(|named| {
+                let facts = RequestFacts {
+                    named: Some(named),
+                    phase: if round % 5 == 0 {
+                        Phase::Decode
+                    } else {
+                        Phase::Single
+                    },
+                    ..facts(16)
+                };
+                let mut out = vec![0.0; order.len()];
+                stage.score(&facts, &pool, &order, &mut out);
+                out
+            });
+            assert_eq!(
+                by_draw, by_pass,
+                "round {round}: {holders:?}, order {order:?}"
+            );
+            for (score, count) in [0.0, 0.5, 1.0].into_iter().zip(&mut reached) {
+                *count += u32::from(by_pass.contains(&score));
+            }
+        }
+        // The rounds reach every score.
+        assert!(reached.iter().all(|&rounds| rounds > 300), "{reached:?}");
     }
 
     /// A hit the slice diverts behind a draw reads the rows named by a

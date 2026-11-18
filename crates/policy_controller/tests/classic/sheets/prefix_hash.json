@@ -1645,6 +1645,636 @@
           ]
         }
       }
+    },
+    {
+      "name": "under-boundaries-a-worker-under-the-bound-keeps-the-deepest-boundary-s-key",
+      "config": {
+        "prefix_token_count": 256,
+        "load_factor": 1.25,
+        "balance_abs_threshold": 10,
+        "cache_boundaries": [
+          64,
+          256
+        ]
+      },
+      "ring": {
+        "tokens": [
+          [
+            3059000,
+            300
+          ]
+        ]
+      },
+      "levels": [
+        {
+          "boundary": 64,
+          "order": [
+            2,
+            0,
+            1,
+            3
+          ]
+        }
+      ],
+      "workers": [
+        12,
+        0,
+        5,
+        1
+      ],
+      "steps": [
+        {
+          "pick": {
+            "tokens": [
+              [
+                3059000,
+                300
+              ]
+            ]
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          0
+        ]
+      }
+    },
+    {
+      "name": "a-worker-past-the-bound-passes-the-key-to-the-next-boundary-s-worker",
+      "config": {
+        "prefix_token_count": 256,
+        "load_factor": 1.25,
+        "balance_abs_threshold": 10,
+        "cache_boundaries": [
+          64,
+          256
+        ]
+      },
+      "ring": {
+        "tokens": [
+          [
+            3059000,
+            300
+          ]
+        ]
+      },
+      "levels": [
+        {
+          "boundary": 64,
+          "order": [
+            2,
+            0,
+            1,
+            3
+          ]
+        }
+      ],
+      "workers": [
+        30,
+        0,
+        5,
+        1
+      ],
+      "steps": [
+        {
+          "pick": {
+            "tokens": [
+              [
+                3059000,
+                300
+              ]
+            ]
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          2
+        ]
+      }
+    },
+    {
+      "name": "workers-past-the-bound-at-every-boundary-pass-the-key-to-the-fewest-requests",
+      "config": {
+        "prefix_token_count": 256,
+        "load_factor": 1.25,
+        "balance_abs_threshold": 10,
+        "cache_boundaries": [
+          64,
+          256
+        ]
+      },
+      "ring": {
+        "tokens": [
+          [
+            3059000,
+            300
+          ]
+        ]
+      },
+      "levels": [
+        {
+          "boundary": 64,
+          "order": [
+            2,
+            0,
+            1,
+            3
+          ]
+        }
+      ],
+      "workers": [
+        30,
+        3,
+        28,
+        0
+      ],
+      "steps": [
+        {
+          "pick": {
+            "tokens": [
+              [
+                3059000,
+                300
+              ]
+            ]
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          3
+        ]
+      }
+    },
+    {
+      "name": "one-worker-at-both-boundaries-passes-the-key-to-the-fewest-requests",
+      "config": {
+        "prefix_token_count": 256,
+        "load_factor": 1.25,
+        "balance_abs_threshold": 10,
+        "cache_boundaries": [
+          64,
+          256
+        ]
+      },
+      "ring": {
+        "tokens": [
+          [
+            3009000,
+            300
+          ]
+        ]
+      },
+      "levels": [
+        {
+          "boundary": 64,
+          "order": [
+            0,
+            2,
+            1,
+            3
+          ]
+        }
+      ],
+      "workers": [
+        30,
+        5,
+        0,
+        1
+      ],
+      "steps": [
+        {
+          "pick": {
+            "tokens": [
+              [
+                3009000,
+                300
+              ]
+            ]
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          2
+        ]
+      }
+    },
+    {
+      "name": "a-down-worker-at-the-next-boundary-hands-the-key-to-that-ring-s-next-member",
+      "config": {
+        "prefix_token_count": 256,
+        "load_factor": 1.25,
+        "balance_abs_threshold": 10,
+        "cache_boundaries": [
+          64,
+          256
+        ]
+      },
+      "ring": {
+        "tokens": [
+          [
+            3017000,
+            300
+          ]
+        ]
+      },
+      "levels": [
+        {
+          "boundary": 64,
+          "order": [
+            2,
+            3,
+            0,
+            1
+          ]
+        }
+      ],
+      "workers": [
+        30,
+        0,
+        5,
+        1
+      ],
+      "steps": [
+        {
+          "ready": [
+            true,
+            true,
+            false,
+            true
+          ]
+        },
+        {
+          "pick": {
+            "tokens": [
+              [
+                3017000,
+                300
+              ]
+            ]
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          3
+        ]
+      }
+    },
+    {
+      "name": "a-down-worker-at-the-deepest-boundary-hands-the-key-to-that-ring-s-next-member",
+      "config": {
+        "prefix_token_count": 256,
+        "load_factor": 1.25,
+        "balance_abs_threshold": 10,
+        "cache_boundaries": [
+          64,
+          256
+        ]
+      },
+      "ring": {
+        "tokens": [
+          [
+            3059000,
+            300
+          ]
+        ]
+      },
+      "levels": [
+        {
+          "boundary": 64,
+          "order": [
+            2,
+            0,
+            1,
+            3
+          ]
+        }
+      ],
+      "workers": [
+        0,
+        5,
+        0,
+        1
+      ],
+      "steps": [
+        {
+          "ready": [
+            false,
+            true,
+            true,
+            true
+          ]
+        },
+        {
+          "pick": {
+            "tokens": [
+              [
+                3059000,
+                300
+              ]
+            ]
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          1
+        ]
+      }
+    },
+    {
+      "name": "under-boundaries-the-256th-token-of-a-prompt-that-reaches-256-is-in-the-key",
+      "config": {
+        "prefix_token_count": 256,
+        "load_factor": 1.25,
+        "balance_abs_threshold": 10,
+        "cache_boundaries": [
+          64,
+          256
+        ]
+      },
+      "workers": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "prompts": {
+        "count": 64,
+        "tokens": 300,
+        "differ_at": 255
+      },
+      "outcome": {
+        "counts": {
+          "draws": 64,
+          "counts": [
+            15,
+            49
+          ]
+        }
+      }
+    },
+    {
+      "name": "under-boundaries-the-257th-token-of-a-prompt-that-reaches-256-is-outside-the-key",
+      "config": {
+        "prefix_token_count": 256,
+        "load_factor": 1.25,
+        "balance_abs_threshold": 10,
+        "cache_boundaries": [
+          64,
+          256
+        ]
+      },
+      "workers": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "prompts": {
+        "count": 64,
+        "tokens": 300,
+        "differ_at": 256
+      },
+      "outcome": {
+        "counts": {
+          "draws": 64,
+          "counts": [
+            64,
+            0
+          ]
+        }
+      }
+    },
+    {
+      "name": "under-boundaries-the-64th-token-of-a-prompt-that-reaches-64-alone-is-in-the-key",
+      "config": {
+        "prefix_token_count": 256,
+        "load_factor": 1.25,
+        "balance_abs_threshold": 10,
+        "cache_boundaries": [
+          64,
+          256
+        ]
+      },
+      "workers": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "prompts": {
+        "count": 64,
+        "tokens": 100,
+        "differ_at": 63
+      },
+      "outcome": {
+        "counts": {
+          "draws": 64,
+          "counts": [
+            7,
+            57
+          ]
+        }
+      }
+    },
+    {
+      "name": "under-boundaries-the-65th-token-of-a-prompt-that-reaches-64-alone-is-outside-the-key",
+      "config": {
+        "prefix_token_count": 256,
+        "load_factor": 1.25,
+        "balance_abs_threshold": 10,
+        "cache_boundaries": [
+          64,
+          256
+        ]
+      },
+      "workers": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "prompts": {
+        "count": 64,
+        "tokens": 100,
+        "differ_at": 64
+      },
+      "outcome": {
+        "counts": {
+          "draws": 64,
+          "counts": [
+            64,
+            0
+          ]
+        }
+      }
+    },
+    {
+      "name": "under-boundaries-a-prompt-that-reaches-none-is-keyed-at-the-one-depth",
+      "config": {
+        "prefix_token_count": 256,
+        "load_factor": 1.25,
+        "balance_abs_threshold": 10,
+        "cache_boundaries": [
+          64,
+          256
+        ]
+      },
+      "workers": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "prompts": {
+        "count": 64,
+        "tokens": 48,
+        "differ_at": 47
+      },
+      "outcome": {
+        "counts": {
+          "draws": 64,
+          "counts": [
+            9,
+            55
+          ]
+        }
+      }
+    },
+    {
+      "name": "a-prompt-that-reaches-a-boundary-is-not-keyed-at-the-one-depth",
+      "config": {
+        "prefix_token_count": 128,
+        "load_factor": 1.25,
+        "balance_abs_threshold": 10,
+        "cache_boundaries": [
+          64,
+          256
+        ]
+      },
+      "workers": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "prompts": {
+        "count": 64,
+        "tokens": 300,
+        "differ_at": 200
+      },
+      "outcome": {
+        "counts": {
+          "draws": 64,
+          "counts": [
+            9,
+            55
+          ]
+        }
+      }
+    },
+    {
+      "name": "under-boundaries-the-256th-token-of-a-text-that-reaches-256-is-in-the-key",
+      "config": {
+        "prefix_token_count": 256,
+        "load_factor": 1.25,
+        "balance_abs_threshold": 10,
+        "cache_boundaries": [
+          64,
+          256
+        ]
+      },
+      "workers": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "prompts": {
+        "count": 64,
+        "tokens": 300,
+        "differ_at": 255,
+        "text": true
+      },
+      "outcome": {
+        "counts": {
+          "draws": 64,
+          "counts": [
+            13,
+            51
+          ]
+        }
+      }
+    },
+    {
+      "name": "under-boundaries-the-257th-token-of-a-text-that-reaches-256-is-outside-the-key",
+      "config": {
+        "prefix_token_count": 256,
+        "load_factor": 1.25,
+        "balance_abs_threshold": 10,
+        "cache_boundaries": [
+          64,
+          256
+        ]
+      },
+      "workers": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "prompts": {
+        "count": 64,
+        "tokens": 300,
+        "differ_at": 256,
+        "text": true
+      },
+      "outcome": {
+        "counts": {
+          "draws": 64,
+          "counts": [
+            64,
+            0
+          ]
+        }
+      }
     }
   ]
 }

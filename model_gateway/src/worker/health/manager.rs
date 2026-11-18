@@ -30,31 +30,33 @@ use openai_protocol::worker::{
     EngineAggregateMetricsSnapshot, FlushCacheResult, HealthCheckConfig, ProfileOptions,
     ProfileResult, SchedulerLoadSnapshot, WorkerLoadResponse, WorkerStatus,
 };
-use smg_worker::{labels::DISCOVERY_PROVIDER_LABEL, settings::UnhealthyRemovalScope};
+use smg_worker::{
+    labels::DISCOVERY_PROVIDER_LABEL, metrics_labels, settings::UnhealthyRemovalScope,
+};
 use tokio::{
     sync::{broadcast, mpsc, Notify},
     task::JoinHandle,
 };
 use tracing::{debug, error, info, warn};
 
-use crate::{
-    observability::metrics::{metrics_labels, Metrics},
-    worker::{
-        health::liveness,
-        identity::{basic::WorkerTypeExt, endpoint::Endpoint},
-        load::{
-            metrics_aggregator::{self, MetricPack},
-            state::LoadSnapshot,
-        },
-        registry::{
-            event::{WorkerConnected, WorkerEvent},
-            WorkerId,
-        },
-        runtime::WorkerRuntime,
-        ConnectionMode, RuntimeType, Worker, WorkerOrigin, WorkerRegistry, WorkerResult,
-        WorkerType,
+use crate::worker::{
+    connection::engine::NO_ENGINE_CONNECTOR,
+    health::liveness,
+    identity::{
+        basic::WorkerTypeExt,
+        endpoint::{grpc_base_url, Endpoint},
     },
-    workflow::steps::local::discover_grpc_kv_engine_id,
+    load::{
+        metrics_aggregator::{self, MetricPack},
+        state::LoadSnapshot,
+    },
+    metrics::Metrics,
+    registry::{
+        event::{WorkerConnected, WorkerEvent},
+        WorkerId,
+    },
+    runtime::WorkerRuntime,
+    ConnectionMode, RuntimeType, Worker, WorkerOrigin, WorkerRegistry, WorkerResult, WorkerType,
 };
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1022,6 +1024,33 @@ fn engine_id_may_be_stale(launched_status: WorkerStatus, worker: &dyn Worker) ->
     }
 }
 
+/// Re-read the KV transfer engine id a gRPC engine reports, for a PD worker
+/// that came back on the same address (#2491): a restarted engine process
+/// carries a new id, and a handoff minted for the old one strands the decode.
+/// The read makes a connection of its own, through the worker's connector,
+/// to the worker's base address: a data-parallel rank is no part of the dial.
+///
+/// Unlike registration discovery, a server-info failure is an error here
+/// rather than a tolerated gap: the caller must tell a read that did not
+/// complete (retry later) from an engine that reports no id (nothing to
+/// retry).
+async fn read_kv_engine_id(worker: &dyn Worker) -> Result<Option<String>, String> {
+    let connected = match worker.engine_connector() {
+        Some(connector) => {
+            let runtime = worker.metadata().spec.runtime_type;
+            connector
+                .connect_grpc(&grpc_base_url(worker.base_url()), runtime)
+                .await
+        }
+        None => Err(NO_ENGINE_CONNECTOR.to_string()),
+    };
+    connected
+        .map_err(|e| format!("Failed to connect to gRPC: {e}"))?
+        .kv_engine_id()
+        .await
+        .map_err(|e| format!("Failed to fetch gRPC server info: {e}"))
+}
+
 /// A PD worker that answers its probe again may be a new engine process on
 /// the same address, with a new KV transfer engine id (#2491); a worker
 /// registered while its engine was still coming up may have none at all.
@@ -1041,11 +1070,7 @@ async fn refresh_kv_engine_id_after_recovery(worker: &Arc<dyn Worker>, timeout: 
     {
         return;
     }
-    let read = tokio::time::timeout(
-        timeout,
-        discover_grpc_kv_engine_id(worker.url(), spec.runtime_type.as_str()),
-    )
-    .await;
+    let read = tokio::time::timeout(timeout, read_kv_engine_id(worker.as_ref())).await;
     // A read that did not complete leaves the id unconfirmed, so the next
     // probe retries instead of the worker serving with a possibly stale id
     // until its next outage. A completed read confirms it, whether or not

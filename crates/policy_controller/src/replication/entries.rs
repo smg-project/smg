@@ -44,6 +44,7 @@ pub const ENTRIES: &[(&str, &str, Fate)] = &[
     ("HealthSink", "probe_outcome", Fate::Journaled),
     ("HealthSink", "connected", Fate::Journaled),
     ("HealthSink", "gateway_veto", Fate::Rebuilt(HELLO)),
+    ("HealthSink", "gateway_veto_noted", Fate::Rebuilt(HELLO)),
     ("HealthSink", "vetoed", Fate::Read),
     (
         "HealthSink",
@@ -119,6 +120,7 @@ pub const ENTRIES: &[(&str, &str, Fate)] = &[
     ("MemoryStore", "apply", Fate::NotYet(GENERATION)),
     ("MemoryStore", "world", Fate::Read),
     ("MemoryStore", "build_view", Fate::Read),
+    ("MemoryStore", "with_world", Fate::Read),
     ("MemoryStore", "build_pair", Fate::Read),
     ("MemoryStore", "deciding", Fate::Read),
     ("MemoryStore", "micros", Fate::Read),

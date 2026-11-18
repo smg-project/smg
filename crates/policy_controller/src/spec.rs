@@ -60,6 +60,12 @@ pub const DENIED_HEADERS: [&str; 7] = [
 /// header by its position in one byte.
 pub const MAX_HEADERS: usize = 256;
 
+/// The highest `view.max_block_hashes`: the hashes a `DecideRequest` at
+/// the contract's bound of 64 KiB carries beside an id of one byte, at
+/// eight bytes a hash and ten of tags and lengths. A higher cap would
+/// bind on no frame the call accepts.
+pub const MAX_BLOCK_HASHES: u32 = 8_190;
+
 /// The filters this build carries.
 pub const FILTERS: [&str; 5] = [
     "healthy",
@@ -123,7 +129,15 @@ pub struct Needs {
     /// The request text in the view (a text-window hash form, for a host
     /// without a tokenizer).
     pub text: bool,
+    /// The request's prefix block hashes over its token ids. A decision is
+    /// handed the hashes as deep as the stages that declare them read
+    /// ([`AppliedSpec::block_hashes_read`]), so a stage that reads the list
+    /// declares one of the two kinds: under a generation where no stage
+    /// does, it is handed none.
     pub token_hashes: bool,
+    /// The request's prefix block hashes over windows of its text, which a
+    /// host without a tokenizer feeds in their place. A stage that reads a
+    /// prefix by either kind sets this beside `text`.
     pub text_hashes: bool,
     /// Load reports per worker.
     pub loads: bool,
@@ -166,8 +180,9 @@ pub struct Needs {
     /// the warming rows by that draw over their whole list. A host that
     /// cannot fills the column, and the pool is read whole. The cap of a
     /// decision is its own profile's, which
-    /// [`Engine::needs_for`](crate::Engine::needs_for) says: the engine's
-    /// summary holds the largest sample of every profile.
+    /// [`Engine::sample_for`](crate::Engine::sample_for) says: the engine's
+    /// summary holds the largest sample of every profile, and a decode
+    /// worker's needs the larger of its two profiles'.
     pub sample: u32,
 }
 
@@ -219,8 +234,9 @@ pub struct ViewSpec {
     /// Ascending token positions the hash index and the prefix-hash ring
     /// key on; empty for none. A hash index needs at least one.
     pub boundaries: Vec<u32>,
-    /// How many prefix block hashes a request carries into the view.
-    #[schemars(range(min = 1))]
+    /// How many prefix block hashes a request carries into the view, 8,190
+    /// at most: one frame of the Decide call carries no more.
+    #[schemars(range(min = 1, max = 8190))]
     pub max_block_hashes: u32,
 }
 
@@ -564,8 +580,11 @@ impl Default for BucketParams {
 
 /// The bounded-load rule of the consistent-hash scorer: a ring owner whose
 /// requests in flight are past both parts of the rule over the candidates'
-/// mean, the request being placed counted in the mean, is passed over, and
-/// the profile's next stage places the request.
+/// mean, the request being placed counted in the mean, is passed over. A
+/// prefix keyed at a boundary is then tried at the next boundary down. A
+/// request no owner keeps is scored as one with no key: the profile's next
+/// stage places it, and in a profile with no stage after the ring the picker
+/// draws among every candidate, the passed owner among them.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct BoundedLoadParams {
@@ -591,7 +610,14 @@ pub struct ConsistentHashParams {
     /// The depth in tokens at which a request with no routing key is keyed
     /// by its prefix: the last whole block at or under the depth, so at
     /// least one block of the view's block size and at most the blocks a
-    /// request carries. Absent, such a request has no key.
+    /// request carries. Under the view's `boundaries` a request that reaches
+    /// one is keyed there instead, at the deepest it reaches. The depth is
+    /// checked in the view's token blocks and read in the blocks a request
+    /// was hashed by. A text request's windows are `block_size` characters,
+    /// a quarter of a token block, so it carries a quarter of the checked
+    /// depth and a deeper depth keys at its last window. Under a block size
+    /// an engine published above the depth a request has no key. Absent, a
+    /// request with no routing key has none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1))]
     pub prefix_tokens: Option<u32>,
@@ -630,8 +656,8 @@ pub struct ResidentWorkParams {
 pub struct BestParams {
     /// How many rows the picker draws where the host names the request's
     /// holders and the pool's warming rows: a pool of more than twice this
-    /// many rows is decided by that sample and the named rows, any other by
-    /// the whole pool. From 1 to 64.
+    /// many rows, and of at least 16, is decided by that sample and the
+    /// named rows, any other by the whole pool. From 1 to 64.
     #[schemars(range(min = 1, max = 64))]
     pub sample: u32,
 }
@@ -1198,8 +1224,9 @@ pub const OVERLOAD_WAITING_REQUESTS: u32 = 8;
 /// vetoed where a binding's overload block names no usage.
 pub const OVERLOAD_TOKEN_USAGE: f32 = 0.8;
 
-/// The overload veto's defaults for the binding's workers: evaluated per
-/// load report by the host and latched, never per request; a worker's own
+/// The overload veto's defaults for the workers of the pools decided under
+/// the binding, as the binding's `overload` field says: evaluated per load
+/// report by the host and latched, never per request; a worker's own
 /// registration thresholds resolve over these.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields, default)]
@@ -1424,10 +1451,13 @@ pub struct BindingSpec {
     pub profiles: BTreeMap<String, String>,
     /// The overload veto's defaults for the workers of the pools decided
     /// under the binding: the pools whose model and phase it is the first
-    /// to match. A decode pool of a model with a pair binding (`pd-pair`
-    /// or `epd`) is decided under that binding, so its block judges the
-    /// pool: a decode-phase binding's block is not read for it, and a pair
-    /// binding with its block switched off leaves the pool unjudged.
+    /// to match. A decode pool of a model whose prefill lookup resolves to
+    /// a pair binding (`pd-pair` or `epd`) is decided under that binding,
+    /// so its block judges the pool: a decode-phase binding's block is not
+    /// read for it, and a pair binding with its block switched off leaves
+    /// the pool unjudged. Where a binding of another plan takes the
+    /// model's prefill lookup first, no pair decision runs for the model
+    /// and its decode pool is the decode phase's own.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub overload: Option<OverloadSpec>,
     /// Sticky sessions.
@@ -1789,7 +1819,15 @@ fn check_view(view: &ViewSpec, denied: &[&str]) -> Result<(), SpecError> {
             }
         }
     }
-    at.nonzero("max_block_hashes", Some(view.max_block_hashes))
+    at.nonzero("max_block_hashes", Some(view.max_block_hashes))?;
+    if view.max_block_hashes > MAX_BLOCK_HASHES {
+        return Err(at.bad(
+            "max_block_hashes",
+            view.max_block_hashes,
+            "at most 8190, the hashes one Decide frame carries",
+        ));
+    }
+    Ok(())
 }
 
 fn check_index(index: &BTreeMap<String, IndexSpec>, view: &ViewSpec) -> Result<(), SpecError> {
@@ -1996,10 +2034,27 @@ impl Deferred {
     }
 }
 
-/// A consistent-hash stage's prefix depth against the view that carries a
-/// request's block hashes. The key is the last whole block at or under
-/// `prefix_tokens`: the depth holds at least one block of the view's block
-/// size, and no more blocks than a request carries into the view.
+/// What a prefix depth breaks against the view that carries a request's
+/// block hashes: `under` when it holds no whole block of the view's block
+/// size, `over` when a request carries no block that deep.
+fn depth_edge(
+    depth: u32,
+    gates: Gates,
+    view: &ViewSpec,
+    under: &'static str,
+    over: &'static str,
+) -> Option<&'static str> {
+    match depth / gates.block_size {
+        0 => Some(under),
+        blocks if blocks > view.max_block_hashes => Some(over),
+        _ => None,
+    }
+}
+
+/// A consistent-hash stage's prefix depths against the view. A key is the
+/// last whole block at or under its depth, so `prefix_tokens` and each of
+/// the view's boundaries hold at least one block and no more blocks than a
+/// request carries.
 fn check_prefix_depth(
     stage: &ScoreStage,
     gates: Gates,
@@ -2013,19 +2068,31 @@ fn check_prefix_depth(
     else {
         return Ok(());
     };
-    match tokens / gates.block_size {
-        0 => Err(at.bad(
-            "prefix_tokens",
-            tokens,
-            "at least one block of view.block_size",
-        )),
-        blocks if blocks > view.max_block_hashes => Err(at.bad(
-            "prefix_tokens",
-            tokens,
-            "at most view.max_block_hashes blocks of view.block_size",
-        )),
-        _ => Ok(()),
+    if let Some(reason) = depth_edge(
+        *tokens,
+        gates,
+        view,
+        "at least one block of view.block_size",
+        "at most view.max_block_hashes blocks of view.block_size",
+    ) {
+        return Err(at.bad("prefix_tokens", tokens, reason));
     }
+    for (i, &boundary) in view.boundaries.iter().enumerate() {
+        if let Some(reason) = depth_edge(
+            boundary,
+            gates,
+            view,
+            "at least one block of view.block_size under a consistent-hash prefix key",
+            "at most view.max_block_hashes blocks of view.block_size under a consistent-hash prefix key",
+        ) {
+            return Err(SpecError::BadField {
+                path: format!("view.boundaries[{i}]"),
+                value: boundary.to_string(),
+                reason,
+            });
+        }
+    }
+    Ok(())
 }
 
 fn built_scorer(scorer: impl Scorer + 'static) -> Resolved<Box<dyn Scorer>> {
@@ -2048,7 +2115,8 @@ fn gates_of(p: &ProfileSpec, view: &ViewSpec) -> Gates {
     Gates::of(affinity, kv, view.block_size)
 }
 
-fn scorer_of(stage: &ScoreStage, gates: Gates) -> Resolved<Box<dyn Scorer>> {
+/// The stage's scorer. `boundaries` are the view's, where a prefix ring keys.
+fn scorer_of(stage: &ScoreStage, gates: Gates, boundaries: &[u32]) -> Resolved<Box<dyn Scorer>> {
     match stage {
         ScoreStage::LeastLoad(p) => built_scorer(LeastLoad::new(
             p.kv_pressure_weight.unwrap_or(0.15),
@@ -2078,7 +2146,7 @@ fn scorer_of(stage: &ScoreStage, gates: Gates) -> Resolved<Box<dyn Scorer>> {
         ScoreStage::ConsistentHash(p) => {
             let ring = ConsistentHash::new(p.bounded_load.as_ref());
             built_scorer(match p.prefix_tokens {
-                Some(tokens) => ring.keyed_by_prefix(tokens, gates),
+                Some(tokens) => ring.keyed_by_prefix(tokens, gates, boundaries),
                 None => ring,
             })
         }
@@ -2240,14 +2308,18 @@ impl HashDepth {
     }
 
     /// What a built scorer reads: a consistent-hash stage keyed by a prefix
-    /// reads as deep as its `prefix_tokens`, any other stage as its `needs`
-    /// declare.
-    fn of_scorer(stage: &ScoreStage, needs: Needs) -> Self {
+    /// reads as deep as its `prefix_tokens` or the deepest of the view's
+    /// `boundaries`, where a request that reaches one is keyed, and any
+    /// other stage as its `needs` declare.
+    fn of_scorer(stage: &ScoreStage, boundaries: &[u32], needs: Needs) -> Self {
         match stage {
             ScoreStage::ConsistentHash(ConsistentHashParams {
                 prefix_tokens: Some(tokens),
                 ..
-            }) => Self::Tokens(*tokens),
+            }) => {
+                let deepest = boundaries.iter().copied().max().unwrap_or(0);
+                Self::Tokens(deepest.max(*tokens))
+            }
             _ => Self::of(needs),
         }
     }
@@ -2297,19 +2369,10 @@ fn check_profile(
         let stage_at = entry_at.sub(stage.name());
         check_stage(&stage, &stage_at)?;
         check_prefix_depth(&stage, gates, view, &stage_at)?;
-        let resolved = match &stage {
-            // A view's boundaries are where the prefix ring keys, the
-            // deepest one a request reaches first.
-            ScoreStage::ConsistentHash(p)
-                if p.prefix_tokens.is_some() && !view.boundaries.is_empty() =>
-            {
-                Resolved::NotInBuild("the consistent-hash boundary levels")
-            }
-            _ => scorer_of(&stage, gates),
-        };
-        match resolved {
+        match scorer_of(&stage, gates, &view.boundaries) {
             Resolved::Built(scorer) => {
-                depth.deepen(HashDepth::of_scorer(&stage, scorer.needs()));
+                let read = HashDepth::of_scorer(&stage, &view.boundaries, scorer.needs());
+                depth.deepen(read);
                 scorers.push(Weighted {
                     scorer,
                     weight: stage.weight(),
@@ -3519,6 +3582,14 @@ mod tests {
             r#"{"apiVersion":"smg.policy/v1","profiles":{"p":{"score":[{"consistent-hash":{"prefix_tokens":256}}],"pick":"best"},"q":{"score":[{"consistent-hash":{"prefix_tokens":512}}],"pick":"best"}},"bindings":[{"match":{"model":"a*"},"profiles":{"single":"p"}},{"match":{"model":"*"},"profiles":{"single":"q"}}]}"#,
         );
         assert_eq!(applied(&two).block_hashes_read(Token, 0), 32);
+        // Under a view's boundaries a prefix key is read at the deepest one
+        // a request reaches, so the generation reads as deep as that one,
+        // and no shallower than the key's own depth.
+        let mut levelled = preset("prefix_hash");
+        levelled.view.boundaries = vec![64, 1024];
+        assert_eq!(applied(&levelled).block_hashes_read(Token, 0), 64);
+        levelled.view.boundaries = vec![64];
+        assert_eq!(applied(&levelled).block_hashes_read(Token, 0), 16);
     }
 
     /// A guest stage of each kind, under the name it is registered by, that
@@ -3810,6 +3881,101 @@ mod tests {
         assert_eq!(engine.needs_for("pd/x", Phase::Prefill), Needs::default());
         assert_eq!(engine.needs_for_phase(Phase::Decode), loads.or(headers));
         assert_eq!(engine.needs_for_phase(Phase::Prefill), Needs::default());
+    }
+
+    /// The needs rows are what a host must feed: a host that feeds, for a
+    /// model and a phase, every row whose glob matches the model feeds what
+    /// the decision of that model and phase reads, with no copy of the
+    /// bindings' order or of the pair's rule. A pair's decode profile is a
+    /// decode row of the pair binding's glob, two bindings of one glob write
+    /// one row a phase, and nothing to feed is no row.
+    #[test]
+    fn the_needs_rows_feed_what_every_decision_reads() {
+        /// What a host feeds for `model` and `phase`: the union of the rows
+        /// whose glob matches.
+        fn fed(engine: &Engine, model: &str, phase: Phase) -> Needs {
+            engine
+                .needs_rows()
+                .into_iter()
+                .filter(|(glob, at, _)| {
+                    let matches = match (glob.strip_prefix('*'), glob.strip_suffix('*')) {
+                        _ if *glob == "*" => true,
+                        (Some(suffix), _) => model.ends_with(suffix),
+                        (_, Some(prefix)) => model.starts_with(prefix),
+                        _ => *glob == model,
+                    };
+                    matches && *at == phase
+                })
+                .fold(Needs::default(), |fed, (_, _, needs)| fed.or(needs))
+        }
+        let loads = Needs {
+            loads: true,
+            ..Needs::default()
+        };
+        let headers = Needs {
+            headers: true,
+            ..Needs::default()
+        };
+        let phases = [Phase::Single, Phase::Prefill, Phase::Decode, Phase::Encode];
+
+        // A decode-phase binding before a pair binding, and a catch-all that
+        // reads nothing: the pair's decode profile is a row of the pair's
+        // glob, and the catch-all writes none.
+        let text = r#"{
+          "apiVersion": "smg.policy/v1",
+          "profiles": {
+            "decode-only": { "filter": ["healthy"], "score": ["least-load"], "pick": "best" },
+            "prefill": { "filter": ["healthy"], "pick": "round-robin" },
+            "pair-decode": { "filter": ["healthy"], "score": ["session-affinity"], "pick": "best" },
+            "default": { "filter": ["healthy"], "pick": "round-robin" }
+          },
+          "bindings": [
+            { "match": { "model": "*", "phase": ["decode"] }, "profile": "decode-only" },
+            { "match": { "model": "pd/*", "phase": ["prefill", "decode"] }, "plan": "pd-pair", "profiles": { "prefill": "prefill", "decode": "pair-decode" } },
+            { "match": { "model": "*" }, "profile": "default" }
+          ]
+        }"#;
+        let engine = doc(text).validate().expect("validates");
+        assert_eq!(
+            engine.needs_rows(),
+            [
+                ("*", Phase::Decode, loads),
+                ("pd/*", Phase::Decode, headers)
+            ]
+        );
+        for model in ["pd/x", "other"] {
+            for phase in phases {
+                assert_eq!(
+                    fed(&engine, model, phase),
+                    engine.needs_for(model, phase),
+                    "{model} {phase:?}"
+                );
+            }
+        }
+
+        // Two bindings of one glob write one row a phase. The first decides
+        // the single phase and reads the headers there: the union feeds the
+        // loads over its word, and never under it.
+        let text = r#"{
+          "apiVersion": "smg.policy/v1",
+          "profiles": {
+            "keyed": { "filter": ["healthy"], "score": ["session-affinity"], "pick": "best" },
+            "loaded": { "filter": ["healthy"], "score": ["least-load"], "pick": "best" }
+          },
+          "bindings": [
+            { "match": { "model": "m", "phase": ["single"] }, "profile": "keyed" },
+            { "match": { "model": "m" }, "profile": "loaded" }
+          ]
+        }"#;
+        let engine = doc(text).validate().expect("validates");
+        assert_eq!(engine.needs_for("m", Phase::Single), headers);
+        assert_eq!(
+            engine.needs_rows(),
+            phases.map(|phase| match phase {
+                Phase::Single => ("m", phase, headers.or(loads)),
+                _ => ("m", phase, loads),
+            })
+        );
     }
 
     #[test]
@@ -4465,6 +4631,17 @@ mod tests {
             bad_field(&spec_with_view(r#"{"max_block_hashes":0}"#)),
             "view.max_block_hashes"
         );
+        // One frame of the Decide call carries 8,190 hashes: that cap is
+        // taken, and one above it is refused by the field's name.
+        let cap = |hashes: u32| spec_with_view(&format!(r#"{{"max_block_hashes":{hashes}}}"#));
+        assert!(cap(MAX_BLOCK_HASHES).validate().is_ok());
+        let refused = cap(MAX_BLOCK_HASHES + 1)
+            .validate()
+            .expect_err("a cap one frame cannot carry");
+        assert_eq!(
+            refused.to_string(),
+            "view.max_block_hashes = 8191 is not at most 8190, the hashes one Decide frame carries"
+        );
         let spec = spec_with_view(r#"{"block_size":128,"boundaries":[256,1024,4096]}"#);
         assert!(spec.validate().is_ok());
         assert_eq!(spec.view.max_block_hashes, 256);
@@ -4632,22 +4809,19 @@ mod tests {
         let needs = prefix.validate().expect("validates").needs();
         assert!(needs.ring && needs.token_hashes && needs.text_hashes);
         // Under a view that names boundaries the prefix ring keys at the
-        // deepest one a request reaches, which this build does not carry.
+        // deepest one a request reaches, and asks for the same.
         let levelled = doc(
             r#"{"apiVersion":"smg.policy/v1","view":{"boundaries":[256,1024]},"profiles":{"p":{"score":[{"consistent-hash":{"prefix_tokens":512}}],"pick":"best"}}}"#,
         );
-        assert_eq!(
-            not_in_build(&levelled),
-            (
-                "profiles.p.score[0].consistent-hash".to_string(),
-                "the consistent-hash boundary levels"
-            )
-        );
-        // A ring with no prefix form reads no boundary and builds there.
+        let needs = levelled.validate().expect("validates").needs();
+        assert!(needs.ring && needs.token_hashes && needs.text_hashes);
+        // A ring with no prefix form reads no boundary and asks for no
+        // hashes there.
         let plain = doc(
             r#"{"apiVersion":"smg.policy/v1","view":{"boundaries":[256,1024]},"profiles":{"p":{"score":[{"consistent-hash":{"bounded_load":{"factor":1.5}}}],"pick":"best"}}}"#,
         );
-        assert!(plain.validate().expect("validates").needs().ring);
+        let needs = plain.validate().expect("validates").needs();
+        assert!(needs.ring && !needs.token_hashes && !needs.text_hashes);
     }
 
     /// The prefix depth is held to the view that carries the hashes: at
@@ -4685,6 +4859,36 @@ mod tests {
         }
         assert_eq!(refused(view, 63), under);
         assert_eq!(refused(view, 320), over);
+        // Under a prefix key each of the view's boundaries is held to the
+        // same two edges.
+        let boundary = |boundaries: &str| {
+            let view = format!(r#"{{"boundaries":{boundaries}}}"#);
+            match spec(&view, 256).validate() {
+                Err(SpecError::BadField { path, reason, .. }) => (path, reason),
+                other => panic!("{boundaries}: validated as {other:?}"),
+            }
+        };
+        assert!(spec(r#"{"boundaries":[16,4096,4111]}"#, 256)
+            .validate()
+            .is_ok());
+        assert_eq!(
+            boundary("[8,64]"),
+            (
+                "view.boundaries[0]".to_string(),
+                "at least one block of view.block_size under a consistent-hash prefix key"
+            )
+        );
+        assert_eq!(
+            boundary("[64,4112]"),
+            (
+                "view.boundaries[1]".to_string(),
+                "at most view.max_block_hashes blocks of view.block_size under a consistent-hash prefix key"
+            )
+        );
+        // A view that no prefix key reads keeps such boundaries.
+        assert!(spec_with_view(r#"{"boundaries":[8,4112]}"#)
+            .validate()
+            .is_ok());
     }
 
     #[test]

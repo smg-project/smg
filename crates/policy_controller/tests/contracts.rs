@@ -164,6 +164,7 @@ fn request_record() -> &'static [&'static str] {
             seed,
             block_size,
             now_micros,
+            pinned_at,
             affinity,
             named,
             model_fingerprint,
@@ -197,7 +198,8 @@ fn constraints_record() -> &'static [&'static str] {
             excluded,
             wire_modes,
             overload_lifted,
-            subset_hint
+            subset_hint,
+            stalled
         }
     )
 }
@@ -629,7 +631,13 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
             record: request_record(),
             // The affinity column rides the request in the crate; the wire
             // carries each entry in its candidate.
-            host_only: &["now_micros", "affinity", "named", "model_fingerprint"],
+            host_only: &[
+                "now_micros",
+                "pinned_at",
+                "affinity",
+                "named",
+                "model_fingerprint",
+            ],
             wire_only: &["prompt_text"],
             wire: &[
                 ("model", Type::String),
@@ -658,7 +666,7 @@ fn proto_mirrors() -> Vec<ProtoMirror> {
         ProtoMirror {
             message: "Constraints",
             record: constraints_record(),
-            host_only: &[],
+            host_only: &["stalled"],
             wire_only: &[],
             wire: &[
                 ("excluded", Type::Fixed64),
@@ -858,7 +866,13 @@ fn wit_mirrors() -> Vec<WitMirror> {
         WitMirror {
             record: "request",
             crate_record: request_record(),
-            host_only: &["now_micros", "affinity", "named", "model_fingerprint"],
+            host_only: &[
+                "now_micros",
+                "pinned_at",
+                "affinity",
+                "named",
+                "model_fingerprint",
+            ],
             before: &[],
             beside: &[],
         },

@@ -8,7 +8,7 @@ use super::{
     KvEvent, KvEventSink, LeaseRecord, LeaseRefused, LeaseState, LeasesStore, LoadSink, LoadSource,
     MembershipChange, MembershipTail, MemoryStore, Pin, PollMode, ReservationKind,
     ReservationStore, ResyncReason, SequenceHash, SessionsStore, Signals, SnapshotChunk,
-    StoredBlock, WorkerFacts, WorkerPatch, WorkerStatus, WorkersStore,
+    StoredBlock, VetoWrite, WorkerFacts, WorkerPatch, WorkerStatus, WorkersStore,
 };
 use crate::{
     lease::{Lease, LeaseId, Membership, Outcome, ReleaseReason, Side, TransportClass},
@@ -1318,4 +1318,78 @@ fn the_identity_rule_reads_a_key_through_its_fingerprint() {
         "the wrapper and the rule agree"
     );
     assert_ne!(identity_of(0, 0), WorkerId(0), "an id is never 0");
+}
+
+#[test]
+fn a_noted_veto_is_written_only_while_its_note_stands() {
+    let store = MemoryStore::new();
+    let now = Instant::now();
+    let (first, second) = (now + Duration::from_secs(30), now + Duration::from_secs(60));
+    let g = GatewayId(1);
+    let w = ready(&store, "http://a:8000");
+
+    // No note behind the write: written as the plain door writes it.
+    let written = store.gateway_veto_noted(g, w, Some(first), false, now);
+    assert_eq!(written, VetoWrite::Written);
+    assert!(store.vetoed(g, w, now));
+    // The note's end stands in the store: the later end is written.
+    let written = store.gateway_veto_noted(g, w, Some(second), true, now);
+    assert_eq!(written, VetoWrite::Written);
+    assert!(store.vetoed(g, w, first), "the later end is shown");
+
+    // The row leaves and comes back under the same id, and its vetoes left
+    // with it. A write that says its note stands writes nothing: the row
+    // registered again takes no end of the row before it.
+    let revision = WorkersStore::get(&store, w).expect("the row").revision;
+    WorkersStore::remove(&store, w, revision).expect("removed");
+    assert_eq!(ready(&store, "http://a:8000"), w, "the same id");
+    for until in [Some(second), None] {
+        let written = store.gateway_veto_noted(g, w, until, true, now);
+        assert_eq!(written, VetoWrite::Left);
+    }
+    assert!(!store.vetoed(g, w, now));
+    assert_eq!(store.health_entries(), 0);
+    // With no note behind it the same end is the gateway's word of now,
+    // and a clear behind a note that stands lifts it.
+    let written = store.gateway_veto_noted(g, w, Some(second), false, now);
+    assert_eq!(written, VetoWrite::Written);
+    assert!(store.vetoed(g, w, now));
+    let written = store.gateway_veto_noted(g, w, None, true, now);
+    assert_eq!(written, VetoWrite::Written);
+    assert!(!store.vetoed(g, w, now));
+
+    // A worker without a row: a veto writes nothing, a clear is taken.
+    let none = WorkerId(7);
+    let written = store.gateway_veto_noted(g, none, Some(first), false, now);
+    assert_eq!(written, VetoWrite::NoRow);
+    let written = store.gateway_veto_noted(g, none, None, false, now);
+    assert_eq!(written, VetoWrite::Written);
+    assert_eq!(store.health_entries(), 0);
+}
+
+#[test]
+fn a_dropped_gateway_takes_its_vetoes_and_completed_dispatches_and_no_other_gateways() {
+    let store = MemoryStore::new();
+    let now = Instant::now();
+    let until = now + Duration::from_secs(60);
+    let (g1, g2) = (GatewayId(1), GatewayId(2));
+    let a = ready(&store, "http://a:8000");
+    let b = ready(&store, "http://b:8000");
+    for gateway in [g1, g2] {
+        store.gateway_veto(gateway, a, Some(until));
+        HealthSink::completed(&store, gateway, b, TransportClass::Ok, now);
+    }
+    store.gateway_veto(g1, b, Some(until));
+    assert_eq!(store.health_entries(), 5);
+
+    assert_eq!(store.drop_gateway(g1), 0, "it held no lease");
+    assert!(!store.vetoed(g1, a, now) && !store.vetoed(g1, b, now));
+    assert!(!store.completed_ok_since(g1, b, now));
+    // The other gateway's stand.
+    assert!(store.vetoed(g2, a, now));
+    assert!(store.completed_ok_since(g2, b, now));
+    assert_eq!(store.health_entries(), 2);
+    // A gateway that holds nothing is dropped as cleanly.
+    assert_eq!(store.drop_gateway(g1), 0);
+    assert_eq!(store.health_entries(), 2);
 }

@@ -438,7 +438,10 @@ async fn signals() {
     let term = pending::<()>();
     let interrupt = async {
         if let Err(error) = tokio::signal::ctrl_c().await {
+            #[cfg(unix)]
             warn!(%error, "no SIGINT handler; SIGTERM alone stops the controller");
+            #[cfg(not(unix))]
+            warn!(%error, "no interrupt handler; the controller serves until it is killed");
             pending::<()>().await;
         }
     };

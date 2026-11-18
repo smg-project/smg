@@ -3,8 +3,12 @@
 //! of 64 and of 512 rows, a decision over rows with a credit held in the
 //! least-load tally, and a pair decision allocate nothing (design 4.4: a
 //! scorer or picker allocates nothing per decision; the host keeps one scratch
-//! per thread so the framework allocates nothing after the first). A separate
-//! executable, so it can declare the counting allocator the pins need.
+//! per thread so the framework allocates nothing after the first). The
+//! store's pins stand beside them: a build from the store allocates nothing
+//! after the first, and two membership writes are held to each other, a
+//! write that moves an offer to one that moves none and a registration into
+//! 512 workers to one into 8. A separate executable, so it can declare the
+//! counting allocator the pins need.
 
 #![expect(clippy::expect_used, reason = "tests that stop on a broken setup")]
 
@@ -15,8 +19,8 @@ use std::time::{Duration, Instant};
 use common::counting_alloc::{calls, Counting};
 use smg_policy_controller::{
     store::{
-        Ask, GatewayId, LoadSink, LoadSource, MemoryStore, PairBuffers, PairingDescriptor,
-        ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore, PUBLISH_WINDOW,
+        Ask, GatewayId, HealthSink, LoadSink, LoadSource, MemoryStore, PairBuffers,
+        PairingDescriptor, ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore, PUBLISH_WINDOW,
     },
     Candidate, Constraints, Engine, Health, Lease, Lifecycle, LoadRow, PairPools, PolicySpec,
     PoolFacts, RequestFacts, Role, Scratch, Side, SignalSource, Target, WireModes, WorkerId,
@@ -395,9 +399,11 @@ fn a_pair_build_with_its_table_allocates_nothing_after_the_first() {
             wire_modes: WireModes::GRPC,
             models: vec!["m".to_string()],
             dp_size: 1,
-            pairing: transport.map(|transport| PairingDescriptor {
-                transport: Some(transport.to_string()),
-                ..PairingDescriptor::default()
+            pairing: transport.map(|transport| {
+                Box::new(PairingDescriptor {
+                    transport: Some(transport.to_string()),
+                    ..PairingDescriptor::default()
+                })
             }),
             ..WorkerFacts::default()
         });
@@ -488,7 +494,7 @@ fn a_write_that_moves_an_offer_allocates_what_a_write_that_moves_none_does() {
 }
 
 #[test]
-fn a_registration_into_a_standing_pool_allocates_its_list_once() {
+fn a_registrations_allocations_do_not_follow_the_fleet() {
     // A membership write walks every member into its pool's list. A
     // standing pool's list starts at the pool's last length and one more,
     // so what a registration allocates does not follow the fleet: one into
@@ -557,4 +563,43 @@ fn index_keys_that_pass_add_no_allocation_to_a_validation() {
         allocations
     };
     assert_eq!(allocations(2_000), allocations(1_000));
+}
+
+#[test]
+fn a_lent_view_from_the_store_after_the_first_allocates_nothing() {
+    for n in [8usize, 64, 512] {
+        let (store, ids, opened) = store_of(n);
+        let asker = GatewayId(1);
+        store.gateway_veto(asker, ids[1], Some(opened + Duration::from_secs(3_600)));
+        let mut out = ViewBuffers::default();
+        for affinity in [false, true] {
+            let ask = Ask {
+                gateway: asker,
+                now: opened + Duration::from_secs(1),
+                pinned: Some(ids[0]),
+                affinity,
+            };
+            // The first view sizes the host's buffers: the mask and the
+            // column.
+            store.with_world(|world| {
+                let first = world.view("m", Role::Single, &ask, false, &mut out);
+                assert!(first.is_some());
+            });
+            let (read, allocations) = allocations_during(|| {
+                store.with_world(|world| {
+                    let view = world
+                        .view("m", Role::Single, &ask, false, &mut out)
+                        .expect("the pool");
+                    let (rows, column) = (view.candidates.len(), view.affinity.len());
+                    (rows, view.stalled.len(), view.pinned_at != 0, column)
+                })
+            });
+            assert_eq!(read, (n, 1, true, if affinity { n } else { 0 }));
+            assert_eq!(
+                allocations, 0,
+                "a lent view of {n} rows allocated (affinity {affinity})"
+            );
+        }
+        assert!(out.candidates.is_empty(), "a lent view copies no row");
+    }
 }

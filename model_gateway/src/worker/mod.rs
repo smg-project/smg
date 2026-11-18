@@ -5,6 +5,7 @@ pub mod health;
 pub mod identity;
 pub mod kv;
 pub mod load;
+pub mod metrics;
 pub mod pd;
 pub(crate) mod periodic_task;
 pub mod registry;

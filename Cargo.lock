@@ -5796,10 +5796,13 @@ dependencies = [
 name = "policy-controller-example"
 version = "0.1.0"
 dependencies = [
+ "mock-worker",
  "serde_yaml",
+ "smg-grpc-client",
  "smg-policy-controller",
  "tikv-jemallocator",
  "tokio",
+ "tonic",
 ]
 
 [[package]]
@@ -8296,9 +8299,11 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "bitflags 2.13.2",
+ "dashmap",
  "http",
  "openssl",
  "reqwest 0.13.4",
+ "rustc-hash 2.1.3",
  "rustls",
  "schemars 1.2.2",
  "serde",

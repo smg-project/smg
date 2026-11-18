@@ -29,10 +29,18 @@
 //! blocks the request was hashed by, text windows at four characters a token
 //! under the text kind. A request that carries no whole block has no key,
 //! and the tokens past a request's last whole block are not in its key.
+//!
+//! Under the view's boundaries the prefix is keyed at the deepest boundary
+//! the request reaches, and the form's depth serves a request that reaches
+//! none. A request reaches a boundary by carrying its last whole block. With
+//! a bounded-load rule an owner passed over at one boundary hands the
+//! request to the owner at the next boundary down, so a prompt that grew
+//! past a loaded worker still lands where its head is held.
 
 use std::{
     cell::RefCell,
     collections::VecDeque,
+    mem,
     time::{Duration, Instant},
 };
 
@@ -305,15 +313,81 @@ fn prefix_key(tokens: u32, gates: Gates, facts: &RequestFacts<'_>) -> u64 {
         .map_or(0, |last| facts.block_hashes[last])
 }
 
+/// The prefix form of the ring: how a request with no routing key is keyed.
+#[derive(Debug)]
+struct Prefix {
+    /// The depth in tokens such a request is keyed at when it reaches no
+    /// boundary.
+    tokens: u32,
+    /// The gates that hold the view's block size.
+    gates: Gates,
+    /// The view's boundaries in tokens, ascending.
+    boundaries: Box<[u32]>,
+}
+
+impl Prefix {
+    /// The request's prefix at `boundary`, where it reaches it: the hash of
+    /// the boundary's last whole block. A request reaches a boundary by
+    /// carrying that block.
+    fn at(&self, boundary: u32, facts: &RequestFacts<'_>) -> Option<u64> {
+        let blocks = self.gates.whole_blocks(boundary, facts) as usize;
+        facts.block_hashes.get(blocks.checked_sub(1)?).copied()
+    }
+}
+
+/// The keys a decision is tried at, in order: a routing key alone, or under
+/// the prefix form the request's prefix at each boundary it reaches, the
+/// deepest first, and at the form's depth when it reaches none. A hash of
+/// zero is no key. One decision walks them, and only past a passed owner,
+/// so the walk reads a boundary when its turn comes and holds no list.
+struct Keys<'a> {
+    facts: &'a RequestFacts<'a>,
+    /// The routing key until it is handed out, `0` for none.
+    routing: u64,
+    /// The prefix form until its keys are out; none under a routing key.
+    prefix: Option<&'a Prefix>,
+    /// The form's boundaries not read yet, the deepest last.
+    below: &'a [u32],
+    /// Whether the request reached a boundary read so far.
+    reached: bool,
+}
+
+impl Iterator for Keys<'_> {
+    type Item = u64;
+
+    fn next(&mut self) -> Option<u64> {
+        if self.routing != 0 {
+            return Some(mem::take(&mut self.routing));
+        }
+        let prefix = self.prefix?;
+        while let Some((&boundary, below)) = self.below.split_last() {
+            self.below = below;
+            if let Some(key) = prefix.at(boundary, self.facts) {
+                self.reached = true;
+                if key != 0 {
+                    return Some(key);
+                }
+            }
+        }
+        self.prefix = None;
+        if self.reached {
+            return None;
+        }
+        Some(prefix_key(prefix.tokens, prefix.gates, self.facts)).filter(|&key| key != 0)
+    }
+}
+
 /// The consistent-hash scorer: the ring owner of the decision's key first,
 /// the ring's next members after it, every other survivor at zero; a keyless
 /// decision scores every survivor equal, so the profile's next stage places
 /// it, or the picker's draw. With a bounded-load rule an owner whose
 /// in-flight count is past both `factor` times the survivors' mean and
 /// `abs_margin` over it, the mean counting the request being placed, is
-/// passed over: the decision is scored as a keyless one. The ring's next
-/// members follow an owner that keeps its key, and they take the key of an
-/// owner that is no survivor, a worker that is down or was tried.
+/// passed over. A prefix keyed at a boundary is then tried at the next
+/// boundary down, and once no owner keeps the key the decision is scored as
+/// a keyless one. The ring's next members follow an owner that keeps its
+/// key, and they take the key of an owner that is no survivor, a worker that
+/// is down or was tried.
 ///
 /// The owner must be among the rows scored, so the scorer answers for the
 /// pool whole and never row by row ([`Scorer::row_wise`]): a profile that
@@ -323,9 +397,8 @@ pub struct ConsistentHash {
     /// `(factor, abs_margin)` of the bounded-load rule, when the spec writes
     /// one.
     bounded: Option<(f64, u32)>,
-    /// The prefix form: the depth in tokens a request with no routing key
-    /// is keyed at, and the gates that hold the view's block size.
-    prefix: Option<(u32, Gates)>,
+    /// The prefix form, for a request with no routing key.
+    prefix: Option<Prefix>,
     ring: RwLock<Ring>,
 }
 
@@ -340,11 +413,16 @@ impl ConsistentHash {
     }
 
     /// The prefix form: a request with no routing key is keyed by its
-    /// prefix, the hash of its last whole block at or under `tokens`, at the
-    /// block size `gates` reads for the request.
+    /// prefix, at the block size `gates` reads for the request. The key is
+    /// the hash of its last whole block at the deepest of `boundaries` it
+    /// reaches, and at or under `tokens` when it reaches none.
     #[must_use]
-    pub fn keyed_by_prefix(mut self, tokens: u32, gates: Gates) -> Self {
-        self.prefix = Some((tokens, gates));
+    pub fn keyed_by_prefix(mut self, tokens: u32, gates: Gates, boundaries: &[u32]) -> Self {
+        self.prefix = Some(Prefix {
+            tokens,
+            gates,
+            boundaries: boundaries.into(),
+        });
         self
     }
 
@@ -368,12 +446,18 @@ impl ConsistentHash {
         .unwrap_or(false)
     }
 
-    /// The decision's key, `0` for none: the routing key, and under the
-    /// prefix form the request's prefix where it carries no routing key.
-    fn key_of(&self, facts: &RequestFacts<'_>) -> u64 {
-        match (facts.session_key.hash, self.prefix) {
-            (0, Some((tokens, gates))) => prefix_key(tokens, gates, facts),
-            (key, _) => key,
+    /// The keys the decision is tried at, in order; none for a keyless one.
+    /// A routing key stands alone, and under the prefix form a request that
+    /// carries none is tried at its prefix keys.
+    fn keys<'a>(&'a self, facts: &'a RequestFacts<'_>) -> Keys<'a> {
+        let routing = facts.session_key.hash;
+        let prefix = self.prefix.as_ref().filter(|_| routing == 0);
+        Keys {
+            facts,
+            routing,
+            prefix,
+            below: prefix.map(|prefix| &*prefix.boundaries).unwrap_or_default(),
+            reached: false,
         }
     }
 
@@ -454,10 +538,11 @@ impl Scorer for ConsistentHash {
         out: &mut [f32],
     ) -> TieBand {
         out.fill(0.0);
-        let key = self.key_of(facts);
-        if key == 0 || kept.is_empty() {
-            return TieBand::NORMALIZED;
-        }
+        let mut keys = self.keys(facts);
+        let first = match keys.next() {
+            Some(key) if !kept.is_empty() => key,
+            _ => return TieBand::NORMALIZED,
+        };
         SLOTS.with(|slots| {
             let mut slots = slots.borrow_mut();
             let mut ring = self.ring.read();
@@ -478,7 +563,7 @@ impl Scorer for ConsistentHash {
                 ring = self.ring.read();
                 Self::fill(&ring, candidates, kept, &mut slots);
             }
-            if let Some((factor, margin)) = self.bounded {
+            let bound = self.bounded.map(|(factor, margin)| {
                 // Both margins over the mean, the request being placed
                 // counted in it: the larger of the two is the bound. The
                 // product is taken as written, in 64-bit floats: an owner
@@ -488,23 +573,33 @@ impl Scorer for ConsistentHash {
                     .map(|&k| u64::from(candidates[k as usize].in_flight))
                     .sum();
                 let mean = (total as f64 + 1.0) / kept.len() as f64;
-                let bound = (mean * factor).max(mean + f64::from(margin));
-                if Self::passed_over(&ring, key, candidates, kept, &slots, bound) {
-                    return;
+                (mean * factor).max(mean + f64::from(margin))
+            });
+            // The first key whose owner keeps it: with no rule, the first.
+            let mut key = Some(first);
+            if let Some(bound) = bound {
+                while let Some(tried) = key {
+                    if !Self::passed_over(&ring, tried, candidates, kept, &slots, bound) {
+                        break;
+                    }
+                    key = keys.next();
                 }
             }
-            Self::rank(&ring, key, kept.len(), &mut slots, out);
+            if let Some(key) = key {
+                Self::rank(&ring, key, kept.len(), &mut slots, out);
+            }
         });
         TieBand::NORMALIZED
     }
 
     fn needs(&self) -> Needs {
-        // The prefix form reads the request's block hashes, in the kind the
-        // host hashes by.
+        // The prefix form reads the request's block hashes in the kind the
+        // host hashes by: over its token ids, or over windows of its text.
         let hashes = self.prefix.is_some();
         Needs {
             ring: true,
             token_hashes: hashes,
+            text: hashes,
             text_hashes: hashes,
             ..Needs::default()
         }
@@ -937,7 +1032,7 @@ mod tests {
     }
 
     fn prefixed(tokens: u32) -> ConsistentHash {
-        ConsistentHash::new(None).keyed_by_prefix(tokens, Gates::default())
+        ConsistentHash::new(None).keyed_by_prefix(tokens, Gates::default(), &[])
     }
 
     #[test]
@@ -1198,8 +1293,141 @@ mod tests {
     #[test]
     fn the_prefix_form_declares_the_request_s_hashes() {
         let needs = prefixed(256).needs();
-        assert!(needs.ring && needs.token_hashes && needs.text_hashes);
+        assert!(needs.ring && needs.token_hashes && needs.text && needs.text_hashes);
         let plain = ConsistentHash::new(None).needs();
-        assert!(plain.ring && !plain.token_hashes && !plain.text_hashes);
+        assert!(plain.ring && !plain.token_hashes && !plain.text && !plain.text_hashes);
+    }
+
+    /// The prefix form at a depth of 128 tokens under the boundaries 64 and
+    /// 256.
+    fn levelled(rule: Option<&BoundedLoadParams>) -> ConsistentHash {
+        ConsistentHash::new(rule).keyed_by_prefix(128, Gates::default(), &[64, 256])
+    }
+
+    fn keys_of(scorer: &ConsistentHash, facts: &RequestFacts<'_>) -> Vec<u64> {
+        scorer.keys(facts).collect()
+    }
+
+    #[test]
+    fn a_request_hashed_as_deep_as_its_generation_reads_keeps_its_boundary_keys() {
+        use crate::{
+            spec::{AppliedSpec, PolicySpec},
+            view::HashKind,
+        };
+        let document: PolicySpec = serde_json::from_str(
+            r#"{"apiVersion":"smg.policy/v1","view":{"boundaries":[64,256]},"profiles":{"p":{"score":[{"consistent-hash":{"prefix_tokens":128}}],"pick":"best"}}}"#,
+        )
+        .expect("a well-formed document");
+        let applied = AppliedSpec::validate(&document).expect("the document validates");
+        let scorer = levelled(None);
+        let hashes: Vec<u64> = (1..=300).collect();
+        for (hash_kind, block_size) in [
+            (HashKind::Token, 0),
+            (HashKind::Token, 8),
+            (HashKind::Token, 64),
+            (HashKind::Text, 0),
+            (HashKind::Text, 64),
+        ] {
+            let read = applied.block_hashes_read(hash_kind, block_size);
+            let handed = |count: usize| RequestFacts {
+                block_hashes: &hashes[..count],
+                hash_kind,
+                block_size,
+                ..RequestFacts::default()
+            };
+            // Both boundaries' keys, as the whole list gives them: the
+            // blocks a host is told to hash give the same two, and one
+            // block fewer loses the deepest.
+            let keys = keys_of(&scorer, &handed(hashes.len()));
+            assert_eq!(keys.len(), 2, "{hash_kind:?} by {block_size}");
+            assert_eq!(
+                keys_of(&scorer, &handed(read)),
+                keys,
+                "{hash_kind:?} by {block_size}"
+            );
+            assert_ne!(
+                keys_of(&scorer, &handed(read - 1)),
+                keys,
+                "{hash_kind:?} by {block_size}"
+            );
+        }
+    }
+
+    #[test]
+    fn under_boundaries_a_prefix_is_keyed_at_each_one_it_reaches_the_deepest_first() {
+        let hashes: Vec<u64> = (1..=20).collect();
+        let scorer = levelled(None);
+        // Blocks of 16 tokens: the boundaries end with the 16th block and
+        // with the 4th. A request that reaches both is tried at both, and
+        // one that reaches the shallower alone is tried there.
+        assert_eq!(keys_of(&scorer, &hashed(&hashes)), [16, 4]);
+        assert_eq!(keys_of(&scorer, &hashed(&hashes[..15])), [4]);
+        assert_eq!(keys_of(&scorer, &hashed(&hashes[..4])), [4]);
+        // A request that reaches no boundary is keyed at the form's depth,
+        // at its own last whole block when it is shorter. A request that
+        // reaches a boundary is not keyed at the depth: 128 tokens end with
+        // the 8th block.
+        assert_eq!(keys_of(&scorer, &hashed(&hashes[..3])), [3]);
+        assert!(keys_of(&scorer, &hashed(&[])).is_empty());
+        // A boundary under one block is reached by no request.
+        let thin = ConsistentHash::new(None).keyed_by_prefix(128, Gates::default(), &[8, 64]);
+        assert_eq!(keys_of(&thin, &hashed(&hashes)), [4]);
+        // A routing key stands alone, and without the form nothing else
+        // keys a request.
+        let routed = RequestFacts {
+            block_hashes: &hashes,
+            ..keyed(5)
+        };
+        assert_eq!(keys_of(&scorer, &routed), [routed.session_key.hash]);
+        assert!(keys_of(&ConsistentHash::new(None), &hashed(&hashes)).is_empty());
+        // Under the text kind a boundary counts in windows at four
+        // characters a token: 64 tokens end with the 16th window, and 256
+        // with the 64th, which this request does not carry.
+        let text = RequestFacts {
+            hash_kind: crate::view::HashKind::Text,
+            ..hashed(&hashes)
+        };
+        assert_eq!(keys_of(&scorer, &text), [16]);
+    }
+
+    #[test]
+    fn an_owner_passed_over_hands_the_key_to_the_next_boundary_down_and_then_to_nobody() {
+        let pool: Vec<Candidate> = (0..4).map(|i| candidate(i, 0)).collect();
+        let plain = ConsistentHash::new(None);
+        let ranks = |key: u64| scored(&plain, &keyed(key), &pool);
+        // Two block hashes that two workers own: the request's 16th block
+        // and its 4th.
+        let deep = 7;
+        let shallow = (8..)
+            .find(|&key| leader(&ranks(key)) != leader(&ranks(deep)))
+            .expect("a key another worker owns");
+        let (deep_owner, shallow_owner) = (leader(&ranks(deep)), leader(&ranks(shallow)));
+        let mut hashes = [100u64; 16];
+        hashes[15] = deep;
+        hashes[3] = shallow;
+        let under = |scorer: &ConsistentHash, deep_load: u32, shallow_load: u32| {
+            let mut pool = pool.clone();
+            pool[deep_owner].in_flight = deep_load;
+            pool[shallow_owner].in_flight = shallow_load;
+            scored(scorer, &hashed(&hashes), &pool)
+        };
+        let rule = BoundedLoadParams {
+            factor: Some(1.25),
+            abs_margin: Some(10),
+        };
+        let bounded = levelled(Some(&rule));
+        // Under the bound the deeper boundary's owner keeps the key, and the
+        // ranks are that key's.
+        assert_eq!(under(&bounded, 0, 0), ranks(deep));
+        assert_eq!(under(&bounded, 13, 0), ranks(deep));
+        // Past it the request goes to the shallower boundary's owner, and
+        // the ranks are that key's.
+        assert_eq!(under(&bounded, 14, 0), ranks(shallow));
+        // Both owners past the bound: nobody is scored.
+        let nobody = under(&bounded, 30, 30);
+        assert!(nobody.iter().all(|&score| score == 0.0), "{nobody:?}");
+        // With no rule the deeper boundary's owner keeps the key whatever
+        // it holds.
+        assert_eq!(under(&levelled(None), 30, 30), ranks(deep));
     }
 }

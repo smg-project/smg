@@ -16,22 +16,20 @@ use super::{
     endpoint::Endpoint,
     metadata::DecodingLabels,
 };
-use crate::{
-    observability::metrics::Metrics,
-    worker::{
-        connection::{
-            engine::{ConnectorDefault, EngineConnection, EngineConnector, NoConnector},
-            http_client::LazyHttpClient,
-        },
-        health::{
-            circuit_breaker::{CircuitBreaker, CircuitBreakerConfig},
-            overload::OverloadThresholds,
-            resilience::ResolvedResilience,
-        },
-        pd::pairing::PdPairing,
-        registry::event::WorkerConnected,
-        Worker,
+use crate::worker::{
+    connection::{
+        engine::{ConnectorDefault, EngineConnection, EngineConnector, NoConnector},
+        http_client::LazyHttpClient,
     },
+    health::{
+        circuit_breaker::{CircuitBreaker, CircuitBreakerConfig},
+        overload::OverloadThresholds,
+        resilience::ResolvedResilience,
+    },
+    metrics::Metrics,
+    pd::pairing::PdPairing,
+    registry::event::WorkerConnected,
+    Worker,
 };
 
 /// Builder for creating BasicWorker instances with fluent API.
@@ -149,11 +147,7 @@ impl<D: ConnectorDefault> BasicWorkerBuilder<D> {
             builder = builder.circuit_breaker_config(config);
         }
         // The rebuild connects the way the live worker does.
-        if let Some(connector) = worker
-            .as_any()
-            .downcast_ref::<BasicWorker>()
-            .and_then(|basic| basic.engine_connector.clone())
-        {
+        if let Some(connector) = worker.engine_connector() {
             builder = builder.engine_connector(connector);
         }
         if let Some(timeout) = metadata.zmq_request_timeout {

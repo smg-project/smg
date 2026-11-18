@@ -20,14 +20,16 @@
 //! writes a publication derives nothing: it is one small object, a pointer
 //! per pool, and new rows for each pool a write was folded into.
 //!
-//! **A pair class is a fact of the rows.** A membership write derives each
-//! model's pair classes from what its prefills and decodes report
-//! ([`PairClasses`]) before any row is built: a worker's row carries its one
+//! **A pair class is a fact of the rows.** A model's pair classes come from
+//! what its prefills and decodes report ([`PairClasses`]), and a membership
+//! write holds them before any row is built: a worker's row carries its one
 //! class, and the model's table says which classes pair. The table names
 //! classes, never rows, so a pool with another gateway's host-local rows
-//! left out reads the same table. A write that moves no member and no
-//! member's offer carries the last write's classes and reads no member's
-//! facts for them.
+//! left out reads the same table. A write that moves one worker or its
+//! offer derives the classes for that worker alone, in the models it left
+//! and joined, from what the writer keeps of each model's derivation. A
+//! write that moves no member and no member's offer carries the last
+//! write's classes and reads no member's facts for them.
 //!
 //! A row in a pool is the candidate row itself. Its fixed fields are
 //! written when the membership's first world is built. Its moving facts
@@ -146,6 +148,10 @@ pub struct ViewBuffers {
     /// The affinity column: one entry per candidate under a profile that
     /// declared it, empty otherwise.
     pub affinity: Vec<AffinityFacts>,
+    /// The rows a veto of the asking gateway masks, by position, where the
+    /// view is a publication's own rows ([`World::view`]); empty where the
+    /// rows were written for the decision.
+    pub stalled: Vec<u32>,
 }
 
 /// The buffers a host keeps across pair decisions: both sides' views and
@@ -229,6 +235,31 @@ impl Built {
     }
 }
 
+/// One decision's view of a pool ([`World::view`]): its rows, and beside
+/// them what is the decision's own where no row carries it.
+#[derive(Clone, Copy, Debug)]
+pub struct PoolView<'a> {
+    /// The decision's candidate slice, in the pool's order: a row's index
+    /// is its position. A publication's own rows where the pool was lent,
+    /// the decision's written copy otherwise.
+    pub candidates: &'a [Candidate],
+    /// The rows a veto of the asking gateway masks at the decision's
+    /// instant, by position, in order: what
+    /// [`Constraints::stalled`](crate::Constraints::stalled) takes. Empty
+    /// where the rows carry their stalled bits.
+    pub stalled: &'a [u32],
+    /// One more than the position of the pinned worker's row: what
+    /// [`RequestFacts::pinned_at`](crate::RequestFacts::pinned_at) takes.
+    /// Zero where no pinned worker is in the pool and where the rows carry
+    /// their session bits.
+    pub pinned_at: u32,
+    /// The affinity column: one entry a row under a profile that declared
+    /// it, empty otherwise.
+    pub affinity: &'a [AffinityFacts],
+    /// What the view read beside the rows.
+    pub built: Built,
+}
+
 /// One pool's shape: what a membership write derives of it and no
 /// publication changes.
 struct PoolShape {
@@ -239,8 +270,10 @@ struct PoolShape {
     locals: Box<[(u32, GatewayId)]>,
     /// The pair classes of the pool's model, on its prefill pool where the
     /// model has a decode too: a pair build reads them by the one lookup
-    /// that finds its two pools. Counted: a membership write that moves no
-    /// offer hands them to the shape it derives ([`Classes::Carry`]).
+    /// that finds its two pools. Counted: a membership write hands them to
+    /// the shape it derives where they stand, a write that moves no offer
+    /// ([`Classes::Carry`]) and a written worker's derive that leaves them
+    /// as they were ([`Classes::Written`]).
     pairs: Option<Arc<PairClasses>>,
 }
 
@@ -455,9 +488,10 @@ fn with_veto(
 
 /// The gateways' vetoes as the writer keeps them: per gateway its vetoed
 /// workers by id, each until an instant. Replaced whole at each of the
-/// three writes that change them, all rare: a veto's write, a membership
-/// write that takes a departed worker's vetoes with its row, and a window's
-/// publication that drops a veto past its end. A world carries what is
+/// four writes that change them, all rare: a veto's write, a gateway's
+/// leaving that takes its whole list, a membership write that takes a
+/// departed worker's vetoes with its row, and a window's publication that
+/// drops a veto past its end. A world carries what is
 /// derived from them: each pool's runs by gateway ([`PoolVetoes`]).
 #[derive(Debug, Default)]
 struct Vetoes {
@@ -679,6 +713,7 @@ impl World {
         let Some(index) = self.index(model, role) else {
             out.candidates.clear();
             out.affinity.clear();
+            out.stalled.clear();
             return None;
         };
         self.build_at(index, ask, out)
@@ -692,7 +727,22 @@ impl World {
     fn build_at(&self, index: usize, ask: &Ask, out: &mut ViewBuffers) -> Option<Built> {
         out.candidates.clear();
         out.affinity.clear();
+        out.stalled.clear();
         let (rows, shape) = (self.rows.get(index)?, self.derived.pools.get(index)?);
+        Some(self.written(index, rows, shape, ask, out))
+    }
+
+    /// The pool at `index` copied into `out` and written for the decision:
+    /// [`World::build`] past its lookup, into buffers its caller cleared.
+    #[inline(always)]
+    fn written(
+        &self,
+        index: usize,
+        rows: &[Candidate],
+        shape: &PoolShape,
+        ask: &Ask,
+        out: &mut ViewBuffers,
+    ) -> Built {
         let now_micros = micros(self.origin, ask.now);
         for (from, to) in Segments::of(&shape.locals, ask.gateway, rows.len()) {
             out.candidates.extend_from_slice(&rows[from..to]);
@@ -727,7 +777,7 @@ impl World {
         // asked last, so no loop of the build holds the answer.
         let masked =
             own.is_some_and(|run| mask(run, ask.now, shape.locals.is_empty(), &mut out.candidates));
-        Some(Built {
+        Built {
             pool_size: out.candidates.len() as u32,
             membership_epoch: self.epoch,
             now_micros,
@@ -739,6 +789,96 @@ impl World {
                 0
             } else {
                 ask.gateway.0
+            },
+        }
+    }
+
+    /// One decision's view of the pool serving `model` in `role`; `None`,
+    /// with the buffers cleared, when no member serves it.
+    ///
+    /// Where every gateway reaches the pool whole, the view is the
+    /// publication's own rows, lent: nothing is written into a row, and
+    /// what [`World::build`] writes there stands beside the rows. A row's
+    /// position was published with it. The vetoes of the asking gateway
+    /// that stand at `ask.now` are handed as positions, in order, read from
+    /// its own run alone and by the build's rule: a veto past its end masks
+    /// nothing. The pinned worker's row is handed as one more than its
+    /// position. Under `ask.affinity` the column is filled as the build
+    /// fills it. A row's report age stays what the report carried when it
+    /// was recorded: the age at the decision is the decision's instant less
+    /// the row's sample instant, and no stage of this crate reads it.
+    ///
+    /// The rows are copied and written ([`World::build`]) where they cannot
+    /// be lent: in a pool that holds host-local rows, where the asking
+    /// gateway's positions are its own, and for a decision that asks for
+    /// `written` rows. A profile that shows its rows to a plugin
+    /// ([`Profile::scoped`](crate::Profile::scoped)) asks for them: a
+    /// plugin's view carries each row's bits and ages as the row's fields.
+    /// Both forms come back as one shape, so a caller hands the mask and
+    /// the pin on whichever rows it was given.
+    pub fn view<'a>(
+        &'a self,
+        model: &str,
+        role: Role,
+        ask: &Ask,
+        written: bool,
+        out: &'a mut ViewBuffers,
+    ) -> Option<PoolView<'a>> {
+        out.candidates.clear();
+        out.affinity.clear();
+        out.stalled.clear();
+        let index = self.index(model, role)?;
+        let (rows, shape) = (self.rows.get(index)?, self.derived.pools.get(index)?);
+        if written || !shape.locals.is_empty() {
+            let built = self.written(index, rows, shape, ask, out);
+            return Some(PoolView {
+                candidates: &out.candidates,
+                stalled: &[],
+                pinned_at: 0,
+                affinity: &out.affinity,
+                built,
+            });
+        }
+        let now_micros = micros(self.origin, ask.now);
+        // The asking gateway's run alone, by the build's rule.
+        let own = self
+            .vetoes
+            .get(index)
+            .and_then(|runs| run_of(runs, ask.gateway));
+        if let Some(run) = own {
+            let standing = run.vetoes.iter().filter(|veto| veto.until > ask.now);
+            out.stalled.extend(standing.map(|veto| veto.row));
+        }
+        // The search of the build's own pin, over the same rows.
+        let pinned_at = ask
+            .pinned
+            .and_then(|id| rows.binary_search_by_key(&id, |row| row.id).ok())
+            .map_or(0, |at| at as u32 + 1);
+        if ask.affinity {
+            let admitted = shape.admitted_micros.iter();
+            out.affinity.extend(admitted.map(|&admitted| AffinityFacts {
+                admitted_age_ms: age_ms(now_micros, admitted),
+                ..AffinityFacts::default()
+            }));
+        }
+        // A view a veto masks is the asking gateway's own list, as a copy
+        // a veto masks is.
+        let reach = if out.stalled.is_empty() {
+            0
+        } else {
+            ask.gateway.0
+        };
+        Some(PoolView {
+            candidates: rows,
+            stalled: &out.stalled,
+            pinned_at,
+            affinity: &out.affinity,
+            built: Built {
+                pool_size: rows.len() as u32,
+                membership_epoch: self.epoch,
+                now_micros,
+                generation: self.spec.generation(),
+                reach,
             },
         })
     }
@@ -927,7 +1067,7 @@ impl<'a> Pool<'a> for [Entry<'a>] {
             entry.row.id,
             facts.wire_modes,
             &facts.engine_kind,
-            facts.pairing.as_ref(),
+            facts.pairing.as_deref(),
         )
     }
 }
@@ -949,9 +1089,8 @@ pub(super) enum Classes {
         joined: Option<WorkerId>,
     },
     /// No member joined or left and no member's offer moved
-    /// ([`same_offer`]): the classes are the last write's, carried. A
-    /// derivation reads the written member's facts, so a write that moves
-    /// none of them pays for none.
+    /// ([`same_offer`]): the classes are the last write's, carried, and no
+    /// member's facts are read for them.
     Carry,
 }
 
@@ -1141,6 +1280,13 @@ pub(super) struct Writer {
     unlisted: Vec<Arc<[Candidate]>>,
     /// How many times a publication allocated a pool's rows.
     allocations: u64,
+    /// Every replaced world a reader still held when the cell let it go
+    /// ([`Self::replaced`]), until a publication finds no reader holding it
+    /// and lets it go. The cell holds the standing world and the writer
+    /// each of these, so a decision that drops the last reader's hold
+    /// frees nothing: not the world, its list of pools, its vetoes, its
+    /// derived tables nor its generation.
+    worlds: Vec<Arc<World>>,
     /// Every member's rows, sorted by worker id: a worker serving several
     /// models has a row in each model's pool.
     places: Vec<Place>,
@@ -1153,10 +1299,11 @@ pub(super) struct Writer {
     /// The generation every world is published under until the next is
     /// applied: the unbound one at the start.
     spec: Arc<AppliedSpec>,
-    /// The generation before the standing one, kept one apply longer: a
-    /// decider that lets go of the last world published under it frees no
-    /// engine, the next apply does. Its whole engine stays resident that
-    /// long, its session table included, as it stood when it was replaced.
+    /// The generation before the standing one, kept one apply longer: the
+    /// publication that lets go of the last world published under it
+    /// frees no engine, the next apply does. Its whole engine stays
+    /// resident that long, its session table included, as it stood when
+    /// it was replaced.
     retired: Option<Arc<AppliedSpec>>,
     /// The engines of the membership, as the overload verdict reads them.
     engines: Vec<EngineRows>,
@@ -1167,6 +1314,10 @@ pub(super) struct Writer {
     /// in them, so a write that judges no engine steps over them as it
     /// did.
     place_engines: Vec<u32>,
+    /// Each place's row among the engines' rows, in the places' order: a
+    /// rank's receipt stands at its first place's, found by no search.
+    /// Written with the receipts, and empty where none is kept.
+    place_slots: Vec<u32>,
     /// When each rank of a data-parallel engine was last heard: the
     /// receipt of its record on file, in microseconds from the origin,
     /// in the engine rows' order. Empty for a membership of single-rank
@@ -1208,6 +1359,7 @@ impl Writer {
             held: Vec::new(),
             unlisted: Vec::new(),
             allocations: 0,
+            worlds: Vec::new(),
             places: Vec::new(),
             vetoes: Arc::default(),
             pool_vetoes: Arc::default(),
@@ -1216,6 +1368,7 @@ impl Writer {
             engines: Vec::new(),
             engine_rows: Vec::new(),
             place_engines: Vec::new(),
+            place_slots: Vec::new(),
             heard: Vec::new(),
             sample_bound: None,
             judging: false,
@@ -1239,6 +1392,18 @@ impl Writer {
         })
     }
 
+    /// Take back the world the cell let go as its successor was shown. One
+    /// no reader holds is freed here, by the write, as a world always was;
+    /// one a reader holds is kept among `worlds`, so that reader's hold is
+    /// not the last. The cell's swap pays each reader's borrow of the
+    /// outgoing world into its count before it returns, so the count read
+    /// here is every reader's.
+    pub(super) fn replaced(&mut self, world: Arc<World>) {
+        if let Err(held) = Arc::try_unwrap(world) {
+            self.worlds.push(held);
+        }
+    }
+
     /// Publish every world from here on under `spec`, the first at once:
     /// the standing membership under the new generation. A number at or
     /// under the standing one is refused by naming the standing one, and
@@ -1258,8 +1423,9 @@ impl Writer {
     /// The generation this one replaces is kept until the next apply, and
     /// the one kept until now is handed back for the caller to let go
     /// outside the store's lock: an engine is freed by the thread that
-    /// applies, never by a decider dropping the last world of an old
-    /// generation, unless a decider holds a world across two applies.
+    /// applies, never by a decider. A world a decider holds across two
+    /// applies keeps its generation past the hand-back: the engine then
+    /// goes with that world, at the publication that lets it go.
     pub(super) fn apply<'a>(
         &mut self,
         spec: Arc<AppliedSpec>,
@@ -1513,31 +1679,30 @@ impl Writer {
         let Some(engine) = self.engine_at(place) else {
             return false;
         };
-        self.hear(engine, place, at);
+        self.hear(place, at);
         self.judged(engine, true)
     }
 
-    /// The member whose first place stands at `place`, a rank of
-    /// `engine`, was heard at `at`: the receipt its sample is aged from.
-    /// Kept for the ranks of a data-parallel engine, and only while an
-    /// engine has a threshold: a write that starts a judgment reads
-    /// every receipt again from the samples, a membership write in its
-    /// walk and an applied generation by [`Self::hear_again`].
-    pub(super) fn hear(&mut self, engine: u32, place: u32, at: Instant) {
+    /// The member whose first place stands at `place` was heard at `at`:
+    /// the receipt its sample is aged from, at the place's own row among
+    /// the engines' rows. Kept for the ranks of a data-parallel engine,
+    /// and only while an engine has a threshold: a write that starts a
+    /// judgment reads every receipt again from the samples, a membership
+    /// write in its walk and an applied generation by
+    /// [`Self::hear_again`].
+    pub(super) fn hear(&mut self, place: u32, at: Instant) {
         if self.heard.is_empty() || !self.judging {
             return;
         }
-        let (Some(rows), Some(place)) = (
-            self.engines.get(engine as usize),
-            self.places.get(place as usize),
-        ) else {
+        let Some(&slot) = self.place_slots.get(place as usize) else {
             return;
         };
-        let found = rows_of(&self.engine_rows, rows)
-            .iter()
-            .position(|row| row.rank && row.pool == place.pool && row.row == place.row);
-        let heard = found.and_then(|index| self.heard.get_mut(rows.at as usize + index));
-        if let Some(heard) = heard {
+        // A member's later place holds no receipt: its row is no rank's.
+        let row = self.engine_rows.get(slot as usize);
+        if !row.is_some_and(|row| row.rank) {
+            return;
+        }
+        if let Some(heard) = self.heard.get_mut(slot as usize) {
             *heard = micros(self.origin, at);
         }
     }
@@ -1660,7 +1825,14 @@ impl Writer {
         // with no veto standing neither collects nor sorts them.
         let standing = !self.vetoes.by_gateway.is_empty();
         let mut ids = Vec::new();
-        for member in members {
+        // The members in id order, by this write's one sort, each id beside
+        // its row: an id is one member, so every pool's entries, the ranks
+        // and the ids are pushed in order and nothing below sorts them. The
+        // sort moves an id and a reference, never a whole entry.
+        let mut members: Vec<(WorkerId, &'a WorkerRow)> =
+            members.map(|member| (member.id, member)).collect();
+        members.sort_unstable_by_key(|&(id, _)| id);
+        for (_, member) in members {
             if standing {
                 ids.push(member.id);
             }
@@ -1686,22 +1858,27 @@ impl Writer {
                 },
                 own: facts.overload,
             };
-            for (n, model) in facts.models.iter().enumerate() {
-                // A model listed twice is one pool's one row.
-                if facts.models[..n].contains(model) {
-                    continue;
-                }
-                let side = role_slot(facts.role);
+            let side = role_slot(facts.role);
+            for model in &facts.models {
                 match groups.get_mut(model.as_str()) {
-                    Some(sides) => sides[side].push(entry),
+                    // A model listed twice is one pool's one row. A member's
+                    // entry is the last of its side until the next member is
+                    // read, so an earlier listing is found there: no model
+                    // before this one is read again.
+                    Some(sides) => {
+                        let list = &mut sides[side];
+                        if list.last().is_none_or(|last| last.row.id != member.id) {
+                            list.push(entry);
+                        }
+                    }
                     None => {
                         // Each side takes room for its pool's last members
                         // and the one this write may add.
                         let before = self.derived.by_model.get(model.as_str());
-                        let standing = before.map_or([0; ROLES], |pools| {
+                        let room = before.map_or([0; ROLES], |pools| {
                             pools.map(|pool| self.derived.members(pool))
                         });
-                        let mut sides: [Vec<Entry<'a>>; ROLES] = standing.map(list_of);
+                        let mut sides: [Vec<Entry<'a>>; ROLES] = room.map(list_of);
                         sides[side].push(entry);
                         groups.insert(model.as_str().into(), sides);
                     }
@@ -1719,11 +1896,12 @@ impl Writer {
         let mut by_model = FxHashMap::default();
         let mut pools = Vec::new();
         for (model, mut sides) in groups {
-            // Every side in id order before a class is derived: the classes
-            // are numbered in it, and each row is built with its class.
-            for entries in &mut sides {
-                entries.sort_unstable_by_key(|entry| (entry.row.id, entry.row.dp_rank));
-            }
+            // Every side stands in id order, as the walk above pushed it,
+            // before a class is derived: the classes are numbered in it, and
+            // each row is built with its class.
+            debug_assert!(sides
+                .iter()
+                .all(|entries| entries.is_sorted_by(|a, b| a.row.id < b.row.id)));
             // The model's classes go on its prefill pool's shape: a model
             // that has classes has that pool.
             let carried = last.as_deref().and_then(|last| last.pairs(&model));
@@ -1734,7 +1912,15 @@ impl Writer {
                 if entries.is_empty() {
                     continue;
                 }
-                let rows: Vec<Candidate> = entries.iter().map(|entry| entry.row).collect();
+                // A row's position is published with it: a pool every
+                // gateway reaches whole is read where it stands.
+                let rows: Vec<Candidate> = (0u32..)
+                    .zip(&entries)
+                    .map(|(position, entry)| Candidate {
+                        position,
+                        ..entry.row
+                    })
+                    .collect();
                 let index = self.working.len() as u32;
                 self.places
                     .extend(entries.iter().enumerate().map(|(row, entry)| Place {
@@ -1790,6 +1976,7 @@ impl Writer {
         engines.clear();
         self.engine_rows.clear();
         self.place_engines.clear();
+        self.place_slots.clear();
         let carries = !silent.is_empty();
         let mut silenced = 0;
         let mut last = None;
@@ -1826,9 +2013,10 @@ impl Writer {
             // Ranks that share an engine do not stand together: each place
             // takes its engine, the engines' rows are counted and given
             // their room, then written in the places' order. The places
-            // and the ranks both stand by id, so a cursor finds a place's
-            // rank as the places pass.
-            ranked.sort_unstable_by_key(|&(id, ..)| id);
+            // and the ranks both stand by id, the ranks as the walk above
+            // pushed them, so a cursor finds a place's rank as the places
+            // pass.
+            debug_assert!(ranked.is_sorted_by(|a, b| a.0 < b.0));
             let mut of_group = vec![u32::MAX; by_key.len()];
             let mut engine = 0_u32;
             let mut next = 0;
@@ -1873,11 +2061,17 @@ impl Writer {
             self.heard.resize(rows as usize, 0);
             last = None;
             next = 0;
-            for (place, &engine) in self.places.iter().zip(&self.place_engines) {
+            self.place_slots.resize(self.places.len(), u32::MAX);
+            let placed = self.places.iter().zip(&self.place_engines);
+            for (index, (place, &engine)) in placed.enumerate() {
                 let Some(engine) = engines.get_mut(engine as usize) else {
                     continue;
                 };
-                let at = (engine.at + engine.len) as usize;
+                let slot = engine.at + engine.len;
+                if let Some(of_place) = self.place_slots.get_mut(index) {
+                    *of_place = slot;
+                }
+                let at = slot as usize;
                 let rank = last != Some(place.id);
                 if let Some(row) = self.engine_rows.get_mut(at) {
                     *row = EngineRow {
@@ -1905,9 +2099,10 @@ impl Writer {
             pools: pools.into_boxed_slice(),
         });
         // A worker's vetoes leave with its row, in this write's own hold:
-        // no publication shows the row without them.
+        // no publication shows the row without them. The ids stand in
+        // order as the walk above pushed them.
         if standing {
-            ids.sort_unstable();
+            debug_assert!(ids.is_sorted_by(|a, b| a < b));
             if let Some(vetoes) = self.vetoes.of_members(&ids) {
                 self.vetoes = Arc::new(vetoes);
             }
@@ -2121,6 +2316,21 @@ impl Writer {
         Some(self.publish())
     }
 
+    /// Lift every veto of `gateway` and publish at once: the gateway is
+    /// gone past its grace period. Every pool's runs are built again, as
+    /// for a membership write. `None` when the gateway held no veto.
+    #[must_use]
+    pub(super) fn drop_gateway(&mut self, gateway: GatewayId) -> Option<Arc<World>> {
+        if !self.vetoes.by_gateway.contains_key(&gateway) {
+            return None;
+        }
+        let mut by_gateway = self.vetoes.by_gateway.clone();
+        by_gateway.remove(&gateway);
+        self.vetoes = Arc::new(Vetoes { by_gateway });
+        self.derive_vetoes();
+        Some(self.publish())
+    }
+
     /// When the waiting folds are due: the end of the window the last
     /// publication opened; `None` when nothing waits, and for a window the
     /// clock cannot add.
@@ -2165,6 +2375,11 @@ impl Writer {
     /// still holds. A publication asks each held row's count once, and each
     /// pool with no spare to write over reads each unlisted row's length.
     fn publish(&mut self) -> Arc<World> {
+        // A world no reader holds any more is let go here, by a write, and
+        // before the rows are asked: what it alone listed is free for this
+        // publication.
+        self.worlds
+            .retain_mut(|world| Arc::get_mut(world).is_none());
         let unlisted = |rows: &mut Arc<[Candidate]>| Arc::get_mut(rows).is_some();
         self.unlisted.extend(self.held.extract_if(.., unlisted));
         let pools = self.working.iter_mut().zip(&mut self.published);

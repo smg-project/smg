@@ -222,6 +222,18 @@ class ShardTableTests(unittest.TestCase):
         self.assertFalse(filter_matches(filters["rust-multimodal"], "crates/tokenizer/src/lib.rs"))
         self.assertFalse(filter_matches(filters["rust-gateway"], "docs/README.md"))
 
+    def test_the_kv_filter_covers_the_source_the_policy_crates_test_reads(self):
+        # The policy controller's binary test holds its allocator settings to
+        # the gateway's constant, read from this file by path: a change there
+        # can change its result, so it runs the kv shard.
+        path = "model_gateway/src/observability/metrics.rs"
+        test = REPO / "crates" / "policy_controller" / "tests" / "binary.rs"
+        self.assertIn(f'"/../../{path}"', test.read_text())
+        filters = path_filters()
+        self.assertTrue(filter_matches(filters["rust-kv"], path), path)
+        # Only that file: the rest of the gateway changes no test of the shard.
+        self.assertFalse(filter_matches(filters["rust-kv"], "model_gateway/src/lib.rs"))
+
     def test_the_gateway_filter_covers_the_sources_its_integration_tests_read(self):
         # The metrics catalogue test walks these roots for recorder and family
         # names, and the dashboard test reads the chart: a change there can
@@ -372,6 +384,31 @@ class ShardTableTests(unittest.TestCase):
                 workspace["tikv-jemallocator"],
             )
             self.assertEqual(dev["tokio"]["version"], workspace["tokio"]["version"])
+            # The door case's dependencies: the mock engine by git from the
+            # crate's own source, the client's transport as the workspace
+            # names it, and the runtime features the example's manifest asks.
+            self.assertEqual(dev["mock-worker"], {"git": "file:///a/checkout"})
+            self.assertEqual(dev["tonic"], workspace["tonic"])
+            self.assertEqual(
+                dev["tokio"]["features"],
+                own_manifest["dev-dependencies"]["tokio"]["features"],
+            )
+            # The decide case's dependency: the engine's client by git from
+            # the crate's own source, which holds requests on the mock engine.
+            self.assertEqual(dev["smg-grpc-client"], {"git": "file:///a/checkout"})
+            # The crate's reference client, which asks the started binary its
+            # decisions: a feature the tests alone turn on, in the example's
+            # manifest and in the copy's.
+            client = {"git": "file:///a/checkout", "features": ["client"]}
+            self.assertEqual(dev["smg-policy-controller"], client)
+            ours = own_manifest["dev-dependencies"]["smg-policy-controller"]
+            self.assertEqual(ours["features"], ["client"])
+            # The release profile the stock controller is built with, without
+            # its per-package entries: a copy with none builds on cargo's
+            # default profile, not the stock build's full LTO in one unit.
+            release = tomllib.loads((REPO / "Cargo.toml").read_text())["profile"]["release"]
+            release.pop("package", None)
+            self.assertEqual(manifest["profile"], {"release": release})
             # The allocator's page setting, as the workspace's cargo
             # configuration holds it: without it an aarch64 build of the
             # copy runs on its build host's page size alone.

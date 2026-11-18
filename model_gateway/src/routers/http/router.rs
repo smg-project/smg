@@ -109,8 +109,9 @@ use crate::{
     },
     wasm::module::{MiddlewareAttachPoint, WasmModuleAttachPoint},
     worker::{
-        identity::endpoint::Endpoint, ConnectionMode, RoutingPool, RuntimeType, Worker,
-        WorkerLoadGuard, WorkerRegistry, WorkerType, UNKNOWN_MODEL_ID,
+        identity::endpoint::Endpoint, metrics::Metrics as WorkerMetrics, ConnectionMode,
+        RoutingPool, RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry, WorkerType,
+        UNKNOWN_MODEL_ID,
     },
 };
 
@@ -1332,7 +1333,7 @@ impl Router {
             worker.api_key(),
         );
 
-        Metrics::record_worker_request(worker.url(), worker.model_id());
+        WorkerMetrics::record_worker_request(worker.url(), worker.model_id());
         match send_with_stale_conn_retry(request_builder).await {
             Ok(res) => Ok(res),
             Err(e) => {
@@ -1419,7 +1420,7 @@ impl Router {
             api_key.as_ref(),
         );
 
-        Metrics::record_worker_request(worker.url(), worker.model_id());
+        WorkerMetrics::record_worker_request(worker.url(), worker.model_id());
         let res = match send_with_stale_conn_retry(request_builder).await {
             Ok(res) => res,
             Err(e) => {
@@ -1566,7 +1567,7 @@ impl Router {
             api_key.as_ref(),
         );
 
-        Metrics::record_worker_request(worker.url(), worker.model_id());
+        WorkerMetrics::record_worker_request(worker.url(), worker.model_id());
         let send = send_with_stale_conn_retry(request_builder);
         tokio::pin!(send);
         let sent = tokio::select! {

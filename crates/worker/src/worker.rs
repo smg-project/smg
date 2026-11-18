@@ -44,14 +44,22 @@ pub enum WorkerType {
     Encode,
 }
 
+impl WorkerType {
+    /// Static string form, identical to `Display`. For hot-path metric labels
+    /// that must avoid per-call allocation/interning.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            WorkerType::Regular => "regular",
+            WorkerType::Prefill => "prefill",
+            WorkerType::Decode => "decode",
+            WorkerType::Encode => "encode",
+        }
+    }
+}
+
 impl std::fmt::Display for WorkerType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            WorkerType::Regular => write!(f, "regular"),
-            WorkerType::Prefill => write!(f, "prefill"),
-            WorkerType::Decode => write!(f, "decode"),
-            WorkerType::Encode => write!(f, "encode"),
-        }
+        f.write_str(self.as_str())
     }
 }
 
@@ -115,15 +123,21 @@ impl ConnectionMode {
     pub fn uses_grpc_pipeline(self) -> bool {
         matches!(self, ConnectionMode::Grpc | ConnectionMode::Zmq)
     }
+
+    /// Static string form, identical to `Display`. For hot-path metric labels
+    /// that must avoid per-call allocation/interning.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            ConnectionMode::Http => "http",
+            ConnectionMode::Grpc => "grpc",
+            ConnectionMode::Zmq => "zmq",
+        }
+    }
 }
 
 impl std::fmt::Display for ConnectionMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ConnectionMode::Http => write!(f, "http"),
-            ConnectionMode::Grpc => write!(f, "grpc"),
-            ConnectionMode::Zmq => write!(f, "zmq"),
-        }
+        f.write_str(self.as_str())
     }
 }
 
@@ -1829,8 +1843,42 @@ impl IntoResponse for ProfileResult {
 }
 
 #[cfg(test)]
+mod worker_type_tests {
+    use super::WorkerType;
+
+    #[test]
+    fn as_str_matches_display_serde_and_from_str() {
+        for worker_type in [
+            WorkerType::Regular,
+            WorkerType::Prefill,
+            WorkerType::Decode,
+            WorkerType::Encode,
+        ] {
+            assert_eq!(worker_type.to_string(), worker_type.as_str());
+            assert_eq!(
+                serde_json::to_value(worker_type).unwrap(),
+                worker_type.as_str()
+            );
+            assert_eq!(worker_type.as_str().parse(), Ok(worker_type));
+        }
+    }
+}
+
+#[cfg(test)]
 mod connection_mode_tests {
     use super::ConnectionMode;
+
+    #[test]
+    fn as_str_matches_display_and_serde() {
+        for mode in [
+            ConnectionMode::Http,
+            ConnectionMode::Grpc,
+            ConnectionMode::Zmq,
+        ] {
+            assert_eq!(mode.to_string(), mode.as_str());
+            assert_eq!(serde_json::to_value(mode).unwrap(), mode.as_str());
+        }
+    }
 
     #[test]
     fn from_url_classifies_known_schemes() {
