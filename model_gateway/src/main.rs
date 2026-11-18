@@ -700,7 +700,7 @@ struct WorkerArgs {
     #[arg(long, default_value_t = false, help_heading = "PD Disaggregation")]
     pd_disaggregation: bool,
 
-    /// Enable EPD (Encode-Prefill-Decode) disaggregated mode (gRPC vLLM or TokenSpeed).
+    /// Enable EPD (Encode-Prefill-Decode) disaggregated mode (gRPC SGLang, vLLM or TokenSpeed).
     /// Encode workers run the vision tower and ship embeddings to prefill over Mooncake;
     /// prefill/decode reuse the PD path. Encode urls are given via `--encode <url> [bootstrap_port]`.
     #[arg(long, default_value_t = false, help_heading = "PD Disaggregation")]
@@ -3966,6 +3966,14 @@ mod tests {
         assert!(!already_on.enable_igw_for_discovery());
         assert!(already_on.routing.enable_igw);
 
+        let mut native_epd = cli_args_from(&[
+            "--backend",
+            "sglang",
+            "--epd-disaggregation",
+            "--service-discovery",
+        ]);
+        assert!(!native_epd.enable_igw_for_discovery());
+        assert!(!native_epd.routing.enable_igw);
         let mut no_discovery = cli_args_from(&[]);
         assert!(!no_discovery.enable_igw_for_discovery());
         assert!(!no_discovery.routing.enable_igw);
@@ -4660,10 +4668,42 @@ mod tests {
         assert!(help.contains(&ceiling) && help.contains(&advised), "{help}");
     }
 
-    /// Over ZMQ, `--backend` pins the startup workers' runtime (the shared
-    /// EngineCore handshake cannot be probed for a wire protocol). The pin must
-    /// reach `RouterConfig` and survive nesting into
-    /// `ServerConfig.router_config` — two-path config-plumbing guard.
+    /// Only explicit SGLang EPD selects managed controls; other engines and SGLang PD retain their path.
+    #[test]
+    fn sglang_epd_uses_existing_role_arguments_only() {
+        for backend in ["sglang", "vllm", "tokenspeed"] {
+            let cli = cli_args_from(&[
+                "--backend",
+                backend,
+                "--epd-disaggregation",
+                "--decode",
+                "grpc://d:30003",
+                "--model-path",
+                "Qwen/Qwen3-VL-8B-Instruct",
+            ]);
+            let config = cli
+                .to_router_config(
+                    vec![("grpc://p:30001".into(), None)],
+                    vec![("grpc://e:30010".into(), None)],
+                )
+                .unwrap();
+            assert_eq!(config.is_sglang_epd(), backend == "sglang");
+            assert_eq!(config.connection_mode, ConnectionMode::Grpc);
+        }
+        let legacy = cli_args_from(&[
+            "--backend",
+            "sglang",
+            "--pd-disaggregation",
+            "--decode",
+            "grpc://d:30003",
+        ]);
+        let config = legacy
+            .to_router_config(vec![("grpc://p:30001".into(), None)], vec![])
+            .unwrap();
+        assert!(!config.is_sglang_epd());
+    }
+
+    /// EngineCore runtime selection remains independent of the SGLang EPD entry point.
     #[test]
     fn zmq_backend_pins_startup_worker_runtime_in_both_configs() {
         let cli = cli_args_from(&[

@@ -250,3 +250,131 @@ def test_native_downloader_keeps_metadata_after_close_and_excludes_weights(monke
     with zipfile.ZipFile(io.BytesIO(archive)) as bundle:
         assert bundle.read("config.json") == b"{}"
         assert bundle.read("tokenizer.json") == b"{}"
+
+
+def test_managed_encoder_resolves_separate_hub_metadata_at_native_revision(tmp_path, monkeypatch):
+    """No model tokenizer is required; every requested metadata file uses its resolved commit."""
+    calls, lookups = [], []
+    files = [
+        "config.json",
+        "preprocessor_config.json",
+        "processor_config.json",
+        "custom_processor.py",
+    ]
+
+    def model_info(repo, *, revision):
+        lookups.append((repo, revision))
+        names = (
+            files
+            + (["tokenizer.json"] if repo == "org/tokenizer" else [])
+            + ["weights.safetensors"]
+        )
+        return SimpleNamespace(
+            sha=repo.replace("/", "-") + "-commit",
+            siblings=[SimpleNamespace(rfilename=name) for name in names],
+        )
+
+    def snapshot(repo, *, revision, allow_patterns, local_files_only):
+        calls.append((repo, revision, allow_patterns, local_files_only))
+        directory = tmp_path / repo.replace("/", "-")
+        directory.mkdir(exist_ok=True)
+        for name in files + (["tokenizer.json"] if repo == "org/tokenizer" else []):
+            (directory / name).write_text("{}")
+        return str(directory)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "huggingface_hub",
+        SimpleNamespace(
+            snapshot_download=snapshot, HfApi=lambda: SimpleNamespace(model_info=model_info)
+        ),
+    )
+    args = _args("org/model", "org/tokenizer")
+    model, tokenizer = model_artifacts.encoder_artifact_dirs(args)
+    assert model != tokenizer
+    assert lookups == [("org/model", "pinned"), ("org/tokenizer", "pinned")]
+    assert [(repo, revision) for repo, revision, _, _ in calls] == [
+        ("org/model", "org-model-commit"),
+        ("org/tokenizer", "org-tokenizer-commit"),
+    ]
+    assert all(
+        "*.py" in patterns and "*.json" in patterns and not local for _, _, patterns, local in calls
+    )
+    assert all(
+        not any(weight in patterns for weight in ("*.bin", "*.safetensors", "*.pt"))
+        for _, _, patterns, _ in calls
+    )
+    assert args.model_path == "org/model" and args.tokenizer_path == "org/tokenizer"
+
+
+@pytest.mark.parametrize("processor_exists", [False, True])
+def test_managed_hub_partial_cache_and_genuinely_absent_processor(
+    tmp_path, monkeypatch, processor_exists
+):
+    from smg_grpc_servicer.rust_lifecycle import resolve_model_metadata_dir
+
+    (tmp_path / "config.json").write_text("{}")
+    names = ["config.json"] + (["preprocessor_config.json"] if processor_exists else [])
+    info = SimpleNamespace(
+        sha="fixed-commit", siblings=[SimpleNamespace(rfilename=name) for name in names]
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "huggingface_hub",
+        SimpleNamespace(
+            HfApi=lambda: SimpleNamespace(model_info=lambda *args, **kwargs: info),
+            snapshot_download=lambda *args, **kwargs: str(tmp_path),
+        ),
+    )
+    # A Hub offline fallback can return a partial directory; only listed files are mandatory.
+    assert resolve_model_metadata_dir("org/model", "pinned") == (
+        None if processor_exists else str(tmp_path)
+    )
+
+
+def test_managed_hub_listing_failure_never_accepts_cached_metadata(tmp_path, monkeypatch):
+    from smg_grpc_servicer.rust_lifecycle import resolve_model_metadata_dir
+
+    (tmp_path / "config.json").write_text("{}")
+
+    def offline(*args, **kwargs):
+        raise OSError("Hub unavailable")
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("must not accept a snapshot without the revision's file list")
+
+    monkeypatch.setitem(
+        sys.modules,
+        "huggingface_hub",
+        SimpleNamespace(
+            HfApi=lambda: SimpleNamespace(model_info=offline), snapshot_download=unexpected
+        ),
+    )
+    assert resolve_model_metadata_dir("org/model", "pinned") is None
+
+
+def test_managed_encoder_local_metadata_does_not_contact_hub(tmp_path, monkeypatch):
+    def unexpected(*args, **kwargs):
+        raise AssertionError("local metadata must not use the network")
+
+    monkeypatch.setitem(
+        sys.modules, "huggingface_hub", SimpleNamespace(snapshot_download=unexpected)
+    )
+    (tmp_path / "tokenizer.json").write_text("{}")
+    assert model_artifacts.encoder_artifact_dirs(_args(str(tmp_path))) == (
+        str(tmp_path),
+        str(tmp_path),
+    )
+
+
+def test_managed_encoder_uses_existing_object_storage_metadata(storage):
+    args = _args("s3://bucket/model")
+    directory = storage.model.get_path(args.model_path)
+    assert model_artifacts.encoder_artifact_dirs(args) == (directory, directory)
+    assert storage.downloads == [args.model_path]
+
+
+def test_managed_encoder_metadata_resolution_fails_closed(monkeypatch):
+    monkeypatch.setattr(model_artifacts, "resolve_model_metadata_dir", lambda *args, **kwargs: None)
+    with pytest.raises(ServicerConfigError, match="native revision"):
+        model_artifacts.encoder_artifact_dirs(_args("org/unavailable"))

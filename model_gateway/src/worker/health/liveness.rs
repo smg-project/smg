@@ -766,7 +766,15 @@ pub(crate) fn on_contact(worker: &Arc<dyn Worker>) {
     if matches!(
         worker.status(),
         WorkerStatus::NotReady | WorkerStatus::Failed
-    ) {
+    ) || (worker.status() == WorkerStatus::Ready
+        && worker
+            .metadata()
+            .spec
+            .labels
+            .contains_key("sglang_prepared"))
+    {
+        // A short outage can change the prepared-input instance before health
+        // probes demote it. Reuse the manager's discovered-label refresh.
         worker.signal_connected();
     }
 }
@@ -785,6 +793,15 @@ pub(crate) fn on_probe_passed(worker: &Arc<dyn Worker>) {
     }
     if worker.stall_reason() == Some(StallReason::Unreachable) {
         set(worker, state, None, "probe");
+        if worker.status() == WorkerStatus::Ready
+            && worker
+                .metadata()
+                .spec
+                .labels
+                .contains_key("sglang_prepared")
+        {
+            worker.signal_connected();
+        }
     }
 }
 
@@ -2525,6 +2542,43 @@ mod tests {
                 .build(),
         );
         (w, rx)
+    }
+
+    #[test]
+    /// Recovery of a Ready worker still refreshes its prepared-input instance generation.
+    fn prepared_instance_refresh_is_signalled_after_ready_worker_recovers() {
+        for probe in [false, true] {
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let w: Arc<dyn Worker> = Arc::new(
+                BasicWorkerBuilder::new("grpc://encoder:8000")
+                    .label("sglang_prepared", "instance-bound")
+                    .connect_signal_tx(tx)
+                    .build(),
+            );
+            w.set_status(WorkerStatus::Ready);
+            set(
+                &w,
+                w.runtime_state().as_deref(),
+                Some(StallReason::Unreachable),
+                "test",
+            );
+            if probe {
+                on_probe_passed(&w);
+            } else {
+                on_contact(&w);
+            }
+            assert_eq!(w.status(), WorkerStatus::Ready);
+            assert!(
+                rx.try_recv().is_ok(),
+                "recovery must refresh the instance labels"
+            );
+            on_contact(&w);
+            on_probe_passed(&w);
+            assert!(
+                rx.try_recv().is_err(),
+                "ordinary contacts do not refresh repeatedly"
+            );
+        }
     }
 
     #[test]

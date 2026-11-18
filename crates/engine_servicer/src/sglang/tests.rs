@@ -1443,6 +1443,271 @@ async fn non_streaming_generate_delivers_only_the_complete() {
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
+/// Shared prepared D identity for quarantine tests; no native scheduler is bypassed.
+fn quarantine_decode_config() -> ManagedConfig {
+    use crate::managed::{ManagedConfig, ManagedContract};
+    ManagedConfig {
+        worker_id: "decode-test".into(),
+        generation: "instance-1".into(),
+        role: "decode".into(),
+        metadata_endpoint: None,
+        max_records: 16,
+        max_work: 4,
+        max_context_bytes: 64 * 1024 * 1024,
+        retention_ms: 1000,
+        max_duration_ms: 60_000,
+        max_clock_error_ms: 1000,
+        contract: ManagedContract {
+            model_revision: "weights".into(),
+            processor_contract: "qwen3".into(),
+            embedding_dtype: "bfloat16".into(),
+            kv_backend: "mooncake".into(),
+            embedding_backend: "mooncake".into(),
+            topology_contract: "tp1".into(),
+            bootstrap_host: "127.0.0.1".into(),
+            bootstrap_port: 8998,
+            tp_size: 1,
+        },
+    }
+}
+
+/// The same quarantine flag used by unconfirmed native cancellation also
+/// closes ordinary text admission, before a scheduler request is registered.
+#[tokio::test]
+async fn quarantined_prepared_runtime_refuses_ordinary_text_before_registration() {
+    use smg_grpc_client::sglang_managed::Limits;
+    use zeromq::{PushSocket, Socket, SocketSend};
+
+    use crate::managed::native::ManagedNativeRuntime;
+
+    async fn text_round_trip(h: &mut Harness, rid: &str) {
+        let mut stream = h
+            .client
+            .generate(generate_request(rid, false, Vec::new()))
+            .await
+            .expect("ordinary text admitted")
+            .into_inner();
+        assert_eq!(recv_add(&mut h.engine_in).await.rid, rid);
+        send(
+            &mut h.engine_out,
+            &batch(rid, vec![7], 1, Some("stop"), None),
+        )
+        .await;
+        assert_eq!(
+            complete(stream.message().bounded().await.unwrap().unwrap()).output_ids,
+            vec![7]
+        );
+        assert!(stream.message().bounded().await.unwrap().is_none());
+        wait_until(|| h.server.state.shared.registry.active() == 0).await;
+    }
+
+    let mut h = harness(model_info()).await;
+    text_round_trip(&mut h, "ordinary-without-prepared").await;
+
+    // Install the real prepared runtime on the RPC harness. Ordinary text has
+    // the same Generate path in both launch modes; no private control is sent.
+    let config = quarantine_decode_config();
+    let client = h.server.state.shared.engine().unwrap().clone();
+    let runtime = Arc::new(
+        ManagedNativeRuntime::new(
+            Arc::new(move || Some(client.clone())),
+            &config,
+            Limits::default(),
+        )
+        .unwrap(),
+    );
+    assert!(h.server.state.prepared.set(Arc::clone(&runtime)).is_ok());
+    assert!(runtime.ready());
+    text_round_trip(&mut h, "ordinary-prepared-ready").await;
+
+    // Exercise the actual metadata-reader failure path, which sets the same
+    // quarantine flag as the cancellation-grace expiry. No test-only flag setter.
+    let endpoint = format!("ipc://{}", h._dir.path().join("quarantine.ipc").display());
+    let receiver = ManagedNativeRuntime::bind_metadata(&endpoint)
+        .await
+        .unwrap();
+    let mut sender = PushSocket::new();
+    sender.connect(&endpoint).await.unwrap();
+    let (failed, ()) = tokio::join!(runtime.read_metadata(receiver), async {
+        sender
+            .send("one invalid metadata frame".into())
+            .await
+            .unwrap();
+    });
+    assert_eq!(failed.unwrap_err().code(), Code::DataLoss);
+    assert!(!runtime.ready());
+    assert!(
+        h.server.state.shared.engine().unwrap().is_alive(),
+        "link stays live"
+    );
+
+    let refused = h
+        .client
+        .generate(generate_request("ordinary-quarantined", false, Vec::new()))
+        .await
+        .expect_err("quarantine must fence ordinary text at the RPC boundary");
+    assert_eq!(refused.code(), Code::Unavailable);
+    assert_eq!(h.server.state.shared.registry.active(), 0);
+    assert_scheduler_idle(&mut h.engine_in).await;
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// A silent D closes its observer after cancellation grace, but only a real native
+/// terminal can release its registration. Health and text RPCs honor quarantine.
+#[tokio::test]
+async fn prepared_decode_cancel_grace_quarantines_without_releasing_native_owner() {
+    use engine_zmq_client::protocol::handshake::ManagedSglangHandshake;
+    use smg_grpc_client::sglang_managed::{budget::Deadline, proto, LAYOUT};
+
+    let dir = tempfile::tempdir().unwrap();
+    let handshake = handshake_address(dir.path());
+    let server = SglangServicerServer::start_managed(
+        config(dir.path(), &handshake, model_info()),
+        quarantine_decode_config(),
+    )
+    .unwrap();
+    let mut ready = default_ready_response();
+    ready.sglang_managed = Some(ManagedSglangHandshake {
+        version: 1,
+        worker_id: "decode-test".into(),
+        generation: "instance-1".into(),
+        role: "decode".into(),
+        layout: LAYOUT.into(),
+    });
+    let engine = connect_to_frontend(&handshake, EngineId::from_engine_index(0), ready)
+        .await
+        .unwrap();
+    let (mut engine_in, mut engine_out) = engine.split();
+    wait_until(|| server.engine_ready()).await;
+    let mut client = SglangSchedulerClient::new(grpc_channel(server.address()).await);
+    let runtime = server.state.prepared.get().unwrap();
+    let rid = "silent-prepared-decode";
+    let operation = proto::OperationRef {
+        identity: Some(proto::Identity {
+            logical_request_id: "request".into(),
+            attempt_id: "attempt".into(),
+            branch_id: 0,
+        }),
+        target: Some(proto::Instance {
+            worker_id: "decode-test".into(),
+            generation: "instance-1".into(),
+        }),
+        operation_id: rid.into(),
+        request_digest: vec![1; 32],
+        plan_digest: vec![2; 32],
+    };
+    let binding = proto::InputBinding {
+        decode: Some(operation.clone()),
+        prefill: Some(proto::Instance {
+            worker_id: "p".into(),
+            generation: "p-generation".into(),
+        }),
+        prefill_rid: "attempt-p".into(),
+        bootstrap: Some(proto::Bootstrap {
+            host: "127.0.0.1".into(),
+            port: 8998,
+            room: 17,
+        }),
+        layout_contract: LAYOUT.into(),
+        processor_contract: "qwen3".into(),
+        model_revision: "weights".into(),
+        ..Default::default()
+    };
+    let deadline = Deadline::admit(
+        &proto::Budget {
+            original_expiry_unix_ms: 61000,
+            remaining_timeout_ms: 60000,
+            ..Default::default()
+        },
+        1000,
+        Instant::now(),
+        0,
+        0,
+        60000,
+    )
+    .unwrap();
+    let (registration, cancellation) = server.state.shared.registry.register(rid).unwrap();
+    // Exercise the native owner below manifest validation, then verify the public
+    // HealthCheck and ordinary Generate RPCs against the resulting quarantine.
+    let mut output = runtime
+        .submit(
+            operation,
+            binding,
+            generate_request(rid, true, Vec::new()),
+            None,
+            None,
+            deadline,
+            registration,
+            cancellation,
+            None,
+        )
+        .unwrap();
+    assert_eq!(recv_add(&mut engine_in).bounded().await.rid, rid);
+    assert_eq!(
+        server.state.shared.registry.abort(&[rid.into()]).unwrap(),
+        1
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), output.next())
+            .await
+            .is_err()
+    );
+    assert_scheduler_idle(&mut engine_in).await;
+    assert!(runtime.ready());
+    assert_eq!(server.state.shared.registry.active(), 1);
+    // Keep transport liveness independent of this request's absent KV/output.
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(1));
+    let verdict = tokio::time::timeout(Duration::from_secs(35), async {
+        loop {
+            tokio::select! {
+                item = output.next() => break item,
+                _ = heartbeat.tick() => send(&mut engine_out, &health_signal()).await,
+                frame = engine_in.recv_frames() => panic!("D aborted before handoff: {frame:?}"),
+            }
+        }
+    })
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap_err();
+    assert_eq!(verdict.code(), Code::Unavailable);
+    assert!(verdict.message().contains("worker quarantined"));
+    assert!(output.next().bounded().await.is_none());
+    assert!(!runtime.ready());
+    assert!(server.state.shared.engine().unwrap().is_alive());
+    assert_eq!(server.state.shared.registry.active(), 1);
+    assert!(
+        !client
+            .health_check(sg::HealthCheckRequest {})
+            .await
+            .unwrap()
+            .into_inner()
+            .healthy
+    );
+    let refused = client
+        .generate(generate_request("text-after-grace", false, Vec::new()))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code(), Code::Unavailable);
+    assert_eq!(server.state.shared.registry.active(), 1);
+    assert_scheduler_idle(&mut engine_in).await;
+    // First native output proves handoff progressed; only now may D send Abort.
+    send(&mut engine_out, &batch(rid, vec![7], 1, None, None)).await;
+    assert_eq!(recv_abort(&mut engine_in).bounded().await, vec![rid]);
+    assert_eq!(server.state.shared.registry.active(), 1);
+    send(
+        &mut engine_out,
+        &batch(rid, vec![8], 2, Some("abort"), None),
+    )
+    .await;
+    wait_until(|| server.state.shared.registry.active() == 0).await;
+    assert!(
+        !runtime.ready(),
+        "a late receipt does not clear instance quarantine"
+    );
+    server.stop(Duration::from_secs(5)).unwrap();
+}
+
 /// String stops ride the request to the scheduler, which keeps its tokenizer
 /// and reports the matched string back.
 #[tokio::test]
@@ -4654,4 +4919,583 @@ async fn a_leftover_handshake_endpoint_does_not_fail_the_link() {
         std::fs::metadata(&endpoint).is_err(),
         "the handshake endpoint file outlived stop"
     );
+}
+
+/// A prepared rejection before native ownership carries an explicit receipt;
+/// callers must not infer this from the gRPC status code alone.
+#[tokio::test]
+async fn prepared_pre_submit_rejection_is_explicit_and_never_reaches_scheduler() {
+    let mut h = harness(model_info()).await;
+    for _ in 0..2 {
+        let mut request = generate_request("prepared-rejected", true, Vec::new());
+        request.prepared_control = vec![1];
+        let status = h
+            .client
+            .generate(request)
+            .await
+            .expect_err("no prepared runtime");
+        assert_eq!(status.code(), Code::FailedPrecondition);
+        assert!(smg_grpc_client::sglang_managed::is_not_submitted(&status));
+        assert_eq!(h.server.active_requests(), 0);
+        assert_scheduler_idle(&mut h.engine_in).await;
+    }
+}
+
+/// Invalid media/control on a duplicate must not hide the earlier native owner.
+#[tokio::test]
+async fn prepared_duplicate_has_no_pre_submit_receipt_while_native_owner_exists() {
+    for hold in 0..3 {
+        let mut h = harness(model_info()).await;
+        let first = h
+            .client
+            .generate(generate_request("duplicate-prepared", true, Vec::new()))
+            .await
+            .unwrap();
+        let native = recv_add(&mut h.engine_in).await;
+        assert_eq!(native.rid, "duplicate-prepared");
+        if hold == 1 {
+            h.server.set_ready(false);
+        }
+        if hold == 2 {
+            h.server.state.shared.registry.set_accepting(false);
+        }
+        let mut duplicate = generate_request("duplicate-prepared", true, Vec::new());
+        duplicate.prepared_control = vec![1];
+        let status = h
+            .client
+            .generate(duplicate)
+            .await
+            .expect_err("existing native owner");
+        assert_eq!(status.code(), Code::AlreadyExists);
+        assert!(!smg_grpc_client::sglang_managed::is_not_submitted(&status));
+        assert_eq!(h.server.active_requests(), 1);
+        assert_scheduler_idle(&mut h.engine_in).await;
+        drop(first);
+    }
+}
+
+/// Prepared admission holds prove no submission, but ordinary Generate keeps
+/// its existing status contract. Both checks run before any scheduler send.
+#[tokio::test]
+async fn prepared_warming_and_draining_rejections_are_explicit_but_legacy_is_unchanged() {
+    for warming in [false, true] {
+        let mut h = harness(model_info()).await;
+        if warming {
+            h.server.set_ready(false);
+        } else {
+            h.server.state.shared.registry.set_accepting(false);
+        }
+        for prepared in [false, true] {
+            let mut request = generate_request("held-prepared", true, Vec::new());
+            if prepared {
+                request.prepared_control = vec![1];
+            }
+            let status = h
+                .client
+                .generate(request)
+                .await
+                .expect_err("admission held");
+            assert_eq!(status.code(), Code::Unavailable);
+            assert_eq!(
+                smg_grpc_client::sglang_managed::is_not_submitted(&status),
+                prepared
+            );
+            assert_eq!(h.server.active_requests(), 0);
+            assert_scheduler_idle(&mut h.engine_in).await;
+        }
+    }
+}
+
+/// The real native owner propagates a scheduler abort before layout metadata;
+/// no layout is ever published and the 60s request budget must not be consumed.
+#[tokio::test]
+async fn prepared_prefill_abort_before_layout_preserves_error_and_releases_owner() {
+    use engine_zmq_client::protocol::handshake::ManagedSglangHandshake;
+    use smg_grpc_client::sglang_managed::{budget::Deadline, proto, LAYOUT};
+    let dir = tempfile::tempdir().unwrap();
+    let handshake = handshake_address(dir.path());
+    let mut managed = quarantine_decode_config();
+    managed.role = "prefill".into();
+    managed.worker_id = "prefill-test".into();
+    managed.metadata_endpoint = Some(format!("ipc://{}", dir.path().join("layout.ipc").display()));
+    let server =
+        SglangServicerServer::start_managed(config(dir.path(), &handshake, model_info()), managed)
+            .unwrap();
+    let mut ready = default_ready_response();
+    ready.sglang_managed = Some(ManagedSglangHandshake {
+        version: 1,
+        worker_id: "prefill-test".into(),
+        generation: "instance-1".into(),
+        role: "prefill".into(),
+        layout: LAYOUT.into(),
+    });
+    let engine = connect_to_frontend(&handshake, EngineId::from_engine_index(0), ready)
+        .await
+        .unwrap();
+    let (mut engine_in, mut engine_out) = engine.split();
+    wait_until(|| server.engine_ready()).await;
+    let runtime = server.state.prepared.get().unwrap();
+    let rid = "prefill-before-layout";
+    let operation = proto::OperationRef {
+        identity: Some(proto::Identity {
+            logical_request_id: "request".into(),
+            attempt_id: "attempt".into(),
+            branch_id: 0,
+        }),
+        target: Some(proto::Instance {
+            worker_id: "prefill-test".into(),
+            generation: "instance-1".into(),
+        }),
+        operation_id: rid.into(),
+        request_digest: vec![1; 32],
+        plan_digest: vec![2; 32],
+    };
+    let binding = proto::InputBinding {
+        decode: Some(operation.clone()),
+        prefill: operation.target.clone(),
+        prefill_rid: rid.into(),
+        bootstrap: Some(proto::Bootstrap {
+            host: "127.0.0.1".into(),
+            port: 8998,
+            room: 17,
+        }),
+        layout_contract: LAYOUT.into(),
+        processor_contract: "qwen3".into(),
+        model_revision: "weights".into(),
+        ..Default::default()
+    };
+    let external = proto::ExternalEncodePlan {
+        receiver_rid: rid.into(),
+        encoder_receive_endpoints: vec!["127.0.0.1:5000".into()],
+        image_counts: vec![1],
+        parts: vec![proto::EncodePart {
+            native_part_rid: format!("{rid}_local_part_0"),
+            part_idx: 0,
+            ordered_item_ids: vec![0],
+        }],
+    };
+    let deadline = Deadline::admit(
+        &proto::Budget {
+            original_expiry_unix_ms: 61000,
+            remaining_timeout_ms: 60000,
+            ..Default::default()
+        },
+        1000,
+        Instant::now(),
+        0,
+        0,
+        60000,
+    )
+    .unwrap();
+    let (registration, cancellation) = server.state.shared.registry.register(rid).unwrap();
+    let mut request = generate_request(rid, true, Vec::new());
+    request.tokenized.as_mut().unwrap().original_text = "image prompt".into();
+    let mut output = runtime
+        .submit(
+            operation,
+            binding,
+            request,
+            Some(external),
+            None,
+            deadline,
+            registration,
+            cancellation,
+            None,
+        )
+        .unwrap();
+    assert_eq!(recv_add(&mut engine_in).bounded().await.rid, rid);
+    let mut rejected = batch(rid, vec![], 0, Some("abort"), None);
+    rejected.finished_messages = vec![Some("managed layout refused expanded prompt".into())];
+    rejected.finished_status = vec![Some(400)];
+    send(&mut engine_out, &rejected).await;
+    let error = tokio::time::timeout(Duration::from_secs(1), output.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(error.code(), Code::InvalidArgument);
+    assert!(error
+        .message()
+        .contains("managed layout refused expanded prompt"));
+    assert!(output.next().bounded().await.is_none());
+    wait_until(|| server.state.shared.registry.active() == 0).await;
+    assert!(runtime.ready());
+    assert_scheduler_idle(&mut engine_in).await;
+    server.stop(Duration::from_secs(5)).unwrap();
+}
+
+/// Wire-order regression: Start reaches D while P metadata is withheld, and
+/// keeping the command stream open never delays the one native Generate.
+#[tokio::test]
+async fn prepared_decode_start_precedes_bind_and_submits_without_half_close() {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use engine_zmq_client::protocol::handshake::ManagedSglangHandshake;
+    use prost::Message;
+    use proto::decode_command::Command;
+    use sha2::{Digest, Sha256};
+    use smg_grpc_client::sglang_managed::{manifest_digest, proto, LAYOUT};
+
+    let dir = tempfile::tempdir().unwrap();
+    let handshake = handshake_address(dir.path());
+    let managed = quarantine_decode_config();
+    let server =
+        SglangServicerServer::start_managed(config(dir.path(), &handshake, model_info()), managed)
+            .unwrap();
+    let mut ready = default_ready_response();
+    ready.sglang_managed = Some(ManagedSglangHandshake {
+        version: 1,
+        worker_id: "decode-test".into(),
+        generation: "instance-1".into(),
+        role: "decode".into(),
+        layout: LAYOUT.into(),
+    });
+    let engine = connect_to_frontend(&handshake, EngineId::from_engine_index(0), ready)
+        .await
+        .unwrap();
+    let (mut engine_in, mut engine_out) = engine.split();
+    wait_until(|| server.engine_ready()).await;
+    let client =
+        smg_grpc_client::SglangSchedulerClient::connect(&format!("http://{}", server.address()))
+            .await
+            .unwrap();
+    let rid = "decode-start-bind";
+    let binding = proto::InputBinding {
+        decode: Some(proto::OperationRef {
+            identity: Some(proto::Identity {
+                logical_request_id: "request".into(),
+                attempt_id: "attempt".into(),
+                branch_id: 0,
+            }),
+            target: Some(proto::Instance {
+                worker_id: "decode-test".into(),
+                generation: "instance-1".into(),
+            }),
+            operation_id: rid.into(),
+            request_digest: vec![1; 32],
+            plan_digest: vec![2; 32],
+        }),
+        prefill: Some(proto::Instance {
+            worker_id: "p".into(),
+            generation: "p-instance".into(),
+        }),
+        prefill_rid: "attempt-p".into(),
+        bootstrap: Some(proto::Bootstrap {
+            host: "127.0.0.1".into(),
+            port: 8998,
+            room: 17,
+        }),
+        layout_contract: LAYOUT.into(),
+        processor_contract: "qwen3".into(),
+        model_revision: "weights".into(),
+        ..Default::default()
+    };
+    let mut request = generate_request(rid, true, Vec::new());
+    request.prepared_control = proto::PrefillStart {
+        version: 1,
+        binding: Some(binding.clone()),
+        budget: Some(proto::Budget {
+            original_expiry_unix_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64
+                + 10000,
+            remaining_timeout_ms: 10000,
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+    .encode_to_vec();
+    let waiting_template = request.clone();
+    let started = Instant::now();
+    for _ in 0..5000 {
+        let encoded = std::hint::black_box(&waiting_template).encode_to_vec();
+        std::hint::black_box(sg::GenerateRequest::decode(encoded.as_slice()).unwrap());
+    }
+    #[expect(
+        clippy::print_stderr,
+        reason = "report test-only compact Start conversion measurement"
+    )]
+    {
+        eprintln!(
+            "compact Start fixture: bytes={} encode+decode_us={:.3}",
+            waiting_template.encoded_len(),
+            started.elapsed().as_secs_f64() * 1e6 / 5000.0
+        );
+    }
+    for tokens in [128, 2048] {
+        let mut sized = waiting_template.clone();
+        sized.tokenized.as_mut().unwrap().input_ids = vec![12345; tokens];
+        let started = Instant::now();
+        for _ in 0..100 {
+            let encoded = std::hint::black_box(&sized).encode_to_vec();
+            std::hint::black_box(sg::GenerateRequest::decode(encoded.as_slice()).unwrap());
+        }
+        #[expect(clippy::print_stderr, reason = "report test-only compact Start sizing")]
+        {
+            eprintln!(
+                "compact Start tokens={tokens} bytes={} encode+decode_us={:.3}",
+                sized.encoded_len(),
+                started.elapsed().as_secs_f64() * 1e6 / 100.0
+            );
+        }
+    }
+    // Waiting is byte-bound and does not consume the native max_work=4 slots.
+    let mut waiting = Vec::new();
+    for index in 0..5 {
+        let mut start = waiting_template.clone();
+        start.request_id = format!("waiting-capacity-{index}");
+        let mut control = proto::PrefillStart::decode(start.prepared_control.as_slice()).unwrap();
+        control
+            .binding
+            .as_mut()
+            .unwrap()
+            .decode
+            .as_mut()
+            .unwrap()
+            .operation_id
+            .clone_from(&start.request_id);
+        start.prepared_control = control.encode_to_vec();
+        waiting.push(
+            client
+                .start_prepared(start, Duration::from_secs(10))
+                .bounded()
+                .await
+                .unwrap(),
+        );
+    }
+    assert_eq!(server.state.shared.registry.active(), 5);
+    assert_scheduler_idle(&mut engine_in).await;
+    drop(waiting);
+    wait_until(|| server.state.shared.registry.active() == 0).await;
+    // Reuse the configured context budget, including a fixed per-entry charge.
+    let runtime = server.state.prepared.get().unwrap();
+    let held = runtime.reserve_start(64 * 1024 * 1024 - 4096).unwrap();
+    let error = match client
+        .start_prepared(waiting_template.clone(), Duration::from_secs(10))
+        .bounded()
+        .await
+    {
+        Err(error) => error,
+        Ok(_) => panic!("Start ignored its byte budget"),
+    };
+    assert_eq!(error.code(), Code::ResourceExhausted);
+    assert_eq!(server.state.shared.registry.active(), 0);
+    assert_scheduler_idle(&mut engine_in).await;
+    drop(held);
+    let (sender, mut output) = client
+        .start_prepared(request, Duration::from_secs(10))
+        .bounded()
+        .await
+        .unwrap();
+    assert_eq!(
+        server.state.shared.registry.active(),
+        1,
+        "D already owns Start before P metadata"
+    );
+    assert_scheduler_idle(&mut engine_in).await;
+    let identity = vec![7; 32];
+    let hash = Sha256::digest([b"sglang-mm-wide-pad-v1".as_slice(), &identity].concat());
+    let pads: Vec<i64> = hash
+        .as_slice()
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|b| 1_000_000 + (u64::from_be_bytes(*b) & ((1 << 62) - 1)) as i64)
+        .collect();
+    let mut input = proto::PreparedDecodeInput {
+        version: 1,
+        binding: Some(binding),
+        unpadded_ids: vec![1, 151655, 2],
+        padded_ids: vec![1, pads[0], 2],
+        images: vec![proto::ImageMetadata {
+            occurrence: 0,
+            full_identity: identity,
+            pad_values: pads,
+            offsets: vec![proto::Offset { start: 1, end: 1 }],
+            native_format: 3,
+            grid_thw: vec![1, 2, 2],
+            native_hash: u64::from_be_bytes([7; 8]),
+            ..Default::default()
+        }],
+        mrope_positions: Some(proto::IntegerArray {
+            shape: vec![3, 3],
+            values: vec![0; 9],
+        }),
+        mrope_delta: Some(proto::IntegerArray {
+            shape: vec![1],
+            values: vec![0],
+        }),
+        image_token_id: 151655,
+        ..Default::default()
+    };
+    input.integrity_digest = manifest_digest(&input);
+    let valid_input = input.clone();
+    sender
+        .send(proto::DecodeCommand {
+            command: Some(Command::BindPreparedInput(input.clone())),
+        })
+        .await
+        .unwrap();
+    // Do not poll the response: Bind must be written independently after headers.
+    assert_eq!(recv_add(&mut engine_in).bounded().await.rid, rid);
+    // Duplicate identical Bind is idempotent, and still cannot submit a second Generate.
+    sender
+        .send(proto::DecodeCommand {
+            command: Some(Command::BindPreparedInput(input)),
+        })
+        .await
+        .unwrap();
+    assert_scheduler_idle(&mut engine_in).await;
+    send(&mut engine_out, &batch(rid, vec![10], 1, None, None)).await;
+    assert!(
+        output.next().bounded().await.unwrap().is_ok(),
+        "first token arrives without half-close"
+    );
+    send(
+        &mut engine_out,
+        &batch(rid, vec![11], 2, Some("length"), None),
+    )
+    .await;
+    while let Some(item) = output.next().bounded().await {
+        item.unwrap();
+    }
+    wait_until(|| server.state.shared.registry.active() == 0).await;
+    drop(sender);
+    for mode in ["cancel", "disconnect", "deadline", "invalid-bind"] {
+        let rid = format!("waiting-{mode}");
+        let mut start = waiting_template.clone();
+        start.request_id.clone_from(&rid);
+        let mut control = proto::PrefillStart::decode(start.prepared_control.as_slice()).unwrap();
+        control
+            .binding
+            .as_mut()
+            .unwrap()
+            .decode
+            .as_mut()
+            .unwrap()
+            .operation_id
+            .clone_from(&rid);
+        let budget = control.budget.as_mut().unwrap();
+        budget.remaining_timeout_ms = if mode == "deadline" { 100 } else { 10000 };
+        budget.original_expiry_unix_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+            + budget.remaining_timeout_ms;
+        start.prepared_control = control.encode_to_vec();
+        let (sender, mut stream) = client
+            .start_prepared(start, Duration::from_secs(10))
+            .bounded()
+            .await
+            .unwrap();
+        assert_eq!(server.state.shared.registry.active(), 1);
+        match mode {
+            "cancel" => {
+                sender
+                    .send(proto::DecodeCommand {
+                        command: Some(Command::Cancel("caller cancelled".into())),
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    stream.next().bounded().await.unwrap().unwrap_err().code(),
+                    Code::Cancelled
+                );
+            }
+            "invalid-bind" => {
+                sender
+                    .send(proto::DecodeCommand {
+                        command: Some(Command::BindPreparedInput(
+                            proto::PreparedDecodeInput::default(),
+                        )),
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    stream.next().bounded().await.unwrap().unwrap_err().code(),
+                    Code::InvalidArgument
+                );
+            }
+            "deadline" => assert_eq!(
+                stream.next().bounded().await.unwrap().unwrap_err().code(),
+                Code::DeadlineExceeded
+            ),
+            _ => {}
+        }
+        drop(stream);
+        sender.closed().bounded().await;
+        drop(sender);
+        wait_until(|| server.state.shared.registry.active() == 0).await;
+        assert_scheduler_idle(&mut engine_in).await;
+        assert!(server.state.prepared.get().unwrap().ready());
+    }
+    // Saturate the response stream while leaving its command half writable.
+    // Cancel must still reach the native owner without the client reading tokens.
+    let rid = "slow-reader";
+    let mut start = waiting_template.clone();
+    start.request_id = rid.into();
+    let mut control = proto::PrefillStart::decode(start.prepared_control.as_slice()).unwrap();
+    control
+        .binding
+        .as_mut()
+        .unwrap()
+        .decode
+        .as_mut()
+        .unwrap()
+        .operation_id = rid.into();
+    start.prepared_control = control.encode_to_vec();
+    let mut input = valid_input;
+    input.binding = control.binding;
+    input.integrity_digest = manifest_digest(&input);
+    let (sender, output) = client
+        .start_prepared(start, Duration::from_secs(10))
+        .bounded()
+        .await
+        .unwrap();
+    sender
+        .send(proto::DecodeCommand {
+            command: Some(Command::BindPreparedInput(input)),
+        })
+        .await
+        .unwrap();
+    assert_eq!(recv_add(&mut engine_in).bounded().await.rid, rid);
+    for count in 1..=80 {
+        send(
+            &mut engine_out,
+            &batch(rid, vec![10; 8192], count * 8192, None, None),
+        )
+        .await;
+    }
+    sender
+        .send(proto::DecodeCommand {
+            command: Some(Command::Cancel("slow consumer".into())),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), recv_abort(&mut engine_in))
+            .await
+            .unwrap(),
+        vec![rid]
+    );
+    send(
+        &mut engine_out,
+        &batch(rid, vec![], 80 * 8192, Some("abort"), None),
+    )
+    .await;
+    wait_until(|| server.state.shared.registry.active() == 0).await;
+    drop(output);
+    drop(sender);
+    // All WaitingInput and native charges have returned, including the slow-reader owner.
+    drop(
+        server
+            .state
+            .prepared
+            .get()
+            .unwrap()
+            .reserve_start(64 * 1024 * 1024 - 4096)
+            .unwrap(),
+    );
+    server.stop(Duration::from_secs(5)).unwrap();
 }

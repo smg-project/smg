@@ -23,8 +23,9 @@
 //! the stream's send window and awaits the response head; the connection's
 //! one task (the socket, with the keep-alive pings, in `connection`)
 //! wakes the call for the head and for every frame of the response body.
-//! No task is spawned per call and nothing relays the answer, as the h2
-//! crate is built to be used.
+//! Ordinary RPCs spawn no task per call and nothing relays the answer.
+//! Bidirectional control streams opt into a response-owned writer task so
+//! commands progress independently of response reads.
 
 mod connection;
 #[cfg(test)]
@@ -44,6 +45,7 @@ use std::{
 
 use h2::{client, Reason, RecvStream, SendStream};
 use http_body::Frame;
+use tokio::task::JoinHandle;
 use tonic::{
     codegen::{
         http::{
@@ -83,10 +85,10 @@ const USER_AGENT_VALUE: &str = concat!("smg-grpc-client/", env!("CARGO_PKG_VERSI
 ///
 /// A call opens its stream on the connection from the task that makes it,
 /// writes the request body under the stream's send window (a one-message
-/// body, which every call of this crate has, is one DATA frame that ends the
+/// body on ordinary RPCs is one DATA frame that ends the
 /// stream) and awaits the response head; the connection's task wakes it for
 /// the head and the body hands tonic every frame as the socket task reads
-/// it. No task is spawned per call and nothing relays the answer.
+/// it. Ordinary RPCs spawn no per-call task and nothing relays the answer.
 ///
 /// A connection that died (the peer went away, a GOAWAY, a keep-alive ping
 /// unanswered) fails the calls in flight on it and is re-dialled under the
@@ -100,16 +102,26 @@ pub struct Channel {
     shared: Arc<Shared>,
 }
 
-/// The response's body: h2's receive stream as an HTTP body, each data
-/// frame's bytes released back to the stream's window as it is read, the
-/// trailers last. A request still being written when the response head
-/// arrived (a peer that answers before it has read the whole request and
-/// keeps reading) is written from here, as the body is read: no task for
-/// that either.
+/// Opt in only bidirectional command streams to response-independent writes.
+#[derive(Clone, Debug)]
+pub(crate) struct IndependentRequestWrite;
+
+#[derive(Debug)]
+struct RequestWriter(JoinHandle<Result<(), Unwritten>>);
+
+impl Drop for RequestWriter {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// The response body returns h2 frames directly. Ordinary request writes are
+/// driven inline; explicitly bidirectional writes have an owned task.
 #[derive(Debug)]
 pub struct RecvBody {
     stream: RecvStream,
     write: Option<BodyWrite>,
+    independent_write: Option<RequestWriter>,
     end: Arc<End>,
 }
 
@@ -128,6 +140,10 @@ impl Service<Request<tonic::body::Body>> for Channel {
 
     fn call(&mut self, request: Request<tonic::body::Body>) -> Self::Future {
         let (mut parts, body) = request.into_parts();
+        let independent = parts
+            .extensions
+            .remove::<IndependentRequestWrite>()
+            .is_some();
         // The origin in front of the call's own path (what tonic's AddOrigin
         // layer wrote).
         let mut uri = self.shared.origin.clone().into_parts();
@@ -150,7 +166,7 @@ impl Service<Request<tonic::body::Body>> for Channel {
                 .requests
                 .send_request(request, ended)
                 .map_err(|e| connection.end.failure(e))?;
-            exchange(response, stream, body, connection.end, ended).await
+            exchange(response, stream, body, connection.end, ended, independent).await
         })
     }
 }
@@ -425,6 +441,7 @@ async fn exchange(
     body: tonic::body::Body,
     end: Arc<End>,
     ended: bool,
+    independent: bool,
 ) -> Result<Response<RecvBody>, BoxError> {
     let mut response = pin!(response);
     let mut write = (!ended).then(|| BodyWrite::new(stream, body));
@@ -445,10 +462,31 @@ async fn exchange(
     if stream.is_end_stream() || parts.headers.contains_key(&GRPC_STATUS) {
         write = None;
     }
-    Ok(Response::from_parts(parts, RecvBody { stream, write, end }))
+    // Only bidirectional control streams need writes to progress while their
+    // caller waits for another worker or stops reading responses. The response
+    // owner aborts this task on drop; ordinary RPCs retain the inline path.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "bidi request writer is owned and aborted by its response body"
+    )]
+    let independent_write = if independent {
+        write.take().map(|write| RequestWriter(tokio::spawn(write)))
+    } else {
+        None
+    };
+    Ok(Response::from_parts(
+        parts,
+        RecvBody {
+            stream,
+            write,
+            independent_write,
+            end,
+        },
+    ))
 }
 
 /// How a request body's write ended short of the stream's end.
+#[derive(Debug)]
 enum Unwritten {
     /// The body itself failed (its encoder refused a message): the stream is
     /// reset and the body's error is the call's.
@@ -589,6 +627,20 @@ impl http_body::Body for RecvBody {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         let this = &mut *self;
+        if let Some(write) = &mut this.independent_write {
+            match Pin::new(&mut write.0).poll(cx) {
+                Poll::Ready(Ok(Ok(()) | Err(Unwritten::Stream))) => this.independent_write = None,
+                Poll::Ready(Ok(Err(Unwritten::Body(error)))) => {
+                    this.independent_write = None;
+                    return Poll::Ready(Some(Err(error)));
+                }
+                Poll::Ready(Err(error)) => {
+                    this.independent_write = None;
+                    return Poll::Ready(Some(Err(error.into())));
+                }
+                Poll::Pending => {}
+            }
+        }
         if let Some(write) = &mut this.write {
             let written = Pin::new(write).poll(cx);
             match written {

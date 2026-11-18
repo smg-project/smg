@@ -151,7 +151,8 @@ impl RoutingPool {
         }
     }
 
-    fn matches(self, worker: &Arc<dyn Worker>) -> bool {
+    /// Share pool membership rules with readiness without changing selection semantics.
+    pub(crate) fn matches(self, worker: &Arc<dyn Worker>) -> bool {
         match self {
             Self::HttpRegular => {
                 *worker.worker_type() == WorkerType::Regular
@@ -1890,6 +1891,21 @@ impl<G: Generation> WorkerRegistry<G> {
         new_status: WorkerStatus,
     ) -> Option<(WorkerStatus, WorkerStatus)> {
         self.transition_status_inner(worker_id, None, new_status)
+    }
+
+    /// Decide a status transition against the current worker under its mutation
+    /// lock. Instance-bound cleanup can survive a metadata refresh without
+    /// racing a replacement or retrying revisions on the request path.
+    pub(crate) fn transition_status_if(
+        &self,
+        worker_id: &WorkerId,
+        new_status: WorkerStatus,
+        predicate: impl FnOnce(&Arc<dyn Worker>) -> bool,
+    ) -> Option<(WorkerStatus, WorkerStatus)> {
+        self.transition_under_lock(worker_id, None, |worker| {
+            ((), predicate(worker).then_some(new_status))
+        })
+        .and_then(|((), transition)| transition)
     }
 
     /// Same as [`Self::transition_status`], but becomes a no-op if the

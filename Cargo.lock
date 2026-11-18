@@ -2219,11 +2219,13 @@ name = "engine-zmq-adapter"
 version = "0.3.0"
 dependencies = [
  "bytes",
+ "const-hex",
  "engine-zmq-client",
  "futures",
  "half",
  "llm-tokenizer",
  "openai-protocol",
+ "prost",
  "prost-types",
  "rustix",
  "serde_json",
@@ -8006,6 +8008,7 @@ dependencies = [
  "h2",
  "http-body",
  "http-body-util",
+ "libc",
  "openai-protocol",
  "prost",
  "prost-types",

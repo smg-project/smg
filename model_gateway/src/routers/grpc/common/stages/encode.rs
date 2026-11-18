@@ -36,7 +36,7 @@ use crate::{
         error,
         grpc::{
             backend_client::{
-                backend_client_if_initialized, send_tokenspeed_encode_frame,
+                backend_client_if_initialized, get_backend_client, send_tokenspeed_encode_frame,
                 send_tokenspeed_encode_rpc, BackendClient,
             },
             client::GrpcClient,
@@ -148,6 +148,8 @@ pub(crate) struct PreparedEncodeJob {
 
 /// The encode worker a job goes to, by the transport that reaches it.
 pub(crate) enum EncodeTarget {
+    /// Native SGLang control uses the ordinary cached worker connection.
+    Sglang(Arc<dyn Worker>),
     /// A gRPC encode worker, by its URL.
     Grpc(String),
     /// A TokenSpeed encode server on the direct ZMQ lane: its worker, whose
@@ -171,6 +173,19 @@ impl EncodePlan {
 }
 
 impl EncodeDispatchPlan {
+    /// SGLang keeps preprocessing and tensor transfer at E; only references travel here.
+    pub(crate) fn sglang(
+        worker: Arc<dyn Worker>,
+        request: smg_grpc_client::sglang_encoder_proto::EncodeRequest,
+        timeout: std::time::Duration,
+    ) -> Self {
+        Self::new(vec![PreparedEncodeJob {
+            item: PreparedEncodeItem::Sglang(Box::new((request, timeout))),
+            target: EncodeTarget::Sglang(worker),
+            bootstrap_room: 0,
+        }])
+    }
+
     fn new(jobs: Vec<PreparedEncodeJob>) -> Self {
         Self { jobs }
     }
@@ -183,18 +198,47 @@ impl EncodeDispatchPlan {
         self.jobs.len()
     }
 
+    /// Prepared-input E owns native cleanup after its RPC observer disconnects.
+    pub(crate) fn is_prepared_input(&self) -> bool {
+        !self.jobs.is_empty()
+            && self
+                .jobs
+                .iter()
+                .all(|job| matches!(job.item, PreparedEncodeItem::Sglang(_)))
+    }
+
     pub(crate) fn into_jobs(self) -> Vec<PreparedEncodeJob> {
         self.jobs
     }
 }
 
 impl PreparedEncodeJob {
+    #[cfg(test)]
+    pub(crate) fn sglang_request(
+        &self,
+    ) -> Option<&smg_grpc_client::sglang_encoder_proto::EncodeRequest> {
+        match &self.item {
+            PreparedEncodeItem::Sglang(request) => Some(&request.0),
+            PreparedEncodeItem::TokenSpeed { .. } => None,
+        }
+    }
+
     pub(crate) async fn dispatch(self) -> std::result::Result<(), String> {
         self.item.dispatch(self.target, self.bootstrap_room).await
     }
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "retain the existing inline TokenSpeed item without adding a hot-path allocation"
+)]
 pub(crate) enum PreparedEncodeItem {
+    Sglang(
+        Box<(
+            smg_grpc_client::sglang_encoder_proto::EncodeRequest,
+            std::time::Duration,
+        )>,
+    ),
     TokenSpeed {
         item: Option<TokenSpeedMultimodalItem>,
         shm_enabled: bool,
@@ -219,6 +263,23 @@ impl PreparedEncodeItem {
         bootstrap_room: i64,
     ) -> std::result::Result<(), String> {
         match &mut self {
+            Self::Sglang(request) => {
+                let EncodeTarget::Sglang(worker) = target else {
+                    return Err("SGLang prepared input requires a registered encoder".into());
+                };
+                let backend = get_backend_client(worker.as_ref())
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .ok_or("encoder connection unavailable")?;
+                let BackendClient::Grpc(GrpcClient::Sglang(client)) = backend.as_ref() else {
+                    return Err("encoder requires SGLang gRPC".into());
+                };
+                client
+                    .encode_native(std::mem::take(&mut request.0), request.1)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+
             Self::TokenSpeed {
                 item,
                 shm_enabled,
@@ -255,6 +316,7 @@ impl PreparedEncodeItem {
                     .unwrap_or_default();
                 let _shm_guard = TokenSpeedShmCleanupGuard(shm_handles);
                 match target {
+                    EncodeTarget::Sglang(_) => Err("unexpected SGLang target".into()),
                     EncodeTarget::Grpc(endpoint) => {
                         send_tokenspeed_encode_rpc(endpoint, request).await
                     }
@@ -734,6 +796,7 @@ mod tests {
                     ("10.0.0.9", 8998)
                 );
             }
+            EncodeTarget::Sglang(_) => panic!("unexpected SGLang target"),
             EncodeTarget::Grpc(endpoint) => panic!("a gRPC target {endpoint}"),
         }
         let PreparedEncodeItem::TokenSpeed {

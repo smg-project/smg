@@ -635,6 +635,20 @@ async fn run_health_loop<G: Generation>(
     }
 }
 
+/// Refreshes change the clock sample, but must not
+/// hide a new instance or changed static contract from the immediate probe.
+fn same_prepared_contract(old: &dyn Worker, new: &dyn Worker) -> bool {
+    use smg_grpc_client::sglang_managed::{proto::Capabilities, validate_instance};
+    let stable = |worker: &dyn Worker| -> Option<Capabilities> {
+        let mut cap: Capabilities =
+            serde_json::from_str(worker.metadata().spec.labels.get("sglang_prepared")?).ok()?;
+        validate_instance(cap.instance.as_ref()?).ok()?;
+        cap.wall_time_unix_ms = 0;
+        Some(cap)
+    };
+    stable(old).is_some_and(|old| stable(new).is_some_and(|new| old == new))
+}
+
 /// Keeps the schedule in step with the registry: a registered or replaced
 /// worker is probed at once, a removed one leaves the schedule, and a lagged
 /// subscription rebuilds it from a fresh snapshot. `Break` when the registry
@@ -646,6 +660,29 @@ fn apply_registry_event<G: Generation>(
     config: &WorkerManagerConfig,
 ) -> ControlFlow<()> {
     match event {
+        Ok(WorkerEvent::Replaced {
+            worker_id,
+            old,
+            new,
+        }) if old.status() == WorkerStatus::Ready
+            && new.status() == WorkerStatus::Ready
+            && same_prepared_contract(old.as_ref(), new.as_ref()) =>
+        {
+            // A probe's label refresh replaces metadata. Probing it immediately
+            // would refresh it again forever. Preserve the already scheduled read;
+            // new instances and non-prepared replacements still probe at once.
+            if !next_check.contains_key(&worker_id) {
+                let slot =
+                    ProbeSlot::of_worker(registry, &worker_id, new.as_ref(), new.status(), config);
+                schedule_at(
+                    next_check,
+                    worker_id,
+                    slot,
+                    tokio::time::Instant::now(),
+                    false,
+                );
+            }
+        }
         Ok(WorkerEvent::Registered { worker_id, worker })
         | Ok(WorkerEvent::Replaced {
             worker_id,
@@ -878,10 +915,22 @@ async fn apply_probe_completion<G: Generation>(
                 .await;
             }
         }
-        if new == WorkerStatus::Ready && labels_follow_the_engine(registry, &worker_id, &worker) {
-            if let Some(jq) = refresh_queue {
-                submit_label_refresh(&worker, jq).await;
-            }
+    }
+    // A prepared process may restart between successful probes. Refresh on the
+    // existing cadence even without a health transition; a queue submission
+    // failure is retried by the next probe. The job queue already coalesces work.
+    let prepared_probe = probe_ok
+        && worker.status() == WorkerStatus::Ready
+        && worker
+            .metadata()
+            .spec
+            .labels
+            .contains_key("sglang_prepared");
+    if (transition.is_some_and(|(_, status)| status == WorkerStatus::Ready) || prepared_probe)
+        && labels_follow_the_engine(registry, &worker_id, &worker)
+    {
+        if let Some(jq) = refresh_queue {
+            submit_label_refresh(&worker, jq).await;
         }
     }
 
@@ -966,6 +1015,19 @@ fn apply_connect_signal<G: Generation>(
     if slot == ProbeSlot::Removal {
         debug!(worker_url = %Endpoint::redacted_str(&url), "Connect signal for a worker being removed; ignoring");
         return None;
+    }
+    // Prepared-input generations can change across a short transport outage
+    // while health still says Ready. The recovery signal must refresh labels
+    // even though it does not promote the worker. Keep revision fencing.
+    if worker.status() == WorkerStatus::Ready
+        && worker.revision() == revision
+        && worker
+            .metadata()
+            .spec
+            .labels
+            .contains_key("sglang_prepared")
+    {
+        return Some((worker_id, worker));
     }
     if matches!(slot, ProbeSlot::Probe(_)) && *worker.connection_mode() != ConnectionMode::Zmq {
         if worker.revision() != revision {

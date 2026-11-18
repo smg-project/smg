@@ -30,8 +30,8 @@ use crate::routers::{
         client::GenerateRequestBuildOptions,
         common::stages::helpers::{self, SamplingDefaultsMask, TagForStart},
         context::{
-            stage_output, AttemptStamp, ClientSelection, ExecutionPlan, PlanSettings,
-            RequestContext, RequestType,
+            stage_output, AttemptStamp, ClientSelection, EncodeOutputs, ExecutionPlan,
+            PlanSettings, RequestContext, RequestType,
         },
         proto_wrapper::{MultimodalData, ProtoGenerateRequest},
         utils,
@@ -143,7 +143,14 @@ pub(crate) fn build(
 
     // The ids are the prompt; the text rides along only when the request
     // carries media (see `helpers::wire_prompt_text`).
-    let carries_media = multimodal_data.is_some() || ctx.state.multimodal_refs.is_some();
+    // Prepared input owns the references after ingress removes them from the
+    // legacy media builder. P still needs the rendered text to expand anchors.
+    let carries_media = multimodal_data.is_some()
+        || ctx.state.multimodal_refs.is_some()
+        || matches!(
+            ctx.state.encode_outputs.as_ref(),
+            Some(EncodeOutputs::PreparedInput(_))
+        );
     let mut proto_request = build_request(
         builder_client,
         request_id,

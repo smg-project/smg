@@ -722,6 +722,18 @@ pub(crate) struct ConfigValidator;
 impl ConfigValidator {
     pub(crate) fn validate(config: &RouterConfig) -> ConfigResult<()> {
         Self::validate_mode(&config.mode)?;
+        if config.is_sglang_epd()
+            && (config.enable_igw
+                || config.connection_mode != ConnectionMode::Grpc
+                || matches!(&config.mode, RoutingMode::EncodePrefillDecode { encode_urls, .. }
+                    if encode_urls.iter().any(|(url, _)| url.starts_with("ipc://"))))
+        {
+            return Err(ConfigError::ValidationFailed {
+                reason:
+                    "SGLang prepared-input EPD requires gRPC E/P/D routing and does not support IGW"
+                        .into(),
+            });
+        }
         bounds::validate(config)?;
         Self::validate_policy(&config.policy)?;
         Self::validate_routing_key_headers(config)?;
@@ -2565,8 +2577,39 @@ impl ConfigValidator {
 
 #[cfg(test)]
 mod tests {
+    use openai_protocol::worker::RuntimeType;
 
     use super::*;
+
+    /// The prepared encoder speaks gRPC; a local ZMQ URL cannot name that endpoint.
+    #[test]
+    fn prepared_encoder_requires_a_grpc_capable_url() {
+        for url in [
+            "grpc://encoder:8000",
+            "http://encoder:8000",
+            "ipc:///tmp/encoder",
+        ] {
+            let config = RouterConfig {
+                mode: RoutingMode::EncodePrefillDecode {
+                    encode_urls: vec![(url.into(), None)],
+                    prefill_urls: vec![],
+                    decode_urls: vec![],
+                    encode_policy: None,
+                    prefill_policy: None,
+                    decode_policy: None,
+                },
+                connection_mode: ConnectionMode::Grpc,
+                startup_worker_runtime_type: Some(RuntimeType::Sglang),
+                ..RouterConfig::default()
+            };
+            let result = ConfigValidator::validate(&config);
+            assert_eq!(
+                result.is_ok(),
+                !url.starts_with("ipc://"),
+                "{url}: {result:?}"
+            );
+        }
+    }
 
     /// The reason reads "Must be > 0", so a signed zero and a negative are refused alike.
     #[test]

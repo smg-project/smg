@@ -21,15 +21,15 @@ use std::{
 
 use bytes::Bytes;
 use engine_servicer::{
-    BoxFuture, EncodeDispatchErrorSink, EncodeDispatchOutcome, EncodeDispatchRequest, EncodeFuture,
-    EncodeMediaRefs, EncodeRelease, EncodeTransport, EncoderDispatchErrorReq, MediaError,
-    MediaFeatures, MediaProcessor, MediaRequest, ProcessedMedia, ServicerConfig, ServicerError,
-    SglangEncodeDispatcher, SglangMediaProcessor, SglangModelInfo, SglangServicerConfig,
-    SglangServicerServer, TokenSpeedModelInfo, TokenSpeedServicerConfig, TokenSpeedServicerServer,
-    TrtllmModelInfo, TrtllmServicerConfig, TrtllmServicerServer, VllmModelInfo, VllmServicerConfig,
-    VllmServicerServer, ALL_MODALITIES, DEFAULT_ENGINE_PREFILL_TOKENS_PER_SEC,
-    DEFAULT_ENGINE_SILENCE_TIMEOUT, DEFAULT_ENGINE_STARTUP_CEILING, DEFAULT_ENGINE_STARTUP_TIMEOUT,
-    PIXEL_MODALITIES,
+    managed::encoder::EncoderServer, BoxFuture, EncodeDispatchErrorSink, EncodeDispatchOutcome,
+    EncodeDispatchRequest, EncodeFuture, EncodeMediaRefs, EncodeRelease, EncodeTransport,
+    EncoderDispatchErrorReq, MediaError, MediaFeatures, MediaProcessor, MediaRequest,
+    ProcessedMedia, ServicerConfig, ServicerError, SglangEncodeDispatcher, SglangMediaProcessor,
+    SglangModelInfo, SglangServicerConfig, SglangServicerServer, TokenSpeedModelInfo,
+    TokenSpeedServicerConfig, TokenSpeedServicerServer, TrtllmModelInfo, TrtllmServicerConfig,
+    TrtllmServicerServer, VllmModelInfo, VllmServicerConfig, VllmServicerServer, ALL_MODALITIES,
+    DEFAULT_ENGINE_PREFILL_TOKENS_PER_SEC, DEFAULT_ENGINE_SILENCE_TIMEOUT,
+    DEFAULT_ENGINE_STARTUP_CEILING, DEFAULT_ENGINE_STARTUP_TIMEOUT, PIXEL_MODALITIES,
 };
 use llm_multimodal::{jpeg_turbo::TurboJpegPolicy, Modality};
 use prost::Message;
@@ -42,7 +42,10 @@ use smg::routers::grpc::worker_media::{
     PixelFormat, WorkerMediaError, WorkerMediaItem, WorkerMediaPipeline, WorkerMediaSettings,
     SCHEMES,
 };
-use smg_grpc_client::vllm_proto as vllm;
+use smg_grpc_client::{
+    sglang_managed::{self, proto as managed, Limits},
+    vllm_proto as vllm,
+};
 use tokio::sync::oneshot;
 
 fn to_py_err(error: ServicerError) -> PyErr {
@@ -526,6 +529,79 @@ impl MediaProcessor for SmgMediaProcessor {
 struct SmgSglangMediaProcessor {
     pipeline: Arc<WorkerMediaPipeline>,
     admission: Arc<tokio::sync::Semaphore>,
+}
+
+/// E-local Rust preprocessing for the managed native encoder bridge.
+/// Serialized CPU tensors never pass through the gateway or the D control service.
+#[pyclass(name = "ManagedEncoderProcessor")]
+pub struct PyManagedEncoderProcessor {
+    pipeline: Arc<WorkerMediaPipeline>,
+    // Keep the runtime that initialized the pipeline alive until its owner drops.
+    _runtime: tokio::runtime::Runtime,
+    max_artifact_bytes: usize,
+}
+
+#[pymethods]
+impl PyManagedEncoderProcessor {
+    /// Apply the same bounded manifest validator at the Python native boundary.
+    #[staticmethod]
+    fn validate_layout(manifest: &[u8], binding: &[u8]) -> PyResult<()> {
+        let limits = Limits::default();
+        if manifest.len() > limits.manifest_bytes || binding.len() > limits.manifest_bytes {
+            return Err(PyValueError::new_err("managed manifest exceeds byte bound"));
+        }
+        let input = managed::PreparedDecodeInput::decode(manifest)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let binding = managed::InputBinding::decode(binding)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        sglang_managed::validate_manifest(&input, &binding, limits)
+            .map_err(|e| PyValueError::new_err(e.to_string()))
+    }
+
+    /// Load the shared Rust processor once, without changing legacy model support defaults.
+    #[new]
+    fn new(
+        py: Python<'_>,
+        options: Bound<'_, PyDict>,
+        tokenizer_dir: String,
+        max_artifact_bytes: usize,
+    ) -> PyResult<Self> {
+        let native = native_media_options(&options, "managed-encoder")?;
+        if max_artifact_bytes == 0
+            || native.max_inflight == 0
+            || native.max_inflight > tokio::sync::Semaphore::MAX_PERMITS
+        {
+            return Err(PyValueError::new_err(
+                "managed encoder requires finite nonzero limits",
+            ));
+        }
+        py.detach(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            let pipeline = runtime
+                .block_on(async {
+                    let tokenizer =
+                        llm_tokenizer::factory::create_tokenizer_async(&tokenizer_dir).await?;
+                    let mut settings = native.settings;
+                    settings.tokenizer_dir = Some(tokenizer_dir);
+                    WorkerMediaPipeline::new_sglang(settings, tokenizer).await
+                })
+                .map_err(|e| PyValueError::new_err(format!("{e:#}")))?;
+            if !matches!(pipeline.spec_name(), "qwen_vl" | "qwen3_vl") {
+                return Err(PyValueError::new_err(
+                    "managed encoder has no artifact adapter for this model",
+                ));
+            }
+            Ok(Self {
+                pipeline: Arc::new(pipeline),
+                _runtime: runtime,
+                max_artifact_bytes,
+            })
+        })
+    }
 }
 
 impl SglangMediaProcessor for SmgSglangMediaProcessor {
@@ -1719,6 +1795,7 @@ impl PySglangGrpcServer {
         kv_events_topic = String::new(),
         encode_dispatcher = None,
         smg_media_processor = None,
+        managed_config = None,
         engine_startup_timeout_secs = None,
         engine_startup_ceiling_secs = None,
         engine_silence_timeout_secs = None,
@@ -1762,6 +1839,7 @@ impl PySglangGrpcServer {
         kv_events_topic: String,
         encode_dispatcher: Option<Bound<'_, PyAny>>,
         smg_media_processor: Option<Bound<'_, PyDict>>,
+        managed_config: Option<String>,
         engine_startup_timeout_secs: Option<f64>,
         engine_startup_ceiling_secs: Option<f64>,
         engine_silence_timeout_secs: Option<f64>,
@@ -1836,6 +1914,13 @@ impl PySglangGrpcServer {
             media_processor: None,
         };
         let inner = py.detach(|| -> PyResult<SglangServicerServer> {
+            if let Some(json) = managed_config {
+                if native.is_some() {
+                    return Err(PyValueError::new_err("managed P/D cannot use legacy media preprocessing"));
+                }
+                let managed = serde_json::from_str(&json).map_err(|e| PyValueError::new_err(format!("invalid managed configuration: {e}")))?;
+                return SglangServicerServer::start_managed(config, managed).map_err(to_py_err);
+            }
             if let Some(native) = native {
                 if !matches!(
                     native.settings.encoder_dtype.as_str(),
@@ -1964,5 +2049,96 @@ impl PySglangGrpcServer {
         }
         let timeout = Duration::from_secs_f64(timeout_secs);
         py.detach(|| self.inner.stop(timeout)).map_err(to_py_err)
+    }
+}
+
+/// Native encoder control shares the existing servicer runtime and Rust media pipeline.
+#[pyclass(name = "ManagedEncoderServer")]
+pub struct PyManagedEncoderServer {
+    server: EncoderServer,
+}
+
+#[pymethods]
+impl PyManagedEncoderServer {
+    #[new]
+    /// Start Rust encoder control with the shared processor; Python retains native GPU ownership.
+    fn new(
+        py: Python<'_>,
+        config_json: String,
+        processor: PyRef<'_, PyManagedEncoderProcessor>,
+    ) -> PyResult<Self> {
+        use engine_servicer::managed::encoder::{EncoderArtifact, EncoderProcessor};
+        let config: serde_json::Value = serde_json::from_str(&config_json)
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        let token = config["image_token_id"]
+            .as_u64()
+            .and_then(|token| u32::try_from(token).ok())
+            .ok_or_else(|| PyValueError::new_err("missing image token id"))?;
+        let pipeline = processor.pipeline.clone();
+        let max_artifact_bytes = processor.max_artifact_bytes;
+        let process: EncoderProcessor = Arc::new(move |urls| {
+            let pipeline = pipeline.clone();
+            Box::pin(async move {
+                let tokens = vec![token; urls.len()];
+                let items = urls
+                    .into_iter()
+                    .map(|url| WorkerMediaItem {
+                        modality: Modality::Image,
+                        url,
+                    })
+                    .collect();
+                let (_, inputs, extras) = pipeline
+                    .process_sglang_encoder(tokens, items)
+                    .await
+                    .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
+                let embedding_tokens = std::iter::once(&inputs)
+                    .chain(extras.iter())
+                    .flat_map(|batch| batch.mm_placeholders.iter())
+                    .map(|item| u64::from(item.length))
+                    .sum();
+                let artifact = smg_grpc_client::sglang_proto::GenerateRequest {
+                    mm_inputs: Some(Box::new(inputs)),
+                    extra_mm_inputs: extras,
+                    ..Default::default()
+                };
+                if artifact.encoded_len() > max_artifact_bytes {
+                    return Err(tonic::Status::resource_exhausted(
+                        "managed CPU artifact exceeds byte budget",
+                    ));
+                }
+                Ok(EncoderArtifact {
+                    bytes: artifact.encode_to_vec().into(),
+                    embedding_tokens,
+                })
+            })
+        });
+        py.detach(move || {
+            EncoderServer::start(&config_json, process)
+                .map(|server| Self { server })
+                .map_err(to_py_err)
+        })
+    }
+
+    /// Stop admission and request cancellation without claiming native release.
+    fn drain(&self) {
+        self.server.drain();
+    }
+    /// Count encoder owners that still lack a native release receipt.
+    fn active(&self) -> usize {
+        self.server.active()
+    }
+    /// Expose control-thread liveness to the Python shutdown observer.
+    fn running(&self) -> bool {
+        self.server.running()
+    }
+    /// Return the recorded control failure so the launcher can begin cleanup.
+    fn last_error(&self) -> PyResult<Option<String>> {
+        self.server.last_error().map_err(to_py_err)
+    }
+    /// Stop the Rust listeners after the caller has drained native owners.
+    fn stop(&self, py: Python<'_>, timeout: f64) -> PyResult<()> {
+        let duration = Duration::try_from_secs_f64(timeout)
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        py.detach(|| self.server.stop(duration).map_err(to_py_err))
     }
 }
