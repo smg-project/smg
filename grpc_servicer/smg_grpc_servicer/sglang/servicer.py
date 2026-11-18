@@ -145,11 +145,20 @@ def _deepseek_v41_items(feature, tensors: dict, offsets: list) -> list:
         raise ValueError(f"{prefix} {sum(patches)} patches but the pixel tensor has {rows} rows")
     items = []
     start = 0
+    previous_last = None
     for index, ((height, width), count, (first, last)) in enumerate(zip(grids, patches, offsets)):
         if height < 1 or width < 1 or height * width != count:
             raise ValueError(
                 f"{prefix} image {index} has a {height}x{width} grid but {count} patches"
             )
+        # SGLang writes the items' embeddings over the placeholders in prompt
+        # order, so the ranges must be in prompt order and must not overlap.
+        if previous_last is not None and first <= previous_last:
+            raise ValueError(
+                f"{prefix} image {index}'s placeholder {first}..={last} does not start "
+                f"after image {index - 1}'s, which ends at {previous_last}"
+            )
+        previous_last = last
         span = last - first + 1
         if tokens is not None and span != tokens[index]:
             raise ValueError(

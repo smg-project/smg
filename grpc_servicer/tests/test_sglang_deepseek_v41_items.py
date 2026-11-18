@@ -176,6 +176,31 @@ def test_span_length_must_match_the_image_tokens(v41_converter):
 
 
 @pytest.mark.parametrize(
+    "spans, message",
+    [
+        ([(1, 5), (1, 5)], "image 1's placeholder 1..=5 does not start after image 0's, "),
+        ([(1, 5), (5, 4)], "image 1's placeholder 5..=8 does not start after image 0's, "),
+        ([(7, 5), (1, 4)], "image 1's placeholder 1..=4 does not start after image 0's, "),
+    ],
+    ids=["same-range", "overlap", "out-of-order"],
+)
+def test_placeholders_out_of_prompt_order_are_refused(v41_converter, spans, message):
+    """SGLang writes the items' embeddings over the placeholders in prompt order:
+    a shared position, or a range before the one of the image ahead of it, would
+    put one image's embeddings on another's positions."""
+    servicer, pb = v41_converter
+    with pytest.raises(ValueError, match=message):
+        _convert(servicer, pb, _v41_batch(pb, spans=spans))
+
+
+def test_placeholders_that_touch_are_two_items(v41_converter):
+    """A range may start right after the one before it ends."""
+    servicer, pb = v41_converter
+    result = _convert(servicer, pb, _v41_batch(pb, spans=[(1, 5), (6, 4)]))
+    assert [item.offsets for item in result.mm_items] == [[(1, 5)], [(6, 9)]]
+
+
+@pytest.mark.parametrize(
     "name, values, shape, dtype, message",
     [
         ("vit_grid", [2, 3, 1], (3,), torch.int64, "vit_grid holds 3 values, not"),

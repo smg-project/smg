@@ -96,6 +96,7 @@ pub(crate) fn deepseek_v41_items(
     };
     let mut items = Vec::with_capacity(images);
     let mut start = 0usize;
+    let mut previous_last = None;
     for (index, ((&[height, width], &count), &(first, last))) in
         grids.iter().zip(&patches).zip(offsets).enumerate()
     {
@@ -104,6 +105,16 @@ pub(crate) fn deepseek_v41_items(
                 "{PREFIX} image {index} has a {height}x{width} grid but {count} patches"
             ));
         }
+        // SGLang writes the items' embeddings over the placeholders in prompt
+        // order, so the ranges must be in prompt order and must not overlap.
+        if let Some(previous) = previous_last.filter(|&previous| first <= previous) {
+            return Err(format!(
+                "{PREFIX} image {index}'s placeholder {first}..={last} does not start after \
+                 image {}'s, which ends at {previous}",
+                index - 1
+            ));
+        }
+        previous_last = Some(last);
         let span = last - first + 1;
         if let Some(tokens) = &tokens {
             if span != tokens[index] {
@@ -357,6 +368,36 @@ mod tests {
             flat_pixels,
             "pixel_values has shape [8], not rows of patches",
         );
+    }
+
+    /// SGLang writes the items' embeddings over the placeholders in prompt
+    /// order: a shared position, or a range before the one of the image
+    /// ahead of it, would put one image's embeddings on another's positions.
+    /// A range may start right after the one before it ends.
+    #[test]
+    fn placeholders_out_of_prompt_order_are_refused() {
+        for (spans, needle) in [
+            (
+                [(1, 5), (1, 5)],
+                "image 1's placeholder 1..=5 does not start after image 0's, which ends at 5",
+            ),
+            (
+                [(1, 5), (5, 4)],
+                "image 1's placeholder 5..=8 does not start after image 0's, which ends at 5",
+            ),
+            (
+                [(7, 5), (1, 4)],
+                "image 1's placeholder 1..=4 does not start after image 0's, which ends at 11",
+            ),
+        ] {
+            let batch = v41_batch(&GRIDS, &PATCHES, &spans);
+            let error = translate_sglang_multimodal(batch, Vec::new(), PROMPT_LEN).unwrap_err();
+            assert!(error.contains(needle), "{error:?} does not name {needle:?}");
+        }
+        let touching = v41_batch(&GRIDS, &PATCHES, &[(1, 5), (6, 4)]);
+        let output = translate_sglang_multimodal(touching, Vec::new(), PROMPT_LEN).unwrap();
+        let offsets: Vec<_> = output.mm_items.iter().map(|item| &item.offsets).collect();
+        assert_eq!(offsets, [&Some(vec![(1, 5)]), &Some(vec![(6, 9)])]);
     }
 
     /// Empty grids make no items. Refused alone, and refused, not a panic,
