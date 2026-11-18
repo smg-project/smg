@@ -22,7 +22,10 @@
 //! (a pair's two sides are in flight together). The frame carries the view
 //! (the request under the plugin's exposure, every candidate, the pool) and
 //! the stage bits the profile binds; the answer carries the survivors, one
-//! score per candidate and the pick, each stage's field its own. A plugin
+//! score per candidate and the pick, each stage's field its own. The
+//! request's block hashes ride the frame only where the plugin's row
+//! declares them (`needs`, either form), the first 8,190 of a longer list,
+//! so a prompt's length sizes no frame of a plugin that reads none. A plugin
 //! bound as a filter or a scorer is asked at the decision's open, so the
 //! native stages run while it computes; a plugin bound as the picker alone
 //! is asked at the pick, with the combined native scores. The deciding

@@ -930,7 +930,14 @@ impl Bound {
             return;
         }
         open.decision_id = lane.next_id();
-        let frame = view::decide(open.decision_id, facts, candidates, pool, &inner.exposure);
+        let frame = view::decide(
+            open.decision_id,
+            facts,
+            candidates,
+            pool,
+            &inner.exposure,
+            inner.needs,
+        );
         if bound & (FILTER | SCORE) == 0 {
             // The pick alone: the frame waits for the combined scores.
             open.pending = Some(frame);
