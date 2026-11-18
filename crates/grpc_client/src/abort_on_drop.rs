@@ -24,7 +24,10 @@ use std::{
     future::Future,
     marker::PhantomData,
     pin::Pin,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     task::{Context, Poll},
     time::Duration,
 };
@@ -105,6 +108,8 @@ struct StreamState<T: Send + 'static, C: AbortOnDropClient> {
     /// The request's deadline and its timer, when the stream is bounded by
     /// one (see [`AbortOnDropStream::with_deadline`]).
     deadline: Option<(RequestDeadline, Pin<Box<Sleep>>)>,
+    // Router bookkeeping follows transport cleanup, not native buffer ownership.
+    release_guard: Option<Arc<dyn Send + Sync>>,
     _marker: PhantomData<fn() -> T>,
 }
 
@@ -123,9 +128,22 @@ impl<T: Send + 'static, C: AbortOnDropClient> AbortOnDropStream<T, C> {
                 saw_item: false,
                 release_drain_bound: RELEASE_DRAIN_MAX_WAIT,
                 deadline: None,
+                release_guard: None,
                 _marker: PhantomData,
             }),
         }
+    }
+
+    /// Retain router bookkeeping through an early drop's transport cleanup.
+    /// Completion of that cleanup is not proof of native resource quiescence.
+    pub fn retain_until_released(&mut self, guard: Arc<impl Send + Sync + 'static>) {
+        self.state.release_guard = Some(guard);
+    }
+
+    /// The protocol reader observed normal completion; its ordinary owner now
+    /// determines when bookkeeping ends. Does not suppress abort-on-drop.
+    pub fn release_retained_guard(&mut self) {
+        self.state.release_guard.take();
     }
 
     /// Bound the stream by the request's `deadline`: a poll at or past it
@@ -227,6 +245,7 @@ impl<T: Send + 'static, C: AbortOnDropClient> StreamState<T, C> {
         // the worker's own end of it (see below), not by the reset that
         // dropping it here would send.
         let stream = self.inner.take();
+        let release_guard = self.release_guard.take();
 
         #[expect(
             clippy::disallowed_methods,
@@ -285,6 +304,7 @@ impl<T: Send + 'static, C: AbortOnDropClient> StreamState<T, C> {
                 release_by_draining(stream, release_bound, &request_id),
             )
             .await;
+            drop(release_guard);
         });
     }
 }

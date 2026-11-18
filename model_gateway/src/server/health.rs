@@ -85,7 +85,10 @@ use crate::{
     config::{bind_socket_addr, ReadinessRoleConfig, RouterConfig, RoutingMode},
     middleware::ProbeResponse,
     observability::inflight_tracker::InFlightRequestTracker,
-    routers::grpc::multimodal::{mm_settings, models_without_media_processing},
+    routers::grpc::{
+        multimodal::{mm_settings, models_without_media_processing},
+        sglang_epd::router as prepared_input,
+    },
     worker::{registry::event::WorkerEvent, Worker, WorkerRegistry, WorkerType, UNKNOWN_MODEL_ID},
 };
 
@@ -207,6 +210,11 @@ impl ModelReadiness {
             .find(|(role, _)| healthy_of(Some(*role)) == 0)
         {
             Some(*lacking)
+        } else if router_config.is_sglang_epd()
+            && has_encode_worker()
+            && !prepared_input::pipeline_ready(workers, router_config.pd_pairing_mode)
+        {
+            Some("no_compatible_epd_pipeline")
         } else if !router_config.disable_tokenizer_autoload
             && !workers
                 .iter()
@@ -422,7 +430,7 @@ impl ProbeState {
         // follows).
         let mut model_ids = worker_registry.get_models();
         model_ids.sort_unstable();
-        let models = model_ids
+        let models: Vec<_> = model_ids
             .into_iter()
             .filter(|model| model != UNKNOWN_MODEL_ID)
             .filter_map(|model| {
@@ -455,7 +463,8 @@ impl ProbeState {
         }
 
         self.readiness.store(Arc::new(ReadinessSnapshot {
-            workers_ready,
+            workers_ready: workers_ready
+                && (!router_config.is_sglang_epd() || models.iter().any(|m| m.ready)),
             tokenizers_ready,
             healthy_workers: healthy_workers.len(),
             total_workers: workers.len(),
@@ -732,7 +741,7 @@ pub fn start_probe_listener(
 mod tests {
     use std::sync::Arc;
 
-    use openai_protocol::worker::{HealthCheckConfig, WorkerStatus};
+    use openai_protocol::worker::{HealthCheckConfig, RuntimeType, WorkerStatus};
     use tower::ServiceExt;
 
     use super::*;
@@ -1225,6 +1234,111 @@ mod tests {
         assert!(!snapshot.tokenizers_ready);
     }
 
+    #[tokio::test]
+    /// Readiness must resolve the served model tokenizer rather than accepting a model-path alias.
+    async fn prepared_epd_probe_uses_served_name_tokenizer_without_path_alias() {
+        use llm_tokenizer::{mock::MockTokenizer, traits::Tokenizer};
+        use smg_grpc_client::sglang_managed::proto::Capabilities;
+
+        use crate::worker::RuntimeType;
+
+        const SERVED: &str = "served-qwen";
+        const PATH: &str = "/weights/qwen-vl";
+        let state = probe_state();
+        let registry = WorkerRegistry::new();
+        let mut router_config = config(RoutingMode::EncodePrefillDecode {
+            encode_urls: vec![],
+            prefill_urls: vec![],
+            decode_urls: vec![],
+            encode_policy: None,
+            prefill_policy: None,
+            decode_policy: None,
+        });
+        router_config.model_path = Some(PATH.into());
+        router_config.startup_worker_runtime_type = Some(RuntimeType::Sglang);
+        for (port, role, capability_role) in [
+            (9501, WorkerType::Encode, "encoder"),
+            (9502, WorkerType::Prefill, "prefill"),
+            (9503, WorkerType::Decode, "decode"),
+        ] {
+            let capability = Capabilities {
+                version: 1,
+                decode_start_bind: capability_role == "decode",
+                role: capability_role.into(),
+                model_revision: "weights".into(),
+                processor_contract: "qwen3".into(),
+                layout_contract: "sglang_native_manifest_v1".into(),
+                embedding_dtype: "bfloat16".into(),
+                embedding_backend: "mooncake".into(),
+                kv_backend: "mooncake".into(),
+                topology_contract: "single-host-tp1".into(),
+                tp_size: 1,
+                ..Default::default()
+            };
+            let model = ModelCard::new(SERVED);
+            assert!(model.aliases.is_empty());
+            registry
+                .register(Arc::new(
+                    BasicWorkerBuilder::new(format!("grpc://127.0.0.1:{port}"))
+                        .model(model)
+                        .worker_type(role)
+                        .runtime_type(RuntimeType::Sglang)
+                        .connection_mode(ConnectionMode::Grpc)
+                        .status(WorkerStatus::Ready)
+                        .health_config(HealthCheckConfig {
+                            disable_health_check: true,
+                            ..Default::default()
+                        })
+                        .label("model_id", PATH)
+                        .label("model_path", PATH)
+                        .label("tokenizer_path", PATH)
+                        .label(
+                            "sglang_prepared",
+                            serde_json::to_string(&capability).unwrap(),
+                        )
+                        .label("sglang_prepared_key", "same-pd-contract")
+                        .build(),
+                ))
+                .unwrap();
+        }
+        assert!(router_config.is_sglang_epd());
+        assert_eq!(registry.get_models(), vec![SERVED.to_string()]);
+        // Separate registries ensure the passing case has no model-path alias.
+        for (registered_name, ready) in [(PATH, false), (SERVED, true)] {
+            let tokenizers = TokenizerRegistry::new();
+            let tokenizer: Arc<dyn Tokenizer> = Arc::new(MockTokenizer::new());
+            tokenizers
+                .load(registered_name, registered_name, PATH, || async move {
+                    Ok(tokenizer)
+                })
+                .await
+                .unwrap();
+            assert_eq!(tokenizers.get(PATH).is_some(), !ready);
+            state.recompute(&registry, &tokenizers, &router_config);
+            let snapshot = state.readiness();
+            assert_eq!(snapshot.tokenizers_ready, ready);
+            assert_eq!(snapshot.models.len(), 1);
+            assert_eq!(snapshot.models[0].model, SERVED);
+            assert_eq!(snapshot.models[0].ready, ready);
+            assert_eq!(
+                snapshot.models[0].reason,
+                if ready {
+                    None
+                } else {
+                    Some("tokenizer_not_ready")
+                }
+            );
+            assert_eq!(
+                state.readiness_response().status(),
+                if ready {
+                    StatusCode::OK
+                } else {
+                    StatusCode::SERVICE_UNAVAILABLE
+                }
+            );
+        }
+    }
+
     /// Under worker-side media placement, a model whose workers report a
     /// vision encoder and none of which processes media references is named
     /// in the ready body, until a capable worker registers; the other
@@ -1542,6 +1656,14 @@ mod tests {
                 {"model": "vision", "ready": false, "reason": "no_healthy_encode_worker",
                  "healthy_workers": 2, "total_workers": 3},
             ])
+        );
+        // A globally enabled prepared adapter still permits a PD-only model.
+        let mut prepared_config = router_config;
+        prepared_config.startup_worker_runtime_type = Some(RuntimeType::Sglang);
+        recompute(&state, &registry, &prepared_config);
+        assert_eq!(
+            json_of(state.readiness_response()).await["models"],
+            body["models"]
         );
     }
 

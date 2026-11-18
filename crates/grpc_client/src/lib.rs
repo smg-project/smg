@@ -24,6 +24,7 @@ pub mod media_identity;
 pub mod mlx_engine;
 pub mod request_deadline;
 mod request_fields;
+pub mod sglang_managed;
 pub mod sglang_scheduler;
 pub mod tokenizer_bundle;
 pub mod tokenspeed_encoder;
@@ -619,3 +620,13 @@ macro_rules! impl_rank_load_conversions {
     };
 }
 pub(crate) use impl_rank_load_conversions;
+
+/// Native SGLang encoder control protocol, without tensor payload adaptation.
+#[expect(
+    clippy::allow_attributes,
+    reason = "the generator decides which lints fire, so these allows cannot be expects"
+)]
+pub mod sglang_encoder_proto {
+    #![allow(clippy::all, clippy::absolute_paths, unused_qualifications)]
+    tonic::include_proto!("sglang.grpc.encoder");
+}

@@ -100,7 +100,7 @@ impl RouterFactory {
                 let mode = grpc_mode(&ctx.router_config).ok_or_else(|| {
                     "gRPC connection mode requires a gRPC routing mode".to_string()
                 })?;
-                Self::create_grpc_router(ctx, mode)
+                Ok(Box::new(GrpcRouter::new(ctx, mode)?))
             }
             ConnectionMode::Http => match &ctx.router_config.mode {
                 RoutingMode::Regular { .. } => Self::create_regular_router(ctx).await,

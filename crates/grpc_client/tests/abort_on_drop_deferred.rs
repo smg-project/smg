@@ -10,10 +10,11 @@
 //! is released by the backend's own end of it after the abort, within a
 //! bound, not by an immediate reset.
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use futures::StreamExt;
 use smg_grpc_client::{vllm_proto as proto, VllmEngineClient};
+use tokio::sync::oneshot::{self, error::TryRecvError};
 
 mod common;
 use common::{generate_request, spawn_mock, wait_for_abort};
@@ -156,4 +157,46 @@ async fn a_backend_that_never_ends_a_dropped_stream_is_reset_after_the_bound() {
         tx.send(Ok(chunk())).await.is_err(),
         "past the bound the stream is released with a reset"
     );
+}
+
+/// Transport cleanup completion is deliberately not a native-buffer release receipt.
+#[tokio::test]
+async fn router_bookkeeping_follows_abort_and_stream_drain() {
+    let (endpoint, state) = spawn_mock().await.unwrap();
+    let client = VllmEngineClient::connect(&endpoint).await.unwrap();
+    let mut stream = client
+        .generate(generate_request("retained-1"))
+        .await
+        .unwrap();
+    let (owner, mut ended) = oneshot::channel::<()>();
+    stream.retain_until_released(Arc::new(owner));
+    let tx = state.lock_tx().take().unwrap();
+    drop(stream);
+    assert_eq!(wait_for_abort(&state).await, ["retained-1"]);
+    assert!(matches!(ended.try_recv(), Err(TryRecvError::Empty)));
+    tx.send(Ok(chunk())).await.unwrap();
+    assert!(matches!(ended.try_recv(), Err(TryRecvError::Empty)));
+    drop(tx);
+    assert!(tokio::time::timeout(Duration::from_secs(5), ended)
+        .await
+        .unwrap()
+        .is_err());
+}
+
+#[tokio::test]
+/// Additional transport ownership must retire on completion without disabling native abort behavior.
+async fn normal_completion_releases_extra_bookkeeping_without_disarming_abort() {
+    let (endpoint, state) = spawn_mock().await.unwrap();
+    let client = VllmEngineClient::connect(&endpoint).await.unwrap();
+    let mut stream = client
+        .generate(generate_request("retained-2"))
+        .await
+        .unwrap();
+    let (owner, ended) = oneshot::channel::<()>();
+    stream.retain_until_released(Arc::new(owner));
+    stream.release_retained_guard();
+    assert!(ended.await.is_err());
+    drop(stream);
+    assert_eq!(wait_for_abort(&state).await, ["retained-2"]);
+    state.lock_tx().take();
 }

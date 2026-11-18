@@ -876,7 +876,8 @@ impl ProtoGenerateRequest {
                 .encode_bootstrap_info
                 .as_ref()
                 .is_some_and(|info| !info.items.is_empty()),
-            Self::Sglang(_) | Self::Vllm(_) | Self::Trtllm(_) | Self::Mlx(_) => false,
+            Self::Sglang(req) => !req.prepared_control.is_empty(),
+            Self::Vllm(_) | Self::Trtllm(_) | Self::Mlx(_) => false,
         }
     }
 

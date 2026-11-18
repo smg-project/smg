@@ -8,7 +8,9 @@ use std::{sync::Arc, time::Duration};
 use futures::StreamExt;
 use openai_protocol::worker::SchedulerLoadSnapshot;
 use prost_types::Timestamp;
-use smg_grpc_client::{media_identity::sglang as contract, sglang_proto as sg};
+use smg_grpc_client::{
+    media_identity::sglang as contract, sglang_managed::clock, sglang_proto as sg,
+};
 use tonic::Status;
 
 use super::{embed, generate, State};
@@ -40,7 +42,13 @@ pub(super) async fn health_check_with(
     state: &Arc<State>,
     timeout: Duration,
 ) -> sg::HealthCheckResponse {
-    if !state.shared.is_serving() {
+    if !state.shared.is_serving()
+        || state.prepared.get().is_some_and(|runtime| !runtime.ready())
+        || state
+            .managed_config
+            .as_ref()
+            .is_some_and(|c| clock::check(c.max_clock_error_ms).is_err())
+    {
         return sg::HealthCheckResponse {
             healthy: false,
             message: state.shared.health_message(PASSED).to_string(),
@@ -155,6 +163,38 @@ pub(super) fn server_info(state: &State) -> sg::GetServerInfoResponse {
     let ready = state.shared.ready();
     let max_total_num_tokens = state.shared.kv_capacity_tokens();
     let mut server_args = struct_from_json(&model.server_args_json);
+    if let Some(config) = &state.managed_config {
+        let capability = config.capabilities();
+        for (key, value) in [
+            (
+                "sglang_prepared",
+                serde_json::to_string(&capability).unwrap_or_default(),
+            ),
+            (
+                "sglang_prepared_key",
+                serde_json::to_string(&(
+                    &capability.model_revision,
+                    &capability.processor_contract,
+                    &capability.layout_contract,
+                    &capability.embedding_dtype,
+                    &capability.kv_backend,
+                    if capability.kv_backend == "mooncake" {
+                        "single-host"
+                    } else {
+                        &capability.topology_contract
+                    },
+                ))
+                .unwrap_or_default(),
+            ),
+        ] {
+            server_args.fields.insert(
+                key.into(),
+                prost_types::Value {
+                    kind: Some(prost_types::value::Kind::StringValue(value)),
+                },
+            );
+        }
+    }
     if state.media.is_some() {
         for (key, value) in [
             ("mm_processor", "smg"),

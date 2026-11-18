@@ -543,9 +543,12 @@ pub(crate) fn resolve_mm_processing(
                         .iter()
                         .filter(|worker| *worker.worker_type() == WorkerType::Encode)
                         .all(|worker| {
-                            PdProtocol::encode_handoff(worker.metadata().spec.runtime_type)
-                                == Some(EncodeHandoff::Push)
-                                && worker_supports_ec_transfer(worker.as_ref())
+                            (PdProtocol::encode_handoff(worker.metadata().spec.runtime_type)
+                                == Some(EncodeHandoff::PreparedInput)
+                                || (PdProtocol::encode_handoff(
+                                    worker.metadata().spec.runtime_type,
+                                ) == Some(EncodeHandoff::Push)
+                                    && worker_supports_ec_transfer(worker.as_ref())))
                                 && worker_accepts_media_refs(worker.as_ref())
                         });
                 let uniform = push_encode

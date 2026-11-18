@@ -1143,11 +1143,11 @@ async fn a_message_whose_tool_use_input_cannot_carry_the_arguments_is_refused() 
     );
     // The stream: the fragments as the model wrote them, and the stop reason the calls give;
     // nothing refused, nothing counted as refused.
-    let ((result, events), scrape) = scraped(message_events(
+    let ((result, events), scrape) = Box::pin(scraped(message_events(
         vec![chunk(0, output), complete(0, "stop")],
         spec(),
         None,
-    ))
+    )))
     .await;
     assert!(result.is_ok(), "{result:?}");
     let partial: String = events
@@ -1443,7 +1443,7 @@ async fn a_messages_call_whose_arguments_are_not_json_carries_the_prefixes_value
     // The stream, cut inside the expression: the block's deltas are the prefix a strict reader
     // accepts and nothing after the break, no text delta carries any of the tail, and a client's
     // partial JSON reader closes the prefix into the whole message's input.
-    let ((result, events), scrape) = scraped(message_events(
+    let ((result, events), scrape) = Box::pin(scraped(message_events(
         vec![
             chunk(
                 0,
@@ -1454,7 +1454,7 @@ async fn a_messages_call_whose_arguments_are_not_json_carries_the_prefixes_value
         ],
         spec(),
         None,
-    ))
+    )))
     .await;
     assert!(result.is_ok(), "{result:?}");
     let partial: String = events

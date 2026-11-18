@@ -37,6 +37,7 @@ mod generate;
 mod info;
 mod lora;
 mod media_identity;
+mod prepared;
 mod service;
 #[cfg(test)]
 mod tests;
@@ -47,13 +48,17 @@ use engine_zmq_adapter::{
     ConstraintKinds, SglangEncodeDispatcher, StructuredOutputBackend,
     StructuredOutputsBackendConfig, StructuredOutputsSupport,
 };
-use smg_grpc_client::sglang_proto::sglang_scheduler_server::SglangSchedulerServer;
+use smg_grpc_client::{
+    sglang_managed::{proto::managed_decode_server::ManagedDecodeServer, Limits},
+    sglang_proto::sglang_scheduler_server::SglangSchedulerServer,
+};
 use tonic::service::Routes;
 
 use crate::{
     engine_link::EngineLink,
     health_probe,
     kv_events::{record_with_queue, KvEventRelay, RankLoads},
+    managed::{native::ManagedNativeRuntime, ManagedConfig},
     metrics::{Identity, ServicerMetrics},
     proto_json,
     servicer::{self, Shared, WireState},
@@ -318,6 +323,9 @@ impl RankLoads for State {
 }
 
 pub(super) struct State {
+    pub(super) managed: bool,
+    pub(super) prepared: std::sync::OnceLock<Arc<ManagedNativeRuntime>>,
+    pub(super) managed_config: Option<ManagedConfig>,
     pub(super) model: SglangModelInfo,
     loras: lora::PreloadedLoras,
     /// What every servicer's state shares: the engine link, the admitted
@@ -350,6 +358,22 @@ pub struct SglangServicerServer {
 }
 
 impl SglangServicerServer {
+    /// Start a dedicated managed P/D pool. Legacy media preprocessing and dispatch are refused.
+    pub fn start_managed(
+        config: SglangServicerConfig,
+        managed: ManagedConfig,
+    ) -> Result<Self, ServicerError> {
+        managed
+            .validate()
+            .map_err(|e| ServicerError::InvalidConfig(e.to_string()))?;
+        if config.encode_dispatcher.is_some() || config.media_processor.is_some() {
+            return Err(ServicerError::InvalidConfig(
+                "managed workers cannot install legacy media dispatch or processing".into(),
+            ));
+        }
+        Self::start_inner(config, None, false, Some(managed))
+    }
+
     /// Validate, bind, and serve on a dedicated runtime thread.
     pub fn start(config: SglangServicerConfig) -> Result<Self, ServicerError> {
         // Only processors with an engine-tested identity contract auto-enable
@@ -371,6 +395,15 @@ impl SglangServicerServer {
         config: SglangServicerConfig,
         mm_hasher: Option<engine_zmq_adapter::SglangCpuMmHasher>,
         media_identity_enabled: bool,
+    ) -> Result<Self, ServicerError> {
+        Self::start_inner(config, mm_hasher, media_identity_enabled, None)
+    }
+
+    fn start_inner(
+        config: SglangServicerConfig,
+        mm_hasher: Option<engine_zmq_adapter::SglangCpuMmHasher>,
+        media_identity_enabled: bool,
+        managed_config: Option<ManagedConfig>,
     ) -> Result<Self, ServicerError> {
         let invalid = |message: &str| ServicerError::InvalidConfig(message.to_string());
         config.servicer.validate()?;
@@ -427,6 +460,9 @@ impl SglangServicerServer {
                         .map(str::to_owned)
                 });
         let state = Arc::new(State {
+            managed: managed_config.is_some(),
+            prepared: std::sync::OnceLock::new(),
+            managed_config: managed_config.clone(),
             loras: lora::PreloadedLoras::from_server_args(&config.model.server_args_json)?,
             media_identity_key,
             media_disaggregation_mode,
@@ -449,7 +485,32 @@ impl SglangServicerServer {
             })
             .max_decoding_message_size(usize::MAX)
             .max_encoding_message_size(usize::MAX),
+        )
+        .add_service(
+            ManagedDecodeServer::new(service::SglangService {
+                state: Arc::clone(&state),
+            })
+            .max_decoding_message_size(Limits::default().manifest_bytes),
         );
+        let mut metadata = None;
+        if let Some(config) = managed_config {
+            let native_state = Arc::downgrade(&state);
+            let runtime = Arc::new(
+                ManagedNativeRuntime::new(
+                    Arc::new(move || native_state.upgrade()?.shared.engine().ok().cloned()),
+                    &config,
+                    Limits::default(),
+                )
+                .map_err(|e| ServicerError::InvalidConfig(e.to_string()))?,
+            );
+            if let Some(endpoint) = config.metadata_endpoint {
+                metadata = Some((Arc::clone(&runtime), endpoint));
+            }
+            state
+                .prepared
+                .set(runtime)
+                .map_err(|_| ServicerError::InvalidConfig("duplicate prepared runtime".into()))?;
+        }
         let connect_state = Arc::clone(&state);
         let server = servicer::Server::start(
             "smg-sglang-servicer",
@@ -458,7 +519,25 @@ impl SglangServicerServer {
             "SGLang",
             &state,
             routes,
-            move |inputs| engine::connect_engine(connect_state, inputs),
+            move |inputs| async move {
+                if let Some((runtime, endpoint)) = metadata {
+                    match ManagedNativeRuntime::bind_metadata(&endpoint).await {
+                        Ok(socket) => {
+                            let errors = Arc::clone(&inputs.last_error);
+                            let ((), result) = tokio::join!(
+                                engine::connect_engine(connect_state, inputs),
+                                runtime.read_metadata(socket)
+                            );
+                            if let Err(error) = result {
+                                crate::record_error(&errors, error.to_string());
+                            }
+                        }
+                        Err(error) => crate::record_error(&inputs.last_error, error.to_string()),
+                    }
+                } else {
+                    engine::connect_engine(connect_state, inputs).await;
+                }
+            },
         )?;
         Ok(Self { server, state })
     }

@@ -517,7 +517,7 @@ struct InputFrame {
     payload: Bytes,
     aux_frames: Vec<Bytes>,
     /// Where the caller waits for the write's result; `None` for a frame no
-    /// caller waits on (the dispatcher's aborts and wakes).
+    /// caller waits on (owned requests, dispatcher aborts and wakes).
     done: Option<oneshot::Sender<Result<()>>>,
     /// The payload bytes the queue bound counts while the frame waits:
     /// `Some` for an add-request, `None` for a control frame.
@@ -1056,8 +1056,16 @@ impl<P: EngineProtocol> ClientInner<P> {
                 done,
                 counted,
             })
-            .map_err(|_writer_gone| Error::ClientClosed {
-                message: "the engine input writer ended".to_string(),
+            .map_err(|_writer_gone| {
+                // A failed enqueue was never popped by the writer. Return its
+                // waiting charge here; RetainedInput returns payload bytes.
+                if let Some(bytes) = counted {
+                    self.waiting_adds.fetch_sub(1, Ordering::AcqRel);
+                    self.waiting_add_bytes.fetch_sub(bytes, Ordering::AcqRel);
+                }
+                Error::ClientClosed {
+                    message: "the engine input writer ended".to_string(),
+                }
             })
     }
 
@@ -1691,6 +1699,19 @@ impl<P: EngineProtocol> Client<P> {
         request: P::Request,
         extra_aux_frames: Vec<Bytes>,
     ) -> Result<RequestStream<P>> {
+        self.submit_inner(request, extra_aux_frames, false).await
+    }
+
+    /// Ordinary submission waits for socket admission. A managed owner instead
+    /// takes the queued frame and its output registration together, without an
+    /// await between enqueue and handoff: a send window cannot roll back native
+    /// D work before P has finished transferring KV.
+    async fn submit_inner(
+        &self,
+        request: P::Request,
+        extra_aux_frames: Vec<Bytes>,
+        owned_queue: bool,
+    ) -> Result<RequestStream<P>> {
         P::validate(&request)?;
         let request_id = P::request_id(&request).to_string();
         // Register before selecting: registration is the admission gate (it
@@ -1745,6 +1766,38 @@ impl<P: EngineProtocol> Client<P> {
             }
         };
         aux_frames.extend(extra_aux_frames);
+        if owned_queue {
+            let bytes = aux_frames.iter().fold(payload.len(), |total, frame| {
+                total.saturating_add(frame.len())
+            });
+            let queued = self.inner.admit_add(bytes).and_then(|()| {
+                self.inner.queue_frame(
+                    &guard.engine_id,
+                    P::add_frame(),
+                    payload,
+                    aux_frames,
+                    None,
+                    Some(bytes),
+                )
+            });
+            if let Err(error) = queued {
+                // No frame was accepted; no native request exists to abort.
+                guard.take_back(false);
+                return Err(error);
+            }
+            // Count the owned queued prompt conservatively in the silence
+            // allowance, not as proof of delivery or a health response.
+            // SGLang has independent ranks, with no wave to wake.
+            self.inner.registry.lock().handed(&guard.request_id);
+            let (engine_id, request_id) = guard.complete();
+            return Ok(RequestStream {
+                request_id,
+                engine_id,
+                receiver,
+                abort_tx: self.inner.abort_tx.clone(),
+                finished: false,
+            });
+        }
         if let Err(error) = self
             .inner
             .send_add_to_engine(&guard.engine_id, payload, aux_frames)
@@ -1830,6 +1883,26 @@ impl<P: EngineProtocol> Client<P> {
         self.inner
             .send_frame(engine_id, request_type, payload, aux_frames, Some(bytes))
             .await
+    }
+}
+
+impl Client<SglangProtocol> {
+    /// Transfer a queued Add and its output registration to a native resource
+    /// owner. Writer failure reaches that stream; it never manufactures native
+    /// completion. Only callers that retain it until safe termination may use
+    /// this path. Legacy submit keeps its original send-window rollback.
+    pub async fn submit_owned(
+        &self,
+        request: <SglangProtocol as EngineProtocol>::Request,
+    ) -> Result<RequestStream<SglangProtocol>> {
+        self.submit_inner(request, Vec::new(), true).await
+    }
+
+    /// Queue cancellation behind Add without retiring its terminal observer.
+    /// Controls bypass Add admission but retain the transport's FIFO and memory
+    /// budget. A successful enqueue is not a native release acknowledgement.
+    pub fn abort_retaining_output(&self, engine_id: &EngineId, request_id: &str) -> Result<()> {
+        self.inner.queue_abort(engine_id, request_id)
     }
 }
 
@@ -2332,7 +2405,7 @@ async fn run_input_writer<P: EngineProtocol>(
             }
             None => {
                 if let Err(error) = result {
-                    warn!(%error, "failed to write a queued abort or wake");
+                    warn!(%error, "failed to write an owned request or queued control");
                     if matches!(error, Error::EngineCoreDead | Error::Transport(_)) {
                         // The socket to the engine is gone, and with it the way
                         // to stop the requests it holds: fail what is in flight,

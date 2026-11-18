@@ -16,7 +16,7 @@ use crate::{
     routers::{
         error,
         grpc::{
-            context::RequestContext,
+            context::{EncodeOutputs, RequestContext},
             multimodal::{self, MediaPlan, MultimodalIntermediate},
             utils::{self, MediaContext},
         },
@@ -77,6 +77,17 @@ pub(crate) async fn prepare_rendered_prompt(
             );
             error::bad_request("multimodal_prompt_contract_mismatch", error.to_string())
         })?;
+    }
+
+    if matches!(
+        ctx.state.encode_outputs,
+        Some(EncodeOutputs::PreparedInput(_))
+    ) {
+        return Ok(RenderedPrompt {
+            token_ids,
+            multimodal_intermediate: None,
+            multimodal_refs: media.map(|media| media.plan),
+        });
     }
 
     // Step 4: Full multimodal processing (fetch + preprocess + expand tokens + hash),

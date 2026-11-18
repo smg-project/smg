@@ -430,6 +430,7 @@ impl WireConstraint {
 /// [`RequestContext::into_dispatch`]. `ResponseSpec` is the only
 /// request-derived input past this point.
 pub(crate) struct DispatchContext {
+    pub worker_registry: Arc<WorkerRegistry>,
     pub root_request_id: Option<String>,
     /// The id the request-id middleware gave the request, for a line written
     /// about it outside its span (a retry's re-selection); always present,
@@ -609,6 +610,8 @@ pub(crate) struct AttemptStamp {
 /// Not `#[derive(Debug)]`: `EncodeDispatchPlan` transitively holds
 /// non-`Debug` raw proto payloads (`TokenSpeedMultimodalItem`).
 pub(crate) enum EncodeOutputs {
+    /// SGLang references and binding budget; E/P/D start together at execution.
+    PreparedInput(Box<super::sglang_epd::router::PreparedInput>),
     /// Per-item bootstrap rendezvous info for the prefill request, plus the
     /// dispatch plan that fans out to the encode workers beside the
     /// prefill/decode pair. Owns the encode jobs' SHM/RDMA Drop guards:
@@ -1267,6 +1270,7 @@ impl RequestContext {
         };
         drop(request_type);
         let parser = self.state.parser;
+        let worker_registry = Arc::clone(&self.components.worker_registry);
         drop(self.components);
         let routing = self.state.routing_snapshot.ok_or_else(|| {
             error!(
@@ -1293,6 +1297,7 @@ impl RequestContext {
         let (created, _) =
             super::common::stages::helpers::request_wall_clock(tenant_request_meta.as_ref());
         Ok(Box::new(DispatchContext {
+            worker_registry,
             root_request_id: if cache_trace::enabled() {
                 request_id.clone()
             } else {

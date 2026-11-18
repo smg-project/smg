@@ -13,9 +13,10 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use anyhow::Context;
 use llm_multimodal::{
     configure_parallelism, data_url::data_url_payload_bytes, jpeg_turbo::TurboJpegPolicy,
-    registry::modality_limit_override, vision::PreProcessorConfig, FrameSampling, MediaConnector,
-    MediaConnectorConfig, MediaConnectorError, MediaContentPart, MediaErrorCode, MediaFault,
-    Modality, ModelMetadata, ModelRegistry, MultiModalError, Parallelism, POOL_THREADS_ENV,
+    registry::modality_limit_override, vision::PreProcessorConfig, EncoderDtype, FrameSampling,
+    MediaConnector, MediaConnectorConfig, MediaConnectorError, MediaContentPart, MediaErrorCode,
+    MediaFault, Modality, ModelMetadata, ModelRegistry, MultiModalError, Parallelism,
+    POOL_THREADS_ENV,
 };
 use llm_tokenizer::TokenizerTrait;
 use openai_protocol::worker::MmProcessingMode;
@@ -813,8 +814,53 @@ impl WorkerMediaPipeline {
         ),
         WorkerMediaError,
     > {
+        self.process_sglang_with_wire_dtype(prompt_token_ids, items, None)
+            .await
+    }
+
+    /// Managed E knows its visual model dtype before preprocessing. Reuse the
+    /// fused image writer without changing the ordinary SGLang worker path.
+    pub async fn process_sglang_encoder(
+        &self,
+        prompt_token_ids: Vec<u32>,
+        items: Vec<WorkerMediaItem>,
+    ) -> Result<
+        (
+            Vec<u32>,
+            sglang::MultimodalInputs,
+            Vec<sglang::MultimodalInputs>,
+        ),
+        WorkerMediaError,
+    > {
+        self.process_sglang_with_wire_dtype(
+            prompt_token_ids,
+            items,
+            self.assembly.image_wire_dtype(),
+        )
+        .await
+    }
+
+    /// Share SGLang assembly while applying a visual dtype only when explicitly supplied.
+    async fn process_sglang_with_wire_dtype(
+        &self,
+        prompt_token_ids: Vec<u32>,
+        items: Vec<WorkerMediaItem>,
+        image_wire_dtype: Option<EncoderDtype>,
+    ) -> Result<
+        (
+            Vec<u32>,
+            sglang::MultimodalInputs,
+            Vec<sglang::MultimodalInputs>,
+        ),
+        WorkerMediaError,
+    > {
         let output = self
-            .process_inputs(prompt_token_ids, items, RuntimeType::Sglang)
+            .process_inputs_with_wire_dtype(
+                prompt_token_ids,
+                items,
+                RuntimeType::Sglang,
+                image_wire_dtype,
+            )
             .await?;
         let dtype = self.assembly.encoder_dtype.clone();
         let span = tracing::Span::current();
@@ -834,6 +880,21 @@ impl WorkerMediaPipeline {
         prompt_token_ids: Vec<u32>,
         items: Vec<WorkerMediaItem>,
         runtime: RuntimeType,
+    ) -> Result<super::MultimodalOutput, WorkerMediaError> {
+        let dtype = (runtime == RuntimeType::Vllm)
+            .then(|| self.assembly.image_wire_dtype())
+            .flatten();
+        self.process_inputs_with_wire_dtype(prompt_token_ids, items, runtime, dtype)
+            .await
+    }
+
+    /// Override image wire dtype for this processing call without changing pipeline defaults.
+    async fn process_inputs_with_wire_dtype(
+        &self,
+        prompt_token_ids: Vec<u32>,
+        items: Vec<WorkerMediaItem>,
+        runtime: RuntimeType,
+        image_wire_dtype: Option<EncoderDtype>,
     ) -> Result<super::MultimodalOutput, WorkerMediaError> {
         if items.is_empty() {
             return Err(WorkerMediaError::Invalid(
@@ -874,11 +935,7 @@ impl WorkerMediaPipeline {
             &self.components,
             CONFIG_KEY,
             &self.model_dir,
-            if runtime == RuntimeType::Vllm {
-                self.assembly.image_wire_dtype()
-            } else {
-                None
-            },
+            image_wire_dtype,
             // In-process: the tensors ride no gRPC message of this worker's
             // own; the framing of the hop that carries them answers.
             None,
@@ -1574,6 +1631,75 @@ mod tests {
             .await
             .unwrap();
         assert!(output.identity.is_none());
+    }
+
+    #[tokio::test]
+    /// The single preprocessing pass must preserve native layout and enforce artifact limits.
+    async fn managed_encoder_one_pass_matches_sglang_artifacts_and_limits() {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        let (_dir, mut pipeline) = vision_test_pipeline(
+            r#"{"model_type":"qwen3_vl","image_token_id":32000,"vision_config":{"patch_size":16,"temporal_patch_size":2,"spatial_merge_size":2}}"#,
+            &[("<|image_pad|>", 32000)],
+        ).await;
+        assert!(pipeline.components.pixel_cache.is_none());
+        for dtype in ["bfloat16", "float16", "float32"] {
+            pipeline.assembly.encoder_dtype = dtype.into();
+            for (width, height, count) in
+                [(224, 224, 1), (1024, 768, 1), (512, 512, 1), (512, 512, 4)]
+            {
+                let items: Vec<_> = (0..count)
+                    .map(|index| {
+                        let image = image::RgbaImage::from_fn(width, height, |x, y| {
+                            image::Rgba([
+                                (x.wrapping_add(index * 17)) as u8,
+                                y as u8,
+                                (x ^ y) as u8,
+                                ((x + y) % 256) as u8,
+                            ])
+                        });
+                        let mut bytes = std::io::Cursor::new(Vec::new());
+                        image::DynamicImage::ImageRgba8(image)
+                            .write_to(&mut bytes, image::ImageFormat::Png)
+                            .unwrap();
+                        WorkerMediaItem {
+                            modality: Modality::Image,
+                            url: format!(
+                                "data:image/png;base64,{}",
+                                STANDARD.encode(bytes.into_inner())
+                            ),
+                        }
+                    })
+                    .collect();
+                let prompt = vec![32000; items.len()];
+                let old = pipeline
+                    .process_sglang(prompt.clone(), items.clone())
+                    .await
+                    .unwrap();
+                let fused = pipeline
+                    .process_sglang_encoder(prompt, items)
+                    .await
+                    .unwrap();
+                assert_eq!(old, fused, "{dtype}: {width}x{height}, {count} images");
+                assert_eq!(fused.1.pixel_values.as_ref().unwrap().dtype, dtype);
+            }
+        }
+        for items in [
+            Vec::new(),
+            vec![WorkerMediaItem {
+                modality: Modality::Image,
+                url: "data:image/png;base64,bm90LWltYWdl".into(),
+            }],
+        ] {
+            let prompt = vec![32000; items.len()];
+            assert!(pipeline
+                .process_sglang(prompt.clone(), items.clone())
+                .await
+                .is_err());
+            assert!(pipeline
+                .process_sglang_encoder(prompt, items)
+                .await
+                .is_err());
+        }
     }
 
     /// Grouped references retain per-modality anchors in interleaved prompts.

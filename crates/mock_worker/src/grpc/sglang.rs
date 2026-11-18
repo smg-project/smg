@@ -416,6 +416,7 @@ fn response(request_id: &str, frame: Frame) -> sg::GenerateResponse {
     sg::GenerateResponse {
         request_id: request_id.to_string(),
         media_identity: None,
+        prepared_input: Vec::new(),
         response: Some(response),
     }
 }

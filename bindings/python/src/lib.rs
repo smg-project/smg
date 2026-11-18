@@ -1382,11 +1382,14 @@ impl Router {
         };
 
         // `backend` normally only steers the routing mode. Over ZMQ an engine
-        // backend additionally pins the startup workers' runtime. HTTP/gRPC,
-        // and ZMQ without a backend, keep auto-detection (None). Mirrors
+        // backend additionally pins the startup workers' runtime. Explicit SGLang
+        // EPD retains it to select the control protocol. Other HTTP/gRPC workers
+        // and ZMQ without a backend keep auto-detection (None). Mirrors
         // `to_router_config` in model_gateway/src/cli/configure.rs.
         let startup_worker_runtime_type =
-            if matches!(self.connection_mode, worker::ConnectionMode::Zmq) {
+            if matches!(self.connection_mode, worker::ConnectionMode::Zmq)
+                || (self.epd_disaggregation && matches!(self.backend, Some(BackendType::Sglang)))
+            {
                 self.backend
                     .as_ref()
                     .and_then(BackendType::startup_worker_runtime)
@@ -2096,7 +2099,12 @@ impl Router {
             all_urls.extend(decode_urls.clone());
         }
 
-        let connection_mode = Self::determine_connection_mode(&all_urls);
+        let connection_mode = if epd_disaggregation && matches!(backend, Some(BackendType::Sglang))
+        {
+            worker::ConnectionMode::Grpc
+        } else {
+            Self::determine_connection_mode(&all_urls)
+        };
 
         Ok(Router {
             worker_urls,
@@ -2587,6 +2595,8 @@ fn smg_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyVllmGrpcServer>()?;
     m.add_class::<PyTokenSpeedGrpcServer>()?;
     m.add_class::<PySglangGrpcServer>()?;
+    m.add_class::<servicer::PyManagedEncoderProcessor>()?;
+    m.add_class::<servicer::PyManagedEncoderServer>()?;
     m.add_class::<PyTrtllmGrpcServer>()?;
     m.add_class::<PyTokenizer>()?;
     m.add_function(wrap_pyfunction!(get_version_string, m)?)?;

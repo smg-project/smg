@@ -109,6 +109,8 @@ impl Drop for PrefillReservation {
 /// Batch sub-requests share one reservation and take one unit of unbounded load
 /// each, which keeps worker load accounting the same as before admission.
 pub enum PrefillLoadGuard {
+    /// The same request retained by its dispatch/transport cleanup owner.
+    Shared(Arc<PrefillLoadGuard>),
     Admission {
         _reservation: Arc<PrefillReservation>,
     },
@@ -118,12 +120,19 @@ pub enum PrefillLoadGuard {
 }
 
 impl PrefillLoadGuard {
+    /// Share one reservation with cleanup without booking another unit of load.
+    pub(crate) fn share(self) -> (Self, Arc<Self>) {
+        let guard = Arc::new(self);
+        (Self::Shared(Arc::clone(&guard)), guard)
+    }
+
     /// Acquire another guard for the same request.
     ///
     /// This is explicit instead of `Clone` because the unbounded variant
     /// increments externally visible worker load.
     pub(crate) fn replicate(&self) -> Self {
         match self {
+            Self::Shared(guard) => guard.replicate(),
             Self::Admission { _reservation } => Self::Admission {
                 _reservation: Arc::clone(_reservation),
             },
@@ -576,6 +585,37 @@ mod tests {
 
     use super::{test_support::select_worker, *};
     use crate::worker::{BasicWorkerBuilder, CircuitBreakerConfig, WorkerType};
+
+    #[tokio::test]
+    /// Cloned cleanup ownership retains the original reservation without double admission.
+    async fn sharing_cleanup_ownership_does_not_book_another_slot() {
+        for bounded in [false, true] {
+            let worker = worker("http://shared-prefill");
+            let admission = PrefillAdmission::new(1, 0, Duration::from_secs(1));
+            let guard = if bounded {
+                let admitted = admission.admit(None, select_worker(&worker)).await.unwrap();
+                PrefillLoadGuard::Admission {
+                    _reservation: Arc::new(admitted.reservation),
+                }
+            } else {
+                PrefillLoadGuard::Unbounded {
+                    _guard: WorkerLoadGuard::with_key(Arc::clone(&worker), None),
+                }
+            };
+            let (guard, retained) = guard.share();
+            assert_eq!(worker.load(), 1);
+            drop(guard);
+            assert_eq!(worker.load(), 1);
+            if bounded {
+                assert!(matches!(
+                    admission.admit(None, select_worker(&worker)).await,
+                    Err(PrefillAdmissionRejection::QueueFull)
+                ));
+            }
+            drop(retained);
+            assert_eq!(worker.load(), 0);
+        }
+    }
 
     fn worker(url: &str) -> Arc<dyn Worker> {
         Arc::new(

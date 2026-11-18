@@ -2067,10 +2067,17 @@ impl ProtoStream {
     /// stream goes through [`Self::next`], which does its bookkeeping.
     async fn next_untracked(&mut self) -> Option<Result<ProtoGenerateResponse, tonic::Status>> {
         let item = match self {
-            Self::Sglang(stream) => stream
-                .next()
-                .await
-                .map(|result| result.map(ProtoGenerateResponse::Sglang)),
+            Self::Sglang(stream) => {
+                let item = stream.next().await;
+                if item.is_none()
+                    || matches!(&item, Some(Ok(response)) if matches!(response.response, Some(sglang::generate_response::Response::Complete(_))))
+                {
+                    // Prepared P's extra owner protects error/cleanup paths.
+                    // Its normal drain still owns the original reservation.
+                    stream.release_retained_guard();
+                }
+                item.map(|result| result.map(ProtoGenerateResponse::Sglang))
+            }
             Self::Vllm(stream) => stream
                 .next()
                 .await

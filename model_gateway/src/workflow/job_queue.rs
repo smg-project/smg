@@ -25,6 +25,7 @@ use wfaas::{StateStore, WorkflowData, WorkflowEngine, WorkflowError, WorkflowId,
 use crate::{
     app_context::AppContext,
     config::{RouterConfig, RoutingMode},
+    routers::grpc::sglang_epd::router::worker_registration_url,
     worker::{health::manager::WorkerJobs, identity::endpoint::Endpoint, registry::WorkerId},
     workflow::{
         create_mcp_workflow_data, create_tokenizer_workflow_data,
@@ -1474,6 +1475,11 @@ impl JobQueue {
 
                 // Process all workers with unified loop
                 for (url, worker_type, bootstrap_port) in workers {
+                    let url = if router_config.is_sglang_epd() {
+                        worker_registration_url(&url)
+                    } else {
+                        url
+                    };
                     let url_for_error = url.clone(); // Clone for error message
                     let proto_worker_type = match worker_type {
                         "prefill" => WorkerType::Prefill,

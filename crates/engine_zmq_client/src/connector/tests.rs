@@ -4109,6 +4109,7 @@ async fn retained_input_releases_on_send_and_enqueue_failure() {
     })
     .await
     .unwrap();
+    inner.admit_add(4).unwrap();
     assert!(matches!(
         inner.queue_frame(
             &missing,
@@ -4121,6 +4122,30 @@ async fn retained_input_releases_on_send_and_enqueue_failure() {
         Err(Error::ClientClosed { .. })
     ));
     assert_eq!(inner.retained_input_bytes.load(Ordering::Relaxed), 0);
+    assert_eq!(inner.waiting_adds.load(Ordering::Relaxed), 0);
+    assert_eq!(inner.waiting_add_bytes.load(Ordering::Relaxed), 0);
+    // The owned submission uses the same failure boundary, retaining neither
+    // a native registration nor a routing slot when enqueue was impossible.
+    let client = EngineCoreClient {
+        inner: Arc::clone(&inner),
+        tasks: Vec::new(),
+    };
+    assert!(matches!(
+        client
+            .submit_inner(request_for("owned-closed", 0), Vec::new(), true)
+            .await,
+        Err(Error::ClientClosed { .. })
+    ));
+    assert_eq!(inner.retained_input_bytes.load(Ordering::Relaxed), 0);
+    assert_eq!(inner.waiting_adds.load(Ordering::Relaxed), 0);
+    assert_eq!(inner.waiting_add_bytes.load(Ordering::Relaxed), 0);
+    assert!(inner
+        .routing
+        .lock()
+        .inflight
+        .values()
+        .all(HashSet::is_empty));
+    assert!(inner.registry.lock().requests.is_empty());
 }
 
 /// Successful local admission releases the writer allowance independently of
