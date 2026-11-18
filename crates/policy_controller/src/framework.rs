@@ -10601,6 +10601,145 @@ mod tests {
         assert_eq!(positions(&decision), vec![6, 4, 2, 0]);
     }
 
+    /// A stage of the tests as a draw may be handed it: the stage's own
+    /// answers, and the word that it reads each row alone
+    /// ([`Scorer::row_wise`]).
+    #[derive(Debug)]
+    struct RowWise<S>(S);
+
+    impl<S: Scorer> Lifecycle for RowWise<S> {}
+
+    impl<S: Scorer> Scorer for RowWise<S> {
+        fn name(&self) -> &'static str {
+            self.0.name()
+        }
+
+        fn score(
+            &self,
+            facts: &RequestFacts<'_>,
+            candidates: &[Candidate],
+            kept: &[u32],
+            out: &mut [f32],
+        ) -> TieBand {
+            self.0.score(facts, candidates, kept, out)
+        }
+
+        fn row_wise(&self) -> bool {
+            true
+        }
+
+        fn front_wise(&self) -> bool {
+            self.0.front_wise()
+        }
+
+        fn spread(&self) -> Spread {
+            self.0.spread()
+        }
+
+        fn score_front(
+            &self,
+            facts: &RequestFacts<'_>,
+            candidates: &[Candidate],
+            kept: &[u32],
+            out: &mut [f32],
+        ) -> (TieBand, Front) {
+            self.0.score_front(facts, candidates, kept, out)
+        }
+    }
+
+    /// A host's picker the rows named join, which reads every score: it
+    /// says nothing of a front, so its profile holds no rank mark.
+    #[derive(Debug)]
+    struct Joining;
+
+    impl Lifecycle for Joining {}
+
+    impl Picker for Joining {
+        fn name(&self) -> &'static str {
+            "joining"
+        }
+
+        fn pick(
+            &self,
+            facts: &RequestFacts<'_>,
+            candidates: &[Candidate],
+            kept: &[u32],
+            scores: &[f32],
+            band: TieBand,
+            out: &mut Targets,
+        ) {
+            Lowest.pick(facts, candidates, kept, scores, band, out);
+        }
+
+        fn draws_first(&self) -> bool {
+            true
+        }
+
+        fn joined_by_named(&self) -> bool {
+            true
+        }
+    }
+
+    /// Under a picker the rows named join ([`Marks::JOINED`]), over a rated
+    /// pool of [`DRAW_FROM`] rows: a request that names rows is the draw's
+    /// ahead of the ranks, and one that names none is the ranks' by the
+    /// profile's rank mark alone. Without the mark every row is asked.
+    #[test]
+    fn a_joined_picker_draws_for_the_rows_named_and_ranks_by_the_mark_alone() {
+        let handed = Arc::new(Mutex::new(Vec::new()));
+        let rows = || handed.lock().expect("the probe's rows").clone();
+        // A rank that puts four of sixteen rows in front, and the probe of
+        // the rows the stage behind it is handed.
+        let stages = || {
+            let ranks = Levelled {
+                levels: (0..16).map(|row| if row < 4 { 1.0 } else { 0.5 }).collect(),
+                step: 0.5,
+                says: true,
+            };
+            vec![
+                Weighted {
+                    scorer: Box::new(RowWise(ranks)),
+                    weight: 4.0,
+                },
+                Weighted {
+                    scorer: Box::new(RowWise(Asked(Arc::clone(&handed)))),
+                    weight: 1.0,
+                },
+            ]
+        };
+        let pool = ranked_pool(16);
+        let names = RequestFacts {
+            named: Some(NamedAffinity::default()),
+            ..request(7)
+        };
+        // Under the built-in picker of that kind the profile holds the
+        // three marks. A request that names none is asked by rank: the
+        // stage behind the rank of the four rows in front.
+        let sampled = crate::builtins::SampledBest::new(2);
+        let engine = staged(stages(), Box::new(sampled));
+        assert_eq!(
+            engine.marks[0].ahead(),
+            Marks::DRAWS_FIRST | Marks::JOINED | Marks::RANKED
+        );
+        let ranked = rated(&engine, &request(7), &pool);
+        assert!(!ranked.trace().drew_first());
+        assert_eq!(rows(), vec![0, 1, 2, 3]);
+        // One that names rows is the draw's, whatever the ranks would put in
+        // front: the stage is handed the sample's two rows.
+        let drew = rated(&engine, &names, &pool);
+        assert!(drew.trace().drew_first());
+        assert_eq!(rows().len(), 2);
+        // The same stages under a picker that reads every score hold no
+        // rank mark, though the first of them is a rank: a request that
+        // names none is asked whole, every row.
+        let engine = staged(stages(), Box::new(Joining));
+        assert_eq!(engine.orders[0].fronts, 0b1);
+        assert_eq!(engine.marks[0].ahead(), Marks::DRAWS_FIRST | Marks::JOINED);
+        let whole = rated(&engine, &request(7), &pool);
+        assert!(!whole.trace().drew_first());
+        assert_eq!(rows(), (0..16).collect::<Vec<u32>>());
+    }
+
     /// A leading stage that orders nothing is not asked by a ranked
     /// decision: its share stands in every row's sum, and the decision is
     /// the one the weighted sum reads, which asks it once.

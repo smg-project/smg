@@ -1018,8 +1018,8 @@ impl Scorer for LeastLoad {
     /// are spread over their own span and not the pool's, so the front can
     /// tell two of its rows apart where the whole pass cannot, whatever
     /// the rows behind them cost: a difference past the tie's microsecond
-    /// stands wherever it is share enough of the front's own span for a
-    /// profile's sum to hold. A long queue on a row in front widens that
+    /// stands wherever it is a large enough share of the front's own span
+    /// for a profile's sum to hold. A long queue on a row in front widens that
     /// span, as one behind the front widens the pool's. Among every row, a
     /// difference that is a small enough share of the pool's span falls
     /// under the last bit of a profile's sum, and the rows are drawn among.

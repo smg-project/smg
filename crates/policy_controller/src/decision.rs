@@ -215,9 +215,9 @@ pub struct Trace {
     /// normalizes over them, so a score need not be the one the whole pass
     /// gives its row. The rows are the whole pass's, and their order too
     /// wherever its sums tell them apart: rows it rounds to one sum it
-    /// draws among, and the front's scores order them. Where it rounds
-    /// more rows to one sum than the trace lists, the rows listed can
-    /// differ too: each is a row of that tie.
+    /// draws among, and the front's scores order them. Where a tie of its
+    /// sums runs past the trace's last row, the rows listed can differ
+    /// too: each is a row of that tie.
     pub top: [(WorkerId, f32); TRACE_TOP],
     pub top_len: u8,
     pub seed: u64,
