@@ -18,7 +18,10 @@
 //! run, and a file a write left under its temporary name is removed. Any
 //! other name is left alone. Two files under one number, or a path that
 //! leads to no directory, refuse the start by name. The [`RETAINED`]
-//! highest numbers are kept; an apply removes the files under them.
+//! highest numbers are kept; an apply removes the files under them. A
+//! generation on file is read by the read call and by a rollback; the read
+//! call reads its file by the directory's path alone ([`read_in`]), under
+//! no lock of the door.
 //!
 //! [`Generations`]: super::generations::Generations
 
@@ -27,6 +30,7 @@ use std::{
     io::{self, Read as _, Write as _},
     path::{Path, PathBuf},
     process,
+    time::SystemTime,
 };
 
 use super::generations::{Format, SpecRejected, MAX_DOCUMENT_BYTES};
@@ -94,6 +98,24 @@ fn named(name: &str) -> Option<Persisted> {
     Some(Persisted { generation, format })
 }
 
+/// The path of `persisted` in the directory at `dir`.
+fn path_in(dir: &Path, persisted: Persisted) -> PathBuf {
+    let Persisted { generation, format } = persisted;
+    let form = format.as_str();
+    dir.join(format!("{generation:0DIGITS$}.{form}"))
+}
+
+/// The bytes on file for `persisted` in the directory at `dir`, one past
+/// the size bound at most: a longer file is refused by its size, not read
+/// whole.
+pub(crate) fn read_in(dir: &Path, persisted: Persisted) -> io::Result<Vec<u8>> {
+    let mut document = Vec::new();
+    fs::File::open(path_in(dir, persisted))?
+        .take(MAX_DOCUMENT_BYTES + 1)
+        .read_to_end(&mut document)?;
+    Ok(document)
+}
+
 /// Syncs the directory itself, so that a rename in it outlasts a crash.
 /// Where a directory does not open as a file there is no such call.
 fn sync_dir(dir: &Path) -> io::Result<()> {
@@ -151,25 +173,29 @@ impl SpecStore {
         })
     }
 
+    /// The directory's path.
+    pub(crate) fn dir(&self) -> &Path {
+        &self.dir
+    }
+
     /// The generations on file, ascending.
     pub(crate) fn kept(&self) -> &[Persisted] {
         &self.kept
     }
 
     fn path(&self, persisted: Persisted) -> PathBuf {
-        let Persisted { generation, format } = persisted;
-        let form = format.as_str();
-        self.dir.join(format!("{generation:0DIGITS$}.{form}"))
+        path_in(&self.dir, persisted)
     }
 
-    /// The bytes on file for `persisted`, one past the size bound at most:
-    /// a longer file is refused by its size, not read whole.
+    /// The bytes on file for `persisted` ([`read_in`]).
     pub(crate) fn read(&self, persisted: Persisted) -> io::Result<Vec<u8>> {
-        let mut document = Vec::new();
-        fs::File::open(self.path(persisted))?
-            .take(MAX_DOCUMENT_BYTES + 1)
-            .read_to_end(&mut document)?;
-        Ok(document)
+        read_in(&self.dir, persisted)
+    }
+
+    /// When the file of `persisted` was written: when its generation was
+    /// applied.
+    pub(crate) fn written(&self, persisted: Persisted) -> io::Result<SystemTime> {
+        fs::metadata(self.path(persisted))?.modified()
     }
 
     /// Persists `document` as `persisted`: written whole under a temporary

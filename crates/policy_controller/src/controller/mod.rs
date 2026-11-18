@@ -12,8 +12,8 @@
 //! controller given a spec file runs its document, watches the file and
 //! answers `GetPolicySpec` and a dry run of `ApplyPolicySpec`
 //! ([`Controller::spec_file`]). A controller given a spec store runs the
-//! newest generation on file and takes its document through the apply call
-//! ([`Controller::spec_store`]).
+//! newest generation on file, takes its document through the apply call and
+//! rolls back to a generation on file ([`Controller::spec_store`]).
 //!
 //! A controller is bound first and served second ([`Controller::bind`], then
 //! [`Controller::serve`]): the bind takes every address (port `0` for an
@@ -552,8 +552,10 @@ impl Controller {
     /// file is applied now, under the number its name states, and the
     /// control scope then takes `ApplyPolicySpec` in enforce mode where
     /// this replica leads. A document is persisted in the directory, then
-    /// applied as the next generation. A directory with no generation on
-    /// file starts the controller with no document, until the first apply.
+    /// applied as the next generation; a rollback runs a generation on file
+    /// again as the next one, and the read call answers a generation on
+    /// file by its number. A directory with no generation on file starts
+    /// the controller with no document, until the first apply.
     ///
     /// Refused here, before anything serves: a path that leads to no
     /// directory, a newest generation that does not run, a spec source

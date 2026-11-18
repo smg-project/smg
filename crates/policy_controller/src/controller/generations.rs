@@ -47,6 +47,14 @@
 //! ([`StoreRefused::SecondSource`]), and a file's document is refused
 //! where a store is bound ([`SpecRejected::SecondSource`]).
 //!
+//! A rollback ([`Generations::roll_back`]) is such a write of a document
+//! the store has on file: it runs again under the next number, whatever
+//! line its bytes write, and its file is the next number's. The read call
+//! answers the standing generation's document from memory and any other
+//! generation on file from its file ([`Generations::read`]), under the
+//! digest and the time the door lists it by, and takes no lock an apply
+//! holds.
+//!
 //! A source that keeps running hands a refusal back here
 //! ([`Generations::reject`]): it is one event and one count, and the
 //! running generation stays.
@@ -66,9 +74,9 @@
 //! the file writes one. Under a spec store the numbers are the directory's,
 //! and no standby follows an applied generation in this build: a store is
 //! bound only beside a lease in the process
-//! ([`Controller::spec_store`](super::Controller::spec_store)). The read
-//! call answers the standing generation alone, and no call rolls back to a
-//! retained one yet. A digest is the applier's ([`Digest`]): it travels
+//! ([`Controller::spec_store`](super::Controller::spec_store)). A file in
+//! the store that is no document of this build is listed nowhere: the read
+//! call does not answer it. A digest is the applier's ([`Digest`]): it travels
 //! with its bytes, and a reader of another build does not recompute it to
 //! compare.
 
@@ -77,10 +85,10 @@ use std::{
     cell::Cell,
     fmt,
     panic::{self, AssertUnwindSafe},
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc,
+        atomic::{AtomicU64, Ordering},
+        Arc, OnceLock,
     },
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -91,7 +99,7 @@ use serde_json::{map::Entry, Map, Number, Value};
 use tokio::{sync::Semaphore, task::JoinError};
 use tracing::{info, warn};
 
-use super::spec_store::{Persisted, SpecStore, StoreRefused};
+use super::spec_store::{self, Persisted, SpecStore, StoreRefused};
 use crate::{
     catalog::Catalog,
     framework::Engine,
@@ -547,11 +555,33 @@ pub(crate) struct NotHeld {
     pub(crate) held: Option<u64>,
     /// The generation the store runs.
     pub(crate) standing: u64,
+    /// Under a spec store, the generations on file. `None` under a file,
+    /// which retains the standing generation's document alone.
+    pub(crate) on_file: Option<OnFile>,
+}
+
+/// The generations on file under a spec store, as a refusal names them.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct OnFile {
+    /// How many are listed.
+    pub(crate) count: usize,
+    /// The oldest one's number and the newest one's: zero where none is.
+    pub(crate) span: (u64, u64),
 }
 
 impl fmt::Display for NotHeld {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "no document is held for generation {}: ", self.asked)?;
+        if let Some(OnFile { count, span }) = self.on_file {
+            let (oldest, newest) = span;
+            return match count {
+                0 => f.write_str("the spec store has no generation on file"),
+                _ => write!(
+                    f,
+                    "the spec store has {count} on file, from generation {oldest} to generation {newest}"
+                ),
+            };
+        }
         match self.held {
             Some(held) => write!(f, "the spec source's document is generation {held}")?,
             None => f.write_str("no spec source has applied one")?,
@@ -571,6 +601,16 @@ pub(crate) struct Counts {
     pub(crate) applied: u64,
     /// Documents a running source handed back as rejected.
     pub(crate) rejected: u64,
+}
+
+/// A generation on file under a spec store: what the read call answers
+/// beside its bytes, and what a rollback finds it by.
+#[derive(Clone, Copy, Debug)]
+struct Retained {
+    persisted: Persisted,
+    digest: Digest,
+    /// When its file was written.
+    applied: SystemTime,
 }
 
 /// The standing generation's document as its source wrote it.
@@ -720,7 +760,8 @@ pub(crate) const WRITES_WAITING: usize = 32;
 /// written longer, so a longer guard names none.
 const DIGEST_TEXT_LEN: usize = "sha256:".len() + 64;
 
-/// Why a dry run gave no verdict.
+/// Why a spec call gave no answer of its own: a dry run or a write no
+/// verdict, a read no document.
 #[derive(Debug)]
 pub(crate) enum Unanswered {
     /// The caller's guard names another digest than the standing one's: the
@@ -734,6 +775,15 @@ pub(crate) enum Unanswered {
     Waiting,
     /// A write call's thread did not end.
     Unwritten(JoinError),
+    /// No document is held for the generation a read or a rollback names.
+    NotHeld(NotHeld),
+    /// A generation on file was not read from its file.
+    Unread {
+        /// The generation.
+        generation: u64,
+        /// What the read failed by.
+        why: String,
+    },
 }
 
 /// A document's size, where it is over the bound.
@@ -770,6 +820,23 @@ pub(crate) enum Line {
     Record(u64),
 }
 
+/// The first steps of a document's pass, in their order: the bound, the
+/// form, the digest.
+fn digested(document: &[u8], format: Format) -> Result<(PolicySpec, Digest), SpecRejected> {
+    if let Some(len) = over_bound(document) {
+        return Err(SpecRejected::TooLarge(len));
+    }
+    let spec = format
+        .parse(document)
+        .map_err(|Refused { path, message }| SpecRejected::Unparsed {
+            format: format.as_str(),
+            path,
+            message,
+        })?;
+    let digest = spec.digest()?;
+    Ok((spec, digest))
+}
+
 /// A document's own pass, in its one order: the bound, the form, the
 /// digest, the validator, then the line against the standing generation,
 /// read as its source reads one (`rule`). Nothing is applied, nothing held
@@ -781,17 +848,7 @@ fn check(
     format: Format,
     rule: Line,
 ) -> Result<Checked, SpecRejected> {
-    if let Some(len) = over_bound(document) {
-        return Err(SpecRejected::TooLarge(len));
-    }
-    let mut spec = format
-        .parse(document)
-        .map_err(|Refused { path, message }| SpecRejected::Unparsed {
-            format: format.as_str(),
-            path,
-            message,
-        })?;
-    let digest = spec.digest()?;
+    let (mut spec, digest) = digested(document, format)?;
     let minted = standing.saturating_add(1);
     let line = match rule {
         // The record states the number: a line in its bytes is no claim.
@@ -848,6 +905,23 @@ fn fault_text(fault: &(dyn Any + Send)) -> String {
         .unwrap_or_else(|| "a panic with no message".to_owned())
 }
 
+/// Runs `pass`, a document's own, with its fault held: a panic of it is a
+/// refusal by name.
+fn holding<T>(pass: impl FnOnce() -> Result<T, SpecRejected>) -> Result<T, SpecRejected> {
+    panic::catch_unwind(AssertUnwindSafe(pass)).unwrap_or_else(|fault| {
+        // The text first: a payload's own drop can panic, and it is freed
+        // under a catch of its own.
+        let told = fault_text(fault.as_ref());
+        crate::framework::release(fault);
+        Err(SpecRejected::Faulted(told))
+    })
+}
+
+/// What a write answers: the number its document runs under, its digest,
+/// and what a host must feed under it, `None` where it is the standing
+/// document again.
+type Written = (u64, Digest, Option<proto::NeedsSummary>);
+
 /// The controller's generations: the door a source applies through and the
 /// standing document.
 pub(crate) struct Generations {
@@ -861,8 +935,14 @@ pub(crate) struct Generations {
     /// store's directory is written under it alone. No reader takes it. It
     /// holds the spec store, once one is bound.
     applying: Mutex<Option<SpecStore>>,
-    /// Whether a spec store is bound: the source takes writes.
-    stored: AtomicBool,
+    /// The spec store's directory, once one is bound: the source takes
+    /// writes, and the read call reads a generation on file by this path,
+    /// under no lock of the door.
+    dir: OnceLock<PathBuf>,
+    /// The generations on file under a spec store, ascending, as the read
+    /// call answers them. Written under the door's lock, at the bind and at
+    /// each write; a reader copies one entry out.
+    on_file: Mutex<Vec<Retained>>,
     /// The write calls let in: the one that applies and the ones that wait
     /// for the door.
     writing: Arc<Semaphore>,
@@ -898,7 +978,8 @@ impl Generations {
             catalog,
             validate,
             applying: Mutex::new(None),
-            stored: AtomicBool::new(false),
+            dir: OnceLock::new(),
+            on_file: Mutex::new(Vec::new()),
             writing: Arc::new(Semaphore::new(WRITES_WAITING + 1)),
             dry_turn: Arc::default(),
             dry_runs: Arc::new(Semaphore::new(DRY_RUNS_WAITING + 1)),
@@ -976,16 +1057,7 @@ impl Generations {
         rule: Line,
     ) -> Result<Checked, SpecRejected> {
         let validator = (self.validate, self.catalog.as_ref());
-        let passed = panic::catch_unwind(AssertUnwindSafe(|| {
-            check(validator, standing, document, format, rule)
-        }));
-        passed.unwrap_or_else(|fault| {
-            // The text first: a payload's own drop can panic, and it is
-            // freed under a catch of its own.
-            let told = fault_text(fault.as_ref());
-            crate::framework::release(fault);
-            Err(SpecRejected::Faulted(told))
-        })
+        holding(|| check(validator, standing, document, format, rule))
     }
 
     /// The standing number and digest, from one load, where `expected`
@@ -1079,47 +1151,86 @@ impl Generations {
     }
 
     /// Binds `dir` as the spec's source, at a start: the newest generation
-    /// on file is applied under the number its name states, and the write
-    /// calls are taken from then on. A newest document that does not run
-    /// refuses the bind, and so does a source bound before this one.
+    /// on file is applied under the number its name states, every
+    /// generation on file is listed for the read call, and the write calls
+    /// are taken from then on. A newest document that does not run refuses
+    /// the bind, and so does a source bound before this one. An older file
+    /// that is no document of this build stays on file and is not listed:
+    /// the read call does not answer it.
     pub(crate) fn bind_store(&self, dir: SpecStore) -> Result<(), StoreRefused> {
         let mut applying = self.applying.lock();
         if applying.is_some() || self.held.lock().is_some() {
             return Err(StoreRefused::SecondSource);
         }
-        if let Some(&newest) = dir.kept().last() {
-            self.restore(&dir, newest)
+        let mut on_file = Vec::with_capacity(dir.kept().len());
+        if let Some((&newest, older)) = dir.kept().split_last() {
+            let restored = self
+                .restore(&dir, newest)
                 .map_err(|source| StoreRefused::Rejected {
                     generation: newest.generation,
                     source,
                 })?;
+            for &persisted in older {
+                match Self::told(&dir, persisted) {
+                    Ok(retained) => on_file.push(retained),
+                    Err(rejected) => warn!(
+                        generation = persisted.generation,
+                        error = %rejected,
+                        "a generation on file is no document of this build: the read call does not answer it"
+                    ),
+                }
+            }
+            on_file.push(restored);
         }
+        *self.on_file.lock() = on_file;
+        // Set once: a second bind is refused above, under the door's lock.
+        let _ = self.dir.set(dir.dir().to_owned());
         *applying = Some(dir);
-        self.stored.store(true, Ordering::Release);
         Ok(())
     }
 
     /// Applies the generation `newest` of `dir` as the store's own record:
-    /// under its file's number, whatever line its bytes write.
-    fn restore(&self, dir: &SpecStore, newest: Persisted) -> Result<(), SpecRejected> {
+    /// under its file's number, whatever line its bytes write, as applied
+    /// when its file was written. It answers the generation as the read
+    /// call lists it.
+    fn restore(&self, dir: &SpecStore, newest: Persisted) -> Result<Retained, SpecRejected> {
         let Persisted { generation, format } = newest;
-        let document = dir
-            .read(newest)
-            .map_err(|error| SpecRejected::Unreadable(error.to_string()))?;
+        let unreadable = |error: std::io::Error| SpecRejected::Unreadable(error.to_string());
+        let document = dir.read(newest).map_err(unreadable)?;
+        let applied = dir.written(newest).map_err(unreadable)?;
         let rule = Line::Record(generation);
         let Checked { digest, next } = self.pass(self.standing(), &document, format, rule)?;
-        let Some(next) = next else {
-            // The store runs this document already: no generation is entered.
-            return Ok(());
-        };
-        let kept = Held {
-            generation,
+        // Where the store runs this document already, none is entered.
+        if let Some(next) = next {
+            let kept = Held {
+                generation,
+                digest,
+                document,
+                format,
+                applied,
+            };
+            self.enter(next, kept)?;
+        }
+        Ok(Retained {
+            persisted: newest,
             digest,
-            document,
-            format,
-            applied: SystemTime::now(),
-        };
-        Ok(self.enter(next, kept)?)
+            applied,
+        })
+    }
+
+    /// The generation `persisted` of `dir` as the read call lists it: its
+    /// digest by the first steps of a document's pass ([`digested`]), a
+    /// fault held as the pass holds one, and when its file was written.
+    fn told(dir: &SpecStore, persisted: Persisted) -> Result<Retained, SpecRejected> {
+        let unreadable = |error: std::io::Error| SpecRejected::Unreadable(error.to_string());
+        let document = dir.read(persisted).map_err(unreadable)?;
+        let (_, digest) = holding(|| digested(&document, persisted.format))?;
+        let applied = dir.written(persisted).map_err(unreadable)?;
+        Ok(Retained {
+            persisted,
+            digest,
+            applied,
+        })
     }
 
     /// `ApplyPolicySpec` in enforce mode where a spec store is bound: the
@@ -1140,9 +1251,56 @@ impl Generations {
         let world = self.store.world();
         let standing = guard(world.spec(), expected)?;
         let before = needs_summary(world.spec().engine());
-        let written = self.write(applying.as_mut(), standing, document, format, Line::Next);
+        let written = match applying.as_mut() {
+            Some(dir) => self.write(dir, standing, document, format, Line::Next),
+            None => Err(SpecRejected::Unpersisted(
+                "no spec store is bound".to_owned(),
+            )),
+        };
         drop(applying);
-        Ok(match written {
+        Ok(self.enforced(standing, before, written))
+    }
+
+    /// `RollbackPolicySpec` where a spec store is bound: the document of
+    /// `wanted`, a generation on file, is read from its file and written as
+    /// [`Generations::enforce`] writes one, under the next number whatever
+    /// line its bytes write ([`Line::Record`]): its pass, its file, then the
+    /// store's entry, under the door's one lock. The standing generation's
+    /// document is no change. A generation that is not on file is not held.
+    /// A document that does not run now, or that the directory does not
+    /// give or take, is refused with the running generation kept, and
+    /// counted as rejected.
+    pub(crate) fn roll_back(&self, wanted: u64) -> Result<Enforced, Unanswered> {
+        let mut applying = self.applying.lock();
+        let found = applying.as_mut().and_then(|dir| {
+            let on_file = dir.kept().iter().copied();
+            let persisted = on_file.rev().find(|kept| kept.generation == wanted)?;
+            Some((dir, persisted))
+        });
+        let Some((dir, persisted)) = found else {
+            return Err(Unanswered::NotHeld(self.not_held(wanted)));
+        };
+        let world = self.store.world();
+        let standing = (world.spec().generation(), world.spec().digest());
+        let before = needs_summary(world.spec().engine());
+        let rule = Line::Record(standing.0.saturating_add(1));
+        let written = dir
+            .read(persisted)
+            .map_err(|error| SpecRejected::Unreadable(error.to_string()))
+            .and_then(|document| self.write(dir, standing, document, persisted.format, rule));
+        drop(applying);
+        Ok(self.enforced(standing, before, written))
+    }
+
+    /// A write's answer: the number its document runs under, with the feed
+    /// before and after it, or its refusal, counted.
+    fn enforced(
+        &self,
+        standing: (u64, Option<Digest>),
+        before: proto::NeedsSummary,
+        written: Result<Written, SpecRejected>,
+    ) -> Enforced {
+        match written {
             Ok((generation, digest, after)) => Enforced {
                 standing,
                 ran: Ok((generation, digest)),
@@ -1156,40 +1314,38 @@ impl Generations {
                 ran: Err(self.reject(rejected)),
                 needs: None,
             },
-        })
+        }
     }
 
-    /// One write under the door's lock: the pass, the persist, the entry.
-    /// It answers the number the document runs under with its digest, and
-    /// what a host must feed under it: `None` where it is the standing
-    /// document again, which is no change.
+    /// One write under the door's lock: the pass, the persist, the entry,
+    /// then the read call's list. It answers the number the document runs
+    /// under with its digest, and what a host must feed under it: `None`
+    /// where it is the standing document again, which is no change.
     fn write(
         &self,
-        dir: Option<&mut SpecStore>,
+        dir: &mut SpecStore,
         standing: (u64, Option<Digest>),
         document: Vec<u8>,
         format: Format,
         rule: Line,
-    ) -> Result<(u64, Digest, Option<proto::NeedsSummary>), SpecRejected> {
-        let Some(dir) = dir else {
-            return Err(SpecRejected::Unpersisted(
-                "no spec store is bound".to_owned(),
-            ));
-        };
+    ) -> Result<Written, SpecRejected> {
         let Checked { digest, next } = self.pass(standing, &document, format, rule)?;
         let Some(next) = next else {
             return Ok((standing.0, digest, None));
         };
         let generation = next.generation();
         let after = needs_summary(next.engine());
-        dir.persist(Persisted { generation, format }, &document)
+        let persisted = Persisted { generation, format };
+        dir.persist(persisted, &document)
             .map_err(|error| SpecRejected::Unpersisted(error.to_string()))?;
+        // The file's own time: a start lists the generation under it too.
+        let applied = dir.written(persisted).unwrap_or_else(|_| SystemTime::now());
         let kept = Held {
             generation,
             digest,
             document,
             format,
-            applied: SystemTime::now(),
+            applied,
         };
         if let Err(stale) = self.enter(next, kept) {
             // What was persisted goes before the door's lock does: a start
@@ -1204,6 +1360,14 @@ impl Generations {
                 warn!(generation = pruned, %error, "a generation past the retained ones stays on file");
             }
         }
+        let mut on_file = self.on_file.lock();
+        on_file.push(Retained {
+            persisted,
+            digest,
+            applied,
+        });
+        on_file.retain(|retained| dir.kept().contains(&retained.persisted));
+        drop(on_file);
         Ok((generation, digest, Some(after)))
     }
 
@@ -1232,15 +1396,35 @@ impl Generations {
                 needs: None,
             });
         }
+        self.in_turn(move |door| door.enforce(&expected, document, format))
+            .await
+    }
+
+    /// [`Generations::roll_back`] off the runtime's workers, in the write
+    /// calls' turn ([`Generations::in_turn`]).
+    pub(crate) async fn roll_back_in_turn(
+        self: &Arc<Self>,
+        wanted: u64,
+    ) -> Result<Enforced, Unanswered> {
+        self.in_turn(move |door| door.roll_back(wanted)).await
+    }
+
+    /// Runs `write` off the runtime's workers, behind the write calls that
+    /// came first. No more calls wait than [`WRITES_WAITING`]: one past
+    /// them is refused.
+    async fn in_turn(
+        self: &Arc<Self>,
+        write: impl FnOnce(&Self) -> Result<Enforced, Unanswered> + Send + 'static,
+    ) -> Result<Enforced, Unanswered> {
         let Ok(place) = Arc::clone(&self.writing).try_acquire_owned() else {
             return Err(Unanswered::Waiting);
         };
         let door = Arc::clone(self);
-        let write = tokio::task::spawn_blocking(move || {
+        let written = tokio::task::spawn_blocking(move || {
             let _place = place;
-            door.enforce(&expected, document, format)
+            write(&door)
         });
-        write
+        written
             .await
             .unwrap_or_else(|join| Err(Unanswered::Unwritten(join)))
     }
@@ -1281,7 +1465,77 @@ impl Generations {
 
     /// Whether the spec's source takes writes: a spec store is bound.
     pub(crate) fn writable(&self) -> bool {
-        self.stored.load(Ordering::Acquire)
+        self.dir.get().is_some()
+    }
+
+    /// The generations on file as a refusal names them, under a spec store.
+    fn listed(&self) -> Option<OnFile> {
+        self.writable().then(|| {
+            let on_file = self.on_file.lock();
+            let number = |retained: Option<&Retained>| {
+                retained.map_or(0, |retained| retained.persisted.generation)
+            };
+            OnFile {
+                count: on_file.len(),
+                span: (number(on_file.first()), number(on_file.last())),
+            }
+        })
+    }
+
+    /// Why no document is held for `asked`, as things stand.
+    fn not_held(&self, asked: u64) -> NotHeld {
+        let held = self.held.lock().as_ref().map(|held| held.generation);
+        NotHeld {
+            asked,
+            held,
+            standing: self.generation(),
+            on_file: self.listed(),
+        }
+    }
+
+    /// `GetPolicySpec`: the standing generation's document from memory
+    /// ([`Generations::document`]), or, under a spec store, a generation on
+    /// file, read from its file off the runtime's workers and answered with
+    /// the digest and the time it is listed under. It takes no lock an
+    /// apply holds: the read waits on no validation and on no file's sync.
+    /// A file an apply removed since the list was read is not held.
+    pub(crate) async fn read(
+        self: &Arc<Self>,
+        wanted: u64,
+    ) -> Result<proto::PolicySpecDocument, Unanswered> {
+        let not_held = match self.document(wanted) {
+            Ok(document) => return Ok(document),
+            Err(not_held) => not_held,
+        };
+        let generation = not_held.asked;
+        let listed = self
+            .on_file
+            .lock()
+            .iter()
+            .copied()
+            .find(|retained| retained.persisted.generation == generation);
+        let (Some(dir), Some(retained)) = (self.dir.get().cloned(), listed) else {
+            return Err(Unanswered::NotHeld(not_held));
+        };
+        let read =
+            tokio::task::spawn_blocking(move || spec_store::read_in(&dir, retained.persisted));
+        let unread = |why: String| Unanswered::Unread { generation, why };
+        match read.await {
+            Ok(Ok(document)) => Ok(proto::PolicySpecDocument {
+                generation,
+                digest: retained.digest.to_string(),
+                document,
+                format: retained.persisted.format.as_str().to_owned(),
+                applied_unix_micros: unix_micros(retained.applied),
+                mode: proto::ApplyMode::Enforce.into(),
+                acks: Vec::new(),
+            }),
+            Ok(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                Err(Unanswered::NotHeld(self.not_held(generation)))
+            }
+            Ok(Err(error)) => Err(unread(error.to_string())),
+            Err(join) => Err(unread(join.to_string())),
+        }
     }
 
     /// How this door reads a document's own line: as an apply call's where
@@ -1322,6 +1576,7 @@ impl Generations {
                 asked,
                 held: other.map(|held| held.generation),
                 standing,
+                on_file: self.listed(),
             }),
         }
     }
@@ -1683,6 +1938,7 @@ pub(crate) mod tests {
                 asked,
                 held: Some(1),
                 standing: 2,
+                on_file: None,
             };
             assert_eq!(not_held, expected, "asked for {wanted}");
         }
@@ -2837,6 +3093,7 @@ pub(crate) mod tests {
             asked: 0,
             held: None,
             standing: 0,
+            on_file: None,
         };
         assert_eq!(generations.document(0), Err(nothing));
 
@@ -2877,6 +3134,7 @@ pub(crate) mod tests {
             asked: 7,
             held: Some(1),
             standing: 7,
+            on_file: None,
         };
         assert_eq!(generations.document(0), Err(behind));
     }
@@ -4151,6 +4409,9 @@ pub(crate) mod tests {
 
         let refused = enforce().await;
         assert!(matches!(refused, Err(Unanswered::Waiting)), "{refused:?}");
+        // A rollback waits in the same turn.
+        let refused = generations.roll_back_in_turn(1).await;
+        assert!(matches!(refused, Err(Unanswered::Waiting)), "{refused:?}");
         assert_eq!(standing(&store), (0, None));
         drop(taken);
         // A call gives its place back at its end: as many calls again as
@@ -4207,6 +4468,175 @@ pub(crate) mod tests {
         assert_eq!(names(dir.path()), on_file);
         // The number the flag's help states.
         assert_eq!(names(dir.path()).len(), 8);
+    }
+
+    /// What a rollback to generation `wanted`, one on file, ran.
+    fn roll_back(generations: &Generations, wanted: u64) -> Result<(u64, Digest), SpecRejected> {
+        generations.roll_back(wanted).expect("on file").ran
+    }
+
+    /// A rollback runs a generation on file again: its bytes are on file
+    /// under the next number and run under it, with their digest and the
+    /// feed an enforce answers. The standing generation, and a generation
+    /// whose document is the standing one's, are no change.
+    #[test]
+    fn a_rollback_runs_a_generation_on_file_again_under_the_next_number() {
+        let (dir, store, generations) = stored();
+        let (_, first) = enforce(&generations, LEAST_LOAD).expect("it runs");
+        let (_, second) = enforce(&generations, RANDOM).expect("it runs");
+        let ran = needs_summary(store.world().spec().engine());
+
+        let back = generations.roll_back(1).expect("on file");
+        assert_eq!(back.standing, (2, Some(second)));
+        assert_eq!(back.ran, Ok((3, first)));
+        assert_eq!(standing(&store), (3, Some(first)));
+        let on_file = std::fs::read(dir.path().join(name_of(3, "yaml"))).expect("the file");
+        assert_eq!(on_file, LEAST_LOAD.as_bytes());
+        let needs = back.needs.expect("the diff");
+        assert_eq!(needs.before, Some(ran));
+        let runs = needs_summary(store.world().spec().engine());
+        assert_eq!(needs.after, Some(runs));
+
+        for same in [3, 1] {
+            assert_eq!(roll_back(&generations, same), Ok((3, first)));
+        }
+        assert_eq!(names(dir.path()).len(), 3);
+        assert_eq!(generations.counts(), applied(3, 0));
+    }
+
+    /// A generation that is not on file is not held: one never applied, and
+    /// one past the generations the store keeps. Nothing is applied and
+    /// nothing counted.
+    #[test]
+    fn a_rollback_to_a_generation_not_on_file_is_not_held() {
+        let (_dir, store, generations) = stored();
+        let last = u64::try_from(RETAINED).expect("a small count") + 1;
+        for number in 1..=last {
+            enforce(&generations, bound_to(number)).expect("it runs");
+        }
+        for gone in [1, last + 1] {
+            let Err(Unanswered::NotHeld(not_held)) = generations.roll_back(gone) else {
+                panic!("generation {gone} is not on file");
+            };
+            let expected = NotHeld {
+                asked: gone,
+                held: Some(last),
+                standing: last,
+                on_file: Some(OnFile {
+                    count: RETAINED,
+                    span: (2, last),
+                }),
+            };
+            assert_eq!(not_held, expected);
+            assert_eq!(
+                not_held.to_string(),
+                format!("no document is held for generation {gone}: the spec store has 8 on file, from generation 2 to generation 9")
+            );
+        }
+        assert_eq!(standing(&store).0, last);
+        assert_eq!(generations.counts(), applied(last, 0));
+    }
+
+    /// A rollback mints its number whatever line the generation's bytes
+    /// write. A file that is no document any more, as a build that dropped
+    /// a stage finds one, is refused by name with the running generation
+    /// kept, counted, and nothing more on file.
+    #[test]
+    fn a_rollback_mints_its_number_and_refuses_a_document_that_does_not_run() {
+        let (dir, store, generations) = stored();
+        enforce(&generations, with_line(LEAST_LOAD, 1)).expect("it runs");
+        enforce(&generations, RANDOM).expect("it runs");
+        assert_eq!(roll_back(&generations, 1).map(|(number, _)| number), Ok(3));
+        let on_file = std::fs::read(dir.path().join(name_of(3, "yaml"))).expect("the file");
+        assert_eq!(on_file, with_line(LEAST_LOAD, 1));
+
+        std::fs::write(dir.path().join(name_of(2, "yaml")), UNKNOWN_FILTER).expect("the file");
+        let refused = roll_back(&generations, 2).expect_err("no such filter");
+        assert!(matches!(refused, SpecRejected::Invalid(_)), "{refused:?}");
+        assert_eq!(standing(&store).0, 3);
+        assert_eq!(names(dir.path()).len(), 3);
+        assert_eq!(generations.counts(), applied(3, 1));
+    }
+
+    /// The read call answers a generation on file by its number, with the
+    /// digest it ran under and its file's time, while the door's lock is
+    /// held: it waits on no apply. A generation that is not on file is not
+    /// held. A start lists the generations on file again, under the same
+    /// digests and times.
+    #[tokio::test]
+    #[expect(
+        clippy::await_holding_lock,
+        reason = "the case holds the door's lock across the read: the read takes none"
+    )]
+    async fn the_read_call_answers_a_generation_on_file() {
+        let (dir, _store, generations) = stored();
+        let (_, first) = enforce(&generations, LEAST_LOAD).expect("it runs");
+        let (_, second) = enforce(&generations, RANDOM).expect("it runs");
+
+        let applying = generations.applying.lock();
+        let old = generations.read(1).await.expect("on file");
+        drop(applying);
+        assert_eq!(
+            (old.generation, old.document.as_slice()),
+            (1, LEAST_LOAD.as_bytes())
+        );
+        assert_eq!(
+            (old.digest.clone(), old.format.as_str()),
+            (first.to_string(), "yaml")
+        );
+        let written = std::fs::metadata(dir.path().join(name_of(1, "yaml")))
+            .and_then(|file| file.modified())
+            .expect("the file's time");
+        assert_eq!(old.applied_unix_micros, unix_micros(written));
+        let stands = generations.read(0).await.expect("the standing one");
+        assert_eq!(
+            (stands.generation, stands.digest.clone()),
+            (2, second.to_string())
+        );
+
+        let Err(Unanswered::NotHeld(not_held)) = generations.read(7).await else {
+            panic!("generation 7 is not on file");
+        };
+        let two = OnFile {
+            count: 2,
+            span: (1, 2),
+        };
+        assert_eq!(not_held.on_file, Some(two));
+
+        let (_store, again) = self::generations();
+        bind(&again, dir.path());
+        let again = Arc::new(again);
+        assert_eq!(again.read(1).await.expect("on file"), old);
+        assert_eq!(again.read(2).await.expect("on file"), stands);
+    }
+
+    /// An older file that is no document of this build stays on file and is
+    /// listed nowhere: the start runs the newest, the read call does not
+    /// answer the older one, and a rollback to it is refused by name.
+    #[tokio::test]
+    async fn an_older_file_that_is_no_document_is_left_on_file_and_not_read() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        std::fs::write(dir.path().join(name_of(1, "yaml")), "profiles: [").expect("the file");
+        std::fs::write(dir.path().join(name_of(2, "yaml")), LEAST_LOAD).expect("the file");
+        let (store, generations) = generations();
+        bind(&generations, dir.path());
+        let generations = Arc::new(generations);
+        assert_eq!(standing(&store).0, 2);
+
+        let Err(Unanswered::NotHeld(not_held)) = generations.read(1).await else {
+            panic!("generation 1 is no document");
+        };
+        let one = OnFile {
+            count: 1,
+            span: (2, 2),
+        };
+        assert_eq!(not_held.on_file, Some(one));
+        let refused = roll_back(&generations, 1).expect_err("no document");
+        assert!(
+            matches!(refused, SpecRejected::Unparsed { .. }),
+            "{refused:?}"
+        );
+        assert_eq!(names(dir.path()).len(), 2);
     }
 
     /// The Numbers table's enforce rows: one enforce under a spec store

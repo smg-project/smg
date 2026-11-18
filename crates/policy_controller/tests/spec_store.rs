@@ -4,8 +4,9 @@
 //! An enforce is on file and runs as generation 1, the read call answers its
 //! bytes, and the next one runs as generation 2. The process is then killed
 //! and started again on the same directory: it runs generation 2 before any
-//! call, under the bytes its caller sent. A start the store refuses exits,
-//! naming why.
+//! call, under the bytes its caller sent, rolls back to a generation the
+//! process before it wrote, and answers each generation on file by its
+//! number. A start the store refuses exits, naming why.
 //!
 //! The cases wait on an answer, never on a clock: a wait that outlasts its
 //! room fails with the last answer it saw.
@@ -41,9 +42,14 @@ use std::{
 };
 
 use replicas::{Lease, Replica, ROOM};
-use smg_policy_controller::{elector::ElectionSettings, proto::ApplyMode};
-use spec::{answers, apply, apply_over, page, read, until, LEAST_LOAD, PACE, RANDOM};
-use tonic::Code;
+use smg_policy_controller::{
+    elector::ElectionSettings,
+    proto::{ApplyMode, ApplyResult, RollbackRequest},
+};
+use spec::{
+    answers, apply, apply_over, as_operator, control, page, read, until, LEAST_LOAD, PACE, RANDOM,
+};
+use tonic::{Code, Response, Status};
 
 const BIN: &str = env!("CARGO_BIN_EXE_smg-policy-controller");
 
@@ -63,6 +69,15 @@ fn start(id: &str, dir: &Path) -> Replica {
     ];
     Replica::start_with(id, Lease::Own, ElectionSettings::default(), 0, &flags)
         .expect("the replica starts")
+}
+
+/// One `RollbackPolicySpec` call on the control listener, as `operator-a`.
+async fn rollback(replica: &Replica, generation: u64) -> Result<ApplyResult, Status> {
+    control(replica)
+        .await?
+        .rollback_policy_spec(as_operator(RollbackRequest { generation }))
+        .await
+        .map(Response::into_inner)
 }
 
 /// The names in the store's directory.
@@ -119,7 +134,9 @@ fn refused(flags: &[&OsStr]) -> (Option<i32>, String) {
 /// next number, are refused by their field with the running generation
 /// kept and nothing more on file. Killed and started again on the same
 /// directory, the binary runs the newest generation on file before any
-/// call, and its next apply is the next number.
+/// call, and its next apply is the next number. A rollback there runs a
+/// generation the first process wrote as the next number, and the read call
+/// answers each generation on file by its number.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_enforce_on_a_spec_store_runs_and_a_start_runs_it_again() {
     let dir = tempfile::tempdir().expect("a directory");
@@ -223,8 +240,27 @@ async fn an_enforce_on_a_spec_store_runs_and_a_start_runs_it_again() {
     let third = led.await.expect("the leader answers").expect("a verdict");
     assert!(third.accepted, "{third:?}");
     assert_eq!(third.generation, 3);
-    let all = BTreeSet::from([name(1), name(2), name(3)]);
-    assert_eq!(on_file(dir.path()), all);
+    let three = BTreeSet::from([name(1), name(2), name(3)]);
+    assert_eq!(on_file(dir.path()), three);
+
+    // A rollback runs a generation on file again as the next number, and
+    // the read call answers each generation on file by its number.
+    let back = rollback(&again, 2).await.expect("a verdict");
+    assert!(back.accepted && !back.read_only, "{back:?}");
+    assert_eq!((back.generation, &back.digest), (4, &second.digest));
+    for (generation, document) in [(1, LEAST_LOAD), (2, RANDOM), (3, LEAST_LOAD), (4, RANDOM)] {
+        let held = read(&again, generation).await.expect("on file");
+        assert_eq!(
+            (held.generation, held.document.as_slice()),
+            (generation, document.as_bytes())
+        );
+    }
+    let kept = fs::read(dir.path().join(name(4))).expect("the generation's file");
+    assert_eq!(kept, RANDOM.as_bytes());
+    let gone = rollback(&again, 9).await.expect_err("not on file");
+    assert_eq!(gone.code(), Code::NotFound, "{gone:?}");
+    let four = BTreeSet::from([name(1), name(2), name(3), name(4)]);
+    assert_eq!(on_file(dir.path()), four);
 }
 
 /// A start the store refuses exits with the refusal in its log: beside a

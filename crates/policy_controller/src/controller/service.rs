@@ -23,9 +23,11 @@
 //! file: `ApplyPolicySpec` answers a dry run's verdict with nothing applied
 //! and an enforce `read_only`, and `RollbackPolicySpec` answers
 //! `read_only`. A spec store takes an enforce: the document is persisted,
-//! then applied as the next generation. One dry run runs at a time and one
-//! apply, and a call past the ones that wait their turn is told to ask
-//! again.
+//! then applied as the next generation. It takes a rollback to a generation
+//! on file, whose document runs again as the next generation, and
+//! `GetPolicySpec` answers a generation on file by its number. One dry run
+//! runs at a time and one write, and a call past the ones that wait their
+//! turn is told to ask again.
 
 use std::{
     io,
@@ -632,8 +634,9 @@ fn verdict(
     }
 }
 
-/// The status of a dry run or an apply that gave no verdict: a guard's by
-/// the standing generation, and a full wait's as one to ask again.
+/// The status of a spec call that gave no answer of its own: a guard's by
+/// the standing generation, a full wait's as one to ask again, and a
+/// generation no document is held for as not found.
 fn unanswered(unanswered: Unanswered) -> Status {
     match unanswered {
         Unanswered::Guarded(standing, digest) => {
@@ -650,6 +653,10 @@ fn unanswered(unanswered: Unanswered) -> Status {
             "{WRITES_WAITING} applies wait their turn: ask again later"
         )),
         Unanswered::Unwritten(join) => Status::internal(format!("the apply did not end: {join}")),
+        Unanswered::NotHeld(not_held) => Status::not_found(not_held.to_string()),
+        Unanswered::Unread { generation, why } => Status::internal(format!(
+            "generation {generation} was not read from its file: {why}"
+        )),
     }
 }
 
@@ -852,8 +859,9 @@ impl PolicyController for Service {
 
     /// The standing generation's document as its source wrote it, with the
     /// number and the digest beside it: every replica answers from its own
-    /// holder. A controller that was given no spec source serves no spec
-    /// call.
+    /// holder. Under a spec store a generation on file is answered by its
+    /// number, from its file ([`Generations::read`]). A controller that was
+    /// given no spec source serves no spec call.
     async fn get_policy_spec(
         &self,
         request: Request<proto::GetPolicySpecRequest>,
@@ -864,14 +872,21 @@ impl PolicyController for Service {
         }
         self.admit(Call::GetPolicySpec, &request)?;
         generations
-            .document(request.get_ref().generation)
+            .read(request.get_ref().generation)
+            .await
             .map(Response::new)
-            .map_err(|not_held| Status::not_found(not_held.to_string()))
+            .map_err(unanswered)
     }
 
     /// `RollbackPolicySpec` by a controller with a spec source: the scope,
     /// the lead, then the source. Under a file, which no call writes, the
-    /// answer is `read_only`, with the standing number and digest.
+    /// answer is `read_only`, with the standing number and digest. Under a
+    /// spec store the document of the generation the call names, one on
+    /// file, is persisted and applied again as the next generation, one
+    /// write at a time ([`Generations::roll_back_in_turn`]), and the call
+    /// answers as an enforce does. A call that names no generation is
+    /// refused by the field, and one that names a generation not on file is
+    /// answered `NOT_FOUND`.
     async fn rollback_policy_spec(
         &self,
         request: Request<proto::RollbackRequest>,
@@ -882,12 +897,24 @@ impl PolicyController for Service {
         }
         self.admit(Call::RollbackPolicySpec, &request)?;
         self.leading(Instant::now())?;
-        if generations.writable() {
-            return Err(Status::unimplemented(
-                "RollbackPolicySpec is not served under a spec store by this build",
+        if !generations.writable() {
+            return Ok(Response::new(read_only(generations)));
+        }
+        let wanted = request.get_ref().generation;
+        if wanted == 0 {
+            return Err(Status::invalid_argument(
+                "generation: a rollback names a generation on file",
             ));
         }
-        Ok(Response::new(read_only(generations)))
+        let Enforced {
+            standing,
+            ran,
+            needs,
+        } = generations
+            .roll_back_in_turn(wanted)
+            .await
+            .map_err(unanswered)?;
+        Ok(Response::new(verdict(standing, ran, needs, false)))
     }
 
     /// Every scope, every replica, any caller: no principal is read, since
@@ -2476,13 +2503,20 @@ mod tests {
         );
     }
 
-    /// A follower takes no write under a spec store either: it refuses by
-    /// the leader's name, and nothing is on file.
+    /// A follower takes no write under a spec store either: it refuses an
+    /// enforce and a rollback by the leader's name, and nothing is on file.
     #[tokio::test]
-    async fn a_follower_refuses_an_enforce_under_a_spec_store() {
+    async fn a_follower_refuses_a_write_under_a_spec_store() {
         let (dir, _elector, _standing, control) = stored(false);
         let refused = control
             .apply_policy_spec(apply(proto::ApplyMode::Enforce, RANDOM, "yaml", ""))
+            .await
+            .expect_err("a follower");
+        assert_eq!(refused.code(), Code::FailedPrecondition);
+        assert_eq!(refused.message(), "this replica does not lead");
+        let rollback = from("operator-a", proto::RollbackRequest { generation: 1 });
+        let refused = control
+            .rollback_policy_spec(rollback)
             .await
             .expect_err("a follower");
         assert_eq!(refused.code(), Code::FailedPrecondition);
@@ -2492,19 +2526,76 @@ mod tests {
         assert_eq!(control.shared.generations.generation(), 0);
     }
 
+    /// A rollback under a spec store, on the leader: the document of a
+    /// generation on file runs again as the next generation, and the answer
+    /// is an enforce's. The read call answers each generation on file by
+    /// its number. A rollback that names no generation is refused by the
+    /// field, and a generation that is not on file is not found, by a
+    /// rollback and by the read call alike.
     #[tokio::test]
-    async fn a_rollback_under_a_spec_store_is_refused_by_name() {
-        let (_dir, _elector, _standing, control) = stored(true);
-        let rollback = from("operator-a", proto::RollbackRequest { generation: 1 });
-        let refused = control
-            .rollback_policy_spec(rollback)
-            .await
-            .expect_err("not served");
-        assert_eq!(refused.code(), Code::Unimplemented);
-        assert_eq!(
-            refused.message(),
-            "RollbackPolicySpec is not served under a spec store by this build"
+    async fn a_rollback_under_a_spec_store_runs_a_generation_on_file_again() {
+        let (dir, _elector, _standing, control) = stored(true);
+        let write = |document: &'static str| {
+            control.apply_policy_spec(apply(proto::ApplyMode::Enforce, document, "yaml", ""))
+        };
+        let rollback = |generation: u64| {
+            let request = proto::RollbackRequest { generation };
+            control.rollback_policy_spec(from("operator-a", request))
+        };
+        let read = |generation: u64| {
+            let request = proto::GetPolicySpecRequest { generation };
+            control.get_policy_spec(from("operator-a", request))
+        };
+        let first = write(RANDOM).await.expect("an answer").into_inner();
+        let second = write(LEAST_LOAD).await.expect("an answer").into_inner();
+        assert_eq!((first.generation, second.generation), (1, 2));
+
+        let back = rollback(1).await.expect("an answer").into_inner();
+        assert!(back.accepted && !back.read_only, "{back:?}");
+        assert_eq!((back.generation, &back.digest), (3, &first.digest));
+        assert!(back.issues.is_empty(), "{back:?}");
+        let feed = back.needs.expect("the needs diff");
+        assert!(
+            feed.before.is_some_and(|before| !before.models.is_empty()),
+            "the document rolled away from reads the loads"
         );
+        assert_eq!(feed.after, Some(proto::NeedsSummary::default()));
+        assert_eq!(control.shared.generations.generation(), 3);
+        let on_file = std::fs::read_dir(dir.path()).expect("the directory");
+        assert_eq!(on_file.count(), 3);
+
+        for (asked, answered, document, digest) in [
+            (1, 1, RANDOM, &first.digest),
+            (2, 2, LEAST_LOAD, &second.digest),
+            (3, 3, RANDOM, &first.digest),
+            (0, 3, RANDOM, &first.digest),
+        ] {
+            let held = read(asked).await.expect("a document").into_inner();
+            assert_eq!(held.generation, answered, "asked for {asked}");
+            assert_eq!(
+                (held.document.as_slice(), &held.digest, held.format.as_str()),
+                (document.as_bytes(), digest, "yaml")
+            );
+        }
+
+        let unnamed = rollback(0).await.expect_err("no generation is named");
+        assert_eq!(unnamed.code(), Code::InvalidArgument);
+        assert_eq!(
+            unnamed.message(),
+            "generation: a rollback names a generation on file"
+        );
+        let gone = [
+            rollback(9).await.expect_err("not on file"),
+            read(9).await.expect_err("not on file"),
+        ];
+        for refused in gone {
+            assert_eq!(refused.code(), Code::NotFound);
+            assert_eq!(
+                refused.message(),
+                "no document is held for generation 9: the spec store has 3 on file, from generation 1 to generation 3"
+            );
+        }
+        assert_eq!(control.shared.generations.generation(), 3);
     }
 
     #[test]

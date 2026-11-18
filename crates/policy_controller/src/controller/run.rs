@@ -185,8 +185,9 @@ struct Cli {
     /// comes in through the apply call, is persisted in the directory, one
     /// file a generation, and is then applied as the next generation. The
     /// newest generation on file is applied at the start, and one that does
-    /// not run refuses the start. The last 8 generations stay on file. One
-    /// replica serves it, its lease in the process: beside a lease another
+    /// not run refuses the start. The last 8 generations stay on file, and a
+    /// rollback runs one of them again as the next generation. One replica
+    /// serves it, its lease in the process: beside a lease another
     /// replica can take the start is refused, since a standby does not
     /// follow an applied generation in this build
     #[arg(
