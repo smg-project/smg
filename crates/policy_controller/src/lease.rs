@@ -8,6 +8,8 @@
 //! calls the lifecycle once per side. Every stateful built-in keeps its state
 //! behind these events alone.
 
+use std::fmt;
+
 use crate::{
     decision::{Decision, Target},
     sessions::SessionVerdict,
@@ -166,6 +168,16 @@ pub enum EventKind {
 }
 
 impl EventKind {
+    /// Every kind, in the order of its bit.
+    pub const ALL: [Self; 6] = [
+        Self::Issued,
+        Self::Dispatched,
+        Self::Completed,
+        Self::Released,
+        Self::Membership,
+        Self::Signal,
+    ];
+
     const fn bit(self) -> u8 {
         1 << self as u8
     }
@@ -173,8 +185,9 @@ impl EventKind {
 
 /// A set of kinds of lifecycle event, as bits over [`EventKind`]. Empty by
 /// default. A plugin's row lists in one the kinds its plugin hears, and a
-/// plugin whose row lists nothing is told nothing.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// plugin whose row lists nothing is told nothing. It prints the kinds it
+/// holds by name, as `{Completed, Signal}`.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub struct EventSet(u8);
 
 impl EventSet {
@@ -182,14 +195,15 @@ impl EventSet {
     pub const NONE: Self = Self(0);
 
     /// Every kind.
-    pub const ALL: Self = Self(
-        EventKind::Issued.bit()
-            | EventKind::Dispatched.bit()
-            | EventKind::Completed.bit()
-            | EventKind::Released.bit()
-            | EventKind::Membership.bit()
-            | EventKind::Signal.bit(),
-    );
+    pub const ALL: Self = {
+        let mut set = Self::NONE;
+        let mut at = 0;
+        while at < EventKind::ALL.len() {
+            set.0 |= EventKind::ALL[at].bit();
+            at += 1;
+        }
+        set
+    };
 
     /// The set of these kinds.
     pub fn of(kinds: impl IntoIterator<Item = EventKind>) -> Self {
@@ -206,6 +220,14 @@ impl EventSet {
 
     pub const fn is_empty(self) -> bool {
         self.0 == 0
+    }
+}
+
+impl fmt::Debug for EventSet {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_set()
+            .entries(EventKind::ALL.iter().filter(|kind| self.contains(**kind)))
+            .finish()
     }
 }
 
@@ -303,18 +325,12 @@ mod tests {
 
     use super::*;
 
-    /// Every kind, in the order of its bit. The match names each, so a new
-    /// kind does not compile until it is placed here, and the case below
-    /// then holds [`EventSet::ALL`] to it.
+    /// The type's list of every kind, held to the order of the bits. The
+    /// match names each, so a new kind does not compile until it has its
+    /// place here, which is its place in [`EventKind::ALL`]: the one list
+    /// that the set of every kind, the set's print and the cases read.
     fn kinds() -> [EventKind; 6] {
-        let kinds = [
-            EventKind::Issued,
-            EventKind::Dispatched,
-            EventKind::Completed,
-            EventKind::Released,
-            EventKind::Membership,
-            EventKind::Signal,
-        ];
+        let kinds = EventKind::ALL;
         for (at, kind) in kinds.into_iter().enumerate() {
             let place = match kind {
                 EventKind::Issued => 0,
@@ -343,6 +359,19 @@ mod tests {
                 assert_eq!(alone.contains(other), other == kind, "{kind:?} {other:?}");
             }
         }
+    }
+
+    /// A set prints the kinds it holds by name, in the order of the bits: a
+    /// row in a log line or a failing case names what the row lists.
+    #[test]
+    fn an_event_set_prints_the_kinds_it_holds_by_name() {
+        let two = EventSet::of([EventKind::Signal, EventKind::Completed]);
+        assert_eq!(format!("{two:?}"), "{Completed, Signal}");
+        assert_eq!(format!("{:?}", EventSet::NONE), "{}");
+        assert_eq!(
+            format!("{:?}", EventSet::ALL),
+            "{Issued, Dispatched, Completed, Released, Membership, Signal}"
+        );
     }
 
     /// A stage that counts what reached it, to prove the box forwards every

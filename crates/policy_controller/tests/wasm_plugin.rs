@@ -1816,7 +1816,7 @@ fn a_plugin_bound_into_a_later_engine_observes_through_it() {
 /// A row lists the kinds of event its module hears, none by default. A
 /// module whose row lists none is never told: no call is made, and a thread
 /// that only tells makes no instance. One whose row lists some is told
-/// those kinds alone.
+/// those kinds alone. A loaded module says the kinds its row lists.
 #[test]
 fn a_module_hears_the_kinds_of_event_its_row_lists_and_no_other() {
     let tell = |engine: &Engine| {
@@ -1838,6 +1838,7 @@ fn a_module_hears_the_kinds_of_event_its_row_lists_and_no_other() {
     unlisted.observes = PluginSpec::new("default", Vec::new()).observes;
     assert_eq!(unlisted.observes, EventSet::NONE);
     let plugin = loaded(&runtime, unlisted);
+    assert_eq!(plugin.observes(), EventSet::NONE);
     let engine = plugin_engine(&plugin);
     assert!(!engine.needs_lifecycle());
     // Told on a thread that never decided, then on the loading thread.
@@ -1859,6 +1860,10 @@ fn a_module_hears_the_kinds_of_event_its_row_lists_and_no_other() {
     let mut listed = spec("listed", guest::record_guest(), mode::LEAST_IN_FLIGHT);
     listed.observes = EventSet::of([EventKind::Released, EventKind::Signal]);
     let plugin = loaded(&runtime, listed);
+    assert_eq!(
+        plugin.observes(),
+        EventSet::of([EventKind::Released, EventKind::Signal])
+    );
     let engine = plugin_engine(&plugin);
     assert!(engine.needs_lifecycle());
     tell(&engine);
@@ -5184,12 +5189,21 @@ fn held_counts_are_made_again(
 /// Makes a case its tries: `once` is one try, told its number, and says
 /// whether it stood. A try a hold of the runner reached says so (see
 /// [`made_again`]) and did not stand. The last try asserts whatever its
-/// witness says: one try stands, or the case fails.
+/// witness says: one try stands, or the case fails. A try reads the host's
+/// lines from where it began ([`warnings`]).
 fn tried(once: impl Fn(u32) -> bool) {
     assert!(
-        (1..=TRIES).any(once),
+        (1..=TRIES).any(|made| {
+            TRY_BEGAN.set(said().lock().expect("the kept lines").len());
+            once(made)
+        }),
         "the last try asserts, so one try stands"
     );
+}
+
+thread_local! {
+    /// How many lines were kept when this thread's try began.
+    static TRY_BEGAN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Whether the close rebuilt the instance a fault dropped: asserted, unless
@@ -5222,8 +5236,8 @@ fn the_close_rebuilt(case: &str, plugin: &Plugin, held: std::time::Duration, mad
 
 /// Whether the host said that it ended a rebuild of `plugin`'s dropped
 /// instance at the init frame's deadline, and of no rebuild of that plugin
-/// that it failed another way. The lines are those of every try: a case's
-/// tries load one name.
+/// that it failed another way. The lines are the try's own: a case's tries
+/// load one name, and an earlier try's ended rebuild is not this one's.
 fn the_frame_ended_the_rebuild(plugin: &str) -> bool {
     let rebuilds: Vec<String> = warnings(plugin)
         .into_iter()
@@ -5235,17 +5249,45 @@ fn the_frame_ended_the_rebuild(plugin: &str) -> bool {
             .all(|line| line.contains("wasm trap: interrupt"))
 }
 
-/// The warnings the host wrote that name `plugin`, where a case installed
-/// the process's subscriber before them: what a failed rebuild said.
+/// The warnings the host wrote that name `plugin` since the thread's try
+/// began (all of them, on a thread that makes no try), where a case
+/// installed the process's subscriber before them: what a failed rebuild
+/// said.
 fn warnings(plugin: &str) -> Vec<String> {
     let named = format!("plugin=\"{plugin}\"");
     said()
         .lock()
         .expect("the kept lines")
         .iter()
+        .skip(TRY_BEGAN.get())
         .filter(|line| line.contains(&named))
         .cloned()
         .collect()
+}
+
+/// A try reads the lines the host wrote since it began: an ended rebuild
+/// that an earlier try's line tells of is not this try's, so the second
+/// try here reads none.
+#[test]
+fn a_try_reads_the_hosts_lines_since_it_began() {
+    const NAME: &str = "a-name-no-case-loads";
+    let ended =
+        format!("plugin=\"{NAME}\" the rebuild of a dropped instance failed: wasm trap: interrupt");
+    tried(|made| {
+        if made == 1 {
+            said().lock().expect("the kept lines").push(ended.clone());
+            assert!(
+                the_frame_ended_the_rebuild(NAME),
+                "the first try's own line"
+            );
+            return false;
+        }
+        assert!(
+            !the_frame_ended_the_rebuild(NAME),
+            "a line of the first try, read in the second"
+        );
+        true
+    });
 }
 
 /// Decides once, and says with the decision whether its thread kept the

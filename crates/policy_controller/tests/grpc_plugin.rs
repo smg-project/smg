@@ -3087,7 +3087,8 @@ fn the_lifecycle_reaches_the_plugin_once_in_order() {
 /// A row lists the kinds of event its plugin hears, none by default. A
 /// plugin whose row lists none is told nothing, and no `Observe` stream is
 /// opened for it. One whose row lists some is sent those kinds alone,
-/// numbered with no gap for the kinds it does not hear.
+/// numbered with no gap for the kinds it does not hear. A loaded plugin
+/// says the kinds its row lists.
 #[test]
 fn a_plugin_hears_the_kinds_of_event_its_row_lists_and_no_other() {
     let served = TestPlugin::serve();
@@ -3107,6 +3108,7 @@ fn a_plugin_hears_the_kinds_of_event_its_row_lists_and_no_other() {
     unlisted.connect_micros = BUDGET_MICROS;
     assert_eq!(unlisted.observes, EventSet::NONE);
     let deaf = Plugin::load(&runtime, unlisted).expect("the plugin loads");
+    assert_eq!(deaf.observes(), EventSet::NONE);
     let deaf_engine = single_engine(profile(&deaf, ALL));
     assert!(!deaf_engine.needs_lifecycle());
     assert_eq!(lead(&decide(&deaf_engine, &pool(4), 1)), Some(103));
@@ -3117,6 +3119,10 @@ fn a_plugin_hears_the_kinds_of_event_its_row_lists_and_no_other() {
     let mut listed = spec(&served, "listed");
     listed.observes = EventSet::of([EventKind::Released, EventKind::Membership]);
     let hearing = Plugin::load(&runtime, listed).expect("the plugin loads");
+    assert_eq!(
+        hearing.observes(),
+        EventSet::of([EventKind::Released, EventKind::Membership])
+    );
     let hearing_engine = single_engine(profile(&hearing, ALL));
     assert!(hearing_engine.needs_lifecycle());
     tell(&hearing_engine);
