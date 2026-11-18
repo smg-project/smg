@@ -1411,6 +1411,11 @@ async fn a_replacement_reconnects_after_a_retired_workers_probe() {
     );
     drop(first);
     assert!(!new.zmq_health_check());
+    // A queued probe and a request can still hold the retired worker.
+    // Only the registered worker may own a driver for this empty cell.
+    assert!(!old.zmq_health_check());
+    assert!(old.engine_connection().await.is_err());
+    assert!(old.zmq_connect_abort.load().is_none());
     let _second = connect_to_frontend(
         &handshake,
         EngineId::from_engine_index(0),

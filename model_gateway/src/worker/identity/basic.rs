@@ -989,10 +989,9 @@ pub struct BasicWorker {
     pub runtime: ArcSwap<WorkerRuntime>,
     pub circuit_breaker: ArcSwap<CircuitBreaker>,
     /// Lazily initialized engine connection (gRPC or ZMQ) for local workers.
-    /// The inner `OnceCell` keeps reads lock-free after initialization and
-    /// dedupes concurrent connects; the outer `ArcSwap` lets the ZMQ health
-    /// probe evict a dead client by swapping in a fresh cell (gRPC never
-    /// swaps — a failed gRPC worker is removed and re-added instead).
+    /// Compatible replacements share the slot in [`EngineConnectionCache`].
+    /// Its current cell deduplicates handshakes; a ZMQ probe on either
+    /// worker can evict that cell when the connection dies.
     pub engine_connection: Arc<EngineConnectionCache>,
     /// What makes the engine connection: the host's connector, as the
     /// builder resolved it. Without one a gRPC or ZMQ connect is refused.
@@ -1110,6 +1109,9 @@ impl BasicWorker {
     /// A worker built without a connector has no handshake to drive, and
     /// none starts: its acquisition refuses and its probe reads not ready.
     fn spawn_zmq_connect_driver(&self, cell: &Arc<OnceCell<Arc<dyn EngineConnection>>>) {
+        if self.superseded.load(Ordering::Acquire) {
+            return;
+        }
         let Some(connector) = self.engine_connector.clone() else {
             return;
         };
@@ -1136,7 +1138,7 @@ impl BasicWorker {
         let revision = self.revision();
         #[expect(
             clippy::disallowed_methods,
-            reason = "detached one-shot handshake driver; the OnceCell dedupes with the request path and the guard self-clears on failure to allow a retry"
+            reason = "detached one-shot handshake driver; the OnceCell dedupes with the request path and the guard clears when the handshake completes"
         )]
         // Detached: only the AbortHandle is kept, so the task keeps running
         // until it completes or the worker leaves the registry.
@@ -1166,8 +1168,14 @@ impl BasicWorker {
                 }
             }
         });
-        self.zmq_connect_abort
-            .store(Some(Arc::new(handle.abort_handle())));
+        let published = Some(Arc::new(handle.abort_handle()));
+        self.zmq_connect_abort.store(published.clone());
+        // Retirement can take the previous handle between the entry check
+        // and publication. Cancel this task even if retirement missed it.
+        if self.superseded.load(Ordering::Acquire) {
+            handle.abort();
+            self.zmq_connect_abort.compare_and_swap(&published, None);
+        }
     }
 
     /// Whether the breaker permits execution. A breaker that moves from open
