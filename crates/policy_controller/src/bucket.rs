@@ -664,10 +664,21 @@ impl Lifecycle for Bucket {
                 fence.admit(new);
             }
             Membership::Snapshot(ids) => {
+                // A snapshot names who stays. The workers the index lists
+                // and it leaves out are its leavers, fenced here, before
+                // the walk reads the table: a partition a decision makes
+                // behind that read lists none of them, and neither does
+                // one the walk has passed.
+                let listed = self.listed.load();
                 let mut fence = self.fence.lock();
                 if !fence.is_empty() {
                     for &id in ids {
                         fence.admit(id);
+                    }
+                }
+                for &id in listed.keys() {
+                    if !ids.contains(&id) {
+                        fence.retire(id, now);
                     }
                 }
             }
@@ -683,8 +694,10 @@ impl Lifecycle for Bucket {
                 }
                 Membership::Replaced { old, new } => pool.rename(old, new),
                 Membership::Snapshot(ids) => {
-                    // The workers the snapshot does not name leave, each
-                    // fenced before its partition forgets it.
+                    // The workers the snapshot does not name leave. The
+                    // fence holds those the index listed at the word; one
+                    // a decision was listing then is fenced here, before
+                    // its partition forgets it.
                     let gone = pool.unnamed(ids);
                     if !gone.is_empty() {
                         let mut fence = self.fence.lock();
@@ -1872,6 +1885,51 @@ mod tests {
         assert!(!partition.lock().by_id.contains_key(&gone));
         led(&scorer, &pool, 0, 2 * SECOND);
         assert_eq!(loads(&scorer).0.len(), 2, "an older view lists it nowhere");
+    }
+
+    /// A snapshot fences its leavers before its walk reads the table: a
+    /// partition a decision makes while the walk waits lists none of them.
+    #[test]
+    fn a_snapshot_s_leaver_is_fenced_before_a_partition_made_during_its_walk() {
+        let scorer = Arc::new(scorer(NEVER, 1.5, 5));
+        let pool = pool(3);
+        led(&scorer, &pool, 0, SECOND);
+        let gone = pool[1].id;
+        let stay = [pool[0].id, pool[2].id];
+        let partition = of(&scorer, "m");
+        // A decision holds the leaver's partition while the feed's call
+        // runs: the walk has read the table and waits for the partition.
+        let held = partition.lock();
+        let feed = {
+            let scorer = Arc::clone(&scorer);
+            std::thread::spawn(move || scorer.on_membership(&Membership::Snapshot(&stay)))
+        };
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        let mut fenced = false;
+        while !fenced && Instant::now() < deadline {
+            fenced = scorer
+                .fence
+                .try_lock_for(std::time::Duration::from_millis(100))
+                .is_some_and(|fence| fence.holds(gone));
+            std::thread::yield_now();
+        }
+        // Another model's first decision, over a view older than the
+        // snapshot, makes its partition behind the walk's read of the
+        // table: the walk never visits it.
+        let _ = led_by(&scorer, &prefill("n", 0, SECOND), &pool, &all(&pool));
+        drop(held);
+        feed.join().expect("the feed's call");
+        let listed = |model: &str| -> Vec<WorkerId> {
+            of(&scorer, model)
+                .lock()
+                .members
+                .iter()
+                .map(|member| member.id)
+                .collect()
+        };
+        assert_eq!(listed("n"), stay, "the partition made during the walk");
+        assert_eq!(listed("m"), stay, "the partition the walk waited for");
+        assert!(fenced, "no fence on the leaver while the walk waited");
     }
 
     /// A decision reads the fence for every row of its view: a fenced row
