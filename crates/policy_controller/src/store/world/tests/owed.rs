@@ -14,7 +14,7 @@ use super::{
 };
 use crate::{
     store::{
-        HealthSink, Kinds, LoadSink, LoadSource, MemoryStore, WorkerFacts, WorkerStatus,
+        HealthSink, Kinds, LoadSink, LoadSource, MemoryStore, Position, WorkerFacts, WorkerStatus,
         WorkersStore,
     },
     view::{Role, WorkerId},
@@ -237,9 +237,10 @@ fn a_followed_join_owes_its_build_and_a_followed_leave_pays_its_own() {
         rows.iter().map(|row| row.id).collect()
     };
     // A followed registration: on file, owed, in no view until the build.
+    let unjournaled = Position::default();
     let joins = leader.upsert(worker(2));
     let row = WorkersStore::get(&leader, joins.id());
-    standby.follow(WorkersStore::epoch(&leader), joins, row);
+    standby.follow(unjournaled, WorkersStore::epoch(&leader), joins, row);
     assert_eq!(listed(&standby).len(), 2);
     assert!(standby.publish_due().is_some());
     standby.publish_now();
@@ -251,11 +252,11 @@ fn a_followed_join_owes_its_build_and_a_followed_leave_pays_its_own() {
         ..worker(2)
     });
     let row = WorkersStore::get(&leader, refresh.id());
-    standby.follow(WorkersStore::epoch(&leader), refresh, row);
+    standby.follow(unjournaled, WorkersStore::epoch(&leader), refresh, row);
     assert!(standby.publish_due().is_some());
     // A followed removal: the row is in no view when the door returns.
     let leaves = leader.remove(a, revision(&leader, a)).expect("removed");
-    standby.follow(WorkersStore::epoch(&leader), leaves, None);
+    standby.follow(unjournaled, WorkersStore::epoch(&leader), leaves, None);
     assert!(!listed(&standby).contains(&a));
     assert_eq!(standby.publish_due(), None);
     // A followed new life: it stands in the old one's place at once.
@@ -266,7 +267,7 @@ fn a_followed_join_owes_its_build_and_a_followed_leave_pays_its_own() {
     let replaces = leader.upsert(life);
     let new = replaces.id();
     let row = WorkersStore::get(&leader, new);
-    standby.follow(WorkersStore::epoch(&leader), replaces, row);
+    standby.follow(unjournaled, WorkersStore::epoch(&leader), replaces, row);
     let rows = listed(&standby);
     assert!(rows.contains(&new) && !rows.contains(&b));
     assert_eq!(standby.publish_due(), None);

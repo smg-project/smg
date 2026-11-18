@@ -19,11 +19,13 @@ mod net;
 
 use std::{
     collections::BTreeMap,
+    convert::Infallible,
     future::Future,
-    io::Write as _,
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    io::{ErrorKind, Write as _},
+    net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener},
+    path::Path,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
     },
     thread,
@@ -33,7 +35,9 @@ use std::{
 use net::{http_get, loopback};
 use prost::Message as _;
 use smg_policy_controller::{
-    controller::{Config, Controller, Election, LeasePlace, Listener, Readiness, Scope, State},
+    controller::{
+        Config, Controller, Election, Error, LeasePlace, Listener, Readiness, Scope, State,
+    },
     elector::{ElectionSettings, Elector, FileLease, Tick},
     proto::{
         self, policy_controller_client::PolicyControllerClient, replica_frame::Frame,
@@ -192,6 +196,11 @@ async fn client(addr: SocketAddr) -> PolicyControllerClient<Channel> {
     PolicyControllerClient::new(channel)
 }
 
+/// How long a stream that should end may stand before its case fails:
+/// far past any stall of a loaded host, so the wait is for the end
+/// itself.
+const STANDING: Duration = Duration::from_secs(120);
+
 /// The standby every case is: the name its calls state and its hello's id.
 const STANDBY: &str = "replication-1";
 
@@ -290,20 +299,18 @@ impl Standby {
     }
 
     /// The stream's status, past the batches still on their way; `None`
-    /// when it ends with none. A stream that goes on fails here, at its
-    /// eighth heartbeat or its 4,096th batch.
+    /// when it ends with none. A leader ends a stream at a look of its own
+    /// (at its lease, at its log), and a loaded host stretches the time to
+    /// that look past any count of heartbeats: the batches before the end
+    /// are read past, however many. A stream that goes on fails here
+    /// [`STANDING`] on, or at its 4,096th batch.
     async fn ended(&mut self) -> Option<Code> {
+        let started = Instant::now();
         let mut end = None;
-        let mut beats = 0;
         for _ in 0..4_096 {
             match self.next().await {
-                Ok(Some(batch)) => {
-                    let said = batch.resync_required || batch.snapshot.is_some();
-                    beats += u32::from(!said && batch.events.is_empty());
-                    if beats == 8 {
-                        break;
-                    }
-                }
+                Ok(Some(_)) if started.elapsed() < STANDING => {}
+                Ok(Some(_)) => break,
                 Ok(None) => {
                     end = Some(None);
                     break;
@@ -314,7 +321,7 @@ impl Standby {
                 }
             }
         }
-        end.expect("the stream's end before its eighth heartbeat")
+        end.expect("the stream's end within two minutes")
     }
 
     /// Reads on up to position `seq`: every event after the stream's
@@ -1303,6 +1310,19 @@ async fn a_standby_that_closes_its_half_ends_the_stream() {
     .await;
 }
 
+/// Removes the lease file at `lease` again and again. A holder's renewal
+/// reads the file, then renames a new one over its path: a removal that
+/// lands between the two is undone, and the holder never sees its lease
+/// gone. A removal that lands outside a renewal stands, and the holder's
+/// next look finds no lease.
+async fn removed_again(lease: &Path) -> Infallible {
+    loop {
+        // Gone already, where the holder has not written since.
+        let _ = std::fs::remove_file(lease);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 /// The fence at the wire. A leader whose lease is gone ends an open stream
 /// `ABORTED` at its next look of the lease. A hello it still waited for is
 /// refused the same way, though it names a place the log does not hold: a
@@ -1340,7 +1360,13 @@ async fn a_leader_that_loses_its_lease_ends_its_stream_and_joins_no_other() {
             .await
             .expect("the leader's word while it leads");
         std::fs::remove_file(&lease).expect("the lease file");
-        assert_eq!(open.ended().await, Some(Code::Aborted));
+        // One removal can be undone by the holder's renewal: the file is
+        // removed again until the stream ends.
+        let ended = tokio::select! {
+            ended = open.ended() => ended,
+            never = removed_again(&lease) => match never {},
+        };
+        assert_eq!(ended, Some(Code::Aborted));
         // The fence is closed, and the hello names a place past the head.
         let lost = place(base.replication_seq + 1_000, base.replication_term);
         late.send(proto::ReplicaFrame {
@@ -1600,12 +1626,66 @@ struct Replica {
 
 /// The leader's address and the standby's: one host, two addresses, so
 /// both listen on one replication port as replicas configured alike do.
+/// Linux routes the second with no alias. Another host refuses its bind:
+/// a case that binds it is ignored there, with that reason.
 const LEADER: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
 const FOLLOWER: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2));
 
+/// The numbers a pair's replication port is drawn from. The leader of a
+/// pair binds one, and its standby binds the same number on its own
+/// address. A bind of port `0` by any other case or process could have
+/// been handed that number there, so these lie below the range the host
+/// hands such a bind from. Each draw of this process takes the next
+/// number, a leader's and another address's from ranges apart: a replica
+/// served alone on the standby's address takes no number a leader holds.
+/// A number is its pair's while the pair's leader lives. A standby that
+/// outlives its leader keeps it on its own address, so a pair's leader
+/// takes a number only where [`free`] finds no holder there.
+fn pair_ports(ip: IpAddr) -> impl Iterator<Item = u16> {
+    const SPAN: usize = 4096;
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    // Linux says where the range starts. A host that does not is taken to
+    // start it at 32,768, Linux's own default, and so is one that starts
+    // it at or under 12,288: its draws then lie inside its own range,
+    // where a bind of port `0` can be handed one.
+    let low = std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range")
+        .ok()
+        .and_then(|range| range.split_whitespace().next()?.parse::<usize>().ok())
+        .filter(|low| *low > 3 * SPAN)
+        .unwrap_or(32_768);
+    let base = low - if ip == LEADER { 2 * SPAN } else { SPAN };
+    // Processes started together have ids side by side. Each starts at a
+    // place its id spreads over the span, so their runs seldom meet.
+    let spread = std::process::id().wrapping_mul(0x9E37_79B1) >> 20;
+    let start = usize::try_from(spread).unwrap_or(0);
+    (0..SPAN).map(move |_| {
+        let drawn = start.wrapping_add(NEXT.fetch_add(1, Ordering::Relaxed)) % SPAN;
+        u16::try_from(base + drawn).expect("a port below the host's range")
+    })
+}
+
+/// Whether nothing holds `port` on `ip`. A pair's leader asks it of the
+/// standby's address once it has bound the number itself. No other pair's
+/// standby binds a number this leader holds, so the look disturbs no pair
+/// and finds one holder alone: a standby that outlived its leader. A bind
+/// refused for another reason fails the case, as the draw's own does.
+fn free(ip: IpAddr, port: u16) -> bool {
+    match TcpListener::bind((ip, port)) {
+        // In use on that address: a holder.
+        Err(error) if error.kind() == ErrorKind::AddrInUse => false,
+        bound => {
+            drop(bound.expect("the look's bind"));
+            true
+        }
+    }
+}
+
 impl Replica {
     /// Binds a replica of the lease at `place` on `ip`, its replication
-    /// listener at `port` (`0` takes one), and serves it.
+    /// listener at `port`, and serves it. `0` takes a number of the pairs'
+    /// own ([`pair_ports`]), the next one free on `ip` and, for a pair's
+    /// leader, on its standby's address too ([`free`]): the number a
+    /// standby of this replica then binds on its own address.
     async fn serve(id: &str, ip: IpAddr, port: u16, place: LeasePlace) -> Self {
         let listener = |name: &str, scopes: &[Scope], port| Listener {
             name: name.to_owned(),
@@ -1613,7 +1693,7 @@ impl Replica {
             scopes: scopes.to_vec(),
             tls: None,
         };
-        let mut controller = Controller::bind(Config {
+        let config = |port| Config {
             controller_id: id.to_owned(),
             listeners: vec![
                 listener("gateway", &[Scope::Gateway, Scope::Ingestion], 0),
@@ -1626,13 +1706,31 @@ impl Replica {
             load_poll_interval: Config::DEFAULT_LOAD_POLL_INTERVAL,
             decide_shards: 2,
             election: Election {
-                lease: place,
+                lease: place.clone(),
                 settings: settings(),
                 advertise: None,
             },
-        })
-        .await
-        .expect("bind");
+        };
+        let mut controller = if port == 0 {
+            let mut bound = None;
+            for drawn in pair_ports(ip) {
+                match Controller::bind(config(drawn)).await {
+                    // In use on this address: the next number.
+                    Err(Error::Bind { source, .. }) if source.kind() == ErrorKind::AddrInUse => {}
+                    // Held on the standby's address by a standby that
+                    // outlived its leader: the next number, and this bind
+                    // is let go.
+                    Ok(_) if ip == LEADER && !free(FOLLOWER, drawn) => {}
+                    other => {
+                        bound = Some(other.expect("bind"));
+                        break;
+                    }
+                }
+            }
+            bound.expect("a free port among the pairs' own")
+        } else {
+            Controller::bind(config(port)).await.expect("bind")
+        };
         for name in ["control", "replication"] {
             controller
                 .identity_as_told(name)
@@ -1766,6 +1864,10 @@ async fn promoted(addr: SocketAddr) -> proto::Snapshot {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "the follower binds 127.0.0.2: off Linux that takes a loopback alias"
+)]
 async fn a_promoted_standby_holds_every_row_and_load_row_of_its_leader() {
     let dir = tempfile::tempdir().expect("a temp dir");
     let mut leader = Replica::serve("replication-0", LEADER, 0, shared(&dir)).await;
@@ -1842,6 +1944,10 @@ async fn a_promoted_standby_holds_every_row_and_load_row_of_its_leader() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "the follower binds 127.0.0.2: off Linux that takes a loopback alias"
+)]
 async fn a_standby_that_joins_late_is_restored_whole_from_a_snapshot_past_one_message() {
     let dir = tempfile::tempdir().expect("a temp dir");
     let mut leader = Replica::serve("replication-0", LEADER, 0, shared(&dir)).await;
@@ -1890,6 +1996,10 @@ async fn a_standby_that_joins_late_is_restored_whole_from_a_snapshot_past_one_me
 /// reader that holds nothing is fed it whole, then the new term's start. A
 /// standby restored from a snapshot tells such a reader to start again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "the follower binds 127.0.0.2: off Linux that takes a loopback alias"
+)]
 async fn a_promoted_standby_feeds_a_reader_that_holds_nothing_from_its_leaders_first_write() {
     let dir = tempfile::tempdir().expect("a temp dir");
     let mut leader = Replica::serve("replication-0", LEADER, 0, shared(&dir)).await;
@@ -2038,6 +2148,10 @@ async fn sample(admin: SocketAddr, series: &str) -> String {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "the follower binds 127.0.0.2: off Linux that takes a loopback alias"
+)]
 async fn a_standby_passes_its_probes_only_while_it_is_synced_with_its_leader() {
     let dir = tempfile::tempdir().expect("a temp dir");
     let mut leader = Replica::serve("replication-0", LEADER, 0, shared(&dir)).await;

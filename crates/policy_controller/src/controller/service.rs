@@ -601,7 +601,8 @@ impl Service {
             is_leader,
         } = shared.leader(shared.fence.leader_term(now));
         // A replica that follows says how far behind it is, by the age of
-        // its stream's last applied frame; a leader follows nobody.
+        // the last frame that left it at its leader's head; a leader follows
+        // nobody.
         // `synced` is the same read of that lag, and reads it alone: the
         // live ranks and the generation narrow the same bit with their
         // steps.

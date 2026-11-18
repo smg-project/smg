@@ -407,15 +407,25 @@ struct Told {
 }
 
 impl Journal for Told {
-    fn member(&self, _: u64, _: MembershipChange, _: Option<&WorkerRow>, _: Option<&WorkerRow>) {}
+    fn member(
+        &self,
+        _: Option<Position>,
+        _: u64,
+        _: MembershipChange,
+        _: Option<&WorkerRow>,
+        _: Option<&WorkerRow>,
+    ) {
+    }
 
-    fn load(&self, _: WorkerId, _: u16, _: &LoadSample) {
+    fn load(&self, _: Option<Position>, _: WorkerId, _: u16, _: &LoadSample) {
         self.loads.fetch_add(1, Ordering::SeqCst);
     }
 
     fn term_rose(&self, term: u64) {
         self.terms.lock().push(term);
     }
+
+    fn term_followed(&self, _: Position) {}
 
     fn carries_loads(&self) -> bool {
         self.carries_loads
@@ -883,19 +893,31 @@ fn a_workers_load_rows_stand_between_its_registration_and_its_leaving() {
 /// of its position, the way the standby's applier does.
 fn follows(standby: &MemoryStore, log: &Log, entry: &Entry) {
     let adopting = log.adopt(entry.at).expect("the next position");
+    applies(standby, entry);
+    assert!(adopting.landed(), "{entry:?}");
+}
+
+/// One of a leader's entries told to a standby's store by the door for a
+/// followed write of its kind, at the entry's place.
+fn applies(standby: &MemoryStore, entry: &Entry) {
     match &entry.event {
         Event::Member {
             epoch, change, row, ..
         } => {
             let (change, row) = told(*change, row.as_deref());
-            standby.follow(*epoch, change, row);
+            standby.follow(entry.at, *epoch, change, row);
         }
         Event::Load { id, rank, sample } => {
-            standby.record(*id, *rank, sample.row, sample.received_at, sample.source);
+            let LoadSample {
+                row,
+                received_at,
+                source,
+                ..
+            } = *sample;
+            standby.follow_load(entry.at, *id, *rank, row, received_at, source);
         }
-        Event::Term => standby.set_term(entry.at.term),
+        Event::Term => standby.follow_term(entry.at),
     }
-    assert!(adopting.landed(), "{entry:?}");
 }
 
 /// A membership change as the replication stream tells it: no row for a
@@ -1395,6 +1417,48 @@ fn a_cut_beside_restores_is_one_restore_whole() {
 }
 
 #[test]
+fn a_row_of_the_standbys_own_inside_an_adoption_takes_no_place_of_its_leaders() {
+    let (leader, led) = journaled(64);
+    leader.set_term(1);
+    let a = leader.upsert(facts("http://a:8000", 1)).id();
+    let before = all(&led).len();
+    // The leader's next events, one of each kind: a load row, a member and
+    // the start of its next term.
+    leader.record(a, 0, running(3), Instant::now(), LoadSource::Stream);
+    leader.upsert(facts("http://b:8000", 1));
+    leader.set_term(2);
+    let entries = all(&led);
+    assert_eq!(entries.len(), before + 3);
+    for event in &entries[before..] {
+        let (standby, followed) = journaled(64);
+        for entry in entries.iter().take_while(|entry| entry.at != event.at) {
+            follows(&standby, &followed, entry);
+        }
+        // A poll's answer that was out when the standby stopped leading
+        // lands while the applier holds the event's place.
+        let adopting = followed.adopt(event.at).expect("the next position");
+        standby.record(a, 0, running(9), Instant::now(), LoadSource::Poll);
+        applies(&standby, event);
+        // The row stands under no term, where the store's own writes
+        // stand, and the leader's event did not land.
+        assert!(!adopting.landed(), "{event:?}");
+        let last = all(&followed).pop().expect("the row");
+        assert!(matches!(last.event, Event::Load { .. }), "{event:?}");
+        assert_eq!(last.at.term, 0, "{event:?}");
+        drop(adopting);
+        // No event of the leader's continues the standby there: it starts
+        // again from a snapshot, and holds what its leader holds.
+        let next = Position {
+            seq: event.at.seq + 1,
+            term: event.at.term,
+        };
+        assert_eq!(followed.adopt(next).err(), Some(Lost), "{event:?}");
+        assert!(standby.restore_from(leader.cut(Kinds::All)));
+        twins(&standby, &leader);
+    }
+}
+
+#[test]
 fn a_change_that_does_not_fit_the_tables_is_not_applied_and_takes_no_place() {
     use MembershipChange::{Registered, Relabelled, Removed, Replaced, StatusChanged};
     let (leader, led) = journaled(64);
@@ -1557,14 +1621,14 @@ fn a_change_that_does_not_fit_the_tables_is_not_applied_and_takes_no_place() {
     };
     for (misfit, epoch, change, row) in misfits {
         let adopting = followed.adopt(at).expect("the next position");
-        standby.follow(epoch, change, row);
+        standby.follow(at, epoch, change, row);
         assert!(!adopting.landed(), "{misfit}");
         drop(adopting);
         assert_eq!(stands(&standby), before, "{misfit}");
     }
     // The change that fits takes the place.
     let adopting = followed.adopt(at).expect("the next position");
-    standby.follow(next, Registered { id: b }, Some(other));
+    standby.follow(at, next, Registered { id: b }, Some(other));
     assert!(adopting.landed());
     assert_eq!(standby.epoch(), next);
 }
@@ -1582,10 +1646,15 @@ fn a_followed_row_keeps_the_instant_it_was_admitted_at() {
     };
     let id = row.id;
     let adopting = followed.adopt(at(1)).expect("the next position");
-    standby.set_term(1);
+    standby.follow_term(at(1));
     drop(adopting);
     let adopting = followed.adopt(at(2)).expect("the next position");
-    standby.follow(1, MembershipChange::Registered { id }, Some(row.clone()));
+    standby.follow(
+        at(2),
+        1,
+        MembershipChange::Registered { id },
+        Some(row.clone()),
+    );
     drop(adopting);
     // An event's row crosses with the instant of its apply: the instant
     // the row was admitted at stays.
@@ -1595,7 +1664,12 @@ fn a_followed_row_keeps_the_instant_it_was_admitted_at() {
         ..row.clone()
     };
     let adopting = followed.adopt(at(3)).expect("the next position");
-    standby.follow(2, MembershipChange::Relabelled { id }, Some(relabelled));
+    standby.follow(
+        at(3),
+        2,
+        MembershipChange::Relabelled { id },
+        Some(relabelled),
+    );
     assert!(adopting.landed());
     let held = WorkersStore::get(&standby, id).expect("the row");
     assert_eq!((held.revision, held.admitted_at), (2, row.admitted_at));

@@ -97,8 +97,8 @@ pub struct Readiness {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Sample {
     pub(crate) state: State,
-    /// The age of the last frame applied from the leader; `None` while
-    /// this replica leads and before any frame.
+    /// The age of the last frame that left this replica at its leader's
+    /// head; `None` while this replica leads and before any such frame.
     pub(crate) lag: Option<Duration>,
     /// Whether this replica does not lead and is synced with its leader.
     pub(crate) synced: bool,
