@@ -13,10 +13,11 @@ pub struct Pin {
     /// it.
     pub last_used: Instant,
     /// The instant the pin ends, by the TTL of the rule that placed its
-    /// key: at or past it the sweep drops the pin. `None` for a key its
-    /// rule keeps with no TTL, and for a key whose rule the writer could
-    /// not name where no standing rule had a TTL: such a pin stays until
-    /// the key's next dispatch writes it anew.
+    /// key: at or past it the sweep drops the pin and a decision's read
+    /// takes none. `None` for a key its rule keeps with no TTL, and for a
+    /// key whose rule the writer could not name where no standing rule had
+    /// a TTL: such a pin stays until the key's next dispatch writes it
+    /// anew, or its worker's row goes.
     pub ends: Option<Instant>,
 }
 

@@ -801,7 +801,9 @@ impl MemoryStore {
     /// it, here and nowhere else: the health tables, the load rows and the
     /// worker's KV lane with its blocks in the index. The vetoes a world
     /// carries are not among them: they leave with the row in the
-    /// publication of the membership write that calls this. Called under
+    /// publication of the membership write that calls this. Nor are the
+    /// sessions' pins of record that name the worker: the write drops
+    /// them once it let its lock go ([`Self::forget_pins`]). Called under
     /// the workers lock:
     /// the health writers take it first and a load write goes into its
     /// worker's entry or nowhere, so a write racing the removal finds the
@@ -812,6 +814,16 @@ impl MemoryStore {
         health.forget(id);
         let mut loads = self.loads.lock();
         loads.ranks.remove(&id);
+    }
+
+    /// The sessions' pins of record that name a worker whose row is gone
+    /// leave here, once the membership write let the workers lock go: the
+    /// walk is as long as the pins of record, and no writer of the
+    /// membership or of a worker's health waits on it. A pin a dispatch
+    /// writes past the walk names a row that is gone and is taken by no
+    /// decision; where its rule has a TTL, the pins' sweep ends it.
+    fn forget_pins(&self, id: WorkerId) {
+        SessionsStore::drop_worker(self, id);
     }
 
     /// How many times a publication allocated a pool's rows since the store
@@ -1104,6 +1116,8 @@ impl WorkersStore for MemoryStore {
                 joined: Some(new_id),
             };
             self.rebuild_world(&workers, classes, change);
+            drop(workers);
+            self.forget_pins(old_id);
             return change;
         }
         let id = identity(&facts.key, facts.incarnation);
@@ -1180,6 +1194,8 @@ impl WorkersStore for MemoryStore {
             joined: None,
         };
         self.rebuild_world(&workers, classes, change);
+        drop(workers);
+        self.forget_pins(id);
         Some(change)
     }
 

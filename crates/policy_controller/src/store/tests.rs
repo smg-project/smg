@@ -1286,6 +1286,31 @@ fn a_pin_past_its_own_end_leaves_where_another_rule_keeps_its_keys_for_ever() {
 }
 
 #[test]
+fn a_removed_workers_pins_of_record_leave_with_its_row() {
+    let store = MemoryStore::new();
+    let (a, b) = (
+        ready(&store, "http://a:8000"),
+        ready(&store, "http://b:8000"),
+    );
+    let sessions: &dyn SessionsStore = &store;
+    let now = Instant::now();
+    sessions.pin(11, a, now, None);
+    sessions.pin(12, b, now, None);
+    sessions.pin(13, a, now, None);
+    let revision = WorkersStore::get(&store, a).expect("the row").revision;
+    store.remove(a, revision).expect("removed");
+    // The removal's own write drops them: no sweep ran, and no rule
+    // stands.
+    assert!(sessions.lookup(11).is_none() && sessions.lookup(13).is_none());
+    assert_eq!(sessions.lookup(12).map(|pin| pin.worker), Some(b));
+    assert_eq!(sessions.len(), 1);
+    // A replaced incarnation's row is gone as well, and so is its pin.
+    let replaced = store.upsert(facts("http://b:8000", 2)).id();
+    assert_ne!(replaced, b);
+    assert!(sessions.is_empty(), "the old incarnation's pin");
+}
+
+#[test]
 fn a_pin_is_written_at_the_commit_and_leaves_with_its_worker_or_at_its_end() {
     let store = MemoryStore::new();
     let sessions: &dyn SessionsStore = &store;
