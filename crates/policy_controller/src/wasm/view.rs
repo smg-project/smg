@@ -645,6 +645,14 @@ fn put(buf: &mut [u8], at: usize, bytes: &[u8]) {
     buf[at..at + bytes.len()].copy_from_slice(bytes);
 }
 
+/// Appends a section of u64 values, eight little-endian bytes each: the
+/// block grows once, by the section's length, and one pass extends it from
+/// the values' bytes.
+fn put_u64s(buf: &mut Vec<u8>, values: impl ExactSizeIterator<Item = u64>) {
+    buf.reserve(8 * values.len());
+    buf.extend(values.flat_map(u64::to_le_bytes));
+}
+
 /// The bits whose flag is set.
 fn bits<const N: usize>(flags: [(bool, u8); N]) -> u8 {
     flags
@@ -722,12 +730,8 @@ impl Packed {
         put(buf, REQ_BLOCK_SIZE, &facts.block_size.to_le_bytes());
         buf.extend_from_slice(facts.model.as_bytes());
         buf.resize(buf.len().next_multiple_of(8), 0);
-        for h in hashes {
-            buf.extend_from_slice(&h.to_le_bytes());
-        }
-        for t in facts.tried {
-            buf.extend_from_slice(&t.0.to_le_bytes());
-        }
+        put_u64s(buf, hashes.iter().copied());
+        put_u64s(buf, facts.tried.iter().map(|t| t.0));
         for h in exposed {
             let len = section_len(h.value)?;
             buf.push(h.name);
@@ -1326,10 +1330,9 @@ mod tests {
             assert_eq!(usize::from(le_u16(b, REQ_HASH_COUNT)), carried, "{needs:?}");
             // No name, no tried id, no header: the hashes are the block's tail.
             assert_eq!(b.len(), HEADER + 8 * carried, "{needs:?}");
-            if carried > 0 {
-                assert_eq!(le_u64(b, HEADER), 0);
-                assert_eq!(le_u64(b, b.len() - 8), longer[carried - 1], "{needs:?}");
-            }
+            // Every hash at its own eight bytes, in the list's order.
+            let read: Vec<u64> = (0..carried).map(|i| le_u64(b, HEADER + 8 * i)).collect();
+            assert_eq!(read, &longer[..carried], "{needs:?}");
         }
         // A list inside the range is carried whole.
         let short = RequestFacts {
@@ -1338,6 +1341,46 @@ mod tests {
         };
         let record = request(&short, &Exposure::default(), token, &[], &[]);
         assert_eq!(record.block_hashes, &longer[..3]);
+    }
+
+    /// The two u64 sections are written a section at a time: every hash and
+    /// every tried id sits at its own eight bytes, little-endian and in
+    /// order, the tried ids after the hashes, at any length of either, in
+    /// a block that held a longer request before.
+    #[test]
+    fn the_packed_sections_hold_every_value_at_its_own_eight_bytes() {
+        let value = |i: u64| (i + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let needs = Needs {
+            token_hashes: true,
+            ..Needs::default()
+        };
+        let mut packed = Packed::default();
+        for (hash_count, tried_count) in [(257, 2), (0, 0), (1, 0), (0, 1), (3, 5)] {
+            let hashes: Vec<u64> = (0..hash_count).map(value).collect();
+            let tried: Vec<WorkerId> = (0..tried_count)
+                .map(|i| WorkerId(value(1_000 + i)))
+                .collect();
+            let facts = RequestFacts {
+                model: "m",
+                block_hashes: &hashes,
+                tried: &tried,
+                ..RequestFacts::default()
+            };
+            packed
+                .fill_request(&facts, &Exposure::default(), needs)
+                .expect("the request packs");
+            let b = &packed.request;
+            // A name of one byte: the sections start at the next multiple of 8.
+            let at = (HEADER + 1).next_multiple_of(8);
+            assert_eq!(b.len(), at + 8 * (hashes.len() + tried.len()));
+            let read: Vec<u64> = (at..b.len()).step_by(8).map(|i| le_u64(b, i)).collect();
+            let wanted: Vec<u64> = hashes
+                .iter()
+                .copied()
+                .chain(tried.iter().map(|t| t.0))
+                .collect();
+            assert_eq!(read, wanted, "{hash_count} hashes, {tried_count} tried ids");
+        }
     }
 
     #[test]
