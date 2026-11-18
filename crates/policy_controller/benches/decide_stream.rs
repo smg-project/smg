@@ -63,6 +63,22 @@
 //! `--bench` is a test too, as criterion reads one: `cargo bench` passes
 //! `--bench`, and a test of every target passes neither.
 //!
+//! A row's members report their loads in bands, by one seeded rule
+//! (`bands`): dealt in a fixed shuffled order, one member stands alone at
+//! the least load, the next two report one request more and score alike,
+//! the next one a request more again, and so on by ones and twos; over 512
+//! members by eights and sixteens, so the least band holds more rows than
+//! a pick has places. A pick's places are then drawn as leases in flight
+//! make the least loaded rows tie: over 8 and 64 members one row alone, a
+//! band of two and the next band's row; over 512 members from one band.
+//! Every member reports 1,024 requests beneath its band, more than the
+//! leases this bench holds on one member, so a lease on file moves no
+//! row's cost: a build that files leases and one that files none pick
+//! over the same costs. Every wire row prints how the three best rows of
+//! its measured decisions scored (`ties`, four counts): each alone, the
+//! best alone and the next two alike, the best two alike, all three
+//! alike. Two builds are compared where they print one tally.
+//!
 //! Every row runs on the allocator the binary registers, under a copy of
 //! its settings (`MALLOC_CONF`). A served decision's frame holds lists
 //! made on a deciding thread and freed on a stream's, and what a list
@@ -325,6 +341,12 @@ const WINDOW: u64 = 128;
 /// An offered request handed over this long after it was due is counted
 /// late: the client's own lag.
 const LATE: Duration = Duration::from_micros(100);
+/// The requests every member reports beneath its band: more than the
+/// leases this bench holds on one member (four streams' windows), so a
+/// lease on file moves no row's cost.
+const HELD: u32 = 1_024;
+/// The seed of the order the members are dealt to their bands in.
+const DEAL: u64 = 0x0B_A4D5;
 
 /// One row's shape.
 #[derive(Clone, Copy)]
@@ -398,12 +420,47 @@ fn model(index: u32) -> String {
     format!("model-{index}")
 }
 
+/// The band of each of `members` rows, a band a request above the one
+/// before it. The rows are dealt in an order shuffled by a fixed seed to
+/// bands of one row and of two by turns; over 512 members to bands of
+/// eight and of sixteen, a sixty-fourth of the rows a unit.
+fn bands(members: u32) -> Vec<u32> {
+    let rows = usize::try_from(members).expect("a count that fits");
+    let mut order: Vec<usize> = (0..rows).collect();
+    let mut state = DEAL;
+    for last in (1..rows).rev() {
+        // One value of SplitMix64 a swap: the same order on every build.
+        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut drawn = state;
+        drawn = (drawn ^ (drawn >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        drawn = (drawn ^ (drawn >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        drawn ^= drawn >> 31;
+        let below = u64::try_from(last).expect("an index that fits") + 1;
+        order.swap(last, usize::try_from(drawn % below).expect("an index"));
+    }
+    let unit = (rows / 64).max(1);
+    let mut band_of = vec![0; rows];
+    let (mut band, mut left) = (0, unit);
+    for row in order {
+        if left == 0 {
+            band += 1;
+            left = if band % 2 == 0 { unit } else { 2 * unit };
+        }
+        if let Some(its) = band_of.get_mut(row) {
+            *its = band;
+        }
+        left -= 1;
+    }
+    band_of
+}
+
 /// `members` ready members that serve every one of `models` models, each
-/// with a load report, under the row's preset as generation 1.
+/// with a load report in its band ([`bands`]), under the row's preset as
+/// generation 1.
 fn fill(store: &MemoryStore, members: u32, models: u32) {
     let models: Vec<String> = (0..models).map(model).collect();
     let now = Instant::now();
-    for index in 0..members {
+    for (index, band) in (0..members).zip(bands(members)) {
         let key = format!("http://worker-{index}.fleet:8000");
         let id = store
             .upsert(WorkerFacts {
@@ -413,7 +470,7 @@ fn fill(store: &MemoryStore, members: u32, models: u32) {
                 role: Role::Single,
                 models: models.clone(),
                 dp_size: 1,
-                max_running: Some(256),
+                max_running: Some(2 * HELD),
                 ..WorkerFacts::default()
             })
             .id();
@@ -423,9 +480,8 @@ fn fill(store: &MemoryStore, members: u32, models: u32) {
             id,
             0,
             LoadRow {
-                running: index % 64,
-                queued: index % 8,
-                max_running: 256,
+                running: HELD + band,
+                max_running: 2 * HELD,
                 ..LoadRow::default()
             },
             now,
@@ -565,6 +621,19 @@ struct Tally {
     /// The measured answers a closed loop could not time: a later request
     /// took their slot of the ring.
     overtaken: u64,
+    /// The measured decisions by how their three best rows scored: each
+    /// alone, the best alone and the next two alike, the best two alike,
+    /// all three alike.
+    ties: [u64; 4],
+}
+
+impl Tally {
+    /// Counts a measured decision under its place of [`Self::ties`].
+    fn tied(&mut self, place: Option<usize>) {
+        if let Some(count) = place.and_then(|place| self.ties.get_mut(place)) {
+            *count += 1;
+        }
+    }
 }
 
 /// The bench's gateway as the store keys its leases: by the fingerprint of
@@ -577,8 +646,10 @@ fn gateway() -> GatewayId {
 /// the setup drifted, and the row would print another path's numbers. The
 /// pick's lease ends here, at the store's leases door, as a gateway's
 /// frame ends one when its request is over: a row holds as many leases as
-/// it has decisions in flight.
-fn picked(decision: &Decision, store: &MemoryStore, gateway: GatewayId) {
+/// it has decisions in flight. Returns the decision's place in a stream's
+/// tally of ties ([`Tally::ties`]), by its trace's three best rows: two
+/// score alike where their scores are one value, bit for bit.
+fn picked(decision: &Decision, store: &MemoryStore, gateway: GatewayId) -> usize {
     assert!(
         matches!(decision.outcome, Some(Outcome::Pick(_))),
         "a pick over the fleet: {decision:?}"
@@ -590,6 +661,14 @@ fn picked(decision: &Decision, store: &MemoryStore, gateway: GatewayId) {
         ended,
         "a pick's answer carries a lease the store filed: {decision:?}"
     );
+    let top = decision.trace.as_ref().map_or(&[][..], |trace| &trace.top);
+    match top {
+        [first, second, third, ..] => {
+            let alike = |one: f32, other: f32| usize::from(one.to_bits() == other.to_bits());
+            2 * alike(first.score, second.score) + alike(second.score, third.score)
+        }
+        _ => 0,
+    }
 }
 
 /// Opens the allocator's count.
@@ -662,6 +741,7 @@ async fn ask(addr: SocketAddr, shape: Shape, store: &MemoryStore) -> Tally {
         late: 0,
         local: 0,
         overtaken: 0,
+        ties: [0; 4],
     };
     if shape.counted && shape.warm == 0 {
         counting();
@@ -677,16 +757,20 @@ async fn ask(addr: SocketAddr, shape: Shape, store: &MemoryStore) -> Tally {
             .expect("an answer, not a status")
             .expect("an answer, not the stream's end");
         let received = Instant::now();
-        match &answer.answer {
-            Some(Answer::Decision(decision)) => picked(decision, store, gateway),
-            Some(Answer::Busy(_)) => tally.busy += 1,
+        let tie = match &answer.answer {
+            Some(Answer::Decision(decision)) => Some(picked(decision, store, gateway)),
+            Some(Answer::Busy(_)) => {
+                tally.busy += 1;
+                None
+            }
             Some(Answer::Credit(_)) | None => continue,
-        }
+        };
         if done == shape.warm {
             tally.opened = received;
         }
         if done >= shape.warm {
             tally.answered += 1;
+            tally.tied(tie);
         }
         // A counted run keeps no round trip: a sort of them would stay in
         // the difference of two runs.
@@ -759,6 +843,7 @@ async fn offer(addr: SocketAddr, shape: Shape, store: &MemoryStore) -> Tally {
         late: 0,
         local: 0,
         overtaken: 0,
+        ties: [0; 4],
     };
     let start = Instant::now();
     let due = |id: u64| start + gap.saturating_mul(u32::try_from(id).unwrap_or(u32::MAX));
@@ -794,15 +879,18 @@ async fn offer(addr: SocketAddr, shape: Shape, store: &MemoryStore) -> Tally {
             .expect("an answer, not a status")
             .expect("an answer, not the stream's end");
         let received = Instant::now();
-        match &answer.answer {
-            Some(Answer::Decision(decision)) => picked(decision, store, gateway),
-            Some(Answer::Busy(_)) => tally.busy += 1,
+        let tie = match &answer.answer {
+            Some(Answer::Decision(decision)) => Some(picked(decision, store, gateway)),
+            Some(Answer::Busy(_)) => {
+                tally.busy += 1;
+                None
+            }
             Some(Answer::Credit(grant)) => {
                 credit += u64::from(grant.window);
                 continue;
             }
             None => continue,
-        }
+        };
         let id: [u8; 8] = answer
             .request_id
             .as_slice()
@@ -814,6 +902,7 @@ async fn offer(addr: SocketAddr, shape: Shape, store: &MemoryStore) -> Tally {
                 tally.opened = received;
             }
             tally.answered += 1;
+            tally.tied(tie);
             let took = received.saturating_duration_since(due(id));
             tally
                 .nanos
@@ -872,6 +961,8 @@ struct Row {
     late: u64,
     local: u64,
     overtaken: u64,
+    /// The streams' tallies of ties together ([`Tally::ties`]).
+    ties: [u64; 4],
 }
 
 /// Runs one wire row: a served controller, the gateway's session, and the
@@ -923,6 +1014,7 @@ fn wire(shape: Shape) -> Row {
         late: 0,
         local: 0,
         overtaken: 0,
+        ties: [0; 4],
     };
     // The streams' answers together over the one interval they share, from
     // the first measured answer of any to the last of all: a sum of each
@@ -943,6 +1035,9 @@ fn wire(shape: Shape) -> Row {
         row.late += tally.late;
         row.local += tally.local;
         row.overtaken += tally.overtaken;
+        for (sum, count) in row.ties.iter_mut().zip(tally.ties) {
+            *sum += count;
+        }
         row.nanos.extend(tally.nanos);
     }
     row.nanos.sort_unstable();
@@ -968,6 +1063,12 @@ fn seconds(millis: u64) -> String {
 /// file gave none.
 fn read<T>(reading: Option<T>, print: impl FnOnce(T) -> String) -> String {
     reading.map_or_else(|| "n/a".to_owned(), print)
+}
+
+/// A row's tally of ties as it prints: the four counts in their order.
+fn ties(counts: [u64; 4]) -> String {
+    let [apart, one_then_two, two_then_one, alike] = counts;
+    format!("{apart}/{one_then_two}/{two_then_one}/{alike}")
 }
 
 /// The engine's own decision, in process: the store's deciding door, the
@@ -1160,7 +1261,7 @@ fn main() -> io::Result<()> {
             });
             writeln!(
                 out,
-                "policy_decide_stream/round_trip/{in_flight} members=64 deciders=2 decisions={} p50_us={} p99_us={} p999_us={} max_us={} per_s={} busy={} cpu_s_per_million={} rss_mib={} overtaken={}",
+                "policy_decide_stream/round_trip/{in_flight} members=64 deciders=2 decisions={} p50_us={} p99_us={} p999_us={} max_us={} per_s={} busy={} cpu_s_per_million={} rss_mib={} overtaken={} ties={}",
                 row.nanos.len(),
                 percentile(&row.nanos, 1, 2),
                 percentile(&row.nanos, 99, 100),
@@ -1171,6 +1272,7 @@ fn main() -> io::Result<()> {
                 read(row.cpu_millis_per_million, seconds),
                 read(row.rss_mib, |mib| mib.to_string()),
                 row.overtaken,
+                ties(row.ties),
             )?;
             out.flush()?;
         }
@@ -1193,7 +1295,7 @@ fn main() -> io::Result<()> {
             });
             writeln!(
                 out,
-                "policy_decide_stream/offered/{offered}/{streams} members=64 deciders=2 decisions={} p50_us={} p99_us={} p999_us={} max_us={} per_s={} busy={} local={} late={} rss_mib={}",
+                "policy_decide_stream/offered/{offered}/{streams} members=64 deciders=2 decisions={} p50_us={} p99_us={} p999_us={} max_us={} per_s={} busy={} local={} late={} rss_mib={} ties={}",
                 row.nanos.len(),
                 percentile(&row.nanos, 1, 2),
                 percentile(&row.nanos, 99, 100),
@@ -1204,6 +1306,7 @@ fn main() -> io::Result<()> {
                 row.local,
                 row.late,
                 read(row.rss_mib, |mib| mib.to_string()),
+                ties(row.ties),
             )?;
             out.flush()?;
         }
@@ -1224,7 +1327,7 @@ fn main() -> io::Result<()> {
                 });
                 writeln!(
                     out,
-                    "policy_decide_stream/rate/{members}/{deciders} models={models} streams=4 in_flight=32 decisions={} per_s={} p50_us={} p99_us={} busy={} cpu_s_per_million={} rss_mib={} overtaken={}",
+                    "policy_decide_stream/rate/{members}/{deciders} models={models} streams=4 in_flight=32 decisions={} per_s={} p50_us={} p99_us={} busy={} cpu_s_per_million={} rss_mib={} overtaken={} ties={}",
                     row.nanos.len(),
                     row.per_second,
                     percentile(&row.nanos, 1, 2),
@@ -1233,6 +1336,7 @@ fn main() -> io::Result<()> {
                     read(row.cpu_millis_per_million, seconds),
                     read(row.rss_mib, |mib| mib.to_string()),
                     row.overtaken,
+                    ties(row.ties),
                 )?;
                 out.flush()?;
             }
