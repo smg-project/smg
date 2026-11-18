@@ -1561,9 +1561,10 @@ mod tests {
     /// A decision its stream stops for the fence keeps no lease. A lease
     /// stands on file while its decision waits in the queue, its engine
     /// told of the issue, and a decision that leaves keeps its own. The
-    /// stream that stops one gives its lease up where it would send it:
-    /// off the file at that send, the engine that issued it told once, as
-    /// of a lease whose answer never left.
+    /// stream that stops one hands its lease's release where it would send
+    /// it. With no decider at work the lease is off the file at that send,
+    /// the engine that issued it told once, as of a lease whose answer
+    /// never left.
     #[tokio::test]
     async fn a_decision_stopped_for_the_fence_gives_its_lease_up_at_the_send() {
         let (step, at_read, release) = hold();

@@ -77,7 +77,9 @@ pub const SPEC_APPLY_TOTAL: &str = "smg_policy_spec_apply_total";
 pub const DECIDE_BUSY_TOTAL: &str = "smg_policy_controller_decide_busy_total";
 /// Decide requests this build had no decision for, by `cause` (`fault`,
 /// `pair_side`, `prompt_text`, `decider_gone`, `lease_ids_spent`): the
-/// `Busy` answers with no reason, each under what took its decision.
+/// `Busy` answers with no reason, each under what took its decision. A
+/// lease's lifecycle call that panics as its decider leaves its work is a
+/// `fault` too, and answered no request.
 pub const DECIDE_NO_DECISION_TOTAL: &str = "smg_policy_controller_decide_no_decision_total";
 /// Decide requests that carried more block hashes than their generation
 /// reads of them: decided over the first ones, the rest hashed for nothing.

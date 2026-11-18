@@ -20,7 +20,9 @@
 //! What a frame says of a lease is handed to the leases' file, never
 //! written by its session ([`MemoryStore::hand`]): whoever holds the
 //! file's turn next applies it, a decider at work or the session itself
-//! where none is, in the order the frames were read.
+//! where none is, in the order the frames were read. A `Decide` stream
+//! hands the release of a decision it stops at its send through a hand
+//! of its own ([`open`]).
 //!
 //! A frame whose lease is on file tells the engine that issued it, the
 //! generation's own, what became of the decision: its dispatch, its
@@ -102,9 +104,10 @@ pub(crate) fn released(
     Ok(())
 }
 
-/// Opens a session's hand at the leases' file: `gateway`'s frames
-/// are handed through it, and the store is given the word to the engine
-/// that whoever applies them tells with ([`tells`]).
+/// Opens a hand at the leases' file, a session's or a `Decide` stream's:
+/// what it says of `gateway`'s leases is handed through it, and the store
+/// is given the word to the engine that whoever applies it tells with
+/// ([`tells`]).
 pub(crate) fn open(store: &MemoryStore, gateway: GatewayId) -> Hand {
     tells(store);
     store.handover(gateway)

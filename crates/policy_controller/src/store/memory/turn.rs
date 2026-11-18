@@ -1,6 +1,8 @@
 //! The turn of the leases' file: who holds it writes the file, and what a
 //! session's frame says of a lease is handed to the file, never written by
-//! the session.
+//! the session. A `Decide` stream hands the same way, the release of a
+//! decision it stops at its send: what is said of a session below holds
+//! for every hand.
 //!
 //! A session reads its frame whole and hands what it says to the file's
 //! ring ([`MemoryStore::hand`]). Whoever takes the turn applies everything

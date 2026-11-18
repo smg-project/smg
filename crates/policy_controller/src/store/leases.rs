@@ -114,8 +114,9 @@ pub struct Dispatch {
     pub since_decision_micros: u32,
 }
 
-/// What a frame says of a lease, as its session hands it to the leases'
-/// file ([`MemoryStore::hand`](super::MemoryStore::hand)).
+/// What is said of a lease, as a session hands a frame's word and a
+/// `Decide` stream a release to the leases' file
+/// ([`MemoryStore::hand`](super::MemoryStore::hand)).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Said {
     /// The dispatch the frame names, and the instant the frame was read.

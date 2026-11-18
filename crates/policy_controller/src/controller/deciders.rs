@@ -67,8 +67,8 @@
 //! full queue, a decision that panicked past its issue) stands until its
 //! deadline and the issues after it, and through a lull until the next
 //! issue: no timer ends one yet. A decision its stream stops at the send
-//! is none of them: the stream gives its lease up there
-//! ([`super::decide`]).
+//! is none of them: the stream hands its lease's release there, as a
+//! session hands a frame's ([`super::decide`]).
 //!
 //! What a lease does not do yet. A request sent twice under one id is
 //! issued two leases. A stage hears a lease's issue here, its dispatch,
@@ -168,7 +168,8 @@ use crate::{
 pub(crate) struct Counts {
     /// `Busy` answers, each at its reason's number on the wire.
     pub(crate) busy: [AtomicU64; 5],
-    /// Decisions that panicked.
+    /// Decisions that panicked, and the lifecycle calls that did as a
+    /// decider left its work.
     pub(crate) faults: AtomicU64,
     /// Requests for a side of a pair plan: prefill or decode under either
     /// pair plan, encode under the plan that has an encode side.
@@ -530,7 +531,7 @@ impl Deciding {
                 Ok(job) => job,
                 Err(TryRecvError::Disconnected) => break,
                 Err(TryRecvError::Empty) => {
-                    self.working = None;
+                    self.rest();
                     let Ok(job) = jobs.recv() else { break };
                     job
                 }
@@ -561,6 +562,33 @@ impl Deciding {
             };
             dropped.fetch_add(1, Ordering::Relaxed);
         }
+        // The queue's last handle is gone: the work drops here too.
+        self.rest();
+    }
+
+    /// Leaves the decider's work at the leases' file. What was handed
+    /// behind its last take is applied here, and the engine's lifecycle
+    /// calls run with it, outside any decision. A call that panics there
+    /// is held as a decision's is: counted with the faults and told once
+    /// a streak, and what it left in the ring is the next take's.
+    fn rest(&mut self) {
+        let Some(leaving) = self.working.take() else {
+            return;
+        };
+        let Err(payload) = catch_unwind(AssertUnwindSafe(|| drop(leaving))) else {
+            return;
+        };
+        // A payload's own drop can panic: the engine's helper frees it
+        // under a catch of its own.
+        release(payload);
+        self.reads.counts.faults.fetch_add(1, Ordering::Relaxed);
+        if !self.faulted {
+            error!(
+                decider = thread::current().name().unwrap_or_default(),
+                "a lease's lifecycle call panicked as its decider left its work: what it left is applied at the decider's next take"
+            );
+        }
+        self.faulted = true;
     }
 
     /// The word of `term`'s mark: the planned hand-over, so the next take
@@ -2130,6 +2158,8 @@ pub(crate) mod tests {
         told: Told,
         reached: std_mpsc::SyncSender<()>,
         go: Arc<Mutex<std_mpsc::Receiver<()>>>,
+        /// Its release call panics.
+        bursts: bool,
     }
 
     impl Lifecycle for Waits {
@@ -2141,6 +2171,7 @@ pub(crate) mod tests {
         }
 
         fn on_released(&self, lease: &Lease, reason: ReleaseReason) {
+            assert!(!self.bursts, "the case's stage panics at a release");
             self.told.on_released(lease, reason);
         }
     }
@@ -2172,6 +2203,18 @@ pub(crate) mod tests {
         std_mpsc::Receiver<()>,
         std_mpsc::SyncSender<()>,
     ) {
+        waits(false)
+    }
+
+    /// [`waiting`]; where it `bursts`, the picker's release call panics.
+    fn waits(
+        bursts: bool,
+    ) -> (
+        Bed,
+        Arc<Mutex<Calls>>,
+        std_mpsc::Receiver<()>,
+        std_mpsc::SyncSender<()>,
+    ) {
         let told = Arc::new(Mutex::new(Vec::new()));
         let (reached, at_issue) = std_mpsc::sync_channel(1);
         let (word, go) = std_mpsc::sync_channel(1);
@@ -2183,6 +2226,7 @@ pub(crate) mod tests {
                     told: Told(Arc::clone(&kept)),
                     reached: reached.clone(),
                     go: Arc::clone(&go),
+                    bursts,
                 })
             })
             .expect("a free name");
@@ -2268,6 +2312,50 @@ pub(crate) mod tests {
         assert_eq!(busy(&answer), Reason::BudgetGoneOnArrival);
         assert_eq!(*told.lock(), [(id.0, None), (id.0, Some(gone))]);
         assert_eq!(bed.store.live(GATEWAY), 0);
+    }
+
+    /// A decider that leaves its work on an empty queue applies what was
+    /// handed behind its last take, and the engine's lifecycle calls run
+    /// with it, outside any decision. A stage's call that panics there is
+    /// a fault as a decision's is: counted, and the decider stands for its
+    /// next request.
+    #[tokio::test]
+    async fn a_stages_call_that_panics_as_a_decider_leaves_its_work_is_a_fault_it_outlives() {
+        let (mut bed, told, at_issue, word) = waits(true);
+        let ended = bed.deciders.ended();
+        assert_eq!(bed.submit(frame(1, 1)), None);
+        at_issue
+            .recv_timeout(PATIENCE)
+            .expect("the stage's issue call");
+        // Its gateway gives the lease up while the stage's call runs: the
+        // frame is left to the decider at work, which applies it as it
+        // leaves that work.
+        let id = LeaseId(1 << 32 | 1);
+        let hand = lifecycle::open(&bed.store, GATEWAY);
+        let gone = Said::Released(None, ReleaseReason::ClientGone);
+        bed.store.hand(&hand, id, gone);
+        word.send(()).expect("the stage waits for the case");
+        picked(&bed.answer().await);
+        let (faults, waited) = (&bed.counts.faults, Instant::now());
+        while faults.load(Ordering::Relaxed) == 0 && !*ended.borrow() {
+            assert!(
+                waited.elapsed() < PATIENCE,
+                "the decider never left its work"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(!*ended.borrow(), "the decider's thread unwound");
+        assert_eq!(faults.load(Ordering::Relaxed), 1);
+        // The lease left the file ahead of the call that panicked.
+        assert_eq!(bed.store.live(GATEWAY), 0);
+        assert_eq!(*told.lock(), [(id.0, None)]);
+        // The decider stands: its next request is decided.
+        assert_eq!(bed.submit(frame(2, 1)), None);
+        at_issue
+            .recv_timeout(PATIENCE)
+            .expect("the stage's issue call");
+        word.send(()).expect("the stage waits for the case");
+        picked(&bed.answer().await);
     }
 
     /// A lease's dispatch span counts from its decision's first read, and
@@ -4696,5 +4784,9 @@ pub(crate) mod tests {
             assert!(keeps_a_row(wires, subset), "{wires:?} {subset:?}");
             assert_eq!(narrowed(wires, subset), 3, "{wires:?} {subset:?}");
         }
+        // A mask that no row of the pool speaks keeps no row and is still
+        // counted: the skip reads the request's own words, never the pool.
+        assert!(keeps_a_row(Some(WireModes::GRPC), None));
+        assert_eq!(narrowed(Some(WireModes::GRPC), None), 0);
     }
 }
