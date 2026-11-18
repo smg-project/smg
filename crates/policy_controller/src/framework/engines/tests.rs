@@ -900,6 +900,27 @@ fn a_row_the_ring_does_not_hold_is_the_whole_passes_to_place() {
 }
 
 #[test]
+fn a_walk_come_round_short_of_the_rows_handed_is_the_whole_passes_to_place() {
+    // A host's broken word: a pool shown with two rows is handed a third
+    // under the same epoch and number. The ring does not hold it, so a
+    // walk comes round having asked about two rows of three.
+    let (mut rows, listed, ends) = fleet(&[3], 4);
+    for row in &mut rows {
+        row.health.healthy = true;
+    }
+    let (ring, whole) = (ring_engine(), ring_engine());
+    let two = Engines::new(0, &listed[..2], &[2]);
+    let (_, by_walk) = keyed_by(&ring, "conv-9", &rows[..2], two, 1);
+    assert!(by_walk, "two rows of two by the walk");
+    let engines = Engines::new(0, &listed, &ends);
+    let (targets, by_walk) = keyed_by(&ring, "conv-9", &rows, engines, 1);
+    let by_pass = keyed(&whole, "conv-9", &rows, Engines::default(), 1);
+    assert_eq!(targets, by_pass);
+    assert_eq!(targets.len(), 3, "{targets:?}");
+    assert!(!by_walk, "a walk that came round short leaves the pool");
+}
+
+#[test]
 fn pools_whose_lists_stand_in_one_buffer_are_each_shown_to_the_ring() {
     // A host that builds every pool's list in one buffer: one place in
     // memory under one epoch, and a number a pool.
