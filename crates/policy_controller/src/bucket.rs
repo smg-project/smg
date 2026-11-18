@@ -2082,6 +2082,72 @@ mod tests {
         assert_eq!(loads(&scorer), (vec![300, 300, 300], 900));
     }
 
+    /// A pair's decode side as its record keeps it. The lease the store
+    /// derives for the side names the side's own worker as the one its
+    /// issue booked: a dispatch on another rank of that worker leaves the
+    /// booking of the issue as it stands.
+    #[test]
+    fn a_decode_side_s_dispatch_on_another_rank_of_its_worker_books_nothing() {
+        let scorer = scorer(NEVER, 1.5, 5);
+        let pool = pool(3);
+        led(&scorer, &pool, 0, SECOND);
+        // Both targets of the pick name the one prefill, the first row,
+        // and two ranks of one decode, the second row.
+        let mut targets = Targets::new();
+        for rank in [0, 1] {
+            targets.push(Target {
+                position: 0,
+                id: pool[0].id,
+                dp_rank: 0,
+                pair: Some(Pair {
+                    decode_position: 1,
+                    decode_id: pool[1].id,
+                    decode_dp_rank: rank,
+                }),
+            });
+        }
+        let picked = crate::store::Picked::of_decodes(&targets);
+        let decision = Decision::Pick(Pick {
+            targets,
+            ..Pick::default()
+        });
+        // The record's own lease as its decider issues it: it books the
+        // pick's first target, the prefill.
+        let prefill = Lease {
+            side: Side::Prefill,
+            target_index: 0,
+            booked: pool[0].id,
+            tokens: 300,
+            issued_micros: SECOND,
+            ..Lease::default()
+        };
+        let side = crate::store::DecodeSide {
+            target: pool[1].id,
+            picked,
+            session: crate::view::Session::NONE,
+            state: crate::store::LeaseState::Issued,
+            tokens: 300,
+            target_index: 0,
+        };
+        let decode = side.lease(&prefill);
+        scorer.on_decision_issued(&decode, &decision);
+        assert_eq!(loads(&scorer), (vec![0, 300, 0], 300));
+        // The side's first dispatch, on the second target, as the store
+        // tells it: the side's lease with the frame's index, on the side's
+        // own worker.
+        let told = Lease {
+            target_index: 1,
+            ..decode
+        };
+        let on = Target {
+            id: pool[1].id,
+            dp_rank: 1,
+            ..Target::default()
+        };
+        scorer.on_dispatched(&told, &on, Side::Decode, 250);
+        assert_eq!(loads(&scorer), (vec![0, 300, 0], 300), "booked once");
+    }
+
     #[test]
     fn a_decode_side_lease_books_its_pair_s_decode_and_not_the_prefill() {
         let scorer = scorer(NEVER, 1.5, 5);
