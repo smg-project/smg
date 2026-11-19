@@ -182,6 +182,8 @@ impl StepExecutor<WorkerWorkflowData> for DiscoverZmqLabelsStep {
 
 #[cfg(test)]
 mod tests {
+    use smg_worker::jobs::WorkerJobAsker;
+
     use super::*;
 
     #[tokio::test]
@@ -285,6 +287,7 @@ mod tests {
                 WorkerSpec::new("ipc:///tmp/engine-a.sock"),
                 WorkerRegistrationMode::Upsert,
                 create_test_app_context(),
+                WorkerJobAsker::Api,
             );
             data.worker_kind = Some(WorkerKind::Local);
             data.connection_mode = Some(ConnectionMode::Zmq);

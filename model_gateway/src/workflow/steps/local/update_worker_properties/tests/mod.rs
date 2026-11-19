@@ -18,6 +18,7 @@ use smg_worker::{
     connection::engine::EngineConnection,
     health::circuit_breaker::{CircuitBreakerConfig, CircuitState},
     identity::basic::{BasicWorker, ConnectionMode, RuntimeType},
+    jobs::WorkerJobAsker,
     registry::WorkerId,
 };
 use tracing_test::traced_test;
@@ -83,6 +84,7 @@ fn make_context(
 ) -> WorkflowContext<WorkerUpdateWorkflowData> {
     let snapshot = snapshot_of(&app_context, std::slice::from_ref(&worker));
     let data = WorkerUpdateWorkflowData {
+        asker: WorkerJobAsker::Api,
         config: WorkerUpdateRequest {
             priority: None,
             cost: None,
@@ -143,6 +145,7 @@ fn make_refresh_context(
         worker.revision(),
     )];
     let data = WorkerUpdateWorkflowData {
+        asker: WorkerJobAsker::Health,
         config: WorkerUpdateRequest {
             priority: None,
             cost: None,
@@ -1357,6 +1360,7 @@ async fn a_refused_rank_leaves_no_partial_update_behind() {
     let second: Arc<dyn Worker> = Arc::new(builder.build());
     let app_ctx = make_app_context(&[Arc::clone(&first), Arc::clone(&second)]);
     let data = WorkerUpdateWorkflowData {
+        asker: WorkerJobAsker::Api,
         config: WorkerUpdateRequest {
             priority: None,
             cost: None,
@@ -1754,8 +1758,12 @@ async fn a_refresh_fills_the_fields_an_empty_registration_label_left_unset() {
     let mut spec = WorkerSpec::new("http://worker:8000");
     spec.models = WorkerModels::Single(Box::new(ModelCard::new("m")));
     spec.labels = labels_of(&[("kv_role", "")]);
-    let mut data =
-        create_worker_workflow_data(spec, WorkerRegistrationMode::Upsert, Arc::clone(&app_ctx));
+    let mut data = create_worker_workflow_data(
+        spec,
+        WorkerRegistrationMode::Upsert,
+        Arc::clone(&app_ctx),
+        WorkerJobAsker::Api,
+    );
     data.worker_kind = Some(WorkerKind::Local);
     data.connection_mode = Some(ConnectionMode::Http);
     data.http_client_handle = Some(Arc::new(http_client()));

@@ -27,8 +27,11 @@ pub use shared::{
     registered_entries, registered_in, ActivateWorkersStep, RegisterWorkersStep,
     UpdatePoliciesStep, WorkerList,
 };
-use smg_worker::workflow::{
-    startup_attempts, worker_registration_workflow, RegistrationGates, DISCOVER_DP_STEP,
+use smg_worker::{
+    jobs::WorkerJobAsker,
+    workflow::{
+        startup_attempts, worker_registration_workflow, RegistrationGates, DISCOVER_DP_STEP,
+    },
 };
 use wfaas::{BackoffStrategy, FailureAction, RetryPolicy, StepDefinition, WorkflowDefinition};
 
@@ -247,8 +250,9 @@ pub fn create_worker_workflow_data(
     config: WorkerSpec,
     registration_mode: WorkerRegistrationMode,
     app_context: Arc<AppContext>,
+    asker: WorkerJobAsker,
 ) -> WorkerWorkflowData {
-    WorkerWorkflowData::new(config, registration_mode, app_context)
+    WorkerWorkflowData::new(config, registration_mode, app_context, asker)
 }
 
 #[cfg(test)]

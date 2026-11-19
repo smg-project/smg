@@ -14,7 +14,7 @@ use openai_protocol::{
 use smg_service_discovery::{DiscoveryHost, DISCOVERY_PROVIDER_LABEL};
 use smg_worker::{
     identity::basic::{ConnectionMode, DEFAULT_BOOTSTRAP_PORT},
-    jobs::WorkerRegistrationMode,
+    jobs::{WorkerJobAsker, WorkerRegistrationMode},
     registry::{RemoteWorkerState, WorkerId, WorkerOrigin},
     workflow::WorkerKind,
 };
@@ -151,6 +151,7 @@ async fn an_addition_waiting_for_a_queue_slot_holds_its_urls_claim() {
     let registration = |url: &str, registration_mode| Job::AddWorker {
         config: Box::new(WorkerSpec::new(url)),
         registration_mode,
+        asker: WorkerJobAsker::Api,
     };
     for other in 1.. {
         tokio::task::yield_now().await;
@@ -167,7 +168,11 @@ async fn an_addition_waiting_for_a_queue_slot_holds_its_urls_claim() {
     let jobs = context.jobs().expect("the queue stands");
     let url = "http://10.0.9.1:8080";
     assert!(!jobs.job_in_flight(url), "no job of the address yet");
-    let mut addition = pin!(jobs.add_worker(WorkerSpec::new(url), WorkerRegistrationMode::Upsert));
+    let mut addition = pin!(jobs.add_worker(
+        WorkerSpec::new(url),
+        WorkerRegistrationMode::Upsert,
+        WorkerJobAsker::Discovery
+    ));
     assert!(
         matches!(futures::poll!(addition.as_mut()), Poll::Pending),
         "the addition waits for a queue slot"
@@ -213,8 +218,12 @@ async fn a_discovered_prefill_worker_without_a_bootstrap_annotation_is_probed_on
     let handle = recorder.handle();
     let _guard = metrics::set_default_local_recorder(&recorder);
 
-    let mut data =
-        create_worker_workflow_data(spec, WorkerRegistrationMode::Upsert, Arc::clone(&context));
+    let mut data = create_worker_workflow_data(
+        spec,
+        WorkerRegistrationMode::Upsert,
+        Arc::clone(&context),
+        WorkerJobAsker::Discovery,
+    );
     data.worker_kind = Some(WorkerKind::Local);
     data.connection_mode = Some(ConnectionMode::Http);
     data.http_client_handle = Some(Arc::new(http_client()));

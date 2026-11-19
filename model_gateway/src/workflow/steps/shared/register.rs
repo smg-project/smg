@@ -350,6 +350,7 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for RegisterWorke
 #[cfg(test)]
 mod tests {
     use openai_protocol::model_card::ModelCard;
+    use smg_worker::jobs::WorkerJobAsker;
 
     use super::*;
     use crate::routers::grpc::backend_client::BasicWorkerBuilder;
@@ -389,6 +390,7 @@ mod tests {
             WorkerSpec::new(url),
             WorkerRegistrationMode::CreateOnly,
             app_context_for_tests(RouterConfig::default(), Arc::clone(&registry), None),
+            WorkerJobAsker::Api,
         );
         data.actual_workers = Some(vec![Arc::clone(&worker)]);
         let state = WorkflowState::new(
@@ -432,6 +434,7 @@ mod tests {
                 Arc::new(WorkerRegistry::new()),
                 None,
             ),
+            WorkerJobAsker::Api,
         );
         let mut state = WorkflowState::new(
             WorkflowInstanceId::new(),

@@ -7,7 +7,7 @@ use wfaas::WorkflowInstanceId;
 use super::*;
 use crate::{
     identity::basic::RuntimeType,
-    jobs::WorkerRegistrationMode,
+    jobs::{WorkerJobAsker, WorkerRegistrationMode},
     labels::flat_labels,
     test_support::{labels_of, RefusedAddress, ScriptedConnector},
     workflow::{
@@ -99,7 +99,12 @@ fn local_context(
     connection_mode: ConnectionMode,
     runtime: Option<&str>,
 ) -> WorkflowContext<WorkerRegistrationWorkflowData<ProbingHost>> {
-    let mut data = WorkerRegistrationWorkflowData::new(spec, WorkerRegistrationMode::Upsert, host);
+    let mut data = WorkerRegistrationWorkflowData::new(
+        spec,
+        WorkerRegistrationMode::Upsert,
+        host,
+        WorkerJobAsker::Api,
+    );
     data.worker_kind = Some(WorkerKind::Local);
     data.connection_mode = Some(connection_mode);
     data.detected_runtime_type = runtime.map(str::to_string);

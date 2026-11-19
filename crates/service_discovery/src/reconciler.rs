@@ -22,7 +22,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use openai_protocol::worker::WorkerSpec;
 use smg_worker::{
     identity::endpoint::{Endpoint, EndpointKey},
-    jobs::WorkerRegistrationMode,
+    jobs::{WorkerJobAsker, WorkerRegistrationMode},
     registry::{WorkerId, WorkerOrigin},
 };
 use tokio::time;
@@ -394,7 +394,11 @@ pub(super) async fn reconcile(
         // every spelling the group was registered under. An IPC endpoint keeps
         // its scheme, because its key is a bare socket path that would not
         // parse back.
-        let removal = jobs.remove_workers_at(target.endpoint.lookup_form(), target.guards.clone());
+        let removal = jobs.remove_workers_at(
+            target.endpoint.lookup_form(),
+            target.guards.clone(),
+            WorkerJobAsker::Discovery,
+        );
         match removal.await {
             Ok(()) => series::record_deregistration(
                 kind.metric_label(),
@@ -418,7 +422,14 @@ pub(super) async fn reconcile(
         // pass can wait for a queue slot between them: the claim is taken
         // with the check, so a registration that took the URL since (a
         // `POST`'s) keeps it, and the next pass adds what is still missing.
-        match jobs.add_worker(spec, WorkerRegistrationMode::Upsert).await {
+        match jobs
+            .add_worker(
+                spec,
+                WorkerRegistrationMode::Upsert,
+                WorkerJobAsker::Discovery,
+            )
+            .await
+        {
             Ok(true) => {
                 series::record_registration(kind.metric_label(), series::REGISTRATION_SUCCESS);
             }
