@@ -19,17 +19,33 @@
 //! of their registration keys, so a cut answer names the same rows at each
 //! call while the rows stand.
 //!
-//! The rows are the store's cut of the watched kinds, as a watch's open
-//! reads them: every row is copied under the membership lock, whatever the
-//! limit. A decision reads the published world and does not wait on it.
-//! What takes that lock waits for the copy, on the thread that brought it:
-//! a membership write, the report of a completed request on a gateway's
-//! session, a load report, a probe's outcome, a veto, and the world's
-//! publication.
+//! The rows are the feed's cut at the log's last watched write, read as a
+//! watch's start reads them
+//! ([`Feed::rows_at_head`](super::watch_workers::Feed::rows_at_head)). The
+//! first read at a place copies every row under the membership lock,
+//! whatever the limit, and each read that starts there shares that copy.
+//! So calls one behind another hold that lock once a write, as watches do:
+//! a call let in shares the copy as a watch can. The last call out lets
+//! the copy go where no watch is open to share it ([`Turn`],
+//! [`Watchers::unshared`](super::watch_workers::Watchers::unshared)): a
+//! copy of every row is held only while a reader can share it. A lone call
+//! with no watch open is its own last call out: a loop of such calls
+//! copies once a call.
+//!
+//! A decision reads the published world and does not wait on that lock.
+//! Whatever takes it waits for a copy, on the thread that brought it.
+//! Among the store's writes, these take it each time: a membership write,
+//! a probe's outcome, a veto that is set, a gateway's report of a request
+//! that completed well, and a generation's apply. Two take it only in a
+//! corner: a polled load answer where it names a rank with no row yet (a
+//! pushed load record takes the load lock alone), and the world's
+//! publication where a build is owed and due. Among the reads: a watch's
+//! open where it copies, a standby's base, and a polling load driver's
+//! tick.
 //! **One snapshot is taken at a time, off the runtime's workers**
-//! ([`Turn`]): one copy of the rows stands at a time, each of those waits
-//! behind one snapshot at most, and the take itself holds no thread a
-//! stream of the listener runs on.
+//! ([`Turn`]): one operator's copy is made at a time, and the take itself
+//! holds no thread a stream of the listener runs on. A watch's open and a
+//! standby's base copy by themselves, in no turn.
 //!
 //! No standby is restored from the answer: redacted, and cut where a bound
 //! bit, it names no place of the log.
@@ -43,7 +59,7 @@ use super::{generations::Generations, replication::age_ms, watch_workers, worker
 use crate::{
     ingest::loads::{split, Address, UNPARSABLE},
     proto::{self, snapshot_request::Slice},
-    store::{Kinds, MemoryStore, WorkerRow},
+    store::{Cut, WorkerRow},
 };
 
 /// Every slice of the contract, in its order.
@@ -99,12 +115,35 @@ fn names(keep: impl Fn(Slice) -> bool) -> String {
 /// second call waits its turn, in the order the calls came, and a call past
 /// the [`SNAPSHOTS_WAITING`] that wait is told to ask again. The take holds
 /// the turn, so a caller that leaves frees it no earlier than its take
-/// ends.
+/// ends. The last call out is told ([`Place`]): the one that leaves no
+/// other call let in.
 #[derive(Debug)]
 pub(crate) struct Turn {
     /// The calls let in: the one that is taken and the ones that wait.
     places: Arc<Semaphore>,
     turn: Arc<Mutex<()>>,
+}
+
+/// A call's place in the turn. It goes back when the call's take ends, or
+/// when its caller leaves before the take began. The call whose place goes
+/// back while no other call is let in is the last call out, and its `out`
+/// runs then: what the calls shared is let go by the last of them.
+struct Place<Out: FnOnce()> {
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    places: Arc<Semaphore>,
+    out: Option<Out>,
+}
+
+impl<Out: FnOnce()> Drop for Place<Out> {
+    fn drop(&mut self) {
+        // The place goes back first: the count then tells whether another
+        // call is let in.
+        drop(self.permit.take());
+        let last = self.places.available_permits() > SNAPSHOTS_WAITING;
+        if let Some(out) = self.out.take().filter(|_| last) {
+            out();
+        }
+    }
 }
 
 impl Default for Turn {
@@ -119,15 +158,23 @@ impl Default for Turn {
 impl Turn {
     /// What `take` answers, run in its turn on a thread of the runtime's
     /// blocking pool; or the refusal of a call no place is left for, or of
-    /// one whose take did not end.
+    /// one whose take did not end. `out` runs where this call is the last
+    /// one out: its place goes back and no other call is let in, whether
+    /// its take ended or its caller left while it waited.
     pub(crate) async fn run<T: Send + 'static>(
         &self,
         take: impl FnOnce() -> T + Send + 'static,
+        out: impl FnOnce() + Send + 'static,
     ) -> Result<T, Status> {
-        let Ok(place) = Arc::clone(&self.places).try_acquire_owned() else {
+        let Ok(permit) = Arc::clone(&self.places).try_acquire_owned() else {
             return Err(Status::resource_exhausted(format!(
                 "{SNAPSHOTS_WAITING} snapshots wait their turn: ask again later"
             )));
+        };
+        let place = Place {
+            permit: Some(permit),
+            places: Arc::clone(&self.places),
+            out: Some(out),
         };
         let turn = Arc::clone(&self.turn).lock_owned().await;
         let taking = tokio::task::spawn_blocking(move || {
@@ -151,6 +198,14 @@ impl Turn {
     #[cfg(test)]
     pub(crate) fn fill(&self) -> Vec<tokio::sync::OwnedSemaphorePermit> {
         std::iter::from_fn(|| Arc::clone(&self.places).try_acquire_owned().ok()).collect()
+    }
+
+    /// One place, taken for a case: a call beside it is not the last out.
+    #[cfg(test)]
+    pub(crate) fn place(&self) -> tokio::sync::OwnedSemaphorePermit {
+        Arc::clone(&self.places)
+            .try_acquire_owned()
+            .expect("a place is free")
     }
 
     /// The turn, held for a case: a call let in waits behind it.
@@ -243,8 +298,9 @@ pub(crate) fn asked(request: proto::SnapshotRequest) -> Result<Asked, Status> {
 }
 
 /// The snapshot `asked` for, as this replica holds it at `now` under
-/// `term`: the header, then each slice asked. The spec slice of a
-/// controller with no spec source is refused ahead of the turn
+/// `term`: the header, then each slice asked. The rows are `cut`'s, which
+/// is read where the worker rows are asked and never else. The spec slice
+/// of a controller with no spec source is refused ahead of the turn
 /// ([`Asked::sourced`]), and the take keeps its own read of the source,
 /// before a row is copied. The header's generation is the spec slice's own
 /// where that slice is told: one read. The answer names no place of the
@@ -253,7 +309,7 @@ pub(crate) fn taken(
     asked: &Asked,
     term: u64,
     controller_id: &str,
-    store: &MemoryStore,
+    cut: impl FnOnce() -> Arc<Cut>,
     generations: &Generations,
     now: Instant,
 ) -> Result<proto::Snapshot, Status> {
@@ -266,7 +322,7 @@ pub(crate) fn taken(
         None
     };
     let (workers, truncated) = if asked.workers {
-        rows(&store.cut(Kinds::Watched).rows, asked, now)
+        rows(&cut().rows, asked, now)
     } else {
         (Vec::new(), false)
     };
@@ -363,7 +419,7 @@ mod tests {
             worker_wire,
         },
         proto::{self, snapshot_request::Slice},
-        store::{Kinds, MemoryStore, WorkerFacts, WorkersStore},
+        store::{Cut, Kinds, MemoryStore, WorkerFacts, WorkersStore},
     };
 
     /// The rows slice alone: every model, no limit.
@@ -773,7 +829,7 @@ mod tests {
                 asked,
                 3,
                 "controller-0",
-                &store,
+                || Arc::new(store.cut(Kinds::Watched)),
                 &generations,
                 Instant::now(),
             )
@@ -843,7 +899,7 @@ mod tests {
             &status,
             1,
             "controller-0",
-            &store,
+            || -> Arc<Cut> { panic!("no row is asked: no cut is read") },
             &generations,
             Instant::now(),
         )
@@ -891,7 +947,7 @@ mod tests {
                     assert!(told.is_ok(), "the case's word came");
                     n
                 };
-                turn.run(take).await
+                turn.run(take, || ()).await
             });
         }
         // Every call is let in: one is taken, the others wait their turn.
@@ -904,7 +960,7 @@ mod tests {
             "a take ran on the runtime's thread"
         );
         assert_eq!(turn.let_in(), SNAPSHOTS_WAITING + 1);
-        let past = tokio::time::timeout(Duration::from_secs(5), turn.run(|| ()))
+        let past = tokio::time::timeout(Duration::from_secs(5), turn.run(|| (), || ()))
             .await
             .expect("an answer at once")
             .expect_err("no place is left");
@@ -926,5 +982,146 @@ mod tests {
         assert_eq!(ended, (0..=SNAPSHOTS_WAITING).collect::<Vec<_>>());
         assert_eq!(most.load(Ordering::SeqCst), 1, "two takes ran at once");
         assert_eq!(turn.let_in(), 0, "each place went back");
+    }
+
+    /// A caller that leaves frees the turn no earlier than its take ends:
+    /// the take holds the turn and the place, not the caller's future. The
+    /// first call's task is ended while its take waits for the case's word.
+    /// Its place stays taken, and a second call's take does not begin until
+    /// the word comes.
+    #[tokio::test]
+    async fn a_caller_that_leaves_frees_the_turn_no_earlier_than_its_take_ends() {
+        let turn = Arc::new(Turn::default());
+        let (release, word) = mpsc::channel::<()>();
+        let (started, at_work) = mpsc::channel::<()>();
+        let mut calls = JoinSet::new();
+        let first = calls.spawn({
+            let turn = Arc::clone(&turn);
+            async move {
+                let take = move || {
+                    started.send(()).expect("the case listens");
+                    word.recv_timeout(Duration::from_secs(30)).is_ok()
+                };
+                turn.run(take, || ()).await.map(|_told| ())
+            }
+        });
+        // The first take is at work on the blocking pool.
+        let since = Instant::now();
+        while at_work.try_recv().is_err() {
+            assert!(since.elapsed() < Duration::from_secs(20), "the take began");
+            tokio::task::yield_now().await;
+        }
+        // Its caller leaves.
+        first.abort();
+        let left = calls.join_next().await.expect("the first call");
+        assert!(
+            left.is_err_and(|ended| ended.is_cancelled()),
+            "the caller left"
+        );
+        assert_eq!(turn.let_in(), 1, "the place is the take's until it ends");
+
+        // A second call is let in and waits: its take does not begin.
+        let ran = Arc::new(AtomicBool::new(false));
+        calls.spawn({
+            let (turn, ran) = (Arc::clone(&turn), Arc::clone(&ran));
+            async move {
+                turn.run(move || ran.store(true, Ordering::SeqCst), || ())
+                    .await
+            }
+        });
+        let since = Instant::now();
+        while turn.let_in() < 2 {
+            assert!(
+                since.elapsed() < Duration::from_secs(20),
+                "the second call took no place"
+            );
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !ran.load(Ordering::SeqCst),
+            "a second take ran beside the first"
+        );
+
+        // The word comes: the first take ends, and the second has its turn.
+        release.send(()).expect("the take waits for the word");
+        calls
+            .join_next()
+            .await
+            .expect("the second call")
+            .expect("its task")
+            .expect("its turn came");
+        assert!(ran.load(Ordering::SeqCst), "the second take ran");
+        let since = Instant::now();
+        while turn.let_in() > 0 {
+            assert!(
+                since.elapsed() < Duration::from_secs(20),
+                "a place did not go back"
+            );
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// The last call out is the one whose place goes back while no other
+    /// call is let in, whether its take ended or its caller left while it
+    /// waited. A call that leaves another let in is not the last.
+    #[tokio::test]
+    async fn the_last_call_out_is_the_one_that_leaves_no_call_let_in() {
+        let turn = Arc::new(Turn::default());
+        let outs = Arc::new(AtomicUsize::new(0));
+        let counted = || {
+            let outs = Arc::clone(&outs);
+            move || {
+                outs.fetch_add(1, Ordering::SeqCst);
+            }
+        };
+        // A call alone is the last out.
+        turn.run(|| (), counted()).await.expect("its turn");
+        assert_eq!(outs.load(Ordering::SeqCst), 1);
+
+        // Two calls are let in: the first out leaves the second let in.
+        let held = turn.hold().await;
+        let mut calls = JoinSet::new();
+        for _ in 0..2 {
+            let (turn, out) = (Arc::clone(&turn), counted());
+            calls.spawn(async move { turn.run(|| (), out).await });
+        }
+        let since = Instant::now();
+        while turn.let_in() < 2 {
+            assert!(
+                since.elapsed() < Duration::from_secs(20),
+                "the calls took no place"
+            );
+            tokio::task::yield_now().await;
+        }
+        drop(held);
+        while let Some(call) = calls.join_next().await {
+            call.expect("the call's task").expect("its turn came");
+        }
+        assert_eq!(outs.load(Ordering::SeqCst), 2, "one last call of the two");
+
+        // A caller that leaves while it waits is the last out too.
+        let held = turn.hold().await;
+        let waiting = calls.spawn({
+            let (turn, out) = (Arc::clone(&turn), counted());
+            async move { turn.run(|| (), out).await }
+        });
+        let since = Instant::now();
+        while turn.let_in() < 1 {
+            assert!(
+                since.elapsed() < Duration::from_secs(20),
+                "the call took no place"
+            );
+            tokio::task::yield_now().await;
+        }
+        waiting.abort();
+        let left = calls.join_next().await.expect("the call");
+        assert!(
+            left.is_err_and(|ended| ended.is_cancelled()),
+            "the caller left"
+        );
+        assert_eq!(turn.let_in(), 0, "its place went back");
+        assert_eq!(outs.load(Ordering::SeqCst), 3, "the caller that left");
+        drop(held);
     }
 }

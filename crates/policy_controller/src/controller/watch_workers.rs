@@ -107,10 +107,11 @@ pub(crate) struct Feed {
     /// The place of the last membership entry the wire had no form for
     /// ([`Feed::untold`]): such an entry is logged once a replica.
     unwired: Arc<Mutex<Position>>,
-    /// The rows at one place of the log: the cut the first watch took
-    /// there, kept for every other that starts there. It is let go when a
-    /// write moves the log past that place and when the last watch leaves:
-    /// a copy of every row is held only while a watch can share it.
+    /// The rows at one place of the log: the cut the first read took there,
+    /// kept for every other that starts there ([`Feed::rows_at_head`]). It
+    /// is let go when a write moves the log past that place, when the last
+    /// watch leaves, and by the last snapshot call out with no watch open:
+    /// a copy of every row is held only while a reader can share it.
     rows: Arc<Mutex<Option<Arc<Cut>>>>,
 }
 
@@ -190,6 +191,32 @@ impl Feed {
         {
             *kept = None;
         }
+    }
+
+    /// The rows at the log's last watched write. A cut is a write's, not a
+    /// reader's: the first read that starts at a place takes it from
+    /// `store`, under the membership lock for the copy, and every read that
+    /// starts there shares it: a watch's start, and the operators'
+    /// snapshot. Reads that come together or in a loop hold that lock once
+    /// a write, and the feed keeps one copy of the rows while a reader can
+    /// share it ([`Feed::let_go`], [`Seat`], [`Watchers::unshared`]). The
+    /// kept cut is named by its place with its term, never by a sequence
+    /// alone: a restore can leave one sequence over other rows.
+    pub(crate) fn rows_at_head(&self, store: &MemoryStore) -> Arc<Cut> {
+        let mut kept = self.rows.lock();
+        let head = self.log.head(Kinds::Watched);
+        if let Some(cut) = kept.as_ref().filter(|cut| cut.at == head) {
+            return Arc::clone(cut);
+        }
+        let cut = Arc::new(store.cut(Kinds::Watched));
+        *kept = Some(Arc::clone(&cut));
+        cut
+    }
+
+    /// The kept cut, for a case.
+    #[cfg(test)]
+    pub(crate) fn kept(&self) -> Option<Arc<Cut>> {
+        self.rows.lock().clone()
     }
 
     /// A membership entry the wire has no form for: no watch is told it,
@@ -278,23 +305,10 @@ impl Source {
         self.fence.leader_term(Instant::now()) == Some(self.term)
     }
 
-    /// The rows at the log's last watched write. A cut is a write's, not a
-    /// watcher's: the first watch that starts at a place takes it, under
-    /// the membership lock for the copy, and every watch that starts there
-    /// shares it. Watchers that open together or in a loop hold that lock
-    /// once a write, and the feed keeps one copy of the rows while a watch
-    /// can share it ([`Feed::let_go`], [`Seat`]). The kept cut is named by
-    /// its place with its term, never by a sequence alone: a restore can
-    /// leave one sequence over other rows.
+    /// The rows a watch starts from: the feed's cut at the log's last
+    /// watched write ([`Feed::rows_at_head`]).
     fn rows(&self) -> Arc<Cut> {
-        let mut kept = self.feed.rows.lock();
-        let head = self.feed.log.head(Kinds::Watched);
-        if let Some(cut) = kept.as_ref().filter(|cut| cut.at == head) {
-            return Arc::clone(cut);
-        }
-        let cut = Arc::new(self.store.cut(Kinds::Watched));
-        *kept = Some(Arc::clone(&cut));
-        cut
+        self.feed.rows_at_head(&self.store)
     }
 }
 
@@ -464,6 +478,19 @@ impl Watchers {
             of,
             kept: Arc::clone(&feed.rows),
         })
+    }
+
+    /// Lets the feed's kept cut go where no watch is open: what the last
+    /// snapshot call out does, once no other call is let in to share it.
+    /// The last seat given back does the same ([`Seat`]): a copy of every
+    /// row is held only while a reader can share it. The table's lock is
+    /// given back first, as there: a watch that opens now takes a cut of
+    /// its own at worst.
+    pub(crate) fn unshared(&self, feed: &Feed) {
+        let none = self.held.lock().is_empty();
+        if none {
+            *feed.rows.lock() = None;
+        }
     }
 
     /// The watches `by` holds open.

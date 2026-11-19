@@ -809,7 +809,8 @@ impl PolicyController for Service {
     /// field refused by its name, the spec slice of a controller with no
     /// spec source among them, and a refused request takes no turn. One
     /// snapshot is taken at a time, off the runtime's workers
-    /// ([`snapshot::Turn`]). The lead is read again behind that wait: the
+    /// ([`snapshot::Turn`]), from the feed's cut at the log's head, which a
+    /// watch's start shares. The lead is read again behind that wait: the
     /// answer is told while this replica still leads the term the call was
     /// admitted under. A standby is restored on its `Replicate` stream,
     /// never from this call.
@@ -827,12 +828,16 @@ impl PolicyController for Service {
                 &asked,
                 term,
                 &shared.controller_id,
-                &shared.store,
+                || shared.feed.rows_at_head(&shared.store),
                 &shared.generations,
                 Instant::now(),
             )
         };
-        let taken = self.shared.snapshots.run(take).await??;
+        // The last call out lets the feed's kept cut go where no watch is
+        // open to share it.
+        let last = Arc::clone(&self.shared);
+        let out = move || last.watchers.unshared(&last.feed);
+        let taken = self.shared.snapshots.run(take, out).await??;
         if self.watched(Instant::now())? != term {
             return Err(Status::unavailable(TAKE_OVER));
         }
@@ -3269,6 +3274,96 @@ mod tests {
         assert_eq!(refused.code(), Code::Unavailable);
     }
 
+    /// A snapshot reads the rows as a watch's start does. It shares the
+    /// cut the feed keeps at the log's head and keeps the one it takes, so
+    /// calls one behind another copy the rows once a write, and the call
+    /// behind a write tells it. The last call out lets the cut go where no
+    /// watch is open: a lone call's cut goes with it, and a call beside
+    /// another that is let in keeps it for that one.
+    #[tokio::test]
+    async fn a_snapshot_shares_the_feeds_cut_and_keeps_none_with_no_watch_open() {
+        use proto::snapshot_request::Slice;
+
+        let (_elector, _standing, control) = electing(true);
+        let feed = control.shared.feed.clone();
+        let told = async || {
+            control
+                .get_snapshot(snapshot(&[Slice::Workers]))
+                .await
+                .expect("the rows")
+                .into_inner()
+                .workers
+                .len()
+        };
+        // No watch is open: a lone call is the last call out, and the cut
+        // it takes goes with it.
+        assert_eq!(told().await, 0);
+        assert!(feed.kept().is_none(), "no reader can share the cut");
+
+        // Another call is let in beside it: the cut stays for that one, the
+        // next call shares it, and the last call out lets it go.
+        let beside = control.shared.snapshots.place();
+        assert_eq!(told().await, 0);
+        let cut = feed.kept().expect("a call is let in to share the cut");
+        assert_eq!(told().await, 0);
+        assert!(
+            Arc::ptr_eq(&cut, &feed.kept().expect("still kept")),
+            "one copy for the calls let in"
+        );
+        drop(beside);
+        assert_eq!(told().await, 0);
+        assert!(feed.kept().is_none(), "the last call out let it go");
+
+        // A watch is open: the snapshot shares the cut its start took.
+        let gateways = Service::new(vec![Scope::Gateway], Arc::clone(&control.shared));
+        let mut watching = gateways
+            .watch_workers(from("gateway-a", proto::WatchWorkersRequest::default()))
+            .await
+            .expect("opened")
+            .into_inner();
+        tokio::time::timeout(Duration::from_secs(5), watching.next())
+            .await
+            .expect("a page within five seconds")
+            .expect("the stream is open")
+            .expect("a page, not a status");
+        let cut = feed.kept().expect("the watch's cut is kept");
+        assert_eq!(told().await, 0);
+        assert!(
+            Arc::ptr_eq(&cut, &feed.kept().expect("still kept")),
+            "the snapshot shared the watch's cut"
+        );
+
+        // A write moves the log past that cut: the next snapshot tells the
+        // row and keeps the cut it took, and the call behind it shares it.
+        let request = proto::RegisterWorkerRequest {
+            spec: Some(proto::WorkerSpec {
+                url: "grpc://10.0.0.5:8000".to_owned(),
+                wire: proto::WireMode::Grpc as i32,
+                role: proto::Role::Single as i32,
+                models: vec!["model-a".to_owned()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        control
+            .register_worker(from("operator-a", request))
+            .await
+            .expect("registered");
+        assert_eq!(told().await, 1);
+        let later = feed.kept().expect("the snapshot's cut is kept");
+        assert!(!Arc::ptr_eq(&cut, &later), "a cut of the later place");
+        assert_eq!(told().await, 1);
+        assert!(
+            Arc::ptr_eq(&later, &feed.kept().expect("still kept")),
+            "one copy a write"
+        );
+
+        // The last watch leaves, and the next snapshot keeps no cut.
+        drop(watching);
+        assert_eq!(told().await, 1);
+        assert!(feed.kept().is_none(), "no watch can share the cut");
+    }
+
     /// A snapshot that waited its turn through a later take of the lease is
     /// told to retry: the lead is read again behind the wait, and no answer
     /// is told under a term the store has since passed.
@@ -3295,6 +3390,52 @@ mod tests {
         }
         // The store is told a later take than the call was admitted under.
         control.shared.store.set_term(2);
+        drop(held);
+        let refused = calls
+            .join_next()
+            .await
+            .expect("the one call")
+            .expect("the call's task")
+            .expect_err("a later take");
+        assert_eq!(
+            (refused.code(), refused.message()),
+            (Code::Unavailable, super::TAKE_OVER)
+        );
+    }
+
+    /// A snapshot admitted under one term waits its turn while the replica
+    /// gives its lease up and takes it again, its store told the new term.
+    /// The fence and the store both stand in the later term: the lead read
+    /// again names a term, and it is not the call's, so the compare itself
+    /// tells the call to retry.
+    #[tokio::test]
+    async fn a_snapshot_that_waited_through_a_take_its_store_follows_is_told_to_retry() {
+        use proto::snapshot_request::Slice;
+
+        let (mut elector, _standing, control) = electing(true);
+        let control = Arc::new(control);
+        let held = control.shared.snapshots.hold().await;
+        let mut calls = JoinSet::new();
+        calls.spawn({
+            let control = Arc::clone(&control);
+            async move { control.get_snapshot(snapshot(&[Slice::Workers])).await }
+        });
+        let began = Instant::now();
+        while control.shared.snapshots.let_in() < 1 {
+            assert!(
+                began.elapsed() < Duration::from_secs(20),
+                "the call took no place"
+            );
+            tokio::task::yield_now().await;
+        }
+        let now = Instant::now();
+        assert!(elector.step_down(None, now).expect("the release"));
+        assert_eq!(
+            elector.tick(now).expect("the take"),
+            Tick::Acquired { term: 2 }
+        );
+        control.shared.store.set_term(2);
+        assert_eq!(control.watched(Instant::now()).ok(), Some(2));
         drop(held);
         let refused = calls
             .join_next()

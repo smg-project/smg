@@ -143,8 +143,8 @@ where
         },
     };
     let mut controller = bind_drawn(LEADER, None, config).await;
-    // The control and the replication listeners take an identity as told.
-    for name in ["control", "replication"] {
+    // Each listener takes an identity as told.
+    for name in ["gateway", "control", "replication"] {
         controller
             .identity_as_told(name)
             .expect("a listener of the configuration");
@@ -1261,8 +1261,10 @@ async fn snapshots_numbers(workers: u32) {
 /// and under a limit of one row. Each line: the rows told and whether a
 /// bound cut them, the answer's bytes, how long the call takes over the
 /// wire (the store's cut, the rows' build, the client's read), and how long
-/// the store's cut takes alone: what a membership write waits behind one
-/// snapshot, whatever its limit.
+/// the store's cut takes alone: what a membership write waits behind a
+/// snapshot that copies, whatever its limit. A last line, with a watch
+/// open: one row asked eleven times, where each call shares the cut the
+/// feed keeps and copies nothing.
 async fn operators_snapshot_numbers(workers: u32) {
     let dir = tempfile::tempdir().expect("a temp dir");
     with_leader(shared(&dir), |leader| async move {
@@ -1309,6 +1311,42 @@ async fn operators_snapshot_numbers(workers: u32) {
             )
             .expect("stdout");
         }
+        // A watch is open: the feed keeps the cut its start took, and each
+        // snapshot shares it.
+        let mut gateway = client(leader.gateway).await;
+        let mut watching = gateway
+            .watch_workers(stated(proto::WatchWorkersRequest::default()))
+            .await
+            .expect("opened")
+            .into_inner();
+        watching
+            .message()
+            .await
+            .expect("the stream is open")
+            .expect("a page");
+        let mut micros = Vec::new();
+        for _ in 0..11 {
+            let request = stated(proto::SnapshotRequest {
+                slices: vec![proto::snapshot_request::Slice::Workers.into()],
+                limit: 1,
+                ..proto::SnapshotRequest::default()
+            });
+            let began = Instant::now();
+            let answer = operator
+                .get_snapshot(request)
+                .await
+                .expect("the rows")
+                .into_inner();
+            micros.push(began.elapsed().as_micros());
+            assert_eq!(answer.workers.len(), 1);
+        }
+        micros.sort_unstable();
+        writeln!(
+            out,
+            "OPERATORS_SNAPSHOT workers={workers} limit=1 watched=1 median_us={} most_us={}",
+            micros[5], micros[10]
+        )
+        .expect("stdout");
     })
     .await;
 }
