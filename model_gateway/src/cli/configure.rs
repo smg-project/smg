@@ -1150,16 +1150,31 @@ impl CliArgs {
     }
 
     /// The router configuration of the flags. A refusal is raised in this
-    /// order: the flag shapes, the discovery flags, the schema file, the
-    /// tenant keys, the history store, the model aliases, and last the
-    /// shared validator over the built configuration, which the builder
-    /// runs.
+    /// order: flag shapes, controller and worker sources, discovery flags,
+    /// the schema file, tenant keys, the history store, model aliases, and
+    /// the shared validator over the built configuration.
     pub(crate) fn to_router_config(
         &self,
         prefill_urls: Vec<(String, Option<u16>)>,
         encode_urls: Vec<(String, Option<u16>)>,
     ) -> ConfigResult<RouterConfig> {
         self.validate_flag_formats()?;
+        if self.routing.policy_controller_address.is_some() {
+            if !self.routing.worker_urls.is_empty()
+                || !encode_urls.is_empty()
+                || !prefill_urls.is_empty()
+                || !self.workers.decode.is_empty()
+            {
+                return Err(ConfigError::IncompatibleConfig {
+                    reason: "--policy-controller-address supplies the workers and conflicts with --worker-urls, --encode, --prefill and --decode".to_owned(),
+                });
+            }
+            if self.selected_discovery_provider().is_some() {
+                return Err(ConfigError::IncompatibleConfig {
+                    reason: "--policy-controller-address supplies the workers and conflicts with --service-discovery and --discovery-provider".to_owned(),
+                });
+            }
+        }
         self.warn_ignored_companions(&prefill_urls, &encode_urls);
 
         let mode = self.routing_mode(prefill_urls, encode_urls);
@@ -1355,7 +1370,16 @@ impl CliArgs {
                 self.integrations.tls_key_path.as_ref(),
             );
 
-        builder.build()
+        let config = RouterConfig {
+            policy_controller: self.routing.policy_controller,
+            policy_controller_address: self.routing.policy_controller_address.clone(),
+            policy_controller_tls_ca_cert: self.routing.policy_controller_tls_ca_cert.clone(),
+            policy_controller_tls_cert: self.routing.policy_controller_tls_cert.clone(),
+            policy_controller_tls_key: self.routing.policy_controller_tls_key.clone(),
+            ..builder.build_with_validation(false)?
+        };
+        config.validate()?;
+        Ok(config)
     }
 
     /// Combine validated router settings with listener, discovery, and authentication flags.
@@ -1504,11 +1528,10 @@ impl CliArgs {
         lines
     }
 
-    /// Phase 3, configure: the router configuration, validated once by the
-    /// builder's `build()`, wrapped in the server configuration. Every
-    /// refusal is a [`ConfigError`] naming the flag; nothing has been bound
-    /// or spawned when one is raised. (`startup` validates once more, for a
-    /// library caller that never went through the builder.)
+    /// Phase 3, configure: assemble the validated router configuration and
+    /// wrap it in the server configuration. A refusal names the flag before
+    /// any listener binds or task starts. Startup also validates configurations
+    /// built by library callers.
     pub(crate) fn configure(
         &self,
         prefill_urls: Vec<(String, Option<u16>)>,

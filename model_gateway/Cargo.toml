@@ -109,7 +109,7 @@ smg-rl.workspace = true
 # The policy document and its presets alone, with none of the crate's
 # features: the routing configuration is written as a document
 # (`config/policy_document.rs`) and nothing decides by it.
-smg-policy-controller.workspace = true
+smg-policy-controller = { workspace = true, features = ["client"] }
 smg-grpc-client.workspace = true
 engine-zmq-client.workspace = true
 engine-zmq-adapter.workspace = true

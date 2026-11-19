@@ -1,8 +1,8 @@
 //! The policy controller in this process.
 //!
 //! A request's worker has two possible deciders: the classic policies, and
-//! the policy controller's engine over the controller's store. One temporary
-//! setting picks one of them for the whole process
+//! the policy controller's engine over the controller's store. One
+//! setting picks a decider for the whole process
 //! ([`RouterConfig::policy_controller`]). The classic policies are the
 //! default.
 //!
@@ -17,6 +17,10 @@
 //!
 //! One site reads the setting, [`start`]. Every other site asks what the
 //! start left in the context.
+//!
+//! Under a controller's address a follower keeps the store's worker rows
+//! as that controller's watch tells them ([`follower`]). The gateway then
+//! discovers, registers and probes no worker of its own.
 
 use std::sync::Arc;
 
@@ -31,6 +35,8 @@ use crate::{
     config::{PolicyDocumentError, RouterConfig},
     routers::RouterTrait,
 };
+
+pub(crate) mod follower;
 
 #[cfg_attr(
     not(test),

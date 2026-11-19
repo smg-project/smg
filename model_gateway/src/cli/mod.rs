@@ -672,6 +672,25 @@ struct RoutingArgs {
     /// the exit is then a failure
     #[arg(long, default_value_t = false, help_heading = "Routing Policy")]
     print_policy_spec: bool,
+
+    #[arg(long, hide = true)]
+    policy_controller: bool,
+
+    /// Follow workers from the policy controller's gateway listener (requires --policy-controller).
+    #[arg(long, value_name = "host:port", help_heading = "Routing Policy")]
+    policy_controller_address: Option<String>,
+
+    /// PEM certificate authority file for the controller connection.
+    #[arg(long, value_name = "path", help_heading = "Routing Policy")]
+    policy_controller_tls_ca_cert: Option<String>,
+
+    /// PEM client certificate file for the controller connection.
+    #[arg(long, value_name = "path", help_heading = "Routing Policy")]
+    policy_controller_tls_cert: Option<String>,
+
+    /// PEM client private key file for the controller connection.
+    #[arg(long, value_name = "path", help_heading = "Routing Policy")]
+    policy_controller_tls_key: Option<String>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -2100,6 +2119,84 @@ mod tests {
             .chain(args.iter().map(|s| (*s).to_string()))
             .collect();
         Cli::parse_from(argv).router_args
+    }
+
+    #[test]
+    fn the_policy_controller_flags_reach_the_router_configuration() {
+        let cli = Cli::try_parse_from([
+            "smg",
+            "--policy-controller",
+            "--policy-controller-address",
+            "controller:30100",
+            "--policy-controller-tls-ca-cert",
+            "ca.pem",
+            "--policy-controller-tls-cert",
+            "cert.pem",
+            "--policy-controller-tls-key",
+            "key.pem",
+        ])
+        .unwrap();
+        let config = cli
+            .router_args
+            .configure(vec![], vec![])
+            .unwrap()
+            .router_config;
+        assert!(config.policy_controller);
+        assert_eq!(
+            config.policy_controller_address.as_deref(),
+            Some("controller:30100")
+        );
+        assert_eq!(
+            config.policy_controller_tls_ca_cert.as_deref(),
+            Some("ca.pem")
+        );
+        assert_eq!(
+            config.policy_controller_tls_cert.as_deref(),
+            Some("cert.pem")
+        );
+        assert_eq!(config.policy_controller_tls_key.as_deref(), Some("key.pem"));
+    }
+
+    #[test]
+    fn a_controller_address_refuses_worker_urls_even_outside_the_selected_mode() {
+        let cli = Cli::try_parse_from([
+            "smg",
+            "--policy-controller",
+            "--policy-controller-address",
+            "controller:30100",
+        ])
+        .unwrap();
+        let error = cli
+            .router_args
+            .to_router_config(vec![("http://worker:8000".to_owned(), None)], vec![])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("--policy-controller-address") && error.contains("--prefill"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_controller_address_refuses_a_discovery_provider_before_reading_its_settings() {
+        let cli = Cli::try_parse_from([
+            "smg",
+            "--policy-controller",
+            "--policy-controller-address",
+            "controller:30100",
+            "--discovery-provider",
+            "file",
+        ])
+        .unwrap();
+        let error = cli
+            .router_args
+            .to_router_config(vec![], vec![])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("--policy-controller-address") && error.contains("--discovery-provider"),
+            "{error}"
+        );
     }
 
     /// The CLI preserves independent role thresholds and rounds percentages up.
