@@ -1486,8 +1486,8 @@ impl Door {
         // The seat follows who owns what the decision reads and what
         // hears its lease: the generation's word as the door last read
         // it, asked again under the decision's own load.
-        let at_models = self.keeping.load(Ordering::Relaxed);
-        let outcome = self.at_a_seat(at_models, term, gateway, request, now);
+        let at_home = self.keeping.load(Ordering::Relaxed);
+        let outcome = self.at_a_seat(at_home, term, gateway, request, now);
         match &outcome {
             // An id at or past the term's mark: the door raises the term,
             // as an election's hand-over does for a served controller.
@@ -1501,7 +1501,7 @@ impl Door {
         outcome
     }
 
-    /// The order at a seat: the model's where `at_models`, the calling
+    /// The order at a seat: the model's where `at_home`, the calling
     /// thread's otherwise. The caller takes the seat, works at its file
     /// and loads the world, and the seat's question is asked under that
     /// load. Where the caller sat at its thread's seat and the generation
@@ -1510,7 +1510,7 @@ impl Door {
     /// decision is made under the load its seat was asked under.
     fn at_a_seat(
         &self,
-        mut at_models: bool,
+        mut at_home: bool,
         term: u64,
         gateway: GatewayId,
         request: &Request<'_>,
@@ -1518,8 +1518,8 @@ impl Door {
     ) -> Result<Decided, Refused> {
         let store = &*self.store;
         let (at, mut slot, _acting, world) = loop {
-            let (at, mut slot) = if at_models {
-                self.models(request.facts.model)
+            let (at, mut slot) = if at_home {
+                self.home(request.facts.model)
             } else {
                 self.seat()
             };
@@ -1531,12 +1531,12 @@ impl Door {
             // One load of the world, for the seat's question and the
             // decision.
             let world = store.loaded();
-            if self.sits(&world, at_models) {
+            if self.sits(&world, at_home) {
                 break (at, slot, acting, world);
             }
             drop(world);
             self.leave(at, at_file);
-            at_models = true;
+            at_home = true;
         };
         let DeciderSlot { buffers, at_file } = &mut *slot;
         let at_file = at_file.get_or_insert_with(|| self.store.at_work());
@@ -1583,17 +1583,20 @@ impl Door {
     /// that keeps state a decider, at any seat otherwise. The door keeps
     /// the generation's word for the callers behind. It is one read, and
     /// it calls no stage.
-    fn sits(&self, world: &World, at_models: bool) -> bool {
+    fn sits(&self, world: &World, at_home: bool) -> bool {
         let keeping = world.spec().engine().keeps_deciders();
+        // Written only where it moved. Every caller reads this word at
+        // each decision, and a store at each would take its cache line
+        // from the other callers' cores.
         if keeping != self.keeping.load(Ordering::Relaxed) {
             self.keeping.store(keeping, Ordering::Relaxed);
         }
-        at_models || !keeping
+        at_home || !keeping
     }
 
     /// Takes the seat of `model`'s decider and waits for it: a model's
     /// requests there decide one at a time.
-    fn models(&self, model: &str) -> (usize, MutexGuard<'_, DeciderSlot>) {
+    fn home(&self, model: &str) -> (usize, MutexGuard<'_, DeciderSlot>) {
         let at = decider_of(model, self.seats.len());
         (at, self.seats[at].0.lock())
     }
@@ -1603,7 +1606,7 @@ impl Door {
     /// have called a door, counted round this door's seats.
     fn seat(&self) -> (usize, MutexGuard<'_, DeciderSlot>) {
         let seats = self.seats.len();
-        // A thread at its end has none of its own words left: it starts
+        // A thread at its end no longer has its own storage: it starts
         // at the first seat.
         let last = SEAT.try_with(Cell::get).unwrap_or(0);
         let own = if last < seats { last } else { last % seats };
@@ -1664,9 +1667,9 @@ impl Door {
     }
 
     /// Hands the file at `at` what the door kept for it, in the order
-    /// said, until nothing waits. The caller holds the file's slot and has
-    /// left its work: no thread is at work there, so each word is applied
-    /// as it is handed and no hand waits.
+    /// said, until nothing waits. The caller holds the seat at `at` and
+    /// has left its work: no thread is at work there, so each word is
+    /// applied as it is handed and no hand waits.
     #[cold]
     fn hand_kept(&self, at: usize) {
         let kept = &self.kept[at];
