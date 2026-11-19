@@ -784,13 +784,12 @@ impl PoolIndex {
 ///   under that lock, and the lane passes a release fence before a batch's
 ///   blocks reach the chain ([`Held`]);
 /// - another row's lane, at a run's split, which writes the holdings of
-///   every row on the run: the chain passes a release fence of its own
-///   there, under the run's lock. A holding stands on a run by a write
-///   under that lock, or by the write of the lane that made the run,
-///   before another lane could find it;
-/// - another row's lane, where a partial table grows, which copies every
-///   row's entry: the chain passes a release fence of its own there too,
-///   under the run's lock;
+///   every row on the run, or where a partial table grows, which copies
+///   every row's entry: the chain passes a release fence of its own where
+///   a version step begins, under the run's lock, and every write of a
+///   split and the store that publishes a grown table stand behind one. A
+///   holding stands on a run by a write under that lock, or by the write
+///   of the lane that made the run, before another lane could find it;
 /// - the reader: an acquire fence in the naming, between its lookup and
 ///   its question ([`PoolIndex::name`]).
 ///
