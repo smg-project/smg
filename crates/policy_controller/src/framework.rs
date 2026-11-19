@@ -3513,6 +3513,11 @@ impl Engine {
             .and_then(|at| u32::try_from(at).ok())
     }
 
+    #[cfg(feature = "controller")]
+    pub(crate) fn binding_at(&self, at: u32) -> Option<&Binding> {
+        self.bindings.get(at as usize).map(|entry| &entry.binding)
+    }
+
     /// The profile a request resolves to for its phase; `None` when no
     /// binding matches or the binding's plan has no side for the phase.
     pub fn profile_for(&self, model: &str, phase: Phase) -> Option<(u16, &Profile)> {

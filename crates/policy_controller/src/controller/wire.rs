@@ -590,7 +590,7 @@ pub(crate) fn credit(term: u64, window: u32) -> proto::DecideAnswer {
 
 /// A decision as the wire carries it; its lease is its answer's to add
 /// ([`decided`]).
-fn decision(decision: &Decision) -> proto::Decision {
+pub(super) fn decision(decision: &Decision) -> proto::Decision {
     let outcome = match decision {
         Decision::Pick(pick) => Outcome::Pick(proto::Pick {
             targets: pick.targets.iter().map(target).collect(),

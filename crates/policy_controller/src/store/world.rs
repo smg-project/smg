@@ -865,6 +865,10 @@ pub struct World {
     /// The generation this publication was made under: its engine and its
     /// number, read with the rows in one load.
     spec: Arc<AppliedSpec>,
+    /// The served decider reads this with the world, before following
+    /// the pointer to the generation.
+    #[cfg(feature = "controller")]
+    samples_decisions: bool,
     /// Each pool's standing in its model's index, at the pool's index.
     indexes: Arc<[Option<Arc<PoolIndex>>]>,
 }
@@ -902,6 +906,11 @@ impl World {
     /// owned world, whose shared count a deciding thread would write.
     pub fn spec(&self) -> &AppliedSpec {
         &self.spec
+    }
+
+    #[cfg(feature = "controller")]
+    pub(crate) fn samples_decisions(&self) -> bool {
+        self.samples_decisions
     }
 
     /// `at` in the rows' clock: microseconds since the store's origin.
@@ -2258,6 +2267,8 @@ impl Writer {
             unreported: Arc::clone(&self.unreported),
             vetoes: Arc::clone(&self.pool_vetoes),
             spec: Arc::clone(&self.spec),
+            #[cfg(feature = "controller")]
+            samples_decisions: self.spec.engine().explain_sample() != 0,
             indexes: Arc::clone(&self.indexes),
         })
     }

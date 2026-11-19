@@ -541,6 +541,26 @@ policy spec rejected: the running generation stays generation=1 error=profiles.d
 
 On the admin listener's `/metrics`, `smg_policy_spec_generation` is the generation that runs, and `smg_policy_spec_apply_total` counts each change as applied or rejected.
 
+### Explain
+
+Each decider can keep 1,024 sampled decisions. Once full, the ring covers about `1,024 × N / R` seconds at sample `N` and a steady rate of `R` picks and sheds per second on that decider. At sample 1 and 1,024 decisions per second, that is one second.
+
+Set `explain: {sample: N}` in the policy document. Use a whole number from 0 to 4,294,967,295. The default, 0, turns sampling off. At 1 the decider keeps every pick and shed. At higher rates it keeps every Nth pick or shed, counting separately at each seat. A new generation starts the count over, and earlier samples stay available until overwritten. A refusal takes no place in the ring.
+
+The first sample at a seat allocates its slots, and the ring overwrites the oldest record when full. The slot storage per decider is 1,024 times the size of a record. A decision keeps its seat when only the sampling rate changes.
+
+Use `Explain` on the control listener with `gateway_id` and `request_id`. A miss returns `NOT_FOUND`. The leader serves this call, with each new term starting empty. A replica that follows returns the leader's address when it knows one. In process, `Door::explain` reads the same key, using the store's gateway id.
+
+**Limits**
+
+- A decision id is refused by field, and the record leaves `decision_id` empty.
+- The record holds no request facts, session keys or headers. It echoes the lookup key and gives the decision and its trace without leases.
+- The full candidate list is unset. The trace holds its own top scores.
+- The view digest is unset.
+- Plugin projections are unset.
+- The lifecycle outcome is unset.
+- Stage and plan names come from the standing generation. An older record keeps its positions and trace.
+
 ## A stage of your own
 
 ```rust
@@ -575,7 +595,7 @@ A stage is a Rust type that implements `Filter`, `Scorer` or `Picker`. You add i
 - Cache events in the stock controller. Its `PushKvEvents` call is not served, and nothing else feeds its cache index. So `prefix-affinity` sees no worker as holding a prefix there. The library places by cache for a host that feeds the index.
 - Two more inputs in the stock controller. A worker's row has a circuit-breaker bit that nothing feeds yet, so `healthy` reads it as closed. A gateway's own breaker still counts: its breaker veto on its session takes the worker out of that gateway's decisions. A key's count of requests in flight is not fed, so `inflight_cap` passes no worker over.
 - A plugin named in the document. The format has no field for one.
-- Five calls of the contract: `Explain`, `PushLoad`, `PushKvEvents`, `StepDown` and `WatchRegime`. The stock controller answers each as not served.
+- Four calls of the contract: `PushLoad`, `PushKvEvents`, `StepDown` and `WatchRegime`. The stock controller answers each as not served.
 - Eight of the ten slices of the snapshot call, `GetSnapshot`. The stock controller serves the worker rows and the spec's status. It refuses a request for any other slice by the slice's name, and a request that names no slice asks for all ten. It also refuses a request for identifiers in clear.
 - The audit mode of the apply call.
 - The gateway's use of the controller.

@@ -51,8 +51,13 @@ impl Principal {
     /// The subject as the store keys a gateway's leases, vetoes and reports:
     /// its fingerprint, never `0`, which is the embedded mode's own gateway.
     pub(crate) fn gateway(&self) -> GatewayId {
-        GatewayId(view::fingerprint(self.subject.as_bytes()))
+        gateway_id(&self.subject)
     }
+}
+
+/// The store's key for a gateway's subject.
+pub(super) fn gateway_id(subject: &str) -> GatewayId {
+    GatewayId(view::fingerprint(subject.as_bytes()))
 }
 
 /// The layer of a listener that takes identities as told: the name the call
