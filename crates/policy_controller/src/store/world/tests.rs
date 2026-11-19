@@ -10,8 +10,8 @@ use std::{
 };
 
 use super::{
-    run_of, seek, Ask, Built, Classes, GatewayRun, OutsideLists, PairBuffers, PoolVeto, PoolVetoes,
-    StaleGeneration, ViewBuffers, World, Writer, PUBLISH_WINDOW, WALKED_RUNS,
+    run_of, seek, side_of, Ask, Built, Classes, GatewayRun, OutsideLists, PairBuffers, PoolVeto,
+    PoolVetoes, StaleGeneration, ViewBuffers, World, Writer, PUBLISH_WINDOW, WALKED_RUNS,
 };
 use crate::{
     counts::Slot,
@@ -5241,4 +5241,22 @@ fn a_member_whose_rows_revision_stands_is_carried_and_one_whose_revision_moved_i
     let members = [row(3, "west", 1), row(7, "west", 2)];
     let back = writer.rebuild(8, members.filed(&writer), |_, _| None, Classes::Derive);
     assert_eq!(zones(&back), (1, 1));
+}
+
+/// A side's whole entries are a list of its own, made once at its length.
+/// The last model's side that lists every member is the entries
+/// themselves: none is copied.
+#[test]
+fn the_last_models_side_of_every_member_takes_the_entries_whole() {
+    let mut entries: Vec<u64> = (10..14).collect();
+    let stood = entries.as_ptr();
+    // Some members of the last model, then every member of an earlier one.
+    let some = side_of(&mut entries, &[1, 3], true);
+    assert_eq!((some.as_slice(), some.capacity()), (&[11, 13][..], 2));
+    let every = side_of(&mut entries, &[0, 1, 2, 3], false);
+    assert_eq!(every, [10, 11, 12, 13]);
+    assert!(every.as_ptr() != stood && entries.len() == 4);
+    let whole = side_of(&mut entries, &[0, 1, 2, 3], true);
+    assert_eq!(whole, [10, 11, 12, 13]);
+    assert!(whole.as_ptr() == stood && entries.is_empty());
 }
