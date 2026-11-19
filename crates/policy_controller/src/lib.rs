@@ -26,7 +26,9 @@
 //!   weighted [`Scorer`]s and one [`Picker`]; a [`Plan`] sequences profiles for
 //!   a request; the [`Engine`] resolves a request to its binding and decides.
 //!   A scorer or picker allocates nothing per decision. The consistent-hash
-//!   scorer owns its ring ([`ring`]), fed by the membership hooks.
+//!   scorer owns its ring ([`ring`]), fed by the membership hooks. The
+//!   prefixes sent to a model's workers are kept by the sent-prefix
+//!   predictor ([`predictor`]), which no decision reads yet.
 //! - 4.5, the stages in code ([`catalog`]): the [`Catalog`] of the stages a
 //!   build knows by name, the stock build's and the ones a host registers.
 //!   A document names either kind the same way, and the validator resolves
@@ -109,6 +111,7 @@ pub mod ingest;
 pub mod lease;
 #[cfg(any(feature = "wasm", feature = "controller"))]
 pub mod plugins;
+pub mod predictor;
 #[cfg(feature = "controller")]
 pub mod proto;
 pub mod replication;
