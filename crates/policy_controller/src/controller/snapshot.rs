@@ -413,12 +413,18 @@ fn rows(cut: &[WorkerRow], asked: &Asked, now: Instant) -> (Vec<proto::WorkerRow
 /// ([`worker_wire::row`]) with its age, and its address without userinfo in
 /// each field that carries it. A row tells its address three times: the
 /// URL, the registration key, which is the URL, and the engine, which is
-/// the key for a single rank. An operator loses no handle by it: a patch
-/// and a removal name a row by its id and its revision.
+/// the key for a single rank. A provider's row tells its maker's key too:
+/// the provider's own text, which may hold an address with a credential,
+/// so it is read as the three are. An operator loses no handle by it: a
+/// patch and a removal name a row by its id and its revision.
 fn redacted(row: &WorkerRow, now: Instant) -> proto::WorkerRow {
     let mut told = worker_wire::row(row);
     told.admitted_age_ms = age_ms(now, row.admitted_at);
-    for address in [&mut told.url, &mut told.registration_key, &mut told.engine] {
+    let maker = told.maker.as_mut().map(|maker| &mut maker.key);
+    for address in [&mut told.url, &mut told.registration_key, &mut told.engine]
+        .into_iter()
+        .chain(maker)
+    {
         if let Some(clean) = without_userinfo(address) {
             *address = clean;
         }
@@ -791,6 +797,46 @@ mod tests {
         assert_eq!(row.admitted_age_ms, 1_500);
         assert_eq!(row.models, ["model-a"]);
         assert_eq!(cut.rows[0].facts.key, key);
+    }
+
+    /// A provider's key for a worker is its own text and may hold an
+    /// address with a credential: a redacted row tells it as it tells the
+    /// row's own address, without the userinfo. A key with no `@` is told
+    /// as it stands, and a control call's row names no maker.
+    #[test]
+    fn a_makers_key_is_told_without_its_userinfo() {
+        use crate::store::Maker;
+
+        let store = MemoryStore::new();
+        register(&store, &url(1), "model-a");
+        let mut row = store.cut(Kinds::Watched).rows[0].clone();
+        let told = |row: &crate::store::WorkerRow| {
+            super::redacted(row, Instant::now())
+                .maker
+                .map(|maker| maker.key)
+        };
+        assert_eq!(told(&row), None, "a control call's row names no maker");
+        row.maker = Maker::provider(
+            "pool",
+            "http://operator-name:s3cret-word@pool.example/pods/a",
+        )
+        .expect("a whole maker");
+        assert_eq!(
+            told(&row).as_deref(),
+            Some("http://pool.example/pods/a"),
+            "the key keeps its userinfo"
+        );
+        let bytes = super::redacted(&row, Instant::now()).encode_to_vec();
+        for secret in ["s3cret-word", "operator-name"] {
+            assert!(
+                !bytes
+                    .windows(secret.len())
+                    .any(|window| window == secret.as_bytes()),
+                "the row tells {secret}"
+            );
+        }
+        row.maker = Maker::provider("pool", "pods/a").expect("a whole maker");
+        assert_eq!(told(&row).as_deref(), Some("pods/a"));
     }
 
     /// The caller's limit leaves rows out, and the mark says so: the rows
