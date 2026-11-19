@@ -353,8 +353,10 @@ impl Controller {
         // completion or release, and the dispatch deadline or an answer
         // that does not leave of its end; no line tells one of a lease
         // that left with its gateway yet: a stage that needs the calls is
-        // refused by name, never run on state half kept.
-        let catalog = Arc::new(catalog.without_lifecycle());
+        // refused by name, never run on state half kept. Nothing here
+        // records the prefixes a worker was sent either: a prefix-affinity
+        // source that reads them is refused by its field.
+        let catalog = Arc::new(catalog.without_lifecycle().without_sent_prefixes());
         let mut listeners = Vec::with_capacity(config.listeners.len());
         for listener in &config.listeners {
             let name = listener.name.clone();

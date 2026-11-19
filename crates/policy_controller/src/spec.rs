@@ -2251,16 +2251,6 @@ fn scorer_of(stage: &ScoreStage, gates: Gates, boundaries: &[u32]) -> Resolved<B
         {
             Resolved::NotInBuild("the prefix-affinity uncached credit")
         }
-        // Nothing records the prefixes sent: a source that reads them would
-        // place as with no affinity where no worker publishes its blocks.
-        ScoreStage::PrefixAffinity(p)
-            if matches!(
-                p.source,
-                Some(AffinitySource::Predictor | AffinitySource::Merged)
-            ) =>
-        {
-            Resolved::NotInBuild("the prefix-affinity predictor")
-        }
         ScoreStage::PrefixAffinity(p) => built_scorer(PrefixAffinity::new(p, gates)),
         ScoreStage::KvPressure(_) => built_scorer(KvPressure),
         ScoreStage::WarmupSlice(p) => built_scorer(WarmupSlice::new(p, gates)),
@@ -2493,6 +2483,22 @@ fn check_profile(
         let stage_at = entry_at.sub(stage.name());
         check_stage(&stage, &stage_at)?;
         check_prefix_depth(&stage, gates, view, &stage_at)?;
+        // A host that records no prefix it sent holds no source that reads
+        // them: where no worker publishes its blocks, the stage would score
+        // every worker as holding nothing.
+        let reads_sent = matches!(
+            &stage,
+            ScoreStage::PrefixAffinity(p)
+                if matches!(p.source, Some(AffinitySource::Predictor | AffinitySource::Merged))
+        );
+        if reads_sent && !catalog.records_sent_prefixes() {
+            complete = false;
+            deferred.note(
+                stage_at.field("source"),
+                "the record of sent prefixes this source reads",
+            );
+            continue;
+        }
         match scorer_of(&stage, gates, &view.boundaries) {
             Resolved::Built(scorer) => {
                 let read = HashDepth::of_scorer(&stage, &view.boundaries, scorer.needs());
@@ -5206,27 +5212,35 @@ mod tests {
     }
 
     /// A prefix-affinity source that reads the prefixes sent is refused by
-    /// name: this build records none, so `predictor` and `merged` would
-    /// place as with no affinity where no worker publishes its blocks. The
-    /// event-fed index validates, named or left out.
+    /// its field where the host records none: `predictor` and `merged`
+    /// would place as with no affinity where no worker publishes its
+    /// blocks. A host that records them validates both. The event-fed
+    /// index validates on either host, named or left out.
     #[test]
-    fn an_affinity_source_of_sent_prefixes_is_refused_as_not_in_this_build() {
+    fn a_source_of_sent_prefixes_is_refused_where_the_host_records_none() {
+        let records_none = Catalog::builtin().without_sent_prefixes();
         for source in ["predictor", "merged"] {
             let score = format!(r#"{{"prefix-affinity":{{"source":"{source}"}}}}"#);
-            let refused = spec_with_score(&score)
-                .validate()
-                .expect_err("a source this build cannot feed");
+            let spec = spec_with_score(&score);
+            let refused = spec
+                .validate_in(&records_none, &[])
+                .expect_err("a source this host cannot feed");
             assert_eq!(
                 refused.to_string(),
-                "profiles.p.score[0].prefix-affinity: the prefix-affinity predictor is not in this build",
+                "profiles.p.score[0].prefix-affinity.source: the record of sent prefixes this source reads is not in this build",
                 "{source}"
+            );
+            assert!(
+                spec.validate().is_ok(),
+                "{source}: a host that records them"
             );
         }
         for score in [
             r#"{"prefix-affinity":{"source":"index"}}"#,
             r#"{"prefix-affinity":{}}"#,
         ] {
-            assert!(spec_with_score(score).validate().is_ok(), "{score}");
+            let spec = spec_with_score(score);
+            assert!(spec.validate_in(&records_none, &[]).is_ok(), "{score}");
         }
     }
 
@@ -5262,7 +5276,7 @@ mod tests {
         for score in [
             r#"{"kv-pressure":{"spread":0.3,"ceiling":0.9}}"#,
             r#"{"warmup-slice":{"secs":0,"miss_share":0.5}}"#,
-            r#"{"prefix-affinity":{"threshold":0.5,"source":"index","spill":{"abs":8,"rel":2.0}}}"#,
+            r#"{"prefix-affinity":{"threshold":0.5,"source":"merged","spill":{"abs":8,"rel":2.0}}}"#,
             r#"{"bucket":{"abs_threshold":32,"rel_threshold":1.0001,"adjust_interval_s":5}}"#,
         ] {
             assert!(spec_with_score(score).validate().is_ok(), "{score}");
