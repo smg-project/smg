@@ -61,6 +61,7 @@ pub(crate) mod ec_push;
 mod encoder_budget;
 mod inflight;
 mod item_limits;
+mod media_client;
 mod pixel_cache;
 mod plan;
 mod process;
