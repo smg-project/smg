@@ -318,7 +318,8 @@ impl<D: Deref<Target = Door>> Handle<D> {
     /// there and ends no side, since the lease holds none such: the
     /// served worker's health takes it, and what the handle owes stands.
     /// Any other outcome ends the handle's own side, and a single's lease
-    /// ends under any side its host names. Said once.
+    /// ends under any side its host names. A side's end is said once. An
+    /// encode outcome on a pair's handle is said at each call.
     pub fn completed(&mut self, outcome: &Outcome, now: Instant) {
         let pair = self.decided.pair();
         let owed = match outcome.side {
