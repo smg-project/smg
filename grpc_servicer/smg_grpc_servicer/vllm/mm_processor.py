@@ -47,6 +47,7 @@ from smg_grpc_servicer.mm_sidecar_protocol import (
     resolve_namespace,
 )
 from smg_grpc_servicer.vllm import config_view
+from smg_grpc_servicer.vllm.media_host_guard import media_connector_kwargs
 from smg_grpc_servicer.vllm.media_refs import (
     BASE_SCHEMES,
     FETCHABLE_MODALITIES,
@@ -65,6 +66,7 @@ ENV_MAX_ITEMS = "SMG_VLLM_MM_MAX_ITEMS"
 ENV_TURBOJPEG = "SMG_VLLM_MM_TURBOJPEG"
 ENV_FETCH_TIMEOUT_MS = "SMG_VLLM_MM_FETCH_TIMEOUT_MS"
 ENV_VIDEO_FETCH_TIMEOUT_MS = "SMG_VLLM_MM_VIDEO_FETCH_TIMEOUT_MS"
+ENV_ALLOW_PRIVATE_MEDIA_HOSTS = "SMG_MM_ALLOW_PRIVATE_MEDIA_HOSTS"
 TURBOJPEG_FLAG = "--mm-turbojpeg"
 
 MODE_OFF = "off"
@@ -298,6 +300,7 @@ class InProcessMediaProcessor:
         max_inflight: int = DEFAULT_MAX_INFLIGHT,
         max_items: int | None = None,
         max_video_frames: int = DEFAULT_MAX_VIDEO_FRAMES,
+        allow_private_media_hosts: bool = False,
     ) -> None:
         _require_inprocess_apis(engine)
         import vllm
@@ -330,6 +333,7 @@ class InProcessMediaProcessor:
             ),
             allowed_local_media_path=model_config.allowed_local_media_path,
             allowed_media_domains=model_config.allowed_media_domains,
+            **media_connector_kwargs(model_config.allowed_media_domains, allow_private_media_hosts),
         )
         self._video_processor = get_video_processor_cls_name(model_config)
         self.schemes = advertised_schemes(model_config.allowed_local_media_path)
@@ -344,7 +348,7 @@ class InProcessMediaProcessor:
         if not model_config.allowed_media_domains:
             logger.warning(
                 "%s=inprocess with no --allowed-media-domains: this worker will fetch media "
-                "from any host the router forwards",
+                "from any public host the router forwards",
                 PROCESSOR_FLAG,
             )
 
@@ -750,6 +754,11 @@ _MM_SETTING_SPECS: dict[str, tuple[str, str, Any]] = {
     "turbojpeg": (TURBOJPEG_FLAG, ENV_TURBOJPEG, TURBOJPEG_PREFER),
     "fetch_timeout_ms": ("--mm-fetch-timeout-ms", ENV_FETCH_TIMEOUT_MS, 10_000),
     "video_fetch_timeout_ms": ("--mm-video-fetch-timeout-ms", ENV_VIDEO_FETCH_TIMEOUT_MS, 30_000),
+    "allow_private_media_hosts": (
+        "--mm-allow-private-media-hosts",
+        ENV_ALLOW_PRIVATE_MEDIA_HOSTS,
+        False,
+    ),
 }
 _MM_INT_SETTINGS = frozenset(
     {
@@ -765,7 +774,10 @@ _MM_INT_SETTINGS = frozenset(
 # The variables that are not legacy spellings of their flag: documented beside
 # it as a supported way to set the value (as the router's SMG_MM_TURBOJPEG
 # is), so no deprecation line when the launcher defines the flag.
-_ENV_NOT_LEGACY = frozenset({"turbojpeg", "fetch_timeout_ms", "video_fetch_timeout_ms"})
+_ENV_NOT_LEGACY = frozenset(
+    {"turbojpeg", "fetch_timeout_ms", "video_fetch_timeout_ms", "allow_private_media_hosts"}
+)
+_MM_BOOL_SETTINGS = frozenset({"allow_private_media_hosts"})
 
 
 @dataclasses.dataclass(frozen=True)
@@ -787,6 +799,7 @@ class MmSettings:
     turbojpeg: str | None = None
     fetch_timeout_ms: int | None = None
     video_fetch_timeout_ms: int | None = None
+    allow_private_media_hosts: bool | None = None
     sources: Mapping[str, str] = dataclasses.field(default_factory=dict, compare=False)
     # The settings whose flag the launcher defines (`from_args`), set or not.
     # For the rest the environment variable is the documented way to set them,
@@ -870,6 +883,10 @@ _MM_FLAG_HELP: dict[str, str] = {
     ),
     "fetch_timeout_ms": "Image/audio download timeout in milliseconds (--mm-processor smg; default 10000).",
     "video_fetch_timeout_ms": "Video download timeout in milliseconds (--mm-processor smg; default 30000).",
+    "allow_private_media_hosts": (
+        "Let worker-side media fetches (--mm-processor inprocess|redis) reach loopback, "
+        "link-local and private addresses, which they refuse by default as the router does."
+    ),
     "max_inflight": "Media requests this worker processes at once.",
     "max_item_bytes": "Cap on an inline (data:) media item's decoded size, in bytes.",
     "max_items": "Media items a request may carry per modality.",
@@ -915,6 +932,9 @@ def add_mm_arguments(parser: argparse.ArgumentParser) -> list[str]:
             kwargs["choices"] = list(VALID_TURBOJPEG)
         elif name in _MM_INT_SETTINGS:
             kwargs["type"] = int
+        elif name in _MM_BOOL_SETTINGS:
+            kwargs["action"] = "store_const"
+            kwargs["const"] = True
         parser.add_argument(flag, **kwargs)
         added.append(flag)
     return added
@@ -998,7 +1018,20 @@ def _validate_flag(name: str, flag: str, value: Any) -> Any:
         if int(value) <= 0:
             raise ValueError(f"{flag}={value} must be positive")
         return int(value)
+    if name in _MM_BOOL_SETTINGS:
+        return _parse_bool(flag, value)
     return value
+
+
+def _parse_bool(where: str, value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in ("1", "true", "yes", "on"):
+        return True
+    if text in ("0", "false", "no", "off"):
+        return False
+    raise ValueError(f"{where}={value!r} is not a boolean")
 
 
 def _read_env(name: str, env: Mapping[str, str], env_name: str) -> Any:
@@ -1011,6 +1044,9 @@ def _read_env(name: str, env: Mapping[str, str], env_name: str) -> Any:
         return resolve_mm_turbojpeg(env) if raw is not None and raw.strip() else None
     if name in _MM_INT_SETTINGS:
         return env_int_opt(env, env_name)
+    if name in _MM_BOOL_SETTINGS:
+        raw = env.get(env_name)
+        return _parse_bool(env_name, raw) if raw is not None and raw.strip() else None
     raw = env.get(env_name)
     return raw if raw else None
 
@@ -1082,6 +1118,7 @@ def build_mm_processor(
             max_inflight=resolved.max_inflight,
             max_items=resolved.max_items,
             max_video_frames=max_video_frames,
+            allow_private_media_hosts=resolved.allow_private_media_hosts,
         )
     return RedisMediaProcessor(
         engine,

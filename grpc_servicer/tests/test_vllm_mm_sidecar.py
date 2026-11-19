@@ -773,6 +773,7 @@ class TestServe:
         assert seen["sidecar_kwargs"]["settings"].sources == {
             "redis_url": "flag",
             "sidecar_namespace": "flag",
+            "allow_private_media_hosts": "default",
         }
 
     def test_the_startup_log_hides_redis_credentials(self, monkeypatch, caplog):

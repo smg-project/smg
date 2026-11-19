@@ -129,8 +129,9 @@ and never schedules. vLLM's `--allowed-media-domains`,
 `--allowed-media-domains` the worker fetches from any public host the router
 forwards. A media URL that names or resolves to a loopback, link-local or
 private address is refused on the worker as on the router, redirects included,
-unless `SMG_MM_ALLOW_PRIVATE_MEDIA_HOSTS=1` is set for a deployment whose media
-origin is internal.
+unless `--mm-allow-private-media-hosts` (the sidecar's
+`--allow-private-media-hosts`, or `SMG_MM_ALLOW_PRIVATE_MEDIA_HOSTS=1`) is set
+for a deployment whose media origin is internal.
 Related knobs: `--mm-max-inflight` (`SMG_VLLM_MM_MAX_INFLIGHT`, default 64)
 bounds concurrent media jobs; `--mm-max-items` (`SMG_VLLM_MM_MAX_ITEMS`, unset
 by default) overrides the model's per-modality reference limits;
