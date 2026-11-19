@@ -180,13 +180,14 @@ async def serve_grpc(
             if on_request_manager_ready is not None:
                 # The state of every launch on the Rust servicer, so a note; a
                 # warning when the launch asked for the sidecar's own /metrics
-                # (--enable-metrics), which nothing serves then.
+                # (--enable-metrics), whose frontend series it does not get.
                 asked_for_metrics = bool(getattr(server_args, "enable_metrics", False))
                 (logger.warning if asked_for_metrics else logger.info)(
                     "The Rust servicer has no request manager to wire SGLang's HTTP sidecar "
-                    "to (its /metrics, admin and profiling endpoints stay off); its own "
-                    "metrics endpoint is --metrics-port / %s; the Python servicer "
-                    "(--servicer-impl python / %s=python) keeps the sidecar",
+                    "to (its admin and profiling endpoints stay off); under --enable-metrics "
+                    "the launcher serves the scheduler's metrics on the sidecar's port; the "
+                    "frontend's request metrics are the servicer's own, on --metrics-port / %s; "
+                    "the Python servicer (--servicer-impl python / %s=python) keeps the sidecar",
                     METRICS_PORT_ENV,
                     SERVICER_IMPL_ENV,
                 )
