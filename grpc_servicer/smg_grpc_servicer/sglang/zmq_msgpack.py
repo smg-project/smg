@@ -52,7 +52,10 @@ from typing import TYPE_CHECKING, Any
 import msgspec
 import zmq
 
-from smg_grpc_servicer.sglang.compat import SchedulerOutputAdapter
+from smg_grpc_servicer.sglang.compat import (
+    SchedulerOutputAdapter,
+    normalize_multimodal_processor_output,
+)
 from smg_grpc_servicer.sglang.config_view import EngineConfigView
 from smg_grpc_servicer.sglang.hidden_states import new_hidden_rows
 from smg_grpc_servicer.sglang.mm_defaults import encoder_dtype
@@ -693,6 +696,8 @@ def decode_request_frames(frames: list[bytes], traces: RequestTraces | None = No
     type_byte = bytes(frames[0])
     if type_byte == REQ_TYPE_ADD:
         request = _request_decoder().decode(frames)
+        if getattr(request, "mm_inputs", None) is not None:
+            request.mm_inputs = normalize_multimodal_processor_output(request.mm_inputs)
         if traces is not None and len(frames) > 2:
             traces.attach(request, request_meta(frames[-1]).get(TRACE_HEADERS_KEY))
         return [request]

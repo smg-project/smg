@@ -2,6 +2,7 @@
 
 import importlib
 from collections.abc import Callable
+from copy import copy
 from typing import Any
 
 
@@ -39,6 +40,53 @@ def get_multimodal_types() -> tuple[Any, Any, Any]:
             raise
         module = importlib.import_module("sglang.srt.managers.schedule_batch")
     return module.Modality, module.MultimodalDataItem, module.MultimodalProcessorOutput
+
+
+def normalize_multimodal_processor_output(output):
+    """Match the SDK's per-image items before scheduler hashing and padding.
+
+    Old releases without the splitter keep their existing behavior. A real
+    import dependency or splitter failure must still fail the request.
+    """
+    if output is None:
+        return output
+    items = output.mm_items or []
+    bundled_images = [
+        item for item in items if item.offsets and len(item.offsets) > 1 and item.is_image()
+    ]
+    if not bundled_images:
+        return output
+    module_name = "sglang.srt.managers.mm_utils"
+    try:
+        module = importlib.import_module(module_name)
+    except ModuleNotFoundError as exc:
+        if exc.name != module_name:
+            raise
+        return output
+    if "get_new_expanded_mm_items" not in vars(module):
+        return output
+    splitter = module.get_new_expanded_mm_items
+    normalized = []
+    changed = False
+    for item in items:
+        if not (item.offsets and len(item.offsets) > 1 and item.is_image()):
+            normalized.append(item)
+            continue
+        if item.pad_value is not None or output.padded_input_ids is not None:
+            raise ValueError("Bundled images must be normalized before padding")
+        expanded = splitter([item])
+        if len(expanded) == 1 and expanded[0] is item:
+            normalized.append(item)
+            continue
+        if len(expanded) != len(item.offsets):
+            raise ValueError("SDK image splitting must preserve every image offset")
+        normalized.extend(expanded)
+        changed = True
+    if not changed:
+        return output
+    result = copy(output)
+    result.mm_items = normalized
+    return result
 
 
 class SchedulerOutputAdapter:
