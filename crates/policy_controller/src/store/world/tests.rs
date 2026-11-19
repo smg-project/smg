@@ -4475,6 +4475,47 @@ fn a_report_moves_the_count_of_each_pool_its_row_stands_in() {
     assert_eq!(counts(at(6)), (0, 1));
 }
 
+/// One publication that writes two pools takes the list of counts again
+/// where either pool's count moved. A pool whose count stands, written in
+/// the same publication as one whose count moved, does not keep the old
+/// list for both: held in both orders of the two pools.
+#[test]
+fn a_publication_of_two_pools_lists_the_count_that_moved_in_either() {
+    const OTHER: &str = "n";
+    let store = MemoryStore::new();
+    let t0 = Instant::now();
+    let at = |turn: u32| t0 + PUBLISH_WINDOW * turn;
+    let counts = |now: Instant| {
+        let count = |model: &str| {
+            let (asked, mut out) = (ask(now), ViewBuffers::default());
+            let built = store.build_view(model, Role::Single, &asked, &mut out);
+            built.expect("the pool").unreported
+        };
+        (count(MODEL), count(OTHER))
+    };
+    let first = member(&store, "http://a:8000");
+    let second = admit(&store, facts("http://b:8000", Role::Single, &[OTHER]));
+    assert_eq!(counts(t0), (1, 1));
+    store.record(second, 0, load(1, 0), at(1), LoadSource::Stream);
+    assert_eq!(counts(at(1)), (1, 0));
+    // One window holds a first report in the first pool and one more in
+    // the second: the first pool's count moves and the second's stands.
+    let inside = at(1) + Duration::from_millis(1);
+    store.record(first, 0, load(1, 0), inside, LoadSource::Stream);
+    store.record(second, 0, load(2, 0), inside, LoadSource::Stream);
+    store.publish(at(2));
+    assert_eq!(counts(at(2)), (0, 0));
+    // The other order. A member joins the second pool, and one window
+    // holds one more report in the first pool and a first in the second.
+    let third = admit(&store, facts("http://c:8000", Role::Single, &[OTHER]));
+    assert_eq!(counts(at(2)), (0, 1));
+    let inside = at(2) + Duration::from_millis(1);
+    store.record(first, 0, load(2, 0), inside, LoadSource::Stream);
+    store.record(third, 0, load(1, 0), inside, LoadSource::Stream);
+    store.publish(at(3));
+    assert_eq!(counts(at(3)), (0, 0));
+}
+
 /// Where the published rows of the model's single pool stand.
 fn published(world: &World) -> *const Candidate {
     rows_of(world, MODEL).as_ptr()
