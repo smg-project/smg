@@ -178,7 +178,9 @@ commands_of() {
             # each provider's settings.
             echo "-p smg-service-discovery" ;;
         engine)
-            echo "-p smg-grpc-client -p engine-zmq-client -p engine-zmq-adapter -p engine-servicer -p mock-worker -p gateway-perf --features engine-zmq-client/mock-engine" ;;
+            # `engine-port` is on for the cases of the client crate's engine port: no package of the shard
+            # asks for it, so nothing else would turn it on.
+            echo "-p smg-grpc-client -p engine-zmq-client -p engine-zmq-adapter -p engine-servicer -p mock-worker -p gateway-perf --features engine-zmq-client/mock-engine,smg-grpc-client/engine-port" ;;
         kv)
             local selectors
             # The example controller rides the policy crate's invocation: it asks for the crate's
