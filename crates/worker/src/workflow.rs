@@ -60,7 +60,7 @@ pub use detect_connection::DetectConnectionModeStep;
 pub use detect_runtime::DetectRuntimeStep;
 pub use discover_dp::{dp_info_from_labels, DiscoverDpInfoStep};
 pub use discover_metadata::DiscoverMetadataStep;
-pub use drain_workers::{DrainWorkersStep, SettleDrainedWorkersStep};
+pub use drain_workers::{pin, DrainWorkersStep, Pin, SettleDrainedWorkersStep};
 pub use find_workers_to_remove::{FindWorkersToRemoveStep, WorkerRemovalRequest};
 pub use host::{require_host, WorkflowHost};
 pub use metadata::discover_engine_labels;

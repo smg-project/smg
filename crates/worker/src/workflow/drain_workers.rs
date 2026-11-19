@@ -9,7 +9,7 @@
 //! different incarnation and leaves the job, so the steps after this one
 //! touch nothing of it.
 
-use std::{sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use tracing::{debug, info};
@@ -21,8 +21,51 @@ use super::{
 };
 use crate::{
     identity::{basic::Worker, endpoint::Endpoint},
+    registry::{Generation, WorkerId, WorkerRegistry},
     worker::WorkerStatus,
 };
+
+/// What a removal's pins make of the worker at a URL in the live registry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Pin {
+    /// The registry holds no worker there.
+    Absent,
+    /// The id is missing from the supplied pins, so the worker is left alone.
+    LeftAlone,
+    /// The id and the revision to check, either pinned or read from the registry.
+    Held { id: WorkerId, revision: u64 },
+}
+
+/// Read the removal's pin for a URL. A held revision still needs to be checked
+/// at the drain, since the worker can move after the pin was read.
+pub fn pin<G: Generation>(
+    registry: &WorkerRegistry<G>,
+    pins: Option<&HashMap<String, Option<u64>>>,
+    url: &str,
+) -> Pin {
+    let Some(id) = registry.get_id_by_url(url) else {
+        return Pin::Absent;
+    };
+    if let Some(pins) = pins {
+        match pins.get(id.as_str()) {
+            None => return Pin::LeftAlone,
+            Some(Some(revision)) => {
+                return Pin::Held {
+                    id,
+                    revision: *revision,
+                }
+            }
+            Some(None) => {}
+        }
+    }
+    match registry.get(&id) {
+        Some(worker) => Pin::Held {
+            id,
+            revision: worker.revision(),
+        },
+        None => Pin::Absent,
+    }
+}
 
 /// Step that transitions Ready workers to `Draining` and waits for the
 /// resolved drain settle window before downstream steps remove them.
@@ -91,42 +134,23 @@ impl<H: WorkflowHost> StepExecutor<WorkerRemovalWorkflowData<H>> for DrainWorker
             // otherwise bypass the drain and start serving traffic up until
             // the remove step runs.
             let url = snapshot.url();
-            let Some(worker_id) = registry.get_id_by_url(url) else {
-                debug!(
-                    "Worker {} not in registry, skipping drain transition",
-                    Endpoint::redacted_str(url)
-                );
-                kept.push(Arc::clone(snapshot));
-                continue;
-            };
-            // The pin the selection passed for this id: absent from the map,
-            // the id is a registration under the URL since the selection;
-            // pinned at no revision (a `DELETE`'s), the id as it stands;
-            // pinned at a revision, that build of it.
-            let pinned_revision = match pins.map(|pins| pins.get(worker_id.as_str()).copied()) {
-                Some(None) => {
+            let (worker_id, revision) = match pin(registry, pins, url) {
+                Pin::Absent => {
+                    debug!(
+                        "Worker {} not in registry, skipping drain transition",
+                        Endpoint::redacted_str(url)
+                    );
+                    kept.push(Arc::clone(snapshot));
+                    continue;
+                }
+                Pin::LeftAlone => {
                     debug!(
                         "Worker {} was registered under the URL after the removal's selection, left alone",
                         Endpoint::redacted_str(url)
                     );
                     continue;
                 }
-                Some(Some(pinned)) => pinned,
-                None => None,
-            };
-            let revision = match pinned_revision {
-                Some(revision) => revision,
-                None => {
-                    let Some(current) = registry.get(&worker_id) else {
-                        debug!(
-                            "Worker {} disappeared from registry, skipping drain transition",
-                            Endpoint::redacted_str(url)
-                        );
-                        kept.push(Arc::clone(snapshot));
-                        continue;
-                    };
-                    current.revision()
-                }
+                Pin::Held { id, revision } => (id, revision),
             };
             // Check Ready under the same lock as the write so a probe's
             // demotion stands. Keep the worker from inside the lock so the
@@ -147,7 +171,10 @@ impl<H: WorkflowHost> StepExecutor<WorkerRemovalWorkflowData<H>> for DrainWorker
                 // pass re-evaluates it). A worker gone altogether stays the
                 // job's, as a worker gone under any other pin does: the
                 // registry step finds nothing and the policy step prunes it.
-                None => match (pinned_revision, registry.get(&worker_id)) {
+                None => match (
+                    pins.and_then(|pins| pins.get(worker_id.as_str()).copied().flatten()),
+                    registry.get(&worker_id),
+                ) {
                     (Some(pinned), Some(current)) => debug!(
                         worker_url = %Endpoint::redacted_str(url),
                         pinned_revision = pinned,
@@ -193,6 +220,38 @@ mod tests {
     };
 
     type WorkerRemovalWorkflowData = super::WorkerRemovalWorkflowData<RegistryHost>;
+
+    #[test]
+    fn a_removals_pins_are_read_in_one_place() {
+        let url = "http://worker:8000";
+        let worker = build_worker(url, 0, WorkerStatus::Ready);
+        let host = make_host(&[Arc::clone(&worker)]);
+        let registry = host.worker_registry();
+        let id = registry.get_id_by_url(url).expect("the registered worker");
+        let revision = worker.revision();
+        let mut pins = HashMap::new();
+
+        assert_eq!(pin(registry, Some(&pins), "http://absent"), Pin::Absent);
+        assert_eq!(pin(registry, Some(&pins), url), Pin::LeftAlone);
+        pins.insert(id.as_str().to_owned(), Some(revision + 1));
+        assert_eq!(
+            pin(registry, Some(&pins), url),
+            Pin::Held {
+                id: id.clone(),
+                revision: revision + 1,
+            }
+        );
+        pins.insert(id.as_str().to_owned(), None);
+        for pins in [Some(&pins), None] {
+            assert_eq!(
+                pin(registry, pins, url),
+                Pin::Held {
+                    id: id.clone(),
+                    revision,
+                }
+            );
+        }
+    }
 
     fn build_worker(url: &str, drain_secs: u64, status: WorkerStatus) -> Arc<dyn Worker> {
         let worker: Arc<dyn Worker> = Arc::new(
@@ -357,6 +416,7 @@ mod tests {
         data.drained_workers.push(Arc::clone(&drained));
 
         let saved = serde_json::json!({
+            "asker": "Api",
             "config": {"url": url, "expected_revisions": null},
             "asker": "Api",
             "workers_to_remove": {"worker_urls": [url]},
