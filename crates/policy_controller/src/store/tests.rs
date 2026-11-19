@@ -662,7 +662,7 @@ fn a_new_row_takes_its_maker_and_a_standing_row_keeps_it() {
     use super::Maker;
 
     let store = MemoryStore::new();
-    let found = Maker::provider("cluster", "pods/a");
+    let found = Maker::provider("cluster", "pods/a").expect("a whole maker");
     let id = store
         .upsert_by(facts("http://w:8000", 1), found.clone())
         .id();
@@ -683,6 +683,18 @@ fn a_new_row_takes_its_maker_and_a_standing_row_keeps_it() {
     let by_hand = store.upsert(facts("http://x:8000", 1)).id();
     let held = WorkersStore::get(&store, by_hand).expect("the row");
     assert_eq!(held.maker, Maker::Control);
+}
+
+#[test]
+fn a_providers_maker_names_its_provider_and_its_key() {
+    use super::Maker;
+
+    assert_eq!(Maker::provider("", "pods/a"), None);
+    assert_eq!(Maker::provider("cluster", ""), None);
+    let Some(Maker::Provider(found)) = Maker::provider("cluster", "pods/a") else {
+        panic!("a maker of both parts is made");
+    };
+    assert_eq!((found.provider(), found.key()), ("cluster", "pods/a"));
 }
 
 #[test]

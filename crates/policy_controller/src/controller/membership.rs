@@ -31,12 +31,14 @@
 //! **A row has one maker** ([`Maker`]): the caller whose registration put
 //! it there, a control call or a provider that finds workers by itself. The
 //! door writes it at a registration and keeps it while the URL's
-//! registration stands. A registration over a standing row, a patch, a
-//! drain and a removal are refused where their caller is not the row's
-//! maker, whole: a control call changes nothing of a provider's row, a
-//! provider nothing of a control call's or of another's. The refusal names
-//! the maker and never the URL. The control scope's three calls are a
-//! control call's; a provider's step writes through the same turn.
+//! registration stands. An upsert or a replacement over a standing row, a
+//! patch, a drain and a removal are refused where their caller is not the
+//! row's maker, whole: a control call changes nothing of a provider's row,
+//! a provider nothing of a control call's or of another's. The refusal
+//! names the maker and never the URL, and it comes ahead of the revision's
+//! test. An add changes no standing row: it is refused as already there,
+//! whoever made the row. The control scope's three calls are a control
+//! call's; a provider's step writes through the same turn.
 //!
 //! **Every life of a URL has a number of its own:** the leader's term above the
 //! store's epoch when the door numbered it, counted from a base the door
@@ -108,7 +110,7 @@ fn made_by(row: &WorkerRow, caller: &Maker) -> Result<(), Status> {
             "the row was made by a control call: its maker alone changes it".to_owned()
         }
         Maker::Provider(found) => {
-            let provider = &found.provider;
+            let provider = found.provider();
             format!(
                 "the row is provider {provider}'s: its worker is changed at the provider's source"
             )
@@ -288,6 +290,8 @@ impl Door {
             }));
         }
         let old = match (mode, standing) {
+            // An add changes no standing row, so it asks no maker: its
+            // refusal is the same whoever made the row.
             (Mode::Add, Some(row)) => {
                 return Err(Status::already_exists(format!(
                     "the URL is registered as worker {:016x} at revision {}",
@@ -1077,7 +1081,7 @@ pub(crate) mod tests {
 
     /// A provider's maker for one worker.
     fn found(key: &str) -> Maker {
-        Maker::provider("cluster", key)
+        Maker::provider("cluster", key).expect("a whole maker")
     }
 
     #[test]
@@ -1211,7 +1215,8 @@ pub(crate) mod tests {
         // A row holds its maker inside the wire's bound. The widest key a row
         // of this spec has room for is registered; one byte more is refused
         // by the row's name, and so is a patch of the row at its brim.
-        let wide = |bytes: usize| Maker::provider("cluster", "k".repeat(bytes));
+        let wide =
+            |bytes: usize| Maker::provider("cluster", "k".repeat(bytes)).expect("a whole maker");
         let third = "grpc://10.0.0.7:8000";
         let (stated, _) = worker_wire::registration(&spec(third), |_| None).expect("the facts");
         let fits =
@@ -1272,6 +1277,29 @@ pub(crate) mod tests {
         refused(door.remove(&operator(), &maker, &leave), "a control call");
         door.deregister(&operator(), under(TERM), &leave)
             .expect("the control call removes its row");
+    }
+
+    #[test]
+    fn an_add_over_a_standing_row_is_already_there_whoever_made_it() {
+        let (store, door) = door();
+        let maker = found("pods/a");
+        door.upsert(&operator(), &maker, TERM, &ask(spec(URL), Mode::Upsert))
+            .expect("found");
+        let other = "grpc://10.0.0.6:8000";
+        door.register(&operator(), under(TERM), &ask(spec(other), Mode::Add))
+            .expect("registered");
+        let epoch = store.epoch();
+        let there = |answer: Result<proto::WorkerEvent, Status>| {
+            let status = answer.expect_err("refused");
+            assert_eq!(status.code(), Code::AlreadyExists, "{status:?}");
+        };
+        // An add asks no maker: a control call's and a provider's read the
+        // same over a provider's row and over a control call's.
+        for url in [URL, other] {
+            there(door.register(&operator(), under(TERM), &ask(spec(url), Mode::Add)));
+            there(door.upsert(&operator(), &maker, TERM, &ask(spec(url), Mode::Add)));
+        }
+        assert_eq!(store.epoch(), epoch);
     }
 
     #[test]

@@ -1682,7 +1682,7 @@ fn a_followed_row_keeps_the_maker_its_leader_wrote() {
 
     let (standby, followed) = journaled(64);
     let at = |seq| Position { seq, term: 1 };
-    let found = Maker::provider("cluster", "pods/a");
+    let found = Maker::provider("cluster", "pods/a").expect("a whole maker");
     let row = WorkerRow {
         id: identity("http://a:8000", 1),
         facts: facts("http://a:8000", 1),

@@ -154,8 +154,8 @@ fn maker(maker: &Maker) -> Option<proto::Maker> {
     match maker {
         Maker::Control => None,
         Maker::Provider(found) => Some(proto::Maker {
-            provider: found.provider.clone(),
-            key: found.key.clone(),
+            provider: found.provider().to_owned(),
+            key: found.key().to_owned(),
         }),
     }
 }
@@ -357,33 +357,31 @@ fn fits(
 /// The bytes a row's maker takes on the wire, under the contract's field
 /// numbers: none for a control call's row.
 fn made(maker: &Maker) -> usize {
-    use prost::encoding::{encoded_len_varint, key_len, string};
+    use prost::encoding::{encoded_len_varint, key_len};
     let Maker::Provider(found) = maker else {
         return 0;
     };
-    let text = |tag: u32, text: &String| {
-        if text.is_empty() {
-            0
-        } else {
-            string::encoded_len(tag, text)
-        }
-    };
-    let inner = text(1, &found.provider) + text(2, &found.key);
-    key_len(27) + encoded_len_varint(u64::try_from(inner).unwrap_or(u64::MAX)) + inner
+    // A length's own bytes, and a text under its tag: neither of a maker's
+    // two is empty.
+    let length = |bytes: usize| encoded_len_varint(u64::try_from(bytes).unwrap_or(u64::MAX));
+    let text = |tag: u32, text: &str| key_len(tag) + length(text.len()) + text.len();
+    let inner = text(1, found.provider()) + text(2, found.key());
+    key_len(27) + length(inner) + inner
 }
 
 /// Refuses, by `path`, a row of these facts under `labels` that passes
 /// [`ROW_BYTES`] with its maker: the facts' own bound ([`fits`]) is told
 /// where they are read, and a provider's row holds its maker inside the
-/// same bound. A control call's row has no maker on the wire, so this
-/// refuses none the facts' bound let through.
+/// same bound. A control call's row has no maker on the wire: the facts'
+/// bound spoke for it where they were read, and it is not weighed again.
 pub(crate) fn room(
     facts: &WorkerFacts,
     labels: &BTreeMap<String, String>,
     maker: &Maker,
     path: &'static str,
 ) -> Result<(), Refused> {
-    if weight(facts, labels) + made(maker) > ROW_BYTES {
+    let made = made(maker);
+    if made > 0 && weight(facts, labels) + made > ROW_BYTES {
         return Err(refused(path, "a row is at most 16384 bytes on the wire"));
     }
     Ok(())
@@ -643,13 +641,21 @@ pub(crate) fn told_row(told: &proto::WorkerRow, now: Instant) -> Result<WorkerRo
     };
     let maker = match &told.maker {
         None => Maker::Control,
-        Some(maker) if maker.provider.is_empty() => {
-            return Err(refused(
-                "row.maker.provider",
-                "a provider's row names its provider",
-            ));
-        }
-        Some(maker) => Maker::provider(maker.provider.clone(), maker.key.clone()),
+        Some(by) => match Maker::provider(by.provider.clone(), by.key.clone()) {
+            Some(maker) => maker,
+            None if by.provider.is_empty() => {
+                return Err(refused(
+                    "row.maker.provider",
+                    "a provider's row names its provider",
+                ));
+            }
+            None => {
+                return Err(refused(
+                    "row.maker.key",
+                    "a provider's row names its key for the worker",
+                ));
+            }
+        },
     };
     let age = Duration::from_millis(told.admitted_age_ms);
     Ok(WorkerRow {
@@ -2600,7 +2606,7 @@ mod tests {
         // A provider's row crosses whole: its name and its key for the
         // worker.
         let found = WorkerRow {
-            maker: Maker::provider("cluster", "pods/a"),
+            maker: Maker::provider("cluster", "pods/a").expect("a whole maker"),
             ..full()
         };
         let told = row(&found);
@@ -2614,8 +2620,8 @@ mod tests {
         // The maker's bytes are the wire's, at a key's length on each
         // side of a length's second byte, and a row holds them inside its
         // bound.
-        for bytes in [0, 1, 110, 127, 128, 300] {
-            let maker = Maker::provider("cluster", "k".repeat(bytes));
+        for bytes in [1, 110, 127, 128, 300] {
+            let maker = Maker::provider("cluster", "k".repeat(bytes)).expect("a whole maker");
             let with = WorkerRow {
                 maker: maker.clone(),
                 ..full()
@@ -2638,16 +2644,24 @@ mod tests {
             ..found.clone()
         };
         assert!(row(&widest).encoded_len() <= ROW_BYTES);
-        // A maker that names no provider is refused by its path.
-        let nameless = proto::WorkerRow {
-            maker: Some(proto::Maker {
-                provider: String::new(),
-                key: "pods/a".to_owned(),
-            }),
-            ..told
-        };
-        let refusal = told_row(&nameless, now).expect_err("refused");
-        assert_eq!(refusal.path, "row.maker.provider");
+        // A maker that lacks its provider or its key is refused by the
+        // part's path, and no leader makes one.
+        for (provider, key, path) in [
+            ("", "pods/a", "row.maker.provider"),
+            ("cluster", "", "row.maker.key"),
+            ("", "", "row.maker.provider"),
+        ] {
+            let lacking = proto::WorkerRow {
+                maker: Some(proto::Maker {
+                    provider: provider.to_owned(),
+                    key: key.to_owned(),
+                }),
+                ..told.clone()
+            };
+            let refusal = told_row(&lacking, now).expect_err("refused");
+            assert_eq!(refusal.path, path);
+            assert_eq!(Maker::provider(provider, key), None);
+        }
     }
 
     #[test]

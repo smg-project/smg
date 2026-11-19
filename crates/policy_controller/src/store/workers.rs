@@ -199,22 +199,36 @@ pub enum Maker {
 }
 
 impl Maker {
-    /// The maker `provider` is for the worker it knows by `key`.
-    pub fn provider(provider: impl Into<String>, key: impl Into<String>) -> Self {
-        Self::Provider(Arc::new(ProviderKey {
-            provider: provider.into(),
-            key: key.into(),
-        }))
+    /// The maker `provider` is for the worker it knows by `key`. `None`
+    /// where either is empty: a provider's maker names both, and a
+    /// follower refuses a row made under less.
+    pub fn provider(provider: impl Into<String>, key: impl Into<String>) -> Option<Self> {
+        let (provider, key) = (provider.into(), key.into());
+        if provider.is_empty() || key.is_empty() {
+            return None;
+        }
+        Some(Self::Provider(Arc::new(ProviderKey { provider, key })))
     }
 }
 
-/// A provider's name with its own key for one worker.
+/// A provider's name with its own key for one worker, neither empty:
+/// [`Maker::provider`] alone makes one.
 #[derive(Debug, PartialEq, Eq)]
 pub struct ProviderKey {
+    provider: String,
+    key: String,
+}
+
+impl ProviderKey {
     /// The provider's name.
-    pub provider: String,
+    pub fn provider(&self) -> &str {
+        &self.provider
+    }
+
     /// The provider's own key for the worker.
-    pub key: String,
+    pub fn key(&self) -> &str {
+        &self.key
+    }
 }
 
 /// One worker as the store holds it.
