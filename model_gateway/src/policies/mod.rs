@@ -19,6 +19,9 @@ mod cache_namespace;
 mod classic_all_vetoed_rows;
 #[cfg(test)]
 #[expect(clippy::print_stdout, reason = "a recorder says where its sheet went")]
+mod classic_cache_aware_rows;
+#[cfg(test)]
+#[expect(clippy::print_stdout, reason = "a recorder says where its sheet went")]
 mod classic_manual_rows;
 #[cfg(test)]
 #[expect(clippy::print_stdout, reason = "a recorder says where its sheet went")]
