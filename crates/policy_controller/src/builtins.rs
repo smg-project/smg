@@ -248,13 +248,32 @@ impl RowTests {
 
 // ---------------------------------------------------------------- scorers
 
+/// The rows whose least and greatest cost are found by compares
+/// ([`normalize_costs`]): the ranks of one engine, the rows of a draw.
+const FEW_COSTS: usize = 16;
+
 /// Lower raw costs become higher normalized scores; equal costs score `1.0`.
 /// Returns the span of the costs, `0.0` when they are all equal.
 fn normalize_costs(out: &mut [f32]) -> f32 {
     let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
-    for &c in out.iter() {
-        lo = lo.min(c);
-        hi = hi.max(c);
+    if out.len() <= FEW_COSTS {
+        // A few rows, compared one by one: a cost that is no number moves
+        // neither end, as the fold below leaves them.
+        for &c in out.iter() {
+            if c < lo {
+                lo = c;
+            }
+            if c > hi {
+                hi = c;
+            }
+        }
+    } else {
+        // Many rows, folded: the minimum and the maximum take any order,
+        // so a step of the loop reads several rows.
+        for &c in out.iter() {
+            lo = lo.min(c);
+            hi = hi.max(c);
+        }
     }
     let span = hi - lo;
     let spread = span > 0.0 && span.is_finite();
@@ -511,11 +530,23 @@ impl SinceReport {
         // At its instant's place: a dispatch that waited for a retirement
         // on a shared lane, or one a stepped clock dated earlier, lands
         // behind a later one, and the release and the retirement read a
-        // lane from its oldest. Instants mostly rise, so this is a push.
-        let at = dispatches.partition_point(|&(held_at, _)| held_at <= at_micros);
-        dispatches.insert(at, (at_micros, tokens));
+        // lane from its oldest. Instants mostly rise, so the lane's newest
+        // is asked first: a dispatch no older than it is a push, and the
+        // place is searched for the one that is. The lane's front moves
+        // only where the dispatch lands there.
+        let newest = dispatches.back().map(|&(held_at, _)| held_at);
+        let front = if newest.is_some_and(|newest| newest > at_micros) {
+            let at = dispatches.partition_point(|&(held_at, _)| held_at <= at_micros);
+            dispatches.insert(at, (at_micros, tokens));
+            at == 0
+        } else {
+            dispatches.push_back((at_micros, tokens));
+            newest.is_none()
+        };
         self.held.fetch_add(Self::weight(tokens), Ordering::Relaxed);
-        lane.publish_oldest(&dispatches);
+        if front {
+            lane.publish_oldest(&dispatches);
+        }
         // Under the lane's lock: a release, which holds every lane, never
         // recomputes the row's oldest past this dispatch. Dispatch instants
         // mostly rise, so this is a read.
@@ -886,6 +917,46 @@ impl LeastLoad {
         (queued + running + credit_work) / drain + self.kv_pressure_weight * k / (1.0 - k)
     }
 
+    /// Costs the rows the first pass left pending, those with no report:
+    /// each from the reporting peers' baseline among the rows handed
+    /// ([`Self::unreported_cost`]). Out of line: a pool whose every row
+    /// reports pays for no second pass.
+    #[cold]
+    #[inline(never)]
+    fn cost_pending(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &[u32],
+        out: &mut [f32],
+        nominal: f32,
+        fleet_has_loads: bool,
+    ) {
+        let mut peer_baseline = 0.0;
+        if fleet_has_loads {
+            peer_baseline = out
+                .iter()
+                .copied()
+                .filter(|cost| *cost != PENDING)
+                .fold(f32::INFINITY, f32::min);
+            if !peer_baseline.is_finite() {
+                peer_baseline = 0.0;
+            }
+        }
+        with_counts!(facts, |counts| {
+            for (slot, &i) in out.iter_mut().zip(kept) {
+                if *slot == PENDING {
+                    *slot = self.unreported_cost(
+                        counts(&candidates[i as usize]),
+                        nominal,
+                        fleet_has_loads,
+                        peer_baseline,
+                    );
+                }
+            }
+        });
+    }
+
     /// The cost of a candidate without a report: the reporting peers' baseline
     /// plus its in-flight work, or the in-flight count alone when no peer
     /// reports.
@@ -961,30 +1032,9 @@ impl LeastLoad {
                 *slot = self.reported_cost(r, *slot, nominal);
             }
         }
-        let fleet_has_loads = reporting > 0;
-        let mut peer_baseline = 0.0;
-        if reporting < rows.len() && fleet_has_loads {
-            peer_baseline = out
-                .iter()
-                .copied()
-                .filter(|cost| *cost != PENDING)
-                .fold(f32::INFINITY, f32::min);
-            if !peer_baseline.is_finite() {
-                peer_baseline = 0.0;
-            }
+        if reporting < rows.len() {
+            self.cost_pending(facts, candidates, rows, out, nominal, reporting > 0);
         }
-        with_counts!(facts, |counts| {
-            for (slot, &i) in out.iter_mut().zip(rows) {
-                if *slot == PENDING {
-                    *slot = self.unreported_cost(
-                        counts(&candidates[i as usize]),
-                        nominal,
-                        fleet_has_loads,
-                        peer_baseline,
-                    );
-                }
-            }
-        });
         // The band of a microsecond of expected wait on the normalized scale:
         // exact for one scorer, additive under several.
         let span = normalize_costs(out);
@@ -1165,6 +1215,46 @@ impl ResidentWork {
     }
 }
 
+impl ResidentWork {
+    /// Costs the rows the first pass left pending, those with no report
+    /// that counts resident tokens: the best reporting peer among the rows
+    /// handed plus the row's requests in flight, or the requests alone
+    /// where no row reports. Out of line: a pool whose every row reports
+    /// pays for no second pass.
+    #[cold]
+    #[inline(never)]
+    fn cost_pending(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &[u32],
+        out: &mut [f32],
+        fleet_reports: bool,
+    ) {
+        let peer_baseline = if fleet_reports {
+            out.iter()
+                .copied()
+                .filter(|cost| *cost != PENDING)
+                .fold(f32::INFINITY, f32::min)
+        } else {
+            0.0
+        };
+        let in_flight_work = self.mean_prefill_tokens as f32 + self.request_tokens as f32;
+        with_counts!(facts, |counts| {
+            for (slot, &i) in out.iter_mut().zip(kept) {
+                if *slot == PENDING {
+                    let in_flight = counts(&candidates[i as usize]) as f32;
+                    *slot = if fleet_reports {
+                        peer_baseline + in_flight * in_flight_work
+                    } else {
+                        in_flight
+                    };
+                }
+            }
+        });
+    }
+}
+
 impl Lifecycle for ResidentWork {
     fn on_dispatched(
         &self,
@@ -1234,28 +1324,9 @@ impl Scorer for ResidentWork {
                 }
             });
         }
-        let fleet_reports = reporting > 0;
-        let peer_baseline = if fleet_reports && reporting < kept.len() {
-            out.iter()
-                .copied()
-                .filter(|cost| *cost != PENDING)
-                .fold(f32::INFINITY, f32::min)
-        } else {
-            0.0
-        };
-        let in_flight_work = self.mean_prefill_tokens as f32 + self.request_tokens as f32;
-        with_counts!(facts, |counts| {
-            for (slot, &i) in out.iter_mut().zip(kept) {
-                if *slot == PENDING {
-                    let in_flight = counts(&candidates[i as usize]) as f32;
-                    *slot = if fleet_reports {
-                        peer_baseline + in_flight * in_flight_work
-                    } else {
-                        in_flight
-                    };
-                }
-            }
-        });
+        if reporting < kept.len() {
+            self.cost_pending(facts, candidates, kept, out, reporting > 0);
+        }
         // The least-load scorer's band, on a score in tokens: equal work is
         // a tie, drawn by the picker.
         let span = normalize_costs(out);
@@ -2683,6 +2754,28 @@ mod tests {
 
     fn kept(n: u32) -> Vec<u32> {
         (0..n).collect()
+    }
+
+    /// The costs find the same ends by either way: a few rows are compared
+    /// one by one, many are folded, and a cost that is no number moves
+    /// neither end. So the same costs score the same bits among a few
+    /// rows and among many.
+    #[test]
+    fn a_few_costs_and_many_find_the_same_ends() {
+        // The cost that is no number stands last: no cost behind it could
+        // take an end back from it.
+        let few = [4.0, 2.0, 3.0, f32::NAN];
+        let mut some = few;
+        let span = normalize_costs(&mut some);
+        assert_eq!(span, 2.0);
+        assert_eq!(some[0].to_bits(), 0.0f32.to_bits());
+        assert_eq!((some[1], some[2]), (1.0, 0.5));
+        assert!(some[3].is_nan());
+        let mut many: Vec<f32> = few.iter().copied().chain([3.0; FEW_COSTS]).collect();
+        assert!(many.len() > FEW_COSTS);
+        assert_eq!(normalize_costs(&mut many), span);
+        let bits = |scores: &[f32]| scores.iter().map(|s| s.to_bits()).collect::<Vec<_>>();
+        assert_eq!(bits(&many[..few.len()]), bits(&some));
     }
 
     /// The engine's order around a picker: the set it compares, that set's
