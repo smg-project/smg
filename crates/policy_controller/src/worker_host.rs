@@ -41,8 +41,9 @@
 //! writes the store. An object built in the place of a standing one takes
 //! that one's running state, its status with it, and not its row's status.
 //! The id and the revision stand beside the object in the
-//! holder ([`Standing`]). No credential and no connector is a row's fact: the
-//! host that brings one hands it to the holder.
+//! holder ([`Standing`]). No credential and no connector is a row's fact. A
+//! host hands the holder its connector ([`Objects::with_connector`]); a
+//! credential has no door yet.
 //!
 //! # What the module does not hold
 //!

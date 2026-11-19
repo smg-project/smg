@@ -9,11 +9,12 @@ use std::{
 
 use parking_lot::{Mutex, RwLock};
 use smg_worker::{
+    connection::engine::EngineConnector,
     identity::basic::Worker,
     registry::{Generation, WorkerId as ObjectId, WorkerRegistry},
 };
 
-use super::object::object;
+use super::object::{builder, object};
 use crate::{
     store::{MembershipChange, MembershipTail, WorkerRow, WorkersStore},
     view::WorkerId,
@@ -99,6 +100,8 @@ struct Held {
 /// it. A reader on a hot path reads it there once and keeps it.
 pub struct Objects<G> {
     registry: Arc<WorkerRegistry<G>>,
+    /// What makes an object's engine connection, where the host handed one.
+    connector: Option<Arc<dyn EngineConnector>>,
     /// Where the last read ended. Held through a read: one follows at a
     /// time.
     read_to: Mutex<Place>,
@@ -119,9 +122,20 @@ impl<G: Generation> Objects<G> {
     pub fn new(registry: Arc<WorkerRegistry<G>>) -> Self {
         Self {
             registry,
+            connector: None,
             read_to: Mutex::new(Place::default()),
             held: RwLock::new(Held::default()),
         }
+    }
+
+    /// Hand every object built from here on `connector`, which makes its
+    /// engine connection. No row holds one: it is the host's. Without it an
+    /// object of a gRPC or a host-local worker refuses its connect, which
+    /// suits a host that reads no engine.
+    #[must_use]
+    pub fn with_connector(mut self, connector: Arc<dyn EngineConnector>) -> Self {
+        self.connector = Some(connector);
+        self
     }
 
     /// The registry the objects stand in.
@@ -291,7 +305,12 @@ impl<G: Generation> Objects<G> {
     /// new id where the row's URL holds no object, else in the place of the
     /// one that stands there, under its id and with its running state.
     fn lay(&self, row: &WorkerRow) {
-        let built = object(row);
+        let built: Arc<dyn Worker> = match &self.connector {
+            Some(connector) => {
+                Arc::new(builder(row).engine_connector(Arc::clone(connector)).build())
+            }
+            None => object(row),
+        };
         // The id first, then the entry, then the registry's write: its
         // event finds the entry.
         let id = self.registry.reserve_id_for_url(&row.facts.key);

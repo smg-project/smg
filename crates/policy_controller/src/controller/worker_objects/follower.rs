@@ -3,6 +3,7 @@
 
 use std::sync::Arc;
 
+use smg_grpc_client::engine_port::GrpcConnector;
 use smg_worker::registry::WorkerRegistry;
 use tokio::sync::watch;
 
@@ -14,7 +15,9 @@ use crate::{
 
 /// The replica's worker objects: their holder, the store it follows and the
 /// wake of its one task. The registry is built here, and the holder alone
-/// writes it.
+/// writes it. Each object connects to its engine through the engine clients'
+/// gRPC connector, so a worker of the host-local wire has no connection
+/// here.
 pub(crate) struct WorkerObjects {
     store: Arc<MemoryStore>,
     objects: Objects<Members>,
@@ -27,7 +30,8 @@ impl WorkerObjects {
     pub(crate) fn new(store: Arc<MemoryStore>, wake: ObjectsWake) -> Self {
         Self {
             store,
-            objects: Objects::new(Arc::new(WorkerRegistry::new())),
+            objects: Objects::new(Arc::new(WorkerRegistry::new()))
+                .with_connector(Arc::new(GrpcConnector)),
             wake,
         }
     }
@@ -63,7 +67,11 @@ impl WorkerObjects {
 mod tests {
     use std::{collections::BTreeMap, time::Instant};
 
-    use tokio::task::{yield_now, JoinSet};
+    use tokio::{
+        net::TcpListener,
+        sync::oneshot,
+        task::{yield_now, JoinSet},
+    };
 
     use super::*;
     use crate::{
@@ -76,7 +84,7 @@ mod tests {
         store::{
             Kinds, LeasesStore, Position, WorkerFacts, WorkerPatch, WorkerStatus, WorkersStore,
         },
-        view::WorkerId,
+        view::{WireModes, WorkerId},
     };
 
     const URL: &str = "http://w:8000";
@@ -305,6 +313,64 @@ mod tests {
             }
         }
         assert_eq!(replica.held(), replica.rows());
+        replica.stopped().await;
+    }
+
+    /// A row of a gRPC worker builds an object that reaches its engine. The
+    /// holder hands each object the gRPC connector, and the object's own
+    /// connection reads the engine's health, its model's labels and its load.
+    #[tokio::test]
+    async fn a_rows_object_reaches_its_engine_over_the_controllers_connector() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("a port");
+        let addr = listener.local_addr().expect("the port's address");
+        let config = mock_worker::config::Config {
+            grpc_base_port: addr.port(),
+            grpc_count: 1,
+            grpc_dp_size: 1,
+            grpc_wire: mock_worker::config::SchedulerWire::Vllm,
+            loads_like: mock_worker::engine::LoadsLike::Vllm,
+            realistic: true,
+            ..mock_worker::config::Config::default()
+        };
+        let model = config.model_id.clone();
+        let (stop, stopped) = oneshot::channel::<()>();
+        let mut engine = JoinSet::new();
+        engine.spawn(mock_worker::grpc::serve_with_listener_until(
+            Arc::new(config),
+            listener,
+            async move {
+                let _ = stopped.await;
+            },
+        ));
+
+        let replica = Replica::new();
+        replica.store.set_term(1);
+        let url = format!("http://{addr}");
+        replica.store.upsert(WorkerFacts {
+            key: url.clone(),
+            engine: url.clone(),
+            incarnation: 1,
+            models: vec![model.clone()],
+            dp_size: 1,
+            wire_modes: WireModes::GRPC,
+            engine_kind: "vllm".to_string(),
+            ..WorkerFacts::default()
+        });
+        replica.caught_up("the registration").await;
+        let registry = replica.workers.objects.registry();
+        let object = registry.get_by_url(&url).expect("the row's object");
+        let connection = object
+            .engine_connection()
+            .await
+            .expect("a connect")
+            .expect("a gRPC worker's connection");
+        assert!(connection.health_check().await.expect("a verdict"));
+        let labels = connection.model_labels().await.expect("the labels");
+        assert!(labels.values().any(|value| *value == model), "{labels:?}");
+        let loads = connection.get_loads().await.expect("a load answer");
+        assert_eq!(loads.dp_rank_count, 1);
+
+        drop(stop);
         replica.stopped().await;
     }
 }

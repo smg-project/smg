@@ -23,6 +23,12 @@ use crate::{
 /// The facts are taken apart with no rest pattern, so a fact added to the
 /// row does not build until this function and the table name it.
 pub fn object(row: &WorkerRow) -> Arc<dyn Worker> {
+    Arc::new(builder(row).build())
+}
+
+/// [`object`] before its build: what the holder builds from where its host
+/// handed it a connector, which no row holds.
+pub(super) fn builder(row: &WorkerRow) -> BasicWorkerBuilder {
     let WorkerFacts {
         key,
         engine,
@@ -73,12 +79,9 @@ pub fn object(row: &WorkerRow) -> Arc<dyn Worker> {
         spec.dp_rank = Some(usize::from(*dp_rank));
         spec.dp_size = Some(usize::from(*dp_size));
     }
-    Arc::new(
-        <BasicWorkerBuilder>::from_spec(spec)
-            .health_config(checks(health))
-            .status(status(row.status))
-            .build(),
-    )
+    <BasicWorkerBuilder>::from_spec(spec)
+        .health_config(checks(health))
+        .status(status(row.status))
 }
 
 /// The one wire an object speaks, of the set its row holds: gRPC first, then
