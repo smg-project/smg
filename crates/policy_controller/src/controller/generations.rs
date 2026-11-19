@@ -551,10 +551,17 @@ enum Handed {
     /// by a leader while the replica followed. So too where the source
     /// handed none.
     Stood,
-    /// It has not stood here since, by this build's digest of it.
-    Unstood(Digest),
+    /// It has not stood here since. The validator admitted it.
+    Unstood {
+        /// This build's digest of it.
+        digest: Digest,
+        /// Its own `generation` line, 0 where it states none. A digest
+        /// reads no line: a document that states a number stood only
+        /// where a generation of that number carried its digest.
+        line: u64,
+    },
     /// The file held no document that could stand: one a look could not
-    /// read or parse, or one a leader's pass refused.
+    /// read or parse, or one the validator's pass refused.
     Undigested,
 }
 
@@ -877,6 +884,9 @@ fn over_bound(document: &[u8]) -> Option<u64> {
 struct Checked {
     /// The document's digest.
     digest: Digest,
+    /// The document's own `generation` line as a claim, 0 where it states
+    /// none or where a record states the number.
+    line: u64,
     /// The generation the document validated into; `None` where it is the
     /// standing generation's document again, or in another form.
     next: Option<AppliedSpec>,
@@ -961,7 +971,11 @@ fn check(
     if line == 0 || line == standing {
         if standing_digest == Some(digest) {
             // The standing generation's document again, or in another form.
-            return Ok(Checked { digest, next: None });
+            return Ok(Checked {
+                digest,
+                line,
+                next: None,
+            });
         }
         if let (true, Some(standing_digest)) = (line != 0, standing_digest) {
             return Err(SpecRejected::ChangedUnderItsLine {
@@ -973,6 +987,7 @@ fn check(
     }
     Ok(Checked {
         digest,
+        line,
         next: Some(next),
     })
 }
@@ -1175,11 +1190,14 @@ impl Generations {
             // The file as it stands now. A document the pass refuses is
             // none that stood.
             *self.handed.lock() = match &checked {
-                Ok(checked) => Handed::Unstood(checked.digest),
+                Ok(checked) => Handed::Unstood {
+                    digest: checked.digest,
+                    line: checked.line,
+                },
                 Err(_) => Handed::Undigested,
             };
         }
-        let Checked { digest, next } = checked?;
+        let Checked { digest, next, .. } = checked?;
         let (standing, _) = standing;
         if let Some(outcome) = unread(standing) {
             return Ok(outcome);
@@ -1198,7 +1216,7 @@ impl Generations {
             if held.as_ref().is_none_or(|held| held.generation != standing) {
                 *held = Some(hold(standing));
             }
-            self.stands(digest);
+            self.stands(standing, digest);
             return Ok(Applied::Unchanged(standing));
         };
         let generation = next.generation();
@@ -1258,7 +1276,7 @@ impl Generations {
             // Under this lock, which the hand of a replica that follows
             // takes as well ([`Generations::shown`]): an entry and a hand
             // stand in one order.
-            self.stands(digest);
+            self.stands(generation, digest);
         }
         self.applied.fetch_add(1, Ordering::Relaxed);
         info!(
@@ -1309,7 +1327,7 @@ impl Generations {
         let standing = guard(world.spec(), expected)?;
         let mut needs = None;
         let would_run = self.pass(standing, document, format, self.line()).and_then(
-            |Checked { digest, next }| {
+            |Checked { digest, next, .. }| {
                 let before = needs_summary(world.spec().engine());
                 let Some(next) = next else {
                     // The standing document again: the feed stands.
@@ -1418,7 +1436,7 @@ impl Generations {
         let document = dir.read(newest).map_err(unreadable)?;
         let applied = dir.written(newest).map_err(unreadable)?;
         let rule = Line::Record(generation);
-        let Checked { digest, next } = self.pass(self.standing(), &document, format, rule)?;
+        let Checked { digest, next, .. } = self.pass(self.standing(), &document, format, rule)?;
         // Where the store runs this document already, none is entered.
         if let Some(next) = next {
             let kept = Held {
@@ -1550,7 +1568,7 @@ impl Generations {
         format: Format,
         rule: Line,
     ) -> Result<Written, SpecRejected> {
-        let Checked { digest, next } = self.pass(standing, &document, format, rule)?;
+        let Checked { digest, next, .. } = self.pass(standing, &document, format, rule)?;
         let Some(next) = next else {
             return Ok((standing.0, digest, None));
         };
@@ -1925,11 +1943,11 @@ impl Generations {
             return Err(SpecRejected::SecondSource);
         }
         let standing = self.standing();
-        let Checked { digest, next } = self.pass(standing, &document, format, Line::Claim)?;
+        let Checked { digest, line, next } = self.pass(standing, &document, format, Line::Claim)?;
         if let Some(next) = next {
             above(standing.0, next.generation())?;
         }
-        self.sourced(digest);
+        self.sourced(digest, line);
         *self.deferred.lock() = Some((document, format));
         self.file_sourced.store(true, Ordering::Relaxed);
         // Until the document lands a request is no decision: the unbound
@@ -2062,7 +2080,7 @@ impl Generations {
     /// none has none that waits.
     ///
     /// The source hands a document at its start, at a leader's look, and
-    /// at the look of a replica that follows, which hands the digest alone
+    /// at the look of a replica that follows, which applies nothing
     /// ([`Generations::shown`]). So the door holds the order of the file's
     /// moves and of the generations. A document that has not stood since
     /// its file took it is the newer word, a rollout's new file or a
@@ -2075,43 +2093,57 @@ impl Generations {
     }
 
     /// The file as a replica that follows found it at a look: the door is
-    /// told what the file holds, by the digest of its document, and
-    /// applies nothing. None of the bytes are kept: a take reads the file
-    /// again, under its own term, through the source's entry. `None` is a
-    /// file the look could not read, and a document that does not parse
-    /// has no digest either: both count as a document that never stood,
-    /// and the take tells them. A replica that follows says nothing of its
-    /// file. A leader's look that could read no file says so here as well,
-    /// behind its own telling of it.
+    /// told what the file holds and applies nothing. The document goes
+    /// through the validator's pass, as at a leader's read, and the door
+    /// keeps its digest and its own `generation` line. None of the bytes
+    /// are kept: a take reads the file again, under its own term, through
+    /// the source's entry. `None` is a file the look could not read. It, a
+    /// document that does not parse and one the pass refuses count as a
+    /// document that never stood, and the take tells them: equal digests
+    /// say nothing of a document that was not validated. A replica that
+    /// follows says nothing of its file. A leader's look that could read
+    /// no file says so here as well, behind its own telling of it.
     ///
-    /// The digest is compared with the standing generation's under the
+    /// The document is compared with the standing generation under the
     /// lock of the bytes held, which a generation enters under: the hand
-    /// and an entry stand in one order, whichever thread runs first.
+    /// and an entry stand in one order, whichever thread runs first. The
+    /// pass runs ahead of that lock: it takes its time.
     pub(crate) fn shown(&self, document: Option<&[u8]>, format: Format) {
-        let digest = document
-            .and_then(|document| holding(|| digested(document, format)).ok())
-            .map(|(_, digest)| digest);
+        let passed = document.and_then(|document| {
+            self.pass(self.standing(), document, format, Line::Claim)
+                .ok()
+        });
         let _entry = self.held.lock();
-        let standing = self.standing().1;
-        *self.handed.lock() = match digest {
-            Some(digest) if standing == Some(digest) => Handed::Stood,
-            Some(digest) => Handed::Unstood(digest),
+        let (number, standing) = self.standing();
+        *self.handed.lock() = match passed {
+            Some(Checked { digest, line, .. })
+                if standing == Some(digest) && (line == 0 || line == number) =>
+            {
+                Handed::Stood
+            }
+            Some(Checked { digest, line, .. }) => Handed::Unstood { digest, line },
             None => Handed::Undigested,
         };
     }
 
-    /// The source handed a document that passed, by its digest: it has
-    /// not stood here since.
-    fn sourced(&self, digest: Digest) {
-        *self.handed.lock() = Handed::Unstood(digest);
+    /// The source handed a document that passed, by its digest and its
+    /// own line: it has not stood here since.
+    fn sourced(&self, digest: Digest, line: u64) {
+        *self.handed.lock() = Handed::Unstood { digest, line };
     }
 
-    /// A document stands on this replica, by its digest: the source's last
-    /// one stood, where it is that one. The caller holds the lock of the
-    /// bytes held.
-    fn stands(&self, digest: Digest) {
+    /// A document stands on this replica under `generation`, by its
+    /// digest: the source's last one stood, where it is that one. A
+    /// document that states its own number is that one under that number
+    /// alone. The caller holds the lock of the bytes held.
+    fn stands(&self, generation: u64, digest: Digest) {
         let mut handed = self.handed.lock();
-        if *handed == Handed::Unstood(digest) {
+        let stood = matches!(
+            *handed,
+            Handed::Unstood { digest: held, line }
+                if held == digest && (line == 0 || line == generation)
+        );
+        if stood {
             *handed = Handed::Stood;
         }
     }
@@ -2222,6 +2254,7 @@ impl Generations {
             Ok(Checked {
                 digest,
                 next: Some(next),
+                ..
             }) => (digest, next),
             Ok(Checked { next: None, .. }) => return Ok(following(applying, None)),
             Err(rejected) => {

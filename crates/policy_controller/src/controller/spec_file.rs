@@ -26,9 +26,10 @@
 //!
 //! Under a shared lease the watch looks whether its replica leads or
 //! follows. A leader's look hands the document to the door, which applies
-//! it. The look of a replica that follows hands the door the document's
-//! digest alone ([`Generations::shown`]): nothing is applied, and nothing is
-//! said of a file that cannot be read or does not parse. So the door knows
+//! it. The look of a replica that follows shows the door the document
+//! ([`Generations::shown`]): the door passes it and keeps none of its
+//! bytes, nothing is applied, and nothing is said of a file that cannot be
+//! read or does not run. So the door knows
 //! whether the file moved before or after the generations its replica
 //! followed, and a take runs the file only where it holds the newer word.
 //!
@@ -1944,6 +1945,49 @@ pub(crate) mod tests {
         assert_eq!(file.poll(), Look::Shown);
         assert_eq!(file.poll(), Look::Same, "shown once");
         assert_eq!((bed.generation(), bed.rejected()), before);
+    }
+
+    /// A file that states its own generation stood only under that number:
+    /// a digest reads no line. The standby's file states 10, and its
+    /// leader runs the same document as generation 1 and then replaces it.
+    /// The take reads the file, and its higher claim runs.
+    #[test]
+    fn a_numbered_file_above_the_generations_it_followed_runs_at_the_take() {
+        let numbered = with_line(LEAST_LOAD, 10);
+        let bed = bed(&numbered);
+        let (mut file, mut elector) = standby(&bed);
+        follow(&bed, &[LEAST_LOAD]);
+        follow(&bed, &[LEAST_LOAD, RANDOM]);
+        assert_eq!(bed.generation(), 2);
+        elector.tick(Instant::now()).expect("a take");
+        assert_eq!(settle(&mut file), Ok(Applied::Generation(10)));
+        assert_eq!(bed.answered().2, numbered);
+        assert_eq!(bed.rejected(), 0);
+    }
+
+    /// A file the validator refuses never stood, whatever its digest. The
+    /// standby's file gains a `kind` line, which no digest reads, under the
+    /// document its replica runs. The take reads the file and tells the
+    /// refusal once, and the running generation stays.
+    #[test]
+    fn a_file_the_validator_refuses_is_told_at_the_take_though_its_digest_stands() {
+        let bed = bed(LEAST_LOAD.as_bytes());
+        let (mut file, mut elector) = standby(&bed);
+        follow(&bed, &[LEAST_LOAD]);
+        shown(
+            &bed,
+            &mut file,
+            format!("kind: PolicySpec\n{LEAST_LOAD}").as_bytes(),
+        );
+        elector.tick(Instant::now()).expect("a take");
+        assert_eq!(
+            settle(&mut file),
+            Err(SpecRejected::Invalid(SpecError::Kind(
+                "PolicySpec".to_owned()
+            )))
+        );
+        assert_eq!((bed.rejected(), bed.generation()), (1, 1));
+        assert_eq!(file.poll(), Look::Same, "told once");
     }
 
     /// A mount one step behind. The standby's file takes the first of two
