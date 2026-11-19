@@ -6,7 +6,9 @@
 //! feed before any request exists.
 //!
 //! The document has an `apiVersion` and no `kind`: its forms are a file and
-//! the API. An unknown field is refused by name, never ignored. A field this
+//! the API. An unknown field is refused by name, never ignored. The one
+//! exception is the parameters of a scorer a host registers, which its
+//! factory's own type reads ([`crate::StageBuild::params`]). A field this
 //! build cannot honour yet (a stage, a plan, a matcher or a binding rule of a
 //! later step) is checked in shape like every other field and then refused
 //! by name as not in this build, so a document written against the published
@@ -869,8 +871,8 @@ impl From<ScoreStage> for ScoreSpec {
 
 /// What a document wrote under a registered scorer's name, written with
 /// the keys of every map in order: the canonical bytes, and so the digest,
-/// are the same whatever order a file wrote the keys in. The value keeps
-/// the written order for the factory that reads it.
+/// are the same whatever order a file wrote the keys in. The validator
+/// hands a factory its parameters in that order too.
 struct Ordered<'a>(&'a serde_json::Value);
 
 impl Serialize for Ordered<'_> {
@@ -2523,6 +2525,13 @@ fn scored(
                 Some(value) => check_added_weight(&value, &at)?,
                 None => 1.0,
             };
+            // One order for the factory, the canonical bytes and the
+            // digest: the keys of every map in order, whatever order the
+            // document wrote them in.
+            params.sort_keys();
+            params
+                .values_mut()
+                .for_each(serde_json::Value::sort_all_objects);
             let scorer = build(&mut StageBuild::new(&params)).map_err(|error| error.at(&at.0))?;
             let answers = scorer.name();
             if answers != name {

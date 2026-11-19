@@ -106,11 +106,11 @@ profiles:
     pick: best
 ```
 
-A scorer in code takes a weight from the document and nothing else:
-`- pack: { weight: 2 }`. A bare name weighs one. Settings of your own are
-your binary's: read them in `main`, from the environment or a file, and move
-them into the factory. The command line is the crate's, and it refuses a flag
-it does not know.
+`Pack` takes a weight from the document and nothing else:
+`- pack: { weight: 2 }`. A bare name weighs one. A scorer with settings of
+its own registers with `scorer_with` and reads them from the document as
+typed parameters: the crate's README shows one. The command line is the
+crate's, and it refuses a flag it does not know.
 
 The stock `not-overloaded` filter is where `pack` stops filling a worker. It
 drops a worker whose engine the store judges overloaded: the queue or the
@@ -221,8 +221,9 @@ repository of your own needs its tag.
 
 ## What it leaves out
 
-- Parameters. A stage in code takes none from the document beyond a scorer's
-  weight.
+- Parameters. `Pack` takes none from the document beyond its weight. A scorer
+  registered with `scorer_with` reads typed parameters, and a filter and a
+  picker take none yet.
 - A filter and a picker. They register as the scorer does.
 - State. `Lifecycle` reports what became of each decision to a scorer that
   learns from it. `Pack` reads the view alone.
