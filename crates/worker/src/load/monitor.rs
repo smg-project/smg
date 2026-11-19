@@ -610,17 +610,20 @@ impl<G: Generation> WorkerMonitor<G> {
             .unwrap_or(received_at);
         let url = worker.url();
         // The stream pushes: silence from this worker is judged by the
-        // stream's cadence from now on (`liveness`, the stale rule). Its
-        // status is read from the same state, for the series below.
-        let ready = if let Some(state) = worker.runtime_state() {
+        // stream's cadence from now on (`liveness`, the stale rule).
+        let runtime = worker.runtime_state();
+        if let Some(state) = &runtime {
             state.note_load_record();
-            state.status() == WorkerStatus::Ready
-        } else {
-            worker.status() == WorkerStatus::Ready
-        };
+        }
         // A worker's entry is made on its first record; the lookup that
         // finds it copies no key.
         let mut reports = self.pushed_reports.lock();
+        // The status is read under this hold, for the series below. A
+        // leave's eviction takes the hold behind the status's change: a
+        // record behind that eviction reads the change, and one ahead of
+        // it has its series under the sentinel the eviction writes.
+        let ready =
+            runtime.map_or_else(|| worker.status(), |state| state.status()) == WorkerStatus::Ready;
         if !reports
             .get(url)
             .is_some_and(|file| Arc::ptr_eq(&file.pusher, worker))
@@ -1333,17 +1336,10 @@ impl<G: Generation> WorkerMonitor<G> {
     /// a no-op: the worker series store dropped the series with the
     /// registration. A same-URL replacement that already republished keeps
     /// its entry, and its series continues uninterrupted. So does a worker
-    /// that left `Ready`, came back and published again ahead of the flush.
-    /// One that came back and has yet to publish loses its old entry and
-    /// gets no sentinel: its feed is live again.
+    /// that left `Ready` and came back ahead of the flush: the batch does
+    /// not evict it, and no sentinel lands over what it wrote since.
     pub(crate) fn flush_pending_evictions(&self) {
         for worker in self.load_state.apply_pending_evictions() {
-            // A worker that is the registry's `Ready` worker again may have
-            // written its series since its return: a sentinel would land
-            // over that record.
-            if self.load_state.is_current_incarnation(&worker) {
-                continue;
-            }
             // A worker can serve multiple models (one load group per model),
             // so sentinel every model's series — not just the primary.
             let dp_size = worker.dp_size().unwrap_or(1);

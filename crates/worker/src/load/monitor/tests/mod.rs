@@ -2523,9 +2523,9 @@ async fn a_refused_publish_leaves_the_old_row_to_the_eviction() {
 }
 
 /// A queued eviction can be applied between a returned worker's first
-/// record and its publish. It removes the row from before the leave and
-/// writes no sentinel: the worker is the registry's `Ready` worker again,
-/// and its series reads the record made since.
+/// record and its publish. It evicts nothing and writes no sentinel: the
+/// worker is the registry's `Ready` worker again, and its series reads the
+/// record made since.
 #[tokio::test]
 async fn a_batch_ahead_of_a_returned_workers_publish_writes_no_sentinel() {
     let rendered = render_with_recorder(|| {
@@ -2559,6 +2559,33 @@ async fn a_leave_handled_behind_the_workers_return_forgets_nothing() {
     settle().await;
 
     assert!(!told_to_forget(&sink, "http://w:1"));
+}
+
+/// A worker can leave `Ready`, come back ahead of the batch and leave
+/// again before it reports. The batch evicts no worker that is `Ready`
+/// again, so the row from before the first leave stands for the second
+/// eviction, which removes it and writes the sentinel of the series.
+#[tokio::test]
+async fn a_second_leave_ahead_of_any_report_still_writes_the_sentinel() {
+    let rendered = render_with_recorder(|| {
+        let (registry, monitor) = build_monitor();
+        let worker = ready_worker("http://w:1", "m");
+        let id = registry.register(Arc::clone(&worker)).unwrap();
+        monitor.apply_pushed_load(&worker, 0, &pushed(7), Instant::now());
+        monitor.flush_pushed();
+        registry.transition_status(&id, WorkerStatus::NotReady);
+        monitor.evict_worker_loads(&worker);
+        registry.transition_status(&id, WorkerStatus::Ready);
+        monitor.flush_pending_evictions();
+        assert_eq!(published_rows(&monitor), vec![(0, 7)], "not evicted");
+
+        registry.transition_status(&id, WorkerStatus::NotReady);
+        monitor.evict_worker_loads(&worker);
+        monitor.flush_pending_evictions();
+
+        assert!(monitor.load_state.snapshot().get("http://w:1").is_none());
+    });
+    assert!(running_series(&rendered).ends_with(" -1"), "{rendered}");
 }
 
 /// A pusher that left `Ready` while registry events were lost stays
