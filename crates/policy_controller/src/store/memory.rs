@@ -21,7 +21,7 @@ use crate::{
     lease::{LeaseId, Lifecycle, Membership, Outcome, ReleaseReason, Side, TransportClass},
     spec::AppliedSpec,
     store::{
-        health::{HealthSink, VetoWrite},
+        health::{HealthSink, HealthWrite, VetoWrite},
         index::{indexed_under, KvEvent, KvTables, LaneCounts},
         journal::{Journal, Kinds, Position},
         kv_events::{BatchFacts, BatchOutcome, KvCursor, KvEventSink, ResyncReason},
@@ -1200,6 +1200,17 @@ impl Workers {
             .get_mut(&id)
             .filter(|row| row.row.revision == revision)
     }
+
+    /// What a health write says where [`Self::guarded`] gave no row: stale
+    /// where a row stands under another revision, gone where none stands.
+    /// Either way the write was judged against nothing.
+    fn unjudged(&self, id: WorkerId) -> HealthWrite {
+        if self.rows.contains_key(&id) {
+            HealthWrite::Stale
+        } else {
+            HealthWrite::Gone
+        }
+    }
 }
 
 /// Tells the journal, at its drop, that a write's locks are let go
@@ -1654,32 +1665,37 @@ fn next_status(row: &mut Row, ok: bool) -> Option<WorkerStatus> {
 }
 
 impl HealthSink for MemoryStore {
-    fn probe_outcome(
-        &self,
-        id: WorkerId,
-        ok: bool,
-        revision: u64,
-    ) -> Option<(WorkerStatus, WorkerStatus)> {
+    fn probe_outcome(&self, id: WorkerId, ok: bool, revision: u64) -> HealthWrite {
         let mut workers = self.writing();
-        let row = workers.guarded(id, revision)?;
+        let Some(row) = workers.guarded(id, revision) else {
+            return workers.unjudged(id);
+        };
         let from = row.row.status;
-        let to = next_status(row, ok)?;
-        workers.set_status(id, to)?;
+        let Some(to) = next_status(row, ok) else {
+            return HealthWrite::Stood(from);
+        };
+        if workers.set_status(id, to).is_none() {
+            return HealthWrite::Stood(from);
+        }
         self.show_status(id, to);
-        Some((from, to))
+        HealthWrite::Moved(from, to)
     }
 
-    fn connected(&self, id: WorkerId, revision: u64) -> Option<(WorkerStatus, WorkerStatus)> {
+    fn connected(&self, id: WorkerId, revision: u64) -> HealthWrite {
         let mut workers = self.writing();
-        let row = workers.guarded(id, revision)?;
+        let Some(row) = workers.guarded(id, revision) else {
+            return workers.unjudged(id);
+        };
         let from = row.row.status;
         if matches!(from, WorkerStatus::Draining | WorkerStatus::Ready) {
-            return None;
+            return HealthWrite::Stood(from);
         }
         row.probes = Probes::default();
-        workers.set_status(id, WorkerStatus::Ready)?;
+        if workers.set_status(id, WorkerStatus::Ready).is_none() {
+            return HealthWrite::Stood(from);
+        }
         self.show_status(id, WorkerStatus::Ready);
-        Some((from, WorkerStatus::Ready))
+        HealthWrite::Moved(from, WorkerStatus::Ready)
     }
 
     fn gateway_veto(&self, gateway: GatewayId, id: WorkerId, until: Option<Instant>) {

@@ -1501,7 +1501,7 @@ fn a_probes_verdict_and_a_connect_signal_are_read_at_once() {
     assert!(!healthy());
 
     // The connect signal of a handshake-promoted worker.
-    assert!(store.connected(id, revision()).is_some());
+    assert!(store.connected(id, revision()).moved().is_some());
     assert!(healthy());
 
     // The prober takes a ready worker out after its failure threshold.

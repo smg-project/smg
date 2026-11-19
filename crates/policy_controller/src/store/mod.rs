@@ -83,7 +83,7 @@ pub mod world;
 mod tests;
 
 pub use encoding::{EncodeClasses, EncodeHandoff, EncodeOffer};
-pub use health::{HealthSink, VetoWrite};
+pub use health::{HealthSink, HealthWrite, VetoWrite};
 pub use index::{
     ContentHash, KvEvent, LaneCounts, Named, SequenceHash, StoredBlock, INDEX_WORKERS,
 };
