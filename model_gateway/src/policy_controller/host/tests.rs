@@ -12,11 +12,12 @@ use axum::{
     body::to_bytes,
     http::{header::RETRY_AFTER, StatusCode},
 };
+use futures::FutureExt;
 use kv_index::compute_request_content_hashes;
 use openai_protocol::worker::WorkerStatus;
-use serde_json::Value;
+use serde_json::{json, Value};
 use smg_policy_controller::{
-    decision::ShedReason,
+    decision::{Decision, Shed, ShedReason, Trace},
     door::Refused,
     lease::{ReleaseReason, TransportClass},
     store::{
@@ -24,14 +25,16 @@ use smg_policy_controller::{
         WorkerStatus as RowStatus, WorkersStore, PUBLISH_WINDOW,
     },
     view::LoadRow,
+    AppliedSpec, PolicySpec,
 };
 use smg_worker::identity::basic::WorkerLoadGuard;
 
 use super::{
-    left_no_worker,
+    left_no_worker, profile_of,
     testing::{bed, cache_bed, store_blocks, MODEL},
     Ask, End, Hashes, Held, Prompt, Unplaced, GATEWAY,
 };
+use crate::observability::{cache_trace, metrics::test_support::render_with_recorder};
 
 /// A first attempt's ask of the request `id`.
 pub(super) fn first(id: &[u8]) -> Ask<'_> {
@@ -78,6 +81,262 @@ async fn a_pick_lands_on_the_gateways_worker_of_its_row() {
         .expect("a worker");
     let row = WorkersStore::get(&*store, placed.id()).expect("the target's row");
     assert_eq!(placed.worker().url(), row.facts.key);
+}
+
+fn assert_decisions(rendered: &str, profile: &str, outcome: &str, count: u32) {
+    for expected in [
+        format!(
+            "smg_policy_decisions_total{{model=\"{MODEL}\",profile=\"{profile}\",outcome=\"{outcome}\",mode=\"embedded\"}} {count}"
+        ),
+        format!(
+            "smg_policy_decision_seconds_count{{mode=\"embedded\",outcome=\"{outcome}\"}} {count}"
+        ),
+    ] {
+        assert!(
+            rendered.lines().any(|line| line == expected),
+            "missing {expected} in:\n{rendered}"
+        );
+    }
+}
+
+#[test]
+fn a_placement_counts_and_times_its_documents_profile() {
+    let (host, store, _) = bed(&["http://w0:8000"]);
+    let document: PolicySpec = serde_yaml::from_str(
+        "apiVersion: smg.policy/v1
+generation: 2
+profiles:
+  batch: { pick: random }
+  chat: { pick: random }
+bindings:
+  - match: { model: 'batch-*' }
+    profile: batch
+  - match: { model: '*' }
+    profile: chat",
+    )
+    .unwrap();
+    store
+        .apply(AppliedSpec::validate(&document).unwrap())
+        .unwrap();
+    assert!(host
+        .profile_name(&Trace {
+            generation: 1,
+            ..Trace::default()
+        })
+        .is_none());
+    let before = Instant::now();
+    let rendered = render_with_recorder(|| {
+        let now = before - Duration::from_secs(60);
+        assert!(host
+            .place(&first(b"r1"), now)
+            .now_or_never()
+            .unwrap()
+            .is_ok());
+    });
+    assert_decisions(&rendered, "chat", "pick", 1);
+    let seconds: f64 = rendered
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix(
+                "smg_policy_decision_seconds_sum{mode=\"embedded\",outcome=\"pick\"} ",
+            )
+        })
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(
+        seconds > 0.0 && seconds <= before.elapsed().as_secs_f64(),
+        "{seconds}"
+    );
+}
+
+#[test]
+fn a_shed_and_each_attempt_to_take_a_target_are_counted() {
+    let (empty, _, _) = bed(&[]);
+    let (unhealthy, _, workers) = bed(&["http://w0:8000"]);
+    workers[0].set_status(WorkerStatus::NotReady);
+    let rendered = render_with_recorder(|| {
+        assert!(matches!(
+            empty
+                .place(&first(b"r1"), Instant::now())
+                .now_or_never()
+                .unwrap(),
+            Err(Unplaced::Shed {
+                reason: ShedReason::NoEndpoints,
+                ..
+            })
+        ));
+        assert_eq!(
+            unhealthy
+                .place(&first(b"r2"), Instant::now())
+                .now_or_never()
+                .unwrap()
+                .err(),
+            Some(Unplaced::NoTargetHolds)
+        );
+    });
+    assert_decisions(&rendered, "random", "shed", 1);
+    assert_decisions(&rendered, "random", "pick", 3);
+}
+
+#[test]
+fn a_request_no_binding_covers_is_shed_under_no_profile() {
+    let (host, store, _) = bed(&["http://w0:8000"]);
+    let document: PolicySpec = serde_yaml::from_str(
+        "apiVersion: smg.policy/v1
+generation: 2
+profiles:
+  batch: { pick: random }
+bindings:
+  - match: { model: 'batch-*' }
+    profile: batch",
+    )
+    .unwrap();
+    store
+        .apply(AppliedSpec::validate(&document).unwrap())
+        .unwrap();
+    let rendered = render_with_recorder(|| {
+        cache_trace::scope(true, async {
+            let unplaced = host.place(&first(b"r1"), Instant::now()).await.err();
+            assert!(
+                matches!(
+                    unplaced,
+                    Some(Unplaced::Shed {
+                        reason: ShedReason::PolicyDeclined,
+                        ..
+                    })
+                ),
+                "{unplaced:?}"
+            );
+            let rows = cache_trace::captured_selections();
+            assert_eq!(rows.len(), 1);
+            // The one profile of the document never ran: the row names none.
+            assert_eq!(rows[0]["policy"], json!(null));
+            assert_eq!(rows[0]["decision"]["profile"], json!(null));
+            assert_eq!(rows[0]["decision"]["emptied_by"], "binding");
+        })
+        .now_or_never()
+        .unwrap();
+    });
+    assert_decisions(&rendered, "", "shed", 1);
+}
+
+#[test]
+fn only_a_shed_ahead_of_every_profile_names_no_profile() {
+    let shed = |reason, emptied_by| {
+        Decision::Shed(Shed {
+            reason,
+            emptied_by,
+            retry_after_secs: 1,
+            wait_allowed: false,
+            trace: Trace {
+                profile: 3,
+                ..Trace::default()
+            },
+        })
+    };
+    for (reason, stage) in [
+        (ShedReason::PolicyDeclined, "binding"),
+        (ShedReason::PolicyDeclined, "affinity-column"),
+        (ShedReason::PolicyDeclined, "written-rows"),
+        (ShedReason::NoEndpoints, "wires"),
+        (ShedReason::NoEndpoints, "subset-hint"),
+    ] {
+        assert_eq!(profile_of(&shed(reason, stage)), None, "{stage}");
+    }
+    // A profile's own stage that declines, and a pool a filter emptied.
+    let by_a_picker = shed(ShedReason::PolicyDeclined, "random");
+    assert_eq!(profile_of(&by_a_picker), Some(3));
+    let emptied = shed(ShedReason::NoEndpoints, "healthy");
+    assert_eq!(profile_of(&emptied), Some(3));
+}
+
+#[test]
+fn a_refused_ask_is_counted_without_a_profile() {
+    let (host, store, _) = bed(&["http://w0:8000"]);
+    // A term above the lease id's term bits cannot mint a lease.
+    LeasesStore::set_term(&*store, 1 << 31);
+    let rendered = render_with_recorder(|| {
+        let refused = host
+            .ask(&first(b"r1"), &[], Instant::now())
+            .now_or_never()
+            .unwrap()
+            .err();
+        assert_eq!(refused, Some(Unplaced::Refused(Refused::Unleased)));
+    });
+    assert_decisions(&rendered, "", "refused", 1);
+}
+
+#[tokio::test]
+async fn a_trace_records_the_worker_taken_each_miss_and_the_shed() {
+    let (host, store, workers) = bed(&["http://w0:8000", "http://w1:8000"]);
+    let ask = first(b"r1");
+    let now = Instant::now();
+    let asked = host.ask(&ask, &[], now).await.unwrap();
+    let targets = asked.targets;
+    let preferred = host.worker(targets.first().unwrap().id).unwrap();
+    preferred.set_status(WorkerStatus::NotReady);
+    drop(asked);
+    cache_trace::scope(true, async {
+        let placed = host.place(&ask, now).await.unwrap();
+        assert_ne!(placed.worker().url(), preferred.url());
+        let rows = cache_trace::captured_selections();
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row["worker"], placed.worker().url());
+        assert_eq!(row["policy"], "random");
+        assert_eq!(row["decision"]["outcome"], "pick");
+        assert_eq!(row["decision"]["generation"], 1);
+        assert_eq!(row["decision"]["survivors"], 2);
+        assert!(row["decision"]["top"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|candidate| candidate["worker"] == preferred.url()));
+        assert_eq!(row["decision"]["lifted"], "none");
+    })
+    .await;
+    for worker in workers {
+        worker.set_status(WorkerStatus::NotReady);
+    }
+    cache_trace::scope(true, async {
+        assert_eq!(
+            host.place(&first(b"r2"), Instant::now()).await.err(),
+            Some(Unplaced::NoTargetHolds)
+        );
+        let rows = cache_trace::captured_selections();
+        assert_eq!(rows.len(), 3);
+        for row in rows {
+            assert_eq!(row["decision"]["outcome"], "pick");
+            assert_eq!(row["worker"], json!(null));
+        }
+    })
+    .await;
+    for target in targets.iter() {
+        let row = WorkersStore::get(&*store, target.id).unwrap();
+        store
+            .set_status(target.id, RowStatus::NotReady, row.revision)
+            .unwrap();
+    }
+    store.publish_now();
+    cache_trace::scope(true, async {
+        let result = host.place(&first(b"r3"), Instant::now()).await;
+        assert!(matches!(
+            result,
+            Err(Unplaced::Shed {
+                reason: ShedReason::NoEndpoints,
+                ..
+            })
+        ));
+        let rows = cache_trace::captured_selections();
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row["worker"], json!(null));
+        assert_eq!(row["decision"]["outcome"], "shed");
+        assert_eq!(row["decision"]["reason"], "no_endpoints");
+        assert_eq!(row["decision"]["emptied_by"], "healthy");
+    })
+    .await;
 }
 
 #[tokio::test]

@@ -23,7 +23,7 @@ struct Capture {
     /// The request asked for its decision record (`x-smg-cache-trace: 1`).
     header_requested: bool,
     prediction: Value,
-    selections: Vec<Selection>,
+    selections: Vec<SelectionRow>,
     truncated: bool,
     gates: Vec<Value>,
     candidates: Vec<Candidate>,
@@ -31,6 +31,13 @@ struct Capture {
     observation_started_ns: u64,
     observation_finished_ns: u64,
     scores: Vec<Value>,
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum SelectionRow {
+    Classic(Selection),
+    Decided(Decided),
 }
 
 /// One candidate as a selection observed it: the worker, and the state read
@@ -90,6 +97,57 @@ struct Selection {
     gates: Vec<Value>,
 }
 
+/// One decision of the policy controller, as the host read it.
+pub(crate) struct Decided {
+    pub profile: Option<Arc<str>>,
+    pub outcome: &'static str,
+    pub generation: u64,
+    pub survivors: Option<u32>,
+    /// Three at most, each with its score and the worker if still registered.
+    pub top: Vec<(Option<Arc<dyn Worker>>, f32)>,
+    /// Written as a decimal string: a reader that holds numbers as floats
+    /// would round it.
+    pub seed: u64,
+    pub lifted: &'static str,
+    /// A shed's reason and the stage that left no candidate.
+    pub shed: Option<(&'static str, &'static str)>,
+    /// The worker the gateway took, where it took one.
+    pub worker: Option<Arc<dyn Worker>>,
+}
+
+impl Serialize for Decided {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let profile = self.profile.as_deref();
+        let worker = self.worker.as_ref().map(|worker| worker.redacted_url());
+        let top: Vec<_> = self
+            .top
+            .iter()
+            .map(|(worker, score)| {
+                let worker = worker.as_ref().map(|worker| worker.redacted_url());
+                json!({"worker": worker, "score": score})
+            })
+            .collect();
+        let mut decision = json!({
+            "outcome": self.outcome, "profile": profile, "generation": self.generation,
+            "top": top, "seed": self.seed.to_string(), "lifted": self.lifted,
+        });
+        if let Some(survivors) = self.survivors {
+            decision["survivors"] = json!(survivors);
+        }
+        if let Some((reason, emptied_by)) = self.shed {
+            decision["reason"] = json!(reason);
+            decision["emptied_by"] = json!(emptied_by);
+        }
+        let mut row = serializer.serialize_map(Some(5))?;
+        row.serialize_entry("policy", &profile)?;
+        row.serialize_entry("origin", "policy_controller")?;
+        row.serialize_entry("worker", &worker)?;
+        row.serialize_entry("prediction", &Value::Null)?;
+        row.serialize_entry("decision", &decision)?;
+        row.end()
+    }
+}
+
 impl Serialize for Selection {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let worker = self.worker.as_ref().map(|worker| worker.redacted_url());
@@ -113,6 +171,15 @@ impl Serialize for Selection {
 }
 
 impl Capture {
+    fn push_selection(&mut self, build: impl FnOnce(&mut Self) -> SelectionRow) {
+        if self.selections.len() >= 16 {
+            self.truncated = true;
+            return;
+        }
+        let row = build(self);
+        self.selections.push(row);
+    }
+
     /// Read the candidates where the pick is about to run: each worker's
     /// handle and its live state, no text. A caller may hold a lock here.
     fn observe_candidates(&mut self, workers: &[Arc<dyn Worker>]) {
@@ -272,6 +339,9 @@ fn compact(value: &mut Value) {
     const LISTS: [&str; 3] = ["candidates", "scores", "gates"];
     if let Some(selections) = value.get_mut("selections").and_then(Value::as_array_mut) {
         for selection in selections.iter_mut().filter_map(Value::as_object_mut) {
+            if selection.contains_key("decision") {
+                continue;
+            }
             let elided = LISTS
                 .iter()
                 .filter_map(|list| {
@@ -374,25 +444,31 @@ pub(crate) fn selection(
         return;
     }
     let _ = CAPTURE.try_with(|capture| {
-        let mut capture = capture.borrow_mut();
-        let capture = &mut *capture;
-        if capture.selections.len() >= 16 {
-            capture.truncated = true;
-            return;
-        }
         // The row's values, moved: its text is written with the evidence.
-        capture.selections.push(Selection {
-            policy,
-            origin,
-            worker: selected.map(|idx| Arc::clone(&workers[idx])),
-            prediction: std::mem::take(&mut capture.prediction),
-            candidates: std::mem::take(&mut capture.candidates),
-            candidates_complete: capture.candidates_complete,
-            observation_started_ns: capture.observation_started_ns,
-            observation_finished_ns: capture.observation_finished_ns,
-            scores: std::mem::take(&mut capture.scores),
-            gates: std::mem::take(&mut capture.gates),
+        capture.borrow_mut().push_selection(|capture| {
+            SelectionRow::Classic(Selection {
+                policy,
+                origin,
+                worker: selected.map(|idx| Arc::clone(&workers[idx])),
+                prediction: std::mem::take(&mut capture.prediction),
+                candidates: std::mem::take(&mut capture.candidates),
+                candidates_complete: capture.candidates_complete,
+                observation_started_ns: capture.observation_started_ns,
+                observation_finished_ns: capture.observation_finished_ns,
+                scores: std::mem::take(&mut capture.scores),
+                gates: std::mem::take(&mut capture.gates),
+            })
         });
+    });
+}
+
+/// Records a decision where a capture has space. Builds `row` only inside
+/// that capture.
+pub(crate) fn decided(row: impl FnOnce() -> Decided) {
+    let _ = CAPTURE.try_with(|capture| {
+        capture
+            .borrow_mut()
+            .push_selection(|_| SelectionRow::Decided(row()));
     });
 }
 
@@ -442,10 +518,14 @@ fn gateway_header(value: &Value) -> Option<String> {
         .as_array()?
         .iter()
         .map(|selection| {
-            json!({
+            let mut row = json!({
                 "policy": selection["policy"], "origin": selection["origin"],
                 "worker": selection["worker"], "prediction": selection["prediction"],
-            })
+            });
+            if let Some(decision) = selection.get("decision") {
+                row["decision"] = decision.clone();
+            }
+            row
         })
         .collect();
     let header = json!({
@@ -492,6 +572,97 @@ pub(crate) fn captured_selections() -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pick_row() -> Decided {
+        use crate::routers::grpc::backend_client::BasicWorkerBuilder;
+
+        let worker: Arc<dyn Worker> =
+            Arc::new(BasicWorkerBuilder::new("http://user:secret@picked:8000").build());
+        let alternate: Arc<dyn Worker> =
+            Arc::new(BasicWorkerBuilder::new("http://alternate:8000/v1?token=hidden").build());
+        Decided {
+            profile: Some("default".into()),
+            outcome: "pick",
+            generation: 7,
+            survivors: Some(4),
+            top: vec![
+                (Some(Arc::clone(&worker)), 1.0),
+                (Some(alternate), 0.5),
+                (None, 0.25),
+            ],
+            seed: 9,
+            lifted: "overload",
+            shed: None,
+            worker: Some(worker),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_decided_row_keeps_the_join_fields_and_the_whole_decision() {
+        scope(true, async {
+            decided(pick_row);
+            let expected = json!({
+                "policy": "default",
+                "origin": "policy_controller",
+                "worker": "http://***@picked:8000",
+                "prediction": null,
+                "decision": {
+                    "outcome": "pick",
+                    "profile": "default",
+                    "generation": 7,
+                    "survivors": 4,
+                    "top": [
+                        {"worker": "http://***@picked:8000", "score": 1.0},
+                        {"worker": "http://alternate:8000/v1", "score": 0.5},
+                        {"worker": null, "score": 0.25}
+                    ],
+                    "seed": "9",
+                    "lifted": "overload"
+                }
+            });
+            assert_eq!(
+                captured_selections().as_slice(),
+                std::slice::from_ref(&expected)
+            );
+            for _ in 0..16 {
+                decided(pick_row);
+            }
+            let evidence = CAPTURE.with(|capture| failure_evidence(&capture.borrow(), None, 503));
+            assert_eq!(evidence["truncated"], true);
+            assert_eq!(evidence["selections"].as_array().unwrap().len(), 16);
+            let line: Value = serde_json::from_str(&encode_capped(evidence, Some(1024))).unwrap();
+            assert_eq!(line["selections"][0], expected);
+        })
+        .await;
+    }
+
+    #[test]
+    fn a_decided_row_is_built_only_inside_a_capture() {
+        decided(|| panic!("there is no capture for this row"));
+    }
+
+    #[tokio::test]
+    async fn the_trace_header_keeps_a_decision_with_three_top_rows() {
+        scope(true, async {
+            decided(|| Decided {
+                survivors: None,
+                ..pick_row()
+            });
+            let header = dispatch(Some("root"), 1, vec!["upstream".into()], true, "regular")
+                .expect("the request asked for a header");
+            assert!(header.len() <= 2048);
+            let decoded: Value = serde_json::from_str(&header).unwrap();
+            let decision = &decoded["selections"][0]["decision"];
+            assert_eq!(decision["top"].as_array().map(Vec::len), Some(3));
+            assert!(decision.get("survivors").is_none());
+
+            let mut oversized = decoded;
+            oversized["selections"][0]["decision"]["top"][2]["worker"] =
+                json!(format!("http://worker/{}", "x".repeat(2048)));
+            assert!(gateway_header(&oversized).is_none());
+        })
+        .await;
+    }
 
     /// The first observed candidate as the evidence lists it.
     fn first_candidate(capture: &Capture) -> Value {

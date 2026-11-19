@@ -32,7 +32,7 @@ use axum::{
 };
 use rand::RngExt;
 use smg_policy_controller::{
-    decision::{Decision, ShedReason, Target, Targets},
+    decision::{Decision, Lifted, ShedReason, Target, Targets, Trace},
     door::{Door, Refused, Request},
     handle::Handle,
     lease::{Outcome, ReleaseReason, Side, TransportClass},
@@ -43,6 +43,10 @@ use smg_worker::identity::basic::{Worker, WorkerLoadGuard};
 
 use crate::{
     middleware::SHED_RETRY_AFTER_SECS,
+    observability::{
+        cache_trace,
+        metrics::{Metrics, PolicyDecision},
+    },
     routers::{
         common::{
             overload::WORKER_OVERLOAD_PROTECTION_SHED_ERROR_CODE,
@@ -73,6 +77,47 @@ const ASKS: usize = 3;
 /// The crate's word, in a shed's `emptied_by`, for a pool no stage emptied:
 /// it held no candidate before any stage ran.
 const NO_STAGE: &str = "none";
+
+fn outcome(decision: &Decision) -> &'static str {
+    match decision {
+        Decision::Pick(_) => "pick",
+        Decision::Shed(_) => "shed",
+        Decision::Queue(_) => "queue",
+    }
+}
+
+/// The controller's sheds made ahead of every profile, each by its reason
+/// and the stage it names: a request no binding matches, an affinity column
+/// that does not fit the rows, rows not written for a profile's scope, a
+/// gateway that shares a wire with no row of the pool, and a subset hint of
+/// none.
+///
+/// A copy of the policy crate's own words, kept until a decision says which
+/// profile made it. It mirrors the sheds `Engine::decide` and
+/// `Engine::decide_pair` make on the bare trace, and the two the door makes
+/// in their place. A shed the crate adds ahead of a profile is counted under
+/// the first profile until it joins this table. So is a shed of the encode
+/// entry, which this host does not ask. A plugin stage registered under one
+/// of these words is read as no profile.
+const AHEAD_OF_A_PROFILE: [(ShedReason, &str); 5] = [
+    (ShedReason::PolicyDeclined, "binding"),
+    (ShedReason::PolicyDeclined, "affinity-column"),
+    (ShedReason::PolicyDeclined, "written-rows"),
+    (ShedReason::NoEndpoints, "wires"),
+    (ShedReason::NoEndpoints, "subset-hint"),
+];
+
+/// The profile that made `decision`, `None` where none did. A shed made
+/// ahead of every profile carries the default trace, whose profile index is
+/// the first profile's: it is counted and traced under none.
+fn profile_of(decision: &Decision) -> Option<u16> {
+    match decision {
+        Decision::Shed(shed) if AHEAD_OF_A_PROFILE.contains(&(shed.reason, shed.emptied_by)) => {
+            None
+        }
+        _ => Some(decision.trace().profile),
+    }
+}
 
 /// What an attempt states of its request.
 #[derive(Clone, Copy, Debug)]
@@ -294,6 +339,56 @@ impl Host {
         self.registry.get_by_url(&row.facts.key)
     }
 
+    fn profile_name(&self, trace: &Trace) -> Option<Arc<str>> {
+        self.door.store().with_world(|world| {
+            let spec = world.spec();
+            if spec.generation() != trace.generation {
+                return None;
+            }
+            let profile = spec.engine().profiles().get(usize::from(trace.profile))?;
+            Some(Arc::from(profile.name.as_str()))
+        })
+    }
+
+    fn trace_decision(&self, decision: &Decision, worker: Option<&Arc<dyn Worker>>) {
+        cache_trace::decided(|| {
+            let trace = decision.trace();
+            let shed = match decision {
+                Decision::Shed(shed) => {
+                    let reason = match shed.reason {
+                        ShedReason::Saturated => "saturated",
+                        ShedReason::FlowLimit => "flow_limit",
+                        ShedReason::NoEndpoints => "no_endpoints",
+                        ShedReason::PolicyDeclined => "policy_declined",
+                        ShedReason::Deadline => "deadline",
+                    };
+                    Some((reason, shed.emptied_by))
+                }
+                Decision::Pick(_) | Decision::Queue(_) => None,
+            };
+            cache_trace::Decided {
+                profile: profile_of(decision).and_then(|_| self.profile_name(trace)),
+                outcome: outcome(decision),
+                generation: trace.generation,
+                survivors: trace.survivors.get(),
+                top: trace
+                    .top
+                    .iter()
+                    .take(usize::from(trace.top_len))
+                    .map(|&(id, score)| (self.worker(id), score))
+                    .collect(),
+                seed: trace.seed,
+                lifted: match trace.lifted {
+                    Lifted::None => "none",
+                    Lifted::Overload => "overload",
+                    Lifted::Liveness => "liveness",
+                },
+                shed,
+                worker: worker.cloned(),
+            }
+        });
+    }
+
     /// The ask: one decision for `ask` at `now` through the controller's
     /// handle, naming the targets the gateway `missed` at this attempt's
     /// earlier commits.
@@ -311,19 +406,40 @@ impl Host {
         missed: &[WorkerId],
         now: Instant,
     ) -> Result<Asked, Unplaced> {
-        let handle = Handle::decide(Arc::clone(&self.door), GATEWAY, &ask.request(missed), now)
-            .map_err(Unplaced::Refused)?;
+        let request = ask.request(missed);
+        let started = Instant::now();
+        let decided = Handle::decide(Arc::clone(&self.door), GATEWAY, &request, now);
+        let seconds = started.elapsed().as_secs_f64();
+        let decision = decided.as_ref().ok().map(Handle::decision);
+        let trace = decision.map(Decision::trace);
+        let generation = trace.map_or(0, |trace| trace.generation);
+        let profile = decision.and_then(profile_of);
+        Metrics::record_policy_decision(
+            ask.model,
+            PolicyDecision {
+                generation,
+                profile,
+                outcome: decision.map_or("refused", outcome),
+                mode: "embedded",
+            },
+            || trace.and_then(|trace| self.profile_name(trace)),
+            seconds,
+        );
+        let handle = decided.map_err(Unplaced::Refused)?;
         let decision = *handle.decision();
         match decision {
             Decision::Pick(pick) => Ok(Asked {
                 targets: pick.targets,
                 handle,
             }),
-            Decision::Shed(shed) => Err(Unplaced::Shed {
-                reason: shed.reason,
-                emptied_by: shed.emptied_by,
-                retry_after_secs: shed.retry_after_secs,
-            }),
+            Decision::Shed(shed) => {
+                self.trace_decision(&decision, None);
+                Err(Unplaced::Shed {
+                    reason: shed.reason,
+                    emptied_by: shed.emptied_by,
+                    retry_after_secs: shed.retry_after_secs,
+                })
+            }
             Decision::Queue(_) => Err(Unplaced::Queued),
         }
     }
@@ -372,6 +488,7 @@ impl Host {
             });
             if let Some(worker) = sendable {
                 handle.take(index);
+                self.trace_decision(handle.decision(), Some(&worker));
                 return Some(Placed {
                     worker,
                     target: *target,
@@ -381,6 +498,7 @@ impl Host {
         }
         handle.released(ReleaseReason::CommitFailed, now);
         missed.extend(targets.iter().map(|target| target.id));
+        self.trace_decision(handle.decision(), None);
         None
     }
 
