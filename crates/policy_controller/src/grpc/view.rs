@@ -508,6 +508,21 @@ pub(crate) fn membership(m: &Membership<'_>) -> proto::lifecycle_event::Event {
     })
 }
 
+/// What [`since`] says of the word [`membership`] makes of `change`, read
+/// before that word is made.
+#[inline]
+pub(crate) fn since_of(change: &Membership<'_>) -> u32 {
+    match change {
+        Membership::Left { .. } => 2,
+        Membership::Added(_)
+        | Membership::Removed(_)
+        | Membership::Replaced { .. }
+        | Membership::Relabelled(_)
+        | Membership::Resized(_)
+        | Membership::Snapshot(_) => 1,
+    }
+}
+
 /// The first protocol version whose streams carry `event`. A stream on an
 /// older one is not sent it, and hears what it heard before the word came.
 #[inline]
@@ -697,7 +712,7 @@ pub(crate) fn read(
 
 #[cfg(test)]
 mod tests {
-    use super::{membership, proto, since, Answer, Invalid, FILTER, PICK, SCORE};
+    use super::{membership, proto, since, since_of, Answer, Invalid, FILTER, PICK, SCORE};
     use crate::{lease::Membership, view::WorkerId};
 
     /// The stages' rules, under a plugin that declared no counter.
@@ -1161,5 +1176,28 @@ mod tests {
         assert_eq!((change.kind, change.worker_id), (kind, 7));
         assert_eq!(change.models, models);
         assert_eq!(since(&membership(&Membership::Relabelled(id))), 1);
+    }
+
+    /// The version that first carries a word reads the same before the word
+    /// is made and after, for every kind the feed tells.
+    #[test]
+    fn a_words_first_version_is_read_alike_before_and_after_it_is_made() {
+        let (id, models) = (WorkerId(7), ["m".to_string()]);
+        let members = [id];
+        let words = [
+            Membership::Snapshot(&members),
+            Membership::Added(id),
+            Membership::Removed(id),
+            Membership::Replaced { old: id, new: id },
+            Membership::Relabelled(id),
+            Membership::Resized(id),
+            Membership::Left {
+                id,
+                models: &models,
+            },
+        ];
+        for word in &words {
+            assert_eq!(since_of(word), since(&membership(word)));
+        }
     }
 }

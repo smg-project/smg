@@ -551,6 +551,12 @@ fn an_ack_that_settles_second_under_another_version_is_cancelled_naming_both() {
         eventually(|| plugin.stats().failed_streams == 1),
         "the load's stream ended: no stream stands"
     );
+    // The events call that names the load's version is open before the
+    // version moves: its hello is the first of the two read below.
+    assert!(
+        eventually(|| served.seen().observe_hellos.len() == 1),
+        "the events call opened under the load's version"
+    );
     // The first hello's ack names 1 and waits at a gate. The second's names
     // 2 at once, and the gate opens once that stream has settled.
     let gate = Gate::default();
