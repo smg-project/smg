@@ -530,11 +530,23 @@ impl SinceReport {
         // At its instant's place: a dispatch that waited for a retirement
         // on a shared lane, or one a stepped clock dated earlier, lands
         // behind a later one, and the release and the retirement read a
-        // lane from its oldest. Instants mostly rise, so this is a push.
-        let at = dispatches.partition_point(|&(held_at, _)| held_at <= at_micros);
-        dispatches.insert(at, (at_micros, tokens));
+        // lane from its oldest. Instants mostly rise, so the lane's newest
+        // is asked first: a dispatch no older than it is a push, and the
+        // place is searched for the one that is. The lane's front moves
+        // only where the dispatch lands there.
+        let newest = dispatches.back().map(|&(held_at, _)| held_at);
+        let front = if newest.is_some_and(|newest| newest > at_micros) {
+            let at = dispatches.partition_point(|&(held_at, _)| held_at <= at_micros);
+            dispatches.insert(at, (at_micros, tokens));
+            at == 0
+        } else {
+            dispatches.push_back((at_micros, tokens));
+            newest.is_none()
+        };
         self.held.fetch_add(Self::weight(tokens), Ordering::Relaxed);
-        lane.publish_oldest(&dispatches);
+        if front {
+            lane.publish_oldest(&dispatches);
+        }
         // Under the lane's lock: a release, which holds every lane, never
         // recomputes the row's oldest past this dispatch. Dispatch instants
         // mostly rise, so this is a read.
