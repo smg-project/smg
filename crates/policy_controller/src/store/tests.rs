@@ -15,7 +15,7 @@ use super::{
     LoadSink, LoadSource, MembershipChange, MembershipTail, MemoryStore, Picked, Pin, PollMode,
     Position, Reachability, ReservationKind, ReservationStore, ResyncReason, Said, SequenceHash,
     SessionsStore, Signals, SnapshotChunk, StoredBlock, VetoWrite, ViewBuffers, WorkerFacts,
-    WorkerPatch, WorkerRow, WorkerStatus, WorkersStore,
+    WorkerPatch, WorkerRow, WorkerStatus, WorkersStore, World,
 };
 use crate::{
     decider::Decider,
@@ -2632,7 +2632,7 @@ thread_local! {
 
 /// A teller that keeps its word for [`told`]: the record a frame found on
 /// file and what the frame said, and for [`told_by`] the decider named.
-fn heard(_: &MemoryStore, record: &LeaseRecord, said: Said, by: Option<Decider>) {
+fn heard(_: &MemoryStore, _: &World, record: &LeaseRecord, said: Said, by: Option<Decider>) {
     TOLD.with(|told| told.borrow_mut().push((*record, said)));
     TOLD_BY.with(|told| told.borrow_mut().push(by));
 }
@@ -2915,6 +2915,43 @@ fn a_frame_handed_while_a_thread_is_at_work_is_left_to_that_thread() {
     );
 }
 
+/// The frames of one take are told under one world, the store's as it
+/// stood at the take's first tell: a take loads it once, however many
+/// frames it tells.
+#[test]
+fn the_frames_of_a_take_are_told_under_one_world() {
+    thread_local! {
+        static UNDER: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
+        static LATER: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+    }
+    // Keeps the epoch of the world each tell is handed; the first tell
+    // publishes a later world before it returns.
+    fn under(store: &MemoryStore, world: &World, _: &LeaseRecord, _: Said, _: Option<Decider>) {
+        UNDER.with_borrow_mut(|under| under.push(world.epoch()));
+        if LATER.replace(false) {
+            ready(store, "http://b:1");
+        }
+    }
+    let now = Instant::now();
+    let store = Arc::new(MemoryStore::new());
+    store.tell_through(under);
+    let a = ready(&store, "http://a:1");
+    LeasesStore::set_term(&*store, 1);
+    let ids = [0, 1, 2].map(|_| LeaseId(1 << 32 | issued_at(&store, a, now).0));
+    let first = store.world().epoch();
+    let hand = Hand::new(GatewayId(1));
+    let at_work = store.at_work();
+    store.hand(&hand, ids[0], GONE);
+    store.hand(&hand, ids[1], GONE);
+    at_work.apply();
+    let later = store.world().epoch();
+    assert!(later > first);
+    assert_eq!(UNDER.take(), [first, first], "one load for the take");
+    store.hand(&hand, ids[2], GONE);
+    at_work.apply();
+    assert_eq!(UNDER.take(), [later], "the next take's own");
+}
+
 /// A decider looks at what is handed before a decision reads its rows'
 /// counts, and that look never waits: a turn it finds held it reads past.
 #[test]
@@ -3031,7 +3068,7 @@ fn a_streams_end_applies_what_it_handed() {
 #[test]
 #[should_panic(expected = "taken first or not at all")]
 fn a_tell_that_takes_a_door_of_the_leases_is_refused_in_a_debug_build() {
-    fn takes_a_door(store: &MemoryStore, _: &LeaseRecord, _: Said, _: Option<Decider>) {
+    fn takes_a_door(store: &MemoryStore, _: &World, _: &LeaseRecord, _: Said, _: Option<Decider>) {
         let _live = LeasesStore::live(store, GatewayId(1));
     }
     let store = MemoryStore::new();
@@ -3053,7 +3090,7 @@ fn a_tell_that_takes_a_door_of_the_leases_is_refused_in_a_debug_build() {
 fn a_frame_handed_as_a_thread_leaves_its_work_is_applied_by_one_of_the_two() {
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::SeqCst};
     static HEARD: AtomicUsize = AtomicUsize::new(0);
-    fn counted(_: &MemoryStore, _: &LeaseRecord, _: Said, _: Option<Decider>) {
+    fn counted(_: &MemoryStore, _: &World, _: &LeaseRecord, _: Said, _: Option<Decider>) {
         HEARD.fetch_add(1, SeqCst);
     }
     const ROUNDS: usize = 100_000;
@@ -3150,7 +3187,7 @@ fn a_frame_handed_as_a_thread_leaves_its_work_is_applied_by_one_of_the_two() {
 fn a_thread_that_leaves_its_work_waits_for_a_held_turn() {
     use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
     static HEARD: AtomicUsize = AtomicUsize::new(0);
-    fn counted(_: &MemoryStore, _: &LeaseRecord, _: Said, _: Option<Decider>) {
+    fn counted(_: &MemoryStore, _: &World, _: &LeaseRecord, _: Said, _: Option<Decider>) {
         HEARD.fetch_add(1, SeqCst);
     }
     let store = Arc::new(MemoryStore::new());
@@ -3221,7 +3258,7 @@ fn a_thread_that_leaves_its_work_waits_for_a_held_turn() {
 #[test]
 fn the_store_is_printed_from_under_its_leases_turn() {
     thread_local!(static PRINTED: RefCell<String> = const { RefCell::new(String::new()) });
-    fn prints(store: &MemoryStore, _: &LeaseRecord, _: Said, _: Option<Decider>) {
+    fn prints(store: &MemoryStore, _: &World, _: &LeaseRecord, _: Said, _: Option<Decider>) {
         PRINTED.with(|printed| *printed.borrow_mut() = format!("{store:?}"));
     }
     let store = MemoryStore::new();
@@ -3337,7 +3374,7 @@ fn told_across(store: &MemoryStore, lease: LeaseId, said: Option<Said>) {
 
 #[test]
 fn a_lease_is_told_issued_before_any_holder_ends_it() {
-    fn ended(store: &MemoryStore, record: &LeaseRecord, said: Said, _: Option<Decider>) {
+    fn ended(store: &MemoryStore, _: &World, record: &LeaseRecord, said: Said, _: Option<Decider>) {
         told_across(store, record.lease.id, Some(said));
     }
     let store = MemoryStore::new();
@@ -3400,7 +3437,7 @@ fn a_lease_is_told_issued_before_any_holder_ends_it() {
 #[test]
 fn a_decider_issues_into_its_own_file_and_a_leases_id_names_it() {
     static NAMES: Mutex<Vec<(LeaseId, Option<Decider>)>> = Mutex::new(Vec::new());
-    fn named(_: &MemoryStore, record: &LeaseRecord, _: Said, by: Option<Decider>) {
+    fn named(_: &MemoryStore, _: &World, record: &LeaseRecord, _: Said, by: Option<Decider>) {
         let mut names = NAMES.lock().expect("no case fails under it");
         names.push((record.lease.id, by));
     }
@@ -3562,7 +3599,7 @@ fn no_thread_acts_at_a_file_beside_the_thread_at_work() {
 fn a_decider_takes_up_its_work_behind_a_hand_that_tells_at_its_file() {
     type Ends = (mpsc::SyncSender<()>, mpsc::Receiver<()>);
     static ENDS: Mutex<Option<Ends>> = Mutex::new(None);
-    fn parks(_: &MemoryStore, _: &LeaseRecord, _: Said, _: Option<Decider>) {
+    fn parks(_: &MemoryStore, _: &World, _: &LeaseRecord, _: Said, _: Option<Decider>) {
         let ends = ENDS.lock().expect("no case fails under it").take();
         if let Some((reached, word)) = ends {
             reached.send(()).expect("the case hears the tell");
@@ -3680,7 +3717,7 @@ fn a_full_ring_stops_its_hand_until_the_thread_at_work_applied() {
 #[test]
 fn the_sweep_ends_a_resting_files_due_leases_under_its_deciders_name() {
     static NAMES: Mutex<Vec<(LeaseId, Option<Decider>)>> = Mutex::new(Vec::new());
-    fn named(_: &MemoryStore, record: &LeaseRecord, _: Said, by: Option<Decider>) {
+    fn named(_: &MemoryStore, _: &World, record: &LeaseRecord, _: Said, by: Option<Decider>) {
         let mut names = NAMES.lock().expect("no case fails under it");
         names.push((record.lease.id, by));
     }
@@ -3803,7 +3840,7 @@ fn a_followed_terms_start_raises_every_file_and_starts_the_blocks_under_it() {
 #[test]
 fn a_lease_of_the_term_before_is_found_in_its_file_behind_a_rise() {
     static NAMES: Mutex<Vec<(LeaseId, Option<Decider>)>> = Mutex::new(Vec::new());
-    fn named(_: &MemoryStore, record: &LeaseRecord, _: Said, by: Option<Decider>) {
+    fn named(_: &MemoryStore, _: &World, record: &LeaseRecord, _: Said, by: Option<Decider>) {
         let mut names = NAMES.lock().expect("no case fails under it");
         names.push((record.lease.id, by));
     }
@@ -3926,7 +3963,7 @@ fn the_first_leases_of_the_most_deciders_are_far_below_the_terms_mark() {
 fn the_files_laid_for_deciders_keep_the_word_and_the_fault_count() {
     use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
     static HEARD: AtomicUsize = AtomicUsize::new(0);
-    fn counted(_: &MemoryStore, _: &LeaseRecord, _: Said, _: Option<Decider>) {
+    fn counted(_: &MemoryStore, _: &World, _: &LeaseRecord, _: Said, _: Option<Decider>) {
         HEARD.fetch_add(1, SeqCst);
     }
     let store = MemoryStore::new();
