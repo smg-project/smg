@@ -1,10 +1,8 @@
-//! Step to drain workers before removal.
+//! Mark Ready workers and wait for drained workers before removal.
 //!
-//! Marks each Ready worker as `Draining` so policies stop selecting it,
-//! then sleeps the maximum `drain_settle_secs` across the workers being
-//! removed. Non-Ready workers (Pending, NotReady, Failed) are not
-//! drained — sleeping for them would just delay the cleanup of broken
-//! workers without protecting any in-flight traffic.
+//! Marking a worker `Draining` keeps policies from selecting it. The wait
+//! uses the longest settle window among the workers marked. Workers in
+//! other states can go straight to removal.
 //!
 //! A pinned removal (`WorkerRemovalRequest::expected_revisions`) reads its
 //! pins again here: a worker whose pin moved since the selection is a
@@ -30,6 +28,38 @@ use crate::{
 /// resolved drain settle window before downstream steps remove them.
 pub struct DrainWorkersStep;
 
+/// Waits for the settle windows of the workers the host's drain marked.
+pub struct SettleDrainedWorkersStep;
+
+async fn settle_drained_workers(workers: &[Arc<dyn Worker>]) {
+    let Some(seconds) = workers
+        .iter()
+        .map(|worker| worker.metadata().health_config.drain_settle_secs)
+        .max()
+    else {
+        debug!("No drained workers, skipping settle");
+        return;
+    };
+
+    info!(
+        "Draining {} worker(s) for {}s before removal",
+        workers.len(),
+        seconds
+    );
+    tokio::time::sleep(Duration::from_secs(seconds)).await;
+}
+
+#[async_trait]
+impl<H: WorkflowHost> StepExecutor<WorkerRemovalWorkflowData<H>> for SettleDrainedWorkersStep {
+    async fn execute(
+        &self,
+        context: &mut WorkflowContext<WorkerRemovalWorkflowData<H>>,
+    ) -> WorkflowResult<StepResult> {
+        settle_drained_workers(&context.data.drained_workers).await;
+        Ok(StepResult::Success)
+    }
+}
+
 #[async_trait]
 impl<H: WorkflowHost> StepExecutor<WorkerRemovalWorkflowData<H>> for DrainWorkersStep {
     async fn execute(
@@ -43,14 +73,13 @@ impl<H: WorkflowHost> StepExecutor<WorkerRemovalWorkflowData<H>> for DrainWorker
             .clone()
             .ok_or_else(|| WorkflowError::ContextValueNotFound("workers_to_remove".to_string()))?;
 
+        context.data.drained_workers.clear();
         if workers_to_remove.is_empty() {
             return Ok(StepResult::Success);
         }
 
         let registry = host.worker_registry();
         let pins = context.data.config.expected_revisions.as_ref();
-        let mut max_drain_secs: u64 = 0;
-        let mut transitioned = 0usize;
         // The workers that stay the job's. A worker whose pin moved since the
         // selection (replaced under its id, or a registration under its URL)
         // is left out, and the job's lists are rewritten without it below.
@@ -99,23 +128,17 @@ impl<H: WorkflowHost> StepExecutor<WorkerRemovalWorkflowData<H>> for DrainWorker
                     current.revision()
                 }
             };
-            // The Ready check is the closure's: it runs under the worker's
-            // mutation lock, in one step with the write, so a probe's
-            // demotion that lands after a check made outside the lock is
-            // not written over with `Draining`. The drain window is read
-            // there too, from the worker the write lands on.
+            // Check Ready under the same lock as the write so a probe's
+            // demotion stands. Keep the worker from inside the lock so the
+            // settle uses the settings of the worker that was marked.
             let drained = registry.apply_if_revision(&worker_id, revision, |worker| {
                 let ready = worker.status() == WorkerStatus::Ready;
-                (
-                    worker.metadata().health_config.drain_settle_secs,
-                    ready.then_some(WorkerStatus::Draining),
-                )
+                (Arc::clone(worker), ready.then_some(WorkerStatus::Draining))
             });
             match drained {
-                Some((drain_secs, transition)) => {
+                Some((worker, transition)) => {
                     if transition.is_some() {
-                        transitioned += 1;
-                        max_drain_secs = max_drain_secs.max(drain_secs);
+                        context.data.drained_workers.push(worker);
                     }
                     kept.push(Arc::clone(snapshot));
                 }
@@ -146,17 +169,7 @@ impl<H: WorkflowHost> StepExecutor<WorkerRemovalWorkflowData<H>> for DrainWorker
             context.data.keep_only(kept);
         }
 
-        if transitioned == 0 {
-            debug!("Drain step: no Ready workers in batch, skipping drain");
-            return Ok(StepResult::Success);
-        }
-
-        info!(
-            "Draining {} worker(s) for {}s before removal",
-            transitioned, max_drain_secs
-        );
-        tokio::time::sleep(Duration::from_secs(max_drain_secs)).await;
-
+        settle_drained_workers(&context.data.drained_workers).await;
         Ok(StepResult::Success)
     }
 
@@ -220,6 +233,7 @@ mod tests {
             affected_models: std::collections::HashSet::new(),
             host: Some(host),
             actual_workers_to_remove: Some(workers),
+            drained_workers: Vec::new(),
             removed_workers: Vec::new(),
         };
         WorkflowContext::new(WorkflowInstanceId::new(), data)
@@ -305,6 +319,58 @@ mod tests {
         tokio::time::advance(Duration::from_secs(4)).await;
         let result = step_handle.await.unwrap().unwrap();
         assert_eq!(result, StepResult::Success);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_drain_step_settles_by_the_same_function() {
+        let first = build_worker("http://worker-a:8080", 2, WorkerStatus::Ready);
+        let selected = build_worker("http://worker-b:8080", 3, WorkerStatus::Ready);
+        let replacement = build_worker(selected.url(), 7, WorkerStatus::Ready);
+        let host = make_host(&[Arc::clone(&first), Arc::clone(&selected)]);
+        let id = host.worker_registry.get_id_by_url(selected.url()).unwrap();
+        assert!(host.worker_registry.replace(&id, Arc::clone(&replacement)));
+        let mut ctx = make_context(host, vec![Arc::clone(&first), Arc::clone(&selected)]);
+        ctx.data.drained_workers.push(selected);
+
+        let start = tokio::time::Instant::now();
+        assert_eq!(
+            DrainWorkersStep.execute(&mut ctx).await.unwrap(),
+            StepResult::Success
+        );
+        assert_eq!(start.elapsed(), Duration::from_secs(7));
+        let [first_drained, second_drained] = ctx.data.drained_workers.as_slice() else {
+            panic!("two workers should have drained");
+        };
+        assert!(Arc::ptr_eq(first_drained, &first));
+        assert!(Arc::ptr_eq(second_drained, &replacement));
+        assert_eq!(first_drained.status(), WorkerStatus::Draining);
+        assert_eq!(second_drained.status(), WorkerStatus::Draining);
+    }
+
+    #[test]
+    fn drained_workers_stay_in_memory_when_the_selection_changes() {
+        let url = "http://worker:8000";
+        let drained = build_worker(url, 7, WorkerStatus::Draining);
+        let mut data = make_context(make_host(&[]), vec![Arc::clone(&drained)]).data;
+        data.drained_workers.push(Arc::clone(&drained));
+
+        let saved = serde_json::json!({
+            "config": {"url": url, "expected_revisions": null},
+            "workers_to_remove": {"worker_urls": [url]},
+            "worker_urls": [url],
+            "affected_models": [],
+        });
+        assert_eq!(serde_json::to_value(&data).unwrap(), saved);
+        let restored: WorkerRemovalWorkflowData = serde_json::from_value(saved).unwrap();
+        assert!(restored.drained_workers.is_empty());
+
+        let mut copy = data.clone();
+        copy.keep_only(Vec::new());
+        assert!(copy.worker_urls.is_empty());
+        let [retained] = copy.drained_workers.as_slice() else {
+            panic!("the drained worker should still be held");
+        };
+        assert!(Arc::ptr_eq(retained, &drained));
     }
 
     /// Regression: status/revision must come from the live registry, not

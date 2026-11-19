@@ -59,6 +59,10 @@ pub struct WorkerRemovalWorkflowData<H> {
     /// Actual worker objects to remove (transient, not serialized)
     #[serde(skip, default)]
     pub actual_workers_to_remove: Option<Vec<Arc<dyn Worker>>>,
+    /// The workers marked `Draining` by the registry drain or the host's
+    /// drain. The settle reads its window from them. The list stays in memory.
+    #[serde(skip, default)]
+    pub drained_workers: Vec<Arc<dyn Worker>>,
     /// The workers the registry step removed at those URLs, a same-URL
     /// replacement that landed during the drain rather than the worker found
     /// (transient, not serialized)
@@ -76,6 +80,7 @@ impl<H> Clone for WorkerRemovalWorkflowData<H> {
             affected_models: self.affected_models.clone(),
             host: self.host.clone(),
             actual_workers_to_remove: self.actual_workers_to_remove.clone(),
+            drained_workers: self.drained_workers.clone(),
             removed_workers: self.removed_workers.clone(),
         }
     }

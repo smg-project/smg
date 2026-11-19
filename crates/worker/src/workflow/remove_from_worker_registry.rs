@@ -224,6 +224,7 @@ mod tests {
             affected_models: workers.iter().map(|w| w.model_id().to_string()).collect(),
             host: Some(host),
             actual_workers_to_remove: Some(workers),
+            drained_workers: Vec::new(),
             removed_workers: Vec::new(),
         };
         WorkflowContext::new(WorkflowInstanceId::new(), data)
