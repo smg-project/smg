@@ -39,12 +39,12 @@
 //!
 //! Memory: 32 bytes a block and its entry in a map, about 60 bytes
 //! together. A block that more than one worker was sent keeps their
-//! places in a list of its own: two bytes a worker, room for twice its
-//! workers at most, and the list's own 24 bytes. A block left with one
-//! worker holds it in itself again, and a list no block uses keeps room
-//! for eight places at most. The blocks stand in pieces of 4,096 that
-//! never move, and the keys in 256 maps by their top byte, so a growth
-//! moves one map's entries.
+//! places in a list of its own: two bytes a worker, room for eight
+//! places or for twice its workers at most, whichever is more, and the
+//! list's own 24 bytes. A block left with one worker holds it in itself
+//! again, and a list no block uses keeps room for eight places at most.
+//! The blocks stand in pieces of 4,096 that never move, and the keys in
+//! 256 maps by their top byte, so a growth moves one map's entries.
 
 use std::{mem, slice};
 
@@ -356,6 +356,15 @@ impl Predictor {
         if before != NONE {
             self.touch(before);
         }
+        // A block no worker is left of that the write stood on and gave
+        // nothing waits at the old end again: the next step takes it.
+        if end != NONE {
+            let block = self.block(end);
+            if block.after == 0 && block.lone == NOBODY && block.group == NONE {
+                self.unlink(end);
+                self.link_oldest(end);
+            }
+        }
     }
 
     /// A worker left the pool, or was replaced: the next read skips it.
@@ -376,9 +385,10 @@ impl Predictor {
     /// thread as it leaves a turn. The oldest blocks leave while more
     /// placements are held than the bound. The placements of the workers
     /// that left are taken out, and a path no worker is left of leaves
-    /// from its deep end. A step visits one entry or takes one block out,
-    /// so a call takes out `budget` blocks at most. Returns the steps
-    /// taken: fewer than `budget` where nothing waits.
+    /// from its deep end. A step visits one entry, takes one block out or
+    /// passes over one that others follow, so a call takes out `budget`
+    /// blocks at most. Returns the steps taken: fewer than `budget` where
+    /// nothing waits.
     pub fn sweep(&mut self, budget: usize) -> usize {
         let mut steps = 0;
         while steps < budget {

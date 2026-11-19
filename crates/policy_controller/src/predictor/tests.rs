@@ -624,6 +624,37 @@ fn a_list_of_workers_keeps_no_room_for_the_workers_that_left() {
     predictor.check();
 }
 
+#[test]
+fn a_block_no_worker_is_left_of_goes_back_to_the_old_end_behind_a_write_it_gave_no_room() {
+    let mut predictor = Predictor::new(1_000);
+    // A path of twelve that a request ended at every block of, then two
+    // blocks of a worker that leaves.
+    let path: Vec<u64> = (1..=12).collect();
+    predictor.sent(SEED, &path, worker(2));
+    for blocks in 1..=12 {
+        predictor.sent(SEED, &path[..blocks], worker(2));
+    }
+    predictor.sent(SEED, &[500, 501], worker(1));
+    predictor.forget(worker(1));
+    // The pass ends with the call's budget: its last visit takes the
+    // second of the two blocks out, and the first waits at the old end.
+    assert_eq!(predictor.sweep(14), 14);
+    assert_eq!((predictor.len(), predictor.blocks()), (12, 13));
+    // A write of that block at the bound stands on it, spends its ten
+    // steps passing over the path's blocks and gets no room. The block
+    // goes back to the old end, and the next step takes it.
+    predictor.set_bound(12);
+    predictor.sent(SEED, &[500], worker(2));
+    assert_eq!(
+        (predictor.len(), predictor.blocks(), predictor.dropped()),
+        (12, 13, 1)
+    );
+    assert_eq!(predictor.sweep(usize::MAX), 1);
+    assert_eq!((predictor.len(), predictor.blocks()), (12, 12));
+    assert_eq!(read(&mut predictor, &path), (12, vec![2]));
+    predictor.check();
+}
+
 /// The cases' draws: the same requests on every run.
 struct Draws(u64);
 
