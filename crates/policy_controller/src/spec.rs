@@ -27,7 +27,7 @@ use std::{
 use rustc_hash::FxHashMap;
 use schemars::{json_schema, JsonSchema, Schema, SchemaGenerator};
 use serde::{
-    de::{self, value::SeqAccessDeserializer, MapAccess, SeqAccess, Visitor},
+    de::{self, MapAccess, SeqAccess, Visitor},
     ser::SerializeMap,
     Deserialize, Deserializer, Serialize, Serializer,
 };
@@ -41,7 +41,7 @@ use crate::{
         SessionAffinity, DEFAULT_KV_PRESSURE_WEIGHT, DEFAULT_MEAN_PREFILL_TOKENS,
         DEFAULT_THROUGHPUT,
     },
-    catalog::{Catalog, Found},
+    catalog::{Catalog, Found, StageBuild},
     framework::{Binding, Engine, OverloadThresholds, Picker, Plan, Profile, Scorer, Weighted},
     ring::ConsistentHash,
     sessions::SessionRule,
@@ -811,11 +811,9 @@ impl ScoreStage {
 pub enum ScoreSpec {
     Name(String),
     Params(ScoreStage),
-    /// A name that is no built-in's, mapped to what the document wrote under
-    /// it: a scorer the catalog adds, with its weight (`{ name: { weight }
-    /// }`). Kept as read: the validator asks the catalog for the name first
-    /// and reads the keys of a name it holds. A key written twice is the
-    /// parser's refusal, as under a built-in.
+    /// A name that is no built-in's, mapped to its weight and any parameters
+    /// its factory reads. The map is kept as read so the validator can ask
+    /// the catalog for the name first. Parsing refuses a repeated key.
     Added {
         name: String,
         written: serde_json::Value,
@@ -844,13 +842,37 @@ impl From<ScoreStage> for ScoreSpec {
     }
 }
 
+/// What a document wrote under a registered scorer's name, written with
+/// the keys of every map in order: the canonical bytes, and so the digest,
+/// are the same whatever order a file wrote the keys in. The value keeps
+/// the written order for the factory that reads it.
+struct Ordered<'a>(&'a serde_json::Value);
+
+impl Serialize for Ordered<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self.0 {
+            serde_json::Value::Object(written) => {
+                let mut keys: Vec<&String> = written.keys().collect();
+                keys.sort_unstable();
+                let mut map = serializer.serialize_map(Some(keys.len()))?;
+                for key in keys {
+                    map.serialize_entry(key, &Ordered(&written[key.as_str()]))?;
+                }
+                map.end()
+            }
+            serde_json::Value::Array(values) => serializer.collect_seq(values.iter().map(Ordered)),
+            value => value.serialize(serializer),
+        }
+    }
+}
+
 impl Serialize for ScoreSpec {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let stage = match self {
             Self::Name(name) => return serializer.serialize_str(name),
             Self::Added { name, written } => {
                 let mut map = serializer.serialize_map(Some(1))?;
-                map.serialize_entry(name, written)?;
+                map.serialize_entry(name, &Ordered(written))?;
                 return map.end();
             }
             Self::Params(stage) => stage,
@@ -955,10 +977,8 @@ where
 }
 
 /// What a document wrote under a scorer's name that is no built-in's, kept
-/// as read for the validator. A key written twice is refused here, in the
-/// words a built-in's parameters refuse it: the map of `serde_json` keeps
-/// the last value and says nothing. Only the entry's own keys are asked:
-/// the validator takes the weight alone, a number.
+/// as read for the validator. Read maps and lists recursively so a key
+/// written twice is refused even inside a parameter.
 struct Written(serde_json::Value);
 
 impl<'de> Deserialize<'de> for Written {
@@ -996,8 +1016,12 @@ impl<'de> Deserialize<'de> for Written {
                 Ok(Written(serde_json::Value::Null))
             }
 
-            fn visit_seq<A: SeqAccess<'de>>(self, seq: A) -> Result<Written, A::Error> {
-                Deserialize::deserialize(SeqAccessDeserializer::new(seq)).map(Written)
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Written, A::Error> {
+                let mut values = Vec::new();
+                while let Some(Written(value)) = seq.next_element()? {
+                    values.push(value);
+                }
+                Ok(Written(serde_json::Value::Array(values)))
             }
 
             fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Written, A::Error> {
@@ -1006,7 +1030,8 @@ impl<'de> Deserialize<'de> for Written {
                     if keys.contains_key(&key) {
                         return Err(de::Error::custom(format_args!("duplicate field `{key}`")));
                     }
-                    keys.insert(key, map.next_value()?);
+                    let Written(value) = map.next_value()?;
+                    keys.insert(key, value);
                 }
                 Ok(Written(keys.into()))
             }
@@ -1616,6 +1641,7 @@ pub struct PolicySpec {
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SpecError {
     #[error("the document carries kind {0:?}: a policy spec has no kind field; its forms are a file and the API, never a custom resource")]
     Kind(String),
@@ -1685,6 +1711,9 @@ pub enum SpecError {
         value: String,
         reason: &'static str,
     },
+    /// A factory's refusal or a stage whose name differs from its registration.
+    #[error("{path}: {reason}")]
+    BadStage { path: String, reason: String },
     #[error("{path}: {what} is not in this build")]
     NotInBuild { path: String, what: &'static str },
     #[error("{path}: header {name:?} is on the deny-list")]
@@ -1758,6 +1787,7 @@ impl SpecError {
             Self::TooManyHeaders { .. } => "view.headers".to_owned(),
             Self::TooManyListed { path, .. } => (*path).to_owned(),
             Self::BadField { path, .. }
+            | Self::BadStage { path, .. }
             | Self::NotInBuild { path, .. }
             | Self::DeniedHeader { path, .. }
             | Self::HeaderNotAllowed { path, .. }
@@ -2399,6 +2429,27 @@ fn scored(
             scorer,
             weight: added_weight(written, &at.sub(name))?,
         })),
+        (entry, Found::With(build)) => {
+            let at = at.sub(name);
+            let mut params = if let ScoreSpec::Added { written, .. } = entry {
+                added_parameters(written, &at)?.clone()
+            } else {
+                serde_json::Map::new()
+            };
+            let weight = match params.shift_remove("weight") {
+                Some(value) => check_added_weight(&value, &at)?,
+                None => 1.0,
+            };
+            let scorer = build(&mut StageBuild::new(&params)).map_err(|error| error.at(&at.0))?;
+            let answers = scorer.name();
+            if answers != name {
+                return Err(SpecError::BadStage {
+                    path: at.0,
+                    reason: format!("scorer registered as {name:?} answers the name {answers:?}"),
+                });
+            }
+            Ok(Scored::Built(Weighted { scorer, weight }))
+        }
         // Only a document built in code: the parser reads a built-in's key
         // into its parameter struct.
         (ScoreSpec::Added { .. }, Found::Typed) => Err(SpecError::BadField {
@@ -2409,16 +2460,21 @@ fn scored(
     }
 }
 
-/// The weight a document gives a scorer added in code: `{ weight }` and no
-/// other key, each refused by name; one when the map is empty.
+fn added_parameters<'a>(
+    written: &'a serde_json::Value,
+    at: &At,
+) -> Result<&'a serde_json::Map<String, serde_json::Value>, SpecError> {
+    written.as_object().ok_or_else(|| SpecError::BadField {
+        path: at.0.clone(),
+        value: written.to_string(),
+        reason: "a map of the scorer's weight: { weight }",
+    })
+}
+
+/// The weight of a scorer whose factory takes no parameters. Any other key
+/// is refused by name. An empty map weighs one.
 fn added_weight(written: &serde_json::Value, at: &At) -> Result<f32, SpecError> {
-    let Some(keys) = written.as_object() else {
-        return Err(SpecError::BadField {
-            path: at.0.clone(),
-            value: written.to_string(),
-            reason: "a map of the scorer's weight: { weight }",
-        });
-    };
+    let keys = added_parameters(written, at)?;
     let mut weight = 1.0;
     for (key, value) in keys {
         if key != "weight" {
@@ -2428,11 +2484,16 @@ fn added_weight(written: &serde_json::Value, at: &At) -> Result<f32, SpecError> 
                 "a parameter of a scorer added in code, which takes its weight alone",
             ));
         }
-        // A number past an `f32` narrows to infinity and is refused below.
-        weight = value.as_f64().map_or(f32::NAN, |number| number as f32);
-        if !above_zero(weight) {
-            return Err(at.bad("weight", value, "a finite number above zero"));
-        }
+        weight = check_added_weight(value, at)?;
+    }
+    Ok(weight)
+}
+
+fn check_added_weight(value: &serde_json::Value, at: &At) -> Result<f32, SpecError> {
+    // A number past an `f32` narrows to infinity and is refused below.
+    let weight = value.as_f64().map_or(f32::NAN, |number| number as f32);
+    if !above_zero(weight) {
+        return Err(at.bad("weight", value, "a finite number above zero"));
     }
     Ok(weight)
 }
@@ -3928,6 +3989,82 @@ impl ViewLists {
 mod tests {
     use super::*;
     use crate::{Candidate, Constraints, Filter, Lifecycle, RequestFacts, Targets, TieBand};
+
+    #[test]
+    fn a_parameter_key_written_twice_is_refused_inside_maps_and_lists() {
+        let score_yaml = |score: &str| {
+            format!("apiVersion: {API_VERSION}\nprofiles:\n  default:\n    score: {score}\n    pick: best\n")
+        };
+        for score in [
+            "[{ queue-price: { costs: { unit: 17, unit: 31 } } }]",
+            "[{ queue-price: { costs: [[{ unit: 17, unit: 31 }]] } }]",
+        ] {
+            let error =
+                serde_yaml::from_str::<PolicySpec>(&score_yaml(score)).expect_err("duplicate key");
+            assert!(
+                error.to_string().contains("duplicate field `unit`"),
+                "{error}"
+            );
+        }
+        let json = format!(
+            r#"{{"apiVersion":"{API_VERSION}","profiles":{{"default":{{"score":[{{"queue-price":{{"costs":[{{"unit":17,"unit":31}}]}}}}],"pick":"best"}}}}}}"#
+        );
+        let error = serde_json::from_str::<PolicySpec>(&json).expect_err("duplicate key");
+        assert!(
+            error.to_string().contains("duplicate field `unit`"),
+            "{error}"
+        );
+
+        let read: PolicySpec = serde_yaml::from_str(&score_yaml(
+            "[{ queue-price: { costs: [[{ unit: 17 }]], weight: 3.5 } }]",
+        ))
+        .expect("a well-formed document");
+        let value = serde_json::to_value(&read).expect("serializes");
+        assert_eq!(
+            value["profiles"]["default"]["score"],
+            serde_json::json!([{ "queue-price": { "costs": [[{ "unit": 17 }]], "weight": 3.5 } }])
+        );
+        let again: PolicySpec = serde_json::from_value(value).expect("parses again");
+        assert_eq!(
+            read.digest().expect("digests"),
+            again.digest().expect("digests")
+        );
+    }
+
+    /// The order a file writes a registered scorer's parameter keys in is
+    /// in no digest, at any depth: two files that write one map in two
+    /// orders are one document. A value that differs is another.
+    #[test]
+    fn the_order_of_a_scorers_parameter_keys_is_in_no_digest() {
+        let document = |score: &str| -> PolicySpec {
+            serde_yaml::from_str(&format!(
+                "apiVersion: {API_VERSION}\nprofiles:\n  default:\n    score: {score}\n    pick: best\n"
+            ))
+            .expect("a well-formed document")
+        };
+        let one = document(
+            "[{ queue-price: { weight: 2, per_request: 500, costs: [{ unit: 17, flat: 3 }] } }]",
+        );
+        let other = document(
+            "[{ queue-price: { costs: [{ flat: 3, unit: 17 }], per_request: 500, weight: 2 } }]",
+        );
+        assert_eq!(
+            one.digest().expect("digests"),
+            other.digest().expect("digests"),
+            "two orders of one map"
+        );
+        assert_eq!(
+            serde_json::to_string(&one).expect("serializes"),
+            serde_json::to_string(&other).expect("serializes")
+        );
+        let moved = document(
+            "[{ queue-price: { weight: 2, per_request: 501, costs: [{ unit: 17, flat: 3 }] } }]",
+        );
+        assert_ne!(
+            one.digest().expect("digests"),
+            moved.digest().expect("digests")
+        );
+    }
 
     #[test]
     fn an_applied_generation_reads_block_hashes_as_deep_as_its_stages_do() {
