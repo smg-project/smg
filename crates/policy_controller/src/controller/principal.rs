@@ -15,7 +15,11 @@
 
 use tonic::{Request, Status};
 
-use crate::{proto::principal::Method, store::GatewayId, view};
+use crate::{
+    proto::principal::Method,
+    store::{token, GatewayId},
+    view,
+};
 
 /// The metadata entry a caller states its name in, on a listener that takes
 /// identities as told.
@@ -53,7 +57,7 @@ impl Principal {
 
 /// The layer of a listener that takes identities as told: the name the call
 /// states in [`ENTRY`] becomes its principal, nothing verified. A name is
-/// one token of visible ASCII (0x21 to 0x7E) with no comma, at most
+/// one [`token`] (visible ASCII, 0x21 to 0x7E, with no comma) of at most
 /// [`NAME_MAX`] bytes, stated once: a call that states none, two, or one
 /// that is no such token passes with no principal. The wire lets a hop
 /// join a key's entries into one value with a comma between them, so a
@@ -64,13 +68,7 @@ pub(crate) fn as_told(mut request: Request<()>) -> Request<()> {
         (Some(name), None) => name
             .to_str()
             .ok()
-            .filter(|name| {
-                !name.is_empty()
-                    && name.len() <= NAME_MAX
-                    && name
-                        .bytes()
-                        .all(|byte| byte.is_ascii_graphic() && byte != b',')
-            })
+            .filter(|name| name.len() <= NAME_MAX && token(name))
             .map(str::to_owned),
         _ => None,
     };
@@ -98,7 +96,10 @@ pub(crate) mod tests {
     use tonic::{Code, Request};
 
     use super::{as_told, principal, Principal, ENTRY, NAME_MAX};
-    use crate::{proto::principal::Method, store::GatewayId};
+    use crate::{
+        proto::principal::Method,
+        store::{token, GatewayId, Maker},
+    };
 
     /// The refusal of a call with no principal, word for word.
     pub(crate) const NO_PRINCIPAL: &str = "the call has no principal: this listener takes none as told, or the call states no single valid name in x-smg-principal";
@@ -118,6 +119,17 @@ pub(crate) mod tests {
             .metadata_mut()
             .insert(ENTRY, name.parse().expect("an ASCII value"));
         request
+    }
+
+    /// One function says the token: a name a principal states is a name a
+    /// provider is made under, and no other is.
+    #[test]
+    fn a_providers_name_is_a_token_a_principal_states() {
+        for name in ["cluster", "pods/a-1", "a,b", "a b", ""] {
+            let stated = principal(&as_told(stating(name))).is_ok();
+            assert_eq!(stated, token(name), "{name:?}");
+            assert_eq!(Maker::provider(name, "k").is_ok(), stated, "{name:?}");
+        }
     }
 
     #[test]

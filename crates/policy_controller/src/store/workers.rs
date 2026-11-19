@@ -199,19 +199,73 @@ pub enum Maker {
 }
 
 impl Maker {
-    /// The maker `provider` is for the worker it knows by `key`. `None`
-    /// where either is empty: a provider's maker names both, and a
-    /// follower refuses a row made under less.
-    pub fn provider(provider: impl Into<String>, key: impl Into<String>) -> Option<Self> {
+    /// The bytes of a provider's name: a label key's bound on the wire.
+    pub const NAME_BYTES: usize = 128;
+    /// The bytes of a provider's key for one worker: a URL's bound on the
+    /// wire.
+    pub const KEY_BYTES: usize = 2_048;
+
+    /// The maker `provider` is for the worker it knows by `key`, or the part
+    /// that breaks its rule. The rules are checked here and nowhere else, so
+    /// a leader makes no maker its follower refuses.
+    ///
+    /// The name is one [`token`] of at most [`Self::NAME_BYTES`] bytes, the
+    /// form of a principal's stated name: the step that registers for a
+    /// provider acts as a principal of that name. A refusal says it as it
+    /// stands.
+    /// The key is not empty and is at most [`Self::KEY_BYTES`] bytes. It is
+    /// the provider's own text and may hold an address with a credential:
+    /// no refusal, log line or metric label carries it. A key past its bound
+    /// is refused and never shortened, since two shortened keys can meet.
+    pub fn provider(provider: impl Into<String>, key: impl Into<String>) -> Result<Self, Unmade> {
         let (provider, key) = (provider.into(), key.into());
-        if provider.is_empty() || key.is_empty() {
-            return None;
+        if provider.is_empty() {
+            return Err(Unmade::Provider("a provider's row names its provider"));
         }
-        Some(Self::Provider(Arc::new(ProviderKey { provider, key })))
+        if provider.len() > Self::NAME_BYTES {
+            return Err(Unmade::Provider("a provider's name is at most 128 bytes"));
+        }
+        if !token(&provider) {
+            return Err(Unmade::Provider(
+                "a provider's name is one token of visible ASCII with no comma",
+            ));
+        }
+        if key.is_empty() {
+            return Err(Unmade::Key("a provider's row names its key for the worker"));
+        }
+        if key.len() > Self::KEY_BYTES {
+            return Err(Unmade::Key("a provider's key is at most 2048 bytes"));
+        }
+        Ok(Self::Provider(Arc::new(ProviderKey { provider, key })))
     }
 }
 
-/// A provider's name with its own key for one worker, neither empty:
+/// Whether `name` is one token: not empty, every byte visible ASCII (0x21 to
+/// 0x7E) and none a comma. A principal's stated name and a provider's name
+/// take this form, so one name reads the same in both; each holds its own
+/// bound. The wire lets a hop join a key's entries into one value with a
+/// comma between them, so a comma is two names.
+#[inline]
+pub fn token(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_graphic() && byte != b',')
+}
+
+/// Why a provider's name and key make no maker: the part that breaks its
+/// rule, with the rule as a refusal says it. The words hold neither text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum Unmade {
+    /// The provider's name.
+    #[error("{0}")]
+    Provider(&'static str),
+    /// The provider's key for the worker.
+    #[error("{0}")]
+    Key(&'static str),
+}
+
+/// A provider's name with its own key for one worker, each inside its rule:
 /// [`Maker::provider`] alone makes one.
 #[derive(Debug, PartialEq, Eq)]
 pub struct ProviderKey {

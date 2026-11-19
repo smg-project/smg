@@ -635,9 +635,10 @@ message WorkerRow {
 // field is empty: a reader refuses a row whose maker lacks one, by that
 // field.
 message Maker {
-  // The provider's name.
+  // The provider's name: one token of visible ASCII (0x21 to 0x7E) with no
+  // comma, at most 128 bytes, the form of a principal's stated name.
   string provider = 1;
-  // The provider's own key for the worker.
+  // The provider's own key for the worker, at most 2048 bytes.
   string key = 2;
 }
 
