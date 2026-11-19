@@ -437,8 +437,26 @@ fn build_worker_spec_omits_a_blank_model_override() {
         };
         let spec = build_worker_spec(&worker, DiscoveryKind::Kubernetes, &*host);
 
-        assert!(!spec.labels.contains_key("served_model_name"));
+        assert!(
+            !spec.labels.contains_key("served_model_name"),
+            "override {model_id_override:?} was stamped as served_model_name"
+        );
     }
+}
+
+#[test]
+fn build_worker_spec_trims_a_padded_model_override() {
+    let host = TestHost::without_a_queue();
+    let worker = DiscoveredWorker {
+        model_id_override: Some(" llama \t".to_string()),
+        ..published("10.0.0.1:8081", "uid-1:8081")
+    };
+    let spec = build_worker_spec(&worker, DiscoveryKind::Kubernetes, &*host);
+
+    assert_eq!(
+        spec.labels.get("served_model_name").map(String::as_str),
+        Some("llama")
+    );
 }
 
 /// Compatibility labels are opaque here: any key a provider supplies is
