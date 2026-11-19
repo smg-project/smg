@@ -408,7 +408,7 @@ mod tests {
 
     use kv_index::{ContentHash, SequenceHash, StoredBlock};
     use openai_protocol::{
-        worker::{ConnectionMode, HealthCheckConfig, RuntimeType, WorkerType},
+        worker::{ConnectionMode, HealthCheckConfig, RuntimeType, WorkerSpec, WorkerType},
         UNKNOWN_MODEL_ID,
     };
     use smg_worker::kv_events::{MAX_CONCURRENT_SINK_REMOVALS, SINK_REMOVAL_PERMITS};
@@ -786,6 +786,40 @@ mod tests {
         // set_block_size doesn't overwrite existing value
         monitor.set_block_size("llama", 64);
         assert_eq!(monitor.block_size("llama"), Some(32));
+    }
+
+    /// The add of an events worker seeds the model's block size from the
+    /// worker's spec, and the size leaves with the model's last events
+    /// subscription: the model's next worker seeds or learns its own.
+    #[tokio::test]
+    async fn the_block_size_comes_with_the_add_and_leaves_with_the_model() {
+        let monitor = KvEventMonitor::new();
+        let mut spec = WorkerSpec::new("grpc://127.0.0.1:7");
+        spec.kv_block_size = Some(32);
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::from_spec(spec)
+                .worker_type(WorkerType::Regular)
+                .connection_mode(ConnectionMode::Grpc)
+                .runtime_type(RuntimeType::TokenSpeed)
+                .health_config(HealthCheckConfig {
+                    disable_health_check: true,
+                    ..Default::default()
+                })
+                .build(),
+        );
+        monitor
+            .on_worker_added(&worker, SubscriptionKind::Events)
+            .await;
+        assert_eq!(
+            monitor.block_size(UNKNOWN_MODEL_ID),
+            Some(32),
+            "the add seeds the size from the spec"
+        );
+        monitor.on_worker_removed(worker.url()).await;
+        assert!(
+            monitor.block_size(UNKNOWN_MODEL_ID).is_none(),
+            "the size left with the model's last events subscription"
+        );
     }
 
     #[tokio::test]
