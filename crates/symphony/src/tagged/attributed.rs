@@ -335,7 +335,8 @@ pub struct Assembler {
     /// Whether the syntax refused bytes inside the started call (a word between tags, a tag out
     /// of its place, cut short or with a tail, a value held for its close that the end cut): the
     /// model's call had something in it the client will not get, so it is no whole call, and
-    /// nothing is made up for its close ([`Self::close`]).
+    /// nothing is made up for its close ([`Self::close`]). The table's configured stuttered
+    /// marker is the exception: it is still reported and dropped, but does not set this flag.
     refused: bool,
     /// The static prefix of the table's stuttered marker held between tags. What follows decides
     /// whether it is the opening tag's stutter or ordinary refused text.
@@ -464,6 +465,8 @@ impl Assembler {
     /// value, which is how a client that reads them as JSON is told, as a cut call tells it. (The
     /// engine's own parser hands such a call out whole with the members its reader matched, `{}`
     /// when none; a client read a well-formed call with no word that the model's call had failed.)
+    /// The table's configured stuttered marker is the exception: it is reported and dropped
+    /// without refusing the call.
     pub fn close(mut self, terminal: &str, out: &mut Events) {
         if self.done {
             return;
@@ -823,16 +826,12 @@ impl Assembler {
     /// closing tag has no place, and neither does a parameter before the function's name closed.
     fn tag_between(&mut self, tag: usize, out: &mut Events) {
         let bytes = self.tags.text(tag);
-        let stutter = tag == OPEN
-            && self.started()
-            && self.marker_held.is_some()
-            && self.marker_held == self.tags.stuttered_marker;
-        if stutter {
-            if let Some(marker) = self.marker_held.take() {
+        match self.marker_held.take() {
+            Some(marker) if tag == OPEN && Some(marker) == self.tags.stuttered_marker => {
                 self.report_between(marker, MalformedReason::TextBetweenTags, out);
             }
-        } else {
-            self.release_held_marker(out);
+            Some(marker) => self.release(marker, MalformedReason::TextBetweenTags, out),
+            None => {}
         }
         if tag == OPEN && self.started() {
             self.object.carried.push_str(bytes);
@@ -1131,7 +1130,9 @@ impl Assembler {
     /// brace of arguments written as one JSON object, held back for the call's end
     /// ([`Self::json_text`]), is refused with the first text released after the object, the
     /// whitespace between them included: the call is no whole call, and its arguments stay the
-    /// strict JSON prefix the fragments wrote.
+    /// strict JSON prefix the fragments wrote. The table's configured stuttered marker is the
+    /// exception: [`Self::report_between`] reports and drops it without refusing the call once the
+    /// following whole parameter opener proves it is a stutter.
     fn release(&mut self, text: &str, why: MalformedReason, out: &mut Events) {
         self.report_between(text, why, out);
         self.refused |= self.started();
@@ -1651,6 +1652,42 @@ mod tests {
             );
             assert_eq!(refused(&events), ["｜DSML｜"], "{tags:?}");
         }
+    }
+
+    #[test]
+    fn a_held_marker_prefix_is_refused_when_the_stream_ends() {
+        let tags = Tags {
+            stuttered_marker: Some("｜DSML｜"),
+            ..Tags::DSML_V4
+        };
+        let events = run_with(
+            tags,
+            &["f\">\n<｜DSML｜parameter name=\"a\" string=\"false\">7</｜DSML｜parameter>\n｜DSM"],
+            true,
+        );
+        assert_eq!(
+            (arguments(&events), shown(&events)),
+            (r#"{"a": 7"#.to_string(), String::new())
+        );
+        assert_eq!(refused(&events), ["｜DSM"]);
+    }
+
+    #[test]
+    fn a_held_marker_prefix_is_refused_when_the_stream_stops() {
+        let tags = Tags {
+            stuttered_marker: Some("｜DSML｜"),
+            ..Tags::DSML_V4
+        };
+        let events = stopped(
+            tags,
+            &["f\">\n<｜DSML｜parameter name=\"a\" string=\"false\">7</｜DSML｜parameter>\n｜DSM"],
+            false,
+        );
+        assert_eq!(
+            (arguments(&events), shown(&events)),
+            (r#"{"a": 7"#.to_string(), String::new())
+        );
+        assert_eq!(refused(&events), ["｜DSM"]);
     }
 
     /// An object-typed value nested past the bound the crate's JSON reader puts on a call's
