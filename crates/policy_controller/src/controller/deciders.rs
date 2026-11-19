@@ -76,7 +76,8 @@
 //! lease's release there, as a session hands a frame's
 //! ([`super::decide`]). Nor is an answer its stream's queue does not
 //! take, full or closed: its decider hands the release where the queue
-//! refuses it.
+//! refuses it and takes its file's turn behind the hand, so its next
+//! decision reads no count of that lease.
 //!
 //! What a lease does not do yet. A request sent twice under one id is
 //! issued two leases. A stage hears a lease's issue here, its release
@@ -610,12 +611,16 @@ impl Deciding {
     /// was full, or the stream had ended. No gateway will name a dispatch
     /// for it, and it would book its worker to its dispatch deadline. The
     /// decider hands its release to its own file as abandoned, as a
-    /// stream does for a decision it stops at the send, and applies it at
-    /// its next take: before its next decision reads a count, or as it
-    /// rests. A full ring makes the hand apply in place, outside any
-    /// decision. A stage's call that panics at either is held where the
-    /// engine is told, as every call of a lease's event is: the hand is
-    /// through, and the lease is off its file.
+    /// stream does for a decision it stops at the send, and gives the hand
+    /// back as a stream does at its end ([`MemoryStore::hand_back`]): it
+    /// takes its file's turn, whoever holds it, and the release is applied
+    /// before the give-up returns. Its look ahead of a decision passes a
+    /// held turn ([`AtWork::apply`]): a release left to that look could
+    /// book its worker through the next pick. The wait is the turn's,
+    /// outside any decision, as is a full ring's, where the hand applies
+    /// in place. A stage's call that panics at either take is held where
+    /// the engine is told, as every call of a lease's event is: the hand
+    /// is through, and the lease is off its file.
     #[cold]
     fn unsent(&self, gateway: GatewayId, answer: wire::Decided) {
         let wire::Decided::Decision {
@@ -628,6 +633,9 @@ impl Deciding {
         let hand = lifecycle::open(&self.reads.store, gateway);
         let abandoned = Said::Released(None, ReleaseReason::Abandoned);
         self.reads.store.hand(&hand, leased.lease.id, abandoned);
+        // The decider is at work at that file, so the hand left the frame
+        // to it: it takes the turn here.
+        self.reads.store.hand_back(hand);
     }
 
     /// The word of `term`'s mark: the planned hand-over, so the next take
@@ -1624,6 +1632,21 @@ pub(crate) mod tests {
         }
     }
 
+    /// A decider of the case's own over the bed's reads, for the case's
+    /// thread. It is not at work until its case seats it.
+    fn deciding(bed: &Bed) -> Deciding {
+        Deciding {
+            reads: bed.reads.clone(),
+            buffers: Buffers::default(),
+            faulted: false,
+            working: None,
+            name: None,
+            index: 0,
+            marked: None,
+            mark: Arc::default(),
+        }
+    }
+
     /// A decider issues into a file of leases of its own: the deciders do
     /// not start over a store made for another count of them.
     #[tokio::test]
@@ -2593,7 +2616,7 @@ pub(crate) mod tests {
     /// A give-up whose hand applies in place and meets another lease's
     /// panicking call there is through: the call is held where the engine
     /// is told, and the hand writes its frame behind it. The unsent
-    /// answer's lease leaves the file at the decider's next take.
+    /// answer's lease leaves the file at the take behind its hand.
     #[tokio::test]
     async fn a_give_up_behind_another_leases_panic_at_a_full_ring_is_still_handed() {
         let (mut bed, told, at_issue, word) = waits(true);
@@ -2632,7 +2655,7 @@ pub(crate) mod tests {
         word.send(()).expect("the stage waits for the case");
         // Two held calls: the first lease's release, where the give-up's
         // hand applied in place, and the second lease's own, where the
-        // decider leaves its work and applies the frame its hand wrote.
+        // decider takes its turn behind the hand and applies its frame.
         let (faults, waited) = (|| bed.store.lifecycle_faults(), Instant::now());
         while faults() < 2 && !*ended.borrow() {
             assert!(
@@ -2646,6 +2669,33 @@ pub(crate) mod tests {
         assert_eq!(bed.counts.faults.load(Ordering::Relaxed), 0);
         assert_eq!(bed.store.live(GATEWAY), 0);
         assert_eq!(*told.lock(), [(first.0, None), (first.0 + 1, None)]);
+    }
+
+    /// The lease of an answer its stream's queue refuses is off its file
+    /// when its decider's give-up returns. The decider is at work there,
+    /// so the hand leaves the frame to it, and its look ahead of a
+    /// decision passes a held turn: the give-up takes the turn itself.
+    /// The decider is the case's own, at work on the case's thread. A
+    /// second thread, which may not apply at that file, reads it.
+    #[test]
+    fn a_refused_answers_lease_is_off_its_file_when_its_give_up_returns() {
+        let bed = bed(Some(preset("random", 1)), true, (1, 8), []);
+        let mut decider = deciding(&bed);
+        decider.working = Some(bed.store.at_work());
+        let answer = decider.answer(checked(frame(1, 1)), GATEWAY, bed.script.taken);
+        let leased = matches!(answer, wire::Decided::Decision { lease: Some(_), .. });
+        assert!(leased, "the decision carries a lease");
+        let live = || {
+            thread::scope(|scope| {
+                let read = scope.spawn(|| bed.store.live(GATEWAY));
+                read.join().expect("the reading thread")
+            })
+        };
+        assert_eq!(live(), 1);
+        // Its stream refuses the answer.
+        decider.unsent(GATEWAY, answer);
+        assert_eq!(live(), 0, "the release waited for the decider's next take");
+        assert_eq!(bed.counts.faults.load(Ordering::Relaxed), 0);
     }
 
     /// A lease's dispatch span counts from its decision's first read, and
@@ -4382,16 +4432,7 @@ pub(crate) mod tests {
         let fault = || [Step::At(Duration::ZERO), Step::Panic];
         let steps = fault().into_iter().chain(fault()).chain(fault());
         let bed = bed(Some(preset("random", 1)), true, (1, 8), steps);
-        let mut decider = Deciding {
-            reads: bed.reads.clone(),
-            buffers: Buffers::default(),
-            faulted: false,
-            working: None,
-            name: None,
-            index: 0,
-            marked: None,
-            mark: Arc::default(),
-        };
+        let mut decider = deciding(&bed);
         let lines = Logged::default();
         let writer = lines.clone();
         let subscriber = tracing_subscriber::fmt()

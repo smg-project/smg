@@ -23,8 +23,9 @@
 //! Who applies. A decider with a job at hand is at work at its file
 //! ([`MemoryStore::at_work`]): it says so, then takes its turn as the
 //! first step of its work, tries the turn once before each decision reads
-//! its rows' counts, takes it at each issue, and takes it once more
-//! before it waits for its next job. While it is at work no other thread
+//! its rows' counts, takes it at each issue, takes it behind the give-up
+//! of an answer its stream refused, and takes it once more before it
+//! waits for its next job. While it is at work no other thread
 //! applies at its file: a thread that holds the file's turn and finds its
 //! decider at work lets go and applies nothing, and what was handed waits
 //! for the decider's next take. So a file's lines stay with the one
@@ -213,9 +214,10 @@ impl DerefMut for Turn<'_> {
 /// A decider's seat at its file ([`MemoryStore::at_work`]). While its
 /// thread works the hands leave what they hand to that file to it: it
 /// applies where it finds its turn free before a read of the counts
-/// ([`AtWork::apply`]) and at each issue. A thread that rests
-/// ([`AtWork::rest`]) or drops its seat takes the turn once more: what was
-/// handed behind its last take is applied before the thread waits.
+/// ([`AtWork::apply`]), at each issue, and behind the give-up of an
+/// answer its stream refused. A thread that rests ([`AtWork::rest`]) or
+/// drops its seat takes the turn once more: what was handed behind its
+/// last take is applied before the thread waits.
 pub struct AtWork {
     store: Arc<MemoryStore>,
     file: usize,
@@ -530,8 +532,10 @@ impl MemoryStore {
 
     /// A stream's end: each file it handed to is looked at once more, so
     /// what it handed is applied before its session leaves, or is left to
-    /// the thread at work there. A hand dropped without this call loses
-    /// nothing: its frames are the next take's.
+    /// the thread at work there. A decider gives the hand of a refused
+    /// answer's release back too: it is the thread at work at its file,
+    /// so it applies. A hand dropped without this call loses nothing: its
+    /// frames are the next take's.
     pub fn hand_back(&self, hand: Hand) {
         for (word, bits) in hand.handed.iter().enumerate() {
             let mut bits = bits.load(Relaxed);
