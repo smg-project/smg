@@ -539,7 +539,8 @@ impl Turn for HostedTurn<'_> {
     }
 
     fn room(&self, facts: &WorkerFacts, maker: &Maker) -> Result<(), HostRefused> {
-        worker_wire::carried(facts)
+        worker_wire::wire_reach(facts.wire_modes, facts.reachable_from, "row.wire")
+            .and_then(|()| worker_wire::carried(facts))
             .and_then(|()| worker_wire::room(facts, &facts.labels, maker, "row"))
             .map_err(|refusal| {
                 HostRefused::Past(Past {
@@ -662,7 +663,7 @@ pub(crate) mod tests {
     };
     #[cfg(feature = "worker-host")]
     use crate::{
-        store::WorkerFacts,
+        store::{GatewayId, Reachability, WorkerFacts},
         view::{Role, WireModes},
         worker_host::{Membership, Refused, StoreDoor, Wrote},
     };
@@ -1522,6 +1523,51 @@ pub(crate) mod tests {
         let row = store.by_key(URL).expect("the found row");
         let back = worker_wire::told_row(&worker_wire::row(&row), std::time::Instant::now());
         assert_eq!(back.map(|back| back.facts), Ok(row.facts));
+    }
+
+    /// The store reads a row as host-local by its reach alone: a row of the
+    /// host-local wire that names no gateway would stand in every gateway's
+    /// pool. A store held in process serves one gateway.
+    #[cfg(feature = "worker-host")]
+    #[test]
+    fn a_host_local_wire_names_its_gateway_at_the_controllers_door() {
+        let stated = |wire: WireModes, from: Reachability| {
+            move |_: Option<&WorkerFacts>| WorkerFacts {
+                wire_modes: wire,
+                reachable_from: from,
+                ..found_facts()
+            }
+        };
+        let (store, door) = door();
+        let hosted = Hosted::new(Arc::new(door), operator(), under(TERM));
+        let maker = found("pods/a");
+        let epoch = store.epoch();
+        for wire in [WireModes::ZMQ, WireModes::GRPC.union(WireModes::ZMQ)] {
+            let answer = hosted.found(&maker, URL, &stated(wire, Reachability::Any));
+            let Err(Refused::Past(past)) = answer else {
+                panic!("{wire:?}: wrong answer: {answer:?}")
+            };
+            assert_eq!(past.fact, "row.wire");
+        }
+        assert_eq!((store.by_key(URL), store.epoch()), (None, epoch));
+
+        // A row that names its gateway is in that gateway's pool alone.
+        let one = Reachability::Gateway(GatewayId(7));
+        hosted
+            .found(&maker, URL, &stated(WireModes::ZMQ, one))
+            .expect("found");
+        let row = store.by_key(URL).expect("the found row");
+        assert_eq!(row.facts.reachable_from, one);
+
+        // A store held in process serves one gateway, and takes the row.
+        let lone = Arc::new(MemoryStore::default());
+        let wrote = StoreDoor::new(Arc::clone(&lone)).found(
+            &maker,
+            URL,
+            &stated(WireModes::ZMQ, Reachability::Any),
+        );
+        let row = lone.by_key(URL).expect("the row in process");
+        assert_eq!(wrote, Ok(Wrote::Registered(row.id)));
     }
 
     #[cfg(feature = "worker-host")]

@@ -403,6 +403,26 @@ pub(crate) fn carried(facts: &WorkerFacts) -> Result<(), Refused> {
     }
 }
 
+/// The controller's rule of a row's wire and its reach, refused by `path`.
+/// A host-local wire is reachable from the one gateway that holds its
+/// socket, so a row of that wire names its gateway: the store reads a row as
+/// host-local by its reach alone, and a row every gateway reaches stands in
+/// every gateway's pool. A control call's registration and a host's found
+/// worker are held to it alike.
+pub(crate) fn wire_reach(
+    wire: WireModes,
+    from: Reachability,
+    path: &'static str,
+) -> Result<(), Refused> {
+    if wire.contains(WireModes::ZMQ) && from == Reachability::Any {
+        return Err(refused(
+            path,
+            "a host-local wire is one gateway's and a registration names none: not served by this build",
+        ));
+    }
+    Ok(())
+}
+
 /// Refuses, by `path`, a row of these facts under `labels` that passes
 /// [`ROW_BYTES`] with its maker: the facts' own bound ([`fits`]) is told
 /// where they are read, and a provider's row holds its maker inside the
@@ -919,17 +939,16 @@ fn over(spec: &proto::WorkerSpec, standing: Option<&WorkerFacts>) -> Result<Work
     let wire_modes = match proto::WireMode::try_from(spec.wire) {
         Ok(proto::WireMode::Http) => Some(WireModes::HTTP),
         Ok(proto::WireMode::Grpc) => Some(WireModes::GRPC),
-        // A host-local wire is reachable from the one gateway that holds its
-        // socket, and no field of a registration names a gateway.
-        Ok(proto::WireMode::Zmq) => {
-            return Err(refused(
-                "spec.wire",
-                "a host-local wire is one gateway's and a registration names none: not served by this build",
-            ));
-        }
+        Ok(proto::WireMode::Zmq) => Some(WireModes::ZMQ),
         Ok(proto::WireMode::Unspecified) => standing.map(|row| row.wire_modes),
         Err(_) => return Err(refused("spec.wire", "a wire this build does not know")),
     };
+    // No field of a registration names a gateway: the row's reach is the
+    // standing row's, and a new row's is every gateway's.
+    let from = standing.map(|row| row.reachable_from).unwrap_or_default();
+    if let Some(wire) = wire_modes {
+        wire_reach(wire, from, "spec.wire")?;
+    }
     let role = match proto::Role::try_from(spec.role) {
         Ok(proto::Role::Single) => Some(Role::Single),
         Ok(proto::Role::Prefill) => Some(Role::Prefill),
@@ -1587,6 +1606,34 @@ mod tests {
         );
         assert!(made.health.probes);
         assert_eq!(made.reachable_from, Reachability::Any);
+    }
+
+    /// One rule of a row's wire and its reach, whoever states the wire: a
+    /// registration's row keeps the reach of the row that stands.
+    #[test]
+    fn a_host_local_wire_is_held_to_the_reach_of_the_row_that_stands() {
+        let stated = proto::WorkerSpec {
+            wire: proto::WireMode::Zmq as i32,
+            ..spec()
+        };
+        let unsaid = proto::WorkerSpec { wire: 0, ..spec() };
+        let standing = |from| WorkerFacts {
+            wire_modes: WireModes::ZMQ,
+            reachable_from: from,
+            ..facts(&spec(), None).expect("a row")
+        };
+        let one = Reachability::Gateway(GatewayId(7));
+        for ask in [&stated, &unsaid] {
+            // One gateway's row takes the wire, stated or left as it stood.
+            let made = facts(ask, Some(&standing(one))).expect("one gateway's row");
+            assert_eq!(
+                (made.wire_modes, made.reachable_from),
+                (WireModes::ZMQ, one)
+            );
+            // A row that every gateway reaches is refused it.
+            let refusal = facts(ask, Some(&standing(Reachability::Any))).expect_err("no gateway");
+            assert_eq!(refusal.path, "spec.wire");
+        }
     }
 
     #[test]
