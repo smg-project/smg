@@ -183,6 +183,9 @@ pub enum Lifted {
     None,
     /// The overload veto: every usable worker was over its thresholds.
     Overload,
+    /// The liveness veto: no worker stood until it was lifted, and the pick
+    /// is of the workers the liveness check doubts.
+    Liveness,
 }
 
 /// The contract's word for the mark: the one mapper, for every writer of a
@@ -193,6 +196,7 @@ impl From<Lifted> for LiftedVeto {
         match mark {
             Lifted::None => Self::None,
             Lifted::Overload => Self::Overload,
+            Lifted::Liveness => Self::Liveness,
         }
     }
 }

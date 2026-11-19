@@ -911,12 +911,11 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             kv_usage_permille: Some(1),
             ..OverloadThresholds::default()
         };
-        let whole = harness.view(MODEL, Role::Single).expect("the view").len();
         harness
             .patch_overload(busy, least)
             .await
             .expect("an operator's patch is taken");
-        overloaded(&mut harness, whole, Some(busy))
+        overloaded(&mut harness, ranks, Some(busy))
             .await
             .expect("an engine at its patched limit reads overloaded");
         let mut vetoed = HashSet::new();
@@ -947,14 +946,14 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             "the gateway's lift of the veto keeps the overloaded row: {lifted:?}"
         );
         assert!(
-            reads_overloaded(&mut harness, whole, Some(busy)),
+            reads_overloaded(&mut harness, ranks, Some(busy)),
             "the engine read overloaded through both rotations"
         );
         harness
             .patch_overload(busy, OverloadThresholds::default())
             .await
             .expect("an operator's patch is taken");
-        overloaded(&mut harness, whole, None)
+        overloaded(&mut harness, ranks, None)
             .await
             .expect("the patch taken back, no row reads overloaded");
 
@@ -1429,12 +1428,11 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             }
         }
         let (key, row) = held.expect("of 256 routing keys one is the busy engine's");
-        let whole = harness.view(MODEL, Role::Single).expect("the view").len();
         harness
             .patch_overload(busy, least)
             .await
             .expect("an operator's patch is taken");
-        overloaded(&mut harness, whole, Some(busy))
+        overloaded(&mut harness, ranks, Some(busy))
             .await
             .expect("an engine at its patched limit reads overloaded");
         for n in 0..8 {
@@ -1447,14 +1445,14 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             );
         }
         assert!(
-            reads_overloaded(&mut harness, whole, Some(busy)),
+            reads_overloaded(&mut harness, ranks, Some(busy)),
             "the engine read overloaded through the key's asks"
         );
         harness
             .patch_overload(busy, OverloadThresholds::default())
             .await
             .expect("an operator's patch is taken");
-        overloaded(&mut harness, whole, None)
+        overloaded(&mut harness, ranks, None)
             .await
             .expect("the patch taken back, no row reads overloaded");
 

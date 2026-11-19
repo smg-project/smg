@@ -126,12 +126,19 @@ impl WireModes {
 pub struct Health {
     /// The worker's status is ready.
     pub healthy: bool,
-    /// The pool's circuit breaker refuses execution.
+    /// The pool's circuit breaker refuses execution, and no rule lifts it.
+    /// A host writes it into a row it copies for the decision, for a veto
+    /// of its own that holds, beside the stalled bit every veto of its own
+    /// writes. Over a publication's own rows such a row stands among the
+    /// host's held rows instead ([`Constraints::held`]).
     pub breaker_open: bool,
-    /// The liveness veto: unreachable or wedged. A host writes it into a
-    /// row it copies for the decision. Over a publication's own rows the
-    /// asking host's vetoes stand beside the rows instead, and a reader of
-    /// this bit asks both ([`Constraints::masks`]).
+    /// A standing veto of the asking host masks the row: the liveness
+    /// veto, unreachable or wedged, or a veto that holds, which writes the
+    /// breaker bit too. A host writes it into a row it copies for the
+    /// decision. Over a publication's own rows the asking host's vetoes
+    /// stand beside the rows instead, and a reader of this bit asks both
+    /// ([`Constraints::masks`]). The all-vetoed rule lifts it as its last
+    /// resort, on a row whose breaker bit is clear.
     pub stalled: bool,
     /// Being drained; nothing new goes there.
     pub draining: bool,
@@ -1059,6 +1066,13 @@ pub struct Constraints<'a> {
     /// stalled bit asks both ([`Constraints::masks`]). Empty where the rows
     /// were written for the decision. In-process only.
     pub stalled: &'a [u32],
+    /// The rows of [`Self::stalled`] a hold of this host stands on, in
+    /// order, each once: a veto no rule lifts, as an open breaker's is. The
+    /// all-vetoed rule lifts the mask as its last resort and leaves these
+    /// rows masked. Empty where the rows were written for the decision:
+    /// there a held row carries the breaker bit beside the stalled one.
+    /// In-process only.
+    pub held: &'a [u32],
     /// The pins of record, where the host keeps a table that outlives the
     /// engine's ([`PinSource`]): a sessions rule asks it for a key its own
     /// table holds no pin of, and no other stage reads it. `None` where

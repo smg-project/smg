@@ -1,7 +1,8 @@
 //! What a decision allocates, pinned at zero: once a first decision has sized
 //! the per-thread scratch, a decision of every preset over a reporting fleet
 //! of 64 and of 512 rows, a decision over rows with a credit held in the
-//! least-load tally, and a pair decision allocate nothing (design 4.4: a
+//! least-load tally, a decision over a pool doubted on every row, and a
+//! pair decision allocate nothing (design 4.4: a
 //! scorer or picker allocates nothing per decision; the host keeps one scratch
 //! per thread so the framework allocates nothing after the first). The
 //! store's pins stand beside them: a build from the store allocates nothing
@@ -271,6 +272,31 @@ fn a_decision_after_a_soft_filter_fallback_allocates_nothing() {
         allocations_during(|| engine.decide(&next, &pool(64), &view, &cx, &mut scratch));
     assert!(decision.pick().is_some());
     assert_eq!(allocations, 0, "the decision after a fallback allocated");
+}
+
+#[test]
+fn a_decision_over_a_doubted_pool_allocates_nothing_after_the_first() {
+    // Every ready row doubted: the pass that lifts the liveness veto reads
+    // the rows with no doubt from one buffer of the scratch. The first such
+    // decision sizes it and the next finds it sized.
+    let engine = engine_of("least_load");
+    let mut view = fleet(64);
+    for row in &mut view {
+        row.health.stalled = true;
+    }
+    let cx = Constraints::default();
+    let mut scratch = Scratch::new();
+    engine
+        .decide(&facts(1), &pool(64), &view, &cx, &mut scratch)
+        .pick()
+        .expect("the doubted fleet routes");
+    let (decision, allocations) =
+        allocations_during(|| engine.decide(&facts(2), &pool(64), &view, &cx, &mut scratch));
+    assert!(decision.pick().is_some());
+    assert_eq!(
+        allocations, 0,
+        "the second decision over a doubted pool allocated"
+    );
 }
 
 #[test]

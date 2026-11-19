@@ -652,8 +652,8 @@ pub(crate) const TYPES: &[Item] = &[
             " aggregated over every gateway (it stands while any gateway holds one, the",
             " microseconds are the longest remaining, 0 only when none remains). The",
             " deciding gateway's own veto is applied before any stage runs: in that",
-            " gateway's candidate rows alone the worker reads breaker-open (a breaker",
-            " veto) or stalled (a liveness veto).",
+            " gateway's candidate rows alone the worker reads stalled, and",
+            " breaker-open too under a breaker veto.",
         ],
         cases: &[
             "load(tuple<u64, u16, load>)",

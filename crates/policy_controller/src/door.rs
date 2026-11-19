@@ -126,6 +126,9 @@ pub(crate) const SUBSET_HINT: &str = "subset-hint";
 #[derive(Default)]
 pub(crate) struct Buffers<L> {
     pub(crate) view: ViewBuffers,
+    /// The rows of a lent view's mask a hold of the asking gateway stands
+    /// on ([`World::held`]): asked where a veto masks the view.
+    pub(crate) held: Vec<u32>,
     /// Both sides' rows of a pair decision and the table of their classes:
     /// a served controller's, the one host that decides a pair.
     #[cfg(feature = "controller")]
@@ -410,6 +413,7 @@ pub(crate) fn pair_in<A: Asked>(
         // A pair's columns ride its two pools, and a pair names no rows.
         affinity: &[],
         stalled: &[],
+        held: &[],
         in_flight: None,
         max_block_hashes: request.hashes_read(spec),
         named: None,
@@ -652,13 +656,14 @@ pub(crate) fn shed(
 
 /// What [`hand`] reads of a pool for one request: the pool's facts, the
 /// decision's instant in the rows' clock, the rows, the mask of the asking
-/// gateway's vetoes beside lent rows, the affinity column, the leases'
-/// counts beside lent rows, and the build the rows were read by.
+/// gateway's vetoes beside lent rows with the rows of it a hold stands on,
+/// the affinity column, the leases' counts beside lent rows, and the build
+/// the rows were read by.
 type Read<'a> = (
     PoolFacts<'a>,
     u64,
     &'a [Candidate],
-    &'a [u32],
+    (&'a [u32], &'a [u32]),
     &'a [AffinityFacts],
     Option<crate::LentCounts<'a>>,
     Option<Built>,
@@ -757,6 +762,7 @@ pub(crate) fn hand<A: Asked, R>(
     };
     let Buffers {
         view,
+        held: holds,
         scratch,
         lists,
         named,
@@ -774,18 +780,18 @@ pub(crate) fn hand<A: Asked, R>(
     // door writes with the counts on it for a plugin, which is shown a
     // row's bits and ages as the row's own fields.
     let by_door = wires.is_none() && request.subset() != Some(0);
-    let (pool, now_micros, candidates, stalled, affinity, counts, built): Read<'_> = if by_door {
+    let (pool, now_micros, candidates, masks, affinity, counts, built): Read<'_> = if by_door {
         match world.view(model, role, &ask, shown, view) {
             Some(read) => (
                 read.pool_facts(),
                 read.built.now_micros,
                 read.candidates,
-                read.stalled,
+                (read.stalled, world.held(&read, &ask, holds)),
                 read.affinity,
                 read.in_flight,
                 Some(read.built),
             ),
-            None => (none(), world.micros(now), &[], &[], &[], None, None),
+            None => (none(), world.micros(now), &[], (&[], &[]), &[], None, None),
         }
     } else {
         let built = world.build(model, role, &ask, view);
@@ -822,12 +828,13 @@ pub(crate) fn hand<A: Asked, R>(
             pool,
             now_micros,
             &view.candidates,
-            &[],
+            (&[], &[]),
             &view.affinity,
             None,
             built,
         )
     };
+    let (stalled, held) = masks;
     if names {
         // A row is named by its place among the rows the decision is made
         // over: the lent rows, or the built ones after their narrowing.
@@ -849,6 +856,7 @@ pub(crate) fn hand<A: Asked, R>(
         budget_micros: u32::try_from(left.as_micros()).unwrap_or(u32::MAX),
         affinity,
         stalled,
+        held,
         in_flight: counts,
         max_block_hashes: request.hashes_read(spec),
         named: names.then(|| named.affinity()),
@@ -922,6 +930,8 @@ pub(crate) struct Viewed<'a> {
     /// candidates are a publication's own rows; empty where they were
     /// written for the decision and carry their own stalled bits.
     pub(crate) stalled: &'a [u32],
+    /// The rows of `stalled` a hold of the asking gateway stands on.
+    pub(crate) held: &'a [u32],
     /// What the leases on file book on each row, by position, where the
     /// candidates are a publication's own rows; `None` where they were
     /// written for the decision and carry their counts.
@@ -1241,6 +1251,7 @@ impl Asked for Request<'_> {
         };
         let constraints = Constraints {
             stalled: viewed.stalled,
+            held: viewed.held,
             pins: viewed.pins,
             ..self.constraints
         };
@@ -1875,8 +1886,9 @@ pub(crate) mod tests {
         sessions::SessionVerdict,
         spec::{AppliedSpec, Needs, PolicySpec},
         store::{
-            Ask, Dispatch, GatewayId, LeaseRecord, LeaseState, LeasesStore, MemoryStore, Picked,
-            Said, SessionsStore, ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore,
+            Ask, Dispatch, GatewayId, HealthSink, LeaseRecord, LeaseState, LeasesStore,
+            MemoryStore, Picked, Said, SessionsStore, VetoWrite, ViewBuffers, WorkerFacts,
+            WorkerStatus, WorkersStore,
         },
         view::{
             Candidate, Constraints, Phase, PoolFacts, RequestFacts, Role, Session, WireModes,
@@ -2290,6 +2302,43 @@ pub(crate) mod tests {
         assert!(decided.decision.pick().is_none(), "no member it can dial");
         assert!(decided.lease.is_none());
         assert_eq!((door.undialed(), door.hashes_cut()), (3, 0));
+    }
+
+    /// The door hands a decision the asking gateway's vetoes as the store
+    /// keeps them. A pool it doubts on every member is steered: a doubt is
+    /// not an outage. A pool it holds on every member is shed at the health
+    /// stage, and one doubted member among held ones takes the request.
+    #[test]
+    fn a_gateways_holds_reach_the_doors_decision() {
+        let store = fleet(1);
+        let door = Door::new(Arc::clone(&store));
+        let now = Instant::now();
+        let until = now + Duration::from_secs(60);
+        let members: Vec<WorkerId> = booked(&store).iter().map(|&(id, _)| id).collect();
+        let veto = |member: WorkerId, hold: Option<Instant>, stands: bool| {
+            let written = store.gateway_veto_noted(GATEWAY, member, Some(until), hold, stands, now);
+            assert_eq!(written, VetoWrite::Written);
+        };
+        let decide = |id: &[u8]| {
+            let decided = door.decide(GATEWAY, &request(id, 7), now);
+            decided.expect("a decision").decision
+        };
+        for &member in &members {
+            veto(member, None, false);
+        }
+        assert!(decide(b"r-1").pick().is_some(), "a doubt is not an outage");
+        for &member in &members {
+            veto(member, Some(until), true);
+        }
+        let shed = decide(b"r-2");
+        assert!(
+            matches!(&shed, Decision::Shed(shed) if shed.emptied_by == "healthy"),
+            "{shed:?}"
+        );
+        veto(members[1], None, true);
+        let pick = decide(b"r-3");
+        let first = pick.pick().and_then(|pick| pick.targets.first());
+        assert_eq!(first.map(|target| target.id), Some(members[1]));
     }
 
     /// In process no election hands a term over: the door starts a store

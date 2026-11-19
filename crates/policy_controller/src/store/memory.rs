@@ -1144,12 +1144,19 @@ impl MemoryStore {
         self.show(&mut loads.writer, world);
     }
 
-    /// Publish `gateway`'s veto on `id`, or its clearing, at once. Called
-    /// under the health lock, which serializes the vetoes' writers, so the
-    /// published vetoes follow the health table's own order.
-    fn show_veto(&self, gateway: GatewayId, id: WorkerId, until: Option<Instant>) {
+    /// Publish `gateway`'s veto on `id` with its hold's end, or its
+    /// clearing, at once. Called under the health lock, which serializes
+    /// the vetoes' writers, so the published vetoes follow the health
+    /// table's own order.
+    fn show_veto(
+        &self,
+        gateway: GatewayId,
+        id: WorkerId,
+        until: Option<Instant>,
+        hold: Option<Instant>,
+    ) {
         let mut loads = self.loads.lock();
-        let world = loads.writer.veto(gateway, id, until);
+        let world = loads.writer.veto(gateway, id, until, hold);
         self.show(&mut loads.writer, world);
     }
 
@@ -1825,7 +1832,8 @@ impl WorkersStore for MemoryStore {
 
 #[derive(Default)]
 struct HealthTables {
-    /// A gateway's veto on a worker, until the instant.
+    /// A gateway's veto on a worker, until the instant. The veto's hold is
+    /// the world's alone: no answer of this table turns on it.
     vetoes: FxHashMap<(GatewayId, WorkerId), Instant>,
     /// The latest completed dispatch of class `Ok` on a worker by each
     /// gateway: the precedence rule is per gateway. One table a gateway:
@@ -1963,12 +1971,14 @@ impl HealthSink for MemoryStore {
                 }
                 let mut health = self.health.lock();
                 health.vetoes.insert((gateway, id), until);
-                self.show_veto(gateway, id, Some(until));
+                // No kind is told through this door, so the veto holds to
+                // its end: no rule lifts a veto it cannot name.
+                self.show_veto(gateway, id, Some(until), Some(until));
             }
             None => {
                 let mut health = self.health.lock();
                 health.vetoes.remove(&(gateway, id));
-                self.show_veto(gateway, id, None);
+                self.show_veto(gateway, id, None, None);
             }
         }
     }
@@ -1978,6 +1988,7 @@ impl HealthSink for MemoryStore {
         gateway: GatewayId,
         id: WorkerId,
         until: Option<Instant>,
+        hold: Option<Instant>,
         stands: bool,
         now: Instant,
     ) -> VetoWrite {
@@ -2001,11 +2012,11 @@ impl HealthSink for MemoryStore {
                     return VetoWrite::NoRow;
                 }
                 health.vetoes.insert((gateway, id), until);
-                self.show_veto(gateway, id, Some(until));
+                self.show_veto(gateway, id, Some(until), hold);
             }
             None => {
                 health.vetoes.remove(&(gateway, id));
-                self.show_veto(gateway, id, None);
+                self.show_veto(gateway, id, None, None);
             }
         }
         VetoWrite::Written

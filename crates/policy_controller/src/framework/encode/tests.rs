@@ -1370,6 +1370,128 @@ fn a_mask_is_numbered_with_the_encoders_offered() {
     assert_eq!(placed.encoders().first().map(|t| t.position), Some(2));
 }
 
+/// A filter that refuses the rows the host holds and reads no mask: a hard
+/// one, or a soft one that the pass opening the encoders does not ask.
+#[derive(Debug)]
+struct HeldOut {
+    soft: bool,
+}
+
+impl crate::framework::Filter for HeldOut {
+    fn name(&self) -> &'static str {
+        "held-out"
+    }
+
+    fn keep(&self, _: &RequestFacts<'_>, row: &Candidate, cx: &Constraints<'_>) -> bool {
+        cx.held.binary_search(&row.position).is_err()
+    }
+
+    fn soft(&self) -> bool {
+        self.soft
+    }
+}
+
+/// The held rows of a mask are numbered with it. Beside rows a side
+/// numbered anew, a stage reads a held row by where the row stands among
+/// them: on the prefill side, on the decode side and among the encoders
+/// offered. A mask that holds no row refuses none here.
+#[test]
+fn the_held_rows_of_a_mask_are_numbered_with_it() {
+    let mut engine = engine();
+    let binding = engine.binding("m", Phase::Prefill).expect("the binding");
+    let Plan::Epd { encode } = binding.plan else {
+        panic!("the epd plan");
+    };
+    let decode = binding.decode_profile.unwrap_or(binding.profile);
+    for (profile, soft) in [(binding.profile, false), (decode, false), (encode, true)] {
+        let profile = usize::from(profile);
+        let filters = &mut engine.profiles[profile].filters;
+        filters.retain(|filter| filter.name() != "healthy");
+        filters.push(Box::new(HeldOut { soft }));
+        engine.marks[profile] =
+            crate::framework::Marks::of(&engine.profiles[profile], engine.orders[profile]);
+    }
+    let open = Constraints::default();
+    let (masked, held) = (
+        masking(&[1]),
+        Constraints {
+            stalled: &[1],
+            held: &[1],
+            ..Constraints::default()
+        },
+    );
+    // The first prefill's class has no encoder and the first decode takes
+    // no image: each side is cut to its other two rows, the last the
+    // fuller. The held row stands first among the rows admitted.
+    let mut cut = Bed::new();
+    cut.prefills = (0..3)
+        .map(|at| row(at, Role::Prefill, 1, 9 * (at / 2)))
+        .collect();
+    cut.prefill_classes = vec![2, 1, 1];
+    cut.decodes = (0..3)
+        .map(|at| row(at, Role::Decode, 1, 9 * (at / 2)))
+        .collect();
+    cut.decodes[0].vision = false;
+    cut.decode_images = true;
+    let (facts, _) = cut.asked();
+    let pair = |sides: [&Constraints<'_>; 3]| {
+        pair_of(&decide_under(&cut, &engine, &facts, cut.pools(), sides).0)
+    };
+    assert_eq!(pair([&open; 3]), (1, 1));
+    assert_eq!(pair([&masked, &masked, &open]), (1, 1));
+    assert_eq!(pair([&held, &open, &open]), (2, 1));
+    assert_eq!(pair([&open, &held, &open]), (1, 2));
+    // One scratch through two decisions: the held rows numbered for the
+    // first are forgotten by the second, whose mask holds none.
+    let (_, pool) = cut.asked();
+    let encode = EncodePool {
+        encoders: &cut.encoders,
+        facts: &cut.facts,
+        prefill_classes: &cut.prefill_classes,
+        affinity: &cut.encode_affinity,
+    };
+    let items = EncodeItems {
+        keys: &cut.keys,
+        one: cut.one,
+        references: cut.references,
+        decode_images: cut.decode_images,
+    };
+    let (mut scratch, mut placed) = (Scratch::new(), EncodePlaced::new());
+    let mut prefill = |cx: &Constraints<'_>| {
+        let decision = engine.decide_encode_pair(
+            &facts,
+            &pool,
+            cut.pools(),
+            encode,
+            items,
+            cx,
+            &open,
+            &open,
+            &mut scratch,
+            &mut placed,
+        );
+        pair_of(&decision).0
+    };
+    assert_eq!(prefill(&held), 2);
+    assert_eq!(prefill(&masked), 1);
+    // The first encoder is of another class: the two offered stand at 0 and
+    // 1, the first of them held and the second the fuller.
+    let mut bed = Bed::new();
+    bed.encoders = (0..3)
+        .map(|at| row(at, Role::Encode, 0, 9 * (at / 2)))
+        .collect();
+    bed.facts = vec![pushing(2), pushing(1), pushing(1)];
+    let (facts, _) = bed.asked();
+    let encoder = |side: &Constraints<'_>| {
+        let sides = [&open, &open, side];
+        let (decision, placed) = decide_under(&bed, &engine, &facts, bed.pools(), sides);
+        assert!(decision.pick().is_some(), "a pick, not {decision:?}");
+        placed.encoders().first().map(|target| target.position)
+    };
+    assert_eq!(encoder(&masked), Some(1));
+    assert_eq!(encoder(&held), Some(2));
+}
+
 /// The `epd` plan with every side turning its pool's rotation.
 fn turning() -> Engine {
     let spec = PolicySpec::epd_presets("round_robin", "round_robin", "round_robin");
@@ -1445,4 +1567,31 @@ fn two_cuts_of_the_prefills_turn_rotations_apart() {
             "{size}: {reached:?}"
         );
     }
+}
+
+/// A side's held list takes its room where a hold is first numbered, one
+/// place a row admitted. A mask with no hold takes none, and a fuller hold
+/// over as many rows grows nothing.
+#[test]
+fn a_sides_held_list_is_sized_once_where_a_hold_is_numbered() {
+    let mut side = Admitted::default();
+    for at in 0..8 {
+        side.push(&row(at, Role::Prefill, 1, 0), at as usize, &[]);
+    }
+    side.take_room();
+    side.renumber(&[1, 3], &[]);
+    assert_eq!(side.held.capacity(), 0, "a mask with no hold takes no room");
+    side.masked.clear();
+    side.renumber(&[1, 3], &[3]);
+    assert_eq!((&side.masked[..], &side.held[..]), (&[1, 3][..], &[3][..]));
+    let room = side.held.capacity();
+    assert!(
+        room >= side.rows.len(),
+        "the first hold takes a place a row"
+    );
+    side.masked.clear();
+    let every: Vec<u32> = (0..8).collect();
+    side.renumber(&every, &every);
+    assert_eq!(side.held, every);
+    assert_eq!(side.held.capacity(), room, "a fuller hold grew the list");
 }
