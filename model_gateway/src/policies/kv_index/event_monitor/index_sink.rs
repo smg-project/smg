@@ -14,6 +14,7 @@ use kv_index::WorkerIdExhausted;
 use parking_lot::Mutex;
 use rustc_hash::FxBuildHasher;
 use smg_grpc_client::common_proto::{kv_cache_event, KvEventBatch};
+use smg_worker::metrics::writers::Metrics;
 use tracing::{debug, info};
 
 use super::{
@@ -22,7 +23,7 @@ use super::{
     port::{BatchFacts, BatchOutcome, KvCursor, KvEventSink, ResyncReason},
     KvBlockSize, KvEventMonitor,
 };
-use crate::worker::{kv::index_backend::KvIndex, metrics::Metrics};
+use crate::policies::kv_index::index_backend::KvIndex;
 
 /// The sink's name for one worker's row: made at [`IndexSink::open`] and
 /// given back by the collector on every call.

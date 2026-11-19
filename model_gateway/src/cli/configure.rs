@@ -29,10 +29,13 @@ use smg::{
     },
     service_discovery::RuntimeDiscoveryConfig,
     version,
-    worker::{identity::endpoint::Endpoint, ConnectionMode, RuntimeType},
 };
 use smg_auth::{ApiKeyEntry, ControlPlaneAuthConfig, JwtConfig, Role};
 use smg_mesh::{MTLSConfig, MeshServerConfig};
+use smg_worker::identity::{
+    basic::{ConnectionMode, RuntimeType},
+    endpoint::Endpoint,
+};
 
 use super::{
     secrets::{

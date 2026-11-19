@@ -26,14 +26,14 @@ use serde_json::{json, Value};
 use smg::{
     config::{RetryConfig, RouterConfig, RoutingMode},
     middleware::TenantRequestMeta,
-    routers::RouterFactory,
+    routers::{grpc::backend_client::BasicWorkerBuilder, RouterFactory},
     tenant::TenantKey,
-    worker::{
-        health::circuit_breaker::CircuitState, BasicWorkerBuilder, ConnectionMode, RuntimeType,
-        Worker, WorkerType,
-    },
 };
 use smg_grpc_client::{constraint_failed_status, tokenspeed_scheduler::tokenspeed_proto as ts};
+use smg_worker::{
+    health::circuit_breaker::CircuitState,
+    identity::basic::{ConnectionMode, RuntimeType, Worker, WorkerType},
+};
 use tokio::{net::TcpListener, time::timeout};
 use tonic::{transport::Server, Request, Response, Status};
 use ts::generate_response::Response as GenResp;

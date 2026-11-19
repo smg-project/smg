@@ -14,6 +14,9 @@ use std::{
 
 use axum::response::Response;
 use smg_grpc_client::vllm_proto as vllm;
+use smg_worker::{
+    health::liveness, identity::basic::Worker, metrics::writers::Metrics as WorkerMetrics,
+};
 use tracing::{debug, error, warn};
 
 use crate::{
@@ -50,7 +53,6 @@ use crate::{
             },
         },
     },
-    worker::{health::liveness, metrics::Metrics as WorkerMetrics, Worker},
 };
 
 /// The message a sequential decode side's silence verdict starts with (see
@@ -1043,22 +1045,23 @@ async fn sequential_decode_side(
 mod tests {
     use std::fmt::Write as _;
 
+    use smg_worker::identity::basic::{
+        ConnectionMode, RuntimeType, Worker, WorkerType, MOONCAKE_CONNECTOR, NIXL_CONNECTOR,
+    };
+
     use super::*;
     use crate::{
         middleware::test_support::text_of,
         routers::{
             common::{attempt_ledger::FailedSide, retry::is_retryable_response},
             grpc::{
+                backend_client::BasicWorkerBuilder,
                 common::stages::request_execution::tests::{
                     answers_after, fails_now, failure, media_refs_request, never_answers,
                     tokenspeed_pair, vllm_pd_mm_request,
                 },
                 proto_wrapper::FanoutStream,
             },
-        },
-        worker::{
-            BasicWorkerBuilder, ConnectionMode, RuntimeType, Worker, WorkerType,
-            MOONCAKE_CONNECTOR, NIXL_CONNECTOR,
         },
     };
 

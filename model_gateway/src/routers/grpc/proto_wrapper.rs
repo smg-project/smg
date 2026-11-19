@@ -31,17 +31,15 @@ use smg_grpc_client::{
     vllm_proto::{self as vllm, generate_complete::MatchedStop as VllmMatchedStop},
     RequestDeadline,
 };
+use smg_worker::{health::liveness, identity::basic::Worker, runtime::WorkerRuntime};
 use tokio::time::error::Elapsed;
 
-use crate::{
-    routers::{
-        common::sse::SseSender,
-        grpc::{
-            multimodal::{log_mm_timing_enabled, mm_rdma_exporter},
-            zmq_client::ZmqGenerateStream,
-        },
+use crate::routers::{
+    common::sse::SseSender,
+    grpc::{
+        multimodal::{log_mm_timing_enabled, mm_rdma_exporter},
+        zmq_client::ZmqGenerateStream,
     },
-    worker::{health::liveness, runtime::WorkerRuntime, Worker},
 };
 
 mod embed;
@@ -711,7 +709,7 @@ pub enum ProtoStream {
     /// each response stamped with its sample's index (see [`FanoutStream`]).
     Fanout(FanoutStream),
     /// Any of the above, with the worker it came from: every response is a
-    /// sign of life for that worker (see [`crate::worker::health::liveness`]).
+    /// sign of life for that worker (see [`smg_worker::health::liveness`]).
     Tracked(Box<TrackedStream>),
     /// The decode side of a disaggregated request: every response restamped
     /// with the prefill side's prefix-cache hit (see [`PrefillCachedTokens`]).
@@ -1079,11 +1077,13 @@ pub fn dispatch_ticket_life(worker: &Arc<dyn Worker>, prompt_tokens: u64) {
 mod tracked_tests {
     use std::sync::Arc;
 
+    use smg_worker::{identity::basic::Worker, runtime::StallReason};
+
     use super::{
         sglang, tokenspeed, vllm, DispatchBooking, FanoutStream, FirstItem, PrefillTicket,
         ProtoGenerateResponse, ProtoStream,
     };
-    use crate::worker::{runtime::StallReason, BasicWorkerBuilder, Worker};
+    use crate::routers::grpc::backend_client::BasicWorkerBuilder;
 
     #[test]
     fn the_cache_hit_a_first_response_reports_is_read_from_a_chunk_or_a_complete() {
@@ -1313,7 +1313,7 @@ mod tracked_tests {
     /// opens a breaker set to two.
     #[tokio::test]
     async fn a_decode_side_that_ends_with_nothing_on_it_earns_no_breaker_success() {
-        use crate::worker::health::circuit_breaker::{CircuitBreakerConfig, CircuitState};
+        use smg_worker::health::circuit_breaker::{CircuitBreakerConfig, CircuitState};
         let worker: Arc<dyn Worker> = Arc::new(
             BasicWorkerBuilder::new("grpc://decode:30000")
                 .circuit_breaker_config(CircuitBreakerConfig {
@@ -1486,7 +1486,7 @@ mod tracked_tests {
     /// at the replay: the decode worker's output, and its success.
     #[tokio::test]
     async fn a_first_item_pulled_ahead_is_replayed_once_and_booked_by_its_reader() {
-        use crate::worker::health::circuit_breaker::{CircuitBreakerConfig, CircuitState};
+        use smg_worker::health::circuit_breaker::{CircuitBreakerConfig, CircuitState};
         type Item = Result<ProtoGenerateResponse, tonic::Status>;
         // Chunks told apart by the count each carries.
         let chunk = |cached_tokens| -> Item {
@@ -1746,7 +1746,7 @@ impl ProtoStream {
     /// for the worker's rate (the side's first response is the end of its
     /// prefill, on either dispatch shape), and every response is progress for
     /// the worker. The side joins no pile: the gateway bounds its silence per
-    /// request (see [`crate::worker::health::liveness::prefill_side_bound`]) instead
+    /// request (see [`smg_worker::health::liveness::prefill_side_bound`]) instead
     /// of judging the worker by sides it cannot see progress on.
     #[must_use]
     pub(crate) fn tracked_prefill_side_booked(
@@ -2436,15 +2436,14 @@ mod fanout_tests {
         },
     };
 
+    use smg_worker::identity::basic::{Worker, WorkerLoadGuard, WorkerType};
+
     use super::*;
-    use crate::{
-        routers::{
-            common::prefill_admission::{
-                test_support::select_worker, PrefillAdmission, PrefillLoadGuard,
-            },
-            grpc::common::response_collection::drain_prefill,
+    use crate::routers::{
+        common::prefill_admission::{
+            test_support::select_worker, PrefillAdmission, PrefillLoadGuard,
         },
-        worker::{BasicWorkerBuilder, Worker, WorkerLoadGuard, WorkerType},
+        grpc::{backend_client::BasicWorkerBuilder, common::response_collection::drain_prefill},
     };
 
     /// A child that yields a script, then ends.
@@ -3294,15 +3293,16 @@ mod watched_tests {
     };
 
     use smg_grpc_client::vllm_proto as vllm;
+    use smg_worker::identity::basic::Worker;
     use tokio::sync::oneshot;
 
     use super::{PrefillCachedTokens, ProtoGenerateComplete, ProtoStream};
-    use crate::{
-        routers::{
-            common::sse::{sse_channel, SseReceiver},
-            grpc::regular::streaming::tests::eof::{chunk, complete, gated_stream, staged_stream},
+    use crate::routers::{
+        common::sse::{sse_channel, SseReceiver},
+        grpc::{
+            backend_client::BasicWorkerBuilder,
+            regular::streaming::tests::eof::{chunk, complete, gated_stream, staged_stream},
         },
-        worker::{BasicWorkerBuilder, Worker},
     };
 
     /// A stream whose `first` frames come at once and whose `rest` wait for
@@ -3705,8 +3705,10 @@ mod wire_field_tests {
 mod first_response_tests {
     use std::{sync::Arc, time::Duration};
 
+    use smg_worker::identity::basic::Worker;
+
     use super::{vllm, FanoutStream, PrefillTicket, ProtoGenerateResponse, ProtoStream};
-    use crate::worker::{BasicWorkerBuilder, Worker};
+    use crate::routers::grpc::backend_client::BasicWorkerBuilder;
 
     /// A timed stream's first response ends its prompt's prefill with the
     /// cache hit the response reports, so the worker's rate learns the

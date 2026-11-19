@@ -41,10 +41,11 @@
 
 use std::{cell::Cell, sync::Arc};
 
+use smg_worker::identity::basic::Worker;
 use tracing::debug;
 
 use super::{LoadBalancingPolicy, SelectWorkerInfo};
-use crate::{observability::metrics::Metrics, worker::Worker};
+use crate::observability::metrics::Metrics;
 
 /// Configuration for the PrefixHash load balancing policy
 #[derive(Debug, Clone)]
@@ -412,12 +413,10 @@ impl LoadBalancingPolicy for PrefixHashPolicy {
 #[cfg(test)]
 mod tests {
     use openai_protocol::worker::WorkerStatus;
+    use smg_worker::identity::basic::WorkerLoadGuard;
 
     use super::*;
-    use crate::{
-        policies::{hash_ring::HashRing, test_support::make_workers},
-        worker::WorkerLoadGuard,
-    };
+    use crate::policies::{hash_ring::HashRing, test_support::make_workers};
 
     #[test]
     fn test_prefix_hash_consistent_routing() {

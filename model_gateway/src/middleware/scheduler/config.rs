@@ -163,7 +163,7 @@ pub enum SettingsValidationError {
 /// then read-only.
 ///
 /// Capacity is not stored here; the scheduler reads it live from
-/// [`crate::worker::WorkerCapacity`] and reacts to changes via its
+/// [`smg_worker::load::capacity::WorkerCapacity`] and reacts to changes via its
 /// watch channel. Settings stay fixed.
 #[derive(Debug, Clone)]
 pub struct SchedulerSettings {

@@ -59,6 +59,7 @@ use std::{
 use async_trait::async_trait;
 use openai_protocol::worker::WorkerType;
 use serde::Deserialize;
+use smg_worker::identity::endpoint::{Endpoint, EndpointKey};
 use tokio::{process::Command, task, time};
 use tracing::info;
 
@@ -71,7 +72,6 @@ use crate::{
     app_context::AppContext,
     config::{ConfigError, ConfigResult, RoutingMode, SlurmDiscoveryConfig},
     observability::metrics::metrics_labels,
-    worker::{identity::endpoint::Endpoint, EndpointKey},
 };
 
 /// The oldest Slurm release this provider reads, as (major, minor).

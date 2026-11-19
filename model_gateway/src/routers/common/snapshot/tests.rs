@@ -9,12 +9,13 @@ use std::{
 };
 
 use openai_protocol::{model_card::ModelCard, worker::WorkerStatus};
+use smg_worker::{
+    identity::basic::BasicWorker,
+    test_support::{no_health_check, worker_with_model_aliases},
+};
 
 use super::*;
-use crate::worker::{
-    test_support::{no_health_check, worker_with_model_aliases},
-    BasicWorker, BasicWorkerBuilder, WorkerRegistry,
-};
+use crate::routers::grpc::backend_client::BasicWorkerBuilder;
 
 /// A gRPC worker of `model` whose card names `window` as its context
 /// window.

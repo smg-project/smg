@@ -44,7 +44,7 @@ model_gateway/src/         the gateway's recorders, each a test module beside th
   policies/classic_manual_rows.rs                                           manual.json
   policies/classic_prefix_hash_rows.rs                                      prefix_hash.json
   policies/classic_all_vetoed_rows.rs                                       all_vetoed.json
-  worker/pd/pair_index/classic_pair_rows.rs                                 pair_index.json
+  routers/common/pair_index/classic_pair_rows.rs                            pair_index.json
   routers/grpc/common/stages/worker_selection/classic_encode_pair_rows.rs   encode_pair.json
   routers/common/classic_pair_select_rows.rs                                pair_select.json
   policies/bucket/classic_bucket_rows.rs                                    bucket.json
@@ -246,7 +246,7 @@ The overload and minimum-tokens sheets' recorders are tests of the worker crate:
 | `manual.json` | `policies::classic_manual_rows` |
 | `prefix_hash.json` | `policies::classic_prefix_hash_rows` |
 | `all_vetoed.json` | `policies::classic_all_vetoed_rows` |
-| `pair_index.json` | `worker::pd::pair_index::classic_pair_rows` |
+| `pair_index.json` | `routers::common::pair_index::classic_pair_rows` |
 | `encode_pair.json` | `worker_selection::classic_encode_pair_rows` |
 | `pair_select.json` | `routers::common::classic_pair_select_rows` |
 | `overload.json` | `load::monitor::classic_overload_rows` |

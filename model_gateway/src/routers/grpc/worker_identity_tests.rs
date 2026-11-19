@@ -12,14 +12,17 @@ use std::{
 
 use engine_zmq_client::protocol::handshake::EngineCoreReadyResponse;
 use openai_protocol::worker::{ConnectionMode, ProfileOptions, RuntimeType, WorkerType};
+use smg_worker::{
+    identity::{
+        basic::{BasicWorker, Worker},
+        error::WorkerError,
+    },
+    test_support::no_health_check,
+};
 use tokio::time;
 
-use crate::{
-    routers::grpc::backend_client::{backend_client_if_initialized, BackendClient},
-    worker::{
-        identity::basic::BasicWorker, test_support::no_health_check, BasicWorkerBuilder, Worker,
-        WorkerError,
-    },
+use crate::routers::grpc::backend_client::{
+    backend_client_if_initialized, BackendClient, BasicWorkerBuilder,
 };
 
 /// What the engine declared at its handshake is read through the backend
@@ -194,7 +197,7 @@ async fn a_replacement_reconnects_after_a_retired_workers_probe() {
         EngineId, ENGINE_CORE_DEAD_SENTINEL,
     };
 
-    use crate::worker::WorkerRegistry;
+    use crate::routers::common::snapshot::WorkerRegistry;
 
     let dir = tempfile::tempdir().unwrap();
     let base = format!("ipc://{}", dir.path().join("engine").display());
@@ -478,8 +481,9 @@ async fn a_zmq_workers_admin_operations_ride_its_control_wire() {
 #[tokio::test]
 async fn a_fleet_flush_skips_the_zmq_workers_without_control_calls_and_counts_them() {
     use engine_zmq_client::mock_engine::default_ready_response;
+    use smg_worker::health::manager::WorkerManager;
 
-    use crate::worker::{WorkerManager, WorkerRegistry};
+    use crate::routers::common::snapshot::WorkerRegistry;
 
     let dir = tempfile::tempdir().unwrap();
     let (silent, _silent_rank) =

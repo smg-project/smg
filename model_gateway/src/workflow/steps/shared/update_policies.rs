@@ -3,6 +3,10 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use smg_worker::{
+    identity::basic::{ConnectionMode, RuntimeType, Worker},
+    kv_events::SubscriptionKind,
+};
 use tracing::{debug, warn};
 use wfaas::{
     StepExecutor, StepResult, WorkflowContext, WorkflowData, WorkflowError, WorkflowResult,
@@ -10,7 +14,6 @@ use wfaas::{
 
 use crate::{
     app_context::AppContext,
-    worker::{ConnectionMode, RuntimeType, SubscriptionKind, Worker},
     workflow::data::{require_app_context, WorkerRegistrationData},
 };
 
@@ -246,7 +249,10 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for UpdatePolicie
 
 #[cfg(test)]
 mod tests {
-    use openai_protocol::worker::{HealthCheckConfig, RuntimeType, WorkerSpec, WorkerType};
+    use openai_protocol::{
+        model_card::ModelCard,
+        worker::{HealthCheckConfig, RuntimeType, WorkerSpec, WorkerType},
+    };
     use tracing_test::traced_test;
     use wfaas::WorkflowInstanceId;
 
@@ -254,8 +260,8 @@ mod tests {
     use crate::{
         app_context::{testing::app_context_for_tests, AppContext},
         config::{PolicyConfig, RouterConfig},
-        policies::{as_cache_aware, PolicyFactory},
-        worker::{BasicWorkerBuilder, KvEventMonitor, ModelCard, WorkerRegistry},
+        policies::{as_cache_aware, kv_index::event_monitor::KvEventMonitor, PolicyFactory},
+        routers::{common::snapshot::WorkerRegistry, grpc::backend_client::BasicWorkerBuilder},
         workflow::{data::WorkerRegistrationMode, steps::create_worker_workflow_data},
     };
 

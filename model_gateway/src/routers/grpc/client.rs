@@ -16,6 +16,7 @@ use smg_grpc_client::{
     SglangGenerateRequestOptions, SglangSchedulerClient, TokenSpeedSchedulerClient,
     TrtllmServiceClient, VllmEngineClient,
 };
+use smg_worker::identity::basic::RuntimeType;
 
 use super::multimodal::SUPPORTS_VISION_LABEL;
 use crate::{
@@ -89,8 +90,7 @@ impl GrpcClient {
 
     /// Runtime type backing this client. Lets shared logic (e.g. the multimodal
     /// capability matrix) key on the backend without matching every variant.
-    pub fn runtime_type(&self) -> crate::worker::RuntimeType {
-        use crate::worker::RuntimeType;
+    pub fn runtime_type(&self) -> RuntimeType {
         match self {
             Self::Sglang(_) => RuntimeType::Sglang,
             Self::Vllm(_) => RuntimeType::Vllm,

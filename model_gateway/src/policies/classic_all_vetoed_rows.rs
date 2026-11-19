@@ -43,13 +43,14 @@ use std::{fs, path::PathBuf, sync::Arc};
 use http::HeaderMap;
 use openai_protocol::worker::WorkerStatus;
 use serde::Serialize;
+use smg_worker::{identity::basic::Worker, runtime::StallReason, test_support::ready_worker};
 
 use super::PolicyRegistry;
 use crate::{
     config::types::PolicyConfig,
-    routers::common::placement::{self, PlacementFailure, PlacementInputs},
-    worker::{
-        runtime::StallReason, test_support::ready_worker, RoutingPool, Worker, WorkerRegistry,
+    routers::common::{
+        placement::{self, PlacementFailure, PlacementInputs},
+        snapshot::{RoutingPool, WorkerRegistry},
     },
 };
 

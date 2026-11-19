@@ -15,13 +15,11 @@ use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use openai_protocol::worker::WorkerStatus;
+use smg_worker::identity::{basic::Worker, endpoint::Endpoint};
 use tracing::{debug, info};
 use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
-use crate::{
-    worker::{identity::endpoint::Endpoint, Worker},
-    workflow::data::{require_app_context, WorkerRemovalWorkflowData},
-};
+use crate::workflow::data::{require_app_context, WorkerRemovalWorkflowData};
 
 /// Step that transitions Ready workers to `Draining` and waits for the
 /// resolved drain settle window before downstream steps remove them.
@@ -167,12 +165,13 @@ mod tests {
     use std::{collections::HashMap, sync::Arc};
 
     use openai_protocol::worker::{HealthCheckConfig, WorkerStatus};
+    use smg_worker::identity::basic::{Worker, WorkerType};
     use wfaas::WorkflowInstanceId;
 
     use super::*;
     use crate::{
         app_context::AppContext,
-        worker::{BasicWorkerBuilder, Worker, WorkerType},
+        routers::grpc::backend_client::BasicWorkerBuilder,
         workflow::data::{WorkerList, WorkerRemovalWorkflowData},
     };
 
@@ -194,7 +193,7 @@ mod tests {
     fn make_app_context(workers: &[Arc<dyn Worker>]) -> Arc<AppContext> {
         use crate::{
             app_context::testing::app_context_for_tests, config::RouterConfig,
-            worker::WorkerRegistry,
+            routers::common::snapshot::WorkerRegistry,
         };
 
         let router_config = RouterConfig::builder()
@@ -371,7 +370,7 @@ mod tests {
     /// Checked outside the lock, the step wrote `NotReady -> Draining` here.
     #[tokio::test]
     async fn test_drain_workers_step_keeps_a_demotion_written_between_its_read_and_its_write() {
-        use crate::worker::registry::event::WorkerEvent;
+        use smg_worker::registry::event::WorkerEvent;
 
         let worker = build_worker("http://w1:8080", 0, WorkerStatus::Ready);
         let app_ctx = make_app_context(&[Arc::clone(&worker)]);

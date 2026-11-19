@@ -13,17 +13,14 @@
 
 use std::{fmt, sync::Arc};
 
-use super::{stream_failure::UpstreamClass, tonic_ext::is_the_engines_own_report};
-use crate::{
-    observability::metrics::metrics_labels,
-    worker::{
-        health::bootstrap_probe::{
-            probe_partners_bootstrap_port, DeadBootstrapPort, REQUEST_PHASE,
-        },
-        metrics::Metrics,
-        Worker,
-    },
+use smg_worker::{
+    health::bootstrap_probe::{probe_partners_bootstrap_port, DeadBootstrapPort, REQUEST_PHASE},
+    identity::basic::Worker,
+    metrics::writers::Metrics,
 };
+
+use super::{stream_failure::UpstreamClass, tonic_ext::is_the_engines_own_report};
+use crate::observability::metrics::metrics_labels;
 
 /// Words an engine puts on a side that never met its partner: the bootstrap
 /// (its server, its room, the wait in the bootstrapping state) and the
@@ -136,11 +133,11 @@ mod tests {
 
     use metrics_exporter_prometheus::PrometheusBuilder;
     use openai_protocol::worker::{RuntimeType, WorkerType};
+    use smg_worker::test_support::RefusedAddress;
 
     use super::*;
-    use crate::{
-        routers::grpc::proto_wrapper::ENGINE_ERROR_MESSAGE,
-        worker::{test_support::RefusedAddress, BasicWorkerBuilder},
+    use crate::routers::grpc::{
+        backend_client::BasicWorkerBuilder, proto_wrapper::ENGINE_ERROR_MESSAGE,
     };
 
     /// A prefill side on the loopback host whose partners are handed `port`.

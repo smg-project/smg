@@ -23,6 +23,10 @@ use std::{
 };
 
 use openai_protocol::worker::WorkerSpec;
+use smg_worker::{
+    identity::endpoint::{Endpoint, EndpointKey},
+    registry::{WorkerId, WorkerOrigin},
+};
 use tokio::time;
 use tracing::{error, info, warn};
 
@@ -31,7 +35,6 @@ use crate::{
     app_context::AppContext,
     config::RouterConfig,
     observability::metrics::{metrics_labels, Metrics},
-    worker::{identity::endpoint::Endpoint, registry::WorkerId, EndpointKey, WorkerOrigin},
     workflow::{Job, WorkerRegistrationMode},
 };
 

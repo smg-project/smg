@@ -2037,7 +2037,7 @@ impl<G: Generation> WorkerRegistry<G> {
         }
 
         // The worker's series are kept for the time its address is
-        // registered (see `worker::metrics::series`). The builder's
+        // registered (see `metrics::series`). The builder's
         // writes for health, HTTP/2 and breaker state preceded this
         // registration and were dropped if the address was retired by an
         // earlier removal, so they are repeated here.

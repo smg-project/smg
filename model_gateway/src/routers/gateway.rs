@@ -41,10 +41,12 @@ use openai_protocol::{
     responses::ResponsesRequest,
     systemone::SystemOneRequest,
     transcription::{AudioFile, TranscriptionRequest},
+    worker::ProviderType,
     UNKNOWN_MODEL_ID,
 };
 use smg_data_connector::MemoryConfig;
 use smg_external_router::spec_for_provider;
+use smg_worker::identity::basic::ConnectionMode;
 use tracing::{debug, info, warn};
 
 use crate::{
@@ -53,7 +55,11 @@ use crate::{
     middleware::TenantRequestMeta,
     policies::PolicyRegistry,
     routers::{
-        common::{body_policy::REASON_MODEL_SELECTION, header_utils::ROUTING_KEY_HINT_MAX_BYTES},
+        common::{
+            body_policy::REASON_MODEL_SELECTION,
+            header_utils::ROUTING_KEY_HINT_MAX_BYTES,
+            snapshot::{RoutingPool, WorkerRegistry, WorkerRegistryExt},
+        },
         error as route_error,
         factory::{router_ids, RouterId},
         grpc::regular::stages::decisions::supports_worker as supports_decisions_worker,
@@ -62,7 +68,6 @@ use crate::{
     },
     server::ServerConfig,
     tenant::storage_tenant,
-    worker::{ConnectionMode, ProviderType, RoutingPool, WorkerRegistry, WorkerRegistryExt},
 };
 
 /// A router family the weighted selection chooses among: its router and the
@@ -1248,14 +1253,18 @@ mod tests {
     use async_trait::async_trait;
     use axum::{http::StatusCode, response::IntoResponse};
     use openai_protocol::{model_card::ModelCard, worker::WorkerStatus};
+    use smg_worker::{
+        health::circuit_breaker::CircuitBreakerConfig,
+        identity::basic::{RuntimeType, WorkerType},
+    };
 
     use super::*;
     use crate::{
         config::types::{PolicyConfig, RoutingKeyOverrideConfig},
         middleware::{RouteRequestMeta, TenantKey},
-        routers::{factory::router_ids, tests::error_shape},
-        worker::{
-            BasicWorkerBuilder, CircuitBreakerConfig, RuntimeType, WorkerRegistry, WorkerType,
+        routers::{
+            common::snapshot::WorkerRegistry, factory::router_ids,
+            grpc::backend_client::BasicWorkerBuilder, tests::error_shape,
         },
     };
 

@@ -15,6 +15,7 @@ use futures::Stream;
 use openai_protocol::{
     model_card::ModelCard,
     worker::{ConnectionMode, HealthCheckConfig, RuntimeType, WorkerType},
+    UNKNOWN_MODEL_ID,
 };
 use smg_grpc_client::{
     common_proto::{self as common, kv_cache_event, KvEventBatch},
@@ -27,10 +28,7 @@ use tonic::{transport::Server, Request, Response, Status};
 use tracing_test::traced_test;
 
 use super::*;
-use crate::{
-    routers::grpc::test_engine::serve_on_loopback,
-    worker::{BasicWorkerBuilder, UNKNOWN_MODEL_ID},
-};
+use crate::routers::grpc::{backend_client::BasicWorkerBuilder, test_engine::serve_on_loopback};
 
 /// The second subscribe call a scheduler noted, by which the first call's
 /// stream was drained to its end.
@@ -575,11 +573,9 @@ fn a_backend_without_kv_events_is_a_gauge_until_the_worker_leaves() {
 #[test]
 fn a_connection_that_is_not_the_gateways_client_carries_no_event_stream() {
     use metrics_exporter_prometheus::PrometheusBuilder;
+    use smg_worker::{connection::engine::EngineConnector, test_support::CountingConnector};
 
-    use crate::worker::{
-        connection::engine::EngineConnector, kv::event_monitor::Slot,
-        test_support::CountingConnector,
-    };
+    use crate::policies::kv_index::event_monitor::Slot;
 
     let recorder = PrometheusBuilder::new().build_recorder();
     let handle = recorder.handle();

@@ -11,11 +11,11 @@ use axum::{
 use openai_protocol::{chat::ChatCompletionRequest, validated::ValidatedJson};
 use serde_json::{json, Value};
 use smg_grpc_client::{sglang_proto, SglangSchedulerClient, VllmEngineClient};
+use smg_worker::identity::basic::{RuntimeType, Worker, WorkerType};
 
 use super::*;
-use crate::{
-    routers::grpc::{context::ExecutionPlanKind, proto_wrapper::ProtoRequest},
-    worker::{BasicWorkerBuilder, RuntimeType, Worker, WorkerType},
+use crate::routers::grpc::{
+    backend_client::BasicWorkerBuilder, context::ExecutionPlanKind, proto_wrapper::ProtoRequest,
 };
 
 fn worker_with_defaults(url: &str, defaults_json: Option<&str>) -> WorkerSelection {

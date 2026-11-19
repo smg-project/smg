@@ -32,10 +32,10 @@ use crate::{
                 persist_conversation_items, persist_conversation_items_if_open, PersistError,
                 PersistStep,
             },
+            snapshot::WorkerRegistry,
         },
         error,
     },
-    worker::WorkerRegistry,
 };
 
 /// Supply failure details when an engine reports only a terminal finish reason.
@@ -782,6 +782,7 @@ mod tests {
     use axum::http::StatusCode;
     use openai_protocol::{
         model_card::ModelCard, responses::ResponseStatus, worker::HealthCheckConfig,
+        UNKNOWN_MODEL_ID,
     };
     use serde_json::json;
     use smg_data_connector::{
@@ -791,11 +792,9 @@ mod tests {
     };
 
     use super::*;
-    use crate::{
-        routers::grpc::common::responses::test_support::{
-            completed_response, response_storage_over,
-        },
-        worker::{BasicWorkerBuilder, UNKNOWN_MODEL_ID},
+    use crate::routers::grpc::{
+        backend_client::BasicWorkerBuilder,
+        common::responses::test_support::{completed_response, response_storage_over},
     };
 
     /// A chain ending in a record its client asked not to store is no

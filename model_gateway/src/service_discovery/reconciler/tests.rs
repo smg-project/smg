@@ -1,9 +1,8 @@
 use openai_protocol::worker::WorkerType;
+use smg_worker::identity::endpoint::endpoint_key;
 
 use super::*;
-use crate::{
-    server::http_client, service_discovery::testing::create_test_app_context, worker::endpoint_key,
-};
+use crate::{server::http_client, service_discovery::testing::create_test_app_context};
 
 fn key(url: &str) -> EndpointKey {
     endpoint_key(url).expect(url)
@@ -222,7 +221,7 @@ fn diverged_ranks_do_not_collapse_on_equal_revisions() {
 fn register_with_labels(app_context: &AppContext, url: &str, labels: &[(&str, &str)]) {
     use openai_protocol::model_card::ModelCard;
 
-    use crate::worker::BasicWorkerBuilder;
+    use crate::routers::grpc::backend_client::BasicWorkerBuilder;
 
     let labels: HashMap<String, String> = labels
         .iter()
@@ -364,7 +363,7 @@ fn owned_workers_exclude_mesh_imported_workers() {
         DISCOVERY_PROVIDER_LABEL.to_string(),
         "kubernetes".to_string(),
     );
-    let state = crate::worker::RemoteWorkerState {
+    let state = smg_worker::registry::RemoteWorkerState {
         worker_id: "peer-w1".to_string(),
         model_id: "m".to_string(),
         url: "http://10.0.0.3:8080".to_string(),
@@ -570,14 +569,12 @@ async fn a_discovered_prefill_worker_without_a_bootstrap_annotation_is_probed_on
     };
 
     use openai_protocol::worker::RuntimeType;
+    use smg_worker::identity::basic::{ConnectionMode, DEFAULT_BOOTSTRAP_PORT};
     use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowInstanceId};
 
-    use crate::{
-        worker::{ConnectionMode, DEFAULT_BOOTSTRAP_PORT},
-        workflow::{
-            data::WorkerKind,
-            steps::{create_worker_workflow_data, CreateLocalWorkerStep, RegisterWorkersStep},
-        },
+    use crate::workflow::{
+        data::WorkerKind,
+        steps::{create_worker_workflow_data, CreateLocalWorkerStep, RegisterWorkersStep},
     };
 
     // A listener on the default port would make a passed probe and an

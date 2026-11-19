@@ -8,12 +8,9 @@
 use std::{collections::BTreeMap, net::Ipv6Addr};
 
 use openai_protocol::worker::WorkerType;
+use smg_worker::identity::endpoint::{Endpoint, EndpointError};
 
-use crate::{
-    config::RoutingMode,
-    observability::metrics::metrics_labels,
-    worker::{identity::endpoint::Endpoint, EndpointError},
-};
+use crate::{config::RoutingMode, observability::metrics::metrics_labels};
 
 /// Which provider produced a snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

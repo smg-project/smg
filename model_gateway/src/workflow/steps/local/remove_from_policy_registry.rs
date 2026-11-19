@@ -12,7 +12,7 @@ use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowRe
 
 use crate::{
     policies::PolicyRegistry,
-    worker::WorkerRegistry,
+    routers::common::snapshot::WorkerRegistry,
     workflow::data::{require_app_context, WorkerRemovalWorkflowData},
 };
 

@@ -3,9 +3,9 @@
 use std::sync::Arc;
 
 use rand::RngExt;
+use smg_worker::identity::basic::Worker;
 
 use super::{draw_eligible, get_healthy_worker_indices, LoadBalancingPolicy, SelectWorkerInfo};
-use crate::worker::Worker;
 
 /// Random selection policy
 ///

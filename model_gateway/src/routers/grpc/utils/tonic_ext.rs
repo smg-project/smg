@@ -306,10 +306,11 @@ impl<T> TonicResultExt for Result<T, tonic::Status> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::worker::health::resilience::{
+    use smg_worker::health::resilience::{
         DEFAULT_CAPACITY_STATUS_CODES, DEFAULT_RETRYABLE_STATUS_CODES,
     };
+
+    use super::*;
 
     /// A status tonic made of an HTTP/2 fault under the call (the h2 error in
     /// its source chain) is the worker's connection failing, whatever code

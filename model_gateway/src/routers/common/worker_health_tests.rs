@@ -7,24 +7,22 @@
 use axum::http::StatusCode;
 use openai_protocol::worker::{ResilienceUpdate, RuntimeType, WorkerType};
 use smg_grpc_client::{h2, is_transport_failure};
-use smg_worker::settings::RetryConfig;
+use smg_worker::{
+    health::{
+        bootstrap_probe::effective_bootstrap_port_for_test, circuit_breaker::CircuitBreakerConfig,
+        liveness::is_connection_code, manager::read_kv_engine_id_for_test,
+        resilience::resolve_resilience,
+    },
+    identity::basic::{ConnectionMode, Worker, DEFAULT_BOOTSTRAP_PORT, MOONCAKE_CONNECTOR},
+    settings::RetryConfig,
+};
 
-use crate::{
-    routers::{
-        common::{
-            kv_transfer::{kv_connector_mode, KvConnectorMode},
-            retry::is_retryable_status,
-        },
-        grpc::test_engine::mock_engine_on_wire,
+use crate::routers::{
+    common::{
+        kv_transfer::{kv_connector_mode, KvConnectorMode},
+        retry::is_retryable_status,
     },
-    worker::{
-        health::{
-            bootstrap_probe::effective_bootstrap_port_for_test,
-            circuit_breaker::CircuitBreakerConfig, liveness::is_connection_code,
-            manager::read_kv_engine_id_for_test, resilience::resolve_resilience,
-        },
-        BasicWorkerBuilder, ConnectionMode, Worker, DEFAULT_BOOTSTRAP_PORT, MOONCAKE_CONNECTOR,
-    },
+    grpc::{backend_client::BasicWorkerBuilder, test_engine::mock_engine_on_wire},
 };
 
 /// The gRPC client's `is_transport_failure` answers another question

@@ -14,6 +14,7 @@ use llm_tokenizer::factory;
 use openai_protocol::{model_card::ModelCard, worker::HealthCheckConfig};
 use serde_json::json;
 use smg_grpc_client::{common_proto as common, tokenspeed_proto as ts};
+use smg_worker::identity::basic::{BasicWorker, ConnectionMode, RuntimeType};
 use tonic::{transport::Server, Request as TonicRequest, Response as TonicResponse, Status};
 use ts::token_speed_scheduler_server::{TokenSpeedScheduler, TokenSpeedSchedulerServer};
 use wfaas::{StepExecutor, WorkflowContext, WorkflowInstanceId};
@@ -28,6 +29,7 @@ use crate::{
         RateLimitBackend, ReserveOutcome, ReserveRequest, SharedReservationHandle, UsageSettlement,
     },
     routers::grpc::{
+        backend_client::BasicWorkerBuilder,
         common::stages::RateLimitOutcome,
         test_engine::serve_on_loopback,
         testing::{
@@ -36,7 +38,6 @@ use crate::{
         },
     },
     tenant::TenantKey,
-    worker::{BasicWorker, BasicWorkerBuilder, ConnectionMode, RuntimeType},
     workflow::{
         create_worker_workflow_data, steps::local::SubmitTokenizerJobStep, JobQueue,
         JobQueueConfig, TokenizerLoadFailure, WorkerKind, WorkerRegistrationMode, WorkerSpec,

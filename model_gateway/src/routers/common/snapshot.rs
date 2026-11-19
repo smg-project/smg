@@ -9,20 +9,18 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
-use openai_protocol::worker::TagVocabulary;
+use openai_protocol::{worker::TagVocabulary, UNKNOWN_MODEL_ID};
+use smg_worker::{
+    identity::basic::{ConnectionMode, RuntimeType, Worker, WorkerType},
+    load,
+    pd::pairing::PdPairingMode,
+    registry::{self, Generation},
+};
 use symphony::grammar::GrammarStart;
 
 use crate::{
     policies::hash_ring::HashRing,
-    worker::{
-        identity::basic::{RuntimeType, WorkerType},
-        pd::{
-            pair_index::{PdPairIndex, PdWire},
-            pairing::PdPairingMode,
-        },
-        registry::{Generation, WorkerRegistry},
-        ConnectionMode, Worker, UNKNOWN_MODEL_ID,
-    },
+    routers::common::pair_index::{PdPairIndex, PdWire},
 };
 
 /// Static routing pool inside a model snapshot.
@@ -382,6 +380,14 @@ impl Generation for ModelWorkerSnapshot {
     }
 }
 
+/// The registry as the gateway names it: its value of a membership
+/// generation is the model snapshot that keeps the routers' projections.
+/// The load monitor holds that registry. The registry is the worker crate's;
+/// this name for it is the gateway's.
+pub type WorkerRegistry = registry::WorkerRegistry<ModelWorkerSnapshot>;
+/// The load monitor over that registry.
+pub type WorkerMonitor = load::monitor::WorkerMonitor<ModelWorkerSnapshot>;
+
 /// The routing readers. They are the gateway's, over the registry's readers
 /// of a generation: a trait, because the registry is the worker crate's type
 /// and an inherent impl stands only where its type is defined.
@@ -425,7 +431,7 @@ pub(crate) trait WorkerRegistryExt {
 /// No worker, for a model the registry does not hold.
 const EMPTY_WORKERS: &[Arc<dyn Worker>] = &[];
 
-impl WorkerRegistryExt for WorkerRegistry<ModelWorkerSnapshot> {
+impl WorkerRegistryExt for WorkerRegistry {
     fn get_routing_pool(&self, model_id: &str, pool: RoutingPool) -> Arc<[Arc<dyn Worker>]> {
         if model_id == UNKNOWN_MODEL_ID {
             return Arc::clone(self.global_generation().pool(pool));
@@ -453,5 +459,7 @@ impl WorkerRegistryExt for WorkerRegistry<ModelWorkerSnapshot> {
     }
 }
 
+#[cfg(any(test, feature = "test-util"))]
+pub mod test_support;
 #[cfg(test)]
 mod tests;

@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use smg_external_router::{builtin_routers, spec_for_backend};
+use smg_worker::identity::basic::ConnectionMode;
 
 use super::{
     external::ExternalRouterAdapter,
@@ -17,7 +18,6 @@ use crate::{
     app_context::AppContext,
     config::{PolicyConfig, RoutingMode},
     policies::{DPRankLoadPolicy, MinimumTokensPolicy, PolicyFactory},
-    worker::ConnectionMode,
 };
 
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]

@@ -39,8 +39,17 @@
 
 use std::{collections::HashMap, fs, path::PathBuf, sync::Arc, time::Duration};
 
-use openai_protocol::worker::{WorkerSpec, WorkerStatus};
+use openai_protocol::{
+    model_card::ModelCard,
+    worker::{WorkerSpec, WorkerStatus},
+};
 use serde::Serialize;
+use smg_worker::{
+    identity::basic::{ConnectionMode, RuntimeType, Worker, WorkerType},
+    pd::pairing::PdPairingMode,
+    runtime::StallReason,
+    test_support::no_health_check,
+};
 
 use super::{
     placement::{select_pair, Pair, PairFailure, PlacementFailure, PlacementInputs},
@@ -49,15 +58,12 @@ use super::{
 use crate::{
     config::types::PolicyConfig,
     policies::{PolicyFactory, PolicyRegistry},
-    worker::{
-        pd::{
+    routers::{
+        common::{
             pair_index::{PdPairIndex, PdWire},
-            pairing::PdPairingMode,
+            snapshot::WorkerRegistry,
         },
-        runtime::StallReason,
-        test_support::no_health_check,
-        BasicWorkerBuilder, ConnectionMode, ModelCard, RuntimeType, Worker, WorkerRegistry,
-        WorkerType,
+        grpc::backend_client::BasicWorkerBuilder,
     },
 };
 

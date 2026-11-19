@@ -19,6 +19,12 @@ use axum::{
     response::Response,
 };
 use rand::RngExt;
+use smg_worker::{
+    health::overload::{
+        BRANCH_ALL_OVERLOADED_FALLBACK, BRANCH_ALL_STALLED_FALLBACK, STAGE_SELECTION,
+    },
+    identity::basic::{ConnectionMode, ConnectionModeExt, RuntimeType, Worker, WorkerType},
+};
 use tracing::{debug, warn};
 
 use crate::{
@@ -34,18 +40,14 @@ use crate::{
     },
     routers::{
         common::{
-            header_utils, overload, pd_admission,
+            header_utils, overload,
+            pair_index::PdPairIndex,
+            pd_admission,
             prefill_admission::{PrefillCandidateError, PrefillSelectionContext},
             retry::mark_non_retryable,
+            snapshot::{RoutingPool, WorkerRegistry, WorkerRegistryExt},
         },
         error,
-    },
-    worker::{
-        health::overload::{
-            BRANCH_ALL_OVERLOADED_FALLBACK, BRANCH_ALL_STALLED_FALLBACK, STAGE_SELECTION,
-        },
-        ConnectionMode, ConnectionModeExt, PdPairIndex, RoutingPool, RuntimeType, Worker,
-        WorkerRegistry, WorkerRegistryExt, WorkerType,
     },
 };
 
@@ -1515,7 +1517,20 @@ mod tests {
     };
 
     use axum::http::StatusCode;
-    use openai_protocol::worker::{HealthCheckConfig, WorkerStatus};
+    use openai_protocol::{
+        model_card::ModelCard,
+        worker::{HealthCheckConfig, WorkerStatus},
+    };
+    use smg_worker::{
+        connection::engine::EngineConnection,
+        health::{circuit_breaker::CircuitState, resilience::ResolvedResilience},
+        identity::{
+            basic::{BasicWorker, WorkerMetadata, WorkerType},
+            error::WorkerResult,
+        },
+        load::state::{one_rank_load, TestFeed},
+        runtime::{RoutingState, StallReason},
+    };
     use tracing_subscriber::Layer;
 
     use super::*;
@@ -1528,14 +1543,7 @@ mod tests {
             hash_ring::HashRing, CacheAwareConfig, CacheAwarePolicy, ConsistentHashingPolicy,
             LeastLoadPolicy, PowerOfTwoPolicy, RoundRobinPolicy,
         },
-        worker::{
-            connection::engine::EngineConnection,
-            health::circuit_breaker::CircuitState,
-            identity::basic::WorkerMetadata,
-            load::state::{one_rank_load, TestFeed},
-            runtime::{RoutingState, StallReason},
-            BasicWorkerBuilder, ModelCard, PdWire, WorkerType,
-        },
+        routers::{common::pair_index::PdWire, grpc::backend_client::BasicWorkerBuilder},
     };
 
     const MODEL: &str = "m";
@@ -3041,7 +3049,7 @@ mod tests {
     /// worker's.
     #[derive(Debug)]
     struct VetoLiftsAfterARead {
-        worker: crate::worker::BasicWorker,
+        worker: BasicWorker,
         lifted: std::sync::OnceLock<()>,
     }
 
@@ -3061,7 +3069,7 @@ mod tests {
         }
 
         /// What `read` sees of the worker; the veto lifts behind the first read.
-        fn read<T>(&self, read: impl FnOnce(&crate::worker::BasicWorker) -> T) -> T {
+        fn read<T>(&self, read: impl FnOnce(&BasicWorker) -> T) -> T {
             let seen = read(&self.worker);
             if self.lifted.set(()).is_ok() {
                 self.worker.set_overloaded(false);
@@ -3132,7 +3140,7 @@ mod tests {
         fn record_circuit_breaker_outcome(&self, success: bool) {
             self.worker.record_circuit_breaker_outcome(success);
         }
-        fn resilience(&self) -> &crate::worker::ResolvedResilience {
+        fn resilience(&self) -> &ResolvedResilience {
             self.worker.resilience()
         }
         fn http_client(&self) -> &reqwest::Client {
@@ -3141,12 +3149,10 @@ mod tests {
         fn http_client_handle_if_initialized(&self) -> Option<Arc<reqwest::Client>> {
             self.worker.http_client_handle_if_initialized()
         }
-        async fn check_health_async(&self) -> crate::worker::WorkerResult<()> {
+        async fn check_health_async(&self) -> WorkerResult<()> {
             self.worker.check_health_async().await
         }
-        async fn engine_connection(
-            &self,
-        ) -> crate::worker::WorkerResult<Option<Arc<dyn EngineConnection>>> {
+        async fn engine_connection(&self) -> WorkerResult<Option<Arc<dyn EngineConnection>>> {
             self.worker.engine_connection().await
         }
         fn is_available(&self) -> bool {

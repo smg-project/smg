@@ -28,12 +28,16 @@ use smg::{
     config::PolicyConfig,
     observability::metrics::{start_prometheus, PrometheusConfig},
     policies::PolicyRegistry,
-    worker::{
-        metrics::Metrics, BasicWorkerBuilder, ConnectionMode, Worker, WorkerMonitor,
-        WorkerRegistry, WorkerType,
+    routers::{
+        common::snapshot::{WorkerMonitor, WorkerRegistry},
+        grpc::backend_client::BasicWorkerBuilder,
     },
 };
 use smg_grpc_client::common_proto::EngineLoad;
+use smg_worker::{
+    identity::basic::{ConnectionMode, Worker, WorkerType},
+    metrics::writers::Metrics,
+};
 
 thread_local! {
     /// Allocation and reallocation calls this thread made.
