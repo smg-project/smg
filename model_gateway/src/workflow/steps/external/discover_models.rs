@@ -12,12 +12,10 @@ use tracing::{debug, info, warn};
 use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
 use crate::{
+    admin::worker_service::{control_character_refusal, logged_strings},
     routers::provider_support,
     server::http_client_builder,
-    worker::{
-        identity::endpoint::Endpoint,
-        registry::service::{control_character_refusal, logged_strings},
-    },
+    worker::identity::endpoint::Endpoint,
     workflow::data::{WorkerKind, WorkerWorkflowData},
 };
 

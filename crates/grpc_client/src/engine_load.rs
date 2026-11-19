@@ -1,8 +1,9 @@
 //! The pushed load record (`common::EngineLoad`, on `KvEventBatch.load`)
 //! against the engines' `GetLoads` shapes: what a servicer fills from its
-//! engine's per-rank report, and what the gateway reads back into its
-//! per-rank snapshot, so the `smg_engine_*` gauges and `GET /loads` show the
-//! same under pushes as under a poll.
+//! engine's per-rank report. What the gateway reads back into its per-rank
+//! snapshot is the worker crate's conversion, beside both of its types; the
+//! cases here hold the two directions together, so the `smg_engine_*` gauges
+//! and `GET /loads` show the same under pushes as under a poll.
 //!
 //! The routing core (running and waiting requests, the queued token-work,
 //! KV usage, generation rate, the admission window) rides every record; the
@@ -12,10 +13,6 @@
 //! engine reports it and left unset otherwise. `waiting_uncached_tokens` is
 //! the servicer's to set: whether the figure is an estimate for one rank or
 //! the engine's own is a per-servicer rule.
-
-use openai_protocol::worker::{
-    EngineMemoryMetricsSnapshot, EngineQueueMetricsSnapshot, SchedulerLoadSnapshot,
-};
 
 use crate::{common_proto as common, sglang_proto, tokenspeed_proto, trtllm_proto, vllm_proto};
 
@@ -179,75 +176,6 @@ impl From<&tokenspeed_proto::SchedulerLoad> for common::EngineLoad {
     }
 }
 
-/// The per-rank snapshot a poll would have produced from what the record
-/// carries, the way the engines' `GetLoads` responses convert: the two
-/// canonical disaggregation queue depths roll the per-stage counters up
-/// (prefill = prealloc + inflight, decode = prealloc + transfer +
-/// retracted), `utilization` is the KV usage, `num_total_reqs` the running
-/// and waiting sum. The rank is the caller's; telemetry the record leaves
-/// unset stays at the type's default, which the gateway merges with what it
-/// knew from the last record that carried it.
-impl From<&common::EngineLoad> for SchedulerLoadSnapshot {
-    /// Read input capacity directly, including absence after the samples expire.
-    fn from(record: &common::EngineLoad) -> Self {
-        let signed = |value: u32| i32::try_from(value).unwrap_or(i32::MAX);
-        let disagg = record.disaggregation.as_ref();
-        Self {
-            active_token_usage: record.active_token_usage,
-            num_resident_tokens: record
-                .num_resident_tokens
-                .map(|tokens| i64::try_from(tokens).unwrap_or(i64::MAX)),
-            num_running_reqs: signed(record.running_requests),
-            num_waiting_reqs: signed(record.waiting_requests),
-            num_waiting_uncached_tokens: record.waiting_uncached_tokens.map_or(0, signed),
-            num_total_reqs: signed(
-                record
-                    .running_requests
-                    .saturating_add(record.waiting_requests),
-            ),
-            num_used_tokens: record.num_used_tokens.unwrap_or(0),
-            max_total_num_tokens: record.max_total_num_tokens.unwrap_or(0),
-            token_usage: record.token_usage,
-            gen_throughput: record.gen_throughput,
-            prefill_throughput: record.prefill_throughput,
-            cache_hit_rate: record.cache_hit_rate.unwrap_or(0.0),
-            utilization: record.token_usage,
-            max_running_requests: signed(record.max_running_requests),
-            memory: record
-                .memory
-                .as_ref()
-                .map(|memory| EngineMemoryMetricsSnapshot {
-                    weight_gb: memory.weight_gb,
-                    kv_cache_gb: memory.kv_cache_gb,
-                    graph_gb: memory.graph_gb,
-                    token_capacity: memory.token_capacity,
-                }),
-            queues: record
-                .queues
-                .as_ref()
-                .map(|queues| EngineQueueMetricsSnapshot {
-                    waiting: queues.waiting,
-                    grammar: queues.grammar,
-                    paused: queues.paused,
-                    retracted: queues.retracted,
-                }),
-            kv_transfer_latency_ms: disagg.map(|d| d.kv_transfer_latency_ms),
-            kv_transfer_speed_gb_s: disagg.map(|d| d.kv_transfer_speed_gb_s),
-            prefill_queue_reqs: disagg.map(|d| {
-                d.prefill_prealloc_queue_reqs
-                    .saturating_add(d.prefill_inflight_queue_reqs)
-            }),
-            decode_queue_reqs: disagg.map(|d| {
-                d.decode_prealloc_queue_reqs
-                    .saturating_add(d.decode_transfer_queue_reqs)
-                    .saturating_add(d.decode_retracted_queue_reqs)
-            }),
-            disagg_mode: disagg.map(|d| d.mode.clone()),
-            ..Default::default()
-        }
-    }
-}
-
 /// Telemetry fields of the record cleared: what an event batch carries
 /// between heartbeats.
 pub fn core_only(record: &mut common::EngineLoad) {
@@ -263,6 +191,10 @@ pub fn core_only(record: &mut common::EngineLoad) {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use openai_protocol::worker::{LoadRecord, LoadTelemetry, SchedulerLoadSnapshot};
+
     use super::*;
 
     /// Every engine's poll carries the measured input capacity the same way
@@ -507,5 +439,73 @@ mod tests {
             (snapshot.num_running_reqs, snapshot.max_total_num_tokens),
             (7, 0)
         );
+    }
+
+    /// Under the worker's reader each telemetry section a record carries is
+    /// its own flag, a record cut to its core carries none, and the age and
+    /// the liveness figures are the wire's fields.
+    #[test]
+    fn a_record_reads_as_the_load_report_reads_it() {
+        let only = |set: fn(&mut common::EngineLoad)| {
+            let mut record = common::EngineLoad::default();
+            set(&mut record);
+            record.telemetry()
+        };
+        assert_eq!(
+            only(|r| r.cache_hit_rate = Some(0.5)),
+            LoadTelemetry::CACHE_HIT_RATE
+        );
+        assert_eq!(
+            only(|r| r.num_used_tokens = Some(1)),
+            LoadTelemetry::USED_TOKENS
+        );
+        assert_eq!(
+            only(|r| r.max_total_num_tokens = Some(1)),
+            LoadTelemetry::TOTAL_TOKENS
+        );
+        assert_eq!(
+            only(|r| r.memory = Some(common::EngineMemory::default())),
+            LoadTelemetry::MEMORY
+        );
+        assert_eq!(
+            only(|r| r.queues = Some(common::EngineQueues::default())),
+            LoadTelemetry::QUEUES
+        );
+        assert_eq!(
+            only(|r| r.disaggregation = Some(common::EngineDisaggregation::default())),
+            LoadTelemetry::DISAGGREGATION
+        );
+        let mut full = common::EngineLoad {
+            cache_hit_rate: Some(0.5),
+            num_used_tokens: Some(1),
+            max_total_num_tokens: Some(1),
+            memory: Some(common::EngineMemory::default()),
+            queues: Some(common::EngineQueues::default()),
+            disaggregation: Some(common::EngineDisaggregation::default()),
+            ..Default::default()
+        };
+        assert_eq!(full.telemetry(), LoadTelemetry::all());
+        core_only(&mut full);
+        assert_eq!(full.telemetry(), LoadTelemetry::empty());
+
+        let record = common::EngineLoad {
+            running_requests: 3,
+            age_ms: 40,
+            engine_silence_ms: Some(1_500),
+            engine_reports_steps: Some(true),
+            prefill_pending_tokens: Some(9),
+            ..Default::default()
+        };
+        assert_eq!(record.age(), Duration::from_millis(40));
+        assert_eq!(record.engine_silence(), Some(Duration::from_millis(1_500)));
+        assert!(record.reports_every_step());
+        assert_eq!(record.prefill_pending(), Some(9));
+        assert_eq!(record.snapshot().num_running_reqs, 3);
+        let quiet = common::EngineLoad::default();
+        assert_eq!(
+            (quiet.age(), quiet.engine_silence(), quiet.prefill_pending()),
+            (Duration::ZERO, None, None)
+        );
+        assert!(!quiet.reports_every_step());
     }
 }

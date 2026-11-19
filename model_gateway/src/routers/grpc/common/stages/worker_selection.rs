@@ -26,8 +26,8 @@ use crate::{
     middleware::{tenant_resolution::AcceptedAt, SHED_RETRY_AFTER_SECS},
     observability::metrics::{metrics_labels, Metrics},
     policies::{
-        hash_ring::HashRing, CacheNamespace, LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo,
-        WorkerRole,
+        hash_ring::HashRing, policy_reads_hash_ring, CacheNamespace, LoadBalancingPolicy,
+        PolicyRegistry, SelectWorkerInfo, WorkerRole,
     },
     routers::{
         common::{
@@ -54,7 +54,7 @@ use crate::{
     },
     worker::{
         ConnectionMode, ModelWorkerSnapshot, PdPairIndex, PdWire, RoutingPool, RuntimeType, Worker,
-        WorkerRegistry, WorkerType,
+        WorkerRegistry, WorkerRegistryExt, WorkerType,
     },
 };
 
@@ -2206,12 +2206,17 @@ impl WorkerSelectionStage {
             encode_item_hashes
         };
         available_encode.retain(pairs_with_prefill);
+        // The ring is read where an item is placed by a policy that walks it.
+        let encode_policy = self.policy_registry.get_encode_policy();
+        let hash_ring = (!hashes.is_empty() && policy_reads_hash_ring(encode_policy.as_ref()))
+            .then(|| self.policy_registry.hash_ring_of(model_id, &snapshot))
+            .flatten();
         let assignments = assign_encode_workers(
             &available_encode,
             hashes,
             model_id,
-            self.policy_registry.get_encode_policy().as_ref(),
-            self.worker_registry.get_hash_ring(model_id),
+            encode_policy.as_ref(),
+            hash_ring,
         )
         .ok_or(EpdSelectionFailure::Unavailable)?;
         Ok((assignments, pair.prefill, pair.decode, pair.runtime))
@@ -2441,7 +2446,7 @@ mod tests {
         routers::{
             common::{
                 attempt_ledger::{mark_upstream_answer, AttemptLedger},
-                prefill_admission::PrefillReservation,
+                prefill_admission::{test_support::select_worker, PrefillReservation},
                 retry::is_retryable_response,
             },
             grpc::{
@@ -2455,8 +2460,8 @@ mod tests {
         },
         tenant::TenantKey,
         worker::{
-            test_support::{no_health_check, select_worker},
-            BasicWorkerBuilder, ConnectionMode, ModelCard, WorkerLoadGuard,
+            test_support::no_health_check, BasicWorkerBuilder, ConnectionMode, ModelCard,
+            WorkerLoadGuard,
         },
     };
 

@@ -38,7 +38,23 @@ pub(crate) fn oriented(image: DynamicImage, orientation: Orientation) -> Dynamic
             DynamicImage::ImageRgb8(turned)
         }
         mut other => {
-            other.apply_orientation(orientation);
+            // A quarter turn builds a new image where `apply_orientation`
+            // would free the one it replaces: it is taken here, so that the
+            // decoder's buffer goes back to the pool. The rest of the
+            // orientation moves the pixels where they are.
+            let (quarter, rest) = match orientation {
+                Orientation::Rotate90 => (Some(other.rotate90()), Orientation::NoTransforms),
+                Orientation::Rotate270 => (Some(other.rotate270()), Orientation::NoTransforms),
+                Orientation::Rotate90FlipH => (Some(other.rotate90()), Orientation::FlipHorizontal),
+                Orientation::Rotate270FlipH => {
+                    (Some(other.rotate270()), Orientation::FlipHorizontal)
+                }
+                in_place => (None, in_place),
+            };
+            if let Some(turned) = quarter {
+                buffer_pool::recycle_image(std::mem::replace(&mut other, turned));
+            }
+            other.apply_orientation(rest);
             other
         }
     }
@@ -780,6 +796,32 @@ mod tests {
         expected.apply_orientation(Orientation::Rotate90);
         let actual = oriented(DynamicImage::ImageRgba8(rgba), Orientation::Rotate90);
         assert!(actual.as_bytes() == expected.as_bytes());
+    }
+
+    /// A quarter turn of a layout other than RGB builds a new image: the
+    /// pixels are `apply_orientation`'s and the source's buffer is idle in
+    /// the pool again. A turn that moves the pixels in place keeps its
+    /// buffer.
+    #[test]
+    fn a_quarter_turn_of_another_layout_returns_the_decoders_buffer() {
+        static POOL: buffer_pool::BufferPool = buffer_pool::BufferPool::new();
+        buffer_pool::with_pool(&POOL, || {
+            let (w, h) = (320, 240);
+            let rgba = image::RgbaImage::from_fn(w, h, |x, y| {
+                image::Rgba([x as u8, y as u8, (x ^ y) as u8, (x + y) as u8])
+            });
+            for orientation in ORIENTATIONS.into_iter().skip(1) {
+                let mut expected = DynamicImage::ImageRgba8(rgba.clone());
+                expected.apply_orientation(orientation);
+                let mut pixels = buffer_pool::take(rgba.as_raw().len());
+                pixels.copy_from_slice(rgba.as_raw());
+                let source = image::RgbaImage::from_raw(w, h, pixels).expect("a 320x240 frame");
+                let actual = oriented(DynamicImage::ImageRgba8(source), orientation);
+                assert!(actual.as_bytes() == expected.as_bytes(), "{orientation:?}");
+                let returned = if actual.width() == h { 512 << 10 } else { 0 };
+                assert_eq!(POOL.held(), returned, "{orientation:?}");
+            }
+        });
     }
 
     /// A frame the size of a decoded photo, above the pool's floor, where a

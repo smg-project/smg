@@ -9,6 +9,10 @@ use serde::{de, Deserialize, Deserializer, Serialize};
 pub use smg_data_connector::{
     HistoryBackend, MemoryConfig, OracleConfig, PostgresConfig, RedisConfig, SchemaConfig,
 };
+// The worker's settings vocabulary lives in the worker crate.
+pub use smg_worker::settings::{
+    PdPairingMode, RetryConfig, UnhealthyRemovalScope, DEFAULT_ZMQ_STARTUP_TIMEOUT_SECS,
+};
 
 use super::{validation::ConfigValidator, ConfigResult};
 use crate::{
@@ -872,10 +876,6 @@ fn default_worker_stall_secs() -> u64 {
     2
 }
 
-/// The default per-stage silence bound of a ZMQ engine's startup handshake:
-/// an hour, since it alone covers the engine's init between HELLO and READY.
-pub const DEFAULT_ZMQ_STARTUP_TIMEOUT_SECS: u64 = 3600;
-
 fn default_zmq_startup_timeout_secs() -> u64 {
     DEFAULT_ZMQ_STARTUP_TIMEOUT_SECS
 }
@@ -1215,58 +1215,6 @@ pub enum ManualAssignmentMode {
     /// policy, then pin. With `--policy manual` (no underlying policy to
     /// delegate to) this falls back to min-load.
     Delegate,
-}
-
-/// How strictly PD placement pairs a prefill with a decode on their KV
-/// transfer protocol (#2483). A descriptor component an engine does not report
-/// is "unknown".
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum PdPairingMode {
-    /// Compare nothing of the KV handoff: placement behaves as if no
-    /// descriptor existed. The gRPC wire still keeps two known runtimes
-    /// apart, since its requests are in the runtime's own message type.
-    Off,
-    /// A known difference in runtime, transport or KV layout refuses the
-    /// pair; unknown components and engine versions pair with anything.
-    #[default]
-    Lenient,
-    /// Runtime, transport and KV layout must be known on both sides and
-    /// agree, and reported engine versions must match.
-    Strict,
-}
-
-impl PdPairingMode {
-    /// Number of modes, for per-mode caches.
-    pub const COUNT: usize = 3;
-
-    /// A dense index for per-mode caches.
-    pub const fn index(self) -> usize {
-        match self {
-            Self::Off => 0,
-            Self::Lenient => 1,
-            Self::Strict => 2,
-        }
-    }
-
-    /// Parse the CLI spelling (`off` / `lenient` / `strict`).
-    pub fn parse(value: &str) -> Option<Self> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "off" => Some(Self::Off),
-            "lenient" => Some(Self::Lenient),
-            "strict" => Some(Self::Strict),
-            _ => None,
-        }
-    }
-
-    /// The CLI spelling.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Off => "off",
-            Self::Lenient => "lenient",
-            Self::Strict => "strict",
-        }
-    }
 }
 
 /// Per-request sticky-routing override: when a sticky key is present, any
@@ -2063,8 +2011,6 @@ pub struct ConsulDiscoveryConfig {
     pub check_interval_secs: u64,
 }
 
-pub use smg_external_router::RetryConfig;
-
 /// Health check configuration for worker monitoring. The four counts and
 /// periods are at least 1 (checked at configuration validation): none of
 /// them has a meaning at 0, and a zero interval would make the checker a
@@ -2099,21 +2045,6 @@ pub struct HealthCheckConfig {
 
 fn default_drain_settle_secs() -> u64 {
     5
-}
-
-/// Which Failed workers the health checker removes. Mesh-imported workers
-/// are never removed under any scope: their owner manages them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UnhealthyRemovalScope {
-    /// None: a Failed worker stays registered and probed, and rejoins in
-    /// place when its engine answers again.
-    Disabled,
-    /// The workers a discovery provider registered, which it registers again
-    /// once their engine returns. Static and API-added workers stay.
-    DiscoveryOwned,
-    /// Every local worker, static and API-added ones included, though
-    /// nothing re-adds those.
-    AllLocal,
 }
 
 /// Resolve `--worker-auto-recovery` into the removal scope. An explicit

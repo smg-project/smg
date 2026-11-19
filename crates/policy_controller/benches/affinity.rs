@@ -74,6 +74,8 @@ fn decide(c: &mut Criterion) {
         let pool = PoolFacts {
             pool_size: n as u32,
             generation: 1,
+            // Every row of the bench's fleet reports a rate.
+            reported: true,
             ..PoolFacts::default()
         };
         let cx = Constraints::default();

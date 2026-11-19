@@ -2,7 +2,8 @@
 //! of the two contract files, the service ([`policy_controller_server`]) and
 //! its client ([`policy_controller_client`]), written by the build script
 //! from `contracts/` in one step. The engine wire's messages a relay forwards
-//! are the gRPC client crate's own (`smg_grpc_client::common_proto`).
+//! are the worker crate's, re-exported by the gRPC client crate
+//! (`smg_grpc_client::common_proto`).
 
 #![allow(
     clippy::all,

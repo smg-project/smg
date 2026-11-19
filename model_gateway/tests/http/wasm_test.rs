@@ -18,10 +18,9 @@ use openai_protocol::worker::WorkerErrorResponse;
 use smg::{
     app_context::AppContext,
     config::RouterConfig,
-    health::ProbeState,
     policies::PolicyRegistry,
     routers::RouterFactory,
-    server::{build_app, AppState},
+    server::{build_app, health::ProbeState, AppState},
     wasm::{
         module::{
             MiddlewareAttachPoint, WasmModuleAddRequest, WasmModuleAddResponse,

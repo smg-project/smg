@@ -2163,6 +2163,7 @@ def test_publish_plan_prints_the_dispatches_and_runs_nothing(repo: Sandbox) -> N
     assert "gh workflow run release-engine-docker.yml --ref v1.14.0 -f engine=vllm" in out
     assert "gh workflow run release-go.yml --ref v1.14.0 -f version=1.14.0" in out
     assert "smg==1.14.0," in out and "and latest" in out
+    assert "-ol9 appended = the Oracle Linux 9 router for linux/amd64" in out
     assert "     smg 1.14.0\n" in out and "     tool-parser 0.6.0\n" in out
     assert "openapi-gen" not in out, (
         "a crate with publish = false is never published: not in the plan"

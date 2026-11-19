@@ -1230,12 +1230,15 @@ impl RequestContext {
     /// Fails loudly when worker selection's outputs (routing snapshot, wire)
     /// are absent: a retry context with defaulted routing inputs could
     /// re-select a worker the retained plan cannot be dispatched to.
-    pub fn into_dispatch(self) -> Result<DispatchContext, axum::response::Response> {
-        let RequestContext {
-            input,
-            components,
-            state,
-        } = self;
+    ///
+    /// Both contexts are a few KiB wide, so both travel boxed: this one
+    /// comes in its box, and the dispatch context leaves in the box the run
+    /// keeps it in.
+    pub fn into_dispatch(
+        self: Box<Self>,
+    ) -> Result<Box<DispatchContext>, axum::response::Response> {
+        // Fields leave the box one at a time: a local that bound `state`
+        // whole would copy all of it to the stack first.
         let RequestInput {
             request_type,
             headers,
@@ -1243,7 +1246,7 @@ impl RequestContext {
             streaming,
             tenant_request_meta,
             rate_limit_cell,
-        } = input;
+        } = self.input;
         // The model the response reports. `RequestContext::new` already
         // canonicalized both the request's `model` field and `model_id`, so a
         // request that arrived under an alias is answered under the canonical
@@ -1263,9 +1266,9 @@ impl RequestContext {
             RequestType::Transcription { request, .. } => request.model.clone(),
         };
         drop(request_type);
-        let parser = state.parser;
-        drop(components);
-        let routing = state.routing_snapshot.ok_or_else(|| {
+        let parser = self.state.parser;
+        drop(self.components);
+        let routing = self.state.routing_snapshot.ok_or_else(|| {
             error!(
                 function = "RequestContext::into_dispatch",
                 "Routing snapshot not captured by worker selection"
@@ -1276,10 +1279,10 @@ impl RequestContext {
             )
         })?;
         let wire = WireConstraint::of(
-            stage_output(state.workers.as_ref(), "RequestContext::into_dispatch")?,
-            state.media_refs_forwarded,
-            if state.media_refs_forwarded {
-                state.media_refs_pipeline
+            stage_output(self.state.workers.as_ref(), "RequestContext::into_dispatch")?,
+            self.state.media_refs_forwarded,
+            if self.state.media_refs_forwarded {
+                self.state.media_refs_pipeline
             } else {
                 PipelinePin::Any
             },
@@ -1289,7 +1292,7 @@ impl RequestContext {
                 .map(str::to_owned);
         let (created, _) =
             super::common::stages::helpers::request_wall_clock(tenant_request_meta.as_ref());
-        Ok(DispatchContext {
+        Ok(Box::new(DispatchContext {
             root_request_id: if cache_trace::enabled() {
                 request_id.clone()
             } else {
@@ -1309,19 +1312,19 @@ impl RequestContext {
             rate_limit_cell,
             routing,
             wire,
-            constraint_decided_on: state.constraint_decided_on,
-            tokenizer: state.tokenizer,
-            workers: state.workers,
-            sticky_key: state.sticky_key,
-            clients: state.clients,
-            encode_outputs: state.encode_outputs,
+            constraint_decided_on: self.state.constraint_decided_on,
+            tokenizer: self.state.tokenizer,
+            workers: self.state.workers,
+            sticky_key: self.state.sticky_key,
+            clients: self.state.clients,
+            encode_outputs: self.state.encode_outputs,
             encode_watch: None,
-            multimodal_inflight: state.multimodal_inflight,
+            multimodal_inflight: self.state.multimodal_inflight,
             dispatch: None,
             load_guards: None,
-            pd_prefill_guard: state.pd_prefill_guard,
-            response: state.response,
-        })
+            pd_prefill_guard: self.state.pd_prefill_guard,
+            response: self.state.response,
+        }))
     }
 
     /// Create context for chat completion request
@@ -1475,78 +1478,52 @@ impl RequestContext {
     }
 
     /// Get Arc clone of chat request (panics if not chat)
-    #[expect(
-        clippy::panic,
-        reason = "typed accessor: caller guarantees variant via RequestType construction"
-    )]
     pub fn chat_request_arc(&self) -> Arc<ChatCompletionRequest> {
-        match &self.input.request_type {
-            RequestType::Chat(req) => Arc::clone(req),
-            _ => panic!("Expected chat request"),
-        }
+        let RequestType::Chat(req) = &self.input.request_type else {
+            expected_shape("chat")
+        };
+        Arc::clone(req)
     }
 
     /// Get Arc clones of the transcription request and its audio (panics if
     /// not a transcription request).
-    #[expect(
-        clippy::panic,
-        reason = "typed accessor: caller guarantees variant via RequestType construction"
-    )]
     pub fn transcription_input_arc(&self) -> (Arc<TranscriptionRequest>, Arc<AudioFile>) {
-        match &self.input.request_type {
-            RequestType::Transcription { request, audio } => {
-                (Arc::clone(request), Arc::clone(audio))
-            }
-            _ => panic!("Expected transcription request"),
-        }
+        let RequestType::Transcription { request, audio } = &self.input.request_type else {
+            expected_shape("transcription")
+        };
+        (Arc::clone(request), Arc::clone(audio))
     }
 
     /// Get Arc clone of generate request (panics if not generate)
-    #[expect(
-        clippy::panic,
-        reason = "typed accessor: caller guarantees variant via RequestType construction"
-    )]
     pub fn generate_request_arc(&self) -> Arc<GenerateRequest> {
-        match &self.input.request_type {
-            RequestType::Generate(req) => Arc::clone(req),
-            _ => panic!("Expected generate request"),
-        }
+        let RequestType::Generate(req) = &self.input.request_type else {
+            expected_shape("generate")
+        };
+        Arc::clone(req)
     }
 
     /// Get Arc clone of completion request (panics if not completion)
-    #[expect(
-        clippy::panic,
-        reason = "typed accessor: caller guarantees variant via RequestType construction"
-    )]
     pub fn completion_request_arc(&self) -> Arc<CompletionRequest> {
-        match &self.input.request_type {
-            RequestType::Completion(req) => Arc::clone(req),
-            _ => panic!("Expected completion request"),
-        }
+        let RequestType::Completion(req) = &self.input.request_type else {
+            expected_shape("completion")
+        };
+        Arc::clone(req)
     }
 
     /// Get Arc clone of responses request (panics if not responses)
-    #[expect(
-        clippy::panic,
-        reason = "typed accessor: caller guarantees variant via RequestType construction"
-    )]
     pub fn responses_request_arc(&self) -> Arc<ResponsesRequest> {
-        match &self.input.request_type {
-            RequestType::Responses(req) => Arc::clone(req),
-            _ => panic!("Expected responses request"),
-        }
+        let RequestType::Responses(req) = &self.input.request_type else {
+            expected_shape("responses")
+        };
+        Arc::clone(req)
     }
 
     /// Get Arc clone of messages request (panics if not messages)
-    #[expect(
-        clippy::panic,
-        reason = "typed accessor: caller guarantees variant via RequestType construction"
-    )]
     pub fn messages_request_arc(&self) -> Arc<CreateMessageRequest> {
-        match &self.input.request_type {
-            RequestType::Messages(req) => Arc::clone(req),
-            _ => panic!("Expected messages request"),
-        }
+        let RequestType::Messages(req) = &self.input.request_type else {
+            expected_shape("messages")
+        };
+        Arc::clone(req)
     }
 
     /// Check if request is streaming (captured at construction).
@@ -1561,6 +1538,18 @@ impl RequestContext {
     pub fn tokenizer_arc(&self) -> Option<Arc<dyn Tokenizer>> {
         self.state.tokenizer.clone()
     }
+}
+
+/// The typed accessors' refusal: the caller read a request shape the context
+/// does not hold. The shape is fixed at construction, so a wrong read is a
+/// programming error, never a request's. The panic names the accessor's line.
+#[expect(
+    clippy::panic,
+    reason = "typed accessor: caller guarantees variant via RequestType construction"
+)]
+#[track_caller]
+fn expected_shape(shape: &str) -> ! {
+    panic!("Expected {shape} request")
 }
 
 impl WorkerSelection {
@@ -1926,9 +1915,9 @@ mod tests {
     use smg_grpc_client::VllmEngineClient;
 
     use super::*;
-    use crate::{
-        routers::grpc::{client::GrpcClient, test_engine::mock_engine},
-        worker::test_support::select_worker,
+    use crate::routers::{
+        common::prefill_admission::test_support::select_worker,
+        grpc::{client::GrpcClient, test_engine::mock_engine},
     };
 
     /// Only multimodal vLLM EPD owns EC state absent from its retained plan.

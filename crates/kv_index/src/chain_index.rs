@@ -1836,13 +1836,17 @@ impl ChainIndex {
                 )
                 .is_ok();
         if claimed {
+            // Release stores: this thread did not take the array, and a reader may still hold it
+            // from the life before. One that reads a word stored here and then passes its
+            // acquire fence reads, in its check of its run's version, the step that ended that
+            // life.
             let slots = self.arena.words(block + end as u32, contents.len());
             for (slot, &hash) in slots.iter().zip(contents) {
-                slot.store(hash, Ordering::Relaxed);
+                slot.store(hash, Ordering::Release);
             }
             let slots = self.arena.words(engine + end as u32, engines.len());
             for (slot, &hash) in slots.iter().zip(engines) {
-                slot.store(hash, Ordering::Relaxed);
+                slot.store(hash, Ordering::Release);
             }
             run.len
                 .store((len + contents.len()) as u32, Ordering::Release);

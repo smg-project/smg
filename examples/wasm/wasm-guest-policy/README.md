@@ -27,7 +27,9 @@ which a `wasm32-wasip2` build of the standard library carries.
   host clamps.
 - `pick`: a position among the survivors.
 - `observe`: the lifecycle of issued decisions. It counts completed
-  dispatches in a counter the plugin's spec declares. The engine forwards the
+  dispatches in a counter the plugin's spec declares. The host calls it with
+  the kinds of event the spec lists in `observes`, none by default: this
+  plugin's spec lists `completed` and no other. The engine forwards the
   lifecycle to scorers and pickers: bound as a filter alone, a plugin
   observes nothing.
 - Two of the four host imports: `log` and `counter`.
@@ -112,7 +114,7 @@ use std::sync::Arc;
 
 use smg_policy_controller::{
     plugins::OpenDecisions,
-    wasm::{Plugin, PluginSpec, Runtime, WasmFilter, WasmPicker, WasmScorer},
+    wasm::{EventKind, EventSet, Plugin, PluginSpec, Runtime, WasmFilter, WasmPicker, WasmScorer},
 };
 
 // One for the process: every plugin runtime is built over it, so a
@@ -123,6 +125,7 @@ let mut spec = PluginSpec::new("least-loaded", std::fs::read(component_path)?);
 spec.config = vec![20]; // the session bonus, in percent
 spec.budget_micros = 10_000; // per call
 spec.metrics = vec!["completed".to_string()]; // counter 0
+spec.observes = EventSet::of([EventKind::Completed]); // what `observe` hears
 let plugin = Plugin::load(&runtime, spec)?;
 
 let bound = plugin.bind();
@@ -155,6 +158,7 @@ Copy this directory, keep the `wit_bindgen::generate!` call pointing at
 it wants from a plugin, and a stage the policy does not implement can decline
 every call. A plugin gets the load rows, the hashes, the headers and the
 session counts only when its spec names them in `needs`: the host cannot read
-what a module wants off the module. Keep `panic = "abort"` in the release
+what a module wants off the module. It hears a lifecycle event only when its
+spec lists the kind in `observes`. Keep `panic = "abort"` in the release
 profile: a panic then ends the call as a trap the host handles, with no
 unwinding code in the module.

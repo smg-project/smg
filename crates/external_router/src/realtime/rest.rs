@@ -61,20 +61,17 @@ pub async fn forward_realtime_rest(
         }
     };
 
-    let auth = match extract_auth_header(headers, worker.api_key()) {
-        Some(v) => v,
-        None => {
-            Metrics::record_router_error(
-                labels.router,
-                labels.backend,
-                metrics_labels::CONNECTION_HTTP,
-                model,
-                endpoint_label,
-                metrics_labels::ERROR_VALIDATION,
-                metrics_labels::REASON_INVALID_REQUEST,
-            );
-            return StatusCode::UNAUTHORIZED.into_response();
-        }
+    let Some(auth) = extract_auth_header(headers, worker.api_key()) else {
+        Metrics::record_router_error(
+            labels.router,
+            labels.backend,
+            metrics_labels::CONNECTION_HTTP,
+            model,
+            endpoint_label,
+            metrics_labels::ERROR_VALIDATION,
+            metrics_labels::REASON_INVALID_REQUEST,
+        );
+        return StatusCode::UNAUTHORIZED.into_response();
     };
 
     // Track load for the duration of the upstream request

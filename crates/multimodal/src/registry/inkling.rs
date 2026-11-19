@@ -68,10 +68,7 @@ impl ModelProcessorSpec for InklingSpec {
         match modality {
             Modality::Image => Ok(Self::IMAGE_PLACEHOLDER.to_string()),
             Modality::Audio => Ok(Self::AUDIO_PLACEHOLDER.to_string()),
-            _ => Err(ModelRegistryError::UnsupportedModality {
-                spec: self.name(),
-                modality,
-            }),
+            _ => Err(ModelRegistryError::unsupported(self.name(), modality)),
         }
     }
 
@@ -83,10 +80,7 @@ impl ModelProcessorSpec for InklingSpec {
         match modality {
             Modality::Image => Self::image_placeholder_id(metadata),
             Modality::Audio => Self::audio_placeholder_id(metadata),
-            _ => Err(ModelRegistryError::UnsupportedModality {
-                spec: self.name(),
-                modality,
-            }),
+            _ => Err(ModelRegistryError::unsupported(self.name(), modality)),
         }
     }
 
@@ -142,10 +136,7 @@ impl ModelProcessorSpec for InklingSpec {
                     },
                 )?,
             )),
-            _ => Err(ModelRegistryError::UnsupportedModality {
-                spec: self.name(),
-                modality,
-            }),
+            _ => Err(ModelRegistryError::unsupported(self.name(), modality)),
         }
     }
 
@@ -214,10 +205,7 @@ impl ModelProcessorSpec for InklingSpec {
                     })
                     .collect())
             }
-            _ => Err(ModelRegistryError::UnsupportedModality {
-                spec: self.name(),
-                modality,
-            }),
+            _ => Err(ModelRegistryError::unsupported(self.name(), modality)),
         }
     }
 

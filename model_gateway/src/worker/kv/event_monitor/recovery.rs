@@ -78,30 +78,6 @@ pub(crate) enum Admission {
     Unrecovered { missed: u64, cleared: bool },
 }
 
-/// How the rank got where it is, for metrics.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ResyncReason {
-    OutOfRange,
-    DataLoss,
-    PublisherRestart,
-    GapCleared,
-    /// The relay served a state snapshot in place of the history it no longer
-    /// had: the worker's state is replaced by the live set it carries.
-    Snapshot,
-}
-
-impl ResyncReason {
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::OutOfRange => "out_of_range",
-            Self::DataLoss => "data_loss",
-            Self::PublisherRestart => "publisher_restart",
-            Self::GapCleared => "gap_cleared",
-            Self::Snapshot => "snapshot",
-        }
-    }
-}
-
 /// Admission state for one `(worker, dp_rank)`.
 #[derive(Debug, Default)]
 pub(crate) struct RankState {

@@ -2638,27 +2638,62 @@ fn contested<'a>(spellings: &[&str], mut added: impl Iterator<Item = (&'a str, b
 }
 
 /// What `source`, a chat template, writes by itself: its raw text and its
-/// string literals, each behind a separator ([`VALUE_SEPARATOR`]). A comment
-/// is not in it, and neither is a literal that `built` names by its byte
-/// offset: one inside an expression the template builds a value from, the
-/// pattern of that value, which it writes only as the value. A template the
-/// lexer refuses is read whole.
-fn written_text(source: &str, built: impl Fn(usize) -> bool) -> String {
-    let mut written = String::new();
-    for item in tokenize(source, false, SyntaxConfig, WhitespaceConfig::default()) {
+/// string literals, each piece a text of its own, and then each run of two
+/// or more pieces that stand side by side, joined. Between two pieces of a
+/// run nothing lies but a comment, the marks of an expression or a join, so
+/// a render that writes one writes the next right after it, and a token the
+/// pieces spell together is written whole. Each text is asked by itself: a
+/// token that matches only as a whole word, or after normalization, is
+/// found in the piece that holds it. The lexer reads under the whitespace
+/// rules of the render ([`build_environment`]).
+/// A comment is not in the texts, and neither is a literal that `built`
+/// names by its byte offset: one inside an expression the template builds a
+/// value from, the pattern of that value, which it writes only as the
+/// value. A template the lexer refuses is read whole.
+fn written_text(source: &str, built: impl Fn(usize) -> bool) -> Vec<String> {
+    let mut written = Vec::new();
+    // The runs of pieces that stand side by side, and how many pieces the
+    // open run holds so far.
+    let mut runs: Vec<String> = Vec::new();
+    let mut pieces = 0_usize;
+    // A newline after a block or a comment that ends a line is not written,
+    // nor the blanks before a block that begins one.
+    let whitespace = WhitespaceConfig {
+        trim_blocks: true,
+        lstrip_blocks: true,
+        ..WhitespaceConfig::default()
+    };
+    for item in tokenize(source, false, SyntaxConfig, whitespace) {
         let Ok((token, span)) = item else {
-            return source.to_owned();
+            return vec![source.to_owned()];
         };
         let text = match &token {
-            Token::TemplateData(text) | Token::Str(text) => *text,
-            Token::String(text) => &**text,
-            _ => continue,
+            Token::TemplateData(text) | Token::Str(text) => Some(*text),
+            Token::String(text) => Some(&**text),
+            Token::VariableStart | Token::VariableEnd | Token::Tilde | Token::Plus => continue,
+            _ => None,
         };
-        if !built(span.start_offset as usize) {
-            written.push(char::from(VALUE_SEPARATOR));
-            written.push_str(text);
+        let Some(text) = text.filter(|_| !built(span.start_offset as usize)) else {
+            // The run ends here; one piece alone is no run.
+            if pieces == 1 {
+                runs.pop();
+            }
+            pieces = 0;
+            continue;
+        };
+        written.push(text.to_owned());
+        if pieces == 0 {
+            runs.push(String::new());
         }
+        if let Some(run) = runs.last_mut() {
+            run.push_str(text);
+        }
+        pieces += 1;
     }
+    if pieces == 1 {
+        runs.pop();
+    }
+    written.extend(runs);
     written
 }
 
@@ -4330,12 +4365,13 @@ impl ChatTemplateState {
         messages: &[serde_json::Value],
         params: ChatTemplateParams,
     ) -> Result<(String, bool)> {
+        // A render call carries no template of its own, so the words name
+        // what holds for every caller: the model has none, and only its
+        // configuration can bring one.
         let env = self.env.as_ref().ok_or_else(|| {
             anyhow!(
-                "Cannot use chat template functions because tokenizer.chat_template is not set \
-                 and no template argument was passed! For information about writing templates and \
-                 setting the tokenizer.chat_template attribute, please see the documentation at \
-                 https://huggingface.co/docs/transformers/main/en/chat_templating",
+                "The model has no chat template. One must be configured for the model; \
+                 a request cannot supply it.",
             )
         })?;
 
@@ -4756,7 +4792,8 @@ impl ChatTemplateState {
                 if source.contains(spelling)
                     && written
                         .get_or_insert_with(written_by_itself)
-                        .contains(spelling)
+                        .iter()
+                        .any(|text| text.contains(spelling))
                 {
                     return Vec::new();
                 }
@@ -4812,24 +4849,24 @@ impl ChatTemplateState {
         };
         // A template that writes an added token whole by itself is of the
         // other kind: its spellings would want the scan of `mark_controls`,
-        // which is not made here. The whole source is asked first, and what
-        // the template writes only where the source holds an added token
-        // somewhere: in a comment, or in the pattern a bound spelling is
-        // built from, the template writes none. Where the flat encode
-        // matches an added token after normalization it is asked too,
-        // whatever the source holds: the normalizer may make one of a text.
-        if cut_out.is_some() || controls.ranges(source).next().is_some() {
-            let bound = |at| {
-                bindings
-                    .iter()
-                    .any(|binding| (binding.span.0..binding.span.1).contains(&at))
-            };
-            let written = written_text(source, bound);
-            if controls.ranges(&written).next().is_some()
-                || cut_out.is_some_and(|cut_out| !cut_out(&written).is_empty())
-            {
-                return declined("it writes an added token whole by itself");
-            }
+        // which is not made here. What the template writes is asked, not
+        // its source: in a comment, or in the pattern a bound spelling is
+        // built from, the template writes none, and pieces that stand side
+        // by side write one whole, so they are asked joined and each by
+        // itself. Where the flat encode matches an added token after
+        // normalization it is asked too: the normalizer may make one of a
+        // text.
+        let bound = |at| {
+            bindings
+                .iter()
+                .any(|binding| (binding.span.0..binding.span.1).contains(&at))
+        };
+        let written = written_text(source, bound);
+        if written.iter().any(|text| {
+            controls.ranges(text).next().is_some()
+                || cut_out.is_some_and(|cut_out| !cut_out(text).is_empty())
+        }) {
+            return declined("it writes an added token whole by itself");
         }
         let Some(literals) = with_marked_literals(source, bindings) else {
             return declined("no string literal holds one of the spellings");

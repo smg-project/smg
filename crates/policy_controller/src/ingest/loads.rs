@@ -17,18 +17,26 @@
 //! and its ranks have no row until a per-rank source names them: a row
 //! holds a figure measured for its rank, never an aggregate. A failed read
 //! writes no row: the row on file ages, the engine's overload verdict
-//! reads clear until the engine is heard again, and health is the
-//! prober's (a later PR). A read that lands after its worker left writes
-//! nothing: the store keeps a worker's load rows exactly as long as its
-//! row.
+//! reads clear until the engine is heard again unless a rank of it is
+//! still heard on its stream, and health is the prober's (a later PR). A
+//! read that lands after its worker left writes nothing: the store keeps
+//! a worker's load rows exactly as long as its row.
 //! A row reachable only through a gateway is never dialed: its records
 //! arrive relayed. The engines are asked through a [`LoadProbe`], so the
 //! tests drive the arbitration without a socket and the binary dials the
 //! engines.
 //!
+//! Where it is built the driver tells the store the period every ready
+//! rank is heard in, by its stream or by the poll: the longer of the poll
+//! interval and the poll's deadline, plus a tick. The store ends the
+//! sample of a rank that lies three such periods behind its engine's
+//! newest ([`LoadSink::heard_every`]).
+//!
 //! The loop also keeps the instant the store names for its publication
 //! ([`LoadSink::publish_due`]): a row that lands inside the store's window
-//! is shown to decisions at the window's end, with no later write.
+//! is shown to decisions at the window's end, with no later write. The
+//! build a membership write owes is paid at the same instant: the write is
+//! another task's, so the store wakes the loop ([`LoadSink::wake_with`]).
 
 use std::{
     collections::{BTreeMap, HashSet},
@@ -43,7 +51,7 @@ use std::{
 use openai_protocol::worker::{RuntimeType, WorkerLoadResponse};
 use parking_lot::Mutex;
 use tokio::{
-    sync::watch,
+    sync::{watch, Notify},
     task::{JoinError, JoinSet},
     time::MissedTickBehavior,
 };
@@ -60,7 +68,9 @@ use crate::{
 pub struct LoadDriverConfig {
     /// How often an engine is polled while its stream is not serving it;
     /// also the freshness bound of the arbitration (a rank whose newest
-    /// record is older than this is polled). The gateway's
+    /// record is older than this is polled), and with a tick the period
+    /// every ready rank is heard in, unless the poll's deadline is longer
+    /// ([`Self::report_period`]). The gateway's
     /// `--load-monitor-interval`, 10 s. An interval the clock cannot add to
     /// the present polls an engine once.
     pub poll_interval: Duration,
@@ -72,6 +82,26 @@ pub struct LoadDriverConfig {
     pub scrape_timeout: Duration,
     /// The scheduler's tick: the resolution of every interval above.
     pub tick: Duration,
+}
+
+impl LoadDriverConfig {
+    /// The period the driver tells the sink ([`LoadSink::heard_every`]),
+    /// true of the slowest read of a sample that can end by its age: the
+    /// longer of the poll interval and the poll's deadline, plus a tick.
+    /// A poll starts on a tick, so two starts of an engine's polls lie at
+    /// most that far apart, and a poll that takes its whole deadline
+    /// lands inside the period it is counted in. A rank that loses one
+    /// report is so heard again within two periods and a deadline, inside
+    /// the three a sample is kept through. The sum saturates at the
+    /// largest interval or deadline a host can set. A sample is aged
+    /// against its engine's newest, and a scrape reads only an engine of
+    /// one rank, whose sample is its engine's newest at any age: the
+    /// scrape's timeout is not in the period.
+    pub fn report_period(&self) -> Duration {
+        self.poll_interval
+            .max(self.poll_deadline)
+            .saturating_add(self.tick)
+    }
 }
 
 impl Default for LoadDriverConfig {
@@ -114,6 +144,10 @@ pub enum ReadError {
     /// The family has no `GetLoads`.
     #[error("no GetLoads on a {0} engine")]
     Unsupported(String),
+    /// The probe's own client was not built, or not within the scrape's
+    /// timeout: the controller's failure, no engine's.
+    #[error("the probe's client is not built: {0}")]
+    Client(String),
 }
 
 impl ReadError {
@@ -125,6 +159,7 @@ impl ReadError {
             Self::Deadline(_) => "deadline",
             Self::NoLoad(_) => "no_load",
             Self::Unsupported(_) => "unsupported",
+            Self::Client(_) => "client",
         }
     }
 }
@@ -139,7 +174,9 @@ pub trait LoadProbe: Send + Sync + 'static {
         deadline: Duration,
     ) -> impl Future<Output = Result<WorkerLoadResponse, ReadError>> + Send;
 
-    /// The text of the engine's metrics endpoint, within `timeout`.
+    /// The text of the engine's metrics endpoint, within `timeout`. A probe
+    /// whose client's build outlasts `timeout` answers that scrape at the
+    /// build's end.
     fn scrape(
         &self,
         url: &str,
@@ -181,22 +218,30 @@ pub struct Failures {
     pub deadline: AtomicU64,
     pub no_load: AtomicU64,
     pub unsupported: AtomicU64,
+    pub client: AtomicU64,
 }
 
 impl Failures {
     /// The labels of the series, in the order of [`Self::each`]: each is its
     /// variant's [`ReadError::label`].
-    pub const LABELS: [&'static str; 5] =
-        ["transport", "answer", "deadline", "no_load", "unsupported"];
+    pub const LABELS: [&'static str; 6] = [
+        "transport",
+        "answer",
+        "deadline",
+        "no_load",
+        "unsupported",
+        "client",
+    ];
 
     /// The counters, in the order of [`Self::LABELS`].
-    fn counters(&self) -> [&AtomicU64; 5] {
+    fn counters(&self) -> [&AtomicU64; 6] {
         [
             &self.transport,
             &self.answer,
             &self.deadline,
             &self.no_load,
             &self.unsupported,
+            &self.client,
         ]
     }
 
@@ -209,13 +254,14 @@ impl Failures {
             ReadError::Deadline(_) => &self.deadline,
             ReadError::NoLoad(_) => &self.no_load,
             ReadError::Unsupported(_) => &self.unsupported,
+            ReadError::Client(_) => &self.client,
         };
         counter.fetch_add(1, Ordering::Relaxed);
     }
 
     /// The counts, with their labels.
-    pub fn each(&self) -> [(&'static str, u64); 5] {
-        let mut out = [("", 0); 5];
+    pub fn each(&self) -> [(&'static str, u64); 6] {
+        let mut out = [("", 0); 6];
         for (slot, (counter, name)) in out
             .iter_mut()
             .zip(self.counters().into_iter().zip(Self::LABELS))
@@ -232,8 +278,11 @@ pub struct LoadDriver<S, P> {
     probe: Arc<P>,
     config: LoadDriverConfig,
     stats: Arc<Stats>,
-    /// The membership grouped by engine, kept until the store's epoch moves.
-    grouped: Mutex<Option<Grouped>>,
+    /// The engines the probe was asked about and not told to forget since:
+    /// it may hold a connection for each. The set outlives a run, as the
+    /// probe does, so an engine that leaves the membership between two
+    /// runs is let go at the next run's first tick.
+    asked: Mutex<HashSet<String>>,
 }
 
 /// The engines of one membership epoch.
@@ -262,10 +311,15 @@ struct Engine {
     ranks: Vec<(u16, WorkerId)>,
 }
 
-/// What the loop keeps between ticks: when each engine is next due, and the
-/// calls that are out.
+/// What a run of polls keeps between its ticks: the membership as last
+/// grouped, when each engine is next due, and the calls that are out.
 #[derive(Default)]
 struct Schedule {
+    /// The membership grouped by engine, kept until the store's epoch
+    /// moves. An epoch names one membership within a run of polls alone:
+    /// between two runs a restore may leave the store at the same epoch
+    /// with another, so a run of polls starts with no grouping.
+    grouped: Option<Grouped>,
     due: BTreeMap<String, Due>,
     /// The calls that have not answered yet. A tick starts calls and waits
     /// for none: an answer is written when it lands, and dropping the
@@ -350,6 +404,14 @@ async fn at(instant: Option<Instant>) {
     }
 }
 
+/// The gate's next word; for ever once its teller is gone.
+async fn turned(polls: &mut watch::Receiver<bool>) -> bool {
+    if polls.changed().await.is_err() {
+        std::future::pending::<()>().await;
+    }
+    *polls.borrow_and_update()
+}
+
 /// What a log line calls an engine: the host and port of its address, never
 /// the address whole (a worker URL may carry userinfo, which no log line
 /// gets; the gRPC client names its peers the same way). An address with an
@@ -376,13 +438,24 @@ where
     S: WorkersStore + LoadSink + 'static,
     P: LoadProbe,
 {
+    /// A driver over `store`. The store is told the report period
+    /// ([`LoadDriverConfig::report_period`]) here, where the driver is built
+    /// and not at its first poll: a store is aged by the period from its
+    /// first judged write.
     pub fn new(store: Arc<S>, probe: Arc<P>, config: LoadDriverConfig) -> Self {
+        let period = config.report_period();
+        if !store.heard_every(period) {
+            warn!(
+                ?period,
+                "the load sink keeps the report period it was told first"
+            );
+        }
         Self {
             store,
             probe,
             config,
             stats: Arc::new(Stats::default()),
-            grouped: Mutex::new(None),
+            asked: Mutex::new(HashSet::new()),
         }
     }
 
@@ -396,34 +469,85 @@ where
     /// is written when it lands, so an engine that does not answer delays
     /// its own rows alone, never the fleet's or the stop, which cancels the
     /// calls still out.
-    pub async fn run(&self, mut stop: watch::Receiver<bool>) {
+    pub async fn run(&self, stop: watch::Receiver<bool>) {
+        // No role to read: the polls run for the loop's length.
+        let (_always, polls) = watch::channel(true);
+        self.run_while(stop, polls, || 0).await;
+    }
+
+    /// [`LoadDriver::run`] on a replica that may follow a leader: the loop
+    /// runs for the process's life and polls only while `polls` reads
+    /// `true`. It pays the store's publications either way, whoever wrote
+    /// the rows: a follower's applier writes them, and the instant the
+    /// store names is read again at each tick. A turn to `false` ends the
+    /// run of polls, with its calls still out and its grouping of the
+    /// membership; a turn to `true` starts the next with a tick at once.
+    ///
+    /// `led` says the term the replica last took, read beside each word.
+    /// The watch keeps its last word alone: a loss and the take after it,
+    /// told before the loop looked, read as one `true`. Under another
+    /// term that word ends the run of polls and starts the next all the
+    /// same, so no call of the last lead lands on a store restored since.
+    pub async fn run_while(
+        &self,
+        mut stop: watch::Receiver<bool>,
+        mut polls: watch::Receiver<bool>,
+        led: impl Fn() -> u64,
+    ) {
         let mut ticker = tokio::time::interval(self.config.tick);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut schedule = Schedule::default();
+        // The word, and the term it was read under: one run of polls.
+        let (mut polling, mut under) = (*polls.borrow_and_update(), led());
+        // A write of another task can leave the store an instant this loop
+        // read none of (a registration's build): the store wakes the loop,
+        // which reads the instant again.
+        let woken = Arc::new(Notify::new());
+        self.store.wake_with(Box::new({
+            let woken = Arc::clone(&woken);
+            move || woken.notify_one()
+        }));
         loop {
             // The instant the store names for the rows its publication
             // window still holds, read after every write of this loop: the
             // last row of a burst is shown within one window of its
-            // receipt, with no later write.
+            // receipt, with no later write. A row another writer brought,
+            // a follower's applier, is read at the next tick.
             let due = self.store.publish_due();
             // The stop first; then the answers before the tick, which finds
             // the engines whose calls landed free to be asked again.
             tokio::select! {
                 biased;
                 _ = stop.wait_for(|stop| *stop) => return,
+                word = turned(&mut polls) => {
+                    // The term is read after the word: a take sets it
+                    // before its word is told.
+                    let led = led();
+                    if (word, led) != (polling, under) {
+                        (polling, under) = (word, led);
+                        schedule = Schedule::default();
+                        if polling {
+                            self.tick(&mut schedule);
+                        }
+                    }
+                }
                 Some(joined) = schedule.calls.join_next() => self.land(&mut schedule.due, joined),
+                () = woken.notified() => {}
                 () = at(due) => self.store.publish(now()),
-                _ = ticker.tick() => self.tick(&mut schedule),
+                _ = ticker.tick() => {
+                    if polling {
+                        self.tick(&mut schedule);
+                    }
+                }
             }
         }
     }
 
     /// The membership grouped by engine: the snapshot is read and regrouped
-    /// only when the store's epoch moved since the last tick (every write,
-    /// a status change included, moves it).
-    fn engines(&self) -> Arc<Vec<Engine>> {
+    /// only when the store's epoch moved since the run's last tick (every
+    /// write, a status change included, moves it).
+    fn engines(&self, grouped: &mut Option<Grouped>) -> Arc<Vec<Engine>> {
         let epoch = self.store.epoch();
-        let mut grouped = self.grouped.lock();
         if let Some(kept) = grouped.as_ref() {
             if kept.epoch == epoch {
                 return Arc::clone(&kept.engines);
@@ -441,10 +565,12 @@ where
     /// One tick: the membership read, the engines that left dropped, the due
     /// calls started. Nothing here waits on an engine.
     fn tick(&self, schedule: &mut Schedule) {
-        let engines = self.engines();
+        let engines = self.engines(&mut schedule.grouped);
         let tick_at = tokio::time::Instant::now();
         let live: HashSet<&str> = engines.iter().map(|engine| engine.key.as_str()).collect();
-        schedule.due.retain(|key, _| {
+        schedule.due.retain(|key, _| live.contains(key.as_str()));
+        let mut asked = self.asked.lock();
+        asked.retain(|key| {
             let kept = live.contains(key.as_str());
             if !kept {
                 self.probe.forget(key);
@@ -452,6 +578,9 @@ where
             kept
         });
         for (index, engine) in engines.iter().enumerate() {
+            if !asked.contains(&engine.key) {
+                asked.insert(engine.key.clone());
+            }
             let slot = schedule
                 .due
                 .entry(engine.key.clone())

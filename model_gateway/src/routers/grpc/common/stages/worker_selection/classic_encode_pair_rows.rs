@@ -26,12 +26,11 @@
 //! times, each time from a fresh fleet and fresh policies, and the recorder
 //! stops if two recordings differ.
 //!
-//! This file is not part of the gateway. It is kept beside the recorded rows
-//! with the commit it records from, and run in a checkout of that commit:
-//! copy it to
-//! `model_gateway/src/routers/grpc/common/stages/worker_selection/classic_encode_pair_rows.rs`,
-//! add `#[cfg(test)] mod classic_encode_pair_rows;` to
-//! `model_gateway/src/routers/grpc/common/stages/worker_selection.rs`, then
+//! This file is an ignored test of the gateway crate, kept beside the code
+//! it runs. It records from the checkout it is built in and writes the sheet
+//! under `CLASSIC_ROWS_OUT`, naming `CLASSIC_ROWS_COMMIT` as the commit it
+//! recorded from. The sheets the policy controller crate replays are in
+//! `crates/policy_controller/tests/classic/sheets`; to record this one again:
 //!
 //! ```text
 //! CLASSIC_ROWS_OUT=<dir> CLASSIC_ROWS_COMMIT=<commit> \
@@ -51,7 +50,10 @@ use super::*;
 use crate::{
     config::types::PolicyConfig,
     policies::PolicyFactory,
-    worker::{test_support::no_health_check, BasicWorkerBuilder, ConnectionMode, ModelCard},
+    worker::{
+        test_support::no_health_check, BasicWorkerBuilder, ConnectionMode, ModelCard,
+        WorkerRegistryExt,
+    },
 };
 
 const MODEL: &str = "m";

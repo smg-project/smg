@@ -48,7 +48,10 @@ use super::*;
 use crate::{
     config::types::PolicyConfig,
     routers::{
-        common::{openai_bridge::FormatRegistry, test_support::fast_retry_config},
+        common::{
+            openai_bridge::FormatRegistry, prefill_admission::test_support::select_worker,
+            test_support::fast_retry_config,
+        },
         grpc::{
             client::ModelInfo,
             common::responses::{
@@ -74,7 +77,6 @@ use crate::{
     tenant::TenantKey,
     worker::{
         health::circuit_breaker::{CircuitBreakerConfig, CircuitState},
-        test_support::select_worker,
         BasicWorkerBuilder, ConnectionMode, RequestCompletionSink, RuntimeType, Worker, WorkerType,
     },
 };
@@ -3932,6 +3934,83 @@ async fn a_request_that_completes_before_the_request_timeout_is_unchanged() {
         "a completed request sends no abort"
     );
     assert_eq!(worker.load(), 0);
+}
+
+/// A worker whose process is gone refuses the dial under the next call. The
+/// client's answer is that failure without the worker's address; the
+/// gateway's own line names the worker.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_refused_dial_is_answered_without_the_workers_address() {
+    use tokio::sync::oneshot;
+
+    use crate::{routers::grpc::test_engine::serve_until, worker::test_support::RefusedAddress};
+
+    // The worker comes up on a port that stays taken after it: the port
+    // refuses again once the worker's listener is gone.
+    let address = RefusedAddress::reserve_shared();
+    let router =
+        Server::builder().add_service(TokenSpeedSchedulerServer::new(GatedScheduler::default()));
+    let (stop, stopped) = oneshot::channel();
+    let server = serve_until(router, address.listen_shared(), stopped);
+    let worker_registry = Arc::new(WorkerRegistry::new());
+    register_worker(&worker_registry, address.port(), WorkerType::Regular);
+    let deps = PipelineDeps::pair(
+        worker_registry.clone(),
+        Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
+        None,
+        None,
+        Duration::from_secs(60),
+    );
+    let pipeline = RequestPipeline::build(Endpoint::Completion, Mode::Regular, &deps)
+        .expect("completion pipeline");
+    let components = components(Arc::clone(&worker_registry)).await;
+    let request = || {
+        pipeline.execute_completion(
+            completion(false),
+            None,
+            MODEL.to_string(),
+            Arc::clone(&components),
+            None,
+            None,
+            None,
+        )
+    };
+
+    // The worker serves a request: the gateway holds its connection from
+    // here on.
+    assert_eq!(request().await.status(), http::StatusCode::OK);
+    // The worker goes away: it stops listening and closes that connection
+    // with a GOAWAY. Its task ends after the gateway's side has answered the
+    // ping the worker sends behind that frame, so the gateway has read the
+    // GOAWAY when the next request starts, and that request dials.
+    stop.send(())
+        .expect("the worker serves until it is stopped");
+    tokio::time::timeout(CASE_CAP, server)
+        .await
+        .expect("the worker closes its connection")
+        .expect("the worker's task ends");
+
+    let response = request().await;
+    assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("drain body");
+    let error: serde_json::Value = serde_json::from_slice(&body).expect("a JSON body");
+    assert_eq!(error["error"]["code"], "start_generation_failed", "{error}");
+    let message = error["error"]["message"].as_str().expect("a message");
+    assert!(
+        message.starts_with("Failed to start generation: "),
+        "{message}"
+    );
+    assert!(
+        message.contains("refused"),
+        "the answer says how the dial failed: {message}"
+    );
+    assert!(
+        !message.contains("127.0.0.1") && !message.contains(&address.port().to_string()),
+        "the answer names the worker's address: {message}"
+    );
 }
 
 /// The request timeout under test and the cap a gateway without it fails at.

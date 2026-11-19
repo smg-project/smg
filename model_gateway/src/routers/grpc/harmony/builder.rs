@@ -479,24 +479,7 @@ impl HarmonyBuilder {
         let mut user_messages = self.convert_chat_messages(messages);
         all_messages.append(&mut user_messages);
 
-        let selection_text = self.extract_selection_text(&all_messages);
-        let conversation = Conversation::from_messages(all_messages);
-        let token_ids = encoding
-            .render_conversation_for_completion(&conversation, Role::Assistant, None)
-            .map_err(|e| format!("Failed to encode Harmony conversation: {e}"))?;
-
-        // Get stop tokens for Harmony assistant actions (<|return|> and <|call|>)
-        let stop_token_ids: Vec<u32> = encoding
-            .stop_tokens_for_assistant_actions()
-            .into_iter()
-            .flat_map(|set| set.into_iter())
-            .collect();
-
-        Ok(HarmonyBuildOutput {
-            input_ids: token_ids,
-            stop_token_ids,
-            selection_text,
-        })
+        self.encode_prompt(encoding, all_messages)
     }
 
     /// Build Harmony request from Responses request
@@ -514,26 +497,15 @@ impl HarmonyBuilder {
     ) -> Result<HarmonyBuildOutput, String> {
         let encoding = try_harmony_encoding()?;
         let all_messages = self.construct_input_messages_with_harmony(request)?;
-
-        let selection_text = self.extract_selection_text(&all_messages);
-        let conversation = Conversation::from_messages(all_messages);
-        let token_ids = encoding
-            .render_conversation_for_completion(&conversation, Role::Assistant, None)
-            .map_err(|e| format!("Failed to encode Harmony conversation: {e}"))?;
-
-        // Get stop tokens for Harmony assistant actions (<|return|> and <|call|>)
-        let stop_token_ids: Vec<u32> = encoding
-            .stop_tokens_for_assistant_actions()
-            .into_iter()
-            .flat_map(|set| set.into_iter())
-            .collect();
+        let output = self.encode_prompt(encoding, all_messages)?;
 
         // What the model receives, decoded back for the trace lines alone:
         // a pass over every prompt token, so it runs only when they print.
         if enabled!(Level::TRACE) {
+            let token_ids = &output.input_ids;
             let decoded_text = encoding
                 .tokenizer()
-                .decode_utf8(&token_ids)
+                .decode_utf8(token_ids)
                 .unwrap_or_else(|_| "<decode error>".to_string());
             trace!(
                 token_count = token_ids.len(),
@@ -544,8 +516,29 @@ impl HarmonyBuilder {
             trace!("DECODED_TEXT_START\n{}\nDECODED_TEXT_END", decoded_text);
         }
 
+        Ok(output)
+    }
+
+    /// The prompt of the assistant's next turn over `all_messages`, with the
+    /// stop tokens of the assistant's actions (`<|return|>` and `<|call|>`)
+    /// and the messages' selection text.
+    fn encode_prompt(
+        &self,
+        encoding: &HarmonyEncoding,
+        all_messages: Vec<HarmonyMessage>,
+    ) -> Result<HarmonyBuildOutput, String> {
+        let selection_text = self.extract_selection_text(&all_messages);
+        let conversation = Conversation::from_messages(all_messages);
+        let input_ids = encoding
+            .render_conversation_for_completion(&conversation, Role::Assistant, None)
+            .map_err(|e| format!("Failed to encode Harmony conversation: {e}"))?;
+        let stop_token_ids = encoding
+            .stop_tokens_for_assistant_actions()
+            .into_iter()
+            .flat_map(|set| set.into_iter())
+            .collect();
         Ok(HarmonyBuildOutput {
-            input_ids: token_ids,
+            input_ids,
             stop_token_ids,
             selection_text,
         })

@@ -40,12 +40,6 @@ impl HarmonyResponseProcessingStage {
     }
 }
 
-impl Default for HarmonyResponseProcessingStage {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[async_trait]
 impl ProcessStage for HarmonyResponseProcessingStage {
     async fn process(
@@ -90,15 +84,8 @@ impl ProcessStage for HarmonyResponseProcessingStage {
 
                 // For streaming, delegate to streaming processor and return SSE response
                 if is_streaming {
-                    // Reserved (if tenant rate limiting is enabled): settled
-                    // with real usage inside the streaming processor on
-                    // success, or abandoned on early disconnect/error by the
-                    // reservation's safety net the processor hands the
-                    // response body (ReservationAttachment's Drop).
-                    let reservation = ctx
-                        .rate_limit_cell
-                        .as_deref()
-                        .and_then(RateLimitCell::take_for_streaming_handoff);
+                    let reservation =
+                        RateLimitCell::stream_reservation(ctx.rate_limit_cell.as_deref());
 
                     let source = StreamSource::new(
                         ctx.workers.as_ref(),

@@ -973,10 +973,25 @@ mod tests {
             ns.output_endpoint(),
         );
         // The first handshake greets the engine and gives up its READY wait
-        // while the engine is still loading.
-        let (gave_up, engine) = tokio::join!(
-            connect_handshake(&handshake, 1, &input, &output, Duration::from_millis(300)),
-            hello(&handshake, EngineId::from_engine_index(0)),
+        // while the engine is still loading. Its 300 ms of silence run out in
+        // that wait alone: until its HELLO is answered the engine counts as
+        // alive, with a sign of life on every poll and the engine polled
+        // first, so a starved host cannot spend them on the greeting.
+        let alive = crate::EngineLiveness::new();
+        let first_startup = StartupBudget {
+            silence: Duration::from_millis(300),
+            ceiling: None,
+            liveness: Some(alive.clone()),
+        };
+        let greeted = hello(&handshake, EngineId::from_engine_index(0));
+        tokio::pin!(greeted);
+        let (engine, gave_up) = tokio::join!(
+            biased;
+            std::future::poll_fn(|cx| {
+                alive.touch();
+                std::future::Future::poll(greeted.as_mut(), cx)
+            }),
+            connect_handshake(&handshake, 1, &input, &output, first_startup),
         );
         let Err(error) = gave_up else {
             panic!("the first handshake must give up its READY wait");

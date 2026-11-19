@@ -1010,15 +1010,33 @@ elect a second leader beside the first.
 {{- end }}
 
 {{/*
+Policy controller replica count -- the count as a reader of the rendered
+manifest takes it, a whole number: a count given as text that reads there
+as a number (2e0, or a 2 after a blank) counts as that number. Zero for a
+null and for a text that reads as no number. Every place that judges the
+count asks here.
+*/}}
+{{- define "smg.policyControllerReplicaCount" -}}
+{{- int (fromYaml (printf "count: %v" .Values.policyController.replicas)).count -}}
+{{- end }}
+
+{{/*
 Policy controller replicas -- more than one only with the election on. With
 it off every replica is a controller of its own, and two would each lead
-alone: the render refuses them. The count is compared as a number and
-written as the values hold it: a null stays the API's default.
+alone: the render refuses them. The count is compared as a reader of the
+rendered manifest takes it: a text that reads there as a number above one
+(2e0, or a 2 after a blank) is refused as that number is. It is written as
+the values hold it: a null stays the API's default. Beside a spec store the
+refusal says one way out, not two: a store takes no election.
 */}}
 {{- define "smg.policyControllerReplicas" -}}
 {{- $replicas := .Values.policyController.replicas -}}
-{{- if and (gt (int $replicas) 1) (not (include "smg.policyControllerElection" .)) -}}
-{{- fail (printf "policyController.replicas is %d with policyController.election.enabled off: each replica would lead alone. Turn the election on, or keep one replica" (int $replicas)) -}}
+{{- $read := include "smg.policyControllerReplicaCount" . -}}
+{{- if and (gt (int $read) 1) (not (include "smg.policyControllerElection" .)) -}}
+{{- if include "smg.policyControllerSpecStore" . -}}
+{{- fail (printf "policyController.replicas is %v beside policyController.specStoreClaim: each replica would lead alone, and a spec store holds one controller's generations. Keep one replica" $replicas) -}}
+{{- end -}}
+{{- fail (printf "policyController.replicas is %v with policyController.election.enabled off: each replica would lead alone. Turn the election on, or keep one replica" $replicas) -}}
 {{- end -}}
 {{- $replicas -}}
 {{- end }}
@@ -1069,6 +1087,59 @@ comparer can hold: any other tag takes the default.
 {{- end }}
 
 {{/*
+Policy controller spec document -- policyController.spec as the bytes of the
+file the controller reads. The controller refuses a start that names no
+source of its spec, so values that hold no document are refused here, by
+name: a null, an empty map, or values with no such key. A value that is no
+map is refused as written, also one that reads as empty (false, 0, an empty
+text or list). The schema names each first, and the helper does where the
+schema's check is skipped. The chart reads no line of the document and
+writes none: whether it runs is the controller's word, and a generation
+line is the document's own.
+*/}}
+{{- define "smg.policyControllerSpec" -}}
+{{- $spec := (.Values.policyController).spec -}}
+{{- if not (or (kindIs "invalid" $spec) (kindIs "map" $spec)) -}}
+{{- fail (printf "policyController.spec is %s: the policy spec document as a map" (toJson $spec)) -}}
+{{- end -}}
+{{- if not $spec -}}
+{{- fail "policyController.spec holds no document: the controller refuses a start that names no source of its policy spec" -}}
+{{- end -}}
+{{- toYaml $spec -}}
+{{- end }}
+
+{{/*
+Policy controller spec store -- the claim named in
+policyController.specStoreClaim, and empty when none is named: the
+controller then runs the document of policyController.spec from its file. A
+store is the other source of the controller's spec. The controller is
+passed --spec-store on the claim's mount: it starts on the newest
+generation on file, and writes each generation an operator applies there.
+What the controller refuses at start beside a store is refused here, in
+its reasons: a document in policyController.spec, since a start names one
+source of its spec, and the election, since a standby does not follow an
+applied generation yet and the controller takes no store beside a lease
+another replica can take. More than one replica is refused where the count
+is judged. A value that is no text is refused as written, where the
+schema's check is skipped.
+*/}}
+{{- define "smg.policyControllerSpecStore" -}}
+{{- $claim := (.Values.policyController).specStoreClaim -}}
+{{- if not (or (kindIs "invalid" $claim) (kindIs "string" $claim)) -}}
+{{- fail (printf "policyController.specStoreClaim is %s: the name of a PersistentVolumeClaim, as text" (toJson $claim)) -}}
+{{- end -}}
+{{- if $claim -}}
+{{- if (.Values.policyController).spec -}}
+{{- fail (printf "policyController.specStoreClaim names %s and policyController.spec holds a document: the controller refuses a start that names two sources of its policy spec. Set policyController.spec to null and upgrade with --reset-then-reuse-values or --reset-values, which drops the release's other overrides: give them again (an empty map does not clear a reused document, and under --reuse-values a null does not either), or leave the claim unnamed" $claim) -}}
+{{- end -}}
+{{- if include "smg.policyControllerElection" . -}}
+{{- fail (printf "policyController.specStoreClaim names %s with policyController.election.enabled on: another replica can take the controller's lease, and a standby does not follow an applied generation in this build. Turn the election off, or keep the spec document" $claim) -}}
+{{- end -}}
+{{- $claim -}}
+{{- end -}}
+{{- end }}
+
+{{/*
 Policy controller CLI arguments -- every argument is a flag of
 smg-policy-controller, each from a value. The controller's id is not here:
 the flag reads HOSTNAME, the pod's name. What the controller refuses at
@@ -1076,11 +1147,17 @@ start is refused at render: two listeners on one port, a settle window
 over half the grace period (the controller's own default of 5 seconds when
 shutdownSettleSeconds is null) and a listener named to take identities as
 told that is none of the three: the schema names it first, and the helper
-does where the schema's check is skipped. Those listeners are a set, said
-in the listeners' own order however the value was written: a reorder rolls
-no pod. With the election on the Lease is named,
+does where the schema's check is skipped. A value that is no list is
+refused there as written, also one that reads as empty (false, 0, an empty
+text or map): null alone is the value left out. Those listeners are a set,
+said in the listeners' own order however the value was written: a reorder
+rolls no pod. With the election on the Lease is named,
 and the pod's own address, which the kubelet writes in place of $(POD_IP):
-the holder of the Lease is named by an address the others can dial.
+the holder of the Lease is named by an address the others can dial. The
+spec file named is the one the Deployment mounts the document as: the one
+key of the document's ConfigMap, under the mount's directory. Where a spec
+store's claim is named the store's directory is passed in the file's
+place: the claim's mount.
 */}}
 {{- define "smg.policyControllerArgs" -}}
 {{- $controller := .Values.policyController -}}
@@ -1099,9 +1176,12 @@ the holder of the Lease is named by an address the others can dial.
 {{- end -}}
 {{- $elected := include "smg.policyControllerElection" . -}}
 {{- $told := list -}}
-{{- $named := $controller.identityAsTold | default list -}}
+{{- $named := list -}}
+{{- if not (kindIs "invalid" $controller.identityAsTold) -}}
+{{- $named = $controller.identityAsTold -}}
+{{- end -}}
 {{- if not (kindIs "slice" $named) -}}
-{{- fail (printf "policyController.identityAsTold is %v: a list of listeners' names (gateway, control, replication)" $named) -}}
+{{- fail (printf "policyController.identityAsTold is %s: a list of listeners' names (gateway, control, replication)" (toJson $named)) -}}
 {{- end -}}
 {{- range $name := $named -}}
 {{- if not (has $name (list "gateway" "control" "replication")) -}}
@@ -1149,7 +1229,51 @@ the holder of the Lease is named by an address the others can dial.
 - "--advertise-address"
 - "$(POD_IP)"
 {{- end }}
+{{- if include "smg.policyControllerSpecStore" . }}
+- "--spec-store"
+- "/var/lib/smg/spec"
+{{- else }}
+- "--spec-file"
+- "/etc/smg/policy-spec/spec.yaml"
+{{- end }}
 {{- range $controller.extraArgs }}
 - {{ . | quote }}
 {{- end }}
+{{- end }}
+
+{{/*
+Policy controller replication as told -- "true" when the controller's
+arguments name the replication listener among those that take identities as
+told; empty when they do not. A replica that does not lead follows its
+leader only where they do. The arguments are read whole, as the controller
+reads them: policyController.identityAsTold and an --identity-as-told flag
+of policyController.extraArgs name alike. The flag's value is the next
+argument or stands behind an equals sign, one name or several between
+commas.
+*/}}
+{{- define "smg.policyControllerReplicationAsTold" -}}
+{{- $told := list -}}
+{{- $value := false -}}
+{{- range $argument := include "smg.policyControllerArgs" . | fromYamlArray -}}
+{{- if $value -}}
+{{- $told = concat $told (splitList "," $argument) -}}
+{{- else if hasPrefix "--identity-as-told=" $argument -}}
+{{- $told = concat $told (splitList "," (trimPrefix "--identity-as-told=" $argument)) -}}
+{{- end -}}
+{{- $value = eq $argument "--identity-as-told" -}}
+{{- end -}}
+{{- if has "replication" $told -}}true{{- end -}}
+{{- end }}
+
+{{/*
+Policy controller TLS -- "true" when the controller's arguments hand its
+gRPC listeners a server certificate (--tls-cert, its value the next
+argument or behind an equals sign); empty when they do not. A standby's
+dial has no credential yet, so a replica whose replication listener serves
+TLS follows no leader.
+*/}}
+{{- define "smg.policyControllerServesTls" -}}
+{{- range $argument := include "smg.policyControllerArgs" . | fromYamlArray -}}
+{{- if or (eq $argument "--tls-cert") (hasPrefix "--tls-cert=" $argument) -}}true{{- end -}}
+{{- end -}}
 {{- end }}

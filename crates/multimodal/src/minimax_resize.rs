@@ -7,6 +7,7 @@ use image::{
 };
 
 use crate::{
+    buffer_pool,
     types::{ImageFrame, ImageSize},
     vision::transforms::{resize_bicubic_torch_aa, round_half_to_even},
     MediaConnectorError,
@@ -118,8 +119,9 @@ fn budget(pixels: u64, limit: u64, modality: &'static str) -> Result<(), MediaCo
 /// Resize directly to the planned patch grid with the M3 uint8 bicubic kernel.
 pub(crate) fn resize_image(image: DynamicImage, width: u32, height: u32) -> DynamicImage {
     if (image.width(), image.height()) == (width, height) {
-        image
-    } else if image.color().has_alpha() {
+        return image;
+    }
+    let resized = if image.color().has_alpha() {
         // Resize straight RGB and alpha independently: the model consumes RGB,
         // while the shared frame must still honor KeepAlpha for other readers.
         let rgba = image.to_rgba8();
@@ -135,7 +137,11 @@ pub(crate) fn resize_image(image: DynamicImage, width: u32, height: u32) -> Dyna
         }))
     } else {
         resize_bicubic_torch_aa(&image, width, height)
-    }
+    };
+    // The frame holds the resized image from here on, so nothing later would
+    // return the decoder's buffer to the pool.
+    buffer_pool::recycle_image(image);
+    resized
 }
 
 /// Include effective geometry in the pixel-cache identity.

@@ -517,11 +517,17 @@ impl TiktokenTokenizer {
     /// template from an explicit path, else the configuration's, else a file
     /// beside the vocabulary; the EOS ids; the renderer).
     fn from_vocabulary(
-        vocabulary: FileVocabulary,
+        mut vocabulary: FileVocabulary,
         dir: &Path,
         chat_template_path: Option<&str>,
         config_chat_template: ConfigChatTemplates,
     ) -> Result<Self> {
+        // An added token with an empty spelling names no text: it is left
+        // out of the set, as the Hugging Face library leaves one out of its
+        // added vocabulary, and no encoder or matcher is built over it.
+        vocabulary
+            .specials
+            .retain(|spelling, _| !spelling.is_empty());
         let FileVocabulary {
             ranks,
             pattern,
@@ -533,9 +539,35 @@ impl TiktokenTokenizer {
             structural_controls,
         } = vocabulary;
 
-        // Build special tokens encoder for CoreBPE (needs FxHashMap)
-        let special_tokens_encoder: FxHashMap<String, Rank> =
-            specials.iter().map(|(k, &v)| (k.clone(), v)).collect();
+        // The added tokens by text: the order the direct encoder takes them
+        // in, and the one that shows a token that begins with another.
+        let mut by_text: Vec<(String, TokenIdType)> = specials
+            .iter()
+            .map(|(token, &id)| (token.clone(), id))
+            .collect();
+        by_text.sort();
+        let one_begins_another = by_text
+            .windows(2)
+            .any(|pair| pair[1].0.starts_with(pair[0].0.as_str()));
+
+        // Build special tokens encoder for CoreBPE (needs FxHashMap). Of two
+        // special tokens that begin at one place the file's own encoder takes
+        // the one this map walks first, and the walk follows the order the
+        // tokens go in. Where one token begins with another they go in by
+        // ascending id, the order the format's own loader hands them over,
+        // so every load reads the same way. No other vocabulary reads by the
+        // order, and its map is filled as it comes.
+        let special_tokens_encoder: FxHashMap<String, Rank> = if one_begins_another {
+            let mut by_id: Vec<(Rank, &String)> =
+                specials.iter().map(|(text, &id)| (id, text)).collect();
+            by_id.sort_unstable();
+            by_id
+                .into_iter()
+                .map(|(id, text)| (text.clone(), id))
+                .collect()
+        } else {
+            specials.iter().map(|(k, &v)| (k.clone(), v)).collect()
+        };
 
         // Calculate true vocab size from max token ID (handles sparse/reserved IDs),
         // build the text-to-id map (borrowing the ranks) and the added tokens' texts
@@ -552,7 +584,7 @@ impl TiktokenTokenizer {
             .iter()
             .map(|(text, &id)| (id, text.clone()))
             .collect();
-        let native = Self::native_encoder(&ranks, &pattern, &specials);
+        let native = Self::native_encoder(&ranks, &pattern, &by_text);
         let tokenizer = Arc::new(CoreBPE::new(ranks, special_tokens_encoder, &pattern)?);
         // Counted and announced once the file's own encoder has loaded too,
         // the point the Hugging Face path counts at as well (before the chat
@@ -723,14 +755,9 @@ impl TiktokenTokenizer {
     fn native_encoder(
         ranks: &FxHashMap<Vec<u8>, Rank>,
         pattern: &str,
-        added_tokens: &HashMap<String, TokenIdType>,
+        specials: &[(String, TokenIdType)],
     ) -> Option<Arc<NativeEncoder>> {
-        let mut specials: Vec<(String, TokenIdType)> = added_tokens
-            .iter()
-            .map(|(token, &id)| (token.clone(), id))
-            .collect();
-        specials.sort();
-        match NativeEncoder::from_ranks(ranks, pattern, &specials) {
+        match NativeEncoder::from_ranks(ranks, pattern, specials) {
             Ok(native) => Some(Arc::new(native)),
             Err(declined) => {
                 tracing::info!(
@@ -1085,42 +1112,91 @@ const CHECKPOINT_RUN_CHARS: usize = 25_000;
 /// Any other text is one piece.
 fn checkpoint_pieces(text: &str) -> Vec<&str> {
     let mut pieces = Vec::new();
-    let mut window_start = 0;
-    let mut window_chars = 0;
-    for (at, _) in text.char_indices() {
-        if window_chars == CHECKPOINT_WINDOW_CHARS {
-            cut_runs(&text[window_start..at], &mut pieces);
-            window_start = at;
-            window_chars = 0;
-        }
-        window_chars += 1;
-    }
-    if !text.is_empty() {
-        cut_runs(&text[window_start..], &mut pieces);
+    let mut rest = text;
+    while !rest.is_empty() {
+        let (window, later) = rest.split_at(window_len(rest));
+        cut_runs(window, &mut pieces);
+        rest = later;
     }
     pieces
 }
 
+/// Whether `text` can be more than one of [`checkpoint_pieces`]. Both cuts
+/// need more characters than [`CHECKPOINT_RUN_CHARS`], and a text holds no
+/// more characters than bytes: a text within the bound is one piece, encoded
+/// without the walk for its cuts and the list of its pieces.
+fn may_cut(text: &str) -> bool {
+    text.len() > CHECKPOINT_RUN_CHARS
+}
+
+/// The bytes of the first window of `text`: of its first
+/// [`CHECKPOINT_WINDOW_CHARS`] characters, or of all of it when it holds no
+/// more. Only a text of more bytes than that is counted, by the character
+/// iterator's skip, which counts whole blocks of bytes.
+fn window_len(text: &str) -> usize {
+    if text.len() <= CHECKPOINT_WINDOW_CHARS {
+        return text.len();
+    }
+    let mut later = text.chars();
+    match later.nth(CHECKPOINT_WINDOW_CHARS - 1) {
+        Some(_) => text.len() - later.as_str().len(),
+        None => text.len(),
+    }
+}
+
 /// One window of [`checkpoint_pieces`], cut at its long runs.
+///
+/// A run of more than [`CHECKPOINT_RUN_CHARS`] characters is more than that
+/// many bytes, so the runs between two run starts at most that many bytes
+/// apart hold no cut. The walk steps from a run start to the last one within
+/// that many bytes and counts characters only in a run that fills the step:
+/// prose and code, with whitespace every few characters, take one look a
+/// step.
 fn cut_runs<'a>(window: &'a str, pieces: &mut Vec<&'a str>) {
-    let mut run_is_space = window.chars().next().is_some_and(python_isspace);
-    let mut run_chars = 0;
     let mut piece_start = 0;
-    for (at, c) in window.char_indices() {
-        let is_space = python_isspace(c);
-        if run_is_space == is_space {
-            run_chars += 1;
-            if run_chars > CHECKPOINT_RUN_CHARS {
-                pieces.push(&window[piece_start..at]);
-                piece_start = at;
-                run_chars = 1;
+    let mut run_start = 0;
+    while window.len() - run_start > CHECKPOINT_RUN_CHARS {
+        let reach = window.floor_char_boundary(run_start + CHECKPOINT_RUN_CHARS);
+        if let Some(next) = last_run_start(window, run_start, reach) {
+            run_start = next;
+            continue;
+        }
+        // One run fills the step and goes on at `reach`. Up to there it is at most
+        // `CHECKPOINT_RUN_CHARS` bytes, so no more characters and no cut; from there each
+        // character that follows a full count starts a piece.
+        let is_space = window[reach..].chars().next().is_some_and(python_isspace);
+        let mut run_chars = window[run_start..reach].chars().count();
+        run_start = window.len();
+        for (at, c) in window[reach..].char_indices() {
+            if python_isspace(c) != is_space {
+                run_start = reach + at;
+                break;
             }
-        } else {
-            run_is_space = is_space;
-            run_chars = 1;
+            if run_chars == CHECKPOINT_RUN_CHARS {
+                pieces.push(&window[piece_start..reach + at]);
+                piece_start = reach + at;
+                run_chars = 0;
+            }
+            run_chars += 1;
         }
     }
     pieces.push(&window[piece_start..]);
+}
+
+/// The last run start of `window` after `from` and no later than `reach`:
+/// the greatest index there whose character is not of the kind of the one
+/// before it. Read from `reach` down, so a run start near it is found at
+/// once.
+fn last_run_start(window: &str, from: usize, reach: usize) -> Option<usize> {
+    let is_space = window[reach..].chars().next().is_some_and(python_isspace);
+    let mut start = reach;
+    for (at, before) in window[from..reach].char_indices().rev() {
+        if python_isspace(before) != is_space {
+            return Some(start);
+        }
+        start = from + at;
+    }
+    None
 }
 
 /// Piecewise encode for a segmented prompt: control pieces with special
@@ -1173,10 +1249,7 @@ fn encode_segments_into(
     ids: &mut Vec<TokenIdType>,
 ) -> Result<()> {
     for segment in segments {
-        // The checkpoint cuts at a window of characters and at a run of them, both longer than
-        // this bound in bytes: a shorter segment is one piece, encoded without the cut's walk
-        // over its characters and the list of its pieces.
-        if checkpoint_pieces && segment.text.len() > CHECKPOINT_RUN_CHARS {
+        if checkpoint_pieces && may_cut(&segment.text) {
             for piece in self::checkpoint_pieces(&segment.text) {
                 encode_piece(bpe, native, allowed, piece, segment.allow_special, ids)?;
             }
@@ -1257,11 +1330,17 @@ impl Encoder for TiktokenTokenizer {
         // vocabulary's own encoder adds: BOS for a tekken.json file, nothing
         // for a tiktoken file (no concept of one).
         let native = self.native.as_deref();
-        let mut tokens: Vec<TokenIdType> = if self.checkpoint_pieces {
+        let mut tokens: Vec<TokenIdType> = if self.checkpoint_pieces && may_cut(input) {
+            // The first piece's ids take the later pieces': a text of one piece, as most
+            // long texts are, is not copied.
             checkpoint_pieces(input)
                 .into_iter()
-                .flat_map(|piece| encode_with_special_tokens(&self.tokenizer, native, piece))
-                .collect()
+                .map(|piece| encode_with_special_tokens(&self.tokenizer, native, piece))
+                .reduce(|mut ids, piece_ids| {
+                    ids.extend(piece_ids);
+                    ids
+                })
+                .unwrap_or_default()
         } else {
             encode_with_special_tokens(&self.tokenizer, native, input)
         };
@@ -1635,7 +1714,7 @@ fn detect_renderer_from_config(dir: &Path) -> Renderer {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
+    use std::sync::{mpsc, Mutex};
 
     use super::*;
     use crate::{
@@ -2505,23 +2584,166 @@ mod tests {
         assert_eq!(flat.token_ids().iter().filter(|&&id| id == 300).count(), 2);
     }
 
-    /// The segment encode skips the checkpoint's cut for a segment of at most
+    /// Both encodes skip the checkpoint's cut for a text of at most
     /// `CHECKPOINT_RUN_CHARS` bytes: such a text holds at most that many
     /// characters, so neither cut can fall inside it and it is one piece.
     #[test]
-    fn a_segment_within_the_run_bound_in_bytes_is_one_checkpoint_piece() {
+    fn a_text_within_the_run_bound_in_bytes_is_one_checkpoint_piece() {
         let at_the_bound = " ".repeat(CHECKPOINT_RUN_CHARS);
+        assert!(!may_cut(&at_the_bound));
         assert_eq!(
             checkpoint_pieces(&at_the_bound),
             vec![at_the_bound.as_str()]
         );
         let past_it = " ".repeat(CHECKPOINT_RUN_CHARS + 1);
+        assert!(may_cut(&past_it));
         assert_eq!(checkpoint_pieces(&past_it).len(), 2);
         let two_byte_characters = "\u{e9}".repeat(CHECKPOINT_RUN_CHARS / 2);
+        assert!(!may_cut(&two_byte_characters));
         assert_eq!(
             checkpoint_pieces(&two_byte_characters),
             vec![two_byte_characters.as_str()]
         );
+    }
+
+    /// The cut steps by bytes and counts by characters: a run is cut at its
+    /// 25,001st character whatever the bytes of its characters, wherever it
+    /// starts, and whichever character the step's end falls in.
+    #[test]
+    fn a_long_run_is_cut_by_its_characters_from_any_start() {
+        // More bytes than the bound and no more characters: whole.
+        let wide = "\u{4e2d}".repeat(CHECKPOINT_RUN_CHARS);
+        assert_eq!(checkpoint_pieces(&wide), vec![wide.as_str()]);
+        let wide_over = format!("{wide}\u{4e2d}");
+        assert_eq!(
+            checkpoint_pieces(&wide_over),
+            vec![wide.as_str(), "\u{4e2d}"]
+        );
+        // The step's end falls inside a two-byte character.
+        let odd = format!("a{}", "\u{e9}".repeat(CHECKPOINT_RUN_CHARS));
+        assert_eq!(
+            checkpoint_pieces(&odd),
+            vec![&odd[..odd.len() - 2], "\u{e9}"]
+        );
+        // A run that starts exactly one step after the run before it.
+        let run = "x".repeat(CHECKPOINT_RUN_CHARS);
+        let next = format!("{run} {run}x");
+        assert_eq!(checkpoint_pieces(&next), vec![&next[..next.len() - 1], "x"]);
+        // A run after a short one, cut twice.
+        let twice = format!(" {run}{run}x");
+        assert_eq!(
+            checkpoint_pieces(&twice),
+            vec![&twice[..=CHECKPOINT_RUN_CHARS], run.as_str(), "x"]
+        );
+        // Whitespace of every width is one kind.
+        let spaces = format!(
+            "{}x",
+            " \u{a0}\u{3000}\u{1c}\n".repeat(CHECKPOINT_RUN_CHARS / 5)
+        );
+        assert_eq!(checkpoint_pieces(&spaces), vec![spaces.as_str()]);
+        let spaces_over = format!(" {spaces}");
+        assert_eq!(
+            checkpoint_pieces(&spaces_over),
+            vec![&spaces_over[..spaces_over.len() - 2], "\nx"]
+        );
+        // A window's end restarts the count: the run across it is not cut.
+        let window = format!(
+            "{}{}",
+            "a ".repeat(CHECKPOINT_WINDOW_CHARS / 2 - 10_000),
+            "x".repeat(20_000)
+        );
+        let across = format!("{window}{} b", "x".repeat(20_000));
+        assert_eq!(
+            checkpoint_pieces(&across),
+            vec![window.as_str(), &across[window.len()..]]
+        );
+    }
+
+    /// The checkpoint's cut as its definition reads, one character at a
+    /// time: the reference [`checkpoint_pieces`] is held against.
+    fn pieces_by_the_definition(text: &str) -> Vec<&str> {
+        let mut pieces = Vec::new();
+        let mut piece_start = 0;
+        let mut window_chars = 0;
+        let mut run_chars = 0;
+        let mut run_is_space = false;
+        for (at, c) in text.char_indices() {
+            let is_space = python_isspace(c);
+            let window_ends = window_chars == CHECKPOINT_WINDOW_CHARS;
+            if window_ends {
+                window_chars = 0;
+            }
+            if window_ends || is_space != run_is_space {
+                run_chars = 0;
+            }
+            if window_ends || run_chars == CHECKPOINT_RUN_CHARS {
+                pieces.push(&text[piece_start..at]);
+                piece_start = at;
+                run_chars = 0;
+            }
+            run_is_space = is_space;
+            run_chars += 1;
+            window_chars += 1;
+        }
+        if !text.is_empty() {
+            pieces.push(&text[piece_start..]);
+        }
+        pieces
+    }
+
+    /// Texts of runs around both bounds, in characters of every width and
+    /// whitespace of both ranges, are cut as the definition cuts them.
+    #[test]
+    fn checkpoint_pieces_are_the_definitions_on_generated_runs() {
+        const SPACES: [char; 5] = [' ', '\n', '\u{1c}', '\u{a0}', '\u{3000}'];
+        const OTHERS: [char; 4] = ['x', '\u{e9}', '\u{4e2d}', '\u{1f600}'];
+        const AT_THE_BOUND: [usize; 5] = [
+            CHECKPOINT_RUN_CHARS - 1,
+            CHECKPOINT_RUN_CHARS,
+            CHECKPOINT_RUN_CHARS + 1,
+            2 * CHECKPOINT_RUN_CHARS,
+            2 * CHECKPOINT_RUN_CHARS + 1,
+        ];
+        let mut state = 0x9E37_79B9usize;
+        let mut below = move |bound: usize| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state % bound
+        };
+        for round in 0..24 {
+            let chars = [30_000, 130_000, CHECKPOINT_WINDOW_CHARS + 60_000][round % 3];
+            let mut text = String::new();
+            let mut len = 0;
+            let mut space = below(2) == 0;
+            while len < chars {
+                // One run at the bound, or a stretch of short runs as prose has them.
+                let at_the_bound = below(3) == 0;
+                let runs = if at_the_bound { 1 } else { 1 + below(4_000) };
+                for _ in 0..runs {
+                    let kind: &[char] = if space { &SPACES } else { &OTHERS };
+                    let run = if at_the_bound {
+                        AT_THE_BOUND[below(AT_THE_BOUND.len())]
+                    } else {
+                        1 + below(9)
+                    };
+                    let one = kind[below(kind.len())];
+                    let mixed = below(2) == 0;
+                    for _ in 0..run {
+                        text.push(if mixed { kind[below(kind.len())] } else { one });
+                    }
+                    len += run;
+                    space = !space;
+                }
+            }
+            let lens =
+                |pieces: Vec<&str>| pieces.iter().map(|piece| piece.len()).collect::<Vec<_>>();
+            assert_eq!(
+                lens(checkpoint_pieces(&text)),
+                lens(pieces_by_the_definition(&text)),
+                "round {round}"
+            );
+        }
     }
 
     #[test]
@@ -2611,6 +2833,40 @@ mod tests {
             kimi.encode(&short, false).unwrap().token_ids(),
             other.encode(&short, false).unwrap().token_ids()
         );
+    }
+
+    /// The byte vocabulary with three controls and one more added token,
+    /// `extra`, that is the beginning of one of them.
+    fn begins_another_dir(extra: &str) -> tempfile::TempDir {
+        let config = serde_json::json!({"added_tokens_decoder": {
+            "300": {"content": "</s:x>", "special": true},
+            "301": {"content": "[INST:x]", "special": true},
+            "302": {"content": "[/INST:x]", "special": false},
+            "303": {"content": extra, "special": false},
+        }});
+        write_tiktoken_dir(&full_byte_tiktoken_model(), &config.to_string(), None)
+    }
+
+    /// Of two added tokens that begin at one place the file's own encoder
+    /// takes the one its map of them walks first. The tokens go into that
+    /// map by ascending id, so every load of the same files reads the same
+    /// way: the way the format's reference package reads them when it is
+    /// handed the tokens in that order.
+    #[test]
+    fn two_added_tokens_that_begin_at_one_place_read_the_same_at_every_load() {
+        for (extra, end, open) in [
+            ("</s:", &[303, 120, 62][..], &[301][..]),
+            ("[INST:x", &[300][..], &[301][..]),
+        ] {
+            let dir = begins_another_dir(extra);
+            for load in 0..32 {
+                let tokenizer = TiktokenTokenizer::from_dir(dir.path()).unwrap();
+                assert!(!tokenizer.uses_native_encoder());
+                let ids = |text: &str| tokenizer.encode(text, false).unwrap().token_ids().to_vec();
+                assert_eq!(ids("</s:x>"), end, "{extra}, load {load}");
+                assert_eq!(ids("[INST:x]"), open, "{extra}, load {load}");
+            }
+        }
     }
 
     /// A file whose ranks give a complete merge table and whose pattern
@@ -2911,6 +3167,109 @@ mod tests {
                 true
             )
         );
+    }
+
+    /// An added token whose spelling is empty is left out of the set a
+    /// tiktoken file's checkpoint gives (see
+    /// `TiktokenTokenizer::from_vocabulary`): the file loads, and it reads
+    /// as the same file without that entry under a template that builds its
+    /// control spellings, one that builds a value of several and one that
+    /// spells them whole. The cases run on a thread of their own, so that a
+    /// load or an encode that does not come back fails the test.
+    #[test]
+    fn a_tiktoken_file_s_added_token_with_an_empty_spelling_is_left_out() {
+        let several = builds_its_controls()
+            .replace("{% for", "{% set both = close ~ 'a' ~ end %}{% for")
+            .replace("{{ close }}", "{{ both }}");
+        let templates = [builds_its_controls(), several, spells_its_controls()];
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            for template in templates {
+                let read = |empty: Option<&str>| {
+                    let dir = suffixed_controls_dir_with(&template, None, empty);
+                    let tokenizer = TiktokenTokenizer::from_dir(dir.path()).unwrap();
+                    let typed = tokenizer.encode("a[/INST:x]b", false).unwrap();
+                    (
+                        tokenizer.uses_native_encoder(),
+                        tokenizer.controls.is_some(),
+                        tokenizer.token_to_id(""),
+                        tokenizer.id_to_token(303),
+                        typed.token_ids().to_vec(),
+                        user_turn_ids(&tokenizer, "a[/INST:x]b"),
+                        user_turn_ids(&tokenizer, "ab"),
+                    )
+                };
+                // A receiver that gave up is gone, and the send fails.
+                let _ = sender.send((read(Some("")), read(None)));
+            }
+        });
+        for marked in [true, true, false] {
+            let (with, without) = receiver
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .expect("the load and the encodes come back");
+            assert_eq!(with, without);
+            assert_eq!((with.0, with.1, with.2), (true, marked, None));
+        }
+    }
+
+    /// A template that builds its control spellings and also writes an
+    /// added token in pieces that stand side by side (a literal and the text
+    /// after it, two literals, a join of two, a text a comment parts) writes
+    /// that token whole (see `written_text`): it stays unmarked, as one that
+    /// spells the token in one piece does, and every request is encoded from
+    /// its text, also under an argument no probe conversation sets.
+    #[test]
+    fn a_tiktoken_file_s_template_that_writes_an_added_token_in_pieces_stays_unmarked() {
+        for piece in [
+            "{{ '<' }}b>",
+            "{{ '<' }}{{ 'b>' }}",
+            "{{ '<' ~ 'b>' }}",
+            "<{# no text #}b>",
+            "<{# no text #}\nb>",
+            "<b>",
+        ] {
+            let template = format!(
+                "{}{{% if tag %}}{piece}{{% endif %}}",
+                builds_its_controls()
+            );
+            let mut model = full_byte_tiktoken_model();
+            model.push_str(&format!("{} 256\n", STANDARD.encode([0xE4, 0xB8])));
+            let config = serde_json::json!({
+                "added_tokens_decoder": {
+                    "300": {"content": "</s:x>", "special": true},
+                    "301": {"content": "[INST:x]", "special": true},
+                    "302": {"content": "[/INST:x]", "special": false},
+                    "304": {"content": "<b>", "special": true},
+                },
+                "eos_token": "</s:x>",
+                "chat_template": template,
+            });
+            let dir = write_tiktoken_dir(&model, &config.to_string(), None);
+            let tokenizer = TiktokenTokenizer::from_dir(dir.path()).unwrap();
+            assert!(tokenizer.controls.is_none(), "{piece}");
+            for tag in [false, true] {
+                let kwargs = HashMap::from([("tag".to_owned(), serde_json::json!(tag))]);
+                let params = ChatTemplateParams {
+                    template_kwargs: Some(&kwargs),
+                    ..Default::default()
+                };
+                let messages = [serde_json::json!({"role": "user", "content": "ab"})];
+                let rendered = tokenizer
+                    .apply_chat_template_with_encoding(&messages, params, None)
+                    .unwrap();
+                assert!(
+                    matches!(rendered.encoding, PromptEncoding::FromText),
+                    "{piece}"
+                );
+                let expected: Vec<TokenIdType> = if tag {
+                    vec![301, 97, 98, 302, 304]
+                } else {
+                    vec![301, 97, 98, 302]
+                };
+                let ids = tokenizer.encode(&rendered.text, false).unwrap();
+                assert_eq!(ids.token_ids().to_vec(), expected, "{piece}");
+            }
+        }
     }
 
     /// The ids of a user turn `content`, and whether the prompt is encoded
