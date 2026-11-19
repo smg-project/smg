@@ -85,9 +85,10 @@
 //! nothing of its own.
 //!
 //! A replica under a shared lease applies no document at its start
-//! ([`Generations::defer`]): the start passes its file's document, and the
-//! replica's first take applies it where the replica runs nothing by then
-//! ([`Generations::at_take`]). So a replica that starts runs no number
+//! ([`Generations::defer`]): the start passes its file's document, and it
+//! is applied under the replica's first lead where the replica runs
+//! nothing by then, at the take or behind the lead's opening
+//! ([`Generations::deferred_now`]). So a replica that starts runs no number
 //! of its own, and follows its leader's generation whatever its number.
 //! A leader runs what its file says: the door counts the takes, and behind
 //! each the file's watch reads its file as a start does, though it never
@@ -1186,7 +1187,7 @@ impl Generations {
     }
 
     /// [`Generations::enter`] where `admit` has the last word on an entry
-    /// of this door's own source: the store asks it under the lock it
+    /// of this door's own source: the store asks it under the locks it
     /// publishes under, and where it refuses nothing is published, kept or
     /// counted, and the answer is `false`. A followed generation is the
     /// log's and asks nobody.
@@ -1850,11 +1851,12 @@ impl Generations {
     }
 
     /// Puts the source's entry under `fence`, the fence of a replica under
-    /// a shared lease: from here the source writes while the fence shows a
-    /// term, and at no other time. A replica that has not led yet, one that
-    /// follows a leader, and one whose lead ended apply nothing of their
-    /// own, whatever their file's watch read ahead of a look. The first
-    /// fence handed stands.
+    /// a shared lease: from here the source writes while the fence shows
+    /// the term its bytes were read under, and at no other time
+    /// ([`Generations::apply_under`]). A replica that has not led yet, one
+    /// that follows a leader, and one whose lead ended apply nothing of
+    /// their own, whatever their file's watch read ahead of a look. The
+    /// first fence handed stands.
     pub(crate) fn under(&self, fence: Arc<Fence>) {
         let _ = self.fence.set(fence);
     }
@@ -6025,6 +6027,34 @@ pub(crate) mod tests {
         // The case holds the lock of the held bytes: the entry passes both
         // reads of the fence under the door's lock and waits behind it.
         let gate = door.held.lock();
+        let outcome = thread::scope(|scope| {
+            let entering = scope.spawn(|| yaml(&door, RANDOM));
+            thread::sleep(deadline + Duration::from_millis(400));
+            assert!(!door.source_writes(), "the fence closed by the clock");
+            drop(gate);
+            entering.join().expect("the entry's thread")
+        });
+        assert_eq!(outcome, Ok(Applied::Waits(0)));
+        assert_eq!(standing(&store), (0, None));
+        assert_eq!(door.counts(), applied(0, 0));
+        assert!(door.held.lock().is_none(), "no bytes are kept");
+    }
+
+    /// The store asks its last word behind every lock its entry waits for.
+    /// An entry that waits for the loads' lock, the last one, while the
+    /// fence closes publishes nothing, and the standing generation stays.
+    #[test]
+    fn a_fence_that_closes_while_the_store_waits_for_its_last_lock_publishes_nothing() {
+        let deadline = Duration::from_millis(800);
+        let store = Arc::new(MemoryStore::new());
+        let door = Generations::new(Arc::clone(&store), stock());
+        let mut elector = election_under(deadline);
+        door.under(elector.fence());
+        elector.tick(Instant::now()).expect("a take");
+        assert!(door.source_writes());
+        // The case holds the loads' lock, as a load's write does: the entry
+        // passes the door's reads of the fence and waits inside the store.
+        let gate = store.holding_loads();
         let outcome = thread::scope(|scope| {
             let entering = scope.spawn(|| yaml(&door, RANDOM));
             thread::sleep(deadline + Duration::from_millis(400));

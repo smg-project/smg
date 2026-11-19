@@ -217,10 +217,11 @@ impl SpecFile {
     /// ([`Generations::defer`]). A file that cannot be read, or a document
     /// that does not run, refuses the start all the same. Until it leads,
     /// a replica that follows a leader runs what the leader's log gives
-    /// it. At its first take the door applies these bytes where the
-    /// replica runs nothing ([`Generations::at_take`]), and behind every
-    /// take the watch reads the file as it stands then, though it never
-    /// moved: a leader runs what its file says.
+    /// it. Under its first lead the door applies these bytes where the
+    /// replica runs nothing, at the take or behind the lead's opening
+    /// ([`Generations::deferred_now`]), and behind every take the watch
+    /// reads the file as it stands then, though it never moved: a leader
+    /// runs what its file says.
     pub(crate) fn start_deferred(
         path: PathBuf,
         generations: Arc<Generations>,

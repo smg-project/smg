@@ -677,11 +677,12 @@ impl MemoryStore {
     }
 
     /// [`MemoryStore::apply`] where `admit` has the last word: it is asked
-    /// under the lock the generation is published under, ahead of the
-    /// publication, and where it refuses nothing is published and the
-    /// answer is `false`. The entry of a source that writes only while its
-    /// replica leads reads the replica's fence here, so a lead that ended
-    /// while the entry waited for this lock publishes nothing.
+    /// under the two locks the generation is published under, behind the
+    /// last one this entry waits for and ahead of the publication, and
+    /// where it refuses nothing is published and the answer is `false`.
+    /// The entry of a source that writes only while its replica leads
+    /// reads the replica's fence here, so a lead that ended while the
+    /// entry waited for either lock publishes nothing.
     #[cfg(feature = "controller")]
     pub(crate) fn apply_admitted(
         &self,
@@ -689,6 +690,13 @@ impl MemoryStore {
         admit: impl FnOnce() -> bool,
     ) -> Result<bool, StaleGeneration> {
         self.apply_at(None, spec, admit)
+    }
+
+    /// Holds the loads' lock, as a load's write does: a case keeps an
+    /// entry waiting where the store's entry waits last.
+    #[cfg(all(test, feature = "controller"))]
+    pub(crate) fn holding_loads(&self) -> impl Drop + '_ {
+        self.loads.lock()
     }
 
     /// A leader's generation, applied as the replication stream tells it:
@@ -718,7 +726,7 @@ impl MemoryStore {
     }
 
     /// [`MemoryStore::apply`], its telling at `at` where a standby's
-    /// applier holds that place, and `admit` asked under the workers lock
+    /// applier holds that place, and `admit` asked under both its locks
     /// ([`MemoryStore::apply_admitted`]): `false` where it refused.
     fn apply_at(
         &self,
@@ -735,11 +743,12 @@ impl MemoryStore {
             // wakes its readers with the membership lock let go.
             let _released = self.released();
             let workers = self.workers.lock();
-            // The last word, under the lock every publication takes.
+            let mut loads = self.loads.lock();
+            // The last word, behind every lock this entry waits for: what
+            // follows is the publication, and it waits for nothing.
             if !admit() {
                 return Ok(false);
             }
-            let mut loads = self.loads.lock();
             let Loads { ranks, writer } = &mut *loads;
             let ranks = &*ranks;
             let (world, before) = writer.apply(

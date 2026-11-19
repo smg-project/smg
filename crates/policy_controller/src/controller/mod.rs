@@ -585,8 +585,9 @@ impl Controller {
         let generations = Arc::clone(&self.shared.generations);
         // Under a shared lease a replica may follow a leader, and then
         // runs its leader's generations: its own file is passed here and
-        // applied at its first take, and its source writes while the
-        // replica leads, by the fence.
+        // applied under its first lead, and its source writes while the
+        // replica leads under the term its bytes were read under, by the
+        // fence.
         let deferred = self.config.election.lease.is_shared();
         if deferred {
             generations.under(Arc::clone(&self.shared.fence));
