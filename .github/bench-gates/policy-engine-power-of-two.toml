@@ -42,7 +42,8 @@
 
 # Count: `count = true`, as policy-engine.toml records it. Read on this file's 15 ids, the same work with cold
 # code ahead of the decision (never committed): 13 count the same in every batch after the first, and two
-# 512-worker rows did not count steadily in that reading. They keep the time's verdict.
+# 512-worker rows did not count steadily in that reading. They keep the time's verdict, which a second
+# measurement decides where every count is within half a percent.
 repeats = 3
 count = true
 # The count ends 2,280 s into the run. The gate step's bound is 60 minutes, which the `decision` row needs,
