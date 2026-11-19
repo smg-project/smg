@@ -16,12 +16,12 @@ use tracing::{debug, warn};
 use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
 use crate::{
-    routers::grpc::client::{flat_labels, GrpcClient},
+    routers::grpc::client::flat_labels,
     workflow::{
         data::{WorkerKind, WorkerWorkflowData},
         steps::{
             local::create_worker::resolve_model_id,
-            util::{grpc_base_url, http_base_url},
+            util::{connect_grpc_as, grpc_base_url, http_base_url},
         },
     },
 };
@@ -367,18 +367,17 @@ async fn fetch_grpc_metadata(
 ) -> Result<(HashMap<String, String>, String), String> {
     let grpc_url = grpc_base_url(url);
 
-    let client = GrpcClient::connect(&grpc_url, runtime_type)
+    let connection = connect_grpc_as(&grpc_url, runtime_type)
         .await
         .map_err(|e| format!("Failed to connect to gRPC: {e}"))?;
 
-    let mut labels = client
-        .get_model_info()
+    let mut labels = connection
+        .model_labels()
         .await
-        .map_err(|e| format!("Failed to fetch gRPC model info: {e}"))?
-        .to_labels();
+        .map_err(|e| format!("Failed to fetch gRPC model info: {e}"))?;
 
-    match client.get_server_info().await {
-        Ok(info) => labels.extend(info.to_labels()),
+    match connection.server_labels().await {
+        Ok(server) => labels.extend(server),
         // An engine that does not implement the call offers nothing to read;
         // any other failure fails a strict read.
         Err(e) if strict && e.code() != tonic::Code::Unimplemented => {

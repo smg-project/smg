@@ -287,8 +287,8 @@ A port is a trait this crate calls and a host implements.
 | Port | Module | What the host says through it | In the gateway |
 |---|---|---|---|
 | `Generation` | `registry` | What it keeps of one membership generation. | The snapshot its routing reads. |
-| `EngineConnector` | `connection::engine` | How to connect a gRPC or ZMQ worker to its engine. | Its gRPC and ZMQ connector. |
-| `EngineConnection` | `connection::engine` | The calls the runtime makes on a connected engine: liveness, the health and load reads, the admin calls, the read of the engine's KV transfer id and the two pushed streams. | Its client of an engine. |
+| `EngineConnector` | `connection::engine` | How to connect a gRPC or ZMQ worker to its engine, and how to dial a gRPC address once. | Its gRPC and ZMQ connector. |
+| `EngineConnection` | `connection::engine` | The calls the runtime makes on a connected engine: liveness, the health and load reads, the labels the engine reports of its model and of itself, the admin calls and the two pushed streams. | Its client of an engine. |
 | `ConnectorDefault` | `connection::engine` | The connector a builder uses when it is handed none. | The same connector. |
 | `WorkerJobs` | `health::manager` | How to remove a failed worker, and how to read a worker's labels again. | Its job queue. |
 | `LoadConsumer` | `load::monitor` | Whether a reader wants loads, and how to trim what readers booked on a worker. | Its policy registry. |

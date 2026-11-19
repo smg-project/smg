@@ -141,6 +141,10 @@ impl EngineConnector for EchoingConnector {
     async fn connect_zmq(&self, link: ZmqLink) -> Result<Arc<dyn EngineConnection>, String> {
         Err(link.base_url)
     }
+
+    async fn dial_grpc(&self, base_url: &str, _timeout: Duration) -> Result<(), String> {
+        Err(base_url.to_string())
+    }
 }
 
 /// The read dials the gRPC base of the worker's address. A data-parallel
