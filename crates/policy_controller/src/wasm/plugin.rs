@@ -844,12 +844,6 @@ struct Standing {
     /// the working place, from the time it is brought to the time it is
     /// given back.
     lent: Option<Decider>,
-    /// The decision whose open brought that state or checked the hold, by
-    /// its number on this thread, zero where none did: its later opens take
-    /// the hold as theirs. No later decision takes that number here: the
-    /// thread's count rises by one a decision, and a thread that takes an
-    /// exited thread's place takes its count with it ([`OpenDecisions`]).
-    checked: u64,
 }
 
 /// A thread's working place for a plugin: its slot, and what the thread is
@@ -859,6 +853,14 @@ struct Standing {
 #[derive(Default)]
 struct Working {
     standing: Cell<Standing>,
+    /// The decision whose open last checked a hold in this place, by its
+    /// number on this thread, zero where none did: its later opens take the
+    /// hold as theirs. No later decision takes that number here: the
+    /// thread's count rises by one a decision, and a thread that takes an
+    /// exited thread's place takes its count with it ([`OpenDecisions`]).
+    /// A word of its own, which a bring neither reads nor writes: the first
+    /// later open of a bring's decision checks the hold it brought, once.
+    checked: Cell<u64>,
     slot: RefCell<Option<Instance>>,
 }
 
@@ -1333,20 +1335,20 @@ impl Plugin {
             return false;
         };
         match now.lent {
-            // The state is here: an earlier open of the decision brought or
-            // checked it, or a decision open around a told event did. Any
-            // other call takes the hold only where the rest still names this
-            // place. A close that did not return can have left the hold, and
-            // the decider can have been brought elsewhere since: such a hold
-            // is stale, its instance is dropped, and the state at rest comes.
+            // The state is here. An open of the decision that last checked
+            // the hold takes it as it stands. Any other call takes it only
+            // where the rest still names this place: the first later open
+            // of the decision that brought it does, once. A close that did
+            // not return can have left the hold, and the decider can have
+            // been brought elsewhere since: such a hold is stale, its
+            // instance is dropped, and the state at rest comes.
             Some(held) if held == decider => {
-                if decision != 0 && now.checked == decision {
+                if decision != 0 && working.checked.get() == decision {
                     return false;
                 }
                 if self.brought_here(working, decider) {
                     if decision != 0 {
-                        now.checked = decision;
-                        working.standing.set(now);
+                        working.checked.set(decision);
                     }
                     return false;
                 }
@@ -1367,7 +1369,6 @@ impl Plugin {
         std::mem::swap(&mut rest.ring, &mut *self.ring().borrow_mut());
         rest.at = std::ptr::from_ref(working).addr();
         now.lent = Some(decider);
-        now.checked = decision;
         working.standing.set(now);
         true
     }
