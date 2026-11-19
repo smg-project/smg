@@ -37,19 +37,18 @@ unless the change is to what they measure, and a new row goes to a bench target 
 Four controls keep the verdict about the code. Binaries of the same bytes pass without a run:
 no code change can move a row. So do two that load the same image, the bytes the loader maps
 with the build id left out: a change outside a bench's code still moves its executable's
-symbol names, debug sections and build id, and such a pair would be timed against itself.
-Each side is measured from a fresh copy of its binary under the
-output directory, through paths and criterion homes of one length: a file's cached pages decide
-its speed on 1 to 6 µs rows (one binary read 9 to 20 % slower than its byte-identical copy on
-whichever side it stood, 2026-11-09), so neither side carries its file's history; the copies go
-after the runs, the output directory being the workflow's artifact. An id that fails after the
-interleaved runs is measured once more per side before the verdict, and that round is read
-within itself (a process that runs a few ids sits on levels of its own), so one burst on the
-runner cannot fail it alone: a burst re-measures near zero and a regression near its size, so a
-round under half the threshold makes the failure a suspect. The host's load before every run
-is recorded,
-and `--busy-above` makes the gate wait for a quieter host and then refuse to judge (exit 2,
-never a failure) rather than read another job's load as a regression.
+symbol names, debug sections and build id, and such a pair would be timed against itself. Each
+side is measured from a fresh copy of its binary under the output directory, through paths and
+criterion homes of one length: a file's cached pages decide its speed on 1 to 6 µs rows (one
+binary read 9 to 20 % slower than its byte-identical copy on whichever side it stood,
+2026-11-09), so neither side carries its file's history; the copies go after the runs, the
+output directory being the workflow's artifact. An id that fails after the interleaved runs is
+measured once more per side before the verdict, and that round is read within itself (a process
+that runs a few ids sits on levels of its own), so one burst on the runner cannot fail it
+alone: a burst re-measures near zero and a regression near its size, so a round under half the
+threshold makes the failure a suspect. The host's load before every run is recorded, and
+`--busy-above` makes the gate wait for a quieter host and then refuse to judge (exit 2, never a
+failure) rather than read another job's load as a regression.
 
 A fifth control tells where code sits from what it does. The functions of a bench executable
 move when code ahead of them grows, and the same machine code further on in its page can read
@@ -518,6 +517,8 @@ def sha256_of(path: Path) -> str:
 # The fields of an ELF header that name its section table (e_shoff; e_shentsize, e_shnum and
 # e_shstrndx): the loader maps them with the first segment, and no run reads them.
 ELF_SECTION_FIELDS = ((0x28, 0x30), (0x3A, 0x40))
+# The sizes of the file header and of one program header of a 64-bit ELF file.
+ELF_EHDR, ELF_PHDR = 64, 56
 PT_LOAD, PT_NOTE, NT_GNU_BUILD_ID = 1, 4, 3
 
 
@@ -525,20 +526,21 @@ def image_of(path: Path) -> str | None:
     """The sha256 of what the loader maps of a 64-bit little-endian ELF executable: its
     program headers and the file bytes of every loadable segment, with the build id and the
     header's section-table fields left out. Those follow what no run reads: symbol names and
-    debug sections. None for any other file, and for one whose headers do not add up."""
+    debug sections. None for any other file, for one whose headers do not add up, and for one
+    whose file header no loadable segment covers: its entry address would go unread."""
     data = bytearray(path.read_bytes())
-    if len(data) < 64 or data[:6] != b"\x7fELF\x02\x01":
+    if len(data) < ELF_EHDR or data[:6] != b"\x7fELF\x02\x01":
         return None
     (phoff,) = struct.unpack_from("<Q", data, 0x20)
     phentsize, phnum = struct.unpack_from("<HH", data, 0x36)
-    if phentsize != 56 or phnum in (0, 0xFFFF) or phoff + phnum * 56 > len(data):
+    if phentsize != ELF_PHDR or phnum in (0, 0xFFFF) or phoff + phnum * ELF_PHDR > len(data):
         return None
-    table = bytes(data[phoff : phoff + phnum * 56])
+    table = bytes(data[phoff : phoff + phnum * ELF_PHDR])
     for start, end in ELF_SECTION_FIELDS:
         data[start:end] = bytes(end - start)
     loads = []
     for n in range(phnum):
-        kind, _, offset, _, _, filesz, _, _ = struct.unpack_from("<IIQQQQQQ", table, n * 56)
+        kind, _, offset, _, _, filesz, _, _ = struct.unpack_from("<IIQQQQQQ", table, n * ELF_PHDR)
         if offset + filesz > len(data):
             return None
         if kind == PT_LOAD:
@@ -552,6 +554,8 @@ def image_of(path: Path) -> str | None:
             if note == NT_GNU_BUILD_ID and data[at + 12 : at + 12 + namesz] == b"GNU\x00":
                 data[desc : desc + descsz] = bytes(descsz)
             at = desc + (descsz + 3) // 4 * 4
+    if not any(offset == 0 and filesz >= ELF_EHDR for offset, filesz in loads):
+        return None
     digest = hashlib.sha256(table)
     for offset, filesz in loads:
         digest.update(data[offset : offset + filesz])
@@ -624,6 +628,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             side: {"path": str(binaries[side]), "sha256": hashes[side], "image": images[side]}
             for side in SIDES
         },
+        # True of two files that load one image too: the saved key keeps its name.
         "identical": hashes["base"] == hashes["pr"] or same_image,
         "order": [],
         "base": {"binary": str(binaries["base"]), "runs": [], "seconds": [], "load": []},
@@ -775,11 +780,12 @@ COUNT_TIMEOUT_S = 120.0
 # +10.4 % at most on rows gated at 10 %: a change beyond twice the threshold on the same
 # instructions is more than where they sit has explained.
 PLACEMENT_CEILING = 2.0
-# What part of a count still reads as level for an id that times a whole pass (`whole_pass`
-# in its gate entry). A change to the pass moves its count by a few instructions (0.03 and
-# 0.04 % where two decide ids read 11.9 and 15.2 % slower by where their code sat), and work
-# inserted into the decision that read the same two ids 16.2 and 11.3 % slower moved their
-# counts by 3.1 and 3.4 %.
+# What part of a count still reads as level. An id that times a whole pass (`whole_pass` in
+# its gate entry) is placed on a level count, and any id that fails on one is measured again
+# first. A change to the pass moves its count by a few instructions (0.03 and 0.04 % where
+# two decide ids read 11.9 and 15.2 % slower by where their code sat), and work inserted into
+# the decision that read the same two ids 16.2 and 11.3 % slower moved their counts by 3.1
+# and 3.4 %.
 LEVEL_COUNT = 0.005
 
 

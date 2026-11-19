@@ -2000,6 +2000,12 @@ def test_a_second_measurement_starts_only_with_room_for_all_its_runs(mod, tmp_pa
     assert rc == 1 and len(saved["second"]["pr"]["runs"]) == 3
 
 
+def counted_row(mod, counts, whole=False):
+    """A failing row on which each executable counted what `counts` gives it."""
+    gate = mod.Gate("^encode/", 0.10, whole_pass=whole)
+    return mod.Row("encode/a", [100, 101, 102], [115, 116, 117], gate, counts=counts)
+
+
 def level_row(mod, base, pr, whole=False):
     """A failing row whose count read `base` and `pr`: for each executable, the last batch of
     its first count and of its second."""
@@ -2007,9 +2013,7 @@ def level_row(mod, base, pr, whole=False):
     def side(first, again):
         return {"batches": [5, 10, first], "again": [5, 10, again]}
 
-    gate = mod.Gate("^encode/", 0.10, whole_pass=whole)
-    counts = {"base": side(*base), "pr": side(*pr)}
-    return mod.Row("encode/a", [100, 101, 102], [115, 116, 117], gate, counts=counts)
+    return counted_row(mod, {"base": side(*base), "pr": side(*pr)}, whole)
 
 
 def test_a_count_reads_level_where_every_count_is_within_the_level(mod):
@@ -2043,9 +2047,7 @@ def test_a_count_that_ended_a_batch_early_hides_no_other_from_the_level(mod):
         """Whether a row reads level on which each executable counted the two lists given."""
         sides = {"base": base, "pr": pr}
         counts = {side: dict(zip(("batches", "again"), two)) for side, two in sides.items()}
-        gate = mod.Gate("^encode/", 0.10)
-        row = mod.Row("encode/a", [100, 101, 102], [115, 116, 117], gate, counts=counts)
-        return row.reads_level
+        return counted_row(mod, counts).reads_level
 
     short = [50_000, 100_000, 200_000], [50_000, 100_000]
     # One executable's second count ended a batch early, and the other's own two counts are
@@ -2057,11 +2059,30 @@ def test_a_count_that_ended_a_batch_early_hides_no_other_from_the_level(mod):
     near = [50_010, 100_020, 200_040], [50_010, 100_020, 200_050]
     assert level(short, near)
     assert level(near, short)
-    # Three counts ran the batch, each neighbour inside the level and the ends 0.9 % apart: a
-    # batch is compared on every count that ran it.
+    # Three counts ran the batch, each neighbour inside the level and the ends 0.9 % apart: the
+    # ends are a pair that last differs there.
     ends = [50_000, 100_010, 200_900], [50_000, 100_010, 201_800]
     assert not level(short, ends)
     assert not level(ends, short)
+    # The set: two counts last differ at the third batch, level there, where a third count that
+    # ran it is 5 % off and level with both at the fourth. No pair's own last batch shows it:
+    # the batch is compared on every count that ran it.
+    whole = [50_000, 100_000, 200_000, 400_000], [50_000, 100_000]
+    apart = [50_000, 100_010, 200_010, 400_000], [50_000, 100_010, 210_000, 400_001]
+    assert not level(whole, apart)
+    assert not level(apart, whole)
+    # The two second counts alone ran the fourth batch, 1.5 % apart there: every two of the four
+    # are read, over the batches the two ran.
+    seconds = [5, 10, 100_000], [5, 10, 100_000, 200_000]
+    further = [5, 10, 100_020], [5, 10, 100_020, 203_000]
+    assert not level(seconds, further)
+    assert not level(further, seconds)
+    # The first counts 1 % apart at the last batch all four ran that differs, and level at the
+    # batch after it, which one second count left: the batches all four ran are read too.
+    early = [5, 100_000, 200_000, 400_000], [5, 100_000, 200_040]
+    late = [5, 101_000, 200_000, 400_100], [5, 101_000, 200_000, 400_100]
+    assert not level(early, late)
+    assert not level(late, early)
 
 
 def test_a_second_measurement_short_of_its_runs_leaves_the_first_to_decide(mod):
@@ -2075,9 +2096,11 @@ def test_a_second_measurement_short_of_its_runs_leaves_the_first_to_decide(mod):
 
 
 def elf(image: bytes, build_id: bytes, unloaded: bytes) -> bytes:
-    """A 64-bit little-endian ELF file of one loadable segment (its headers, a build id note
-    and `image`) with `unloaded` bytes behind it, and a section table its header names there."""
-    note = struct.pack("<III", 4, len(build_id), 3) + b"GNU\x00" + build_id
+    """A 64-bit little-endian ELF file of one loadable segment (its headers, two notes and
+    `image`) with `unloaded` bytes behind it, and a section table its header names there."""
+    # A note of another kind stands first: the walk steps over it to the build id.
+    note = struct.pack("<III", 4, 16, 1) + b"GNU\x00" + bytes(16)
+    note += struct.pack("<III", 4, len(build_id), 3) + b"GNU\x00" + build_id
     loaded = 64 + 2 * 56 + len(note) + len(image)
     sections = (loaded + len(unloaded), 64, len(unloaded) % 7, 1)
     header = struct.pack(
@@ -2114,3 +2137,25 @@ def test_two_files_that_load_the_same_image_are_the_same_program(mod, tmp_path, 
     assert mod.image_of(script) is None
     base.write_bytes(elf(b"code" * 64, b"A" * 20, b"")[:200])
     assert mod.image_of(base) is None
+
+
+def test_a_file_whose_header_no_loadable_segment_covers_has_no_image(mod, tmp_path):
+    def entered(at: int, covered: bool) -> Path:
+        """A file whose entry address is `at`, its header inside the loadable segment or not."""
+        data = bytearray(elf(b"code" * 64, b"A" * 20, b"symbols"))
+        struct.pack_into("<Q", data, 0x18, at)
+        if not covered:
+            # The segment starts behind the file header: 64 bytes on, 64 bytes fewer.
+            (size,) = struct.unpack_from("<Q", data, 64 + 32)
+            struct.pack_into("<Q", data, 64 + 8, 64)
+            struct.pack_into("<Q", data, 64 + 32, size - 64)
+        path = tmp_path / f"bench-{at:x}-{covered}"
+        path.write_bytes(bytes(data))
+        return path
+
+    # The loader maps the header with the first segment: the entry address is in the image.
+    one, other = mod.image_of(entered(0x1000, True)), mod.image_of(entered(0x2000, True))
+    assert one != other and None not in (one, other)
+    # No segment covers it: two entry addresses would read as one image, so there is none.
+    assert mod.image_of(entered(0x1000, False)) is None
+    assert mod.image_of(entered(0x2000, False)) is None
