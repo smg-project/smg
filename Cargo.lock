@@ -7813,7 +7813,6 @@ dependencies = [
  "metrics-util",
  "mock-worker",
  "ndarray",
- "notify",
  "once_cell",
  "openai-harmony",
  "openai-protocol",

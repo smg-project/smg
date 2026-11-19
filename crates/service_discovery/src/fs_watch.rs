@@ -17,6 +17,10 @@ use std::{
     time::Duration,
 };
 
+/// The watcher package. A start answers with its error, so the package is
+/// named here: a host reads that error by this crate's version of it and
+/// pins none of its own.
+pub use notify;
 use notify::{event::ModifyKind, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::{sync::mpsc, time};
 
