@@ -1520,9 +1520,11 @@ impl CliArgs {
     }
 
     /// The routing part of a command line alone, as a configuration, checked
-    /// as a start checks that part ([`RouterConfigBuilder::build_routing`]).
-    /// It reads the command line and no file: no secret, no key and no
-    /// store address. A start checks the rest of the line.
+    /// by the validator's rules for that part
+    /// ([`RouterConfigBuilder::build_routing`]). It reads the command line
+    /// and no file: no secret, no key and no store address. A start checks
+    /// the rest of the line, and it alone resolves a Consul address and the
+    /// Consul environment.
     fn routing_config(
         &self,
         prefill_urls: Vec<(String, Option<u16>)>,

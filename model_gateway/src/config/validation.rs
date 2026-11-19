@@ -464,10 +464,12 @@ impl ConfigValidator {
         Ok(())
     }
 
-    /// Every check a start runs over the routing part, in a start's order:
-    /// its shapes, the overload thresholds, the tenant header's name, the
+    /// The validator's checks of the routing part, in a start's order: its
+    /// shapes, the overload thresholds, the tenant header's name, the
     /// discovery settings, then the fit of the policies to the pools. A
-    /// start runs them among its other checks ([`Self::validate`]).
+    /// start runs them among its other checks ([`Self::validate`]), and
+    /// then resolves a discovery provider's own configuration: a Consul
+    /// address and the Consul environment are checked there alone.
     /// `--print-policy-spec` runs these alone, over a configuration that
     /// holds the routing part alone. None reads a file.
     pub(crate) fn validate_routing(config: &RouterConfig) -> ConfigResult<()> {
