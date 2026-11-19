@@ -1414,7 +1414,8 @@ turns on by itself, on this path as on the Python one, when the launcher is
 given no `--kv-events-config`, at a port found free on the host rather than
 SGLang's fixed default (an explicit one is kept as given, its endpoint
 included; `SMG_SGLANG_SERVICER_KV_EVENTS=0` leaves the publisher off). SGLang's
-HTTP sidecar (metrics and profiling endpoints) is not started on this path.
+HTTP sidecar is not started on this path: its admin and profiling endpoints are
+off, and the launcher serves its scheduler metrics (see Metrics below).
 Tuning: `SMG_SGLANG_SERVICER_HANDSHAKE_PORT` (default: a
 free port), `SMG_SGLANG_SERVICER_DRAIN_SECS` (default 5),
 `SMG_SGLANG_SERVICER_WARMUP` (the planned warm-up before SERVING, as for vLLM
@@ -1460,8 +1461,17 @@ and labels are the ones every engine's Rust servicer exposes (see the vLLM
 section above); the scheduler matches string stops itself, so this servicer
 has no `smg_servicer_string_stops_total` series. A port equal to `--port` is
 refused before the scheduler starts, and the flag is refused under the Python
-servicer, which exposes no endpoint (SGLang's own HTTP sidecar is not started
-on the Rust path either).
+servicer, which exposes no endpoint of its own.
+
+Under `--enable-metrics` the scheduler ranks record SGLang's scheduler series
+(running and queued requests, KV cache usage, generation throughput, queue
+time, cache hit rate) into Prometheus's multiprocess directory
+(`PROMETHEUS_MULTIPROC_DIR`), and the launcher serves them where SGLang's HTTP
+sidecar would: `GET /metrics` on `--host` at `--smg-http-sidecar-port`, else
+`--port + 1`, under SGLang's own names. The sidecar's frontend series
+(requests, aborts, time to first token, inter-token latency) are not recorded
+on this path; the families above are their counterparts. A listener that
+cannot start is logged, and the servicer runs on.
 
 ```bash
 sglang serve --model-path Qwen/Qwen3-0.6B --grpc-mode --port 30000 --metrics-port 29100
