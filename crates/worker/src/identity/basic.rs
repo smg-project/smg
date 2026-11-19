@@ -1392,8 +1392,9 @@ impl BasicWorker {
             }
             Err(err) => {
                 tracing::warn!(
-                    "HTTP health check failed for {}: {err:?}",
-                    super::endpoint::Endpoint::redacted_str(&health_url)
+                    "HTTP health check failed for {}: {:?}",
+                    super::endpoint::Endpoint::redacted_str(&health_url),
+                    err.without_url()
                 );
                 Ok(false)
             }
