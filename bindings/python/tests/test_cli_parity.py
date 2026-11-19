@@ -52,6 +52,11 @@ def test_the_executable_registers_its_allocator_before_running_the_command_line(
 # Flags of the Rust CLI the launcher does not take, with the reason.
 CLI_ONLY = {
     "--disable-audit-logging": "the launcher's switch is --control-plane-audit-enabled",
+    "--policy-controller": "the binary's hidden setting; the launcher starts no controller mode yet",
+    "--policy-controller-address": "the binary follows a controller; the launcher takes the mode once it serves",
+    "--policy-controller-tls-ca-cert": "rides --policy-controller-address",
+    "--policy-controller-tls-cert": "rides --policy-controller-address",
+    "--policy-controller-tls-key": "rides --policy-controller-address",
     "--print-policy-spec": "the binary prints its policy document and exits; the launcher does not",
 }
 
