@@ -386,8 +386,8 @@ pub trait LeasesStore: Send + Sync {
 
     /// Files a pair's lease: `record`, its prefill part, with `decode`,
     /// its decode side, under one hold. The record takes the mark of a
-    /// pair's lease from the side's worker. A pair that is handed to
-    /// another store travels by this door, with its decode side.
+    /// pair's lease. A pair that is handed to another store travels by
+    /// this door, with its decode side.
     fn issue_pair(&self, record: LeaseRecord, decode: DecodeSide) -> Result<(), LeaseRefused>;
 
     /// The gateway dispatched the lease as `dispatch` says, at `at`;

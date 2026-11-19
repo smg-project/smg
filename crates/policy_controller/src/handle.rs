@@ -146,13 +146,16 @@ impl<D: Deref<Target = Door>> Handle<D> {
                 side: leased.lease.side,
                 decided: now,
             });
-        let decode = match owed {
-            Owed::Dispatch { lease, .. } if decided.pair() => Owed::Dispatch {
+        // A pair's decode side owes a dispatch of its own, under the
+        // lease's id.
+        let decode = if let (true, Owed::Dispatch { lease, .. }) = (decided.pair(), owed) {
+            Owed::Dispatch {
                 lease,
                 side: Side::Decode,
                 decided: now,
-            },
-            _ => Owed::Nothing,
+            }
+        } else {
+            Owed::Nothing
         };
         Ok(Self {
             door,
@@ -186,12 +189,21 @@ impl<D: Deref<Target = Door>> Handle<D> {
     /// record. Nothing stands on a target not taken, so there is nothing
     /// to release. `None` where the pick has no target at `index`, and
     /// where no dispatch is owed any more: what was taken before stands.
-    /// A pair takes the target for each side that still owes dispatch.
+    /// Before any dispatch a pair takes the target for both sides. Where
+    /// its decode went out first, the prefill stays the one the decode
+    /// was sent for: a target of another prefill is not taken. After the
+    /// prefill's dispatch, see [`Self::take_decode`].
     pub fn take(&mut self, index: usize) -> Option<Target> {
         let Owed::Dispatch { .. } = self.owed else {
             return None;
         };
         let (taken, target) = self.target_at(index)?;
+        // A decode that no longer waits names its prefill: the prefill
+        // goes there.
+        let settled = self.decided.pair() && !matches!(self.decode, Owed::Dispatch { .. });
+        if settled && target.id != self.target.id {
+            return None;
+        }
         (self.index, self.target) = (taken, target);
         Some(target)
     }
@@ -277,15 +289,25 @@ impl<D: Deref<Target = Door>> Handle<D> {
     /// `now`: a request whose send failed was sent, and the engine hears a
     /// lease's events in their order. That dispatch carries the
     /// completion's instant, so a stage that times a request from its
-    /// dispatch reads a span of zero for it. A decode outcome ends the
-    /// decode side. Other outcomes end the handle's own side. Said once.
+    /// dispatch reads a span of zero for it. On a pair's handle a decode
+    /// outcome ends the decode side, and an encode outcome writes
+    /// nothing: the lease holds no such side. Any other outcome ends the
+    /// handle's own side, and a single's lease ends under any side its
+    /// host names. Said once.
     pub fn completed(&mut self, outcome: &Outcome, now: Instant) {
-        let owed = if outcome.side == Side::Decode {
-            self.dispatched_decode(now);
-            &mut self.decode
-        } else {
-            self.dispatched(now);
-            &mut self.owed
+        let pair = self.decided.pair();
+        let owed = match outcome.side {
+            Side::Decode if pair => {
+                self.dispatched_decode(now);
+                &mut self.decode
+            }
+            // A side the pair's lease does not hold: nothing is written,
+            // as the served path writes nothing for such a frame.
+            Side::Encode if pair => return,
+            Side::Single | Side::Prefill | Side::Decode | Side::Encode => {
+                self.dispatched(now);
+                &mut self.owed
+            }
         };
         let Owed::Completion { lease, side, .. } = *owed else {
             return;
@@ -1163,8 +1185,12 @@ mod tests {
         }
     }
 
+    /// A single's handle holds no decode side: a decode's take, dispatch
+    /// and release say nothing. Its lease ends under any side its host
+    /// names, a decode outcome among them: a decode phase can stand under
+    /// a single plan, and the outcome its host read reaches the store.
     #[test]
-    fn a_single_handle_says_nothing_of_a_decode_side() {
+    fn a_single_handle_ends_under_a_decode_outcome_and_says_nothing_else_of_a_decode_side() {
         let (door, heard) = bed();
         let store = door.store();
         let now = Instant::now();
@@ -1174,14 +1200,83 @@ mod tests {
         handle.dispatched_decode(now);
         assert_eq!(handle.take_decode(1), None);
         handle.released_decode(ReleaseReason::ClientGone, now);
-        let decoded = Outcome {
-            side: Side::Decode,
-            ..outcome(first.id, TransportClass::Ok)
-        };
-        handle.completed(&decoded, now);
         let state = LeasesStore::get(&**store, GATEWAY, lease).map(|filed| filed.state);
         assert_eq!(state, Some(LeaseState::ISSUED));
         assert_eq!(counted(store), [(first.id, 1)]);
         assert_eq!(*heard.lock(), [Call::Issued]);
+        let decoded = Outcome {
+            side: Side::Decode,
+            ..outcome(first.id, TransportClass::Ok)
+        };
+        handle.completed(&decoded, now + Duration::from_micros(400));
+        assert!(LeasesStore::get(&**store, GATEWAY, lease).is_none());
+        assert_eq!(counted(store), []);
+        let told = [
+            Call::Issued,
+            Call::Dispatched(first.id, 0, 400),
+            Call::Completed(first.id, TransportClass::Ok, 5_000),
+        ];
+        assert_eq!(*heard.lock(), told);
+        drop(handle);
+        assert_eq!(*heard.lock(), told, "the drop says nothing more");
+    }
+
+    /// A pair's lease holds no encode side: an encode outcome writes
+    /// nothing, and the prefill's lease stands for its own end.
+    #[test]
+    fn an_encode_outcome_on_a_pairs_handle_says_nothing() {
+        let door = pair_door(1, 1).expect("a pair door");
+        let store = door.store();
+        let now = Instant::now();
+        let mut handle = paired(&door, now).expect("a pair's handle");
+        let lease = handle.lease().expect("the pair's lease").lease.id;
+        let first = handle.take(0).expect("the first target");
+        let decode = first.pair.expect("the first decode").decode_id;
+        let before = states(store, lease);
+        let encoded = Outcome {
+            side: Side::Encode,
+            ..outcome(first.id, TransportClass::Ok)
+        };
+        handle.completed(&encoded, now);
+        assert_eq!(states(store, lease), before, "neither side moved");
+        assert_eq!(pair_counts(store, [first.id, decode]), [1, 1]);
+        assert!(words().is_empty(), "nothing was said");
+        handle.completed(&outcome(first.id, TransportClass::Ok), now);
+        let ended = states(store, lease).map(|[prefill, _]| prefill);
+        assert_eq!(ended, Some(LeaseState::Completed));
+        drop(handle);
+        let _ = words();
+    }
+
+    /// A decode already sent names its prefill: a take behind it keeps
+    /// the prefill the decode was sent for.
+    #[test]
+    fn a_prefill_taken_behind_a_sent_decode_stays_on_its_prefill() {
+        let door = pair_door(2, 2).expect("a pair door");
+        let store = door.store();
+        let now = Instant::now();
+        let mut handle = paired(&door, now).expect("a pair's handle");
+        let first = handle.take(0).expect("the first target");
+        let alternate = handle.take(1).expect("the alternate target");
+        assert_eq!(handle.take(0), Some(first));
+        let other = ["http://p0:8000", "http://p1:8000"]
+            .into_iter()
+            .filter_map(|key| store.by_key(key))
+            .find(|worker| worker.id != first.id)
+            .expect("another prefill");
+        // The picker lists one prefill. Add a target to exercise the handle's check.
+        let Decision::Pick(pick) = &mut handle.decided.decision else {
+            panic!("a pair pick");
+        };
+        let different = pick.targets.as_slice().len();
+        pick.targets.push(Target {
+            id: other.id,
+            ..alternate
+        });
+        handle.dispatched_decode(now);
+        assert_eq!(handle.take(different), None, "another prefill");
+        assert_eq!(handle.take(1), Some(alternate), "the same prefill");
+        drop(handle);
+        let _ = words();
     }
 }
