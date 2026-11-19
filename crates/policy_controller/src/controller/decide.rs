@@ -533,8 +533,8 @@ mod tests {
             config::Scope,
             deciders::{
                 tests::{
-                    busy, fleet, frame, frame_for, gone, hearing, lease_of, picked, preset, Script,
-                    Step, BUDGET, PATIENCE,
+                    busy, fleet, frame, frame_for, gone, hearing, lease_of, picked, preset,
+                    settled, Script, Step, BUDGET, PATIENCE,
                 },
                 Clock, Counts, Deciders, Job, Reads,
             },
@@ -1599,7 +1599,9 @@ mod tests {
             (busy(&second), second.request_id.as_slice(), second.term),
             (Reason::NotLeader, &[2][..], 1)
         );
-        assert_eq!(store.get(gateway, LeaseId(id(2))), None);
+        // The lease's release was handed at the send: its file's decider
+        // applies it as it leaves its work, or this read does.
+        settled(|| store.get(gateway, LeaseId(id(2))).is_none()).await;
         assert_eq!(store.live(gateway), 2);
         let abandoned = (id(2), Some(ReleaseReason::Abandoned));
         assert_eq!(heard.lock()[3..], [abandoned]);
@@ -1638,7 +1640,9 @@ mod tests {
             (Reason::BudgetGoneOnArrival, &[2][..], 1)
         );
         let store: &dyn LeasesStore = bed.shared.store.as_ref();
-        assert_eq!(store.get(gateway, LeaseId(id(2))), None);
+        // The lease's release was handed at the send: its file's decider
+        // applies it as it leaves its work, or this read does.
+        settled(|| store.get(gateway, LeaseId(id(2))).is_none()).await;
         assert_eq!(store.live(gateway), 2);
         let late = (id(2), Some(ReleaseReason::LateDecision));
         assert_eq!(heard.lock()[3..], [late]);

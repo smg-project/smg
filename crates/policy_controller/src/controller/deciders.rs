@@ -947,6 +947,21 @@ pub(crate) mod tests {
     /// Past the renew deadline of the bed's election.
     const FENCED: Duration = Duration::from_secs(1_801);
 
+    /// Waits until what a handed frame changes shows, [`PATIENCE`] at
+    /// most. The frame's file applies it by its decider as that leaves
+    /// its work, or by the hand: a case that reads at once reads ahead of
+    /// a decider still at work.
+    pub(crate) async fn settled(mut shows: impl FnMut() -> bool) {
+        let since = Instant::now();
+        while !shows() {
+            assert!(
+                since.elapsed() < PATIENCE,
+                "a handed frame waits on no lull"
+            );
+            tokio::task::yield_now().await;
+        }
+    }
+
     /// What one read of the case's clock does before it shows the hour.
     pub(crate) enum Step {
         /// Shows the taken instant plus this much, from this read on.
@@ -2460,14 +2475,7 @@ pub(crate) mod tests {
         // The decider waits on its empty queue, or is about to: it applies
         // as it leaves its work, or the hand does.
         bed.store.hand(&hand, LeaseId(id(2)), gone);
-        let since = Instant::now();
-        while told.lock().len() < 4 {
-            assert!(
-                since.elapsed() < PATIENCE,
-                "a handed frame waits on no lull"
-            );
-            tokio::task::yield_now().await;
-        }
+        settled(|| told.lock().len() >= 4).await;
         assert_eq!(told.lock()[3], released(2));
     }
 
@@ -2528,14 +2536,7 @@ pub(crate) mod tests {
         let hand = lifecycle::open(&bed.store, GATEWAY);
         let gone = Said::Released(None, ReleaseReason::ClientGone);
         bed.store.hand(&hand, LeaseId(lease_of(&answer).id), gone);
-        let since = Instant::now();
-        while named.lock().len() < 2 {
-            assert!(
-                since.elapsed() < PATIENCE,
-                "a handed frame waits on no lull"
-            );
-            tokio::task::yield_now().await;
-        }
+        settled(|| named.lock().len() >= 2).await;
         assert_eq!(*named.lock(), [Some(Decider::new(0)); 2]);
         assert_eq!(Decider::acting(), None);
     }
@@ -5235,17 +5236,9 @@ pub(crate) mod tests {
             .expect("the frame reads");
         // The decider waits on its empty queue, or is about to: it applies
         // the frame as it leaves its work, or the hand did.
-        let since = Instant::now();
-        let pin = loop {
-            if let Some(pin) = SessionsStore::lookup(&*bed.store, lease.session.get()) {
-                break pin;
-            }
-            assert!(
-                since.elapsed() < PATIENCE,
-                "a handed frame waits on no lull"
-            );
-            tokio::task::yield_now().await;
-        };
+        let read = || SessionsStore::lookup(&*bed.store, lease.session.get());
+        settled(|| read().is_some()).await;
+        let pin = read().expect("a pin");
         assert_eq!(pin.ends, Some(lease.issued_micros + kept));
     }
 

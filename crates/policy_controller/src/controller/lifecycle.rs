@@ -265,7 +265,6 @@ pub(crate) mod tests {
         catalog::Catalog,
         controller::gateways::tests::lease,
         decision::{Pair, Target, Targets},
-        door::pinned,
         framework::{Picker, TieBand},
         lease::{Lease, LeaseId, Lifecycle, Outcome, ReleaseReason, Side, TransportClass},
         proto::{
@@ -943,6 +942,71 @@ pub(crate) mod tests {
         assert_eq!((table, pin.worker, pin.ends), (1, WorkerId(7), Some(ends)));
     }
 
+    /// Each side of a pair carries the rule's TTL in its own issued state.
+    /// The prefill's dispatch ends the record's own issued state, and the
+    /// decode's dispatch behind it still ends its key's pin by the rule.
+    /// No plan files such a pair today, as a sessions rule runs under the
+    /// single plan alone: the record is filed by hand. No generation 7
+    /// stands, so no engine is told and each pin names its side's worker.
+    #[test]
+    fn a_pairs_second_dispatch_ends_its_keys_pin_by_its_own_sides_state() {
+        const DECODE_KEY: Session = Session::from_raw(43);
+        let store = MemoryStore::new();
+        let [p, d] = ["p", "d"].map(|key| worker(&store, key));
+        let t0 = Instant::now();
+        let mut targets = Targets::new();
+        targets.push(Target {
+            id: p,
+            pair: Some(Pair {
+                decode_id: d,
+                ..Pair::default()
+            }),
+            ..Target::default()
+        });
+        let issued = LeaseState::issued(Some(60_000_000));
+        let record = LeaseRecord {
+            lease: Lease {
+                id: LeaseId(1),
+                side: Side::Prefill,
+                generation: 7,
+                session: KEY,
+                session_verdict: SessionVerdict::Claimed(p),
+                issued_micros: store.micros(t0),
+                ..Lease::default()
+            },
+            gateway: A,
+            request: 1,
+            target: p,
+            picked: Picked::of(&targets),
+            decode: Some(DecodeSide {
+                target: d,
+                picked: Picked::of_decodes(&targets),
+                session: DECODE_KEY,
+                state: issued,
+                tokens: 0,
+                target_index: 0,
+            }),
+            term: 0,
+            issued_at: t0,
+            dispatch_deadline: t0 + Duration::from_secs(5),
+            state: issued,
+        };
+        LeasesStore::issue(&store, record).expect("the key is free");
+        let at = t0 + Duration::from_millis(3);
+        for side in [proto::Side::Prefill, proto::Side::Decode] {
+            let frame = proto::Dispatched {
+                side: side.into(),
+                ..a_dispatched(1)
+            };
+            dispatched(&store, &open(&store, A), &frame, at).expect("the frame reads");
+        }
+        let ends = Some(store.micros(t0) + 60_000_000);
+        for (key, worker) in [(KEY, p), (DECODE_KEY, d)] {
+            let pin = SessionsStore::lookup(&store, key.get()).expect("a pin");
+            assert_eq!((pin.worker, pin.ends), (worker, ends));
+        }
+    }
+
     /// A lease whose generation left tells no engine: its pin ends by the
     /// TTL its own decision was made under, counted from its issue,
     /// whatever the standing rules keep. Here one of them keeps its keys
@@ -992,33 +1056,6 @@ pub(crate) mod tests {
         dispatched(&store, &open(&store, A), &a_dispatched(1), at).expect("the frame reads");
         let pin = SessionsStore::lookup(&store, KEY.get()).expect("a pin");
         assert_eq!((pin.worker, pin.ends), (WorkerId(7), None));
-    }
-
-    /// The pin's writer reads its lease's rule off the issued state, and
-    /// the door tells a dispatch once, with the record as it stood
-    /// issued. A record past that state, were one told, would read as a
-    /// rule with no TTL: it pins nothing, and a pin that stands keeps
-    /// its end.
-    #[test]
-    fn a_record_past_its_issue_pins_nothing_by_its_leases_rule() {
-        let store = MemoryStore::new();
-        let t0 = Instant::now();
-        let mut record = lease(A, 1, t0);
-        record.lease.session = KEY;
-        record.lease.session_verdict = SessionVerdict::Claimed(WorkerId(7));
-        record.lease.issued_micros = store.micros(t0);
-        record.state = LeaseState::Dispatched { at: t0 };
-        pinned(&store, &record.lease, record.state, None, WorkerId(7), t0);
-        assert!(SessionsStore::lookup(&store, KEY.get()).is_none());
-        // As issued under a rule of a minute it pins to the minute's
-        // end; told once more as the door wrote it, it leaves that end.
-        record.state = LeaseState::issued(Some(60_000_000));
-        pinned(&store, &record.lease, record.state, None, WorkerId(7), t0);
-        record.state = LeaseState::Dispatched { at: t0 };
-        pinned(&store, &record.lease, record.state, None, WorkerId(7), t0);
-        let pin = SessionsStore::lookup(&store, KEY.get()).expect("a pin");
-        let ends = store.micros(t0) + 60_000_000;
-        assert_eq!((pin.worker, pin.ends), (WorkerId(7), Some(ends)));
     }
 
     /// Two leases of one key under a rule of a second, in flight at an

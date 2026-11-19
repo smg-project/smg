@@ -1979,6 +1979,66 @@ fn the_dispatch_deadline_ends_each_side_that_waits_and_a_dispatched_side_stands(
     assert_eq!(sides(&store, 3), Some((abandoned, at)));
 }
 
+/// A pair under a sessions rule with a TTL stands and ends as any pair:
+/// each side's issued state carries the TTL, and what tests a side that
+/// waits asks the state, not an equality with the bare one. No plan
+/// files such a pair today, as a sessions rule runs under the single
+/// plan alone: the records are filed by hand.
+#[test]
+fn a_pair_issued_under_a_rule_with_a_ttl_stands_and_ends_as_any_pair() {
+    let store = MemoryStore::new();
+    let (p, d) = (ready(&store, "http://p:1"), ready(&store, "http://d:1"));
+    let leases: &dyn LeasesStore = &store;
+    let (gateway, now) = (GatewayId(1), Instant::now());
+    leases.set_term(1);
+    let under = LeaseState::issued(Some(60_000_000));
+    let keyed = |id: u64, at: Instant| {
+        let mut record = pair(id, p, &[d], at);
+        record.state = under;
+        record.decode = record.decode.map(|side| DecodeSide {
+            state: under,
+            ..side
+        });
+        record
+    };
+    // The first pair's sides are dispatched one by one, the second's
+    // prefill alone.
+    for id in [1, 2] {
+        leases.issue(keyed(id, now)).expect("the key is free");
+    }
+    let dispatched = LeaseState::Dispatched { at: now };
+    assert!(leases.dispatched(gateway, LeaseId(1), on(Side::Prefill, 0), now));
+    assert_eq!(sides(&store, 1), Some((dispatched, under)));
+    assert!(leases.dispatched(gateway, LeaseId(1), on(Side::Decode, 0), now));
+    assert_eq!(sides(&store, 1), Some((dispatched, dispatched)));
+    assert!(leases.dispatched(gateway, LeaseId(2), on(Side::Prefill, 0), now));
+    // An issue past the deadline ends the decode side that waits, and
+    // the dispatched sides stand.
+    let later = now + Duration::from_secs(2);
+    let world = store.world();
+    store
+        .issue_decided(
+            booking(gateway, 0, p, later),
+            [world.booked_of(p), None],
+            |_| (),
+        )
+        .expect("minted under the store's term");
+    let abandoned = LeaseState::Released(ReleaseReason::Abandoned);
+    assert_eq!(sides(&store, 1), Some((dispatched, dispatched)));
+    assert_eq!(sides(&store, 2), Some((dispatched, abandoned)));
+    // The store's own sweep hands such a pair's record back as it left it.
+    leases.issue(keyed(3, later)).expect("the key is free");
+    assert!(leases.dispatched(gateway, LeaseId(3), on(Side::Prefill, 0), later));
+    let swept = leases.expire(later + Duration::from_secs(9));
+    let states = |record: &LeaseRecord| (record.state, record.decode.map(|side| side.state));
+    let at = LeaseState::Dispatched { at: later };
+    assert!(swept
+        .iter()
+        .map(states)
+        .any(|sides| sides == (at, Some(abandoned))));
+    assert_eq!(sides(&store, 3), Some((at, abandoned)));
+}
+
 #[test]
 fn hello_pages_restore_exactly_what_they_list_and_a_gone_gateway_loses_its_leases() {
     let store = MemoryStore::new();
