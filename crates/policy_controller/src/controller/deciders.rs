@@ -5096,11 +5096,12 @@ pub(crate) mod tests {
     /// profile with no prefix stage a pick states nothing.
     #[test]
     fn a_decision_states_what_its_first_target_holds_of_the_request() {
-        let stated = |score: &str, block: u64| {
+        let stated = |score: &str, block: u64, view: &str| {
             let document: PolicySpec = serde_json::from_str(&format!(
                 r#"{{
                   "apiVersion": "smg.policy/v1",
                   "generation": 1,
+                  "view": {view},
                   "profiles": {{ "p": {{ "score": [{score}], "pick": "best" }} }},
                   "bindings": [{{ "profile": "p" }}]
                 }}"#
@@ -5155,20 +5156,24 @@ pub(crate) mod tests {
             let first = pick.targets.first().map(|target| target.id);
             (first == Some(members[5]), pick.overlap())
         };
-        let (holder, held) = stated(r#""prefix-affinity""#, 1);
+        let (holder, held) = stated(r#""prefix-affinity""#, 1, "{}");
         assert!(holder, "the block's one holder is picked");
         assert_eq!(
             (held.blocks, held.source, held.margin_held),
             (1, OverlapSource::Index, false)
         );
         assert!(held.of >= 1, "the request's blocks: {held:?}");
-        let (_, missed) = stated(r#""prefix-affinity""#, 999);
+        // Under a limit of the reports' age the stage stands behind the
+        // limit's reader of loads, and says the same.
+        let aged = stated(r#""prefix-affinity""#, 1, r#"{"max_report_age_ms": 1000}"#);
+        assert_eq!(aged, (true, held));
+        let (_, missed) = stated(r#""prefix-affinity""#, 999, "{}");
         let nothing = Overlap {
             of: held.of,
             ..Overlap::default()
         };
         assert_eq!(missed, nothing, "a block nobody holds");
-        let (_, unsaid) = stated(r#""least-load""#, 1);
+        let (_, unsaid) = stated(r#""least-load""#, 1, "{}");
         assert_eq!(unsaid, Overlap::default(), "no prefix stage");
     }
 
