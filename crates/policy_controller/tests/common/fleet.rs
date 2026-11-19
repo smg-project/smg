@@ -637,7 +637,7 @@ async fn probe(
                 // A verdict is pushed under the lock its write was made
                 // under: a reader that saw the write reads the verdict.
                 let mut verdicts = turns.verdicts.lock();
-                if let Some((from, to)) = store.probe_outcome(id, healthy, row.revision) {
+                if let Some((from, to)) = store.probe_outcome(id, healthy, row.revision).moved() {
                     verdicts.push(Verdict {
                         engine,
                         from,
