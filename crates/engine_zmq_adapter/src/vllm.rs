@@ -4,15 +4,17 @@
 
 use std::{
     collections::{BTreeSet, HashMap},
+    ops::Range,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use bytes::Bytes;
 use engine_zmq_client::{
-    codec::{decode_value, dtype::ModelDtype},
+    codec::{decode_value, dtype::ModelDtype, OpaqueValue},
     connector::EngineCoreStream,
     protocol::vllm::{
         logprobs::TokenLogprob,
+        multimodal::MmFeatures,
         output::{
             EngineCoreEventType, EngineCoreFinishReason, EngineCoreOutput, SpecDecodeMetrics,
             StopReason,
@@ -525,6 +527,10 @@ pub(crate) struct TranslatedMedia {
     pub(crate) mm_features: Option<MmFeaturesPayload>,
     pub(crate) aux_frames: Vec<Bytes>,
     pub(crate) cache_salt: Option<String>,
+    /// The prompt positions `mm_features` fill with their items' embeddings
+    /// (sorted, merged runs), which the out-of-vocab prompt check exempts
+    /// ([`validate_token_ids`]); empty without features.
+    pub(crate) embed_positions: Vec<Range<usize>>,
 }
 
 /// Media processed worker-side (the servicer's `media_refs` path), in the
@@ -579,10 +585,18 @@ impl ProcessedMedia {
                     .map(|bytes| decode_value(&bytes).map(MmFeaturesPayload::Raw))
                     .transpose()
                     .map_err(|error| format!("processed mm_features are not msgpack: {error}"))?;
+                let embed_positions = match &mm_features {
+                    Some(MmFeaturesPayload::Raw(features)) => {
+                        let prompt_len = prompt_token_ids(req).map_or(0, <[u32]>::len);
+                        encoded_embed_positions(features, &aux_frames, prompt_len)
+                    }
+                    _ => Vec::new(),
+                };
                 Ok(TranslatedMedia {
                     mm_features,
                     aux_frames,
                     cache_salt,
+                    embed_positions,
                 })
             }
             Self::Batches(batches) => translate_batches_for(req, batches, model_dtype),
@@ -604,17 +618,153 @@ fn translate_batches_for(
     // an encoder-cache consumer's (the encoder's handles).
     let has_remote_transfer =
         kv_transfer_params(req)?.is_some() || ec_transfer_params(req)?.is_some();
-    let (mm_features, cache_salt) = multimodal::translate_batches(
-        batches,
-        prompt_token_ids(req)?,
-        model_dtype,
-        has_remote_transfer,
-    )?;
+    let prompt = prompt_token_ids(req)?;
+    let (mm_features, cache_salt) =
+        multimodal::translate_batches(batches, prompt, model_dtype, has_remote_transfer)?;
+    // From the features the engine gets, not the batches: a tensor-less
+    // identity batch is dropped into `cache_salt` (alone, or beside batches
+    // with tensors), so its placeholders get no embedding and stay text.
+    let embed_positions = mm_features
+        .as_ref()
+        .map(|features| typed_embed_positions(features, prompt.len()))
+        .unwrap_or_default();
     Ok(TranslatedMedia {
         mm_features: mm_features.map(MmFeaturesPayload::Typed),
         aux_frames: Vec::new(),
         cache_salt,
+        embed_positions,
     })
+}
+
+/// The embed positions of the features this client built
+/// ([`multimodal::translate_batches`], which checked each range against the
+/// prompt): each item's `mm_position`, narrowed by its `is_embed` mask.
+fn typed_embed_positions(features: &MmFeatures, prompt_len: usize) -> Vec<Range<usize>> {
+    let mut runs = Vec::new();
+    for feature in features {
+        let position = &feature.mm_position;
+        let mask = position
+            .is_embed
+            .as_ref()
+            .filter(|tensor| tensor.dtype == "bool")
+            .and_then(|tensor| tensor.data.as_raw_view())
+            .map(Bytes::as_ref);
+        push_item_runs(
+            &mut runs,
+            position.offset,
+            position.length,
+            mask,
+            prompt_len,
+        );
+    }
+    merge_runs(runs)
+}
+
+/// The embed positions of `mm_features` as vLLM's own encoder wrote them
+/// (a list of `MultiModalFeatureSpec` maps): each item's `mm_position` range,
+/// narrowed by its `is_embed` mask when that is a readable bool tensor
+/// (inline, or in the aux frame it names). An item whose position cannot be
+/// read contributes nothing, which leaves its positions to the vocabulary
+/// bound.
+fn encoded_embed_positions(
+    features: &OpaqueValue,
+    aux_frames: &[Bytes],
+    prompt_len: usize,
+) -> Vec<Range<usize>> {
+    fn field<'v>(value: &'v OpaqueValue, key: &str) -> Option<&'v OpaqueValue> {
+        value
+            .as_map()?
+            .iter()
+            .find(|(name, _)| name.as_str() == Some(key))
+            .map(|(_, value)| value)
+    }
+    /// A bool tensor's bytes: `(dtype, shape, ext-3 raw view | aux index)`.
+    fn bool_mask<'v>(tensor: &'v OpaqueValue, aux_frames: &'v [Bytes]) -> Option<&'v [u8]> {
+        let [dtype, _shape, data] = tensor.as_array()?.as_slice() else {
+            return None;
+        };
+        if dtype.as_str() != Some("bool") {
+            return None;
+        }
+        match data {
+            OpaqueValue::Ext(3, bytes) => Some(bytes.as_slice()),
+            index => {
+                let index = usize::try_from(index.as_u64()?).ok()?;
+                aux_frames.get(index.checked_sub(1)?).map(Bytes::as_ref)
+            }
+        }
+    }
+    let mut runs = Vec::new();
+    for item in features.as_array().map(Vec::as_slice).unwrap_or_default() {
+        let Some(position) = field(item, "mm_position") else {
+            continue;
+        };
+        let (Some(offset), Some(length)) = (
+            field(position, "offset").and_then(OpaqueValue::as_u64),
+            field(position, "length").and_then(OpaqueValue::as_u64),
+        ) else {
+            continue;
+        };
+        let mask = field(position, "is_embed").and_then(|tensor| bool_mask(tensor, aux_frames));
+        push_item_runs(
+            &mut runs,
+            usize::try_from(offset).unwrap_or(usize::MAX),
+            usize::try_from(length).unwrap_or(usize::MAX),
+            mask,
+            prompt_len,
+        );
+    }
+    merge_runs(runs)
+}
+
+/// Push one item's embed positions: its range `offset..offset + length`,
+/// clipped to the prompt, narrowed to the `true` (non-zero) bytes of its
+/// `is_embed` mask. A mask that is not one byte per position is not trusted
+/// and the range counts whole: vLLM's `None` mask means the same, and every
+/// position in a feature's range is the media pipeline's expansion, not the
+/// caller's text.
+fn push_item_runs(
+    runs: &mut Vec<Range<usize>>,
+    offset: usize,
+    length: usize,
+    mask: Option<&[u8]>,
+    prompt_len: usize,
+) {
+    let start = offset.min(prompt_len);
+    let end = start.saturating_add(length).min(prompt_len);
+    let Some(mask) = mask.filter(|mask| mask.len() == length) else {
+        runs.push(start..end);
+        return;
+    };
+    let mut open: Option<usize> = None;
+    for (position, &byte) in (start..end).zip(mask) {
+        match (byte != 0, open) {
+            (true, None) => open = Some(position),
+            (false, Some(from)) => {
+                runs.push(from..position);
+                open = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(from) = open {
+        runs.push(from..end);
+    }
+}
+
+/// Sort runs by start and merge the overlapping or adjacent ones, dropping
+/// the empty ones.
+fn merge_runs(mut runs: Vec<Range<usize>>) -> Vec<Range<usize>> {
+    runs.retain(|run| !run.is_empty());
+    runs.sort_unstable_by_key(|run| run.start);
+    let mut merged: Vec<Range<usize>> = Vec::with_capacity(runs.len());
+    for run in runs {
+        match merged.last_mut() {
+            Some(last) if run.start <= last.end => last.end = last.end.max(run.end),
+            _ => merged.push(run),
+        }
+    }
+    merged
 }
 
 /// Whether the request carries multimodal batches to translate.
@@ -722,6 +872,7 @@ pub(crate) fn translate_request_with_media(
         mm_features,
         aux_frames: _,
         cache_salt,
+        embed_positions: _,
     } = media;
     let data_parallel_rank = req
         .data_parallel_rank
@@ -796,6 +947,25 @@ pub(crate) fn kv_transfer_params(
         })));
     }
     Ok(None)
+}
+
+/// Whether the request is the decode side of a PD pair, whose prompt's KV
+/// comes from the prefill side. Read from its connector params as
+/// [`kv_transfer_params`] resolves them, the JSON field first and alone:
+/// there, NIXL's `do_remote_prefill = true` says so. Without it, the legacy
+/// typed host/port pair, which the gateway injects into a Mooncake decode
+/// side only (and never into a prefill side), says so for a single-sample
+/// request; at `n > 1` the gateway injects it all the same, but that decode
+/// side recomputes the prompt itself (and keeps its media to do it).
+/// Unreadable params say no (the translation refuses them).
+pub(crate) fn consumes_remote_prefill(req: &vllm::GenerateRequest) -> bool {
+    let Ok(Some(params)) = kv_transfer_params(req) else {
+        return false;
+    };
+    if req.kv_transfer_params_json.is_some() {
+        return params.get("do_remote_prefill") == Some(&serde_json::Value::Bool(true));
+    }
+    req.sampling_params.as_ref().map_or(1, |sp| sp.n) <= 1
 }
 
 /// Connector encoder-cache transfer params for encode-prefill-decode
@@ -1001,18 +1171,37 @@ pub(crate) fn validate_sampling(sp: &vllm::SamplingParams, max_tokens: u32) -> R
 /// backstop) drops any the model cannot sample, so a refusal names the
 /// caller's ids.
 ///
-/// Stricter than vLLM in one case: vLLM bounds prompt ids by the larger of the
-/// model's and the tokenizer's vocabulary, because some multimodal models'
-/// placeholder tokens lie past the model's vocabulary (only those positions
-/// are masked out of the embedding lookup). This client knows only the
-/// model's size, so such a model's multimodal prompts are refused here rather
-/// than risk an unmasked text position past the table.
+/// Prompt ids are bounded by position. vLLM bounds them all by the larger of
+/// the model's and the tokenizer's vocabulary, because some multimodal
+/// models' placeholder tokens lie past the model's vocabulary (those
+/// positions take the item's embedding, not a table row). This client knows
+/// only the model's size, so it bounds text positions by it and leaves the
+/// positions the request's media fills unbounded, as they were before this
+/// check: `embed_positions`, read from the features the engine is sent (each
+/// item's `mm_position`, narrowed by its `is_embed` mask), so only a position
+/// an item's embedding replaces is exempt. A tensor-less identity batch sends
+/// no feature and exempts nothing.
+///
+/// The decode side of a PD pair ([`consumes_remote_prefill`]) skips the
+/// prompt bound, and only that one. Its prompt is the prefill side's expanded
+/// one, image-token run included, with the media stripped to an identity
+/// batch (or to nothing) because the KV it pulls supplies those positions; the
+/// prefill side of the same request ran the bound against its full features.
+/// The gateway builds these params, and a caller that forges them gets only
+/// what it had before this check existed: no prompt bound here. The risk
+/// left is the same one: should the KV load fail and the engine recompute the
+/// prompt, a text-position id past the vocabulary would reach the embedding
+/// table on the decode side. `stop_token_ids` and `logit_bias` are checked on
+/// every leg.
 pub(crate) fn validate_token_ids(
     req: &vllm::GenerateRequest,
+    embed_positions: &[Range<usize>],
     vocab_size: u32,
 ) -> Result<(), String> {
     if let Some(vllm::generate_request::Input::Tokenized(tokenized)) = &req.input {
-        validate_prompt_ids(&tokenized.input_ids, vocab_size)?;
+        if !consumes_remote_prefill(req) {
+            validate_prompt_ids(&tokenized.input_ids, embed_positions, vocab_size)?;
+        }
     }
     let Some(sp) = req.sampling_params.as_ref() else {
         return Ok(());
@@ -1037,13 +1226,29 @@ pub(crate) fn validate_token_ids(
     Ok(())
 }
 
-/// Refuse a prompt id past the model's vocabulary, with vLLM's message
-/// (`InputProcessor`; see [`validate_token_ids`]). Prompt ids are unsigned, so
+/// Refuse a prompt id past the model's vocabulary at a text position, with
+/// vLLM's message (`InputProcessor`) naming the largest; a position in
+/// `embed_positions` (sorted runs) takes a multimodal item's embedding and
+/// is not bounded (see [`validate_token_ids`]). Prompt ids are unsigned, so
 /// only the upper bound applies.
-pub(crate) fn validate_prompt_ids(input_ids: &[u32], vocab_size: u32) -> Result<(), String> {
-    match input_ids.iter().copied().max() {
-        Some(max) if max >= vocab_size => Err(format!("Token id {max} is out of vocabulary")),
-        _ => Ok(()),
+pub(crate) fn validate_prompt_ids(
+    input_ids: &[u32],
+    embed_positions: &[Range<usize>],
+    vocab_size: u32,
+) -> Result<(), String> {
+    let is_embed = |position: usize| {
+        let after = embed_positions.partition_point(|run| run.start <= position);
+        after > 0 && embed_positions[after - 1].contains(&position)
+    };
+    let text_max = input_ids
+        .iter()
+        .enumerate()
+        .filter(|&(position, &id)| id >= vocab_size && !is_embed(position))
+        .map(|(_, &id)| id)
+        .max();
+    match text_max {
+        Some(id) => Err(format!("Token id {id} is out of vocabulary")),
+        None => Ok(()),
     }
 }
 

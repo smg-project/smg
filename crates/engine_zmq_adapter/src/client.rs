@@ -871,9 +871,11 @@ impl ZmqEngineClient {
             refuse_greedy_choices(sp).map_err(tonic::Status::invalid_argument)?;
         }
         // After the media translation, not before: an SHM payload must be read
-        // (and so unlinked) even when the request is then refused.
+        // (and so unlinked) even when the request is then refused, and the
+        // translation says which prompt positions the media fills.
         if let Some(vocab_size) = self.vocab_size() {
-            validate_token_ids(&req, vocab_size).map_err(tonic::Status::invalid_argument)?;
+            validate_token_ids(&req, &media.embed_positions, vocab_size)
+                .map_err(tonic::Status::invalid_argument)?;
         }
         let subs = fan_out_requests(req);
         let last = subs.len().saturating_sub(1);
@@ -3242,6 +3244,148 @@ mod tests {
             engines[0].recv().await.expect("inbound"),
             EngineInbound::Add(_)
         ));
+    }
+
+    /// The vocabulary bound reads the positions the engine's features fill: a
+    /// placeholder id past the vocabulary reaches the engine where an image
+    /// is attached, the same id at a text position is refused before it does,
+    /// and so is one under a tensor-less identity batch, which attaches
+    /// nothing.
+    #[tokio::test]
+    async fn an_out_of_vocab_placeholder_id_passes_only_where_the_image_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let (client, mut engines) = connected_ranks(dir.path(), 1).await;
+        client.set_vocab_size(1000);
+        // One image, its token 1000 at 1..3, its pixels inline.
+        let image = || vllm::MultimodalInputs {
+            pixel_values: Some(vllm::TensorData {
+                shape: vec![1, 4],
+                dtype: "float32".to_string(),
+                payload: Some(vllm::tensor_data::Payload::Inline(
+                    [0.0f32, 1.0, 2.0, 3.0]
+                        .iter()
+                        .flat_map(|v| v.to_le_bytes())
+                        .collect::<Vec<u8>>()
+                        .into(),
+                )),
+            }),
+            im_token_id: Some(1000),
+            mm_placeholders: vec![vllm::PlaceholderRange {
+                offset: 1,
+                length: 2,
+            }],
+            mm_hashes: vec!["h0".to_string()],
+            batched_keys: vec!["pixel_values".to_string()],
+            ..Default::default()
+        };
+        let request = |input_ids: Vec<u32>, mm: vllm::MultimodalInputs| vllm::GenerateRequest {
+            request_id: "mm".to_string(),
+            input: Some(vllm::generate_request::Input::Tokenized(
+                vllm::TokenizedInput {
+                    original_text: String::new(),
+                    input_ids,
+                },
+            )),
+            mm_inputs: Some(mm),
+            sampling_params: Some(vllm::SamplingParams {
+                max_tokens: Some(4),
+                ..Default::default()
+            }),
+            stream: true,
+            ..Default::default()
+        };
+        let identity = vllm::MultimodalInputs {
+            pixel_values: None,
+            batched_keys: Vec::new(),
+            ..image()
+        };
+
+        for (input_ids, mm) in [
+            (vec![1000, 1000, 1000, 6], image()),
+            (vec![5, 1000, 1000, 6], identity),
+        ] {
+            let Err(status) = client.generate_vllm_streams(request(input_ids, mm)).await else {
+                panic!("an out-of-vocab id at a text position was accepted");
+            };
+            assert_eq!(status.code(), Code::InvalidArgument);
+            assert_eq!(status.message(), "Token id 1000 is out of vocabulary");
+        }
+        let quiet = tokio::time::timeout(Duration::from_millis(200), engines[0].recv()).await;
+        assert!(
+            quiet.is_err(),
+            "a refused request reached the engine: {quiet:?}"
+        );
+
+        let _streams = client
+            .generate_vllm_streams(request(vec![5, 1000, 1000, 6], image()))
+            .await
+            .expect("the image's positions are not bounded by the vocabulary");
+        let EngineInbound::Add(add) = engines[0].recv().await.expect("inbound") else {
+            panic!("expected the add");
+        };
+        assert_eq!(add.prompt_token_ids, Some(vec![5, 1000, 1000, 6]));
+        assert!(add.mm_features.is_some(), "the image rides along");
+    }
+
+    /// A request shaped like the gateway's language-model-only PD decode
+    /// leg (the prefill side's expanded prompt, image-token run past the
+    /// vocabulary included, the per-image hashes, `do_remote_prefill`)
+    /// reaches the engine; the same prompt without the handoff, or with an
+    /// out-of-vocab `logit_bias` key, does not.
+    #[tokio::test]
+    async fn a_pd_decode_leg_is_not_held_to_the_prompt_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let (client, mut engines) = connected_ranks(dir.path(), 1).await;
+        client.set_vocab_size(1000);
+        let request = |kv_transfer_params_json: Option<&str>, logit_bias: Option<i32>| {
+            vllm::GenerateRequest {
+                request_id: "decode".to_string(),
+                input: Some(vllm::generate_request::Input::Tokenized(
+                    vllm::TokenizedInput {
+                        original_text: String::new(),
+                        input_ids: vec![5, 1000, 1000, 6],
+                    },
+                )),
+                mm_inputs: Some(vllm::MultimodalInputs {
+                    mm_hashes: vec!["h0".to_string()],
+                    ..Default::default()
+                }),
+                kv_transfer_params_json: kv_transfer_params_json.map(str::to_string),
+                sampling_params: Some(vllm::SamplingParams {
+                    max_tokens: Some(4),
+                    logit_bias: logit_bias.map(|id| (id, 1.0)).into_iter().collect(),
+                    ..Default::default()
+                }),
+                stream: true,
+                ..Default::default()
+            }
+        };
+        const DECODE: Option<&str> = Some(r#"{"do_remote_prefill":true}"#);
+
+        for (params, bias, refusal) in [
+            (None, None, "Token id 1000 is out of vocabulary"),
+            (DECODE, Some(999_999_999), "[999999999] in logit_bias"),
+        ] {
+            let Err(status) = client.generate_vllm_streams(request(params, bias)).await else {
+                panic!("an out-of-vocab id was accepted ({params:?}, {bias:?})");
+            };
+            assert_eq!(status.code(), Code::InvalidArgument);
+            assert!(status.message().contains(refusal), "{}", status.message());
+        }
+        let quiet = tokio::time::timeout(Duration::from_millis(200), engines[0].recv()).await;
+        assert!(
+            quiet.is_err(),
+            "a refused request reached the engine: {quiet:?}"
+        );
+
+        let _streams = client
+            .generate_vllm_streams(request(DECODE, None))
+            .await
+            .expect("a decode side's prompt is not bounded");
+        let EngineInbound::Add(add) = engines[0].recv().await.expect("inbound") else {
+            panic!("expected the add");
+        };
+        assert_eq!(add.prompt_token_ids, Some(vec![5, 1000, 1000, 6]));
     }
 
     /// Answer each rank's next utility call with its entry in `answers`,

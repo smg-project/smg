@@ -79,7 +79,7 @@ impl ZmqEngineClient {
         // A pooling prompt indexes the same embedding table as a generate one
         // (text only: no position takes a multimodal embedding).
         if let (Some(vocab_size), Some(ids)) = (self.vocab_size(), &request.prompt_token_ids) {
-            validate_prompt_ids(ids, vocab_size).map_err(Status::invalid_argument)?;
+            validate_prompt_ids(ids, &[], vocab_size).map_err(Status::invalid_argument)?;
         }
         // vLLM's frontend refuses a task the model runner does not serve
         // (`InputProcessor._validate_params`, in its words); the engine's own
