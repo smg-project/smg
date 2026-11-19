@@ -2,7 +2,7 @@
 //! file.
 //!
 //! The process-level rustls crypto provider and the HTTP client constructors
-//! that need it live in the worker tree (`worker::connection::client_factory`),
+//! that need it live in the worker crate (`smg_worker::connection::client_factory`),
 //! which builds the worker-directed clients; [`crate::server`] re-exports
 //! them.
 

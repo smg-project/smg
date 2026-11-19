@@ -12,16 +12,14 @@ use llm_multimodal::Modality;
 use llm_tokenizer::traits::{PromptEncoding, Tokenizer};
 use tracing::{debug, error, warn};
 
-use crate::{
-    routers::{
-        error,
-        grpc::{
-            context::RequestContext,
-            multimodal::{self, MediaPlan, MultimodalIntermediate},
-            utils::{self, MediaContext},
-        },
+use crate::routers::{
+    common::snapshot::RoutingPool,
+    error,
+    grpc::{
+        context::RequestContext,
+        multimodal::{self, MediaPlan, MultimodalIntermediate},
+        utils::{self, MediaContext},
     },
-    worker::RoutingPool,
 };
 
 /// A rendered prompt as the stages hand it on: the token ids, expanded for
@@ -227,7 +225,7 @@ mod tests {
         middleware::ReportedRefusal,
         observability::logging::test_support::{test_subscriber, LinesAtWarnOrAbove},
         routers::{
-            common::placement::PipelinePin,
+            common::{placement::PipelinePin, snapshot::WorkerRegistry},
             grpc::{
                 context::RequestContext,
                 multimodal::{
@@ -239,7 +237,6 @@ mod tests {
                 utils::MediaContext,
             },
         },
-        worker::WorkerRegistry,
     };
 
     /// A request context for model "m" over the mock tokenizer, and the

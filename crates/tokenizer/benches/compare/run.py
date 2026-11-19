@@ -90,10 +90,16 @@ def check_corpus(corpus, output, any_corpus):
     target.mkdir(parents=True, exist_ok=True)
     joint = CORPUS["class_1m"]["joint"].encode()
     for index, name in enumerate(names):
-        if not (target / name).exists():
-            following = names[(index + 1) % len(names)]
-            data = (source / name).read_bytes() + joint + (source / following).read_bytes()
+        following = names[(index + 1) % len(names)]
+        data = (source / name).read_bytes() + joint + (source / following).read_bytes()
+        # A text that a run on another corpus left here is replaced: no hash covers the 1m class.
+        if not (target / name).exists() or (target / name).read_bytes() != data:
             (target / name).write_bytes(data)
+    # A text under a name this corpus does not have is one that another corpus left, and the cells
+    # read every file of the directory: it is removed.
+    for path in target.iterdir():
+        if path.name not in names:
+            path.unlink()
 
 
 def reference_crate(source, output):
@@ -115,13 +121,18 @@ def reference_crate(source, output):
 def build(column, adapter, features, crate, output, locked):
     """Build a copy of one adapter whose path dependency names `crate`; the binary's path."""
     stage = output / "build" / column / "harness"
+    # The copies take the time of this call, not the times of their sources, so cargo compiles the
+    # adapter and the cell module again on every call. A cache that another output directory
+    # filled would otherwise pass for fresh: cargo knows an adapter by its place inside its own
+    # workspace, and such a cache names the cell module of the other copy.
     shutil.copytree(
         HERE / "harness" / adapter,
         stage / adapter,
         dirs_exist_ok=True,
         ignore=shutil.ignore_patterns("target"),
+        copy_function=shutil.copy,
     )
-    shutil.copy2(HERE / "harness" / "cells.rs", stage / "cells.rs")
+    shutil.copy(HERE / "harness" / "cells.rs", stage / "cells.rs")
     manifest = stage / adapter / "Cargo.toml"
     text = manifest.read_text()
     if crate is not None:
@@ -143,9 +154,12 @@ def build(column, adapter, features, crate, output, locked):
         subprocess.run(
             command, cwd=REPO, env=environment, stdout=log, stderr=subprocess.STDOUT, check=True
         )
+    built = target / "release" / adapter
+    if built.stat().st_mtime < (stage / "cells.rs").stat().st_mtime:
+        raise ValueError(f"{built} is older than the copy it was built from")
     binary = output / "bin" / column
     binary.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(target / "release" / adapter, binary)
+    shutil.copy2(built, binary)
     return binary
 
 
@@ -188,7 +202,8 @@ def families_of(args):
 
 def one(args, column, family, cores, cell):
     """One fresh process of one column on one cell; the record of its one output line."""
-    command = [str(args.output / "bin" / column), *cell]
+    # With this flag a cell that panics says why on stderr, and the record keeps the end of it.
+    command = [str(args.output / "bin" / column), *cell, "--show-panics"]
     if cores:
         command = ["taskset", "-c", cores, *command]
     context = {
@@ -204,8 +219,12 @@ def one(args, column, family, cores, cell):
             command, capture_output=True, encoding="utf-8", errors="replace", timeout=CELL_TIMEOUT
         )
         context["rc"], lines, context["stderr"] = done.returncode, done.stdout, done.stderr[-300:]
-    except subprocess.TimeoutExpired:
-        context["rc"], lines, context["stderr"] = 124, "", "timeout"
+    except subprocess.TimeoutExpired as exc:
+        # A thread that panicked before a barrier leaves its cell waiting: what the process wrote
+        # to stderr until the timeout is kept (the exception holds it as bytes).
+        tail = (exc.stderr or b"").decode("utf-8", "replace")[-300:]
+        context["rc"], lines = 124, ""
+        context["stderr"] = f"timeout; {tail}" if tail else "timeout"
     try:
         out = json.loads(lines.strip().splitlines()[-1]) if lines.strip() else None
     except ValueError:
@@ -353,6 +372,9 @@ def run(args):
 def ids(args):
     """Every column's token ids on the parity strings; the count that equals the column smg."""
     corpus = args.corpus / "parity.jsonl"
+    # The parity cell writes one record per string of the corpus: a non-blank line of the file.
+    with corpus.open(encoding="utf-8") as handle:
+        strings = sum(1 for line in handle if line.strip())
     totals = {}
     lines = []
 
@@ -360,17 +382,28 @@ def ids(args):
         out = Path(scratch) / f"{column}.jsonl"
         command = [str(args.output / "bin" / column), "parity"]
         command += [str(args.models / family), str(corpus), str(out), "--no-inc"]
-        subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        done = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        status[column] = done.returncode
+        # The cell makes its file once the column has loaded the family.
+        if out.exists():
+            written.add(column)
         found = {}
-        for record in records(out):
-            value = record.get("ids")
-            text = json.dumps(value).encode()
-            found[record["i"]] = hashlib.sha256(text).hexdigest() if value is not None else "error"
+        try:
+            for record in records(out):
+                value = record.get("ids")
+                text = json.dumps(value).encode()
+                found[record["i"]] = (
+                    hashlib.sha256(text).hexdigest() if value is not None else "error"
+                )
+        except ValueError:
+            # A line that does not parse is where the file was cut off: the strings before it are
+            # kept, and the summary names the column, whose file is short of a record per string.
+            pass
         digests[column] = found
 
     for family in families_of(args):
         columns = columns_of(args, family)
-        digests = {}
+        digests, status, written = {}, {}, set()
         # The columns of a family side by side: no time is read here.
         with tempfile.TemporaryDirectory(dir=args.output) as scratch:
             workers = [
@@ -386,8 +419,9 @@ def ids(args):
         parts = [f"{family}: {len(ours)} strings, smg failed on {failed}"]
         for column in columns[1:]:
             theirs = digests[column]
-            if not theirs:
-                # The column has no file of this family to load: no string of it is counted.
+            if column not in written:
+                # A column that cannot load the family ends before its cell makes the file: no
+                # string of it is counted. A file without a record is compared as any other.
                 parts.append(f"{column} did not load")
                 continue
             same = sum(1 for index, value in ours.items() if theirs.get(index) == value)
@@ -395,6 +429,20 @@ def ids(args):
             total[0] += same
             total[1] += len(ours)
             parts.append(f"{column} {same} of {len(ours)}")
+        # A process that died leaves a short file, and its missing strings read as differences.
+        ended = [f"{column} {code}" for column, code in sorted(status.items()) if code]
+        if ended:
+            parts.append("exit status not 0: " + ", ".join(ended))
+        # A file without a whole record for every string is named whatever the exit status: a
+        # write that failed leaves it short, cut off inside a line or empty, and the cell still
+        # ends at status 0. A column that did not load made no file and is named above.
+        short = [
+            f"{column} {len(digests[column])} of {strings}"
+            for column in columns
+            if len(digests[column]) != strings and (column in written or column == "smg")
+        ]
+        if short:
+            parts.append("incomplete output: " + ", ".join(short))
         lines.append("; ".join(parts))
         print(lines[-1], flush=True)
     lines.append("TOTAL SAME: " + "; ".join(f"{c} {t[0]} of {t[1]}" for c, t in totals.items()))
@@ -411,7 +459,8 @@ MISC_HEAD = (
 )
 MEMORY_HEAD = (
     "family,arm,load_ms,rss_kb_before_load,rss_kb_after_load,hwm_kb_after_500k,hwm_kb_after_1m,"
-    "allocs_2k_encode,growth_kb_per_thread_shared,growth_kb_per_thread_own,backend"
+    "allocs_2k_encode,growth_kb_per_thread_shared,growth_kb_per_thread_own,level_kb_per_thread_own,"
+    "backend"
 )
 # What names a cell of the decode group: the key of its size in the cell's line, its argument.
 SIZED = {"dec": ("len", "--len"), "stream": ("streams", "--streams"), "batch": ("n", "--n")}
@@ -487,7 +536,10 @@ def collect(args):
             continue
         key, flag = SIZED[kind]
         figures = [None] * 11
-        if ctx["rc"] == 0:
+        # A cell checks its own output: a stream text that differs from the full decode is no result.
+        wrong = out.get("inc_eq_full") is False or bool(out.get("inc_ne_full"))
+        status = "incorrect" if ctx["rc"] == 0 and wrong else ctx["rc"]
+        if status == 0:
             step = out.get("step_ns") or {}
             figures = [
                 p50(out, "full_ns_per_tok"),
@@ -503,7 +555,7 @@ def collect(args):
                 p50(out, "api_tok_per_s") if out.get("api") else None,
             ]
         cell = f"{kind}{out.get(key) or option(ctx['args'], flag)}"
-        head = [ctx["family"], cell, column(ctx), ctx["round"], ctx["rc"]]
+        head = [ctx["family"], cell, column(ctx), ctx["round"], status]
         rows.append(head + [shown(value, ".3f") for value in figures] + [backend(out)])
     rows.sort(key=lambda row: row[:4])
     write_csv(target / "misc-rounds.csv", MISC_HEAD, rows)
@@ -535,6 +587,7 @@ def collect(args):
                     shown(mem.get("allocs_2k_encode"), ".0f"),
                     shown(mem.get("growth_kb_per_thread_shared"), ".0f"),
                     shown(mem.get("growth_kb_per_thread_own"), ".0f"),
+                    shown(mem.get("level_kb_per_thread_own"), ".0f"),
                     backend(info or mem),
                 ]
             )
@@ -592,7 +645,7 @@ def main():
         parser.error(f"{args.action} needs --corpus")
     if args.edge:
         args.cells = ["encode"]
-    for name in ("corpus", "models", "output", "csv"):
+    for name in ("corpus", "models", "output", "csv", "fastokens_src"):
         if getattr(args, name):
             setattr(args, name, getattr(args, name).resolve())
     args.output.mkdir(parents=True, exist_ok=True)

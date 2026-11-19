@@ -31,7 +31,7 @@ use engine_servicer::{
     DEFAULT_ENGINE_SILENCE_TIMEOUT, DEFAULT_ENGINE_STARTUP_CEILING, DEFAULT_ENGINE_STARTUP_TIMEOUT,
     PIXEL_MODALITIES,
 };
-use llm_multimodal::{jpeg_turbo::TurboJpegPolicy, Modality};
+use llm_multimodal::{jpeg_turbo::TurboJpegPolicy, MediaErrorCode, Modality};
 use prost::Message;
 use pyo3::{
     exceptions::{PyRuntimeError, PyTimeoutError, PyValueError},
@@ -359,8 +359,10 @@ fn lent_bytes(owner: Bound<'_, PyAny>) -> PyResult<Bytes> {
 /// Python's answer to one media request, called once: `("ok",
 /// (prompt_token_ids, mm_features | None, aux_frames, cache_salt | None,
 /// media_identity | None))` where each aux frame is a read-only numpy view
-/// lent without a copy, or `(kind, message)` with `kind` one of `invalid`,
-/// `unavailable`, `internal`.
+/// lent without a copy, `("media", (code, message))` for a failure of the
+/// request's own media under the public `code` the router answers (one it
+/// does not know is `media_fetch_failed`, as the router reads it), or
+/// `(kind, message)` with `kind` one of `invalid`, `unavailable`, `internal`.
 #[pyclass(name = "_MediaDone")]
 struct MediaDone {
     tx: Mutex<Option<oneshot::Sender<Result<ProcessedMedia, MediaError>>>>,
@@ -392,6 +394,16 @@ impl MediaDone {
                         cache_salt,
                     },
                     media_identity,
+                })
+            }
+            "media" => {
+                let (code, message): (String, String) = payload.extract()?;
+                Err(MediaError::Media {
+                    fault: smg_grpc_client::WorkerMediaFault::Client,
+                    code: MediaErrorCode::parse(&code)
+                        .unwrap_or(MediaErrorCode::FetchFailed)
+                        .as_str(),
+                    message,
                 })
             }
             "invalid" => Err(MediaError::Invalid(payload.extract()?)),

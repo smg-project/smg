@@ -16,18 +16,19 @@ that adds a surface must update this file.
 Test-only files that the mount also touches, none of them a new surface:
 `model_gateway/tests/http/rl_control_plane_test.rs` (gateway-level `/v1/rl` tests),
 `model_gateway/test_harness/src/mock_worker.rs` (engine-native RL routes on the
-mock), and the three `#[cfg(test)]` `AppContext { .. }` literals in
-`src/service_discovery/testing.rs`, `src/workflow/steps/local/drain_workers.rs`, and
-`src/workflow/steps/local/update_worker_properties.rs`, which gain `rl: None`
+mock), and the `#[cfg(test)]` `AppContext { .. }` literal in
+`src/app_context.rs`, which gains `rl: None`
 because the struct grew a field. The gateway-level test relies on
 `TestRouterConfig` disabling health checks, so the mock stopped mid-test
 stays registered and the fan-out still targets it.
 
 Gateway-side changes that carry RL data but are not crate couplings (the RL
 crate does not call into them; they exist so the data plane reports what the
-control plane changed): `src/routers/grpc/client.rs` lifts `rl.control_url`
-and the `rl.*` capability keys from TokenSpeed gRPC server info into worker
-labels (`TOKENSPEED_GRPC_KEYS`); `src/routers/grpc/proto_wrapper.rs`,
+control plane changed): the client crate's label conversions
+(`crates/grpc_client/src/engine_labels.rs`), which the gateway's dispatch
+client asks, lift `rl.control_url` and the `rl.*` capability keys from
+TokenSpeed gRPC server info into worker labels (`TOKENSPEED_GRPC_KEYS`);
+`src/routers/grpc/proto_wrapper.rs`,
 `src/routers/grpc/common/response_formatting.rs` (`effective_weight_version`),
 `src/routers/grpc/regular/{processor,streaming}.rs` and
 `src/routers/grpc/pipeline.rs` carry the engine-reported

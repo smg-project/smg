@@ -9,16 +9,16 @@
 use std::borrow::Cow;
 
 use serde_json::{value::RawValue, Value};
-use tracing::warn;
-
-use crate::{
-    observability::metrics::metrics_labels,
-    worker::{
-        pd::pairing::{connector_profile, KvTransferProfile},
+use smg_worker::{
+    identity::basic::{
         Worker, DEFAULT_BOOTSTRAP_PORT, MOONCAKE_CONNECTOR, MORIIO_CONNECTOR, MORIIO_MODE_LABEL,
         NIXL_CONNECTOR,
     },
+    pd::pairing::{connector_profile, KvTransferProfile},
 };
+use tracing::warn;
+
+use crate::observability::metrics::metrics_labels;
 
 /// KV-transfer params tagged onto the NIXL prefill side so the engine pins its
 /// KV blocks and returns the handoff params for the decode worker.
@@ -600,8 +600,10 @@ pub(crate) fn mooncake_decode_params(
 
 #[cfg(test)]
 mod tests {
+    use smg_worker::identity::basic::{BasicWorker, WorkerType};
+
     use super::*;
-    use crate::worker::{BasicWorker, BasicWorkerBuilder, WorkerType};
+    use crate::routers::grpc::backend_client::BasicWorkerBuilder;
 
     /// The decode side's bootstrap URL must parse for every spelling the
     /// bootstrap host arrives in: bracketed from a worker URL, bare from a
@@ -1227,7 +1229,7 @@ mod tests {
 
     #[test]
     fn a_refreshed_engine_id_is_what_the_handoff_is_minted_for() {
-        use crate::worker::{ConnectionMode, RuntimeType};
+        use smg_worker::identity::basic::{ConnectionMode, RuntimeType};
 
         let worker = BasicWorkerBuilder::new("grpc://p:1")
             .worker_type(WorkerType::Prefill)

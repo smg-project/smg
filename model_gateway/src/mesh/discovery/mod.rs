@@ -1,6 +1,6 @@
 //! SMG mesh router-peer discovery.
 //!
-//! Distinct from [`crate::service_discovery`]: this finds *SMG router peers*
+//! Distinct from [`smg_service_discovery`]: this finds *SMG router peers*
 //! for the mesh cluster, not inference workers. It is Kubernetes-specific and
 //! runs independently of whichever worker discovery provider is selected — or
 //! of none at all.

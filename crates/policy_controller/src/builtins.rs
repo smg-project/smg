@@ -18,14 +18,19 @@ use parking_lot::{Mutex, MutexGuard};
 use rustc_hash::{FxHashMap, FxHasher};
 
 use crate::{
+    affinity::WarmRule,
     counts::with_counts,
     decision::{Target, Targets, MAX_TARGETS},
     framework::{
-        top_drawn, top_pass, Filter, Front, Narrowed, Picker, Scorer, TieBand, Unit, DRAW_BOUND,
+        top_drawn, top_pass, Filter, Front, Narrowed, Picker, Scorer, Spread, TieBand, Unit,
+        DRAW_BOUND,
     },
     lease::{Lease, Lifecycle, Membership, Side},
     spec::Needs,
-    view::{Candidate, Constraints, LoadRow, ModelFingerprint, PoolFacts, RequestFacts, WorkerId},
+    view::{
+        Candidate, Constraints, LoadRow, ModelFingerprint, PoolFacts, ReportCutoff, RequestFacts,
+        WorkerId,
+    },
     Draw,
 };
 
@@ -45,6 +50,11 @@ pub struct Healthy;
 impl Filter for Healthy {
     fn name(&self) -> &'static str {
         "healthy"
+    }
+
+    // Refuses by a row's health bits and its host's mask.
+    fn refuses_by_reports(&self) -> bool {
+        false
     }
 
     fn row_wise(&self) -> bool {
@@ -83,6 +93,11 @@ impl Filter for OwnBits {
         "healthy"
     }
 
+    // Refuses by a row's health bits.
+    fn refuses_by_reports(&self) -> bool {
+        false
+    }
+
     fn keep(&self, _: &RequestFacts<'_>, c: &Candidate, _: &Constraints<'_>) -> bool {
         c.health.routable_ignoring_overload()
     }
@@ -105,6 +120,11 @@ impl Filter for NotOverloaded {
         "not-overloaded"
     }
 
+    // Refuses by the overload bit of a row's health, unless its host lifts it.
+    fn refuses_by_reports(&self) -> bool {
+        false
+    }
+
     fn row_wise(&self) -> bool {
         true
     }
@@ -121,6 +141,11 @@ pub struct HasCapacity;
 impl Filter for HasCapacity {
     fn name(&self) -> &'static str {
         "has-capacity"
+    }
+
+    // Refuses by a bit its host supplies.
+    fn refuses_by_reports(&self) -> bool {
+        false
     }
 
     fn row_wise(&self) -> bool {
@@ -141,6 +166,11 @@ pub struct HasRoom;
 impl Filter for HasRoom {
     fn name(&self) -> &'static str {
         "has-room"
+    }
+
+    // Refuses by a bit its host supplies.
+    fn refuses_by_reports(&self) -> bool {
+        false
     }
 
     fn row_wise(&self) -> bool {
@@ -166,6 +196,11 @@ impl Filter for NotTried {
         "not-tried"
     }
 
+    // Refuses by the request's own tried list and its host's exclusions.
+    fn refuses_by_reports(&self) -> bool {
+        false
+    }
+
     fn row_wise(&self) -> bool {
         true
     }
@@ -183,7 +218,8 @@ impl Filter for NotTried {
 /// profile holds. The engine folds a profile made of these filters alone
 /// into one at its build ([`RowTests::of`]), and a decision that draws first
 /// asks it about each row drawn: one call a row, where the filters' own
-/// `keep`s are a call a filter.
+/// `keep`s are a call a filter. A whole pass asks it about every row of
+/// the single plan's pool, in one loop where the filters are a loop each.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct RowTests(u8);
 
@@ -219,6 +255,22 @@ impl RowTests {
         Some(Self(tests))
     }
 
+    /// The set as one decision asks it: without the overload test where
+    /// the host lifted that veto, and without the tried test where the
+    /// request names no row tried and the host none excluded. A test left
+    /// out keeps every row under these facts, so the set that is left
+    /// keeps the rows the whole set keeps, at fewer tests a row.
+    pub(crate) fn asked(self, facts: &RequestFacts<'_>, cx: &Constraints<'_>) -> Self {
+        let mut tests = self.0;
+        if cx.overload_lifted {
+            tests &= !Self::NOT_OVERLOADED;
+        }
+        if facts.tried.is_empty() && cx.excluded.is_empty() {
+            tests &= !Self::NOT_TRIED;
+        }
+        Self(tests)
+    }
+
     /// Whether a decision under `cx` asks the host's mask about a row
     /// beside [`RowTests::keeps`]: the health filter is in the set and a
     /// veto stands.
@@ -248,13 +300,145 @@ impl RowTests {
 
 // ---------------------------------------------------------------- scorers
 
+/// A scorer that can read reports through a decision's cutoff. The bare
+/// scorer reads the row directly, and the document wraps it only when it
+/// sets a limit.
+pub(crate) trait ReadsLoad: Scorer {
+    fn score_with(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &[u32],
+        out: &mut [f32],
+        load: impl Fn(&Candidate) -> Option<LoadRow> + Copy,
+    ) -> TieBand;
+
+    fn score_front_with(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        _kept: &[u32],
+        asked: &[u32],
+        out: &mut [f32],
+        load: impl Fn(&Candidate) -> Option<LoadRow> + Copy,
+    ) -> (TieBand, Front) {
+        (
+            self.score_with(facts, candidates, asked, out, load),
+            Front::Unsaid,
+        )
+    }
+}
+
+#[derive(Debug)]
+struct ReportAge<S> {
+    stage: S,
+    max_age_ms: u64,
+}
+
+pub(crate) fn with_report_age(
+    stage: impl ReadsLoad + 'static,
+    max_age_ms: Option<u64>,
+) -> Box<dyn Scorer> {
+    match max_age_ms {
+        Some(max_age_ms) => Box::new(ReportAge { stage, max_age_ms }),
+        None => Box::new(stage),
+    }
+}
+
+impl<S: ReadsLoad> Lifecycle for ReportAge<S> {
+    fn on_dispatched(
+        &self,
+        lease: &Lease,
+        target: &Target,
+        side: Side,
+        since_decision_micros: u32,
+    ) {
+        self.stage
+            .on_dispatched(lease, target, side, since_decision_micros);
+    }
+
+    fn on_membership(&self, change: &Membership<'_>) {
+        self.stage.on_membership(change);
+    }
+}
+
+impl<S: ReadsLoad> Scorer for ReportAge<S> {
+    fn name(&self) -> &'static str {
+        self.stage.name()
+    }
+
+    fn score(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &[u32],
+        out: &mut [f32],
+    ) -> TieBand {
+        let cutoff = ReportCutoff::new(facts.now_micros, self.max_age_ms);
+        self.stage
+            .score_with(facts, candidates, kept, out, |row| cutoff.load(row))
+    }
+
+    fn score_front(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &[u32],
+        asked: &[u32],
+        out: &mut [f32],
+    ) -> (TieBand, Front) {
+        let cutoff = ReportCutoff::new(facts.now_micros, self.max_age_ms);
+        self.stage
+            .score_front_with(facts, candidates, kept, asked, out, |row| cutoff.load(row))
+    }
+
+    fn row_wise(&self) -> bool {
+        self.stage.row_wise()
+    }
+
+    fn front_wise(&self) -> bool {
+        self.stage.front_wise()
+    }
+
+    fn spread(&self) -> Spread {
+        self.stage.spread()
+    }
+
+    fn needs(&self) -> Needs {
+        self.stage.needs()
+    }
+
+    fn warm_rule(&self) -> Option<WarmRule> {
+        self.stage.warm_rule()
+    }
+}
+
+/// The rows whose least and greatest cost are found by compares
+/// ([`normalize_costs`]): the ranks of one engine, the rows of a draw.
+const FEW_COSTS: usize = 16;
+
 /// Lower raw costs become higher normalized scores; equal costs score `1.0`.
 /// Returns the span of the costs, `0.0` when they are all equal.
 fn normalize_costs(out: &mut [f32]) -> f32 {
     let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
-    for &c in out.iter() {
-        lo = lo.min(c);
-        hi = hi.max(c);
+    if out.len() <= FEW_COSTS {
+        // A few rows, compared one by one: a cost that is no number moves
+        // neither end, as the fold below leaves them.
+        for &c in out.iter() {
+            if c < lo {
+                lo = c;
+            }
+            if c > hi {
+                hi = c;
+            }
+        }
+    } else {
+        // Many rows, folded: the minimum and the maximum take any order,
+        // so a step of the loop reads several rows.
+        for &c in out.iter() {
+            lo = lo.min(c);
+            hi = hi.max(c);
+        }
     }
     let span = hi - lo;
     let spread = span > 0.0 && span.is_finite();
@@ -277,6 +461,11 @@ impl Lifecycle for LeastRequests {}
 impl Scorer for LeastRequests {
     fn name(&self) -> &'static str {
         "least-requests"
+    }
+
+    // Scores by the count in flight: a late count moves the pick.
+    fn refuses_by_reports(&self) -> bool {
+        false
     }
 
     fn score(
@@ -305,6 +494,11 @@ impl Lifecycle for SessionAffinity {}
 impl Scorer for SessionAffinity {
     fn name(&self) -> &'static str {
         "session-affinity"
+    }
+
+    // Scores by the session's hit on a row.
+    fn refuses_by_reports(&self) -> bool {
+        false
     }
 
     fn score(
@@ -348,6 +542,11 @@ impl Lifecycle for FewestSessions {}
 impl Scorer for FewestSessions {
     fn name(&self) -> &'static str {
         "fewest-sessions"
+    }
+
+    // Scores by the sessions a row holds: a late count moves the pick.
+    fn refuses_by_reports(&self) -> bool {
+        false
     }
 
     fn score(
@@ -511,11 +710,23 @@ impl SinceReport {
         // At its instant's place: a dispatch that waited for a retirement
         // on a shared lane, or one a stepped clock dated earlier, lands
         // behind a later one, and the release and the retirement read a
-        // lane from its oldest. Instants mostly rise, so this is a push.
-        let at = dispatches.partition_point(|&(held_at, _)| held_at <= at_micros);
-        dispatches.insert(at, (at_micros, tokens));
+        // lane from its oldest. Instants mostly rise, so the lane's newest
+        // is asked first: a dispatch no older than it is a push, and the
+        // place is searched for the one that is. The lane's front moves
+        // only where the dispatch lands there.
+        let newest = dispatches.back().map(|&(held_at, _)| held_at);
+        let front = if newest.is_some_and(|newest| newest > at_micros) {
+            let at = dispatches.partition_point(|&(held_at, _)| held_at <= at_micros);
+            dispatches.insert(at, (at_micros, tokens));
+            at == 0
+        } else {
+            dispatches.push_back((at_micros, tokens));
+            newest.is_none()
+        };
         self.held.fetch_add(Self::weight(tokens), Ordering::Relaxed);
-        lane.publish_oldest(&dispatches);
+        if front {
+            lane.publish_oldest(&dispatches);
+        }
         // Under the lane's lock: a release, which holds every lane, never
         // recomputes the row's oldest past this dispatch. Dispatch instants
         // mostly rise, so this is a read.
@@ -776,6 +987,14 @@ impl Credits {
 /// its profile names none.
 pub const DEFAULT_MEAN_PREFILL_TOKENS: u32 = 1024;
 
+/// The weight of the KV-pressure barrier in a load scorer's expected wait
+/// when its profile names none.
+pub const DEFAULT_KV_PRESSURE_WEIGHT: f32 = 0.15;
+
+/// The drain rate, in tokens per second, a load scorer assumes when no
+/// candidate reports a live one and its profile names none.
+pub const DEFAULT_THROUGHPUT: f32 = 2000.0;
+
 /// The expected wait: token-work over drain rate plus a convex KV-pressure
 /// barrier, the since-report dispatch credit water-filling arrivals between
 /// reports. The host's in-flight count floors the report.
@@ -886,6 +1105,46 @@ impl LeastLoad {
         (queued + running + credit_work) / drain + self.kv_pressure_weight * k / (1.0 - k)
     }
 
+    /// Costs the rows the first pass left pending, those with no report:
+    /// each from the reporting peers' baseline among the rows handed
+    /// ([`Self::unreported_cost`]). Out of line: a pool whose every row
+    /// reports pays for no second pass.
+    #[cold]
+    #[inline(never)]
+    fn cost_pending(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &[u32],
+        out: &mut [f32],
+        nominal: f32,
+        fleet_has_loads: bool,
+    ) {
+        let mut peer_baseline = 0.0;
+        if fleet_has_loads {
+            peer_baseline = out
+                .iter()
+                .copied()
+                .filter(|cost| *cost != PENDING)
+                .fold(f32::INFINITY, f32::min);
+            if !peer_baseline.is_finite() {
+                peer_baseline = 0.0;
+            }
+        }
+        with_counts!(facts, |counts| {
+            for (slot, &i) in out.iter_mut().zip(kept) {
+                if *slot == PENDING {
+                    *slot = self.unreported_cost(
+                        counts(&candidates[i as usize]),
+                        nominal,
+                        fleet_has_loads,
+                        peer_baseline,
+                    );
+                }
+            }
+        });
+    }
+
     /// The cost of a candidate without a report: the reporting peers' baseline
     /// plus its in-flight work, or the in-flight count alone when no peer
     /// reports.
@@ -905,10 +1164,15 @@ impl LeastLoad {
 
     /// The mean rate of the kept rows that report one, which a report
     /// without a rate drains at: the default where none reports one.
-    fn mean_rate(&self, candidates: &[Candidate], kept: &[u32]) -> f32 {
+    fn mean_rate(
+        &self,
+        candidates: &[Candidate],
+        kept: &[u32],
+        load: impl Fn(&Candidate) -> Option<LoadRow>,
+    ) -> f32 {
         let (sum, n) = kept
             .iter()
-            .filter_map(|&i| candidates[i as usize].load)
+            .filter_map(|&i| load(&candidates[i as usize]))
             .filter(|r| r.live_rate > 0)
             .fold((0.0f32, 0u32), |(s, n), r| (s + r.live_rate as f32, n + 1));
         if n > 0 && sum.is_finite() {
@@ -930,6 +1194,7 @@ impl LeastLoad {
         rows: &[u32],
         nominal: f32,
         out: &mut [f32],
+        load: impl Fn(&Candidate) -> Option<LoadRow>,
     ) -> TieBand {
         // One load of the tally: each reporting row's held work is read
         // (released first when its report's sample reaches a dispatch) and
@@ -942,7 +1207,7 @@ impl LeastLoad {
             with_counts!(facts, |counts| {
                 for (slot, &i) in out.iter_mut().zip(rows) {
                     let c = &candidates[i as usize];
-                    *slot = match c.load {
+                    *slot = match load(c) {
                         Some(_) => {
                             let (tokens, requests) =
                                 tally.get(&(c.id, c.dp_rank)).map_or((0, 0), |since| {
@@ -957,34 +1222,13 @@ impl LeastLoad {
             });
         }
         for (slot, &i) in out.iter_mut().zip(rows) {
-            if let Some(r) = candidates[i as usize].load {
+            if let Some(r) = load(&candidates[i as usize]) {
                 *slot = self.reported_cost(r, *slot, nominal);
             }
         }
-        let fleet_has_loads = reporting > 0;
-        let mut peer_baseline = 0.0;
-        if reporting < rows.len() && fleet_has_loads {
-            peer_baseline = out
-                .iter()
-                .copied()
-                .filter(|cost| *cost != PENDING)
-                .fold(f32::INFINITY, f32::min);
-            if !peer_baseline.is_finite() {
-                peer_baseline = 0.0;
-            }
+        if reporting < rows.len() {
+            self.cost_pending(facts, candidates, rows, out, nominal, reporting > 0);
         }
-        with_counts!(facts, |counts| {
-            for (slot, &i) in out.iter_mut().zip(rows) {
-                if *slot == PENDING {
-                    *slot = self.unreported_cost(
-                        counts(&candidates[i as usize]),
-                        nominal,
-                        fleet_has_loads,
-                        peer_baseline,
-                    );
-                }
-            }
-        });
         // The band of a microsecond of expected wait on the normalized scale:
         // exact for one scorer, additive under several.
         let span = normalize_costs(out);
@@ -1027,6 +1271,11 @@ impl Scorer for LeastLoad {
         "least-load"
     }
 
+    // Costs by the count in flight and its credits: late ones move the pick.
+    fn refuses_by_reports(&self) -> bool {
+        false
+    }
+
     fn row_wise(&self) -> bool {
         true
     }
@@ -1045,12 +1294,44 @@ impl Scorer for LeastLoad {
         kept: &[u32],
         out: &mut [f32],
     ) -> TieBand {
+        self.score_with(facts, candidates, kept, out, |c| c.load)
+    }
+
+    fn score_front(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &[u32],
+        asked: &[u32],
+        out: &mut [f32],
+    ) -> (TieBand, Front) {
+        self.score_front_with(facts, candidates, kept, asked, out, |c| c.load)
+    }
+
+    fn needs(&self) -> Needs {
+        Needs {
+            loads: true,
+            ..Needs::default()
+        }
+    }
+}
+
+impl ReadsLoad for LeastLoad {
+    fn score_with(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &[u32],
+        out: &mut [f32],
+        load: impl Fn(&Candidate) -> Option<LoadRow> + Copy,
+    ) -> TieBand {
         self.costs(
             facts,
             candidates,
             kept,
-            self.mean_rate(candidates, kept),
+            self.mean_rate(candidates, kept, load),
             out,
+            load,
         )
     }
 
@@ -1071,17 +1352,18 @@ impl Scorer for LeastLoad {
     /// span, as one behind the front widens the pool's. Among every row, a
     /// difference that is a small enough share of the pool's span falls
     /// under the last bit of a profile's sum, and the rows are drawn among.
-    fn score_front(
+    fn score_front_with(
         &self,
         facts: &RequestFacts<'_>,
         candidates: &[Candidate],
         kept: &[u32],
         asked: &[u32],
         out: &mut [f32],
+        load: impl Fn(&Candidate) -> Option<LoadRow> + Copy,
     ) -> (TieBand, Front) {
         let mut rated = true;
         for &i in asked {
-            let Some(report) = candidates[i as usize].load else {
+            let Some(report) = load(&candidates[i as usize]) else {
                 return (TieBand::NORMALIZED, Front::Whole);
             };
             rated &= report.live_rate > 0;
@@ -1091,19 +1373,12 @@ impl Scorer for LeastLoad {
         let nominal = if rated {
             self.default_throughput
         } else {
-            self.mean_rate(candidates, kept)
+            self.mean_rate(candidates, kept, load)
         };
         (
-            self.costs(facts, candidates, asked, nominal, out),
+            self.costs(facts, candidates, asked, nominal, out, load),
             Front::Unsaid,
         )
-    }
-
-    fn needs(&self) -> Needs {
-        Needs {
-            loads: true,
-            ..Needs::default()
-        }
     }
 }
 
@@ -1165,6 +1440,46 @@ impl ResidentWork {
     }
 }
 
+impl ResidentWork {
+    /// Costs the rows the first pass left pending, those with no report
+    /// that counts resident tokens: the best reporting peer among the rows
+    /// handed plus the row's requests in flight, or the requests alone
+    /// where no row reports. Out of line: a pool whose every row reports
+    /// pays for no second pass.
+    #[cold]
+    #[inline(never)]
+    fn cost_pending(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &[u32],
+        out: &mut [f32],
+        fleet_reports: bool,
+    ) {
+        let peer_baseline = if fleet_reports {
+            out.iter()
+                .copied()
+                .filter(|cost| *cost != PENDING)
+                .fold(f32::INFINITY, f32::min)
+        } else {
+            0.0
+        };
+        let in_flight_work = self.mean_prefill_tokens as f32 + self.request_tokens as f32;
+        with_counts!(facts, |counts| {
+            for (slot, &i) in out.iter_mut().zip(kept) {
+                if *slot == PENDING {
+                    let in_flight = counts(&candidates[i as usize]) as f32;
+                    *slot = if fleet_reports {
+                        peer_baseline + in_flight * in_flight_work
+                    } else {
+                        in_flight
+                    };
+                }
+            }
+        });
+    }
+}
+
 impl Lifecycle for ResidentWork {
     fn on_dispatched(
         &self,
@@ -1192,6 +1507,11 @@ impl Scorer for ResidentWork {
         "resident-work"
     }
 
+    // Costs by the count in flight and its credits: late ones move the pick.
+    fn refuses_by_reports(&self) -> bool {
+        false
+    }
+
     /// The rows a picker drew are costed among themselves, as the
     /// least-load scorer costs them: a row with no report, or whose report
     /// counts no resident tokens, is costed against the rows handed.
@@ -1206,6 +1526,26 @@ impl Scorer for ResidentWork {
         kept: &[u32],
         out: &mut [f32],
     ) -> TieBand {
+        self.score_with(facts, candidates, kept, out, |c| c.load)
+    }
+
+    fn needs(&self) -> Needs {
+        Needs {
+            loads: true,
+            ..Needs::default()
+        }
+    }
+}
+
+impl ReadsLoad for ResidentWork {
+    fn score_with(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &[u32],
+        out: &mut [f32],
+        load: impl Fn(&Candidate) -> Option<LoadRow> + Copy,
+    ) -> TieBand {
         // One load of the tally, as the least-load scorer reads it: a row
         // that counts resident tokens is costed with its credit, any other
         // is marked and costed after the reporting peers' baseline is known.
@@ -1218,7 +1558,7 @@ impl Scorer for ResidentWork {
                     // A report releases the dispatches it reflects whatever the
                     // score reads of them: a rank whose report counts no
                     // resident tokens would hold its credit at the bound.
-                    let reported = c.load.map(|r| {
+                    let reported = load(c).map(|r| {
                         let credit = tally.get(&(c.id, c.dp_rank)).map_or((0, 0), |since| {
                             since.credit_through(c.load_sampled_at_micros)
                         });
@@ -1234,28 +1574,9 @@ impl Scorer for ResidentWork {
                 }
             });
         }
-        let fleet_reports = reporting > 0;
-        let peer_baseline = if fleet_reports && reporting < kept.len() {
-            out.iter()
-                .copied()
-                .filter(|cost| *cost != PENDING)
-                .fold(f32::INFINITY, f32::min)
-        } else {
-            0.0
-        };
-        let in_flight_work = self.mean_prefill_tokens as f32 + self.request_tokens as f32;
-        with_counts!(facts, |counts| {
-            for (slot, &i) in out.iter_mut().zip(kept) {
-                if *slot == PENDING {
-                    let in_flight = counts(&candidates[i as usize]) as f32;
-                    *slot = if fleet_reports {
-                        peer_baseline + in_flight * in_flight_work
-                    } else {
-                        in_flight
-                    };
-                }
-            }
-        });
+        if reporting < kept.len() {
+            self.cost_pending(facts, candidates, kept, out, reporting > 0);
+        }
         // The least-load scorer's band, on a score in tokens: equal work is
         // a tie, drawn by the picker.
         let span = normalize_costs(out);
@@ -1263,13 +1584,6 @@ impl Scorer for ResidentWork {
             TieBand((TIE_EPSILON_SECS / span).min(1.0))
         } else {
             TieBand::NORMALIZED
-        }
-    }
-
-    fn needs(&self) -> Needs {
-        Needs {
-            loads: true,
-            ..Needs::default()
         }
     }
 }
@@ -1705,6 +2019,11 @@ impl Picker for Best {
         "best"
     }
 
+    // Picks the best score of the rows kept.
+    fn refuses_by_reports(&self) -> bool {
+        false
+    }
+
     /// The targets are the best of the rows handed: a rank may put rows in
     /// front of this picker.
     fn front_wise(&self) -> bool {
@@ -1758,6 +2077,11 @@ impl Lifecycle for SampledBest {}
 impl Picker for SampledBest {
     fn name(&self) -> &'static str {
         "best"
+    }
+
+    // Picks the best score of the rows it draws.
+    fn refuses_by_reports(&self) -> bool {
+        false
     }
 
     /// The targets are the best of the rows handed: a rank may put rows in
@@ -1852,6 +2176,11 @@ impl Picker for Passthrough {
         "passthrough"
     }
 
+    // Picks the rows in the order handed.
+    fn refuses_by_reports(&self) -> bool {
+        false
+    }
+
     fn draws_first(&self) -> bool {
         true
     }
@@ -1914,6 +2243,11 @@ impl Picker for Random {
         "random"
     }
 
+    // Picks by its draw.
+    fn refuses_by_reports(&self) -> bool {
+        false
+    }
+
     fn draws_first(&self) -> bool {
         true
     }
@@ -1942,17 +2276,7 @@ impl Picker for Random {
         // rows left names one of them by stepping over these.
         let mut drawn = [pick; MAX_TARGETS];
         for len in 1..MAX_TARGETS.min(candidates.len()) {
-            let mut row = draw.below(candidates.len() - len);
-            let mut at = len;
-            for (i, &taken) in drawn[..len].iter().enumerate() {
-                if row < taken {
-                    at = i;
-                    break;
-                }
-                row += 1;
-            }
-            drawn.copy_within(at..len, at + 1);
-            drawn[at] = row;
+            let row = step_over(&mut drawn, len, draw.below(candidates.len() - len));
             if keep(&candidates[row]) {
                 kept.push(row as u32);
             }
@@ -1983,27 +2307,37 @@ impl Picker for Random {
     ) {
         let mut draw = Draw::new(facts.seed);
         let n = kept.len();
+        // The positions taken so far, ascending.
         let mut taken = [usize::MAX; MAX_TARGETS];
         for slot in 0..MAX_TARGETS.min(n) {
             // The j-th position among those not taken yet: a partial
             // Fisher-Yates without the copy of the survivor list.
-            let j = draw.below(n - slot);
-            let mut seen = 0usize;
-            let mut chosen = 0usize;
-            for i in 0..n {
-                if taken[..slot].contains(&i) {
-                    continue;
-                }
-                if seen == j {
-                    chosen = i;
-                    break;
-                }
-                seen += 1;
-            }
-            taken[slot] = chosen;
+            let chosen = step_over(&mut taken, slot, draw.below(n - slot));
             out.push(target_of(&candidates[kept[chosen] as usize]));
         }
     }
+}
+
+/// The `j`-th position not among `taken[..len]`, which stand ascending,
+/// entered among them in its place. Neither the step over a position
+/// taken nor the entry branches on `j`: a drawn value is no pattern a
+/// branch can learn, and a branch missed costs more than every step here.
+#[inline]
+fn step_over(taken: &mut [usize; MAX_TARGETS], len: usize, j: usize) -> usize {
+    let mut row = j;
+    for &at in &taken[..len] {
+        row += usize::from(row >= at);
+    }
+    // Entered by least and greatest: each position above the row moves up
+    // one place.
+    let mut held = row;
+    for at in &mut taken[..len] {
+        let (least, greatest) = ((*at).min(held), (*at).max(held));
+        *at = least;
+        held = greatest;
+    }
+    taken[len] = held;
+    row
 }
 
 /// The picker of a profile that leaves the placement to its binding's
@@ -2023,6 +2357,11 @@ impl Lifecycle for Manual {}
 impl Picker for Manual {
     fn name(&self) -> &'static str {
         "manual"
+    }
+
+    // Declines by the placement its request's rule names, never by a count.
+    fn refuses_by_reports(&self) -> bool {
+        false
     }
 
     fn pick(
@@ -2149,6 +2488,11 @@ impl Picker for PowerOfTwo {
         "power-of-two"
     }
 
+    // Picks the better score of two draws.
+    fn refuses_by_reports(&self) -> bool {
+        false
+    }
+
     fn draws_first(&self) -> bool {
         true
     }
@@ -2219,6 +2563,11 @@ impl Lifecycle for CountFirst {}
 impl Picker for CountFirst {
     fn name(&self) -> &'static str {
         "count-first"
+    }
+
+    // Picks the fewest in flight: a late count moves the pick.
+    fn refuses_by_reports(&self) -> bool {
+        false
     }
 
     /// The targets are the best of the rows handed: a rank may put rows in
@@ -2336,6 +2685,11 @@ impl Lifecycle for PowerOfTwoCountFirst {}
 impl Picker for PowerOfTwoCountFirst {
     fn name(&self) -> &'static str {
         "power-of-two-count-first"
+    }
+
+    // Picks the fewer in flight of two draws: a late count moves the pick.
+    fn refuses_by_reports(&self) -> bool {
+        false
     }
 
     fn draws_first(&self) -> bool {
@@ -2561,6 +2915,11 @@ impl Picker for RoundRobin {
         "round-robin"
     }
 
+    // Picks by its rotation.
+    fn refuses_by_reports(&self) -> bool {
+        false
+    }
+
     fn draws_first(&self) -> bool {
         true
     }
@@ -2683,6 +3042,28 @@ mod tests {
 
     fn kept(n: u32) -> Vec<u32> {
         (0..n).collect()
+    }
+
+    /// The costs find the same ends by either way: a few rows are compared
+    /// one by one, many are folded, and a cost that is no number moves
+    /// neither end. So the same costs score the same bits among a few
+    /// rows and among many.
+    #[test]
+    fn a_few_costs_and_many_find_the_same_ends() {
+        // The cost that is no number stands last: no cost behind it could
+        // take an end back from it.
+        let few = [4.0, 2.0, 3.0, f32::NAN];
+        let mut some = few;
+        let span = normalize_costs(&mut some);
+        assert_eq!(span, 2.0);
+        assert_eq!(some[0].to_bits(), 0.0f32.to_bits());
+        assert_eq!((some[1], some[2]), (1.0, 0.5));
+        assert!(some[3].is_nan());
+        let mut many: Vec<f32> = few.iter().copied().chain([3.0; FEW_COSTS]).collect();
+        assert!(many.len() > FEW_COSTS);
+        assert_eq!(normalize_costs(&mut many), span);
+        let bits = |scores: &[f32]| scores.iter().map(|s| s.to_bits()).collect::<Vec<_>>();
+        assert_eq!(bits(&many[..few.len()]), bits(&some));
     }
 
     /// The engine's order around a picker: the set it compares, that set's
@@ -5328,6 +5709,43 @@ mod tests {
                 let written = picked(picker, &own, &pool, &flat);
                 let read = picked(picker, &beside, &bare, &flat);
                 assert_eq!(written, read, "{} at seed {seed}", picker.name());
+            }
+        }
+    }
+
+    /// Random's pick and its draw name the row the loops they replace
+    /// named: the j-th position not taken yet, found by stepping over the
+    /// positions taken, which stand ascending behind each step. Every
+    /// pool size the whole pass and the draw meet, over many seeds.
+    #[test]
+    fn a_random_draw_steps_over_the_positions_taken_as_the_loop_did() {
+        for n in 1..=40usize {
+            for seed in 0..400u64 {
+                let mut draw = Draw::new(seed);
+                let mut taken = [usize::MAX; MAX_TARGETS];
+                let mut looped = [usize::MAX; MAX_TARGETS];
+                for slot in 0..MAX_TARGETS.min(n) {
+                    let j = draw.below(n - slot);
+                    let stepped = step_over(&mut taken, slot, j);
+                    // The loop as it stood: the j-th position not taken.
+                    let (mut seen, mut chosen) = (0usize, 0usize);
+                    for i in 0..n {
+                        if looped[..slot].contains(&i) {
+                            continue;
+                        }
+                        if seen == j {
+                            chosen = i;
+                            break;
+                        }
+                        seen += 1;
+                    }
+                    looped[slot] = chosen;
+                    assert_eq!(stepped, chosen, "{n} rows, seed {seed}, slot {slot}");
+                    assert!(taken[..=slot].is_sorted(), "{n} rows, seed {seed}");
+                    let mut ascending = looped;
+                    ascending[..=slot].sort_unstable();
+                    assert_eq!(taken, ascending, "{n} rows, seed {seed}");
+                }
             }
         }
     }

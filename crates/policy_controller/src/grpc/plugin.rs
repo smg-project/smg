@@ -21,10 +21,11 @@ use super::{
     config::{GrpcPluginSpec, Transport},
     runtime::{
         answer_bytes, Command, Fault, Lane, LaneEvents, ObserveLane, Peer, Readiness, Runtime,
-        SendError, Wait, Witness,
+        SendError, Spoken, Wait, Witness,
     },
     unit::Unit,
     view::{self, Answer, FILTER, PICK, SCORE},
+    PROTOCOL, PROTOCOL_MIN,
 };
 use crate::{
     decision::{Decision, Target},
@@ -215,7 +216,14 @@ impl Inner {
         self.unit.fail(self.now());
     }
 
-    fn observe(&self, event: proto::lifecycle_event::Event) {
+    /// Raises one event. The queue's room comes first and `event` makes the
+    /// event behind it: one the full queue refuses is counted and not built.
+    fn observe(&self, event: impl FnOnce() -> proto::lifecycle_event::Event) {
+        let Ok(room) = self.observe_tx.try_reserve() else {
+            bump(&self.tally.observe_dropped);
+            return;
+        };
+        let event = event();
         // The number is the stream's: the I/O thread writes it where the
         // event enters the stream, so threads that raise events at once
         // cannot send a later number first. A refused event is counted
@@ -224,18 +232,15 @@ impl Inner {
         // every event that entered the queue before the loss. An event whose
         // thread stood between this read and its entry when the loss fell
         // can arrive on either side.
-        let request = proto::ObserveRequest {
+        room.send(proto::ObserveRequest {
             request: Some(proto::observe_request::Request::Event(
                 proto::LifecycleEvent {
                     seq: self.tally.observe_dropped.load(Ordering::Relaxed),
                     event: Some(event),
                 },
             )),
-        };
-        match self.observe_tx.try_send(request) {
-            Ok(()) => bump(&self.tally.observed),
-            Err(_) => bump(&self.tally.observe_dropped),
-        }
+        });
+        bump(&self.tally.observed);
     }
 }
 
@@ -326,6 +331,8 @@ impl Plugin {
             counters: spec.metrics.clone(),
             connect: Duration::from_micros(u64::from(spec.connect_micros)),
             answer_bytes: answer_bytes(spec.max_candidates, spec.metrics.len()),
+            versions: PROTOCOL_MIN..=PROTOCOL,
+            spoken: Spoken::default(),
         });
         let (observe_tx, observe_rx) = mpsc::channel(OBSERVE_QUEUE);
         let inner = Arc::new_cyclic(|me| Inner {
@@ -1169,7 +1176,7 @@ impl BoundPlugin for Bound {
 
     fn observe_issued(&self, lease: &Lease, decision: &Decision) {
         let inner = &self.plugin.inner;
-        inner.observe(view::issued(lease, decision, &inner.exposure));
+        inner.observe(|| view::issued(lease, decision, &inner.exposure));
     }
 
     fn observe_dispatched(
@@ -1181,26 +1188,34 @@ impl BoundPlugin for Bound {
     ) {
         self.plugin
             .inner
-            .observe(view::dispatched(lease, side, since_decision_micros));
+            .observe(|| view::dispatched(lease, side, since_decision_micros));
     }
 
     fn observe_completed(&self, lease: &Lease, outcome: &Outcome) {
-        self.plugin.inner.observe(view::completed(lease, outcome));
+        self.plugin
+            .inner
+            .observe(|| view::completed(lease, outcome));
     }
 
     fn observe_released(&self, lease: &Lease, reason: ReleaseReason) {
-        self.plugin.inner.observe(view::released(lease, reason));
+        self.plugin.inner.observe(|| view::released(lease, reason));
     }
 
     fn observe_membership(&self, change: &Membership<'_>) {
-        if let Some(event) = view::membership(change) {
-            self.plugin.inner.observe(event);
+        let inner = &self.plugin.inner;
+        // A word the standing streams' version has no kind for is not
+        // raised: in the queue it would take a place a heard event needs,
+        // and a refusal of it would number a loss the stream never had.
+        let since = view::since_of(change);
+        if since > PROTOCOL_MIN && inner.peer.spoken.stands_under(since) {
+            return;
         }
+        inner.observe(|| view::membership(change));
     }
 
     fn observe_signal(&self, signal: &Signal) {
         let inner = &self.plugin.inner;
-        inner.observe(view::signal(signal, inner.now()));
+        inner.observe(|| view::signal(signal, inner.now()));
     }
 }
 

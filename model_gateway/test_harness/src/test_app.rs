@@ -5,23 +5,25 @@ use std::{
 
 use axum::Router;
 use llm_tokenizer::registry::TokenizerRegistry;
+use openai_protocol::model_card::ModelCard;
 use reqwest::Client;
 use smg::{
     app_context::AppContext,
     config::RouterConfig,
     middleware::{AuthConfig, TokenBucket},
     policies::PolicyRegistry,
-    routers::RouterTrait,
-    server::{build_app, build_apps, health, AppState, GatewayApps},
-    worker::{
-        BasicWorkerBuilder, ModelCard, RuntimeType, Worker, WorkerMonitor, WorkerRegistry,
-        WorkerType,
+    routers::{
+        common::snapshot::{WorkerMonitor, WorkerRegistry},
+        grpc::backend_client::BasicWorkerBuilder,
+        RouterTrait,
     },
+    server::{build_app, build_apps, health, AppState, GatewayApps},
 };
 use smg_data_connector::{
     MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
 };
 use smg_mcp::{McpConfig, McpOrchestrator};
+use smg_worker::identity::basic::{RuntimeType, Worker, WorkerType};
 
 /// Create a test Axum application using the actual server's build_app function
 #[expect(

@@ -15,23 +15,29 @@ use llm_multimodal::{
 };
 use openai_protocol::worker::MmProcessingMode;
 use smg_grpc_client::{common_proto as common, vllm_proto as vllm};
+use smg_worker::{
+    identity::basic::{ConnectionMode, RuntimeType, Worker, WorkerType},
+    labels::SUPPORTS_VISION_LABEL,
+};
 
 use super::{
-    capability::{runtime_supports_modality, SUPPORTS_VISION_LABEL},
+    capability::runtime_supports_modality,
     config::MultimodalComponents,
     plan::{MediaPlan, PlaceholderTokens},
 };
 use crate::{
     observability::metrics::Metrics,
     routers::{
-        common::placement::{self, PipelinePin, NO_MEDIA_REF_CAPABLE_WORKER_CODE},
+        common::{
+            placement::{self, PipelinePin, NO_MEDIA_REF_CAPABLE_WORKER_CODE},
+            snapshot::WorkerRegistry,
+        },
         error,
         grpc::{
             common::stages::pd_protocol::{EncodeHandoff, PdProtocol},
             context::WorkerSelection,
         },
     },
-    worker::{ConnectionMode, RuntimeType, Worker, WorkerRegistry, WorkerType},
 };
 
 /// Worker label carrying the advertised backend (`GetServerInfo.mm_processor`).
@@ -963,6 +969,9 @@ pub(crate) fn assemble_media_refs(plan: &MediaPlan) -> Result<vllm::MediaRefs, M
 mod tests {
     use std::sync::Arc;
 
+    use openai_protocol::model_card::ModelCard;
+    use smg_worker::{identity::basic::WorkerType, test_support::no_health_check};
+
     use super::*;
     #[cfg(all(
         feature = "jemalloc-stats",
@@ -970,13 +979,11 @@ mod tests {
         not(target_env = "musl")
     ))]
     use crate::routers::grpc::testing::bytes_allocated_during;
-    use crate::{
-        routers::grpc::multimodal::{
-            config::MultimodalConfigRegistry, settings::MultimodalSettings,
-        },
-        worker::{
-            test_support::{no_health_check, registry_with},
-            BasicWorkerBuilder, ModelCard, WorkerType,
+    use crate::routers::{
+        common::snapshot::test_support::registry_with,
+        grpc::{
+            backend_client::BasicWorkerBuilder,
+            multimodal::{config::MultimodalConfigRegistry, settings::MultimodalSettings},
         },
     };
 

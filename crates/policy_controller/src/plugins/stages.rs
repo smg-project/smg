@@ -671,8 +671,9 @@ mod tests {
     /// A host names a decision's rows in the affinity column's place only
     /// for a profile whose every stage answers row by row, and a plugin's
     /// stage does not. A profile that holds one, as a filter or as a scorer
-    /// beside the affinity stage, takes no sample and is named no rows: its
-    /// plugin reads the column whole.
+    /// beside the affinity stage, is named no rows: its plugin reads the
+    /// column whole. A profile of row-wise stages that reads the column and
+    /// takes no sample is named every holder.
     #[test]
     fn a_profile_that_holds_a_plugins_stage_is_named_no_rows() {
         // The sample of the profile that decides, and the cap a host names
@@ -710,6 +711,19 @@ mod tests {
             .expect("a free name, the stage's own");
         let scored = r#""score":["prefix-affinity","quiet"]"#;
         assert_eq!(named(&scoring, scored), (0, 0));
+    }
+
+    /// A plugin's rule is its own, and its stage of each kind says
+    /// nothing of what it may refuse by: the trait's own answer stands,
+    /// that it may refuse by a report of leases, and the host of its
+    /// decision applies what its gateways reported first.
+    #[test]
+    fn a_plugins_stage_of_each_kind_is_taken_as_one_that_may_refuse_by_reports() {
+        use crate::framework::{Filter, Picker};
+
+        assert!(PluginFilter::new(Arc::new(Quiet), None).refuses_by_reports());
+        assert!(PluginScorer::new(Arc::new(Quiet), None).refuses_by_reports());
+        assert!(PluginPicker::new(Arc::new(Quiet), None).refuses_by_reports());
     }
 
     /// The forwarding adapter hands the plugin the kinds its row lists and

@@ -180,6 +180,111 @@ impl WorkerFacts {
     }
 }
 
+/// Who made a row: the caller whose registration put it there. A row has
+/// one maker while its registration stands, through every refresh and every
+/// new incarnation of its key. It is what the membership door knows of a
+/// row and no fact a registrant states: it moves no revision and is no part
+/// of the facts. The door writes it, and a caller that is not a row's maker
+/// changes nothing of the row there. Two makers are one where they agree
+/// whole.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum Maker {
+    /// A control call. Any caller of the control scope changes the row.
+    #[default]
+    Control,
+    /// A provider that finds workers by itself. Its key stands apart from
+    /// the row, held once for every copy of it: a copy of the row copies no
+    /// string of its maker.
+    Provider(Arc<ProviderKey>),
+}
+
+impl Maker {
+    /// The bytes of a provider's name: a label key's bound on the wire.
+    pub const NAME_BYTES: usize = 128;
+    /// The bytes of a provider's key for one worker: a URL's bound on the
+    /// wire.
+    pub const KEY_BYTES: usize = 2_048;
+
+    /// The maker `provider` is for the worker it knows by `key`, or the part
+    /// that breaks its rule. The rules are checked here and nowhere else, so
+    /// a leader makes no maker its follower refuses.
+    ///
+    /// The name is one [`token`] of at most [`Self::NAME_BYTES`] bytes, the
+    /// form of a principal's stated name: the step that registers for a
+    /// provider acts as a principal of that name. A refusal says it as it
+    /// stands.
+    /// The key is not empty and is at most [`Self::KEY_BYTES`] bytes. It is
+    /// the provider's own text and may hold an address with a credential:
+    /// no refusal, log line or metric label carries it. A key past its bound
+    /// is refused and never shortened, since two shortened keys can meet.
+    pub fn provider(provider: impl Into<String>, key: impl Into<String>) -> Result<Self, Unmade> {
+        let (provider, key) = (provider.into(), key.into());
+        if provider.is_empty() {
+            return Err(Unmade::Provider("a provider's row names its provider"));
+        }
+        if provider.len() > Self::NAME_BYTES {
+            return Err(Unmade::Provider("a provider's name is at most 128 bytes"));
+        }
+        if !token(&provider) {
+            return Err(Unmade::Provider(
+                "a provider's name is one token of visible ASCII with no comma",
+            ));
+        }
+        if key.is_empty() {
+            return Err(Unmade::Key("a provider's row names its key for the worker"));
+        }
+        if key.len() > Self::KEY_BYTES {
+            return Err(Unmade::Key("a provider's key is at most 2048 bytes"));
+        }
+        Ok(Self::Provider(Arc::new(ProviderKey { provider, key })))
+    }
+}
+
+/// Whether `name` is one token: not empty, every byte visible ASCII (0x21 to
+/// 0x7E) and none a comma. A principal's stated name and a provider's name
+/// take this form, so one name reads the same in both; each holds its own
+/// bound. The wire lets a hop join a key's entries into one value with a
+/// comma between them, so a comma is two names.
+#[inline]
+pub fn token(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_graphic() && byte != b',')
+}
+
+/// Why a provider's name and key make no maker: the part that breaks its
+/// rule, with the rule as a refusal says it. The words hold neither text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum Unmade {
+    /// The provider's name.
+    #[error("{0}")]
+    Provider(&'static str),
+    /// The provider's key for the worker.
+    #[error("{0}")]
+    Key(&'static str),
+}
+
+/// A provider's name with its own key for one worker, each inside its rule:
+/// [`Maker::provider`] alone makes one.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ProviderKey {
+    provider: String,
+    key: String,
+}
+
+impl ProviderKey {
+    /// The provider's name.
+    pub fn provider(&self) -> &str {
+        &self.provider
+    }
+
+    /// The provider's own key for the worker.
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+}
+
 /// One worker as the store holds it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct WorkerRow {
@@ -194,6 +299,8 @@ pub struct WorkerRow {
     pub revision: u64,
     /// When the row was created on the host's clock.
     pub admitted_at: Instant,
+    /// Who made the row.
+    pub maker: Maker,
 }
 
 /// The mutable facts of a row a patch may change (`PatchWorker`; today the
@@ -280,7 +387,9 @@ pub enum MembershipTail {
 /// Every write moves the store's epoch; a write of a row's facts moves the
 /// row's revision, a status change does not. A watcher
 /// reads a snapshot with its epoch, then the changes since it; past the
-/// store's buffer it is told to snapshot again. The snapshot carries the
+/// store's buffer it is told to snapshot again, and it snapshots again
+/// where the store took another store's rows ([`Self::history`]). The
+/// snapshot carries the
 /// facts the gateways' pools derive from (role, wire modes, engine kind,
 /// reachability), never a pool list.
 ///
@@ -303,7 +412,16 @@ pub trait WorkersStore: Send + Sync {
     /// with another incarnation is `Replaced` (the old id leaves with its
     /// state); the same key and incarnation refresh the facts in place
     /// (`Resized` when the data-parallel width moved, else `Relabelled`).
-    fn upsert(&self, facts: WorkerFacts) -> MembershipChange;
+    /// A new key's row is a control call's ([`Maker::Control`]).
+    fn upsert(&self, facts: WorkerFacts) -> MembershipChange {
+        self.upsert_by(facts, Maker::Control)
+    }
+
+    /// [`Self::upsert`] from `maker`: a new key's row is made by it. A row
+    /// that stands under the key keeps the maker it has, through a refresh
+    /// and through a new incarnation, whoever calls. Who may write a row is
+    /// the membership door's test, not the store's.
+    fn upsert_by(&self, facts: WorkerFacts, maker: Maker) -> MembershipChange;
 
     /// Change a row's mutable facts; `None` when the row is gone or
     /// `revision` moved.
@@ -335,4 +453,16 @@ pub trait WorkersStore: Send + Sync {
 
     /// The changes after `epoch`, or the instruction to snapshot again.
     fn changes_since(&self, epoch: u64) -> MembershipTail;
+
+    /// Which history of rows the store holds: it moves when the rows are
+    /// replaced whole by another store's
+    /// ([`MemoryStore::restore_from`](super::MemoryStore::restore_from))
+    /// and at no write. An epoch names a place in one history, and a row
+    /// under one id and one revision may state other facts in the next, so
+    /// a watcher that keeps its place keeps this beside it and starts again
+    /// from a snapshot, trusting nothing it held, when it moves. A store
+    /// that never takes another's rows stays at `0`.
+    fn history(&self) -> u64 {
+        0
+    }
 }

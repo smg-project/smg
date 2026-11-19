@@ -13,8 +13,9 @@ use smg::{
     policies::{
         CacheAwareConfig, CacheAwarePolicy, CacheNamespace, LoadBalancingPolicy, SelectWorkerInfo,
     },
-    worker::{BasicWorkerBuilder, Worker, WorkerType},
+    routers::grpc::backend_client::BasicWorkerBuilder,
 };
+use smg_worker::identity::basic::{Worker, WorkerType};
 
 fn workers() -> Vec<Arc<dyn Worker>> {
     ["http://w1:8000", "http://w2:8000"]

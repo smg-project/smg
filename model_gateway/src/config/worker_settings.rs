@@ -7,11 +7,13 @@
 
 use std::time::Duration;
 
-use super::types::RouterConfig;
-use crate::worker::{
+use smg_worker::{
     connection::http_client::WorkerHttpClientSettings,
     health::{liveness::Budgets, overload::OverloadThresholds},
+    settings::RegistrationSettings,
 };
+
+use super::types::RouterConfig;
 
 impl RouterConfig {
     /// Gateway-level thresholds: the `--worker-overload-*` values, which
@@ -20,8 +22,8 @@ impl RouterConfig {
     /// (`worker_overload_protection: false`) switches both off whatever the
     /// thresholds say; per-worker `overload` blocks still apply on top.
     ///
-    /// [`DEFAULT_WAITING_REQUESTS`]: crate::worker::health::overload::DEFAULT_WAITING_REQUESTS
-    /// [`DEFAULT_TOKEN_USAGE_CEILING`]: crate::worker::health::overload::DEFAULT_TOKEN_USAGE_CEILING
+    /// [`DEFAULT_WAITING_REQUESTS`]: smg_worker::health::overload::DEFAULT_WAITING_REQUESTS
+    /// [`DEFAULT_TOKEN_USAGE_CEILING`]: smg_worker::health::overload::DEFAULT_TOKEN_USAGE_CEILING
     pub fn worker_overload_thresholds(&self) -> OverloadThresholds {
         if !self.worker_overload_protection {
             return OverloadThresholds::default();
@@ -34,7 +36,8 @@ impl RouterConfig {
 
     /// Every liveness budget this configuration carries: the stall, wedge and
     /// stale thresholds and the warm-up slice. The one place the budgets are
-    /// read from a configuration; `worker::configure_liveness` applies them.
+    /// read from a configuration; `smg_worker::health::liveness::configure_from`
+    /// applies them.
     pub fn worker_liveness_budgets(&self) -> Budgets {
         Budgets {
             stall: Duration::from_secs(self.worker_stall_secs),
@@ -60,12 +63,34 @@ impl RouterConfig {
             pool_idle_timeout_secs: self.upstream_pool_idle_timeout_secs,
         }
     }
+
+    /// What the worker crate's registration steps read of this
+    /// configuration: the HTTP/2 switch, the health probe's timeout, the
+    /// three startup timings and the DP switch.
+    pub fn registration_settings(&self) -> RegistrationSettings {
+        RegistrationSettings {
+            upstream_http2: self.upstream_http2,
+            health_check_timeout_secs: self.health_check.timeout_secs,
+            startup_timeout_secs: self.worker_startup_timeout_secs,
+            startup_delay_secs: self.worker_startup_delay_secs,
+            startup_check_interval_secs: self.worker_startup_check_interval_secs,
+            dp_aware: self.dp_aware,
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use openai_protocol::worker::HttpPoolConfig;
+    use smg_worker::{
+        connection::http_client::WorkerHttpClientCache,
+        health::overload::{DEFAULT_TOKEN_USAGE_CEILING, DEFAULT_WAITING_REQUESTS},
+    };
+
     use super::*;
-    use crate::worker::health::overload::{DEFAULT_TOKEN_USAGE_CEILING, DEFAULT_WAITING_REQUESTS};
+    use crate::routers::grpc::backend_client::BasicWorkerBuilder;
 
     fn gateway_config(
         protection: bool,
@@ -162,5 +187,40 @@ mod tests {
         assert!(settings.upstream_http2);
         assert_eq!(settings.request_timeout_secs, 21);
         assert_eq!(settings.pool_idle_timeout_secs, 22);
+    }
+
+    #[test]
+    fn entry_lives_exactly_as_long_as_worker_handles() {
+        let cache =
+            WorkerHttpClientCache::new(RouterConfig::default().worker_http_client_settings());
+        let handle = cache
+            .get(&HttpPoolConfig::default(), false)
+            .expect("client");
+        let probe = Arc::downgrade(&handle);
+        let worker_a = BasicWorkerBuilder::new("http://a:1")
+            .http_client(handle.clone())
+            .build();
+        let worker_b = BasicWorkerBuilder::new("http://b:1")
+            .http_client(handle)
+            .build();
+
+        drop(worker_a);
+        assert!(
+            probe.upgrade().is_some(),
+            "entry survives while another worker holds it"
+        );
+
+        drop(worker_b);
+        assert!(
+            probe.upgrade().is_none(),
+            "last worker drop releases the entry"
+        );
+
+        // The dead entry cannot be upgraded, so the next get rebuilds.
+        let rebuilt = cache
+            .get(&HttpPoolConfig::default(), false)
+            .expect("client");
+        assert!(probe.upgrade().is_none());
+        drop(rebuilt);
     }
 }

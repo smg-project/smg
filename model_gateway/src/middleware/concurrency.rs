@@ -372,9 +372,8 @@ mod tests {
         },
         observability::inflight_tracker::InFlightRequestTracker,
         policies::PolicyRegistry,
-        routers::gateway::Gateway,
+        routers::{common::snapshot::WorkerRegistry, gateway::Gateway},
         server::{health::ProbeState, http_client},
-        worker::WorkerRegistry,
     };
 
     fn test_app_state(

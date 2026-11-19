@@ -11,6 +11,7 @@ pub mod abort_on_drop;
 pub mod channel;
 pub mod codec;
 pub mod constraint_failure;
+pub mod engine_labels;
 pub mod engine_load;
 mod framed;
 pub mod media_fault;
@@ -34,7 +35,8 @@ pub use channel::{
     normalize_grpc_endpoint, Channel, DEFAULT_CONNECT_TIMEOUT,
 };
 pub use constraint_failure::{
-    constraint_failed_status, is_constraint_failure, CONSTRAINT_FAILED_METADATA_KEY,
+    constraint_failed_status, constraint_refused_status, is_constraint_failure,
+    is_constraint_refusal, CONSTRAINT_FAILED_METADATA_KEY, CONSTRAINT_REFUSED_METADATA_KEY,
 };
 /// The HTTP/2 layer under the channels, re-exported for callers that build
 /// or classify the transport faults [`is_transport_failure`] recognises.

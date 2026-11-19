@@ -103,3 +103,26 @@ impl Default for RetryConfig {
 fn default_retry_jitter_factor() -> f32 {
     0.2
 }
+
+/// What a host fixes for every worker registration it runs, read once from
+/// its own configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegistrationSettings {
+    /// Whether worker-directed clients are tuned for HTTP/2 upstreams. An HTTP
+    /// worker that declares no version is then asked for HTTP/2 with prior
+    /// knowledge beside HTTP/1.1.
+    pub upstream_http2: bool,
+    /// Timeout of one health probe, in seconds, for a worker whose own health
+    /// settings name none.
+    pub health_check_timeout_secs: u64,
+    /// How long a starting worker is polled before its registration fails, in
+    /// seconds.
+    pub startup_timeout_secs: u64,
+    /// How long a worker is left alone before its first probe, in seconds.
+    pub startup_delay_secs: u64,
+    /// The pause between two probes of a starting worker, in seconds.
+    pub startup_check_interval_secs: u64,
+    /// Whether a registration reads how many data-parallel (DP) ranks a
+    /// worker runs. A host that addresses each rank on its own turns it on.
+    pub dp_aware: bool,
+}

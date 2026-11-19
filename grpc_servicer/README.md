@@ -127,10 +127,20 @@ and never schedules. vLLM's `--allowed-media-domains`,
 `--allowed-local-media-path`, `--media-io-kwargs`, `--limit-mm-per-prompt` and
 `VLLM_*_FETCH_TIMEOUT` govern fetching on the worker; without
 `--allowed-media-domains` the worker fetches from any public host the router
-forwards. A media URL that names or resolves to a loopback, link-local or
+forwards. The worker reads that list as the router reads its own, for vLLM's
+check of the first URL and for its own check of every redirect: entries are
+trimmed and compared case-insensitively (an entry with padding or capitals,
+which used to match no host, now matches its host), and an IPv6 address is
+listed in brackets (`[2001:db8::1]`). vLLM's check wants the first URL to spell
+an IPv6 address as the entry does; on redirects any spelling of the address
+matches. A list whose entries are all blank still refuses every host. A media
+URL whose host carries an IPv6 zone ID (`[fe80::1%25eth0]`) is refused, as on
+the router, and an entry with one is ignored with a warning. A media URL that
+names or resolves to a loopback, link-local or
 private address is refused on the worker as on the router, redirects included,
-unless `SMG_MM_ALLOW_PRIVATE_MEDIA_HOSTS=1` is set for a deployment whose media
-origin is internal.
+unless `--mm-allow-private-media-hosts` (the sidecar's
+`--allow-private-media-hosts`, or `SMG_MM_ALLOW_PRIVATE_MEDIA_HOSTS=1`) is set
+for a deployment whose media origin is internal.
 Related knobs: `--mm-max-inflight` (`SMG_VLLM_MM_MAX_INFLIGHT`, default 64)
 bounds concurrent media jobs; `--mm-max-items` (`SMG_VLLM_MM_MAX_ITEMS`, unset
 by default) overrides the model's per-modality reference limits;
@@ -179,7 +189,16 @@ it is: a host that cannot be resolved, refuses the connection or answers 4xx
 is a 400; a host that does not deliver within the budget, answers 5xx or
 breaks the transfer is a 502, so a client knows whether to retry. None of
 these counts against the worker's circuit breaker, and the Router replays
-none of them on another worker, which would meet the same media.
+none of them on another worker, which would meet the same media. The vLLM Rust
+worker answers the same way for the media vLLM's own fetcher refuses under
+`--mm-processor inprocess`, by where it failed: a reference refused before
+the download (a host the policy refuses, a URL or data URL the fetcher does
+not take) or bytes that do not decode (an image the loader cannot read, bad
+base64) is a 400 `invalid_multimodal_request`; a download the origin refuses
+(a 4xx) or redirects to a host the policy refuses is a 400
+`media_fetch_failed`; a download over vLLM's size cap or an
+inline payload over `--mm-max-item-bytes` is a 400 `media_too_large`. A
+timeout, a refused connection or an origin 5xx stays retryable there.
 
 For `nvidia/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B`, the router can preprocess
 audio from `/v1/chat/completions` with `--mm-processing router`. Use a vLLM
@@ -424,7 +443,9 @@ vLLM's fixed default, so two engines on one host do not collide; an explicit
 one is kept as given, its endpoint included, and
 `SMG_VLLM_SERVICER_KV_EVENTS=0` leaves the publisher off). Tuning:
 `SMG_VLLM_SERVICER_HANDSHAKE_PORT` (default: a free port),
-`SMG_VLLM_SERVICER_DRAIN_SECS` (default 5),
+`SMG_VLLM_SERVICER_DRAIN_SECS` (default 30: the most a shutdown signal waits
+for in-flight streams; it stops as soon as none is left; see the shutdown note
+below),
 `SMG_VLLM_SERVICER_STARTUP_TIMEOUT_SECS` (default 1800: how long the servicer
 waits for a sign of life from the engine during its handshake; the launcher
 reports the engine process alive each time it polls it, and the handshake's
@@ -454,6 +475,25 @@ TokenSpeed Rust servicers alike: one runtime worker carries about 100k output
 tokens/s on one connection with its lock uncontended; raise it to 2-4 when one
 engine serves more than about 512 concurrent streams and their inter-token p99
 matters more than the servicer's CPU).
+
+**Shutdown (Rust mode).** On SIGTERM or SIGINT the servicer turns NOT_SERVING
+and drains: in-flight streams get up to `SMG_VLLM_SERVICER_DRAIN_SECS` to
+finish with the engine still up, and a second signal ends the drain at once.
+Once no stream is left the engine stays up
+`SMG_VLLM_SERVICER_DRAIN_LINGER_SECS` longer, within the drain bound: default
+5 when `--kv-transfer-config`'s `kv_role` is `kv_producer` or `kv_both`
+(the decode worker pulls a prefill's KV after its stream ended, which the
+servicer does not see), else 1. A busy decode worker can pull the KV later
+than that: NIXL reads it when the decode scheduler admits the request, so
+raise `SMG_VLLM_SERVICER_DRAIN_LINGER_SECS` for a decode tier that queues.
+Then the server stops (up to 5 s) and the engine is terminated: vLLM's own
+process manager first gives the engine cores vLLM's `--shutdown-timeout`
+(5 s when it is 0, the default) before force-killing them, then the launcher
+waits up to 30 s for them to exit. The pod's `terminationGracePeriodSeconds`
+must cover the drain bound + 5 + 5 + 30 s with a margin: 70 s by default,
+against Kubernetes' default grace of 30 s; a `--shutdown-timeout N` puts N in
+place of the second 5. The smg chart's `workers[].terminationGracePeriodSeconds`
+defaults to 90; raise it with the drain bound and the shutdown timeout.
 
 ##### Prefill/decode over NIXL on one host: restarting a side in place
 
@@ -713,15 +753,25 @@ grammar compile instead of falling back. Pin `guidance` (or `xgrammar`)
 explicitly when that matters; the engine keeps the backend of its first
 structured request either way, as it does behind vLLM's own frontend.
 
-A constraint the engine's backend cannot enforce is refused before the engine
-with INVALID_ARGUMENT (a 400 at a router), the same way on every Rust servicer:
-a JSON-schema feature xgrammar drops (`multipleOf`, `uniqueItems`, a string
-`format` it lacks, ...) wherever xgrammar is the backend, whether the schema is
-a `response_format`'s or inside a forced tool call's structural tag; every kind
-of constraint on an engine with no grammar backend; a kind the backend does not
-compile. The vLLM servicer reads the backend off `--structured-outputs-config`,
-the SGLang and TokenSpeed servicers off their engine's `--grammar-backend` (see
-their sections); a backend the servicer does not know is left to the engine.
+A constraint the engine's backend cannot enforce is refused before the engine,
+the same way on every Rust servicer: a JSON-schema feature xgrammar drops
+(`multipleOf`, `uniqueItems`, a string `format` it lacks, ...) wherever
+xgrammar is the backend, whether the schema is a `response_format`'s or inside
+a forced tool call's structural tag; every kind of constraint on an engine with
+no grammar backend; a kind the backend does not compile. The vLLM servicer
+reads the backend off `--structured-outputs-config`, the SGLang and TokenSpeed
+servicers off their engine's `--grammar-backend` (see their sections); a
+backend the servicer does not know is left to the engine. The refusal is
+`INVALID_ARGUMENT` with the trailer `smg-constraint-refused: worker`, the
+message naming the constraint, the keyword and where it stands. Behind the
+servicers a router answers the client a 400 under the code
+`unsupported_constraint` with the servicer's message alone (not
+`start_generation_failed`, nor on a disaggregated pair the side's
+`prefill_worker_failed_to_start`), replays nothing (every worker of the kind
+refuses it alike) and samples no circuit breaker against the worker. On
+`/v1/messages` the answer is the request's `invalid_request_error`, whose
+envelope carries no code (it rides in `X-SMG-Error-Code`). A router that
+predates the trailer answers a 400 under the code of whatever failed to start.
 
 A constraint the engine admitted and then could not continue the request under
 (a sampled token the grammar rejects, as speculative decoding can produce) is
@@ -1007,7 +1057,11 @@ included; `SMG_TOKENSPEED_SERVICER_KV_EVENTS=0` leaves the publisher off; a
 hybrid model's State groups leave it off, as above).
 Tuning:
 `SMG_TOKENSPEED_SERVICER_HANDSHAKE_PORT` (default: a
-free port), `SMG_TOKENSPEED_SERVICER_DRAIN_SECS` (default 5),
+free port), `SMG_TOKENSPEED_SERVICER_DRAIN_SECS` (default 30: the most a shutdown signal
+waits for in-flight streams; it stops as soon as none is left, a second signal
+at once; the pod's termination grace must cover it as for vLLM above),
+`SMG_TOKENSPEED_SERVICER_DRAIN_LINGER_SECS` (default 1: how long the scheduler
+stays up after the last stream, within the drain bound),
 `SMG_TOKENSPEED_SERVICER_WARMUP` (the planned warm-up before SERVING, as for
 vLLM above: `full` by default, `fast`, `off`, a budget in seconds or
 `<level>:<seconds>`; planned from `--max-num-seqs` and the chunk size or
@@ -1404,9 +1458,14 @@ turns on by itself, on this path as on the Python one, when the launcher is
 given no `--kv-events-config`, at a port found free on the host rather than
 SGLang's fixed default (an explicit one is kept as given, its endpoint
 included; `SMG_SGLANG_SERVICER_KV_EVENTS=0` leaves the publisher off). SGLang's
-HTTP sidecar (metrics and profiling endpoints) is not started on this path.
+HTTP sidecar is not started on this path: its admin and profiling endpoints are
+off, and the launcher serves its scheduler metrics (see Metrics below).
 Tuning: `SMG_SGLANG_SERVICER_HANDSHAKE_PORT` (default: a
-free port), `SMG_SGLANG_SERVICER_DRAIN_SECS` (default 5),
+free port), `SMG_SGLANG_SERVICER_DRAIN_SECS` (default 30: the most a shutdown
+signal waits for in-flight streams; it stops as soon as none is left, a second
+signal at once; the pod's termination grace must cover it as for vLLM above),
+`SMG_SGLANG_SERVICER_DRAIN_LINGER_SECS` (default 1: how long the scheduler
+stays up after the last stream, within the drain bound),
 `SMG_SGLANG_SERVICER_WARMUP` (the planned warm-up before SERVING, as for vLLM
 above: `full` by default, `fast`, `off`, a budget in seconds or
 `<level>:<seconds>`; planned from `--max-running-requests` and
@@ -1450,8 +1509,17 @@ and labels are the ones every engine's Rust servicer exposes (see the vLLM
 section above); the scheduler matches string stops itself, so this servicer
 has no `smg_servicer_string_stops_total` series. A port equal to `--port` is
 refused before the scheduler starts, and the flag is refused under the Python
-servicer, which exposes no endpoint (SGLang's own HTTP sidecar is not started
-on the Rust path either).
+servicer, which exposes no endpoint of its own.
+
+Under `--enable-metrics` the scheduler ranks record SGLang's scheduler series
+(running and queued requests, KV cache usage, generation throughput, queue
+time, cache hit rate) into Prometheus's multiprocess directory
+(`PROMETHEUS_MULTIPROC_DIR`), and the launcher serves them where SGLang's HTTP
+sidecar would: `GET /metrics` on `--host` at `--smg-http-sidecar-port`, else
+`--port + 1`, under SGLang's own names. The sidecar's frontend series
+(requests, aborts, time to first token, inter-token latency) are not recorded
+on this path; the families above are their counterparts. A listener that
+cannot start is logged, and the servicer runs on.
 
 ```bash
 sglang serve --model-path Qwen/Qwen3-0.6B --grpc-mode --port 30000 --metrics-port 29100
@@ -1601,8 +1669,8 @@ refused by name instead of dropped: beam search, the logits-returning flags,
 KV-cache retention, prompt-tuning and lookahead configs. `Embed` and
 `SubscribeKvEvents` answer UNIMPLEMENTED, as the Python servicer answers them;
 `GetTokenizer` serves the local tokenizer directory. The launcher's knobs are
-the shared ones under the `SMG_TRTLLM_SERVICER_*` names (handshake port, drain,
-start-up and silence bounds, prefill allowance); `--metrics-port` (and
+the shared ones under the `SMG_TRTLLM_SERVICER_*` names (handshake port, drain
+and its linger, start-up and silence bounds, prefill allowance); `--metrics-port` (and
 `--metrics-host`, `SMG_TRTLLM_SERVICER_METRICS_PORT/_HOST`) serves the Rust
 servicer's Prometheus metrics, the families every engine's Rust servicer
 exposes (see the vLLM section above), with `wire="trtllm"`.

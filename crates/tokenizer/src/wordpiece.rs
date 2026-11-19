@@ -265,8 +265,11 @@ impl WordPieceEncoder {
 
     /// The ids the post-processor puts before and after one sequence: the
     /// library frames one token no vocabulary holds, and what stands around
-    /// it is the frame.
-    fn frame<M: Model>(tokenizer: &TokenizerOf<M>) -> Result<(Vec<u32>, Vec<u32>), Declined> {
+    /// it is the frame. The direct Unigram encoder reads its frame here
+    /// too.
+    pub(crate) fn frame<M: Model>(
+        tokenizer: &TokenizerOf<M>,
+    ) -> Result<(Vec<u32>, Vec<u32>), Declined> {
         const PROBE: u32 = u32::MAX;
         let Some(post_processor) = tokenizer.get_post_processor() else {
             return Ok((Vec::new(), Vec::new()));

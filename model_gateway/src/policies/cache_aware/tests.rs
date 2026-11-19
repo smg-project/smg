@@ -1,6 +1,7 @@
 use kv_index::{compute_content_hash, ContentHash, GroupKind, SequenceHash, StoredBlock};
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
 use openai_protocol::worker::{SchedulerLoadSnapshot, WorkerLoadResponse, WorkerStatus};
+use smg_worker::load::state::TestFeed;
 use tokio::sync::watch;
 use tracing_test::traced_test;
 
@@ -11,7 +12,6 @@ use crate::{
         test_support::{make_worker, make_workers},
         PolicyRegistry, PowerOfTwoPolicy,
     },
-    worker::load::state::TestFeed,
 };
 
 #[test]
@@ -51,12 +51,17 @@ fn overlap_affinity_group(
     );
     CacheAwarePolicy::affinity_score_group(&candidates, tuning.selection_temperature)
 }
+use smg_worker::{
+    identity::basic::WorkerType,
+    runtime::StallReason,
+    test_support::{no_health_check, ready_worker},
+};
+
 use crate::{
     observability::metrics::CACHE_AWARE_MATCH_RATIO_BUCKETS,
-    worker::{
-        runtime::StallReason,
-        test_support::{no_health_check, ready_worker, worker_of},
-        BasicWorkerBuilder, WorkerBlocks, WorkerType,
+    policies::kv_index::index_backend::WorkerBlocks,
+    routers::{
+        common::snapshot::test_support::worker_of, grpc::backend_client::BasicWorkerBuilder,
     },
 };
 
@@ -5492,8 +5497,9 @@ fn a_large_pool_of_one_model_decides_as_the_scan_with_and_without_an_event_index
 #[test]
 fn a_mixed_pool_whose_first_worker_has_no_event_index_is_the_scans() {
     use openai_protocol::model_card::ModelCard;
+    use smg_worker::{identity::basic::WorkerType, test_support::no_health_check};
 
-    use crate::worker::{test_support::no_health_check, BasicWorkerBuilder, WorkerType};
+    use crate::routers::grpc::backend_client::BasicWorkerBuilder;
 
     let (policy, mut workers) = large_pool(40, 37, &[&[1, 2, 3, 4], &[5, 6, 7, 8]], test_config());
     workers[0] = Arc::new(
@@ -5520,8 +5526,9 @@ fn a_mixed_pool_whose_first_worker_has_no_event_index_is_the_scans() {
 #[test]
 fn a_mixed_pool_whose_sampled_workers_have_no_event_index_is_the_scans() {
     use openai_protocol::model_card::ModelCard;
+    use smg_worker::{identity::basic::WorkerType, test_support::no_health_check};
 
-    use crate::worker::{test_support::no_health_check, BasicWorkerBuilder, WorkerType};
+    use crate::routers::grpc::backend_client::BasicWorkerBuilder;
 
     let (policy, mut workers) = large_pool(40, 37, &[&[1, 2, 3, 4], &[5, 6, 7, 8]], test_config());
     workers[0].set_status(WorkerStatus::NotReady);

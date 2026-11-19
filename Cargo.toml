@@ -1,5 +1,5 @@
 [workspace]
-members = ["model_gateway", "model_gateway/test_harness", "crates/protocols", "crates/worker", "crates/reasoning_parser", "crates/response_template", "crates/tool_parser", "crates/symphony", "crates/workflow", "crates/tokenizer", "crates/auth", "crates/mcp",
+members = ["model_gateway", "model_gateway/test_harness", "crates/protocols", "crates/worker", "crates/service_discovery", "crates/reasoning_parser", "crates/response_template", "crates/tool_parser", "crates/symphony", "crates/workflow", "crates/tokenizer", "crates/auth", "crates/mcp",
     "crates/external_router", "crates/kv_index", "crates/data_connector", "crates/multimodal", "crates/mm_rdma", "crates/wasm", "crates/mesh", "crates/grpc_client", "crates/engine_zmq_client", "crates/engine_zmq_adapter", "crates/engine_servicer", "bindings/python", "bindings/golang", "clients/rust", "clients/openapi-gen", "crates/mock_worker", "crates/gateway_perf", "crates/rl", "crates/radix_tree", "crates/policy_controller", "examples/policy-controller"]
 resolver = "2"
 
@@ -11,6 +11,7 @@ rust-version = "1.100"
 # Internal workspace crates
 openai-protocol = { version = "1.18.0", path = "crates/protocols" }
 smg-worker = { version = "0.1.0", path = "crates/worker" }
+smg-service-discovery = { version = "0.1.0", path = "crates/service_discovery" }
 smg-mm-rdma = { version = "0.1.1", path = "crates/mm_rdma" }
 reasoning-parser = { version = "1.11.0", path = "crates/reasoning_parser" }
 smg-response-template = { version = "0.3.0", path = "crates/response_template" }
@@ -33,6 +34,9 @@ engine-zmq-client = { version = "0.5.0", path = "crates/engine_zmq_client" }
 engine-zmq-adapter = { version = "0.3.0", path = "crates/engine_zmq_adapter" }
 engine-servicer = { version = "0.4.0", path = "crates/engine_servicer" }
 smg-rl = { version = "0.3.1", path = "crates/rl" }
+# With none of its features: the gateway takes the policy document and its presets alone. The
+# crate's default set (`wasm`) is the host of its plugin stages, which the gateway does not load.
+smg-policy-controller = { version = "0.1.0", path = "crates/policy_controller", default-features = false }
 
 # Shared dependencies
 anyhow = "1.0"

@@ -27,6 +27,7 @@ tracing.workspace = true
 engine-zmq-client = { workspace = true, features = ["mock-engine"] }
 tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+zeromq.workspace = true
 
 [lints]
 workspace = true

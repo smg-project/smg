@@ -13,9 +13,8 @@ pub mod wasm_module_removal;
 // Typed workflow data structures
 pub use data::{
     McpWorkflowData, ProtocolUpdateRequest, TokenizerWorkflowData, WasmRegistrationWorkflowData,
-    WasmRemovalWorkflowData, WorkerKind, WorkerList as WorkflowWorkerList, WorkerRegistrationData,
-    WorkerRegistrationMode, WorkerRemovalWorkflowData, WorkerSpec, WorkerUpdateWorkflowData,
-    WorkerWorkflowData,
+    WasmRemovalWorkflowData, WorkerRegistrationData, WorkerRegistrationMode,
+    WorkerRemovalWorkflowData, WorkerSpec, WorkerUpdateWorkflowData, WorkerWorkflowData,
 };
 // Typed workflow engines
 pub use engines::WorkflowEngines;
@@ -46,27 +45,19 @@ pub use steps::{
     CreateExternalWorkersStep,
     // Local registration steps
     CreateLocalWorkerStep,
-    DetectConnectionModeStep,
-    DiscoverDPInfoStep,
-    DiscoverMetadataStep,
     DiscoverModelsStep,
-    DpInfo,
     // Update steps
     FindWorkerToUpdateStep,
-    // Removal steps
-    FindWorkersToRemoveStep,
     ModelInfo,
     ModelsResponse,
     RegisterWorkersStep,
     ReleaseTokenizerStep,
     RemoveFromPolicyRegistryStep,
-    RemoveFromWorkerRegistryStep,
     UpdatePoliciesForWorkerStep,
     UpdatePoliciesStep,
     UpdateRemainingPoliciesStep,
     UpdateWorkerPropertiesStep,
     WorkerList,
-    WorkerRemovalRequest,
 };
 pub use tokenizer_registration::{
     create_tokenizer_registration_workflow, create_tokenizer_workflow_data,

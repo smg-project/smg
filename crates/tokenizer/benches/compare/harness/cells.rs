@@ -1481,7 +1481,9 @@ fn cell_threads(
                 total_ns.fetch_add(ns, Ordering::Relaxed);
                 lat_op.lock().unwrap().extend(ops);
                 lat_tok.lock().unwrap().extend(per);
-                // stay alive (tables and objects resident) until the main thread has read the resident set
+                // stay alive (tables and objects resident) until the main thread has read the resident set:
+                // the first wait says this thread is done, the second returns after the read
+                hold.wait();
                 hold.wait();
             });
         }
@@ -1492,6 +1494,8 @@ fn cell_threads(
         hold.wait();
         let wall = t0.elapsed().as_nanos() as f64;
         let (rss, _) = rss_kb();
+        // the threads leave only now, after the resident set is read
+        hold.wait();
         (wall, rss)
     });
     let tt = total_tokens.load(Ordering::Relaxed) as f64;
@@ -1578,11 +1582,15 @@ fn cell_mem(
                 for r in 0..20 {
                     let _ = std::hint::black_box(tok.encode(&texts[(t + r) % texts.len()], false));
                 }
+                // alive until the main thread has read the resident set: the second wait returns after it
+                hold.wait();
                 hold.wait();
             });
         }
         hold.wait();
-        rss_kb().0
+        let rss = rss_kb().0;
+        hold.wait();
+        rss
     });
     let (rss_t2, _) = rss_kb();
     // the same with one object per thread
@@ -1596,11 +1604,15 @@ fn cell_mem(
                 for r in 0..20 {
                     let _ = std::hint::black_box(mine.encode(&texts[(t + r) % texts.len()], false));
                 }
+                // the tokenizer of this thread lives until the main thread has read the resident set
+                hold2.wait();
                 hold2.wait();
             });
         }
         hold2.wait();
-        rss_kb().0
+        let rss = rss_kb().0;
+        hold2.wait();
+        rss
     });
     emit(&json!({
         "cell":"mem","load_ms": l.load_ms,

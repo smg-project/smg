@@ -20,9 +20,9 @@ use smg::{
     middleware::TenantRequestMeta,
     routers::RouterTrait,
     tenant::TenantKey,
-    worker::{RuntimeType, Worker, WorkerType},
     workflow::Job,
 };
+use smg_worker::identity::basic::{RuntimeType, Worker, WorkerType};
 
 use super::{completion_request, prefill_worker_for};
 use crate::common;

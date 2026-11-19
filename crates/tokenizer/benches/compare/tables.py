@@ -25,6 +25,9 @@ SIZES = ("256", "2k", "32k", "128k", "500k", "1m")
 BAND = 0.20
 # A change between two releases of this crate counts as faster or slower beyond this much.
 LEVEL = 0.05
+# The step and first-delta cells time one call between two reads of a clock that moves in steps of
+# about this many nanoseconds: a change of one step or less is below what those cells resolve.
+TICK = 10.0
 
 
 def read(name):
@@ -52,7 +55,10 @@ class Run:
 
     def __init__(self, new, old):
         self.new, self.old = new, old
-        self.encode, self.misc, self.memory, self.backend, self.failed = {}, {}, {}, {}, {}
+        self.encode, self.misc, self.memory, self.backend = {}, {}, {}, {}
+        # Lines without a figure, by family, cell and column: the process failed, or it ended at
+        # status 0 and its cell found its own stream text wrong (the status `incorrect`).
+        self.failed, self.wrong = {}, {}
         for row in read("encode-rounds.csv"):
             if row["backend"]:
                 self.backend.setdefault((row["family"], row["arm"]), row["backend"])
@@ -60,9 +66,13 @@ class Run:
                 key = (row["family"], row["class"], row["mode"], row["arm"])
                 self.encode.setdefault(key, []).append(float(row["ns_per_token_p50"]))
         for row in read("misc-rounds.csv"):
+            if row["backend"]:
+                # The decode lines say which path a build took where the encode file has no line of it.
+                self.backend.setdefault((row["family"], row["arm"]), row["backend"])
             if row["rc"] != "0":
+                counts = self.wrong if row["rc"] == "incorrect" else self.failed
                 key = (row["family"], row["cell"], row["arm"])
-                self.failed[key] = self.failed.get(key, 0) + 1
+                counts[key] = counts.get(key, 0) + 1
                 continue
             for name, text in row.items():
                 if name.endswith(("_p50", "_p99")) and text:
@@ -74,8 +84,17 @@ class Run:
                     self.memory[(row["family"], name, row["arm"])] = float(text)
 
     def v1_encodes(self, family):
-        """Whether the v1 build took the v1 encoder for the family (else it ran SMG's own)."""
+        """Whether the v1 build took the v1 encoder for the family (else its next encode path)."""
         return "hf:v1" in self.backend.get((family, "v1"), "")
+
+    def v1_path(self, family):
+        """The encode path the v1 build took on a family whose file the v1 pipeline declines."""
+        backend = self.backend.get((family, "v1"), "")
+        if "hf:tokenizers" in backend:
+            return "the `tokenizers` crate's"
+        if "hf:native" in backend or "tiktoken" in backend:
+            return "SMG's own"
+        return f"`{backend}`" if backend else "one the csv files do not name"
 
     def enc(self, family, cls, mode, arm):
         if arm == "v1" and not self.v1_encodes(family):
@@ -237,11 +256,11 @@ MEMORY = (
         "the growth per thread on one shared tokenizer",
     ),
     (
-        "growth per thread, a tokenizer per thread, MB",
-        "growth_kb_per_thread_own",
+        "resident level per thread, a tokenizer per thread, MB",
+        "level_kb_per_thread_own",
         1024.0,
         ".1f",
-        "the growth per thread with a tokenizer per thread",
+        "the resident level per thread with a tokenizer per thread",
     ),
 )
 
@@ -356,17 +375,27 @@ def reading(run):
         def worse(entry):
             return -entry[4] if entry[5] else entry[4]
 
-        faster = sum(1 for entry in moved if worse(entry) < -LEVEL)
+        def one_step(entry):
+            return entry[7] == "ns" and abs(entry[2] - entry[3]) <= 1.1 * TICK
+
+        fast = [entry for entry in moved if worse(entry) < -LEVEL]
         slow = sorted((entry for entry in moved if worse(entry) > LEVEL), key=worse, reverse=True)
         named = [
-            f"{family}, {title}, {now / scale:.1f} against {before / scale:.1f} {unit}"
-            f" ({100 * change:+.1f} %)"
-            for family, title, now, before, change, _, scale, unit in slow
+            f"{entry[0]}, {entry[1]}, {entry[2] / entry[6]:.1f} against {entry[3] / entry[6]:.1f}"
+            f" {entry[7]} ({100 * entry[4]:+.1f} %{', one step of the clock' if one_step(entry) else ''})"
+            for entry in slow
         ]
+        steps = sum(1 for entry in fast if one_step(entry))
+        clock = (
+            f" The step and first-delta cells read a clock that moves in steps of about {TICK:.0f}"
+            f" ns; {steps} of the faster cells differ by one step or less."
+            if steps or any(one_step(entry) for entry in slow)
+            else ""
+        )
         lines.append(
-            f"- Against v{old}, decode, streaming and batch: of {len(moved)} cells {faster} read"
+            f"- Against v{old}, decode, streaming and batch: of {len(moved)} cells {len(fast)} read"
             f" faster and {len(slow)} slower by more than {100 * LEVEL:.0f} %,"
-            f" {len(moved) - faster - len(slow)} within it.{slower(named)}"
+            f" {len(moved) - len(fast) - len(slow)} within it.{slower(named)}{clock}"
         )
     for arm in ("fastokens", "v1"):
         for mode in ("cold", "warm"):
@@ -387,7 +416,7 @@ def reading(run):
                 f" to {percent(max(margins))} %)."
             )
     for title, cell, name, _ in DECODE:
-        margins, missing, failed = [], [], True
+        margins, missing, failed, wrong = [], [], 0, 0
         for model in MODELS:
             ours = run.other(model["name"], cell, name, run.new)
             margin = ratio(run.other(model["name"], cell, name, "fastokens"), ours)
@@ -395,10 +424,18 @@ def reading(run):
                 margins.append(margin)
             elif ours is not None:
                 missing.append(model["family"])
-                failed = failed and run.failed.get((model["name"], cell, "fastokens"), 0) > 0
+                key = (model["name"], cell, "fastokens")
+                failed += run.failed.get(key, 0) > 0
+                wrong += run.wrong.get(key, 0) > 0
         note = ""
         if missing:
-            why = ", whose process failed in every round" if failed else ""
+            why = ""
+            if failed == len(missing) and not wrong:
+                why = ", whose process failed in every round"
+            elif wrong == len(missing) and not failed:
+                why = ", whose stream text was wrong in every round"
+            elif failed or wrong:
+                why = ", whose process failed or gave a wrong stream text"
             note = f" The fastokens column has no figure for {', '.join(missing)}{why}."
         if margins:
             lines.append(against(title, "fastokens", margins, note))
@@ -434,11 +471,17 @@ def reading(run):
                 f"- Load and memory, against {label}: SMG {new} reads lower by more than"
                 f" {100 * LEVEL:.0f} % on " + "; on ".join(parts) + "."
             )
-    declined = [model["family"] for model in MODELS if not run.v1_encodes(model["name"])]
+    declined = [model for model in MODELS if not run.v1_encodes(model["name"])]
     if declined:
+        # Which path that build took on each of them, as its backend text says.
+        took = {}
+        for model in declined:
+            took.setdefault(run.v1_path(model["name"]), []).append(model["family"])
+        paths = "; ".join(f"{path} for {', '.join(names)}" for path, names in took.items())
         lines.append(
-            f"- The v1 column reads `-` for {', '.join(declined)}: the v1 pipeline declines their files,"
-            " and that build runs SMG's own encoder there."
+            f"- The v1 column reads `-` for {', '.join(model['family'] for model in declined)}:"
+            " the v1 pipeline declines their files, and that build takes its next encode path"
+            f" there ({paths})."
         )
     spread = []
     for model in MODELS:

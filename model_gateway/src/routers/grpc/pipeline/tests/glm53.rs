@@ -1,9 +1,9 @@
 //! GLM-5.3 checkpoint rendering through the normal gRPC pipelines.
 
+use smg_worker::test_support::no_health_check;
+
 use super::*;
-use crate::{
-    routers::grpc::common::stages::selection_context_length, worker::test_support::no_health_check,
-};
+use crate::routers::grpc::common::stages::selection_context_length;
 
 /// Build a checkpoint-backed tokenizer without any multimodal components.
 async fn glm53_components(worker_registry: Arc<WorkerRegistry>) -> Arc<SharedComponents> {

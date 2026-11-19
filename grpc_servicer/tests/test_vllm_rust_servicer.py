@@ -13,10 +13,12 @@ import asyncio
 import dataclasses
 import inspect
 import json
+import logging
 import os
 import re
 import subprocess
 import sys
+import time
 import types
 from pathlib import Path
 from types import SimpleNamespace
@@ -1368,7 +1370,7 @@ def test_serve_rust_starts_the_engine_cores_from_this_process(monkeypatch, tmp_p
     _install_fake_servicer(monkeypatch, FakeServer)
     monkeypatch.setattr(rust.multiprocessing, "get_context", lambda method: pytest.fail(method))
     monkeypatch.setattr(rust, "resolve_tokenizer_dir", lambda *a, **k: str(tmp_path))
-    monkeypatch.setattr(rust_lifecycle, "free_port", lambda: 24321)
+    monkeypatch.setattr(rust_lifecycle, "free_port", lambda exclude=(): 24321)
     monkeypatch.setenv("SMG_ZMQ_SOCKET_DIR", str(tmp_path))
     supervised: dict = {}
 
@@ -1420,6 +1422,20 @@ def test_install_undoes_a_fake_under_a_real_package():
     assert (vars(package).get("servicer"), sys.modules.get(name)) == before
 
 
+def test_every_rust_binding_reports_its_in_flight_requests():
+    """The drain waits on the in-flight count; a wheel built without it would
+    leave every launcher on the timed drain without a word. Skipped where the
+    `smg` wheel is not installed."""
+    servicer = pytest.importorskip("smg.servicer")
+    for name in (
+        "VllmGrpcServer",
+        "SglangGrpcServer",
+        "TokenSpeedGrpcServer",
+        "TrtllmGrpcServer",
+    ):
+        assert hasattr(getattr(servicer, name), "active_requests"), name
+
+
 def test_serve_rust_constructs_the_server_with_keywords_the_binding_takes(monkeypatch, tmp_path):
     """The keyword set `serve_rust` hands the Rust server is bound against the
     compiled binding's constructor: a fact the launcher gains without a
@@ -1431,7 +1447,7 @@ def test_serve_rust_constructs_the_server_with_keywords_the_binding_takes(monkey
     _stub_engine_exceptions(monkeypatch)
     _install_fake_servicer(monkeypatch, FakeServer)
     monkeypatch.setattr(rust, "resolve_tokenizer_dir", lambda *a, **k: str(tmp_path))
-    monkeypatch.setattr(rust_lifecycle, "free_port", lambda: 24321)
+    monkeypatch.setattr(rust_lifecycle, "free_port", lambda exclude=(): 24321)
     monkeypatch.setenv("SMG_ZMQ_SOCKET_DIR", str(tmp_path))
     constructed: dict = {}
 
@@ -1475,7 +1491,7 @@ def test_serve_rust_holds_readiness_for_the_planned_warm_up(monkeypatch, tmp_pat
     _install_fake_servicer(monkeypatch, FakeServer)
     monkeypatch.setattr(rust, "launch_engine_cores", lambda ns: FakeEngine())
     monkeypatch.setattr(rust, "resolve_tokenizer_dir", lambda *a, **k: str(tmp_path))
-    monkeypatch.setattr(rust_lifecycle, "free_port", lambda: 24321)
+    monkeypatch.setattr(rust_lifecycle, "free_port", lambda exclude=(): 24321)
     monkeypatch.setenv("SMG_ZMQ_SOCKET_DIR", str(tmp_path))
     recorded: dict = {}
 
@@ -1501,7 +1517,8 @@ def test_serve_rust_holds_readiness_for_the_planned_warm_up(monkeypatch, tmp_pat
     monkeypatch.setenv(rust.WARMUP_ENV, "off")
     assert asyncio.run(rust.serve_rust(args)) == 0
     assert recorded["server"].events == []
-    assert recorded["supervise_kwargs"] == {}
+    assert "warmup" not in recorded["supervise_kwargs"]
+    assert recorded["supervise_kwargs"]["linger_secs"] == rust_lifecycle.DRAIN_LINGER_SECS
 
 
 # ---------------------------------------------------------------------------
@@ -1602,6 +1619,287 @@ def test_supervise_drains_then_stops_on_a_signal():
     server.engine_ready = True
     assert _run_supervise(server, engine, before=lambda stop: stop.set(), drain_secs=0.01) == 0
     # Draining is announced before the stop, with the engine still up for it.
+    assert server.events == ["serving:False", "stop:1.0"]
+    assert engine.events == ["terminate"]
+
+
+class CountingServer(FakeServer):
+    """A server that reports its in-flight streams: ``counts`` is what
+    successive reads return (the last value repeats)."""
+
+    def __init__(self, counts):
+        super().__init__()
+        self.engine_ready = True
+        self._counts = list(counts)
+        self.reads: list[int] = []  # every count the drain read, in order
+
+    @property
+    def active_requests(self) -> int:
+        count = self._counts.pop(0) if len(self._counts) > 1 else self._counts[0]
+        self.reads.append(count)
+        return count
+
+
+def _drain_time(server, engine, drain_secs, linger_secs=0.0):
+    async def run():
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        await rust_lifecycle.drain_server(server, engine, drain_secs, 0.01, linger_secs=linger_secs)
+        return loop.time() - started
+
+    return asyncio.run(run())
+
+
+def test_drain_ends_at_once_when_nothing_is_in_flight():
+    assert _drain_time(CountingServer([0]), FakeEngine(), drain_secs=30.0) < 0.5
+
+
+def test_drain_waits_for_in_flight_streams_and_ends_when_they_finish():
+    # Three reads with streams open, then none: done long before the bound,
+    # and not before the count reached zero.
+    server = CountingServer([2, 2, 1, 0])
+    elapsed = _drain_time(server, FakeEngine(), drain_secs=30.0)
+    assert server.reads == [2, 2, 1, 0]
+    assert elapsed < 1.0
+
+
+def test_drain_lingers_after_the_last_stream_within_the_bound():
+    assert 0.2 <= _drain_time(CountingServer([0]), FakeEngine(), 30.0, linger_secs=0.2) < 1.0
+    # The linger never stretches the bound.
+    assert _drain_time(CountingServer([1, 0]), FakeEngine(), 0.05, linger_secs=5.0) < 0.5
+
+
+def test_the_linger_ends_when_the_engine_exits(caplog):
+    """The linger watches the engine like the rest of the drain: an engine
+    that exits meanwhile is not waited on for the rest of the linger."""
+    engine = FakeEngine()
+
+    async def run():
+        loop = asyncio.get_running_loop()
+        loop.call_later(0.1, setattr, engine, "returncode", -9)
+        started = loop.time()
+        failed = not await rust_lifecycle.drain_server(
+            CountingServer([0]), engine, 30.0, 0.01, linger_secs=30.0
+        )
+        return failed, loop.time() - started
+
+    with caplog.at_level(logging.WARNING, logger=rust_lifecycle.logger.name):
+        failed, elapsed = asyncio.run(run())
+    assert failed and 0.1 <= elapsed < 1.0
+    assert "Engine exited with code -9 during drain" in caplog.text
+
+
+def test_drain_stops_at_the_bound_and_warns_with_the_streams_it_cuts(caplog):
+    with caplog.at_level(logging.WARNING, logger=rust_lifecycle.logger.name):
+        elapsed = _drain_time(CountingServer([3]), FakeEngine(), drain_secs=0.1)
+    assert 0.1 <= elapsed < 1.0
+    assert "3 request(s) still in flight" in caplog.text
+
+
+def test_drain_ends_when_the_engine_exits():
+    engine = FakeEngine()
+    engine.returncode = -9
+    assert _drain_time(CountingServer([5]), engine, drain_secs=30.0) < 0.5
+
+
+def test_drain_without_an_in_flight_count_waits_the_whole_bound():
+    assert 0.1 <= _drain_time(FakeServer(), FakeEngine(), drain_secs=0.1) < 1.0
+
+
+class UnreadableAfter(CountingServer):
+    """Reports ``counts``, then a getter that ``fails`` (raises) or reports
+    nothing."""
+
+    def __init__(self, counts, *, fails):
+        super().__init__(counts)
+        self._reads, self._fails = len(counts), fails
+
+    @property
+    def active_requests(self):
+        if self._reads:
+            self._reads -= 1
+            return CountingServer.active_requests.fget(self)
+        if self._fails:
+            raise RuntimeError("binding lost its registry")
+        return None
+
+
+@pytest.mark.parametrize("fails", [True, False], ids=["getter-raises", "getter-returns-none"])
+def test_drain_waits_out_the_bound_when_the_count_turns_unreadable(caplog, fails):
+    """A count that cannot be read mid-drain is unknown, not zero: the rest
+    of the bound is waited out instead of stopping on streams in flight."""
+    server = UnreadableAfter([2, 2], fails=fails)
+    with caplog.at_level(logging.WARNING, logger=rust_lifecycle.logger.name):
+        elapsed = _drain_time(server, FakeEngine(), drain_secs=0.3)
+    assert 0.3 <= elapsed < 1.0
+    assert "became unreadable during the drain" in caplog.text
+    assert "waiting out the remaining" in caplog.text
+
+
+def test_drain_reports_what_it_waits_on_periodically(monkeypatch, caplog):
+    monkeypatch.setattr(rust_lifecycle, "_DRAIN_LOG_SECS", 0.05)
+    with caplog.at_level(logging.INFO, logger=rust_lifecycle.logger.name):
+        _drain_time(CountingServer([4]), FakeEngine(), drain_secs=0.2)
+    assert "Draining: 4 request(s) in flight, waiting up to 0.2s" in caplog.text
+    assert "Draining: 4 request(s) in flight after 0s" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "server",
+    [CountingServer([3]), CountingServer([0]), FakeServer()],
+    ids=["busy", "linger", "timed"],
+)
+def test_a_second_signal_cuts_the_drain_short(caplog, server):
+    """Whatever the drain waits on (streams, the linger, a timed drain), a
+    second signal ends it and the stop proceeds."""
+
+    async def run():
+        loop = asyncio.get_running_loop()
+        cut = asyncio.Event()
+        loop.call_later(0.1, cut.set)
+        started = loop.time()
+        await rust_lifecycle.drain_server(
+            server, FakeEngine(), 30.0, 0.01, linger_secs=30.0, cut=cut
+        )
+        return loop.time() - started
+
+    with caplog.at_level(logging.WARNING, logger=rust_lifecycle.logger.name):
+        assert asyncio.run(run()) < 1.0
+    assert "A second shutdown signal ended the drain" in caplog.text
+
+
+def test_the_signal_handler_starts_the_drain_then_cuts_it():
+    stop, cut = asyncio.Event(), asyncio.Event()
+    on_signal = rust_lifecycle.shutdown_signal_handler(stop, cut)
+    on_signal()
+    assert stop.is_set() and not cut.is_set()
+    on_signal()
+    assert cut.is_set()
+    on_signal()  # a third changes nothing
+    assert stop.is_set() and cut.is_set()
+
+
+def test_supervise_stops_at_once_on_a_second_signal_during_the_drain():
+    server, engine = CountingServer([5]), FakeEngine()
+
+    async def run():
+        stop, cut = asyncio.Event(), asyncio.Event()
+        on_signal = rust_lifecycle.shutdown_signal_handler(stop, cut)
+        task = asyncio.create_task(
+            rust_lifecycle.supervise(
+                server,
+                engine,
+                drain_secs=30.0,
+                stop_timeout=1.0,
+                stop_event=stop,
+                poll_secs=0.01,
+                drain_cut=cut,
+            )
+        )
+        await asyncio.sleep(0.05)
+        on_signal()  # the drain begins: five streams in flight, 30 s bound
+        await asyncio.sleep(0.1)
+        assert not task.done()
+        on_signal()
+        return await asyncio.wait_for(task, 1.0)
+
+    assert asyncio.run(run()) == 0
+    assert server.events == ["serving:False", "stop:1.0"]
+    assert engine.events == ["terminate"]
+
+
+def test_supervise_passes_its_linger_to_the_drain():
+    server, engine = CountingServer([0]), FakeEngine()
+
+    async def run():
+        stop = asyncio.Event()
+        task = asyncio.create_task(
+            rust_lifecycle.supervise(
+                server,
+                engine,
+                drain_secs=30.0,
+                stop_timeout=1.0,
+                stop_event=stop,
+                poll_secs=0.01,
+                linger_secs=0.3,
+            )
+        )
+        await asyncio.sleep(0.02)
+        stop.set()
+        started = time.monotonic()
+        await task
+        return time.monotonic() - started
+
+    assert 0.3 <= asyncio.run(run()) < 1.0
+
+
+@pytest.mark.parametrize(
+    "config, linger",
+    [
+        (None, rust_lifecycle.DRAIN_LINGER_SECS),
+        ("", rust_lifecycle.DRAIN_LINGER_SECS),
+        (SimpleNamespace(kv_role="kv_producer"), rust.KV_PRODUCER_DRAIN_LINGER_SECS),
+        (
+            {"kv_connector": "NixlConnector", "kv_role": "kv_both"},
+            rust.KV_PRODUCER_DRAIN_LINGER_SECS,
+        ),
+        ('{"kv_connector": "NixlConnector", "kv_role": "kv_producer"}', 5.0),
+        ('{"kv_connector": "NixlConnector", "kv_role": "kv_consumer"}', 1.0),
+        ("not json", rust_lifecycle.DRAIN_LINGER_SECS),
+    ],
+)
+def test_a_kv_producer_lingers_longer_after_the_drain(config, linger):
+    """A PD prefill engine's stream ends with its prefill; the decode worker
+    pulls the KV afterwards, so the engine stays up longer by default."""
+    args = argparse.Namespace(kv_transfer_config=config)
+    assert rust.default_drain_linger_secs(args) == linger
+    assert rust.VllmLauncher().default_drain_linger_secs(args) == linger
+
+
+def test_the_linger_is_read_with_the_launcher_knobs(tmp_path):
+    names = dict(
+        handshake_port_env="X_HS",
+        drain_secs_env="X_DRAIN",
+        startup_timeout_secs_env="X_START",
+        startup_ceiling_secs_env="X_CEIL",
+        silence_timeout_secs_env="X_SILENCE",
+        prefill_tokens_per_sec_env="X_PREFILL",
+        drain_linger_secs_env=rust.DRAIN_LINGER_SECS_ENV,
+    )
+    socket_dir = {"SMG_ZMQ_SOCKET_DIR": str(tmp_path)}
+    read = rust_lifecycle.read_launcher_knobs
+    assert read(**names, environ=socket_dir).drain_linger_secs == rust_lifecycle.DRAIN_LINGER_SECS
+    producer = read(**names, default_drain_linger_secs=5.0, environ=socket_dir)
+    assert producer.drain_linger_secs == 5.0
+    env = {rust.DRAIN_LINGER_SECS_ENV: "0", **socket_dir}
+    assert read(**names, default_drain_linger_secs=5.0, environ=env).drain_linger_secs == 0.0
+    with pytest.raises(rust_lifecycle.ServicerConfigError, match="must be at least 0"):
+        read(**names, environ={rust.DRAIN_LINGER_SECS_ENV: "-1", **socket_dir})
+
+
+def test_an_unset_drain_knob_is_thirty_seconds(tmp_path):
+    """The drain bound's default is what the chart's termination grace is
+    sized for: 30 s when the launcher's variable is unset."""
+    launcher = rust.VllmLauncher()
+    knobs = rust_lifecycle.read_launcher_knobs(
+        handshake_port_env=launcher.handshake_port_env,
+        drain_secs_env=launcher.drain_secs_env,
+        startup_timeout_secs_env=launcher.startup_timeout_secs_env,
+        startup_ceiling_secs_env=launcher.startup_ceiling_secs_env,
+        silence_timeout_secs_env=launcher.silence_timeout_secs_env,
+        prefill_tokens_per_sec_env=launcher.prefill_tokens_per_sec_env,
+        drain_linger_secs_env=launcher.drain_linger_secs_env,
+        environ={"SMG_ZMQ_SOCKET_DIR": str(tmp_path)},
+    )
+    assert rust.DRAIN_SECS_ENV == "SMG_VLLM_SERVICER_DRAIN_SECS"
+    assert knobs.drain_secs == 30.0
+
+
+def test_supervise_stops_an_idle_server_without_waiting_out_the_drain_bound():
+    server, engine = CountingServer([0]), FakeEngine()
+    started = time.monotonic()
+    assert _run_supervise(server, engine, before=lambda stop: stop.set(), drain_secs=30.0) == 0
+    assert time.monotonic() - started < rust_lifecycle.DRAIN_LINGER_SECS + 1.0
     assert server.events == ["serving:False", "stop:1.0"]
     assert engine.events == ["terminate"]
 
@@ -1823,7 +2121,7 @@ def test_serve_rust_wires_the_server_the_engine_and_the_supervisor(monkeypatch, 
 
     monkeypatch.setattr(rust, "launch_engine_cores", fake_launch)
     monkeypatch.setattr(rust, "resolve_tokenizer_dir", lambda *a, **k: str(tmp_path))
-    monkeypatch.setattr(rust_lifecycle, "free_port", lambda: 24321)
+    monkeypatch.setattr(rust_lifecycle, "free_port", lambda exclude=(): 24321)
     monkeypatch.setattr(sys, "argv", ["vllm", "serve", "org/m", "--grpc", "--port", "50051"])
     monkeypatch.setenv("SMG_ZMQ_SOCKET_DIR", str(tmp_path))
     monkeypatch.setenv("SMG_VLLM_SERVICER_DRAIN_SECS", "0")

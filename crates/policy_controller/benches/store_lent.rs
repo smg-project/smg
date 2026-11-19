@@ -77,7 +77,6 @@ enum Beside {
 /// the instant its last window opened.
 fn pool_of(n: usize, beside: Beside) -> (MemoryStore, Vec<WorkerId>, Instant) {
     let store = MemoryStore::new();
-    let opened = Instant::now();
     let register = |key: String, reachable_from: Reachability| {
         let id = store
             .upsert(WorkerFacts {
@@ -98,22 +97,23 @@ fn pool_of(n: usize, beside: Beside) -> (MemoryStore, Vec<WorkerId>, Instant) {
         id
     };
     let ids: Vec<WorkerId> = (0..n)
-        .map(|index| {
-            let id = register(format!("http://w{index}:8000"), Reachability::Any);
-            store.record(id, 0, record_of(index), opened, LoadSource::Stream);
-            id
-        })
+        .map(|index| register(format!("http://w{index}:8000"), Reachability::Any))
         .collect();
-    match beside {
-        Beside::Nothing => {}
-        Beside::Veto => {
-            let until = Some(opened + Duration::from_secs(3_600));
-            store.gateway_veto(ASKER, ids[1], until);
-        }
-        Beside::Local => {
-            let theirs = Reachability::Gateway(GatewayId(2));
-            register("unix:///local".to_string(), theirs);
-        }
+    if beside == Beside::Local {
+        let theirs = Reachability::Gateway(GatewayId(2));
+        register("unix:///local".to_string(), theirs);
+    }
+    // The store stamps a membership write with its own clock, and the build
+    // those writes leave owed is due from the first of them. The pool's
+    // clock is read behind the last registration: the publication one
+    // window on is then due however long the registrations took.
+    let opened = Instant::now();
+    for (index, &id) in ids.iter().enumerate() {
+        store.record(id, 0, record_of(index), opened, LoadSource::Stream);
+    }
+    if beside == Beside::Veto {
+        let until = Some(opened + Duration::from_secs(3_600));
+        store.gateway_veto(ASKER, ids[1], until);
     }
     let opened = opened + PUBLISH_WINDOW;
     store.publish(opened);

@@ -168,7 +168,9 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// Returns a reference to avoid cloning on every access
     fn connection_mode(&self) -> &ConnectionMode;
 
-    /// Get the worker's lifecycle status.
+    /// Get the worker's lifecycle status. A worker that returns a runtime
+    /// state ([`Self::runtime_state`]) reads its status from it: the
+    /// registry's health sink reads the status that stands there.
     fn status(&self) -> WorkerStatus;
 
     /// Get the current monotonic worker revision.

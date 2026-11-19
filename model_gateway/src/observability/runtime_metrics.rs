@@ -58,9 +58,8 @@ use std::{
 };
 
 use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
+use smg_worker::metrics::writers::intern_string;
 use tokio::runtime::{Handle, RuntimeMetrics};
-
-use crate::worker::metrics::intern_string;
 
 /// Canary sleep interval. Wake drift is measured against this.
 const CANARY_INTERVAL: Duration = Duration::from_millis(10);

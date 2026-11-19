@@ -10,6 +10,10 @@ use openai_protocol::worker::WorkerLoadResponse;
 use rand::SeedableRng;
 use rand::{rngs::StdRng, RngExt};
 use rustc_hash::FxHashMap;
+use smg_worker::{
+    identity::basic::{Worker, WorkerType},
+    load::state::{LoadReceiver, LoadSnapshot},
+};
 use tracing::debug;
 
 use super::{get_healthy_worker_indices, LoadBalancingPolicy, SelectWorkerInfo};
@@ -17,14 +21,7 @@ use super::{get_healthy_worker_indices, LoadBalancingPolicy, SelectWorkerInfo};
 pub use crate::policies::expected_wait::{
     DEFAULT_KV_PRESSURE_WEIGHT, DEFAULT_MEAN_PREFILL_TOKENS, DEFAULT_THROUGHPUT,
 };
-use crate::{
-    observability::cache_trace,
-    policies::expected_wait::ExpectedWait,
-    worker::{
-        load::state::{LoadReceiver, LoadSnapshot},
-        Worker, WorkerType,
-    },
-};
+use crate::{observability::cache_trace, policies::expected_wait::ExpectedWait};
 
 /// Dispatches kept per worker between reports. A worker that never reports
 /// (a dark fleet is scored by its live in-flight count instead) would
@@ -1305,14 +1302,17 @@ mod tests {
     use std::collections::HashMap;
 
     use openai_protocol::worker::SchedulerLoadSnapshot;
+    use smg_worker::{
+        identity::basic::WorkerType,
+        load::state::{one_rank_load, one_rank_load_reqs_only, TestFeed},
+        test_support::no_health_check,
+    };
 
     use super::*;
     use crate::{
         policies::test_support::{fed_pair, make_worker, make_workers},
-        worker::{
-            load::state::{one_rank_load, one_rank_load_reqs_only, TestFeed},
-            test_support::{no_health_check, worker_of},
-            BasicWorkerBuilder, WorkerType,
+        routers::{
+            common::snapshot::test_support::worker_of, grpc::backend_client::BasicWorkerBuilder,
         },
     };
 

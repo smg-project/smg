@@ -1512,7 +1512,7 @@ mod tests {
         assert_eq!(session.status().await, (Code::Aborted, ENDED.to_owned()));
         assert_eq!(
             LeasesStore::get(&*store, gateway, LeaseId(1)).map(|record| record.state),
-            Some(LeaseState::Issued),
+            Some(LeaseState::ISSUED),
             "a fenced replica releases nothing"
         );
     }
@@ -1626,7 +1626,7 @@ mod tests {
         );
         assert_eq!(
             LeasesStore::get(&*store, gateway, LeaseId(1)).map(|record| record.state),
-            Some(LeaseState::Issued),
+            Some(LeaseState::ISSUED),
             "a frame the floor refuses is not applied"
         );
     }

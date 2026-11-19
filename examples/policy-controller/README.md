@@ -46,8 +46,11 @@ instead ([`wasm-guest-policy`](../wasm/wasm-guest-policy)).
 1. Write the stage. Implement `Scorer`, `Filter` or `Picker` for a type of
    yours. A scorer writes one score for each row it is handed, from 0 to 1
    with higher better, and allocates nothing. A stage declares what it reads
-   in `needs`: `Pack` declares the load reports. A stage that keeps no state
-   takes every default of `Lifecycle`.
+   in `needs`: `Pack` declares the load reports. A stage that only places
+   says so in `refuses_by_reports`, as `Pack` does. A stage that says nothing
+   is taken as one that may refuse a request by its gateways' reports of
+   leases, and each decision under it applies those reports first. A stage
+   that keeps no state takes every default of `Lifecycle`.
 2. Register it. Start from `Catalog::builtin()` and add the stage under a new
    name with `scorer`, `filter` or `picker`. The name must be free among the
    built-ins and across the three kinds, and it must be the name the stage

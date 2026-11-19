@@ -5,6 +5,7 @@ edition = "2021"
 description = "Worker wire types, settings and optional runtime for SMG"
 license = "Apache-2.0"
 repository = "https://github.com/smg-project/smg"
+readme = "README.md"
 keywords = ["smg", "llm", "gateway", "worker", "types"]
 categories = ["data-structures"]
 # The default-layer case walks the workspace's manifests, which a published
@@ -63,6 +64,10 @@ runtime = [
 # of a crate that hosts it. Its scripted engine speaks through tonic's prost
 # codec.
 test-util = ["runtime", "dep:tonic-prost"]
+# The worker side of the workflows a host runs over its workers on the
+# workflow engine: the steps of a worker's removal, the start of a worker's
+# registration, the data they pass along and the host trait they read.
+workflow = ["runtime", "dep:wfaas"]
 
 [dependencies]
 anyhow = { workspace = true, optional = true }
@@ -95,6 +100,7 @@ tonic-prost = { workspace = true, optional = true }
 tracing = { workspace = true, optional = true }
 url = "2.5"
 uuid = { workspace = true, optional = true }
+wfaas = { workspace = true, optional = true }
 
 [dev-dependencies]
 # The test servers speak HTTP/2 to the prior-knowledge clients.

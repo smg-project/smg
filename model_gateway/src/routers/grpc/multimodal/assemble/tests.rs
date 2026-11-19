@@ -1233,10 +1233,11 @@ fn tokenspeed_epd_items_and_hashes_follow_prompt_binding_order() {
 #[cfg(target_os = "linux")]
 fn an_inline_encode_assembly_writes_no_shared_memory() {
     use openai_protocol::worker::{TransportMode, WorkerSpec};
+    use smg_worker::identity::basic::Worker;
 
-    use crate::{
-        routers::grpc::proto_wrapper::{mm_shm_dev_writable, TokenSpeedTensorStorage},
-        worker::{BasicWorkerBuilder, Worker},
+    use crate::routers::grpc::{
+        backend_client::BasicWorkerBuilder,
+        proto_wrapper::{mm_shm_dev_writable, TokenSpeedTensorStorage},
     };
 
     if !mm_shm_dev_writable() {
@@ -1571,7 +1572,7 @@ fn a_mixed_size_batch_is_refused_by_a_worker_that_normalizes_on_device() {
 /// unknown or absent labels retain float32 and integer metadata stays intact.
 #[test]
 fn sglang_assembly_honors_worker_dtype_for_all_batches() {
-    use crate::worker::BasicWorkerBuilder;
+    use crate::routers::grpc::backend_client::BasicWorkerBuilder;
 
     for (label, expected, width) in [
         (None, "float32", 4),

@@ -1,12 +1,16 @@
 //! The gRPC disaggregation mode (Regular/PD/EPD).
 
+use smg_worker::identity::basic::ConnectionMode;
+
 use crate::{
     config::types::{RouterConfig, RoutingMode},
-    routers::grpc::{
-        common::stages::WorkerSelectionMode,
-        context::{ExecutionPlanKind, PlanSettings},
+    routers::{
+        common::snapshot::RoutingPool,
+        grpc::{
+            common::stages::WorkerSelectionMode,
+            context::{ExecutionPlanKind, PlanSettings},
+        },
     },
-    worker::{ConnectionMode, RoutingPool},
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

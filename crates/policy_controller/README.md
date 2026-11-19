@@ -41,10 +41,11 @@ bindings:
 | `match: { model: "*" }` | This binding matches every model. |
 | `profile: default` | A matching request uses the profile `default`. |
 
-Four more rules:
+A few more rules:
 
 - `filter` and `score` may be left out. `pick` is required.
 - With one profile, `bindings` may be left out. The profile then serves every request. With two profiles or more, the bindings are required.
+- `view.max_report_age_ms` is optional and takes a whole number from 1 to 3,599,999. At decision time, built-in load scorers treat a report older than the limit like a missing report. A report exactly at the limit still counts. Omit the limit to use reports of any age.
 - A field the format does not know is refused by name. Nothing is ignored.
 - The document has no `kind` line. A document that writes one is refused.
 
@@ -459,16 +460,17 @@ The `manual` preset is a **sessions rule** and nothing else. A rule sits on a bi
 | `assignment` | `delegate` | How a new key gets its worker: `random`, `min_load` (the fewest running requests), `min_group` (the fewest active keys) or `delegate` (the profile's own stages). |
 | `ttl_s` | 14400 | Seconds an idle key stays remembered. |
 | `sweep_s` | 120 | Seconds between two sweeps of idle keys. |
-| `inflight_cap` | 2 | Requests of one key a worker carries before the next one goes elsewhere. `65535` means no cap. |
+| `inflight_cap` | 2 | Requests of one key a worker carries before the next one is placed again, over every usable worker. The key's worker changes only to another worker under the cap. `65535` means no cap. |
 | `recovery` | `original` | Which worker leads when both of a key's workers are usable: `original`, the first, or `latest`. |
 
-One more rule for the hash ring. Under `consistent_hashing`, a key stays on its worker while that worker is over the overload thresholds. `overload.shed_when_all_vetoed: true` on the binding moves the key to the ring's next worker instead.
+One more rule for the hash ring. Under `consistent_hashing`, a key stays on its worker while that worker is over the overload thresholds. `overload.shed_when_all_vetoed: true` on the binding moves the key to the ring's next worker instead. At the in-flight cap the ring places the request on the key's worker again, so the cap moves the key only where the overload veto drops that worker.
 
 ## Loading and changing a document
 
 The stock controller takes its document from one of two sources. A start names exactly one.
 
 The binary needs the crate's `controller` feature. Without it the binary is not built.
+The feature builds from a checkout of this repository. Its build script reads the worker crate's proto directory, which a copy from the registry does not hold.
 
 ```sh
 cargo build --release -p smg-policy-controller --features controller
@@ -484,12 +486,20 @@ smg-policy-controller --controller-id controller-0 --spec-file policy.yaml
 - It is read at the start. A file that cannot be read, or a document that is refused, stops the start.
 - It is then watched, by a look each second. A changed file is applied in place as the next generation. Nothing restarts.
 - A changed file that is refused is rejected whole. The running document stays.
+- With a standby, the leader's file decides. The standby follows each document its leader applies and runs it under the leader's number. It looks at its own file all the while and applies nothing from it. When it takes the lead it applies its file's document as the next generation, unless that document ran on it since the file last changed. That comes within about two seconds of the take, and the replica runs the document it followed until then. A file whose document ran there since, applied by the replica or told by its leader, waits for its next change: a mount that lags behind the leader's brings no older document back.
+- Under a shared lease a replica checks its file at the start and applies it when it leads. Two replicas that start over two versions of the file still pair up: the second follows the first, and runs its own file's document once it leads. So a rollout of a new file takes effect as the new replicas take over.
+- A file whose document never ran on the replica counts as the newer word. So a replica that starts over an older file runs it once it leads, and so does one whose mount took a document that its leader's mount skipped. A file that changes less than two looks ahead of the generation that replaces its document counts the same way. Each brings an older document back with no hand of an operator, until the mount's next sync. A document that states its own `generation` has none of this. It counts as run only under its own number: a higher number runs at the take, and one at or under the running generation never runs.
+- A standby says nothing of a file it cannot read or that does not run: its silence is no verdict on its file. The replica tells it once it leads.
+- A leader that followed nobody applies its file's document a moment behind the start of its lead. Until then its `Decide` call answers `Busy` with no reason: the gateway is to decide that request itself. The controller counts those under the cause `document_awaited` of `smg_policy_controller_decide_no_decision_total`, and `GetPolicySpec` says no document is held.
+
+**The lease as a file.** A limit first. Each renewal of a file lease is a durable write, once a second by default. On a volume whose sync can take over a second, the leader answers `Busy` for that time. Under the default timing a renewal that takes two seconds also ends its gateways' sessions, which dial again, and one that takes three can lose the lease. Keep the file on a quiet local volume, or run the slower timing: `--lease-duration-ms 15000 --lease-renew-deadline-ms 10000 --lease-renew-period-ms 2000`, which leaves a renewal 8 seconds. With `--lease-file <path>` the replicas of one host elect their leader over that file. Its directory must exist.
 
 **A store.** `--spec-store <directory>` takes the place of the file. Documents then arrive through the apply call, `ApplyPolicySpec`, in its enforce mode.
 
 - Each document is saved in the directory before it runs, one file for each generation. The last 8 stay on file.
 - `RollbackPolicySpec` runs one of them again, as the next generation.
 - `GetPolicySpec` reads the running document, under either source.
+- `GetSnapshot` with its `SLICE_SPEC` slice tells the running generation and its digest, under either source. Under a store it also lists the generations on file that a rollback can name. The leader serves it.
 - The calls are gRPC, on the controller's control listener. [`contracts/policy_controller.proto`](contracts/policy_controller.proto) defines them. The repository ships no command-line client for them yet.
 
 **A dry run.** `ApplyPolicySpec` in its dry-run mode checks a document and applies nothing. It says whether the document would run. If not, it gives the one issue that refuses it: the field's path and the reason. It works under either source.
@@ -536,6 +546,26 @@ policy spec rejected: the running generation stays generation=1 error=profiles.d
 
 On the admin listener's `/metrics`, `smg_policy_spec_generation` is the generation that runs, and `smg_policy_spec_apply_total` counts each change as applied or rejected.
 
+### Explain
+
+Each decider can keep 1,024 sampled decisions. Once full, the ring covers about `1,024 × N / R` seconds at sample `N` and a steady rate of `R` picks and sheds per second on that decider. At sample 1 and 1,024 decisions per second, that is one second.
+
+Set `explain: {sample: N}` in the policy document. Use a whole number from 0 to 4,294,967,295. The default, 0, turns sampling off. At 1 the decider keeps every pick and shed. At higher rates it keeps every Nth pick or shed, counting separately at each seat. A new generation starts the count over, and earlier samples stay available until overwritten. A refusal takes no place in the ring.
+
+The first sample at a seat allocates its slots, and the ring overwrites the oldest record when full. The slot storage per decider is 1,024 times the size of a record. A decision keeps its seat when only the sampling rate changes.
+
+Use `Explain` on the control listener with `gateway_id` and `request_id`. A miss returns `NOT_FOUND`. The leader serves this call, with each new term starting empty. A replica that follows returns the leader's address when it knows one. In process, `Door::explain` reads the same key, using the store's gateway id.
+
+**Limits**
+
+- A decision id is refused by field, and the record leaves `decision_id` empty.
+- The record holds no request facts, session keys or headers. It echoes the lookup key and gives the decision and its trace without leases.
+- The full candidate list is unset. The trace holds its own top scores.
+- The view digest is unset.
+- Plugin projections are unset.
+- The lifecycle outcome is unset.
+- Stage and plan names come from the standing generation. An older record keeps its positions and trace.
+
 ## A stage of your own
 
 ```rust
@@ -566,9 +596,11 @@ A stage is a Rust type that implements `Filter`, `Scorer` or `Picker`. You add i
 - A sessions rule under `pd-pair` or `epd`.
 - The `best-with-temperature` picker, and three settings of `prefix-affinity`: `decay`, `accounting_ttl_ms` and `spill.uncached_credit`.
 - The `bucket` scorer in the stock controller. The library runs it. The stock controller refuses a document that names it, because it does not yet report every request's end to a stage.
+- `prefix-affinity` with `source` set to `predictor` or `merged` in the stock controller. Both read the prefixes sent to each worker. The library validates them for a host that fills that column. The stock controller refuses a document that names either, because it does not yet record the prefixes it sent.
 - Cache events in the stock controller. Its `PushKvEvents` call is not served, and nothing else feeds its cache index. So `prefix-affinity` sees no worker as holding a prefix there. The library places by cache for a host that feeds the index.
 - Two more inputs in the stock controller. A worker's row has a circuit-breaker bit that nothing feeds yet, so `healthy` reads it as closed. A gateway's own breaker still counts: its breaker veto on its session takes the worker out of that gateway's decisions. A key's count of requests in flight is not fed, so `inflight_cap` passes no worker over.
 - A plugin named in the document. The format has no field for one.
-- Six calls of the contract: `Explain`, `GetSnapshot`, `PushLoad`, `PushKvEvents`, `StepDown` and `WatchRegime`. The stock controller answers each as not served.
+- Four calls of the contract: `PushLoad`, `PushKvEvents`, `StepDown` and `WatchRegime`. The stock controller answers each as not served.
+- Eight of the ten slices of the snapshot call, `GetSnapshot`. The stock controller serves the worker rows and the spec's status. It refuses a request for any other slice by the slice's name, and a request that names no slice asks for all ten. It also refuses a request for identifiers in clear.
 - The audit mode of the apply call.
 - The gateway's use of the controller.

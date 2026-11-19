@@ -30,9 +30,10 @@ use std::{fs, path::PathBuf};
 
 use serde::Serialize;
 use smg_grpc_client::tokenspeed_proto as ts;
+use smg_worker::identity::basic::{ConnectionMode, RuntimeType};
 
 use super::*;
-use crate::worker::{BasicWorkerBuilder, ConnectionMode, RuntimeType};
+use crate::routers::grpc::backend_client::BasicWorkerBuilder;
 
 const URL: &str = "ipc:///tmp/classic-sticky-rank.ipc";
 

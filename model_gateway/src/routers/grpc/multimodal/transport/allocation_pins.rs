@@ -9,17 +9,21 @@
 use std::sync::Arc;
 
 use llm_multimodal::{EncoderDtype, Modality};
-use openai_protocol::worker::RuntimeType;
+use openai_protocol::{model_card::ModelCard, worker::RuntimeType};
+use smg_worker::{
+    identity::basic::{ConnectionMode, Worker, WorkerType},
+    test_support::no_health_check,
+};
 
 use super::{
     mm_encoder_input_dtype, mm_sglang_encoder_input_dtype, mm_vllm_encoder_input_dtype,
     shared_image_wire_dtype_over, DtypeOverrides,
 };
-use crate::{
-    routers::grpc::{context::WorkerSelection, mode::Mode, testing::bytes_allocated_during},
-    worker::{
-        test_support::no_health_check, BasicWorkerBuilder, ConnectionMode, ModelCard, Worker,
-        WorkerRegistry, WorkerType,
+use crate::routers::{
+    common::snapshot::WorkerRegistry,
+    grpc::{
+        backend_client::BasicWorkerBuilder, context::WorkerSelection, mode::Mode,
+        testing::bytes_allocated_during,
     },
 };
 

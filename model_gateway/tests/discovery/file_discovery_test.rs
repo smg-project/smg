@@ -5,13 +5,10 @@
 
 use std::{path::Path, sync::Arc, time::Duration};
 
-use smg::{
-    app_context::AppContext,
-    config::RoutingMode,
-    service_discovery::{
-        start_service_discovery, FileProviderConfig, RuntimeDiscoveryConfig, DISCOVERY_ID_LABEL,
-        DISCOVERY_PROVIDER_LABEL,
-    },
+use smg::app_context::AppContext;
+use smg_service_discovery::{
+    start_service_discovery, DiscoveryHost, FileProviderConfig, Roles, RuntimeDiscoveryConfig,
+    DISCOVERY_ID_LABEL, DISCOVERY_PROVIDER_LABEL,
 };
 use tokio::task::JoinHandle;
 
@@ -55,17 +52,11 @@ async fn start_file_discovery_every(
     interval: Duration,
     app_context: &Arc<AppContext>,
 ) -> JoinHandle<()> {
-    let config = FileProviderConfig::new(
-        path.to_path_buf(),
-        interval,
-        &RoutingMode::Regular {
-            worker_urls: vec![],
-        },
-    )
-    .unwrap();
+    let config =
+        FileProviderConfig::new(path.to_path_buf(), interval, Some(Roles::Regular)).unwrap();
     start_service_discovery(
         RuntimeDiscoveryConfig::File(config),
-        Arc::clone(app_context),
+        Arc::clone(app_context) as Arc<dyn DiscoveryHost>,
     )
     .await
     .unwrap()
