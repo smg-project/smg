@@ -25,13 +25,15 @@
 //! Where another call is let in or a watch is open, the first read at a
 //! place copies every row under the membership lock and keeps the copy,
 //! and each read that starts there shares it: calls that come together
-//! hold that lock once a write, as watches do. The last call out lets the
-//! copy go where no watch is open to share it ([`Turn`],
+//! hold that lock once a write, as watches do. A call with no limit and no
+//! models takes that road too, alone or not: it would copy every row
+//! anyway, and a call let in while it runs shares the copy. The last call
+//! out lets the copy go where no watch is open to share it ([`Turn`],
 //! [`Watchers::unshared`](super::watch_workers::Watchers::unshared)): a
-//! copy of every row is held only while a reader can share it. A call that
-//! is alone with no watch open copies the rows it may tell and keeps
-//! nothing ([`MemoryStore::rows_serving`]): its limit's worth, or every row
-//! its models serve where it states no limit.
+//! copy of every row is held only while a reader can share it. Any other
+//! call that is alone with no watch open copies the rows it may tell and
+//! keeps nothing ([`MemoryStore::rows_serving`]): its limit's worth, or
+//! every row its models serve where it states no limit.
 //!
 //! A decision reads the published world and does not wait on that lock.
 //! Whatever takes it waits for a copy, on the thread that brought it.
@@ -313,8 +315,10 @@ pub(crate) enum Rows {
 /// The rows of one take, by the cheapest road that keeps calls that come
 /// together at one copy a write. A cut kept at the log's head is shared
 /// with no copy. Where another call is let in or a watch is open the
-/// feed's cut is taken and kept: somebody can share it. A call that is
-/// alone with no watch open reads the rows it may tell and keeps nothing.
+/// feed's cut is taken and kept: somebody can share it. A call with no
+/// limit and no models takes it too: it would copy every row anyway, and a
+/// call let in while it runs shares the copy. Any other call that is alone
+/// with no watch open reads the rows it may tell and keeps nothing.
 pub(crate) fn read(
     asked: &Asked,
     turn: &Turn,
@@ -325,7 +329,8 @@ pub(crate) fn read(
     if let Some(cut) = feed.kept_at_head() {
         return Rows::Shared(cut);
     }
-    if turn.let_in() > 1 || watchers.open() {
+    let every = asked.limit == usize::MAX && asked.models.is_empty();
+    if every || turn.let_in() > 1 || watchers.open() {
         return Rows::Shared(feed.rows_at_head(store));
     }
     let (rows, serving) =
