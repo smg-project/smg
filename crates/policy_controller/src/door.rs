@@ -1065,8 +1065,8 @@ pub struct Request<'a> {
     /// host's what the deciding view adds: the instant in the rows'
     /// clock, the affinity column, the rows the store names and the
     /// leases' counts. A budget of 0 states none, and the engine is told
-    /// no bound. A frame's 0 says none is left: a host refuses a request
-    /// whose time is spent itself.
+    /// no bound. A frame's 0 says none is left: a host itself refuses a
+    /// request whose time is spent.
     pub facts: RequestFacts<'a>,
     /// What the host alone knows. The door writes its standing vetoes and
     /// the pins of record over the host's.
@@ -1322,7 +1322,9 @@ impl Door {
 
     /// The store the door decides over, for what a host reads and
     /// publishes there. What became of a lease it says through
-    /// [`Door::report`].
+    /// [`Door::report`], and its clock runs through [`Door::sweep`] alone:
+    /// the store's own pass ([`LeasesStore::expire`]) asks no host, and
+    /// would end a lease whose dispatch the door still keeps.
     #[must_use]
     pub fn store(&self) -> &Arc<MemoryStore> {
         &self.store
