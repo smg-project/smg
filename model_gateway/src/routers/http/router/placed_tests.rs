@@ -49,6 +49,7 @@ const CHAT: &str = "/v1/chat/completions";
 const GENERATE: &str = "/generate";
 const GENERATE_BODY: &[u8] = br#"{"text":"hi"}"#;
 const TRANSCRIBE: &str = "/v1/audio/transcriptions";
+const AUDIO_TYPE: &str = "audio/wav";
 
 fn router(worker_registry: Arc<WorkerRegistry>, host: Option<Host>) -> Router {
     Router {
@@ -287,8 +288,9 @@ async fn a_workers_failure_completes_its_lease_before_the_retry_asks() -> Case {
 
     // Only A can take the first attempt. Its answer makes B ready to retry.
     let first_store = Arc::clone(&store);
-    serve_chat(
+    serve_worker(
         first,
+        CHAT,
         post(move || {
             let ready = first_store
                 .set_status(b_row.id, RowStatus::Ready, b_row.revision)
@@ -303,8 +305,9 @@ async fn a_workers_failure_completes_its_lease_before_the_retry_asks() -> Case {
     let at_retry = Arc::new(AtomicUsize::new(0));
     let count = Arc::clone(&at_retry);
     let retry_store = Arc::clone(&store);
-    serve_chat(
+    serve_worker(
         retry,
+        CHAT,
         post(move || {
             count.store(LeasesStore::live(&*retry_store, GATEWAY), Ordering::SeqCst);
             async { StatusCode::OK }
@@ -347,9 +350,9 @@ async fn a_send_that_reaches_no_worker_completes_as_a_failed_connection() -> Cas
     clippy::disallowed_methods,
     reason = "the test server stops with its runtime"
 )]
-fn serve_chat(listener: TcpListener, handler: MethodRouter) {
+fn serve_worker(listener: TcpListener, path: &'static str, handler: MethodRouter) {
     tokio::spawn(
-        async move { axum::serve(listener, axum::Router::new().route(CHAT, handler)).await },
+        async move { axum::serve(listener, axum::Router::new().route(path, handler)).await },
     );
 }
 
@@ -357,13 +360,14 @@ const FIRST_FRAME: &[u8] = b"data: a\n\n";
 const FRAME_WAIT: Duration = Duration::from_secs(5);
 
 /// The caller sends each frame after reading the previous one.
-async fn gated_stream() -> Case<(String, mpsc::Sender<Bytes>)> {
+async fn gated_stream(path: &'static str) -> Case<(String, mpsc::Sender<Bytes>)> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let url = format!("http://{}", listener.local_addr()?);
     let (frames, body) = mpsc::channel(1);
     let body = Arc::new(parking_lot::Mutex::new(Some(body)));
-    serve_chat(
+    serve_worker(
         listener,
+        path,
         post(move || {
             let body = body.lock().take();
             async move {
@@ -385,7 +389,7 @@ async fn next_frame(body: &mut BodyDataStream) -> Case<Bytes> {
 
 #[tokio::test]
 async fn a_stream_holds_its_lease_to_its_last_frame() -> Case {
-    let (url, frames) = gated_stream().await?;
+    let (url, frames) = gated_stream(CHAT).await?;
     let registry = Arc::new(WorkerRegistry::new());
     let (host, store, _) = bed_over(Arc::clone(&registry), &[&url]);
     let row = store.by_key(&url).ok_or("the worker has no row")?.id;
@@ -413,7 +417,7 @@ async fn a_stream_holds_its_lease_to_its_last_frame() -> Case {
 
 #[tokio::test]
 async fn a_stream_dropped_before_its_end_is_cancelled() -> Case {
-    let (url, frames) = gated_stream().await?;
+    let (url, frames) = gated_stream(CHAT).await?;
     let registry = Arc::new(WorkerRegistry::new());
     let (host, store, workers) = bed_over(Arc::clone(&registry), &[&url]);
     let row = store.by_key(&url).ok_or("the worker has no row")?.id;
@@ -553,19 +557,25 @@ async fn no_model(router: &Router) -> Case<Response> {
         .await)
 }
 
-async fn transcription(router: &Router) -> Response {
+async fn transcription(
+    router: &Router,
+    model_id: &str,
+    streaming: bool,
+    content_type: &str,
+) -> Response {
     let meta = TenantRequestMeta::new(TenantKey::from("test-tenant"));
     let request = TranscriptionRequest {
-        model: MODEL.into(),
+        model: model_id.into(),
+        stream: streaming.then_some(true),
         ..TranscriptionRequest::default()
     };
     let audio = AudioFile {
         bytes: Bytes::from_static(b"audio"),
         file_name: "speech.wav".into(),
-        content_type: Some("audio/wav".into()),
+        content_type: Some(content_type.into()),
     };
     router
-        .route_audio_transcriptions(None, &meta, &request, audio, MODEL)
+        .route_audio_transcriptions(None, &meta, &request, audio, model_id)
         .await
 }
 
@@ -645,7 +655,7 @@ async fn a_request_that_names_no_model_is_asked_under_the_one_model_served() -> 
 fn assert_unnamed_model(models: [Option<&str>; 2], expected: Option<&str>) {
     let registry = Arc::new(WorkerRegistry::new());
     let urls = ["http://127.0.0.1:1", "http://127.0.0.1:2"];
-    let (host, _, _) = bed_over_models(Arc::clone(&registry), urls.into_iter().zip(models));
+    let (host, _, _) = bed_over_models(Arc::clone(&registry), urls.into_iter().zip(models), None);
     let router = router(registry, Some(host));
     assert_eq!(router.model_of_an_unnamed_request().as_deref(), expected);
 }
@@ -673,6 +683,7 @@ async fn a_request_that_names_no_model_is_not_found_where_several_are_served() -
     let (host, store, _) = bed_over_models(
         Arc::clone(&registry),
         [a.as_str(), b.as_str()].into_iter().zip(models),
+        None,
     );
     let router = router(registry, Some(host));
     assert_model_not_found(no_model(&router).await?, UNKNOWN_MODEL_ID).await?;
@@ -692,6 +703,7 @@ async fn one_model_beside_a_worker_with_none_takes_the_unnamed_request_alone() -
     let (host, _, _) = bed_over_models(
         Arc::clone(&registry),
         [a.as_str(), b.as_str()].into_iter().zip(models),
+        None,
     );
     let router = router(registry, Some(host));
     for _ in 0..6 {
@@ -707,7 +719,7 @@ async fn workers_with_no_model_are_asked_under_the_no_model_id() -> Case {
     assert_unnamed_model([None; 2], Some(UNKNOWN_MODEL_ID));
     let (url, hits) = fixed_status_upstream(&[GENERATE], StatusCode::OK).await;
     let registry = Arc::new(WorkerRegistry::new());
-    let (host, _, _) = bed_over_models(Arc::clone(&registry), [(url.as_str(), None)]);
+    let (host, _, _) = bed_over_models(Arc::clone(&registry), [(url.as_str(), None)], None);
     let router = router(registry, Some(host));
     assert_eq!(no_model(&router).await?.status(), StatusCode::OK);
     assert_eq!(hits.load(Ordering::SeqCst), 1);
@@ -734,14 +746,163 @@ async fn a_named_model_no_worker_serves_is_not_found_and_asks_nothing() -> Case 
 }
 
 #[tokio::test]
-async fn a_transcription_under_the_host_is_refused_by_name() -> Case {
+async fn a_transcription_under_the_host_goes_to_the_placed_worker() -> Case {
     let (url, hits) = fixed_status_upstream(&[TRANSCRIBE], StatusCode::OK).await;
     let registry = Arc::new(WorkerRegistry::new());
-    let (host, store, _) = bed_over(Arc::clone(&registry), &[&url]);
-    let router = router(registry, Some(host));
-    assert_refused(transcription(&router).await, "a transcription request").await?;
-    assert_eq!(hits.load(Ordering::SeqCst), 0);
+    let (host, store, workers) = bed_over(Arc::clone(&registry), &[&url]);
+    let row = store.by_key(&url).ok_or("the worker has no row")?.id;
+    registry.set_overload_shed(true);
+    assert!(registry.set_worker_overloaded(&workers[0], true));
+    let mut router = router(registry, Some(host));
+    let start = Instant::now();
+
+    let response = transcription(&router, MODEL, false, AUDIO_TYPE).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
     assert_eq!(LeasesStore::live(&*store, GATEWAY), 0);
+    assert!(store.completed_ok_since(GATEWAY, row, start));
+
+    // A capped read that fails ends the lease by the answer the client reads.
+    router.max_payload_size = 1;
+    let start = Instant::now();
+    let response = transcription(&router, MODEL, false, AUDIO_TYPE).await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+    assert_eq!(LeasesStore::live(&*store, GATEWAY), 0);
+    assert!(!store.completed_ok_since(GATEWAY, row, start));
+
+    let response = transcription(&router, MODEL, false, "invalid").await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        extract_error_code_from_response(&response),
+        "multipart_build_failed"
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+    assert_eq!(LeasesStore::live(&*store, GATEWAY), 0);
+    Ok(())
+}
+
+fn ranked_transcription_bed(ranked: &str, plain: Option<&str>) -> (Router, Arc<MemoryStore>) {
+    let registry = Arc::new(WorkerRegistry::new());
+    let urls_and_models = std::iter::once(ranked)
+        .chain(plain)
+        .map(|url| (url, Some(MODEL)));
+    let (host, store, _) = bed_over_models(Arc::clone(&registry), urls_and_models, Some(ranked));
+    (router(registry, Some(host)), store)
+}
+
+#[tokio::test]
+async fn a_transcription_passes_over_a_data_parallel_worker() -> Case {
+    let plain = "http://127.0.0.1:2";
+    let (router, store) = ranked_transcription_bed("http://127.0.0.1:1", Some(plain));
+    let row = store.by_key(plain).ok_or("the plain worker has no row")?;
+    store
+        .set_status(row.id, RowStatus::NotReady, row.revision)
+        .ok_or("the plain worker's row stood")?;
+    store.publish_now();
+
+    // Only the ranked row can be picked. If committed, it would reach the
+    // bad form and return its 400 before sending to the worker.
+    let response = transcription(&router, MODEL, false, "invalid").await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        extract_error_code_from_response(&response),
+        "no_available_workers"
+    );
+    assert!(response.extensions().get::<ReportedRefusal>().is_some());
+    assert_eq!(LeasesStore::live(&*store, GATEWAY), 0);
+
+    let (ranked, ranked_hits) = fixed_status_upstream(&[TRANSCRIBE], StatusCode::OK).await;
+    let (plain, plain_hits) = fixed_status_upstream(&[TRANSCRIBE], StatusCode::OK).await;
+    let (router, store) = ranked_transcription_bed(&ranked, Some(&plain));
+    let mut doc = PolicySpec::preset("round_robin")?;
+    doc.generation += 1;
+    store.apply(AppliedSpec::validate(&doc)?)?;
+    for _ in 0..6 {
+        assert_eq!(
+            transcription(&router, MODEL, false, AUDIO_TYPE)
+                .await
+                .status(),
+            StatusCode::OK
+        );
+    }
+    assert_eq!(
+        (
+            ranked_hits.load(Ordering::SeqCst),
+            plain_hits.load(Ordering::SeqCst)
+        ),
+        (0, 6)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_pool_of_data_parallel_workers_alone_reads_the_routes_400() -> Case {
+    let (mut router, store) = ranked_transcription_bed("http://127.0.0.1:1", None);
+    let response = transcription(&router, MODEL, false, AUDIO_TYPE).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let hosted = to_bytes(response.into_body(), 1024).await?;
+    let error: Value = serde_json::from_slice(&hosted)?;
+    assert_eq!(error["error"]["code"], "dp_aware_not_supported");
+    assert_eq!(
+        error["error"]["message"],
+        "/v1/audio/transcriptions does not yet support DP-aware workers"
+    );
+    assert_eq!(LeasesStore::live(&*store, GATEWAY), 0);
+
+    router.host = None;
+    let response = transcription(&router, MODEL, false, AUDIO_TYPE).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(to_bytes(response.into_body(), 1024).await?, hosted);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_transcription_for_a_model_no_worker_serves_is_not_found() -> Case {
+    let registry = Arc::new(WorkerRegistry::new());
+    let (host, store, _) = bed_over(Arc::clone(&registry), &["http://127.0.0.1:1"]);
+    let router = router(registry, Some(host));
+    let model = "unserved-model";
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+
+    let response = transcription(&router, model, false, AUDIO_TYPE).await;
+    assert_model_not_found(response, model).await?;
+    assert_eq!(LeasesStore::live(&*store, GATEWAY), 0);
+    let rendered = recorder.handle().render();
+    assert!(
+        rendered.lines().any(|line| {
+            line.starts_with("smg_router_upstream_responses_total{")
+                && line.contains("status_code=\"404\"")
+                && line.contains("error_code=\"model_not_found\"")
+                && line.ends_with(" 1")
+        }),
+        "{rendered}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_streamed_transcription_holds_its_lease_to_its_last_frame() -> Case {
+    let (url, frames) = gated_stream(TRANSCRIBE).await?;
+    let registry = Arc::new(WorkerRegistry::new());
+    let (host, store, _) = bed_over(Arc::clone(&registry), &[&url]);
+    let row = store.by_key(&url).ok_or("the worker has no row")?.id;
+    let router = router(registry, Some(host));
+
+    let response = timeout(FRAME_WAIT, transcription(&router, MODEL, true, AUDIO_TYPE)).await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[CONTENT_TYPE], "text/event-stream");
+    assert_eq!(LeasesStore::live(&*store, GATEWAY), 1);
+    let mut body = response.into_body().into_data_stream();
+    frames.send(Bytes::from_static(FIRST_FRAME)).await?;
+    assert_eq!(next_frame(&mut body).await?.as_ref(), FIRST_FRAME);
+    assert_eq!(LeasesStore::live(&*store, GATEWAY), 1);
+    let last_frame = Instant::now();
+    drop(frames);
+    assert!(timeout(FRAME_WAIT, body.next()).await?.is_none());
+    assert_eq!(LeasesStore::live(&*store, GATEWAY), 0);
+    assert!(store.completed_ok_since(GATEWAY, row, last_frame));
     Ok(())
 }
 
@@ -776,7 +937,12 @@ async fn the_classic_policy_serves_the_three_shapes_without_a_host() -> Case {
     let (_, store, _) = bed_over(Arc::clone(&registry), &[&url]);
     let router = router(registry, None);
     assert_eq!(no_model(&router).await?.status(), StatusCode::OK);
-    assert_eq!(transcription(&router).await.status(), StatusCode::OK);
+    assert_eq!(
+        transcription(&router, MODEL, false, AUDIO_TYPE)
+            .await
+            .status(),
+        StatusCode::OK
+    );
     let streamed = router
         .route_streaming_request(streamed_request(&[GENERATE_BODY]), GENERATE, false)
         .await

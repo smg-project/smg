@@ -458,6 +458,7 @@ async fn decided_or_refused(config: RouterConfig) -> Case {
             "route_classify",
             "route_decisions",
             "route_systemone",
+            "route_audio_transcriptions",
             "route_rerank",
             "route_messages",
             "route_messages_count_tokens",

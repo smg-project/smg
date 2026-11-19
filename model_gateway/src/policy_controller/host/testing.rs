@@ -38,29 +38,36 @@ pub(crate) fn bed(urls: &[&str]) -> Bed {
 /// [`bed`] where the gateway routes by `policy`.
 pub(crate) fn bed_under(policy: PolicyConfig, urls: &[&str]) -> Bed {
     let rows = urls.iter().map(|&url| (url, Some(MODEL)));
-    started(policy, Arc::new(WorkerRegistry::new()), rows)
+    started(policy, Arc::new(WorkerRegistry::new()), rows, None)
 }
 
 /// The same store and host over workers registered in `registry`.
 pub(crate) fn bed_over(registry: Arc<WorkerRegistry>, urls: &[&str]) -> Bed {
-    bed_over_models(registry, urls.iter().map(|&url| (url, Some(MODEL))))
+    bed_over_models(registry, urls.iter().map(|&url| (url, Some(MODEL))), None)
 }
 
 /// One worker and one ready row per URL, with each worker's model or the
-/// no-model id in its row.
+/// no-model id in its row. The worker at `ranked_url` has rank zero.
 pub(crate) fn bed_over_models<'a>(
     registry: Arc<WorkerRegistry>,
     urls_and_models: impl IntoIterator<Item = (&'a str, Option<&'a str>)>,
+    ranked_url: Option<&str>,
 ) -> Bed {
-    started(RouterConfig::default().policy, registry, urls_and_models)
+    started(
+        RouterConfig::default().policy,
+        registry,
+        urls_and_models,
+        ranked_url,
+    )
 }
 
 /// The store a start makes for `policy`, with its rows and its workers in
-/// `registry`.
+/// `registry`. The worker at `ranked_url` has rank zero.
 fn started<'a>(
     policy: PolicyConfig,
     registry: Arc<WorkerRegistry>,
     urls_and_models: impl IntoIterator<Item = (&'a str, Option<&'a str>)>,
+    ranked_url: Option<&str>,
 ) -> Bed {
     let config = RouterConfig {
         policy_controller: true,
@@ -70,7 +77,7 @@ fn started<'a>(
     let store = start(&config)
         .expect("the start takes the routing")
         .expect("the controller was picked");
-    bed_with(store, registry, urls_and_models)
+    bed_with(store, registry, urls_and_models, ranked_url)
 }
 
 /// Three ready rows under the cache-aware preset, with the second row's id.
@@ -81,7 +88,7 @@ pub(crate) fn cache_bed() -> (Host, Arc<MemoryStore>, WorkerId) {
     store.apply(applied).expect("the store takes the preset");
     let urls = ["http://w0:8000", "http://w1:8000", "http://w2:8000"];
     let rows = urls.iter().map(|&url| (url, Some(MODEL)));
-    let (host, store, _) = bed_with(store, Arc::new(WorkerRegistry::new()), rows);
+    let (host, store, _) = bed_with(store, Arc::new(WorkerRegistry::new()), rows, None);
     let holder = store.by_key(urls[1]).expect("the second worker's row").id;
     (host, store, holder)
 }
@@ -92,17 +99,31 @@ pub(crate) fn bed_with<'a>(
     store: Arc<MemoryStore>,
     registry: Arc<WorkerRegistry>,
     urls_and_models: impl IntoIterator<Item = (&'a str, Option<&'a str>)>,
+    ranked_url: Option<&str>,
 ) -> Bed {
     let events = store.deciding(|world| world.spec().needs().events);
     let mut workers = Vec::new();
     for (url, model) in urls_and_models {
+        let builder = BasicWorkerBuilder::new(url).status(WorkerStatus::Ready);
+        let builder = match model {
+            Some(model) => builder.model(ModelCard::new(model)),
+            None => builder,
+        };
+        let ranked = ranked_url == Some(url);
+        let dp_size: u16 = if ranked { 2 } else { 1 };
+        let builder = if ranked {
+            builder.dp_config(0, usize::from(dp_size))
+        } else {
+            builder
+        };
+        let worker: Arc<dyn Worker> = Arc::new(builder.build());
         let facts = WorkerFacts {
-            key: url.to_string(),
+            key: worker.url().to_string(),
             engine: url.to_string(),
             incarnation: 1,
             role: Role::Single,
             models: vec![model.unwrap_or(UNKNOWN_MODEL_ID).to_string()],
-            dp_size: 1,
+            dp_size,
             max_running: Some(64),
             signals: Signals {
                 events,
@@ -118,12 +139,6 @@ pub(crate) fn bed_with<'a>(
                 .set_status(id, RowStatus::Ready, row.revision)
                 .expect("the row stands");
         }
-        let builder = BasicWorkerBuilder::new(url).status(WorkerStatus::Ready);
-        let builder = match model {
-            Some(model) => builder.model(ModelCard::new(model)),
-            None => builder,
-        };
-        let worker: Arc<dyn Worker> = Arc::new(builder.build());
         registry
             .register(Arc::clone(&worker))
             .expect("the worker registers");
