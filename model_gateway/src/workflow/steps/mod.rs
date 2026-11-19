@@ -14,12 +14,13 @@ pub use external::{
 };
 pub use local::{
     create_worker_removal_workflow, create_worker_removal_workflow_data,
-    create_worker_update_workflow, create_worker_update_workflow_data, CreateLocalWorkerStep,
-    FindWorkerToUpdateStep, ReleaseTokenizerStep, RemoveFromPolicyRegistryStep,
-    UpdatePoliciesForWorkerStep, UpdateRemainingPoliciesStep, UpdateWorkerPropertiesStep,
+    create_worker_update_workflow, create_worker_update_workflow_data, FindWorkerToUpdateStep,
+    ReleaseTokenizerStep, RemoveFromPolicyRegistryStep, UpdatePoliciesForWorkerStep,
+    UpdateRemainingPoliciesStep, UpdateWorkerPropertiesStep,
 };
 use local::{
-    DiscoverZmqLabelsStep, EnsureHarmonyEncodingStep, SubmitTokenizerJobStep, ZMQ_LABELS_STEP,
+    CheckLocalWorkerStep, DiscoverZmqLabelsStep, EnsureHarmonyEncodingStep, SubmitTokenizerJobStep,
+    CHECK_LOCAL_WORKER_STEP, ZMQ_LABELS_STEP,
 };
 use openai_protocol::worker::WorkerSpec;
 use shared::REGISTER_WORKERS_STEP;
@@ -30,7 +31,8 @@ pub use shared::{
 use smg_worker::{
     jobs::WorkerJobAsker,
     workflow::{
-        startup_attempts, worker_registration_workflow, RegistrationGates, DISCOVER_DP_STEP,
+        startup_attempts, worker_registration_workflow, RegistrationGates,
+        CREATE_LOCAL_WORKER_STEP, DISCOVER_DP_STEP,
     },
 };
 use wfaas::{BackoffStrategy, FailureAction, RetryPolicy, StepDefinition, WorkflowDefinition};
@@ -62,6 +64,8 @@ use crate::{
 ///  (ZMQ only)                           |
 ///       |                               |
 ///  create_local_worker           create_external_workers
+///       |                               |
+///  check_local_worker                   |
 ///       |                               |
 ///  ensure_harmony_encoding              |
 ///  (gRPC gpt-oss only)                  |
@@ -98,17 +102,25 @@ pub fn create_worker_registration_workflow(
         classify_worker_type = classify_worker_type.with_delay(startup_delay);
     }
 
-    // Steps 1, 1.5, 2a and 2b, the connection mode (HTTP vs gRPC), the
-    // runtime, the metadata read and the DP read, are the worker crate's.
-    // The first waits on the classification, which carries the startup
-    // delay. The gateway's own steps of the local line hang behind the
-    // last of them, one after another: the engine writes a step's whole
-    // copy of the run's data back, so two steps that wait on one step
-    // would each drop what the other wrote.
+    // The worker crate detects and builds local workers. The ZMQ label read
+    // stands between the detection and the creation, and the check and the
+    // encoding steps behind the creation, one after another: the engine
+    // writes a step's whole copy of the run's data back, so two steps that
+    // wait on one step would each drop what the other wrote.
+    let check_local_worker = StepDefinition::new(
+        CHECK_LOCAL_WORKER_STEP,
+        "Check Local Worker",
+        Arc::new(CheckLocalWorkerStep),
+    )
+    .with_timeout(Duration::from_secs(5))
+    .with_failure_action(FailureAction::FailWorkflow)
+    .depends_on(&[CREATE_LOCAL_WORKER_STEP]);
+
     worker_registration_workflow::<AppContext>(
         &settings,
         RegistrationGates {
             detection: Some("classify_worker_type"),
+            creation: Some(ZMQ_LABELS_STEP),
         },
     )
     // Step 0: Classify worker type (Local vs External)
@@ -132,18 +144,7 @@ pub fn create_worker_registration_workflow(
         .with_failure_action(FailureAction::ContinueNextStep)
         .depends_on(&[DISCOVER_DP_STEP]),
     )
-    // Step 3 (local): Create local worker(s), behind the ZMQ label step,
-    // the last step of the local line's detection.
-    .add_step(
-        StepDefinition::new(
-            "create_local_worker",
-            "Create Local Worker",
-            Arc::new(CreateLocalWorkerStep),
-        )
-        .with_timeout(Duration::from_secs(5))
-        .with_failure_action(FailureAction::FailWorkflow)
-        .depends_on(&[ZMQ_LABELS_STEP]),
-    )
+    .add_step(check_local_worker)
     // Step 3b (local): gRPC gpt-oss workers need the Harmony encoding; load
     // it before registration so an unavailable vocab fails this worker
     // instead of panicking the gateway or erroring at first request.
@@ -162,7 +163,7 @@ pub fn create_worker_registration_workflow(
         })
         .with_timeout(Duration::from_secs(30))
         .with_failure_action(FailureAction::FailWorkflow)
-        .depends_on(&["create_local_worker"]),
+        .depends_on(&[CHECK_LOCAL_WORKER_STEP]),
     )
     // === EXTERNAL BRANCH ===
     // Step 1 (external): Discover models from /v1/models
@@ -205,7 +206,7 @@ pub fn create_worker_registration_workflow(
         .with_timeout(Duration::from_secs(5))
         .with_failure_action(FailureAction::FailWorkflow)
         .depends_on(&[
-            "create_local_worker",
+            CHECK_LOCAL_WORKER_STEP,
             "ensure_harmony_encoding",
             "create_external_workers",
         ]),
@@ -263,9 +264,9 @@ mod tests {
     use smg_worker::workflow::{
         DETECT_CONNECTION_MODE_STEP, DETECT_RUNTIME_STEP, DISCOVER_METADATA_STEP,
     };
+    use wfaas::StepId;
 
     use super::*;
-    use crate::config::RouterConfig;
 
     fn config_with(timeout_secs: u64, check_interval_secs: u64) -> RouterConfig {
         RouterConfig::builder()
@@ -358,25 +359,18 @@ mod tests {
         assert_eq!(startup_delay(&config), None);
     }
 
-    /// From the classification to the creation a local worker's steps form
-    /// one chain: each waits on the step before it and on no other. The
-    /// engine writes a step's whole copy of the run's data back, so two of
-    /// them waiting on one step would each drop what the other wrote: a ZMQ
-    /// worker's default runtime and labels, or its DP shape.
+    fn step<'a>(
+        workflow: &'a WorkflowDefinition<WorkerWorkflowData>,
+        id: &str,
+    ) -> &'a StepDefinition<WorkerWorkflowData> {
+        let id = StepId::new(id);
+        workflow.steps.iter().find(|step| step.id == id).unwrap()
+    }
+
+    /// Each local step writes the run's data before the next one reads it.
     #[test]
     fn a_local_workers_steps_write_the_data_one_after_another() {
         let workflow = create_worker_registration_workflow(&config_with(1800, 30));
-        let waits_on = |id: &str| -> Vec<String> {
-            workflow
-                .steps
-                .iter()
-                .find(|step| step.id.to_string() == id)
-                .expect("the step is in the workflow")
-                .depends_on
-                .iter()
-                .map(ToString::to_string)
-                .collect()
-        };
         let line = [
             "classify_worker_type",
             DETECT_CONNECTION_MODE_STEP,
@@ -384,16 +378,134 @@ mod tests {
             DISCOVER_METADATA_STEP,
             DISCOVER_DP_STEP,
             ZMQ_LABELS_STEP,
-            "create_local_worker",
+            CREATE_LOCAL_WORKER_STEP,
+            CHECK_LOCAL_WORKER_STEP,
         ];
         for pair in line.windows(2) {
+            let next = step(&workflow, pair[1]);
             assert_eq!(
-                waits_on(pair[1]),
-                [pair[0]],
+                next.depends_on,
+                [StepId::new(pair[0])],
                 "{} waits on {} alone",
                 pair[1],
                 pair[0]
             );
+            assert!(next.depends_on_any.is_empty(), "{}", pair[1]);
         }
+        let dependents = |id: &str| {
+            let id = StepId::new(id);
+            let mut dependents: Vec<_> = workflow
+                .steps
+                .iter()
+                .filter(|step| {
+                    step.depends_on
+                        .iter()
+                        .chain(&step.depends_on_any)
+                        .any(|dep| dep == &id)
+                })
+                .map(|step| step.id.to_string())
+                .collect();
+            dependents.sort_unstable();
+            dependents
+        };
+        // Classification also starts the external branch.
+        for pair in line[1..].windows(2) {
+            assert_eq!(dependents(pair[0]), [pair[1]], "{}", pair[0]);
+        }
+        assert_eq!(
+            dependents(CHECK_LOCAL_WORKER_STEP),
+            ["ensure_harmony_encoding", REGISTER_WORKERS_STEP]
+        );
+        let register = step(&workflow, REGISTER_WORKERS_STEP);
+        assert_eq!(
+            register.depends_on,
+            [
+                CHECK_LOCAL_WORKER_STEP,
+                "ensure_harmony_encoding",
+                "create_external_workers"
+            ]
+            .map(StepId::new)
+        );
+        assert!(register.depends_on_any.is_empty());
+    }
+
+    #[test]
+    fn the_harmony_encoding_waits_on_the_check_step_alone() {
+        let workflow = create_worker_registration_workflow(&config_with(1800, 30));
+        let check = step(&workflow, CHECK_LOCAL_WORKER_STEP);
+        assert_eq!(check.id, StepId::new("check_local_worker"));
+        assert_eq!(check.name, "Check Local Worker");
+        assert_eq!(check.timeout, Some(Duration::from_secs(5)));
+        assert!(check.retry_policy.is_none());
+        assert!(matches!(check.on_failure, FailureAction::FailWorkflow));
+
+        let harmony = step(&workflow, "ensure_harmony_encoding");
+        assert_eq!(harmony.depends_on, [StepId::new(CHECK_LOCAL_WORKER_STEP)]);
+        assert!(harmony.depends_on_any.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_unknown_parser_override_fails_the_registration_and_writes_no_worker() {
+        use openai_protocol::worker::{ConnectionMode, RuntimeType};
+        use smg_worker::workflow::WORKER_REGISTRATION_WORKFLOW;
+        use wfaas::{StepStatus, WorkflowEngine, WorkflowId, WorkflowStatus};
+
+        use crate::{
+            app_context::testing::app_context_for_tests, config::ParserChoice,
+            routers::common::snapshot::WorkerRegistry,
+        };
+
+        let config = RouterConfig {
+            parser: ParserChoice::Legacy,
+            ..config_with(1, 1)
+        };
+        let registry = Arc::new(WorkerRegistry::new());
+        let host = app_context_for_tests(
+            config.clone(),
+            Arc::clone(&registry),
+            Some(tool_parser::ParserFactory::default()),
+        );
+        let engine = WorkflowEngine::new();
+        engine
+            .register_workflow(create_worker_registration_workflow(&config))
+            .unwrap();
+
+        let url = "ipc:///tmp/worker-unknown-parser.ipc";
+        let mut spec = WorkerSpec::new(url);
+        spec.connection_mode = ConnectionMode::Zmq;
+        spec.runtime_type = RuntimeType::Vllm;
+        spec.labels.insert("model_id".into(), "m".into());
+        spec.labels
+            .insert("tool_parser".into(), "no-such-parser".into());
+        let id = engine
+            .start_workflow(
+                WorkflowId::new(WORKER_REGISTRATION_WORKFLOW),
+                create_worker_workflow_data(
+                    spec,
+                    WorkerRegistrationMode::Upsert,
+                    host,
+                    WorkerJobAsker::Api,
+                ),
+            )
+            .await
+            .unwrap();
+        let state = engine
+            .wait_for_terminal_state(id, url, Duration::from_secs(5))
+            .await
+            .unwrap();
+
+        assert!(registry.is_empty());
+        assert_eq!(state.status, WorkflowStatus::Failed);
+        let check = &state.step_states[&StepId::new(CHECK_LOCAL_WORKER_STEP)];
+        assert_eq!(check.status, StepStatus::Failed);
+        assert_eq!(check.attempt, 1);
+        assert_eq!(
+            check.last_error.as_deref(),
+            Some(
+                "Step failed: create_worker - worker ipc:///tmp/worker-unknown-parser.ipc \
+                 declares a parser override for model 'm' the gateway cannot read with: \
+                 unknown tool-call parser 'no-such-parser'"
+            )
+        );
     }
 }

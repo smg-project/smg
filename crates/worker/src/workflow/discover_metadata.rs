@@ -11,7 +11,7 @@ use super::{
     host::{require_host, WorkflowHost},
     metadata::{discover_engine_labels, fetch_grpc_metadata},
     registration::DISCOVER_METADATA_STEP,
-    runtimes::METADATA_DEFAULT,
+    runtimes::DEFAULT_RUNTIME,
 };
 use crate::identity::{basic::ConnectionMode, endpoint::Endpoint};
 
@@ -56,9 +56,9 @@ impl<H: WorkflowHost> StepExecutor<WorkerRegistrationWorkflowData<H>> for Discov
                         warn!(
                             "No detected_runtime_type for {}, defaulting to {}",
                             Endpoint::redacted_str(&config.url),
-                            METADATA_DEFAULT
+                            DEFAULT_RUNTIME
                         );
-                        METADATA_DEFAULT.as_str()
+                        DEFAULT_RUNTIME.as_str()
                     });
                 let client = context.data.http_client(DISCOVER_METADATA_STEP)?;
                 let connector = require_host(context.data.host.as_ref())?.engine_connector();

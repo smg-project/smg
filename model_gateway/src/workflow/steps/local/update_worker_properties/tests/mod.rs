@@ -509,7 +509,7 @@ async fn a_label_set_by_an_update_stays_the_operators_through_a_refresh() {
 async fn a_rank_workers_window_follows_the_engine_in_rank_space() {
     // The engine runs attention DP over 8 ranks with a window of 256: a
     // rank worker carries the share, 32, and records it in rank space.
-    let discovered = labels_for_rank(
+    let discovered = smg_worker::workflow::labels_for_rank(
         &labels_of(&[("max_running_requests", "256"), ("attn_dp_size", "8")]),
         Some((0, 8)),
         &HashMap::new(),
@@ -1414,7 +1414,7 @@ fn registered_worker(
     labels: HashMap<String, String>,
     discovered_labels: HashMap<String, String>,
 ) -> Arc<dyn Worker> {
-    use super::super::create_worker::{build_model_card, resolve_model_id};
+    use smg_worker::workflow::{build_model_card, resolve_model_id};
     let model_id = resolve_model_id(&spec, &labels).to_string();
     let card = build_model_card(&model_id, &spec, &labels, &HashMap::new());
     Arc::new(
@@ -1747,12 +1747,9 @@ async fn a_conflicting_parser_override_from_a_label_update_is_warned_about() {
 #[tokio::test]
 async fn a_refresh_fills_the_fields_an_empty_registration_label_left_unset() {
     use openai_protocol::worker::WorkerModels;
-    use smg_worker::workflow::WorkerKind;
+    use smg_worker::workflow::{CreateLocalWorkerStep, WorkerKind};
 
-    use crate::workflow::{
-        data::WorkerRegistrationMode,
-        steps::{create_worker_workflow_data, local::CreateLocalWorkerStep},
-    };
+    use crate::workflow::{data::WorkerRegistrationMode, steps::create_worker_workflow_data};
 
     let app_ctx = make_app_context(&[]);
     let mut spec = WorkerSpec::new("http://worker:8000");

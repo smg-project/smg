@@ -50,7 +50,8 @@
 //!
 //! The `workflow` feature adds `workflow`, the worker side of the workflows
 //! a host runs over its workers on the workflow engine: the steps of a
-//! worker's removal, the data they pass along and the host trait they read.
+//! worker's removal and of a registration's detection and creation. It holds
+//! their order, the data they pass along and the host trait they read.
 //!
 //! The `proto` feature adds `common_proto`, the messages every engine's gRPC
 //! service shares, and the conversion of the engine load record into the

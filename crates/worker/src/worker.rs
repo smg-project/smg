@@ -461,7 +461,7 @@ fn default_drain_settle_secs() -> u64 {
 // ── Health check config ─────────────────────────────────────────────
 
 /// Health check configuration shared across protocol and runtime layers.
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct HealthCheckConfig {
     /// Health check timeout in seconds (default: 30).
     #[serde(default = "default_health_check_timeout")]

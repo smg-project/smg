@@ -72,7 +72,7 @@ async fn an_http_workers_labels_are_read_with_the_hosts_client() {
 /// runtime the detection settled.
 #[tokio::test]
 async fn a_grpc_workers_labels_are_read_through_the_hosts_connector() {
-    let runtime = METADATA_DEFAULT;
+    let runtime = DEFAULT_RUNTIME;
     let engine = Arc::new(ScriptedAnswers::describing(
         Ok(&[("model_path", "org/model-a")]),
         Ok(&[("version", "1.2")]),
@@ -114,7 +114,7 @@ async fn a_read_that_fails_leaves_no_labels_and_passes() {
         ScriptedConnector::default(),
         WorkerSpec::new("grpc://worker-a:9000"),
         ConnectionMode::Grpc,
-        Some(METADATA_DEFAULT.as_str()),
+        Some(DEFAULT_RUNTIME.as_str()),
     );
     ctx.data
         .discovered_labels

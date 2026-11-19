@@ -11,13 +11,13 @@ use smg_worker::{
         endpoint::Endpoint,
         sampling_defaults::{SamplingDefaults, DEFAULT_SAMPLING_PARAMS_LABEL},
     },
-    workflow::WorkerKind,
+    workflow::{resolve_model_id, WorkerKind},
 };
 use tool_parser::GrammarStart;
 use tracing::{debug, warn};
 use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowResult};
 
-use crate::workflow::{data::WorkerWorkflowData, steps::local::create_worker::resolve_model_id};
+use crate::workflow::data::WorkerWorkflowData;
 
 /// The id of the step that writes a ZMQ worker's runtime default and labels.
 pub(crate) const ZMQ_LABELS_STEP: &str = "discover_zmq_labels";
