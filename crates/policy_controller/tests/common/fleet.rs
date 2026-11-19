@@ -1142,6 +1142,26 @@ impl Harness {
         Ok(())
     }
 
+    /// Opens the harness's session again at the controller it asks, as a
+    /// gateway does whose session that controller ended. The dial is tried
+    /// until the controller welcomes it, inside the room.
+    pub async fn redial(&mut self) -> Result<(), String> {
+        let gateway = format!("http://{}", self.replica.gateway());
+        let asked = Instant::now();
+        loop {
+            match Client::connect(&gateway, GATEWAY).await {
+                Ok(client) => {
+                    self.client = client;
+                    return Ok(());
+                }
+                Err(_) if asked.elapsed() < ROOM => {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                Err(refused) => return Err(format!("no session opens inside the room: {refused}")),
+            }
+        }
+    }
+
     /// Ask: who leads, as the reference client hears it on the gateway
     /// listener.
     pub async fn leader(&mut self) -> Result<LeaderInfo, String> {

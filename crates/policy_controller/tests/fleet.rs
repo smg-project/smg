@@ -126,7 +126,7 @@ use smg_policy_controller::{
     client::{self, blocking, Answer, Client},
     controller::{State, PROTOCOL_VERSION},
     proto::{
-        completed::Class, decision::Outcome, identity::Form, principal, released, Completed,
+        busy, completed::Class, decision::Outcome, identity::Form, principal, released, Completed,
         DecideRequest, Decision, Identity, OverloadThresholds, Released, RequestFacts, ShedReason,
         Side,
     },
@@ -456,7 +456,7 @@ async fn leased(harness: &mut Harness, ask: DecideRequest) -> Result<(Picked, Ve
         .facts
         .as_ref()
         .is_some_and(|facts| facts.session_key.is_some());
-    let answer = harness.client().decide(ask).await;
+    let answer = answered(harness, ask).await;
     let Ok(Answer::Decision(Decision {
         leases,
         outcome: Some(Outcome::Pick(pick)),
@@ -478,6 +478,42 @@ async fn leased(harness: &mut Harness, ask: DecideRequest) -> Result<(Picked, Ve
     Ok((row_of(harness, target.id, target.dp_rank)?, leases))
 }
 
+/// The pause before an ask is asked again.
+const AGAIN: Duration = Duration::from_millis(25);
+
+/// Whether `error` is a session its controller ended because it stopped
+/// leading, or leads under a later term: a gateway opens its session again.
+fn ended(error: &client::Error) -> bool {
+    matches!(error, client::Error::Status(status) if status.code() == Code::Aborted)
+}
+
+/// One ask's answer, as a gateway comes to it at a leader that stops
+/// leading for a moment. A leader whose renewal lands past its renew
+/// deadline leads nobody until one lands in time, and the lease's store on
+/// a busy host can hold a renewal that long. Meanwhile it answers that it
+/// does not lead, and a renewal that took the deadline whole ends the
+/// session. A gateway asks again, on a session it opens again where its own
+/// was ended, and so does the case, inside the room.
+async fn answered(harness: &mut Harness, ask: DecideRequest) -> Result<Answer, client::Error> {
+    let began = Instant::now();
+    loop {
+        match harness.client().decide(ask.clone()).await {
+            Err(error) if ended(&error) && began.elapsed() < ROOM => {
+                // Boxed: the dial's future is large, and every ask of a case would carry it.
+                if Box::pin(harness.redial()).await.is_err() {
+                    return Err(error);
+                }
+            }
+            Ok(Answer::Busy(busy))
+                if busy.reason() == busy::Reason::NotLeader && began.elapsed() < ROOM =>
+            {
+                tokio::time::sleep(AGAIN).await;
+            }
+            answer => return answer,
+        }
+    }
+}
+
 /// Gives `leases` up on the session, as a gateway whose client left, and
 /// waits until the store's file holds `left` leases of the gateway.
 async fn given_up(harness: &mut Harness, leases: &[u64], left: usize) -> Result<(), String> {
@@ -487,7 +523,13 @@ async fn given_up(harness: &mut Harness, leases: &[u64], left: usize) -> Result<
             reason: released::Reason::ClientGone.into(),
             ..Released::default()
         };
-        let reported = harness.client().released(released).await;
+        let reported = match harness.client().released(released).await {
+            Err(error) if ended(&error) => {
+                Box::pin(harness.redial()).await?;
+                harness.client().released(released).await
+            }
+            reported => reported,
+        };
         reported.map_err(|status| format!("a lease is not given up: {status:?}"))?;
     }
     // Every pick of the case passes here, and a report is one frame the
