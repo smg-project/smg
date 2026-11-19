@@ -70,6 +70,7 @@ use std::{
     time::Duration,
 };
 
+use arc_swap::Guard;
 use parking_lot::{Mutex, MutexGuard};
 
 use super::{Key, Leases, MemoryStore};
@@ -78,14 +79,30 @@ use crate::{
     lease::LeaseId,
     store::{
         leases::{LeaseRecord, LeaseState, Said},
+        world::World,
         GatewayId,
     },
 };
 
-/// What tells the engine of a frame applied to a lease on file: the record
-/// as it stood before the frame, what the frame said, and the decider whose
-/// file the lease is on, where the store's host named its deciders.
-type Teller = fn(&MemoryStore, &LeaseRecord, Said, Option<Decider>);
+/// What tells the engine of a frame applied to a lease on file: the world
+/// the frame is told under, the record as it stood before the frame, what
+/// the frame said, and the decider whose file the lease is on, where the
+/// store's host named its deciders.
+type Teller = fn(&MemoryStore, &World, &LeaseRecord, Said, Option<Decider>);
+
+/// The world a take's frames are told under: the store's, loaded at the
+/// take's first tell. So a take that tells nothing loads no world, and one
+/// that tells many loads one: each frame of a take is told under the
+/// generation that stood at the take's first tell.
+#[derive(Default)]
+pub(super) struct Told(Option<Guard<Arc<World>>>);
+
+impl Told {
+    /// The world this take tells under.
+    pub(super) fn world(&mut self, store: &MemoryStore) -> &World {
+        self.0.get_or_insert_with(|| store.world.load())
+    }
+}
 
 /// What a frame said of a gateway's lease, as it waits in the ring.
 type Handed = (GatewayId, LeaseId, Said);
@@ -234,7 +251,8 @@ impl AtWork {
     /// that applies, and the decision's issue is one.
     pub fn apply(&self) {
         if let Some(mut turn) = self.store.files[self.file].try_take() {
-            self.store.applied(self.file, &mut turn);
+            self.store
+                .applied(self.file, &mut turn, &mut Told::default());
         }
     }
 
@@ -436,10 +454,10 @@ impl MemoryStore {
     }
 
     /// Tells the engine what `said` did to the lease `record` stood as,
-    /// on the file at `at`: under its decider's name.
-    pub(super) fn tell(&self, at: usize, record: &LeaseRecord, said: Said) {
+    /// on the file at `at`: under `world` and its decider's name.
+    pub(super) fn tell(&self, at: usize, world: &World, record: &LeaseRecord, said: Said) {
         if let Some(tell) = self.files.teller.get() {
-            tell(self, record, said, self.files[at].name);
+            tell(self, world, record, said, self.files[at].name);
         }
     }
 
@@ -485,7 +503,7 @@ impl MemoryStore {
     /// the caller may act at that file ([`Self::applied`]).
     pub(super) fn turn_of(&self, at: usize) -> Turn<'_> {
         let mut turn = self.files[at].take();
-        self.applied(at, &mut turn);
+        self.applied(at, &mut turn, &mut Told::default());
         turn
     }
 
@@ -504,13 +522,13 @@ impl MemoryStore {
     /// any thread while none is, read under the turn. `false` where
     /// another thread is at work: what waits is that thread's to apply,
     /// so no thread acts as a decider beside it.
-    pub(super) fn applied(&self, at: usize, turn: &mut Turn<'_>) -> bool {
+    pub(super) fn applied(&self, at: usize, turn: &mut Turn<'_>, told: &mut Told) -> bool {
         if !self.may_act(at) {
             return false;
         }
         let Behind { leases, ring } = &mut *turn.behind;
         while let Ok((gateway, lease, said)) = ring.try_recv() {
-            self.apply_frame(at, leases, (gateway, lease), said);
+            self.apply_frame(at, leases, (gateway, lease), said, told);
         }
         true
     }
@@ -530,7 +548,7 @@ impl MemoryStore {
             return false;
         }
         let mut turn = self.files[at].take();
-        self.applied(at, &mut turn)
+        self.applied(at, &mut turn, &mut Told::default())
     }
 
     /// A stream's end: each file it handed to is looked at once more, so
@@ -601,7 +619,7 @@ impl MemoryStore {
     /// engine. A lease not on file is no error and tells nothing: its
     /// dispatch deadline ended it, or its gateway decided that request
     /// itself. Neither does a second dispatch of one lease.
-    fn apply_frame(&self, at: usize, leases: &mut Leases, key: Key, said: Said) {
+    fn apply_frame(&self, at: usize, leases: &mut Leases, key: Key, said: Said, told: &mut Told) {
         let found = match said {
             Said::Dispatched(dispatch, when) => {
                 let found = leases.records.get(&key).map(|held| held.record);
@@ -616,7 +634,7 @@ impl MemoryStore {
             Said::Released(..) => leases.end(&key),
         };
         if let Some(record) = found {
-            self.tell(at, &record, said);
+            self.tell(at, told.world(self), &record, said);
         }
     }
 }

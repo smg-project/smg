@@ -2746,7 +2746,8 @@ impl MemoryStore {
         let at = self.acting();
         let file = u8::try_from(at).unwrap_or(u8::MAX);
         let mut leases = self.files[at].take();
-        let acts = self.applied(at, &mut leases);
+        let mut told = turn::Told::default();
+        let acts = self.applied(at, &mut leases, &mut told);
         let (lease, store) = (record.term, leases.term);
         if lease > store {
             return Err(LeaseRefused::TermAhead { lease, store });
@@ -2776,7 +2777,8 @@ impl MemoryStore {
             let Some(ended) = leases.end_due(now, &mut steps) else {
                 break;
             };
-            self.tell(at, &ended, Said::Released(None, ReleaseReason::Abandoned));
+            let said = Said::Released(None, ReleaseReason::Abandoned);
+            self.tell(at, told.world(self), &ended, said);
         }
         Ok(record.lease)
     }
@@ -2996,12 +2998,14 @@ impl LeasesStore for MemoryStore {
                 continue;
             }
             let mut leases = self.files[at].take();
-            if !self.applied(at, &mut leases) {
+            let mut told = turn::Told::default();
+            if !self.applied(at, &mut leases, &mut told) {
                 continue;
             }
             let mut steps = usize::MAX;
             while let Some(record) = leases.end_due(now, &mut steps) {
-                self.tell(at, &record, Said::Released(None, ReleaseReason::Abandoned));
+                let said = Said::Released(None, ReleaseReason::Abandoned);
+                self.tell(at, told.world(self), &record, said);
                 ended.push(record);
             }
         }

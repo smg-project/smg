@@ -48,7 +48,9 @@ use crate::{
         released::{Reason, What},
     },
     sessions::{Forgets, SessionVerdict},
-    store::{Dispatch, GatewayId, Hand, HealthSink, LeaseRecord, MemoryStore, Said, SessionsStore},
+    store::{
+        Dispatch, GatewayId, Hand, HealthSink, LeaseRecord, MemoryStore, Said, SessionsStore, World,
+    },
     view::{Session, WorkerId},
 };
 
@@ -143,11 +145,11 @@ pub(crate) fn tells(store: &MemoryStore) {
 /// fault is counted on the store ([`MemoryStore::lifecycle_faults`]) and
 /// a streak of faults writes one line. It costs no request its decision
 /// and ends no thread.
-fn told(store: &MemoryStore, record: &LeaseRecord, said: Said, by: Option<Decider>) {
+fn told(store: &MemoryStore, world: &World, record: &LeaseRecord, said: Said, by: Option<Decider>) {
     // The lease's own decider acts while its event is told, whichever
     // thread applies the frame.
     let _acting = by.map(Decider::enter);
-    let Err(payload) = catch_unwind(AssertUnwindSafe(|| tell(store, record, said))) else {
+    let Err(payload) = catch_unwind(AssertUnwindSafe(|| tell(store, world, record, said))) else {
         store.call_returned();
         return;
     };
@@ -163,51 +165,49 @@ fn told(store: &MemoryStore, record: &LeaseRecord, said: Said, by: Option<Decide
 }
 
 /// What [`told`] tells, under its catch.
-fn tell(store: &MemoryStore, record: &LeaseRecord, said: Said) {
-    store.with_world(|world| {
-        let spec = world.spec();
-        let engine = (spec.generation() == record.lease.generation).then(|| spec.engine());
-        match (said, engine) {
-            (Said::Dispatched(dispatch, at), engine) => {
-                let Some((id, dp_rank)) = record.target_at(dispatch.target_index) else {
-                    return;
-                };
-                let target = Target {
-                    id,
-                    dp_rank,
-                    ..Target::default()
-                };
-                // The record was read before the door wrote the dispatched
-                // index: the lease told carries it, for a stage that reads
-                // the index off the lease.
-                let lease = Lease {
-                    target_index: dispatch.target_index,
-                    ..record.lease
-                };
-                // The table hears first and the pin of record reads it.
-                // The stages hear last, so nothing is held across their
-                // loop: a value kept for the pin behind it cost every
-                // lease a store and a reload a profile.
-                if let Some(engine) = engine {
-                    engine.dispatched_key(&lease, &target, dispatch.side);
-                }
-                pinned(store, record, engine, id, at);
-                if let Some(engine) = engine {
-                    engine.dispatched_stages(
-                        &lease,
-                        &target,
-                        dispatch.side,
-                        dispatch.since_decision_micros,
-                    );
-                }
+fn tell(store: &MemoryStore, world: &World, record: &LeaseRecord, said: Said) {
+    let spec = world.spec();
+    let engine = (spec.generation() == record.lease.generation).then(|| spec.engine());
+    match (said, engine) {
+        (Said::Dispatched(dispatch, at), engine) => {
+            let Some((id, dp_rank)) = record.target_at(dispatch.target_index) else {
+                return;
+            };
+            let target = Target {
+                id,
+                dp_rank,
+                ..Target::default()
+            };
+            // The record was read before the door wrote the dispatched
+            // index: the lease told carries it, for a stage that reads
+            // the index off the lease.
+            let lease = Lease {
+                target_index: dispatch.target_index,
+                ..record.lease
+            };
+            // The table hears first and the pin of record reads it.
+            // The stages hear last, so nothing is held across their
+            // loop: a value kept for the pin behind it cost every
+            // lease a store and a reload a profile.
+            if let Some(engine) = engine {
+                engine.dispatched_key(&lease, &target, dispatch.side);
             }
-            (Said::Completed(outcome), Some(engine)) => {
-                engine.on_completed(&record.lease, &outcome);
+            pinned(store, record, engine, id, at);
+            if let Some(engine) = engine {
+                engine.dispatched_stages(
+                    &lease,
+                    &target,
+                    dispatch.side,
+                    dispatch.since_decision_micros,
+                );
             }
-            (Said::Released(_, reason), Some(engine)) => engine.on_released(&record.lease, reason),
-            (Said::Completed(_) | Said::Released(..), None) => {}
         }
-    });
+        (Said::Completed(outcome), Some(engine)) => {
+            engine.on_completed(&record.lease, &outcome);
+        }
+        (Said::Released(_, reason), Some(engine)) => engine.on_released(&record.lease, reason),
+        (Said::Completed(_) | Said::Released(..), None) => {}
+    }
 }
 
 /// Writes a keyed lease's pin of record at its dispatch (design 5.1, the
