@@ -23,7 +23,7 @@ use std::{
     collections::{btree_map, BTreeMap, BTreeSet},
     fmt, io,
     marker::PhantomData,
-    sync::LazyLock,
+    sync::{Arc, LazyLock},
 };
 
 use rustc_hash::FxHashMap;
@@ -47,6 +47,7 @@ use crate::{
     framework::{Binding, Engine, OverloadThresholds, Picker, Plan, Profile, Scorer, Weighted},
     ring::ConsistentHash,
     routing_key::KeySources,
+    sent::SentCredit,
     sessions::SessionRule,
     terms::Term,
     view::{permille, HashKind, Phase, MAX_REPORT_AGE_MS},
@@ -1377,6 +1378,12 @@ pub struct ProfileSpec {
     pub score: Vec<ScoreSpec>,
     /// The picker.
     pub pick: PickSpec,
+    /// The number of milliseconds a send counts for. An unset limit keeps
+    /// sends from expiring by age. A stage must ask for the profile's tally
+    /// for the limit to be used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
+    pub sent_ttl_ms: Option<u32>,
 }
 
 /// A closed range with one or both bounds.
@@ -2675,6 +2682,8 @@ fn scored(
     profile: &str,
     at: &At,
     catalog: &Catalog,
+    sent_ttl_ms: Option<u32>,
+    sent: &mut Option<Arc<SentCredit>>,
 ) -> Result<Scored, SpecError> {
     let name = entry.name();
     let Some(found) = catalog.find_scorer(name) else {
@@ -2725,7 +2734,8 @@ fn scored(
             params
                 .values_mut()
                 .for_each(serde_json::Value::sort_all_objects);
-            let scorer = build(&mut StageBuild::new(&params)).map_err(|error| error.at(&at.0))?;
+            let mut context = StageBuild::new(&params, profile, sent_ttl_ms, sent);
+            let scorer = build(&mut context).map_err(|error| error.at(&at.0))?;
             let answers = scorer.name();
             if answers != name {
                 return Err(SpecError::BadStage {
@@ -2841,9 +2851,11 @@ fn check_profile(
     catalog: &Catalog,
     deferred: &mut Deferred,
     depth: &mut HashDepth,
+    sent_credits: &mut Vec<Arc<SentCredit>>,
 ) -> Result<Option<(Profile, bool)>, SpecError> {
     let gates = gates_of(p, view);
     let at = At::new(format!("profiles.{name}"));
+    at.nonzero("sent_ttl_ms", p.sent_ttl_ms)?;
     let mut filters = Vec::with_capacity(p.filter.len());
     for f in &p.filter {
         filters.push(
@@ -2858,9 +2870,10 @@ fn check_profile(
     let mut scorers = Vec::with_capacity(p.score.len());
     let mut complete = true;
     let mut plain_ring = false;
+    let mut sent = None;
     for (i, entry) in p.score.iter().enumerate() {
         let entry_at = At::new(format!("{}.score[{i}]", at.0));
-        let stage = match scored(entry, name, &entry_at, catalog)? {
+        let stage = match scored(entry, name, &entry_at, catalog, p.sent_ttl_ms, &mut sent)? {
             Scored::Typed(stage) => stage,
             Scored::Built(weighted) => {
                 depth.deepen(HashDepth::of(weighted.scorer.needs()));
@@ -2914,6 +2927,9 @@ fn check_profile(
             None
         }
     };
+    if let Some(ms) = p.sent_ttl_ms.filter(|_| sent.is_none()) {
+        return Err(at.bad("sent_ttl_ms", ms, "a limit any stage of this profile reads"));
+    }
     // The scores combine by each weight's share of the weights' sum: a sum
     // that is not finite, or whose reciprocal is not, gives shares that
     // lose the order of every row. A stage this build does not carry adds
@@ -2977,6 +2993,7 @@ fn check_profile(
     }
     Ok(match picker {
         Some(picker) if complete => {
+            sent_credits.extend(sent);
             // A filter and a picker name no depth of their own.
             let unkeyed = filters.iter().map(|filter| filter.needs());
             depth.deepen(HashDepth::of(unkeyed.fold(picker.needs(), Needs::or)));
@@ -3609,27 +3626,32 @@ impl PolicySpec {
                 filter: standard_filters(),
                 score: vec![],
                 pick: "random".into(),
+                sent_ttl_ms: None,
             },
             "round_robin" => ProfileSpec {
                 filter: standard_filters(),
                 score: vec![],
                 pick: "round-robin".into(),
+                sent_ttl_ms: None,
             },
             "passthrough" => ProfileSpec {
                 filter: standard_filters(),
                 score: vec![],
                 pick: "passthrough".into(),
+                sent_ttl_ms: None,
             },
             // The expected-wait form: two draws compared by least-load.
             "power_of_two" => ProfileSpec {
                 filter: standard_filters(),
                 score: vec!["least-load".into()],
                 pick: "power-of-two".into(),
+                sent_ttl_ms: None,
             },
             "least_load" => ProfileSpec {
                 filter: standard_filters(),
                 score: vec!["least-load".into()],
                 pick: "best".into(),
+                sent_ttl_ms: None,
             },
             // The ring owner of the decision's key (an encode item's content
             // hash, a request's routing key), the ring's next members as the
@@ -3638,6 +3660,7 @@ impl PolicySpec {
                 filter: standard_filters(),
                 score: vec!["consistent-hash".into()],
                 pick: "best".into(),
+                sent_ttl_ms: None,
             },
             // The ring owner of the request's key: its routing key, else its
             // prefix at 256 tokens. An owner past the bounded-load rule is
@@ -3663,6 +3686,7 @@ impl PolicySpec {
                     "least-requests".into(),
                 ],
                 pick: "best".into(),
+                sent_ttl_ms: None,
             },
             // Sticky sessions over a random assignment: a key stays with the
             // first worker it was placed on, no in-flight cap, the first
@@ -3674,6 +3698,7 @@ impl PolicySpec {
                 filter: standard_filters(),
                 score: vec![],
                 pick: "manual".into(),
+                sent_ttl_ms: None,
             },
             // Affinity first, the expected wait within the group: the slice
             // and the diversion over everything when due, the holder tiers
@@ -3699,6 +3724,7 @@ impl PolicySpec {
                 // A large pool is decided by a draw of sixteen rows and the
                 // rows the host names: its holders and its warming rows.
                 pick: PickStage::Best(BestParams { sample: 16 }).into(),
+                sent_ttl_ms: None,
             },
             // Prefill placement by request size: the worker whose range of
             // sizes holds the prompt, the least booked survivor when the
@@ -3708,6 +3734,7 @@ impl PolicySpec {
                 filter: standard_filters(),
                 score: vec!["bucket".into()],
                 pick: "best".into(),
+                sent_ttl_ms: None,
             },
             other => return Err(SpecError::UnknownPreset(other.to_string())),
         };
@@ -3864,6 +3891,7 @@ impl PolicySpec {
         let mut profiles = Vec::with_capacity(self.profiles.len());
         let has_shadows = self.bindings.iter().any(|binding| binding.shadow.is_some());
         let mut scoped_stages = BTreeMap::new();
+        let mut sent_credits = Vec::new();
         // Noted by name: the built vector lines up with the document's
         // positions only once nothing is deferred.
         let mut by_assignment = Vec::new();
@@ -3878,6 +3906,7 @@ impl PolicySpec {
                 catalog,
                 &mut deferred,
                 &mut depth,
+                &mut sent_credits,
             )?;
             if let Some((built, by_key)) = built {
                 if has_shadows {
@@ -3965,6 +3994,7 @@ impl PolicySpec {
         }
         needs.headers |= !self.view.headers.is_empty();
         let mut engine = Engine::new(profiles, bindings, self.generation, needs);
+        engine.sent_credits = sent_credits;
         engine.set_explain_sample(self.explain.sample);
         engine.limit_report_age(self.view.max_report_age_ms);
         for at in sheds {
@@ -6257,9 +6287,15 @@ mod tests {
         );
         let catalog = Catalog::builtin();
         let entry = &spec.profiles["p"].score[0];
-        let Scored::Typed(stage) = scored(entry, "p", &At::new("profiles.p.score[0]"), &catalog)
-            .expect("a built-in scorer")
-        else {
+        let Scored::Typed(stage) = scored(
+            entry,
+            "p",
+            &At::new("profiles.p.score[0]"),
+            &catalog,
+            None,
+            &mut None,
+        )
+        .expect("a built-in scorer") else {
             panic!("a typed scorer");
         };
         let Resolved::Built(scorer) = scorer_of(

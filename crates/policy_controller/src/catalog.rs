@@ -15,7 +15,7 @@
 //! sandbox and no budget. A policy that must change without a rebuild is a
 //! plugin.
 
-use std::{convert::Infallible, fmt};
+use std::{convert::Infallible, fmt, sync::Arc};
 
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value};
@@ -26,6 +26,7 @@ use crate::{
         Passthrough, PowerOfTwo, PowerOfTwoCountFirst, Random, RoundRobin,
     },
     framework::{Filter, Picker, Scorer},
+    sent::SentCredit,
     spec::{SpecError, SCORERS},
 };
 
@@ -58,15 +59,29 @@ pub(crate) enum Found<T: ?Sized, F = Infallible> {
     With(F),
 }
 
-/// The parameters a document supplies to a stage's factory. The factory
-/// borrows the map for the call. A stage owns any parameters it keeps.
+/// The parameters and profile state available to a stage's factory.
+/// The factory borrows the parameters for the call. A stage owns any
+/// parameters it keeps.
 pub struct StageBuild<'a> {
     written: &'a Map<String, Value>,
+    profile: &'a str,
+    sent_ttl_ms: Option<u32>,
+    sent: &'a mut Option<Arc<SentCredit>>,
 }
 
 impl<'a> StageBuild<'a> {
-    pub(crate) fn new(written: &'a Map<String, Value>) -> Self {
-        Self { written }
+    pub(crate) fn new(
+        written: &'a Map<String, Value>,
+        profile: &'a str,
+        sent_ttl_ms: Option<u32>,
+        sent: &'a mut Option<Arc<SentCredit>>,
+    ) -> Self {
+        Self {
+            written,
+            profile,
+            sent_ttl_ms,
+            sent,
+        }
     }
 }
 
@@ -85,6 +100,15 @@ impl StageBuild<'_> {
     /// order the document wrote them in.
     pub fn written(&self) -> &Map<String, Value> {
         self.written
+    }
+
+    /// The profile's count of sends. The first call for a profile makes
+    /// its tally under that profile's `sent_ttl_ms`.
+    pub fn sent(&mut self) -> Arc<SentCredit> {
+        Arc::clone(
+            self.sent
+                .get_or_insert_with(|| Arc::new(SentCredit::new(self.profile, self.sent_ttl_ms))),
+        )
     }
 }
 

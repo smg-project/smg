@@ -3,7 +3,7 @@
 //! to its binding and decides. A scorer or picker allocates nothing per
 //! decision: scratch lives in the per-thread [`Scratch`] the host keeps.
 
-use std::{any::Any, collections::HashMap, fmt::Debug};
+use std::{any::Any, collections::HashMap, fmt::Debug, sync::Arc};
 
 use crate::{
     affinity::{forget_judged, WarmRule},
@@ -13,6 +13,7 @@ use crate::{
         MAX_TARGETS, TRACE_TOP,
     },
     lease::{Lease, Lifecycle, Membership, Outcome, ReleaseReason, Side, Signal},
+    sent::SentCredit,
     sessions::{Assignment, Claim, Forgets, SessionRule, SessionTable, SessionVerdict},
     spec::Needs,
     view::{
@@ -2492,6 +2493,8 @@ pub struct Engine {
     /// overlap stated ([`Engine::decide_stated`]), and no other does. The
     /// place is kept whole: a profile is as long as its document makes it.
     stating: Vec<Option<usize>>,
+    /// One tally per profile that reads sends.
+    pub(crate) sent_credits: Vec<Arc<SentCredit>>,
 }
 
 /// A stage that keeps a number of the reports, by its place in the engine.
@@ -3477,6 +3480,7 @@ impl Engine {
             max_report_age_ms: None,
             keepers,
             stating,
+            sent_credits: Vec::new(),
         }
     }
 
@@ -4937,13 +4941,13 @@ fn all_reports_current(candidates: &[Candidate], now_micros: u64, max_age_ms: u6
 }
 
 impl Engine {
-    /// The table's half of a dispatch ([`Lifecycle::on_dispatched`]): the
+    /// The session table's part of a dispatch ([`Lifecycle::on_dispatched`]): the
     /// session pin follows the dispatched worker of the side, the decode
     /// of a pair target on the decode side and the target itself
     /// otherwise. The controller keeps its own record of the pin: it reads
     /// the table behind this half, and tells the stages last
-    /// ([`dispatched_stages`](Self::dispatched_stages)). The two halves
-    /// are the crate's own: a host tells a dispatch whole, by the trait.
+    /// ([`Self::dispatched_stages`]). A host tells a dispatch whole, by the
+    /// trait.
     pub(crate) fn dispatched_table(&self, lease: &Lease, target: &Target, side: Side) {
         let dispatched = match (side, target.pair) {
             (Side::Decode, Some(pair)) => pair.decode_id,
@@ -4955,7 +4959,35 @@ impl Engine {
         }
     }
 
-    /// The stages' half of a dispatch: each profile's scorers and its
+    /// Records a dispatch in each profile tally that stages read.
+    #[inline]
+    pub(crate) fn dispatched_sent(
+        &self,
+        lease: &Lease,
+        target: &Target,
+        side: Side,
+        since_decision_micros: u32,
+    ) {
+        if !self.sent_credits.is_empty() {
+            self.credit_dispatch(lease, target, side, since_decision_micros);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn credit_dispatch(
+        &self,
+        lease: &Lease,
+        target: &Target,
+        side: Side,
+        since_decision_micros: u32,
+    ) {
+        for credit in &self.sent_credits {
+            credit.dispatched(lease, target, side, since_decision_micros);
+        }
+    }
+
+    /// The stages' part of a dispatch: each profile's scorers and its
     /// picker hear it.
     pub(crate) fn dispatched_stages(
         &self,
@@ -5010,6 +5042,7 @@ impl Lifecycle for Engine {
         }
     }
 
+    #[inline(always)]
     fn on_dispatched(
         &self,
         lease: &Lease,
@@ -5018,6 +5051,7 @@ impl Lifecycle for Engine {
         since_decision_micros: u32,
     ) {
         self.dispatched_table(lease, target, side);
+        self.dispatched_sent(lease, target, side, since_decision_micros);
         self.dispatched_stages(lease, target, side, since_decision_micros);
     }
 
@@ -5045,6 +5079,9 @@ impl Lifecycle for Engine {
                 self.sessions.forget_worker(*worker);
             }
             _ => {}
+        }
+        for credit in &self.sent_credits {
+            credit.membership(change);
         }
         for profile in &self.profiles {
             for w in &profile.scorers {

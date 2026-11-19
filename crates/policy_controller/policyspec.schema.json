@@ -203,6 +203,15 @@
         "pick": {
           "description": "The picker.",
           "$ref": "#/$defs/PickSpec"
+        },
+        "sent_ttl_ms": {
+          "description": "The number of milliseconds a send counts for. An unset limit keeps\nsends from expiring by age. A stage must ask for the profile's tally\nfor the limit to be used.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 1
         }
       },
       "additionalProperties": false,

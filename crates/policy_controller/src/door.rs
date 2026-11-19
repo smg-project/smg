@@ -1266,10 +1266,13 @@ pub(crate) struct Viewed<'a> {
 /// the issue and hear nothing of it. The caller loads `world` for this
 /// word, or once for the words it tells in a row: behind a later
 /// generation's start, a word told under such a load still reaches the
-/// lease's own engine. A dispatch is told on the target its report names
-/// by index, as the record holds the pick, and the lease told names that
-/// index: the record was read before the door wrote it. A report that
-/// names no target of the pick tells nothing.
+/// lease's own engine. A dispatch also feeds the counts of sends of the
+/// generation `world` holds, whichever generation issued the lease: a
+/// send is the host's, whatever document decided it
+/// ([`Engine::dispatched_sent`]). A dispatch is told on the target its
+/// report names by index, as the record holds the pick, and the lease
+/// told names that index: the record was read before the door wrote it.
+/// A report that names no target of the pick tells nothing.
 ///
 /// A pair's lease is told by side: a dispatch on the side its frame names,
 /// with that side's lease and on that side's worker, and an end once a
@@ -1311,9 +1314,9 @@ pub(crate) fn told(
 /// What [`told`] tells, under its catch.
 fn tell(store: &MemoryStore, world: &World, found: &Sides, said: Said) {
     let spec = world.spec();
-    let engine = (spec.generation() == found.record.lease.generation).then(|| spec.engine());
-    match (said, engine) {
-        (Said::Dispatched(dispatch, at), engine) => {
+    let issuing = || (spec.generation() == found.record.lease.generation).then(|| spec.engine());
+    match said {
+        Said::Dispatched(dispatch, at) => {
             // The side the frame names: its lease, and its worker at
             // the index the frame names.
             let Some((lease, stood)) = found.side(dispatch.side) else {
@@ -1335,12 +1338,19 @@ fn tell(store: &MemoryStore, world: &World, found: &Sides, said: Said) {
                 target_index: dispatch.target_index,
                 ..lease
             };
+            spec.engine().dispatched_sent(
+                &lease,
+                &target,
+                dispatch.side,
+                dispatch.since_decision_micros,
+            );
             // The table hears first and the pin of record reads it.
             // The stages hear last, so nothing is held across their
             // loop: a value kept for the pin behind it cost every
             // lease a store and a reload a profile. A stage's call
             // that unwinds there leaves the pin of record written,
             // beside the table's entry.
+            let engine = issuing();
             if let Some(engine) = engine {
                 engine.dispatched_table(&lease, &target, dispatch.side);
             }
@@ -1354,14 +1364,17 @@ fn tell(store: &MemoryStore, world: &World, found: &Sides, said: Said) {
                 );
             }
         }
-        (Said::Completed(outcome), Some(engine)) => {
-            let side = Some(outcome.side);
-            found.each_ending(side, |lease| engine.on_completed(lease, &outcome));
+        Said::Completed(outcome) => {
+            if let Some(engine) = issuing() {
+                let side = Some(outcome.side);
+                found.each_ending(side, |lease| engine.on_completed(lease, &outcome));
+            }
         }
-        (Said::Released(side, reason), Some(engine)) => {
-            found.each_ending(side, |lease| engine.on_released(lease, reason));
+        Said::Released(side, reason) => {
+            if let Some(engine) = issuing() {
+                found.each_ending(side, |lease| engine.on_released(lease, reason));
+            }
         }
-        (Said::Completed(_) | Said::Released(..), None) => {}
     }
 }
 
@@ -1795,7 +1808,8 @@ fn quiet(store: &MemoryStore, world: &World, found: &Sides, said: Said, by: Opti
 impl Door {
     /// A door over `store`, with a seat for each of its files. The store
     /// is given the door's word to the engine: whoever applies a report
-    /// to a lease tells the engine that issued it. A store that names no
+    /// to a lease tells the engine that issued it, and a dispatch feeds
+    /// the standing generation's counts of sends. A store that names no
     /// decider has one file: the door decides there, and tells what is
     /// said of its leases, as decider 0.
     #[must_use]

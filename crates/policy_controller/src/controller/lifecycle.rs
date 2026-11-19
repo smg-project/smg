@@ -27,7 +27,9 @@
 //! A frame whose lease is on file tells the engine that issued it, the
 //! generation's own, what became of the decision: its dispatch, its
 //! completion or its release. A generation that no longer stands is told
-//! nothing: the stages of a later one never saw the issue.
+//! nothing: the stages of a later one never saw the issue. A dispatch
+//! alone goes further: it feeds the standing generation's counts of
+//! sends, whichever generation issued the lease.
 //!
 //! A pair's lease stands under one id: its record is the prefill side,
 //! and its decode side is filed beside the record. A frame moves the
