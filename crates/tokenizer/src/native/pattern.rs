@@ -1894,13 +1894,8 @@ impl Scanner {
     }
 
     /// [`Self::for_each_match`] through [`block`]'s pass, for a text
-    /// [`Pattern::by_blocks`] gives a reader of. The pass cuts each ASCII stretch
-    /// of the text. What lies between two stretches and behind the last one
-    /// is matched here piece by piece, from the piece the pass left open:
-    /// text beyond ASCII, a blank run the pass declines, the text's last
-    /// block. Where the pass cut nothing the walk goes twice as far before
-    /// the pass is tried again, up to [`block::MAX_WALK`], so a text with
-    /// no ASCII stretch pays one test of two blocks per walk.
+    /// [`Pattern::by_blocks`] gives a reader of: [`each_match_by_blocks`]
+    /// with this template's pass ([`block::pieces`]) and its `match_at`.
     #[inline(always)]
     fn for_each_match_by_blocks<const WORDS: bool, F: FnMut(usize, usize)>(
         &self,
@@ -1908,38 +1903,22 @@ impl Scanner {
         text: &str,
         f: &mut F,
     ) {
-        let mut pos = 0;
-        let mut walk = 2 * block::BLOCK;
-        while pos < text.len() {
-            let open = block::pieces(
-                text.as_bytes(),
-                pos,
-                self.digit_cap,
-                |at| clitic_match(classes, text, at, &self.clitics),
-                f,
-            );
-            walk = if open > pos {
-                2 * block::BLOCK
-            } else {
-                (2 * walk).min(block::MAX_WALK)
-            };
-            let until = open + walk;
-            pos = open;
-            while pos < text.len() && pos < until {
-                match self.match_at::<WORDS, false>(classes, text, pos) {
-                    Some(end) if end > pos => {
-                        f(pos, end);
-                        pos = end;
-                    }
-                    _ => {
-                        let Some((_, len)) = next_char(text, pos) else {
-                            return;
-                        };
-                        pos += len;
-                    }
-                }
-            }
-        }
+        each_match_by_blocks(
+            text,
+            #[inline(always)]
+            |from, f| {
+                block::pieces(
+                    text.as_bytes(),
+                    from,
+                    self.digit_cap,
+                    |at| clitic_match(classes, text, at, &self.clitics),
+                    f,
+                )
+            },
+            #[inline(always)]
+            |pos| self.match_at::<WORDS, false>(classes, text, pos),
+            f,
+        );
     }
 
     /// The end of the piece that starts at `pos`, if one does: the first of
@@ -2966,6 +2945,51 @@ where
                     return;
                 };
                 pos += len;
+            }
+        }
+    }
+}
+
+/// [`each_match`] through [`block`]'s pass: the one walk behind the
+/// templates' `for_each_match_by_blocks`, compiled into each with its own
+/// `pass` and `match_at`. `pass(pos, f)` cuts the ASCII stretch that begins
+/// at `pos`, a piece's start, and gives the start of the piece it left
+/// open. What lies between two stretches and behind the last one is matched
+/// here piece by piece, from that piece: text beyond ASCII, a blank run the
+/// pass declines, the text's last block. Where the pass cut nothing the
+/// walk goes twice as far before the pass is tried again, up to
+/// [`block::MAX_WALK`], so a text with no ASCII stretch pays one test of
+/// two blocks per walk.
+#[inline(always)]
+pub(super) fn each_match_by_blocks<P, M, F>(text: &str, mut pass: P, mut match_at: M, f: &mut F)
+where
+    P: FnMut(usize, &mut F) -> usize,
+    M: FnMut(usize) -> Option<usize>,
+    F: FnMut(usize, usize),
+{
+    let mut pos = 0;
+    let mut walk = 2 * block::BLOCK;
+    while pos < text.len() {
+        let open = pass(pos, f);
+        walk = if open > pos {
+            2 * block::BLOCK
+        } else {
+            (2 * walk).min(block::MAX_WALK)
+        };
+        let until = open + walk;
+        pos = open;
+        while pos < text.len() && pos < until {
+            match match_at(pos) {
+                Some(end) if end > pos => {
+                    f(pos, end);
+                    pos = end;
+                }
+                _ => {
+                    let Some((_, len)) = next_char(text, pos) else {
+                        return;
+                    };
+                    pos += len;
+                }
             }
         }
     }

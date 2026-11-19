@@ -3495,8 +3495,10 @@ impl NativeEncoder {
     /// compiled in here, the lean loop moved the code of the other loops,
     /// and the byte loops and the cased scanner cost 1 to 2 % more
     /// operations per token on text the lean scan never reads (counted). A
-    /// pattern with no lean scan goes on to the other copy, which is the
-    /// function as it was.
+    /// pattern with no lean scan leaves this copy at once: through
+    /// [`Self::encode_single_stage_by_blocks`] when it gives a reader of the
+    /// text by blocks (the cased-letter template, `Pattern::by_cased_blocks`),
+    /// else on to the other copy, which is the function as it was.
     #[inline(never)]
     #[expect(clippy::too_many_arguments)]
     fn encode_single_stage<const ASCII: bool>(

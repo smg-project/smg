@@ -65,8 +65,8 @@
 use super::{
     block,
     pattern::{
-        clitic_match, concat, each_match, next_char, plain_class, previous_boundary, repeat, Class,
-        Node,
+        clitic_match, concat, each_match, each_match_by_blocks, plain_class, previous_boundary,
+        repeat, Class, Node,
     },
     scan::{Bits, Roles, WordScan},
 };
@@ -422,10 +422,9 @@ impl Scanner {
     }
 
     /// [`Self::for_each_match`] through [`block`]'s pass, for a text
-    /// `Pattern::by_blocks` gives a reader of: the pass cuts each ASCII
-    /// stretch, and what lies between two stretches and behind the last one
-    /// is matched here piece by piece from the piece the pass left open
-    /// (see `pattern::Scanner::for_each_match_by_blocks`, the same walk).
+    /// `Pattern::by_cased_blocks` gives a reader of: the templates' one walk
+    /// (`pattern::each_match_by_blocks`) with this template's pass
+    /// ([`Self::block_pass`]) and its `match_at`.
     #[inline(always)]
     pub(super) fn for_each_match_by_blocks<const WORDS: bool, F: FnMut(usize, usize)>(
         &self,
@@ -433,32 +432,14 @@ impl Scanner {
         text: &str,
         f: &mut F,
     ) {
-        let mut pos = 0;
-        let mut walk = 2 * block::BLOCK;
-        while pos < text.len() {
-            let open = self.block_pass(classes, text, pos, f);
-            walk = if open > pos {
-                2 * block::BLOCK
-            } else {
-                (2 * walk).min(block::MAX_WALK)
-            };
-            let until = open + walk;
-            pos = open;
-            while pos < text.len() && pos < until {
-                match self.match_at::<WORDS>(classes, text, pos) {
-                    Some(end) if end > pos => {
-                        f(pos, end);
-                        pos = end;
-                    }
-                    _ => {
-                        let Some((_, len)) = next_char(text, pos) else {
-                            return;
-                        };
-                        pos += len;
-                    }
-                }
-            }
-        }
+        each_match_by_blocks(
+            text,
+            #[inline(always)]
+            |from, f| self.block_pass(classes, text, from, f),
+            #[inline(always)]
+            |pos| self.match_at::<WORDS>(classes, text, pos),
+            f,
+        );
     }
 
     /// The most digits the digit alternative takes at once.
