@@ -788,9 +788,12 @@ message Decline {
 // for and left unanswered is declined. A frame that declines a stage in
 // `decline.stage` and fills that stage's answer field is invalid: refused
 // as malformed like any other invalid frame (the decision falls back, the
-// breaker counts it), never read one way or the other. `counters` holds no
-// more increments than the hello declared counters; a longer list is
-// invalid the same way.
+// breaker counts it), never read one way or the other. When SCORE is asked
+// for, a set `tie_band` must be finite, in [0, 1], and beside `scores`.
+// A band beside a named SCORE decline or without scores makes the frame
+// malformed. The host ignores the band and scores for an unasked SCORE.
+// `counters` holds no more increments than the hello declared counters.
+// A longer list is invalid the same way.
 message PluginDecision {
   fixed64 decision_id = 1;
   Survivors survivors = 2;
@@ -799,6 +802,9 @@ message PluginDecision {
   Decline decline = 5;
   // Counter increments by declared id, applied by the controller.
   repeated CounterDelta counters = 6;
+  // The tie band on the scores' 0 to 1 scale. Rows within this band of the
+  // best score tie. The host uses its default band when the field is unset.
+  optional float tie_band = 7;
 }
 
 message CounterDelta {
