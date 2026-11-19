@@ -51,7 +51,7 @@ use index_sink::{IndexSink, OpenRow};
 // The worker crate's port, at the path it had here.
 use smg_worker::kv_events::port;
 pub use smg_worker::kv_events::SubscriptionKind;
-use smg_worker::kv_events::{port::KvEventSink, KvEventCollector, KvEventHost};
+use smg_worker::kv_events::{port::KvEventSink, KvEventCollector, KvEventFeed, KvEventHost};
 
 /// Interval between publications of each model's index size and, for the chain
 /// index, its shape and memory (`smg_kv_index_*` gauges by model).
@@ -144,7 +144,7 @@ impl KvEventHost for IndexHost {
         ticket: Arc<KvIndex>,
         worker: &Arc<dyn Worker>,
         model: &str,
-    ) -> Option<(Arc<OpenRow>, <OpenRow as KvEventSink>::Id)> {
+    ) -> Option<KvEventFeed<OpenRow>> {
         match self
             .sink
             .open(ticket, model, worker.url(), worker.dp_rank())

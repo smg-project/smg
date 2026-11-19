@@ -23,12 +23,12 @@ mod subscription;
 
 #[cfg(feature = "runtime")]
 pub use collector::{KvEventCollector, KvEventHost};
-#[cfg(feature = "runtime")]
-pub use subscription::SubscriptionKind;
 /// A batch's header as the collector says it to a sink, for a host's cases
 /// of its sink.
 #[cfg(all(feature = "runtime", any(test, feature = "test-util")))]
 pub use subscription::{batch_facts, batch_rank};
+#[cfg(feature = "runtime")]
+pub use subscription::{KvEventFeed, SubscriptionKind};
 /// The bound on the removals that run at once and its permits, for a host's
 /// cases of what a removal holds up.
 #[cfg(all(feature = "runtime", any(test, feature = "test-util")))]

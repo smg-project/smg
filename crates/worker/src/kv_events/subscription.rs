@@ -34,6 +34,10 @@ pub enum SubscriptionKind {
     Loads,
 }
 
+/// A worker's place in a sink, as a host hands it to the worker's task: the
+/// sink, and the worker's id in it.
+pub type KvEventFeed<S> = (Arc<S>, <S as KvEventSink>::Id);
+
 /// Where a load record pushed on a worker's event stream goes: the load
 /// monitor, as the collector's streams hold it. Held by this name,
 /// the sink brings nothing of the registry the load monitor is built over.
@@ -370,7 +374,7 @@ impl Rounds {
     pub(super) async fn subscription_loop<S>(
         worker: Arc<dyn Worker>,
         worker_url: String,
-        feed: Option<(Arc<S>, S::Id)>,
+        feed: Option<KvEventFeed<S>>,
         model_id: String,
         mut shutdown_rx: oneshot::Receiver<()>,
         load_sink: Option<Weak<dyn PushedLoadSink>>,

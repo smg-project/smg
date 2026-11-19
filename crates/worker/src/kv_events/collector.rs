@@ -19,7 +19,7 @@ use tracing::{debug, error, info};
 
 use super::{
     port::KvEventSink,
-    subscription::{PushedLoadSink, Rounds, SubscriptionKind},
+    subscription::{KvEventFeed, PushedLoadSink, Rounds, SubscriptionKind},
 };
 use crate::{
     common_proto::KvEventBatch,
@@ -53,7 +53,7 @@ pub trait KvEventHost: Send + Sync + 'static {
         ticket: Self::Ticket,
         worker: &Arc<dyn Worker>,
         model: &str,
-    ) -> Option<(Arc<Self::Sink>, <Self::Sink as KvEventSink>::Id)>;
+    ) -> Option<KvEventFeed<Self::Sink>>;
 
     /// The model's last events subscription is gone.
     ///
@@ -779,7 +779,7 @@ mod tests {
             (): (),
             worker: &Arc<dyn Worker>,
             model: &str,
-        ) -> Option<(Arc<NullSink>, ())> {
+        ) -> Option<KvEventFeed<NullSink>> {
             self.calls
                 .lock()
                 .push(format!("open {model} {}", worker.url()));
