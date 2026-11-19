@@ -21,7 +21,7 @@ use smg_worker::{
     identity::basic::Worker,
     load::port::{LoadSink, PollMode, PolledMember, PolledRanks},
     registry::{Generation, WorkerId as ObjectId},
-    worker::{ConnectionMode, WorkerLoadResponse},
+    worker::{ConnectionMode, WorkerLoadResponse, WorkerStatus as ObjectStatus},
 };
 
 use super::{object::role, Lead, Objects};
@@ -55,6 +55,8 @@ struct KeptMember {
 /// read, so its load under-reads until its registration states the width.
 /// An unready rank counts as served when checking an empty
 /// answer, so the engine's verdict stands until its next record or report.
+/// An object that is not `Ready` lays no sample, by a record or by a poll's
+/// answer: its forget took its row's loads, and they stay off the file.
 /// Loads are a row's, not an object's. A forgotten object's row is evicted
 /// and its engine judged again, unless a later object was heard or asked
 /// under the row first: the loads are that object's then. Behind a reset
@@ -165,6 +167,11 @@ impl<G: Generation, S: StoreLoadSink + ?Sized> LoadAdapter<G, S> {
         };
         let rows: Vec<_> = answer
             .filter_map(|(worker, report)| {
+                // A member whose status left `Ready` while its poll was out
+                // lays no sample either: it stands as a rank not asked.
+                if worker.status() != ObjectStatus::Ready {
+                    return None;
+                }
                 let member = self.member(worker)?;
                 let row = report
                     .filter(|report| !report.loads.is_empty())
@@ -196,7 +203,13 @@ impl<G: Generation, S: StoreLoadSink + ?Sized + 'static> LoadSink for LoadAdapte
         received_at: Instant,
         sampled_at: Instant,
     ) {
-        if !self.leads() {
+        // A worker that is not `Ready` still feeds the collector's sink.
+        // The store judges every rank on file, so its record would lay
+        // again the sample its forget took off, and hold the engine's
+        // verdict over the ranks that stay. The collector reads the status
+        // and says the forget under one hold: a record that reads `Ready`
+        // lands ahead of the eviction, and a later one is dropped.
+        if !self.leads() || worker.status() != ObjectStatus::Ready {
             return;
         }
         let Ok(rank) = u16::try_from(rank) else {
@@ -851,6 +864,33 @@ mod tests {
         first.set_status(ObjectStatus::NotReady);
         adapter.forget(&first);
         assert_eq!(replica.store.ranks(zero), 0);
+        replica.publish();
+        assert!(!replica.overloaded(one, now));
+        // The rank drains its queue and keeps pushing: nothing is laid.
+        adapter.record(&first, 0, &report(0, 6), now, now);
+        assert_eq!(replica.store.ranks(zero), 0);
+        replica.publish();
+        assert!(!replica.overloaded(one, now));
+    }
+
+    /// A rank's status left `Ready` while its engine's poll was out. The
+    /// answer lays the row of the rank that stays and none for the rank
+    /// that left.
+    #[test]
+    fn a_poll_answer_lays_no_sample_for_a_rank_that_left_ready() {
+        let replica = Replica::new();
+        let adapter = replica.lead();
+        let now = Instant::now();
+        let [(zero, first), (one, second)] = replica.two_ranks(Some(5));
+        first.set_status(ObjectStatus::NotReady);
+        adapter.forget(&first);
+        let (busy, idle) = (report(0, 6), report(1, 1));
+        adapter.report(
+            &[polled(&first, Some(&busy)), polled(&second, Some(&idle))],
+            now,
+        );
+        assert_eq!(replica.store.ranks(zero), 0);
+        assert_eq!(replica.store.ranks(one), 1);
         replica.publish();
         assert!(!replica.overloaded(one, now));
     }
