@@ -265,7 +265,6 @@ pub(crate) mod tests {
         catalog::Catalog,
         controller::gateways::tests::lease,
         decision::{Pair, Target, Targets},
-        door::pinned,
         framework::{Picker, TieBand},
         lease::{Lease, LeaseId, Lifecycle, Outcome, ReleaseReason, Side, TransportClass},
         proto::{
@@ -992,33 +991,6 @@ pub(crate) mod tests {
         dispatched(&store, &open(&store, A), &a_dispatched(1), at).expect("the frame reads");
         let pin = SessionsStore::lookup(&store, KEY.get()).expect("a pin");
         assert_eq!((pin.worker, pin.ends), (WorkerId(7), None));
-    }
-
-    /// The pin's writer reads its lease's rule off the issued state, and
-    /// the door tells a dispatch once, with the record as it stood
-    /// issued. A record past that state, were one told, would read as a
-    /// rule with no TTL: it pins nothing, and a pin that stands keeps
-    /// its end.
-    #[test]
-    fn a_record_past_its_issue_pins_nothing_by_its_leases_rule() {
-        let store = MemoryStore::new();
-        let t0 = Instant::now();
-        let mut record = lease(A, 1, t0);
-        record.lease.session = KEY;
-        record.lease.session_verdict = SessionVerdict::Claimed(WorkerId(7));
-        record.lease.issued_micros = store.micros(t0);
-        record.state = LeaseState::Dispatched { at: t0 };
-        pinned(&store, &record.lease, record.state, None, WorkerId(7), t0);
-        assert!(SessionsStore::lookup(&store, KEY.get()).is_none());
-        // As issued under a rule of a minute it pins to the minute's
-        // end; told once more as the door wrote it, it leaves that end.
-        record.state = LeaseState::issued(Some(60_000_000));
-        pinned(&store, &record.lease, record.state, None, WorkerId(7), t0);
-        record.state = LeaseState::Dispatched { at: t0 };
-        pinned(&store, &record.lease, record.state, None, WorkerId(7), t0);
-        let pin = SessionsStore::lookup(&store, KEY.get()).expect("a pin");
-        let ends = store.micros(t0) + 60_000_000;
-        assert_eq!((pin.worker, pin.ends), (WorkerId(7), Some(ends)));
     }
 
     /// Two leases of one key under a rule of a second, in flight at an

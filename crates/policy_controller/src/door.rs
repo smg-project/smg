@@ -952,7 +952,7 @@ fn tell(store: &MemoryStore, world: &World, record: &LeaseRecord, said: Said) {
 /// dispatch converts no clock. The table's lock is let go before the
 /// store's pin is written: no lock is held across the two. `stood` is
 /// the dispatched side's state as it stood before this dispatch.
-pub(crate) fn pinned(
+fn pinned(
     store: &MemoryStore,
     lease: &Lease,
     stood: LeaseState,
@@ -1573,7 +1573,7 @@ pub(crate) mod tests {
 
     use parking_lot::Mutex;
 
-    use super::{decider_of, Door, Refused, Request, Swept, TERM_MARK};
+    use super::{decider_of, pinned, Door, Refused, Request, Swept, TERM_MARK};
     use crate::{
         builtins::Random,
         catalog::Catalog,
@@ -1581,12 +1581,13 @@ pub(crate) mod tests {
         decision::{Decision, Target, Targets},
         framework::{Picker, TieBand},
         lease::{Lease, LeaseId, Lifecycle, Outcome, ReleaseReason, Side, TransportClass},
+        sessions::SessionVerdict,
         spec::{AppliedSpec, PolicySpec},
         store::{
-            Ask, Dispatch, GatewayId, LeaseState, LeasesStore, MemoryStore, Said, SessionsStore,
-            ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore,
+            Ask, Dispatch, GatewayId, LeaseRecord, LeaseState, LeasesStore, MemoryStore, Picked,
+            Said, SessionsStore, ViewBuffers, WorkerFacts, WorkerStatus, WorkersStore,
         },
-        view::{Candidate, Constraints, Phase, RequestFacts, Role, WireModes, WorkerId},
+        view::{Candidate, Constraints, Phase, RequestFacts, Role, Session, WireModes, WorkerId},
     };
 
     const MODEL: &str = "model-a";
@@ -2489,5 +2490,46 @@ pub(crate) mod tests {
         assert!(matches!(on_file.state, LeaseState::Dispatched { .. }));
         assert_eq!(door.sweep(leased.due), Swept::default(), "dispatched");
         assert_eq!(counted(&store).len(), 1);
+    }
+
+    /// The pin's writer reads its lease's rule off the issued state, and
+    /// the door tells a dispatch once, with the record as it stood
+    /// issued. A record past that state, were one told, would read as a
+    /// rule with no TTL: it pins nothing, and a pin that stands keeps
+    /// its end.
+    #[test]
+    fn a_record_past_its_issue_pins_nothing_by_its_leases_rule() {
+        const KEY: Session = Session::from_raw(41);
+        let store = MemoryStore::new();
+        let t0 = Instant::now();
+        let mut record = LeaseRecord {
+            lease: Lease {
+                id: LeaseId(1),
+                session: KEY,
+                session_verdict: SessionVerdict::Claimed(WorkerId(7)),
+                issued_micros: store.micros(t0),
+                ..Lease::default()
+            },
+            gateway: GATEWAY,
+            request: 1,
+            target: WorkerId(7),
+            picked: Picked::default(),
+            decode: None,
+            term: 0,
+            issued_at: t0,
+            dispatch_deadline: t0 + Duration::from_secs(5),
+            state: LeaseState::Dispatched { at: t0 },
+        };
+        pinned(&store, &record.lease, record.state, None, WorkerId(7), t0);
+        assert!(SessionsStore::lookup(&store, KEY.get()).is_none());
+        // As issued under a rule of a minute it pins to the minute's
+        // end; told once more as the door wrote it, it leaves that end.
+        record.state = LeaseState::issued(Some(60_000_000));
+        pinned(&store, &record.lease, record.state, None, WorkerId(7), t0);
+        record.state = LeaseState::Dispatched { at: t0 };
+        pinned(&store, &record.lease, record.state, None, WorkerId(7), t0);
+        let pin = SessionsStore::lookup(&store, KEY.get()).expect("a pin");
+        let ends = store.micros(t0) + 60_000_000;
+        assert_eq!((pin.worker, pin.ends), (WorkerId(7), Some(ends)));
     }
 }
