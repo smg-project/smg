@@ -215,6 +215,13 @@ impl HashRing {
             && own.next().is_none()
     }
 
+    /// Whether this ring and `other` are one table of positions, for the
+    /// cases that say a ring was taken from another and not built again.
+    #[cfg(test)]
+    pub(crate) fn shares_positions_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.entries, &other.entries)
+    }
+
     /// Hash a string to a ring position using blake3 (stable across versions).
     #[inline]
     #[expect(

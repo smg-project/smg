@@ -489,10 +489,15 @@ pub struct SelectWorkerInfo<'a> {
     /// body access populate it); used when no valid routing-key header is
     /// present under the routing-key override.
     pub rid_key: Option<&'a str>,
-    /// The hash ring of the model's membership generation, for O(log n)
-    /// consistent hashing: filled once a generation and passed through, so
-    /// no request rebuilds it. A placement hands it to a policy that reads
-    /// it (`policy_reads_hash_ring`) and `None` to any other.
+    /// The hash ring the model's requests are placed on, for O(log n)
+    /// consistent hashing: the ring of the model's membership generation,
+    /// or the ring kept from an earlier generation while that one is
+    /// filled, so no request builds it. The ring can therefore name workers
+    /// that left and lack workers that joined: a policy that walks it takes
+    /// a URL only where its own workers hold an eligible worker there, and
+    /// places a request that no URL takes as with no ring. A placement
+    /// hands the ring to a policy that reads it (`policy_reads_hash_ring`)
+    /// and `None` to any other, and to all before a model's first ring.
     pub hash_ring: Option<Arc<HashRing>>,
     /// Which PD role this selection is for (default `Single`); namespaces
     /// header-based sticky routing so prefill and decode stick independently.

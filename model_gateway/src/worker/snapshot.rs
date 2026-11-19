@@ -265,25 +265,40 @@ impl ModelWorkerSnapshot {
         (**spelling == *model_id).then_some(labels)
     }
 
-    /// The consistent-hash ring over the URLs of this generation's members.
-    /// The first read after the membership change fills it: `kept` hands the
-    /// ring the gateway kept for the model, and the fill reconciles that
-    /// ring to these members, hashing only the URLs it does not hold; with
-    /// none kept it builds the ring whole. A kept ring over these very
-    /// members, as after a generation is published again over the same
-    /// list, is taken as it is. Every read after it reads the filled ring,
-    /// and a read that arrives during the fill waits for it.
-    /// Whatever ring `kept` hands, the cell holds the ring of these
-    /// members: a kept ring saves hashing and decides no placement.
-    pub(crate) fn hash_ring(&self, kept: impl FnOnce() -> Option<Arc<HashRing>>) -> &Arc<HashRing> {
+    /// The consistent-hash ring over the URLs of this generation's members,
+    /// once it is filled ([`Self::fill_hash_ring`], [`Self::take_hash_ring`]).
+    pub(crate) fn hash_ring(&self) -> Option<&Arc<HashRing>> {
+        self.hash_ring.get()
+    }
+
+    /// Fills the ring cell, where it is empty, and answers its ring. The
+    /// fill reconciles `kept`, the ring the gateway kept for the model, to
+    /// these members, hashing only the URLs it does not hold; with none
+    /// kept it builds the ring whole. A kept ring over these very members
+    /// is taken as it is. A call that arrives during another's fill waits
+    /// for it. Whatever ring `kept` is, the cell holds the ring of these
+    /// members: `kept` saves hashing and decides nothing of the ring filled.
+    pub(crate) fn fill_hash_ring(&self, kept: Option<Arc<HashRing>>) -> &Arc<HashRing> {
         self.hash_ring.get_or_init(|| {
             let urls = || self.all.iter().map(|worker| worker.url());
-            match kept() {
+            match kept {
                 Some(kept) if kept.is_over(urls()) => kept,
                 Some(kept) => Arc::new(kept.updated(urls())),
                 None => Arc::new(HashRing::new(urls())),
             }
         })
+    }
+
+    /// Puts `ring` into the ring cell where it is the ring over these very
+    /// members, as after a generation is published again over the same
+    /// list: a compare of the URLs, with nothing hashed. Any other ring is
+    /// left out, and so is every ring once the cell is filled.
+    pub(crate) fn take_hash_ring(&self, ring: &Arc<HashRing>) {
+        let urls = self.all.iter().map(|worker| worker.url());
+        if ring.worker_count() == self.all.len() && ring.is_over(urls) {
+            // A fill that got there first put in a ring of the same content.
+            let _ = self.hash_ring.set(Arc::clone(ring));
+        }
     }
 
     /// Whether the ring cell is filled, for the cases that say who filled it.
