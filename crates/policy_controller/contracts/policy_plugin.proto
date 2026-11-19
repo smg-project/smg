@@ -461,7 +461,7 @@ message Trace {
   bool drew_first = 12;
   // The soft veto lifted to make this pick; none unless that veto left the
   // pool nobody, or left a session key handed on at its sessions rule's
-  // in-flight cap nobody under the cap. The all-vetoed rule's pick sets it,
+  // in-flight cap nobody. The all-vetoed rule's pick sets it,
   // and so does the pick of a session key kept on its worker. A host counts
   // both from this field.
   LiftedVeto lifted = 13;

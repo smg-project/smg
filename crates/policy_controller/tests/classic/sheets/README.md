@@ -22,6 +22,10 @@ places a request on, over two pools its pair index has paired.
 One sheet records no pick and no policy: `overload.json` holds whether the gateway reads one worker as overloaded
 after each thing its load monitor is handed about the worker.
 
+One sheet records one rule over the policies that read no routing key themselves: `sticky_override.json` holds
+where the gateway's routing-key override places a keyed request, and what it does with a key that has two
+requests in flight on its worker.
+
 Two sheets record a rank of one worker and no worker: `minimum_tokens.json` holds the rank the gateway's
 minimum-tokens policy gives each request after each thing its rank cache is handed about the worker, and
 `sticky_rank.json` holds the rank the gateway pins each request of one grouped worker to by its sticky key.
@@ -40,6 +44,7 @@ crates/policy_controller/tests/classic/sheets/
   minimum_tokens.json
   sticky_rank.json
   cache_aware.json
+  sticky_override.json
 model_gateway/src/         the gateway's recorders, each a test module beside the code it runs
   policies/classic_rows.rs                                                  power_of_two.json
   policies/classic_manual_rows.rs                                           manual.json
@@ -51,6 +56,7 @@ model_gateway/src/         the gateway's recorders, each a test module beside th
   policies/bucket/classic_bucket_rows.rs                                    bucket.json
   routers/grpc/common/stages/request_execution/classic_sticky_rank_rows.rs  sticky_rank.json
   policies/classic_cache_aware_rows.rs                                      cache_aware.json
+  policies/classic_sticky_override_rows.rs                                  sticky_override.json
 crates/worker/src/         the worker crate's recorders, test modules beside the load monitor
   load/monitor/classic_overload_rows.rs                                     overload.json
   load/monitor/classic_minimum_tokens_rows.rs                               minimum_tokens.json
@@ -234,6 +240,17 @@ pool, which is the pool's order and no rule of the policy.
   then the others, and a spread row counts what each rank took, the largest count first. Nothing in a row draws:
   a key's rank is its hash, and the recorder runs each row twice and stops if the two runs differ.
 
+The rows of `sticky_override.json` are sequence rows and four drawn rows in the manual sheet's shape, taken through
+the routing-key override: the policy registry's own selection with the override on. A row names the policy under
+the override (`policy`) and the sticky map's assignment mode (`assignment`). Each worker has the requests the router
+holds on it and the routing keys with a request in flight on it. A step is a pick (the request's routing key, if it
+carries one, and its `model`), a worker that stops being routable (`down`) or is routable again (`up`), new loads
+for every worker (`loads`), or the requests of one key in flight on every worker from here on (`held`): the count
+the override's cap reads. No row states the cap: it is the gateway's own, two requests of the key on its worker,
+and the rows at one request and at two hold it. No pick moves a count: the counts move by the row's steps alone.
+Under `delegate` a sequence row runs power of two over two workers with no load report, so the policy compares
+both by their requests in flight and draws nothing.
+
 ## The sheets
 
 Each sheet is recorded on its own, so the commit is a column of the sheet's row and never one commit for the
@@ -253,6 +270,7 @@ directory. The sha256 is of the file as committed.
 | `minimum_tokens.json` | the minimum-tokens rank of one worker: a poll's answer, a rank it omits, an answer with no token capacity or no entry, a failed poll, an eviction, a worker that stands for one rank, used tokens beside context tokens | `615542c4c69bb28fb3cb3e9e4ee29a8e2be0a7bc` | 18: 18 sequence, 0 drawn | `1ab41e023fa4f9b507860655a3d917aee68686479d09eaa3b1e9cf8e71d56139` | `classic_minimum_tokens_rows.rs` |
 | `sticky_rank.json` | the rank of a sticky key on one grouped worker under hash placement: a key's rank, a request with no key, a worker of one engine or of no count, the ranks a connection places a pin on, how the keys keep and spread | `615542c4c69bb28fb3cb3e9e4ee29a8e2be0a7bc` | 8: 6 sequence, 2 drawn | `d8663087d143cb6d8f46777b2abf6b38e16153fb738c33240c8c7473c86805af` | `classic_sticky_rank_rows.rs` |
 | `cache_aware.json` | cache aware in single placement, under each of its three matchers: a holder kept, the count gate and its spill, its factor under the command line's defaults, a margin under its floor, a miss, a match at the threshold, a holder tried or not usable, the two KV gates, a request that ends, the blocks a worker stores and removes | `bfe189b332349c44cf7e3b6e1102a9b5a2699d9d` | 28: 26 sequence, 2 drawn | `f13a642dc9252e0328f8092b3ff322a03f270d918311c3b5c5dd29979ab8f085` | `classic_cache_aware_rows.rs` |
+| `sticky_override.json` | the routing-key override over a policy that reads no key: a pin under the cap and under its model, a key seen first under the map's modes and under `delegate`, each pin order after a failover, and at the cap a pin that follows, a pick on the pinned worker again, a pick on a worker at the cap, every worker at the cap, no other worker routable | `26f90083091e4dd791420febd88beda3bef3faac` | 18: 14 sequence, 4 drawn | `d74b5e3c8a31b4f1c8cd55cef5629acad0659658c830d937f94b056e9580562b` | `classic_sticky_override_rows.rs` |
 
 ## Recording
 
@@ -282,6 +300,7 @@ The overload and minimum-tokens sheets' recorders are tests of the worker crate:
 | `minimum_tokens.json` | `load::monitor::classic_minimum_tokens_rows` |
 | `sticky_rank.json` | `request_execution::classic_sticky_rank_rows` |
 | `cache_aware.json` | `policies::classic_cache_aware_rows` |
+| `sticky_override.json` | `policies::classic_sticky_override_rows` |
 
 The pair sheet's recorder is a child of the pair index and reads a pairing descriptor by its readers, so it records the
 descriptor the gateway derived and never a second reading of the registration. The encode sheet's recorder is a
@@ -349,6 +368,7 @@ fails once the reason no longer holds.
   (`a-ten-token-prompt-keeps-its-key-s-worker-over-the-fewest-requests`). The other 45 rows replay.
 - `bucket.json`: none. All 19 rows replay.
 - `cache_aware.json`: none. All 28 rows replay.
+- `sticky_override.json`: none. All 18 rows replay.
 - `minimum_tokens.json`: ten rows are decided apart, each by a rule of the crate's store or scorer that the
   replay names with the ranks the crate gives. The gateway reads the tokens a rank's cache uses, and only from an
   entry that carries token capacity. The crate scores a rank by the context tokens of the requests it holds

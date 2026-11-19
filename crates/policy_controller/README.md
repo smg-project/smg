@@ -459,10 +459,10 @@ The `manual` preset is a **sessions rule** and nothing else. A rule sits on a bi
 | `assignment` | `delegate` | How a new key gets its worker: `random`, `min_load` (the fewest running requests), `min_group` (the fewest active keys) or `delegate` (the profile's own stages). |
 | `ttl_s` | 14400 | Seconds an idle key stays remembered. |
 | `sweep_s` | 120 | Seconds between two sweeps of idle keys. |
-| `inflight_cap` | 2 | Requests of one key a worker carries before the next one goes elsewhere. `65535` means no cap. |
+| `inflight_cap` | 2 | Requests of one key a worker carries before the next one is placed again, over every usable worker. The key's worker changes only to another worker under the cap. `65535` means no cap. |
 | `recovery` | `original` | Which worker leads when both of a key's workers are usable: `original`, the first, or `latest`. |
 
-One more rule for the hash ring. Under `consistent_hashing`, a key stays on its worker while that worker is over the overload thresholds. `overload.shed_when_all_vetoed: true` on the binding moves the key to the ring's next worker instead.
+One more rule for the hash ring. Under `consistent_hashing`, a key stays on its worker while that worker is over the overload thresholds. `overload.shed_when_all_vetoed: true` on the binding moves the key to the ring's next worker instead. At the in-flight cap the ring places the request on the key's worker again, so the cap moves the key only where the overload veto drops that worker.
 
 ## Loading and changing a document
 

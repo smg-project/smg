@@ -29,6 +29,9 @@ mod classic_prefix_hash_rows;
 #[cfg(test)]
 #[expect(clippy::print_stdout, reason = "a recorder says where its sheet went")]
 mod classic_rows;
+#[cfg(test)]
+#[expect(clippy::print_stdout, reason = "a recorder says where its sheet went")]
+mod classic_sticky_override_rows;
 mod consistent_hashing;
 pub mod cost;
 mod dp_min_token;
