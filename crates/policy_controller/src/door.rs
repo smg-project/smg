@@ -13,8 +13,9 @@
 //! `Asked`): a frame as the served controller checked it, or the facts a
 //! host in process holds ([`Request`]).
 //!
-//! A generation may sample picks and sheds at the seat that decided.
-//! [`Door::explain`] reads them by gateway and request id.
+//! A seat has one lock for decisions and another for sampled picks and
+//! sheds. A sampling decision takes the slot lock before the ring lock.
+//! [`Door::explain`] reads by gateway and request id under the ring lock.
 
 use std::{
     cell::Cell,
@@ -1516,20 +1517,23 @@ impl Drop for Handed<'_> {
     }
 }
 
-/// A seat on lines of its own: a thread that decides at one seat writes
-/// no line the thread at the next one reads.
+/// A seat a file of the store, on cache lines of its own.
 #[derive(Default)]
 #[repr(align(128))]
-struct Seat(Mutex<DeciderSlot>);
+struct Seat {
+    /// The seat's state across decisions. Only decisions take this lock.
+    slot: Mutex<DeciderSlot>,
+    /// The seat's recent decisions, locked by sampling decisions and reads.
+    samples: Mutex<Samples>,
+}
 
-/// What a seat's holder keeps across decisions.
+/// What a seat's holder keeps across decisions, under the decision lock.
 #[derive(Default)]
 struct DeciderSlot {
     buffers: Buffers<()>,
     /// The holder's place at the seat's file, taken at the seat's first
     /// decision.
     at_file: Option<AtWork>,
-    samples: Samples,
 }
 
 thread_local! {
@@ -1537,6 +1541,11 @@ thread_local! {
     /// is the thread's number among the threads that have called one, so
     /// threads start at seats of their own.
     static SEAT: Cell<usize> = Cell::new(CALLERS.fetch_add(1, Ordering::Relaxed));
+}
+
+#[cfg(test)]
+thread_local! {
+    static ON_SAMPLE_READ: Cell<Option<Box<dyn FnOnce()>>> = const { Cell::new(None) };
 }
 
 /// The threads that have called a door so far.
@@ -1635,14 +1644,21 @@ impl Door {
         }
     }
 
-    /// Finds a sampled decision by gateway and request id. Each seat is
-    /// held for at most one scan of its 1,024 slots.
+    /// Finds a sampled decision by gateway and request id. A read holds
+    /// only the ring lock at each seat, for one scan of up to 1,024 records.
     #[must_use]
     pub fn explain(&self, gateway: GatewayId, request_id: &[u8]) -> Option<DecisionRecord> {
         let key = fingerprint(request_id);
         self.seats
             .iter()
-            .filter_map(|seat| seat.0.lock().samples.find(0, gateway, key))
+            .filter_map(|seat| {
+                let samples = seat.samples.lock();
+                #[cfg(test)]
+                if let Some(reading) = ON_SAMPLE_READ.take() {
+                    reading();
+                }
+                samples.find(0, gateway, key)
+            })
             .max_by_key(|record| record.at)
     }
 
@@ -1745,11 +1761,7 @@ impl Door {
             // The store lays at most one file for each byte-sized name.
             debug_assert!(at < Decider::COUNT);
             let _acting = Decider::new(at as u8).enter();
-            let DeciderSlot {
-                buffers,
-                at_file,
-                samples,
-            } = &mut *slot;
+            let DeciderSlot { buffers, at_file } = &mut *slot;
             let at_file = at_file.get_or_insert_with(|| self.store.at_work());
             // The thread works at the seat's file for this decision: what
             // was handed is applied as it takes up the work.
@@ -1792,7 +1804,8 @@ impl Door {
             let decided = catch_unwind(AssertUnwindSafe(order));
             if flags & SAMPLES_DECISIONS != 0 {
                 if let Ok(Ok(answer)) = &decided {
-                    samples.keep(0, engine, &taken, &answer.decision);
+                    let samples = &self.seats[at].samples;
+                    samples.lock().keep(0, engine, &taken, &answer.decision);
                 }
             }
             // The load ends with the decision.
@@ -1824,7 +1837,7 @@ impl Door {
     /// requests there decide one at a time.
     fn home(&self, model: &str) -> (usize, MutexGuard<'_, DeciderSlot>) {
         let at = decider_of(model, self.seats.len());
-        (at, self.seats[at].0.lock())
+        (at, self.seats[at].slot.lock())
     }
 
     /// Takes the seat the calling thread decides at: the one it took
@@ -1837,7 +1850,7 @@ impl Door {
         // at the first seat.
         let last = SEAT.try_with(Cell::get).unwrap_or(0);
         let own = if last < seats { last } else { self.round(last) };
-        match self.seats[own].0.try_lock() {
+        match self.seats[own].slot.try_lock() {
             Some(slot) => (own, slot),
             None => self.another(own),
         }
@@ -1861,12 +1874,12 @@ impl Door {
         let seats = self.seats.len();
         for step in 1..seats {
             let at = (own + step) % seats;
-            if let Some(slot) = self.seats[at].0.try_lock() {
+            if let Some(slot) = self.seats[at].slot.try_lock() {
                 let _ = SEAT.try_with(|seat| seat.set(at));
                 return (at, slot);
             }
         }
-        (own, self.seats[own].0.lock())
+        (own, self.seats[own].slot.lock())
     }
 
     /// The term past `term`, where the store still stands under `term`;
@@ -2003,8 +2016,8 @@ pub(crate) mod tests {
     use parking_lot::Mutex;
 
     use super::{
-        decider_of, pinned, DecisionRecord, Door, Refused, Request, Swept, DISPATCH_TTL, SEAT,
-        TERM_MARK,
+        decider_of, pinned, DecisionRecord, Door, Refused, Request, Swept, DISPATCH_TTL,
+        ON_SAMPLE_READ, SEAT, TERM_MARK,
     };
     use crate::{
         builtins::Random,
@@ -2224,14 +2237,99 @@ pub(crate) mod tests {
             .expect("a later generation");
     }
 
+    /// Holds a read at the first seat until the returned sender drops.
+    fn hold_read<'scope>(
+        scope: &'scope thread::Scope<'scope, '_>,
+        door: &'scope Door,
+    ) -> Result<mpsc::Sender<()>, mpsc::RecvTimeoutError> {
+        let (held, entered) = mpsc::channel();
+        let (release, resume) = mpsc::channel();
+        scope.spawn(move || {
+            ON_SAMPLE_READ.set(Some(Box::new(move || {
+                let _ = held.send(());
+                let _ = resume.recv();
+            })));
+            let _ = door.explain(GATEWAY, b"read");
+        });
+        entered.recv_timeout(PATIENCE)?;
+        Ok(release)
+    }
+
+    #[test]
+    fn a_read_of_a_ring_leaves_a_caller_at_its_seat() {
+        let door = &Door::new(fleet(2));
+        thread::scope(|scope| {
+            let _read = hold_read(scope, door).expect("the read holds the first ring");
+            let (answer, answered) = mpsc::channel();
+            scope.spawn(move || {
+                seated(0);
+                let (lease, _) = leased(door, b"caller", 7);
+                let _ = answer.send((door.store().file_of(lease), SEAT.get()));
+            });
+            assert_eq!(answered.recv_timeout(PATIENCE), Ok((0, 0)));
+        });
+    }
+
+    #[test]
+    fn a_read_of_a_ring_holds_no_decision_of_its_model() {
+        let store = fleet(1);
+        picking(&store, 2, "scoped", || Box::new(Scoped));
+        let door = &Door::new(store);
+        let _ = leased(door, b"warm", 7);
+        thread::scope(|scope| {
+            let _read = hold_read(scope, door).expect("the read holds the model's ring");
+            let (answer, answered) = mpsc::channel();
+            scope.spawn(move || {
+                let (lease, _) = leased(door, b"home", 7);
+                let _ = answer.send(door.store().file_of(lease));
+            });
+            assert_eq!(answered.recv_timeout(PATIENCE), Ok(0));
+        });
+    }
+
+    #[test]
+    fn a_kept_record_waits_for_a_read_and_is_found() {
+        let store = fleet(1);
+        sampling(&store, 2, 1);
+        let door = &Door::new(store);
+        let id = b"kept";
+        let decision = thread::scope(|scope| {
+            let read = hold_read(scope, door).expect("the read holds the ring");
+            let (answer, answered) = mpsc::channel();
+            scope.spawn(move || {
+                let decided = door
+                    .decide(GATEWAY, &request(id, 7), Instant::now())
+                    .expect("a decision");
+                let _ = answer.send(decided.decision);
+            });
+            let due = Instant::now() + PATIENCE;
+            while LeasesStore::live(&**door.store(), GATEWAY) == 0 {
+                assert!(Instant::now() < due, "the decision files its lease");
+                thread::yield_now();
+            }
+            assert_eq!(
+                answered.recv_timeout(Duration::from_millis(100)),
+                Err(mpsc::RecvTimeoutError::Timeout),
+                "a decision that keeps a record waits for the read"
+            );
+            assert!(door.seats[0].slot.is_locked());
+            drop(read);
+            answered
+                .recv_timeout(PATIENCE)
+                .expect("the decision returns after the read")
+        });
+        let record = door.explain(GATEWAY, id).expect("the kept record");
+        assert_eq!(record.decision, decision);
+    }
+
     #[test]
     fn sampling_off_allocates_no_slots_and_explains_nothing() {
         let door = Door::new(fleet(1));
         let _ = leased(&door, b"off", 1);
         assert!(door.explain(GATEWAY, b"off").is_none());
-        let seat = door.seats[0].0.lock();
-        assert_eq!(seat.samples.slots(), 0);
-        assert_eq!(seat.samples.counted(), 0);
+        let samples = door.seats[0].samples.lock();
+        assert_eq!(samples.slots(), 0);
+        assert_eq!(samples.counted(), 0);
     }
 
     #[test]
@@ -2270,7 +2368,7 @@ pub(crate) mod tests {
                         assert_eq!(door.store().file_of(lease), at);
                         door.report(GATEWAY, lease, gone());
                         if n < 3 {
-                            assert_eq!(door.seats[at].0.lock().samples.slots(), 0);
+                            assert_eq!(door.seats[at].samples.lock().slots(), 0);
                         }
                     }
                 });
@@ -2300,7 +2398,7 @@ pub(crate) mod tests {
         assert!(door.explain(GATEWAY, &0_u32.to_le_bytes()).is_none());
         assert!(door.explain(GATEWAY, &1_u32.to_le_bytes()).is_some());
         assert!(door.explain(GATEWAY, &1_024_u32.to_le_bytes()).is_some());
-        let slots = door.seats[0].0.lock().samples.slots();
+        let slots = door.seats[0].samples.lock().slots();
         assert_eq!(slots, 1_024);
         let bytes = size_of::<DecisionRecord>();
         writeln!(

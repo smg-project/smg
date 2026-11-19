@@ -1,5 +1,5 @@
 //! The recent decisions of one seat. The seat's holder counts and writes,
-//! and a reader copies a matching record while holding that seat.
+//! and a reader copies a matching record under the seat's ring lock.
 
 use std::{collections::VecDeque, time::Instant};
 
