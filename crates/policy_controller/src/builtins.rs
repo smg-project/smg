@@ -192,6 +192,17 @@ impl Filter for HasRoom {
 #[derive(Debug)]
 pub struct NotTried;
 
+impl NotTried {
+    /// Whether the request names no row tried and its host none excluded:
+    /// the filter then keeps every row. The one test behind both
+    /// shortcuts that read it: the filter's own pass and the fold's set
+    /// ([`RowTests::asked`]).
+    #[inline(always)]
+    fn names_none(facts: &RequestFacts<'_>, cx: &Constraints<'_>) -> bool {
+        facts.tried.is_empty() && cx.excluded.is_empty()
+    }
+}
+
 impl Filter for NotTried {
     fn name(&self) -> &'static str {
         "not-tried"
@@ -217,8 +228,7 @@ impl Filter for NotTried {
         cx: &Constraints<'_>,
         kept: &mut Vec<u32>,
     ) {
-        // With neither list naming a worker, every row stays in the pool.
-        if facts.tried.is_empty() && cx.excluded.is_empty() {
+        if Self::names_none(facts, cx) {
             return;
         }
         kept.retain(|&i| self.keep(facts, &candidates[i as usize], cx));
@@ -280,7 +290,7 @@ impl RowTests {
         if cx.overload_lifted {
             tests &= !Self::NOT_OVERLOADED;
         }
-        if facts.tried.is_empty() && cx.excluded.is_empty() {
+        if NotTried::names_none(facts, cx) {
             tests &= !Self::NOT_TRIED;
         }
         Self(tests)
@@ -1345,8 +1355,8 @@ impl LeastLoad {
                 }
             });
         }
-        let mut rate = None;
-        let mut nominal = || *rate.get_or_insert_with(|| self.mean_rate(candidates, kept, load));
+        let mut mean = None;
+        let mut nominal = || *mean.get_or_insert_with(|| self.mean_rate(candidates, kept, load));
         for (slot, &i) in out.iter_mut().zip(rows) {
             if let Some(r) = load(&candidates[i as usize]) {
                 let drain = if r.live_rate > 0 {
@@ -4267,6 +4277,28 @@ mod tests {
         );
     }
 
+    /// A row without a report drains at the mean rate of the peers that
+    /// report one, not at the default. Its peers report 8,000 and 1,000
+    /// tokens a second, so its four requests wait 4 x 1,024 / 4,500 =
+    /// 0.91 s, ahead of the peer whose one request waits 1.02 s. At the
+    /// default of 2,000 they would wait 2.05 s, behind it.
+    #[test]
+    fn a_row_without_a_report_drains_at_its_peers_mean_rate() {
+        let ll = LeastLoad::new(0.15, 1024, 2000.0);
+        let mut pool = [candidate(0, 0), candidate(1, 4), candidate(2, 0)];
+        pool[0].load = Some(LoadRow {
+            live_rate: 8_000,
+            ..report(0, 0)
+        });
+        pool[2].load = Some(LoadRow {
+            live_rate: 1_000,
+            ..report(1, 0)
+        });
+        let mut scores = [0.0f32; 3];
+        ll.score(&RequestFacts::default(), &pool, &kept(3), &mut scores);
+        assert!(scores[0] > scores[1] && scores[1] > scores[2], "{scores:?}");
+    }
+
     #[test]
     fn kv_pressure_raises_the_cost_of_an_otherwise_equal_worker() {
         let ll = LeastLoad::new(0.15, 1024, 2000.0);
@@ -6820,7 +6852,10 @@ mod tests {
     /// thread a rank credits dispatches and two more decide and read. A
     /// row is decided once its report was told, as a host shows a world it
     /// told, and the row told before it is decided on: every number a row
-    /// is handed is its own rank's, and rows are handed numbers.
+    /// is handed is its own rank's. The round ends on one more instant, of
+    /// the rank told last alone, so a reader is handed a number on a
+    /// runner of any size. On one or two cores that number may be the
+    /// only one: the turns then showed no hand-over of their own.
     #[test]
     fn a_slot_told_under_two_ranks_hands_each_row_its_own_ranks_number() {
         const INSTANTS: u64 = 20_000;
