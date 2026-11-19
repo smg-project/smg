@@ -693,7 +693,12 @@ message LifecycleEvent {
 // pool. An Observe stream names the version last fixed and lives under it:
 // one that ends is opened again under that version, and once the plugin's
 // Decide streams settle on another, the controller ends it and the next
-// names that one. Version 2 adds MembershipChange.KIND_LEFT.
+// names that one. Version 2 adds MembershipChange.KIND_LEFT. Where the
+// version last fixed is 1 and no Decide stream is open, a KIND_LEFT event
+// waits for the next one to settle: the controller ends the Observe stream
+// and holds the events behind that one. The next Observe stream opens at
+// the settle: on version 2 the event is sent first, on version 1 it is not
+// sent.
 message PluginHello {
   uint32 protocol_min = 1;
   uint32 protocol_max = 2;

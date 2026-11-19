@@ -3245,11 +3245,13 @@ fn left_words_past_the_queues_bound_cost_a_stream_on_protocol_1_nothing() {
     assert_eq!(seen.events[0].seq, 1, "no loss is numbered");
 }
 
-/// A left word raised while no stream stands waits in the queue for the
-/// stream that settles next. Where that one settles on protocol 1 the word
-/// is not written: the plugin hears the relabelling behind it alone, as the
-/// first event, and the word takes no number on a stream that does not
-/// carry it. Here the load's stream has ended as the two words are raised.
+/// A left word raised while no stream stands waits for the stream that
+/// settles next: the events call that still stands yields at it, and the
+/// word is kept with the events behind it. Where that stream settles on
+/// protocol 1 the word is not written: the plugin hears the relabelling
+/// behind it alone, as the first event, and the word takes no number on a
+/// stream that does not carry it. Here the load's stream has ended as the
+/// two words are raised.
 #[test]
 fn a_left_word_that_waited_for_a_stream_is_not_written_on_protocol_1() {
     use proto::{lifecycle_event::Event, membership_change::Kind};
