@@ -11,6 +11,7 @@ from google.protobuf import descriptor_pb2, descriptor_pool, message_factory
 from smg_grpc_proto import vllm_engine_pb2
 from smg_grpc_proto.generated import common_pb2
 from smg_grpc_servicer.vllm import model_info
+from smg_grpc_servicer.vllm.decoding_policy import POLICY_ENV, constrained_decoding_policy
 from smg_grpc_servicer.vllm.scheduler_loads import managed_ranks
 
 _SERVICER = Path(__file__).parents[1] / "smg_grpc_servicer" / "vllm" / "servicer.py"
@@ -58,6 +59,13 @@ def _response_type(legacy):
             label=descriptor_pb2.FieldDescriptorProto.LABEL_OPTIONAL,
             type=descriptor_pb2.FieldDescriptorProto.TYPE_STRING,
         )
+    if not any(f.name == "constrained_decoding" for f in response.field):
+        response.field.add(
+            name="constrained_decoding",
+            number=31,
+            label=descriptor_pb2.FieldDescriptorProto.LABEL_OPTIONAL,
+            type=descriptor_pb2.FieldDescriptorProto.TYPE_STRING,
+        )
     pool = descriptor_pool.DescriptorPool()
     pool.AddSerializedFile(common_pb2.DESCRIPTOR.serialized_pb)
     pool.Add(descriptor)
@@ -90,7 +98,10 @@ def test_get_server_info_reports_encoder_dtype_with_current_and_legacy_protos(
         model_config=model_config, parallel_config=SimpleNamespace(data_parallel_size=1)
     )
     servicer = SimpleNamespace(
-        engine=SimpleNamespace(vllm_config=config), _mm_processor=None, _mm_encoder_budget=0
+        engine=SimpleNamespace(vllm_config=config),
+        _mm_processor=None,
+        _mm_encoder_budget=0,
+        _constrained_decoding="",
     )
     info = asyncio.run(_server_info_method(response_type)(servicer, None, None))
     assert info.model_dtype == (dtype or "")
@@ -136,7 +147,10 @@ def test_get_server_info_reports_where_the_engine_starts_a_grammar(legacy):
         ),
     )
     servicer = SimpleNamespace(
-        engine=SimpleNamespace(vllm_config=config), _mm_processor=None, _mm_encoder_budget=0
+        engine=SimpleNamespace(vllm_config=config),
+        _mm_processor=None,
+        _mm_encoder_budget=0,
+        _constrained_decoding="",
     )
     info = asyncio.run(_server_info_method(response_type)(servicer, None, None))
     if legacy:
@@ -157,7 +171,10 @@ def test_get_server_info_reports_the_engines_encoder_budget(legacy):
         model_config=model_config, parallel_config=SimpleNamespace(data_parallel_size=1)
     )
     servicer = SimpleNamespace(
-        engine=SimpleNamespace(vllm_config=config), _mm_processor=None, _mm_encoder_budget=192000
+        engine=SimpleNamespace(vllm_config=config),
+        _mm_processor=None,
+        _mm_encoder_budget=192000,
+        _constrained_decoding="",
     )
     info = asyncio.run(_server_info_method(response_type)(servicer, None, None))
     if legacy:
@@ -167,6 +184,73 @@ def test_get_server_info_reports_the_engines_encoder_budget(legacy):
     servicer._mm_encoder_budget = 0
     info = asyncio.run(_server_info_method(response_type)(servicer, None, None))
     assert info.mm_encoder_budget == 0
+
+
+@pytest.mark.parametrize("installed_legacy", [False, True])
+@pytest.mark.parametrize("policy", [None, "requested", "always", "invalid"])
+@pytest.mark.parametrize("legacy", [False, True])
+def test_get_server_info_reports_decoding_policy(monkeypatch, policy, legacy, installed_legacy):
+    """Bad declarations fail initialization; metadata RPCs keep serving the startup policy."""
+    monkeypatch.setenv("SMG_VLLM_SERVICER_IMPL", "python")
+    if installed_legacy:
+        monkeypatch.setattr(
+            vllm_engine_pb2,
+            "DESCRIPTOR",
+            _response_type_without("constrained_decoding").DESCRIPTOR.file,
+        )
+    monkeypatch.delenv(POLICY_ENV, raising=False)
+    if policy is not None:
+        monkeypatch.setenv(POLICY_ENV, policy)
+    response_type = (
+        _response_type_without("constrained_decoding") if legacy else _response_type(False)
+    )
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(dtype="torch.bfloat16", is_multimodal_model=False),
+        parallel_config=SimpleNamespace(data_parallel_size=1),
+    )
+    servicer = SimpleNamespace(
+        engine=SimpleNamespace(vllm_config=config),
+        _mm_processor=None,
+        _mm_encoder_budget=0,
+        _constrained_decoding="",
+    )
+    initialize = _policy_initializer(response_type)
+    if policy == "invalid" or (legacy and policy == "always"):
+        with pytest.raises(ValueError, match="SMG_VLLM_CONSTRAINED_DECODING|smg-grpc-proto"):
+            initialize(servicer, None, 0)
+    else:
+        initialize(servicer, None, 0)
+        monkeypatch.setenv(POLICY_ENV, "invalid-after-start")
+        info = asyncio.run(_server_info_method(response_type)(servicer, None, None))
+        if not legacy:
+            assert info.constrained_decoding == (policy or "")
+
+
+def _policy_initializer(response_type):
+    """Run the real constructor up to engine setup, without importing vLLM/torch."""
+    tree = ast.parse(_SERVICER.read_text())
+    cls = next(
+        n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "VllmEngineServicer"
+    )
+    method = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "__init__")
+    engine_setup = next(
+        i
+        for i, node in enumerate(method.body)
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Attribute) and target.attr == "engine" for target in node.targets
+        )
+    )
+    method.body = method.body[:engine_setup]
+    for arg in method.args.args:
+        arg.annotation = None
+    namespace = {
+        "vllm_engine_pb2": SimpleNamespace(GetServerInfoResponse=response_type),
+        "constrained_decoding_policy": constrained_decoding_policy,
+        "settle_logging": lambda: None,
+    }
+    exec(compile(ast.Module(body=[method], type_ignores=[]), str(_SERVICER), "exec"), namespace)
+    return namespace["__init__"]
 
 
 @pytest.mark.parametrize("ranks", [[0], [1], [0, 1], []])
@@ -194,6 +278,7 @@ def test_ec_addresses_preserve_managed_global_rank_slots(monkeypatch, ranks):
         ),
         _mm_processor=None,
         _mm_encoder_budget=0,
+        _constrained_decoding="",
     )
     info = asyncio.run(
         _server_info_method(vllm_engine_pb2.GetServerInfoResponse)(servicer, None, None)

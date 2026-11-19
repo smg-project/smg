@@ -21,8 +21,7 @@ from functools import cached_property
 from typing import Any
 
 from smg_grpc_servicer.config_view import attr_int, attr_list, attr_str, positive_int
-
-CONSTRAINED_DECODING_POLICIES = ("requested", "always")
+from smg_grpc_servicer.constrained_decoding import CONSTRAINED_DECODING_POLICIES
 
 
 def constrained_decoding_policy(value: Any) -> str:
