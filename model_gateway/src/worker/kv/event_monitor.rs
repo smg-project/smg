@@ -11,16 +11,16 @@
 //! - `on_worker_removed` — signals graceful shutdown, task cleans up indexer
 //! - `stop` — signals shutdown to all tasks, clears state
 //!
-//! The work of a subscription is split by stage: `subscription.rs` runs the
-//! task per worker (connecting, reconnecting, the stream read loop, the
-//! pushed load records, the worker's departure); `admission.rs` keeps one
-//! stream's state (per-rank cursors, gap recovery, relay snapshots, and the
-//! metrics around an applied batch); `apply.rs` takes one event into the
-//! index (tiers, cache groups, namespaces, and the physical copies of a
-//! block, counted per worker).
+//! The work of a subscription is split by stage: the worker crate's KV event
+//! collector runs the task per worker (connecting, reconnecting, the stream
+//! read loop, the pushed load records, the worker's departure);
+//! `admission.rs` keeps one stream's state (per-rank cursors, gap recovery,
+//! relay snapshots, and the metrics around an applied batch); `apply.rs`
+//! takes one event into the index (tiers, cache groups, namespaces, and the
+//! physical copies of a block, counted per worker).
 //!
-//! The task and the index meet at one port (`port.rs`): the task says what
-//! its stream brought, and `index_sink.rs`, the sink over the models'
+//! The task and the index meet at the worker crate's port: the task says
+//! what its stream brought, and `index_sink.rs`, the sink over the models'
 //! indexes, keeps each worker's stream state and applies what its cursor
 //! admits.
 
@@ -53,17 +53,18 @@ use crate::worker::{
 
 mod admission;
 mod apply;
+#[cfg(test)]
+mod gateway_tests;
 mod index_sink;
-mod port;
 mod recovery;
-mod subscription;
 
 #[cfg(any(test, feature = "test-util"))]
 pub(crate) use apply::WorkerIndexState;
 use index_sink::{IndexSink, OpenRow};
-use port::KvEventSink;
-pub use subscription::SubscriptionKind;
-use subscription::{KvEventCollector, PushedLoadSink};
+// The worker crate's port, at the path it had here.
+use smg_worker::kv_events::port;
+pub use smg_worker::kv_events::SubscriptionKind;
+use smg_worker::kv_events::{port::KvEventSink, KvEventCollector, PushedLoadSink};
 
 /// Interval between publications of each model's index size and, for the chain
 /// index, its shape and memory (`smg_kv_index_*` gauges by model).
@@ -914,12 +915,10 @@ mod tests {
 
     use kv_index::{ContentHash, SequenceHash, StoredBlock};
     use openai_protocol::worker::{ConnectionMode, HealthCheckConfig, RuntimeType, WorkerType};
+    use smg_worker::kv_events::{INDEX_REMOVAL_PERMITS, MAX_CONCURRENT_INDEX_REMOVALS};
     use tracing_test::traced_test;
 
-    use super::{
-        subscription::{INDEX_REMOVAL_PERMITS, MAX_CONCURRENT_INDEX_REMOVALS},
-        *,
-    };
+    use super::*;
     use crate::worker::{kv::index_backend::WorkerBlocks, BasicWorkerBuilder, WorkerRegistry};
 
     async fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {

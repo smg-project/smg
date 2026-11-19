@@ -9,8 +9,10 @@
 //! is the loopback address nothing answers at: a dead worker's port, held for
 //! as long as the test needs it. [`NoEngine`] is an engine connection with no
 //! engine behind it, and [`CountingConnector`] the connector that hands those
-//! out. A test of a metric renders its scrape with [`render_with_recorder`]
-//! and reads it with [`assert_metric`] and [`sorted_series`].
+//! out; [`ScriptedEngine`] is one whose two pushed streams follow a
+//! [`Script`]. A test of a metric renders its scrape with
+//! [`render_with_recorder`] and reads it with [`assert_metric`] and
+//! [`sorted_series`].
 
 use std::{
     net::{Ipv4Addr, SocketAddr},
@@ -40,6 +42,9 @@ use crate::{
         WorkerType,
     },
 };
+
+mod scripted_engine;
+pub use scripted_engine::{Script, ScriptedEngine};
 
 /// The members alone: the value of a generation for a test that derives
 /// nothing from one.

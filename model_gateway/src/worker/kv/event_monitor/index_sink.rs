@@ -70,13 +70,6 @@ impl OpenRow {
         let id = self.id;
         (Arc::new(self), id)
     }
-
-    /// The index sink and the row's id, for a case that holds the row itself
-    /// while a round feeds it.
-    #[cfg(test)]
-    pub(crate) fn feed(&self) -> (Arc<IndexSink>, RowId) {
-        (Arc::clone(&self.sink), self.id)
-    }
 }
 
 /// Every call goes to the sink the row stands in.
@@ -367,11 +360,9 @@ impl KvEventSink for IndexSink {
 #[cfg(test)]
 mod tests {
     use smg_grpc_client::common_proto::{KvBlock, KvBlocksStored, KvCacheEvent, KvSnapshotChunk};
+    use smg_worker::kv_events::{batch_facts, batch_rank};
 
-    use super::{
-        super::subscription::{batch_facts, batch_rank},
-        *,
-    };
+    use super::*;
 
     /// One stored block of sixteen tokens that start at `first_token`, as
     /// batch `sequence` of `rank`.

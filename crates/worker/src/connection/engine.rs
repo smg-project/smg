@@ -157,9 +157,9 @@ pub struct ZmqLink {
 /// default ([`ConnectorDefault`]); a worker with neither refuses a gRPC or
 /// ZMQ connect.
 ///
-/// The host's event monitor subscribes through the host's own client alone:
-/// a connector that hands out another connection leaves its workers without
-/// KV events, and their load polled.
+/// The KV event collector subscribes through the connection's two stream
+/// calls: a connector whose connections refuse them leaves its workers
+/// without KV events, and their load polled.
 #[async_trait]
 pub trait EngineConnector: fmt::Debug + Send + Sync {
     /// Connect to the gRPC server of an engine of `runtime` at `base_url`.

@@ -19,6 +19,11 @@
 //! holds the thresholds past which a load report marks a worker overloaded.
 //! The gateway re-exports each module at the path it had there.
 //!
+//! [`kv_events`] holds the port between the collector of the KV cache events
+//! an engine pushes and a host's sink: the sink's calls and the facts that
+//! cross them. The collector itself, one subscription a worker over the
+//! engine handle's two stream calls, comes with the `runtime` feature.
+//!
 //! The `metrics` feature adds `metrics`, the mechanism those writers share
 //! with a host's: the bounded label set, the model labels' one set and the
 //! handles a record keeps.
@@ -37,8 +42,8 @@
 //! of its own, and the merge of the metrics scraped from the workers. The
 //! gateway re-exports each module at the path it had there. `test-util` adds
 //! `test_support`, what a test builds its workers with, and opens the test
-//! readers and hooks the registry, the series store and the label interner
-//! keep for their own cases.
+//! readers and hooks the registry, the series store, the label interner and
+//! the KV event collector keep for their own cases.
 //!
 //! The `proto` feature adds `common_proto`, the messages every engine's gRPC
 //! service shares, and the conversion of the engine load record into the
@@ -54,6 +59,7 @@ pub const UNKNOWN_MODEL_ID: &str = "unknown";
 pub mod connection;
 pub mod health;
 pub mod identity;
+pub mod kv_events;
 pub mod labels;
 #[cfg(feature = "runtime")]
 pub mod load;
