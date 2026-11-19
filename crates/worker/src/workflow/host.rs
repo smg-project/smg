@@ -44,7 +44,12 @@ pub fn require_host<H>(host: Option<&Arc<H>>) -> WorkflowResult<&Arc<H>> {
 /// The hosts of the steps' own cases.
 #[cfg(test)]
 pub(crate) mod testing {
-    use std::sync::{Arc, OnceLock};
+    use std::{
+        net::Ipv4Addr,
+        sync::{Arc, OnceLock},
+    };
+
+    use tokio::net::TcpListener;
 
     use super::WorkflowHost;
     use crate::{
@@ -169,5 +174,36 @@ pub(crate) mod testing {
             .worker_client_cache()
             .get(&HttpPoolConfig::default(), false)
             .unwrap()
+    }
+
+    /// An engine's HTTP metadata endpoints as a test serves them: each route
+    /// answers every GET with its status and JSON body, any other path a 404.
+    /// Returns the base URL; the stub serves for as long as the runtime that
+    /// spawned it runs.
+    pub(crate) async fn serve_json_routes(
+        routes: Vec<(&'static str, http::StatusCode, serde_json::Value)>,
+    ) -> String {
+        let mut router = axum::Router::new();
+        for (path, status, body) in routes {
+            router = router.route(
+                path,
+                axum::routing::get(move || {
+                    let body = body.clone();
+                    async move { (status, axum::Json(body)) }
+                }),
+            );
+        }
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("a loopback port of the system's choice");
+        let addr = listener.local_addr().expect("the bound address");
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "a test fixture: the stub lives as long as the test's runtime"
+        )]
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        format!("http://{addr}")
     }
 }

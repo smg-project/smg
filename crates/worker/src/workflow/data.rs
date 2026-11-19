@@ -146,6 +146,9 @@ pub struct WorkerRegistrationWorkflowData<H: WorkflowHost> {
     #[serde(skip, default)]
     pub http_client_handle: Option<Arc<reqwest::Client>>,
     pub detected_runtime_type: Option<String>,
+    /// What the worker's engine reports about itself, as labels. The metadata
+    /// read writes it. For a worker whose engine reports nothing ahead of its
+    /// handshake, a step of the host's own writes what the host knows.
     pub discovered_labels: HashMap<String, String>,
     pub dp_info: Option<DpInfo>,
     /// What the host's own steps keep on this registration between them

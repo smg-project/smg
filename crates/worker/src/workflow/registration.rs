@@ -7,7 +7,7 @@ use wfaas::{BackoffStrategy, FailureAction, RetryPolicy, StepDefinition, Workflo
 
 use super::{
     data::WorkerRegistrationWorkflowData, detect_connection::DetectConnectionModeStep,
-    detect_runtime::DetectRuntimeStep, host::WorkflowHost,
+    detect_runtime::DetectRuntimeStep, discover_metadata::DiscoverMetadataStep, host::WorkflowHost,
 };
 use crate::settings::RegistrationSettings;
 
@@ -18,6 +18,9 @@ pub const WORKER_REGISTRATION_WORKFLOW: &str = "worker_registration";
 pub const DETECT_CONNECTION_MODE_STEP: &str = "detect_connection_mode";
 /// The id of the step that tells which runtime a worker runs.
 pub const DETECT_RUNTIME_STEP: &str = "detect_backend";
+/// The id of the step that reads what a worker's engine reports about
+/// itself.
+pub const DISCOVER_METADATA_STEP: &str = "discover_metadata";
 
 /// The host's steps that this crate's steps of a registration wait on, one
 /// field a gate. A gate names a step the host adds to the workflow; the
@@ -48,8 +51,8 @@ pub fn startup_attempts(settings: &RegistrationSettings) -> u32 {
 }
 
 /// The worker side of a registration: the connection detection, polled at
-/// the startup cadence of `settings`, and the runtime detection behind it,
-/// with the same budget of attempts.
+/// the startup cadence of `settings`, the runtime detection behind it with
+/// the same budget of attempts, and the metadata read behind that.
 ///
 /// The startup delay, the time a worker is left alone before its first
 /// probe, stands on the step that opens the workflow. With
@@ -100,6 +103,20 @@ pub fn worker_registration_workflow<H: WorkflowHost>(
             .with_timeout(Duration::from_secs(10))
             .with_failure_action(FailureAction::ContinueNextStep)
             .depends_on(&[DETECT_CONNECTION_MODE_STEP]),
+        )
+        .add_step(
+            StepDefinition::new(
+                DISCOVER_METADATA_STEP,
+                "Discover Metadata",
+                Arc::new(DiscoverMetadataStep),
+            )
+            .with_retry(RetryPolicy {
+                max_attempts: 3,
+                backoff: BackoffStrategy::Fixed(Duration::from_secs(1)),
+            })
+            .with_timeout(Duration::from_secs(10))
+            .with_failure_action(FailureAction::ContinueNextStep)
+            .depends_on(&[DETECT_RUNTIME_STEP]),
         )
 }
 

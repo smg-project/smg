@@ -10,8 +10,8 @@
 //! as long as the test needs it. [`NoEngine`] is an engine connection with no
 //! engine behind it, and [`CountingConnector`] the connector that hands those
 //! out; [`ScriptedEngine`] is one whose two pushed streams follow a
-//! [`Script`]. [`ScriptedAnswers`] is a connection whose health call and
-//! server labels answer as a case scripts them, and [`ScriptedConnector`] the
+//! [`Script`]. [`ScriptedAnswers`] is a connection whose health call, model
+//! labels and server labels answer as a case scripts them, and [`ScriptedConnector`] the
 //! connector that hands such connections out by runtime. A test of a metric
 //! renders its scrape with
 //! [`render_with_recorder`] and reads it with [`assert_metric`] and
@@ -522,12 +522,14 @@ impl EngineConnector for CountingConnector {
     }
 }
 
-/// An engine connection that answers its health call and its server labels
-/// as a case scripts them, and refuses every other call as unimplemented. A
+/// An engine connection that answers its health call, its model labels and
+/// its server labels as a case scripts them, and refuses every other call as
+/// unimplemented. A
 /// case may change the health answer while a connection is held.
 #[derive(Debug)]
 pub struct ScriptedAnswers {
     health: Mutex<Result<HealthAnswer, tonic::Code>>,
+    model: Result<HashMap<String, String>, tonic::Code>,
     server: Result<HashMap<String, String>, tonic::Code>,
 }
 
@@ -537,6 +539,7 @@ impl ScriptedAnswers {
     pub fn answering_health(health: Result<HealthAnswer, tonic::Code>) -> Self {
         Self {
             health: Mutex::new(health),
+            model: Err(tonic::Code::Unimplemented),
             server: Err(tonic::Code::Unimplemented),
         }
     }
@@ -544,14 +547,20 @@ impl ScriptedAnswers {
     /// A connection whose server reports the labels of `server`, or refuses
     /// their read with its code, and that refuses its health call.
     pub fn reporting(server: Result<&[(&str, &str)], tonic::Code>) -> Self {
+        Self::describing(Err(tonic::Code::Unimplemented), server)
+    }
+
+    /// A connection whose engine reports the model labels of `model` and the
+    /// server labels of `server`, or refuses either read with its code, and
+    /// that refuses its health call.
+    pub fn describing(
+        model: Result<&[(&str, &str)], tonic::Code>,
+        server: Result<&[(&str, &str)], tonic::Code>,
+    ) -> Self {
         Self {
             health: Mutex::new(Err(tonic::Code::Unimplemented)),
-            server: server.map(|labels| {
-                labels
-                    .iter()
-                    .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
-                    .collect()
-            }),
+            model: model.map(labels_of),
+            server: server.map(labels_of),
         }
     }
 
@@ -559,6 +568,14 @@ impl ScriptedAnswers {
     pub fn set_health(&self, health: Result<HealthAnswer, tonic::Code>) {
         *self.health.lock() = health;
     }
+}
+
+/// The label map `pairs` spell, each name and value owned.
+pub fn labels_of(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+    pairs
+        .iter()
+        .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+        .collect()
 }
 
 fn not_scripted<T>() -> Result<T, tonic::Status> {
@@ -603,7 +620,7 @@ impl EngineConnection for ScriptedAnswers {
     }
 
     async fn model_labels(&self) -> Result<HashMap<String, String>, tonic::Status> {
-        not_scripted()
+        scripted(self.model.clone())
     }
 
     async fn server_labels(&self) -> Result<HashMap<String, String>, tonic::Status> {

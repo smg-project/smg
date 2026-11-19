@@ -46,7 +46,6 @@ pub use steps::{
     // Local registration steps
     CreateLocalWorkerStep,
     DiscoverDPInfoStep,
-    DiscoverMetadataStep,
     DiscoverModelsStep,
     // Update steps
     FindWorkerToUpdateStep,

@@ -128,3 +128,22 @@ fn the_runtime_detection_waits_on_the_connection_detection() {
     assert_eq!(step.retry_policy.as_ref().unwrap().max_attempts, 54);
     assert_eq!(step.timeout, Some(Duration::from_secs(10)));
 }
+
+/// The metadata read waits on the runtime detection, with three attempts of
+/// ten seconds each.
+#[test]
+fn the_metadata_read_waits_on_the_runtime_detection() {
+    let workflow = worker_registration_workflow::<RegistryHost>(
+        &settings(300, 7, 5),
+        RegistrationGates::default(),
+    );
+
+    let step = workflow
+        .steps
+        .iter()
+        .find(|step| step.id == StepId::new(DISCOVER_METADATA_STEP))
+        .unwrap();
+    assert_eq!(step.depends_on, vec![StepId::new(DETECT_RUNTIME_STEP)]);
+    assert_eq!(step.retry_policy.as_ref().unwrap().max_attempts, 3);
+    assert_eq!(step.timeout, Some(Duration::from_secs(10)));
+}

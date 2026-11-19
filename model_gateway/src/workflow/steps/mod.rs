@@ -2,6 +2,7 @@ pub mod classify;
 pub mod external;
 pub mod local;
 pub mod shared;
+#[cfg(test)]
 pub(crate) mod util;
 
 use std::{sync::Arc, time::Duration};
@@ -14,11 +15,13 @@ pub use external::{
 pub use local::{
     create_worker_removal_workflow, create_worker_removal_workflow_data,
     create_worker_update_workflow, create_worker_update_workflow_data, CreateLocalWorkerStep,
-    DiscoverDPInfoStep, DiscoverMetadataStep, FindWorkerToUpdateStep, ReleaseTokenizerStep,
-    RemoveFromPolicyRegistryStep, UpdatePoliciesForWorkerStep, UpdateRemainingPoliciesStep,
-    UpdateWorkerPropertiesStep,
+    DiscoverDPInfoStep, FindWorkerToUpdateStep, ReleaseTokenizerStep, RemoveFromPolicyRegistryStep,
+    UpdatePoliciesForWorkerStep, UpdateRemainingPoliciesStep, UpdateWorkerPropertiesStep,
 };
-use local::{DiscoverDPInfoStep as DPStep, EnsureHarmonyEncodingStep, SubmitTokenizerJobStep};
+use local::{
+    DiscoverDPInfoStep as DPStep, DiscoverZmqLabelsStep, EnsureHarmonyEncodingStep,
+    SubmitTokenizerJobStep, ZMQ_LABELS_STEP,
+};
 use openai_protocol::worker::WorkerSpec;
 use shared::REGISTER_WORKERS_STEP;
 pub use shared::{
@@ -26,7 +29,7 @@ pub use shared::{
     UpdatePoliciesStep, WorkerList,
 };
 use smg_worker::workflow::{
-    startup_attempts, worker_registration_workflow, RegistrationGates, DETECT_RUNTIME_STEP,
+    startup_attempts, worker_registration_workflow, RegistrationGates, DISCOVER_METADATA_STEP,
 };
 use wfaas::{BackoffStrategy, FailureAction, RetryPolicy, StepDefinition, WorkflowDefinition};
 
@@ -50,6 +53,9 @@ use crate::{
 ///  detect_backend                       |
 ///       |                               |
 ///  discover_metadata                    |
+///       |                               |
+///  discover_zmq_labels                  |
+///  (ZMQ only)                           |
 ///       |                               |
 ///  discover_dp_info                     |
 ///       |                               |
@@ -90,9 +96,9 @@ pub fn create_worker_registration_workflow(
         classify_worker_type = classify_worker_type.with_delay(startup_delay);
     }
 
-    // Steps 1 and 1.5, the connection mode (HTTP vs gRPC) and the runtime,
-    // are the worker crate's. The first waits on the classification, which
-    // carries the startup delay.
+    // Steps 1, 1.5 and 2a, the connection mode (HTTP vs gRPC), the runtime
+    // and the metadata read, are the worker crate's. The first waits on the
+    // classification, which carries the startup delay.
     worker_registration_workflow::<AppContext>(
         &settings,
         RegistrationGates {
@@ -102,12 +108,14 @@ pub fn create_worker_registration_workflow(
     // Step 0: Classify worker type (Local vs External)
     .add_step(classify_worker_type)
     // === LOCAL BRANCH ===
-    // Step 2a: Discover metadata
+    // Step 2a (ZMQ): what the gateway knows of a ZMQ worker ahead of its
+    // handshake, behind the crate's metadata read, which reads nothing for
+    // such a worker.
     .add_step(
         StepDefinition::new(
-            "discover_metadata",
-            "Discover Metadata",
-            Arc::new(DiscoverMetadataStep),
+            ZMQ_LABELS_STEP,
+            "Discover ZMQ Labels",
+            Arc::new(DiscoverZmqLabelsStep),
         )
         .with_retry(RetryPolicy {
             max_attempts: 3,
@@ -115,7 +123,7 @@ pub fn create_worker_registration_workflow(
         })
         .with_timeout(Duration::from_secs(10))
         .with_failure_action(FailureAction::ContinueNextStep)
-        .depends_on(&[DETECT_RUNTIME_STEP]),
+        .depends_on(&[DISCOVER_METADATA_STEP]),
     )
     // Step 2b: Discover DP info (after metadata)
     .add_step(
@@ -126,7 +134,7 @@ pub fn create_worker_registration_workflow(
             })
             .with_timeout(Duration::from_secs(10))
             .with_failure_action(FailureAction::FailWorkflow)
-            .depends_on(&["discover_metadata"]),
+            .depends_on(&[DISCOVER_METADATA_STEP, ZMQ_LABELS_STEP]),
     )
     // Step 3 (local): Create local worker(s)
     .add_step(

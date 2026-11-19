@@ -7,12 +7,11 @@ use openai_protocol::{worker::WorkerSpec, UNKNOWN_MODEL_ID};
 use reqwest::Client;
 use smg_worker::{
     identity::{basic::ConnectionMode, endpoint::Endpoint},
-    workflow::{DpInfo, WorkerKind},
+    workflow::{get_server_info, DpInfo, WorkerKind},
 };
 use tracing::{debug, warn};
 use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
-use super::discover_metadata::get_server_info;
 use crate::workflow::data::WorkerWorkflowData;
 
 /// Get DP info for a worker URL.
@@ -266,5 +265,23 @@ mod tests {
         );
         let overflow = labels_of(&[("dp_size", &usize::MAX.to_string()), ("attn_dp_size", "2")]);
         assert!(dp_info_from_labels(&overflow).is_err());
+    }
+
+    /// The DP width reads the same from a server info's flattened labels,
+    /// whichever way the server splits it.
+    #[test]
+    fn dp_info_from_labels_reads_a_flattened_server_info() {
+        use smg_worker::{labels::flat_labels, workflow::ServerInfo};
+
+        for (dp_size, attn_dp_size) in [(4, None), (1, Some(4))] {
+            let body = serde_json::json!({
+                "model_path": "org/model-a",
+                "dp_size": dp_size,
+                "attn_dp_size": attn_dp_size,
+            });
+            let info: ServerInfo = serde_json::from_value(body).unwrap();
+            let dp_info = dp_info_from_labels(&flat_labels(&info)).unwrap();
+            assert_eq!(dp_info.dp_size, 4);
+        }
     }
 }

@@ -10,6 +10,19 @@ pub(super) struct HttpRuntime {
     pub(super) owners: &'static [&'static str],
     /// The path that tells it apart.
     pub(super) path: &'static str,
+    /// How its metadata is read.
+    pub(super) metadata: MetadataRead,
+}
+
+/// How an HTTP worker's metadata is read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum MetadataRead {
+    /// The info routes: the server's and the model's, each under its older
+    /// spelling too, then the model list for what they left open. A runtime
+    /// with no row is read so.
+    InfoRoutes,
+    /// The model list, then the row's own path.
+    ModelListAndPath,
 }
 
 /// The runtimes told apart over HTTP, the deciding row first. Where the
@@ -20,11 +33,13 @@ pub(super) const HTTP_RUNTIMES: [HttpRuntime; 2] = [
         runtime: RuntimeType::Vllm,
         owners: &["vllm"],
         path: "/version",
+        metadata: MetadataRead::ModelListAndPath,
     },
     HttpRuntime {
         runtime: RuntimeType::Sglang,
         owners: &["sglang", "nvidia"],
         path: "/server_info",
+        metadata: MetadataRead::InfoRoutes,
     },
 ];
 
@@ -48,6 +63,17 @@ pub(super) const GRPC_DETECTION_ORDER: [RuntimeType; 5] = [
     RuntimeType::TokenSpeed,
     RuntimeType::Mlx,
 ];
+
+/// The runtime a metadata read takes for an HTTP worker whose runtime no
+/// detection settled.
+pub(super) const METADATA_DEFAULT: RuntimeType = RuntimeType::Sglang;
+
+/// The row of the runtime that `runtime_type` names by its id, if it has one.
+pub(super) fn http_runtime(runtime_type: &str) -> Option<&'static HttpRuntime> {
+    HTTP_RUNTIMES
+        .iter()
+        .find(|row| row.runtime.as_str() == runtime_type)
+}
 
 /// The runtime a model list's owner names, if it names one.
 pub(super) fn runtime_of_owner(owner: &str) -> Option<RuntimeType> {
@@ -104,5 +130,19 @@ mod tests {
         for (id, runtime) in ids.iter().zip(GRPC_DETECTION_ORDER) {
             assert_eq!(*id, runtime.as_str());
         }
+    }
+
+    /// A runtime is found by its id, written as the id is; a text that is no
+    /// row's id finds none, and the default's read is the info routes'.
+    #[test]
+    fn a_row_is_found_by_its_runtimes_id() {
+        for row in &HTTP_RUNTIMES {
+            let found = http_runtime(row.runtime.as_str()).map(|found| found.runtime);
+            assert_eq!(found, Some(row.runtime));
+            assert!(http_runtime(&row.runtime.as_str().to_uppercase()).is_none());
+        }
+        assert!(http_runtime("a-runtime-with-no-row").is_none());
+        let default = http_runtime(METADATA_DEFAULT.as_str()).map(|row| row.metadata);
+        assert_eq!(default, Some(MetadataRead::InfoRoutes));
     }
 }
