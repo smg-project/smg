@@ -1,5 +1,5 @@
 {
-  "recorded_from": "cf54401bbe057e75476c4f22ade5c14d96fecc06",
+  "recorded_from": "bfe189b332349c44cf7e3b6e1102a9b5a2699d9d",
   "policy": "cache_aware",
   "rows": [
     {
@@ -236,6 +236,76 @@
         "sequence": [
           1,
           0
+        ]
+      }
+    },
+    {
+      "name": "tokens-at-the-command-lines-defaults-a-match-of-half-is-a-hit",
+      "matcher": "tokens",
+      "config": {
+        "cache_threshold": 0.3,
+        "balance_abs_threshold": 64,
+        "balance_rel_threshold": 1.5,
+        "block_size": 16,
+        "balance_token_usage_threshold": 1.0,
+        "overload_token_usage_threshold": 1.0
+      },
+      "workers": [
+        {
+          "in_flight": 2,
+          "state": "free",
+          "report": null
+        },
+        {
+          "in_flight": 0,
+          "state": "free",
+          "report": null
+        },
+        {
+          "in_flight": 2,
+          "state": "free",
+          "report": null
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "prompt": [
+              [
+                1000,
+                64
+              ]
+            ],
+            "tried": []
+          }
+        },
+        {
+          "loads": [
+            0,
+            3,
+            1
+          ]
+        },
+        {
+          "pick": {
+            "prompt": [
+              [
+                1000,
+                32
+              ],
+              [
+                6000,
+                32
+              ]
+            ],
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          1,
+          1
         ]
       }
     },
@@ -947,8 +1017,8 @@
         "counts": {
           "draws": 6000,
           "counts": [
-            3036,
-            2964,
+            3009,
+            2991,
             0
           ]
         }
@@ -1424,6 +1494,17 @@
             "worker": 1,
             "prompt": [
               [
+                1000,
+                32
+              ]
+            ]
+          }
+        },
+        {
+          "stored": {
+            "worker": 2,
+            "prompt": [
+              [
                 7000,
                 16
               ]
@@ -1450,7 +1531,30 @@
                 64
               ]
             ],
-            "kept_blocks": 2
+            "kept_blocks": 1
+          }
+        },
+        {
+          "pick": {
+            "prompt": [
+              [
+                1000,
+                64
+              ]
+            ],
+            "tried": []
+          }
+        },
+        {
+          "removed": {
+            "worker": 1,
+            "prompt": [
+              [
+                1000,
+                32
+              ]
+            ],
+            "kept_blocks": 0
           }
         },
         {
@@ -1491,8 +1595,183 @@
       "outcome": {
         "sequence": [
           0,
+          1,
           0,
           2
+        ]
+      }
+    },
+    {
+      "name": "events-at-the-command-lines-defaults-a-holder-under-the-factor-keeps-its-prefix",
+      "matcher": "events",
+      "config": {
+        "cache_threshold": 0.3,
+        "balance_abs_threshold": 64,
+        "balance_rel_threshold": 1.5,
+        "block_size": 16,
+        "balance_token_usage_threshold": 1.0,
+        "overload_token_usage_threshold": 1.0
+      },
+      "workers": [
+        {
+          "in_flight": 37,
+          "state": "free",
+          "report": null
+        },
+        {
+          "in_flight": 19,
+          "state": "free",
+          "report": null
+        },
+        {
+          "in_flight": 19,
+          "state": "free",
+          "report": null
+        }
+      ],
+      "steps": [
+        {
+          "stored": {
+            "worker": 0,
+            "prompt": [
+              [
+                1000,
+                64
+              ]
+            ]
+          }
+        },
+        {
+          "pick": {
+            "prompt": [
+              [
+                1000,
+                64
+              ]
+            ],
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          0
+        ]
+      }
+    },
+    {
+      "name": "events-at-the-command-lines-defaults-a-holder-over-the-factor-spills",
+      "matcher": "events",
+      "config": {
+        "cache_threshold": 0.3,
+        "balance_abs_threshold": 64,
+        "balance_rel_threshold": 1.5,
+        "block_size": 16,
+        "balance_token_usage_threshold": 1.0,
+        "overload_token_usage_threshold": 1.0
+      },
+      "workers": [
+        {
+          "in_flight": 39,
+          "state": "free",
+          "report": null
+        },
+        {
+          "in_flight": 19,
+          "state": "free",
+          "report": null
+        },
+        {
+          "in_flight": 18,
+          "state": "free",
+          "report": null
+        }
+      ],
+      "steps": [
+        {
+          "stored": {
+            "worker": 0,
+            "prompt": [
+              [
+                1000,
+                64
+              ]
+            ]
+          }
+        },
+        {
+          "pick": {
+            "prompt": [
+              [
+                1000,
+                64
+              ]
+            ],
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          2
+        ]
+      }
+    },
+    {
+      "name": "events-a-margin-under-the-floor-spills-a-holder-the-floor-would-keep",
+      "matcher": "events",
+      "config": {
+        "cache_threshold": 0.5,
+        "balance_abs_threshold": 2,
+        "balance_rel_threshold": 1.5,
+        "block_size": 16,
+        "balance_token_usage_threshold": 1.0,
+        "overload_token_usage_threshold": 1.0
+      },
+      "workers": [
+        {
+          "in_flight": 8,
+          "state": "free",
+          "report": null
+        },
+        {
+          "in_flight": 3,
+          "state": "free",
+          "report": null
+        },
+        {
+          "in_flight": 4,
+          "state": "free",
+          "report": null
+        }
+      ],
+      "steps": [
+        {
+          "stored": {
+            "worker": 0,
+            "prompt": [
+              [
+                1000,
+                64
+              ]
+            ]
+          }
+        },
+        {
+          "pick": {
+            "prompt": [
+              [
+                1000,
+                64
+              ]
+            ],
+            "tried": []
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          1
         ]
       }
     },
@@ -1721,8 +2000,8 @@
         "counts": {
           "draws": 6000,
           "counts": [
-            3039,
-            2961,
+            3013,
+            2987,
             0
           ]
         }

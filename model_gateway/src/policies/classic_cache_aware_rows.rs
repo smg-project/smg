@@ -32,7 +32,8 @@
 //! A sequence row is recorded twenty times from a fresh pool and a fresh
 //! policy and must come out the same each time; a drawn row records how
 //! often each worker took the row's last request over its draws, each draw
-//! from a fresh pool and a fresh policy.
+//! from a fresh pool and a fresh policy, and every request of a draw is
+//! placed.
 //!
 //! The tree matchers write at every request: the worker a request was
 //! placed on holds its prompt from then on. The index is written by the
@@ -406,9 +407,13 @@ impl Bed {
     }
 
     /// The request of pick `n` ends: its worker holds one fewer, and the
-    /// policy that placed it is told.
+    /// policy that placed it is told. A row ends no request that was
+    /// placed nowhere.
     fn complete(&self, n: usize) {
-        let worker = &self.workers[self.picked[n]];
+        let worker = self
+            .workers
+            .get(self.picked[n])
+            .expect("a row ends a request it placed");
         worker.decrement_load();
         self.policies
             .policy_for_worker(worker.as_ref())
@@ -502,16 +507,15 @@ fn drawn_row(
     steps: Vec<Step>,
 ) -> Row {
     const DRAWS: u32 = 6_000;
-    let mut counts = vec![0u32; workers.len() + 2];
+    let mut counts = vec![0u32; workers.len()];
     for _ in 0..DRAWS {
         let picked = Bed::run(matcher, &config, &workers, &steps);
+        assert!(
+            picked.iter().all(|&place| place < workers.len()),
+            "{name}: a drawn row places every request, and a draw answered {picked:?}"
+        );
         counts[*picked.last().expect("a drawn row ends with a request")] += 1;
     }
-    assert_eq!(
-        counts.split_off(workers.len()),
-        [0, 0],
-        "{name}: a drawn row places every request"
-    );
     Row {
         name,
         matcher,
@@ -535,6 +539,23 @@ const PLAIN: Config = Config {
     block_size: 16,
     balance_token_usage_threshold: 1.0,
     overload_token_usage_threshold: 1.0,
+};
+
+/// The gateway's command line defaults where the policy's own differ: a
+/// match over three tenths of the prompt is a hit, and the count gate
+/// stands at a relative 1.5 and an absolute 64.
+const COMMAND_LINE: Config = Config {
+    cache_threshold: 0.3,
+    balance_abs_threshold: 64,
+    balance_rel_threshold: 1.5,
+    ..PLAIN
+};
+
+/// A count gate whose absolute margin is set under its floor of four.
+const UNDER_THE_FLOOR: Config = Config {
+    balance_abs_threshold: 2,
+    balance_rel_threshold: 1.5,
+    ..PLAIN
 };
 
 /// Free workers with no report, by their requests in flight.
@@ -614,7 +635,7 @@ const THREE: [[u32; 2]; 2] = [[1000, 48], [5000, 16]];
 const TWO: [[u32; 2]; 2] = [[1000, 32], [6000, 32]];
 /// Prompts that share nothing with it.
 const OTHER: [[u32; 2]; 1] = [[9000, 64]];
-const THIRD: [[u32; 2]; 1] = [[8000, 64]];
+const ANOTHER: [[u32; 2]; 1] = [[8000, 64]];
 const ASIDE: [[u32; 2]; 1] = [[7000, 16]];
 /// The same as text: four ids are one block of sixteen characters, and no
 /// two runs start with the same character.
@@ -672,6 +693,15 @@ fn rows() -> Vec<Row> {
             free(&[2, 0, 2]),
             vec![pick(&WHOLE), Step::Loads(vec![0, 3, 1]), pick(&TWO)],
         ),
+        // At the command line's defaults a match over three tenths is a
+        // hit: the same half keeps its holder.
+        sequence_row(
+            "tokens-at-the-command-lines-defaults-a-match-of-half-is-a-hit",
+            Tokens,
+            COMMAND_LINE,
+            free(&[2, 0, 2]),
+            vec![pick(&WHOLE), Step::Loads(vec![0, 3, 1]), pick(&TWO)],
+        ),
         // A miss goes to the fewest in flight, and a request that ends frees
         // its worker for the next one.
         sequence_row(
@@ -679,7 +709,12 @@ fn rows() -> Vec<Row> {
             Tokens,
             PLAIN,
             free(&[2, 0, 3]),
-            vec![pick(&WHOLE), pick(&OTHER), Step::Complete(0), pick(&THIRD)],
+            vec![
+                pick(&WHOLE),
+                pick(&OTHER),
+                Step::Complete(0),
+                pick(&ANOTHER),
+            ],
         ),
         // The tree names the holders of the deepest match alone. With that
         // holder tried, the request is a miss, though another worker holds
@@ -825,8 +860,10 @@ fn rows() -> Vec<Row> {
             pick(&WHOLE),
         ],
     ));
-    // A removed block shortens what its worker holds, and the last one ends
-    // the hold.
+    // A removed block shortens what its worker holds: a worker that held
+    // less then holds more and takes the request. The last removed block
+    // ends a hold. A third worker's block of another prompt keeps the index
+    // from standing empty.
     rows.push(sequence_row(
         "events-a-removed-block-shortens-the-hold-and-the-last-one-ends-it",
         Events,
@@ -834,13 +871,46 @@ fn rows() -> Vec<Row> {
         free(&[2, 1, 0]),
         vec![
             stored(0, &WHOLE),
-            stored(1, &ASIDE),
+            stored(1, &HALF),
+            stored(2, &ASIDE),
             pick(&WHOLE),
-            removed(0, &WHOLE, 2),
+            removed(0, &WHOLE, 1),
+            pick(&WHOLE),
+            removed(1, &HALF, 0),
             pick(&WHOLE),
             removed(0, &WHOLE, 0),
             pick(&WHOLE),
         ],
+    ));
+    // At the command line's defaults the count gate takes a factor of 1.5.
+    // A holder over the mean by more than the margin keeps its prefix while
+    // the factor allows it, and spills past the factor.
+    for (name, in_flight) in [
+        (
+            "events-at-the-command-lines-defaults-a-holder-under-the-factor-keeps-its-prefix",
+            [37, 19, 19],
+        ),
+        (
+            "events-at-the-command-lines-defaults-a-holder-over-the-factor-spills",
+            [39, 19, 18],
+        ),
+    ] {
+        rows.push(sequence_row(
+            name,
+            Events,
+            COMMAND_LINE,
+            free(&in_flight),
+            vec![stored(0, &WHOLE), pick(&WHOLE)],
+        ));
+    }
+    // A margin set under the floor decides: it spills a holder the floor
+    // would keep.
+    rows.push(sequence_row(
+        "events-a-margin-under-the-floor-spills-a-holder-the-floor-would-keep",
+        Events,
+        UNDER_THE_FLOOR,
+        free(&[8, 3, 4]),
+        vec![stored(0, &WHOLE), pick(&WHOLE)],
     ));
     for (name, config) in [
         (
