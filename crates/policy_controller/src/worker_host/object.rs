@@ -113,7 +113,7 @@ fn seconds(milliseconds: u32) -> u64 {
     u64::from(milliseconds).div_ceil(1_000).max(1)
 }
 
-fn status(status: WorkerStatus) -> ObjectStatus {
+pub(super) fn status(status: WorkerStatus) -> ObjectStatus {
     match status {
         WorkerStatus::Pending => ObjectStatus::Pending,
         WorkerStatus::Ready => ObjectStatus::Ready,
