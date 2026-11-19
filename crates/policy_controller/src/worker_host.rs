@@ -51,6 +51,11 @@
 //! and sets the object's status to the status that stands there. The host
 //! supplies the [`Lead`] and the term the adapter writes under.
 //!
+//! [`KvAdapter`] decodes the worker's KV events for the store's index, and
+//! [`KvHost`] gives each subscription its row in the store. Every replica
+//! runs the adapter over its own streams. The three limits of the decode
+//! are described in `kv.rs`.
+//!
 //! # What the module does not hold
 //!
 //! It builds no registry, no engine and no task. The host builds the
@@ -58,11 +63,13 @@
 //! moved. It names nothing of the controller.
 
 mod health;
+mod kv;
 mod lead;
 mod object;
 mod objects;
 
 pub use health::HealthAdapter;
+pub use kv::{KvAdapter, KvHost};
 pub use lead::{Lead, SoleLead};
 pub use object::object;
 pub use objects::{Members, Objects, Standing};
