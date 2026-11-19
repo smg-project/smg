@@ -14,6 +14,10 @@
 //! lease a decision books and its release, the spec push and its
 //! acknowledgement, and reconnection.
 //!
+//! A watch of the controller's workers opens on the same channel
+//! ([`Client::watch_workers`]): a stream of its own, which the session and
+//! an ask do not wait for.
+//!
 //! The client takes its channel and makes no credential:
 //! [`Client::connect`] dials an address in the clear, and
 //! [`Client::connect_with`] an endpoint the caller configured with its own
@@ -21,15 +25,16 @@
 //! (`x-smg-principal`); a stated id is no credential. [`blocking::Client`]
 //! drives the same calls for a caller that runs no runtime.
 //!
-//! No wait of the client for its peer outlasts [`ANSWER_WAIT`], on any
-//! endpoint: the dial, each call from its send to its answer's end, the
+//! No wait of the client for its peer but one outlasts [`ANSWER_WAIT`], on
+//! any endpoint: the dial, each call from its send to its answer's end, the
 //! session's call with its first frame, a report's wait for room in the
 //! session's queue, the wait for the session's end, the decide stream's
 //! open, an ask's waits for room in its queue and for its answer, and the
 //! wait for the decide stream's end. An endpoint's own time-outs end a
 //! wait sooner, and as the channel's error, not as the client's
 //! [`Error::NoAnswer`]: [`Error::Status`] for a call and
-//! [`Error::Connect`] for the dial.
+//! [`Error::Connect`] for the dial. The one is a watch's next event
+//! ([`Watch::next`]): a fleet that does not change tells nothing.
 
 use std::{
     future::{poll_fn, Future},
@@ -54,7 +59,7 @@ use crate::{
         controller_frame, decide_answer, gateway_frame,
         policy_controller_client::PolicyControllerClient, Busy, Completed, ControllerFrame,
         DecideAnswer, DecideRequest, Decision, Dispatched, GatewayFrame, Hello, LeaderInfo,
-        LeaderRequest, Released, Welcome,
+        LeaderRequest, Released, WatchWorkersRequest, Welcome, WorkerEvent,
     },
 };
 
@@ -573,6 +578,26 @@ fn fit(request: &mut DecideRequest) -> Result<usize, Error> {
     }
 }
 
+/// A watch of the controller's workers, open on the client's channel
+/// ([`Client::watch_workers`]).
+#[derive(Debug)]
+pub struct Watch {
+    events: Streaming<WorkerEvent>,
+}
+
+impl Watch {
+    /// The watch's next event, or none where the controller ended the
+    /// stream with no error: it ends a stream whose watcher took nothing
+    /// for a while after an event, and the watcher opens the watch again
+    /// after the last event it took. A stream ended with a status tells it
+    /// ([`Error::Status`]): `ABORTED` where its replica stopped leading.
+    /// This wait holds no bound of the client's: a fleet that does not
+    /// change tells nothing.
+    pub async fn next(&mut self) -> Result<Option<WorkerEvent>, Error> {
+        Ok(self.events.message().await?)
+    }
+}
+
 /// One gateway's side of the protocol over one channel.
 #[derive(Debug)]
 pub struct Client {
@@ -742,6 +767,24 @@ impl Client {
         Ok(answer)
     }
 
+    /// Opens a watch of the controller's workers as `request` asks: a
+    /// snapshot first or the tail after a place, of every model or of the
+    /// ones it names. The stream is the watch's own: it shares the client's
+    /// channel and its stated id, and neither the session nor an ask waits
+    /// for it. An event's term is the one its place was written under, so
+    /// it is not held to the client's floor: a watcher hands the place back
+    /// at its resume, and the controller tells it to start again where the
+    /// place is another history's. An open that outlasts the client's bound
+    /// is [`Error::NoAnswer`]; one the controller refuses tells its status
+    /// ([`Error::Status`]).
+    pub async fn watch_workers(&mut self, request: WatchWorkersRequest) -> Result<Watch, Error> {
+        let open = self.stub.watch_workers(request);
+        let events = answered("the watch's open", self.wait, open)
+            .await??
+            .into_inner();
+        Ok(Watch { events })
+    }
+
     /// The session's end, awaited within the client's bound: the status the
     /// controller ended the stream with, the same at each ask once it is
     /// read. A frame that comes first raises the floor by its term and is
@@ -851,6 +894,23 @@ pub mod blocking {
         /// [`super::Client::decide`].
         pub fn decide(&mut self, request: DecideRequest) -> Result<Answer, Error> {
             self.runtime.drive(self.inner.decide(request))
+        }
+
+        /// [`super::Client::watch_workers`].
+        pub fn watch_workers(
+            &mut self,
+            request: super::WatchWorkersRequest,
+        ) -> Result<super::Watch, Error> {
+            self.runtime.drive(self.inner.watch_workers(request))
+        }
+
+        /// [`super::Watch::next`] of a watch this client opened, on the
+        /// client's runtime.
+        pub fn next_of(
+            &mut self,
+            watch: &mut super::Watch,
+        ) -> Result<Option<super::WorkerEvent>, Error> {
+            self.runtime.drive(watch.next())
         }
 
         /// [`super::Client::welcome`].
