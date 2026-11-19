@@ -316,12 +316,13 @@ impl Ring {
 ///
 /// The bound in bytes: a slot is at most 120 bytes whatever the event. A
 /// load row is its slot alone: 65,536 of them are 7.9 MB, held from the
-/// start. A membership event's rows stand apart from its slot, 320 bytes a
-/// row and its strings: about 0.51 KB an event at a row of a short URL, one
+/// start. A membership event's rows stand apart from its slot, 328 bytes a
+/// row and its strings: about 0.52 KB an event at a row of a short URL, one
 /// model, no label, no pairing descriptor and no encode connector, a second
 /// row for a replacement, so 4,096 membership events are about 2.1 MB at
 /// that row. A pairing descriptor stands apart from its row, 168 bytes and
-/// its strings, held once for every copy of that row.
+/// its strings, held once for every copy of that row, and so does a
+/// provider's key, 64 bytes and its strings.
 ///
 /// The fields stand in the order written (`repr(C)`), the lock first: a
 /// read addresses the ring off the log's own pointer, whatever the ring's
@@ -1153,11 +1154,13 @@ mod tests {
 
     #[test]
     fn a_slot_is_at_most_120_bytes_and_a_membership_row_stands_apart() {
-        // The log's bound in bytes is told from these two: a ring's slots,
-        // and apart from its slot a membership event's rows (two for a
-        // replacement), each with its strings.
+        // The log's bound in bytes is told from these: a ring's slots, and
+        // apart from its slot a membership event's rows (two for a
+        // replacement), each with its strings. A provider's key stands
+        // apart from its row, behind a pointer's two counts.
         assert!(size_of::<Entry>() <= 120);
-        assert!(size_of::<WorkerRow>() <= 320);
+        assert!(size_of::<WorkerRow>() <= 328);
+        assert!(size_of::<crate::store::ProviderKey>() + 2 * size_of::<usize>() <= 64);
     }
 
     #[test]

@@ -1010,6 +1010,7 @@ pub(crate) mod tests {
                 status: WorkerStatus::Ready,
                 revision: 1,
                 admitted_at: Instant::now(),
+                maker: Default::default(),
             }
         }
         fn paged(fleet: &[WorkerRow]) -> Vec<usize> {

@@ -1798,7 +1798,12 @@ const MEMBERSHIP_FIELDS: &[(&str, &[ResumeField])] = &[
             ("dp_rank", 23, Type::Uint32),
             ("engine", 24, Type::String),
             ("health_policy", 25, Type::Message),
+            ("maker", 27, Type::Message),
         ],
+    ),
+    (
+        "Maker",
+        &[("provider", 1, Type::String), ("key", 2, Type::String)],
     ),
     ("WorkerSpec", &[("health_policy", 14, Type::Message)]),
 ];

@@ -1816,6 +1816,7 @@ fn a_publication_before_a_departing_workers_row_leaves_still_shows_its_veto() {
         status: WorkerStatus::Ready,
         revision: 1,
         admitted_at: origin,
+        maker: Default::default(),
     };
     let members = [row(1, "http://a:8000"), row(2, "http://b:8000")];
     let masked = |world: &World| {
@@ -2072,6 +2073,7 @@ fn row_serving(id: u64, models: &[&str], admitted_at: Instant) -> WorkerRow {
         status: WorkerStatus::Ready,
         revision: 1,
         admitted_at,
+        maker: Default::default(),
     }
 }
 
@@ -5135,6 +5137,7 @@ fn a_member_whose_rows_revision_stands_is_carried_and_one_whose_revision_moved_i
         status: WorkerStatus::Ready,
         revision,
         admitted_at: origin,
+        maker: Default::default(),
     };
     let zones = |world: &World| (listed(world, WorkerId(3)).1, listed(world, WorkerId(7)).1);
     let mut writer = Writer::new(PUBLISH_WINDOW, origin);

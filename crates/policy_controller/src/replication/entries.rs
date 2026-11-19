@@ -31,6 +31,7 @@ const GENERATION: &str =
 /// The list: `(trait or type, entry, fate)`, each in its file's own order.
 pub const ENTRIES: &[(&str, &str, Fate)] = &[
     ("WorkersStore", "upsert", Fate::Journaled),
+    ("WorkersStore", "upsert_by", Fate::Journaled),
     ("WorkersStore", "patch", Fate::Journaled),
     ("WorkersStore", "remove", Fate::Journaled),
     ("WorkersStore", "set_status", Fate::Journaled),

@@ -621,6 +621,20 @@ message WorkerRow {
   // admitted where it is applied; a row an event changes keeps the
   // admission its standby holds.
   uint64 admitted_age_ms = 26;
+  // Who made the row. Absent: a control call. The caller that made a row
+  // alone changes it: a registration over it, a patch, a drain and a
+  // removal from any other are refused PERMISSION_DENIED, and the words
+  // name the maker. A reader that knows no such field reads every row as
+  // a control call's.
+  Maker maker = 27;
+}
+
+// A provider that finds workers by itself, as a row's maker.
+message Maker {
+  // The provider's name.
+  string provider = 1;
+  // The provider's own key for the worker.
+  string key = 2;
 }
 
 // A host-local wire is reachable from one gateway only.
