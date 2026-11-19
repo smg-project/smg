@@ -44,6 +44,7 @@ use crate::{
     catalog::{Catalog, Found, StageBuild},
     framework::{Binding, Engine, OverloadThresholds, Picker, Plan, Profile, Scorer, Weighted},
     ring::ConsistentHash,
+    routing_key::KeySources,
     sessions::SessionRule,
     view::{permille, HashKind, Phase, MAX_REPORT_AGE_MS},
 };
@@ -65,6 +66,30 @@ pub const DENIED_HEADERS: [&str; 7] = [
 /// The most headers `view.headers` may list: a view names an allow-listed
 /// header by its position in one byte.
 pub const MAX_HEADERS: usize = 256;
+
+/// Header names no routing key source may carry: the credentials of
+/// [`DENIED_HEADERS`]. `cookie` may be a source, and stays off every
+/// allow-list: a key read from it leaves as its fingerprint alone
+/// ([`DerivedKey`](crate::DerivedKey)). A host's tenant header is refused
+/// here as there.
+pub const DENIED_KEY_HEADERS: [&str; 6] = [
+    "authorization",
+    "proxy-authorization",
+    "set-cookie",
+    "x-api-key",
+    "api-key",
+    "x-goog-api-key",
+];
+
+/// The most bytes of a value a routing key source hands where its entry
+/// names no `max_bytes`: the gateway's cap on a routing key header.
+pub const KEY_BYTES: u32 = 128;
+
+/// The most bytes an entry's `max_bytes` may ask for.
+pub const MAX_KEY_BYTES: u32 = 8192;
+
+/// The most sources one `routing_key` block lists.
+pub const MAX_KEY_SOURCES: usize = 8;
 
 /// The highest `view.max_block_hashes`: the hashes a `DecideRequest` at
 /// the contract's bound of 64 KiB carries beside an id of one byte, at
@@ -1401,10 +1426,13 @@ pub enum Recovery {
 #[serde(deny_unknown_fields)]
 pub struct SessionsSpec {
     /// The header whose value is the session key; listed in `view.headers`.
+    /// Left out where the binding names its key's sources under
+    /// `routing_key`: a binding names them once.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub sticky_header: String,
     /// The headers looked up in order for the key, the sticky header among
     /// them; empty means the sticky header alone. Each listed in
-    /// `view.headers`.
+    /// `view.headers`. Left out under `routing_key` too.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub headers: Vec<String>,
     /// How long an idle key stays pinned, in seconds; above zero (default
@@ -1448,6 +1476,42 @@ fn default_sweep_s() -> u32 {
 
 fn default_inflight_cap() -> u16 {
     2
+}
+
+/// Where a binding's requests take their routing key from: the sources a
+/// host reads in order, and the first that holds a value is the key. A ring
+/// places by the key and a sessions rule pins it. No value enters a view,
+/// so the list is not held to `view.headers`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RoutingKeySpec {
+    /// The sources, read in order: one to eight, each named once.
+    #[schemars(length(min = 1, max = 8))]
+    pub sources: Vec<KeySourceSpec>,
+    /// Take the turn and retry suffixes off a key, so every turn of a
+    /// conversation shares one (`conv_t2_r1` keys as `conv`); default
+    /// false.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub strip_lineage: bool,
+}
+
+/// One source of a routing key: exactly one of `header` and `rid`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct KeySourceSpec {
+    /// A request header, lowercase. A credential header is refused, as on
+    /// `view.headers`; `cookie` is not. A key from a header `view.headers`
+    /// does not list leaves as its fingerprint alone.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub header: Option<String>,
+    /// The request's own id, the `rid` of its body: `true` names it.
+    #[serde(skip_serializing_if = "is_default")]
+    pub rid: bool,
+    /// The most bytes of a value this source hands, 8192 at most (default
+    /// 128). A longer value is passed over and the next source is read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1, max = 8192))]
+    pub max_bytes: Option<u32>,
 }
 
 /// A second profile deciding a share of the binding's requests, the
@@ -1567,6 +1631,11 @@ pub struct BindingSpec {
     /// and its decode pool is the decode phase's own.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub overload: Option<OverloadSpec>,
+    /// Where the binding's requests take their routing key from. Absent, a
+    /// sessions rule's own headers are the sources, and a binding with no
+    /// rule names none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub routing_key: Option<RoutingKeySpec>,
     /// Sticky sessions.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sessions: Option<SessionsSpec>,
@@ -1885,6 +1954,16 @@ fn glob_ok(model: &str) -> bool {
 
 /// A lowercase header name outside the deny-lists.
 fn check_header_name(name: &str, path: String, denied: &[&str]) -> Result<(), SpecError> {
+    check_header_outside(name, path, &DENIED_HEADERS, denied)
+}
+
+/// A lowercase header name outside `stock` and the host's own `denied`.
+fn check_header_outside(
+    name: &str,
+    path: String,
+    stock: &[&str],
+    denied: &[&str],
+) -> Result<(), SpecError> {
     let token =
         |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit() || b"!#$%&'*+-.^_`|~".contains(&b);
     if name.is_empty() || !name.bytes().all(token) {
@@ -1894,7 +1973,7 @@ fn check_header_name(name: &str, path: String, denied: &[&str]) -> Result<(), Sp
             reason: "a lowercase header name",
         });
     }
-    if DENIED_HEADERS.contains(&name) || denied.iter().any(|d| d.eq_ignore_ascii_case(name)) {
+    if stock.contains(&name) || denied.iter().any(|d| d.eq_ignore_ascii_case(name)) {
         return Err(SpecError::DeniedHeader {
             path,
             name: name.to_string(),
@@ -2823,6 +2902,43 @@ fn check_overload(overload: &OverloadSpec, at: &At) -> Result<(), SpecError> {
 
 fn check_sessions(
     sessions: &SessionsSpec,
+    by_routing_key: bool,
+    cx: &BindingContext<'_>,
+    at: &At,
+) -> Result<(), SpecError> {
+    if by_routing_key {
+        // A binding names its key's sources once: under `routing_key` the
+        // rule's own spelling is refused by name.
+        for (name, written) in [
+            ("sticky_header", !sessions.sticky_header.is_empty()),
+            ("headers", !sessions.headers.is_empty()),
+        ] {
+            if written {
+                return Err(SpecError::BadSessions {
+                    index: cx.index,
+                    name,
+                    reason: "left out while the binding names routing_key",
+                });
+            }
+        }
+    } else if sessions.sticky_header.is_empty() {
+        return Err(SpecError::BadSessions {
+            index: cx.index,
+            name: "sticky_header",
+            reason: "named while the binding names no routing_key",
+        });
+    } else {
+        check_session_headers(sessions, cx, at)?;
+    }
+    at.nonzero("ttl_s", Some(sessions.ttl_s))?;
+    at.nonzero("sweep_s", Some(sessions.sweep_s))?;
+    at.nonzero("inflight_cap", Some(sessions.inflight_cap))
+}
+
+/// The headers a sessions rule names itself: each a header name on the
+/// view's allow-list, the sticky header among the listed ones.
+fn check_session_headers(
+    sessions: &SessionsSpec,
     cx: &BindingContext<'_>,
     at: &At,
 ) -> Result<(), SpecError> {
@@ -2856,9 +2972,56 @@ fn check_sessions(
             });
         }
     }
-    at.nonzero("ttl_s", Some(sessions.ttl_s))?;
-    at.nonzero("sweep_s", Some(sessions.sweep_s))?;
-    at.nonzero("inflight_cap", Some(sessions.inflight_cap))
+    Ok(())
+}
+
+/// A binding's routing key sources: one to eight entries, each a header
+/// outside the credential names or the request's own id, each named once,
+/// with a byte cap inside the schema's.
+fn check_routing_key(
+    block: &RoutingKeySpec,
+    cx: &BindingContext<'_>,
+    at: &At,
+) -> Result<(), SpecError> {
+    let listed = block.sources.len();
+    if listed == 0 || listed > MAX_KEY_SOURCES {
+        return Err(at.bad(
+            "sources",
+            format_args!("{listed} entries"),
+            "a list of one to eight sources",
+        ));
+    }
+    let mut seen = BTreeSet::new();
+    for (i, source) in block.sources.iter().enumerate() {
+        let at = At::new(format!("{}.sources[{i}]", at.0));
+        let name = match (&source.header, source.rid) {
+            (Some(name), false) => {
+                check_header_outside(name, at.field("header"), &DENIED_KEY_HEADERS, cx.denied)?;
+                name.as_str()
+            }
+            (None, true) => "rid",
+            (written, _) => {
+                return Err(SpecError::BadField {
+                    path: at.0,
+                    value: written.as_ref().map_or("neither", |_| "both").to_string(),
+                    reason: "one of header and rid",
+                });
+            }
+        };
+        if !seen.insert((source.rid, name)) {
+            return Err(SpecError::Duplicate {
+                path: at.0,
+                name: name.to_string(),
+            });
+        }
+        at.number(
+            "max_bytes",
+            source.max_bytes,
+            |bytes| (1..=MAX_KEY_BYTES).contains(&bytes),
+            "between 1 and 8192",
+        )?;
+    }
+    Ok(())
 }
 
 fn check_canary(canary: &CanarySpec, cx: &BindingContext<'_>, at: &At) -> Result<(), SpecError> {
@@ -2898,9 +3061,12 @@ fn check_binding_rules(
     if let Some(overload) = &b.overload {
         check_overload(overload, &at.sub("overload"))?;
     }
+    if let Some(block) = &b.routing_key {
+        check_routing_key(block, cx, &at.sub("routing_key"))?;
+    }
     if let Some(sessions) = &b.sessions {
         let at = at.sub("sessions");
-        check_sessions(sessions, cx, &at)?;
+        check_sessions(sessions, b.routing_key.is_some(), cx, &at)?;
         if sessions.issue_session_id {
             deferred.note(at.field("issue_session_id"), "issuing a session id");
         }
@@ -3702,6 +3868,10 @@ pub struct AppliedSpec {
     block_size: u32,
     pairing: Pairing,
     lists: ViewLists,
+    /// Each binding's routing key sources, by the binding's place in the
+    /// document; none where a binding names none
+    /// ([`AppliedSpec::key_sources_for`]).
+    key_sources: Box<[Option<KeySources>]>,
     /// A start's document waits for the first lead of this store's
     /// replica ([`AppliedSpec::mark_document_awaited`]): set on the unbound start
     /// alone, and gone with it at the first publication.
@@ -3750,6 +3920,11 @@ impl AppliedSpec {
             block_size: Gates::of(None, None, document.view.block_size).block_size,
             pairing: document.plans.pd_pair.pairing,
             lists: ViewLists::of(&document.view),
+            key_sources: document
+                .bindings
+                .iter()
+                .map(|binding| KeySources::of_binding(binding, &document.view))
+                .collect(),
             #[cfg(feature = "controller")]
             awaited: AtomicBool::new(false),
         }
@@ -3769,6 +3944,7 @@ impl AppliedSpec {
             block_size: Gates::default().block_size,
             pairing: Pairing::default(),
             lists: ViewLists::default(),
+            key_sources: Box::default(),
             #[cfg(feature = "controller")]
             awaited: AtomicBool::new(false),
         }
@@ -3854,6 +4030,19 @@ impl AppliedSpec {
     #[must_use]
     pub fn needs(&self) -> Needs {
         self.engine.needs()
+    }
+
+    /// The sources a request of `phase` for `model` takes its routing key
+    /// from: those of the first binding that matches it, a pair request's
+    /// by its prefill lookup. The host reads the request by them
+    /// ([`KeySources::derive`]) and hands the engine the one key
+    /// ([`RequestFacts::session_key`](crate::RequestFacts::session_key)).
+    /// `None` where no binding matches or the binding names no source: the
+    /// request carries no key.
+    #[must_use]
+    pub fn key_sources_for(&self, model: &str, phase: Phase) -> Option<&KeySources> {
+        let at = self.engine.binding_position(model, phase)?;
+        self.key_sources.get(usize::try_from(at).ok()?)?.as_ref()
     }
 
     /// The mode a store derives its pair classes under while this
@@ -6024,10 +6213,17 @@ mod tests {
                 "issuing a session id"
             )
         );
-        let err = parse_error(
-            r#"{"apiVersion":"smg.policy/v1","profiles":{"p":{"pick":"best"}},"bindings":[{"profile":"p","sessions":{"ttl_s":1}}]}"#,
+        // A rule names its key's header, or the binding names `routing_key`.
+        assert_eq!(
+            spec_with_binding(r#"{"profile":"p","sessions":{"ttl_s":1}}"#)
+                .validate()
+                .err(),
+            Some(SpecError::BadSessions {
+                index: 0,
+                name: "sticky_header",
+                reason: "named while the binding names no routing_key",
+            })
         );
-        assert!(err.contains("missing field `sticky_header`"), "{err}");
 
         assert_eq!(
             spec_with_binding(r#"{"profile":"p","shadow":"ghost"}"#)
@@ -6119,6 +6315,134 @@ mod tests {
                 .validate()
                 .is_ok()
         );
+    }
+
+    /// A binding's `routing_key` block names one to eight sources, each a
+    /// header outside the credential names or the request's own id, each
+    /// once, with a byte cap inside the schema's. Beside it a sessions rule
+    /// names no header of its own.
+    #[test]
+    fn a_routing_key_block_is_checked_in_shape() {
+        let block = |block: &str| {
+            spec_with_binding(&format!(r#"{{"profile":"p","routing_key":{block}}}"#)).validate()
+        };
+        // Every form of a source, `cookie` among the headers: no value of
+        // these enters a view, so none is held to `view.headers`.
+        assert!(block(
+            r#"{"sources":[{"header":"x-smg-routing-key"},{"rid":true},{"header":"x-forwarded-for","max_bytes":8192},{"header":"cookie"}],"strip_lineage":true}"#
+        )
+        .is_ok());
+        // A header named `rid` and the request's own id are two sources.
+        assert!(block(r#"{"sources":[{"header":"rid"},{"rid":true}]}"#).is_ok());
+        let refused = |text: &str| block(text).expect_err(text).to_string();
+        let nine: Vec<String> = (0..9).map(|i| format!(r#"{{"header":"x-{i}"}}"#)).collect();
+        let nine = format!(r#"{{"sources":[{}]}}"#, nine.join(","));
+        for (text, message) in [
+            (
+                r#"{"sources":[]}"#,
+                "bindings[0].routing_key.sources = 0 entries is not a list of one to eight sources",
+            ),
+            (
+                nine.as_str(),
+                "bindings[0].routing_key.sources = 9 entries is not a list of one to eight sources",
+            ),
+            (
+                r#"{"sources":[{}]}"#,
+                "bindings[0].routing_key.sources[0] = neither is not one of header and rid",
+            ),
+            (
+                r#"{"sources":[{"header":"x-a","rid":true}]}"#,
+                "bindings[0].routing_key.sources[0] = both is not one of header and rid",
+            ),
+            (
+                r#"{"sources":[{"header":"X-A"}]}"#,
+                "bindings[0].routing_key.sources[0].header = X-A is not a lowercase header name",
+            ),
+            (
+                r#"{"sources":[{"header":"authorization"}]}"#,
+                "bindings[0].routing_key.sources[0].header: header \"authorization\" is on the deny-list",
+            ),
+            (
+                r#"{"sources":[{"header":"x-a"},{"header":"x-a"}]}"#,
+                "bindings[0].routing_key.sources[1]: \"x-a\" appears twice",
+            ),
+            (
+                r#"{"sources":[{"rid":true},{"rid":true}]}"#,
+                "bindings[0].routing_key.sources[1]: \"rid\" appears twice",
+            ),
+            (
+                r#"{"sources":[{"rid":true,"max_bytes":0}]}"#,
+                "bindings[0].routing_key.sources[0].max_bytes = 0 is not between 1 and 8192",
+            ),
+            (
+                r#"{"sources":[{"rid":true,"max_bytes":8193}]}"#,
+                "bindings[0].routing_key.sources[0].max_bytes = 8193 is not between 1 and 8192",
+            ),
+        ] {
+            assert_eq!(refused(text), message);
+        }
+        // One spelling or the other beside a sessions rule.
+        let beside = |sessions: &str| {
+            spec_with_binding(&format!(
+                r#"{{"profile":"p","routing_key":{{"sources":[{{"rid":true}}]}},"sessions":{sessions}}}"#
+            ))
+            .validate()
+            .err()
+        };
+        assert_eq!(beside(r#"{"ttl_s":600}"#), None);
+        for (sessions, name) in [
+            (r#"{"sticky_header":"x-session-id"}"#, "sticky_header"),
+            (r#"{"headers":["x-session-id"]}"#, "headers"),
+        ] {
+            assert_eq!(
+                beside(sessions),
+                Some(SpecError::BadSessions {
+                    index: 0,
+                    name,
+                    reason: "left out while the binding names routing_key",
+                })
+            );
+        }
+    }
+
+    /// The applied document answers a request's key sources from whichever
+    /// spelling its binding writes: the `routing_key` block, or a sessions
+    /// rule's own headers. A binding with neither names none.
+    #[test]
+    fn the_applied_document_answers_a_bindings_key_sources() {
+        let applied = AppliedSpec::validate(&doc(
+            r#"{"apiVersion":"smg.policy/v1","view":{"headers":["x-session-id","x-tenant-session"]},"profiles":{"p":{"pick":"best"}},"bindings":[
+                {"match":{"model":"chat/*"},"profile":"p","routing_key":{"sources":[{"header":"x-smg-routing-key"},{"rid":true},{"header":"cookie"}]}},
+                {"match":{"model":"code/*"},"profile":"p","sessions":{"sticky_header":"x-session-id","headers":["x-tenant-session","x-session-id"]}},
+                {"profile":"p"}]}"#,
+        ))
+        .expect("the document validates");
+        let read = |model: &str| {
+            applied
+                .key_sources_for(model, Phase::Single)
+                .map(|sources| (sources.headers().collect::<Vec<_>>(), sources.reads_rid()))
+        };
+        assert_eq!(
+            read("chat/a"),
+            Some((vec!["x-smg-routing-key", "cookie"], true))
+        );
+        assert_eq!(
+            read("code/a"),
+            Some((vec!["x-tenant-session", "x-session-id"], false))
+        );
+        assert_eq!(read("other"), None, "a binding with no source");
+        // A rule's own header is on the view's allow-list: its key leaves in
+        // the clear.
+        let rule = applied
+            .key_sources_for("code/a", Phase::Single)
+            .expect("the rule's headers");
+        let derived = rule
+            .derive(|name| (name == "x-session-id").then_some(&b"s-1"[..]), None)
+            .expect("a key");
+        assert_eq!(derived.key, crate::Identity::plain("s-1"));
+        assert!(AppliedSpec::unbound()
+            .key_sources_for("chat/a", Phase::Single)
+            .is_none());
     }
 
     #[test]

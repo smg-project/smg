@@ -36,7 +36,8 @@
 //!   every name once ([`PolicySpec::validate_in`]).
 //! - 4.6, the schema ([`spec`]): [`PolicySpec`] (`apiVersion: smg.policy/v1`,
 //!   no `kind`), its validator and the [`Needs`] summary the host reads at
-//!   apply, before any request exists.
+//!   apply, before any request exists. A binding names where a request's
+//!   routing key comes from, and one function derives it ([`routing_key`]).
 //!
 //! - 5.1 and appendix A, the store ingress ([`store`]): the traits through
 //!   which the controller's store is fed (membership, health, loads, KV
@@ -144,6 +145,7 @@ pub mod predictor;
 pub mod proto;
 pub mod replication;
 pub mod ring;
+pub mod routing_key;
 pub mod sessions;
 pub mod spec;
 pub mod store;
@@ -172,6 +174,7 @@ pub use lease::{
     Side, Signal, TransportClass,
 };
 pub use ring::{ConsistentHash, Ring};
+pub use routing_key::{DerivedKey, KeySource, KeySources};
 pub use sessions::{
     Assignment, Forgets, Pins, Recovery, SessionRule, SessionTable, SessionVerdict,
 };
