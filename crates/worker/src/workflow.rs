@@ -75,7 +75,8 @@ pub use registration::{
 };
 pub use removal::{
     worker_removal_workflow, RemovalOrder, DRAIN_WORKERS_STEP, FIND_WORKERS_TO_REMOVE_STEP,
-    REMOVE_FROM_WORKER_REGISTRY_STEP, SETTLE_DRAINED_WORKERS_STEP, WORKER_REMOVAL_WORKFLOW,
+    REMOVE_FROM_WORKER_REGISTRY_STEP, SETTLE_DRAINED_WORKERS_STEP, SETTLE_STEP_TIMEOUT,
+    WORKER_REMOVAL_WORKFLOW,
 };
 pub use remove_from_worker_registry::RemoveFromWorkerRegistryStep;
 pub use retry::single_attempt;

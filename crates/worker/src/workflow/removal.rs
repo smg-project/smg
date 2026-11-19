@@ -39,6 +39,17 @@ pub enum RemovalOrder {
     },
 }
 
+/// The bound of a step that waits a settle window. The window is a worker's
+/// own setting, known only at run time. A step with no timeout of its own
+/// runs under the workflow's default, and a window longer than that default
+/// would end the removal there and leave its workers draining. This bound is
+/// one day, and a longer window ends the removal at it.
+///
+/// A host that waits for a removal waits at least this long. A host that
+/// gave up earlier would report a failure while its run went on to remove
+/// the worker.
+pub const SETTLE_STEP_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
+
 /// Builds the worker steps of a removal. Each step has one attempt.
 ///
 /// Use [`RemovalOrder::Registry`] when the registry owns membership. Add
@@ -66,8 +77,8 @@ pub fn worker_removal_workflow<H: WorkflowHost>(
             .with_timeout(Duration::from_secs(10))
             .with_retry(single_attempt()),
         );
-    // Neither wait sets a timeout of its own: a settle window is known only
-    // at run time. The workflow's default timeout still bounds each wait.
+    // Each wait carries its own bound: the window is known only at run
+    // time, and the workflow's default timeout would cut a longer one.
     match order {
         RemovalOrder::Registry => workflow
             .add_step(
@@ -76,6 +87,7 @@ pub fn worker_removal_workflow<H: WorkflowHost>(
                     "Drain Ready workers before removal",
                     Arc::new(DrainWorkersStep),
                 )
+                .with_timeout(SETTLE_STEP_TIMEOUT)
                 .with_retry(single_attempt())
                 .depends_on(&[FIND_WORKERS_TO_REMOVE_STEP]),
             )
@@ -95,6 +107,7 @@ pub fn worker_removal_workflow<H: WorkflowHost>(
                 "Wait for drained workers before removal",
                 Arc::new(SettleDrainedWorkersStep),
             )
+            .with_timeout(SETTLE_STEP_TIMEOUT)
             .with_retry(single_attempt())
             .depends_on(&[drain]),
         ),
@@ -127,7 +140,7 @@ mod tests {
     type RemovalData = WorkerRemovalWorkflowData<RegistryHost>;
 
     /// What a host builds on: three steps in a line under the ids this crate
-    /// names, the drain alone without a timeout, each step tried once.
+    /// names, the drain under the bound of a settle, each step tried once.
     #[test]
     fn the_registry_order_is_as_it_was() {
         let mut workflow = worker_removal_workflow::<RegistryHost>(RemovalOrder::Registry);
@@ -151,7 +164,7 @@ mod tests {
                 (
                     StepId::new(DRAIN_WORKERS_STEP),
                     vec![StepId::new(FIND_WORKERS_TO_REMOVE_STEP)],
-                    None,
+                    Some(SETTLE_STEP_TIMEOUT),
                 ),
                 (
                     StepId::new(REMOVE_FROM_WORKER_REGISTRY_STEP),
@@ -182,7 +195,7 @@ mod tests {
         let settle = &workflow.steps[1];
         assert_eq!(settle.depends_on, [StepId::new(HOST_DRAIN)]);
         assert!(settle.depends_on_any.is_empty());
-        assert_eq!(settle.timeout, None);
+        assert_eq!(settle.timeout, Some(SETTLE_STEP_TIMEOUT));
         assert_eq!(
             settle
                 .retry_policy
@@ -278,7 +291,7 @@ mod tests {
             .start_workflow(WorkflowId::new(WORKER_REMOVAL_WORKFLOW), data)
             .await
             .unwrap();
-        let timeout = Duration::from_secs(15);
+        let timeout = Duration::from_secs(600);
         tokio::time::timeout(timeout, engine.wait_for_completion(run, "removal", timeout))
             .await
             .unwrap()
@@ -311,6 +324,62 @@ mod tests {
                 Duration::from_secs(seconds)
             );
         }
+    }
+
+    /// A drain window longer than the workflow's default step timeout
+    /// still ends in the removal: the worker leaves the registry once the
+    /// window is over.
+    #[tokio::test(start_paused = true)]
+    async fn a_drain_window_past_the_default_step_timeout_ends_in_the_removal() {
+        let registry = Arc::new(WorkerRegistry::new());
+        registry
+            .register(worker(URL, 400, WorkerStatus::Ready))
+            .unwrap();
+        let engine = WorkflowEngine::new();
+        engine
+            .register_workflow(worker_removal_workflow::<RegistryHost>(
+                RemovalOrder::Registry,
+            ))
+            .unwrap();
+        let mut data = removal_data();
+        data.host = Some(Arc::new(RegistryHost {
+            worker_registry: Arc::clone(&registry),
+        }));
+        let start = Instant::now();
+        let run = engine
+            .start_workflow(WorkflowId::new(WORKER_REMOVAL_WORKFLOW), data)
+            .await
+            .unwrap();
+        let bound = Duration::from_secs(600);
+        tokio::time::timeout(bound, engine.wait_for_completion(run, "removal", bound))
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(start.elapsed() >= Duration::from_secs(400));
+        assert!(registry.get_by_url(URL).is_none());
+    }
+
+    /// The same window in the door's order: the host's removal runs once
+    /// the window of the workers its drain marked is over.
+    #[tokio::test(start_paused = true)]
+    async fn a_settle_window_past_the_default_step_timeout_reaches_the_hosts_removal() {
+        let registry = Arc::new(WorkerRegistry::new());
+        registry
+            .register(worker(URL, 400, WorkerStatus::Ready))
+            .unwrap();
+        let drained = vec![worker(URL, 400, WorkerStatus::Draining)];
+        let removed_at = Arc::new(OnceLock::new());
+        let record_removal = Arc::clone(&removed_at);
+        let start = Instant::now();
+        run_door_removal(
+            registry,
+            move |data| data.drained_workers.clone_from(&drained),
+            move |_| record_removal.set(Instant::now()).unwrap(),
+        )
+        .await;
+
+        assert_eq!(*removed_at.get().unwrap() - start, Duration::from_secs(400));
     }
 
     #[tokio::test(start_paused = true)]
