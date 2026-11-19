@@ -2,6 +2,7 @@
 
 use std::{error::Error, sync::atomic::Ordering};
 
+use openai_protocol::{model_card::ModelCard, worker::WorkerStatus};
 use serde_json::{json, Value};
 use smg_policy_controller::{
     store::{GatewayId, LeasesStore, WorkersStore},
@@ -17,9 +18,12 @@ use crate::{
     config::PolicyConfig,
     middleware::ReportedRefusal,
     policy_controller::host::testing::{bed_over, MODEL},
-    routers::common::{
-        request_lease::test_probe::{spawn_release_gated_stub, DropProbeRequest},
-        test_support::fast_retry_config,
+    routers::{
+        common::{
+            request_lease::test_probe::{spawn_release_gated_stub, DropProbeRequest},
+            test_support::fast_retry_config,
+        },
+        grpc::backend_client::BasicWorkerBuilder,
     },
     tenant::TenantKey,
 };
@@ -89,6 +93,32 @@ async fn the_same_bed_with_no_host_is_placed_by_the_classic_policy() -> Case {
     let (a, b) = six_chats(false).await?;
     assert!(a > 0);
     assert_eq!(a + b, 6);
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_attempt_is_never_placed_on_a_worker_of_another_wire() -> Case {
+    let (a, hits_a) = fixed_status_upstream(&[CHAT], StatusCode::OK).await;
+    let (b, hits_b) = fixed_status_upstream(&[CHAT], StatusCode::OK).await;
+    let registry = Arc::new(WorkerRegistry::new());
+    let (host, _store, _) = bed_over(Arc::clone(&registry), &[&a, &b]);
+    // A's row stands in the store, and the gateway's worker at A speaks
+    // another wire.
+    registry.register_or_replace(Arc::new(
+        BasicWorkerBuilder::new(a.as_str())
+            .model(ModelCard::new(MODEL))
+            .status(WorkerStatus::Ready)
+            .connection_mode(ConnectionMode::Grpc)
+            .build(),
+    ));
+    let router = router(registry, Some(host));
+    for _ in 0..16 {
+        assert_eq!(chat(&router).await?.status(), StatusCode::OK);
+    }
+    assert_eq!(
+        (hits_a.load(Ordering::SeqCst), hits_b.load(Ordering::SeqCst)),
+        (0, 16)
+    );
     Ok(())
 }
 

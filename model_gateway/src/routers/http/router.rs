@@ -143,6 +143,15 @@ struct StreamRelayMode {
     rechunk: Option<RechunkPolicy>,
 }
 
+/// The regular HTTP router's rule at the host's commit: the membership of
+/// the classic pool it draws from. The router sends plain HTTP to a regular
+/// worker's URL, so a target of another wire or of another role is passed
+/// over.
+fn regular_http(worker: &dyn Worker) -> bool {
+    *worker.worker_type() == WorkerType::Regular
+        && *worker.connection_mode() == ConnectionMode::Http
+}
+
 /// One dispatch attempt of a typed request: the inputs every stage of
 /// `Router::route_typed_request_once` reads. The route builds it once and
 /// every retry reads the same lease, ledger and tried lists.
@@ -774,7 +783,8 @@ impl Router {
     }
 
     /// The attempt's placement by the policy controller, or the answer of a
-    /// request it did not place.
+    /// request it did not place. The commit keeps to this router's own pool
+    /// ([`regular_http`]).
     async fn place_attempt<T>(
         &self,
         host: &Host,
@@ -794,7 +804,8 @@ impl Router {
             tried: &tried,
             hashes: None,
         };
-        host.place(&ask, Instant::now()).await.map_err(|unplaced| {
+        let placed = host.place_where(&ask, regular_http, Instant::now()).await;
+        placed.map_err(|unplaced| {
             self.report_refusal(
                 "Router::route_typed_request",
                 attempt.model_id,
