@@ -29,12 +29,14 @@
 //! any endpoint: the dial, each call from its send to its answer's end, the
 //! session's call with its first frame, a report's wait for room in the
 //! session's queue, the wait for the session's end, the decide stream's
-//! open, an ask's waits for room in its queue and for its answer, and the
-//! wait for the decide stream's end. An endpoint's own time-outs end a
-//! wait sooner, and as the channel's error, not as the client's
-//! [`Error::NoAnswer`]: [`Error::Status`] for a call and
+//! open, an ask's waits for room in its queue and for its answer, the wait
+//! for the decide stream's end, and a watch's open. An endpoint's own
+//! time-outs end a wait sooner, and as the channel's error, not as the
+//! client's [`Error::NoAnswer`]: [`Error::Status`] for a call and
 //! [`Error::Connect`] for the dial. The one is a watch's next event
-//! ([`Watch::next`]): a fleet that does not change tells nothing.
+//! ([`Watch::next`]): a fleet that does not change tells nothing, and a
+//! peer gone silent ends that wait through the channel's keepalive
+//! ([`KEEPALIVE`]).
 
 use std::{
     future::{poll_fn, Future},
@@ -76,6 +78,11 @@ const HASH: usize = 8;
 /// time-outs end at a call's response headers and a peer may stall after
 /// them.
 pub const ANSWER_WAIT: Duration = Duration::from_secs(5);
+
+/// How often a channel [`Client::connect`] dials asks its peer for a sign
+/// of life. A peer that answers none within [`ANSWER_WAIT`] ends the
+/// channel's streams, a watch's wait among them.
+pub const KEEPALIVE: Duration = Duration::from_secs(5);
 
 type Stub = PolicyControllerClient<InterceptedService<Channel, Principal>>;
 
@@ -592,7 +599,9 @@ impl Watch {
     /// after the last event it took. A stream ended with a status tells it
     /// ([`Error::Status`]): `ABORTED` where its replica stopped leading.
     /// This wait holds no bound of the client's: a fleet that does not
-    /// change tells nothing.
+    /// change tells nothing. A peer gone silent ends it through the
+    /// channel's keepalive ([`KEEPALIVE`]); a caller that brings its own
+    /// endpoint ([`Client::connect_with`]) sets one on it.
     pub async fn next(&mut self) -> Result<Option<WorkerEvent>, Error> {
         Ok(self.events.message().await?)
     }
@@ -624,7 +633,10 @@ impl Client {
     /// plain endpoint.
     pub async fn connect(address: &str, gateway_id: &str) -> Result<Self, Error> {
         let endpoint = Endpoint::from_shared(address.to_owned())
-            .map_err(|error| Error::Address(error.to_string()))?;
+            .map_err(|error| Error::Address(error.to_string()))?
+            .http2_keep_alive_interval(KEEPALIVE)
+            .keep_alive_timeout(ANSWER_WAIT)
+            .keep_alive_while_idle(true);
         Self::connect_with(endpoint, gateway_id).await
     }
 
