@@ -2533,12 +2533,12 @@ fn contested<'a>(spellings: &[&str], mut added: impl Iterator<Item = (&'a str, b
 /// that follow each other in the source a render may write nothing (a
 /// parenthesis, a block tag, an expression that comes out empty): the
 /// glued text holds a token such pieces spell together, and in it a piece
-/// stands between its neighbours as in a render. Each text is asked by
-/// itself: a token that matches only as a whole word, or after
-/// normalization, is found in the piece that holds it. The glued text is
-/// left out where it would repeat a text: after one piece alone, or one
-/// run of every piece. The lexer reads under the whitespace rules of the
-/// render ([`build_environment`]).
+/// stands between the pieces before and after it in the source. Each text
+/// is asked by itself: a token that matches only as a whole word, or
+/// after normalization, is found in the piece that holds it. The glued
+/// text is left out where it would repeat a text: after one piece alone,
+/// or one run of every piece. The lexer reads under the whitespace rules
+/// of the render ([`build_environment`]).
 /// A comment is not in the texts, and neither is a literal that `built`
 /// names by its byte offset: one inside an expression the template builds a
 /// value from, the pattern of that value, which it writes only as the

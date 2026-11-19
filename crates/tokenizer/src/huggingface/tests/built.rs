@@ -388,18 +388,7 @@ fn a_whole_word_token_in_one_of_two_joined_pieces_leaves_the_template_as_it_was(
 /// a run of two pieces stands before it, or a piece follows it.
 #[test]
 fn a_whole_word_token_at_the_end_of_a_piece_leaves_the_template_as_it_was() {
-    let conversion = with_added_token("<a>")
-        .replace(
-            r#""special": false}],"#,
-            r#""special": false},
-        {"id": 20, "content": "tag", "single_word": true, "lstrip": false, "rstrip": false, "normalized": true, "special": true}],"#,
-        )
-        .replace(r#""<a>": 19}"#, r#""<a>": 19, "tag": 20}"#)
-        .replace(
-            r#""normalizer": null"#,
-            r#""normalizer": {"type": "BertNormalizer", "clean_text": true, "handle_chinese_chars": false, "strip_accents": null, "lowercase": true}"#,
-        );
-    assert!(conversion.contains(r#""id": 20"#) && conversion.contains("BertNormalizer"));
+    let conversion = with_a_whole_word_entry();
     let marked = |before: &str, after: &str| {
         let template = [before, &builds(), after].concat();
         let temp = TempDir::new().unwrap();
