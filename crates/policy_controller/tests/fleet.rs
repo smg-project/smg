@@ -72,6 +72,10 @@
 //! is no pick of a rotation until the gateway lifts the veto, and a session
 //! key keeps its ring worker over it.
 //!
+//! A gateway's link answers concurrent asks. Their leases leave the store
+//! on the caller's reports, or on the link's own release if an answer
+//! arrives after the caller's budget.
+//!
 //! No stub server: the engines are the mock worker's, the controller is the
 //! one the binary runs and the client is the generated one. Every wait is
 //! bounded and named, and the case stands under one outer bound.
@@ -128,12 +132,12 @@ use net::vm_rss_kib;
 use openai_protocol::worker::RuntimeType;
 use prost::Message as _;
 use smg_policy_controller::{
-    client::{self, blocking, Answer, Client},
+    client::{self, blocking, Answer, Client, Link, Unanswered},
     controller::{State, PROTOCOL_VERSION},
     proto::{
-        busy, completed::Class, decision::Outcome, identity::Form, principal, released,
-        worker_event, Completed, DecideRequest, Decision, Identity, OverloadThresholds, Released,
-        RequestFacts, ShedReason, Side, WatchWorkersRequest,
+        busy, completed::Class, decision::Outcome, gateway_frame, identity::Form, principal,
+        released, worker_event, Completed, DecideRequest, Decision, Identity, Lease,
+        OverloadThresholds, Released, RequestFacts, ShedReason, Side, WatchWorkersRequest,
     },
     spec::{BindingSpec, Match},
     store::{LaneCounts, MemoryStore, WorkerFacts, WorkerStatus, WorkersStore},
@@ -143,10 +147,10 @@ use smg_policy_controller::{
 };
 use tokio::{
     net::{TcpListener, TcpStream},
-    sync::{oneshot, Notify},
+    sync::{oneshot, Barrier, Notify},
     task::JoinSet,
 };
-use tonic::Code;
+use tonic::{transport::Endpoint, Code};
 
 const MODEL: &str = "fleet-model";
 
@@ -2477,6 +2481,144 @@ async fn the_blocking_client_asks_a_started_controller_from_a_thread_of_its_own(
                 if page.last && page.workers.is_empty()),
             "{told:?}"
         );
+        harness.stop().await.expect("a clean stop");
+    };
+    tokio::time::timeout(CASE, case)
+        .await
+        .expect("the case ends inside its outer bound");
+}
+
+/// One ready worker under a controller that leads itself.
+async fn linked_fleet(gateway: &str) -> Result<(Harness, Link), String> {
+    let mut harness = Harness::start().await?;
+    harness.apply("round_robin")?;
+    harness.register(&FLEET[..1]).await?;
+    harness.feed();
+    within("the worker is ready", ROOM, || {
+        harness
+            .view(MODEL, Role::Single)
+            .is_ok_and(|pool| pool.len() == 1 && pool[0].healthy)
+    })
+    .await?;
+    let endpoint = Endpoint::from_shared(format!("http://{}", harness.gateway()))
+        .map_err(|error| error.to_string())?;
+    let link = Box::pin(Link::connect(endpoint, gateway))
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok((harness, link))
+}
+
+async fn linked_pick(link: &Link, request: DecideRequest) -> Result<Lease, String> {
+    let answer = link.ask(request, ROOM).await;
+    let Ok(Decision {
+        leases,
+        outcome: Some(Outcome::Pick(_)),
+        ..
+    }) = answer
+    else {
+        return Err(format!("no pick: {answer:?}"));
+    };
+    let [lease] = leases.as_slice() else {
+        return Err(format!("a pick with the wrong leases: {leases:?}"));
+    };
+    Ok(*lease)
+}
+
+async fn leases_before_expiry(
+    harness: &Harness,
+    link: &Link,
+    gateway: &str,
+    left: usize,
+    before: Instant,
+) -> Result<(), String> {
+    let span = Duration::from_millis(u64::from(link.welcome().dispatch_ttl_ms));
+    within(
+        "the store reaches the reported lease count before expiry",
+        span.saturating_sub(before.elapsed()),
+        || before.elapsed() < span && harness.leases(gateway) == left,
+    )
+    .await
+    .map(|_| ())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_link_answers_sixty_four_asks_and_reports_the_end_of_each_lease() {
+    const GATEWAY: &str = "fleet-link";
+    let case = async {
+        let (harness, link) = Box::pin(linked_fleet(GATEWAY))
+            .await
+            .expect("a ready fleet");
+        let mut asks = JoinSet::new();
+        let count = usize::try_from(ASKS).expect("the number of asks fits");
+        let ready = Arc::new(Barrier::new(count + 1));
+        let before = Instant::now();
+        for n in 0..ASKS {
+            let link = link.clone();
+            let ready = Arc::clone(&ready);
+            asks.spawn(async move {
+                let session = session_of(&n.to_string(), MODEL);
+                ready.wait().await;
+                let lease = linked_pick(&link, keyed(nth("link", n), session))
+                    .await
+                    .expect("the controller answers with a pick");
+                assert_eq!(lease.session_key, session, "each ask gets its own decision");
+                (lease.id, lease.side)
+            });
+        }
+        ready.wait().await;
+        let mut leases = HashMap::new();
+        while let Some(answer) = asks.join_next().await {
+            let (id, side) = answer.expect("the caller gets its answer");
+            assert!(
+                leases.insert(id, side).is_none(),
+                "a distinct lease for every ask"
+            );
+        }
+        assert_eq!(harness.leases(GATEWAY), count);
+        for (lease_id, side) in leases {
+            link.report(gateway_frame::Frame::Released(Released {
+                what: Some(released::What::LeaseId(lease_id)),
+                reason: released::Reason::ClientGone.into(),
+                side,
+            }))
+            .expect("the link takes the report");
+        }
+        leases_before_expiry(&harness, &link, GATEWAY, 0, before)
+            .await
+            .expect("the reports end the leases");
+        assert!(link.stands());
+        drop(link);
+        harness.stop().await.expect("a clean stop");
+    };
+    tokio::time::timeout(CASE, case)
+        .await
+        .expect("the case ends inside its outer bound");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_link_releases_the_lease_of_a_zero_budget_ask() {
+    const GATEWAY: &str = "fleet-late-link";
+    let case = async {
+        let (harness, link) = Box::pin(linked_fleet(GATEWAY))
+            .await
+            .expect("a ready fleet");
+        let before = Instant::now();
+        let first = linked_pick(&link, ask(b"first"))
+            .await
+            .expect("a first pick");
+        assert!(matches!(
+            link.ask(ask(b"late"), Duration::ZERO).await,
+            Err(Unanswered::Late)
+        ));
+        let last = linked_pick(&link, ask(b"last")).await.expect("a last pick");
+        // The three asks run on the same decider. The gap proves that the
+        // middle ask booked a lease even if its release has arrived already.
+        assert_eq!(last.id, first.id + 2);
+        leases_before_expiry(&harness, &link, GATEWAY, 2, before)
+            .await
+            .expect("only the first and last leases remain");
+        assert!(link.stands());
+        drop(link);
         harness.stop().await.expect("a clean stop");
     };
     tokio::time::timeout(CASE, case)
