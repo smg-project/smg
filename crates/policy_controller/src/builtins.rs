@@ -1882,19 +1882,22 @@ impl ResidentWork {
         let Some(r) = report else {
             return PENDING;
         };
-        let (tokens, requests) = tally.get(&(row.id, row.dp_rank)).map_or((0, 0), |since| {
-            let credit = since.credit_through(row.load_sampled_at_micros);
-            if since.keeps_before(row.load_sampled_at_micros) {
-                self.settle(None, since, row, Slot::NONE);
-            }
-            credit
+        let since = tally.get(&(row.id, row.dp_rank));
+        let (tokens, requests) = since.map_or((0, 0), |since| {
+            since.credit_through(row.load_sampled_at_micros)
         });
-        if r.resident_counted {
+        let cost = if r.resident_counted {
             *reporting += 1;
             self.reported_cost(in_flight(), r, tokens, requests)
         } else {
             PENDING
+        };
+        // Behind the cost: in front of it the test's call held the row's
+        // parts live across it, at every row.
+        if let Some(since) = since.filter(|since| since.keeps_before(row.load_sampled_at_micros)) {
+            self.settle(None, since, row, Slot::NONE);
         }
+        cost
     }
 }
 
