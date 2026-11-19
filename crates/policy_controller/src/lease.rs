@@ -325,7 +325,8 @@ pub trait Lifecycle: Send + Sync {
     /// tells it before it shows a decision that report ([`Signal::Load`]
     /// with the rank's slot and the report's sample instant). `false` by
     /// default: a host tells no report to an engine none of whose stages
-    /// keeps one, and such a stage decides the same untold.
+    /// keeps one, and such a stage decides the same untold. The engine asks
+    /// once, at its build: the answer is the stage's for the engine's life.
     fn keeps_loads(&self) -> bool {
         false
     }

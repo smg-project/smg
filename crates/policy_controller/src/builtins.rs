@@ -432,8 +432,10 @@ struct SinceReport {
     retiring: Mutex<()>,
     lanes: [DispatchLane; DISPATCH_LANES],
     /// What a stage that keeps the row's cost as one number was last told
-    /// of the row. A report's tell and a dispatch hold it while they write
-    /// that number, so each number is of one report and one credit.
+    /// of the row, with the credit behind that report. A report's tell and
+    /// a dispatch hold it while they write that number, and such a stage
+    /// records its dispatches under it, so each number is of one report
+    /// and one credit.
     told: Mutex<Told>,
 }
 
@@ -446,6 +448,24 @@ struct Told {
     slot: Slot,
     sampled_at_micros: u64,
     row: Option<LoadRow>,
+    /// The credit behind the report: the token-work and the requests of
+    /// the dispatches the row holds that were made after the sample, in
+    /// the held word's form. The number is made of this and never of the
+    /// held word: the row still holds the dispatches the report reflects,
+    /// for a decision that reads the world standing before the report's
+    /// own is shown ([`ResidentWork::tell`]). A dispatch keeps it up while
+    /// the rank is bound to a cell, and a tell that binds the rank one
+    /// reads it again.
+    after: u64,
+}
+
+impl Told {
+    /// Whether `word` is the report this one holds, under the same slot.
+    fn says(&self, word: &Self) -> bool {
+        self.slot == word.slot
+            && self.sampled_at_micros == word.sampled_at_micros
+            && self.row == word.row
+    }
 }
 
 impl Default for Told {
@@ -454,6 +474,7 @@ impl Default for Told {
             slot: Slot::NONE,
             sampled_at_micros: 0,
             row: None,
+            after: 0,
         }
     }
 }
@@ -561,13 +582,28 @@ impl SinceReport {
         u64::from(tokens) << REQUEST_BITS | 1
     }
 
+    /// Records one dispatch.
     fn record(&self, at_micros: u64, tokens: u32) {
+        self.record_behind(at_micros, tokens, u64::MAX);
+    }
+
+    /// Records one dispatch for a stage that keeps the credit behind a
+    /// report sampled at `sampled_at_micros` ([`Told::after`]). Returns what
+    /// the dispatch moves that credit by, as the held word counts it and
+    /// wrapping: its own weight where it was made after the sample, less
+    /// what a retirement in front of it took of such dispatches. Inlined:
+    /// a stage told nothing records through [`SinceReport::record`], whose
+    /// copy holds none of this.
+    #[inline(always)]
+    fn record_behind(&self, at_micros: u64, tokens: u32, sampled_at_micros: u64) -> u64 {
         // Past the bound the row's oldest batch retires before this dispatch
         // lands, by instant across the lanes: the newest credits stay,
         // whichever lane holds them, past a partial release.
-        if self.held.load(Ordering::Relaxed) & REQUEST_MASK >= SINCE_REPORT_KEPT {
-            self.retire_oldest_batch();
-        }
+        let retired = if self.held.load(Ordering::Relaxed) & REQUEST_MASK >= SINCE_REPORT_KEPT {
+            self.retire_oldest_batch(sampled_at_micros)
+        } else {
+            0
+        };
         let lane = &self.lanes[lane_of_this_thread()];
         let mut dispatches = lane.dispatches.lock();
         // At its instant's place: a dispatch that waited for a retirement
@@ -596,6 +632,12 @@ impl SinceReport {
         if at_micros < self.oldest_micros.load(Ordering::Acquire) {
             self.oldest_micros.fetch_min(at_micros, Ordering::AcqRel);
         }
+        let counted = if at_micros > sampled_at_micros {
+            Self::weight(tokens)
+        } else {
+            0
+        };
+        counted.wrapping_sub(retired)
     }
 
     fn pop_oldest(&self, dispatches: &mut Dispatches) {
@@ -617,8 +659,9 @@ impl SinceReport {
     /// subtraction from the held word per batch. A row a release took below
     /// the bound in the meantime keeps its dispatches. The row's oldest
     /// instant stays where it was: a value too low costs a release walk,
-    /// never a missed one.
-    fn retire_oldest_batch(&self) {
+    /// never a missed one. Returns what it took of the dispatches made
+    /// after `sampled_at_micros`, as the held word counts them.
+    fn retire_oldest_batch(&self, sampled_at_micros: u64) -> u64 {
         // One retirement at a time: a dispatch that finds one in progress
         // lands while the row is within a batch above the bound, and past
         // that waits for the retirement and runs its own, so the row never
@@ -629,7 +672,7 @@ impl SinceReport {
             None if self.held.load(Ordering::Relaxed) & REQUEST_MASK
                 < SINCE_REPORT_KEPT + RETIRE_BATCH as u64 =>
             {
-                return;
+                return 0;
             }
             None => {
                 #[cfg(test)]
@@ -642,9 +685,9 @@ impl SinceReport {
         // record path's read and these locks may have taken the row below
         // it, and then the newer credits stay.
         if self.held.load(Ordering::Relaxed) & REQUEST_MASK < SINCE_REPORT_KEPT {
-            return;
+            return 0;
         }
-        let mut retired = 0;
+        let (mut retired, mut after) = (0, 0);
         for _ in 0..RETIRE_BATCH {
             // The lane whose front is the oldest; none when every lane is
             // empty.
@@ -656,13 +699,45 @@ impl SinceReport {
             let Some((_, i)) = oldest else {
                 break;
             };
-            if let Some((_, tokens)) = held_lanes[i].pop_front() {
+            if let Some((at, tokens)) = held_lanes[i].pop_front() {
                 retired += Self::weight(tokens);
+                if at > sampled_at_micros {
+                    after += Self::weight(tokens);
+                }
             }
         }
         self.held.fetch_sub(retired, Ordering::Relaxed);
         for (dispatches, lane) in held_lanes.iter().zip(&self.lanes) {
             lane.publish_oldest(dispatches);
+        }
+        after
+    }
+
+    /// The token-work and requests of the dispatches the row holds that
+    /// were made after the sample, in the held word's form, and none
+    /// released: what [`SinceReport::credit_through`] reads behind its
+    /// release, read with the row's dispatches left where they are. Under
+    /// every lane's lock, as a release holds them, so no dispatch lands
+    /// between the lanes' reads and the word's.
+    fn after(&self, sampled_at_micros: u64) -> u64 {
+        let held_lanes = self.lock_lanes();
+        let reflected: u64 = held_lanes
+            .iter()
+            .flat_map(|dispatches| {
+                dispatches
+                    .iter()
+                    .take_while(|&&(at, _)| at <= sampled_at_micros)
+            })
+            .map(|&(_, tokens)| Self::weight(tokens))
+            .sum();
+        self.held.load(Ordering::Relaxed) - reflected
+    }
+
+    /// Releases the dispatches made at or before the sample, where the row
+    /// holds one: [`SinceReport::credit_through`] with nothing read.
+    fn release(&self, sampled_at_micros: u64) {
+        if self.oldest_micros.load(Ordering::Acquire) <= sampled_at_micros {
+            self.release_through(sampled_at_micros);
         }
     }
 
@@ -807,8 +882,10 @@ impl Credits {
     /// Credits the rank a dispatch landed on. A lease that states no size
     /// is credited at `mean_prefill`, the calling stage's own mean: a
     /// credit of no tokens would read its worker as free until that
-    /// worker's next report. `credited` is shown the rank's entry behind
-    /// the credit.
+    /// worker's next report. `credit` is handed the rank's entry with the
+    /// dispatch's instant and its size, and records it
+    /// ([`SinceReport::record`]): a stage that keeps the rank's number
+    /// records it under the report it was told.
     fn dispatched(
         &self,
         lease: &Lease,
@@ -816,7 +893,7 @@ impl Credits {
         side: Side,
         since_decision_micros: u32,
         mean_prefill: u32,
-        credited: impl FnOnce(&SinceReport),
+        credit: impl FnOnce(&SinceReport, u64, u32),
     ) {
         // The decode side of a pair target is the pair's decode rank; the
         // target itself is the prefill. The credit dates from the dispatch,
@@ -837,13 +914,11 @@ impl Credits {
         // dispatch to a rank enters it (another dispatch may have entered it
         // meanwhile: the entry the map holds is the one credited).
         if let Some(since) = self.tally.load().get(&rank) {
-            since.record(dispatched_micros, tokens);
-            credited(since);
+            credit(since, dispatched_micros, tokens);
             return;
         }
         if let Some(since) = self.entry(rank) {
-            since.record(dispatched_micros, tokens);
-            credited(&since);
+            credit(&since, dispatched_micros, tokens);
         }
     }
 
@@ -942,7 +1017,7 @@ impl LeastLoad {
     #[cfg(test)]
     fn retire_oldest_batch_of(&self, worker: WorkerId, dp_rank: u16) {
         if let Some(since) = self.credits.tally.load().get(&(worker, dp_rank)) {
-            since.retire_oldest_batch();
+            since.retire_oldest_batch(u64::MAX);
         }
     }
 
@@ -1145,7 +1220,7 @@ impl Lifecycle for LeastLoad {
             side,
             since_decision_micros,
             self.mean_prefill_tokens,
-            |_| {},
+            |since, at_micros, tokens| since.record(at_micros, tokens),
         );
     }
 
@@ -1447,17 +1522,17 @@ impl ResidentWork {
 }
 
 impl ResidentWork {
-    /// Writes into `cell` the number of what `told` holds and of the
-    /// credit of `since`, the row's entry: called with the entry's told
+    /// Writes into `cell` the number of what `told` holds: its report and
+    /// the credit behind it ([`Told::after`]). Called with the entry's told
     /// report held, so the number is of one report and one credit. A
     /// report that counts no resident tokens, no report, and a report of
-    /// an instant the cell keeps none of, keep none.
-    /// The credit is read as a decision reads it, the dispatches the
-    /// report reflects released first.
-    fn keep(&self, cell: &Kept, since: &SinceReport, told: &Told) {
+    /// an instant the cell keeps none of, keep none. Nothing is released
+    /// here: the credit behind the report is what a decision reads behind
+    /// its release.
+    fn keep(&self, cell: &Kept, told: &Told) {
         match told.row {
             Some(row) if row.resident_counted && cell.takes(told.sampled_at_micros) => {
-                let (tokens, requests) = since.credit_through(told.sampled_at_micros);
+                let (tokens, requests) = (told.after >> REQUEST_BITS, told.after & REQUEST_MASK);
                 let reported = u64::from(row.running) + u64::from(row.queued);
                 let cost = self.reported_cost(0, row, tokens, requests);
                 cell.write(told.sampled_at_micros, cost, reported + requests);
@@ -1478,9 +1553,22 @@ impl ResidentWork {
     /// word: a host tells every rank at each of its publications. Another
     /// report under the instant of the one it holds is taken, and the cell
     /// keeps no number of that instant.
+    ///
+    /// THE RELEASE LAGS THE TELL BY A REPORT. A host tells a world's reports
+    /// before it shows the world, and until the show a decision still reads
+    /// the world that stands, whose row holds the report before this one.
+    /// That row is costed by its own report and every dispatch made after
+    /// it, so the dispatches this report reflects stay where they are: the
+    /// number is made of the credit made after this report's sample, read
+    /// with nothing released ([`SinceReport::after`]). What the report
+    /// before this one reflects is released here, a report late: its world
+    /// has stood since its own show, where a stage told nothing releases it
+    /// at that world's first decision. A row that holds this report and is
+    /// costed from its parts releases what it reflects itself, as ever:
+    /// those dispatches are none of the credit behind it.
     fn tell(&self, bound: &mut Bound, cell: &Kept, since: &Arc<SinceReport>, word: Told) {
         let mut told = since.told.lock();
-        let mut news = false;
+        let (mut news, mut rebound) = (false, false);
         if told.slot != word.slot {
             // A host that moved the rank's slot: the entry lets the cell
             // it wrote go.
@@ -1495,17 +1583,25 @@ impl ResidentWork {
                 theirs.slot = Slot::NONE;
             }
             told.slot = word.slot;
-            news = true;
+            (news, rebound) = (true, true);
         }
-        if word.sampled_at_micros >= told.sampled_at_micros && *told != word {
+        if word.sampled_at_micros >= told.sampled_at_micros && !told.says(&word) {
             if word.sampled_at_micros == told.sampled_at_micros {
                 cell.keep_none_through(word.sampled_at_micros);
             }
-            *told = word;
+            since.release(told.sampled_at_micros);
+            *told = Told {
+                after: since.after(word.sampled_at_micros),
+                ..word
+            };
             news = true;
+        } else if rebound {
+            // The report it holds, under a new slot: an entry bound to no
+            // cell kept no credit behind it, so the credit is read here.
+            told.after = since.after(told.sampled_at_micros);
         }
         if news {
-            self.keep(cell, since, &told);
+            self.keep(cell, &told);
         }
     }
 
@@ -1618,18 +1714,27 @@ impl Lifecycle for ResidentWork {
         side: Side,
         since_decision_micros: u32,
     ) {
-        // The credit first, then the number of the rank it landed on,
-        // where the stage keeps one.
+        // The credit and the number of the rank it landed on, under the
+        // report the rank's entry was told: a tell reads the dispatch in the
+        // row or in the credit behind its report, never in both.
         self.credits.dispatched(
             lease,
             target,
             side,
             since_decision_micros,
             self.mean_prefill_tokens,
-            |since| {
-                let told = since.told.lock();
+            |since, at_micros, tokens| {
+                let mut told = since.told.lock();
+                // A rank bound to no cell keeps no credit behind its
+                // report: the tell that binds it one reads it again.
+                if told.slot == Slot::NONE {
+                    since.record(at_micros, tokens);
+                    return;
+                }
+                let moved = since.record_behind(at_micros, tokens, told.sampled_at_micros);
+                told.after = told.after.wrapping_add(moved);
                 if let Some(cell) = self.kept.cell(told.slot) {
-                    self.keep(cell, since, &told);
+                    self.keep(cell, &told);
                 }
             },
         );
@@ -1673,6 +1778,7 @@ impl Lifecycle for ResidentWork {
                 slot,
                 sampled_at_micros,
                 row: Some(row),
+                after: 0,
             };
             self.tell(&mut bound, cell, &since, word);
         }
@@ -6268,5 +6374,202 @@ mod tests {
         }
         assert_eq!(kept_of(&told, slots[2], &pool[2]), None, "the leaver's");
         alike(&pool, "a rank left");
+    }
+
+    /// Between a report's tell and the show of its world a decision still
+    /// reads the world that stands. A told stage scores that world's rows
+    /// as a stage told nothing does, bit for bit: the dispatches the newer
+    /// report reflects are still credited to the row that holds the report
+    /// before it. Behind the show it scores the newer world alike too, with
+    /// a dispatch made in the window and one dated before the newer sample.
+    /// What a report reflects is released a report late.
+    #[test]
+    fn a_standing_world_scores_alike_between_a_tell_and_its_show() {
+        let mut standing = [candidate(0, 1), candidate(1, 1)];
+        standing[0].load = Some(resident(1, 2_000));
+        standing[1].load = Some(resident(1, 1_000));
+        for row in &mut standing {
+            row.load_sampled_at_micros = 1_000;
+        }
+        let lent = Lent::take(&mut standing);
+        let slots = [0, 1].map(|at: usize| lent.slot_of(&standing[at]));
+        let (told, untold) = (ResidentWork::new(700), ResidentWork::new(700));
+        let scores = |stage: &ResidentWork, pool: &[Candidate; 2]| {
+            let facts = lent.beside(&RequestFacts::default());
+            let mut out = [0.0f32; 2];
+            stage.score(&facts, pool, &kept(2), &mut out);
+            out.map(f32::to_bits)
+        };
+        let dispatch = |issued_micros: u64| {
+            let lease = Lease {
+                issued_micros,
+                tokens: 1_500,
+                ..Lease::default()
+            };
+            for stage in [&told, &untold] {
+                stage.on_dispatched(&lease, &target_of(&standing[0]), Side::Single, 0);
+            }
+        };
+        for (row, slot) in standing.iter().zip(slots) {
+            tell(&told, slot, row);
+        }
+        dispatch(2_000);
+        assert_eq!(scores(&told, &standing), scores(&untold, &standing));
+
+        // The next report reflects that dispatch. Its world is told and
+        // not shown yet: the standing row keeps the dispatch's credit.
+        let mut next = standing;
+        next[0].load = Some(resident(2, 3_600));
+        next[0].load_sampled_at_micros = 3_000;
+        tell(&told, slots[0], &next[0]);
+        assert_eq!(
+            scores(&told, &standing),
+            scores(&untold, &standing),
+            "told and not shown"
+        );
+        let rank = (standing[0].id, standing[0].dp_rank);
+        assert_eq!(told.held_at(rank.0, rank.1), 1, "nothing released yet");
+
+        // A dispatch in the window is credited behind both reports. One a
+        // stepped clock dates before the newer sample is credited behind
+        // the standing report alone.
+        dispatch(3_500);
+        dispatch(2_500);
+        assert_eq!(
+            scores(&told, &standing),
+            scores(&untold, &standing),
+            "dispatches in the window"
+        );
+        // The newer report's two requests and 3,600 tokens, and the one
+        // dispatch made after its sample.
+        assert_eq!(kept_of(&told, slots[0], &next[0]), Some((7_200.0, 3)));
+
+        // The world is shown: its rows score alike.
+        assert_eq!(scores(&told, &next), scores(&untold, &next), "shown");
+        assert_eq!(
+            told.held_at(rank.0, rank.1),
+            3,
+            "the number reads no credit"
+        );
+        assert_eq!(untold.held_at(rank.0, rank.1), 1, "a row's read releases");
+
+        // The report behind it releases what the shown one reflects.
+        let mut third = next;
+        third[0].load = Some(resident(3, 5_200));
+        third[0].load_sampled_at_micros = 5_000;
+        tell(&told, slots[0], &third[0]);
+        assert_eq!(told.held_at(rank.0, rank.1), 1, "a report late");
+        assert_eq!(
+            scores(&told, &next),
+            scores(&untold, &next),
+            "the shown world"
+        );
+    }
+
+    /// A report that counts no resident tokens still releases the
+    /// dispatches it reflects, beside a lent table as beside none: its
+    /// rank would hold its credit to the bound otherwise.
+    #[test]
+    fn a_report_with_no_count_releases_what_it_reflects_beside_a_lent_table() {
+        let mut pool = [candidate(0, 1)];
+        pool[0].load = Some(uncounted(1));
+        pool[0].load_sampled_at_micros = 3_000;
+        let lent = Lent::take(&mut pool);
+        let stage = ResidentWork::new(700);
+        let lease = Lease {
+            issued_micros: 2_000,
+            tokens: 1_500,
+            ..Lease::default()
+        };
+        stage.on_dispatched(&lease, &target_of(&pool[0]), Side::Single, 0);
+        assert_eq!(stage.held_at(pool[0].id, pool[0].dp_rank), 1);
+        let facts = lent.beside(&RequestFacts::default());
+        let mut out = [0.0f32; 1];
+        stage.score(&facts, &pool, &kept(1), &mut out);
+        assert_eq!(
+            stage.held_at(pool[0].id, pool[0].dp_rank),
+            0,
+            "the report reflects the dispatch"
+        );
+    }
+
+    /// Past the credit's bound the row's oldest dispatches retire, and the
+    /// credit behind the told report gives up what a retirement takes of
+    /// it: the number is the cost a stage told nothing reads.
+    #[test]
+    fn a_rank_past_the_credits_bound_keeps_the_number_an_untold_stage_reads() {
+        // Three rows, the rank past the bound the dearest: the middle
+        // row's score turns on that rank's cost.
+        let mut pool = [candidate(0, 1), candidate(1, 1), candidate(2, 1)];
+        for (row, tokens) in pool.iter_mut().zip([2_000, 500, 40_000]) {
+            row.load = Some(resident(1, tokens));
+            row.load_sampled_at_micros = 1_000;
+        }
+        let lent = Lent::take(&mut pool);
+        let slot = lent.slot_of(&pool[0]);
+        let (told, untold) = (ResidentWork::new(700), ResidentWork::new(700));
+        for row in &pool {
+            tell(&told, lent.slot_of(row), row);
+        }
+        let over = SINCE_REPORT_KEPT + 2 * RETIRE_BATCH as u64 + 3;
+        for at in 0..over {
+            let lease = Lease {
+                issued_micros: 2_000 + at,
+                tokens: 10,
+                ..Lease::default()
+            };
+            for stage in [&told, &untold] {
+                stage.on_dispatched(&lease, &target_of(&pool[0]), Side::Single, 0);
+            }
+        }
+        let held = told.held_at(pool[0].id, pool[0].dp_rank);
+        assert!((held as u64) < over, "a retirement ran: {held} held");
+        assert_eq!(held, untold.held_at(pool[0].id, pool[0].dp_rank));
+        let scores = |stage: &ResidentWork| {
+            let facts = lent.beside(&RequestFacts::default());
+            let mut out = [0.0f32; 3];
+            stage.score(&facts, &pool, &kept(3), &mut out);
+            out.map(f32::to_bits)
+        };
+        let scored = scores(&told);
+        assert_eq!(scored, scores(&untold));
+        assert!(
+            scored[2] != scored[0] && scored[2] != scored[1],
+            "the middle row stands between: {scored:?}"
+        );
+        let (_, accounted) = kept_of(&told, slot, &pool[0]).expect("a number");
+        assert_eq!(u64::from(accounted), 1 + held as u64);
+    }
+
+    /// A rank whose slot another rank took is bound to no cell, and a
+    /// dispatch to it keeps no credit behind its report. Told that report
+    /// again under a slot, it keeps the number of the report and of every
+    /// dispatch made after it: the credit is read again where the rank is
+    /// bound.
+    #[test]
+    fn a_rank_bound_again_keeps_the_dispatches_it_took_unbound() {
+        let stage = ResidentWork::new(700);
+        let mut pool = [candidate(0, 0), candidate(1, 0)];
+        pool[0].load = Some(resident(1, 2_000));
+        pool[0].load_sampled_at_micros = 1_000;
+        pool[1].load = Some(resident(3, 6_000));
+        pool[1].load_sampled_at_micros = 1_500;
+        let lent = Lent::take(&mut pool);
+        let (first, second) = (lent.slot_of(&pool[0]), lent.slot_of(&pool[1]));
+        let (rank, other) = (pool[0], pool[1]);
+        tell(&stage, first, &rank);
+        assert_eq!(kept_of(&stage, first, &rank), Some((2_700.0, 1)));
+        // Another rank takes the slot: the first is bound to none.
+        tell(&stage, first, &other);
+        assert_eq!(kept_of(&stage, first, &rank), None, "the slot is another's");
+        let lease = Lease {
+            issued_micros: 3_000,
+            tokens: 1_500,
+            ..Lease::default()
+        };
+        stage.on_dispatched(&lease, &target_of(&rank), Side::Single, 0);
+        // Told its report again, under a second slot.
+        tell(&stage, second, &rank);
+        assert_eq!(kept_of(&stage, second, &rank), Some((4_900.0, 2)));
     }
 }
