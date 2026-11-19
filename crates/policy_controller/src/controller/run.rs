@@ -813,6 +813,31 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "discovery")]
+    #[test]
+    fn a_slurm_job_name_under_two_roles_is_refused_at_the_start() {
+        let shared = [
+            "--discovery-provider",
+            "slurm",
+            "--slurm-prefill-job-name",
+            "shared",
+            "--slurm-decode-job-name",
+            "shared",
+            "--slurm-port",
+            "8000",
+        ];
+        let Err(ConfigError::DiscoveryFlag { flag, reason }) = config(&shared) else {
+            panic!("one job name under two roles was taken");
+        };
+        assert_eq!(flag, "--discovery-provider");
+        assert!(
+            reason.contains("'shared' maps to both prefill and decode workers"),
+            "{reason}"
+        );
+        let apart = [&shared[..5], &["other", "--slurm-port", "8000"]].concat();
+        assert!(config(&apart).expect("two names").discovery.is_some());
+    }
+
     #[cfg(not(feature = "discovery"))]
     #[test]
     fn a_build_without_discovery_refuses_its_flags() {
