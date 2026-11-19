@@ -184,9 +184,9 @@ pub use spec::{
 };
 pub use view::{
     fingerprint, AffinityFacts, Candidate, Constraints, Engines, HashKind, Header, Health,
-    Identity, LoadRow, MediaCounts, ModelFingerprint, NamedAffinity, NamedHolder, OverloadRegime,
-    Phase, PinSource, PoolFacts, RequestFacts, Role, Session, SignalSource, WireModes, WorkerId,
-    ZoneCapacity,
+    Identity, KeyedRow, LoadRow, MediaCounts, ModelFingerprint, NamedAffinity, NamedHolder,
+    OverloadRegime, Phase, PinSource, PoolFacts, RequestFacts, Role, Session, SignalSource,
+    WireModes, WorkerId, ZoneCapacity,
 };
 
 /// SplitMix64 over a decision's seed: the only randomness a stage gets, so a

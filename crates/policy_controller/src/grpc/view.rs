@@ -16,8 +16,9 @@ use crate::{
     proto,
     spec::Needs,
     view::{
-        AffinityFacts, Candidate, HashKind, Health, Identity, LoadRow, OverloadRegime, Phase,
-        PoolFacts, RequestFacts, Role, SignalSource, WireModes, ZoneCapacity,
+        lay_session_in_flight, AffinityFacts, Candidate, HashKind, Health, Identity, LoadRow,
+        OverloadRegime, Phase, PoolFacts, RequestFacts, Role, SignalSource, WireModes,
+        ZoneCapacity,
     },
 };
 
@@ -282,15 +283,21 @@ pub(crate) fn decide(
     exposure: &Exposure,
     needs: Needs,
 ) -> proto::PluginDecide {
+    // A candidate's affinity facts ride the request's column, by its
+    // index: the same index reads the row and its entry.
+    let mut rows: Vec<proto::Candidate> = with_counts!(facts, |counts| (0u32..)
+        .zip(candidates)
+        .map(|(index, c)| candidate(c, facts.affinity_at(index), counts(c)))
+        .collect());
+    // The key's counts a host lent beside its rows are each row's own in
+    // the frame.
+    lay_session_in_flight(facts, &mut rows, |row, in_flight| {
+        row.session_in_flight = u32::from(in_flight);
+    });
     proto::PluginDecide {
         decision_id,
         request: Some(request(facts, exposure, needs)),
-        // A candidate's affinity facts ride the request's column, by its
-        // index: the same index reads the row and its entry.
-        candidates: with_counts!(facts, |counts| (0u32..)
-            .zip(candidates)
-            .map(|(index, c)| candidate(c, facts.affinity_at(index), counts(c)))
-            .collect()),
+        candidates: rows,
         pool: Some(pool(pool_facts)),
         stages: 0,
         scores_in: Vec::new(),
@@ -1116,6 +1123,50 @@ mod tests {
         );
         let read: Vec<u32> = frame.candidates.iter().map(|c| c.in_flight).collect();
         assert_eq!(read, [4, 0, 9]);
+    }
+
+    /// The frame carries each candidate's count of the request's session
+    /// key as the request's facts read it: the lent rows' counts where the
+    /// host lends them, and zero for every other row, whatever the rows
+    /// themselves say.
+    #[test]
+    fn the_frame_gives_a_row_the_keys_count_its_request_reads() {
+        use crate::{
+            plugins::config::Exposure,
+            spec::Needs,
+            view::{Candidate, KeyedRow, PoolFacts, RequestFacts},
+        };
+
+        let rows: Vec<Candidate> = (0..)
+            .zip([5, 0, 0])
+            .map(|(position, session_in_flight)| Candidate {
+                position,
+                session_in_flight,
+                ..Candidate::default()
+            })
+            .collect();
+        let frame = |facts: &RequestFacts<'_>| {
+            let frame = super::decide(
+                1,
+                facts,
+                &rows,
+                &PoolFacts::default(),
+                &Exposure::default(),
+                Needs::default(),
+            );
+            let read = frame.candidates.iter().map(|c| c.session_in_flight);
+            read.collect::<Vec<u32>>()
+        };
+        assert_eq!(frame(&RequestFacts::default()), [5, 0, 0], "the rows' own");
+        let lent = [KeyedRow {
+            row: 2,
+            in_flight: 3,
+        }];
+        let facts = RequestFacts {
+            lent_session_in_flight: Some(&lent),
+            ..RequestFacts::default()
+        };
+        assert_eq!(frame(&facts), [0, 0, 3], "the lent rows alone");
     }
 
     /// The view's trace is the contract's pair. A counted trace leaves with

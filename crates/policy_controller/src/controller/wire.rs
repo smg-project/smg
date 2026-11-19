@@ -354,8 +354,9 @@ impl Checked {
                 pinned_at: 0,
                 // What the leases book, beside rows a view lent.
                 lent_in_flight: view.in_flight.as_ref(),
-                // The store writes no count of a key's requests into a
+                // The store lends no count of a key's requests beside a
                 // decision's rows yet.
+                lent_session_in_flight: None,
                 session_counted: false,
             },
             &Constraints {

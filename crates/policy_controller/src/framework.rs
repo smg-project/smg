@@ -3276,6 +3276,22 @@ fn debug_assert_named(facts: &RequestFacts<'_>, pool: &[Candidate]) {
     );
 }
 
+/// A debug build asserts that the rows a host lent its key's counts for
+/// ([`RequestFacts::lent_session_in_flight`]) stand for `pool`, once where
+/// a decision takes its inputs: ascending by row, a row once, and under
+/// the pool's size. A list out of order hides a row's count from the
+/// cap's search. A release build does not check what the host derived.
+fn debug_assert_keyed(facts: &RequestFacts<'_>, pool: &[Candidate]) {
+    let under = |row: u32| (row as usize) < pool.len();
+    debug_assert!(
+        facts.lent_session_in_flight.is_none_or(|lent| {
+            lent.is_sorted_by(|a, b| a.row < b.row)
+                && lent.last().is_none_or(|keyed| under(keyed.row))
+        }),
+        "the rows lent a key's counts stand ascending and under the pool's size"
+    );
+}
+
 /// A debug build asserts that every row's `position` is its index in `pool`,
 /// once where a decision takes its inputs. A row is found by where it stands
 /// in the pool the decision was given, and the readers that still take a
@@ -3744,7 +3760,7 @@ impl Engine {
     /// the pool stays empty with those vetoes lifted. Where the binding
     /// steers, a keyed request of a profile that places by the session key is
     /// decided with the overload veto lifted, so the key keeps its worker;
-    /// under a sessions rule with an in-flight cap, only where the host wrote
+    /// under a sessions rule with an in-flight cap, only where the host holds
     /// the key's counts ([`RequestFacts::session_counted`]). The request's
     /// affinity column is empty or holds one entry a candidate; any other is
     /// refused, as a decline under the stage name `affinity-column`. Rows
@@ -3768,6 +3784,7 @@ impl Engine {
         };
         debug_assert_indexed(candidates);
         debug_assert_named(facts, candidates);
+        debug_assert_keyed(facts, candidates);
         if !column_fits(facts.affinity, candidates) {
             return shed(ShedReason::PolicyDeclined, AFFINITY_COLUMN, bare);
         }
@@ -4054,7 +4071,7 @@ impl Engine {
         });
         if let Some(i) = owner {
             let c = &candidates[i as usize];
-            if Self::at_cap(rule, c) {
+            if Self::at_cap(rule, facts, c) {
                 // At the cap: the stages place the request again, over every
                 // candidate the filters kept.
                 if let Some(respilled) = self.respill(
@@ -4138,7 +4155,13 @@ impl Engine {
                     // A dispatch on an alternate writes that worker among
                     // the key's pins: none at the rule's cap stands behind
                     // the pin.
-                    Self::drop_alternates_at_cap(rule, candidates, &buf.kept, &mut pick.targets);
+                    Self::drop_alternates_at_cap(
+                        rule,
+                        facts,
+                        candidates,
+                        &buf.kept,
+                        &mut pick.targets,
+                    );
                     // The followed pin is put to the rule's cap as the pin
                     // read first is: the lift is of the overload veto alone.
                     // A rule with no cap asks no walk for the pin's row.
@@ -4147,7 +4170,7 @@ impl Engine {
                             .kept
                             .iter()
                             .find(|&&i| candidates[i as usize].id == first)
-                            .is_some_and(|&i| Self::at_cap(rule, &candidates[i as usize]));
+                            .is_some_and(|&i| Self::at_cap(rule, facts, &candidates[i as usize]));
                     if capped {
                         if let Some(handed) = self.hand_on::<KEPT>(
                             profile, index, rule, placing, facts, pool, set, cx, buf, all_vetoed,
@@ -4187,11 +4210,12 @@ impl Engine {
                             // over the buffers.
                             Self::drop_alternates_at_cap(
                                 rule,
+                                facts,
                                 candidates,
                                 &buf.kept,
                                 &mut pick.targets,
                             );
-                            if Self::at_cap(rule, c) {
+                            if Self::at_cap(rule, facts, c) {
                                 if let Some(handed) = self.hand_on::<KEPT>(
                                     profile, index, rule, placing, facts, pool, set, cx, buf,
                                     all_vetoed, owner,
@@ -4237,10 +4261,11 @@ impl Engine {
         self.place(profile, index, assignment, facts, pool, candidates, buf)
     }
 
-    /// Whether a pin carries its rule's in-flight cap of the key's requests.
-    /// A cap of zero is none.
-    const fn at_cap(rule: &SessionRule, pin: &Candidate) -> bool {
-        rule.inflight_cap != 0 && pin.session_in_flight >= rule.inflight_cap
+    /// Whether a pin carries its rule's in-flight cap of the key's requests,
+    /// by the count the request's facts read for the pin's row
+    /// ([`RequestFacts::session_in_flight`]). A cap of zero is none.
+    fn at_cap(rule: &SessionRule, facts: &RequestFacts<'_>, pin: &Candidate) -> bool {
+        rule.inflight_cap != 0 && facts.session_in_flight(pin) >= rule.inflight_cap
     }
 
     /// Drops the targets behind the first that carry the rule's cap of the
@@ -4251,6 +4276,7 @@ impl Engine {
     /// asks no walk.
     fn drop_alternates_at_cap(
         rule: &SessionRule,
+        facts: &RequestFacts<'_>,
         candidates: &[Candidate],
         kept: &[u32],
         targets: &mut Targets,
@@ -4264,7 +4290,7 @@ impl Engine {
             let capped = nth > 0
                 && kept.iter().any(|&k| {
                     let c = &candidates[k as usize];
-                    c.id == target.id && Self::at_cap(rule, c)
+                    c.id == target.id && Self::at_cap(rule, facts, c)
                 });
             if !capped {
                 targets.push(*target);
@@ -4308,7 +4334,7 @@ impl Engine {
             let under_the_cap = |id: WorkerId| {
                 buf.kept.iter().any(|&k| {
                     let c = &candidates[k as usize];
-                    c.id == id && !Self::at_cap(rule, c)
+                    c.id == id && !Self::at_cap(rule, facts, c)
                 })
             };
             pick.session_verdict = match taken {
@@ -4323,7 +4349,13 @@ impl Engine {
             // with no verdict keeps its alternates: its commit moves no pin.
             match pick.session_verdict {
                 SessionVerdict::Respill => {
-                    Self::drop_alternates_at_cap(rule, candidates, &buf.kept, &mut pick.targets);
+                    Self::drop_alternates_at_cap(
+                        rule,
+                        facts,
+                        candidates,
+                        &buf.kept,
+                        &mut pick.targets,
+                    );
                 }
                 SessionVerdict::Pinned => {
                     let placed = pick.targets;
@@ -8951,6 +8983,73 @@ mod tests {
         );
         let placed: Vec<u32> = pick.targets.iter().map(|t| t.position).collect();
         assert_eq!(placed, [0], "the pin alone");
+    }
+
+    /// The key's count as a keyed decision of the capped cases reads it for
+    /// the pool: the pick's row and what the rule did with the key. `lent`
+    /// is the list a host hands beside its rows, where it hands one.
+    fn capped(
+        engine: &Engine,
+        pool: &[Candidate],
+        lent: Option<&[crate::KeyedRow]>,
+    ) -> (u32, SessionVerdict) {
+        let facts = RequestFacts {
+            model: "m",
+            session_key: Identity::hashed(7),
+            now_micros: 20,
+            lent_session_in_flight: lent,
+            session_counted: true,
+            ..RequestFacts::default()
+        };
+        let mut scratch = Scratch::new();
+        let cx = Constraints::default();
+        let decision = engine.decide(&facts, &PoolFacts::default(), pool, &cx, &mut scratch);
+        let pick = decision.pick().expect("a pick");
+        let first = pick.targets.first().expect("a target");
+        (first.position, pick.session_verdict)
+    }
+
+    /// The cap reads the key's count where the request's facts hold it. The
+    /// rows a host lends beside its pool answer as the rows' own count
+    /// does: under the cap the pin keeps the key, and at the cap the stages
+    /// place the request again, where a pick under the cap takes the pin
+    /// and a pick at the cap leaves it. Beside a lent list the rows' own
+    /// counts are not read.
+    #[test]
+    fn the_cap_reads_a_count_lent_beside_the_rows_as_it_reads_the_rows_own() {
+        use SessionVerdict::{Pinned, Respill};
+        let engine = session_engine(SESSIONS);
+        let mut pool = vec![candidate(0, 0), candidate(1, 3), candidate(2, 5)];
+        assert_eq!(place_keyed(&engine, &pool, 7, 10).position, 0);
+        // The key's worker carries the most requests from here: the stages
+        // place a request of the key at its cap on the second row.
+        pool[0].in_flight = 9;
+        let keyed = |row, in_flight| crate::KeyedRow { row, in_flight };
+        let lent = |rows: &[crate::KeyedRow]| capped(&engine, &pool, Some(rows));
+        assert_eq!(lent(&[]), (0, Pinned), "no request of the key in flight");
+        assert_eq!(lent(&[keyed(0, 1)]), (0, Pinned), "under the cap");
+        assert_eq!(lent(&[keyed(0, 2)]), (1, Respill), "at the cap");
+        let (both, unmoved) = ([keyed(0, 2), keyed(1, 2)], (1, SessionVerdict::None));
+        assert_eq!(lent(&both), unmoved, "the pick at its cap");
+        // The rows' own counts answer where no list stands, and are not
+        // read beside one.
+        pool[0].session_in_flight = 2;
+        assert_eq!(capped(&engine, &pool, None), (1, Respill));
+        assert_eq!(capped(&engine, &pool, Some(&[])), (0, Pinned));
+        assert_eq!(capped(&engine, &pool, Some(&[keyed(1, 2)])), (0, Pinned));
+    }
+
+    /// A list out of its rows' order hides a row's count from the cap's
+    /// search, so a debug build stops where the decision takes its inputs.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "the rows lent a key's counts stand ascending")]
+    fn rows_lent_out_of_order_stop_a_debug_build() {
+        let engine = session_engine(SESSIONS);
+        let pool = vec![candidate(0, 0), candidate(1, 3)];
+        let keyed = |row, in_flight| crate::KeyedRow { row, in_flight };
+        let answer = capped(&engine, &pool, Some(&[keyed(1, 2), keyed(0, 2)]));
+        panic!("a list out of order answered {answer:?}");
     }
 
     /// A key with no routable pin is placed by the rule's assignment: the

@@ -17,7 +17,7 @@
 //! ahead of its pass ([`keeps_its_key`]): where the binding steers, a keyed
 //! request is decided with the veto lifted ([`Engine::keep`]), so the key
 //! keeps its worker while that worker is over its thresholds. A sessions
-//! rule with an in-flight cap keeps the key only where the host wrote the
+//! rule with an in-flight cap keeps the key only where the host holds the
 //! cap's count ([`RequestFacts::session_counted`]). Under a sessions rule
 //! the key's pin is asked first, with the veto as it stands, and the lifted
 //! pass places a key no pin takes. Where the veto as it stands leaves the
@@ -186,7 +186,7 @@ impl Engine {
 /// over on every worker is shed. So does a sessions rule whose own
 /// assignment places a key no pin takes: no stage is asked where that key
 /// goes, and nothing is lifted. So does a rule with an in-flight cap under
-/// a host that writes no count of the key's requests into its rows
+/// a host that holds no count of the key's requests
 /// ([`RequestFacts::session_counted`]): a kept key leaves its worker at the
 /// cap alone, and a cap that reads no count hands no key on.
 pub(super) fn keeps_its_key(
