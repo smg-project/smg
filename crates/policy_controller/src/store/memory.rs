@@ -3041,8 +3041,7 @@ impl MemoryStore {
         let at = self.acting();
         let file = u8::try_from(at).unwrap_or(u8::MAX);
         let mut leases = self.files[at].take();
-        let mut told = turn::Told::default();
-        let acts = self.applied(at, &mut leases, &mut told);
+        let acts = self.applied(at, &mut leases);
         let (lease, store) = (record.term, leases.term);
         if lease > store {
             return Err(LeaseRefused::TermAhead { lease, store });
@@ -3077,11 +3076,14 @@ impl MemoryStore {
         // call that ends none stopped at a lease that waits, at an empty
         // queue or at its last step, and so would the next.
         let (now, mut steps) = (record.issued_at, DUE_STEPS);
+        // The ends of one issue are told under one load of the world,
+        // taken at the first: an issue that ends none loads none.
+        let mut one = turn::OneLoad::default();
         for _ in 0..if acts { ABANDONED } else { 0 } {
             let Some(found) = leases.end_due(now, &mut steps) else {
                 break;
             };
-            self.tell_abandoned(at, told.world(self), &found);
+            self.tell_abandoned(at, one.world(self), &found);
         }
         Ok(record.lease)
     }
@@ -3092,7 +3094,7 @@ impl MemoryStore {
     /// pair's each side that waited, the prefill's first, with the record
     /// as found: the word reads a side's lease where that side stands. An
     /// issue's ends and the store's own sweep tell by it, each under the
-    /// `world` of its take.
+    /// one `world` it loaded for its ends ([`turn::OneLoad`]).
     fn tell_abandoned(&self, at: usize, world: &World, found: &LeaseRecord) {
         let abandoned = |side| Said::Released(side, ReleaseReason::Abandoned);
         if found.decode.is_none() {
@@ -3304,13 +3306,14 @@ impl MemoryStore {
                 continue;
             }
             let mut leases = self.files[at].take();
-            let mut told = turn::Told::default();
-            if !self.applied(at, &mut leases, &mut told) || !settled(at) {
+            if !self.applied(at, &mut leases) || !settled(at) {
                 continue;
             }
-            let mut steps = usize::MAX;
+            // The ends of one file's sweep are told under one load of
+            // the world, taken at the first.
+            let (mut steps, mut one) = (usize::MAX, turn::OneLoad::default());
             while let Some(found) = leases.end_due(now, &mut steps) {
-                self.tell_abandoned(at, told.world(self), &found);
+                self.tell_abandoned(at, one.world(self), &found);
                 ended.push(left(found));
             }
         }

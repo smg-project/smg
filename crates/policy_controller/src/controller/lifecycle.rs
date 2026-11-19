@@ -250,6 +250,7 @@ fn past(field: &'static str, number: u32, most: u32) -> Status {
 #[cfg(test)]
 pub(crate) mod tests {
     use std::{
+        cell::RefCell,
         sync::Arc,
         time::{Duration, Instant},
     };
@@ -288,6 +289,12 @@ pub(crate) mod tests {
     const KEY: Session = Session::from_raw(41);
     /// The lease whose release the hearing stage panics at.
     const BURSTS: u64 = 99;
+
+    thread_local! {
+        /// A case's own step inside a stage's call: the hearing stage's
+        /// next release on this thread runs it once, before it returns.
+        static AT_RELEASE: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+    }
 
     /// A worker the store holds a row for.
     pub(crate) fn worker(store: &MemoryStore, key: &str) -> WorkerId {
@@ -372,6 +379,9 @@ pub(crate) mod tests {
                 _ => "released",
             };
             self.0.lock().push((call, lease.id.0, WorkerId(0)));
+            if let Some(step) = AT_RELEASE.take() {
+                step();
+            }
             assert_ne!(lease.id.0, BURSTS, "the stage's call panics");
         }
     }
@@ -598,6 +608,41 @@ pub(crate) mod tests {
             None,
             "the file is written all the same"
         );
+    }
+
+    /// Two frames of one take are told under one world, the take's: a
+    /// generation that starts inside the first frame's call starts behind
+    /// that load, and the second frame still reaches the engine that issued
+    /// its lease. The next take's frame is told under the world of its own
+    /// tell: the later generation stands there, and its stages never saw
+    /// the issue.
+    #[test]
+    fn a_takes_second_frame_reaches_its_leases_engine_behind_a_later_generations_start() {
+        let store = Arc::new(MemoryStore::new());
+        let t0 = Instant::now();
+        let first = hearing(&store, 1);
+        for id in 1..=3 {
+            issued(&store, id, 1, t0);
+        }
+        let hand = open(&store, A);
+        // The first release's call applies generation 2 before it returns.
+        let second = Arc::new(Mutex::new(None));
+        let (applies, kept) = (Arc::clone(&store), Arc::clone(&second));
+        AT_RELEASE.set(Some(Box::new(move || {
+            *kept.lock() = Some(hearing(&applies, 2));
+        })));
+        let at_work = store.at_work();
+        for id in 1..=2 {
+            released(&store, &hand, &a_released(id)).expect("the frame reads");
+        }
+        at_work.apply();
+        let told = [1, 2].map(|lease| ("released", lease, WorkerId(0)));
+        assert_eq!(*first.lock(), told);
+        released(&store, &hand, &a_released(3)).expect("the frame reads");
+        at_work.apply();
+        let second = second.lock().take();
+        let second = second.expect("the first release applied generation 2");
+        assert_eq!((first.lock().len(), second.lock().len()), (2, 0));
     }
 
     #[test]

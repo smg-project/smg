@@ -131,15 +131,24 @@ use crate::{
 /// store's host named its deciders.
 type Teller = fn(&MemoryStore, &World, &LeaseRecord, Said, Option<Decider>);
 
-/// The world a take's frames are told under: the store's, loaded at the
-/// take's first tell. So a take that tells nothing loads no world, and one
-/// that tells many loads one: each frame of a take is told under the
-/// generation that stood at the take's first tell.
+/// One load of the world for a run of words to the engine: the store's
+/// world, loaded at the run's first word and held to its last. A run is
+/// one loop's words: the frames an apply finds in the ring, the leases an
+/// issue ends, the leases a sweep ends in a file. So a run that tells
+/// nothing loads no world, and one that tells many loads one: each word
+/// of a run is told under the generation that stood at the run's first.
+/// Each run builds its own where it tells, so one hold of a turn may load
+/// twice: the leases an issue ends may be told under a later world than
+/// the frames its apply found. Where a generation starts between the two,
+/// the engine that issued those leases does not hear their ends. That is
+/// a limit of this form, not its aim: one load for both runs undoes it.
+/// None is passed in by a caller: that cost every take a holder's
+/// building and its drop, whatever the take found.
 #[derive(Default)]
-pub(super) struct Told(Option<Guard<Arc<World>>>);
+pub(super) struct OneLoad(Option<Guard<Arc<World>>>);
 
-impl Told {
-    /// The world this take tells under.
+impl OneLoad {
+    /// The world this run tells under.
     pub(super) fn world(&mut self, store: &MemoryStore) -> &World {
         self.0.get_or_insert_with(|| store.world.load())
     }
@@ -337,8 +346,7 @@ impl AtWork {
     /// issue is one, and a refused request has none.
     pub fn apply(&self) {
         if let Some(mut turn) = self.store.files[self.file].try_take() {
-            self.store
-                .applied(self.file, &mut turn, &mut Told::default());
+            self.store.applied(self.file, &mut turn);
         }
     }
 
@@ -586,7 +594,7 @@ impl MemoryStore {
     /// the caller may act at that file ([`Self::applied`]).
     pub(super) fn turn_of(&self, at: usize) -> Turn<'_> {
         let mut turn = self.files[at].take();
-        self.applied(at, &mut turn, &mut Told::default());
+        self.applied(at, &mut turn);
         turn
     }
 
@@ -604,14 +612,16 @@ impl MemoryStore {
     /// caller may act as its decider: the thread at work at the file, or
     /// any thread while none is, read under the turn. `false` where
     /// another thread is at work: what waits is that thread's to apply,
-    /// so no thread acts as a decider beside it.
-    pub(super) fn applied(&self, at: usize, turn: &mut Turn<'_>, told: &mut Told) -> bool {
+    /// so no thread acts as a decider beside it. The frames it finds are
+    /// told under one load of the world, the apply's own ([`OneLoad`]).
+    pub(super) fn applied(&self, at: usize, turn: &mut Turn<'_>) -> bool {
         if !self.may_act(at) {
             return false;
         }
         let Behind { leases, ring } = &mut *turn.behind;
+        let mut one = OneLoad::default();
         while let Some((gateway, lease, said)) = ring.take() {
-            self.apply_frame(at, leases, (gateway, lease), said, told);
+            self.apply_frame(at, leases, (gateway, lease), said, &mut one);
         }
         true
     }
@@ -626,12 +636,16 @@ impl MemoryStore {
     /// turn, and what waits is left to it. A thread at work is read
     /// first, with no turn held: its file's turn is not taken from it, and
     /// its next take applies what waits.
+    ///
+    /// Kept out of line: laid into a hand it costs each hand three
+    /// instructions, by count.
+    #[inline(never)]
     fn settle(&self, at: usize) -> bool {
         if !self.may_act(at) {
             return false;
         }
         let mut turn = self.files[at].take();
-        self.applied(at, &mut turn, &mut Told::default())
+        self.applied(at, &mut turn)
     }
 
     /// A stream's end: each file it handed to is looked at once more, so
@@ -716,7 +730,7 @@ impl MemoryStore {
     /// itself. Neither does a second dispatch of one lease, nor a frame on
     /// a side of a pair's lease that ended: the word is of the sides the
     /// record held as the frame found it.
-    fn apply_frame(&self, at: usize, leases: &mut Leases, key: Key, said: Said, told: &mut Told) {
+    fn apply_frame(&self, at: usize, leases: &mut Leases, key: Key, said: Said, one: &mut OneLoad) {
         let found = match said {
             Said::Dispatched(dispatch, when) => {
                 let found = leases.records.get(&key).map(|held| held.record);
@@ -733,7 +747,7 @@ impl MemoryStore {
             Said::Released(side, reason) => leases.released(&key, side, reason),
         };
         if let Some(record) = found {
-            self.tell(at, told.world(self), &record, said);
+            self.tell(at, one.world(self), &record, said);
         }
     }
 }
