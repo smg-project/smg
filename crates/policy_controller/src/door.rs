@@ -58,8 +58,8 @@ use crate::{
 
 mod explain;
 
-pub use explain::DecisionRecord;
 pub(crate) use explain::Samples;
+pub use explain::{DecisionRecord, Names};
 
 /// A request as a door reads it: what the rows' narrowing, the engine's
 /// request and the lease take of it, in whatever form it was asked.

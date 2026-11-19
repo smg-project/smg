@@ -70,13 +70,13 @@ use crate::{
     catalog::Catalog,
     door::DecisionRecord,
     elector::{Elector, Fence},
-    framework::{Engine, Plan},
+    framework::Engine,
     proto::{
         self,
         policy_controller_server::{PolicyController, PolicyControllerServer},
     },
     replication::Unled,
-    spec::{Digest, PlanName},
+    spec::Digest,
     store::MemoryStore,
 };
 
@@ -662,36 +662,12 @@ fn explained(
         at_unix_micros,
         ..Default::default()
     };
-    if trace.generation != engine.generation() {
-        return answer;
-    }
-    if let Some(binding) = record.binding.and_then(|at| engine.binding_at(at)) {
-        let plan = match binding.plan {
-            Plan::Single => PlanName::Single,
-            Plan::PdPair => PlanName::PdPair,
-            Plan::Epd { .. } => PlanName::Epd,
-        };
-        plan.name().clone_into(&mut answer.plan_name);
-        let at = trace.profile;
-        // A shed can precede the profile's run. Its trace can then hold
-        // zero even where the binding uses profiles at other positions.
-        let bound = at == binding.profile
-            || binding.decode_profile == Some(at)
-            || matches!(binding.plan, Plan::Epd { encode } if encode == at);
-        if let Some(profile) = engine.profiles().get(usize::from(at)).filter(|_| bound) {
-            answer.profile_name.clone_from(&profile.name);
-            profile.picker.name().clone_into(&mut answer.picker_name);
-            answer.filter_names = profile
-                .filters
-                .iter()
-                .map(|f| f.name().to_owned())
-                .collect();
-            answer.scorer_names = profile
-                .scorers
-                .iter()
-                .map(|w| w.scorer.name().to_owned())
-                .collect();
-        }
+    if let Some(names) = record.names(engine) {
+        names.plan.clone_into(&mut answer.plan_name);
+        answer.profile_name = names.profile;
+        answer.picker_name = names.picker;
+        answer.filter_names = names.filters;
+        answer.scorer_names = names.scorers;
     }
     answer
 }
