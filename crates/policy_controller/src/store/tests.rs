@@ -712,15 +712,21 @@ fn a_providers_maker_is_made_inside_the_rules_of_its_two_parts() {
     assert!(Maker::provider(name.as_str(), key.as_str()).is_ok());
     // The part that breaks its rule is named, the name's rules first.
     let unmade = |provider: &str, key: &str| Maker::provider(provider, key).expect_err("no maker");
-    assert!(matches!(unmade("", "pods/a"), Unmade::Provider(_)));
+    // An empty name is refused in its own words, ahead of the token's.
+    assert_eq!(
+        unmade("", "pods/a"),
+        Unmade::Provider("a provider's row names its provider")
+    );
     assert!(matches!(unmade("", ""), Unmade::Provider(_)));
     assert!(matches!(
         unmade(&format!("{name}p"), "pods/a"),
         Unmade::Provider(_)
     ));
-    for blank in ["a b", "a\nb", "a\u{7}b"] {
-        let refused = unmade(blank, "pods/a");
-        assert!(matches!(refused, Unmade::Provider(_)), "{blank:?}");
+    // A name is one token: a blank, a control character, a comma, a letter
+    // outside ASCII and a character of no width each make none.
+    for name in ["a b", "a\nb", "a\u{7}b", "a,b", "\u{e9}", "a\u{200b}b"] {
+        let refused = unmade(name, "pods/a");
+        assert!(matches!(refused, Unmade::Provider(_)), "{name:?}");
     }
     assert!(matches!(unmade("cluster", ""), Unmade::Key(_)));
     assert!(matches!(

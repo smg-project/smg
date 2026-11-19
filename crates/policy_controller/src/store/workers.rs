@@ -209,8 +209,10 @@ impl Maker {
     /// that breaks its rule. The rules are checked here and nowhere else, so
     /// a leader makes no maker its follower refuses.
     ///
-    /// The name is not empty, is at most [`Self::NAME_BYTES`] bytes and
-    /// holds no blank or control character: a refusal says it as it stands.
+    /// The name is one [`token`] of at most [`Self::NAME_BYTES`] bytes, the
+    /// form of a principal's stated name: the step that registers for a
+    /// provider acts as a principal of that name. A refusal says it as it
+    /// stands.
     /// The key is not empty and is at most [`Self::KEY_BYTES`] bytes. It is
     /// the provider's own text and may hold an address with a credential:
     /// no refusal, log line or metric label carries it. A key past its bound
@@ -223,12 +225,9 @@ impl Maker {
         if provider.len() > Self::NAME_BYTES {
             return Err(Unmade::Provider("a provider's name is at most 128 bytes"));
         }
-        if provider
-            .chars()
-            .any(|c| c.is_whitespace() || c.is_control())
-        {
+        if !token(&provider) {
             return Err(Unmade::Provider(
-                "a provider's name holds no blank or control character",
+                "a provider's name is one token of visible ASCII with no comma",
             ));
         }
         if key.is_empty() {
@@ -239,6 +238,19 @@ impl Maker {
         }
         Ok(Self::Provider(Arc::new(ProviderKey { provider, key })))
     }
+}
+
+/// Whether `name` is one token: not empty, every byte visible ASCII (0x21 to
+/// 0x7E) and none a comma. A principal's stated name and a provider's name
+/// take this form, so one name reads the same in both; each holds its own
+/// bound. The wire lets a hop join a key's entries into one value with a
+/// comma between them, so a comma is two names.
+#[inline]
+pub fn token(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_graphic() && byte != b',')
 }
 
 /// Why a provider's name and key make no maker: the part that breaks its

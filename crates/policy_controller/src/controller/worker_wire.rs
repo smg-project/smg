@@ -2585,7 +2585,7 @@ mod tests {
 
     #[test]
     fn a_row_crosses_with_its_maker() {
-        use super::{blank, maker_weight, room};
+        use super::{maker_weight, room};
         use crate::store::{Maker, Unmade};
 
         let now = Instant::now();
@@ -2653,6 +2653,8 @@ mod tests {
             ("", "", "row.maker.provider"),
             (wide.as_str(), "pods/a", "row.maker.provider"),
             ("a cluster", "pods/a", "row.maker.provider"),
+            ("a,b", "pods/a", "row.maker.provider"),
+            ("\u{e9}", "pods/a", "row.maker.provider"),
             ("cluster", long.as_str(), "row.maker.key"),
         ] {
             let broken = proto::WorkerRow {
@@ -2666,11 +2668,6 @@ mod tests {
             let (Unmade::Provider(why) | Unmade::Key(why)) =
                 Maker::provider(provider, key).expect_err("no maker");
             assert_eq!((refusal.path, refusal.why), (path, why));
-        }
-        // A provider's name holds the rule of a stated name.
-        for name in ["cluster", "a b", "a\tb", "a\u{7}b", "\u{e9}"] {
-            let refused = matches!(Maker::provider(name, "k"), Err(Unmade::Provider(_)));
-            assert_eq!(refused, blank(name), "{name:?}");
         }
     }
 

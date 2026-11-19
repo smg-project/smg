@@ -44,7 +44,7 @@
 //! or revision of an earlier answer. The door reads the standing row in its
 //! turn, tests the maker whole and removes the row. Only the row of exactly
 //! that maker goes: a late or a repeated removal never takes a later worker
-//! at the URL.
+//! at the URL that another key made. A key names one life of a worker.
 //!
 //! **Every life of a URL has a number of its own:** the leader's term above the
 //! store's epoch when the door numbered it, counted from a base the door
@@ -94,7 +94,7 @@ fn invalid(refused: Refused) -> Status {
     Status::invalid_argument(format!("{}: {}", refused.path, refused.why))
 }
 
-/// A `REPLACE` of a URL no row stands under.
+/// A `REPLACE` or a provider's removal of a URL no row stands under.
 fn absent() -> Status {
     Status::not_found("no worker is registered under the URL")
 }
@@ -465,7 +465,16 @@ impl Door {
     /// tested whole and the row is removed. So the call takes away only the
     /// row of exactly `maker`: a late or a repeated removal never takes a
     /// later worker at the URL, which another key made. No row under the
-    /// URL is `NOT_FOUND`, and the caller reads that as done.
+    /// URL is `NOT_FOUND`, and a row of another maker is `PERMISSION_DENIED`:
+    /// the caller reads both as done, since neither leaves a row of its own.
+    ///
+    /// The URL is the registration's own text: another spelling of the
+    /// address names no row, so a caller passes the text it registered. A
+    /// key names one life of a worker: a provider that uses a key again for
+    /// the next worker at the URL loses that row to its own late removal.
+    /// Under the control maker the call takes a control call's row away with
+    /// no revision. No caller passes that maker: a control call's removal
+    /// names the id and the revision.
     #[cfg_attr(
         not(test),
         expect(
@@ -1376,8 +1385,15 @@ pub(crate) mod tests {
             door.remove_found(&operator(), &found("pods/b"), under(TERM), URL),
             "provider cluster's under another key",
         );
+        // A caller of another provider is told whose the row is, and
+        // nothing of a key.
+        let stranger = Maker::provider("nodes", "pods/a").expect("a whole maker");
+        denied(
+            door.remove_found(&operator(), &stranger, under(TERM), URL),
+            "provider cluster's: its worker",
+        );
         // No row under the URL is not found, and a replica that does not
-        // lead refuses by name. None of the four wrote.
+        // lead refuses by name. None of the five wrote.
         let none = door
             .remove_found(&operator(), &maker, under(TERM), "grpc://10.0.0.9:8000")
             .expect_err("no row");
@@ -1890,6 +1906,16 @@ pub(crate) mod tests {
             door.deregister(&operator(), under(TERM), &drain)
                 .expect(answer);
         }
+        // A provider's removal by URL leaves its line too: refused over the
+        // control call's row, and written where it takes its own row away.
+        let maker = found("pods/a");
+        door.remove_found(&operator(), &maker, under(TERM), URL)
+            .expect_err("a control call's row");
+        let other = "grpc://10.0.0.6:8000";
+        door.upsert(&operator(), &maker, TERM, &ask(spec(other), Mode::Upsert))
+            .expect("found");
+        door.remove_found(&operator(), &maker, under(TERM), other)
+            .expect("taken away");
 
         // A line a call, in the calls' order: what a write made, `nothing`
         // where a call wrote none, a refusal by its code.
@@ -1906,6 +1932,17 @@ pub(crate) mod tests {
             ("membership write", "PatchWorker", "made=\"nothing\""),
             ("membership write", "DeregisterWorker", "made=\"status\""),
             ("membership write", "DeregisterWorker", "made=\"nothing\""),
+            (
+                "membership call refused",
+                "a provider's removal",
+                "code=PermissionDenied",
+            ),
+            ("membership write", "RegisterWorker", "made=\"registered\""),
+            (
+                "membership write",
+                "a provider's removal",
+                "made=\"removed\"",
+            ),
         ];
         assert_eq!(lines.len(), want.len(), "{logged}");
         for (line, (kind, call, made)) in lines.iter().zip(want) {
