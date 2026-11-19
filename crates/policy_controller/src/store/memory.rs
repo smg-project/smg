@@ -444,10 +444,11 @@ impl MemoryStore {
     /// caller starts again from a snapshot.
     ///
     /// The world's engine is told the change as at the leader's own write
-    /// ([`MembershipChange::as_lifecycle`]), and ahead of it the models a
-    /// registration took its worker off ([`Membership::Left`]): a
-    /// standby's stages hold what its leader's hold, with no step at a
-    /// take.
+    /// ([`MembershipChange::as_lifecycle`]), and with it the models a
+    /// registration took its worker off ([`Membership::Left`]): ahead of
+    /// the change where the registration keeps its id, and behind it, for
+    /// the new id, where a new incarnation replaced the row. A standby's
+    /// stages hold what its leader's hold, with no step at a take.
     pub fn follow(
         &self,
         at: Position,
@@ -1978,7 +1979,7 @@ impl LoadSink for MemoryStore {
         answer: &[(WorkerId, u16, Option<LoadRow>)],
         polled_at: Instant,
         source: LoadSource,
-    ) {
+    ) -> Vec<usize> {
         let mut loads = self.loads.lock();
         // A rank the answer names may have no row yet, inside the window of
         // its registration or of a refresh that moved it. Written now, its
@@ -2008,8 +2009,9 @@ impl LoadSink for MemoryStore {
         let mut first: Option<(u32, Brought)> = None;
         let mut others: Vec<(u32, Brought)> = Vec::new();
         let mut omits = false;
-        let mut passed = false;
-        for &(id, rank, row) in answer {
+        // The door's answer: the positions of the rows it passes over.
+        let mut passed: Vec<usize> = Vec::new();
+        for (position, &(id, rank, row)) in answer.iter().enumerate() {
             // A report that lands after its worker left (the poll was out
             // when the row went) finds no entry and is dropped.
             let Some(ranks) = table.get_mut(&id) else {
@@ -2020,7 +2022,9 @@ impl LoadSink for MemoryStore {
             // A row the answer brings for it is passed over. It names its
             // engine all the same, which is read below where it matters.
             if ranks.pushed_since(rank, polled_at) {
-                passed |= row.is_some();
+                if row.is_some() {
+                    passed.push(position);
+                }
                 continue;
             }
             let (engine, brought) = match row {
@@ -2058,7 +2062,7 @@ impl LoadSink for MemoryStore {
         // naming is the answer's, whichever sample stands. It moves a mark
         // only beside a rank the answer left out, so the passed-over rows
         // are read for their engines there and nowhere else.
-        if omits && passed {
+        if omits && !passed.is_empty() {
             for &(id, rank, row) in answer {
                 let pushed = table
                     .get(&id)
@@ -2072,7 +2076,7 @@ impl LoadSink for MemoryStore {
             }
         }
         let Some(first) = first else {
-            return;
+            return passed;
         };
         // A rank an answer leaves unnamed beside a rank it names is marked,
         // and a rank an answer names is named again: read once the
@@ -2147,6 +2151,7 @@ impl LoadSink for MemoryStore {
             let world = writer.folded_at(polled_at);
             self.show(writer, world);
         }
+        passed
     }
 
     fn heard_every(&self, period: Duration) -> bool {

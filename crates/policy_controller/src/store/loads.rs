@@ -120,12 +120,20 @@ pub trait LoadSink: Send + Sync {
     /// A row the answer brings for a rank that pushed since the poll began
     /// is passed over, and names its engine all the same: a rank left out
     /// beside it is avoided.
+    ///
+    /// The door answers the positions in `answer` of the rows it passed
+    /// over, in the answer's order: the rows a caller that keeps a file of
+    /// its own must not lay over it, since the record that stands is the
+    /// newer. A position that brought no row is never on the list, nor is
+    /// a row for an id that is no member, which is dropped. The list says
+    /// what the door passed over at this write, and it is empty, with no
+    /// allocation, where it passed over nothing.
     fn report(
         &self,
         answer: &[(WorkerId, u16, Option<LoadRow>)],
         polled_at: Instant,
         source: LoadSource,
-    );
+    ) -> Vec<usize>;
 
     /// The poll decision for the worker at `now` under the poll `interval`.
     fn poll_mode(&self, id: WorkerId, now: Instant, interval: Duration) -> PollMode;
