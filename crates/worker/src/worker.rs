@@ -4,7 +4,12 @@
 //! enums, and core configuration. These types are shared across API
 //! request/response boundaries and internal runtime state.
 
-use std::{borrow::Cow, collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    borrow::Cow,
+    collections::HashMap,
+    sync::{Arc, LazyLock},
+    time::Duration,
+};
 
 #[cfg(feature = "axum")]
 use axum::{
@@ -1570,11 +1575,24 @@ pub const KV_TOKENS_USED: &str = "kv_tokens_used";
 /// A token count offered by name from the fixed token-capacity field.
 pub const KV_TOKENS_CAPACITY: &str = "kv_tokens_capacity";
 
-/// One value an engine reports by name alongside its fixed fields.
+/// The two names offered from the fixed token counts and their unit, each
+/// made once.
+static FIXED_COUNT_NAMES: LazyLock<[Arc<str>; 3]> = LazyLock::new(|| {
+    [
+        Arc::from(KV_TOKENS_USED),
+        Arc::from(KV_TOKENS_CAPACITY),
+        Arc::from("tokens"),
+    ]
+});
+
+/// One value an engine reports by name alongside its fixed fields. The name
+/// and the unit are shared strings: a copy of a report, which the load
+/// monitor makes at each publish, allocates none. A connection that knows
+/// a name ahead of its reports makes it once and clones it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct NamedValue {
-    pub name: Cow<'static, str>,
-    pub unit: Cow<'static, str>,
+    pub name: Arc<str>,
+    pub unit: Arc<str>,
     pub value: f64,
     /// Age of this value's sample in milliseconds, when the engine reports it.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1662,29 +1680,26 @@ impl SchedulerLoadSnapshot {
     /// snapshot offers by name is its own record's. Missing fixed counts
     /// are stored as zero.
     pub fn named_values(&self) -> impl Iterator<Item = NamedValue> + '_ {
+        let [used, capacity, tokens] = &*FIXED_COUNT_NAMES;
         let fixed = [
+            (used, self.num_used_tokens, LoadTelemetry::USED_TOKENS),
             (
-                KV_TOKENS_USED,
-                self.num_used_tokens,
-                LoadTelemetry::USED_TOKENS,
-            ),
-            (
-                KV_TOKENS_CAPACITY,
+                capacity,
                 self.max_total_num_tokens,
                 LoadTelemetry::TOTAL_TOKENS,
             ),
         ]
         .into_iter()
-        .filter_map(|(name, count, part)| {
-            (count != 0
+        .filter(|&(name, count, part)| {
+            count != 0
                 && !self.kept.contains(part)
-                && !self.values.iter().any(|value| value.name == name))
-            .then_some(NamedValue {
-                name: Cow::Borrowed(name),
-                unit: Cow::Borrowed("tokens"),
-                value: f64::from(count),
-                age_ms: None,
-            })
+                && !self.values.iter().any(|value| value.name == *name)
+        })
+        .map(move |(name, count, _)| NamedValue {
+            name: Arc::clone(name),
+            unit: Arc::clone(tokens),
+            value: f64::from(count),
+            age_ms: None,
         });
         self.values.iter().cloned().chain(fixed)
     }
@@ -1731,10 +1746,10 @@ pub trait LoadRecord {
 
     /// How many values the record names, ahead of the bounds its snapshot
     /// keeps them under: what the snapshot's list holds fewer was dropped
-    /// at a bound. Zero for a record that names none.
-    fn values_sent(&self) -> usize {
-        0
-    }
+    /// at a bound, and the load monitor counts it. Zero for a record that
+    /// names none. Every record type says it: a default would let one that
+    /// carries values count no drop.
+    fn values_sent(&self) -> usize;
 
     /// How long the engine has produced no output while it held requests
     /// it reports on every step. `None` while it holds none, or when the
@@ -2308,9 +2323,13 @@ mod load_snapshot_tests {
         };
         let values: Vec<_> = snapshot.named_values().collect();
         assert_eq!(values, [used, capacity.clone()]);
-        assert!(values.iter().all(|value| {
-            matches!(value.name, Cow::Borrowed(_)) && matches!(value.unit, Cow::Borrowed(_))
+        // The offered names and their unit are made once: two offers share
+        // them.
+        let again: Vec<_> = snapshot.named_values().collect();
+        assert!(values.iter().zip(&again).all(|(first, second)| {
+            Arc::ptr_eq(&first.name, &second.name) && Arc::ptr_eq(&first.unit, &second.unit)
         }));
+        assert!(Arc::ptr_eq(&values[0].unit, &values[1].unit));
 
         snapshot.num_used_tokens = 0;
         assert_eq!(snapshot.named_values().collect::<Vec<_>>(), [capacity]);
@@ -2326,7 +2345,7 @@ mod load_snapshot_tests {
         let names = |snapshot: &SchedulerLoadSnapshot| -> Vec<String> {
             snapshot
                 .named_values()
-                .map(|value| value.name.into_owned())
+                .map(|value| value.name.to_string())
                 .collect()
         };
         assert_eq!(names(&snapshot), [KV_TOKENS_USED, KV_TOKENS_CAPACITY]);
@@ -2363,7 +2382,7 @@ mod load_snapshot_tests {
             let values: Vec<_> = snapshot.named_values().collect();
             assert_eq!(values.len(), 2);
             assert_eq!(values[0], value);
-            assert_eq!(values[1].name, other);
+            assert_eq!(&*values[1].name, other);
         }
     }
 

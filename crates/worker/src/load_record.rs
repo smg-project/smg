@@ -5,7 +5,7 @@
 //! engine's `GetLoads` shape into the record, and the cases that hold the two
 //! together.
 
-use std::{borrow::Cow, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use crate::{
     common_proto as common,
@@ -19,8 +19,8 @@ const MAX_VALUES: usize = 64;
 const MAX_NAME_BYTES: usize = 63;
 const MAX_UNIT_BYTES: usize = 31;
 
-/// The record's named values under the snapshot's bounds: of the first
-/// `MAX_VALUES` entries, each but one with an empty name, a name or a unit
+/// The record's named values under the snapshot's bounds: the first
+/// `MAX_VALUES` entries, less those with an empty name, a name or a unit
 /// over its bound, a value that is not finite, or a name an entry kept
 /// ahead of it states. The first of a name stands. What is left out here
 /// is counted where the record is taken: the record's list less this one
@@ -32,13 +32,13 @@ fn read_values(values: &[common::NamedValue]) -> Vec<NamedValue> {
             || sample.name.len() > MAX_NAME_BYTES
             || sample.unit.len() > MAX_UNIT_BYTES
             || !sample.value.is_finite()
-            || named.iter().any(|kept| kept.name == sample.name.as_str())
+            || named.iter().any(|kept| *kept.name == *sample.name)
         {
             continue;
         }
         named.push(NamedValue {
-            name: Cow::Owned(sample.name.clone()),
-            unit: Cow::Owned(sample.unit.clone()),
+            name: Arc::from(sample.name.as_str()),
+            unit: Arc::from(sample.unit.as_str()),
             value: sample.value,
             age_ms: sample.age_ms,
         });

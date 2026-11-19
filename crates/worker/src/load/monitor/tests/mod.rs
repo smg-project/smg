@@ -1,7 +1,7 @@
 mod prom_scrape;
 mod worker_load_manager;
 
-use std::{borrow::Cow, collections::HashMap, sync::mpsc};
+use std::{collections::HashMap, sync::mpsc};
 
 use super::*;
 use crate::{
@@ -48,6 +48,10 @@ impl LoadRecord for Unread {
 
     fn snapshot(&self) -> SchedulerLoadSnapshot {
         panic!("the snapshot of an ignored record was built")
+    }
+
+    fn values_sent(&self) -> usize {
+        panic!("the named values of an ignored record were counted")
     }
 
     fn engine_silence(&self) -> Option<Duration> {
@@ -183,6 +187,10 @@ impl LoadRecord for PushedRecord {
 
     fn snapshot(&self) -> SchedulerLoadSnapshot {
         self.snapshot.clone()
+    }
+
+    fn values_sent(&self) -> usize {
+        self.snapshot.values.len()
     }
 
     fn engine_silence(&self) -> Option<Duration> {
@@ -894,8 +902,8 @@ async fn a_records_named_values_take_the_place_of_the_ranks_last() {
     let worker = ready_worker("grpc://w1:9000", "llama-3");
     registry.register(Arc::clone(&worker)).unwrap();
     let named = |name: &'static str, value: f64| NamedValue {
-        name: Cow::Borrowed(name),
-        unit: Cow::Borrowed("items"),
+        name: name.into(),
+        unit: "items".into(),
         value,
         age_ms: None,
     };
@@ -989,7 +997,7 @@ async fn a_core_record_offers_no_fixed_count_the_entry_kept() {
     registry.register(Arc::clone(&worker)).unwrap();
     let names = |rank: &SchedulerLoadSnapshot| -> Vec<String> {
         rank.named_values()
-            .map(|value| value.name.into_owned())
+            .map(|value| value.name.to_string())
             .collect()
     };
     let heartbeat = pushed(7).used_tokens(2_048).total_tokens(8_192);
@@ -1631,14 +1639,14 @@ async fn a_connections_named_values_reach_the_load_sink_and_fleet_response() {
         build_recording(PollMode::Poll, PolledRanks::default(), true, false);
     let expected = vec![
         NamedValue {
-            name: Cow::Borrowed("blocked_cycles"),
-            unit: Cow::Borrowed("cycles"),
+            name: "blocked_cycles".into(),
+            unit: "cycles".into(),
             value: 17.0,
             age_ms: Some(29),
         },
         NamedValue {
-            name: Cow::Borrowed("wait_time"),
-            unit: Cow::Borrowed("ms"),
+            name: "wait_time".into(),
+            unit: "ms".into(),
             value: 2.75,
             age_ms: None,
         },
