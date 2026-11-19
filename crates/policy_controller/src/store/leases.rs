@@ -109,9 +109,9 @@ impl Picked {
         picked
     }
 
-    /// What a pair's record keeps of the pick `targets` for its decode
-    /// side: the decode of each target behind the first and every target's
-    /// decode rank. A target that names no pair keeps none.
+    /// What a pair's decode side keeps of the pick `targets`: the decode
+    /// of each target behind the first and every target's decode rank. A
+    /// target that names no pair keeps none.
     pub fn of_decodes(targets: &Targets) -> Self {
         let mut picked = Self::default();
         let decodes = || targets.iter().map(|target| target.pair.unwrap_or_default());
@@ -189,6 +189,13 @@ impl DecodeSide {
     }
 }
 
+/// The mark a pair's record carries: its lease has a decode side, which
+/// stands beside the record in the file's list of places. It names no
+/// worker: the side's own target is the one place its worker is read
+/// ([`Sides`]), and a dispatch that moves the side moves it there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DecodeMark;
+
 /// One lease as the store holds it: a single's whole, or the prefill part
 /// of a pair's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -204,15 +211,14 @@ pub struct LeaseRecord {
     pub target: WorkerId,
     /// The pick's other targets and the ranks, for that `Dispatched`.
     pub picked: Picked,
-    /// The mark of a pair's lease: the decode worker its decision chose.
-    /// `None` marks a single's lease and no pair's: a pair is filed with
-    /// its decode side ([`LeasesStore::issue_pair`]), and the door that
-    /// files it writes the mark from that side's worker, as a door that
-    /// files a record alone clears it. The mark says that a decode side
-    /// stands beside the record and nothing of that side: its worker after
-    /// a dispatch, its state and its booking are the side's own word
-    /// ([`Sides`]).
-    pub decode: Option<WorkerId>,
+    /// The mark of a pair's lease. `None` marks a single's lease and no
+    /// pair's: a pair is filed with its decode side
+    /// ([`LeasesStore::issue_pair`]), and the door that files it sets the
+    /// mark, as a door that files a record alone clears it. The mark says
+    /// that a decode side stands beside the record and nothing of that
+    /// side: its worker, its state and its booking are the side's own
+    /// word ([`Sides`]).
+    pub decode: Option<DecodeMark>,
     /// The term of the leader that issued the lease.
     pub term: u64,
     pub issued_at: Instant,
