@@ -402,5 +402,11 @@ required-features = ["controller"]
 name = "encode_classes"
 harness = false
 
+# The sent-prefix predictor's read and write. No decision reads the
+# predictor yet, so no id of `decision` moves with it.
+[[bench]]
+name = "predictor"
+harness = false
+
 [lints]
 workspace = true
