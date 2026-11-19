@@ -154,7 +154,9 @@ pub trait LoadSink: Send + Sync {
     fn fetch_failed(&self, members: &[Arc<dyn Worker>]);
 
     /// The worker's loads are forgotten: it left the registry, was
-    /// replaced, or its status left `Ready`.
+    /// replaced, or its status left `Ready`. It is also said, under the
+    /// lock of the reports, for a worker whose pushed report a record of
+    /// the registry's worker at the URL replaced.
     fn forget(&self, worker: &Arc<dyn Worker>);
 
     /// The collector reset itself: it stopped its groups and dropped every
