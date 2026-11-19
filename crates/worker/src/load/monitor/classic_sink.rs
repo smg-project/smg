@@ -121,36 +121,35 @@ impl<G: Generation> ClassicLoadSink<G> {
     /// to the poll for such a worker; the poll's entry for the quiet rank
     /// replaces the one on file, so the report the next push publishes
     /// carries it and the rank's figures are at most a tick interval old,
-    /// the poll decision's own bound. A rank whose record arrived
-    /// since the poll began keeps it: the stream's is the newer. The
-    /// receipt of a rank that stays is not touched: a poll
-    /// is not the stream working, and the worker stays polled until the
-    /// rank's records resume. Only a rank on file is replaced: a rank the
-    /// stream never named has no receipt for the poll decision to age, so
-    /// a poll's figure for it would sit in the report unrefreshed once the
-    /// pushing ranks are fresh again; it stays out of the pushed report,
-    /// and the poll's report stands for it while the worker is polled. A
-    /// worker with no pushed record on file has no report to merge into;
-    /// the poll's report stands on its own, as always. A rank on file that
-    /// pushed nothing since the poll began and that the answer omits leaves
-    /// the file, its row and its receipt, as after an empty answer: the
-    /// file and the poll's publish say one thing of a rank, and the
-    /// worker's next pushed record does not publish the old row again. The
-    /// answer that may retract a rank from the file is one whose entries
-    /// the rank cache takes as the worker's ranks, and no other: its entries
-    /// are ranks and it carries token capacity, which stands in for the
-    /// engine's own list of its ranks. An answer the cache does not take
+    /// the poll decision's own bound. A rank whose record arrived since the
+    /// poll began keeps it: the stream's is the newer. The receipt of a rank
+    /// that stays is not touched: a poll is not the stream working, and the
+    /// worker stays polled until the rank's records resume. Only a rank on
+    /// file is replaced: a rank the stream never named has no receipt for the
+    /// poll decision to age, so a poll's figure for it would sit in the
+    /// report unrefreshed once the pushing ranks are fresh again; it stays
+    /// out of the pushed report, and the poll's report stands for it while
+    /// the worker is polled. A worker with no pushed record on file has no
+    /// report to merge into; the poll's report stands on its own, as always.
+    /// A rank on file that pushed nothing since the poll began and that the
+    /// answer omits leaves the file, its row and its receipt, as after an
+    /// empty answer: the file and the poll's publish say one thing of a rank,
+    /// and the worker's next pushed record does not publish the old row
+    /// again. The answer that may retract a rank from the file is one whose
+    /// entries the rank cache takes as the worker's ranks, and no other: its
+    /// entries are ranks and it carries token capacity, which stands in for
+    /// the engine's own list of its ranks. An answer the cache does not take
     /// leaves the cache nothing of the worker and takes nothing from the
     /// file: the old row stays. A retraction reads one more word of the
     /// answer, where the two tests part: an answer that counts more ranks
-    /// than it lists is short by its own count, so it says nothing of a
-    /// rank it leaves out and retracts none, though the cache takes its
-    /// rows as the counts to pick by.
-    /// A rank worker's file holds its own rank and its answer is scoped to
-    /// that rank, so an answer with rows never omits it. Names, in `ranks`,
-    /// the ranks on file that pushed since the poll began (the stream's,
-    /// the newer), named by the poll's answer or not, and the ranks that
-    /// leave the file; the rows are the collector's to keep, lay or drop.
+    /// than it lists is short by its own count, so it says nothing of a rank
+    /// it leaves out and retracts none, though the cache takes its rows as
+    /// the counts to pick by. A rank worker's file holds its own rank and its
+    /// answer is scoped to that rank, so an answer with rows never omits it.
+    /// Names, in `ranks`, the ranks on file that pushed since the poll began
+    /// (the stream's, the newer), named by the poll's answer or not, and the
+    /// ranks that leave the file; the rows are the collector's to keep, lay
+    /// or drop.
     pub(super) fn merge(
         &self,
         url: &str,

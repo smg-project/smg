@@ -158,9 +158,15 @@ pub trait LoadSink: Send + Sync {
     fn forget(&self, worker: &Arc<dyn Worker>);
 
     /// The collector reset itself: it stopped its groups and dropped every
-    /// load it published, at its own drop, at its start and after it lost
-    /// registry events. What the sink keeps of any worker is void: a worker
-    /// that left while events were lost is never said at [`Self::forget`].
+    /// load it published. It does so on two paths: at its start and after
+    /// it lost registry events. What the sink keeps of any worker is void:
+    /// a worker that left while events were lost is never said at
+    /// [`Self::forget`].
+    ///
+    /// A dropped collector says nothing: its drop stops its tasks and calls
+    /// no sink. The host that drops a collector owns the sink too: it voids
+    /// its store when it chooses, or it starts the next collector over the
+    /// same sink, whose start says the reset.
     fn reset(&self);
 
     /// Whether a reader wants worker loads, asked by a collector that is

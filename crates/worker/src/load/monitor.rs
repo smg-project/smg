@@ -198,9 +198,9 @@ impl WorkerLoadManager {
         }
     }
 
-    /// Drop every cached DP load entry. Used by `WorkerMonitor` during
-    /// `stop_all_groups` and lag-recovery rebuilds so the cache cannot
-    /// hand out stale per-rank loads after a full reconcile.
+    /// Drop every cached DP load entry. Called by the monitor's own sink at
+    /// the monitor's reset ([`LoadSink::reset`]), so the cache cannot hand
+    /// out stale per-rank loads after a full reconcile.
     pub fn clear(&self) {
         self.dp_cached_loads.write().clear();
     }
@@ -1062,14 +1062,17 @@ impl<G: Generation> WorkerMonitor<G> {
         *self.liveness_sweep_task.lock() = Some(sweep_handle);
     }
 
-    /// Stop every per-group polling loop and clear the shared load
-    /// snapshot + DP-rank cache.
+    /// Stop every per-group polling loop, clear the shared load snapshot
+    /// and the probe memo, and say the reset to the sink
+    /// ([`LoadSink::reset`]): the monitor's own drops its DP-rank cache
+    /// and fails every overload veto open.
     ///
-    /// Called from `Drop`, the bootstrap reconcile path, and the
-    /// `RecvError::Lagged` rebuild. Always clears both caches even
-    /// when no groups were running, so a lag-recovery rebuild cannot
-    /// inherit stale per-rank loads from a previous incarnation.
-    /// Idempotent.
+    /// Called from the rebuild from the registry alone, which is the
+    /// bootstrap reconcile path and the `RecvError::Lagged` rebuild. The
+    /// monitor's drop does not call it: the drop aborts the tasks and
+    /// says nothing to the sink. Always clears, even when no groups were
+    /// running, so a lag-recovery rebuild cannot inherit stale per-rank
+    /// loads from a previous incarnation. Idempotent.
     pub(crate) fn stop_all_groups(&self) {
         let drained: Vec<(WorkerGroupKey, GroupState)> = {
             let mut handles = self.group_handles.lock();
@@ -1551,6 +1554,10 @@ impl<G: Generation> WorkerMonitor<G> {
 
 impl<G> Drop for WorkerMonitor<G> {
     fn drop(&mut self) {
+        // The tasks are aborted and the sink is told nothing: no reset is
+        // said here. A sink's code inside a drop would run on whatever
+        // thread lets the last handle go, under the locks that thread
+        // holds. `LoadSink::reset` says what a host does instead.
         if let Some(handle) = self.event_task.get_mut().take() {
             handle.abort();
         }
@@ -2321,10 +2328,13 @@ mod native_loads_tests {
         );
         worker.set_status(WorkerStatus::Ready);
         registry.register(Arc::clone(&worker)).unwrap();
+
+        // The loop's start resets every flag, so this one is set after it
+        // and the failed fetch alone is left to clear it.
+        monitor.start_event_loop();
         registry.set_worker_overloaded(&worker, true);
         assert_eq!(registry.overloaded_worker_count("a"), 1);
 
-        monitor.start_event_loop();
         wait_until("the absent feed to clear the veto", || {
             !worker.is_overloaded()
         })
