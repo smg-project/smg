@@ -320,13 +320,8 @@ pub(super) fn emptied(
     }
     let candidates = set.candidates;
     let steers = set.vetoed == AllVetoed::Steer;
-    let whole = RequestFacts {
-        tried: &[],
-        ..*facts
-    };
-    // The pass as the last lift left it, and the stage that ended it. Each
-    // pass is put to no rule: where it leaves nobody, its own stage stands.
-    let mut pass = *cx;
+    // The stage that ended the last pass. Each pass is put to no rule:
+    // where it leaves nobody, its own stage stands.
     let mut ended = emptied_by;
     // A pool with no row over its thresholds gains nobody when the overload
     // veto is lifted: that tier is one look at the whole set.
@@ -336,7 +331,14 @@ pub(super) fn emptied(
             .iter()
             .any(|row| !NotOverloaded.keep(facts, row, cx))
     {
-        pass.overload_lifted = true;
+        let whole = RequestFacts {
+            tried: &[],
+            ..*facts
+        };
+        let pass = Constraints {
+            overload_lifted: true,
+            ..*cx
+        };
         match overload_pass(profile, &whole, &pass, buf, set.shedding()) {
             None => {
                 buf.lifted = Lifted::Overload;
@@ -351,28 +353,7 @@ pub(super) fn emptied(
     let own = candidates.iter().any(|row| row.health.stalled);
     let masked = cx.stalled.len() > cx.held.len();
     if (own || masked) && veto_ran(profile, Healthy.name(), ended) {
-        pass.overload_lifted |= steers;
-        pass.stalled = cx.held;
-        let stage = if own {
-            let mut rows = std::mem::take(&mut buf.undoubted);
-            undoubted(candidates, &mut rows);
-            let lifted = Set {
-                candidates: &rows,
-                ..set.shedding()
-            };
-            let stage = filter(profile, &whole, &pass, buf, lifted);
-            buf.undoubted = rows;
-            stage
-        } else {
-            filter(profile, &whole, &pass, buf, set.shedding())
-        };
-        match stage {
-            None => {
-                buf.lifted = Lifted::Liveness;
-                return emptied_by;
-            }
-            Some(stage) => ended = stage,
-        }
+        return doubted(emptied_by, own, profile, facts, cx, buf, set);
     }
     ended
 }
@@ -410,6 +391,59 @@ fn overload_pass(
         }
     }
     filter(profile, whole, cx, buf, set)
+}
+
+/// The pass of [`emptied`] that lifts the liveness veto: the profile's
+/// filters once more, over the rows with no doubt ([`undoubted`]) where a
+/// row's own bit is set (`own`), with the host's mask cut to the rows a
+/// hold stands on. `emptied_by` with the rows the pass kept in `buf.kept`
+/// and the lift said in `buf.lifted`, or the stage that left it nobody.
+///
+/// The overload veto is lifted in this pass under a steering binding,
+/// whether its own tier ran or not: that tier runs under no other.
+///
+/// Out of line: the overload tier's pass, the one a pool over its
+/// thresholds on every worker takes, keeps nothing of this one in hand.
+#[cold]
+#[inline(never)]
+fn doubted(
+    emptied_by: &'static str,
+    own: bool,
+    profile: &Profile,
+    facts: &RequestFacts<'_>,
+    cx: &Constraints<'_>,
+    buf: &mut Buffers,
+    set: Set<'_>,
+) -> &'static str {
+    let whole = RequestFacts {
+        tried: &[],
+        ..*facts
+    };
+    let pass = Constraints {
+        overload_lifted: cx.overload_lifted || set.vetoed == AllVetoed::Steer,
+        stalled: cx.held,
+        ..*cx
+    };
+    let stage = if own {
+        let mut rows = std::mem::take(&mut buf.undoubted);
+        undoubted(set.candidates, &mut rows);
+        let lifted = Set {
+            candidates: &rows,
+            ..set.shedding()
+        };
+        let stage = filter(profile, &whole, &pass, buf, lifted);
+        buf.undoubted = rows;
+        stage
+    } else {
+        filter(profile, &whole, &pass, buf, set.shedding())
+    };
+    match stage {
+        None => {
+            buf.lifted = Lifted::Liveness;
+            emptied_by
+        }
+        Some(stage) => stage,
+    }
 }
 
 /// The rows as they read with no doubt, into `rows`: each row of
