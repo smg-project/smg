@@ -267,26 +267,42 @@ impl Peer {
 /// offered it alone, and the end of the last one frees it for the next
 /// settle.
 pub(crate) struct Spoken {
-    /// The version last fixed, and how many settled `Decide` streams stand
-    /// on it: with none the version is free.
-    fixed: watch::Sender<(u32, usize)>,
+    stand: watch::Sender<Stand>,
+}
+
+/// A plugin's version as its `Decide` streams leave it.
+#[derive(Clone, Copy, Default)]
+struct Stand {
+    /// The version last fixed, zero before the first settle.
+    fixed: u32,
+    /// How many settled streams stand on it: with none the version is free.
+    standing: usize,
+    /// The settles that fixed a version, the last one with them. A stream
+    /// that settles and ends between two looks of the events task shows in
+    /// this count alone.
+    settles: u64,
 }
 
 impl Default for Spoken {
     fn default() -> Self {
         Self {
-            fixed: watch::Sender::new((0, 0)),
+            stand: watch::Sender::new(Stand::default()),
         }
     }
 }
 
 impl Spoken {
+    /// The version and its streams as they stand, in one reading.
+    fn stand(&self) -> Stand {
+        *self.stand.borrow()
+    }
+
     /// The versions a `Decide` hello offers: the fixed one alone while a
     /// stream stands on it, the host's range otherwise.
     fn offer(&self, versions: &RangeInclusive<u32>) -> (u32, u32) {
-        match *self.fixed.borrow() {
-            (_, 0) => (*versions.start(), *versions.end()),
-            (fixed, _) => (fixed, fixed),
+        match self.stand() {
+            Stand { standing: 0, .. } => (*versions.start(), *versions.end()),
+            Stand { fixed, .. } => (fixed, fixed),
         }
     }
 
@@ -297,18 +313,20 @@ impl Spoken {
     /// range, and this one settled second.
     fn settle(&self, version: u32) -> Result<Standing<'_>, u32> {
         let mut other = None;
-        self.fixed.send_if_modified(|(fixed, standing)| {
-            if *standing == 0 {
+        self.stand.send_if_modified(|stand| {
+            if stand.standing == 0 {
                 // The events task waits for the version to move, and with
-                // a word kept for a stream to stand.
-                *fixed = version;
-                *standing = 1;
+                // a word kept for a settle. The count shows this one though
+                // its stream ends before the task looks.
+                stand.fixed = version;
+                stand.standing = 1;
+                stand.settles += 1;
                 return true;
             }
-            if *fixed == version {
-                *standing += 1;
+            if stand.fixed == version {
+                stand.standing += 1;
             } else {
-                other = Some(*fixed);
+                other = Some(stand.fixed);
             }
             false
         });
@@ -324,20 +342,10 @@ impl Spoken {
     /// heard event needs, and a refusal of it would number a loss the
     /// stream never had. With no stream standing the next settle may fix
     /// any version: the event is raised, and the events task keeps it for
-    /// the call that carries it ([`Self::stands_on`]).
+    /// the call that carries it ([`forward`]).
     pub(crate) fn stands_under(&self, since: u32) -> bool {
-        let (fixed, standing) = *self.fixed.borrow();
-        standing != 0 && fixed < since
-    }
-
-    /// Whether a stream stands on `version`. A word that version has no
-    /// kind for, taken by an events call that named it, is then written to
-    /// no stream of the plugin. With none on it the version is free or has
-    /// moved: the word is kept, and the next settle says what becomes of
-    /// it.
-    fn stands_on(&self, version: u32) -> bool {
-        let (fixed, standing) = *self.fixed.borrow();
-        standing != 0 && fixed == version
+        let stand = self.stand();
+        stand.standing != 0 && stand.fixed < since
     }
 }
 
@@ -349,8 +357,8 @@ impl Drop for Standing<'_> {
     fn drop(&mut self) {
         // No waiter reads a stream's end: the version stays the last one
         // fixed, and the next settle says what it is.
-        self.0.fixed.send_if_modified(|(_, standing)| {
-            *standing = standing.saturating_sub(1);
+        self.0.stand.send_if_modified(|stand| {
+            stand.standing = stand.standing.saturating_sub(1);
             false
         });
     }
@@ -1304,12 +1312,13 @@ async fn open_observe(
 /// that one. With no stream standing the last version holds, so a call that
 /// ends is opened again under it. A word that version has no kind for ends
 /// the call that takes it then: the word is kept, the events behind it
-/// wait in the queue, and the next call opens once a stream stands or the
-/// version fixed carries the word.
+/// wait in the queue, and the next call opens once a stream stands, the
+/// version fixed carries the word, or a stream has settled since the word
+/// was kept, though it has ended.
 async fn observe_streams<O, F, C, T>(
     lane: &ObserveLane,
     queue: &mut mpsc::Receiver<proto::ObserveRequest>,
-    kept: &mut Option<proto::ObserveRequest>,
+    kept: &mut Option<Kept>,
     sent: &mut u64,
     lost: &mut u64,
     said: &mut Said,
@@ -1320,19 +1329,25 @@ async fn observe_streams<O, F, C, T>(
     C: Future<Output = Result<T, tonic::Status>>,
 {
     let frame = lane.peer.connect;
-    let mut spoken = lane.peer.spoken.fixed.subscribe();
+    let mut spoken = lane.peer.spoken.stand.subscribe();
     loop {
         if lane.events.strong_count() == 0 {
             return;
         }
         // The wait for the first settle is cut each frame: the plugin may
         // have been dropped meanwhile. A word kept waits the same way, for
-        // a stream that stands or a version fixed that carries it.
-        let since = kept.as_ref().map_or(0, carried_since);
-        let settled =
-            spoken.wait_for(|(fixed, standing)| *fixed != 0 && (*standing != 0 || *fixed >= since));
+        // a stream that stands, a version fixed that carries it, or a
+        // settle since it was kept: a stream that settled and ended says
+        // what becomes of the word as one that stands does.
+        let (since, under) = kept
+            .as_ref()
+            .map_or((0, 0), |kept| (carried_since(&kept.word), kept.settles));
+        let settled = spoken.wait_for(|stand| {
+            stand.fixed != 0
+                && (stand.standing != 0 || stand.fixed >= since || stand.settles != under)
+        });
         let version = match tokio::time::timeout(frame, settled).await {
-            Ok(Ok(fixed)) => fixed.0,
+            Ok(Ok(stand)) => stand.fixed,
             Ok(Err(_)) => return,
             Err(_) => continue,
         };
@@ -1350,7 +1365,7 @@ async fn observe_streams<O, F, C, T>(
         };
         let moved = async {
             if spoken
-                .wait_for(|(fixed, _)| *fixed != version)
+                .wait_for(|stand| stand.fixed != version)
                 .await
                 .is_err()
             {
@@ -1407,7 +1422,15 @@ struct Requests<'a> {
     spoken: &'a Spoken,
     /// The word the call before took and could not carry: this call writes
     /// it first, or keeps it in turn.
-    kept: &'a mut Option<proto::ObserveRequest>,
+    kept: &'a mut Option<Kept>,
+}
+
+/// A word an events call took and could not carry, kept for the call that
+/// opens next, with the settles its plugin had seen as it was kept: a later
+/// count says a stream settled since, though none may stand.
+struct Kept {
+    word: proto::ObserveRequest,
+    settles: u64,
 }
 
 /// How one turn of the events task ended.
@@ -1483,10 +1506,10 @@ where
     let (outcome, at) = loop {
         // One event: the word kept first, then the queue's next.
         let send = async {
-            let mut event = match kept.take() {
-                Some(event) => event,
+            let (mut event, under) = match kept.take() {
+                Some(kept) => (kept.word, Some(kept.settles)),
                 None => match queue.recv().await {
-                    Some(event) => event,
+                    Some(event) => (event, None),
                     None => return Found::Closed,
                 },
             };
@@ -1500,15 +1523,24 @@ where
                 // A word the call's version has no kind for is not written
                 // and takes no number. While a stream stands on that
                 // version no stream of the plugin hears the word: it is let
-                // go, and the refusals it carried still count. With none on
-                // it the version is free or has moved: the word is kept,
-                // and the call that opens next writes it first.
-                if newer && spoken.stands_on(version) {
-                    *lost = (*lost).max(numbered.seq);
-                    return Found::Next;
-                }
+                // go, and the refusals it carried still count. So is a word
+                // kept since before a settle that fixed that version, though
+                // the stream has ended: the settle said what becomes of it.
+                // Otherwise the version is free or has moved: the word is
+                // kept, and the call that opens next writes it first. One
+                // reading judges the word and dates its keeping.
                 if newer {
-                    *kept = Some(event);
+                    let stand = spoken.stand();
+                    let fixed = stand.fixed == version;
+                    let settled = under.is_some_and(|under| stand.settles != under);
+                    if fixed && (stand.standing != 0 || settled) {
+                        *lost = (*lost).max(numbered.seq);
+                        return Found::Next;
+                    }
+                    *kept = Some(Kept {
+                        word: event,
+                        settles: stand.settles,
+                    });
                     return Found::Yields;
                 }
                 numbered.seq = number(sent, lost, numbered.seq);
@@ -1585,8 +1617,8 @@ mod tests {
 
     use super::{
         number, observe, run_commands, Command, Ended, Fault, Lane, LaneEvents, LaneState,
-        ObserveLane, Opened, Peer, Requests, Runtime, Said, SendError, Spoken, Turn, Wait, Witness,
-        OBSERVE_WINDOW, PEER_TEXT, PROMISE_MICROS, RECONNECT_PAUSE, STAND, WINDOW,
+        ObserveLane, Opened, Peer, Requests, Runtime, Said, SendError, Spoken, Stand, Turn, Wait,
+        Witness, OBSERVE_WINDOW, PEER_TEXT, PROMISE_MICROS, RECONNECT_PAUSE, STAND, WINDOW,
     };
     use crate::{grpc::config::Transport, plugins::OpenDecisions, proto};
 
@@ -1613,7 +1645,11 @@ mod tests {
     /// A plugin's version as one settled `Decide` stream fixed it.
     fn standing_on(version: u32) -> Spoken {
         Spoken {
-            fixed: watch::Sender::new((version, 1)),
+            stand: watch::Sender::new(Stand {
+                fixed: version,
+                standing: 1,
+                settles: 1,
+            }),
         }
     }
 
@@ -2380,13 +2416,17 @@ mod tests {
         }
     }
 
-    /// The staging of the two cases below. The last stream on 1 ends and
+    /// The staging of the four cases below. The last stream on 1 ends and
     /// the call that named 1 lives on. A minute later a left word is raised
     /// and a relabelling behind it, and a frame and a half after that a
     /// stream settles on `next`: inside a frame of the kept word's wait, so
-    /// the settle itself must wake it. It says that settle's instant and
+    /// the settle itself must wake it. Where it does not stand, that stream
+    /// ends before the events task looks. It says that settle's instant and
     /// what the calls were written; no call failed.
-    async fn a_stream_settles_behind_a_left_word(next: u32) -> (tokio::time::Instant, Vec<Heard>) {
+    async fn a_stream_settles_behind_a_left_word(
+        next: u32,
+        stands: bool,
+    ) -> (tokio::time::Instant, Vec<Heard>) {
         use crate::{lease::Membership, view::WorkerId};
         let (models, minute) = (["m".to_owned()], Duration::from_secs(60));
         let (events, lane, raise) = unsettled();
@@ -2408,7 +2448,8 @@ mod tests {
                 .try_send(word(&relabelled))
                 .expect("the queue takes it");
             tokio::time::sleep(lane.peer.connect * 3 / 2).await;
-            let _next = spoken.settle(next).expect("the next settle");
+            let settle = spoken.settle(next).expect("the next settle");
+            let _next = stands.then_some(settle);
             settled.set(Some(tokio::time::Instant::now()));
             tokio::time::sleep(minute).await;
         };
@@ -2428,7 +2469,7 @@ mod tests {
     /// numbered, as the settle falls. The call on 1 was written neither.
     #[tokio::test(start_paused = true)]
     async fn a_left_word_raised_with_no_stream_standing_is_written_once_one_settles_on_2() {
-        let (settled, heard) = a_stream_settles_behind_a_left_word(2).await;
+        let (settled, heard) = a_stream_settles_behind_a_left_word(2, true).await;
         assert_eq!(heard, [(2, 1, true, settled), (2, 2, false, settled)]);
     }
 
@@ -2438,8 +2479,27 @@ mod tests {
     /// settle falls writes it, the first event.
     #[tokio::test(start_paused = true)]
     async fn a_left_word_raised_with_no_stream_standing_is_let_go_once_one_settles_on_1() {
-        let (settled, heard) = a_stream_settles_behind_a_left_word(1).await;
+        let (settled, heard) = a_stream_settles_behind_a_left_word(1, true).await;
         assert_eq!(heard, [(1, 1, false, settled)]);
+    }
+
+    /// A stream that settles on 1 and ends before the events task looks
+    /// still says what becomes of a kept left word. The word is let go and
+    /// takes no number, and the call that opens as the settle falls writes
+    /// the relabelling behind it, the first event.
+    #[tokio::test(start_paused = true)]
+    async fn a_kept_left_word_is_let_go_by_a_settle_on_1_whose_stream_has_ended() {
+        let (settled, heard) = a_stream_settles_behind_a_left_word(1, false).await;
+        assert_eq!(heard, [(1, 1, false, settled)]);
+    }
+
+    /// The same where the stream settled on 2: the call that names 2 opens
+    /// as the settle falls and writes the word first, though no stream
+    /// stands.
+    #[tokio::test(start_paused = true)]
+    async fn a_kept_left_word_is_written_behind_a_settle_on_2_whose_stream_has_ended() {
+        let (settled, heard) = a_stream_settles_behind_a_left_word(2, false).await;
+        assert_eq!(heard, [(2, 1, true, settled), (2, 2, false, settled)]);
     }
 
     /// A call that stood and was ended by the host arms the outage's line
