@@ -1573,6 +1573,23 @@ impl ResidentWork {
         drop(lanes);
     }
 
+    /// [`ResidentWork::settle`] for the first decision under a report:
+    /// the rank's entry is found again here, once a report a rank, so the
+    /// routine that costs a row hands back its cost alone.
+    #[cold]
+    #[inline(never)]
+    fn settle_first(
+        &self,
+        tally: &FxHashMap<RankKey, Arc<SinceReport>>,
+        cell: Option<&Kept>,
+        row: &Candidate,
+        slot: Slot,
+    ) {
+        if let Some(since) = tally.get(&(row.id, row.dp_rank)) {
+            self.settle(cell, since, row, slot);
+        }
+    }
+
     /// Takes `word`, a rank's report as its host tells it, into `since`,
     /// the rank's entry, and leaves `cell`, the cell of the word's slot,
     /// awaiting the report's first decision. Called with the bound entries
@@ -1639,26 +1656,35 @@ impl ResidentWork {
     /// row that is marked. Inlined into each row loop of the score: as a
     /// call it read 19 instructions a row more for a host that lends no
     /// counts.
+    ///
+    /// The release rides with its test, whichever view the row came in:
+    /// under a later sample than the report whose number the stage keeps
+    /// it may have taken dispatches that number counts, and the number is
+    /// sent back ([`ResidentWork::settle`]). One stage can be handed rows
+    /// beside a lent table and rows a host wrote.
     #[inline(always)]
-    fn cost_reported<'t>(
+    fn cost_reported(
         &self,
-        tally: &'t FxHashMap<RankKey, Arc<SinceReport>>,
+        tally: &FxHashMap<RankKey, Arc<SinceReport>>,
         row: &Candidate,
         in_flight: impl FnOnce() -> u32,
         reporting: &mut usize,
-    ) -> (f32, Option<&'t Arc<SinceReport>>) {
+    ) -> f32 {
         let Some(r) = row.load else {
-            return (PENDING, None);
+            return PENDING;
         };
-        let since = tally.get(&(row.id, row.dp_rank));
-        let (tokens, requests) = since.map_or((0, 0), |since| {
-            since.credit_through(row.load_sampled_at_micros)
+        let (tokens, requests) = tally.get(&(row.id, row.dp_rank)).map_or((0, 0), |since| {
+            let credit = since.credit_through(row.load_sampled_at_micros);
+            if since.keeps_before(row.load_sampled_at_micros) {
+                self.settle(None, since, row, Slot::NONE);
+            }
+            credit
         });
         if r.resident_counted {
             *reporting += 1;
-            (self.reported_cost(in_flight(), r, tokens, requests), since)
+            self.reported_cost(in_flight(), r, tokens, requests)
         } else {
-            (PENDING, since)
+            PENDING
         }
     }
 }
@@ -1701,16 +1727,11 @@ impl ResidentWork {
                         }
                         _ => {
                             let tally = tally.get_or_insert_with(|| self.credits.tally.load());
-                            let (cost, since) =
-                                self.cost_reported(tally, c, || in_flight, &mut reporting);
-                            // The report's first decision, and a decision
-                            // under a later sample than the kept report's,
-                            // each owe the rank's number a word.
-                            if let Some(since) = since {
-                                let awaited = cell.is_some_and(|cell| cell.awaits(c));
-                                if awaited || since.keeps_before(c.load_sampled_at_micros) {
-                                    self.settle(cell, since, c, run.slot_of(c));
-                                }
+                            let cost = self.cost_reported(tally, c, || in_flight, &mut reporting);
+                            // The report's first decision keeps the
+                            // rank's number from here on.
+                            if cell.is_some_and(|cell| cell.awaits(c)) {
+                                self.settle_first(tally, cell, c, run.slot_of(c));
                             }
                             cost
                         }
@@ -1718,13 +1739,7 @@ impl ResidentWork {
                 }
                 Some(_) => {
                     let tally = tally.get_or_insert_with(|| self.credits.tally.load());
-                    let (cost, since) = self.cost_reported(tally, c, || run.of(c), &mut reporting);
-                    if let Some(since) = since {
-                        if since.keeps_before(c.load_sampled_at_micros) {
-                            self.settle(None, since, c, run.slot_of(c));
-                        }
-                    }
-                    cost
+                    self.cost_reported(tally, c, || run.of(c), &mut reporting)
                 }
             };
         }
@@ -1742,7 +1757,7 @@ impl ResidentWork {
         let tally = self.credits.tally.load();
         for (slot, &i) in out.iter_mut().zip(kept) {
             let c = &candidates[i as usize];
-            (*slot, _) = self.cost_reported(&tally, c, || c.in_flight, &mut reporting);
+            *slot = self.cost_reported(&tally, c, || c.in_flight, &mut reporting);
         }
         reporting
     }
@@ -6788,6 +6803,79 @@ mod tests {
         assert_eq!(number, None, "the number steps aside");
         alike(&back, "the member's row as it stands");
         assert_eq!(kept_of(&told, slots[3], &back[0]), Some((1_700.0, 1)));
+    }
+
+    /// One stage may be handed both forms of a view: rows beside a lent
+    /// table, and rows a host wrote with their own counts. A written row
+    /// costed under a later sample than the kept report's releases
+    /// dispatches the kept number counts, as it does on a stage told
+    /// nothing. The number steps aside there too, and the kept report's
+    /// next decision reads the row as it stands.
+    #[test]
+    fn a_later_sample_in_a_written_view_sends_the_kept_number_back() {
+        // The member under test costs between a cheap row and a dear row,
+        // so its score turns on its cost.
+        let mut rows = [candidate(0, 1), candidate(1, 1), candidate(2, 1)];
+        rows[0].load = Some(resident(1, 1_000));
+        rows[1].load = Some(resident(1, 500));
+        rows[2].load = Some(resident(1, 40_000));
+        for row in &mut rows {
+            row.load_sampled_at_micros = 20_000;
+        }
+        let lent = Lent::take(&mut rows);
+        let slots = [0, 1, 2].map(|at: usize| lent.slot_of(&rows[at]));
+        let (told, untold) = (ResidentWork::new(700), ResidentWork::new(700));
+        let scores = |stage: &ResidentWork, pool: &[Candidate; 3]| {
+            let facts = lent.beside(&RequestFacts::default());
+            let mut out = [0.0f32; 3];
+            stage.score(&facts, pool, &kept(3), &mut out);
+            out.map(f32::to_bits)
+        };
+        // The same rows with no table lent: each row's own count.
+        let written = |stage: &ResidentWork, pool: &[Candidate; 3]| {
+            let mut out = [0.0f32; 3];
+            stage.score(&RequestFacts::default(), pool, &kept(3), &mut out);
+            out.map(f32::to_bits)
+        };
+        let member = (rows[0].id, rows[0].dp_rank);
+        let held = |stage: &ResidentWork| stage.held_at(member.0, member.1);
+        let alike = |pool: &[Candidate; 3], step: &str| {
+            let main = scores(&untold, pool);
+            assert_eq!(scores(&told, pool), main, "{step}");
+            assert_eq!(scores(&told, pool), main, "{step}: by the number");
+            assert_eq!(held(&told), held(&untold), "{step}: the dispatches held");
+        };
+        for (row, slot) in rows.iter().zip(slots) {
+            tell(&told, slot, row);
+        }
+        alike(&rows, "the world told");
+        let lease = Lease {
+            issued_micros: 60_000,
+            tokens: 3_000,
+            ..Lease::default()
+        };
+        for stage in [&told, &untold] {
+            stage.on_dispatched(&lease, &target_of(&rows[0]), Side::Single, 0);
+        }
+        alike(&rows, "a dispatch behind its report");
+        assert_eq!(kept_of(&told, slots[0], &rows[0]), Some((5_400.0, 2)));
+
+        // A host's own rows, the member's sampled later than that
+        // dispatch: costed from its parts, the row releases it on both
+        // stages.
+        let mut later = rows;
+        later[0].load_sampled_at_micros = 100_000;
+        assert_eq!(
+            written(&told, &later),
+            written(&untold, &later),
+            "a written view"
+        );
+        assert_eq!(held(&untold), 0, "the later sample released the dispatch");
+        assert_eq!(held(&told), 0, "on the told stage too");
+        let number = kept_of(&told, slots[0], &rows[0]);
+        assert_eq!(number, None, "the number steps aside");
+        alike(&rows, "the member's row as it stands");
+        assert_eq!(kept_of(&told, slots[0], &rows[0]), Some((1_700.0, 1)));
     }
 
     /// A told stage beside a stage told nothing through a long walk of a
