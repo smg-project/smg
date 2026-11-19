@@ -1339,7 +1339,7 @@ pub(crate) mod tests {
         let profile = document.profiles.get_mut("random");
         profile.expect("the preset's profile").pick = name.into();
         let digest = document.digest().expect("the document digests");
-        AppliedSpec::validate_digested(&document, digest, &catalog)
+        AppliedSpec::validate_digested(&document, digest, &catalog, &[])
             .expect("the catalog holds the stage")
     }
 
@@ -2192,7 +2192,7 @@ pub(crate) mod tests {
         let profile = document.profiles.get_mut("random");
         profile.expect("the preset's profile").pick = "told".into();
         let digest = document.digest().expect("the document digests");
-        AppliedSpec::validate_digested(&document, digest, &catalog)
+        AppliedSpec::validate_digested(&document, digest, &catalog, &[])
             .expect("the catalog holds the stage")
     }
 
@@ -2279,7 +2279,7 @@ pub(crate) mod tests {
         let profile = document.profiles.get_mut("random");
         profile.expect("the preset's profile").pick = "waits".into();
         let digest = document.digest().expect("the document digests");
-        let spec = AppliedSpec::validate_digested(&document, digest, &catalog)
+        let spec = AppliedSpec::validate_digested(&document, digest, &catalog, &[])
             .expect("the catalog holds the stage");
         (bed(Some(spec), true, (2, 8), []), told, at_issue, word)
     }
@@ -2906,7 +2906,7 @@ pub(crate) mod tests {
         let profile = document.profiles.get_mut("random");
         profile.expect("the preset's profile").pick = "told".into();
         let digest = document.digest().expect("the document digests");
-        let spec = AppliedSpec::validate_digested(&document, digest, &catalog)
+        let spec = AppliedSpec::validate_digested(&document, digest, &catalog, &[])
             .expect("the catalog holds the stage");
         let mut bed = bed(Some(spec), true, (1, 8), []);
         let id = |count: u64| 1 << 32 | count;
@@ -2983,7 +2983,7 @@ pub(crate) mod tests {
         let profile = document.profiles.get_mut("random");
         profile.expect("the preset's profile").pick = "named".into();
         let digest = document.digest().expect("the document digests");
-        let spec = AppliedSpec::validate_digested(&document, digest, &catalog)
+        let spec = AppliedSpec::validate_digested(&document, digest, &catalog, &[])
             .expect("the catalog holds the stage");
         let mut bed = bed(Some(spec), true, (1, 8), []);
         let answer = bed.ask(frame(1, 1)).await;
@@ -3379,7 +3379,7 @@ pub(crate) mod tests {
             let document: PolicySpec =
                 serde_json::from_str(&document).expect("a document of this build");
             let digest = document.digest().expect("the document digests");
-            let spec = AppliedSpec::validate_digested(&document, digest, &catalog);
+            let spec = AppliedSpec::validate_digested(&document, digest, &catalog, &[]);
             let store = Arc::new(MemoryStore::new().with_deciders(2));
             let (singles, _) = fleet(&store);
             store
@@ -3699,7 +3699,7 @@ pub(crate) mod tests {
         let profile = document.profiles.get_mut("random");
         profile.expect("the preset's profile").pick = "seen".into();
         let digest = document.digest().expect("the document digests");
-        let spec = AppliedSpec::validate_digested(&document, digest, &catalog)
+        let spec = AppliedSpec::validate_digested(&document, digest, &catalog, &[])
             .expect("the catalog holds the stage");
         let mut bed = bed(Some(spec), true, (2, 8), []);
         // Three decisions and no word from their gateway: three leases
@@ -4150,7 +4150,7 @@ pub(crate) mod tests {
             profile.filter.push("shown".to_string());
         }
         let digest = document.digest().expect("the document digests");
-        let spec = AppliedSpec::validate_digested(&document, digest, &catalog)
+        let spec = AppliedSpec::validate_digested(&document, digest, &catalog, &[])
             .expect("the catalog holds every stage the document names");
         let store = MemoryStore::new();
         let (mut singles, _) = fleet(&store);
@@ -5609,7 +5609,7 @@ pub(crate) mod tests {
         )
         .expect("a document of this build");
         let digest = document.digest().expect("the document digests");
-        AppliedSpec::validate_digested(&document, digest, &catalog)
+        AppliedSpec::validate_digested(&document, digest, &catalog, &[])
             .expect("the catalog holds the stage")
     }
 

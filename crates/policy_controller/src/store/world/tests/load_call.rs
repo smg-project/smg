@@ -182,7 +182,8 @@ mod held {
             ..BindingSpec::default()
         }];
         let digest = document.digest().expect("a digest");
-        AppliedSpec::validate_digested(&document, digest, &catalog).expect("the document validates")
+        AppliedSpec::validate_digested(&document, digest, &catalog, &[])
+            .expect("the document validates")
     }
 
     /// A stage that keeps the reports is told each rank's report with the

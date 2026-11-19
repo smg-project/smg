@@ -4230,16 +4230,17 @@ impl AppliedSpec {
     }
 
     /// [`AppliedSpec::validate`] over the stages `catalog` holds, under a
-    /// digest its caller took already: the controller's door reads the
+    /// digest its caller took already: the operator door reads the
     /// document's digest against the standing one and hands it on, so an
     /// apply digests its document once.
-    #[cfg(any(test, feature = "controller"))]
+    #[cfg(any(test, feature = "operator"))]
     pub(crate) fn validate_digested(
         document: &PolicySpec,
         digest: Digest,
         catalog: &Catalog,
+        denied_headers: &[&str],
     ) -> Result<Self, SpecError> {
-        let built = document.built(catalog, &[])?;
+        let built = document.built(catalog, denied_headers)?;
         Ok(Self::of(document, digest, built))
     }
 
@@ -4638,7 +4639,7 @@ mod tests {
         #[cfg(feature = "controller")]
         {
             let digest = keyed.digest().expect("the document digests");
-            let applied = AppliedSpec::validate_digested(&keyed, digest, &Catalog::builtin())
+            let applied = AppliedSpec::validate_digested(&keyed, digest, &Catalog::builtin(), &[])
                 .expect("the preset validates");
             assert_eq!(applied.block_hashes_read(Token, 0), 8);
         }
@@ -8044,7 +8045,7 @@ mod tests {
             .digest()
             .expect("a digest");
         assert_ne!(document.digest(), Ok(handed));
-        let applied = AppliedSpec::validate_digested(&document, handed, &Catalog::builtin())
+        let applied = AppliedSpec::validate_digested(&document, handed, &Catalog::builtin(), &[])
             .expect("a preset validates");
         assert_eq!(applied.digest(), Some(handed));
     }
@@ -8058,7 +8059,7 @@ mod tests {
         let mut document = PolicySpec::preset("least_load").expect("a preset");
         document.plans.pd_pair.pairing = Pairing::Strict;
         let digest = document.digest().expect("a digest");
-        let handed = AppliedSpec::validate_digested(&document, digest, &Catalog::builtin())
+        let handed = AppliedSpec::validate_digested(&document, digest, &Catalog::builtin(), &[])
             .expect("a preset validates");
         assert_eq!(handed.pairing(), Pairing::Strict);
         let own = AppliedSpec::validate(&document).expect("a preset validates");

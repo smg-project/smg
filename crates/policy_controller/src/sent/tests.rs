@@ -261,8 +261,8 @@ fn removing_a_worker_clears_its_ranks_sends() {
 
 fn apply(store: &MemoryStore, document: &PolicySpec, catalog: &Catalog) {
     let digest = document.digest().expect("a digest");
-    let spec =
-        AppliedSpec::validate_digested(document, digest, catalog).expect("the policy validates");
+    let spec = AppliedSpec::validate_digested(document, digest, catalog, &[])
+        .expect("the policy validates");
     store.apply(spec).expect("a newer generation");
 }
 

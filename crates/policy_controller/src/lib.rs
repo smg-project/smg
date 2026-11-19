@@ -75,6 +75,9 @@
 //!   the load helpers (the row conversion, the scrape parser). The KV
 //!   subscription, the prober and discovery arrive in the step's later PRs.
 //!
+//! - Behind the `operator` feature, `operator::SpecDoor` applies a
+//!   host's start document and serves its status, document and dry run.
+//!   The feature also serves worker snapshots over the host's store.
 //! - The door ([`door`]): the order of one decision's calls, written once
 //!   for every host. A host that embeds the engine asks [`door::Door`],
 //!   which runs the order on the caller's thread over a
@@ -112,12 +115,11 @@
 //!   each object a gRPC connector: an object connects to its engine at its
 //!   first use.
 //!
-//! What this step does not hold: the gRPC plugin service, the operator calls,
-//! the other ingestion drivers and the gRPC API; they arrive in later
-//! steps and build on these types. The
-//! in-process view carries two host instants (the decision's clock and a
+//! The in-process view carries two host instants (the decision's clock and a
 //! report's sample instant); the wire carries durations only.
 
+#[cfg(any(feature = "ingest", feature = "operator"))]
+mod address;
 pub mod affinity;
 pub mod bucket;
 pub mod builtins;
@@ -138,6 +140,8 @@ pub mod handle;
 #[cfg(feature = "ingest")]
 pub mod ingest;
 pub mod lease;
+#[cfg(feature = "operator")]
+pub mod operator;
 #[cfg(any(feature = "wasm", feature = "controller"))]
 pub mod plugins;
 pub mod predictor;

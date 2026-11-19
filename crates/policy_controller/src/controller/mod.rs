@@ -56,7 +56,8 @@ mod service;
 mod session;
 mod snapshot;
 mod spec_file;
-mod spec_store;
+pub(crate) use crate::operator::spec_store;
+pub use crate::operator::SpecRejected;
 mod standby;
 pub mod tls;
 mod watch_workers;
@@ -87,7 +88,6 @@ pub use self::{
     admin::{Version, VERSION},
     config::{Config, ConfigError, Listener, Scope, Tls},
     election::{Election, LeaseError, LeasePlace},
-    generations::SpecRejected,
     principal::ENTRY as PRINCIPAL_ENTRY,
     readiness::{Readiness, State},
     run::run,

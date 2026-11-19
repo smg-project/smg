@@ -431,7 +431,7 @@ pub(crate) mod tests {
         let profile = document.profiles.get_mut("random");
         profile.expect("the preset's profile").pick = "hears".into();
         let digest = document.digest().expect("the document digests");
-        let spec = AppliedSpec::validate_digested(&document, digest, &catalog)
+        let spec = AppliedSpec::validate_digested(&document, digest, &catalog, &[])
             .expect("the catalog holds the stage");
         store.apply(spec).expect("a later generation");
         (heard, indexes)
