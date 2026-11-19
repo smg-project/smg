@@ -522,9 +522,9 @@ where
                 word = turned(&mut polls) => {
                     // The term is read after the word: a take sets it
                     // before its word is told.
-                    let led = led();
-                    if (word, led) != (polling, under) {
-                        (polling, under) = (word, led);
+                    let term = led();
+                    if (word, term) != (polling, under) {
+                        (polling, under) = (word, term);
                         schedule = Schedule::default();
                         if polling {
                             self.tick(&mut schedule);
