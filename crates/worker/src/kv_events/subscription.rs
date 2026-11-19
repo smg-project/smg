@@ -719,7 +719,8 @@ impl KvEventCollector {
     /// Process batches from a single stream connection: every batch that is
     /// more than a load record goes to the sink with its rank and its header
     /// facts, a snapshot's start said ahead of its first chunk; a batch whose
-    /// rank fits none goes to no sink. A batch the sink took is `on_batch`'s;
+    /// rank fits none goes to no sink, and the first such batch of the stream
+    /// is said to the operator. A batch the sink took is `on_batch`'s;
     /// a gap ends the stream, for a replay.
     async fn process_stream<S: KvEventSink<Batch = KvEventBatch>>(
         mut stream: tonic::Streaming<KvEventBatch>,
@@ -732,6 +733,8 @@ impl KvEventCollector {
     ) -> StreamResult {
         use futures::StreamExt;
 
+        // One line a stream, however many of its batches carry no rank.
+        let mut misfit_rank_said = false;
         while let Some(result) = stream.next().await {
             let batch = match result {
                 Ok(batch) => batch,
@@ -748,6 +751,15 @@ impl KvEventCollector {
             // goes to no sink, as a load record of a negative rank goes to
             // no monitor.
             let Some(rank) = batch_rank(&batch) else {
+                if !misfit_rank_said {
+                    misfit_rank_said = true;
+                    warn!(
+                        worker_url = %Endpoint::redacted_str(worker_url),
+                        dp_rank = ?batch.dp_rank,
+                        "KV event batch with a data-parallel rank that fits no rank; \
+                         this stream's batches of such a rank are dropped"
+                    );
+                }
                 Metrics::record_kv_event_batch(worker_url, "not_indexed");
                 continue;
             };
@@ -1734,7 +1746,9 @@ mod tests {
 
     /// A batch whose rank fits no `u16` names no rank of an engine: it is
     /// said to no sink, where rank 0's cursor would have taken it, and the
-    /// batches around it are said as they come.
+    /// batches around it are said as they come. The operator reads one line
+    /// a stream, with the first such rank as the engine sent it.
+    #[tracing_test::traced_test]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_batch_of_a_rank_that_fits_none_is_said_to_no_sink() {
         let ranked = |sequence_number, dp_rank| KvEventBatch {
@@ -1773,6 +1787,16 @@ mod tests {
                 "admit 7 rank 0 seq 8"
             ]
         );
+        logs_assert(|lines: &[&str]| {
+            let said: Vec<&&str> = lines
+                .iter()
+                .filter(|line| line.contains("fits no rank"))
+                .collect();
+            match said.as_slice() {
+                [line] if line.contains("dp_rank=Some(-1)") => Ok(()),
+                other => Err(format!("one line with the first rank, got {other:?}")),
+            }
+        });
     }
 
     /// The count of a relay snapshot's chunks, rule by rule: a first chunk
