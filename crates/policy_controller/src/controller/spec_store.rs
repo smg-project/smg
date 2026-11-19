@@ -1430,7 +1430,9 @@ pub(crate) mod tests {
             );
             return;
         }
-        let opened = SpecStore::open_within(dir.path().to_owned(), Duration::ZERO);
+        // This start waits: a child process of another case may hold a copy
+        // of the lock's open file until its exec.
+        let opened = SpecStore::open(dir.path().to_owned());
         fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).expect("its bits");
         let store = opened.expect("the start goes on");
         assert_eq!(store.kept(), [at(1, YAML)]);
