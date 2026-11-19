@@ -94,11 +94,11 @@
 //!   the load driver over the store, and the binary of the package's name
 //!   over them. The scopes' calls and the election arrive in the step's
 //!   later PRs.
-//! - Behind the `client` feature, the reference client of the controller's
-//!   protocol (`client`): one gateway's side of it (the dial, `Leader`,
-//!   the session's `Hello` answered by a `Welcome`, a request's lifecycle
-//!   reports on that session, and the watch of the workers' rows), with a
-//!   blocking form. No shipped binary builds it.
+//! - Behind the `client` feature, the gateway's side of the controller's
+//!   protocol (`client`). The reference client (`client::Client`) asks
+//!   one request at a time, reports its lifecycle and watches workers'
+//!   rows, with a blocking form. A host's requests share `client::Link`
+//!   for concurrent asks on one decide stream and reports on one session.
 //! - Behind the same feature, the watcher (`watcher`): a gateway's copy of
 //!   the controller's workers. It takes the watch's events in their order
 //!   into a [`store::MemoryStore`] of its own, through the door a
