@@ -10,19 +10,21 @@
 //! a frame as the served controller checked it.
 
 use std::{
+    panic::{catch_unwind, AssertUnwindSafe},
     sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant},
 };
 
 use crate::{
-    decision::{Decision, Shed, ShedReason, Trace},
-    framework::{Plan, Scratch},
+    decider::Decider,
+    decision::{Decision, Shed, ShedReason, Target, Trace},
+    framework::{release, Engine, Plan, Scratch},
     lease::{Lease, LeaseId, LeaseKind, Lifecycle, Side},
-    sessions::SessionVerdict,
+    sessions::{Forgets, SessionVerdict},
     spec::AppliedSpec,
     store::{
         leases::DISPATCH_TTL, Ask, Built, GatewayId, LeaseRecord, LeaseRefused, LeaseState,
-        MemoryStore, Named, Naming, Picked, SessionsStore, ViewBuffers, World,
+        MemoryStore, Named, Naming, Picked, Said, SessionsStore, ViewBuffers, World,
     },
     view::{
         fingerprint, AffinityFacts, Candidate, Constraints, NamedAffinity, Phase, PinSource,
@@ -629,6 +631,150 @@ pub(crate) struct Viewed<'a> {
     /// The pins of record the host lends the decision ([`PinSource`]);
     /// `None` where it keeps none.
     pub(crate) pins: Option<&'a dyn PinSource>,
+}
+
+/// Tells the engine what was said of a lease: one function of the record
+/// found on file and the report, whoever calls it. `true` where a stage's
+/// call panicked and was held, for the first of a streak: its host may
+/// write a line for that one.
+///
+/// The engine told is the one of the lease's own generation, where that
+/// generation still stands: a later generation's stages never saw the
+/// issue and hear nothing of it. A dispatch is told on the target its
+/// report names by index, as the record holds the pick, and the lease told
+/// names that index: the record was read before the door wrote it. A
+/// report that names no target of the pick tells nothing.
+///
+/// Its caller is whoever applies the report, under the turn of the leases'
+/// file: what it calls is bounded and takes no door of the leases. It
+/// enters as the decider whose file the lease is on, on whichever thread
+/// applies.
+///
+/// A stage's call that panics is held here, whoever applies: a decider
+/// inside a decision or as it takes up or leaves its work, a session, the
+/// gateways' sweep, a host's own thread. The lease's event stands on file
+/// as applied and the fault is counted on the store
+/// ([`MemoryStore::lifecycle_faults`]). It costs no request its decision
+/// and ends no thread.
+pub(crate) fn told(
+    store: &MemoryStore,
+    world: &World,
+    record: &LeaseRecord,
+    said: Said,
+    by: Option<Decider>,
+) -> bool {
+    // The lease's own decider acts while its event is told, whichever
+    // thread applies the report.
+    let _acting = by.map(Decider::enter);
+    let Err(payload) = catch_unwind(AssertUnwindSafe(|| tell(store, world, record, said))) else {
+        store.call_returned();
+        return false;
+    };
+    // A payload's own drop can panic: the engine's helper frees it under a
+    // catch of its own.
+    release(payload);
+    store.call_faulted()
+}
+
+/// What [`told`] tells, under its catch.
+fn tell(store: &MemoryStore, world: &World, record: &LeaseRecord, said: Said) {
+    let spec = world.spec();
+    let engine = (spec.generation() == record.lease.generation).then(|| spec.engine());
+    match (said, engine) {
+        (Said::Dispatched(dispatch, at), engine) => {
+            let Some((id, dp_rank)) = record.target_at(dispatch.target_index) else {
+                return;
+            };
+            let target = Target {
+                id,
+                dp_rank,
+                ..Target::default()
+            };
+            // The record was read before the door wrote the dispatched
+            // index: the lease told carries it, for a stage that reads
+            // the index off the lease.
+            let lease = Lease {
+                target_index: dispatch.target_index,
+                ..record.lease
+            };
+            // The table hears first and the pin of record reads it.
+            // The stages hear last, so nothing is held across their
+            // loop: a value kept for the pin behind it cost every
+            // lease a store and a reload a profile. A stage's call
+            // that unwinds there leaves the pin of record written,
+            // beside the table's entry.
+            if let Some(engine) = engine {
+                engine.dispatched_table(&lease, &target, dispatch.side);
+            }
+            pinned(store, record, engine, id, at);
+            if let Some(engine) = engine {
+                engine.dispatched_stages(
+                    &lease,
+                    &target,
+                    dispatch.side,
+                    dispatch.since_decision_micros,
+                );
+            }
+        }
+        (Said::Completed(outcome), Some(engine)) => {
+            engine.on_completed(&record.lease, &outcome);
+        }
+        (Said::Released(_, reason), Some(engine)) => engine.on_released(&record.lease, reason),
+        (Said::Completed(_) | Said::Released(..), None) => {}
+    }
+}
+
+/// Writes a keyed lease's pin of record at its dispatch (design 5.1, the
+/// sessions row: written at the commit, never at selection). The pin names
+/// the worker the key's rule prefers once the engine was told, as its
+/// table holds it: a dispatch on the failover leaves the preferred worker
+/// pinned. Where no engine was told it names the dispatched worker. A
+/// lease no sessions rule governed pins nothing.
+///
+/// The pin ends where the engine's table forgets the key, and never under
+/// a rule without a TTL. Where the table holds no such key, or no engine
+/// was told, the lease's own rule ends it: the TTL its decision was made
+/// under, as its record on file carries it, counted from the lease's
+/// issue as the table counted it then. So it does where the dispatch
+/// itself made the table's entry anew and no decision has read it: that
+/// entry holds no instant yet. An end the lease's rule counts never moves
+/// the pin's end earlier: a lease dispatched behind a newer one of its
+/// key, or behind a dispatch whose table ended the pin later, leaves the
+/// later end standing. Either end stands on the decision clock: a
+/// dispatch converts no clock. The table's lock is let go before the
+/// store's pin is written: no lock is held across the two.
+fn pinned(
+    store: &MemoryStore,
+    record: &LeaseRecord,
+    engine: Option<&Engine>,
+    dispatched: WorkerId,
+    at: Instant,
+) {
+    let lease = &record.lease;
+    if lease.session == Session::NONE || lease.session_verdict == SessionVerdict::None {
+        return;
+    }
+    let held = engine.and_then(|engine| engine.sessions().held(lease.session));
+    let preferred = held
+        .map(|(pins, _)| pins[0])
+        .filter(|pin| *pin != WorkerId(0));
+    let (key, worker) = (lease.session.get(), preferred.unwrap_or(dispatched));
+    match held {
+        // The table's word is the key's rule as it stands: it moves the
+        // pin's end either way.
+        Some((_, Forgets::At(forgotten))) => {
+            SessionsStore::pin(store, key, worker, at, Some(forgotten));
+        }
+        Some((_, Forgets::Never)) => SessionsStore::pin(store, key, worker, at, None),
+        // The lease's own rule is the word of a decision that may be older
+        // than the pin's last writer: it never moves the end earlier.
+        Some((_, Forgets::Unread)) | None => {
+            let ends = record
+                .session_ttl_micros
+                .map(|ttl| lease.issued_micros.saturating_add(ttl));
+            SessionsStore::pin_no_earlier(store, key, worker, at, ends);
+        }
+    }
 }
 
 /// The counter at which a term's leader is told to leave: three quarters of
