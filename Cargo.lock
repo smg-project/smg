@@ -2233,6 +2233,7 @@ dependencies = [
  "tokio",
  "tonic",
  "tracing",
+ "zeromq",
 ]
 
 [[package]]
