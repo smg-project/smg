@@ -527,9 +527,9 @@ def image_of(path: Path) -> str | None:
     program headers and the file bytes of every loadable segment, with the build id and the
     header's section-table fields left out. Those follow what no run reads: symbol names and
     debug sections. None for any other file, for one whose headers do not add up, and for one
-    that keeps its file header or a program header's bytes outside every loadable segment: the
-    loader reads the entry address, the interpreter's path and the property note from the file,
-    and the image would not hold them."""
+    whose file header, or the bytes a program header names, do not lie whole inside one loadable
+    segment: the loader reads the entry address, the interpreter's path and the property note
+    from the file, and the image would not hold them."""
     data = bytearray(path.read_bytes())
     if len(data) < ELF_EHDR or data[:6] != b"\x7fELF\x02\x01":
         return None

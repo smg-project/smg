@@ -2182,6 +2182,7 @@ def test_what_the_loader_reads_from_the_file_lies_inside_a_loadable_segment(mod,
     assert image(b"B" * 20, False) is None
     # A segment that starts at the file's start holds the header only where it holds all of it.
     data = bytearray(elf(b"code" * 64, b"A" * 20, b"symbols"))
+    # The note names no bytes here: behind so short a segment it would refuse the file itself.
     struct.pack_into("<Q", data, 64 + 56 + 32, 0)
     path = tmp_path / "bench-short"
     for size, held in ((63, False), (64, True)):
