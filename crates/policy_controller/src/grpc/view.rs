@@ -569,12 +569,14 @@ pub(crate) fn signal(s: &Signal, now_micros: u64) -> proto::lifecycle_event::Eve
 /// Why an answer broke the contract; the log line names it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Invalid {
-    /// A declined stage whose answer field is filled.
+    /// A declined stage that carries an answer.
     DeclinedAndAnswered,
     /// A survivor position out of range or named twice.
     Survivor,
     /// Not one finite score per candidate.
     Scores,
+    /// A tie band outside its range or without scores.
+    Band,
     /// A pick outside the surviving set.
     Pick,
     /// More counter increments than the plugin declared counters.
@@ -587,6 +589,7 @@ impl std::fmt::Display for Invalid {
             Self::DeclinedAndAnswered => "a declined stage carries an answer",
             Self::Survivor => "a surviving position is out of range or repeated",
             Self::Scores => "the scores are not one finite value per candidate",
+            Self::Band => "the tie band is not a finite value from 0 to 1 beside its scores",
             Self::Pick => "the pick is outside the surviving set",
             Self::Counters => "more counter increments than declared counters",
         })
@@ -607,6 +610,8 @@ pub(crate) struct Answer {
     /// One score per candidate, clamped by the host, when the scorer
     /// answered.
     pub(crate) scores: Vec<f32>,
+    /// The band the scorer gave with its scores.
+    pub(crate) band: Option<f32>,
     /// The pick, when the picker answered.
     pub(crate) pick: Option<u32>,
     /// The counter increments by declared id.
@@ -618,11 +623,11 @@ pub(crate) fn bit(mask: &[u64], position: u32) -> bool {
         .is_some_and(|word| word & (1 << (position % 64)) != 0)
 }
 
-/// Reads a frame's answer under the validity rules (design appendix B and
-/// the protocol's own comments): each asked stage answers its own field;
-/// `survivors` present and empty sheds; a pick after a PICK decline is
-/// unset; an asked stage left unanswered is declined; a declined stage
-/// with its field filled is invalid. The pick is judged here against the
+/// Reads a frame's answer under the protocol's validity rules. A present
+/// `survivors` field with no positions sheds. A pick after a PICK decline
+/// is unset, and an asked stage left unanswered is declined. A declined
+/// stage that carries an answer is invalid. The scorer's band must be
+/// finite, from 0 to 1, and beside scores. The pick is judged here against the
 /// plugin's own survivors when its filter answered in the frame, and against
 /// the candidate count otherwise; the picker judges it against the rows the
 /// profile's filters left. The counter list is judged first: an answer
@@ -671,15 +676,24 @@ pub(crate) fn read(
     }
     // The scorer.
     if named & SCORE != 0 {
-        if !d.scores.is_empty() {
+        if !d.scores.is_empty() || d.tie_band.is_some() {
             return Err(Invalid::DeclinedAndAnswered);
         }
     } else if asked & SCORE != 0 {
         if d.scores.is_empty() {
+            if d.tie_band.is_some() {
+                return Err(Invalid::Band);
+            }
             answer.declined |= SCORE;
         } else {
             if d.scores.len() != count as usize || d.scores.iter().any(|s| !s.is_finite()) {
                 return Err(Invalid::Scores);
+            }
+            if let Some(band) = d.tie_band {
+                if !(0.0..=1.0).contains(&band) {
+                    return Err(Invalid::Band);
+                }
+                answer.band = Some(band);
             }
             answer.scores = d.scores;
             for s in &mut answer.scores {
@@ -713,7 +727,13 @@ pub(crate) fn read(
 
 #[cfg(test)]
 mod tests {
-    use super::{membership, proto, since, since_of, Answer, Invalid, FILTER, PICK, SCORE};
+    use prost::Message;
+
+    use super::{
+        membership,
+        proto::{self, decline::Reason as DeclineReason},
+        since, since_of, Answer, Invalid, FILTER, PICK, SCORE,
+    };
     use crate::{lease::Membership, view::WorkerId};
 
     /// The stages' rules, under a plugin that declared no counter.
@@ -738,6 +758,7 @@ mod tests {
                 detail: String::new(),
             }),
             counters: Vec::new(),
+            tie_band: None,
         }
     }
 
@@ -876,6 +897,95 @@ mod tests {
             )
             .unwrap_err(),
             Invalid::DeclinedAndAnswered
+        );
+    }
+
+    #[test]
+    fn a_band_beside_asked_scores_is_read() {
+        for band in [Some(0.375), Some(0.0), Some(1.0), None] {
+            let d = proto::PluginDecision {
+                tie_band: band,
+                ..decision(None, vec![0.625], None, None)
+            };
+            let answer = read(d, SCORE, 1).expect("scores with an optional band");
+            assert_eq!(answer.band, band);
+        }
+    }
+
+    #[test]
+    fn a_band_that_is_no_value_from_0_to_1_is_refused() {
+        for band in [f32::NAN, -0.125, 1.125, f32::INFINITY, f32::NEG_INFINITY] {
+            let d = proto::PluginDecision {
+                tie_band: Some(band),
+                ..decision(None, vec![0.875], None, None)
+            };
+            assert_eq!(
+                read(d, SCORE, 1).expect_err("a band outside the range"),
+                Invalid::Band,
+                "{band}"
+            );
+        }
+        assert_eq!(
+            Invalid::Band.to_string(),
+            "the tie band is not a finite value from 0 to 1 beside its scores"
+        );
+    }
+
+    #[test]
+    fn a_band_beside_a_declined_scorer_or_beside_no_scores_is_refused() {
+        let band = Some(0.1875);
+        for (decline, invalid) in [
+            (
+                Some((SCORE, DeclineReason::NotApplicable as i32)),
+                Invalid::DeclinedAndAnswered,
+            ),
+            (None, Invalid::Band),
+        ] {
+            let d = proto::PluginDecision {
+                tie_band: band,
+                ..decision(None, Vec::new(), None, decline)
+            };
+            assert_eq!(
+                read(d, SCORE, 1).expect_err("a band without scores"),
+                invalid
+            );
+        }
+    }
+
+    #[test]
+    fn a_band_where_the_scorer_was_not_asked_is_not_read() {
+        for band in [0.6875, f32::NAN] {
+            let d = proto::PluginDecision {
+                tie_band: Some(band),
+                ..decision(None, vec![0.4375], Some(0), None)
+            };
+            let answer = read(d, PICK, 1).expect("the pick answers the only stage asked");
+            assert_eq!((answer.pick, answer.band), (Some(0), None));
+            assert!(answer.scores.is_empty());
+        }
+    }
+
+    #[test]
+    fn a_decision_with_no_band_encodes_as_before_and_tag_7_reads_as_the_band() {
+        let d = proto::PluginDecision {
+            decision_id: 29,
+            ..decision(None, vec![0.625], None, None)
+        };
+        let before = [
+            0x09, 0x1d, 0, 0, 0, 0, 0, 0, 0, // decision id
+            0x1a, 0x04, 0, 0, 0x20, 0x3f, // scores
+        ];
+        assert_eq!(d.encode_to_vec(), before);
+
+        let mut with_band = before.to_vec();
+        with_band.extend([0x3d, 0, 0, 0, 0x3e]);
+        let decoded = proto::PluginDecision::decode(with_band.as_slice()).expect("a decision");
+        assert_eq!(
+            decoded,
+            proto::PluginDecision {
+                tie_band: Some(0.125),
+                ..d
+            }
         );
     }
 

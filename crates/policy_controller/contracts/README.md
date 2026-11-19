@@ -29,7 +29,10 @@ clock, a lease's issue instant), and each file's comments name them.
   number and name, enum values are never renumbered, a `oneof` only grows. An
   unknown `oneof` case decodes as unset: a `Decision` with no outcome is a
   deadline miss, a `PluginDecision` that answers none of its asked stages a
-  decline. An empty filter mask is a present, empty `survivors` message and
+  decline.
+  A `PluginDecision` may carry a `tie_band` with its scores, and the host uses
+  its default band when the field is absent.
+  An empty filter mask is a present, empty `survivors` message and
   sheds the request; it is never a decline. `Hello` carries the protocol
   range and `Welcome` the chosen version; the controller speaks N and N-1 and
   upgrades first. A plugin speaks one version on all its streams, fixed by
