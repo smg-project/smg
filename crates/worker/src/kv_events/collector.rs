@@ -58,8 +58,8 @@ pub trait KvEventHost: Send + Sync + 'static {
     /// The model's last events subscription is gone.
     ///
     /// Called under the slot lock like [`enroll`](Self::enroll), by whoever
-    /// lifts the subscription's reservation: it must not wait, and it must
-    /// not call the collector.
+    /// frees the subscription's slot: it must not wait, and it must not
+    /// call the collector.
     fn model_left(&self, _model: &str) {}
 }
 
@@ -418,16 +418,15 @@ impl<H: KvEventHost> KvEventCollector<H> {
 
     /// The end of a removal, run by the subscription task once the sink has
     /// heard that the worker left: lift the URL's reservation if it is this
-    /// task's
-    /// (a later subscription under the URL has its own), and tell the host
-    /// when the model's last events subscription went with it.
-    /// The task does this itself, since a caller may drop
-    /// `on_worker_removed` before the task has ended; the remover lifts too,
-    /// after its wait, for a task that was past this step when the removal
-    /// began. A slot that is `Active` (the task ended on its own, or `stop`
-    /// took the subscription) is left as it is. `worker` is the removed
-    /// worker itself, which the task holds through the write made here (see
-    /// the task in [`Self::on_worker_added`]).
+    /// task's (a later subscription under the URL has its own), and tell the
+    /// host when the model's last events subscription went with it. The task
+    /// does this itself, since a caller may drop `on_worker_removed` before
+    /// the task has ended; the remover lifts too, after its wait, for a task
+    /// that was past this step when the removal began. A slot that is
+    /// `Active` (the task ended on its own, or `stop` took the subscription)
+    /// is left as it is. `worker` is the removed worker itself, which the
+    /// task holds through the write made here (see the task in
+    /// [`Self::on_worker_added`]).
     async fn complete_removal(
         slots: &Mutex<HashMap<String, Slot>>,
         host: &H,
