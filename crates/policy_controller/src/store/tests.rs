@@ -2062,10 +2062,10 @@ impl Journal for WaitsAtRestart {
 }
 
 /// A take beside a restore stands whole behind it. The take's write waits
-/// for the file's turn, which the restore holds from its start until the
-/// file is emptied: the first lease of the term taken is filed in the
-/// emptied file, on the restored row's count, and the restore ends no
-/// lease of that term.
+/// for its file's turn, and the restore holds every file's turn from its
+/// start until it has read the ids on file: the first lease of the term
+/// taken is filed behind that read, on the restored row's count, and the
+/// restore ends no lease of that term.
 #[test]
 fn a_take_beside_a_restore_files_its_first_lease_behind_it() {
     let (reached, stands) = mpsc::channel();

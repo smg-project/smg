@@ -2332,6 +2332,42 @@ mod tests {
         assert_eq!(*bed.names.lock(), ["standby-0"; 5]);
     }
 
+    /// A stream's first batch that lands in part: the event that landed is
+    /// the stream's first, and the stream ends as one that applied, so the
+    /// next opens at once and a streak of empty streams ends there.
+    #[tokio::test]
+    async fn a_first_batch_that_lands_in_part_ends_its_stream_as_one_that_applied() {
+        let mut bed = Bed::new().await;
+        let (_elector, standing, standby) = standing_by(&bed, FIVE);
+        let leader = led();
+        let now = Instant::now();
+        follow(&standby.follower, &leader.1, now);
+        let place = standby.follower.place();
+        standing.send_replace(bed.holds("leader-1", 7));
+        let named = standby.shared.leader(None);
+        // One batch of the leader's next event twice: the first lands and
+        // the second, at a number the log has passed, does not.
+        leader.0.upsert(facts("http://halved:8000", 1));
+        let lands = entries(&leader.1, place).remove(0);
+        let halved = proto::ReplicationBatch {
+            events: vec![worker_wire::replication(&lands, now); 2],
+            ..batch(&lands, now)
+        };
+        let applied = AtomicBool::new(false);
+        let script = async {
+            let mut opened = bed.opened().await;
+            assert!(matches!(opened.frame().await, Some(Frame::Hello(_))));
+            opened.says(halved).await;
+            opened
+        };
+        let (ended, _opened) = tokio::join!(standby.stream(&named, &applied), script);
+        assert_eq!((ended.next, ended.applied), (Next::Join, true));
+        assert!(ended.why.is_none(), "{:?}", ended.why);
+        assert!(!applied.load(Ordering::Relaxed), "no whole frame landed");
+        assert_eq!(standby.follower.place(), lands.at);
+        assert_eq!(standby.shared.lag.asks(), 1);
+    }
+
     #[tokio::test]
     async fn an_ask_states_the_floor_its_place_no_longer_names() {
         let mut bed = Bed::new().await;

@@ -261,7 +261,7 @@ fn flags(spec: &Path) -> [&OsStr; 6] {
     ]
 }
 
-/// The numbers of the pairs' own a leader's start tries.
+/// How many of the pairs' own numbers a leader's start tries.
 const NUMBERS: usize = 16;
 
 /// The whole case's bound: its waits sum to seconds on an idle host.
