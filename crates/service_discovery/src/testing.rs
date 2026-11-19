@@ -1,11 +1,14 @@
 //! Shared test fixtures for the discovery modules.
 
+#[cfg(feature = "kubernetes")]
+use std::collections::BTreeMap;
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{HashMap, HashSet},
     sync::Arc,
 };
 
 use async_trait::async_trait;
+#[cfg(feature = "kubernetes")]
 use k8s_openapi::{
     api::core::v1::{Pod, PodCondition, PodSpec, PodStatus},
     apimachinery::pkg::apis::meta::v1::ObjectMeta,
@@ -262,6 +265,7 @@ impl WorkerJobs for RecordedJobs {
 
 /// A running, ready pod named `name` at `ip`, carrying `labels`: the shape
 /// the Kubernetes watchers' tests feed to their label selectors.
+#[cfg(feature = "kubernetes")]
 pub fn make_labeled_pod(name: &str, ip: &str, labels: &[(&str, &str)]) -> Pod {
     let mut label_map = BTreeMap::new();
     for &(k, v) in labels {

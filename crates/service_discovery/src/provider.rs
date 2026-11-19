@@ -5,19 +5,35 @@
 //! sees only these, so it never learns which kind of source produced a worker
 //! beyond the [`DiscoveryKind`] it is handed.
 
-use std::{collections::BTreeMap, net::Ipv6Addr};
+use std::collections::BTreeMap;
+#[cfg(any(feature = "consul", feature = "slurm"))]
+use std::net::Ipv6Addr;
 
 use openai_protocol::worker::WorkerType;
-use smg_worker::identity::endpoint::{Endpoint, EndpointError};
+use smg_worker::identity::endpoint::Endpoint;
+#[cfg(any(feature = "consul", feature = "slurm"))]
+use smg_worker::identity::endpoint::EndpointError;
 
+#[cfg(any(
+    test,
+    feature = "consul",
+    feature = "file",
+    feature = "kubernetes",
+    feature = "slurm"
+))]
 use super::series;
 
-/// Which provider produced a snapshot.
+/// Which provider produced a snapshot. A kind stands in a build that holds
+/// its provider.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) enum DiscoveryKind {
+    #[cfg(any(test, feature = "kubernetes"))]
     Kubernetes,
+    #[cfg(any(test, feature = "file"))]
     File,
+    #[cfg(any(test, feature = "slurm"))]
     Slurm,
+    #[cfg(any(test, feature = "consul"))]
     Consul,
 }
 
@@ -30,9 +46,13 @@ impl DiscoveryKind {
     /// must not silently orphan them.
     pub(super) fn as_label(self) -> &'static str {
         match self {
+            #[cfg(any(test, feature = "kubernetes"))]
             DiscoveryKind::Kubernetes => "kubernetes",
+            #[cfg(any(test, feature = "file"))]
             DiscoveryKind::File => "file",
+            #[cfg(any(test, feature = "slurm"))]
             DiscoveryKind::Slurm => "slurm",
+            #[cfg(any(test, feature = "consul"))]
             DiscoveryKind::Consul => "consul",
         }
     }
@@ -40,9 +60,13 @@ impl DiscoveryKind {
     /// The `discovery` value on discovery metrics.
     pub(super) fn metric_label(self) -> &'static str {
         match self {
+            #[cfg(any(test, feature = "kubernetes"))]
             DiscoveryKind::Kubernetes => series::DISCOVERY_KUBERNETES,
+            #[cfg(any(test, feature = "file"))]
             DiscoveryKind::File => series::DISCOVERY_FILE,
+            #[cfg(any(test, feature = "slurm"))]
             DiscoveryKind::Slurm => series::DISCOVERY_SLURM,
+            #[cfg(any(test, feature = "consul"))]
             DiscoveryKind::Consul => series::DISCOVERY_CONSUL,
         }
     }
@@ -61,6 +85,7 @@ pub enum Roles {
 }
 
 impl Roles {
+    #[cfg(any(feature = "consul", feature = "file"))]
     pub(super) fn allows(self, worker_type: WorkerType) -> bool {
         matches!(
             (self, worker_type),
@@ -78,10 +103,12 @@ impl Roles {
 
     /// The type of a record that names none. Regular routing has only one; a
     /// disaggregated record must say which pool it joins.
+    #[cfg(any(feature = "consul", feature = "file"))]
     pub(super) fn default_type(self) -> Option<WorkerType> {
         (self == Self::Regular).then_some(WorkerType::Regular)
     }
 
+    #[cfg(any(feature = "consul", feature = "file"))]
     pub(super) fn name(self) -> &'static str {
         match self {
             Self::Regular => "regular",
@@ -94,6 +121,7 @@ impl Roles {
 /// The endpoint of a server on `host` (a name or an address, IPv6 bracketed
 /// or not) and `port`, with no scheme, so registration probes for HTTP and
 /// gRPC both.
+#[cfg(any(feature = "consul", feature = "slurm"))]
 pub(super) fn endpoint_at(host: &str, port: u16) -> Result<Endpoint, EndpointError> {
     let authority = if host.parse::<Ipv6Addr>().is_ok() {
         format!("[{host}]:{port}")
@@ -211,6 +239,27 @@ fn hash_field(hasher: &mut blake3::Hasher, value: Option<&str>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Each provider's kind stamps its own name on a worker and on a series.
+    #[test]
+    fn each_kind_has_its_own_labels() {
+        let kinds = [
+            DiscoveryKind::Kubernetes,
+            DiscoveryKind::File,
+            DiscoveryKind::Slurm,
+            DiscoveryKind::Consul,
+        ];
+        let labels = kinds.map(|kind| (kind.as_label(), kind.metric_label()));
+        assert_eq!(
+            labels,
+            [
+                ("kubernetes", "kubernetes"),
+                ("file", "file"),
+                ("slurm", "slurm"),
+                ("consul", "consul"),
+            ]
+        );
+    }
 
     fn worker_at(url: &str) -> DiscoveredWorker {
         DiscoveredWorker {

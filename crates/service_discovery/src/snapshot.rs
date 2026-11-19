@@ -2,7 +2,9 @@
 //! reads, shared by the file, Slurm and Consul providers, and what such a read
 //! left out.
 
-use std::{collections::HashSet, fmt::Display};
+#[cfg(any(feature = "consul", feature = "slurm"))]
+use std::collections::HashSet;
+use std::fmt::Display;
 
 use tokio::time::Instant;
 use tracing::{info, warn};
@@ -15,6 +17,7 @@ use super::{
 };
 
 /// A record a read left out of an answer it otherwise applied.
+#[cfg(any(feature = "consul", feature = "slurm"))]
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct Skip {
     /// The `reason` of `smg_discovery_skipped_total`.
@@ -24,6 +27,7 @@ pub(super) struct Skip {
 
 /// What reads leave out: counted on every read, and logged when it first
 /// appears, so a skip that lasts is logged once.
+#[cfg(any(feature = "consul", feature = "slurm"))]
 pub(super) struct SkipLog {
     kind: DiscoveryKind,
     /// How logs name the provider.
@@ -32,6 +36,7 @@ pub(super) struct SkipLog {
     last: HashSet<String>,
 }
 
+#[cfg(any(feature = "consul", feature = "slurm"))]
 impl SkipLog {
     pub(super) fn new(kind: DiscoveryKind, provider: &'static str) -> Self {
         Self {
@@ -103,7 +108,7 @@ impl LastGood {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, any(feature = "consul", feature = "file")))]
     pub(super) fn desired(&self) -> Option<&DesiredState> {
         self.desired.as_ref()
     }
