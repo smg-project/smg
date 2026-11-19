@@ -109,7 +109,8 @@ use rustc_hash::FxHashMap;
 use crate::{
     affinity::WarmRule,
     counts::{Counts, KeptCounts, LentCounts, Slot},
-    framework::{OverloadThresholds, PairPools, PairTable},
+    framework::{Engine, OverloadThresholds, PairPools, PairTable},
+    lease::{Lifecycle, Signal},
     spec::{AppliedSpec, Listed, Pairing},
     store::{
         encoding::{EncodeClasses, EncodeHandoff, EncodeMember},
@@ -952,6 +953,42 @@ impl World {
     #[cfg(feature = "controller")]
     pub(crate) fn samples_decisions(&self) -> bool {
         self.samples_decisions
+    }
+
+    /// Tells this world's engine each rank's report, where a stage of it
+    /// keeps a number of them ([`Lifecycle::keeps_loads`]): what the store
+    /// does before it shows a world, so a decision over the world finds
+    /// the numbers of its own rows. An engine with no such stage says so
+    /// by one word made at its build, and the tell is not entered: by
+    /// count the call alone read 29 instructions a publication.
+    pub(crate) fn tell_kept_loads(&self) {
+        let engine = self.spec.engine();
+        if engine.keeps_loads() {
+            self.tell_loads(engine);
+        }
+    }
+
+    /// Tells each stage of `engine` that keeps a number of the reports
+    /// each rank's report as this world shows it to a decision, with the
+    /// rank's slot and the report's sample instant ([`Signal::Load`]). A
+    /// stage that keeps none is sent nothing. A member of several pools is
+    /// told once a pool, the same word.
+    pub fn tell_loads(&self, engine: &Engine) {
+        engine.tell_loads(|tell| {
+            for (rows, shape) in self.rows.iter().zip(self.derived.pools.iter()) {
+                for (row, &slot) in rows.iter().zip(shape.booked.iter()) {
+                    if let Some(load) = row.load {
+                        tell(&Signal::Load {
+                            worker: row.id,
+                            dp_rank: row.dp_rank,
+                            row: load,
+                            slot,
+                            sampled_at_micros: row.load_sampled_at_micros,
+                        });
+                    }
+                }
+            }
+        });
     }
 
     /// `at` in the rows' clock: microseconds since the store's origin.

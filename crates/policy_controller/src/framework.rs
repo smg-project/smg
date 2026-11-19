@@ -2454,6 +2454,40 @@ pub struct Engine {
     seat_flags: u8,
     explain_sample: u32,
     max_report_age_ms: Option<u64>,
+    /// The stages that keep a number of the reports
+    /// ([`Lifecycle::keeps_loads`]), each by its place: listed once at the
+    /// build, so a publication asks no stage whether it keeps them.
+    keepers: Vec<Keeper>,
+}
+
+/// A stage that keeps a number of the reports, by its place in the engine.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Keeper {
+    /// The scorer at `stage` of the profile at `profile`.
+    Scorer { profile: u16, stage: u16 },
+    /// The picker of the profile at `profile`.
+    Picker { profile: u16 },
+}
+
+impl Keeper {
+    /// The stages of `profiles` that say they keep the reports, in the
+    /// profiles' order, a profile's scorers ahead of its picker.
+    fn of(profiles: &[Profile]) -> Vec<Self> {
+        let mut keepers = Vec::new();
+        // Inclusive ranges: a walk over as many stages as a place can
+        // name ends with the list, where an open range steps past its end.
+        for (at, profile) in (0..=u16::MAX).zip(profiles) {
+            for (stage, weighted) in (0..=u16::MAX).zip(&profile.scorers) {
+                if weighted.scorer.keeps_loads() {
+                    keepers.push(Self::Scorer { profile: at, stage });
+                }
+            }
+            if profile.picker.keeps_loads() {
+                keepers.push(Self::Picker { profile: at });
+            }
+        }
+        keepers
+    }
 }
 
 /// A stage keeps state a decider, so each model decides at its own seat.
@@ -3302,6 +3336,7 @@ impl Engine {
             .iter()
             .map(|profile| RowTests::of(&profile.filters))
             .collect();
+        let keepers = Keeper::of(&profiles);
         // A picker that leaves the placement to its rule has no stages to
         // delegate to: the assignment that places is written beside each
         // binding here, once, so no decision asks. The binding itself keeps
@@ -3338,6 +3373,7 @@ impl Engine {
             seat_flags: u8::from(keeping) * KEEPS_DECIDERS,
             explain_sample: 0,
             max_report_age_ms: None,
+            keepers,
         }
     }
 
@@ -4626,6 +4662,30 @@ impl Engine {
     }
 }
 
+impl Engine {
+    /// Tells a world's reports, each as its host shows it to decisions, to
+    /// every stage that keeps a number of the reports
+    /// ([`Lifecycle::keeps_loads`]), and to no other stage. `reports` is
+    /// run once for each such stage and hands every report to the call it
+    /// is given. An engine with no such stage never runs it: a publication
+    /// that tells nobody walks no row. A plugin that watches signals hears
+    /// of a world's reports no more than it did before a stage kept any.
+    pub(crate) fn tell_loads(&self, reports: impl Fn(&mut dyn FnMut(&Signal))) {
+        for keeper in &self.keepers {
+            match *keeper {
+                Keeper::Scorer { profile, stage } => {
+                    let scorer = &self.profiles[usize::from(profile)].scorers[usize::from(stage)];
+                    reports(&mut |report| scorer.scorer.on_signal(report));
+                }
+                Keeper::Picker { profile } => {
+                    let picker = &self.profiles[usize::from(profile)].picker;
+                    reports(&mut |report| picker.on_signal(report));
+                }
+            }
+        }
+    }
+}
+
 impl Lifecycle for Engine {
     fn on_decision_issued(&self, lease: &Lease, decision: &Decision) {
         for profile in &self.profiles {
@@ -4687,6 +4747,10 @@ impl Lifecycle for Engine {
             }
             profile.picker.on_signal(signal);
         }
+    }
+
+    fn keeps_loads(&self) -> bool {
+        !self.keepers.is_empty()
     }
 
     fn needs_lifecycle(&self) -> bool {
@@ -10786,6 +10850,30 @@ mod tests {
             whole > 10_000 && drawn > 10_000 && emptied > 500 && steered > 500 && aside > 500,
             "{whole} whole, {drawn} drawn, {emptied} emptied, {steered} steered, {aside} aside"
         );
+    }
+
+    /// A profile may hold as many scorers as a place can name: the walk
+    /// that lists the stages that keep reports ends with the list.
+    #[test]
+    fn an_engine_of_as_many_scorers_as_a_place_names_is_built() {
+        let scorers = (0..u16::MAX)
+            .map(|_| Weighted {
+                scorer: Box::new(LeastRequests),
+                weight: 1.0,
+            })
+            .collect();
+        let engine = Engine::new(
+            vec![Profile {
+                name: "wide".into(),
+                filters: Vec::new(),
+                scorers,
+                picker: Box::new(Best),
+            }],
+            vec![single_binding()],
+            1,
+            Needs::default(),
+        );
+        assert!(!engine.keeps_loads(), "no stage of it keeps a report");
     }
 
     #[test]

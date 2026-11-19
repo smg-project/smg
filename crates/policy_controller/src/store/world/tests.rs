@@ -32,6 +32,7 @@ mod encode_classes;
 mod encode_door;
 mod engines;
 mod list_room;
+mod load_call;
 mod membership_call;
 mod mode_and_overload;
 mod owed;
