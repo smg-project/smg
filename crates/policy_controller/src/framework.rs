@@ -4106,7 +4106,8 @@ impl Engine {
     /// A pin at its rule's in-flight cap ([`Self::at_cap`]) puts the request
     /// to the stages again, over every survivor: the cap bounds where a pin
     /// may move, not where a request may go. A placement on `pin` again is
-    /// the pin taken ([`SessionVerdict::Pinned`]). One on another worker
+    /// the pin taken ([`SessionVerdict::Pinned`]), and the decision names no
+    /// other target, as where a pin is under the cap. One on another worker
     /// under the cap is marked [`SessionVerdict::Respill`], and its commit
     /// fronts that worker, whichever of its targets it lands on: a
     /// respill's alternates are the workers under the cap alone. One on
@@ -4146,15 +4147,26 @@ impl Engine {
                 Some(id) if under_the_cap(id) => SessionVerdict::Respill,
                 _ => SessionVerdict::None,
             };
-            if pick.session_verdict == SessionVerdict::Respill {
-                // A respill's commit fronts the worker it lands on, the first
-                // target or an alternate behind it: no worker at the cap
-                // stands among its targets.
-                let placed = pick.targets;
-                pick.targets.clear();
-                for target in placed.iter().filter(|target| under_the_cap(target.id)) {
-                    pick.targets.push(*target);
+            // A commit moves the pins by the decision's verdict, whichever of
+            // its targets it lands on. So a respill names the workers under
+            // the cap alone, and the pin taken again is the decision's one
+            // target, as a pin under the cap is. A placement with no verdict
+            // keeps its alternates: its commit moves no pin.
+            let placed = pick.targets;
+            match pick.session_verdict {
+                SessionVerdict::Respill => {
+                    pick.targets.clear();
+                    for target in placed.iter().filter(|target| under_the_cap(target.id)) {
+                        pick.targets.push(*target);
+                    }
                 }
+                SessionVerdict::Pinned => {
+                    pick.targets.clear();
+                    if let Some(first) = placed.first() {
+                        pick.targets.push(*first);
+                    }
+                }
+                _ => {}
             }
         }
         Some(decision)
@@ -8534,6 +8546,48 @@ mod tests {
             3,
             "the pin moved under the cap"
         );
+    }
+
+    /// The pin taken again at the cap is the decision's one target, as a pin
+    /// under the cap is. A dispatch on an alternate would move the pin by
+    /// the key's recovery, onto a worker at the cap as onto any other.
+    #[test]
+    fn the_pin_taken_again_at_the_cap_names_no_alternate() {
+        let engine = session_engine(SESSIONS);
+        let mut pool = vec![
+            candidate(0, 0),
+            candidate(1, 1),
+            candidate(2, 2),
+            candidate(3, 3),
+        ];
+        assert_eq!(place_keyed(&engine, &pool, 7, 10).position, 0);
+        // Every worker at the cap, the pin with the fewest requests: the
+        // stages pick it again.
+        for c in &mut pool {
+            c.session_in_flight = 2;
+        }
+        let decision = decide_keyed(&engine, &pool, 7, 20);
+        let pick = decision.pick().expect("the stages place");
+        assert_eq!(pick.session_verdict, SessionVerdict::Pinned);
+        // The dispatch of the decision's last target, under its verdict.
+        let last = *pick.targets.as_slice().last().expect("a target");
+        let lease = Lease {
+            session: session(7),
+            session_verdict: pick.session_verdict,
+            issued_micros: 20,
+            ..Lease::default()
+        };
+        engine.on_dispatched(&lease, &last, Side::Single, 0);
+        for c in &mut pool {
+            c.session_in_flight = 0;
+        }
+        assert_eq!(
+            place_keyed(&engine, &pool, 7, 30).position,
+            0,
+            "the pin stayed"
+        );
+        let placed: Vec<u32> = pick.targets.iter().map(|t| t.position).collect();
+        assert_eq!(placed, [0], "the pin alone");
     }
 
     /// A key with no routable pin is placed by the rule's assignment: the
