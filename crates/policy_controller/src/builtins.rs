@@ -1191,7 +1191,7 @@ impl LeastLoad {
     /// KV-pressure barrier over the running requests' share of the cache (a
     /// full but reclaimable prefix cache is no pressure). Runs after the load
     /// is gone.
-    fn reported_cost(&self, r: LoadRow, credit_work: f32, nominal: f32) -> f32 {
+    fn reported_cost(&self, r: LoadRow, credit_work: f32, drain: f32) -> f32 {
         let mean = self.mean_prefill_tokens as f32;
         let queued = if r.waiting_uncached_tokens > 0 {
             r.waiting_uncached_tokens as f32
@@ -1199,11 +1199,6 @@ impl LeastLoad {
             r.queued as f32 * mean
         };
         let running = r.running as f32 * mean;
-        let drain = if r.live_rate > 0 {
-            r.live_rate as f32
-        } else {
-            nominal
-        };
         // The active share, at the legacy formula's clamp: a saturated row
         // prices its barrier at 999 times the weight, not a million.
         let k = r.active_kv().clamp(0.0, 0.999);
@@ -1269,6 +1264,8 @@ impl LeastLoad {
 
     /// The mean rate of the kept rows that report one, which a report
     /// without a rate drains at: the default where none reports one.
+    #[cold]
+    #[inline(never)]
     fn mean_rate(
         &self,
         candidates: &[Candidate],
@@ -1288,18 +1285,17 @@ impl LeastLoad {
     }
 
     /// The costs of `rows`, spread over their span, and their band: the one
-    /// body behind the stage's two entries, entered where each is. A row
-    /// costs what it costs among the kept rows where `nominal` is their
-    /// mean rate ([`Self::mean_rate`]).
+    /// body behind the stage's two entries. A row that needs a fallback
+    /// drains at the mean of the kept rows' rates ([`Self::mean_rate`]).
     #[inline(always)]
     fn costs(
         &self,
         facts: &RequestFacts<'_>,
         candidates: &[Candidate],
         rows: &[u32],
-        nominal: f32,
+        kept: &[u32],
         out: &mut [f32],
-        load: impl Fn(&Candidate) -> Option<LoadRow>,
+        load: impl Fn(&Candidate) -> Option<LoadRow> + Copy,
     ) -> TieBand {
         // One load of the tally: each reporting row's held work is read
         // (released first when its report's sample reaches a dispatch) and
@@ -1326,13 +1322,26 @@ impl LeastLoad {
                 }
             });
         }
+        let mut rate = None;
+        let mut nominal = || *rate.get_or_insert_with(|| self.mean_rate(candidates, kept, load));
         for (slot, &i) in out.iter_mut().zip(rows) {
             if let Some(r) = load(&candidates[i as usize]) {
-                *slot = self.reported_cost(r, *slot, nominal);
+                let drain = if r.live_rate > 0 {
+                    r.live_rate as f32
+                } else {
+                    nominal()
+                };
+                *slot = self.reported_cost(r, *slot, drain);
             }
         }
         if reporting < rows.len() {
-            self.cost_pending(facts, candidates, rows, out, nominal, reporting > 0);
+            let fleet_has_loads = reporting > 0;
+            let rate = if fleet_has_loads {
+                nominal()
+            } else {
+                self.default_throughput
+            };
+            self.cost_pending(facts, candidates, rows, out, rate, fleet_has_loads);
         }
         // The band of a microsecond of expected wait on the normalized scale:
         // exact for one scorer, additive under several.
@@ -1431,14 +1440,7 @@ impl ReadsLoad for LeastLoad {
         out: &mut [f32],
         load: impl Fn(&Candidate) -> Option<LoadRow> + Copy,
     ) -> TieBand {
-        self.costs(
-            facts,
-            candidates,
-            kept,
-            self.mean_rate(candidates, kept, load),
-            out,
-            load,
-        )
+        self.costs(facts, candidates, kept, kept, out, load)
     }
 
     /// As [`Self::score`], with one word more, of the rows asked. A row
@@ -1467,22 +1469,13 @@ impl ReadsLoad for LeastLoad {
         out: &mut [f32],
         load: impl Fn(&Candidate) -> Option<LoadRow> + Copy,
     ) -> (TieBand, Front) {
-        let mut rated = true;
         for &i in asked {
-            let Some(report) = load(&candidates[i as usize]) else {
+            if load(&candidates[i as usize]).is_none() {
                 return (TieBand::NORMALIZED, Front::Whole);
-            };
-            rated &= report.live_rate > 0;
+            }
         }
-        // The mean is read by a report without a rate alone: where each row
-        // asked holds a rate none is folded, and no cost reads the default.
-        let nominal = if rated {
-            self.default_throughput
-        } else {
-            self.mean_rate(candidates, kept, load)
-        };
         (
-            self.costs(facts, candidates, asked, nominal, out, load),
+            self.costs(facts, candidates, asked, kept, out, load),
             Front::Unsaid,
         )
     }
