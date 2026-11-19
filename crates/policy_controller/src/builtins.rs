@@ -807,6 +807,14 @@ impl Credits {
 /// its profile names none.
 pub const DEFAULT_MEAN_PREFILL_TOKENS: u32 = 1024;
 
+/// The weight of the KV-pressure barrier in a load scorer's expected wait
+/// when its profile names none.
+pub const DEFAULT_KV_PRESSURE_WEIGHT: f32 = 0.15;
+
+/// The drain rate, in tokens per second, a load scorer assumes when no
+/// candidate reports a live one and its profile names none.
+pub const DEFAULT_THROUGHPUT: f32 = 2000.0;
+
 /// The expected wait: token-work over drain rate plus a convex KV-pressure
 /// barrier, the since-report dispatch credit water-filling arrivals between
 /// reports. The host's in-flight count floors the report.

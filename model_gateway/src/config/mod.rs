@@ -1,5 +1,6 @@
 pub(crate) mod bounds;
 pub mod builder;
+mod policy_document;
 pub(crate) mod redacted;
 pub mod secrets;
 #[cfg(test)]
@@ -9,6 +10,7 @@ pub(crate) mod validation;
 mod worker_settings;
 
 pub use builder::*;
+pub use policy_document::PolicyDocumentError;
 use smg_service_discovery::DiscoveryConfigError;
 pub use types::*;
 pub(crate) use validation::parse_listen_ip;
