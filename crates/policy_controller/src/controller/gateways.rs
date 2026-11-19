@@ -1610,14 +1610,14 @@ pub(crate) mod tests {
     /// The store reads no kind: the note says which ends hold. Every kind
     /// but the doubt of liveness holds, a number this build has no name for
     /// among them, and the hold shown is the latest of their ends. A worker
-    /// reads to its gateway as behind an open breaker while a hold stands,
-    /// and as doubted from then to its veto's end.
+    /// reads to its gateway as masked to its veto's end, and as behind an
+    /// open breaker too while a hold stands.
     #[test]
     fn the_store_is_shown_the_hold_among_a_workers_kinds() {
         let (_elector, store, gateways, t0) = leading(GRACE);
         let w = worker(&store, "http://a:8000");
         let seat = welcomed(&gateways, A, "gateway-a", TERM, t0);
-        let (held, doubted, clear) = ((true, false), (false, true), (false, false));
+        let (held, doubted, clear) = ((true, true), (false, true), (false, false));
         // A doubt of liveness alone holds nothing.
         assert_eq!(seat.veto(w, LIVENESS, Some(t0 + 9 * S), t0), Vetoed::Shown);
         assert_eq!(bits(&store, A, w, t0), doubted);
@@ -1658,7 +1658,7 @@ pub(crate) mod tests {
             (doubted, LIVENESS, t0 + 9 * S),
         ];
         assert_eq!(seat.restore(&list, t0), 3);
-        assert_eq!(bits(&store, A, held, t0), (true, false));
+        assert_eq!(bits(&store, A, held, t0), (true, true));
         assert_eq!(bits(&store, A, held, t0 + 5 * S), (false, true));
         assert_eq!(bits(&store, A, doubted, t0), (false, true));
         assert_eq!(bits(&store, A, doubted, t0 + 9 * S), (false, false));

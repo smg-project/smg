@@ -1095,8 +1095,8 @@ impl World {
     /// with what is the decision's own written over it: its position in the slice, its
     /// report's age at `ask.now`, the bit of a veto of the asking gateway
     /// that is in this publication and stands at that instant, and the
-    /// session bit on the pinned worker. A veto's bit is the breaker bit
-    /// while its hold stands and the stalled bit from then on: the store
+    /// session bit on the pinned worker. A veto writes the stalled bit,
+    /// and the breaker bit beside it while its hold stands: the store
     /// keeps no kind, and the hold says which veto no rule lifts. A veto
     /// past its end masks nothing and costs the build one
     /// compare until a window's publication drops it; a store that
@@ -1223,7 +1223,7 @@ impl World {
     /// that stand at `ask.now` are handed as positions, in order, read from
     /// its own run alone and by the build's rule: a veto past its end masks
     /// nothing. The rows of them a hold stands on are handed once more,
-    /// apart: where the build writes the breaker bit, the view names the
+    /// apart: where the build writes a row both bits, the view names the
     /// row twice. The pinned worker's row is handed as one more than its
     /// position. Under `ask.affinity` the column is filled as the build
     /// fills it. A row's report age stays what the report carried when it
@@ -1327,8 +1327,8 @@ impl World {
     ///
     /// A view under no veto has no held row and is answered here at one
     /// test: its pool's vetoes are not read again. Rows written for a
-    /// decision carry the breaker bit where a hold stands, and their
-    /// view's mask is empty.
+    /// decision carry the breaker bit beside the stalled one where a hold
+    /// stands, and their view's mask is empty.
     #[inline]
     pub fn held<'a>(&self, view: &PoolView<'_>, ask: &Ask, rows: &'a mut Vec<u32>) -> &'a [u32] {
         if view.stalled.is_empty() {
@@ -1521,9 +1521,9 @@ impl World {
     }
 }
 
-/// Write a veto's bit on each row of `rows` a veto of `run` masks at `now`,
-/// and say whether one did: the breaker bit while the veto's hold stands,
-/// the stalled bit from then on.
+/// Write a veto's bits on each row of `rows` a veto of `run` masks at
+/// `now`, and say whether one did: the stalled bit, and the breaker bit
+/// beside it while the veto's hold stands.
 ///
 /// A pool every gateway dials whole is copied whole (`whole`): a veto's row
 /// is its position. Another gateway's host-local rows are left out, so
@@ -1544,13 +1544,15 @@ fn mask(run: &GatewayRun, now: Instant, whole: bool, rows: &mut [Candidate]) -> 
             row_of_id(rows, veto.id)
         };
         if let Some(row) = row {
-            // A hold refuses execution on the row as an open breaker does,
-            // and no rule lifts it. A veto with no hold, or past its
-            // hold's end, is a doubt.
+            // Every standing veto masks its row, as the mask beside lent
+            // rows names it: a stage that reads the stalled bit refuses
+            // the row whichever way its host handed it. A hold says more,
+            // by the breaker bit: it refuses execution as an open breaker
+            // does, and no rule lifts it. A veto with no hold, or past its
+            // hold's end, is a doubt alone.
+            row.health.stalled = true;
             if veto.ends.held_at(now) {
                 row.health.breaker_open = true;
-            } else {
-                row.health.stalled = true;
             }
             masked = true;
         }

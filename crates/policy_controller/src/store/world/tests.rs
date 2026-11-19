@@ -139,8 +139,8 @@ fn lent_agrees(store: &MemoryStore, ask: &Ask) {
         }
         assert!(view.stalled.is_sorted(), "the mask is in the rows' order");
         // The rows of the mask a hold stands on, asked apart. A held row is
-        // a row of the mask. The build writes it the breaker bit, and a row
-        // of the mask no hold stands on the stalled bit.
+        // a row of the mask. The build writes every row of the mask the
+        // stalled bit, and a held one the breaker bit beside it.
         let mut buffer = Vec::new();
         let holds = world.held(&view, ask, &mut buffer);
         assert!(holds.is_sorted(), "the held rows are in the rows' order");
@@ -149,10 +149,9 @@ fn lent_agrees(store: &MemoryStore, ask: &Ask) {
         assert!(holds.iter().all(masked), "a held row is masked");
         for &position in view.stalled {
             let health = &mut rows[position as usize].health;
+            health.stalled = true;
             if held(&position) {
                 health.breaker_open = true;
-            } else {
-                health.stalled = true;
             }
         }
         if let Some(at) = view.pinned_at.checked_sub(1) {
@@ -172,24 +171,9 @@ fn running(store: &MemoryStore, now: Instant) -> Option<u32> {
 }
 
 /// The workers of the pool that `gateway`'s vetoes mask at `now`, by id: a
-/// build writes a veto's row the breaker bit while its hold stands and the
-/// stalled bit from then on.
+/// build writes a veto's row the stalled bit, and the breaker bit beside
+/// it while its hold stands.
 fn stalled(store: &MemoryStore, gateway: GatewayId, now: Instant) -> Vec<WorkerId> {
-    let asked = Ask {
-        gateway,
-        ..ask(now)
-    };
-    view(store, &asked)
-        .0
-        .iter()
-        .filter(|row| row.health.stalled || row.health.breaker_open)
-        .map(|row| row.id)
-        .collect()
-}
-
-/// The workers of the pool `gateway` doubts at `now`, by id: the rows a
-/// build writes the stalled bit on.
-fn doubted(store: &MemoryStore, gateway: GatewayId, now: Instant) -> Vec<WorkerId> {
     let asked = Ask {
         gateway,
         ..ask(now)
@@ -202,8 +186,24 @@ fn doubted(store: &MemoryStore, gateway: GatewayId, now: Instant) -> Vec<WorkerI
         .collect()
 }
 
+/// The workers of the pool `gateway` doubts at `now`, by id: the rows a
+/// build writes the stalled bit alone on.
+fn doubted(store: &MemoryStore, gateway: GatewayId, now: Instant) -> Vec<WorkerId> {
+    let asked = Ask {
+        gateway,
+        ..ask(now)
+    };
+    view(store, &asked)
+        .0
+        .iter()
+        .filter(|row| row.health.stalled && !row.health.breaker_open)
+        .map(|row| row.id)
+        .collect()
+}
+
 /// The workers of the pool a hold of `gateway` stands on at `now`, by id:
-/// the rows a build writes the breaker bit on.
+/// the rows a build writes the breaker bit on, each beside the stalled
+/// bit.
 fn held(store: &MemoryStore, gateway: GatewayId, now: Instant) -> Vec<WorkerId> {
     let asked = Ask {
         gateway,
@@ -213,6 +213,7 @@ fn held(store: &MemoryStore, gateway: GatewayId, now: Instant) -> Vec<WorkerId> 
         .0
         .iter()
         .filter(|row| row.health.breaker_open)
+        .inspect(|row| assert!(row.health.stalled, "a held row is masked"))
         .map(|row| row.id)
         .collect()
 }

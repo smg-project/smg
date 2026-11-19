@@ -303,9 +303,10 @@ fn veto_ran(profile: &Profile, veto: &str, emptied_by: &str) -> bool {
 /// shed as saturated. Nothing harder is lifted: a worker that is not ready,
 /// behind an open breaker or draining stays refused, and a doubt on such a
 /// worker opens no pass. So does a row a hold of the host stands on,
-/// whichever way the host says it: by the breaker bit on a row it wrote, or
-/// among its held rows beside lent ones ([`Constraints::held`]), which the
-/// lifted pass keeps masked.
+/// whichever way the host says it: by the breaker bit beside the stalled
+/// one on a row it wrote, or among its held rows beside lent ones
+/// ([`Constraints::held`]). The lifted pass leaves such a row both bits and
+/// keeps the held rows masked, so a stage reads it as vetoed in every pass.
 ///
 /// A set put to no rule is shed where it emptied ([`AllVetoed::Unasked`]):
 /// each side of a pair, and the rule's own passes, so the rule is asked
@@ -463,18 +464,21 @@ fn doubted(
 }
 
 /// The rows as they read with no doubt, into `rows`: each row of
-/// `candidates` with its liveness bit cleared, in the same order, so a
-/// stage handed a row reads the lift whatever it reads of the row. The pass
-/// that lifts the liveness veto is shown these where a row's own bit is
-/// set. Rows the host's mask alone doubts are read as they are, with the
-/// mask cut to the rows a hold stands on. A stage that answers from its
-/// own scope answers as it did: the scope was opened over the decision's
-/// rows. One pool of rows a scratch, sized at the first pass that needs it.
+/// `candidates` with its stalled bit cleared where its breaker bit is
+/// clear, in the same order, so a stage handed a row reads the lift
+/// whatever it reads of the row. A row that carries both bits is one a hold
+/// of the host stands on, where the host wrote its rows. It keeps both, as
+/// a held row stays in the mask beside lent rows. The pass that lifts the
+/// liveness veto is shown these where a row's own bit is set. Rows the
+/// host's mask alone doubts are read as they are, with the mask cut to the
+/// rows a hold stands on. A stage that answers from its own scope answers
+/// as it did: the scope was opened over the decision's rows. One pool of
+/// rows a scratch, sized at the first pass that needs it.
 fn undoubted(candidates: &[Candidate], rows: &mut Vec<Candidate>) {
     rows.clear();
     rows.extend(candidates.iter().map(|row| Candidate {
         health: Health {
-            stalled: false,
+            stalled: row.health.stalled && row.health.breaker_open,
             ..row.health
         },
         ..*row
@@ -3466,7 +3470,7 @@ mod tests {
     /// row is shed at the health stage under either word of the binding, as
     /// with no tier. One doubted row among held ones takes the request
     /// whatever it holds. So it does where the host wrote its rows: there a
-    /// held row carries the breaker bit.
+    /// held row carries the breaker bit beside the stalled one.
     #[test]
     fn a_row_the_host_holds_stays_refused_through_the_liveness_tier() {
         let pool = [free(0, 0), free(1, 1), free(2, 9), free(3, 2)];
@@ -3487,8 +3491,8 @@ mod tests {
         };
         let mut written = pool;
         for row in &mut written {
+            row.health.stalled = true;
             row.health.breaker_open = row.position != 2;
-            row.health.stalled = row.position == 2;
         }
         for shed in [false, true] {
             let engine = engine_of("least_load", shed);
@@ -3501,6 +3505,60 @@ mod tests {
                 assert_eq!(order(&one), vec![2], "shed {shed}");
                 assert_eq!(one.trace().lifted, Lifted::Liveness);
             }
+        }
+    }
+
+    /// Keeps every row, and writes down what a stage that knows no lift
+    /// reads of each: whether the row's stalled bit or the host's mask
+    /// refuses it.
+    #[derive(Debug)]
+    struct Shown(Arc<Mutex<Vec<bool>>>);
+    impl Filter for Shown {
+        fn name(&self) -> &'static str {
+            "shown"
+        }
+        fn keep(&self, _: &RequestFacts<'_>, row: &Candidate, cx: &Constraints<'_>) -> bool {
+            let mut shown = self.0.lock().expect("no reader panics");
+            shown.push(row.health.stalled || cx.masks(row.position));
+            true
+        }
+    }
+
+    /// A stage of a host's own that reads the stalled bit and the mask, and
+    /// knows no lift, refuses a held row in every pass: the first, and the
+    /// lifted one, where a doubted row reads clear. Rows the host wrote and
+    /// rows it lent beside its lists show the stage the same.
+    #[test]
+    fn a_held_row_reads_as_vetoed_to_a_stage_in_every_pass() {
+        let shown = Arc::new(Mutex::new(Vec::new()));
+        let stage: Box<dyn Filter> = Box::new(Shown(Arc::clone(&shown)));
+        let (engine, _) = counted_among(|_| vec![stage, Box::new(Healthy)]);
+        let lent = [free(0, 0), free(1, 1)];
+        let mut written = lent;
+        written[0].health.stalled = true;
+        written[0].health.breaker_open = true;
+        written[1].health.stalled = true;
+        let hosts: [(&[Candidate], &[u32], &[u32]); 2] =
+            [(&lent, &[0, 1], &[0]), (&written, &[], &[])];
+        for (pool, stalled, held) in hosts {
+            let masked = Constraints {
+                stalled,
+                held,
+                ..Constraints::default()
+            };
+            let mut scratch = Scratch::new();
+            let decision = engine.decide(
+                &facts(1),
+                &PoolFacts::default(),
+                pool,
+                &masked,
+                &mut scratch,
+            );
+            assert_eq!(order(&decision), vec![1]);
+            assert_eq!(decision.trace().lifted, Lifted::Liveness);
+            // Row by row: the first pass, then the lifted one.
+            let passes = std::mem::take(&mut *shown.lock().expect("no reader panics"));
+            assert_eq!(passes, [true, true, true, false]);
         }
     }
 
