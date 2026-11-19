@@ -5,11 +5,14 @@
     run.py ids --corpus DIR        every column's token ids on the parity strings, against `smg`
     run.py run --corpus DIR --cores 2,4,6,8
                                    the cells: one fresh process per column and cell, pinned to a core
+    run.py collect --release 1.16.0 --csv DIR
+                                   the three csv files that tables.py reads, from the raw lines
 
 README.md beside this file says what a cell measures. Standard library only.
 """
 
 import argparse
+import csv
 import hashlib
 import json
 import os
@@ -399,6 +402,145 @@ def ids(args):
     (args.output / "ids-summary.txt").write_text("\n".join(lines) + "\n")
 
 
+ENCODE_HEAD = "family,class,mode,arm,round,rc,ns_per_token_p50,reps,tokens,load_ms,backend"
+MISC_HEAD = (
+    "family,cell,arm,round,rc,full_ns_per_token_p50,inc_ns_per_token_p50,step_ns_p50,"
+    "first_delta_ns_p50,stream_step_ns_p50,stream_step_ns_p99,stream_first_delta_wall_ns_p50,"
+    "stream_first_delta_own_ns_p50,batch_tokens,batch_loop_tok_per_s_p50,"
+    "batch_api_tok_per_s_p50,backend"
+)
+MEMORY_HEAD = (
+    "family,arm,load_ms,rss_kb_before_load,rss_kb_after_load,hwm_kb_after_500k,hwm_kb_after_1m,"
+    "allocs_2k_encode,growth_kb_per_thread_shared,growth_kb_per_thread_own,backend"
+)
+# What names a cell of the decode group: the key of its size in the cell's line, its argument.
+SIZED = {"dec": ("len", "--len"), "stream": ("streams", "--streams"), "batch": ("n", "--n")}
+
+
+def p50(out, name):
+    value = out.get(name)
+    return value.get("p50") if isinstance(value, dict) else None
+
+
+def shown(value, form):
+    return "" if value is None else format(value, form)
+
+
+def option(arguments, name):
+    return arguments[arguments.index(name) + 1] if name in arguments else None
+
+
+def write_csv(path, head, rows):
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle, lineterminator="\n")
+        writer.writerow(head.split(","))
+        writer.writerows(rows)
+    print(f"{path}: {len(rows)} lines")
+
+
+def collect(args):
+    """The three csv files that tables.py reads, from the raw lines of `run`: a line per process.
+
+    A process that failed keeps its line with an empty figure. `--release` names the column
+    `smg` (`smg-1.16.0`): the name tables.py takes as `--new`.
+    """
+    raw = args.output / "raw"
+    target = args.csv or args.output
+    target.mkdir(parents=True, exist_ok=True)
+    ours = f"smg-{args.release}" if args.release else "smg"
+
+    def column(ctx):
+        return ours if ctx["column"] == "smg" else ctx["column"]
+
+    def backend(out):
+        # One csv field without a comma; an error text inside it is cut short.
+        return (out.get("backend") or "").replace(",", ";")[:110]
+
+    rows = []
+    for record in records(raw / "encode.jsonl"):
+        ctx, out = record["ctx"], record["out"] or {}
+        figure = p50(out, "ns_per_tok") if ctx["rc"] == 0 else None
+        rows.append(
+            [
+                ctx["family"],
+                out.get("class") or option(ctx["args"], "--class"),
+                out.get("mode") or option(ctx["args"], "--mode"),
+                column(ctx),
+                ctx["round"],
+                ctx["rc"],
+                shown(figure, ".3f"),
+                shown(out.get("reps"), ""),
+                shown(out.get("total_tokens"), ".0f"),
+                shown(out.get("load_ms"), ".1f"),
+                backend(out),
+            ]
+        )
+    order = {name: index for index, name in enumerate(CLASSES)}
+    rows.sort(key=lambda row: (row[0], order.get(row[1], len(order)), row[2] or "", *row[3:5]))
+    write_csv(target / "encode-rounds.csv", ENCODE_HEAD, rows)
+
+    rows = []
+    for record in records(raw / "decode.jsonl"):
+        ctx, out = record["ctx"], record["out"] or {}
+        kind = out.get("cell") or ctx["args"][0]
+        if kind not in SIZED:
+            continue
+        key, flag = SIZED[kind]
+        figures = [None] * 11
+        if ctx["rc"] == 0:
+            step = out.get("step_ns") or {}
+            figures = [
+                p50(out, "full_ns_per_tok"),
+                p50(out, "inc_ns_per_tok"),
+                None if kind == "stream" else step.get("p50"),
+                p50(out, "first_delta_ns"),
+                step.get("p50") if kind == "stream" else None,
+                step.get("p99") if kind == "stream" else None,
+                p50(out, "first_delta_wall_ns"),
+                p50(out, "first_delta_own_ns"),
+                out.get("tokens"),
+                p50(out, "loop_tok_per_s"),
+                p50(out, "api_tok_per_s") if out.get("api") else None,
+            ]
+        cell = f"{kind}{out.get(key) or option(ctx['args'], flag)}"
+        head = [ctx["family"], cell, column(ctx), ctx["round"], ctx["rc"]]
+        rows.append(head + [shown(value, ".3f") for value in figures] + [backend(out)])
+    rows.sort(key=lambda row: row[:4])
+    write_csv(target / "misc-rounds.csv", MISC_HEAD, rows)
+
+    found = {}
+    for record in records(raw / "memory.jsonl"):
+        ctx, out = record["ctx"], record["out"] or {}
+        if ctx["rc"] == 0 and out.get("cell") in ("info", "mem"):
+            found.setdefault((ctx["family"], column(ctx)), {})[out["cell"]] = out
+    # This release first, then earlier releases, then the references in the order of COLUMNS.
+    references = [name for name in COLUMNS if name != "smg"]
+    earlier = sorted({name for _, name in found} - {ours} - set(references))
+    rows = []
+    for model in MODELS:
+        for name in [ours, *earlier, *references]:
+            cells = found.get((model["name"], name))
+            if not cells:
+                continue
+            info, mem = cells.get("info", {}), cells.get("mem", {})
+            rows.append(
+                [
+                    model["name"],
+                    name,
+                    shown(info.get("load_ms"), ".1f"),
+                    shown(info.get("rss_kb_before"), ".0f"),
+                    shown(info.get("rss_kb_after"), ".0f"),
+                    shown(mem.get("hwm_kb_after_500k"), ".0f"),
+                    shown(mem.get("hwm_kb_after_1m"), ".0f"),
+                    shown(mem.get("allocs_2k_encode"), ".0f"),
+                    shown(mem.get("growth_kb_per_thread_shared"), ".0f"),
+                    shown(mem.get("growth_kb_per_thread_own"), ".0f"),
+                    backend(info or mem),
+                ]
+            )
+    write_csv(target / "load-memory.csv", MEMORY_HEAD, rows)
+
+
 def main():
     def names(text):
         return [name for name in text.split(",") if name]
@@ -406,10 +548,8 @@ def main():
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument("action", choices=["prepare", "ids", "run"])
-    parser.add_argument(
-        "--corpus", type=Path, required=True, help="perf/<class>/*.txt, parity.jsonl"
-    )
+    parser.add_argument("action", choices=["prepare", "ids", "run", "collect"])
+    parser.add_argument("--corpus", type=Path, help="perf/<class>/*.txt, parity.jsonl")
     parser.add_argument("--models", type=Path, default=Path("/tmp/smg-tokenizer-models"))
     parser.add_argument("--output", type=Path, default=Path("/tmp/smg-compare-results"))
     parser.add_argument("--columns", type=names, default=[], help="a subset, comma separated")
@@ -441,15 +581,22 @@ def main():
     )
     parser.add_argument("--reps", type=int, default=30)
     parser.add_argument("--slow-reps", type=int, default=10)
+    parser.add_argument(
+        "--csv", type=Path, help="collect: where the csv files go (default --output)"
+    )
+    parser.add_argument("--release", help="collect: the column smg is written as smg-RELEASE")
     args = parser.parse_args()
     if args.action == "run" and not args.cores:
         parser.error("run needs --cores")
+    if args.action != "collect" and not args.corpus:
+        parser.error(f"{args.action} needs --corpus")
     if args.edge:
         args.cells = ["encode"]
-    for name in ("corpus", "models", "output"):
-        setattr(args, name, getattr(args, name).resolve())
+    for name in ("corpus", "models", "output", "csv"):
+        if getattr(args, name):
+            setattr(args, name, getattr(args, name).resolve())
     args.output.mkdir(parents=True, exist_ok=True)
-    {"prepare": prepare, "ids": ids, "run": run}[args.action](args)
+    {"prepare": prepare, "ids": ids, "run": run, "collect": collect}[args.action](args)
 
 
 if __name__ == "__main__":

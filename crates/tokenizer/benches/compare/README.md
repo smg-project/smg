@@ -28,6 +28,8 @@ python crates/tokenizer/benches/compare/run.py prepare --corpus <corpus> --previ
 python crates/tokenizer/benches/compare/run.py ids --corpus <corpus>
 python crates/tokenizer/benches/compare/run.py run --corpus <corpus> --cores 2,4,6,8
 python crates/tokenizer/benches/compare/run.py run --corpus <corpus> --cores 2,4,6,8 --rounds 5 --edge 0.10
+python crates/tokenizer/benches/compare/run.py collect --release 1.16.0 --csv crates/tokenizer/benches/compare
+python crates/tokenizer/benches/compare/tables.py --readme crates/tokenizer/README.md
 ```
 
 `prepare` downloads the tokenizer files of the sixteen checkpoints in `models.json` at their pinned
@@ -48,6 +50,11 @@ cell's own line. A process that failed has a non-zero `rc`. The `v1` column on a
 pipeline declines runs this crate's own encoder: its `backend` string then has no `hf:v1`, and that cell
 is no reference. The last command above is the edge pass: five more rounds on the encode cells in which
 `smg` stands within 10 % of its best reference, where three rounds can leave the side open.
+
+`collect` writes the three csv files that `tables.py` reads from those raw lines, one line per process:
+`encode-rounds.csv` (the p50 of nanoseconds per token), `misc-rounds.csv` (decode, streams and batch) and
+`load-memory.csv`. A process that failed keeps its line with an empty figure. `--release` names the `smg`
+column (`smg-1.16.0`) and `--csv` the directory, here the one `tables.py` reads.
 
 Run on an otherwise idle machine, each stream on a physical core whose sibling is idle; do not compile
 or run other benchmarks at the same time. Two builds of one source differ by up to about 20 % on a cell
@@ -111,3 +118,9 @@ pools until a text reaches its class's token count.
   implementation as its adapter's lock pins it.
 - `corpus.json`: the corpus record above.
 - `run.py`: the runner.
+- `encode-rounds.csv`, `misc-rounds.csv`, `load-memory.csv`: the figures of the 1.16.0 run, one line per process
+  (family, cell, column, round), written by `run.py collect` from that run's raw lines; `environment.json` says
+  what it ran on.
+- `tables.py`: writes [RESULTS.md](RESULTS.md) from those three files and, with `--readme`, the tables and the reading
+  list of the crate README. A figure is the median over a cell's rounds; the `v1` column has none where its
+  `backend` string has no `hf:v1`.
