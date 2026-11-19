@@ -43,13 +43,29 @@
 //!   carried none they name no lease, which a session takes. A stream
 //!   hands the session its reports sixteen at a time: a hand-over wakes
 //!   the session's thread, and one a request would time the wake.
+//! - `policy_decide_stream/door/64/<callers>`: decisions a second asked in
+//!   process at a host's door (`Door::decide`) by 1, 8 and 64 callers at once
+//!   on one model over 64 members. There is no wire, no controller and no
+//!   deciding thread: each caller is a thread that decides on itself and
+//!   reports the pick's lease released at once (`Door::report`). Callers of
+//!   one model decide one at a time, so the row reads what the door's turn
+//!   costs its callers. A row asks the same count of decisions whatever its
+//!   callers, shared among them, and its rate is the callers' measured
+//!   decisions, begun together, over the one interval they share. It prints
+//!   the callers' CPU (`callers_us`) and the switches they asked for a
+//!   decision and, for one caller, its cycles and instructions a decision,
+//!   counted in a pass apart whose rate is not read. A caller sits on a core
+//!   of its own where the process was given as many; a row with more callers
+//!   than cores prints `cores=none`.
 //! - `policy_decide_stream/count/<mode>/<members>`, one cell a run, named by
 //!   `DECIDE_STREAM_COUNT=<mode>:<members>:<decisions>`: the whole process's
 //!   allocator calls a decision, `in_process` (the store's deciding door, a
 //!   view as the row's decider reads it and the engine's decide on this
 //!   thread), `commit` (the same with the pick's lease issued at the
 //!   store's leases door and ended there, as a host that embeds the engine
-//!   commits a decision), `stream` (the decision asked over one stream,
+//!   commits a decision), `door` (a decision asked at a host's door on this
+//!   thread and its lease reported released at once, `Door::decide` and
+//!   `Door::report`), `stream` (the decision asked over one stream,
 //!   one at a time so every decision wakes the same threads whatever its
 //!   fleet, the client's own calls included) or `pair` (the `stream` cell
 //!   under a pair plan, over that many prefills and as many decodes: each
@@ -110,9 +126,9 @@
 //! files no lease answers with none: its rows run the same, and every wire
 //! row prints the leases its measured picks carried (`leases`). A row
 //! whose picks carry a lease for some and none for others stops the bench.
-//! `DECIDE_STREAM_ROWS=round_trip`, `offered`, `rate` or `gateway` runs one
-//! kind alone, and `--test` runs every row for a moment. A run with no
-//! `--bench` is a test too, as criterion reads one: `cargo bench` passes
+//! `DECIDE_STREAM_ROWS=round_trip`, `offered`, `door`, `rate` or `gateway`
+//! runs one kind alone, and `--test` runs every row for a moment. A run with
+//! no `--bench` is a test too, as criterion reads one: `cargo bench` passes
 //! `--bench`, and a test of every target passes neither.
 //!
 //! A row's members report their loads in bands, by one seeded rule
@@ -178,7 +194,7 @@ use std::{
     net::{Ipv4Addr, SocketAddr},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        mpsc as std_mpsc, Arc, OnceLock,
+        mpsc as std_mpsc, Arc, Barrier, OnceLock,
     },
     thread,
     time::{Duration, Instant},
@@ -186,6 +202,7 @@ use std::{
 
 use smg_policy_controller::{
     controller::{Config, Controller, Election, Listener, Scope, State},
+    door::{self, Door},
     proto::{
         completed::Class, controller_frame, decide_answer::Answer, decision::Outcome,
         gateway_frame::Frame, policy_controller_client::PolicyControllerClient, Completed,
@@ -873,8 +890,7 @@ fn runs(cores: &[usize]) -> String {
     runs.join(",")
 }
 
-/// The cycles and the instructions of a row's one deciding thread, in user
-/// space.
+/// The cycles and the instructions of one thread of a row, in user space.
 struct Counters {
     cycles: kernel::Counter,
     instructions: kernel::Counter,
@@ -886,9 +902,15 @@ impl Counters {
     /// them from its users.
     fn open() -> Option<Self> {
         let (decider, _) = threads().into_iter().find(|(_, name)| name == "decide-0")?;
+        Self::over(decider)
+    }
+
+    /// Counters over `thread`, the calling thread as 0, from now; none
+    /// where the kernel gives none.
+    fn over(thread: i32) -> Option<Self> {
         Some(Self {
-            cycles: kernel::Counter::open(decider, 0)?,
-            instructions: kernel::Counter::open(decider, 1)?,
+            cycles: kernel::Counter::open(thread, 0)?,
+            instructions: kernel::Counter::open(thread, 1)?,
         })
     }
 
@@ -2152,6 +2174,221 @@ fn in_process(store: &MemoryStore, decisions: u64, commit: bool) -> u64 {
     CALLS.load(Ordering::Relaxed)
 }
 
+/// The door rows' cells, each by its members and its callers at once on
+/// one model.
+const DOOR: [(u32, usize); 3] = [(64, 1), (64, 8), (64, 64)];
+
+/// The decisions a door row measures, over a wire stream's: a decision at
+/// the door ends in microseconds, and a stream's count of them would be a
+/// pass under a second.
+const DOOR_DECISIONS: u64 = 16;
+
+/// A host's door over a store of one file, its fleet filled as a wire
+/// row's is. No controller is served beside it: a store has one host at
+/// its files.
+fn door_over(members: u32) -> Door {
+    let store = MemoryStore::new().with_deciders(1);
+    fill(&store, Shape::bar(members, 1, Fleet::Shared, false, 0, 0));
+    Door::new(Arc::new(store))
+}
+
+/// The host that asks at the door, as the store names a gateway.
+const HOST: GatewayId = GatewayId(1);
+
+/// Asks one decision at the door for `seed` and reports the pick's lease
+/// released at once, as a host reports one whose client left.
+fn ask_door(door: &Door, name: &str, seed: u64) {
+    let id = seed.to_le_bytes();
+    let request = door::Request {
+        id: &id,
+        facts: RequestFacts {
+            model: name,
+            seed,
+            budget_micros: BUDGET_MICROS,
+            ..RequestFacts::default()
+        },
+        constraints: Constraints::default(),
+    };
+    let decided = door
+        .decide(HOST, &request, Instant::now())
+        .expect("the door decides");
+    let leased = decided
+        .lease
+        .expect("a pick over the fleet, with its lease");
+    let gone = Said::Released(None, ReleaseReason::ClientGone);
+    door.report(HOST, leased.lease.id, gone);
+    black_box(&decided.decision);
+}
+
+/// Counts the allocator's calls over `decisions` asked at a door on this
+/// thread, as [`in_process`] counts the engine's.
+fn at_door(door: &Door, decisions: u64) -> u64 {
+    let name = model(0);
+    for seed in 0..2_000 {
+        ask_door(door, &name, seed);
+    }
+    counting();
+    for seed in 0..decisions {
+        ask_door(door, &name, 2_000 + seed);
+    }
+    COUNTING.store(false, Ordering::Relaxed);
+    CALLS.load(Ordering::Relaxed)
+}
+
+/// What one pass of a door row measured, over all its callers.
+struct DoorPass {
+    per_second: u64,
+    /// The measured decisions of all the callers.
+    decisions: u64,
+    /// What the callers spent over their measured decisions; none where
+    /// the kernel's files did not read.
+    spent: Option<Spent>,
+    /// The first caller's cycles and instructions in user space, where the
+    /// pass counted them.
+    counted: Option<(u64, u64)>,
+    /// The callers' cores as the row prints them; none for a pass that is
+    /// not pinned.
+    cores: Option<String>,
+}
+
+/// What one caller of a door pass measured.
+struct Called {
+    /// Where its measured decisions began and where they ended.
+    from: Instant,
+    to: Instant,
+    /// What it spent over them; none where the kernel's files did not
+    /// read.
+    spent: Option<Spent>,
+    /// Its cycles and instructions in user space, where the pass counted
+    /// them.
+    counted: Option<(u64, u64)>,
+}
+
+/// Runs one pass of a door row: `callers` threads at once on one model at
+/// one door, each asking `warm` decisions and then, all from one instant,
+/// `measured`, a caller a core where the process was given as many
+/// ([`GIVEN`]). The rate is the callers' measured decisions together over
+/// the one interval they share, from the first of them to the last. A
+/// `counted` pass opens each caller's counters, and its rate is not read.
+fn door_pass(members: u32, callers: usize, warm: u64, measured: u64, counted: bool) -> DoorPass {
+    let door = Arc::new(door_over(members));
+    let cores = GIVEN
+        .get()
+        .map(|given| given.iter().copied().take(callers).collect::<Vec<_>>())
+        .filter(|cores| cores.len() == callers);
+    let (start, measure) = (
+        Arc::new(Barrier::new(callers)),
+        Arc::new(Barrier::new(callers)),
+    );
+    let threads: Vec<_> = (0..callers)
+        .map(|index| {
+            let (door, start, measure) =
+                (Arc::clone(&door), Arc::clone(&start), Arc::clone(&measure));
+            let core = cores.as_ref().and_then(|cores| cores.get(index).copied());
+            let caller = move || {
+                if let Some(core) = core {
+                    assert!(kernel::pin(0, core), "a caller sits on core {core}");
+                }
+                let name = model(0);
+                // Seeds of its own a caller: no two ask under one id.
+                let first = u64::try_from(index).expect("a caller's number") << 40;
+                start.wait();
+                for seed in first..first + warm {
+                    ask_door(&door, &name, seed);
+                }
+                // The measured decisions begin together: a caller still
+                // warming would ask, inside the interval the rate is read
+                // over, decisions no row counts.
+                measure.wait();
+                let counters = counted.then(|| Counters::over(0)).flatten();
+                let (before, from) = (Spent::of("thread-self"), Instant::now());
+                for seed in first + warm..first + warm + measured {
+                    ask_door(&door, &name, seed);
+                }
+                let to = Instant::now();
+                let spent = before
+                    .zip(Spent::of("thread-self"))
+                    .map(|(before, after)| after.since(before));
+                Called {
+                    from,
+                    to,
+                    spent,
+                    counted: counters.and_then(|counters| counters.read()),
+                }
+            };
+            thread::Builder::new()
+                .name(format!("caller-{index}"))
+                .spawn(caller)
+                .expect("a caller's thread")
+        })
+        .collect();
+    let ends: Vec<_> = threads
+        .into_iter()
+        .map(|thread| thread.join().expect("a caller ends"))
+        .collect();
+    let from = ends.iter().map(|end| end.from).min();
+    let to = ends.iter().map(|end| end.to).max();
+    let shared = from
+        .zip(to)
+        .map_or(0, |(from, to)| to.duration_since(from).as_nanos());
+    let decisions = measured * u64::try_from(callers).expect("a count of callers");
+    DoorPass {
+        per_second: (decisions * 1_000_000_000)
+            .checked_div(u64::try_from(shared).unwrap_or(u64::MAX))
+            .unwrap_or(0),
+        decisions,
+        spent: ends.iter().try_fold(Spent::default(), |sum, end| {
+            end.spent.map(|spent| sum.with(spent))
+        }),
+        counted: ends.first().and_then(|end| end.counted),
+        cores: cores.as_deref().map(runs),
+    }
+}
+
+/// Runs and prints a door row: the pass of its middle rate with the
+/// passes' least and most, the callers' CPU and the switches they asked
+/// for a decision, and for one caller its cycles and instructions a
+/// decision, counted in a pass apart whose rate is not read.
+fn door_row(
+    out: &mut impl Write,
+    members: u32,
+    callers: usize,
+    passes: usize,
+    warm: u64,
+    measured: u64,
+) -> io::Result<()> {
+    let mut rows: Vec<DoorPass> = (0..passes.max(1))
+        .map(|_| door_pass(members, callers, warm, measured, false))
+        .collect();
+    rows.sort_unstable_by_key(|row| row.per_second);
+    let least = rows.first().map_or(0, |row| row.per_second);
+    let most = rows.last().map_or(0, |row| row.per_second);
+    let middle = rows.len().saturating_sub(1) / 2;
+    let row = rows.into_iter().nth(middle).expect("a row runs a pass");
+    let counted = (callers == 1)
+        .then(|| door_pass(members, callers, warm, measured, true))
+        .and_then(|pass| {
+            let (cycles, instructions) = pass.counted?;
+            cycles
+                .checked_div(pass.decisions)
+                .zip(instructions.checked_div(pass.decisions))
+        });
+    writeln!(
+        out,
+        "policy_decide_stream/door/{members}/{callers} models=1 cores={} passes={} decisions={} per_s={} least_per_s={least} most_per_s={most} callers_us={} switches={} caller_cycles={} caller_instructions={} rss_mib={}",
+        row.cores.as_deref().unwrap_or("none"),
+        passes.max(1),
+        row.decisions,
+        row.per_second,
+        read(row.spent, |spent| spent.apart(row.decisions)),
+        read(row.spent, |spent| each(spent.asked, row.decisions)),
+        read(counted, |(cycles, _)| cycles.to_string()),
+        read(counted, |(_, instructions)| instructions.to_string()),
+        read(rss_mib(), |mib| mib.to_string()),
+    )?;
+    out.flush()
+}
+
 /// One count row, `<mode>:<members>:<decisions>`.
 fn count(cell: &str, out: &mut impl Write) -> io::Result<()> {
     let mut parts = cell.split(':');
@@ -2184,6 +2421,7 @@ fn count(cell: &str, out: &mut impl Write) -> io::Result<()> {
             served.stop();
             (calls, 0)
         }
+        "door" => (at_door(&door_over(shape.members), decisions), 0),
         "stream" | "pair" => {
             let row = wire(shape);
             (row.calls, row.busy)
@@ -2191,7 +2429,7 @@ fn count(cell: &str, out: &mut impl Write) -> io::Result<()> {
         _ => {
             return writeln!(
                 out,
-                "a count row's mode is in_process, commit, stream or pair"
+                "a count row's mode is in_process, commit, door, stream or pair"
             )
         }
     };
@@ -2405,6 +2643,14 @@ fn main() -> io::Result<()> {
         .ok()
         .and_then(|passes| passes.parse().ok())
         .unwrap_or(1);
+    if all || rows == "door" {
+        for (members, callers) in DOOR {
+            // The same decisions a row, shared among its callers.
+            let shared =
+                DOOR_DECISIONS * measured / u64::try_from(callers).expect("a count of callers");
+            door_row(&mut out, members, callers, passes, warm, shared)?;
+        }
+    }
     for (kind, frames, cells) in [("rate", false, &RATE[..]), ("gateway", true, &TOLD[..])] {
         if !all && rows != kind {
             continue;
