@@ -1,4 +1,4 @@
-//! Nemotron-H Omni prompt contract.
+//! Nemotron VL / Omni prompt contract.
 //!
 //! Mirrors the serving engine's Nemotron-Omni processor. The chat template renders one
 //! `<image>` per image, one `<so_embedding>` per audio and the literal text
@@ -16,8 +16,21 @@
 //! a clip with at most 32, else 32 spread evenly across the clip. A clip whose
 //! decoder reported no frame rate or indices cannot be stamped and is refused.
 //!
-//! The processors hard-code this checkpoint family's geometry; a config that
+//! The processors hard-code this checkpoint's geometry; a config that
 //! differs is refused rather than served with the wrong grids.
+//!
+//! That is the `Packed` instance (`nemotron_omni`): Nemotron 3 Nano Omni as
+//! packed patch rows and mel frames. The `Reference` (`nemotron_vl`) and
+//! `ReferenceTiled` (`nemotron_vl_tiled`) instances serve the family's
+//! architectures (`ARCHITECTURES`) from their config in the engine's own
+//! tensors, without audio: `pixel_values_flat` (one image per item with
+//! `imgs_sizes` and `num_tokens_per_image`, or tiles with
+//! `image_num_patches`; the two lay their pixels out differently, so each
+//! takes an instance) and `pixel_values_flat_video` with `video_num_patches`,
+//! `frames_indices` and `frame_duration_ms`. Their tubelets hold
+//! `video_temporal_patch_size` frames, and the engine embeds a video's whole
+//! replacement (it embeds the separators itself), so the whole replacement
+//! is the feature range.
 
 use std::collections::HashMap;
 
@@ -33,15 +46,25 @@ use crate::{
     },
     types::{
         EncoderFieldLayouts, FieldLayout, Modality, PlaceholderRange, PromptReplacement, TokenId,
-        VideoSamplingInfo,
     },
     vision::{
-        processors::nemotron_omni::{grid_tokens, VIDEO_TEMPORAL_PATCH_SIZE},
+        processors::nemotron_omni::{
+            grid_tokens, NemotronConfigError, NemotronGeometry, DYNAMIC_IMAGE_SIDE_TENSORS,
+            VIDEO_TEMPORAL_PATCH_SIZE,
+        },
         NemotronOmniProcessor, PreProcessorConfig, VisionPreProcessor,
     },
 };
 
+/// Nemotron 3 Nano Omni, the checkpoint the `Packed` instance serves.
 const MODEL_TYPE: &str = "NemotronH_Nano_Omni_Reasoning_V3";
+/// The engine's architectures for this processor.
+const ARCHITECTURES: [&str; 4] = [
+    "NemotronH_Nano_VL_V2",
+    MODEL_TYPE,
+    "NemotronH_Super_Omni_Reasoning_V3",
+    "NemotronH_Omni_Reasoning_V3",
+];
 const IMAGE_PLACEHOLDER: &str = "<image>";
 const AUDIO_PLACEHOLDER: &str = "<so_embedding>";
 /// What the chat template writes for a video, and the reserved token the
@@ -50,30 +73,42 @@ const VIDEO_MARKER: &str = "<video>";
 const VIDEO_ANCHOR: &str = "<SPECIAL_30>";
 /// The engine's default video loader keeps at most this many frames of a clip.
 const MAX_SAMPLED_FRAMES: usize = 32;
+/// A Reference video's tensors beside its frames, one entry per video.
+const VIDEO_SIDE_TENSORS: [&str; 3] = ["video_num_patches", "frames_indices", "frame_duration_ms"];
 
-pub(super) struct NemotronOmniSpec;
+/// The family's spec, one instance per tensor layout (see the module docs).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum NemotronOmniSpec {
+    /// Nemotron 3 Nano Omni as packed patch rows, with audio.
+    Packed,
+    /// The engine's tensors for checkpoints whose images are sized dynamically.
+    Reference,
+    /// The engine's tensors for checkpoints whose images are tiled.
+    ReferenceTiled,
+}
 
 impl NemotronOmniSpec {
-    fn unsupported(modality: Modality) -> ModelRegistryError {
-        ModelRegistryError::unsupported("nemotron_omni", modality)
+    fn unsupported(self, modality: Modality) -> ModelRegistryError {
+        ModelRegistryError::unsupported(self.name(), modality)
     }
 
     /// The anchor token, the feature token id and the wrapping begin/end ids.
     /// Video frames fill `<image>` positions.
     fn tokens(
+        self,
         metadata: &ModelMetadata,
         modality: Modality,
     ) -> RegistryResult<(&'static str, TokenId, TokenId, TokenId)> {
         let (anchor, feature, begin, end) = match modality {
             Modality::Image => (IMAGE_PLACEHOLDER, IMAGE_PLACEHOLDER, "<img>", "</img>"),
             Modality::Video => (VIDEO_ANCHOR, IMAGE_PLACEHOLDER, "<img>", "</img>"),
-            Modality::Audio => (
+            Modality::Audio if self == Self::Packed => (
                 AUDIO_PLACEHOLDER,
                 AUDIO_PLACEHOLDER,
                 "<so_start>",
                 "<so_end>",
             ),
-            Modality::ImageEmbeds => return Err(Self::unsupported(modality)),
+            Modality::Audio | Modality::ImageEmbeds => return Err(self.unsupported(modality)),
         };
         Ok((
             anchor,
@@ -83,16 +118,42 @@ impl NemotronOmniSpec {
         ))
     }
 
-    /// `(frames, rows, cols)` per video, as the paired processor emits them.
+    /// The checkpoint's geometry, as the Reference processor reads it.
+    fn geometry(config: &Value) -> RegistryResult<NemotronGeometry> {
+        NemotronGeometry::from_model_config(config).map_err(Self::geometry_error)
+    }
+
+    fn geometry_error(error: NemotronConfigError) -> ModelRegistryError {
+        let name = |ptr: &str| ptr.trim_start_matches('/').replace('/', ".");
+        match error {
+            NemotronConfigError::Missing(ptr) => {
+                ModelRegistryError::MissingConfigField { field: name(ptr) }
+            }
+            NemotronConfigError::Invalid(ptr) => ModelRegistryError::InvalidConfigField {
+                field: name(ptr),
+                reason: "the engine's processor refuses this value".to_string(),
+            },
+        }
+    }
+
+    fn int_values<'a>(
+        preprocessed: &'a PreprocessedEncoderInputs,
+        key: &str,
+    ) -> RegistryResult<&'a [i64]> {
+        match preprocessed.model_specific.get(key) {
+            Some(ModelSpecificValue::IntTensor { data, .. }) => Ok(data),
+            _ => Err(ModelRegistryError::InvalidPreprocessedField {
+                field: key.to_string(),
+            }),
+        }
+    }
+
+    /// `(frames, rows, cols)` per video, as the Packed processor emits them.
     fn video_grids(preprocessed: &PreprocessedEncoderInputs) -> RegistryResult<Vec<[usize; 3]>> {
         let invalid = || ModelRegistryError::InvalidPreprocessedField {
             field: "video_grid_thw".to_string(),
         };
-        let Some(ModelSpecificValue::IntTensor { data, .. }) =
-            preprocessed.model_specific.get("video_grid_thw")
-        else {
-            return Err(invalid());
-        };
+        let data = Self::int_values(preprocessed, "video_grid_thw")?;
         if data.len() != 3 * preprocessed.feature_token_counts.len() {
             return Err(invalid());
         }
@@ -110,72 +171,151 @@ impl NemotronOmniSpec {
             .collect()
     }
 
-    /// The separator before each tubelet: its frames and their timestamps
-    /// (the source index times `int(1000 / fps)` milliseconds).
-    fn tubelet_separator(
-        tubelet: usize,
-        frames: usize,
-        sampling: &VideoSamplingInfo,
-    ) -> RegistryResult<String> {
-        let first = tubelet * VIDEO_TEMPORAL_PATCH_SIZE;
-        let frame_ms = (1000.0 / sampling.source_fps).trunc();
-        let mut parts = Vec::with_capacity(VIDEO_TEMPORAL_PATCH_SIZE);
-        for frame in first..(first + VIDEO_TEMPORAL_PATCH_SIZE).min(frames) {
-            let index = sampling.frame_indices.get(frame).ok_or_else(|| {
-                ModelRegistryError::InvalidPreprocessedField {
-                    field: "video frame_indices".to_string(),
-                }
-            })?;
-            let seconds = *index as f64 * frame_ms / 1000.0;
-            let word = if frame == first { "Frame" } else { "frame" };
-            parts.push(format!(
-                "{word} {} sampled at {seconds:.2} seconds",
-                frame + 1
-            ));
-        }
+    /// The separator before tubelet `tubelet` of `size` frames: its frames
+    /// and their timestamps (`seconds`, one per frame of the clip, printed as
+    /// Python's `:.2f` prints them).
+    fn tubelet_separator(tubelet: usize, size: usize, seconds: &[f64]) -> String {
+        let first = tubelet * size;
+        let parts: Vec<String> = (first..(first + size).min(seconds.len()))
+            .map(|frame| {
+                let word = if frame == first { "Frame" } else { "frame" };
+                format!(
+                    "{word} {} sampled at {:.2} seconds",
+                    frame + 1,
+                    seconds[frame]
+                )
+            })
+            .collect();
         let separator = format!("{}: ", parts.join(" and "));
-        Ok(if tubelet > 0 {
+        if tubelet > 0 {
             format!("\n{separator}")
         } else {
             separator
-        })
+        }
     }
 
+    /// Each video's stamped tubelets. A frame's timestamp is its source index
+    /// times `int(1000 / fps)` milliseconds: Packed takes the indices and the
+    /// rate from the decoder's report in `media`, Reference from the tensors
+    /// its processor emits.
     fn video_replacements(
+        self,
         metadata: &ModelMetadata,
         preprocessed: &PreprocessedEncoderInputs,
         media: &[MediaItemInfo],
     ) -> RegistryResult<Vec<PromptReplacement>> {
-        let (anchor, token, begin, end) = Self::tokens(metadata, Modality::Video)?;
-        Self::video_grids(preprocessed)?
-            .into_iter()
-            .enumerate()
-            .map(|(item, [frames, rows, cols])| {
-                let sampling = media
-                    .get(item)
-                    .and_then(|m| m.video_sampling.as_ref())
-                    .filter(|s| s.source_fps.is_finite() && s.source_fps > 0.0)
-                    .ok_or_else(|| ModelRegistryError::InvalidPreprocessedField {
-                        field: "video frame times (the decoder reported no frame rate)".to_string(),
-                    })?;
-                let per_tubelet = grid_tokens(rows, cols);
-                let mut tokens = Vec::new();
-                let mut ranges = Vec::new();
-                for tubelet in 0..frames.div_ceil(VIDEO_TEMPORAL_PATCH_SIZE) {
-                    let separator = Self::tubelet_separator(tubelet, frames, sampling)?;
-                    tokens.extend(metadata.encode_plain("nemotron_omni", &separator)?);
-                    tokens.push(begin);
-                    ranges.push(PlaceholderRange {
-                        offset: tokens.len(),
-                        length: per_tubelet,
-                    });
-                    tokens.extend(std::iter::repeat_n(token, per_tubelet));
-                    tokens.push(end);
-                }
-                Ok(PromptReplacement::sequence(Modality::Video, anchor, tokens)
-                    .with_feature_ranges(ranges))
+        let (anchor, token, begin, end) = self.tokens(metadata, Modality::Video)?;
+        let invalid = |field: &str| ModelRegistryError::InvalidPreprocessedField {
+            field: field.to_string(),
+        };
+        // One video, from its frames per tubelet, its tokens per tubelet and
+        // its frames' timestamps.
+        let replacement = |size: usize, per_tubelet: usize, seconds: Vec<f64>| {
+            let mut tokens = Vec::new();
+            let mut ranges = Vec::new();
+            for tubelet in 0..seconds.len().div_ceil(size) {
+                let separator = Self::tubelet_separator(tubelet, size, &seconds);
+                tokens.extend(metadata.encode_plain(self.name(), &separator)?);
+                tokens.push(begin);
+                ranges.push(PlaceholderRange {
+                    offset: tokens.len(),
+                    length: per_tubelet,
+                });
+                tokens.extend(std::iter::repeat_n(token, per_tubelet));
+                tokens.push(end);
+            }
+            if self != Self::Packed {
+                // The engine embeds the whole replacement.
+                ranges = vec![PlaceholderRange {
+                    offset: 0,
+                    length: tokens.len(),
+                }];
+            }
+            Ok(PromptReplacement::sequence(Modality::Video, anchor, tokens)
+                .with_feature_ranges(ranges))
+        };
+        if self == Self::Packed {
+            return Self::video_grids(preprocessed)?
+                .into_iter()
+                .enumerate()
+                .map(|(item, [frames, rows, cols])| {
+                    let sampling = media
+                        .get(item)
+                        .and_then(|m| m.video_sampling.as_ref())
+                        .filter(|s| s.source_fps.is_finite() && s.source_fps > 0.0)
+                        .ok_or_else(|| {
+                            invalid("video frame times (the decoder reported no frame rate)")
+                        })?;
+                    let frame_ms = (1000.0 / sampling.source_fps).trunc();
+                    let indices = sampling
+                        .frame_indices
+                        .get(..frames)
+                        .ok_or_else(|| invalid("video frame_indices"))?;
+                    replacement(
+                        VIDEO_TEMPORAL_PATCH_SIZE,
+                        grid_tokens(rows, cols),
+                        indices
+                            .iter()
+                            .map(|&index| index as f64 * frame_ms / 1000.0)
+                            .collect(),
+                    )
+                })
+                .collect();
+        }
+        let geometry = Self::geometry(metadata.config)?;
+        let frames_per_video = Self::int_values(preprocessed, "video_num_patches")?;
+        let durations = Self::int_values(preprocessed, "frame_duration_ms")?;
+        let mut indices = Self::int_values(preprocessed, "frames_indices")?;
+        if frames_per_video.len() != preprocessed.feature_token_counts.len()
+            || durations.len() != frames_per_video.len()
+        {
+            return Err(invalid("video_num_patches"));
+        }
+        frames_per_video
+            .iter()
+            .zip(durations)
+            .zip(&preprocessed.feature_token_counts)
+            .map(|((&frames, &frame_ms), &count)| {
+                let frames = usize::try_from(frames)
+                    .ok()
+                    .filter(|&f| f > 0 && f <= indices.len())
+                    .ok_or_else(|| invalid("frames_indices"))?;
+                let (own, rest) = indices.split_at(frames);
+                indices = rest;
+                replacement(
+                    geometry.video_temporal_patch_size.max(1),
+                    count / geometry.tubelets(frames),
+                    own.iter()
+                        .map(|&index| index as f64 * frame_ms as f64 / 1000.0)
+                        .collect(),
+                )
             })
             .collect()
+    }
+
+    /// A Reference modality's tensors: the engine's name for its pixels, its
+    /// side tensors (one entry per item, kept on the CPU), and the one of
+    /// them its pixels are cut by when they are not batched.
+    fn reference_tensors(
+        self,
+        modality: Modality,
+    ) -> Option<(&'static str, &'static [&'static str], Option<&'static str>)> {
+        Some(match (self, modality) {
+            (Self::Reference, Modality::Image) => {
+                ("pixel_values_flat", &DYNAMIC_IMAGE_SIDE_TENSORS, None)
+            }
+            (Self::ReferenceTiled, Modality::Image) => (
+                "pixel_values_flat",
+                &["image_num_patches"],
+                Some("image_num_patches"),
+            ),
+            (Self::Reference | Self::ReferenceTiled, Modality::Video) => (
+                "pixel_values_flat_video",
+                &VIDEO_SIDE_TENSORS,
+                Some("video_num_patches"),
+            ),
+            _ => return None,
+        })
     }
 
     fn has_audio(config: &Value) -> bool {
@@ -216,11 +356,31 @@ impl NemotronOmniSpec {
 
 impl ModelProcessorSpec for NemotronOmniSpec {
     fn name(&self) -> &'static str {
-        "nemotron_omni"
+        match self {
+            Self::Packed => "nemotron_omni",
+            Self::Reference => "nemotron_vl",
+            Self::ReferenceTiled => "nemotron_vl_tiled",
+        }
     }
 
+    /// Packed serves its one checkpoint; a Reference instance serves the
+    /// family's architectures whose images are laid out its way.
     fn matches(&self, metadata: &ModelMetadata) -> bool {
-        metadata.config_model_type() == Some(MODEL_TYPE)
+        if *self == Self::Packed {
+            return metadata.config_model_type() == Some(MODEL_TYPE);
+        }
+        let config = metadata.config;
+        let named = |name: &str| ARCHITECTURES.contains(&name);
+        let family = metadata.config_model_type().is_some_and(named)
+            || config
+                .get("architectures")
+                .and_then(Value::as_array)
+                .is_some_and(|names| names.iter().filter_map(Value::as_str).any(named));
+        family
+            && config
+                .pointer("/vision_config/args/min_num_patches")
+                .is_some_and(|v| !v.is_null())
+                == (*self == Self::Reference)
     }
 
     fn placeholder_token(&self, _metadata: &ModelMetadata) -> RegistryResult<String> {
@@ -236,7 +396,7 @@ impl ModelProcessorSpec for NemotronOmniSpec {
         metadata: &ModelMetadata,
         modality: Modality,
     ) -> RegistryResult<String> {
-        Ok(Self::tokens(metadata, modality)?.0.to_string())
+        Ok(self.tokens(metadata, modality)?.0.to_string())
     }
 
     fn placeholder_token_id_for(
@@ -244,13 +404,16 @@ impl ModelProcessorSpec for NemotronOmniSpec {
         metadata: &ModelMetadata,
         modality: Modality,
     ) -> RegistryResult<TokenId> {
-        Ok(Self::tokens(metadata, modality)?.1)
+        Ok(self.tokens(metadata, modality)?.1)
     }
 
-    /// The processors emit packed patch rows and mel frames, not the engine's
-    /// `pixel_values_flat` / `pixel_values_flat_video` inputs.
+    /// The Packed processors emit packed patch rows and mel frames, not the
+    /// engine's `pixel_values_flat` / `pixel_values_flat_video` inputs.
     fn encoder_input_format(&self) -> EncoderInputFormat {
-        EncoderInputFormat::Packed
+        match self {
+            Self::Packed => EncoderInputFormat::Packed,
+            Self::Reference | Self::ReferenceTiled => EncoderInputFormat::Reference,
+        }
     }
 
     fn rendered_marker_for(&self, modality: Modality) -> Option<&'static str> {
@@ -290,9 +453,14 @@ impl ModelProcessorSpec for NemotronOmniSpec {
         &self,
         metadata: &ModelMetadata,
     ) -> RegistryResult<HashMap<Modality, usize>> {
-        Self::check_config(metadata.config)?;
         let mut limits =
             HashMap::from([(Modality::Image, usize::MAX), (Modality::Video, usize::MAX)]);
+        if *self != Self::Packed {
+            // The Reference instances serve no audio.
+            Self::geometry(metadata.config)?;
+            return Ok(limits);
+        }
+        Self::check_config(metadata.config)?;
         if Self::has_audio(metadata.config) {
             limits.insert(Modality::Audio, usize::MAX);
         }
@@ -301,12 +469,30 @@ impl ModelProcessorSpec for NemotronOmniSpec {
 
     fn vision_processor(
         &self,
-        _model_config: &Value,
-        _preprocessor_config: &PreProcessorConfig,
+        model_config: &Value,
+        preprocessor_config: &PreProcessorConfig,
         modality: Modality,
     ) -> RegistryResult<Box<dyn VisionPreProcessor>> {
         match modality {
-            Modality::Image | Modality::Video => Ok(Box::new(NemotronOmniProcessor::new())),
+            Modality::Image | Modality::Video => Ok(Box::new(if *self == Self::Packed {
+                NemotronOmniProcessor::new()
+            } else {
+                // The processor config wins where it names a value: Nemotron
+                // 3.5 Super VL sizes its video frames only there.
+                let geometry = Self::geometry(model_config)?
+                    .with_preprocessor_config(preprocessor_config)
+                    .map_err(|error| ModelRegistryError::InvalidPreprocessorConfig {
+                        spec: self.name(),
+                        modality,
+                        reason: match error {
+                            NemotronConfigError::Missing(key) => format!("{key} is missing"),
+                            NemotronConfigError::Invalid(key) => {
+                                format!("{key} holds a value the engine's processor refuses")
+                            }
+                        },
+                    })?;
+                NemotronOmniProcessor::reference(geometry)
+            })),
             _ => Err(ModelRegistryError::unsupported(self.name(), modality)),
         }
     }
@@ -318,8 +504,8 @@ impl ModelProcessorSpec for NemotronOmniSpec {
     ) -> RegistryResult<Option<Box<dyn AudioPreProcessor>>> {
         // No `sound_config` is a model without audio; a `sound_config` the
         // port cannot serve is the configuration error `check_config` reports,
-        // not a missing processor.
-        if !Self::has_audio(model_config) {
+        // not a missing processor. The Reference instances serve no audio.
+        if *self != Self::Packed || !Self::has_audio(model_config) {
             return Ok(None);
         }
         let params = ParakeetAudioParams::from_model_config(model_config)
@@ -344,7 +530,7 @@ impl ModelProcessorSpec for NemotronOmniSpec {
         _preprocessor_config: &PreProcessorConfig,
     ) -> RegistryResult<Vec<PromptReplacement>> {
         match modality {
-            Modality::Video => Self::video_replacements(metadata, preprocessed, media),
+            Modality::Video => self.video_replacements(metadata, preprocessed, media),
             _ => self.prompt_replacements_for(metadata, preprocessed, modality),
         }
     }
@@ -356,9 +542,9 @@ impl ModelProcessorSpec for NemotronOmniSpec {
         modality: Modality,
     ) -> RegistryResult<Vec<PromptReplacement>> {
         if modality == Modality::Video {
-            return Self::video_replacements(metadata, preprocessed, &[]);
+            return self.video_replacements(metadata, preprocessed, &[]);
         }
-        let (placeholder, token, begin, end) = Self::tokens(metadata, modality)?;
+        let (placeholder, token, begin, end) = self.tokens(metadata, modality)?;
         Ok(preprocessed
             .feature_token_counts
             .iter()
@@ -374,6 +560,15 @@ impl ModelProcessorSpec for NemotronOmniSpec {
     }
 
     fn encoder_field_layouts_for(&self, modality: Modality) -> EncoderFieldLayouts {
+        if *self != Self::Packed {
+            let (_, side, sizes) = self.reference_tensors(modality).unwrap_or_default();
+            return EncoderFieldLayouts::new(
+                sizes.map_or(FieldLayout::Batched, FieldLayout::flat),
+                side.iter()
+                    .map(|key| ((*key).to_string(), FieldLayout::Batched))
+                    .collect(),
+            );
+        }
         match modality {
             Modality::Image => EncoderFieldLayouts::new(
                 FieldLayout::flat("patches_per_image"),
@@ -403,6 +598,16 @@ impl ModelProcessorSpec for NemotronOmniSpec {
             Modality::ImageEmbeds => EncoderFieldLayouts::default(),
         }
     }
+
+    fn keep_on_cpu_keys_for(&self, modality: Modality) -> Vec<String> {
+        let (_, side, _) = self.reference_tensors(modality).unwrap_or_default();
+        side.iter().map(|key| (*key).to_string()).collect()
+    }
+
+    fn encoder_input_key_for(&self, modality: Modality) -> Option<String> {
+        self.reference_tensors(modality)
+            .map(|(key, ..)| key.to_string())
+    }
 }
 
 #[cfg(test)]
@@ -411,8 +616,11 @@ mod tests {
 
     use super::*;
     use crate::{
-        registry::test_helpers::{test_preprocessed_with_tokens, TestTokenizer},
-        types::ImageSize,
+        registry::{
+            test_helpers::{test_preprocessed_with_tokens, TestTokenizer},
+            ModelRegistry,
+        },
+        types::{ImageSize, VideoSamplingInfo},
     };
 
     fn tokenizer() -> TestTokenizer {
@@ -446,7 +654,7 @@ mod tests {
 
     #[test]
     fn audio_processor_tells_no_audio_from_an_audio_config_it_cannot_serve() {
-        let spec = NemotronOmniSpec;
+        let spec = NemotronOmniSpec::Packed;
         let default = PreProcessorConfig::default();
 
         let mut config = checkpoint_config();
@@ -473,7 +681,7 @@ mod tests {
     #[test]
     fn refuses_a_config_off_the_implemented_geometry() {
         let tokenizer = tokenizer();
-        let spec = NemotronOmniSpec;
+        let spec = NemotronOmniSpec::Packed;
         let limits = |config: &Value| {
             spec.modality_limits(&ModelMetadata {
                 model_id: "nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-NVFP4",
@@ -543,7 +751,7 @@ mod tests {
             tokenizer: &tokenizer,
             config: &config,
         };
-        let spec = NemotronOmniSpec;
+        let spec = NemotronOmniSpec::Packed;
 
         assert_eq!(
             spec.modality_limits(&metadata).unwrap(),
@@ -579,7 +787,7 @@ mod tests {
 
     #[test]
     fn preprocesses_packed_inputs_with_the_reference_loader_sampling() {
-        let spec = NemotronOmniSpec;
+        let spec = NemotronOmniSpec::Packed;
         assert_eq!(spec.encoder_input_format(), EncoderInputFormat::Packed);
         assert_eq!(
             spec.video_frame_sampling(),
@@ -597,7 +805,7 @@ mod tests {
             tokenizer: &tokenizer,
             config: &config,
         };
-        let spec = NemotronOmniSpec;
+        let spec = NemotronOmniSpec::Packed;
         assert!(spec.matches(&metadata));
         let limits = spec.modality_limits(&metadata).unwrap();
         assert!(limits.contains_key(&Modality::Image) && limits.contains_key(&Modality::Audio));
@@ -625,7 +833,7 @@ mod tests {
             tokenizer: &tokenizer,
             config: &config,
         };
-        let spec = NemotronOmniSpec;
+        let spec = NemotronOmniSpec::Packed;
         assert_eq!(spec.rendered_marker_for(Modality::Video), Some("<video>"));
         assert_eq!(spec.rendered_marker_for(Modality::Image), None);
 
@@ -692,5 +900,263 @@ mod tests {
             let second_offset = first.len() + tubelet.len() + second.len() + 1;
             assert_eq!(offsets, [(first.len() + 1, 4), (second_offset, 4)]);
         }
+    }
+
+    /// [`checkpoint_config`] with the fields only the Reference layout reads.
+    fn omni_config() -> Value {
+        let mut config = checkpoint_config();
+        config["architectures"] = json!([MODEL_TYPE]);
+        config["force_image_size"] = json!(512);
+        config
+    }
+
+    /// The Nemotron Nano V2 VL config: tiles, frames one at a time.
+    fn v2_config() -> Value {
+        let mut config = omni_config();
+        config["architectures"] = json!(["NemotronH_Nano_VL_V2"]);
+        config["model_type"] = json!("NemotronH_Nano_VL_V2");
+        config["use_thumbnail"] = json!(true);
+        config["vision_config"] = json!({"args": {}});
+        config.as_object_mut().unwrap().remove("sound_config");
+        config
+    }
+
+    fn metadata<'a>(tokenizer: &'a TestTokenizer, config: &'a Value) -> ModelMetadata<'a> {
+        ModelMetadata {
+            model_id: "nvidia/test",
+            tokenizer,
+            config,
+        }
+    }
+
+    #[test]
+    fn serves_each_architecture_by_its_image_layout() {
+        let tokenizer = tokenizer();
+        let tiled = NemotronOmniSpec::ReferenceTiled;
+        let dynamic = NemotronOmniSpec::Reference;
+        let omni = omni_config();
+        let v2 = v2_config();
+        // NemotronH_Omni_Reasoning_V3: its own model_type, the architecture names it.
+        let mut super_vl = omni_config();
+        super_vl["model_type"] = json!("nemotron_h_omni");
+        super_vl["architectures"] = json!(["NemotronH_Omni_Reasoning_V3"]);
+        super_vl["sound_config"] = Value::Null;
+        for (config, is_dynamic) in [(&omni, true), (&v2, false), (&super_vl, true)] {
+            let metadata = metadata(&tokenizer, config);
+            assert_eq!(dynamic.matches(&metadata), is_dynamic);
+            assert_eq!(tiled.matches(&metadata), !is_dynamic);
+            // Images and video; the Omni checkpoint's audio is not served.
+            let limits = if is_dynamic { &dynamic } else { &tiled }
+                .modality_limits(&metadata)
+                .unwrap();
+            assert_eq!(limits.len(), 2);
+            assert!(!limits.contains_key(&Modality::Audio));
+        }
+        let other = json!({"model_type": "qwen3_vl", "vision_config": {"args": {}}});
+        assert!(!tiled.matches(&metadata(&tokenizer, &other)));
+
+        let mut broken = omni_config();
+        broken.as_object_mut().unwrap().remove("patch_size");
+        assert_eq!(
+            dynamic.modality_limits(&metadata(&tokenizer, &broken)),
+            Err(ModelRegistryError::MissingConfigField {
+                field: "patch_size".to_string()
+            })
+        );
+        broken["patch_size"] = json!(16);
+        broken["downsample_ratio"] = json!(2);
+        assert!(matches!(
+            dynamic.modality_limits(&metadata(&tokenizer, &broken)),
+            Err(ModelRegistryError::InvalidConfigField { field, .. }) if field == "downsample_ratio"
+        ));
+    }
+
+    #[test]
+    fn only_a_reference_registry_serves_the_reference_layout() {
+        let tokenizer = tokenizer();
+        let (omni, v2) = (omni_config(), v2_config());
+        let name = |registry: &ModelRegistry, config: &Value| {
+            registry
+                .lookup(&metadata(&tokenizer, config))
+                .map(|spec| spec.name())
+        };
+        let default = ModelRegistry::new();
+        let reference = ModelRegistry::for_format(EncoderInputFormat::Reference);
+        assert_eq!(name(&default, &omni), Some("nemotron_omni"));
+        assert_eq!(name(&default, &v2), None);
+        assert_eq!(name(&reference, &omni), Some("nemotron_vl"));
+        assert_eq!(name(&reference, &v2), Some("nemotron_vl_tiled"));
+        let packed = ModelRegistry::for_format(EncoderInputFormat::Packed);
+        assert_eq!(name(&packed, &omni), Some("nemotron_omni"));
+        assert_eq!(name(&packed, &v2), None);
+
+        let serves = |registry: &ModelRegistry, spec| registry.spec_names().contains(&spec);
+        assert!(!serves(&default, "nemotron_vl"));
+        assert!(!serves(&reference, "nemotron_omni"));
+        assert!(serves(&reference, "qwen3_vl") && !serves(&packed, "qwen3_vl"));
+    }
+
+    /// The processor config's fault is reported as its own, not as the
+    /// model config's.
+    #[test]
+    fn reports_a_processor_config_the_engine_refuses() {
+        let processor_config = PreProcessorConfig::from_value(json!({"max_num_tiles": 0})).unwrap();
+        assert!(matches!(
+            NemotronOmniSpec::ReferenceTiled.vision_processor(
+                &v2_config(),
+                &processor_config,
+                Modality::Image
+            ),
+            Err(ModelRegistryError::InvalidPreprocessorConfig {
+                spec: "nemotron_vl_tiled",
+                modality: Modality::Image,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn names_the_engines_tensors() {
+        let tiled = NemotronOmniSpec::ReferenceTiled;
+        let dynamic = NemotronOmniSpec::Reference;
+        assert_eq!(
+            dynamic.encoder_input_format(),
+            EncoderInputFormat::Reference
+        );
+        assert_eq!(
+            dynamic.encoder_input_key_for(Modality::Image).as_deref(),
+            Some("pixel_values_flat")
+        );
+        assert_eq!(
+            dynamic.encoder_input_key_for(Modality::Video).as_deref(),
+            Some("pixel_values_flat_video")
+        );
+        assert_eq!(
+            tiled
+                .encoder_field_layouts_for(Modality::Image)
+                .encoder_input,
+            FieldLayout::flat("image_num_patches")
+        );
+        assert_eq!(
+            dynamic
+                .encoder_field_layouts_for(Modality::Image)
+                .encoder_input,
+            FieldLayout::Batched
+        );
+        assert_eq!(
+            dynamic.keep_on_cpu_keys_for(Modality::Video),
+            ["video_num_patches", "frames_indices", "frame_duration_ms"]
+        );
+        assert_eq!(
+            dynamic.rendered_marker_for(Modality::Video),
+            Some("<video>")
+        );
+    }
+
+    #[test]
+    fn wraps_images_around_their_feature_runs() {
+        let tokenizer = tokenizer();
+        let config = omni_config();
+        let metadata = metadata(&tokenizer, &config);
+        let spec = NemotronOmniSpec::Reference;
+        let preprocessed = test_preprocessed_with_tokens(&[ImageSize::new(64, 32)], &[3]);
+        let replacements = spec
+            .prompt_replacements_for(&metadata, &preprocessed, Modality::Image)
+            .unwrap();
+        assert_eq!(replacements.len(), 1);
+        assert_eq!(replacements[0].tokens, vec![19, 18, 18, 18, 20]);
+        assert!(spec
+            .prompt_replacements_for(&metadata, &preprocessed, Modality::Audio)
+            .is_err());
+    }
+
+    fn video(frames: &[i64], frame_ms: i64, tokens: usize) -> PreprocessedEncoderInputs {
+        let mut preprocessed = test_preprocessed_with_tokens(&[ImageSize::new(64, 64)], &[tokens]);
+        for (key, value) in [
+            (
+                "video_num_patches",
+                ModelSpecificValue::int_1d(vec![frames.len() as i64]),
+            ),
+            (
+                "frame_duration_ms",
+                ModelSpecificValue::int_1d(vec![frame_ms]),
+            ),
+            (
+                "frames_indices",
+                ModelSpecificValue::int_2d(frames.to_vec(), 1, frames.len()),
+            ),
+        ] {
+            preprocessed.model_specific.insert(key.to_string(), value);
+        }
+        preprocessed
+    }
+
+    #[test]
+    fn stamps_each_reference_video_tubelet_with_its_frames() {
+        const TEXT_BASE: TokenId = 1000;
+        let tokenizer = tokenizer().with_byte_encoder(TEXT_BASE.unsigned_abs());
+        let text = |s: &str| {
+            s.bytes()
+                .map(|b| TEXT_BASE + TokenId::from(b))
+                .collect::<Vec<_>>()
+        };
+        let spec = NemotronOmniSpec::Reference;
+        let tubelet = [vec![19], vec![18; 4], vec![20]].concat();
+        let omni = omni_config();
+        for (frames, frame_ms, first, second) in [
+            // 33 ms per source frame: 15 * 33 ms = 0.495 s prints as 0.49, as Python's :.2f does.
+            (
+                [0, 15, 29],
+                33,
+                "Frame 1 sampled at 0.00 seconds and frame 2 sampled at 0.49 seconds: ",
+                "\nFrame 3 sampled at 0.96 seconds: ",
+            ),
+            // int(1000 / 24) truncates to 41 ms.
+            (
+                [0, 720, 1440],
+                41,
+                "Frame 1 sampled at 0.00 seconds and frame 2 sampled at 29.52 seconds: ",
+                "\nFrame 3 sampled at 59.04 seconds: ",
+            ),
+        ] {
+            let replacements = spec
+                .prompt_replacements_for(
+                    &metadata(&tokenizer, &omni),
+                    &video(&frames, frame_ms, 8),
+                    Modality::Video,
+                )
+                .unwrap();
+            assert_eq!(replacements.len(), 1);
+            let expected = [text(first), tubelet.clone(), text(second), tubelet.clone()].concat();
+            assert_eq!(replacements[0].tokens, expected);
+            assert_eq!(replacements[0].placeholder_token, "<SPECIAL_30>");
+            // The engine embeds the whole replacement.
+            let ranges: Vec<_> = replacements[0].feature_ranges.iter().flatten().collect();
+            assert_eq!(
+                ranges,
+                [&PlaceholderRange {
+                    offset: 0,
+                    length: expected.len()
+                }]
+            );
+        }
+
+        // V2 stamps every frame on its own.
+        let v2 = v2_config();
+        let replacements = spec
+            .prompt_replacements_for(
+                &metadata(&tokenizer, &v2),
+                &video(&[0, 10], 100, 8),
+                Modality::Video,
+            )
+            .unwrap();
+        let expected = [
+            text("Frame 1 sampled at 0.00 seconds: "),
+            tubelet.clone(),
+            text("\nFrame 2 sampled at 1.00 seconds: "),
+            tubelet,
+        ]
+        .concat();
+        assert_eq!(replacements[0].tokens, expected);
     }
 }

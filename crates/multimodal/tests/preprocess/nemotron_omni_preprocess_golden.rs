@@ -20,7 +20,7 @@ use llm_multimodal::{
     audio::{DecodedAudio, ParakeetAudioProcessor},
     encoder_inputs::{ModelSpecificValue, PreprocessedEncoderInputs},
     vision::{
-        processors::{nemotron_vl::NemotronVLGeometry, NemotronOmniProcessor, NemotronVLProcessor},
+        processors::{nemotron_omni::NemotronGeometry, NemotronOmniProcessor},
         transforms::rgb_bytes,
         VideoClipOptions, VisionPreProcessor,
     },
@@ -336,9 +336,9 @@ fn audio_matches_the_reference_extractor() {
 }
 
 /// The reference-layout processor for the checkpoint geometry the fixture was generated for.
-fn reference_processor() -> NemotronVLProcessor {
-    NemotronVLProcessor::new(
-        NemotronVLGeometry::from_model_config(&serde_json::json!({
+fn reference_processor() -> NemotronOmniProcessor {
+    NemotronOmniProcessor::reference(
+        NemotronGeometry::from_model_config(&serde_json::json!({
             "patch_size": 16, "downsample_ratio": 0.5, "force_image_size": 512,
             "norm_mean": [0.48145466, 0.4578275, 0.40821073],
             "norm_std": [0.26862954, 0.26130258, 0.27577711],
