@@ -185,6 +185,16 @@ struct Booking {
     at_micros: u64,
 }
 
+/// Whose clock dates a booking.
+#[derive(Clone, Copy, Debug)]
+enum Clock {
+    /// The decider's own, at a decision's issue. It can go back.
+    Issue,
+    /// A gateway's word of a dispatch, told after the fact. A date behind
+    /// the window's is late, and no clock that went back.
+    Dispatch,
+}
+
 /// The booked tokens of a decision's survivors: the most, the least, and
 /// the first survivor that holds the least, by its place among the kept.
 #[derive(Clone, Copy, Debug)]
@@ -496,12 +506,11 @@ impl Pool {
     /// booking on file it stands as said.
     ///
     /// `None` where that instant is more than `window_micros` before the
-    /// booking at the window's front, which [`Pool::book`] ages by: the
-    /// dispatch aged before it was told. Booked there, it would read as a
-    /// clock that went back, and end every booking it passed. `None` too
-    /// where the window is full and that instant is as far before the
-    /// booking behind the front: a full window loses its front to the cap
-    /// before any booking is aged, and that one is aged first.
+    /// booking at the window's front: the dispatch aged before it was
+    /// told, and its booking would stand behind a window that passed it.
+    /// `None` too where the window is full and that instant is as far
+    /// before the booking behind the front: a full window loses its front
+    /// to the cap, and that one stands at the front next.
     fn dispatched_at(
         &self,
         issued_micros: u64,
@@ -525,20 +534,26 @@ impl Pool {
     }
 
     /// Book `tokens` on a member at `at_micros`. The bookings older than the
-    /// window leave first, each with its tokens off its worker's load, and
-    /// so does one dated more than the window after this one: a clock that
-    /// went back that far ends what it passed. A booking dated a little
-    /// before the window's oldest arrived out of its clock's order, as the
-    /// bookings of two deciders can, and nothing leaves on its account.
-    /// Inlined: the issue's booking ran it in line while it was its one
-    /// caller, and a call there costs every decision.
+    /// window leave first, each with its tokens off its worker's load. At
+    /// an issue so does one dated more than the window after this one: a
+    /// clock that went back that far ends what it passed. A dispatch's date
+    /// is told late and went nowhere: no booking leaves for being newer
+    /// than it. A booking dated a little before the window's oldest arrived
+    /// out of its clock's order, as the bookings of two deciders can, and
+    /// nothing leaves on its account. Inlined: the issue's booking ran it
+    /// in line while it was its one caller, and a call there costs every
+    /// decision.
     #[inline]
-    fn book(&mut self, member: u32, tokens: u32, at_micros: u64, window_micros: u64) {
+    fn book(&mut self, member: u32, tokens: u32, at_micros: u64, window_micros: u64, clock: Clock) {
         if let Some(booked) = self.members.get_mut(member as usize) {
             booked.load = booked.load.saturating_add(u64::from(tokens));
         }
         while let Some(oldest) = self.window.front() {
-            let aged = at_micros.abs_diff(oldest.at_micros) > window_micros;
+            let passed = match clock {
+                Clock::Issue => at_micros.abs_diff(oldest.at_micros),
+                Clock::Dispatch => at_micros.saturating_sub(oldest.at_micros),
+            };
+            let aged = passed > window_micros;
             if !aged && self.window.len() < WINDOW_CAP {
                 break;
             }
@@ -694,6 +709,7 @@ impl Lifecycle for Bucket {
                     lease.tokens,
                     lease.issued_micros,
                     self.interval_micros,
+                    Clock::Issue,
                 );
             }
         }
@@ -742,7 +758,13 @@ impl Lifecycle for Bucket {
                 self.interval_micros,
             );
             if let Some(at_micros) = dated {
-                pool.book(member, lease.tokens, at_micros, self.interval_micros);
+                pool.book(
+                    member,
+                    lease.tokens,
+                    at_micros,
+                    self.interval_micros,
+                    Clock::Dispatch,
+                );
             }
         }
     }
@@ -1823,8 +1845,8 @@ mod tests {
         assert_eq!(loads(&scorer), (vec![0, 10, 0], 10));
         // The first lease's dispatch on the third row is told then, dated
         // 250 microseconds behind its decision: more than an interval
-        // before the booking on file. Booked there it would read as a clock
-        // that went back, and end the newer booking.
+        // before the booking on file. It aged before it was told, and books
+        // nothing.
         dispatch(&scorer, pool[2].id, 1, 300, SECOND, 250);
         assert_eq!(loads(&scorer), (vec![0, 10, 0], 10));
         assert_eq!(last_booked_at(&scorer), Some(3 * SECOND));
@@ -1873,13 +1895,14 @@ mod tests {
         // A full window loses its front to the cap, whatever its age, and
         // the booking behind it is the first one aged. The same dispatch
         // now books nothing: more than an interval before that booking, it
-        // would end every booking the issues made.
+        // aged before it was told.
         dispatch(&scorer, pool[2].id, 1, 8, 92 * tenth, 0);
         assert_eq!(loads(&scorer), (vec![1, full - 2, 8], full + 7));
         assert_eq!(of(&scorer, "m").lock().window.len(), WINDOW_CAP);
-        // One dated within an interval of both is booked, and the cap ends
-        // the front alone.
-        dispatch(&scorer, pool[2].id, 1, 8, 96 * tenth, 0);
+        // One dated exactly an interval before that booking is booked, as
+        // the booking step keeps a booking exactly an interval away, and
+        // the cap ends the front alone.
+        dispatch(&scorer, pool[2].id, 1, 8, 95 * tenth, 0);
         assert_eq!(loads(&scorer), (vec![0, full - 2, 16], full + 14));
         assert_eq!(of(&scorer, "m").lock().window.len(), WINDOW_CAP);
     }
@@ -1912,6 +1935,35 @@ mod tests {
         dispatch(&scorer, pool[2].id, 1, 8, 92 * tenth, 0);
         assert_eq!(loads(&scorer), (vec![0, full - 1, 8], full + 7));
         assert_eq!(of(&scorer, "m").lock().window.len(), WINDOW_CAP);
+    }
+
+    #[test]
+    fn a_late_dispatch_ends_no_booking_newer_than_its_date() {
+        let scorer = scorer(NEVER, 1.5, 1);
+        let pool = pool(3);
+        let tenth = SECOND / 10;
+        led(&scorer, &pool, 0, 10 * SECOND);
+        // Three bookings arrive out of their clocks' order, and the window
+        // fills behind them. The first of the newer ones ends the first of
+        // the three as aged: the full window stands on a front, an older
+        // booking behind it, and newer ones behind that.
+        book(&scorer, &pool, 0, 1, 96 * tenth);
+        book(&scorer, &pool, 0, 1, 105 * tenth);
+        book(&scorer, &pool, 1, 1, 90 * tenth);
+        for _ in 2..WINDOW_CAP {
+            book(&scorer, &pool, 1, 1, 112 * tenth);
+        }
+        let full = WINDOW_CAP as u64;
+        assert_eq!(loads(&scorer), (vec![1, full - 1, 0], full));
+        assert_eq!(of(&scorer, "m").lock().window.len(), WINDOW_CAP);
+        // A dispatch dated within an interval of the front and of the
+        // booking behind it is booked. The cap ends the front, and the
+        // booking behind it leaves as aged, more than an interval older
+        // than the dispatch. The newer ones stand: the dispatch's date is
+        // late, and no clock that went back.
+        dispatch(&scorer, pool[2].id, 1, 8, 101 * tenth, 0);
+        assert_eq!(loads(&scorer), (vec![0, full - 2, 8], full + 6));
+        assert_eq!(of(&scorer, "m").lock().window.len(), WINDOW_CAP - 1);
     }
 
     #[test]
