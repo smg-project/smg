@@ -20,7 +20,7 @@ use crate::{
 /// here.
 pub(crate) struct WorkerObjects {
     store: Arc<MemoryStore>,
-    objects: Objects<Members>,
+    objects: Arc<Objects<Members>>,
     wake: ObjectsWake,
 }
 
@@ -30,10 +30,17 @@ impl WorkerObjects {
     pub(crate) fn new(store: Arc<MemoryStore>, wake: ObjectsWake) -> Self {
         Self {
             store,
-            objects: Objects::new(Arc::new(WorkerRegistry::new()))
-                .with_connector(Arc::new(GrpcConnector)),
+            objects: Arc::new(
+                Objects::new(Arc::new(WorkerRegistry::new()))
+                    .with_connector(Arc::new(GrpcConnector)),
+            ),
             wake,
         }
+    }
+
+    /// The holder shared with readers of the replica's worker objects.
+    pub(crate) fn holder(&self) -> Arc<Objects<Members>> {
+        Arc::clone(&self.objects)
     }
 
     /// The holder, for a case that reads what stands.

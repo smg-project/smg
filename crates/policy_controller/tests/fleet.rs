@@ -1338,8 +1338,15 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             "the busy engine's blocks reach its row's index",
             PROBE_INTERVAL + ROOM,
             || {
+                // The listener's stream and the store's own are two: they
+                // are read at rest, the cursor at the last sequence the
+                // listener heard and the index holding what it holds.
                 harness.heard(busy).first().is_some_and(|row| {
-                    row.indexed > 0 && row.cursor.is_some_and(|cursor| cursor.applied >= 1)
+                    row.indexed > 0
+                        && row.indexed == row.held
+                        && row
+                            .cursor
+                            .is_some_and(|cursor| cursor.applied >= 1 && cursor.applied == row.last)
                 })
             },
         )
@@ -1361,7 +1368,7 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
             "the cursor stands at what the stream delivered: {fed:?}"
         );
         assert!(
-            fed.applied >= 1 && fed.indexed == fed.held,
+            fed.indexed >= 1 && fed.indexed == fed.held,
             "the index holds each block the engine's events left it holding: {fed:?}"
         );
         assert_eq!(
@@ -1402,7 +1409,7 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
         for engine in engines.iter().filter(|engine| **engine != busy) {
             for idle in harness.heard(*engine) {
                 assert!(
-                    idle.applied == 0 && idle.indexed == 0 && idle.held == 0,
+                    idle.last == 0 && idle.indexed == 0 && idle.held == 0,
                     "an engine that stored no block published none: engine {engine} {idle:?}"
                 );
             }
@@ -2213,7 +2220,7 @@ async fn the_fleet_registers_its_loads_follow_and_a_dead_engine_leaves_the_healt
         writeln!(out, "FLEET_READY_MS {}", ready.as_millis()).expect("stdout");
         writeln!(out, "FLEET_LOADS_FOLLOW_MS {}", followed.as_millis()).expect("stdout");
         writeln!(out, "FLEET_KV_FOLLOW_MS {}", stored.as_millis()).expect("stdout");
-        writeln!(out, "FLEET_KV_BATCHES {}", fed.applied).expect("stdout");
+        writeln!(out, "FLEET_KV_BATCHES {}", fed.last).expect("stdout");
         writeln!(out, "FLEET_KV_BLOCKS {}", fed.indexed).expect("stdout");
         writeln!(out, "FLEET_DEATH_WRITTEN_MS {}", written.as_millis()).expect("stdout");
         writeln!(out, "FLEET_DEATH_SEEN_MS {}", seen.as_millis()).expect("stdout");
