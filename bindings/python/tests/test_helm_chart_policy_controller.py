@@ -412,6 +412,20 @@ def test_a_router_on_its_slurm_variant_takes_the_releases_controller():
     assert container(inside)["image"] == router_image(inside) + "-policy-controller"
 
 
+@needs_helm
+def test_a_router_on_its_ol9_variant_takes_the_releases_controller():
+    """The Oracle Linux 9 variant is the router's alone too. Its suffix is cut
+    as the Slurm variant's is: where it ends a tag, and nowhere else."""
+    documents = render(*ON, "global.image.tag=1.16.0-ol9")
+    of_the_router = router_image(documents)
+    assert of_the_router.endswith(":1.16.0-ol9")
+    assert (
+        container(documents)["image"] == of_the_router.removesuffix("-ol9") + "-policy-controller"
+    )
+    inside = render(*ON, "global.image.tag=1.16.0-ol9-rc.1")
+    assert container(inside)["image"] == router_image(inside) + "-policy-controller"
+
+
 def published(workflow: str, environment: dict[str, str], tmp_path: Path) -> dict[str, list[str]]:
     """The lists of image references a publishing workflow's own tags step
     writes for one run, the step run under bash: each multi-line output, by

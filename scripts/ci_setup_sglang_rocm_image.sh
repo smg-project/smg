@@ -91,6 +91,21 @@ if [ "$verify_only" -eq 0 ] && [ -z "${SMG_SGLANG_ROCM_IMAGE:-}" ]; then
     exit 0
 fi
 
+# E2E dependencies must resolve against the image's complete telemetry cohort.
+# Otherwise a new FastMCP can upgrade only the API while the image SDK and
+# semantic-conventions still require the old API exactly. Publish this as a
+# requirement for that one resolver transaction, not a global pip constraint
+# (the benchmark also creates an independent genai-bench environment).
+SMG_CI_OTEL_API_VERSION="$(python3 -c '
+from importlib.metadata import PackageNotFoundError, version
+from packaging.version import Version
+
+try:
+    print(Version(version("opentelemetry-api")))
+except PackageNotFoundError:
+    raise SystemExit("ERROR: SGLang ROCm image lacks opentelemetry-api metadata")
+')"
+
 # This repair is scoped to the pinned SGLang 0.5.21 / ROCm 10 image cohort.
 # Build the original extension sdist against this image's Torch builtin API;
 # a cached or public binary wheel may have been built for a different Torch.
@@ -133,5 +148,6 @@ python3 "$SCRIPT_DIR/ci_verify_sglang_rocm_cohort.py" "${verify_output[@]}"
 
 # Carry the observed image version into the next Actions step.
 if [ "$verify_only" -eq 0 ] && [ -n "${GITHUB_ENV:-}" ]; then
+    echo "SMG_CI_OTEL_API_VERSION=${SMG_CI_OTEL_API_VERSION}" >> "$GITHUB_ENV"
     echo "SMG_CI_GRPC_COMPANION_VERSION=${SMG_CI_GRPC_COMPANION_VERSION}" >> "$GITHUB_ENV"
 fi
