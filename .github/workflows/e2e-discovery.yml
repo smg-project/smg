@@ -23,7 +23,7 @@ on:
       # and `cli/configure.rs` owns the CLI -> discovery-config conversion
       # feeding it.
       - model_gateway/src/server.rs
-      - model_gateway/src/main.rs
+      - model_gateway/src/cli/mod.rs
       - model_gateway/src/cli/configure.rs
       - model_gateway/src/config/**
       # What a discovered worker becomes: its endpoint, and the workflow that

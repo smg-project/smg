@@ -1,13 +1,28 @@
 //! Phase 1b to phase 3 of the start-up, on the parsed arguments: the secrets'
 //! sources resolved into the flag fields, the start-up announced, and the
 //! server configuration assembled from the flags (`CliArgs::configure`).
-//! The argument structs stay with `CliArgs` at the crate root, where clap
-//! builds them; this module reads them.
+//! The parent module declares the argument structs that clap builds.
 
 use std::collections::HashMap;
 
 use rand::{distr::Alphanumeric, RngExt};
-use smg::{
+use smg_auth::{ApiKeyEntry, ControlPlaneAuthConfig, JwtConfig, Role};
+use smg_mesh::{MTLSConfig, MeshServerConfig};
+use smg_service_discovery::RuntimeDiscoveryConfig;
+use smg_worker::identity::{
+    basic::{ConnectionMode, RuntimeType},
+    endpoint::Endpoint,
+};
+
+use super::{
+    secrets::{
+        EnvLookup, API_KEY_SETTING, CONTROL_PLANE_API_KEYS_SETTING, POSTGRES_DB_URL_SETTING,
+        REDIS_URL_SETTING, TENANT_API_KEYS_SETTING,
+    },
+    value::parse_role_mapping,
+    Backend, CliArgs, DiscoveryProvider,
+};
+use crate::{
     config::{
         bind_socket_addr,
         secrets::{parse_control_plane_api_key, parse_tenant_api_key},
@@ -30,22 +45,6 @@ use smg::{
     },
     version,
 };
-use smg_auth::{ApiKeyEntry, ControlPlaneAuthConfig, JwtConfig, Role};
-use smg_mesh::{MTLSConfig, MeshServerConfig};
-use smg_service_discovery::RuntimeDiscoveryConfig;
-use smg_worker::identity::{
-    basic::{ConnectionMode, RuntimeType},
-    endpoint::Endpoint,
-};
-
-use super::{
-    secrets::{
-        EnvLookup, API_KEY_SETTING, CONTROL_PLANE_API_KEYS_SETTING, POSTGRES_DB_URL_SETTING,
-        REDIS_URL_SETTING, TENANT_API_KEYS_SETTING,
-    },
-    value::parse_role_mapping,
-};
-use crate::{Backend, CliArgs, DiscoveryProvider};
 
 enum OracleConnectSource {
     Dsn { descriptor: String },
