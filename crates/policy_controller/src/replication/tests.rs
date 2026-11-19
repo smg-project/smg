@@ -1643,6 +1643,7 @@ fn a_followed_row_keeps_the_instant_it_was_admitted_at() {
         status: WorkerStatus::Pending,
         revision: 1,
         admitted_at: Instant::now(),
+        maker: Default::default(),
     };
     let id = row.id;
     let adopting = followed.adopt(at(1)).expect("the next position");
@@ -1673,6 +1674,46 @@ fn a_followed_row_keeps_the_instant_it_was_admitted_at() {
     assert!(adopting.landed());
     let held = WorkersStore::get(&standby, id).expect("the row");
     assert_eq!((held.revision, held.admitted_at), (2, row.admitted_at));
+}
+
+#[test]
+fn a_followed_row_keeps_the_maker_its_leader_wrote() {
+    use crate::store::Maker;
+
+    let (standby, followed) = journaled(64);
+    let at = |seq| Position { seq, term: 1 };
+    let found = Maker::provider("cluster", "pods/a").expect("a whole maker");
+    let row = WorkerRow {
+        id: identity("http://a:8000", 1),
+        facts: facts("http://a:8000", 1),
+        status: WorkerStatus::Pending,
+        revision: 1,
+        admitted_at: Instant::now(),
+        maker: found.clone(),
+    };
+    let id = row.id;
+    let adopting = followed.adopt(at(1)).expect("the next position");
+    standby.follow_term(at(1));
+    drop(adopting);
+    let adopting = followed.adopt(at(2)).expect("the next position");
+    standby.follow(
+        at(2),
+        1,
+        MembershipChange::Registered { id },
+        Some(row.clone()),
+    );
+    drop(adopting);
+    let relabelled = WorkerRow { revision: 2, ..row };
+    let adopting = followed.adopt(at(3)).expect("the next position");
+    standby.follow(
+        at(3),
+        2,
+        MembershipChange::Relabelled { id },
+        Some(relabelled),
+    );
+    assert!(adopting.landed());
+    let held = WorkersStore::get(&standby, id).expect("the row");
+    assert_eq!((held.revision, held.maker), (2, found));
 }
 
 /// A prefill or a decode of the model on one runtime's gRPC side, which

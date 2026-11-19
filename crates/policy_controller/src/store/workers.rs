@@ -180,6 +180,57 @@ impl WorkerFacts {
     }
 }
 
+/// Who made a row: the caller whose registration put it there. A row has
+/// one maker while its registration stands, through every refresh and every
+/// new incarnation of its key. It is what the membership door knows of a
+/// row and no fact a registrant states: it moves no revision and is no part
+/// of the facts. The door writes it, and a caller that is not a row's maker
+/// changes nothing of the row there. Two makers are one where they agree
+/// whole.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum Maker {
+    /// A control call. Any caller of the control scope changes the row.
+    #[default]
+    Control,
+    /// A provider that finds workers by itself. Its key stands apart from
+    /// the row, held once for every copy of it: a copy of the row copies no
+    /// string of its maker.
+    Provider(Arc<ProviderKey>),
+}
+
+impl Maker {
+    /// The maker `provider` is for the worker it knows by `key`. `None`
+    /// where either is empty: a provider's maker names both, and a
+    /// follower refuses a row made under less.
+    pub fn provider(provider: impl Into<String>, key: impl Into<String>) -> Option<Self> {
+        let (provider, key) = (provider.into(), key.into());
+        if provider.is_empty() || key.is_empty() {
+            return None;
+        }
+        Some(Self::Provider(Arc::new(ProviderKey { provider, key })))
+    }
+}
+
+/// A provider's name with its own key for one worker, neither empty:
+/// [`Maker::provider`] alone makes one.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ProviderKey {
+    provider: String,
+    key: String,
+}
+
+impl ProviderKey {
+    /// The provider's name.
+    pub fn provider(&self) -> &str {
+        &self.provider
+    }
+
+    /// The provider's own key for the worker.
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+}
+
 /// One worker as the store holds it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct WorkerRow {
@@ -194,6 +245,8 @@ pub struct WorkerRow {
     pub revision: u64,
     /// When the row was created on the host's clock.
     pub admitted_at: Instant,
+    /// Who made the row.
+    pub maker: Maker,
 }
 
 /// The mutable facts of a row a patch may change (`PatchWorker`; today the
@@ -303,7 +356,16 @@ pub trait WorkersStore: Send + Sync {
     /// with another incarnation is `Replaced` (the old id leaves with its
     /// state); the same key and incarnation refresh the facts in place
     /// (`Resized` when the data-parallel width moved, else `Relabelled`).
-    fn upsert(&self, facts: WorkerFacts) -> MembershipChange;
+    /// A new key's row is a control call's ([`Maker::Control`]).
+    fn upsert(&self, facts: WorkerFacts) -> MembershipChange {
+        self.upsert_by(facts, Maker::Control)
+    }
+
+    /// [`Self::upsert`] from `maker`: a new key's row is made by it. A row
+    /// that stands under the key keeps the maker it has, through a refresh
+    /// and through a new incarnation, whoever calls. Who may write a row is
+    /// the membership door's test, not the store's.
+    fn upsert_by(&self, facts: WorkerFacts, maker: Maker) -> MembershipChange;
 
     /// Change a row's mutable facts; `None` when the row is gone or
     /// `revision` moved.

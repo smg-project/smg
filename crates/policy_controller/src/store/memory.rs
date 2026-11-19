@@ -32,7 +32,7 @@ use crate::{
         reservations::{ReservationKind, ReservationStore},
         sessions::{Pin, SessionsStore},
         workers::{
-            identity, MembershipChange, MembershipTail, WorkerFacts, WorkerPatch, WorkerRow,
+            identity, Maker, MembershipChange, MembershipTail, WorkerFacts, WorkerPatch, WorkerRow,
             WorkerStatus, WorkersStore,
         },
         world::{
@@ -1422,7 +1422,7 @@ impl MemoryStore {
 }
 
 impl WorkersStore for MemoryStore {
-    fn upsert(&self, mut facts: WorkerFacts) -> MembershipChange {
+    fn upsert_by(&self, mut facts: WorkerFacts, maker: Maker) -> MembershipChange {
         // A blank value of a descriptor or of an encode offer is no report:
         // the row of record holds what the two rules read. A descriptor that
         // stands so is kept where it is, shared or not: a row written again
@@ -1507,6 +1507,9 @@ impl WorkersStore for MemoryStore {
                         status,
                         revision: 1,
                         admitted_at: now,
+                        // The key's registration stands through its new
+                        // incarnation, and so does its maker.
+                        maker: old.as_ref().map_or(maker, |old| old.row.maker.clone()),
                     },
                     probes: Probes::default(),
                     slot: self.join(new_id),
@@ -1557,6 +1560,7 @@ impl WorkersStore for MemoryStore {
                     status: WorkerStatus::Pending,
                     revision: 1,
                     admitted_at: now,
+                    maker,
                 },
                 probes: Probes::default(),
                 slot: self.join(id),
