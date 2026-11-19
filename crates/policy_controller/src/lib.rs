@@ -100,6 +100,8 @@ pub mod controller;
 pub mod counts;
 pub mod decider;
 pub mod decision;
+#[cfg(feature = "controller")]
+mod door;
 pub mod elector;
 pub mod framework;
 #[cfg(feature = "controller")]
