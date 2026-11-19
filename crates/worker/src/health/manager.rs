@@ -1652,7 +1652,7 @@ impl WorkerManager {
     }
 
     /// Build the fleet-wide load body from the monitor's published
-    /// snapshot: the same numbers the routing policies are acting on.
+    /// snapshot, with each rank's report under its worker's address.
     ///
     /// No request reaches a worker. That is what makes the route safe to
     /// stack — a gateway registered as a worker under another gateway

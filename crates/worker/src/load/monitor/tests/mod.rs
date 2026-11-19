@@ -5,16 +5,18 @@ use std::{collections::HashMap, sync::mpsc};
 
 use super::*;
 use crate::{
-    health::overload::OverloadThresholds,
+    common_proto as common,
+    health::{manager::WorkerManager, overload::OverloadThresholds},
     identity::basic::{ConnectionMode, WorkerType},
     model_card::ModelCard,
     runtime::StallReason,
     test_support::{
-        ready_worker, render_with_recorder, BasicWorkerBuilder, LoadReaders, WorkerMonitor,
-        WorkerRegistry,
+        assert_metric, ready_worker, render_with_recorder, BasicWorkerBuilder, LoadReaders,
+        ScriptedAnswers, WorkerMonitor, WorkerRegistry,
     },
     worker::{
-        EngineMemoryMetricsSnapshot, EngineQueueMetricsSnapshot, HealthCheckConfig, WorkerStatus,
+        EngineMemoryMetricsSnapshot, EngineQueueMetricsSnapshot, HealthCheckConfig, NamedValue,
+        WorkerStatus,
     },
 };
 
@@ -46,6 +48,10 @@ impl LoadRecord for Unread {
 
     fn snapshot(&self) -> SchedulerLoadSnapshot {
         panic!("the snapshot of an ignored record was built")
+    }
+
+    fn values_sent(&self) -> usize {
+        panic!("the named values of an ignored record were counted")
     }
 
     fn engine_silence(&self) -> Option<Duration> {
@@ -181,6 +187,10 @@ impl LoadRecord for PushedRecord {
 
     fn snapshot(&self) -> SchedulerLoadSnapshot {
         self.snapshot.clone()
+    }
+
+    fn values_sent(&self) -> usize {
+        self.snapshot.values.len()
     }
 
     fn engine_silence(&self) -> Option<Duration> {
@@ -882,6 +892,138 @@ async fn a_record_replaces_the_memory_or_queues_section_it_carries() {
     assert_eq!(rank0.queues.map(|q| q.waiting), Some(6));
 }
 
+/// A record's named values are that record's alone. The next record's list
+/// takes their place in the rank's entry, where the fixed telemetry a record
+/// leaves out stays: a reader that wants a value across records keeps it
+/// itself.
+#[tokio::test]
+async fn a_records_named_values_take_the_place_of_the_ranks_last() {
+    let (registry, monitor) = build_monitor();
+    let worker = ready_worker("grpc://w1:9000", "llama-3");
+    registry.register(Arc::clone(&worker)).unwrap();
+    let named = |name: &'static str, value: f64| NamedValue {
+        name: name.into(),
+        unit: "items".into(),
+        value,
+        age_ms: None,
+    };
+    let mut heartbeat = pushed(7).used_tokens(2_048);
+    heartbeat.snapshot.values = vec![named("queue_depth", 4.0), named("ready", 1.0)];
+    monitor.apply_pushed_load(&worker, 0, &heartbeat, Instant::now());
+    let rank0 = published_rank0(&monitor, "grpc://w1:9000");
+    assert_eq!(rank0.values, heartbeat.snapshot.values);
+
+    // A record that names one of the two: its list stands whole.
+    let mut other = pushed(8);
+    other.snapshot.values = vec![named("ready", 0.0)];
+    monitor.apply_pushed_load(&worker, 0, &other, Instant::now());
+    let rank0 = published_rank0(&monitor, "grpc://w1:9000");
+    assert_eq!(rank0.values, other.snapshot.values);
+    assert_eq!(rank0.num_used_tokens, 2_048);
+
+    // A core-only record names none: the entry holds none, and the fixed
+    // telemetry of the heartbeat stays.
+    monitor.apply_pushed_load(&worker, 0, &pushed(9), Instant::now());
+    let rank0 = published_rank0(&monitor, "grpc://w1:9000");
+    assert!(rank0.values.is_empty());
+    assert_eq!(rank0.num_used_tokens, 2_048);
+    assert_eq!(rank0.num_running_reqs, 9);
+}
+
+/// The named values a pushed record's snapshot drops at a bound are counted
+/// by the worker: the record's list less the snapshot's. A record whose
+/// values all stand writes no series.
+#[tokio::test]
+async fn a_pushed_record_counts_the_named_values_its_snapshot_drops() {
+    let (registry, monitor) = build_monitor();
+    let worker = ready_worker("grpc://w1:9000", "llama-3");
+    registry.register(Arc::clone(&worker)).unwrap();
+    let value = |name: &str, value: f64| common::NamedValue {
+        name: name.to_string(),
+        unit: "items".to_string(),
+        value,
+        age_ms: None,
+    };
+    let whole = common::EngineLoad {
+        running_requests: 7,
+        values: vec![value("queue_depth", 4.0)],
+        ..Default::default()
+    };
+    let rendered = render_with_recorder(|| {
+        monitor.apply_pushed_load(&worker, 0, &whole, Instant::now());
+    });
+    assert!(
+        !rendered.contains("smg_engine_load_values_dropped_total{"),
+        "{rendered}"
+    );
+
+    // One stands. An empty name, a value that is not finite and a name the
+    // record states again are dropped: three of each record's four.
+    let dropping = common::EngineLoad {
+        running_requests: 8,
+        values: vec![
+            value("queue_depth", 5.0),
+            value("", 1.0),
+            value("ready", f64::NAN),
+            value("queue_depth", 6.0),
+        ],
+        ..Default::default()
+    };
+    let rendered = render_with_recorder(|| {
+        monitor.apply_pushed_load(&worker, 0, &dropping, Instant::now());
+        monitor.apply_pushed_load(&worker, 0, &dropping, Instant::now());
+    });
+    assert_metric(
+        &rendered,
+        "smg_engine_load_values_dropped_total",
+        &["worker=\"grpc://w1:9000\""],
+        "6",
+    );
+    let rank0 = published_rank0(&monitor, "grpc://w1:9000");
+    assert_eq!(rank0.values.len(), 1);
+    assert_eq!(
+        (rank0.values[0].name.as_ref(), rank0.values[0].value),
+        ("queue_depth", 5.0)
+    );
+}
+
+/// What a rank's entry offers by name is its own record's. A count the entry
+/// keeps from a heartbeat is not offered under a later record that did not
+/// carry it, and the entry still holds it.
+#[tokio::test]
+async fn a_core_record_offers_no_fixed_count_the_entry_kept() {
+    let (registry, monitor) = build_monitor();
+    let worker = ready_worker("grpc://w1:9000", "llama-3");
+    registry.register(Arc::clone(&worker)).unwrap();
+    let names = |rank: &SchedulerLoadSnapshot| -> Vec<String> {
+        rank.named_values()
+            .map(|value| value.name.to_string())
+            .collect()
+    };
+    let heartbeat = pushed(7).used_tokens(2_048).total_tokens(8_192);
+    monitor.apply_pushed_load(&worker, 0, &heartbeat, Instant::now());
+    let rank0 = published_rank0(&monitor, "grpc://w1:9000");
+    assert_eq!(names(&rank0), ["kv_tokens_used", "kv_tokens_capacity"]);
+
+    monitor.apply_pushed_load(&worker, 0, &pushed(8), Instant::now());
+    let rank0 = published_rank0(&monitor, "grpc://w1:9000");
+    assert!(names(&rank0).is_empty());
+    assert_eq!(
+        (rank0.num_used_tokens, rank0.max_total_num_tokens),
+        (2_048, 8_192)
+    );
+
+    // A record that carries one of the two offers that one.
+    let capacity = pushed(9).total_tokens(4_096);
+    monitor.apply_pushed_load(&worker, 0, &capacity, Instant::now());
+    let rank0 = published_rank0(&monitor, "grpc://w1:9000");
+    assert_eq!(names(&rank0), ["kv_tokens_capacity"]);
+    assert_eq!(
+        (rank0.num_used_tokens, rank0.max_total_num_tokens),
+        (2_048, 4_096)
+    );
+}
+
 /// The poll decision reads the receipt of the worker's pushed records
 /// against the tick interval: none on file polls as always, a record
 /// within the interval on every pushing rank suppresses the poll, and a
@@ -1315,6 +1457,7 @@ struct RecordingLoadSink {
     said: Mutex<Vec<Said>>,
     /// The workers the sink was told to forget, in order.
     forgotten: Mutex<Vec<Arc<dyn Worker>>>,
+    polled_values: Mutex<Vec<NamedValue>>,
     mode: PollMode,
     ranks: PolledRanks,
     needs: bool,
@@ -1372,6 +1515,14 @@ impl LoadSink for RecordingLoadSink {
 
     fn report(&self, answer: &[PolledMember<'_>], _polled_at: Instant) -> PolledRanks {
         let locked = self.locked();
+        self.polled_values.lock().extend(
+            answer
+                .iter()
+                .filter_map(|member| member.answer)
+                .flat_map(|report| &report.loads)
+                .flat_map(|rank| &rank.values)
+                .cloned(),
+        );
         self.said
             .lock()
             .push(Said::Report(Self::members(answer), locked));
@@ -1444,6 +1595,7 @@ fn build_recording(
     let sink = Arc::new(RecordingLoadSink {
         said: Mutex::new(Vec::new()),
         forgotten: Mutex::new(Vec::new()),
+        polled_values: Mutex::new(Vec::new()),
         mode,
         ranks,
         needs,
@@ -1479,6 +1631,57 @@ fn answer_of(rank: i32, running: i32) -> WorkerLoadResponse {
         }],
         ..Default::default()
     }
+}
+
+#[tokio::test]
+async fn a_connections_named_values_reach_the_load_sink_and_fleet_response() {
+    let (registry, monitor, sink) =
+        build_recording(PollMode::Poll, PolledRanks::default(), true, false);
+    let expected = vec![
+        NamedValue {
+            name: "blocked_cycles".into(),
+            unit: "cycles".into(),
+            value: 17.0,
+            age_ms: Some(29),
+        },
+        NamedValue {
+            name: "wait_time".into(),
+            unit: "ms".into(),
+            value: 2.75,
+            age_ms: None,
+        },
+    ];
+    let mut answer = answer_of(2, 3);
+    answer.loads[0].values.clone_from(&expected);
+    let worker: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new("grpc://worker:9132")
+            .connection_mode(ConnectionMode::Grpc)
+            .model(ModelCard::new("m"))
+            .engine_connection(ScriptedAnswers::answering_loads(answer))
+            .build(),
+    );
+    worker.set_status(WorkerStatus::Ready);
+    registry.register(worker).unwrap();
+    let group = WorkerGroupKey {
+        model_id: "m".into(),
+        worker_type: WorkerType::Regular,
+        connection_mode: ConnectionMode::Grpc,
+    };
+    poll_group_once(&monitor, &group, Duration::from_secs(5), Instant::now()).await;
+    assert_eq!(*sink.polled_values.lock(), expected);
+
+    let fleet = WorkerManager::fleet_loads(&registry, &monitor.load_snapshot(), None, "test");
+    assert_eq!(fleet.loads[0].values, expected);
+    let json = serde_json::to_value(fleet).unwrap();
+    assert_eq!(
+        json["loads"][0]["values"],
+        serde_json::json!([
+            {"name": "blocked_cycles", "unit": "cycles", "value": 17.0, "age_ms": 29},
+            {"name": "wait_time", "unit": "ms", "value": 2.75},
+        ])
+    );
+    let decoded: WorkerLoadResponse = serde_json::from_value(json).unwrap();
+    assert_eq!(decoded.loads[0].values, expected);
 }
 
 /// A pushed record crosses the port once, after the monitor laid it in the

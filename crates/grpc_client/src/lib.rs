@@ -597,6 +597,7 @@ macro_rules! impl_rank_load_conversions {
                     cache_hit_rate: load.cache_hit_rate,
                     utilization: load.utilization,
                     max_running_requests: load.max_running_requests,
+                    values: Vec::new(),
                     ..Default::default()
                 }
             }

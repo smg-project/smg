@@ -243,8 +243,13 @@ The wire types need no feature. `WorkerSpec` is the one description of a
 worker: the admin API takes it as input and returns it as output, so only
 `url` is required. `WorkerInfo` is what the admin API answers for a worker.
 `WorkerStatus` is its lifecycle: `pending`, `ready`, `not_ready`, `failed`,
-`draining`. `WorkerLoadResponse` is the load report of one worker. They live
-in the `worker` module, and the model card in `model_card`.
+`draining`. `WorkerLoadResponse` is the load report of one worker. A rank's
+report in it (`SchedulerLoadSnapshot`) holds fixed figures and the values an
+engine reports by name (`NamedValue`). The named values are those of the
+rank's newest record: a pushed record's list takes the place of the last.
+What a pushed record names past the list's bounds is dropped and counted by
+worker in `smg_engine_load_values_dropped_total`. They live in the `worker`
+module, and the model card in `model_card`.
 
 The proto is one file, `proto/common.proto`, package `smg.grpc.common`. It
 declares the messages every engine's gRPC service shares: the tokenizer's

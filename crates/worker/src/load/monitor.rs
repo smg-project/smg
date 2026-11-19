@@ -434,7 +434,9 @@ type EngineAnswer = Vec<(Arc<dyn Worker>, Option<WorkerLoadResponse>)>;
 /// the engine's figures between heartbeats. Absent is absent: a section the
 /// engine never reports stays unset. `previous` is the rank's entry the
 /// record replaces; what it keeps moves out of it. `carried` is the
-/// record's own word on what it carries.
+/// record's own word on what it carries. The entry is marked with the
+/// parts it kept (`SchedulerLoadSnapshot::kept`), so what it offers by
+/// name is its own record's.
 fn keep_telemetry(
     fresh: &mut SchedulerLoadSnapshot,
     previous: SchedulerLoadSnapshot,
@@ -462,6 +464,7 @@ fn keep_telemetry(
         fresh.decode_queue_reqs = previous.decode_queue_reqs;
         fresh.disagg_mode = previous.disagg_mode;
     }
+    fresh.kept = LoadTelemetry::all().difference(carried);
 }
 
 /// A pushed record is sampled this much before its receipt on top of its own
@@ -568,8 +571,8 @@ impl<G: Generation> WorkerMonitor<G> {
     }
 
     /// A load record pushed on a worker's KV-event stream (`KvEventBatch.load`,
-    /// the servicer's `GetLoads` figures for `dp_rank`, received at
-    /// `received_at`): the same input as a poll of that worker. It replaces
+    /// the servicer's scheduler report for `dp_rank`, received at
+    /// `received_at`). Its fixed fields have the shape of a poll. It replaces
     /// the rank's entry in the worker's report in place, goes to the overload
     /// verdict and the wedged rule at once, which read the report where it
     /// is, to its own rank's `smg_engine_*` gauges, set through the handles
@@ -655,8 +658,17 @@ impl<G: Generation> WorkerMonitor<G> {
         // What a poll would have put in the rank's entry, with the telemetry
         // the record left out (an event batch's record is the core only)
         // kept from the last record that carried it.
+        // The record's named values are its own: the entry's list is this
+        // record's, and none of the last record's is kept.
         let mut fresh = record.snapshot();
         fresh.dp_rank = dp_rank;
+        // The values the record named and its snapshot does not hold were
+        // dropped at the snapshot's bounds. They are counted here, where
+        // the record and its snapshot stand together.
+        let dropped = record.values_sent().saturating_sub(fresh.values.len());
+        if dropped != 0 {
+            Metrics::record_engine_load_values_dropped(url, dropped);
+        }
         let at = match report
             .loads
             .binary_search_by_key(&dp_rank, |load| load.dp_rank)
