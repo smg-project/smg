@@ -484,6 +484,7 @@ smg-policy-controller --controller-id controller-0 --spec-file policy.yaml
 - It is read at the start. A file that cannot be read, or a document that is refused, stops the start.
 - It is then watched, by a look each second. A changed file is applied in place as the next generation. Nothing restarts.
 - A changed file that is refused is rejected whole. The running document stays.
+- With a standby, the leader's file decides. The standby follows each document its leader applies and runs it under the leader's number. It reads its own file again once it leads.
 
 **A store.** `--spec-store <directory>` takes the place of the file. Documents then arrive through the apply call, `ApplyPolicySpec`, in its enforce mode.
 

@@ -69,11 +69,19 @@
 //! other; a spec store keeps the last
 //! [`RETAINED`](super::spec_store::RETAINED) on file.
 //!
-//! Limits. A minted number is this replica's own. Under a file, a replica
-//! that starts remembers nothing and admits its source's document as it
-//! stands, so two replicas that read one file agree on a number only where
-//! the file writes one. Under a spec store the numbers are the directory's,
-//! and no standby follows an applied generation in this build: a store is
+//! A replica that follows a leader has one writer at this door, the log
+//! ([`Generations::following`]): it runs each generation its leader applied,
+//! under the leader's number, by this build's own pass over the leader's
+//! bytes, and its own file is looked at while it leads alone. A leader's
+//! stream is told a generation by this door ([`Generations::sent`]): the
+//! log holds the number, and the document crosses where it still stands.
+//!
+//! Limits. Under a file, a replica that starts remembers nothing and admits
+//! its source's document as it stands: until it follows or leads, its
+//! number is its own. A number only rises, so a replica that runs a
+//! generation its leader's is not above keeps its own and follows no
+//! further. Under a spec store the numbers are the directory's,
+//! and no standby follows beside one in this build: a store is
 //! bound only beside a lease in the process
 //! ([`Controller::spec_store`](super::Controller::spec_store)). One process
 //! holds a store's directory, under the store's own lock, as far as the
@@ -95,22 +103,25 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc, OnceLock,
     },
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use parking_lot::Mutex;
+use parking_lot::{Mutex, MutexGuard};
 use serde::de::{self, DeserializeSeed, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde_json::{map::Entry, Map, Number, Value};
 use tokio::{sync::Semaphore, task::JoinError};
 use tracing::{info, warn};
 
-use super::spec_store::{self, Persisted, SpecStore, StoreRefused};
+use super::{
+    spec_store::{self, Persisted, SpecStore, StoreRefused},
+    worker_wire::{self, Refused as Unfollowed},
+};
 use crate::{
     catalog::Catalog,
     framework::Engine,
     proto,
     spec::{AppliedSpec, Digest, PolicySpec, SpecError},
-    store::{MemoryStore, StaleGeneration},
+    store::{MemoryStore, Position, StaleGeneration},
     view::Phase,
 };
 
@@ -181,6 +192,14 @@ impl Format {
             Self::Yaml => "yaml",
             Self::Json => "json",
         }
+    }
+
+    /// The form a contract's `format` field names, as [`Format::as_str`]
+    /// writes one; none for any other name.
+    pub(crate) fn named(name: &str) -> Option<Self> {
+        [Self::Yaml, Self::Json]
+            .into_iter()
+            .find(|format| format.as_str() == name)
     }
 
     /// The document these bytes read as. A YAML document is read once, into
@@ -1038,7 +1057,7 @@ impl Generations {
             return Ok(Applied::Unchanged(standing));
         };
         let generation = next.generation();
-        self.enter(next, hold(generation))?;
+        self.enter(next, hold(generation), None)?;
         drop(applying);
         Ok(Applied::Generation(generation))
     }
@@ -1047,13 +1066,22 @@ impl Generations {
     /// runs from, under the lock the read call takes: a reader sees the
     /// number and its bytes change together. Every generation this door
     /// applies goes through here, whatever its source: one count and one
-    /// event each.
-    fn enter(&self, next: AppliedSpec, kept: Held) -> Result<(), StaleGeneration> {
+    /// event each. `at` is the place of the leader's event the generation
+    /// applies, on a replica that follows ([`Generations::following`]).
+    fn enter(
+        &self,
+        next: AppliedSpec,
+        kept: Held,
+        at: Option<Position>,
+    ) -> Result<(), StaleGeneration> {
         let (generation, digest, format) = (kept.generation, kept.digest, kept.format);
         let bytes = kept.document.len();
         {
             let mut held = self.held.lock();
-            self.store.apply(next)?;
+            match at {
+                Some(at) => self.store.follow_generation(at, next)?,
+                None => self.store.apply(next)?,
+            }
             *held = Some(kept);
         }
         self.applied.fetch_add(1, Ordering::Relaxed);
@@ -1224,7 +1252,7 @@ impl Generations {
                 format,
                 applied,
             };
-            self.enter(next, kept)?;
+            self.enter(next, kept, None)?;
         }
         Ok(Retained {
             persisted: newest,
@@ -1365,7 +1393,7 @@ impl Generations {
             format,
             applied,
         };
-        if let Err(stale) = self.enter(next, kept) {
+        if let Err(stale) = self.enter(next, kept, None) {
             // What was persisted goes before the door's lock does: a start
             // never reads a generation the entry refused.
             if let Err(error) = dir.forget() {
@@ -1601,6 +1629,221 @@ impl Generations {
                 standing,
                 on_file: self.listed(),
             }),
+        }
+    }
+}
+
+/// Why a leader's generation is not followed, in the stream's words: its
+/// number is not above the one this replica runs.
+const NOT_ABOVE: &str = "a generation that is not above the one this replica runs";
+
+/// The path of a generation event's number.
+const NUMBER: &str = "generation.status.generation";
+
+impl Held {
+    /// The generation as a standby is sent it: its status, and the document
+    /// as the read call answers it.
+    fn sent(&self) -> proto::GenerationEvent {
+        let digest = self.digest.to_string();
+        proto::GenerationEvent {
+            status: Some(proto::SpecStatus {
+                generation: self.generation,
+                digest: digest.clone(),
+                applied_unix_micros: unix_micros(self.applied),
+                mode: proto::ApplyMode::Enforce.into(),
+                ..proto::SpecStatus::default()
+            }),
+            document: Some(proto::SpecPush {
+                generation: self.generation,
+                digest,
+                document: self.document.clone(),
+                format: self.format.as_str().to_owned(),
+                needs: None,
+            }),
+        }
+    }
+}
+
+/// The replication half: what a leader's stream is told of a generation,
+/// and how a standby applies one.
+impl Generations {
+    /// The event a standby is sent of `generation`, a number the log holds:
+    /// with the document where this door still holds that generation, and
+    /// the number alone where a later one replaced it. An apply swaps the
+    /// held document under the lock this takes, with its call of the
+    /// store's entry: an entry of the log is never read here ahead of its
+    /// document.
+    pub(crate) fn sent(&self, generation: u64) -> proto::GenerationEvent {
+        let held = self.held.lock();
+        match held.as_ref().filter(|held| held.generation == generation) {
+            Some(held) => held.sent(),
+            None => worker_wire::generation_told(generation),
+        }
+    }
+
+    /// The standing generation's event, for the snapshot a standby is
+    /// restored from; none where no document is held for it.
+    pub(crate) fn standing_sent(&self) -> Option<proto::GenerationEvent> {
+        let held = self.held.lock();
+        let standing = self.generation();
+        held.as_ref()
+            .filter(|held| held.generation == standing)
+            .map(Held::sent)
+    }
+
+    /// A leader's generation as the replication stream tells it, passed
+    /// and not yet applied: the log is the one writer of a standby's door.
+    /// The document's pass runs here, under the door's lock, and the answer
+    /// holds that lock until it lands ([`Following::land`]).
+    ///
+    /// The number says what the event does. Above the standing one, the
+    /// document runs under it ([`Line::Record`]) whatever its digest: a
+    /// replica that read the same file under a lower number takes its
+    /// leader's. At the standing number with the standing bytes, and with
+    /// no document (the generation stood no longer when its leader sent
+    /// the event), nothing changes. No other event is followed: the
+    /// store's number only rises, so a replica that runs a generation its
+    /// leader's is not above keeps its own, says both and leaves the synced
+    /// state, as it does for a document its build does not run. The bytes
+    /// are compared, never the digests: a digest is its build's.
+    pub(crate) fn following(
+        &self,
+        told: &proto::GenerationEvent,
+    ) -> Result<Following<'_>, Unfollowed> {
+        let number = told.status.as_ref().map_or(0, |status| status.generation);
+        if number == 0 {
+            return Err(Unfollowed {
+                path: NUMBER,
+                why: "a generation's event names its number",
+            });
+        }
+        let applying = self.applying.lock();
+        let following = |applying, change| Following {
+            door: self,
+            _applying: applying,
+            number,
+            change,
+        };
+        let Some(push) = &told.document else {
+            return Ok(following(applying, None));
+        };
+        let Some(format) = Format::named(&push.format) else {
+            return Err(Unfollowed {
+                path: "generation.document.format",
+                why: "a form this build does not know",
+            });
+        };
+        if applying.is_some() {
+            return Err(Unfollowed {
+                path: "generation.document",
+                why: "a spec store is bound here, and no standby follows beside one",
+            });
+        }
+        let (standing, digest) = self.standing();
+        if number <= standing {
+            let same = number == standing
+                && self.held.lock().as_ref().map_or_else(
+                    || digest.is_some_and(|digest| digest.to_string() == push.digest),
+                    |held| held.format == format && held.document == push.document,
+                );
+            if same {
+                return Ok(following(applying, None));
+            }
+            warn!(
+                generation = number,
+                digest = %push.digest,
+                standing,
+                standing_digest = ?digest,
+                "a leader's generation is not above the one this replica runs: the replica keeps its own"
+            );
+            return Err(Unfollowed {
+                path: NUMBER,
+                why: NOT_ABOVE,
+            });
+        }
+        // The standing digest is no part of this pass: the leader's number
+        // is taken whatever the document under it.
+        let rule = Line::Record(number);
+        let (digest, next) = match self.pass((standing, None), &push.document, format, rule) {
+            Ok(Checked {
+                digest,
+                next: Some(next),
+            }) => (digest, next),
+            Ok(Checked { next: None, .. }) => return Ok(following(applying, None)),
+            Err(rejected) => {
+                warn!(
+                    generation = number,
+                    error = %rejected,
+                    "a leader's generation does not run on this replica: the running generation stays"
+                );
+                return Err(Unfollowed {
+                    path: "generation.document",
+                    why: "a document this replica's build does not run",
+                });
+            }
+        };
+        // The leader's own time where it states one: the read call answers
+        // one time for a generation on every replica.
+        let applied = told
+            .status
+            .as_ref()
+            .and_then(|status| u64::try_from(status.applied_unix_micros).ok())
+            .filter(|micros| *micros != 0)
+            .map_or_else(SystemTime::now, |micros| {
+                UNIX_EPOCH + Duration::from_micros(micros)
+            });
+        let kept = Held {
+            generation: number,
+            digest,
+            document: push.document.clone(),
+            format,
+            applied,
+        };
+        Ok(following(applying, Some((next, kept))))
+    }
+}
+
+/// A leader's generation that passed here and waits to land
+/// ([`Generations::following`]). It holds the door's lock: no apply comes
+/// between its pass and its entry.
+pub(crate) struct Following<'a> {
+    door: &'a Generations,
+    _applying: MutexGuard<'a, Option<SpecStore>>,
+    number: u64,
+    /// The generation to enter, with the bytes it runs from; none where the
+    /// event changes nothing here.
+    change: Option<(AppliedSpec, Held)>,
+}
+
+impl Following<'_> {
+    /// Applies it. `at` is the place of the leader's event, which the
+    /// store's entry journals; none beside a restore, whose snapshot stands
+    /// at one place for all it holds. An event that changes nothing
+    /// journals its place alone.
+    pub(crate) fn land(self, at: Option<Position>) -> Result<(), Unfollowed> {
+        let Self {
+            door,
+            _applying,
+            number,
+            change,
+        } = self;
+        match (change, at) {
+            (Some((next, kept)), at) => door.enter(next, kept, at).map_err(|stale| {
+                warn!(
+                    generation = number,
+                    standing = stale.standing,
+                    "a leader's generation is not above the one this replica runs: the replica keeps its own"
+                );
+                Unfollowed {
+                    path: NUMBER,
+                    why: NOT_ABOVE,
+                }
+            }),
+            (None, Some(at)) => {
+                door.store.follow_generation_place(at, number);
+                Ok(())
+            }
+            (None, None) => Ok(()),
         }
     }
 }
@@ -5021,5 +5264,121 @@ pub(crate) mod tests {
             )
             .expect("stdout");
         }
+    }
+
+    /// What a leader's door sends of its standing generation.
+    fn sent(leader: &Generations) -> proto::GenerationEvent {
+        leader.standing_sent().expect("a held document")
+    }
+
+    /// `told` followed at no place, as a restore lands one.
+    fn followed(standby: &Generations, told: &proto::GenerationEvent) -> Result<(), Unfollowed> {
+        standby.following(told)?.land(None)
+    }
+
+    #[test]
+    fn a_form_is_named_as_it_is_written() {
+        for format in [Format::Yaml, Format::Json] {
+            assert_eq!(Format::named(format.as_str()), Some(format));
+        }
+        assert_eq!(Format::named("YAML"), None);
+    }
+
+    #[test]
+    fn a_standby_runs_its_leaders_generation_under_the_leaders_number() {
+        let (led, leader) = generations();
+        assert_eq!(leader.standing_sent(), None, "no document is held yet");
+        yaml(&leader, RANDOM).expect("a valid document");
+        yaml(&leader, LEAST_LOAD).expect("a changed document");
+        let told = sent(&leader);
+        assert_eq!(told, leader.sent(2), "the standing one, by its number");
+        // A generation that stands no longer is sent by its number alone.
+        assert_eq!(leader.sent(1), worker_wire::generation_told(1));
+
+        let (store, standby) = generations();
+        followed(&standby, &told).expect("above the unbound one");
+        assert_eq!(standing(&store), standing(&led));
+        // The read call answers the leader's bytes, form and time.
+        assert_eq!(
+            standby.document(0).expect("held"),
+            leader.document(0).expect("held")
+        );
+        assert_eq!(standby.counts().applied, 1);
+        // Told again, it changes nothing.
+        followed(&standby, &told).expect("the standing one again");
+        // Nor does an event with no document, whatever its number.
+        followed(&standby, &worker_wire::generation_told(9)).expect("no document");
+        assert_eq!(standing(&store), standing(&led));
+        assert_eq!(standby.counts().applied, 1);
+    }
+
+    #[test]
+    fn a_replica_that_read_the_same_file_under_a_lower_number_takes_its_leaders() {
+        let (_, leader) = generations();
+        yaml(&leader, with_line(LEAST_LOAD, 5)).expect("a claim above none");
+        let (store, standby) = generations();
+        yaml(&standby, LEAST_LOAD).expect("a valid document");
+        let (own, digest) = standing(&store);
+        assert_eq!(own, 1);
+        followed(&standby, &sent(&leader)).expect("the leader's number is above its own");
+        assert_eq!(
+            standing(&store),
+            (5, digest),
+            "one document, the leader's number"
+        );
+        assert_eq!(standby.document(0).expect("held").generation, 5);
+    }
+
+    #[test]
+    fn a_generation_that_is_not_above_the_standing_one_is_not_followed() {
+        let (_, leader) = generations();
+        yaml(&leader, RANDOM).expect("a valid document");
+        let (store, standby) = generations();
+        yaml(&standby, LEAST_LOAD).expect("a valid document");
+        // Its own number over another document.
+        let own = standing(&store);
+        let refused = followed(&standby, &sent(&leader)).expect_err("another document");
+        assert_eq!((refused.path, refused.why), (NUMBER, NOT_ABOVE));
+        assert_eq!(standing(&store), own);
+        // A number under its own, whatever the document.
+        yaml(&standby, RANDOM).expect("a changed document");
+        let own = standing(&store);
+        assert_eq!(own.0, 2);
+        let refused = followed(&standby, &sent(&leader)).expect_err("under its own");
+        assert_eq!((refused.path, refused.why), (NUMBER, NOT_ABOVE));
+        assert_eq!(standing(&store), own);
+        assert_eq!(standby.document(0).expect("held").generation, 2);
+    }
+
+    #[test]
+    fn an_event_this_replica_cannot_run_is_refused_by_its_path() {
+        let (store, standby) = generations();
+        yaml(&standby, RANDOM).expect("a valid document");
+        let own = standing(&store);
+        let push = |document: &str, format: &str| {
+            Some(proto::SpecPush {
+                generation: 2,
+                document: document.as_bytes().to_vec(),
+                format: format.to_owned(),
+                ..proto::SpecPush::default()
+            })
+        };
+        let mut told = worker_wire::generation_told(2);
+        // A stage this build does not hold.
+        told.document = push(&LEAST_LOAD.replace("healthy", "no-such-stage"), "yaml");
+        let refused = followed(&standby, &told).expect_err("a stage this build lacks");
+        assert_eq!(refused.path, "generation.document");
+        // A form it does not know, and an event that names no number.
+        told.document = push(LEAST_LOAD, "toml");
+        let refused = followed(&standby, &told).expect_err("no such form");
+        assert_eq!(refused.path, "generation.document.format");
+        let refused = followed(&standby, &proto::GenerationEvent::default());
+        assert_eq!(refused.expect_err("no number").path, NUMBER);
+        assert_eq!(standing(&store), own);
+        assert_eq!(standby.counts().applied, 1);
+        // The same event with a document that runs is followed.
+        told.document = push(LEAST_LOAD, "yaml");
+        followed(&standby, &told).expect("above its own");
+        assert_eq!(standing(&store).0, 2);
     }
 }

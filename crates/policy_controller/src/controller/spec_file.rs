@@ -306,14 +306,28 @@ impl SpecFile {
     /// flight ends by itself and the watch does not wait on it. The runtime
     /// that ran it does, at its own end: the controller's `run` bounds that
     /// wait.
-    pub(crate) async fn run(self, stop: watch::Receiver<bool>) -> Result<(), JoinError> {
-        self.run_looking(stop, look).await
+    ///
+    /// `leads` is the role's word of a replica that follows a leader: while
+    /// it says the replica does not lead, the watch looks at nothing. The
+    /// log is then the one writer of the replica's door
+    /// ([`Generations::following`]), and two replicas that read one file
+    /// never apply it twice under two numbers. The state last read stays as
+    /// it was, so the first looks after a take read a file that changed
+    /// meanwhile, as a leader's watch does. `None` for a replica that
+    /// follows nobody: its watch looks at every poll.
+    pub(crate) async fn run(
+        self,
+        stop: watch::Receiver<bool>,
+        leads: Option<watch::Receiver<bool>>,
+    ) -> Result<(), JoinError> {
+        self.run_looking(stop, leads, look).await
     }
 
     /// [`SpecFile::run`] with the look as its argument.
     async fn run_looking<L>(
         mut self,
         mut stop: watch::Receiver<bool>,
+        leads: Option<watch::Receiver<bool>>,
         mut look: L,
     ) -> Result<(), JoinError>
     where
@@ -325,6 +339,9 @@ impl SpecFile {
             tokio::select! {
                 () = sleep(POLL) => {}
                 _ = stop.wait_for(|stop| *stop) => return Ok(()),
+            }
+            if leads.as_ref().is_some_and(|leads| !*leads.borrow()) {
+                continue;
             }
             let looking = tokio::task::spawn_blocking(move || {
                 self.poll_looking(&mut look);
@@ -1292,7 +1309,7 @@ pub(crate) mod tests {
         };
         let (stop, stopped) = watch::channel(false);
         let mut watching = JoinSet::new();
-        watching.spawn(file.run_looking(stopped, counted));
+        watching.spawn(file.run_looking(stopped, None, counted));
 
         // No look before a poll has passed, then a step a poll: the first
         // sees the file moved, the second reads it between two looks.
@@ -1342,7 +1359,7 @@ pub(crate) mod tests {
         };
         let (stop, stopped) = watch::channel(false);
         let mut watching = JoinSet::new();
-        watching.spawn(file.run_looking(stopped, counted));
+        watching.spawn(file.run_looking(stopped, None, counted));
 
         // One look, and half a poll into the wait for the next.
         sleep(POLL * 3 / 2).await;
@@ -1352,5 +1369,52 @@ pub(crate) mod tests {
         ended(&mut watching).await.expect("the loop's last join");
         assert_eq!(began.elapsed(), stopped_at, "the loop waited no poll out");
         assert_eq!(looks.load(Ordering::SeqCst), 1, "no look after the stop");
+    }
+
+    /// The watch of a replica that follows a leader. While the role's word
+    /// says the replica does not lead, the watch looks at nothing, whatever
+    /// the file became: the log is the one writer of its door. At the word
+    /// that it leads, its next looks read the file as it stands, and the
+    /// file is applied as a leader's is. Back under a leader, it looks at
+    /// nothing again.
+    #[tokio::test(start_paused = true)]
+    async fn the_watch_of_a_replica_that_follows_looks_only_while_it_leads() {
+        let bed = bed(LEAST_LOAD.as_bytes());
+        let file = bed.start();
+        let looks = Arc::new(AtomicUsize::new(0));
+        let counted = {
+            let looks = Arc::clone(&looks);
+            move |path: &Path| {
+                let n = looks.fetch_add(1, Ordering::SeqCst) + 1;
+                assert!(n <= 20, "the loop looks without end");
+                look(path)
+            }
+        };
+        let (stop, stopped) = watch::channel(false);
+        let (role, leads) = watch::channel(false);
+        let mut watching = JoinSet::new();
+        watching.spawn(file.run_looking(stopped, Some(leads), counted));
+
+        // Between two polls, so the word and a look never share an instant.
+        replace(&bed.path, RANDOM.as_bytes());
+        sleep(9 * POLL / 2).await;
+        assert_eq!(looks.load(Ordering::SeqCst), 0, "no look while it follows");
+        assert_eq!(bed.generation(), 1);
+
+        // The take: a look that sees the file moved, then the read between
+        // two looks.
+        role.send_replace(true);
+        sleep(2 * POLL).await;
+        assert_eq!(looks.load(Ordering::SeqCst), 3);
+        assert_eq!(bed.generation(), 2, "applied as a leader's file is");
+
+        role.send_replace(false);
+        replace(&bed.path, LEAST_LOAD.as_bytes());
+        sleep(5 * POLL).await;
+        assert_eq!(looks.load(Ordering::SeqCst), 3, "no look once it follows");
+        assert_eq!(bed.generation(), 2);
+
+        stop.send_replace(true);
+        ended(&mut watching).await.expect("the loop's last join");
     }
 }

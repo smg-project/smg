@@ -241,19 +241,21 @@ impl Shared {
                 counts: Arc::default(),
             },
         )?;
+        let generations = Arc::new(Generations::new(Arc::clone(&store), catalog));
         Ok(Self {
             controller_id,
             address,
             identity: elector.identity().to_owned(),
             fence: elector.fence(),
             standing,
-            generations: Arc::new(Generations::new(Arc::clone(&store), catalog)),
+            generations: Arc::clone(&generations),
             door: Door::new(Arc::clone(&store), Arc::clone(&feed.log)),
             replication: Replication::new(
                 Arc::clone(&store),
                 Arc::clone(&feed.log),
                 elector.fence(),
-            ),
+            )
+            .telling(Arc::clone(&generations)),
             lag: Arc::new(Lag::new(standby::synced_within(Duration::ZERO))),
             store,
             gateways,
@@ -853,17 +855,13 @@ impl PolicyController for Service {
                 ));
             }
         };
-        let format = match apply.format.as_str() {
-            "yaml" => Format::Yaml,
-            "json" => Format::Json,
-            _ => {
-                // A form no one names takes no pass and no turn: the guard,
-                // then the form.
-                generations
-                    .guarded(&apply.expected_digest)
-                    .map_err(unanswered)?;
-                return Err(Status::invalid_argument("format: name yaml or json"));
-            }
+        let Some(format) = Format::named(&apply.format) else {
+            // A form no one names takes no pass and no turn: the guard,
+            // then the form.
+            generations
+                .guarded(&apply.expected_digest)
+                .map_err(unanswered)?;
+            return Err(Status::invalid_argument("format: name yaml or json"));
         };
         // The guard is the door's to read, behind the turn its pass waits.
         let (expected, document) = (apply.expected_digest, apply.document);

@@ -612,8 +612,9 @@ impl Controller {
     /// may make none, a directory that is not read, two files under one
     /// number, a newest generation that does not run, a spec source taken
     /// before this one, and a lease another replica can take
-    /// ([`LeasePlace`]). A standby does not follow an applied generation in
-    /// this build, so a promoted one would run without it.
+    /// ([`LeasePlace`]). A standby follows a file's generations alone in
+    /// this build: a store's directory is one replica's own, so a promoted
+    /// one would hold none of it.
     pub async fn spec_store(&mut self, dir: impl Into<PathBuf>) -> Result<(), Error> {
         let path = dir.into();
         let refused = |source| Error::SpecStore {
@@ -873,8 +874,11 @@ impl Controller {
         });
         if let Some(file) = spec_file {
             let file_stop = stop.subscribe();
+            // A replica that follows applies its leader's generations from
+            // the log: its own watch looks at the file while it leads.
+            let leads = follows.map(|_| shared.role.subscribe());
             tasks.spawn(async move {
-                file.run(file_stop)
+                file.run(file_stop, leads)
                     .await
                     .map_err(|join| Error::Task(join.to_string()))
             });

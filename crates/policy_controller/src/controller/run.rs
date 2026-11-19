@@ -195,8 +195,8 @@ struct Cli {
     /// until the first apply. The last 8 generations stay on file, and a
     /// rollback runs one of them again as the next generation. One replica
     /// serves it, its lease in the process: beside a lease another
-    /// replica can take the start is refused, since a standby does not
-    /// follow an applied generation in this build. One process holds the
+    /// replica can take the start is refused, since a standby follows a
+    /// file's generations alone in this build. One process holds the
     /// directory, under a lock on a file it makes there: a start that
     /// cannot make that file is refused, and one that finds it held waits
     /// for its holder to stop, refused where it is still held at the end
@@ -1557,7 +1557,7 @@ mod tests {
     }
 
     /// Beside a lease another replica can take, a spec store refuses the
-    /// start by name: a standby would not follow an applied generation.
+    /// start by name: a standby follows a file's generations alone.
     #[tokio::test]
     async fn a_spec_store_refuses_the_start_beside_a_lease_another_replica_can_take() {
         let dir = tempfile::tempdir().expect("a directory");
@@ -1578,7 +1578,7 @@ mod tests {
             }) => assert_eq!(
                 refused.to_string(),
                 format!(
-                    "the spec store {}: another replica can take this controller's lease, and a standby does not follow an applied generation in this build: keep the lease in the process, or hand the spec as a file",
+                    "the spec store {}: another replica can take this controller's lease, and a standby follows a file's generations alone in this build: keep the lease in the process, or hand the spec as a file",
                     store.display()
                 )
             ),

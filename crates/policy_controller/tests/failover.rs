@@ -8,10 +8,14 @@
 //! polls the engines itself.
 //!
 //! What crosses the take is what a standby applies: the fleet's rows, under
-//! the ids the leader gave them, and their loads. Both replicas run one
-//! document from one spec file. No session's pin and no lease crosses a take
-//! in this build, so the case asks keys the ring places and gives each lease
-//! up as it goes.
+//! the ids the leader gave them, their loads, and the leader's document.
+//! Each replica reads a spec file of its own, and both files change once
+//! the fleet has registered, each to another document. The standby follows
+//! its leader's and looks at no file while it follows. Promoted, it reads
+//! its own file as a leader does, and applies it as the generation after
+//! its leader's. No session's pin and no lease crosses a take in this build,
+//! so the case asks keys the ring places and gives each lease up as it
+//! goes.
 //!
 //! No call reads a following standby's rows from outside its process. The
 //! traffic runs until the standby reads synced and has applied, on two
@@ -105,6 +109,14 @@ const LAG: &str = "smg_policy_controller_replication_lag_seconds";
 /// The document both replicas run: the ring preset's one profile.
 const DOCUMENT: &str = "apiVersion: smg.policy/v1\nprofiles:\n  default:\n    filter: [healthy]\n    score: [consistent-hash]\n    pick: best\n";
 
+/// The leader's file after its change: the same profile under a written
+/// binding, so the routing is the same and the document is another one.
+const CHANGED: &str = "apiVersion: smg.policy/v1\nprofiles:\n  default:\n    filter: [healthy]\n    score: [consistent-hash]\n    pick: best\nbindings:\n  - match: { model: \"*\" }\n    profile: default\n";
+
+/// The standby's file after its change, a third document with the same
+/// routing: what a promoted standby applies from its own file.
+const OWN: &str = "apiVersion: smg.policy/v1\nprofiles:\n  default:\n    filter: [healthy]\n    score: [consistent-hash]\n    pick: best\nbindings:\n  - match: { model: fleet-model }\n    profile: default\n  - match: { model: \"*\" }\n    profile: default\n";
+
 /// `message` as a call that states the operator's name: a listener its
 /// operator named takes the name a call states.
 fn stating<T>(message: T) -> Request<T> {
@@ -152,6 +164,16 @@ async fn through_the_door(
             Err(status) => return Err(format!("the door took no registration: {status}")),
         }
     }
+}
+
+/// The document the replica behind `door` runs, as its operator reads it.
+async fn document(
+    door: &mut PolicyControllerClient<Channel>,
+) -> Result<proto::PolicySpecDocument, String> {
+    door.get_policy_spec(stating(proto::GetPolicySpecRequest::default()))
+        .await
+        .map(tonic::Response::into_inner)
+        .map_err(|status| format!("the door answered no document: {status}"))
 }
 
 /// The gateway's session at `replica`, opened once the replica leads: a
@@ -273,8 +295,11 @@ async fn a_killed_leaders_standby_answers_each_routing_key_on_its_worker() {
         let dir = tempfile::tempdir().expect("a temp dir");
         let lease = dir.path().join("lease");
         let spec = dir.path().join("policy.yaml");
-        std::fs::write(&spec, DOCUMENT).expect("the document's file");
+        std::fs::write(&spec, DOCUMENT).expect("the leader's file");
         let flags = flags(&spec);
+        let own = dir.path().join("standby.yaml");
+        std::fs::write(&own, DOCUMENT).expect("the standby's file");
+        let following = self::flags(&own);
 
         // The pair, under the election's default timings, on a replication
         // port of the pairs' own numbers: no bind of port 0 is handed it on
@@ -311,7 +336,7 @@ async fn a_killed_leaders_standby_answers_each_routing_key_on_its_worker() {
             (STANDBY, port),
             Lease::File(&lease),
             ElectionSettings::default(),
-            &flags,
+            &following,
         )
         .expect("the standby starts");
         assert!(
@@ -342,6 +367,30 @@ async fn a_killed_leaders_standby_answers_each_routing_key_on_its_worker() {
                 .expect("the door takes a worker");
             workers.push(worker);
         }
+
+        // Both files change, each to another document. The leader's watch
+        // applies its own as the next generation. The standby's watch looks
+        // at nothing while it follows: its document is its leader's.
+        std::fs::write(&own, OWN).expect("the standby's file");
+        std::fs::write(&spec, CHANGED).expect("the leader's file");
+        let changed = Instant::now();
+        loop {
+            let held = document(&mut door)
+                .await
+                .expect("the leader answers its document");
+            if held.generation == 2 {
+                assert_eq!(held.document, CHANGED.as_bytes());
+                break;
+            }
+            assert!(
+                changed.elapsed() < ROOM,
+                "the leader applies its changed file inside the room: it runs generation {}",
+                held.generation
+            );
+            tokio::time::sleep(PACE).await;
+        }
+        // The standby's frames are read behind the registrations and the
+        // leader's apply: both stand behind a frame younger than this.
         let registered = Instant::now();
 
         // A registration is in force for a decision within one publication
@@ -453,6 +502,39 @@ async fn a_killed_leaders_standby_answers_each_routing_key_on_its_worker() {
                 worker, homes[&key],
                 "a routing key keeps its worker when its leader is killed"
             );
+        }
+
+        // The promoted standby runs the document its leader applied, under
+        // the leader's number, until its own watch reads its file as a
+        // leader's does: the file changed while it followed, and it is
+        // applied as the generation after the leader's. A standby that had
+        // not followed the leader's document would count one less, and one
+        // that had read its own file while it followed would not be here.
+        let channel = Channel::from_shared(format!("http://{}", standby.control))
+            .expect("a uri")
+            .connect()
+            .await
+            .expect("the promoted standby's control listener accepts");
+        let mut door = PolicyControllerClient::new(channel);
+        let promoted = Instant::now();
+        loop {
+            let held = document(&mut door)
+                .await
+                .expect("the promoted standby answers its document");
+            if held.generation == 3 {
+                assert_eq!(held.document, OWN.as_bytes());
+                break;
+            }
+            assert_eq!(
+                (held.generation, held.document.as_slice()),
+                (2, CHANGED.as_bytes()),
+                "ahead of its own file's turn a promoted standby runs the document its leader applied"
+            );
+            assert!(
+                promoted.elapsed() < ROOM,
+                "a promoted standby reads its own file inside the room"
+            );
+            tokio::time::sleep(PACE).await;
         }
 
         // The promoted standby polls the engines itself: no other

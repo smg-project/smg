@@ -161,7 +161,7 @@ pub enum StoreRefused {
     },
     /// The election's lease is one another replica can take.
     #[error(
-        "another replica can take this controller's lease, and a standby does not follow an applied generation in this build: keep the lease in the process, or hand the spec as a file"
+        "another replica can take this controller's lease, and a standby follows a file's generations alone in this build: keep the lease in the process, or hand the spec as a file"
     )]
     BesideASharedLease,
     /// The controller took a spec source before this one.

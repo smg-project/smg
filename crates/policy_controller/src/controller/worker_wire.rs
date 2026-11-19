@@ -461,8 +461,23 @@ pub(crate) fn replication(entry: &Entry, now: Instant) -> proto::ReplicationEven
         Written::Member { .. } => member(entry).map(Sent::Membership),
         Written::Load { id, rank, sample } => Some(Sent::Load(load(*id, *rank, sample, now))),
         Written::Term => Some(Sent::TermStart(proto::TermStart {})),
+        Written::Generation { generation } => Some(Sent::Generation(generation_told(*generation))),
     };
     proto::ReplicationEvent { event }
+}
+
+/// A generation's event as a log entry says it: the number alone. The
+/// stream that sends it joins the document where its door still holds that
+/// generation; sent as it is here, it tells a standby that the generation
+/// stood no longer, and the standby journals the place alone.
+pub(crate) fn generation_told(generation: u64) -> proto::GenerationEvent {
+    proto::GenerationEvent {
+        status: Some(proto::SpecStatus {
+            generation,
+            ..proto::SpecStatus::default()
+        }),
+        document: None,
+    }
 }
 
 const fn unknown(path: &'static str) -> Refused {

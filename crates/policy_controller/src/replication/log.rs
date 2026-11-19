@@ -44,6 +44,10 @@ pub enum Event {
     /// head of a store that leads is never under term `0`, and how a
     /// follower of the log learns the term before the leader's next write.
     Term,
+    /// A generation applied, by its number: one of the watched kinds, and
+    /// told to no watch. The document it runs from is its door's to hold,
+    /// never the log's: an apply costs the ring one small entry.
+    Generation { generation: u64 },
 }
 
 /// An event at its place in the history.
@@ -669,6 +673,11 @@ impl Log {
                 let term = self.own(&ring);
                 let mut seq = ring.head.seq + 1;
                 if term == 0 {
+                    // A generation applied under no term takes no place:
+                    // the take that starts a term tells the standing one.
+                    if matches!(event, Event::Generation { .. }) {
+                        return;
+                    }
                     // Its number is the write's whole name: past the head,
                     // and past every own write a restart left above it.
                     seq = ring.fresh(seq);
@@ -962,6 +971,10 @@ impl Journal for Log {
         );
     }
 
+    fn generation(&self, at: Option<Position>, generation: u64) {
+        self.push(at, Event::Generation { generation });
+    }
+
     fn term_rose(&self, term: u64) {
         let mut ring = self.ring.lock();
         if term <= self.term.load(Ordering::Relaxed) {
@@ -1026,6 +1039,8 @@ mod tests {
     const TERM: u32 = u32::MAX;
     /// The mark a membership event reads as, above its epoch.
     const MEMBER: u32 = 1_000_000;
+    /// A generation's mark: its number above this.
+    const GENERATION: u32 = 2_000_000;
 
     /// A load row of the store's own, marked by its `running`.
     fn load(log: &Log, running: u32) {
@@ -1078,6 +1093,9 @@ mod tests {
                     MEMBER + u32::try_from(*epoch).expect("a test's epoch")
                 }
                 Event::Term => TERM,
+                Event::Generation { generation } => {
+                    GENERATION + u32::try_from(*generation).expect("a test's generation")
+                }
             })
             .collect()
     }
@@ -1134,6 +1152,9 @@ mod tests {
                     follower.load(Some(entry.at), *id, *rank, sample);
                 }
                 Event::Term => follower.term_followed(entry.at),
+                Event::Generation { generation } => {
+                    follower.generation(Some(entry.at), *generation);
+                }
                 Event::Member {
                     epoch,
                     change,

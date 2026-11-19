@@ -650,11 +650,50 @@ impl MemoryStore {
     /// ([`Membership::Snapshot`]), under the workers lock and with the load
     /// lock let go: its stages start empty, and each membership write after
     /// it is told behind the same lock, in its order.
+    ///
+    /// The journal is told the generation's number there too, behind the
+    /// publication ([`Journal::generation`]).
     pub fn apply(&self, spec: AppliedSpec) -> Result<(), StaleGeneration> {
+        self.apply_at(None, spec)
+    }
+
+    /// A leader's generation, applied as the replication stream tells it:
+    /// [`MemoryStore::apply`] with the place of the leader's event, `at`,
+    /// which the journal keeps for this write where the applier holds it.
+    /// A generation the store refuses tells the journal nothing, so the
+    /// guard of its position does not land.
+    pub fn follow_generation(
+        &self,
+        at: Position,
+        spec: AppliedSpec,
+    ) -> Result<(), StaleGeneration> {
+        self.apply_at(Some(at), spec)
+    }
+
+    /// A leader's generation event that changes nothing here: the store
+    /// runs that generation already, or the generation stood no longer when
+    /// its leader sent the event and a later event tells what replaced it.
+    /// It writes nothing, and the journal keeps the place under the
+    /// membership lock, as an apply's is kept.
+    pub fn follow_generation_place(&self, at: Position, generation: u64) {
+        let _released = self.released();
+        let _workers = self.workers.lock();
+        if let Some(journal) = &self.journal {
+            journal.generation(Some(at), generation);
+        }
+    }
+
+    /// [`MemoryStore::apply`], its telling at `at` where a standby's
+    /// applier holds that place.
+    fn apply_at(&self, at: Option<Position>, spec: AppliedSpec) -> Result<(), StaleGeneration> {
         // The writer takes a second reference: when it refuses, the last
         // one is this one, let go after the lock.
         let spec = Arc::new(spec);
+        let generation = spec.generation();
         let before = {
+            // Taken before the lock, so dropped after it: the journal
+            // wakes its readers with the membership lock let go.
+            let _released = self.released();
             let workers = self.workers.lock();
             let mut loads = self.loads.lock();
             let Loads { ranks, writer } = &mut *loads;
@@ -677,6 +716,9 @@ impl MemoryStore {
                 self.pins_swept.lock().every = Some(every);
             }
             self.tell_members(&workers);
+            if let Some(journal) = &self.journal {
+                journal.generation(at, generation);
+            }
             before
         };
         drop(before);
@@ -2971,6 +3013,15 @@ impl LeasesStore for MemoryStore {
         self.raise(term, || {
             if let Some(journal) = &self.journal {
                 journal.term_rose(term);
+                // A term's history starts with the generation that stands:
+                // one applied under no term took no place, and a standby
+                // joins at this start. The number is read behind the rise:
+                // an apply that published ahead of it is read here, and
+                // one that publishes behind it tells itself under the term.
+                let standing = self.world.load().spec().generation();
+                if standing != 0 {
+                    journal.generation(None, standing);
+                }
             }
         });
     }
