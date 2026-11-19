@@ -416,7 +416,6 @@ mod tests {
         data.drained_workers.push(Arc::clone(&drained));
 
         let saved = serde_json::json!({
-            "asker": "Api",
             "config": {"url": url, "expected_revisions": null},
             "asker": "Api",
             "workers_to_remove": {"worker_urls": [url]},

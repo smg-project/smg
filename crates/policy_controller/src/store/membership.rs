@@ -4,7 +4,7 @@
 
 use std::{collections::hash_map::RandomState, fmt, hash::BuildHasher};
 
-use super::workers::{Maker, WorkerFacts, WorkerRow};
+use super::workers::{Maker, WorkerFacts, WorkerRow, WorkerStatus};
 
 /// A write of a row by a caller that did not make it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -36,6 +36,20 @@ impl fmt::Display for NotMaker<'_> {
 }
 
 impl WorkerRow {
+    /// How a registration of `facts` changes this row, by whichever door it
+    /// comes. A drain is of the registration it named and ends with it: a
+    /// registration over a draining row is the URL's next life, whatever
+    /// its facts, and a removal that named the draining row then names a
+    /// row that left. A patch and a second drain keep a drain. Any other
+    /// row is changed as its facts are ([`WorkerFacts::laid_over`]).
+    pub fn laid(&self, facts: &WorkerFacts) -> Laid {
+        if self.status == WorkerStatus::Draining {
+            Laid::Another
+        } else {
+            facts.laid_over(&self.facts)
+        }
+    }
+
     /// Whether `caller` made the row. Check before writing a standing row.
     pub fn made_by(&self, caller: &Maker) -> Result<(), NotMaker<'_>> {
         if self.maker == *caller {

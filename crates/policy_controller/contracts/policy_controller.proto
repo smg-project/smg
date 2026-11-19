@@ -816,7 +816,9 @@ message RegisterWorkerRequest {
     // and answer the row unmoved, a change of role, wire or models is a new
     // incarnation, any other change is made in place. The models change
     // when their set does: the same ids in another order are written in
-    // place, and the row tells the stated order. A caller that did not make
+    // place, and the row tells the stated order. Over a draining row every
+    // registration is the URL's next incarnation, whatever its facts: a
+    // drain ends with the registration it named. A caller that did not make
     // the standing row is PERMISSION_DENIED, whatever the facts.
     MODE_UPSERT = 3;
   }
