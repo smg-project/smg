@@ -746,10 +746,6 @@ pub(crate) fn init_metrics() {
     );
 
     // Layer 3: Worker metrics
-    describe_gauge!(
-        "smg_worker_pool_size",
-        "Current worker pool size by worker_type, connection_mode, model"
-    );
     // The worker's own series, described by the worker's module.
     describe_worker_series();
     describe_counter!(
@@ -2205,23 +2201,6 @@ impl Metrics {
     // ========================================================================
     // Layer 3: Worker metrics
     // ========================================================================
-
-    /// Set worker pool size
-    pub fn set_worker_pool_size(
-        worker_type: &'static str,
-        connection_mode: &'static str,
-        model_id: &str,
-        size: usize,
-    ) {
-        let model = intern_model_label(model_id);
-        gauge!(
-            "smg_worker_pool_size",
-            "worker_type" => worker_type,
-            "connection_mode" => connection_mode,
-            "model" => model
-        )
-        .set(size as f64);
-    }
 
     /// Record worker selection
     pub fn record_worker_selection(

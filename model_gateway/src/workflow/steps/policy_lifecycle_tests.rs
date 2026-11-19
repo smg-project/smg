@@ -10,13 +10,13 @@ use openai_protocol::{
     model_card::ModelCard,
     worker::{WorkerSpec, WorkerUpdateRequest},
 };
-use smg_worker::identity::basic::Worker;
+use smg_worker::{identity::basic::Worker, workflow::RemoveFromWorkerRegistryStep};
 use wfaas::{StepExecutor, WorkflowContext, WorkflowInstanceId};
 
 use super::{
     create_worker_removal_workflow_data, create_worker_update_workflow_data,
     create_worker_workflow_data, RegisterWorkersStep, RemoveFromPolicyRegistryStep,
-    RemoveFromWorkerRegistryStep, UpdatePoliciesForWorkerStep, UpdatePoliciesStep,
+    UpdatePoliciesForWorkerStep, UpdatePoliciesStep,
 };
 use crate::{
     app_context::{testing::app_context_for_tests, AppContext},

@@ -46,6 +46,10 @@
 //! readers and hooks the registry, the series store, the label interner and
 //! the KV event collector keep for their own cases.
 //!
+//! The `workflow` feature adds `workflow`, the worker side of the workflows
+//! a host runs over its workers on the workflow engine: the steps of a
+//! worker's removal, the data they pass along and the host trait they read.
+//!
 //! The `proto` feature adds `common_proto`, the messages every engine's gRPC
 //! service shares, and the conversion of the engine load record into the
 //! per-rank snapshot of a load report.
@@ -84,6 +88,8 @@ pub mod settings;
 #[cfg(all(feature = "runtime", any(test, feature = "test-util")))]
 pub mod test_support;
 pub mod worker;
+#[cfg(feature = "workflow")]
+pub mod workflow;
 
 /// The messages every engine's gRPC service shares (`proto/common.proto`,
 /// package `smg.grpc.common`): the tokenizer's chunks, the KV cache events,

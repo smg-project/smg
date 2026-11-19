@@ -13,13 +13,14 @@ use smg_worker::{
         basic::{BasicWorker, ConnectionMode, RuntimeType, Worker, WorkerType},
         endpoint::Endpoint,
     },
+    workflow::WorkerList,
 };
 use tracing::{debug, info};
 use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
 use crate::{
     routers::grpc::backend_client::BasicWorkerBuilder,
-    workflow::data::{require_app_context, WorkerKind, WorkerList, WorkerWorkflowData},
+    workflow::data::{require_app_context, WorkerKind, WorkerWorkflowData},
 };
 
 /// Normalize URL for external APIs (ensure https://).

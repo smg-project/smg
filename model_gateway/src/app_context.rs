@@ -20,6 +20,7 @@ use smg_worker::{
         DEFAULT_CONNECT_TIMEOUT_SECS,
     },
     health::liveness,
+    workflow::WorkflowHost,
 };
 use tokio::sync::broadcast::error::RecvError;
 use tool_parser::ParserFactory as ToolParserFactory;
@@ -39,7 +40,7 @@ use crate::{
             overload, pd_admission,
             prefill_admission::PrefillAdmission,
             realtime::RealtimeRegistry,
-            snapshot::{WorkerMonitor, WorkerRegistry},
+            snapshot::{ModelWorkerSnapshot, WorkerMonitor, WorkerRegistry},
         },
         gateway::Gateway,
         grpc::{
@@ -217,6 +218,16 @@ pub struct AppContextBuilder {
     kv_event_monitor: Option<Arc<KvEventMonitor>>,
     webrtc_bind_addr: Option<std::net::IpAddr>,
     webrtc_stun_server: Option<String>,
+}
+
+/// The context hosts the worker crate's workflow steps: they read the
+/// registry through this and nothing else of the gateway.
+impl WorkflowHost for AppContext {
+    type Generation = ModelWorkerSnapshot;
+
+    fn worker_registry(&self) -> &Arc<WorkerRegistry> {
+        &self.worker_registry
+    }
 }
 
 impl AppContext {

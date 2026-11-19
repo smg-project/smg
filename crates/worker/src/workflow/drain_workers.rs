@@ -14,24 +14,29 @@
 use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
-use openai_protocol::worker::WorkerStatus;
-use smg_worker::identity::{basic::Worker, endpoint::Endpoint};
 use tracing::{debug, info};
 use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
-use crate::workflow::data::{require_app_context, WorkerRemovalWorkflowData};
+use super::{
+    data::WorkerRemovalWorkflowData,
+    host::{require_host, WorkflowHost},
+};
+use crate::{
+    identity::{basic::Worker, endpoint::Endpoint},
+    worker::WorkerStatus,
+};
 
 /// Step that transitions Ready workers to `Draining` and waits for the
 /// resolved drain settle window before downstream steps remove them.
 pub struct DrainWorkersStep;
 
 #[async_trait]
-impl StepExecutor<WorkerRemovalWorkflowData> for DrainWorkersStep {
+impl<H: WorkflowHost> StepExecutor<WorkerRemovalWorkflowData<H>> for DrainWorkersStep {
     async fn execute(
         &self,
-        context: &mut WorkflowContext<WorkerRemovalWorkflowData>,
+        context: &mut WorkflowContext<WorkerRemovalWorkflowData<H>>,
     ) -> WorkflowResult<StepResult> {
-        let app_context = require_app_context(context.data.app_context.as_ref())?;
+        let host = require_host(context.data.host.as_ref())?;
         let workers_to_remove = context
             .data
             .actual_workers_to_remove
@@ -42,7 +47,7 @@ impl StepExecutor<WorkerRemovalWorkflowData> for DrainWorkersStep {
             return Ok(StepResult::Success);
         }
 
-        let registry = &app_context.worker_registry;
+        let registry = host.worker_registry();
         let pins = context.data.config.expected_revisions.as_ref();
         let mut max_drain_secs: u64 = 0;
         let mut transitioned = 0usize;
@@ -164,16 +169,16 @@ impl StepExecutor<WorkerRemovalWorkflowData> for DrainWorkersStep {
 mod tests {
     use std::{collections::HashMap, sync::Arc};
 
-    use openai_protocol::worker::{HealthCheckConfig, WorkerStatus};
-    use smg_worker::identity::basic::{Worker, WorkerType};
     use wfaas::WorkflowInstanceId;
 
     use super::*;
     use crate::{
-        app_context::AppContext,
-        routers::grpc::backend_client::BasicWorkerBuilder,
-        workflow::data::{WorkerList, WorkerRemovalWorkflowData},
+        test_support::{BasicWorkerBuilder, WorkerRegistry},
+        worker::{HealthCheckConfig, WorkerType},
+        workflow::{data::WorkerList, host::testing::RegistryHost},
     };
+
+    type WorkerRemovalWorkflowData = super::WorkerRemovalWorkflowData<RegistryHost>;
 
     fn build_worker(url: &str, drain_secs: u64, status: WorkerStatus) -> Arc<dyn Worker> {
         let worker: Arc<dyn Worker> = Arc::new(
@@ -190,36 +195,30 @@ mod tests {
         worker
     }
 
-    fn make_app_context(workers: &[Arc<dyn Worker>]) -> Arc<AppContext> {
-        use crate::{
-            app_context::testing::app_context_for_tests, config::RouterConfig,
-            routers::common::snapshot::WorkerRegistry,
-        };
-
-        let router_config = RouterConfig::builder()
-            .worker_startup_timeout_secs(1)
-            .build_unchecked();
+    fn make_host(workers: &[Arc<dyn Worker>]) -> Arc<RegistryHost> {
         let registry = Arc::new(WorkerRegistry::new());
         for w in workers {
             registry.register(Arc::clone(w)).unwrap();
         }
-        app_context_for_tests(router_config, registry, None)
+        Arc::new(RegistryHost {
+            worker_registry: registry,
+        })
     }
 
     fn make_context(
-        app_context: Arc<AppContext>,
+        host: Arc<RegistryHost>,
         workers: Vec<Arc<dyn Worker>>,
     ) -> WorkflowContext<WorkerRemovalWorkflowData> {
         let worker_urls: Vec<String> = workers.iter().map(|w| w.url().to_string()).collect();
         let data = WorkerRemovalWorkflowData {
-            config: super::super::find_workers_to_remove::WorkerRemovalRequest {
+            config: crate::workflow::WorkerRemovalRequest {
                 url: worker_urls.first().cloned().unwrap_or_default(),
                 expected_revisions: None,
             },
             workers_to_remove: Some(WorkerList::from_workers(&workers)),
             worker_urls,
             affected_models: std::collections::HashSet::new(),
-            app_context: Some(app_context),
+            host: Some(host),
             actual_workers_to_remove: Some(workers),
             removed_workers: Vec::new(),
         };
@@ -228,8 +227,8 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn test_drain_workers_step_skips_when_workers_list_empty() {
-        let app_ctx = make_app_context(&[]);
-        let mut ctx = make_context(app_ctx, vec![]);
+        let host = make_host(&[]);
+        let mut ctx = make_context(host, vec![]);
         let result = DrainWorkersStep.execute(&mut ctx).await.unwrap();
         assert_eq!(result, StepResult::Success);
     }
@@ -238,8 +237,8 @@ mod tests {
     async fn test_drain_workers_step_skips_when_no_ready_workers() {
         // Failed worker: should not transition or sleep.
         let worker = build_worker("http://w1:8080", 30, WorkerStatus::Failed);
-        let app_ctx = make_app_context(&[Arc::clone(&worker)]);
-        let mut ctx = make_context(Arc::clone(&app_ctx), vec![Arc::clone(&worker)]);
+        let host = make_host(&[Arc::clone(&worker)]);
+        let mut ctx = make_context(Arc::clone(&host), vec![Arc::clone(&worker)]);
 
         let start = tokio::time::Instant::now();
         let result = DrainWorkersStep.execute(&mut ctx).await.unwrap();
@@ -257,8 +256,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn test_drain_workers_step_transitions_ready_to_draining() {
         let worker = build_worker("http://w1:8080", 5, WorkerStatus::Ready);
-        let app_ctx = make_app_context(&[Arc::clone(&worker)]);
-        let mut ctx = make_context(Arc::clone(&app_ctx), vec![Arc::clone(&worker)]);
+        let host = make_host(&[Arc::clone(&worker)]);
+        let mut ctx = make_context(Arc::clone(&host), vec![Arc::clone(&worker)]);
 
         #[expect(
             clippy::disallowed_methods,
@@ -283,8 +282,8 @@ mod tests {
     async fn test_drain_workers_step_uses_max_drain_settle() {
         let w1 = build_worker("http://w1:8080", 3, WorkerStatus::Ready);
         let w2 = build_worker("http://w2:8080", 7, WorkerStatus::Ready);
-        let app_ctx = make_app_context(&[Arc::clone(&w1), Arc::clone(&w2)]);
-        let mut ctx = make_context(Arc::clone(&app_ctx), vec![Arc::clone(&w1), Arc::clone(&w2)]);
+        let host = make_host(&[Arc::clone(&w1), Arc::clone(&w2)]);
+        let mut ctx = make_context(Arc::clone(&host), vec![Arc::clone(&w1), Arc::clone(&w2)]);
 
         #[expect(
             clippy::disallowed_methods,
@@ -316,14 +315,14 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn test_drain_workers_step_uses_live_registry_status_not_snapshot() {
         let worker = build_worker("http://w-live:8080", 5, WorkerStatus::Pending);
-        let app_ctx = make_app_context(&[Arc::clone(&worker)]);
+        let host = make_host(&[Arc::clone(&worker)]);
         // Snapshot was taken while Pending — the step must NOT trust this.
         let snapshot = vec![Arc::clone(&worker)];
         // Live state flips to Ready before the step runs (e.g. a probe
         // succeeded between find_workers_to_remove and drain_workers).
         worker.set_status(WorkerStatus::Ready);
 
-        let mut ctx = make_context(Arc::clone(&app_ctx), snapshot);
+        let mut ctx = make_context(Arc::clone(&host), snapshot);
 
         #[expect(
             clippy::disallowed_methods,
@@ -346,8 +345,8 @@ mod tests {
         // workers transition to Draining (so policies stop selecting
         // them) but the step does not sleep.
         let worker = build_worker("http://w1:8080", 0, WorkerStatus::Ready);
-        let app_ctx = make_app_context(&[Arc::clone(&worker)]);
-        let mut ctx = make_context(Arc::clone(&app_ctx), vec![Arc::clone(&worker)]);
+        let host = make_host(&[Arc::clone(&worker)]);
+        let mut ctx = make_context(Arc::clone(&host), vec![Arc::clone(&worker)]);
 
         let start = tokio::time::Instant::now();
         let result = DrainWorkersStep.execute(&mut ctx).await.unwrap();
@@ -370,17 +369,17 @@ mod tests {
     /// Checked outside the lock, the step wrote `NotReady -> Draining` here.
     #[tokio::test]
     async fn test_drain_workers_step_keeps_a_demotion_written_between_its_read_and_its_write() {
-        use smg_worker::registry::event::WorkerEvent;
+        use crate::registry::event::WorkerEvent;
 
         let worker = build_worker("http://w1:8080", 0, WorkerStatus::Ready);
-        let app_ctx = make_app_context(&[Arc::clone(&worker)]);
-        let registry = &app_ctx.worker_registry;
+        let host = make_host(&[Arc::clone(&worker)]);
+        let registry = &host.worker_registry;
         let worker_id = registry
             .get_id_by_url("http://w1:8080")
             .expect("registered");
         let revision = worker.revision();
         let mut events = registry.subscribe_events();
-        let mut ctx = make_context(Arc::clone(&app_ctx), vec![Arc::clone(&worker)]);
+        let mut ctx = make_context(Arc::clone(&host), vec![Arc::clone(&worker)]);
 
         // The step runs on its own thread and runtime so that, paused at the
         // seam, it blocks neither this test nor the write placed in between.
@@ -430,11 +429,11 @@ mod tests {
     /// The context of a pinned removal: the request's pins beside the workers
     /// the selection found.
     fn make_pinned_context(
-        app_context: Arc<AppContext>,
+        host: Arc<RegistryHost>,
         workers: Vec<Arc<dyn Worker>>,
         expected_revisions: HashMap<String, Option<u64>>,
     ) -> WorkflowContext<WorkerRemovalWorkflowData> {
-        let mut ctx = make_context(app_context, workers);
+        let mut ctx = make_context(host, workers);
         ctx.data.config.expected_revisions = Some(expected_revisions);
         ctx
     }
@@ -448,23 +447,18 @@ mod tests {
     async fn a_worker_replaced_after_the_selection_is_left_out_of_a_pinned_removal() {
         let url = "http://w1:8080";
         let found = build_worker(url, 5, WorkerStatus::Ready);
-        let app_ctx = make_app_context(&[Arc::clone(&found)]);
-        let id = app_ctx
-            .worker_registry
-            .get_id_by_url(url)
-            .expect("registered");
+        let host = make_host(&[Arc::clone(&found)]);
+        let id = host.worker_registry.get_id_by_url(url).expect("registered");
         let pinned = found.revision();
         let mut ctx = make_pinned_context(
-            Arc::clone(&app_ctx),
+            Arc::clone(&host),
             vec![Arc::clone(&found)],
             HashMap::from([(id.as_str().to_string(), Some(pinned))]),
         );
         // The replacement lands between the selection and the drain.
         let replacement = build_worker(url, 5, WorkerStatus::Ready);
         assert!(
-            app_ctx
-                .worker_registry
-                .replace(&id, Arc::clone(&replacement)),
+            host.worker_registry.replace(&id, Arc::clone(&replacement)),
             "the replacement lands"
         );
         assert_ne!(
@@ -511,13 +505,13 @@ mod tests {
     async fn a_replacement_written_between_the_drains_read_and_its_write_is_left_out() {
         let url = "http://w1:8080";
         let found = build_worker(url, 0, WorkerStatus::Ready);
-        let app_ctx = make_app_context(&[Arc::clone(&found)]);
-        let registry = &app_ctx.worker_registry;
+        let host = make_host(&[Arc::clone(&found)]);
+        let registry = &host.worker_registry;
         let id = registry.get_id_by_url(url).expect("registered");
         let pinned = found.revision();
         let replacement = build_worker(url, 0, WorkerStatus::Ready);
         let mut ctx = make_pinned_context(
-            Arc::clone(&app_ctx),
+            Arc::clone(&host),
             vec![Arc::clone(&found)],
             HashMap::from([(id.as_str().to_string(), Some(pinned))]),
         );
@@ -557,11 +551,11 @@ mod tests {
     async fn a_registration_under_the_url_since_the_selection_is_left_out_of_a_pinned_removal() {
         let url = "http://w1:8080";
         let found = build_worker(url, 5, WorkerStatus::Ready);
-        let app_ctx = make_app_context(&[Arc::clone(&found)]);
-        let registry = &app_ctx.worker_registry;
+        let host = make_host(&[Arc::clone(&found)]);
+        let registry = &host.worker_registry;
         let id = registry.get_id_by_url(url).expect("registered");
         let mut ctx = make_pinned_context(
-            Arc::clone(&app_ctx),
+            Arc::clone(&host),
             vec![Arc::clone(&found)],
             HashMap::from([(id.as_str().to_string(), Some(found.revision()))]),
         );
@@ -597,21 +591,16 @@ mod tests {
     async fn a_worker_pinned_at_no_revision_is_drained_as_it_stands() {
         let url = "http://w1:8080";
         let found = build_worker(url, 5, WorkerStatus::Ready);
-        let app_ctx = make_app_context(&[Arc::clone(&found)]);
-        let id = app_ctx
-            .worker_registry
-            .get_id_by_url(url)
-            .expect("registered");
+        let host = make_host(&[Arc::clone(&found)]);
+        let id = host.worker_registry.get_id_by_url(url).expect("registered");
         let mut ctx = make_pinned_context(
-            Arc::clone(&app_ctx),
+            Arc::clone(&host),
             vec![Arc::clone(&found)],
             HashMap::from([(id.as_str().to_string(), None)]),
         );
         let replacement = build_worker(url, 5, WorkerStatus::Ready);
         assert!(
-            app_ctx
-                .worker_registry
-                .replace(&id, Arc::clone(&replacement)),
+            host.worker_registry.replace(&id, Arc::clone(&replacement)),
             "the replacement lands"
         );
 

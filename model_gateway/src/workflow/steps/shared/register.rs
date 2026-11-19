@@ -10,6 +10,7 @@ use smg_worker::{
     health::bootstrap_probe,
     identity::basic::Worker,
     registry::{worker_model_ids, WorkerId},
+    workflow::{pool_group, refresh_worker_pool_sizes, PoolGroups},
 };
 use tracing::debug;
 use wfaas::{
@@ -17,7 +18,6 @@ use wfaas::{
     WorkflowResult, WorkflowState,
 };
 
-use super::{pool_group, refresh_worker_pool_sizes, PoolGroups};
 use crate::{
     routers::{
         common::{pd_admission, snapshot::WorkerRegistry},
