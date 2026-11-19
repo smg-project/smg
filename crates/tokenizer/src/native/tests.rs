@@ -5567,7 +5567,11 @@ fn an_ascii_free_line_splits_into_its_pieces_in_one_pass() {
 /// pair inside a word becomes the next token), the byte tokens ranked
 /// first or, as in a file whose byte tokens are not its first lines, last.
 fn tiktoken_ranks(state: &mut u64, merges: usize, bytes_last: bool) -> FxHashMap<Vec<u8>, u32> {
-    let corpus = random_text(state, 6000, &[]);
+    tiktoken_ranks_of(&random_text(state, 6000, &[]), merges, bytes_last)
+}
+
+/// [`tiktoken_ranks`] learnt from `corpus`.
+fn tiktoken_ranks_of(corpus: &str, merges: usize, bytes_last: bool) -> FxHashMap<Vec<u8>, u32> {
     let mut symbols: Vec<Vec<u8>> = corpus.bytes().map(|b| vec![b]).collect();
     let mut tokens: Vec<Vec<u8>> = Vec::new();
     let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
@@ -5670,6 +5674,102 @@ fn a_tiktoken_vocabulary_encodes_on_the_direct_path_as_its_own_encoder_does() {
             Ok(own.encode_ordinary(&long))
         );
     }
+}
+
+/// The Kimi template on the direct path cuts shaped text as the file's own
+/// encoder does. The direct path reads the template's matches by the scanner
+/// of the cased template behind its opening run; the file's encoder runs the
+/// pattern itself. The vocabulary is learnt from text of the same parts, so
+/// tokens span the edges the template cuts at (an ideograph and the letter,
+/// the digit or the mark beside it, a radical and the punctuation beside
+/// it): a piece cut elsewhere merges to other ids. The parts are every class
+/// the template tells apart: ideographs of the plane and above it, the Han
+/// characters that are no letters (iteration marks, numerals, radicals),
+/// kana and CJK punctuation, letter runs of every case structure with
+/// marks, digits, white space and line ends, punctuation, the clitics in
+/// both cases, and those side by side, with the special tokens among them,
+/// whole and cut. One text in sixteen is encoded again cut at every
+/// character, from the start and to the end, and one is long enough for
+/// the thread pool.
+#[test]
+fn the_kimi_template_encodes_shaped_text_as_the_files_own_encoder_does() {
+    const SPECIALS: [&str; 4] = ["[BOS]", "[EOS]", "<|im_end|>", "<|reserved_token_1|>"];
+    const PARTS: &[&str] = &[
+        "中", "中文", "汉字", "漢字", "㐀", "豈", "𠀀", "々", "〻", "〇", "〡", "⺀", "⿕", "あ",
+        "ア", "ー", "。", "、", "a", "word", "Word", "WORD", "wORD", "iPhone", "McDonald", "HTTPd",
+        "é", "É", "ß", "ſ", "ǅx", "ʰa", "я", "Я", "ก", "ा", "\u{301}", "1", "22", "333", "4444",
+        "٣", "²", " ", "  ", "\t", "\n", "\n\n", "\r\n", "\u{A0}", "\u{3000}", ".", ",", "!", "?",
+        "-", "(", ")", "\"", "/", "...", "，", "😀", "\u{200D}", "\u{FFFD}", "'", "'s", "'S", "'t",
+        "'re", "'RE", "'ve", "'m", "'ll", "'LL", "'d", "'x", "’s", "中A", "A中", "a中b", "中1",
+        "1〇", "〇1", "!⺀", "⺀!", "⺀a", " 中", "中 ", "中's", "中\n",
+    ];
+    let shaped = |state: &mut u64, parts: usize, specials: &[&str]| -> String {
+        let mut text = String::new();
+        for _ in 0..parts {
+            let roll = pseudo_random(state);
+            if !specials.is_empty() && roll.is_multiple_of(13) {
+                let special = specials[(roll / 13) as usize % specials.len()];
+                // Whole, or cut so that only a prefix of it stands.
+                let cut = if roll.is_multiple_of(3) {
+                    special.len() / 2
+                } else {
+                    special.len()
+                };
+                text.push_str(&special[..cut]);
+            } else {
+                text.push_str(PARTS[(roll % PARTS.len() as u64) as usize]);
+            }
+        }
+        text
+    };
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    let ranks = tiktoken_ranks_of(&shaped(&mut state, 2500, &[]), 600, false);
+    let next = ranks.len() as u32 + 7;
+    let specials: Vec<(String, u32)> = SPECIALS
+        .iter()
+        .enumerate()
+        .map(|(i, special)| ((*special).to_owned(), next + i as u32))
+        .collect();
+    let native =
+        NativeEncoder::from_ranks(&ranks, KIMI_K2_PATTERN, &specials).expect("the direct path");
+    assert!(native.stages[0].pattern.has_scanner());
+    let own = CoreBPE::new(
+        ranks.clone(),
+        specials.iter().cloned().collect(),
+        KIMI_K2_PATTERN,
+    )
+    .expect("the file's encoder");
+    let same = |text: &str| {
+        if text.is_empty() {
+            return;
+        }
+        assert_eq!(
+            native.encode(None, text, false),
+            Ok(own.encode_with_special_tokens(text)),
+            "{text:?}"
+        );
+        assert_eq!(
+            native.encode_plain(None, text, true),
+            Ok(own.encode_ordinary(text)),
+            "plain: {text:?}"
+        );
+    };
+    for round in 0..2000 {
+        let text = shaped(&mut state, 1 + round % 40, &SPECIALS);
+        same(&text);
+        if round % 16 == 0 {
+            for (cut, _) in text.char_indices() {
+                same(&text[..cut]);
+                same(&text[cut..]);
+            }
+        }
+    }
+    let mut long = String::new();
+    while long.len() < 3 * PARALLEL_MIN_BYTES {
+        long.push_str(&shaped(&mut state, 24, &SPECIALS));
+        long.push(' ');
+    }
+    same(&long);
 }
 
 /// Characters of the pool the sentencepiece vocabulary below has no token
