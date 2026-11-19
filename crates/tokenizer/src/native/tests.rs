@@ -7389,32 +7389,56 @@ fn a_piece_without_an_opening_byte_is_final_before_its_image() {
 }
 
 #[test]
-fn a_long_text_takes_the_pool_only_when_it_is_alone() {
+fn a_long_text_takes_the_pool_while_few_are_in_flight() {
+    // One text for every two threads of the pool, and at least one.
+    for (threads, texts) in [(1, 1), (2, 1), (3, 1), (4, 2), (8, 4), (16, 8), (64, 32)] {
+        assert_eq!(
+            NativeEncoder::pooled_texts(threads),
+            texts,
+            "{threads} threads"
+        );
+    }
     // On a count of its own: the process's is shared with every test that
     // encodes while this one runs.
     let count = AtomicUsize::new(0);
     let long = "a".repeat(PARALLEL_MIN_BYTES);
-    let pool = rayon::current_num_threads() > 1;
+    let threads = rayon::current_num_threads();
+    let pool = threads > 1;
+    let few = NativeEncoder::pooled_texts(threads);
     let first = InFlight::enter(&count);
-    assert!(first.alone);
+    assert_eq!(first.texts, 1);
     assert_eq!(NativeEncoder::worth_the_pool(&long, Some(&first)), pool);
     assert!(
         !NativeEncoder::worth_the_pool(&long[1..], Some(&first)),
         "a shorter text"
     );
-    // A text that comes in while another is in flight stays on its caller's
-    // thread, and so does the next one while that one is.
-    let second = InFlight::enter(&count);
-    assert!(!second.alone);
-    assert!(!NativeEncoder::worth_the_pool(&long, Some(&second)));
-    drop(first);
-    let third = InFlight::enter(&count);
-    assert!(!third.alone);
-    drop((second, third));
+    // The texts that come in while it is in flight take the pool up to the
+    // share of this pool, each as it comes in.
+    let mut held = vec![first];
+    while held.len() < few {
+        let text = InFlight::enter(&count);
+        assert_eq!(text.texts, held.len() + 1);
+        assert_eq!(NativeEncoder::worth_the_pool(&long, Some(&text)), pool);
+        held.push(text);
+    }
+    // One more stays on its caller's thread, and so does the next one while
+    // that one is in flight.
+    let over = InFlight::enter(&count);
+    assert_eq!(over.texts, few + 1);
+    assert!(!NativeEncoder::worth_the_pool(&long, Some(&over)));
+    let next = InFlight::enter(&count);
+    assert!(!NativeEncoder::worth_the_pool(&long, Some(&next)));
+    drop((over, next));
+    // A text that leaves makes room for the one that comes in after it.
+    held.pop();
+    let after = InFlight::enter(&count);
+    assert_eq!(after.texts, few);
+    assert_eq!(NativeEncoder::worth_the_pool(&long, Some(&after)), pool);
+    drop((held, after));
     // Every text is out again: nothing is counted and the next is alone.
     assert_eq!(count.load(Ordering::Relaxed), 0);
     let next = InFlight::enter(&count);
-    assert!(next.alone);
+    assert_eq!(next.texts, 1);
     assert_eq!(NativeEncoder::worth_the_pool(&long, Some(&next)), pool);
     // The entry counts a text from `COUNTED_MIN_BYTES` up and no shorter
     // one, which so never takes the pool.
@@ -7425,8 +7449,8 @@ fn a_long_text_takes_the_pool_only_when_it_is_alone() {
 
 #[test]
 fn callers_at_once_keep_the_ids_of_a_lone_one() {
-    // Long texts through the entry from several threads at once: the text
-    // that finds itself alone takes the pool and the others encode on their
+    // Long texts through the entry from several threads at once: the few
+    // the pool has threads for take it and the others encode on their
     // callers' threads (see `worth_the_pool`); the ids are those of the
     // serial encode either way.
     let mut state = 0x900D_C0DE_0000_0013u64;
