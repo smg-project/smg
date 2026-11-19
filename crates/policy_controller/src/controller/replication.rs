@@ -2002,6 +2002,27 @@ mod tests {
         assert!(batch(feed.look(said + BEAT)).snapshot.is_some());
     }
 
+    /// A room taken with no cut made yet is a hold all the same: a sweep
+    /// leaves it, and a restore beside four rooms waits.
+    #[test]
+    fn a_room_with_no_cut_yet_is_held_through_a_sweep() {
+        let leader = Leader::leading();
+        leader.writes(3);
+        let source = leader.replication();
+        source
+            .cuts
+            .holds
+            .lock()
+            .extend((0..RESTORES).map(|_| Arc::new(Hold::default())));
+        // A room dates no part: no instant lets it go.
+        source.cuts.sweep(leader.at + STALLED + STALLED);
+        assert_eq!(source.cuts.holds.lock().len(), RESTORES);
+        let fifth = source
+            .restore(leader.term, leader.at)
+            .expect("the term is served");
+        assert!(fifth.is_none(), "a restore beside four rooms waits");
+    }
+
     #[test]
     fn a_restore_whose_stream_took_no_part_for_the_bound_lets_its_cut_go() {
         let leader = Leader::leading();
