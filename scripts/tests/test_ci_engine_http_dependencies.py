@@ -53,6 +53,7 @@ elif args[0] == "-c":
     def version(name):
         value = {
             "grpcio-reflection": os.environ.get("IMAGE_REFLECTION_VERSION"),
+            "opentelemetry-api": os.environ.get("IMAGE_OTEL_API_VERSION", "1.45.0"),
             "sglang": os.environ.get("IMAGE_SGLANG_VERSION", "0.5.21"),
             "torch": os.environ.get("IMAGE_TORCH_VERSION", "2.11.0+rocm10.0.0"),
             "apache-tvm-ffi": "0.1.12",
@@ -89,7 +90,7 @@ elif args[:2] == ["-m", "pip"]:
         args == ["-m", "pip", "check"]
         or args == ["-m", "pip", "install", "clients/python/"]
         or (args[:4] == ["-m", "pip", "install", "e2e_test/"]
-            and all(arg.startswith(("mcp", "fastapi", "starlette")) for arg in args[4:]))
+            and all(arg.startswith(("mcp", "fastapi", "starlette", "opentelemetry-api==")) for arg in args[4:]))
         or (args[:3] == ["-m", "pip", "install"] and len(args) == 5
             and args[3].startswith("grpcio-health-checking==")
             and args[4].startswith("grpcio-reflection=="))
@@ -147,6 +148,8 @@ def run_installer(
     }
     for name in (
         "SMG_CI_GRPC_COMPANION_VERSION",
+        "SMG_CI_OTEL_API_VERSION",
+        "IMAGE_OTEL_API_VERSION",
         "SMG_SGLANG_ROCM_IMAGE",
         "IMAGE_REFLECTION_VERSION",
         "IMAGE_SGLANG_VERSION",
@@ -232,14 +235,16 @@ def test_sglang_image_companion_survives_separate_actions_steps(tmp_path, image_
         ["-m", "pip", "check"],
     ]
     assert github_env.read_text() == (
-        "EXISTING=value\nSMG_CI_GRPC_COMPANION_VERSION=" + image_version + "\n"
+        "EXISTING=value\nSMG_CI_OTEL_API_VERSION=1.45.0\n"
+        f"SMG_CI_GRPC_COMPANION_VERSION={image_version}\n"
     )
     native = [json.loads(line) for line in (tmp_path / "native.jsonl").read_text().splitlines()]
     assert native == [[str(ROOT / "scripts/ci_verify_sglang_rocm_cohort.py")]]
-    name, value = github_env.read_text().splitlines()[-1].split("=", 1)
+    handoff = dict(line.split("=", 1) for line in github_env.read_text().splitlines())
     (tmp_path / "pip.jsonl").unlink()
     # A new bash process consumes the real producer output, not the setup shell.
-    result, calls = run_installer(tmp_path, {}, extra_env={name: value})
+    result, calls = run_installer(tmp_path, {}, extra_env=handoff)
+    assert calls[0] == ["-m", "pip", "install", "e2e_test/", "opentelemetry-api==1.45.0"]
     assert result.returncode == 0, result.stderr
     assert calls[-1] == [
         "-m",
@@ -248,6 +253,47 @@ def test_sglang_image_companion_survives_separate_actions_steps(tmp_path, image_
         "grpcio-health-checking==" + image_version,
         "grpcio-reflection==" + image_version,
     ]
+
+
+@pytest.mark.parametrize("version", ["1.45.0", "1.46.0"])
+def test_sglang_otel_requirement_joins_the_e2e_resolver(tmp_path, version):
+    result, calls = run_installer(
+        tmp_path,
+        {"sglang": ["fastapi>=0.120.1"]},
+        extra_env={"SMG_CI_OTEL_API_VERSION": version},
+    )
+    assert result.returncode == 0, result.stderr
+    assert calls[0] == [
+        "-m",
+        "pip",
+        "install",
+        "e2e_test/",
+        "fastapi>=0.120.1",
+        "opentelemetry-api==" + version,
+    ]
+    # No separate post-install API downgrade can leave FastMCP inconsistent.
+    assert all("opentelemetry-api==" + version not in call for call in calls[1:])
+
+
+def test_sglang_invalid_otel_handoff_stops_before_pip(tmp_path):
+    result, calls = run_installer(
+        tmp_path, {}, extra_env={"SMG_CI_OTEL_API_VERSION": "1.45.0\nother-package"}
+    )
+    assert result.returncode != 0 and "InvalidVersion" in result.stderr
+    assert calls == []
+
+
+@pytest.mark.parametrize("version", ["", "not-a-version"])
+def test_sglang_invalid_image_otel_metadata_stops_before_install(tmp_path, version):
+    result, calls = run_installer(
+        tmp_path,
+        {},
+        script="ci_setup_sglang_rocm_image.sh",
+        extra_env={"IMAGE_REFLECTION_VERSION": "1.84.0", "IMAGE_OTEL_API_VERSION": version},
+    )
+    assert result.returncode != 0 and "InvalidVersion" in result.stderr
+    assert calls == []
+    assert not (tmp_path / "github.env").exists()
 
 
 def test_missing_sglang_image_companion_stops_before_install(tmp_path):
