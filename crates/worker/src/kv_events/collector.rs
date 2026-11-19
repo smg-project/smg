@@ -655,28 +655,32 @@ impl<H: KvEventHost> KvEventCollector<H> {
         Self::lift_reservation(&mut handles, &self.host, worker_url, id);
     }
 
-    /// Stop every subscription, for good: an add that comes later, or that
-    /// was waiting for a turn of the slot lock, starts none. What the host
-    /// keeps for a model is the host's to clear: a stop tells it of no
-    /// model.
+    /// Stop every subscription, for good. The active tasks are told to stop
+    /// and awaited, and the task of a removal under way is awaited too: on
+    /// return no task of the collector runs, and an add that comes later,
+    /// or that was waiting for a turn of the slot lock, starts none. What
+    /// the host keeps for a model is the host's to clear: a stop tells it
+    /// of no model.
     pub async fn stop(&self) {
-        let subscriptions: Vec<(String, WorkerSubscription)> = {
+        let (subscriptions, leaving) = {
             let mut handles = self.worker_handles.lock().await;
             // Under the lock, ahead of the slots taken below: an add on a
             // later turn finds the mark.
             self.stopped.store(true, Ordering::Relaxed);
             let mut active = Vec::new();
+            let mut leaving = Vec::new();
             for (url, slot) in std::mem::take(&mut *handles) {
                 match slot {
                     Slot::Active(sub) => active.push((url, sub)),
-                    // The task behind a removal in flight lifts its own
-                    // reservation.
-                    reserved @ Slot::Removing(_) => {
-                        handles.insert(url, reserved);
+                    // The task behind a removal under way lifts its own
+                    // reservation: the stop waits for its end below.
+                    Slot::Removing(reserved) => {
+                        leaving.push(reserved.done.clone());
+                        handles.insert(url, Slot::Removing(reserved));
                     }
                 }
             }
-            active
+            (active, leaving)
         };
 
         if !subscriptions.is_empty() {
@@ -696,6 +700,11 @@ impl<H: KvEventHost> KvEventCollector<H> {
                     Metrics::record_kv_event_subscription_failure(&url, "join_error");
                 }
             }
+        }
+        // Nothing is ever sent on a reservation's channel: each wait returns
+        // when its task has ended.
+        for mut done in leaving {
+            let _ = done.changed().await;
         }
     }
 
@@ -1871,6 +1880,35 @@ mod tests {
             (None, None),
             "the add starts nothing behind the stop"
         );
+    }
+
+    /// A stop returns once no task of the collector runs: it waits for the
+    /// task of a removal under way too, which lifts its own reservation. The
+    /// reservation is laid here as a removal's first turn leaves it, and the
+    /// case holds the channel's end that such a task holds.
+    #[tokio::test]
+    async fn a_stop_waits_for_the_task_of_a_removal_under_way() {
+        let collector = new_collector();
+        let (done_tx, done) = watch::channel(());
+        collector.worker_handles.lock().await.insert(
+            "grpc://127.0.0.1:19".to_string(),
+            Slot::Removing(Reservation {
+                id: NEXT_SUBSCRIPTION_ID.fetch_add(1, Ordering::Relaxed),
+                done,
+                model_id: "m".to_string(),
+                kind: SubscriptionKind::Loads,
+            }),
+        );
+
+        let mut cx = std::task::Context::from_waker(futures::task::noop_waker_ref());
+        let mut stop = std::pin::pin!(collector.stop());
+        assert!(
+            std::future::Future::poll(stop.as_mut(), &mut cx).is_pending(),
+            "the stop waits for the task of the removal under way"
+        );
+        // The task ends: its channel closes.
+        drop(done_tx);
+        stop.await;
     }
 
     /// A dropped collector aborts its tasks, and an aborted task tells the
