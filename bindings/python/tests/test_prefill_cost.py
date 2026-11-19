@@ -60,7 +60,8 @@ def test_prefill_cost_is_a_distinct_policy_and_forwards_its_own_tuning():
 
 @pytest.mark.parametrize("url", ["http://worker:8080", "ipc:///tmp/prefill-cost-worker"])
 def test_prefill_cost_rejects_transports_without_lease_handoff_at_startup(url):
-    router = Router.from_args(RouterArgs(worker_urls=[url], policy="prefill_cost"))
+    # port=0 fails later validation if the policy guard stops rejecting this mode.
+    router = Router.from_args(RouterArgs(worker_urls=[url], policy="prefill_cost", port=0))
     with pytest.raises(ValueError, match="regular native gRPC"):
         router.start()
 
@@ -68,6 +69,7 @@ def test_prefill_cost_rejects_transports_without_lease_handoff_at_startup(url):
 def test_prefill_cost_rejects_disaggregated_mode_at_startup():
     args = RouterArgs(
         worker_urls=[],
+        port=0,
         pd_disaggregation=True,
         prefill_urls=[("grpc://prefill:8080", None)],
         decode_urls=["grpc://decode:8080"],
