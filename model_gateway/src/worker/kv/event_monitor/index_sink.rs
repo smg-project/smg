@@ -52,19 +52,57 @@ pub(crate) struct IndexSink {
     block_sizes: Arc<DashMap<String, KvBlockSize>>,
 }
 
-/// A row for the length of one subscription task. Dropped without
-/// [`KvEventSink::removed`] (the task panicked or was aborted), it takes the
-/// row's state with it, as the task's local went, and leaves the worker's
-/// blocks in the index, as they stayed.
+/// A row for the length of one subscription, and the sink its collector
+/// feeds: the collector holds the row and hands it to the job that says the
+/// worker left, so a task aborted while that job is pending takes nothing
+/// from under it. Dropped without [`KvEventSink::removed`] (the task
+/// panicked, or was aborted ahead of that job), it takes the row's state
+/// with it, as the task's local went, and leaves the worker's blocks in the
+/// index, as they stayed.
 pub(crate) struct OpenRow {
     sink: Arc<IndexSink>,
     id: RowId,
 }
 
 impl OpenRow {
-    /// The sink and the row's id, as the collector holds them.
-    pub(crate) fn feed(&self) -> (Arc<IndexSink>, RowId) {
-        (Arc::clone(&self.sink), self.id)
+    /// The row as its collector holds it, with the row's id.
+    pub(crate) fn into_feed(self) -> (Arc<Self>, RowId) {
+        let id = self.id;
+        (Arc::new(self), id)
+    }
+}
+
+/// Every call goes to the sink the row stands in.
+impl KvEventSink for OpenRow {
+    type Batch = KvEventBatch;
+    type Id = RowId;
+
+    fn admit(&self, id: RowId, rank: u16, facts: BatchFacts, batch: &KvEventBatch) -> BatchOutcome {
+        self.sink.admit(id, rank, facts, batch)
+    }
+
+    fn reconnected(&self, id: RowId) {
+        self.sink.reconnected(id);
+    }
+
+    fn resync(&self, id: RowId, rank: Option<u16>, reason: ResyncReason) {
+        self.sink.resync(id, rank, reason);
+    }
+
+    fn cursor(&self, id: RowId, rank: u16) -> Option<KvCursor> {
+        self.sink.cursor(id, rank)
+    }
+
+    fn removed(&self, id: RowId) {
+        self.sink.removed(id);
+    }
+
+    fn block_size(&self, model: &str) -> Option<u32> {
+        self.sink.block_size(model)
+    }
+
+    fn set_block_size(&self, model: &str, size: u32) {
+        self.sink.set_block_size(model, size);
     }
 }
 
@@ -322,11 +360,9 @@ impl KvEventSink for IndexSink {
 #[cfg(test)]
 mod tests {
     use smg_grpc_client::common_proto::{KvBlock, KvBlocksStored, KvCacheEvent, KvSnapshotChunk};
+    use smg_worker::kv_events::{batch_facts, batch_rank};
 
-    use super::{
-        super::subscription::{batch_facts, batch_rank},
-        *,
-    };
+    use super::*;
 
     /// One stored block of sixteen tokens that start at `first_token`, as
     /// batch `sequence` of `rank`.
@@ -358,13 +394,14 @@ mod tests {
         let row = sink
             .open(Arc::clone(&index), "m", "grpc://w1:9000", rank)
             .expect("the index interns the worker");
-        let (_, id) = row.feed();
+        let id = row.id;
         (index, sink, row, id)
     }
 
     /// Say `batch` to the sink as the collector does.
     fn admit(sink: &IndexSink, id: RowId, batch: &KvEventBatch) -> BatchOutcome {
-        sink.admit(id, batch_rank(batch), batch_facts(batch), batch)
+        let rank = batch_rank(batch).expect("the case's rank is a rank");
+        sink.admit(id, rank, batch_facts(batch), batch)
     }
 
     fn applied(sink: &IndexSink, id: RowId, rank: u16) -> Option<u64> {
@@ -405,7 +442,7 @@ mod tests {
         let again = sink
             .open(Arc::clone(&index), "m", "grpc://w1:9000", None)
             .expect("the index interns the worker again");
-        let (_, next) = again.feed();
+        let next = again.id;
         assert_ne!(next, id);
         assert_eq!(sink.cursor(next, 0), None, "the new row has heard no rank");
         // Sequence 3 is below the old cursor: a row that had kept it would
@@ -519,6 +556,27 @@ mod tests {
         assert_eq!(sink.rows.len(), 0);
         assert_eq!(sink.cursor(id, 0), None);
         assert_ne!(index.current_size(), 0);
+    }
+
+    /// The job that says a worker left holds the row itself: a task aborted
+    /// while the job is pending drops nothing the job needs, and the
+    /// worker's blocks leave the index. A row the task alone held went with
+    /// the task, ahead of the job, which then found nothing to remove.
+    #[test]
+    fn a_dispatched_removal_holds_its_row_past_its_task() {
+        let (index, sink, row, id) = opened(None);
+        assert_eq!(
+            admit(&sink, id, &stored(1, 1_000, None)),
+            BatchOutcome::Applied
+        );
+        // The collector's hold moves into the job at its dispatch, and the
+        // task is gone before the job runs.
+        let (feed, id) = row.into_feed();
+        std::thread::spawn(move || feed.removed(id))
+            .join()
+            .expect("the job runs");
+        assert_eq!(index.current_size(), 0);
+        assert_eq!(sink.rows.len(), 0, "the row went with the job's hold");
     }
 
     /// The outcome is read by the cursor. A batch of a rank the row does not

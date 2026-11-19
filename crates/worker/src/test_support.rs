@@ -9,8 +9,10 @@
 //! is the loopback address nothing answers at: a dead worker's port, held for
 //! as long as the test needs it. [`NoEngine`] is an engine connection with no
 //! engine behind it, and [`CountingConnector`] the connector that hands those
-//! out. A test of a metric renders its scrape with [`render_with_recorder`]
-//! and reads it with [`assert_metric`] and [`sorted_series`].
+//! out; [`ScriptedEngine`] is one whose two pushed streams follow a
+//! [`Script`]. A test of a metric renders its scrape with
+//! [`render_with_recorder`] and reads it with [`assert_metric`] and
+//! [`sorted_series`].
 
 use std::{
     net::{Ipv4Addr, SocketAddr},
@@ -25,6 +27,7 @@ use metrics_exporter_prometheus::PrometheusBuilder;
 use tokio::net::{TcpListener, TcpSocket};
 
 use crate::{
+    common_proto::KvEventBatch,
     connection::engine::{AdminAnswer, EngineConnection, EngineConnector, ZmqLink},
     identity::{
         basic::{ConnectionMode, Worker},
@@ -39,6 +42,9 @@ use crate::{
         WorkerType,
     },
 };
+
+mod scripted_engine;
+pub use scripted_engine::{Script, ScriptedEngine};
 
 /// The members alone: the value of a generation for a test that derives
 /// nothing from one.
@@ -404,14 +410,21 @@ mod tests {
 }
 
 /// An engine connection with no engine behind it: alive, without admin
-/// calls, and every call refused as unavailable. What a test hands a worker
-/// whose connection only has to exist.
+/// calls, every call refused as unavailable and its two streams as
+/// unimplemented. What a test hands a worker whose connection only has to
+/// exist.
 #[derive(Debug, Default)]
 pub struct NoEngine;
 
 fn no_engine<T>() -> Result<T, tonic::Status> {
     Err(tonic::Status::unavailable(
         "no engine behind the test's connection",
+    ))
+}
+
+fn no_stream<T>() -> Result<T, tonic::Status> {
+    Err(tonic::Status::unimplemented(
+        "the test's connection carries no event stream",
     ))
 }
 
@@ -447,6 +460,19 @@ impl EngineConnection for NoEngine {
 
     async fn kv_engine_id(&self) -> Result<Option<String>, tonic::Status> {
         no_engine()
+    }
+
+    async fn subscribe_kv_events(
+        &self,
+        _start_seq: u64,
+    ) -> Result<tonic::Streaming<KvEventBatch>, tonic::Status> {
+        no_stream()
+    }
+
+    async fn subscribe_load_records(
+        &self,
+    ) -> Result<tonic::Streaming<KvEventBatch>, tonic::Status> {
+        no_stream()
     }
 }
 

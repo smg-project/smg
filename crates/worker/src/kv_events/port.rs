@@ -16,20 +16,20 @@
 /// servicer's message, with the blocks the index applies) rides beside them
 /// as the host's own type.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct BatchFacts {
+pub struct BatchFacts {
     /// The publisher's sequence number: monotonic per rank, each rank its
     /// own counter.
-    pub(crate) sequence: u64,
+    pub sequence: u64,
     /// The batch carries the engine's own cache clear, wherever it stands
     /// among the events: the cursor's fact (a batch below the cursor that
     /// clears is a restarted publisher, since what such a batch leaves
     /// owes nothing to what came before it). The clear itself is the
     /// batch's: a collector sets this when a clear stands among what it
     /// decoded, and a sink empties the rank there.
-    pub(crate) clears: bool,
+    pub clears: bool,
     /// The batch is one chunk of a relay's state snapshot, not a batch the
     /// publisher sent.
-    pub(crate) snapshot: Option<SnapshotChunk>,
+    pub snapshot: Option<SnapshotChunk>,
 }
 
 /// One chunk of a relay's in-band snapshot, stamped with a sequence the
@@ -39,37 +39,38 @@ pub(crate) struct BatchFacts {
 /// ([`ResyncReason::Snapshot`]) before the first chunk and a snapshot the
 /// stream ended in the middle of ([`ResyncReason::SnapshotAbandoned`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct SnapshotChunk {
+pub struct SnapshotChunk {
     /// The snapshot could not cover the engine's whole life: the rank's
     /// blocks are a partial set until the next resync.
-    pub(crate) unknown_before: bool,
+    pub unknown_before: bool,
 }
 
 /// What the sink did with a batch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum BatchOutcome {
+pub enum BatchOutcome {
     /// The cursor advanced to it: the sink took the batch, and applied it to
     /// the index where its rank is one the sink indexes for the id.
     Applied,
     /// A duplicate below the cursor, or a batch for an id the sink holds
     /// nothing for: not taken, and the cursor stays where it was.
     Skipped,
-    /// A gap with no replay asked yet: the caller reconnects asking for a
-    /// replay from `expected`; the batch is not applied (the replay resends
-    /// it). A second gap on the same rank is applied as lost history (see
-    /// [`KvCursor::degraded`]).
+    /// A gap with no replay asked yet: `expected` is the first sequence the
+    /// batch's own rank is missing. The collector subscribes again from rank
+    /// 0's cursor (the servicers replay rank 0's publisher), and the batch
+    /// is not applied (the replay resends it). A second gap on the same rank
+    /// is applied as lost history (see [`KvCursor::degraded`]).
     Gap { expected: u64, received: u64 },
 }
 
 /// Why a rank's cursor was reset or its blocks replaced, and the label the
 /// resync is counted under. This crate's collector says four: `OutOfRange`
 /// and `DataLoss`, the server's own status codes, and a snapshot's two ends,
-/// `Snapshot` and `SnapshotAbandoned`. Its sink finds two with its cursor,
-/// `PublisherRestart` and `GapCleared`, and counts a `Snapshot` where it
-/// clears for one. The store's statement holds three more, a relay's
-/// frames, which no stream of this crate carries.
+/// `Snapshot` and `SnapshotAbandoned`. The gateway's sink finds two with its
+/// cursor, `PublisherRestart` and `GapCleared`, and counts a `Snapshot`
+/// where it clears for one. The store's statement holds three more, a
+/// relay's frames, which no stream of this crate carries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ResyncReason {
+pub enum ResyncReason {
     /// The server's history no longer reaches the cursor.
     OutOfRange,
     /// The server lost batches it cannot name.
@@ -90,7 +91,7 @@ pub(crate) enum ResyncReason {
 
 impl ResyncReason {
     /// The metric label of the reason.
-    pub(crate) const fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::OutOfRange => "out_of_range",
             Self::DataLoss => "data_loss",
@@ -104,15 +105,15 @@ impl ResyncReason {
 
 /// One rank's cursor as a subscriber reads it before it (re)subscribes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct KvCursor {
+pub struct KvCursor {
     /// The last sequence applied, `0` for none: servers resume strictly
     /// after it.
-    pub(crate) applied: u64,
+    pub applied: u64,
     /// A replay was asked for and its batches have not arrived.
-    pub(crate) replay_pending: bool,
+    pub replay_pending: bool,
     /// A gap could not be recovered: the rank's blocks are a partial set
     /// until a resync.
-    pub(crate) degraded: bool,
+    pub degraded: bool,
 }
 
 /// Where KV event batches are admitted and applied.
@@ -135,7 +136,7 @@ pub(crate) struct KvCursor {
 /// collector says to the id: a new connection, a snapshot's start (a resync
 /// for `Snapshot`, before the admit of its first chunk) and a snapshot the
 /// stream ended in the middle of.
-pub(crate) trait KvEventSink: Send + Sync {
+pub trait KvEventSink: Send + Sync {
     /// The batch as the collector's wire crate defines it; a sink reads of
     /// it what its own index needs.
     type Batch: ?Sized;
@@ -176,13 +177,6 @@ pub(crate) trait KvEventSink: Send + Sync {
 
     /// The block size of record for a model, once a stored block or a
     /// registration named it.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "asked by no collector of this crate: routing reads the size from the monitor"
-        )
-    )]
     fn block_size(&self, model: &str) -> Option<u32>;
 
     /// Name a model's block size at a registration: provisional until a

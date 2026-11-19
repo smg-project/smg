@@ -11,16 +11,16 @@
 //! - `on_worker_removed` — signals graceful shutdown, task cleans up indexer
 //! - `stop` — signals shutdown to all tasks, clears state
 //!
-//! The work of a subscription is split by stage: `subscription.rs` runs the
-//! task per worker (connecting, reconnecting, the stream read loop, the
-//! pushed load records, the worker's departure); `admission.rs` keeps one
-//! stream's state (per-rank cursors, gap recovery, relay snapshots, and the
-//! metrics around an applied batch); `apply.rs` takes one event into the
-//! index (tiers, cache groups, namespaces, and the physical copies of a
-//! block, counted per worker).
+//! The work of a subscription is split by stage: the worker crate's KV event
+//! collector runs the task per worker (connecting, reconnecting, the stream
+//! read loop, the pushed load records, the worker's departure);
+//! `admission.rs` keeps one stream's state (per-rank cursors, gap recovery,
+//! relay snapshots, and the metrics around an applied batch); `apply.rs`
+//! takes one event into the index (tiers, cache groups, namespaces, and the
+//! physical copies of a block, counted per worker).
 //!
-//! The task and the index meet at one port (`port.rs`): the task says what
-//! its stream brought, and `index_sink.rs`, the sink over the models'
+//! The task and the index meet at the worker crate's port: the task says
+//! what its stream brought, and `index_sink.rs`, the sink over the models'
 //! indexes, keeps each worker's stream state and applies what its cursor
 //! admits.
 
@@ -31,12 +31,10 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc, OnceLock, Weak,
     },
-    time::Instant,
 };
 
 use dashmap::{mapref::entry::Entry, DashMap};
 use futures::FutureExt as _;
-use smg_grpc_client::common_proto::EngineLoad;
 use tokio::{
     sync::{oneshot, watch, Mutex},
     task::JoinHandle,
@@ -55,16 +53,18 @@ use crate::worker::{
 
 mod admission;
 mod apply;
+#[cfg(test)]
+mod gateway_tests;
 mod index_sink;
-mod port;
 mod recovery;
-mod subscription;
 
 #[cfg(any(test, feature = "test-util"))]
 pub(crate) use apply::WorkerIndexState;
 use index_sink::{IndexSink, OpenRow};
-use port::KvEventSink;
-pub(crate) use subscription::EngineStreams;
+// The worker crate's port, at the path it had here.
+use smg_worker::kv_events::port;
+pub use smg_worker::kv_events::SubscriptionKind;
+use smg_worker::kv_events::{port::KvEventSink, KvEventCollector, PushedLoadSink};
 
 /// Interval between publications of each model's index size and, for the chain
 /// index, its shape and memory (`smg_kv_index_*` gauges by model).
@@ -86,19 +86,6 @@ const STATS_INTERVAL_SECS: u64 = 30;
 pub(crate) struct KvBlockSize {
     pub(crate) tokens: usize,
     pub(crate) from_events: bool,
-}
-
-/// What a worker's stream is for.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SubscriptionKind {
-    /// The worker's KV events into its model's index, with the load records
-    /// that ride them: a worker under a cache-aware policy.
-    Events,
-    /// The worker's load records alone (`SubscribeKvEventsRequest.
-    /// loads_only`): a worker priced by its load with no KV index. A
-    /// servicer that predates the field streams its events too; they are
-    /// dropped.
-    Loads,
 }
 
 pub struct KvEventMonitor {
@@ -133,33 +120,6 @@ pub struct KvEventMonitor {
     /// sink, a peer in the app context. Unset in a monitor built alone (the
     /// tests), which holds every object.
     worker_registry: OnceLock<Weak<dyn WorkerLookup>>,
-}
-
-/// Where a load record pushed on a worker's event stream goes: the load
-/// monitor, as this monitor's streams hold it. Held by this name,
-/// the sink brings nothing of the registry the load monitor is built over.
-pub(crate) trait PushedLoadSink: Send + Sync {
-    /// Take the record of `dp_rank` received at `received_at`
-    /// ([`WorkerMonitor::apply_pushed_load`]).
-    fn push_load(
-        self: Arc<Self>,
-        worker: &Arc<dyn Worker>,
-        dp_rank: i32,
-        record: &EngineLoad,
-        received_at: Instant,
-    );
-}
-
-impl<G: Generation> PushedLoadSink for WorkerMonitor<G> {
-    fn push_load(
-        self: Arc<Self>,
-        worker: &Arc<dyn Worker>,
-        dp_rank: i32,
-        record: &EngineLoad,
-        received_at: Instant,
-    ) {
-        self.apply_pushed_load(worker, dp_rank, record, received_at);
-    }
 }
 
 /// The registry as this monitor holds it: it asks one thing of it, the
@@ -519,7 +479,8 @@ impl KvEventMonitor {
             // index silently frozen for this worker until then.
             let result = std::panic::AssertUnwindSafe(async move {
                 // An events subscription opens its row in the sink first. The
-                // row is the task's for its whole life and goes with it.
+                // row is the collector's from here on: it goes with the loop,
+                // or with the job that says the worker left.
                 let row = match indexer {
                     Some(index) => {
                         match sink.open(index, &loop_model_id, &worker_url, worker.dp_rank()) {
@@ -541,10 +502,10 @@ impl KvEventMonitor {
                     }
                     None => None,
                 };
-                Self::subscription_loop(
+                KvEventCollector::subscription_loop(
                     worker,
                     worker_url,
-                    row.as_ref().map(OpenRow::feed),
+                    row.map(OpenRow::into_feed),
                     loop_model_id,
                     shutdown_rx,
                     load_sink,
@@ -954,12 +915,10 @@ mod tests {
 
     use kv_index::{ContentHash, SequenceHash, StoredBlock};
     use openai_protocol::worker::{ConnectionMode, HealthCheckConfig, RuntimeType, WorkerType};
+    use smg_worker::kv_events::{INDEX_REMOVAL_PERMITS, MAX_CONCURRENT_INDEX_REMOVALS};
     use tracing_test::traced_test;
 
-    use super::{
-        subscription::{INDEX_REMOVAL_PERMITS, MAX_CONCURRENT_INDEX_REMOVALS},
-        *,
-    };
+    use super::*;
     use crate::worker::{kv::index_backend::WorkerBlocks, BasicWorkerBuilder, WorkerRegistry};
 
     async fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {

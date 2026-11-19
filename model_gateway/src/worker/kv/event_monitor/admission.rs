@@ -307,6 +307,9 @@ impl KvEventMonitor {
         if batch.dp_rank.is_none() {
             state.saw_unranked = true;
         }
+        // Read once, from the facts the collector said: the first chunk's
+        // line and the cursor's mark stand on one answer.
+        let unknown_before = facts.snapshot.is_some_and(|said| said.unknown_before);
         if chunk.index == 0 || state.snapshot.is_none() {
             if chunk.index != 0 {
                 warn!(
@@ -325,7 +328,7 @@ impl KvEventMonitor {
                 through = batch.sequence_number + u64::from(chunk.count.saturating_sub(chunk.index + 1)),
                 "KV event relay served a state snapshot; replacing the worker's index state"
             );
-            if chunk.unknown_before > 0 {
+            if unknown_before {
                 warn!(
                     worker_url = %Endpoint::redacted_str(worker_url),
                     rank,
@@ -348,7 +351,7 @@ impl KvEventMonitor {
         }
         let cursor = state.ranks.entry(rank).or_default();
         cursor.resync_to(facts.sequence);
-        if facts.snapshot.is_some_and(|said| said.unknown_before) {
+        if unknown_before {
             cursor.mark_degraded();
         }
         on_batch(batch);
@@ -517,14 +520,11 @@ mod tests {
         salt::namespace_seed, ContentHash, ReferenceIndexer, SequenceHash, StoredBlock,
     };
     use smg_grpc_client::common_proto::{
-        EngineLoad, KvBlock, KvBlocksRemoved, KvBlocksStored, KvCacheCleared, KvCacheEvent,
-        KvCacheTier,
+        KvBlock, KvBlocksRemoved, KvBlocksStored, KvCacheCleared, KvCacheEvent, KvCacheTier,
     };
+    use smg_worker::kv_events::batch_facts;
 
-    use super::{
-        super::{apply::convert_kv_block, subscription::batch_facts},
-        *,
-    };
+    use super::{super::apply::convert_kv_block, *};
     use crate::worker::{
         kv::event_monitor::recovery::{Cursor, GAP_CLEAR_THRESHOLD, RESTART_WINDOW},
         test_support::kv_cache_cleared,
@@ -1872,28 +1872,6 @@ mod tests {
         assert_eq!(sim.deliver(&next), BatchOutcome::Applied);
         sim.assert_matches_reference();
         assert_eq!(sim.reference.worker_block_count(sim.worker), 1);
-    }
-
-    /// A batch that carries only a load record repeats the last sequence and
-    /// has no events: it is recognised before admission, so it is neither a
-    /// duplicate nor a restart to the rank's cursor.
-    #[test]
-    fn a_load_only_batch_is_recognised_before_admission() {
-        let record = EngineLoad {
-            running_requests: 3,
-            load_only: true,
-            ..Default::default()
-        };
-        let mut only = batch(7, None, vec![]);
-        only.load = Some(record.clone());
-        assert!(KvEventMonitor::is_load_only(&only));
-        let mut carrying = batch(8, None, vec![stored(None, &[1])]);
-        carrying.load = Some(EngineLoad {
-            load_only: false,
-            ..record
-        });
-        assert!(!KvEventMonitor::is_load_only(&carrying));
-        assert!(!KvEventMonitor::is_load_only(&batch(9, None, vec![])));
     }
 
     /// A snapshot whose relay joined the publisher late and could not replay

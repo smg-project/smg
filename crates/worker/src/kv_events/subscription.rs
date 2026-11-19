@@ -7,19 +7,59 @@ use std::{
     time::{Duration, Instant},
 };
 
-use async_trait::async_trait;
-use smg_grpc_client::common_proto::{kv_cache_event, EngineLoad, KvEventBatch, KvSnapshotChunk};
 use tokio::sync::{oneshot, Semaphore};
 use tracing::{error, info, warn};
 
-use super::{
-    port::{BatchFacts, BatchOutcome, KvEventSink, ResyncReason, SnapshotChunk},
-    KvEventMonitor, PushedLoadSink, SubscriptionKind,
-};
+use super::port::{BatchFacts, BatchOutcome, KvEventSink, ResyncReason, SnapshotChunk};
 use crate::{
-    routers::grpc::backend_client::typed,
-    worker::{health::liveness, identity::endpoint::Endpoint, metrics::Metrics, Worker},
+    common_proto::{kv_cache_event, EngineLoad, KvEventBatch, KvSnapshotChunk},
+    connection::engine::EngineConnection,
+    health::liveness,
+    identity::{basic::Worker, endpoint::Endpoint},
+    load::monitor::WorkerMonitor,
+    metrics::writers::Metrics,
+    registry::Generation,
 };
+
+/// What a worker's stream is for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SubscriptionKind {
+    /// The worker's KV events to the sink, with the load records that ride
+    /// them: a worker whose cache the host indexes.
+    Events,
+    /// The worker's load records alone (`SubscribeKvEventsRequest.
+    /// loads_only`): a worker whose load the host reads and whose cache it
+    /// does not index. A servicer that predates the field streams its
+    /// events too; they are dropped.
+    Loads,
+}
+
+/// Where a load record pushed on a worker's event stream goes: the load
+/// monitor, as the collector's streams hold it. Held by this name,
+/// the sink brings nothing of the registry the load monitor is built over.
+pub trait PushedLoadSink: Send + Sync {
+    /// Take the record of `dp_rank` received at `received_at`
+    /// ([`WorkerMonitor::apply_pushed_load`]).
+    fn push_load(
+        self: Arc<Self>,
+        worker: &Arc<dyn Worker>,
+        dp_rank: i32,
+        record: &EngineLoad,
+        received_at: Instant,
+    );
+}
+
+impl<G: Generation> PushedLoadSink for WorkerMonitor<G> {
+    fn push_load(
+        self: Arc<Self>,
+        worker: &Arc<dyn Worker>,
+        dp_rank: i32,
+        record: &EngineLoad,
+        received_at: Instant,
+    ) {
+        self.apply_pushed_load(worker, dp_rank, record, received_at);
+    }
+}
 
 /// Initial reconnection delay after stream failure.
 const INITIAL_RECONNECT_DELAY_MS: u64 = 100;
@@ -69,9 +109,8 @@ const MAX_RECONNECT_DELAY_MS: u64 = 5_000;
 
 /// Index cleanup is CPU-bound and can touch many blocks. Keep it
 /// off Tokio workers and bound concurrent purges during fleet-wide drains.
-pub(super) const MAX_CONCURRENT_INDEX_REMOVALS: usize = 4;
-pub(super) static INDEX_REMOVAL_PERMITS: Semaphore =
-    Semaphore::const_new(MAX_CONCURRENT_INDEX_REMOVALS);
+pub const MAX_CONCURRENT_INDEX_REMOVALS: usize = 4;
+pub static INDEX_REMOVAL_PERMITS: Semaphore = Semaphore::const_new(MAX_CONCURRENT_INDEX_REMOVALS);
 
 /// Result of processing a stream connection to completion.
 enum StreamResult {
@@ -243,23 +282,6 @@ async fn sleep_or_shutdown(
     }
 }
 
-/// The two streams an engine pushes: its KV cache events and its load
-/// records. The subscription loop is their one caller, so the trait stands
-/// here. The gateway's client implements it, and the loop reads that client
-/// back from the worker's connection handle.
-#[async_trait]
-pub(crate) trait EngineStreams: Send + Sync {
-    /// Subscribe to the engine's KV cache events from `start_seq` on.
-    async fn subscribe_kv_events(
-        &self,
-        start_seq: u64,
-    ) -> Result<tonic::Streaming<KvEventBatch>, tonic::Status>;
-
-    /// Subscribe to the engine's load records alone, no events.
-    async fn subscribe_load_records(&self)
-        -> Result<tonic::Streaming<KvEventBatch>, tonic::Status>;
-}
-
 /// Subscribe to the worker's KV events from `start_seq` (`Events`), or to
 /// its load records alone (`Loads`), with `deadline` on the server's answer.
 /// A live server answers a subscription with headers
@@ -270,7 +292,7 @@ pub(crate) trait EngineStreams: Send + Sync {
 /// removal ends it at once (without this arm a call that never answers,
 /// retried at every contact, would keep the task alive past the removal).
 async fn subscribe_with_deadline(
-    backend_client: &dyn EngineStreams,
+    backend_client: &dyn EngineConnection,
     start_seq: u64,
     kind: SubscriptionKind,
     wake: Option<&Arc<tokio::sync::Notify>>,
@@ -299,7 +321,12 @@ async fn subscribe_with_deadline(
     }
 }
 
-impl KvEventMonitor {
+/// The collector of one worker's pushed stream: the subscription loop and
+/// its rounds. It keeps nothing: a subscription's state is its task's, and
+/// what a stream brought is the sink's.
+pub struct KvEventCollector;
+
+impl KvEventCollector {
     /// Tell the sink the worker left, when its subscription ends: on the
     /// blocking pool and under a fleet-wide bound, since the worker's blocks
     /// leave the sink's index inside the call.
@@ -336,11 +363,11 @@ impl KvEventMonitor {
     /// the worker left; without one it streams the worker's load records
     /// alone. Exits when `shutdown_rx`
     /// fires or the backend returns `Unimplemented`. Each round
-    /// ([`Self::subscription_round`]) gets the backend client, subscribes
+    /// (`subscription_round`) gets the backend client, subscribes
     /// under the deadline and drains one stream, then says what comes next;
     /// this loop is the one place that sleeps the reconnect backoff and the
     /// one place that ends the task.
-    pub(super) async fn subscription_loop<S>(
+    pub async fn subscription_loop<S>(
         worker: Arc<dyn Worker>,
         worker_url: String,
         feed: Option<(Arc<S>, S::Id)>,
@@ -429,29 +456,18 @@ impl KvEventMonitor {
         };
 
         let start_seq = sub.role.resume_sequence();
-        // The streams are the gateway's client's: the loop reads it back from
-        // the handle through the request path's reader. A connection of another
-        // type carries no stream: said once, in that reader's words, and read
-        // as an engine that serves none.
-        let subscribed = match typed(sub.worker.as_ref(), backend_client) {
-            Ok(streams) => {
-                subscribe_with_deadline(
-                    streams.as_ref(),
-                    start_seq,
-                    sub.role.kind(),
-                    sub.wake,
-                    shutdown_rx,
-                    SUBSCRIBE_DEADLINE,
-                )
-                .await
-            }
-            Err(error) => {
-                error!(%error, "The worker's connection carries no event stream");
-                Subscribed::Refused(tonic::Status::unimplemented(
-                    "the worker's connection carries no event stream",
-                ))
-            }
-        };
+        // The streams are the connection's own calls: one whose wire carries
+        // none refuses them as unimplemented, and is read as an engine that
+        // serves none.
+        let subscribed = subscribe_with_deadline(
+            backend_client.as_ref(),
+            start_seq,
+            sub.role.kind(),
+            sub.wake,
+            shutdown_rx,
+            SUBSCRIBE_DEADLINE,
+        )
+        .await;
         let stream = match subscribed {
             Subscribed::Stream(stream) => {
                 info!(
@@ -678,7 +694,7 @@ impl KvEventMonitor {
         mut on_batch: impl FnMut(&KvEventBatch),
         mut on_load: impl FnMut(&KvEventBatch, &EngineLoad),
     ) -> StreamResult {
-        use tokio_stream::StreamExt;
+        use futures::StreamExt;
 
         while let Some(result) = stream.next().await {
             let batch = match result {
@@ -701,9 +717,10 @@ impl KvEventMonitor {
     }
 
     /// Process batches from a single stream connection: every batch that is
-    /// more than a load record goes to the sink with its header facts, a
-    /// snapshot's start said ahead of its first chunk. A batch the sink took
-    /// is `on_batch`'s; a gap ends the stream, for a replay.
+    /// more than a load record goes to the sink with its rank and its header
+    /// facts, a snapshot's start said ahead of its first chunk; a batch whose
+    /// rank fits none goes to no sink. A batch the sink took is `on_batch`'s;
+    /// a gap ends the stream, for a replay.
     async fn process_stream<S: KvEventSink<Batch = KvEventBatch>>(
         mut stream: tonic::Streaming<KvEventBatch>,
         worker_url: &str,
@@ -713,7 +730,7 @@ impl KvEventMonitor {
         mut on_batch: impl FnMut(),
         mut on_load: impl FnMut(&KvEventBatch, &EngineLoad),
     ) -> StreamResult {
-        use tokio_stream::StreamExt;
+        use futures::StreamExt;
 
         while let Some(result) = stream.next().await {
             let batch = match result {
@@ -727,12 +744,19 @@ impl KvEventMonitor {
                     continue;
                 }
             }
+            // A rank that fits no `u16` is no rank of an engine: its batch
+            // goes to no sink, as a load record of a negative rank goes to
+            // no monitor.
+            let Some(rank) = batch_rank(&batch) else {
+                Metrics::record_kv_event_batch(worker_url, "not_indexed");
+                continue;
+            };
             if let Some(chunk) = &batch.snapshot {
                 if count_snapshot_chunk(snapshot, chunk) {
                     sink.resync(id, None, ResyncReason::Snapshot);
                 }
             }
-            match sink.admit(id, batch_rank(&batch), batch_facts(&batch), &batch) {
+            match sink.admit(id, rank, batch_facts(&batch), &batch) {
                 BatchOutcome::Applied => on_batch(),
                 BatchOutcome::Skipped => {}
                 BatchOutcome::Gap { expected, received } => {
@@ -746,13 +770,13 @@ impl KvEventMonitor {
 
     /// A batch that carries only a load record (`EngineLoad.load_only`): no
     /// events, the last sequence repeated; it never enters admission.
-    pub(super) fn is_load_only(batch: &KvEventBatch) -> bool {
+    fn is_load_only(batch: &KvEventBatch) -> bool {
         batch.load.as_ref().is_some_and(|load| load.load_only)
     }
 }
 
 /// The header facts of a batch, as a sink's cursor reads them.
-pub(super) fn batch_facts(batch: &KvEventBatch) -> BatchFacts {
+pub fn batch_facts(batch: &KvEventBatch) -> BatchFacts {
     BatchFacts {
         sequence: batch.sequence_number,
         clears: batch.events.iter().any(|event| {
@@ -764,12 +788,12 @@ pub(super) fn batch_facts(batch: &KvEventBatch) -> BatchFacts {
     }
 }
 
-/// The rank a batch names, 0 for a batch that names none.
-pub(super) fn batch_rank(batch: &KvEventBatch) -> u16 {
+/// The rank a batch names, 0 for a batch that names none; `None` for a rank
+/// that fits no `u16`, which is no rank of an engine.
+pub fn batch_rank(batch: &KvEventBatch) -> Option<u16> {
     batch
         .dp_rank
-        .and_then(|rank| u16::try_from(rank).ok())
-        .unwrap_or(0)
+        .map_or(Some(0), |rank| u16::try_from(rank).ok())
 }
 
 /// Count one chunk of a relay's snapshot on its stream. `open` is the chunks
@@ -790,52 +814,56 @@ fn count_snapshot_chunk(open: &mut Option<u32>, chunk: &KvSnapshotChunk) -> bool
 
 #[cfg(test)]
 mod tests {
-    use std::{net::SocketAddr, pin::Pin, sync::Mutex};
+    use std::sync::Mutex;
 
-    use dashmap::DashMap;
-    use futures::Stream;
-    use openai_protocol::{
-        model_card::ModelCard,
-        worker::{ConnectionMode, HealthCheckConfig, RuntimeType, WorkerType},
-    };
-    use smg_grpc_client::{
-        common_proto as common,
-        tokenspeed_scheduler::tokenspeed_proto::{
-            self as ts,
-            token_speed_scheduler_server::{TokenSpeedScheduler, TokenSpeedSchedulerServer},
-        },
-    };
-    use tonic::{transport::Server, Request, Response, Status};
+    use tonic::Status;
     use tracing_test::traced_test;
 
-    use super::{
-        super::{
-            index_sink::{IndexSink, OpenRow},
-            port::KvCursor,
-            KvBlockSize,
-        },
-        *,
-    };
+    use super::{super::port::KvCursor, *};
     use crate::{
-        config::types::PolicyConfig,
-        policies::PolicyRegistry,
-        routers::grpc::{backend_client::BackendClient, test_engine::serve_on_loopback},
-        worker::{
-            identity::basic::StallReason, kv::index_backend::KvIndex, BasicWorkerBuilder,
-            WorkerMonitor, WorkerRegistry, UNKNOWN_MODEL_ID,
+        common_proto as common,
+        identity::basic::StallReason,
+        test_support::{
+            BasicWorkerBuilder, LoadReaders, Script, ScriptedEngine, WorkerMonitor, WorkerRegistry,
         },
     };
 
-    /// A sink over one fresh index with a row open in it, as an events
-    /// subscription starts: for a worker that stands for `rank` of its
-    /// engine, or for the whole of it.
-    fn open_row(worker_url: &str, rank: Option<usize>) -> (Arc<KvIndex>, Arc<IndexSink>, OpenRow) {
-        let index = Arc::new(KvIndex::chain());
-        let sink = Arc::new(IndexSink::new(Arc::new(DashMap::new())));
-        let row = sink
-            .open(Arc::clone(&index), "m", worker_url, rank)
-            .expect("the index interns the worker");
-        (index, sink, row)
+    /// Where the cases' workers stand, by name alone: nothing dials it.
+    const URL: &str = "grpc://w1:9000";
+
+    /// A scripted engine and a gRPC worker connected to it.
+    fn connected(script: Script) -> (Arc<dyn Worker>, Arc<ScriptedEngine>) {
+        let engine = Arc::new(ScriptedEngine::new(script));
+        (engine.worker(URL), engine)
+    }
+
+    /// A stream that fails on its first message, as a server's does whose
+    /// first message the client cannot decode.
+    fn first_message_fails() -> Script {
+        Script::Stream(vec![Err(Status::out_of_range(
+            "the first message is larger than the decode limit",
+        ))])
+    }
+
+    /// The loop of `worker` over a recording sink, as a host's task runs it,
+    /// with the sender that ends it as the worker's removal does.
+    fn spawned_loop(
+        worker: &Arc<dyn Worker>,
+    ) -> (tokio::task::JoinHandle<()>, oneshot::Sender<()>) {
+        let (leave, leaving) = oneshot::channel();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the case ends the loop and awaits its task"
+        )]
+        let task = tokio::spawn(KvEventCollector::subscription_loop(
+            Arc::clone(worker),
+            worker.url().to_string(),
+            Some((Arc::new(Said::default()), 7)),
+            "m".to_string(),
+            leaving,
+            None,
+        ));
+        (task, leave)
     }
 
     /// A sink that keeps what the collector said to it, in order, and
@@ -923,48 +951,6 @@ mod tests {
         }
     }
 
-    fn learned(sizes: &DashMap<String, KvBlockSize>) -> Option<usize> {
-        sizes.get("m").map(|size| size.tokens)
-    }
-
-    #[test]
-    fn a_partial_entry_never_sets_the_block_size_below_the_full_block() {
-        let sizes: DashMap<String, KvBlockSize> = DashMap::new();
-        // The engine's first batch names a partial entry before a full block.
-        KvEventMonitor::learn_block_size(&sizes, "m", &stored_batch(&[(1, 64), (2, 128)]));
-        assert_eq!(learned(&sizes), Some(128));
-        // A partial entry on its own never lowers the size.
-        KvEventMonitor::learn_block_size(&sizes, "m", &stored_batch(&[(3, 64)]));
-        assert_eq!(learned(&sizes), Some(128));
-        // A larger block raises it.
-        KvEventMonitor::learn_block_size(&sizes, "m", &stored_batch(&[(4, 256)]));
-        assert_eq!(learned(&sizes), Some(256));
-    }
-
-    #[test]
-    fn the_first_stored_block_replaces_a_provisional_seed() {
-        let sizes: DashMap<String, KvBlockSize> = DashMap::new();
-        sizes.insert(
-            "m".to_string(),
-            KvBlockSize {
-                tokens: 1152,
-                from_events: false,
-            },
-        );
-        KvEventMonitor::learn_block_size(&sizes, "m", &stored_batch(&[(1, 128)]));
-        assert_eq!(
-            sizes.get("m").map(|size| *size),
-            Some(KvBlockSize {
-                tokens: 128,
-                from_events: true,
-            })
-        );
-        // Empty blocks and batches without stores change nothing.
-        KvEventMonitor::learn_block_size(&sizes, "m", &stored_batch(&[(2, 0)]));
-        KvEventMonitor::learn_block_size(&sizes, "m", &KvEventBatch::default());
-        assert_eq!(learned(&sizes), Some(128));
-    }
-
     /// The reconnect delay a failing stream waits doubles from the initial
     /// delay to the cap, stays at the cap once there, and a reset returns
     /// it to the initial delay.
@@ -994,195 +980,13 @@ mod tests {
         );
     }
 
-    /// What the test scheduler's `SubscribeKvEvents` does.
-    enum Subscribe {
-        /// Accepts the call and never answers it, as an engine still
-        /// starting behind an open port does.
-        Hang,
-        /// Answers at once with a stream that fails on its first message,
-        /// as a server does whose first message the client cannot decode;
-        /// each call's arrival is noted.
-        FailFirstMessage(Arc<Mutex<Vec<Instant>>>),
-        /// Answers `UNIMPLEMENTED`, as a backend whose KV event publisher is
-        /// off does.
-        Unimplemented,
-        /// Notes the request, then never answers it, like `Hang`.
-        RecordRequest(Arc<Mutex<Option<common::SubscribeKvEventsRequest>>>),
-        /// Answers at once with a stream that yields the script's items,
-        /// then ends.
-        Stream(Vec<Result<KvEventBatch, Status>>),
-        /// Answers at once with a stream that yields nothing and never ends.
-        Open,
-    }
-
-    struct TestScheduler(Subscribe);
-
-    type ServerStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
-
-    #[tonic::async_trait]
-    impl TokenSpeedScheduler for TestScheduler {
-        type GenerateStream = ServerStream<ts::GenerateResponse>;
-        type SubscribeKvEventsStream = ServerStream<KvEventBatch>;
-        type GetTokenizerStream = ServerStream<common::GetTokenizerChunk>;
-
-        async fn generate(
-            &self,
-            _: Request<ts::GenerateRequest>,
-        ) -> Result<Response<Self::GenerateStream>, Status> {
-            Err(Status::unimplemented("test scheduler"))
-        }
-
-        async fn health_check(
-            &self,
-            _: Request<ts::HealthCheckRequest>,
-        ) -> Result<Response<ts::HealthCheckResponse>, Status> {
-            Err(Status::unimplemented("test scheduler"))
-        }
-
-        async fn abort(
-            &self,
-            _: Request<ts::AbortRequest>,
-        ) -> Result<Response<ts::AbortResponse>, Status> {
-            Err(Status::unimplemented("test scheduler"))
-        }
-
-        async fn get_model_info(
-            &self,
-            _: Request<ts::GetModelInfoRequest>,
-        ) -> Result<Response<ts::GetModelInfoResponse>, Status> {
-            Err(Status::unimplemented("test scheduler"))
-        }
-
-        async fn get_server_info(
-            &self,
-            _: Request<ts::GetServerInfoRequest>,
-        ) -> Result<Response<ts::GetServerInfoResponse>, Status> {
-            Err(Status::unimplemented("test scheduler"))
-        }
-
-        async fn get_loads(
-            &self,
-            _: Request<ts::GetLoadsRequest>,
-        ) -> Result<Response<ts::GetLoadsResponse>, Status> {
-            Err(Status::unimplemented("test scheduler"))
-        }
-
-        async fn subscribe_kv_events(
-            &self,
-            request: Request<common::SubscribeKvEventsRequest>,
-        ) -> Result<Response<Self::SubscribeKvEventsStream>, Status> {
-            match &self.0 {
-                Subscribe::Hang => std::future::pending().await,
-                Subscribe::RecordRequest(seen) => {
-                    *seen.lock().unwrap() = Some(request.into_inner());
-                    std::future::pending().await
-                }
-                Subscribe::Unimplemented => {
-                    Err(Status::unimplemented("KV cache events not enabled"))
-                }
-                Subscribe::Stream(script) => Ok(Response::new(Box::pin(futures::stream::iter(
-                    script.clone(),
-                )))),
-                Subscribe::Open => Ok(Response::new(Box::pin(futures::stream::pending()))),
-                Subscribe::FailFirstMessage(calls) => {
-                    calls.lock().unwrap().push(Instant::now());
-                    Ok(Response::new(Box::pin(futures::stream::once(async {
-                        Err(Status::out_of_range(
-                            "the first message is larger than the decode limit",
-                        ))
-                    }))))
-                }
-            }
-        }
-
-        async fn flush_cache(
-            &self,
-            _: Request<common::FlushCacheRequest>,
-        ) -> Result<Response<common::FlushCacheResponse>, Status> {
-            Err(Status::unimplemented("test scheduler"))
-        }
-
-        async fn start_profile(
-            &self,
-            _: Request<common::StartProfileRequest>,
-        ) -> Result<Response<common::ProfileResponse>, Status> {
-            Err(Status::unimplemented("test scheduler"))
-        }
-
-        async fn stop_profile(
-            &self,
-            _: Request<common::StopProfileRequest>,
-        ) -> Result<Response<common::ProfileResponse>, Status> {
-            Err(Status::unimplemented("test scheduler"))
-        }
-
-        async fn get_tokenizer(
-            &self,
-            _: Request<common::GetTokenizerRequest>,
-        ) -> Result<Response<Self::GetTokenizerStream>, Status> {
-            Err(Status::unimplemented("test scheduler"))
-        }
-    }
-
-    fn grpc_worker(addr: SocketAddr) -> Arc<dyn Worker> {
-        Arc::new(
-            BasicWorkerBuilder::new(format!("grpc://{addr}"))
-                .worker_type(WorkerType::Regular)
-                .connection_mode(ConnectionMode::Grpc)
-                .runtime_type(RuntimeType::TokenSpeed)
-                .health_config(HealthCheckConfig {
-                    disable_health_check: true,
-                    ..Default::default()
-                })
-                .build(),
-        )
-    }
-
-    /// A rank worker of a data-parallel engine at `addr`: rank `rank` of `size`.
-    fn rank_worker(addr: SocketAddr, rank: usize, size: usize) -> Arc<dyn Worker> {
-        Arc::new(
-            BasicWorkerBuilder::new(format!("grpc://{addr}"))
-                .worker_type(WorkerType::Regular)
-                .connection_mode(ConnectionMode::Grpc)
-                .runtime_type(RuntimeType::TokenSpeed)
-                .health_config(HealthCheckConfig {
-                    disable_health_check: true,
-                    ..Default::default()
-                })
-                .dp_config(rank, size)
-                .build(),
-        )
-    }
-
-    /// The test scheduler served on a loopback port bound before it is
-    /// handed out, as its address and its server task.
-    async fn serve(behaviour: Subscribe) -> (SocketAddr, tokio::task::JoinHandle<()>) {
-        let router =
-            Server::builder().add_service(TokenSpeedSchedulerServer::new(TestScheduler(behaviour)));
-        serve_on_loopback(router).await
-    }
-
-    /// A gRPC worker at `addr` and its backend client.
-    async fn connected(addr: SocketAddr) -> (Arc<dyn Worker>, Arc<BackendClient>) {
-        let worker = grpc_worker(addr);
-        let client = worker
-            .engine_connection()
-            .await
-            .expect("a backend client")
-            .expect("a gRPC worker has one")
-            .downcast_arc::<BackendClient>()
-            .expect("the gateway's client");
-        (worker, client)
-    }
-
     /// The subscribe call under its deadline: a server that never answers is
     /// refused as unavailable at the deadline; a contact with the worker
     /// while the call hangs ends it for a fresh one; the worker's removal
     /// ends it at once; the server's own refusal is passed through.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_subscribe_call_ends_at_its_deadline_a_contact_or_the_removal() {
-        let (addr, server) = serve(Subscribe::Hang).await;
-        let (worker, client) = connected(addr).await;
+        let (worker, client) = connected(Script::Hang);
         let wake = worker.runtime_state().map(|state| state.contact_wake());
         let (_keep, mut shutdown_rx) = oneshot::channel::<()>();
 
@@ -1243,10 +1047,9 @@ mod tests {
             .await,
             Subscribed::Shutdown
         ));
-        server.abort();
 
-        let (addr, server) = serve(Subscribe::Unimplemented).await;
-        let (_worker, client) = connected(addr).await;
+        let refusal = Status::unimplemented("KV cache events not enabled");
+        let (_worker, client) = connected(Script::Refuse(refusal));
         let (_keep, mut shutdown_rx) = oneshot::channel::<()>();
         let Subscribed::Refused(status) = subscribe_with_deadline(
             client.as_ref(),
@@ -1261,7 +1064,6 @@ mod tests {
             panic!("the server's refusal is passed through");
         };
         assert_eq!(status.code(), tonic::Code::Unimplemented);
-        server.abort();
     }
 
     /// A stream drained to its end says how it ended: closed by the server
@@ -1278,23 +1080,18 @@ mod tests {
             ..Default::default()
         };
         let behaviours = [
-            Subscribe::Stream(vec![Ok(load_only)]),
-            Subscribe::Stream(vec![Err(Status::data_loss("the subscriber fell behind"))]),
-            Subscribe::Open,
+            Script::Stream(vec![Ok(load_only)]),
+            Script::Stream(vec![Err(Status::data_loss("the subscriber fell behind"))]),
+            Script::Open,
         ];
         for (which, behaviour) in behaviours.into_iter().enumerate() {
-            let (addr, server) = serve(behaviour).await;
-            let (worker, client) = connected(addr).await;
-            let (_index, sink, row) = open_row(worker.url(), None);
-            let (_, id) = row.feed();
+            let (worker, client) = connected(behaviour);
+            let sink = Said::default();
             let wake = worker.runtime_state().map(|state| state.contact_wake());
             let sub = WorkerSubscription {
                 worker: &worker,
                 worker_url: worker.url(),
-                role: Role::Index {
-                    sink: sink.as_ref(),
-                    id,
-                },
+                role: Role::Index { sink: &sink, id: 7 },
                 model_id: "m",
                 load_sink: None,
                 wake: wake.as_ref(),
@@ -1326,7 +1123,7 @@ mod tests {
             }
             let drained = tokio::time::timeout(
                 Duration::from_secs(5),
-                KvEventMonitor::drain_stream(&sub, stream, &mut snapshot, &mut shutdown_rx),
+                KvEventCollector::drain_stream(&sub, stream, &mut snapshot, &mut shutdown_rx),
             )
             .await
             .unwrap_or_else(|_| panic!("case {which}: the drain ends"));
@@ -1362,7 +1159,6 @@ mod tests {
                     "case 2: the removal cuts an open stream"
                 ),
             }
-            server.abort();
         }
     }
 
@@ -1394,20 +1190,13 @@ mod tests {
             // Another rank's record is not this worker's.
             Ok(record(9, Some(1), true)),
         ];
-        let (addr, server) = serve(Subscribe::Stream(script)).await;
-        let worker = rank_worker(addr, 0, 2);
-        let client = worker
-            .engine_connection()
-            .await
-            .expect("a backend client")
-            .expect("a gRPC worker has one")
-            .downcast_arc::<BackendClient>()
-            .expect("the gateway's client");
+        let client = Arc::new(ScriptedEngine::new(Script::Stream(script)));
+        let worker = client.rank_worker(URL, 0, 2);
         let registry = Arc::new(WorkerRegistry::new());
         registry.register(Arc::clone(&worker));
         let monitor = Arc::new(WorkerMonitor::new(
             Arc::clone(&registry),
-            Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
+            Arc::new(LoadReaders::Blind),
             1,
             false,
             false,
@@ -1418,7 +1207,7 @@ mod tests {
         let sub = WorkerSubscription {
             worker: &worker,
             worker_url: worker.url(),
-            role: Role::<IndexSink>::Loads,
+            role: Role::<Said>::Loads,
             model_id: "m",
             load_sink: Some(&sink),
             wake: wake.as_ref(),
@@ -1439,7 +1228,7 @@ mod tests {
         };
         let drained = tokio::time::timeout(
             Duration::from_secs(5),
-            KvEventMonitor::drain_stream(&sub, stream, &mut snapshot, &mut shutdown_rx),
+            KvEventCollector::drain_stream(&sub, stream, &mut snapshot, &mut shutdown_rx),
         )
         .await
         .expect("the drain ends");
@@ -1471,52 +1260,11 @@ mod tests {
             vec![(0, 5)],
             "rank 0's newer record from the event batch; rank 1's dropped"
         );
-        server.abort();
-    }
-
-    /// A loads-only subscription asks the servicer for its records alone,
-    /// from the subscription on, and creates no index for the model.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_loads_only_subscription_asks_for_records_alone_and_keeps_no_index() {
-        let seen = Arc::new(Mutex::new(None));
-        let (addr, server) = serve(Subscribe::RecordRequest(Arc::clone(&seen))).await;
-        let worker = grpc_worker(addr);
-        let monitor = KvEventMonitor::new();
-        monitor
-            .on_worker_added(&worker, SubscriptionKind::Loads)
-            .await;
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let request = loop {
-            if let Some(request) = *seen.lock().unwrap() {
-                break request;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "the subscribe call never reached the scheduler"
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        };
-        assert!(request.loads_only, "{request:?}");
-        assert!(request.load_records_before_first_batch, "{request:?}");
-        assert_eq!(request.start_sequence_number, 0);
-        assert!(
-            monitor.get_indexer(worker.model_id()).is_none()
-                && monitor.get_indexer(UNKNOWN_MODEL_ID).is_none(),
-            "a loads-only subscription builds no index"
-        );
-        tokio::time::timeout(
-            Duration::from_secs(5),
-            monitor.on_worker_removed(worker.url()),
-        )
-        .await
-        .expect("removal returns while the subscribe call hangs");
-        server.abort();
     }
 
     /// Load-only batches contact only their eligible rank, while KV events
-    /// still contact the subscriber even when their rank is foreign (another
-    /// rank's batch is the stream working; it is not indexed, see
-    /// `a_rank_worker_indexes_its_ranks_batches_only`).
+    /// still contact the subscriber even when their rank is foreign: a batch
+    /// the sink took is the stream working, whichever rank it names.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn pushed_load_contact_respects_virtual_rank_without_filtering_events() {
         for (pinned, rank, load_only, contact) in [
@@ -1541,22 +1289,17 @@ mod tests {
                     stored_batch(&[(42, 16)])
                 }
             };
-            let (addr, server) = serve(Subscribe::Stream(vec![Ok(batch)])).await;
-            let (_transport_worker, client) = connected(addr).await;
-            let mut builder = BasicWorkerBuilder::new(format!("grpc://{addr}"));
+            let (_transport_worker, client) = connected(Script::Stream(vec![Ok(batch)]));
+            let mut builder = BasicWorkerBuilder::new(URL);
             if let Some(pinned) = pinned {
                 builder = builder.dp_config(pinned, 8);
             }
             let worker: Arc<dyn Worker> = Arc::new(builder.build());
-            let (_index, sink, row) = open_row(worker.url(), None);
-            let (_, id) = row.feed();
+            let sink = Said::default();
             let sub = WorkerSubscription {
                 worker: &worker,
                 worker_url: worker.url(),
-                role: Role::Index {
-                    sink: sink.as_ref(),
-                    id,
-                },
+                role: Role::Index { sink: &sink, id: 7 },
                 model_id: "m",
                 load_sink: None,
                 wake: None,
@@ -1578,7 +1321,7 @@ mod tests {
             let mut snapshot = None;
             let drained = tokio::time::timeout(
                 Duration::from_secs(5),
-                KvEventMonitor::drain_stream(&sub, stream, &mut snapshot, &mut shutdown_rx),
+                KvEventCollector::drain_stream(&sub, stream, &mut snapshot, &mut shutdown_rx),
             )
             .await
             .expect("the finite stream ends");
@@ -1591,173 +1334,7 @@ mod tests {
                 contact,
                 "pinned={pinned:?}, rank={rank:?}, load_only={load_only}"
             );
-            server.abort();
         }
-    }
-
-    /// Under `--dp-aware` an engine's stream names every rank's batches; a
-    /// rank worker indexes its rank's and the unranked ones, never another
-    /// rank's, so its overlap is its own cache, while every rank's batch
-    /// moves its cursor, so the resubscribe cursor is the unpinned worker's.
-    /// An unexpanded worker indexes them all.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_rank_worker_indexes_its_ranks_batches_only() {
-        // Three blocks of distinct content (the chain index is keyed by the
-        // tokens, not the engine's hash), numbered per admission cursor: a
-        // batch that names no rank runs on rank 0's cursor.
-        let ranked = |hash: i64, first_token: u32, sequence_number: u64, dp_rank: Option<i32>| {
-            let mut batch = stored_batch(&[(hash, 16)]);
-            if let Some(kv_cache_event::Data::Stored(stored)) = batch.events[0].data.as_mut() {
-                stored.blocks[0].token_ids = (first_token..first_token + 16).collect();
-            }
-            batch.sequence_number = sequence_number;
-            batch.dp_rank = dp_rank;
-            batch
-        };
-        let batches = || {
-            vec![
-                Ok(ranked(42, 1_000, 1, Some(0))),
-                Ok(ranked(43, 2_000, 1, Some(1))),
-                Ok(ranked(44, 3_000, 2, None)),
-            ]
-        };
-        for (pinned, indexed) in [(Some(1), 2), (Some(0), 2), (None, 3)] {
-            let (addr, server) = serve(Subscribe::Stream(batches())).await;
-            let (_transport_worker, client) = connected(addr).await;
-            let mut builder = BasicWorkerBuilder::new(format!("grpc://{addr}"));
-            if let Some(pinned) = pinned {
-                builder = builder.dp_config(pinned, 2);
-            }
-            let worker: Arc<dyn Worker> = Arc::new(builder.build());
-            let (indexer, sink, row) = open_row(worker.url(), worker.dp_rank());
-            let worker_id = indexer.intern_worker(worker.url()).unwrap();
-            let (_, id) = row.feed();
-            let sub = WorkerSubscription {
-                worker: &worker,
-                worker_url: worker.url(),
-                role: Role::Index {
-                    sink: sink.as_ref(),
-                    id,
-                },
-                model_id: "m",
-                load_sink: None,
-                wake: None,
-            };
-            let (_keep, mut shutdown_rx) = oneshot::channel();
-            let Subscribed::Stream(stream) = subscribe_with_deadline(
-                client.as_ref(),
-                0,
-                SubscriptionKind::Events,
-                None,
-                &mut shutdown_rx,
-                Duration::from_secs(5),
-            )
-            .await
-            else {
-                panic!("the server answers with a stream");
-            };
-            let mut snapshot = None;
-            let drained = tokio::time::timeout(
-                Duration::from_secs(5),
-                KvEventMonitor::drain_stream(&sub, stream, &mut snapshot, &mut shutdown_rx),
-            )
-            .await
-            .expect("the finite stream ends");
-            assert!(matches!(
-                drained,
-                Drained::Ended {
-                    result: StreamResult::Ended,
-                    applied: true
-                }
-            ));
-            assert_eq!(
-                indexer.worker_block_count(worker_id),
-                indexed,
-                "pinned={pinned:?}"
-            );
-            assert_eq!(
-                sub.role.resume_sequence(),
-                2,
-                "rank 0's cursor moved by rank 0's and the unranked batch, pinned={pinned:?}"
-            );
-            server.abort();
-        }
-    }
-
-    /// A subscribe call that never answers, retried at every contact with
-    /// the worker, must still see the worker's removal: with no shutdown arm
-    /// on the call the task lived on and `on_worker_removed` never returned.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn removal_ends_a_subscribe_call_that_never_answers() {
-        let (addr, server) = serve(Subscribe::Hang).await;
-
-        let worker = grpc_worker(addr);
-        let monitor = KvEventMonitor::new();
-        monitor
-            .on_worker_added(&worker, SubscriptionKind::Events)
-            .await;
-        // Let the task connect and park in the subscribe call.
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        // The worker keeps being heard from on other paths; every contact
-        // retries the parked call well inside its deadline.
-        let pinger = {
-            let worker = Arc::clone(&worker);
-            #[expect(
-                clippy::disallowed_methods,
-                reason = "the contact source is stopped at the end of the test"
-            )]
-            tokio::spawn(async move {
-                loop {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                    worker.runtime_state().unwrap().note_contact();
-                }
-            })
-        };
-
-        tokio::time::timeout(
-            Duration::from_secs(5),
-            monitor.on_worker_removed(worker.url()),
-        )
-        .await
-        .expect("removal returns while the subscribe call hangs");
-
-        pinger.abort();
-        server.abort();
-    }
-
-    /// The subscription asks the servicer for load records before the
-    /// publisher's first batch: this gateway admits a `load_only` batch to
-    /// no cursor, and the silence of an engine frozen on the first request
-    /// it ever receives reaches the wedge rule through no other record.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn the_subscription_asks_for_load_records_before_the_first_batch() {
-        let seen = Arc::new(Mutex::new(None));
-        let (addr, server) = serve(Subscribe::RecordRequest(Arc::clone(&seen))).await;
-        let worker = grpc_worker(addr);
-        let monitor = KvEventMonitor::new();
-        monitor
-            .on_worker_added(&worker, SubscriptionKind::Events)
-            .await;
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let request = loop {
-            if let Some(request) = *seen.lock().unwrap() {
-                break request;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "the subscribe call never reached the scheduler"
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        };
-        assert!(request.load_records_before_first_batch, "{request:?}");
-        assert_eq!(request.start_sequence_number, 0);
-        tokio::time::timeout(
-            Duration::from_secs(5),
-            monitor.on_worker_removed(worker.url()),
-        )
-        .await
-        .expect("removal returns while the subscribe call hangs");
-        server.abort();
     }
 
     /// A stream that fails on its first message is a failed subscription,
@@ -1776,35 +1353,29 @@ mod tests {
 
         let recorder = PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();
-        let calls = Arc::new(Mutex::new(Vec::new()));
+        let (worker, engine) = connected(first_message_fails());
         // One thread, so the subscription task's metrics land on this
         // thread's recorder.
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
-        let addr = metrics::with_local_recorder(&recorder, || {
+        metrics::with_local_recorder(&recorder, || {
             runtime.block_on(async {
-                let (addr, server) = serve(Subscribe::FailFirstMessage(Arc::clone(&calls))).await;
-                let worker = grpc_worker(addr);
-                let monitor = KvEventMonitor::new();
-                monitor
-                    .on_worker_added(&worker, SubscriptionKind::Events)
-                    .await;
+                let (task, leave) = spawned_loop(&worker);
                 // Four connects are three failed streams, each with its
                 // delay slept before the next connect.
                 let deadline = Instant::now() + Duration::from_secs(30);
-                while calls.lock().unwrap().len() < 4 {
+                while engine.calls().len() < 4 {
                     assert!(Instant::now() < deadline, "no fourth subscribe call");
                     tokio::time::sleep(Duration::from_millis(20)).await;
                 }
-                monitor.on_worker_removed(worker.url()).await;
-                server.abort();
-                addr
-            })
+                leave.send(()).unwrap();
+                task.await.unwrap();
+            });
         });
 
-        let calls = calls.lock().unwrap().clone();
+        let calls: Vec<Instant> = engine.calls().into_iter().map(|(_, at)| at).collect();
         // The delay scheduled after each failed stream doubles up to the cap,
         // and each was slept: the gap before a connect is at least the delay
         // the retry line before it scheduled. A loaded host only stretches a
@@ -1855,10 +1426,7 @@ mod tests {
             .lines()
             .find(|line| line.starts_with("smg_kv_event_stream_errors_total{"))
             .unwrap_or_else(|| panic!("no stream error counted:\n{rendered}"));
-        assert!(
-            line.contains(&format!("worker=\"grpc://{addr}\"")),
-            "{line}"
-        );
+        assert!(line.contains(&format!("worker=\"{URL}\"")), "{line}");
         assert!(line.contains("error=\"out_of_range\""), "{line}");
         let errors: f64 = line.rsplit(' ').next().unwrap().parse().unwrap();
         assert!(
@@ -1876,23 +1444,18 @@ mod tests {
     /// wake's doing.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_contact_with_the_worker_ends_its_subscriptions_backoff_early() {
-        let calls = Arc::new(Mutex::new(Vec::new()));
-        let (addr, server) = serve(Subscribe::FailFirstMessage(Arc::clone(&calls))).await;
-        let worker = grpc_worker(addr);
-        let monitor = KvEventMonitor::new();
-        monitor
-            .on_worker_added(&worker, SubscriptionKind::Events)
-            .await;
+        let (worker, engine) = connected(first_message_fails());
+        let (task, leave) = spawned_loop(&worker);
         // The worker is heard from on another path until six connects are in.
         let deadline = Instant::now() + Duration::from_secs(10);
-        while calls.lock().unwrap().len() < 6 && Instant::now() < deadline {
+        while engine.calls().len() < 6 && Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(20)).await;
             worker.runtime_state().unwrap().note_contact();
         }
-        monitor.on_worker_removed(worker.url()).await;
-        server.abort();
+        leave.send(()).unwrap();
+        task.await.unwrap();
 
-        let calls = calls.lock().unwrap().clone();
+        let calls: Vec<Instant> = engine.calls().into_iter().map(|(_, at)| at).collect();
         let gaps: Vec<Duration> = calls.windows(2).map(|pair| pair[1] - pair[0]).collect();
         // The delay scheduled before each connect after the first, in the
         // loop's own order: no stream here delivers a batch, so none resets.
@@ -1908,189 +1471,6 @@ mod tests {
             gaps.iter().zip(&delays).any(|(gap, delay)| gap < delay),
             "no connect came before its scheduled delay: gaps {gaps:?}, delays {delays:?}"
         );
-    }
-
-    /// A backend that serves no KV events (an engine whose publisher is off)
-    /// leaves one WARN line, which names the model, carries the servicer's
-    /// own reason and says that the model reaches the approximate tree only
-    /// when no worker of it publishes; the worker carries a gauge from the
-    /// answer until it leaves.
-    #[traced_test]
-    #[test]
-    fn a_backend_without_kv_events_is_a_gauge_until_the_worker_leaves() {
-        use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
-
-        fn gauge(handle: &PrometheusHandle, worker_url: &str) -> Option<f64> {
-            let prefix = format!("smg_kv_events_unavailable{{worker=\"{worker_url}\"}}");
-            handle
-                .render()
-                .lines()
-                .find(|line| line.starts_with(&prefix))
-                .and_then(|line| line.rsplit(' ').next())
-                .and_then(|value| value.parse().ok())
-        }
-
-        let recorder = PrometheusBuilder::new().build_recorder();
-        let handle = recorder.handle();
-        // The subscription task publishes from the runtime's thread, which
-        // must be the one holding the local recorder.
-        metrics::with_local_recorder(&recorder, || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            rt.block_on(async {
-                let (addr, server) = serve(Subscribe::Unimplemented).await;
-
-                let worker: Arc<dyn Worker> = Arc::new(
-                    BasicWorkerBuilder::new(format!("grpc://{addr}"))
-                        .worker_type(WorkerType::Regular)
-                        .connection_mode(ConnectionMode::Grpc)
-                        .runtime_type(RuntimeType::TokenSpeed)
-                        .model(ModelCard::new("hybrid-m"))
-                        .health_config(HealthCheckConfig {
-                            disable_health_check: true,
-                            ..Default::default()
-                        })
-                        .build(),
-                );
-                let monitor = KvEventMonitor::new();
-                monitor
-                    .on_worker_added(&worker, SubscriptionKind::Events)
-                    .await;
-                for _ in 0..500 {
-                    if gauge(&handle, worker.url()) == Some(1.0) {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-                assert_eq!(
-                    gauge(&handle, worker.url()),
-                    Some(1.0),
-                    "the answer raises the gauge"
-                );
-                // The WARN line itself names the model, carries the servicer's
-                // reason and says when the model reaches the tree; the
-                // subscription's start line names the model too, so the
-                // checks are scoped to the refusal's line.
-                logs_assert(|lines: &[&str]| {
-                    let line = lines
-                        .iter()
-                        .find(|line| line.contains("does not implement SubscribeKvEvents"))
-                        .ok_or_else(|| "no refusal line was logged".to_string())?;
-                    for wanted in [
-                        "WARN",
-                        "hybrid-m",
-                        "KV cache events not enabled",
-                        "approximate prefix tree only when no worker of it publishes events",
-                    ] {
-                        if !line.contains(wanted) {
-                            return Err(format!("the refusal line lacks {wanted:?}: {line}"));
-                        }
-                    }
-                    Ok(())
-                });
-
-                monitor.on_worker_removed(worker.url()).await;
-                assert_eq!(
-                    gauge(&handle, worker.url()),
-                    Some(0.0),
-                    "the worker's removal lowers it"
-                );
-                server.abort();
-            });
-        });
-    }
-
-    /// A worker whose connection is not the gateway's client carries no
-    /// event stream: its subscription is refused as unimplemented, the
-    /// worker's gauge rises, and no second connect is asked for.
-    #[test]
-    fn a_connection_that_is_not_the_gateways_client_carries_no_event_stream() {
-        use metrics_exporter_prometheus::PrometheusBuilder;
-
-        use crate::worker::{
-            connection::engine::EngineConnector, kv::event_monitor::Slot,
-            test_support::CountingConnector,
-        };
-
-        let recorder = PrometheusBuilder::new().build_recorder();
-        let handle = recorder.handle();
-        // The subscription task publishes from the runtime's thread, which
-        // must be the one holding the local recorder.
-        metrics::with_local_recorder(&recorder, || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            rt.block_on(async {
-                let connector = Arc::new(CountingConnector::default());
-                let worker: Arc<dyn Worker> = Arc::new(
-                    BasicWorkerBuilder::new("grpc://no-engine:9000")
-                        .worker_type(WorkerType::Regular)
-                        .connection_mode(ConnectionMode::Grpc)
-                        .model(ModelCard::new("m"))
-                        .health_config(HealthCheckConfig {
-                            disable_health_check: true,
-                            ..Default::default()
-                        })
-                        .engine_connector(Arc::clone(&connector) as Arc<dyn EngineConnector>)
-                        .build(),
-                );
-                let prefix = format!("smg_kv_events_unavailable{{worker=\"{}\"}}", worker.url());
-                let gauge = || {
-                    handle
-                        .render()
-                        .lines()
-                        .find(|line| line.starts_with(&prefix))
-                        .and_then(|line| line.rsplit(' ').next()?.parse::<f64>().ok())
-                };
-                let monitor = KvEventMonitor::new();
-                monitor
-                    .on_worker_added(&worker, SubscriptionKind::Events)
-                    .await;
-                for _ in 0..500 {
-                    if gauge() == Some(1.0) {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-                assert_eq!(gauge(), Some(1.0), "the refusal raises the gauge");
-                assert_eq!(connector.connects(), 1, "no second connect");
-                // The connect count cannot tell a second subscription over the
-                // kept handle from an end: the loop's own task says it ended.
-                let mut ended = false;
-                for _ in 0..500 {
-                    ended = match monitor.worker_handles.lock().await.get(worker.url()) {
-                        Some(Slot::Active(sub)) => sub.handle.is_finished(),
-                        Some(Slot::Removing(_)) => false,
-                        None => true,
-                    };
-                    if ended {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-                assert!(ended, "the refusal ends the loop");
-                monitor.on_worker_removed(worker.url()).await;
-            });
-        });
-    }
-
-    #[tokio::test]
-    async fn a_removed_workers_blocks_leave_the_index_off_the_runtime() {
-        let (indexer, sink, row) = open_row("http://w1:8000", None);
-        let (_, id) = row.feed();
-        let batch = stored_batch(&[(1, 16)]);
-        assert_eq!(
-            sink.admit(id, batch_rank(&batch), batch_facts(&batch), &batch),
-            BatchOutcome::Applied
-        );
-        assert_ne!(indexer.current_size(), 0, "the stored block is indexed");
-
-        KvEventMonitor::remove_from_sink(sink, id, "grpc://w1:9000").await;
-
-        assert_eq!(indexer.current_size(), 0);
     }
 
     /// A subscription of `worker` that feeds `sink` under id 7.
@@ -2113,9 +1493,7 @@ mod tests {
     /// the sink stands.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_round_subscribes_from_the_sinks_cursor() {
-        let seen = Arc::new(Mutex::new(None));
-        let (addr, server) = serve(Subscribe::RecordRequest(Arc::clone(&seen))).await;
-        let worker = grpc_worker(addr);
+        let (worker, engine) = connected(Script::Hang);
         let sink = Said {
             applied: 41,
             ..Said::default()
@@ -2126,27 +1504,26 @@ mod tests {
         let request = async {
             let deadline = Instant::now() + Duration::from_secs(5);
             let request = loop {
-                if let Some(request) = *seen.lock().unwrap() {
+                if let Some((request, _)) = engine.calls().first().copied() {
                     break request;
                 }
                 assert!(
                     Instant::now() < deadline,
-                    "the subscribe call never reached the scheduler"
+                    "the subscribe call never reached the engine"
                 );
                 tokio::time::sleep(Duration::from_millis(20)).await;
             };
-            // The scheduler never answers: the worker's removal ends the round.
+            // The engine never answers: the worker's removal ends the round.
             let _ = shutdown_tx.send(());
             request
         };
         let (round, request) = tokio::join!(
-            KvEventMonitor::subscription_round(&sub, &mut backoff, &mut shutdown_rx),
+            KvEventCollector::subscription_round(&sub, &mut backoff, &mut shutdown_rx),
             request,
         );
         assert!(matches!(round, Round::Shutdown | Round::Backoff));
         assert_eq!(request.start_sequence_number, 41);
         assert_eq!(sink.calls(), ["cursor 7 rank 0"]);
-        server.abort();
     }
 
     /// What crosses the port from the collector's side, call by call, held
@@ -2190,13 +1567,12 @@ mod tests {
             ),
         ];
         for (script, expected, again) in scripts {
-            let (addr, server) = serve(Subscribe::Stream(script)).await;
-            let worker = grpc_worker(addr);
+            let (worker, _engine) = connected(Script::Stream(script));
             let sink = Said::default();
             let sub = said_subscription(&worker, &sink);
             let (_keep, mut shutdown_rx) = oneshot::channel::<()>();
             let round =
-                KvEventMonitor::subscription_round(&sub, &mut Backoff::new(), &mut shutdown_rx)
+                KvEventCollector::subscription_round(&sub, &mut Backoff::new(), &mut shutdown_rx)
                     .await;
             if again {
                 assert!(matches!(round, Round::Again), "{expected:?}");
@@ -2212,11 +1588,10 @@ mod tests {
                 .filter(|call| !call.starts_with("cursor"))
                 .collect();
             assert_eq!(said, expected);
-            server.abort();
         }
 
         let sink = Arc::new(Said::default());
-        KvEventMonitor::remove_from_sink(Arc::clone(&sink), 7, "grpc://w1:9000").await;
+        KvEventCollector::remove_from_sink(Arc::clone(&sink), 7, "grpc://w1:9000").await;
         assert_eq!(sink.calls(), ["removed 7"]);
     }
 
@@ -2239,13 +1614,12 @@ mod tests {
             ..stored_batch(&[(1, 16)])
         };
         let script = vec![Ok(chunk(6, 0)), Ok(chunk(7, 1)), Ok(chunk(8, 2)), Ok(live)];
-        let (addr, server) = serve(Subscribe::Stream(script)).await;
-        let worker = grpc_worker(addr);
+        let (worker, _engine) = connected(Script::Stream(script));
         let sink = Said::default();
         let sub = said_subscription(&worker, &sink);
         let (_keep, mut shutdown_rx) = oneshot::channel::<()>();
         let round =
-            KvEventMonitor::subscription_round(&sub, &mut Backoff::new(), &mut shutdown_rx).await;
+            KvEventCollector::subscription_round(&sub, &mut Backoff::new(), &mut shutdown_rx).await;
         assert!(matches!(round, Round::Backoff));
         let said: Vec<String> = sink
             .calls()
@@ -2263,6 +1637,175 @@ mod tests {
                 "admit 7 rank 0 seq 9",
             ]
         );
-        server.abort();
+    }
+
+    /// A subscribe call the engine refuses as out of range is an expired
+    /// replay cursor: the collector says so to the sink, starts the backoff
+    /// over and subscribes again at once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_expired_cursor_is_said_to_the_sink_and_retried_at_once() {
+        let expired = Status::out_of_range("the replay cursor expired");
+        let (worker, _engine) = connected(Script::Refuse(expired));
+        let sink = Said::default();
+        let sub = said_subscription(&worker, &sink);
+        let (_keep, mut shutdown_rx) = oneshot::channel::<()>();
+        let mut backoff = Backoff::new();
+        backoff.grow();
+        let round =
+            KvEventCollector::subscription_round(&sub, &mut backoff, &mut shutdown_rx).await;
+        assert!(matches!(round, Round::Again));
+        assert_eq!(backoff.delay_ms(), INITIAL_RECONNECT_DELAY_MS);
+        assert_eq!(
+            sink.calls(),
+            ["cursor 7 rank 0", "resync 7 None out_of_range"]
+        );
+    }
+
+    /// A first chunk that comes while a snapshot is open starts the snapshot
+    /// over: its start is said again and the count is the new chunk's, so
+    /// the chunks that fill it leave no snapshot abandoned.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_snapshot_started_over_inside_a_stream_is_said_again() {
+        let chunk = |sequence_number, index, count| KvEventBatch {
+            sequence_number,
+            snapshot: Some(KvSnapshotChunk {
+                index,
+                count,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let script = vec![Ok(chunk(6, 0, 3)), Ok(chunk(7, 0, 2)), Ok(chunk(8, 1, 2))];
+        let (worker, _engine) = connected(Script::Stream(script));
+        let sink = Said::default();
+        let sub = said_subscription(&worker, &sink);
+        let (_keep, mut shutdown_rx) = oneshot::channel::<()>();
+        let round =
+            KvEventCollector::subscription_round(&sub, &mut Backoff::new(), &mut shutdown_rx).await;
+        assert!(matches!(round, Round::Backoff));
+        let said: Vec<String> = sink
+            .calls()
+            .into_iter()
+            .filter(|call| !call.starts_with("cursor"))
+            .collect();
+        assert_eq!(
+            said,
+            [
+                "reconnected 7",
+                "resync 7 None snapshot",
+                "admit 7 rank 0 seq 6 chunk",
+                "resync 7 None snapshot",
+                "admit 7 rank 0 seq 7 chunk",
+                "admit 7 rank 0 seq 8 chunk",
+            ]
+        );
+    }
+
+    /// A batch that carries only a load record repeats the last sequence and
+    /// has no events: it is recognised before admission, so it is neither a
+    /// duplicate nor a restart to a rank's cursor.
+    #[test]
+    fn a_load_only_batch_is_recognised_before_admission() {
+        let record = EngineLoad {
+            running_requests: 3,
+            load_only: true,
+            ..Default::default()
+        };
+        let only = KvEventBatch {
+            sequence_number: 7,
+            load: Some(record.clone()),
+            ..Default::default()
+        };
+        assert!(KvEventCollector::is_load_only(&only));
+        let carrying = KvEventBatch {
+            sequence_number: 8,
+            load: Some(EngineLoad {
+                load_only: false,
+                ..record
+            }),
+            ..stored_batch(&[(1, 16)])
+        };
+        assert!(!KvEventCollector::is_load_only(&carrying));
+        assert!(!KvEventCollector::is_load_only(&KvEventBatch {
+            sequence_number: 9,
+            ..Default::default()
+        }));
+    }
+
+    /// A batch whose rank fits no `u16` names no rank of an engine: it is
+    /// said to no sink, where rank 0's cursor would have taken it, and the
+    /// batches around it are said as they come.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_batch_of_a_rank_that_fits_none_is_said_to_no_sink() {
+        let ranked = |sequence_number, dp_rank| KvEventBatch {
+            sequence_number,
+            dp_rank,
+            ..stored_batch(&[(1, 16)])
+        };
+        assert_eq!(batch_rank(&ranked(1, None)), Some(0));
+        assert_eq!(batch_rank(&ranked(1, Some(65_535))), Some(65_535));
+        assert_eq!(batch_rank(&ranked(1, Some(65_536))), None);
+        assert_eq!(batch_rank(&ranked(1, Some(-1))), None);
+
+        let script = vec![
+            Ok(ranked(5, Some(1))),
+            Ok(ranked(6, Some(-1))),
+            Ok(ranked(7, Some(65_536))),
+            Ok(ranked(8, None)),
+        ];
+        let (worker, _engine) = connected(Script::Stream(script));
+        let sink = Said::default();
+        let sub = said_subscription(&worker, &sink);
+        let (_keep, mut shutdown_rx) = oneshot::channel::<()>();
+        let round =
+            KvEventCollector::subscription_round(&sub, &mut Backoff::new(), &mut shutdown_rx).await;
+        assert!(matches!(round, Round::Backoff));
+        let said: Vec<String> = sink
+            .calls()
+            .into_iter()
+            .filter(|call| !call.starts_with("cursor"))
+            .collect();
+        assert_eq!(
+            said,
+            [
+                "reconnected 7",
+                "admit 7 rank 1 seq 5",
+                "admit 7 rank 0 seq 8"
+            ]
+        );
+    }
+
+    /// The count of a relay snapshot's chunks, rule by rule: a first chunk
+    /// opens a snapshot of its count, inside an open one too; a chunk that
+    /// comes without its first opens one as well; a later chunk counts down
+    /// and the one that fills the count closes it; a count of zero is one
+    /// chunk.
+    #[test]
+    fn a_snapshots_chunks_are_counted_by_these_rules() {
+        let chunk = |index, count| KvSnapshotChunk {
+            index,
+            count,
+            ..Default::default()
+        };
+        // The count before the chunk, the chunk, whether it opens a
+        // snapshot, the count after it.
+        let rows = [
+            (None, chunk(0, 3), true, Some(2)),
+            (Some(2), chunk(1, 3), false, Some(1)),
+            (Some(1), chunk(2, 3), false, None),
+            (None, chunk(1, 3), true, Some(2)),
+            (Some(2), chunk(0, 2), true, Some(1)),
+            (None, chunk(0, 1), true, None),
+            (None, chunk(0, 0), true, None),
+        ];
+        for (before, chunk, opens, after) in rows {
+            let mut open = before;
+            assert_eq!(
+                count_snapshot_chunk(&mut open, &chunk),
+                opens,
+                "{before:?} {chunk:?}"
+            );
+            assert_eq!(open, after, "{before:?} {chunk:?}");
+        }
     }
 }
