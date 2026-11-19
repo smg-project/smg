@@ -69,9 +69,9 @@ impl LeaseState {
     /// The TTL an issued lease's rule ends its key's pin by; `None` under
     /// a rule with no TTL, under no rule, and once the lease left the
     /// issued state. The pin's writer takes `None` as no end at all, so
-    /// it asks [`Self::is_issued`] first: the door tells a dispatch once,
-    /// with the record as it stood before its dispatch was written, and
-    /// a record past that state pins nothing by its lease's rule.
+    /// it asks [`Self::is_issued`] first: the door tells a side's dispatch
+    /// once, with the side as it stood before its dispatch was written,
+    /// and a side past that state pins nothing by its lease's rule.
     pub fn session_ttl_micros(self) -> Option<u64> {
         match self {
             Self::Issued { session_ttl_micros } if session_ttl_micros != u64::MAX => {

@@ -397,7 +397,9 @@ pub(crate) fn pair_in<A: Asked>(
             let first = pick.targets.first()?;
             let chosen = first.pair?;
             // The pair's one decision: its rule's TTL as a single's
-            // booking carries it, in each side's issued state.
+            // booking carries it, in each side's issued state. No pair
+            // carries one yet: a sessions rule runs under the single
+            // plan alone.
             let ttl_micros = if pick.session_verdict == SessionVerdict::None {
                 None
             } else {
