@@ -514,7 +514,12 @@ pub(crate) fn membership(m: &Membership<'_>) -> proto::lifecycle_event::Event {
 pub(crate) fn since_of(change: &Membership<'_>) -> u32 {
     match change {
         Membership::Left { .. } => 2,
-        _ => 1,
+        Membership::Added(_)
+        | Membership::Removed(_)
+        | Membership::Replaced { .. }
+        | Membership::Relabelled(_)
+        | Membership::Resized(_)
+        | Membership::Snapshot(_) => 1,
     }
 }
 
