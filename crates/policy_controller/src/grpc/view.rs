@@ -482,7 +482,7 @@ pub(crate) fn released(l: &Lease, r: ReleaseReason) -> proto::lifecycle_event::E
 
 /// A membership word as the plugin contract carries it. `None` for
 /// [`Membership::Left`]: the contract has no kind for it, and a plugin
-/// hears the `Relabelled` or `Resized` that follows it.
+/// hears the write's own word, said beside it.
 pub(crate) fn membership(m: &Membership<'_>) -> Option<proto::lifecycle_event::Event> {
     use proto::membership_change::Kind;
     let (kind, worker_id, old_worker_id, ids) = match m {
@@ -684,7 +684,8 @@ pub(crate) fn read(
 
 #[cfg(test)]
 mod tests {
-    use super::{proto, Answer, Invalid, FILTER, PICK, SCORE};
+    use super::{membership, proto, Answer, Invalid, FILTER, PICK, SCORE};
+    use crate::{lease::Membership, view::WorkerId};
 
     /// The stages' rules, under a plugin that declared no counter.
     fn read(d: proto::PluginDecision, asked: u32, count: u32) -> Result<Answer, Invalid> {
@@ -1126,5 +1127,19 @@ mod tests {
                 wire.len()
             );
         }
+    }
+
+    /// The contract has no kind for the models a worker left: the mapper
+    /// hands a plugin nothing for that word, and the write's own word as
+    /// before.
+    #[test]
+    fn a_plugin_is_told_nothing_of_the_models_a_worker_left() {
+        let (id, models) = (WorkerId(7), ["m".to_string()]);
+        let left = Membership::Left {
+            id,
+            models: &models,
+        };
+        assert!(membership(&left).is_none());
+        assert!(membership(&Membership::Relabelled(id)).is_some());
     }
 }

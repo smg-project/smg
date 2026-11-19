@@ -149,7 +149,8 @@ service PolicyController {
   // publication window (20 ms) of their answer, and they are in force for
   // decisions when it ends. A deregistration and a new incarnation's
   // replacing of the old are in force at their answer: no decision made
-  // after it names the worker that left.
+  // after it names the worker that left. So is a refresh that takes its
+  // worker off a model, for the pools it leaves.
   rpc RegisterWorker(RegisterWorkerRequest) returns (WorkerEvent);
   rpc PatchWorker(PatchWorkerRequest) returns (WorkerEvent);
   rpc DeregisterWorker(DeregisterWorkerRequest) returns (WorkerEvent);

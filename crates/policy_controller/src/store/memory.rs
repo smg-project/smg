@@ -431,7 +431,9 @@ impl MemoryStore {
     ///
     /// The pools follow as at the leader's own write: a join, a refresh and
     /// a patch leave their build owed, which the replica's loop pays at the
-    /// window's end, and a leave pays its own before it is told.
+    /// window's end, and a leave pays its own before it is told: a removal,
+    /// a replaced incarnation, a registration that takes its worker off a
+    /// model.
     ///
     /// The change is applied only where it fits the tables: the epoch is
     /// the next one, a new row's id is free and a registration's key too,
@@ -534,7 +536,8 @@ impl MemoryStore {
         workers.record_over(change, left.as_ref());
         // The build each write leaves, as the leader's own: a join, a
         // refresh and a patch owe it, and a leave pays its own before it is
-        // told. What is owed, the replica's loop pays at the window's end.
+        // told, a registration that takes its worker off a model among
+        // them. What is owed, the replica's loop pays at the window's end.
         let now = Instant::now();
         match change {
             MembershipChange::Registered { id } => {
@@ -556,8 +559,13 @@ impl MemoryStore {
                     left: Some(old),
                     joined: Some(new),
                 };
+                // A replacement that takes its worker off a model says so
+                // for the new id, behind the build it pays and behind its
+                // own word, as at the leader's own write.
+                let models = Self::replaced_models(left, workers.rows.get(&new));
                 self.pay_leave(&workers, classes, now);
                 self.tell_membership(change);
+                self.tell_left(new, &models);
             }
             MembershipChange::Relabelled { id } | MembershipChange::Resized { id } => {
                 self.index_member(&workers, id);
@@ -855,6 +863,26 @@ impl MemoryStore {
         self.tell_membership(change);
     }
 
+    /// Tell the engine the models a replaced incarnation left, for the id
+    /// that replaced it, and no word where it left none. Said behind the
+    /// build the replacement pays and behind its own word: a stage has
+    /// retired the old id and carried its places to the new one by then.
+    fn tell_left(&self, id: WorkerId, models: &[String]) {
+        if !models.is_empty() {
+            self.tell_engine(&Membership::Left { id, models });
+        }
+    }
+
+    /// The models a replaced incarnation stood in a pool of and its
+    /// successor does not ([`left_models`]), from the row a replacement
+    /// took out and the row it put in: none where either is not there.
+    fn replaced_models(old: Option<WorkerRow>, new: Option<&Row>) -> Vec<String> {
+        match (old, new) {
+            (Some(old), Some(new)) => left_models(old.facts, &new.row.facts),
+            _ => Vec::new(),
+        }
+    }
+
     /// A membership write left the pools to be built again. Called under
     /// the workers lock by every membership write, with what the write asks
     /// of the pair classes. The build is owed until the store's window ends
@@ -903,14 +931,15 @@ impl MemoryStore {
         self.show(writer, world);
     }
 
-    /// A leave pays its own build. A removal and a replaced incarnation owe
-    /// the build as every membership write does and pay it in the same
-    /// write, as the ask pays it, with every write the window held. Called
-    /// under the workers lock, before the leave is told: the worker is in no
-    /// pool when its write returns, under every profile and stage and
-    /// whoever wrote, a served call or a followed change. A storm of
-    /// removals so builds once a removal. The window stands as it was, and
-    /// the host is not woken: nothing is left owed.
+    /// A leave pays its own build. A removal, a replaced incarnation and a
+    /// registration that takes its worker off a model owe the build as
+    /// every membership write does and pay it in the same write, as the ask
+    /// pays it, with every write the window held. Called under the workers
+    /// lock, before the leave is told: the worker is in no pool it left
+    /// when its write returns, under every profile and stage and whoever
+    /// wrote, a served call or a followed change. A storm of removals so
+    /// builds once a removal. The window stands as it was, and the host is
+    /// not woken: nothing is left owed.
     fn pay_leave(&self, workers: &Workers, classes: Classes, at: Instant) {
         self.loads.lock().writer.owe(classes, at);
         self.pay(workers, None);
@@ -922,7 +951,8 @@ impl MemoryStore {
     /// The build of a registration, a refresh and a patch starts within one
     /// publication window of their answer, when the store's host pays the
     /// due instant ([`LoadSink::publish_due`]), and they are in force for
-    /// decisions when it ends. A caller that needs its own write in force
+    /// decisions when it ends; a registration that takes its worker off a
+    /// model has paid its own. A caller that needs its own write in force
     /// at once asks here: a test, a bench's fill, a host with no loop. The
     /// store asks for itself where a write is of a worker's row: a lease on
     /// the worker, a poll's answer for a rank of it. The ask builds the
@@ -1439,8 +1469,14 @@ impl WorkersStore for MemoryStore {
                 left: Some(old_id),
                 joined: Some(new_id),
             };
+            // The models the new incarnation no longer stands in a pool of:
+            // the stages hear them for the new id, behind the build the
+            // replacement pays and behind its own word, which retires the
+            // old id and carries its places first.
+            let left = Self::replaced_models(old.map(|old| old.row), workers.rows.get(&new_id));
             self.pay_leave(&workers, classes, now);
             self.tell_membership(change);
+            self.tell_left(new_id, &left);
             drop(workers);
             self.forget_pins(old_id);
             return change;

@@ -971,7 +971,7 @@ pub(crate) fn release_reason(r: ReleaseReason) -> wit::ReleaseReason {
 
 /// A membership word as the guest's world carries it. `None` for
 /// [`Membership::Left`]: the world has no case for it, and a guest hears
-/// the `relabelled` or `resized` that follows it.
+/// the write's own word, said beside it.
 pub(crate) fn membership<'a>(
     m: &Membership<'_>,
     snapshot: &'a mut Vec<u64>,
@@ -1699,5 +1699,20 @@ mod tests {
             ..Lease::default()
         };
         assert_eq!(lease(&told, &Exposure::default()).target_index, 1);
+    }
+
+    /// The guest's world has no case for the models a worker left: the
+    /// mapper hands a guest nothing for that word, and the write's own word
+    /// as before.
+    #[test]
+    fn a_guest_is_told_nothing_of_the_models_a_worker_left() {
+        let (id, models) = (WorkerId(7), ["m".to_string()]);
+        let left = Membership::Left {
+            id,
+            models: &models,
+        };
+        let mut snapshot = Vec::new();
+        assert!(membership(&left, &mut snapshot).is_none());
+        assert!(membership(&Membership::Relabelled(id), &mut snapshot).is_some());
     }
 }

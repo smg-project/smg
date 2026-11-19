@@ -8343,6 +8343,28 @@ fn an_instance_made_anew_hears_the_membership_as_it_stands() {
     assert_eq!(pick(), Some(102), "two members stand");
 }
 
+/// The feed keeps nothing of the models a worker left, since no contract
+/// carries the word yet: an instance level with the feed hears no call for
+/// it and counts the members it counted.
+#[test]
+fn a_guest_hears_nothing_of_the_models_a_worker_left() {
+    use smg_policy_controller::Membership;
+    let runtime = runtime();
+    let plugin = load(&runtime, "left", guest::record_guest(), mode::COUNT_MEMBERS);
+    let engine = plugin_engine(&plugin);
+    let pick = || pick_ids(&decide(&engine, &pool(4), 1)).first().copied();
+    engine.on_membership(&Membership::Snapshot(&[WorkerId(100), WorkerId(101)]));
+    assert_eq!(pick(), Some(102), "two members stand");
+    let level = plugin.stats().observed;
+    let models = ["a".to_owned()];
+    engine.on_membership(&Membership::Left {
+        id: WorkerId(100),
+        models: &models,
+    });
+    assert_eq!(pick(), Some(102), "the same two members");
+    assert_eq!(plugin.stats().observed, level, "no call for the word");
+}
+
 /// The feed keeps its last 64 changes. An instance behind that many hears
 /// each, one call a change; one further behind, or behind a snapshot, hears
 /// the list as it stands, as one snapshot.
