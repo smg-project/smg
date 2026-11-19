@@ -15,11 +15,13 @@
 //! own. The policies that walk a ring take a URL only where the request's
 //! workers hold an eligible worker at it, and a URL's places on a ring
 //! depend on the URL alone. A worker that left is therefore passed over at
-//! once, and its keys land where the generation's own ring puts them. A
-//! worker that joined takes no keyed request until its ring is filled: its
-//! keys stay with the workers that held them. Where none of those is
+//! once, and a worker that joined takes no keyed request until its ring is
+//! filled. A key lands where the generation's own ring puts it, unless
+//! that ring gives it to a worker that joined. Such a key stays, until the
+//! fill, with the worker that held it, or with the next one on the kept
+//! ring where that worker left. Where no worker of the kept ring is
 //! eligible, a key is placed as with no ring, and the worker that joined
-//! can take it. No other key moves. The
+//! can take it. The
 //! registry publishes a generation before it sends the event the task
 //! wakes on, so the task fills that generation or a newer one. The task
 //! alone writes a kept ring, from the generation that stands, so a kept

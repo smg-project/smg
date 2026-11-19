@@ -598,6 +598,12 @@ async fn the_task_fills_a_wave_once_from_the_ring_it_kept() {
     assert!(between
         .iter()
         .all(|generation| !generation.hash_ring_is_filled()));
+    // The fill runs on a thread of its own: it writes the generation's cell
+    // first and keeps the ring after it.
+    until("the wave's ring is kept", || {
+        kept(&rings, "model").is_some_and(|ring| ring.worker_count() == 64)
+    })
+    .await;
     let ring = kept(&rings, "model").expect("the ring of the generation that stands");
     assert_same_placements(&ring, &HashRing::new((0..64).map(url)));
 }
