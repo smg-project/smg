@@ -44,6 +44,15 @@ pub struct Names {
     pub scorers: Vec<String>,
 }
 
+/// A sampled decision with the names that can still be read for it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Explained {
+    /// The sampled decision.
+    pub record: DecisionRecord,
+    /// `None` when the decision's generation or binding is unavailable.
+    pub names: Option<Names>,
+}
+
 impl DecisionRecord {
     /// Reads names if `engine` has the recorded generation number and binding.
     #[must_use]
