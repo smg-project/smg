@@ -156,7 +156,7 @@ use super::{
 use crate::{
     decider::Decider,
     decision::Decision,
-    door::{decide_in, decider_of, issue, past_mark, Buffers, Part, StorePins, Taken},
+    door::{decide_in, decider_of, issue, past_mark, summed, Buffers, Part, StorePins, Taken},
     elector::{term_said, Fence},
     framework::release,
     lease::{Lease, Lifecycle, ReleaseReason},
@@ -237,8 +237,7 @@ impl Counts {
 
     /// One of a part's counts, summed over the parts.
     fn whole(&self, count: impl Fn(&Part) -> &AtomicU64) -> u64 {
-        let parts = self.parts.iter();
-        parts.map(|part| count(part).load(Ordering::Relaxed)).sum()
+        summed(&self.parts, count)
     }
 }
 
@@ -898,7 +897,7 @@ pub(crate) mod tests {
         },
         decider::Decider,
         decision::{Decision, Targets},
-        door::{cut_reach, hand, keeps_a_row, narrow, TERM_MARK},
+        door::{cut_reach, hand, keeps_a_row, narrow, Door, Request, TERM_MARK},
         elector::{Elector, Tick, TERM_CEILING},
         framework::{DecisionScope, Filter, Picker, Scratch, TieBand},
         lease::{Lease, LeaseId, Lifecycle, ReleaseReason},
@@ -1329,6 +1328,51 @@ pub(crate) mod tests {
             // view, under the generation that view was published under,
             // with its lease.
             assert_eq!(unleased(answer), bed.engines(&frame, 1));
+        }
+    }
+
+    /// Same facts, same answer: over two stores laid alike, the served
+    /// path and the door in process pick the same targets for a request,
+    /// and file its lease under the same id on the same first target.
+    #[tokio::test]
+    async fn the_door_and_the_served_path_decide_alike() {
+        let mut bed = bed(Some(preset("random", 1)), true, (1, 8), []);
+        let beside = Arc::new(MemoryStore::new().with_deciders(1));
+        fleet(&beside);
+        let applied = beside.apply(preset("random", 1));
+        applied.expect("above the unbound start");
+        let door = Door::new(Arc::clone(&beside));
+        let first_on_file = |store: &MemoryStore, lease: u64| {
+            let record = LeasesStore::get(store, GATEWAY, LeaseId(lease));
+            record.map(|record| record.target)
+        };
+        for (id, seed) in (1..=9).zip(100..) {
+            let served = bed.ask(frame(id, seed)).await;
+            let asked = Request {
+                id: &[id],
+                facts: RequestFacts {
+                    model: MODEL,
+                    seed,
+                    budget_micros: u32::try_from(BUDGET.as_micros()).expect("five seconds"),
+                    ..RequestFacts::default()
+                },
+                constraints: Constraints::default(),
+            };
+            let decided = door.decide(GATEWAY, &asked, bed.script.taken);
+            let decided = decided.expect("the door decides");
+            let pick = decided.decision.pick().expect("a pick over the fleet");
+            let Outcome::Pick(sent) = outcome(&served) else {
+                panic!("a pick: {served:?}");
+            };
+            let sent = sent.targets.iter().map(|target| WorkerId(target.id));
+            let sent: Vec<_> = sent.collect();
+            let made: Vec<_> = pick.targets.iter().map(|target| target.id).collect();
+            assert_eq!(sent, made, "request {id}: the same targets, in order");
+            let lease = decided.lease.expect("a pick's lease").lease.id.0;
+            assert_eq!(lease_of(&served).id, lease, "request {id}: the same id");
+            let booked = first_on_file(&beside, lease);
+            assert_eq!(first_on_file(&bed.store, lease), booked, "request {id}");
+            assert_eq!(booked, made.first().copied(), "request {id}");
         }
     }
 

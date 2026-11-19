@@ -3609,7 +3609,7 @@ impl AppliedSpec {
     /// digest its caller took already: the controller's door reads the
     /// document's digest against the standing one and hands it on, so an
     /// apply digests its document once.
-    #[cfg(feature = "controller")]
+    #[cfg(any(test, feature = "controller"))]
     pub(crate) fn validate_digested(
         document: &PolicySpec,
         digest: Digest,

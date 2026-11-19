@@ -1342,7 +1342,6 @@ fn two_gateways_sharing_a_lease_number_hold_separate_reservations() {
 
 /// The manual preset as `generation`, its keys pinned for `ttl_s` and swept
 /// every `sweep_s`.
-#[cfg(feature = "controller")]
 fn manual_ruled(generation: u64, ttl_s: u32, sweep_s: u32) -> crate::spec::AppliedSpec {
     use crate::spec::{AppliedSpec, PolicySpec};
 
@@ -1354,7 +1353,6 @@ fn manual_ruled(generation: u64, ttl_s: u32, sweep_s: u32) -> crate::spec::Appli
     AppliedSpec::validate(&document).expect("the document validates")
 }
 
-#[cfg(feature = "controller")]
 #[test]
 fn the_pins_sweep_drops_each_pin_past_its_own_end_once_an_interval() {
     let store = MemoryStore::new();
@@ -1398,7 +1396,6 @@ fn the_pins_sweep_drops_each_pin_past_its_own_end_once_an_interval() {
 /// The pins outlive generations, and the interval read at a tick is the
 /// standing generation's: an apply that shortens the sweep waits out no
 /// earlier interval, however long the one the last pass ran under.
-#[cfg(feature = "controller")]
 #[test]
 fn a_shorter_sweep_applied_waits_out_no_earlier_interval() {
     let store = MemoryStore::new();
@@ -1424,7 +1421,6 @@ fn a_shorter_sweep_applied_waits_out_no_earlier_interval() {
 /// A generation that sweeps, replaced before the sweep ticked once: its
 /// interval was learned at its apply, so the pins it ended still leave
 /// under a generation that sweeps nothing.
-#[cfg(feature = "controller")]
 #[test]
 fn a_generation_replaced_before_any_pass_still_leaves_its_interval() {
     let store = MemoryStore::new();
@@ -1445,7 +1441,6 @@ fn a_generation_replaced_before_any_pass_still_leaves_its_interval() {
 /// Two standing rules, one that keeps its keys for ever and one that ends
 /// them: the sweep runs at the interval of the rule that sweeps, each pin
 /// leaves at its own end, and a pin with none stays.
-#[cfg(feature = "controller")]
 #[test]
 fn a_pin_past_its_own_end_leaves_where_another_rule_keeps_its_keys_for_ever() {
     use crate::spec::{AppliedSpec, PolicySpec};

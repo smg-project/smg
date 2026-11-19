@@ -47,9 +47,7 @@ use crate::{
 mod blocks;
 mod turn;
 
-use blocks::Blocks;
-#[cfg(any(test, feature = "controller"))]
-use blocks::Minted;
+use blocks::{Blocks, Minted};
 pub use turn::{AtWork, Hand};
 
 /// Membership changes kept for watchers; a watcher further behind snapshots
@@ -104,7 +102,6 @@ pub struct MemoryStore {
     sessions: Vec<Mutex<FxHashMap<u64, Pin>>>,
     /// When the pins were last swept and how often a pass runs
     /// ([`Self::sweep_pins`]).
-    #[cfg(feature = "controller")]
     pins_swept: Mutex<PinsSwept>,
     /// The files of leases behind their turns, one a decider ([`turn`]).
     files: turn::Files,
@@ -215,7 +212,6 @@ impl MemoryStore {
             sessions: (0..crate::sessions::SHARDS)
                 .map(|_| Mutex::default())
                 .collect(),
-            #[cfg(feature = "controller")]
             pins_swept: Mutex::default(),
             files: turn::Files::one(leases),
             blocks: Blocks::default(),
@@ -672,7 +668,6 @@ impl MemoryStore {
             // the sweep still leaves its interval for the pins it ended.
             // It is saved under the workers lock, so two applies save
             // theirs in the order of their publications.
-            #[cfg(feature = "controller")]
             if let Some(every) = spec.engine().pins_shortest_sweep() {
                 self.pins_swept.lock().every = Some(every);
             }
@@ -2507,7 +2502,6 @@ impl SessionsStore for MemoryStore {
 }
 
 /// When the pins were last swept, and at what interval.
-#[cfg(feature = "controller")]
 #[derive(Default)]
 struct PinsSwept {
     /// The instant of the last pass; `None` before the first.
@@ -2517,7 +2511,6 @@ struct PinsSwept {
     every: Option<u64>,
 }
 
-#[cfg(feature = "controller")]
 impl MemoryStore {
     /// One pass of the pins' sweep at `now`, where one is due: each pin of
     /// record past its own end leaves the table, whatever the other rules
@@ -2564,7 +2557,6 @@ struct Leases {
     counts: Arc<Counts>,
     /// The block of the term's counter the file mints from, as far as it
     /// minted into it ([`MemoryStore::issue_decided`]).
-    #[cfg(any(test, feature = "controller"))]
     minted: Minted,
     /// Every lease filed as issued, by its dispatch deadline, the earliest
     /// first. A lease that left the file or was dispatched keeps its place
@@ -2578,13 +2570,11 @@ struct Leases {
 type Key = (GatewayId, LeaseId);
 
 /// The leases past their dispatch deadline that one issue ends at most.
-#[cfg(any(test, feature = "controller"))]
 pub(crate) const ABANDONED: usize = 2;
 
 /// The places of the deadline queue one issue steps over at most, the
 /// places of leases that were dispatched or left the file among them: four
 /// for the one it adds, so the queue shortens under any run of issues.
-#[cfg(any(test, feature = "controller"))]
 const DUE_STEPS: usize = 4;
 
 /// A lease on file with the slot of the count it books on its worker.
@@ -2607,7 +2597,6 @@ impl Leases {
     /// for a term past 31 bits and for a term whose counter is spent: an
     /// id is never 0, never carries the bit of a gateway's own ids and
     /// never repeats.
-    #[cfg(any(test, feature = "controller"))]
     fn mint(&mut self, blocks: &Blocks, file: u8) -> Option<LeaseId> {
         let term = self.term;
         if term >= 1 << 31 {
@@ -2797,7 +2786,6 @@ impl MemoryStore {
     /// past its deadline stands no longer than the next issues take, and no
     /// call passes over the file: an issue adds one place to the queue and
     /// steps over [`DUE_STEPS`] at most.
-    #[cfg(any(test, feature = "controller"))]
     pub(crate) fn issue_decided(
         &self,
         mut record: LeaseRecord,

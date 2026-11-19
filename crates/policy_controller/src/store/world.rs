@@ -946,7 +946,6 @@ impl World {
     /// `built` read names it beside the worker's row: what the lease of a
     /// decision over that build books. `None` for a worker the pool does
     /// not list. `built` is a build of this world.
-    #[cfg(feature = "controller")]
     pub(crate) fn booked(&self, built: &Built, id: WorkerId) -> Option<Slot> {
         let pool = built.pool as usize;
         let (rows, shape) = (self.rows.get(pool)?, self.derived.pools.get(pool)?);

@@ -16,7 +16,6 @@ use crate::{
 
 /// The time a gateway has to name a lease's dispatch: the design's default.
 /// A lease still issued past it is released as abandoned.
-#[cfg(feature = "controller")]
 pub(crate) const DISPATCH_TTL: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Where a lease stands.
