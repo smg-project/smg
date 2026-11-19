@@ -299,14 +299,18 @@ fn veto_ran(profile: &Profile, veto: &str, emptied_by: &str) -> bool {
 /// doubt ([`undoubted`]) and is otherwise as the pass before it: a steering
 /// binding has the overload veto lifted there too, a binding that sheds
 /// keeps it. So under a binding that sheds a doubted worker under its
-/// thresholds takes the request, and a pool over on every ready worker is
-/// shed as saturated. Nothing harder is lifted: a worker that is not ready,
-/// behind an open breaker or draining stays refused, and a doubt on such a
-/// worker opens no pass. So does a row a hold of the host stands on,
-/// whichever way the host says it: by the breaker bit beside the stalled
-/// one on a row it wrote, or among its held rows beside lent ones
-/// ([`Constraints::held`]). The lifted pass leaves such a row both bits and
-/// keeps the held rows masked, so a stage reads it as vetoed in every pass.
+/// thresholds takes the request. A pool that pass leaves nobody is shed at
+/// the stage that ended it, as a pool with no doubt in it is: as saturated
+/// where that stage is the overload veto's. A document that lists the
+/// health stage ahead of that veto, as every preset does, sheds a pool
+/// over on every ready worker so. Nothing harder is lifted: a worker that
+/// is not ready, behind an open breaker or draining stays refused, and a
+/// doubt on such a worker opens no pass. So does a row a hold of the host
+/// stands on, whichever way the host says it: by the breaker bit beside
+/// the stalled one on a row it wrote, or among its held rows beside lent
+/// ones ([`Constraints::held`]). The lifted pass leaves such a row both
+/// bits and keeps the held rows masked, so a stage reads it as vetoed in
+/// every pass.
 ///
 /// A set put to no rule is shed where it emptied ([`AllVetoed::Unasked`]):
 /// each side of a pair, and the rule's own passes, so the rule is asked
