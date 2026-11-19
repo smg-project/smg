@@ -36,6 +36,8 @@ from __future__ import annotations
 
 import copy
 import dataclasses
+import hashlib
+import json
 import logging
 import os
 import pkgutil
@@ -111,11 +113,118 @@ def attributes_grammar_aborts() -> bool:
     return active() or os.environ.get(GRAMMAR_ATTRIBUTION_ENV, "").strip() not in ("", "0")
 
 
+# Diagnostic only: no token text, image bytes, tensor transfers or extra requests.
+_QWENVL_TRACE_SLOTS = iter(range(12))
+
+
+def _trace_qwenvl(event, scheduler=None, req=None, **facts):
+    if os.environ.get("SMG_QWENVL_REQUEST_DIAGNOSTIC") != "1":
+        return
+    try:
+        if req is not None:
+            model = getattr(getattr(scheduler, "server_args", None), "model_path", None)
+            mm = getattr(req, "multimodal_inputs", None)
+            canonical = "Qwen/Qwen3-VL-8B-Instruct"
+            local_root = os.environ.get("ROUTER_LOCAL_MODEL_PATH", "")
+            local_alias = os.path.join(local_root, canonical) if local_root else None
+            if model not in (canonical, local_alias) or model is None or mm is None:
+                return
+        # Reserve before IDs, item/grid metadata, hashing or tensor property reads.
+        slot = next(_QWENVL_TRACE_SLOTS, None)
+        if slot is None:
+            return
+        if req is not None:
+
+            def ids(value):
+                if not isinstance(value, (list, array)):
+                    return {"available": False}
+                result = {"length": len(value), "sha256": None}
+                if len(value) <= 32768:
+                    digest = hashlib.sha256()
+                    for token in value:
+                        if type(token) is not int or not -(2**63) <= token < 2**63:
+                            return {**result, "integer_domain_valid": False}
+                        digest.update(token.to_bytes(8, "little", signed=True))
+                    result["sha256"] = digest.hexdigest()
+                else:
+                    result["hash_omitted_over_32768"] = True
+                return result
+
+            def tensor_metadata(value):
+                if value is None:
+                    return None
+                if type(value) is int:
+                    return (
+                        {"scalar": value}
+                        if -(2**63) <= value < 2**63
+                        else {"scalar_over_cap": True}
+                    )
+                dims = getattr(value, "shape", None)
+                device = getattr(getattr(value, "device", None), "type", None)
+                return {
+                    "shape": [dim if type(dim) is int else None for dim in dims]
+                    if isinstance(dims, (list, tuple)) and len(dims) <= 8
+                    else None,
+                    "device_type": device if device in ("cpu", "cuda", "meta") else None,
+                }
+
+            def item_metadata(item):
+                modality = getattr(getattr(item, "modality", None), "name", None)
+                data = getattr(item, "model_specific_data", None)
+                return {
+                    "modality": modality if modality in ("IMAGE", "VIDEO", "AUDIO") else None,
+                    "model_specific_data_is_dict": isinstance(data, dict),
+                    "image_grid_thw_present": isinstance(data, dict) and "image_grid_thw" in data,
+                    "image_grid_thw": tensor_metadata(data.get("image_grid_thw"))
+                    if isinstance(data, dict)
+                    else None,
+                    "feature": tensor_metadata(getattr(item, "feature", None)),
+                }
+
+            original = ids(getattr(req, "origin_input_ids", None))
+            unpadded = ids(getattr(req, "origin_input_ids_unpadded", None))
+            items = getattr(mm, "mm_items", None)
+            rid = getattr(req, "rid", None)
+            facts.update(
+                request_id_sha256=hashlib.sha256(rid.encode()).hexdigest()
+                if isinstance(rid, str) and len(rid) <= 512
+                else None,
+                model=model,
+                original_ids=original,
+                unpadded_ids=unpadded,
+                original_unpadded_hash_equal=(original["sha256"] == unpadded["sha256"])
+                if original.get("sha256") is not None and unpadded.get("sha256") is not None
+                else None,
+                mm_items_count=len(items) if isinstance(items, (list, tuple)) else None,
+                mm_items=[item_metadata(item) for item in items[:4]]
+                if isinstance(items, (list, tuple))
+                else None,
+                mm_items_summary_truncated=isinstance(items, (list, tuple)) and len(items) > 4,
+                mrope_positions=tensor_metadata(getattr(mm, "mrope_positions", None)),
+                mrope_position_delta=tensor_metadata(getattr(mm, "mrope_position_delta", None)),
+            )
+        record = json.dumps({"event": event, "slot": slot, **facts}, sort_keys=True)
+        if len(record) <= 4096:
+            logger.warning("SMG_QWENVL_REQUEST_DIAGNOSTIC %s", record)
+    except Exception:
+        # Diagnostic metadata must not change engine success/failure semantics.
+        return
+
+
+def _trace_mrope_call(original, scheduler, req, branch, *args, **kwargs):
+    _trace_qwenvl("mrope_before", scheduler, req, branch=branch)
+    try:
+        return original(scheduler, req, *args, **kwargs)
+    finally:
+        _trace_qwenvl("mrope_after", scheduler, req, branch=branch)
+
+
 def register() -> None:
     """The ``sglang.srt.plugins`` entry point."""
     if attributes_grammar_aborts():
         register_grammar_attribution()
     if not active():
+        _trace_qwenvl("registration", handshake_active=False, registered=False)
         return
     from sglang.srt.plugins.hook_registry import HookRegistry, HookType
 
@@ -125,8 +234,10 @@ def register() -> None:
     HookRegistry.register(f"{_RECEIVER}._pull_raw_reqs", pull_raw_reqs, HookType.AROUND)
     HookRegistry.register(f"{_SCHEDULER}.run_event_loop", run_event_loop, HookType.AROUND)
     target = f"{_SCHEDULER}._maybe_compute_mrope_positions"
-    if _resolves(target):
+    mrope_available = _resolves(target)
+    if mrope_available:
         HookRegistry.register(target, mrope_from_unpadded, HookType.AROUND)
+    _trace_qwenvl("registration", handshake_active=True, registered=mrope_available)
     from smg_grpc_servicer.sglang import mm_broadcast
 
     if mm_broadcast.enabled():
@@ -158,8 +269,9 @@ def mrope_from_unpadded(original, scheduler, req, *args, **kwargs):
         # A shallow view shares multimodal results without rewriting the caller's cache tokens.
         req_view = copy.copy(req)
         req_view.origin_input_ids = unpadded
-        return original(scheduler, req_view, *args, **kwargs)
-    return original(scheduler, req, *args, **kwargs)
+        _trace_qwenvl("mrope_selected_unpadded", scheduler, req, branch="unpadded")
+        return _trace_mrope_call(original, scheduler, req_view, "unpadded", *args, **kwargs)
+    return _trace_mrope_call(original, scheduler, req, "fallback", *args, **kwargs)
 
 
 def create_channels(original, cls, *args, **kwargs):
