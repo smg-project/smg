@@ -1541,8 +1541,8 @@ fn generic_stream_end_releases_a_held_replacement_character() {
 
 /// `max_token_id` counts the added tokens `vocab_size` leaves out: two
 /// placeholders added past the model's last id, the larger is the largest;
-/// without them the model's last id is, and the default reads it off
-/// `vocab_size`.
+/// without them the model's last id is, a sparse vocabulary's largest id
+/// whatever its count, and the default reads it off `vocab_size`.
 #[test]
 fn max_token_id_counts_the_added_tokens() {
     let with_added = |added_tokens: serde_json::Value| {
@@ -1570,6 +1570,19 @@ fn max_token_id_counts_the_added_tokens() {
     assert_eq!(crate::TokenizerTrait::max_token_id(&placeholders), Some(5));
     let plain = with_added(serde_json::json!([]));
     assert_eq!(crate::TokenizerTrait::max_token_id(&plain), Some(3));
+
+    // A sparse vocabulary: two entries, the placeholder at 1500.
+    let definition = serde_json::json!({
+        "version": "1.0", "added_tokens": [],
+        "model": {"type": "WordLevel", "unk_token": "[UNK]", "vocab": {
+            "[UNK]": 0, "<image>": 1500
+        }}
+    });
+    let sparse = crate::HuggingFaceTokenizer::from_tokenizer(
+        tokenizers::Tokenizer::from_bytes(serde_json::to_vec(&definition).unwrap()).unwrap(),
+    );
+    assert_eq!(crate::TokenizerTrait::vocab_size(&sparse), 2);
+    assert_eq!(crate::TokenizerTrait::max_token_id(&sparse), Some(1500));
 
     let mock = mock::MockTokenizer::new();
     let size = crate::TokenizerTrait::vocab_size(&mock);
