@@ -116,6 +116,7 @@ pub const ENTRIES: &[(&str, &str, Fate)] = &[
     ("MemoryStore", "journaled", Fate::Read),
     ("MemoryStore", "followed", Fate::Read),
     ("MemoryStore", "cut", Fate::Read),
+    ("MemoryStore", "rows_serving", Fate::Read),
     (
         "MemoryStore",
         "restore_from",

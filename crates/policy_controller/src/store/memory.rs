@@ -303,6 +303,40 @@ impl MemoryStore {
         }
     }
 
+    /// The first `limit` rows in key order of the ones `serves` admits,
+    /// with the count it admits: what a read that tells a few rows copies,
+    /// where [`MemoryStore::cut`] copies every row. The rows are visited
+    /// under the membership lock and the ones told are cloned there, so a
+    /// writer waits for those alone: a selection puts the limit's worth in
+    /// front, and they are sorted after the lock. The rows name no write of
+    /// the journal: no reader starts a tail from them.
+    pub fn rows_serving(
+        &self,
+        serves: impl Fn(&WorkerRow) -> bool,
+        limit: usize,
+    ) -> (Vec<WorkerRow>, usize) {
+        let (mut rows, serving) = {
+            let workers = self.workers.lock();
+            let mut serving: Vec<&WorkerRow> = workers
+                .rows
+                .values()
+                .map(|row| &row.row)
+                .filter(|row| serves(row))
+                .collect();
+            let count = serving.len();
+            if limit < count {
+                if let Some(last) = limit.checked_sub(1) {
+                    serving.select_nth_unstable_by(last, |a, b| a.facts.key.cmp(&b.facts.key));
+                }
+                serving.truncate(limit);
+            }
+            let rows: Vec<WorkerRow> = serving.into_iter().cloned().collect();
+            (rows, count)
+        };
+        rows.sort_by(|a, b| a.facts.key.cmp(&b.facts.key));
+        (rows, serving)
+    }
+
     /// The tables replaced by `cut`, a leader's snapshot whole: what a
     /// standby starts from, and starts from again when the leader's log no
     /// longer holds its place. Every row and load row the store held leaves

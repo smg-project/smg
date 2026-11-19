@@ -44,6 +44,8 @@
 //! with it, so the ceiling of watches bounds what a principal leaves
 //! unread.
 
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{
     pin::Pin,
     sync::Arc,
@@ -113,6 +115,9 @@ pub(crate) struct Feed {
     /// watch leaves, and by the last snapshot call out with no watch open:
     /// a copy of every row is held only while a reader can share it.
     rows: Arc<Mutex<Option<Arc<Cut>>>>,
+    /// The cuts of every row this feed took, for a case.
+    #[cfg(test)]
+    cuts: Arc<AtomicUsize>,
 }
 
 impl Feed {
@@ -135,6 +140,8 @@ impl Feed {
             teller: Arc::default(),
             unwired: Arc::default(),
             rows: Arc::default(),
+            #[cfg(test)]
+            cuts: Arc::default(),
         }
     }
 
@@ -209,8 +216,25 @@ impl Feed {
             return Arc::clone(cut);
         }
         let cut = Arc::new(store.cut(Kinds::Watched));
+        #[cfg(test)]
+        self.cuts.fetch_add(1, Ordering::Relaxed);
         *kept = Some(Arc::clone(&cut));
         cut
+    }
+
+    /// The kept cut where it stands at the log's last watched write: what a
+    /// read shares with no copy. None where a write moved the log past it,
+    /// and where none is kept.
+    pub(crate) fn kept_at_head(&self) -> Option<Arc<Cut>> {
+        let kept = self.rows.lock();
+        let head = self.log.head(Kinds::Watched);
+        kept.as_ref().filter(|cut| cut.at == head).cloned()
+    }
+
+    /// The cuts of every row this feed took, for a case.
+    #[cfg(test)]
+    pub(crate) fn cuts(&self) -> usize {
+        self.cuts.load(Ordering::Relaxed)
     }
 
     /// The kept cut, for a case.
@@ -487,10 +511,14 @@ impl Watchers {
     /// given back first, as there: a watch that opens now takes a cut of
     /// its own at worst.
     pub(crate) fn unshared(&self, feed: &Feed) {
-        let none = self.held.lock().is_empty();
-        if none {
+        if !self.open() {
             *feed.rows.lock() = None;
         }
+    }
+
+    /// Whether a watch holds a seat: a reader that can share a kept cut.
+    pub(crate) fn open(&self) -> bool {
+        !self.held.lock().is_empty()
     }
 
     /// The watches `by` holds open.
