@@ -27,7 +27,7 @@ use crate::{
     },
     lease::{Lease, Lifecycle, Membership, Outcome, ReleaseReason, Side, Signal},
     spec::{CostMargin, Needs, Unreported},
-    terms::{Term, TermValues},
+    terms::{Coefficients, Term},
     view::{
         Candidate, Constraints, LoadRow, ModelFingerprint, PoolFacts, ReportCutoff, RequestFacts,
         WorkerId,
@@ -335,7 +335,7 @@ pub(crate) trait ReadsLoad: Scorer {
         candidates: &[Candidate],
         kept: &[u32],
         out: &mut [f32],
-        load: impl Fn(&Candidate) -> Option<LoadRow> + Copy,
+        load: impl Fn(&Candidate) -> Option<&LoadRow> + Copy,
     ) -> TieBand;
 
     fn score_front_with(
@@ -345,7 +345,7 @@ pub(crate) trait ReadsLoad: Scorer {
         _kept: &[u32],
         asked: &[u32],
         out: &mut [f32],
-        load: impl Fn(&Candidate) -> Option<LoadRow> + Copy,
+        load: impl Fn(&Candidate) -> Option<&LoadRow> + Copy,
     ) -> (TieBand, Front) {
         (
             self.score_with(facts, candidates, asked, out, load),
@@ -1249,14 +1249,12 @@ impl LeastLoad {
     /// for, at the mean prefill. Read under one tally load; no division here.
     fn credit_work(
         &self,
-        c: &Candidate,
+        report: &LoadRow,
         in_flight: u32,
         credit_tokens: u64,
         credit_requests: u64,
     ) -> f32 {
-        let reported = c
-            .load
-            .map_or(0, |r| u64::from(r.running) + u64::from(r.queued));
+        let reported = u64::from(report.running) + u64::from(report.queued);
         let unaccounted = u64::from(in_flight).saturating_sub(reported + credit_requests);
         unaccounted as f32 * self.mean_prefill_tokens as f32 + credit_tokens as f32
     }
@@ -1264,9 +1262,9 @@ impl LeastLoad {
     /// The expected wait of a reporting candidate once its credit work is
     /// known: the queued and running work over the drain rate, plus the convex
     /// KV-pressure barrier over the running requests' share of the cache (a
-    /// full but reclaimable prefix cache is no pressure). Runs after the load
-    /// is gone.
-    fn reported_cost(&self, r: LoadRow, credit_work: f32, drain: f32) -> f32 {
+    /// full but reclaimable prefix cache is no pressure). Runs after the
+    /// tally is released.
+    fn reported_cost(&self, r: &LoadRow, credit_work: f32, drain: f32) -> f32 {
         let mean = self.mean_prefill_tokens as f32;
         let queued = if r.waiting_uncached_tokens > 0 {
             r.waiting_uncached_tokens as f32
@@ -1345,7 +1343,7 @@ impl LeastLoad {
         &self,
         candidates: &[Candidate],
         kept: &[u32],
-        load: impl Fn(&Candidate) -> Option<LoadRow>,
+        load: impl Fn(&Candidate) -> Option<&LoadRow>,
     ) -> f32 {
         let (sum, n) = kept
             .iter()
@@ -1370,7 +1368,7 @@ impl LeastLoad {
         rows: &[u32],
         kept: &[u32],
         out: &mut [f32],
-        load: impl Fn(&Candidate) -> Option<LoadRow> + Copy,
+        load: impl Fn(&Candidate) -> Option<&LoadRow> + Copy,
     ) -> TieBand {
         // One load of the tally: each reporting row's held work is read
         // (released first when its report's sample reaches a dispatch) and
@@ -1384,13 +1382,13 @@ impl LeastLoad {
                 for (slot, &i) in out.iter_mut().zip(rows) {
                     let c = &candidates[i as usize];
                     *slot = match load(c) {
-                        Some(_) => {
+                        Some(report) => {
                             let (tokens, requests) =
                                 tally.get(&(c.id, c.dp_rank)).map_or((0, 0), |since| {
                                     since.credit_through(c.load_sampled_at_micros)
                                 });
                             reporting += 1;
-                            self.credit_work(c, counts(c), tokens, requests)
+                            self.credit_work(report, counts(c), tokens, requests)
                         }
                         None => PENDING,
                     };
@@ -1484,7 +1482,7 @@ impl Scorer for LeastLoad {
         kept: &[u32],
         out: &mut [f32],
     ) -> TieBand {
-        self.score_with(facts, candidates, kept, out, |c| c.load)
+        self.score_with(facts, candidates, kept, out, |c| c.load.as_ref())
     }
 
     fn score_front(
@@ -1495,7 +1493,7 @@ impl Scorer for LeastLoad {
         asked: &[u32],
         out: &mut [f32],
     ) -> (TieBand, Front) {
-        self.score_front_with(facts, candidates, kept, asked, out, |c| c.load)
+        self.score_front_with(facts, candidates, kept, asked, out, |c| c.load.as_ref())
     }
 
     fn needs(&self) -> Needs {
@@ -1513,7 +1511,7 @@ impl ReadsLoad for LeastLoad {
         candidates: &[Candidate],
         kept: &[u32],
         out: &mut [f32],
-        load: impl Fn(&Candidate) -> Option<LoadRow> + Copy,
+        load: impl Fn(&Candidate) -> Option<&LoadRow> + Copy,
     ) -> TieBand {
         self.costs(facts, candidates, kept, kept, out, load)
     }
@@ -1542,7 +1540,7 @@ impl ReadsLoad for LeastLoad {
         kept: &[u32],
         asked: &[u32],
         out: &mut [f32],
-        load: impl Fn(&Candidate) -> Option<LoadRow> + Copy,
+        load: impl Fn(&Candidate) -> Option<&LoadRow> + Copy,
     ) -> (TieBand, Front) {
         for &i in asked {
             if load(&candidates[i as usize]).is_none() {
@@ -1725,7 +1723,7 @@ impl ResidentWork {
     fn reported_cost(
         &self,
         in_flight: u32,
-        r: LoadRow,
+        r: &LoadRow,
         credit_tokens: u64,
         credit_requests: u64,
     ) -> f32 {
@@ -1794,7 +1792,7 @@ impl ResidentWork {
     /// credit. A report that counts no resident tokens, no report, and a
     /// report of an instant the cell keeps none of, keep none.
     fn keep(&self, cell: &Kept, told: &Told, held: u64) {
-        match told.row {
+        match told.row.as_ref() {
             Some(row) if row.resident_counted && cell.takes(told.sampled_at_micros) => {
                 let (tokens, requests) = (held >> REQUEST_BITS, held & REQUEST_MASK);
                 let reported = u64::from(row.running) + u64::from(row.queued);
@@ -1956,7 +1954,7 @@ impl ResidentWork {
         &self,
         tally: &FxHashMap<RankKey, Arc<SinceReport>>,
         row: &Candidate,
-        report: Option<LoadRow>,
+        report: Option<&LoadRow>,
         in_flight: impl FnOnce() -> u32,
         reporting: &mut usize,
     ) -> f32 {
@@ -2014,7 +2012,7 @@ impl ResidentWork {
         candidates: &[Candidate],
         kept: &[u32],
         out: &mut [f32],
-        load: impl Fn(&Candidate) -> Option<LoadRow>,
+        load: impl Fn(&Candidate) -> Option<&LoadRow>,
     ) -> usize {
         let mut reporting = 0usize;
         let run = lent.run();
@@ -2066,7 +2064,7 @@ impl ResidentWork {
         candidates: &[Candidate],
         kept: &[u32],
         out: &mut [f32],
-        load: impl Fn(&Candidate) -> Option<LoadRow>,
+        load: impl Fn(&Candidate) -> Option<&LoadRow>,
     ) -> usize {
         let mut reporting = 0usize;
         let tally = self.credits.tally.load();
@@ -2192,7 +2190,7 @@ impl Scorer for ResidentWork {
         kept: &[u32],
         out: &mut [f32],
     ) -> TieBand {
-        self.score_with(facts, candidates, kept, out, |c| c.load)
+        self.score_with(facts, candidates, kept, out, |c| c.load.as_ref())
     }
 
     fn needs(&self) -> Needs {
@@ -2210,7 +2208,7 @@ impl ReadsLoad for ResidentWork {
         candidates: &[Candidate],
         kept: &[u32],
         out: &mut [f32],
-        load: impl Fn(&Candidate) -> Option<LoadRow> + Copy,
+        load: impl Fn(&Candidate) -> Option<&LoadRow> + Copy,
     ) -> TieBand {
         // A loop a kind of host. The loop beside a lent table stands here;
         // the loop of a host that lends no counts is a call, and stays the
@@ -2239,7 +2237,7 @@ impl ReadsLoad for ResidentWork {
 /// the cost margin of the least cost share the top score.
 #[derive(Debug)]
 pub struct LeastCost {
-    terms: Box<[(Term, f64)]>,
+    terms: Coefficients,
     margin: CostMargin,
     request_cost: Option<f64>,
     loads: bool,
@@ -2259,25 +2257,136 @@ impl LeastCost {
             Some(Unreported::MissingAsZero) | None => None,
         };
         Self {
-            terms,
+            terms: Coefficients::of(&terms),
             margin,
             request_cost,
             loads,
         }
     }
 
-    /// The cost of `row` with `load`, its report as the decision reads it.
-    fn cost_of(&self, facts: &RequestFacts<'_>, row: &Candidate, load: Option<LoadRow>) -> RowCost {
-        let mut values = TermValues::new(facts, row, load);
-        let mut sum = 0.0;
-        for &(term, coefficient) in &self.terms {
-            if let Some(value) = term.read(&mut values) {
-                sum += value * coefficient;
-            } else if let Some(price) = self.request_cost {
-                return RowCost::OverLeast(f64::from(values.in_flight()) * price);
-            }
+    /// The cost of a row with its report and count as the decision reads them.
+    #[inline(always)]
+    fn cost_of<const RESIDENT: bool, const WAITING: bool, const KV_OR_RUNNING: bool>(
+        &self,
+        load: Option<&LoadRow>,
+        reads_count: bool,
+        count: impl Fn() -> u32,
+    ) -> RowCost {
+        let in_flight = reads_count.then(&count);
+        let sum = 0.0 + f64::from(in_flight.unwrap_or_default()) * self.terms.in_flight;
+        let missing = || {
+            self.request_cost.map_or(RowCost::Sum(sum), |price| {
+                RowCost::OverLeast(f64::from(in_flight.unwrap_or_else(count)) * price)
+            })
+        };
+        match load {
+            Some(report) => self
+                .terms
+                .add_report::<RESIDENT, WAITING, KV_OR_RUNNING>(
+                    sum,
+                    report,
+                    self.request_cost.is_some(),
+                )
+                .map_or_else(missing, RowCost::Sum),
+            None if self.loads => missing(),
+            None => RowCost::Sum(sum),
         }
-        RowCost::Sum(sum)
+    }
+
+    #[inline(always)]
+    fn sum_rows<const RESIDENT: bool, const WAITING: bool, const KV_OR_RUNNING: bool>(
+        &self,
+        candidates: &[Candidate],
+        kept: &[u32],
+        costs: &mut Vec<RowCost>,
+        load: impl Fn(&Candidate) -> Option<&LoadRow>,
+        counts: impl Fn(&Candidate) -> u32,
+        reads_count: bool,
+    ) -> (CostBounds, bool) {
+        let mut bounds = CostBounds::EMPTY;
+        let mut pending = false;
+        costs.extend(kept.iter().map(|&i| {
+            let row = &candidates[i as usize];
+            let cost =
+                self.cost_of::<RESIDENT, WAITING, KV_OR_RUNNING>(load(row), reads_count, || {
+                    counts(row)
+                });
+            match cost {
+                RowCost::Sum(sum) => bounds.include(sum),
+                RowCost::OverLeast(_) => pending = true,
+            }
+            cost
+        }));
+        (bounds, pending)
+    }
+
+    /// A document names which optional values the walk tests.
+    #[inline(always)]
+    fn walk<const KV_OR_RUNNING: bool>(
+        &self,
+        candidates: &[Candidate],
+        kept: &[u32],
+        costs: &mut Vec<RowCost>,
+        load: impl Fn(&Candidate) -> Option<&LoadRow>,
+        counts: impl Fn(&Candidate) -> u32,
+        reads_count: bool,
+    ) -> (CostBounds, bool) {
+        let resident = self.terms.resident_tokens != 0.0;
+        let waiting = self.terms.waiting_uncached_tokens != 0.0;
+        match (resident, waiting) {
+            (false, false) => self.sum_rows::<false, false, KV_OR_RUNNING>(
+                candidates,
+                kept,
+                costs,
+                load,
+                counts,
+                reads_count,
+            ),
+            (false, true) => self.sum_rows::<false, true, KV_OR_RUNNING>(
+                candidates,
+                kept,
+                costs,
+                load,
+                counts,
+                reads_count,
+            ),
+            (true, false) => self.sum_rows::<true, false, KV_OR_RUNNING>(
+                candidates,
+                kept,
+                costs,
+                load,
+                counts,
+                reads_count,
+            ),
+            (true, true) => self.sum_rows::<true, true, KV_OR_RUNNING>(
+                candidates,
+                kept,
+                costs,
+                load,
+                counts,
+                reads_count,
+            ),
+        }
+    }
+
+    fn collect_costs(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &[u32],
+        costs: &mut Vec<RowCost>,
+        load: impl Fn(&Candidate) -> Option<&LoadRow>,
+    ) -> (CostBounds, bool) {
+        // A written count is a field of the row. Beside a lent table, read
+        // it where a term or the missing-report price needs it.
+        with_counts!(facts, |counts, written| {
+            let reads_count = written || self.terms.in_flight != 0.0;
+            if self.terms.names_kv_or_running() {
+                self.walk::<true>(candidates, kept, costs, load, counts, reads_count)
+            } else {
+                self.walk::<false>(candidates, kept, costs, load, counts, reads_count)
+            }
+        })
     }
 }
 
@@ -2311,7 +2420,7 @@ impl Scorer for LeastCost {
         kept: &[u32],
         out: &mut [f32],
     ) -> TieBand {
-        self.score_with(facts, candidates, kept, out, |c| c.load)
+        self.score_with(facts, candidates, kept, out, |c| c.load.as_ref())
     }
 }
 
@@ -2322,33 +2431,25 @@ impl ReadsLoad for LeastCost {
         candidates: &[Candidate],
         kept: &[u32],
         out: &mut [f32],
-        load: impl Fn(&Candidate) -> Option<LoadRow> + Copy,
+        load: impl Fn(&Candidate) -> Option<&LoadRow> + Copy,
     ) -> TieBand {
         with_costs(|costs| {
-            let mut least_reported = f64::INFINITY;
-            let mut pending = false;
-            costs.extend(kept.iter().map(|&i| {
-                let row = &candidates[i as usize];
-                let cost = self.cost_of(facts, row, load(row));
-                match cost {
-                    RowCost::Sum(sum) => least_reported = least_reported.min(sum),
-                    RowCost::OverLeast(_) => pending = true,
-                }
-                cost
-            }));
+            let (mut bounds, pending) = self.collect_costs(facts, candidates, kept, costs, load);
             if pending {
-                let baseline = if least_reported.is_finite() {
-                    least_reported
+                let baseline = if bounds.least.is_finite() {
+                    bounds.least
                 } else {
                     0.0
                 };
                 for cost in costs.iter_mut() {
                     if let RowCost::OverLeast(price) = *cost {
-                        *cost = RowCost::Sum(baseline + price);
+                        let sum = baseline + price;
+                        bounds.include(sum);
+                        *cost = RowCost::Sum(sum);
                     }
                 }
             }
-            write_cost_scores(out, self.margin, costs)
+            write_cost_scores(out, self.margin, costs, bounds)
         })
     }
 }
@@ -2364,6 +2465,28 @@ impl RowCost {
     fn value(self) -> f64 {
         match self {
             Self::Sum(value) | Self::OverLeast(value) => value,
+        }
+    }
+}
+
+/// The ends of the finite costs found while pricing the rows.
+struct CostBounds {
+    least: f64,
+    greatest: f64,
+}
+
+impl CostBounds {
+    const EMPTY: Self = Self {
+        least: f64::INFINITY,
+        greatest: f64::NEG_INFINITY,
+    };
+
+    fn include(&mut self, cost: f64) {
+        if cost < self.least {
+            self.least = cost;
+        }
+        if cost > self.greatest {
+            self.greatest = cost;
         }
     }
 }
@@ -2393,16 +2516,20 @@ pub fn score_costs(
 ) -> TieBand {
     with_costs(|costs| {
         costs.extend((0..out.len()).map(|i| RowCost::Sum(cost(i))));
-        write_cost_scores(out, margin, costs)
+        let mut bounds = CostBounds::EMPTY;
+        for &cost in costs.iter() {
+            bounds.include(cost.value());
+        }
+        write_cost_scores(out, margin, costs, bounds)
     })
 }
 
-fn write_cost_scores(out: &mut [f32], margin: CostMargin, costs: &[RowCost]) -> TieBand {
-    let (mut least, mut greatest) = (f64::INFINITY, f64::NEG_INFINITY);
-    for &cost in costs {
-        least = least.min(cost.value());
-        greatest = greatest.max(cost.value());
-    }
+fn write_cost_scores(
+    out: &mut [f32],
+    margin: CostMargin,
+    costs: &[RowCost],
+    CostBounds { least, greatest }: CostBounds,
+) -> TieBand {
     let span = greatest - least;
     if span == 0.0 {
         out.fill(1.0);
@@ -3858,10 +3985,10 @@ mod tests {
     use super::*;
     use crate::{
         affinity::{Gates, WarmupSlice},
-        counts::tests::Lent,
+        counts::tests::{Lent, RUN_READERS},
         decision::{Pair, Pick},
         lease::{EventKind, TransportClass},
-        spec::WarmupSliceParams,
+        spec::{LeastCostParams, WarmupSliceParams},
         view::{Health, LoadRow},
     };
 
@@ -3935,7 +4062,7 @@ mod tests {
                 kept: &[u32],
                 out: &mut [f32],
             ) -> TieBand {
-                self.score_with(facts, candidates, kept, out, |row| row.load)
+                self.score_with(facts, candidates, kept, out, |row| row.load.as_ref())
             }
             fn score_front(
                 &self,
@@ -3945,7 +4072,7 @@ mod tests {
                 asked: &[u32],
                 out: &mut [f32],
             ) -> (TieBand, Front) {
-                self.score_front_with(facts, candidates, kept, asked, out, |row| row.load)
+                self.score_front_with(facts, candidates, kept, asked, out, |row| row.load.as_ref())
             }
             fn row_wise(&self) -> bool {
                 true
@@ -4009,7 +4136,7 @@ mod tests {
                 candidates: &[Candidate],
                 kept: &[u32],
                 out: &mut [f32],
-                load: impl Fn(&Candidate) -> Option<LoadRow> + Copy,
+                load: impl Fn(&Candidate) -> Option<&LoadRow> + Copy,
             ) -> TieBand {
                 for (slot, &index) in out.iter_mut().zip(kept) {
                     *slot = if load(&candidates[index as usize]).is_some() {
@@ -4027,7 +4154,7 @@ mod tests {
                 _: &[u32],
                 asked: &[u32],
                 out: &mut [f32],
-                load: impl Fn(&Candidate) -> Option<LoadRow> + Copy,
+                load: impl Fn(&Candidate) -> Option<&LoadRow> + Copy,
             ) -> (TieBand, Front) {
                 let band = self.score_with(facts, candidates, asked, out, load);
                 (band, Front::of(self.spread(), out))
@@ -4111,6 +4238,190 @@ mod tests {
             std::mem::take(&mut *bare.0.events.lock())
         };
         assert_eq!(tell(wrapped.as_ref()), tell(&bare));
+    }
+
+    const COST_TERMS: [(&str, f64); 7] = [
+        ("candidate.in_flight", 9.9e14),
+        ("load.active_kv_permille", -1.25),
+        ("load.kv_usage_permille", 0.75),
+        ("load.queued", -9.9e14),
+        ("load.resident_tokens", 0.5),
+        ("load.running", -0.25),
+        ("load.waiting_uncached_tokens", 2.75),
+    ];
+
+    fn cost_by_term(terms: &[(Term, f64)], row: &Candidate, price: Option<f64>) -> RowCost {
+        let mut sum = 0.0;
+        for &(term, coefficient) in terms {
+            if let Some(value) = term.read(row.load.as_ref(), row.in_flight) {
+                sum += value * coefficient;
+            } else if let Some(price) = price {
+                return RowCost::OverLeast(f64::from(row.in_flight) * price);
+            }
+        }
+        RowCost::Sum(sum)
+    }
+
+    fn cost_bits(cost: RowCost) -> (bool, u64) {
+        (
+            matches!(cost, RowCost::OverLeast(_)),
+            cost.value().to_bits(),
+        )
+    }
+
+    #[test]
+    fn field_sums_match_the_terms_read_in_name_order() {
+        let mut draw = Draw::new(17);
+        let mut rows: Vec<_> = (0u32..64)
+            .map(|position| {
+                let mut row = candidate(position, draw.next_u64() as u32);
+                row.load = (!position.is_multiple_of(5)).then(|| LoadRow {
+                    running: draw.next_u64() as u32,
+                    queued: draw.next_u64() as u32,
+                    waiting_uncached_tokens: if position.is_multiple_of(2) {
+                        0
+                    } else {
+                        draw.next_u64() as u32
+                    },
+                    kv_usage_permille: draw.below(1_001) as u16,
+                    active_kv_permille: draw.below(1_001) as u16,
+                    resident_tokens: draw.next_u64() as u32,
+                    resident_counted: position.is_multiple_of(3),
+                    ..LoadRow::default()
+                });
+                row
+            })
+            .collect();
+        // Cancellation makes the smaller terms sensitive to where they were
+        // added. An empty report supplies zero waiting tokens.
+        rows[0].in_flight = u32::MAX;
+        rows[0].load = Some(LoadRow {
+            queued: u32::MAX,
+            running: 7,
+            ..LoadRow::default()
+        });
+        rows[5] = candidate(5, 0);
+        rows[5].load = Some(LoadRow::default());
+        let facts = RequestFacts::default();
+        let kept = kept(rows.len() as u32);
+        let mut costs = Vec::new();
+        for mask in 0..1 << COST_TERMS.len() {
+            let terms: Box<_> = COST_TERMS
+                .iter()
+                .enumerate()
+                .filter(|(bit, _)| mask & (1 << bit) != 0)
+                .map(|(_, &(name, coefficient))| (Term::named(name).unwrap(), coefficient))
+                .collect();
+            for price in [None, Some(1.5), Some(-0.0)] {
+                let rule = price.map_or(Unreported::MissingAsZero, |request_cost| {
+                    Unreported::OverLeast { request_cost }
+                });
+                let stage = LeastCost::new(terms.clone(), CostMargin::default(), Some(rule));
+                costs.clear();
+                stage.collect_costs(&facts, &rows, &kept, &mut costs, |row| row.load.as_ref());
+                assert_eq!(costs.len(), rows.len());
+                for (row, &cost) in rows.iter().zip(&costs) {
+                    assert_eq!(
+                        cost_bits(cost),
+                        cost_bits(cost_by_term(&terms, row, price)),
+                        "terms {mask:07b}, {rule:?}, row {}",
+                        row.position
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_document_with_one_term_costs_its_field_times_the_coefficient() {
+        let mut row = candidate(0, 17);
+        row.load = Some(LoadRow {
+            active_kv_permille: 19,
+            kv_usage_permille: 23,
+            queued: 29,
+            resident_tokens: 31,
+            running: 37,
+            waiting_uncached_tokens: 41,
+            resident_counted: true,
+            ..LoadRow::default()
+        });
+        let zero = Candidate {
+            load: Some(LoadRow {
+                resident_counted: true,
+                ..LoadRow::default()
+            }),
+            ..candidate(1, 0)
+        };
+        let facts = RequestFacts::default();
+        let mut costs = Vec::new();
+        for ((name, _), value) in COST_TERMS.into_iter().zip([17, 19, 23, 29, 31, 37, 41]) {
+            let params: LeastCostParams = serde_yaml::from_str(&format!(
+                "terms: {{{name}: -2.5}}\nunreported: missing-as-zero"
+            ))
+            .unwrap();
+            let terms = params
+                .terms
+                .iter()
+                .map(|(name, &coefficient)| (Term::named(name).unwrap(), coefficient))
+                .collect();
+            let stage = LeastCost::new(terms, params.margin, params.unreported);
+            let want = f64::from(value) * -2.5;
+            costs.clear();
+            stage.collect_costs(
+                &facts,
+                &[row, zero, candidate(2, 0)],
+                &[0, 1, 2],
+                &mut costs,
+                |row| row.load.as_ref(),
+            );
+            assert_eq!(cost_bits(costs[0]), (false, want.to_bits()), "{name}");
+            assert_eq!(cost_bits(costs[1]), (false, 0.0f64.to_bits()), "{name}");
+            assert_eq!(cost_bits(costs[2]), (false, 0.0f64.to_bits()), "{name}");
+        }
+    }
+
+    #[test]
+    fn lent_and_written_rows_score_alike_with_one_lent_reader() {
+        let terms = [
+            (Term::InFlight, 3.5),
+            (Term::named("load.queued").unwrap(), 6.0),
+        ];
+        let stage = LeastCost::new(
+            Box::new(terms),
+            CostMargin::default(),
+            Some(Unreported::OverLeast { request_cost: 2.5 }),
+        );
+        let mut rows = [candidate(0, 2), candidate(1, 3), candidate(2, 4)];
+        for index in [0, 2] {
+            rows[index].load = Some(LoadRow {
+                queued: index as u32 + 1,
+                ..LoadRow::default()
+            });
+        }
+        let facts = RequestFacts::default();
+        let mut written = [0.0; 3];
+        stage.score(&facts, &rows, &[0, 1, 2], &mut written);
+        let lent = Lent::take(&mut rows);
+        let mut scores = [0.0; 3];
+        let before = RUN_READERS.get();
+        stage.score(&lent.beside(&facts), &rows, &[0, 1, 2], &mut scores);
+        assert_eq!(scores.map(f32::to_bits), written.map(f32::to_bits));
+        assert_eq!(RUN_READERS.get() - before, 1);
+    }
+
+    #[test]
+    fn the_sum_and_the_missing_report_price_share_one_count() {
+        let stage = LeastCost::new(
+            Box::new([
+                (Term::InFlight, 2.0),
+                (Term::named("load.queued").unwrap(), 3.0),
+            ]),
+            CostMargin::default(),
+            Some(Unreported::OverLeast { request_cost: 4.0 }),
+        );
+        let count = Cell::new(13);
+        let missing = stage.cost_of::<false, false, false>(None, true, || count.replace(29));
+        assert_eq!(cost_bits(missing), (true, 52.0f64.to_bits()));
     }
 
     /// The costs find the same ends by either way: a few rows are compared
@@ -4498,11 +4809,12 @@ mod tests {
             tokens: 48,
             ..unstated
         };
+        let report = pool[0].load.as_ref().unwrap();
         for mean in [512, 2_048] {
             let ll = LeastLoad::new(0.15, mean, 2000.0);
             // Two requests in flight that no report and no credit account
             // for cost the stage's mean each.
-            let in_flight = ll.credit_work(&pool[0], 2, 0, 0);
+            let in_flight = ll.credit_work(report, 2, 0, 0);
             assert_eq!(in_flight, 2.0 * mean as f32);
             // The first dispatch to a rank enters it and the second finds
             // it: each is credited at that mean, so the two cost dispatched
@@ -4513,7 +4825,7 @@ mod tests {
             }
             let (tokens, requests) = ll.held_word_at(pool[0].id, 0);
             assert_eq!((tokens, requests), (2 * u64::from(mean), 2));
-            assert_eq!(ll.credit_work(&pool[0], 2, tokens, requests), in_flight);
+            assert_eq!(ll.credit_work(report, 2, tokens, requests), in_flight);
             // A stated size is credited as stated.
             assert_eq!(ll.held_word_at(pool[1].id, 0), (96, 2));
         }
@@ -4820,11 +5132,11 @@ mod tests {
         pool[1].load = Some(resident(1, 9_000));
         let cheap = ResidentWork::new(1_000);
         assert_eq!(
-            cheap.reported_cost(pool[0].in_flight, resident(2, 6_000), 0, 0),
+            cheap.reported_cost(pool[0].in_flight, &resident(2, 6_000), 0, 0),
             8_000.0
         );
         assert_eq!(
-            cheap.reported_cost(pool[1].in_flight, resident(1, 9_000), 0, 0),
+            cheap.reported_cost(pool[1].in_flight, &resident(1, 9_000), 0, 0),
             10_000.0
         );
         assert_eq!(resident_scores(&cheap, &pool), [1.0, 0.0]);
@@ -4840,7 +5152,7 @@ mod tests {
             ..resident(1, 6_000)
         };
         assert_eq!(
-            cheap.reported_cost(pool[0].in_flight, queued, 0, 0),
+            cheap.reported_cost(pool[0].in_flight, &queued, 0, 0),
             8_000.0
         );
     }
@@ -4982,7 +5294,7 @@ mod tests {
             ..resident(2, 8_000)
         };
         assert_eq!(
-            rw.reported_cost(busy.in_flight, row, 0, 0),
+            rw.reported_cost(busy.in_flight, &row, 0, 0),
             8_000.0 + 2_000.0 + 5.0 * 1_000.0
         );
     }
@@ -5022,17 +5334,17 @@ mod tests {
         // Two reported requests hold 8,000 tokens, a mean context of 4,000;
         // three more are in transit.
         assert_eq!(
-            rw.reported_cost(busy.in_flight, resident(2, 8_000), 0, 0),
+            rw.reported_cost(busy.in_flight, &resident(2, 8_000), 0, 0),
             8_000.0 + 3.0 * 4_000.0 + 5.0 * 1_000.0
         );
         // One of the three is a credited dispatch of 1,500 tokens.
         assert_eq!(
-            rw.reported_cost(busy.in_flight, resident(2, 8_000), 1_500, 1),
+            rw.reported_cost(busy.in_flight, &resident(2, 8_000), 1_500, 1),
             8_000.0 + 1_500.0 + 2.0 * 4_000.0 + 5.0 * 1_000.0
         );
         let idle = candidate(1, 2);
         assert_eq!(
-            rw.reported_cost(idle.in_flight, resident(0, 0), 0, 0),
+            rw.reported_cost(idle.in_flight, &resident(0, 0), 0, 0),
             2.0 * DEFAULT_MEAN_PREFILL_TOKENS as f32 + 2.0 * 1_000.0
         );
     }

@@ -1,6 +1,6 @@
 //! Fields a policy can use in a sum, in the units of the row that holds them.
 
-use crate::view::{Candidate, LoadRow, RequestFacts};
+use crate::view::LoadRow;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Term {
@@ -27,42 +27,12 @@ impl Term {
         matches!(self, Self::Load(_))
     }
 
-    pub(crate) fn read(self, values: &mut TermValues<'_, '_>) -> Option<f64> {
+    #[cfg(test)]
+    pub(crate) fn read(self, load: Option<&LoadRow>, in_flight: u32) -> Option<f64> {
         match self {
-            Self::Load(field) => field.read(values.load.as_ref()?),
-            Self::InFlight => Some(f64::from(values.in_flight())),
+            Self::Load(field) => field.read(load?),
+            Self::InFlight => Some(f64::from(in_flight)),
         }
-    }
-}
-
-/// The reads of one row. A sum and its missing-report price can ask for
-/// the same count, so the first read serves both. The report is the one
-/// the decision reads: none where it is past the document's age limit.
-pub(crate) struct TermValues<'row, 'facts> {
-    facts: &'row RequestFacts<'facts>,
-    row: &'row Candidate,
-    load: Option<LoadRow>,
-    in_flight: Option<u32>,
-}
-
-impl<'row, 'facts> TermValues<'row, 'facts> {
-    pub(crate) fn new(
-        facts: &'row RequestFacts<'facts>,
-        row: &'row Candidate,
-        load: Option<LoadRow>,
-    ) -> Self {
-        Self {
-            facts,
-            row,
-            load,
-            in_flight: None,
-        }
-    }
-
-    pub(crate) fn in_flight(&mut self) -> u32 {
-        *self
-            .in_flight
-            .get_or_insert_with(|| self.facts.in_flight(self.row))
     }
 }
 
@@ -76,6 +46,7 @@ pub(crate) enum LoadField {
     ResidentTokens,
 }
 
+#[cfg(test)]
 impl LoadField {
     fn read(self, row: &LoadRow) -> Option<f64> {
         let value = match self {
@@ -96,24 +67,78 @@ impl LoadField {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// Coefficients in field name order. A field left out has coefficient zero.
+#[derive(Debug, Default)]
+pub(crate) struct Coefficients {
+    pub(crate) in_flight: f64,
+    active_kv: f64,
+    kv_usage: f64,
+    queued: f64,
+    pub(crate) resident_tokens: f64,
+    running: f64,
+    pub(crate) waiting_uncached_tokens: f64,
+}
 
-    #[test]
-    fn the_sum_and_the_missing_report_price_share_one_count() {
-        let facts = RequestFacts::default();
-        let first = Candidate {
-            in_flight: 13,
-            ..Candidate::default()
-        };
-        let changed = Candidate {
-            in_flight: 29,
-            ..Candidate::default()
-        };
-        let mut values = TermValues::new(&facts, &first, None);
-        assert_eq!(Term::InFlight.read(&mut values), Some(13.0));
-        values.row = &changed;
-        assert_eq!(values.in_flight(), 13);
+impl Coefficients {
+    pub(crate) fn of(terms: &[(Term, f64)]) -> Self {
+        let mut coefficients = Self::default();
+        for &(term, coefficient) in terms {
+            let field = match term {
+                Term::InFlight => &mut coefficients.in_flight,
+                Term::Load(field) => match field {
+                    LoadField::ActiveKv => &mut coefficients.active_kv,
+                    LoadField::KvUsage => &mut coefficients.kv_usage,
+                    LoadField::Queued => &mut coefficients.queued,
+                    LoadField::ResidentTokens => &mut coefficients.resident_tokens,
+                    LoadField::Running => &mut coefficients.running,
+                    LoadField::WaitingUncachedTokens => &mut coefficients.waiting_uncached_tokens,
+                },
+            };
+            *field = coefficient;
+        }
+        coefficients
+    }
+
+    pub(crate) fn names_kv_or_running(&self) -> bool {
+        self.active_kv != 0.0 || self.kv_usage != 0.0 || self.running != 0.0
+    }
+
+    /// Adds the report's terms in name order. A missing named value ends
+    /// the sum under `over_least` and adds nothing otherwise.
+    #[inline(always)]
+    pub(crate) fn add_report<
+        const RESIDENT: bool,
+        const WAITING: bool,
+        const KV_OR_RUNNING: bool,
+    >(
+        &self,
+        mut sum: f64,
+        row: &LoadRow,
+        over_least: bool,
+    ) -> Option<f64> {
+        if KV_OR_RUNNING {
+            sum += f64::from(row.active_kv_permille) * self.active_kv;
+            sum += f64::from(row.kv_usage_permille) * self.kv_usage;
+        }
+        sum += f64::from(row.queued) * self.queued;
+        if RESIDENT {
+            if row.resident_counted {
+                sum += f64::from(row.resident_tokens) * self.resident_tokens;
+            } else if over_least {
+                return None;
+            }
+        }
+        if KV_OR_RUNNING {
+            sum += f64::from(row.running) * self.running;
+        }
+        if WAITING {
+            // A queue reported by depth alone gives no count of its tokens.
+            if row.waiting_uncached_tokens != 0 || row.queued == 0 {
+                sum += f64::from(row.waiting_uncached_tokens) * self.waiting_uncached_tokens;
+            } else if over_least {
+                return None;
+            }
+        }
+        Some(sum)
     }
 }

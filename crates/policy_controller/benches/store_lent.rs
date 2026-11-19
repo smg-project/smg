@@ -19,6 +19,8 @@
 //! - `policy_store_lent/decide/<preset>/<door>/<n>`: the whole decision,
 //!   the view and the engine's answer over it, under each preset of the
 //!   build that places a request over this fleet.
+//! - `policy_store_lent/decide/least_cost/lent/512`: the sum of running,
+//!   queued and in-flight requests, with the store's counts beside its rows.
 //!
 //! A bench target of its own: the store bench is built on a pull request's
 //! base with the pull request's bench sources, and the base's store has no
@@ -256,6 +258,48 @@ fn decide_cells(c: &mut Criterion) {
     }
 }
 
+fn least_cost_lent(c: &mut Criterion) {
+    const ROWS: usize = 512;
+    let mut spec = PolicySpec::preset("least_load").expect("a preset of this build");
+    let profile = spec.profiles.values_mut().next().expect("one profile");
+    profile.score = serde_yaml::from_str(
+        "- least-cost:\n    terms: {load.running: 0.75, load.queued: 43, candidate.in_flight: 177}\n    unreported: {over-least: {request_cost: 211}}",
+    )
+    .expect("a least-cost scorer");
+    let engine = spec.validate().expect("the profile validates");
+    let (store, _, opened) = pool_of(ROWS, Beside::Nothing);
+    let ask = ask_at(opened, None, false);
+    let cx = Constraints::default();
+    let mut out = ViewBuffers::default();
+    let mut scratch = Scratch::new();
+    let mut seed = 0u64;
+    c.bench_with_input(
+        BenchmarkId::new("policy_store_lent/decide/least_cost/lent", ROWS),
+        &ROWS,
+        |b, _| {
+            b.iter(|| {
+                seed = seed.wrapping_add(1);
+                store.with_world(|world| {
+                    let view = world
+                        .view(MODEL, Role::Single, black_box(&ask), false, &mut out)
+                        .expect("the pool");
+                    let facts = RequestFacts {
+                        lent_in_flight: Some(view.in_flight.as_ref().expect("lent counts")),
+                        ..facts(seed, view.built.now_micros)
+                    };
+                    engine.decide(
+                        &facts,
+                        &view.pool_facts(),
+                        view.candidates,
+                        &cx,
+                        &mut scratch,
+                    )
+                })
+            });
+        },
+    );
+}
+
 fn store_lent(c: &mut Criterion) {
     view_cells(c, "view", Beside::Nothing, false);
     view_cells(c, "view_veto", Beside::Veto, false);
@@ -263,6 +307,7 @@ fn store_lent(c: &mut Criterion) {
     view_cells(c, "view_pin", Beside::Nothing, true);
     view_cells(c, "view_local", Beside::Local, false);
     decide_cells(c);
+    least_cost_lent(c);
 }
 
 criterion_group!(benches, store_lent);
