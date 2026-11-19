@@ -27,7 +27,7 @@ use std::{
 use rustc_hash::FxHashMap;
 use schemars::{json_schema, JsonSchema, Schema, SchemaGenerator};
 use serde::{
-    de::{self, value::SeqAccessDeserializer, MapAccess, SeqAccess, Visitor},
+    de::{self, MapAccess, SeqAccess, Visitor},
     ser::SerializeMap,
     Deserialize, Deserializer, Serialize, Serializer,
 };
@@ -955,10 +955,8 @@ where
 }
 
 /// What a document wrote under a scorer's name that is no built-in's, kept
-/// as read for the validator. A key written twice is refused here, in the
-/// words a built-in's parameters refuse it: the map of `serde_json` keeps
-/// the last value and says nothing. Only the entry's own keys are asked:
-/// the validator takes the weight alone, a number.
+/// as read for the validator. Read maps and lists recursively so a key
+/// written twice is refused even inside a parameter.
 struct Written(serde_json::Value);
 
 impl<'de> Deserialize<'de> for Written {
@@ -996,8 +994,12 @@ impl<'de> Deserialize<'de> for Written {
                 Ok(Written(serde_json::Value::Null))
             }
 
-            fn visit_seq<A: SeqAccess<'de>>(self, seq: A) -> Result<Written, A::Error> {
-                Deserialize::deserialize(SeqAccessDeserializer::new(seq)).map(Written)
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Written, A::Error> {
+                let mut values = Vec::new();
+                while let Some(Written(value)) = seq.next_element()? {
+                    values.push(value);
+                }
+                Ok(Written(serde_json::Value::Array(values)))
             }
 
             fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Written, A::Error> {
@@ -1006,7 +1008,8 @@ impl<'de> Deserialize<'de> for Written {
                     if keys.contains_key(&key) {
                         return Err(de::Error::custom(format_args!("duplicate field `{key}`")));
                     }
-                    keys.insert(key, map.next_value()?);
+                    let Written(value) = map.next_value()?;
+                    keys.insert(key, value);
                 }
                 Ok(Written(keys.into()))
             }
@@ -3928,6 +3931,47 @@ impl ViewLists {
 mod tests {
     use super::*;
     use crate::{Candidate, Constraints, Filter, Lifecycle, RequestFacts, Targets, TieBand};
+
+    #[test]
+    fn a_parameter_key_written_twice_is_refused_inside_maps_and_lists() {
+        let score_yaml = |score: &str| {
+            format!("apiVersion: {API_VERSION}\nprofiles:\n  default:\n    score: {score}\n    pick: best\n")
+        };
+        for score in [
+            "[{ queue-price: { costs: { unit: 17, unit: 31 } } }]",
+            "[{ queue-price: { costs: [[{ unit: 17, unit: 31 }]] } }]",
+        ] {
+            let error =
+                serde_yaml::from_str::<PolicySpec>(&score_yaml(score)).expect_err("duplicate key");
+            assert!(
+                error.to_string().contains("duplicate field `unit`"),
+                "{error}"
+            );
+        }
+        let json = format!(
+            r#"{{"apiVersion":"{API_VERSION}","profiles":{{"default":{{"score":[{{"queue-price":{{"costs":[{{"unit":17,"unit":31}}]}}}}],"pick":"best"}}}}}}"#
+        );
+        let error = serde_json::from_str::<PolicySpec>(&json).expect_err("duplicate key");
+        assert!(
+            error.to_string().contains("duplicate field `unit`"),
+            "{error}"
+        );
+
+        let read: PolicySpec = serde_yaml::from_str(&score_yaml(
+            "[{ queue-price: { costs: [[{ unit: 17 }]], weight: 3.5 } }]",
+        ))
+        .expect("a well-formed document");
+        let value = serde_json::to_value(&read).expect("serializes");
+        assert_eq!(
+            value["profiles"]["default"]["score"],
+            serde_json::json!([{ "queue-price": { "costs": [[{ "unit": 17 }]], "weight": 3.5 } }])
+        );
+        let again: PolicySpec = serde_json::from_value(value).expect("parses again");
+        assert_eq!(
+            read.digest().expect("digests"),
+            again.digest().expect("digests")
+        );
+    }
 
     #[test]
     fn an_applied_generation_reads_block_hashes_as_deep_as_its_stages_do() {
