@@ -109,7 +109,7 @@ fn member(entry: &Entry) -> (MembershipChange, &WorkerRow, u64) {
 fn left(entry: &Entry) -> Option<&WorkerRow> {
     match &entry.event {
         Event::Member { left, .. } => left.as_deref(),
-        Event::Load { .. } | Event::Term => None,
+        Event::Load { .. } | Event::Term | Event::Generation { .. } => None,
     }
 }
 
@@ -425,6 +425,8 @@ impl Journal for Told {
         self.terms.lock().push(term);
     }
 
+    fn generation(&self, _: Option<Position>, _: u64) {}
+
     fn term_followed(&self, _: Position) {}
 
     fn carries_loads(&self) -> bool {
@@ -565,7 +567,7 @@ impl Twin {
                     self.loads.insert((*id, *rank), *sample);
                 }
             }
-            Event::Term => {}
+            Event::Term | Event::Generation { .. } => {}
         }
     }
 }
@@ -710,7 +712,7 @@ fn a_cut_and_the_tail_after_it_are_the_next_cut_under_writers() {
             match entry.event {
                 Event::Member { .. } => members += 1,
                 Event::Load { .. } => load_rows += 1,
-                Event::Term => {}
+                Event::Term | Event::Generation { .. } => {}
             }
             twin.apply(&entry.event);
         }
@@ -881,7 +883,7 @@ fn a_workers_load_rows_stand_between_its_registration_and_its_leaving() {
                     ),
                 }
             }
-            Event::Term => {}
+            Event::Term | Event::Generation { .. } => {}
         }
     }
     assert!(load_rows > 0, "no load row was written to a member");
@@ -917,6 +919,9 @@ fn applies(standby: &MemoryStore, entry: &Entry) {
             standby.follow_load(entry.at, *id, *rank, row, received_at, source);
         }
         Event::Term => standby.follow_term(entry.at),
+        Event::Generation { generation } => {
+            standby.follow_generation_place(entry.at, *generation);
+        }
     }
 }
 
@@ -1897,4 +1902,103 @@ fn a_standbys_pair_classes_follow_each_membership_write_and_a_restore() {
     assert_eq!(pair_rows(&other), fewer);
     let (ours, theirs) = (other.world(), leader.world());
     assert_eq!(ours.pairs("m"), theirs.pairs("m"));
+}
+
+/// A document that validates, under the generation `number`.
+fn generation(number: u64) -> AppliedSpec {
+    let mut document = PolicySpec::preset("round_robin").expect("a preset of this build");
+    document.generation = number;
+    AppliedSpec::validate(&document).expect("a preset validates")
+}
+
+/// The generations a log holds, each at its place.
+fn generations(log: &Log) -> Vec<(Position, u64)> {
+    all(log)
+        .iter()
+        .filter_map(|entry| match entry.event {
+            Event::Generation { generation } => Some((entry.at, generation)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_generation_takes_a_place_under_a_term_and_a_take_tells_the_standing_one() {
+    let at = |seq, term| Position { seq, term };
+    // A store that runs no document tells none at its take.
+    let (unbound, log) = journaled(16);
+    unbound.set_term(1);
+    assert_eq!(generations(&log), []);
+    assert_eq!(log.head(Kinds::All), at(1, 1));
+
+    let (store, log) = journaled(16);
+    // Applied before any take: the log is told, and keeps no place for it.
+    store.apply(generation(3)).expect("above the unbound one");
+    assert_eq!(log.head(Kinds::All), Position::default());
+    // The take tells the term's start, then the generation that stands.
+    store.set_term(1);
+    let start = Entry {
+        at: at(1, 1),
+        event: Event::Term,
+    };
+    assert_eq!(all(&log)[0], start);
+    assert_eq!(generations(&log), [(at(2, 1), 3)]);
+    // An apply under the term takes the next place, among the membership
+    // writes, and it is one of the watched kinds.
+    store.upsert(facts("grpc://a:9000", 1));
+    store.apply(generation(4)).expect("above the standing one");
+    assert_eq!(generations(&log), [(at(2, 1), 3), (at(4, 1), 4)]);
+    assert_eq!(log.head(Kinds::Watched), at(4, 1));
+    // A generation the store refuses tells nothing.
+    store
+        .apply(generation(4))
+        .expect_err("not above the standing one");
+    assert_eq!(log.head(Kinds::All), at(4, 1));
+    // The next take tells the standing one again, under its own term.
+    store.set_term(2);
+    assert_eq!(generations(&log).last(), Some(&(at(6, 2), 4)));
+}
+
+#[test]
+fn a_standby_follows_a_generation_at_its_leaders_place() {
+    let (leader, led) = journaled(16);
+    let (standby, log) = journaled(16);
+    leader.set_term(1);
+    leader.apply(generation(2)).expect("above the unbound one");
+    leader.apply(generation(5)).expect("above the standing one");
+    let entries = all(&led);
+    let (start, told) = entries.split_first().expect("the term's start");
+    log.join(start.at).expect("the leader's first place");
+    standby.follow_term(start.at);
+    for entry in told {
+        let Event::Generation { generation: number } = entry.event else {
+            panic!("the leader wrote no row: {entry:?}");
+        };
+        let adopting = log.adopt(entry.at).expect("the next position");
+        standby
+            .follow_generation(entry.at, generation(number))
+            .expect("above its own");
+        assert!(adopting.landed(), "{entry:?}");
+    }
+    assert_eq!(all(&log), entries, "the leader's history, place by place");
+    assert_eq!(standby.world().spec().generation(), 5);
+    assert_eq!(log.followed(), Some(1), "it leads nothing by it");
+
+    // A generation the store refuses tells nothing: its guard does not
+    // land, and the standby starts again from a snapshot.
+    let next = Position {
+        seq: log.head(Kinds::All).seq + 1,
+        term: 1,
+    };
+    let adopting = log.adopt(next).expect("the next position");
+    standby
+        .follow_generation(next, generation(5))
+        .expect_err("not above its own");
+    assert!(!adopting.landed());
+    // An event that changes nothing journals its place alone.
+    let adopting = log.adopt(next).expect("the next position");
+    standby.follow_generation_place(next, 5);
+    assert!(adopting.landed());
+    assert_eq!(generations(&log).last(), Some(&(next, 5)));
+    assert_eq!(standby.world().spec().generation(), 5);
 }

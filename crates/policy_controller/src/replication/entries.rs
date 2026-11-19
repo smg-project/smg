@@ -25,8 +25,6 @@ const DISPATCHED: &str = "a new leader reads dispatched leases from the engines'
                           snapshots and rebuilds credits from its own tally";
 const PINS: &str = "pins, reservations and lease ends are journaled once pins have one table";
 const PUBLISHED: &str = "every replica publishes its own world";
-const GENERATION: &str =
-    "the applied generation joins the watched kinds with the step that journals an apply";
 
 /// The list: `(trait or type, entry, fate)`, each in its file's own order.
 pub const ENTRIES: &[(&str, &str, Fate)] = &[
@@ -110,8 +108,7 @@ pub const ENTRIES: &[(&str, &str, Fate)] = &[
     ("LeasesStore", "restore", Fate::Rebuilt(HELLO)),
     ("LeasesStore", "drop_gateways", Fate::NotYet(PINS)),
     ("LeasesStore", "live", Fate::Read),
-    // The store type's own entries. A generation's apply is its one write:
-    // a standby holds the generation applied to it, not its leader's.
+    // The store type's own entries. A generation's apply is its one write.
     ("MemoryStore", "new", Fate::Read),
     ("MemoryStore", "with_publish_window", Fate::Read),
     ("MemoryStore", "journaled", Fate::Read),
@@ -127,7 +124,13 @@ pub const ENTRIES: &[(&str, &str, Fate)] = &[
     ("MemoryStore", "follow", Fate::Journaled),
     ("MemoryStore", "follow_load", Fate::Journaled),
     ("MemoryStore", "follow_term", Fate::Journaled),
-    ("MemoryStore", "apply", Fate::NotYet(GENERATION)),
+    // The generation's number is journaled, one of the watched kinds. The
+    // document it runs from is its door's to hold: whoever sends the event
+    // joins the two, and a standby applies the document through its own
+    // door under the leader's number.
+    ("MemoryStore", "apply", Fate::Journaled),
+    ("MemoryStore", "follow_generation", Fate::Journaled),
+    ("MemoryStore", "follow_generation_place", Fate::Journaled),
     ("MemoryStore", "world", Fate::Read),
     ("MemoryStore", "build_view", Fate::Read),
     ("MemoryStore", "with_world", Fate::Read),

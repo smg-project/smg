@@ -1324,6 +1324,12 @@ message ReplicationSnapshot {
   // Each row's `admitted_age_ms` is its age at the part's send.
   repeated WorkerRow workers = 4;
   repeated LoadSample loads = 5;
+  // The generation that stands at the leader when the part is sent, with its
+  // document, on the snapshot's first part: at the snapshot's place or
+  // after it, never before. Unset where the leader holds no document. A
+  // standby restored from the snapshot runs the document under this number;
+  // the event of the same generation, where it follows, changes nothing.
+  GenerationEvent generation = 6;
 }
 
 message ReplicationEvent {
@@ -1351,6 +1357,11 @@ message TermStart {}
 // A generation as the leader applied it (the status, the document the
 // gateways receive), so a standby serves GetPolicySpec and RollbackPolicySpec
 // and runs it after promotion; a rollback replicates the restored one alike.
+// A leader's log keeps the generation's number alone, and the document is
+// joined at the send: an event with no document states a generation that
+// stood no longer by then. A standby applies nothing for it and journals the
+// position; a later event carries what replaced it. A leader states the
+// generation that stands again behind the start of each term it takes.
 message GenerationEvent {
   SpecStatus status = 1;
   SpecPush document = 2;

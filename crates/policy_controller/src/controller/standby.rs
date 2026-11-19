@@ -31,6 +31,7 @@ use tracing::{info, warn};
 
 use super::{
     election::Standing,
+    generations::Generations,
     principal::ENTRY,
     replication::BEAT,
     service::{Leader, Shared},
@@ -58,15 +59,40 @@ pub(crate) enum Halt {
     Unread(Refused),
 }
 
+/// An event's refusal where this build, or an applier with no door for
+/// it, does not apply its kind.
+const UNAPPLIED: Refused = Refused {
+    path: "batch.events",
+    why: "an event this build does not apply",
+};
+
 /// The standby's applier over one store and the log it journals to.
 pub(crate) struct Follower {
     store: Arc<MemoryStore>,
     log: Arc<Log>,
+    /// The door a leader's generation is applied through
+    /// ([`Follower::through`]).
+    generations: Option<Arc<Generations>>,
 }
 
 impl Follower {
     pub(crate) fn new(store: Arc<MemoryStore>, log: Arc<Log>) -> Self {
-        Self { store, log }
+        Self {
+            store,
+            log,
+            generations: None,
+        }
+    }
+
+    /// The same, applying a leader's generations through `generations`, the
+    /// replica's one door for a document: the log is that door's one writer
+    /// while the replica follows. With no door a generation's event is one
+    /// this applier does not apply, and the standby leaves the synced state
+    /// at its place.
+    #[must_use]
+    pub(crate) fn through(mut self, generations: Arc<Generations>) -> Self {
+        self.generations = Some(generations);
+        self
     }
 
     /// Where the standby stands: the place its next hello names. A standby
@@ -98,8 +124,28 @@ impl Follower {
     /// whole ([`Staged`]): the standby stands at the cut's place after it.
     /// `false` where the log refuses that place (a history that is not
     /// ahead of its own), the store as it was.
-    pub(crate) fn restore(&self, cut: Cut) -> bool {
-        self.store.restore_from(cut)
+    ///
+    /// `told` is the leader's standing generation where the snapshot
+    /// states one. Its document's pass comes first, under the door's lock,
+    /// and the generation lands behind the restore under that lock still:
+    /// a document this replica does not run leaves the store as it was, by
+    /// its path. A snapshot stands at one place for all it holds, so the
+    /// generation journals none. With no door the generation is not
+    /// applied.
+    pub(crate) fn restore(
+        &self,
+        cut: Cut,
+        told: Option<&proto::GenerationEvent>,
+    ) -> Result<bool, Refused> {
+        let following = match (told, &self.generations) {
+            (Some(told), Some(generations)) => Some(generations.following(told)?),
+            _ => None,
+        };
+        if !self.store.restore_from(cut) {
+            return Ok(false);
+        }
+        following.map_or(Ok(()), |following| following.land(None))?;
+        Ok(true)
     }
 
     /// One batch applied at `now`: each event at its position under the
@@ -153,13 +199,19 @@ impl Follower {
                     self.store.follow_load(at, id, rank, row, now, source);
                 }
                 Some(Sent::TermStart(_)) => self.store.follow_term(at),
-                // A kind this build does not apply, and one it does not know.
-                Some(_) | None => {
-                    return Err(Halt::Unread(Refused {
-                        path: "batch.events",
-                        why: "an event this build does not apply",
-                    }));
+                // Through the replica's door, which journals the place: the
+                // document's pass runs here, on the applier's own task.
+                Some(Sent::Generation(told)) => {
+                    let Some(generations) = &self.generations else {
+                        return Err(Halt::Unread(UNAPPLIED));
+                    };
+                    generations
+                        .following(told)
+                        .and_then(|following| following.land(Some(at)))
+                        .map_err(Halt::Unread)?;
                 }
+                // A kind this build does not apply, and one it does not know.
+                Some(_) | None => return Err(Halt::Unread(UNAPPLIED)),
             }
             if !adopting.landed() {
                 return Err(Halt::Lost(at));
@@ -182,6 +234,9 @@ pub(crate) struct Staged {
     part: u32,
     rows: Vec<WorkerRow>,
     loads: Vec<(WorkerId, u16, LoadSample)>,
+    /// The leader's standing generation, as the first part that states one
+    /// said it.
+    generation: Option<proto::GenerationEvent>,
 }
 
 impl Staged {
@@ -224,6 +279,9 @@ impl Staged {
             return refused("batch.snapshot.part", "a part out of its snapshot's order");
         }
         self.part += 1;
+        if self.generation.is_none() {
+            self.generation = part.generation.as_deref().cloned();
+        }
         worker_wire::told_part(part, now, &mut self.rows, &mut self.loads)?;
         Ok(part.last.then(|| Cut {
             at,
@@ -541,7 +599,8 @@ pub(crate) struct Standby {
 
 impl Standby {
     pub(crate) fn new(shared: Arc<Shared>, port: u16) -> Self {
-        let follower = Follower::new(Arc::clone(&shared.store), Arc::clone(&shared.feed.log));
+        let follower = Follower::new(Arc::clone(&shared.store), Arc::clone(&shared.feed.log))
+            .through(Arc::clone(&shared.generations));
         Self {
             shared,
             follower,
@@ -804,10 +863,13 @@ impl Standby {
                     Ok(None) => continue,
                     Err(refused) => return Ended::waits(landed, unread(refused)),
                 };
+                let generation = staging.generation.take();
                 staged = None;
                 let (at, rows) = (cut.at, cut.rows.len());
-                if !self.follower.restore(cut) {
-                    return Ended::unfollowed(at, landed);
+                match self.follower.restore(cut, generation.as_ref()) {
+                    Ok(true) => {}
+                    Ok(false) => return Ended::unfollowed(at, landed),
+                    Err(refused) => return Ended::waits(landed, unread(refused)),
                 }
                 info!(
                     controller_id = %self.shared.controller_id,
@@ -1055,6 +1117,7 @@ mod tests {
                     Event::Member { epoch, change, .. } => format!("{epoch} {change:?}"),
                     Event::Load { id, rank, .. } => format!("load {id:?} {rank}"),
                     Event::Term => "term".to_owned(),
+                    Event::Generation { generation } => format!("generation {generation}"),
                 };
                 (entry.at, what)
             })
@@ -1156,7 +1219,7 @@ mod tests {
         // The standby held a row of its own, under no term.
         standby.upsert(facts("http://stale:8000", 1));
         let first = snapshot(&leader, at);
-        assert!(follower.restore(staged(&first, at)));
+        assert_eq!(follower.restore(staged(&first, at), None), Ok(true));
         assert_eq!(follower.place(), leader.1.head(Kinds::All));
         assert_eq!(held(&standby), held(&leader.0));
         rest(&leader.0, at);
@@ -1165,7 +1228,7 @@ mod tests {
         // A snapshot of the term it followed before is a history it left:
         // refused, the store as it was.
         let place = follower.place();
-        assert!(!follower.restore(staged(&first, at)));
+        assert_eq!(follower.restore(staged(&first, at), None), Ok(false));
         assert_eq!(follower.place(), place);
         assert_eq!(held(&standby), held(&leader.0));
     }
@@ -1571,7 +1634,11 @@ mod tests {
             let mut micros: Vec<u128> = (0..21)
                 .map(|_| {
                     let began = Instant::now();
-                    assert!(follower.restore(staged(&parts, at)), "a restore");
+                    assert_eq!(
+                        follower.restore(staged(&parts, at), None),
+                        Ok(true),
+                        "a restore"
+                    );
                     began.elapsed().as_micros()
                 })
                 .collect();
@@ -2831,5 +2898,114 @@ mod tests {
         stop.send_replace(true);
         let ended = timeout(FIVE, running.join_next()).await;
         assert!(matches!(ended, Ok(Some(Ok(())))), "the stop ends the loop");
+    }
+
+    /// The stock door over a replica's store.
+    fn door((store, _): &Replica) -> Arc<Generations> {
+        let catalog = Arc::new(crate::catalog::Catalog::builtin());
+        Arc::new(Generations::new(Arc::clone(store), catalog))
+    }
+
+    /// A standby's applier over its own store and log, through `door`.
+    fn through((store, log): &Replica, door: &Arc<Generations>) -> Follower {
+        Follower::new(Arc::clone(store), Arc::clone(log)).through(Arc::clone(door))
+    }
+
+    /// One entry as a leader's stream sends it at `now`: a generation with
+    /// the document `documents` holds for it at the send.
+    fn sent(documents: &Generations, entry: &Entry, now: Instant) -> proto::ReplicationBatch {
+        let mut batch = batch(entry, now);
+        if let Event::Generation { generation } = entry.event {
+            batch.events[0].event = Some(Sent::Generation(documents.sent(generation)));
+        }
+        batch
+    }
+
+    #[test]
+    fn a_standby_applies_its_leaders_generations_through_its_own_door() {
+        use crate::controller::generations::{
+            tests::{LEAST_LOAD, RANDOM},
+            Format,
+        };
+
+        let (leader, _, standby) = pair();
+        let (leading, following) = (door(&leader), door(&standby));
+        let follower = through(&standby, &following);
+        let at = Instant::now();
+        let apply = |document: &str| leading.apply(document.into(), Format::Yaml);
+        apply(RANDOM).expect("a valid document");
+        leader.0.upsert(facts("http://a:8000", 1));
+        apply(LEAST_LOAD).expect("a changed document");
+        // An event a batch, each generation with the document the leader's
+        // door holds at the send: the first stands no longer.
+        let led = entries(&leader.1, start(&leader.1));
+        for entry in &led {
+            let batch = sent(&leading, entry, at);
+            assert_eq!(follower.apply(&batch, at), Ok(()), "{entry:?}");
+        }
+        assert_eq!(told(&standby.1), told(&leader.1), "one history");
+        assert_eq!(held(&standby.0), held(&leader.0));
+        assert_eq!(
+            following.document(0).expect("held"),
+            leading.document(0).expect("held")
+        );
+        assert_eq!(following.counts().applied, 1, "the one that stood");
+
+        // An applier with no door does not apply a generation: its standby
+        // leaves the synced state at that place, the term's start applied.
+        let other = replica();
+        let bare = Follower::new(Arc::clone(&other.0), Arc::clone(&other.1));
+        assert_eq!(bare.apply(&batch(&led[0], at), at), Ok(()));
+        assert_eq!(
+            bare.apply(&sent(&leading, &led[1], at), at),
+            Err(Halt::Unread(UNAPPLIED))
+        );
+    }
+
+    #[test]
+    fn a_snapshot_restores_its_leaders_standing_generation_or_nothing() {
+        use crate::controller::generations::{tests::LEAST_LOAD, Format};
+
+        let (leader, _, standby) = pair();
+        let (leading, following) = (door(&leader), door(&standby));
+        let follower = through(&standby, &following);
+        let at = Instant::now();
+        first(&leader.0, at);
+        leading
+            .apply(LEAST_LOAD.into(), Format::Yaml)
+            .expect("a valid document");
+        let told = leading.standing_sent();
+        // The first part states the generation, and the staging keeps it.
+        let mut parts = snapshot(&leader, at);
+        parts[0].snapshot.as_mut().expect("a part").generation = told.clone().map(Box::new);
+        let stage = || {
+            let mut staging = Staged::default();
+            let mut cut = None;
+            for part in &parts {
+                cut = staging.take(part, at).expect("the snapshot's next part");
+            }
+            (cut.expect("the last part"), staging.generation)
+        };
+        let (cut, stated) = stage();
+        assert_eq!(stated, told);
+        // A document this replica does not read: nothing is restored.
+        let mut unread = told.clone().expect("a held document");
+        unread.document.as_mut().expect("a document").format = "toml".to_owned();
+        let before = follower.place();
+        let refused = follower.restore(cut, Some(&unread));
+        assert_eq!(
+            refused.expect_err("no such form").path,
+            "generation.document.format"
+        );
+        assert_eq!(follower.place(), before);
+        assert_eq!(following.generation(), 0);
+        // The generation lands behind the restore, at no place of its own.
+        assert_eq!(follower.restore(stage().0, stated.as_ref()), Ok(true));
+        assert_eq!(follower.place(), leader.1.head(Kinds::All));
+        assert_eq!(held(&standby.0), held(&leader.0));
+        assert_eq!(
+            following.document(0).expect("held"),
+            leading.document(0).expect("held")
+        );
     }
 }

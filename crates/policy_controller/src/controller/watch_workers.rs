@@ -556,7 +556,7 @@ impl Asked {
                         .flatten()
                         .any(|row| self.serves(row))
             }
-            Event::Load { .. } | Event::Term => false,
+            Event::Load { .. } | Event::Term | Event::Generation { .. } => false,
         }
     }
 

@@ -186,8 +186,14 @@ pub(crate) struct SpecFile {
     path: PathBuf,
     format: Format,
     generations: Arc<Generations>,
-    /// The state last read: seen again, it is not read again.
+    /// The state last read: seen again, it is not read again, but behind a
+    /// take.
     read: Seen,
+    /// The door's count of takes at the last read. Behind a take the file
+    /// is read as a start reads it, though it never moved: a leader runs
+    /// what its file says, and a replica that followed another document
+    /// applies its own file's as the next generation.
+    took: u64,
     /// A state other than the last read, seen once: read when the next look
     /// finds it standing.
     moved: Option<Seen>,
@@ -206,13 +212,41 @@ impl SpecFile {
         Self::start_looking(path, generations, look)
     }
 
+    /// The start of a replica under a shared lease: the file is read as it
+    /// stands and its document passed, never applied
+    /// ([`Generations::defer`]). A file that cannot be read, or a document
+    /// that does not run, refuses the start all the same. Until it leads,
+    /// a replica that follows a leader runs what the leader's log gives
+    /// it. At its first take the door applies these bytes where the
+    /// replica runs nothing ([`Generations::at_take`]), and behind every
+    /// take the watch reads the file as it stands then, though it never
+    /// moved: a leader runs what its file says.
+    pub(crate) fn start_deferred(
+        path: PathBuf,
+        generations: Arc<Generations>,
+    ) -> Result<Self, SpecRejected> {
+        Self::start_by(path, generations, look, Generations::defer)
+    }
+
     /// [`SpecFile::start`] with the look as its argument: the identity is
     /// the file system's word, and a case hands in a file that moves under
     /// its read.
     fn start_looking(
         path: PathBuf,
         generations: Arc<Generations>,
+        look: impl FnMut(&Path) -> Seen,
+    ) -> Result<Self, SpecRejected> {
+        let apply = |door: &Generations, document, format| door.apply(document, format).map(drop);
+        Self::start_by(path, generations, look, apply)
+    }
+
+    /// The start's read, and the document handed to the door by `hand`: an
+    /// apply, or the pass alone of a replica under a shared lease.
+    fn start_by(
+        path: PathBuf,
+        generations: Arc<Generations>,
         mut look: impl FnMut(&Path) -> Seen,
+        hand: impl FnOnce(&Generations, Vec<u8>, Format) -> Result<(), SpecRejected>,
     ) -> Result<Self, SpecRejected> {
         let format = Format::of(&path);
         // The look after the read has the word. A file that moved under its
@@ -226,12 +260,14 @@ impl SpecFile {
                 Seen::Unreadable(error) => Err(SpecRejected::Unreadable(error.clone())),
             };
             if look(&path) == found {
-                generations.apply(document?, format)?;
+                hand(&generations, document?, format)?;
+                let took = generations.takes();
                 return Ok(Self {
                     path,
                     format,
                     generations,
                     read: found,
+                    took,
                     moved: None,
                     unsettled: 0,
                 });
@@ -256,7 +292,9 @@ impl SpecFile {
     /// "stood still for one poll" is two looks in a row that agree.
     fn poll_looking(&mut self, mut look: impl FnMut(&Path) -> Seen) -> Look {
         let now = look(&self.path);
-        if now == self.read {
+        // Behind a take the file is read though it never moved.
+        let takes = self.generations.takes();
+        if now == self.read && takes == self.took {
             self.moved = None;
             self.unsettled = 0;
             return Look::Same;
@@ -279,7 +317,16 @@ impl SpecFile {
                 document.and_then(|document| self.generations.apply(document, self.format))
             }
         };
+        // The door read nothing: this replica stopped leading while the
+        // look was in flight. The state stays unread, so a look reads it
+        // once the replica leads again.
+        if let Ok(waits @ Applied::Waits(_)) = outcome {
+            self.moved = None;
+            self.unsettled = 0;
+            return Look::Read(Ok(waits));
+        }
         self.read = now;
+        self.took = takes;
         self.moved = None;
         self.unsettled = 0;
         Look::Read(outcome.map_err(|rejected| self.generations.reject(rejected)))
@@ -306,6 +353,15 @@ impl SpecFile {
     /// flight ends by itself and the watch does not wait on it. The runtime
     /// that ran it does, at its own end: the controller's `run` bounds that
     /// wait.
+    ///
+    /// While the source does not write at its door, the watch looks at
+    /// nothing: the replica is under a shared lease and does not lead
+    /// ([`Generations::source_writes`]). Asking saves the looks and holds
+    /// no rule: the door holds who writes, and a look that was in flight
+    /// when the replica stopped leading applies nothing there
+    /// ([`Applied::Waits`]). So two replicas that read one file never apply
+    /// it twice under two numbers. The first looks after a take read the
+    /// file as a start does, whether it changed meanwhile or not.
     pub(crate) async fn run(self, stop: watch::Receiver<bool>) -> Result<(), JoinError> {
         self.run_looking(stop, look).await
     }
@@ -325,6 +381,9 @@ impl SpecFile {
             tokio::select! {
                 () = sleep(POLL) => {}
                 _ = stop.wait_for(|stop| *stop) => return Ok(()),
+            }
+            if !self.generations.source_writes() {
+                continue;
             }
             let looking = tokio::task::spawn_blocking(move || {
                 self.poll_looking(&mut look);
@@ -349,6 +408,7 @@ pub(crate) mod tests {
             mpsc,
         },
         thread,
+        time::Instant,
     };
 
     use tempfile::TempDir;
@@ -357,9 +417,13 @@ pub(crate) mod tests {
     use super::*;
     use crate::{
         controller::generations::{
-            tests::{faulting, long_text_under_aliases, padded, with_line, LEAST_LOAD, RANDOM},
+            tests::{
+                bound_to, election, election_under, faulting, long_text_under_aliases, padded,
+                with_line, LEAST_LOAD, RANDOM,
+            },
             Validate,
         },
+        elector::Tick,
         spec::{AppliedSpec, SpecError},
         store::MemoryStore,
     };
@@ -1352,5 +1416,185 @@ pub(crate) mod tests {
         ended(&mut watching).await.expect("the loop's last join");
         assert_eq!(began.elapsed(), stopped_at, "the loop waited no poll out");
         assert_eq!(looks.load(Ordering::SeqCst), 1, "no look after the stop");
+    }
+
+    /// The watch of a replica under a shared lease. While the replica does
+    /// not lead, the watch looks at nothing, whatever the file became: the
+    /// log writes at its door. Behind the replica's take its next looks
+    /// read the file as it stands, and the file is applied as a leader's
+    /// is. Back under a leader, it looks at nothing again.
+    #[tokio::test(start_paused = true)]
+    async fn the_watch_of_a_replica_that_follows_looks_only_while_it_leads() {
+        let bed = bed(LEAST_LOAD.as_bytes());
+        let mut elector = election();
+        bed.generations.under(elector.fence());
+        let file = SpecFile::start_deferred(bed.path.clone(), Arc::clone(&bed.generations))
+            .expect("a file that runs");
+        follow(&bed, &[RANDOM, &bound_to(1)]);
+        let looks = Arc::new(AtomicUsize::new(0));
+        let counted = {
+            let looks = Arc::clone(&looks);
+            move |path: &Path| {
+                let n = looks.fetch_add(1, Ordering::SeqCst) + 1;
+                assert!(n <= 20, "the loop looks without end");
+                look(path)
+            }
+        };
+        let (stop, stopped) = watch::channel(false);
+        let mut watching = JoinSet::new();
+        watching.spawn(file.run_looking(stopped, counted));
+
+        // Between two polls, so the take and a look never share an instant.
+        replace(&bed.path, RANDOM.as_bytes());
+        sleep(9 * POLL / 2).await;
+        assert_eq!(looks.load(Ordering::SeqCst), 0, "no look while it follows");
+        assert_eq!(bed.generation(), 2);
+
+        // The take: a look that sees the file moved, then the read between
+        // two looks.
+        elector.tick(Instant::now()).expect("a take");
+        sleep(2 * POLL).await;
+        assert_eq!(looks.load(Ordering::SeqCst), 3);
+        assert_eq!(bed.generation(), 3, "applied as a leader's file is");
+
+        assert!(elector.release().expect("a release"), "it held the lease");
+        follow(&bed, &[RANDOM, &bound_to(1), &bound_to(2), &bound_to(3)]);
+        replace(&bed.path, LEAST_LOAD.as_bytes());
+        sleep(5 * POLL).await;
+        assert_eq!(looks.load(Ordering::SeqCst), 3, "no look once it follows");
+        assert_eq!(bed.generation(), 4);
+
+        stop.send_replace(true);
+        ended(&mut watching).await.expect("the loop's last join");
+    }
+
+    /// `bed` follows the standing generation of a leader that applied
+    /// `documents` in their order, as a stream that begins now brings it.
+    fn follow(bed: &Bed, documents: &[&str]) {
+        let leader = self::bed(b"");
+        for document in documents {
+            let applied = leader
+                .generations
+                .apply(document.as_bytes().to_vec(), Format::Yaml);
+            applied.expect("a document that runs");
+        }
+        let told = leader.generations.standing_sent().expect("it stands");
+        let following = bed.generations.following(&told);
+        following
+            .and_then(|following| following.land(None))
+            .expect("above no generation");
+    }
+
+    /// The start of a replica under a shared lease passes its file and
+    /// applies nothing: the replica's first take applies it where the
+    /// replica followed nothing. A leader runs what its file says: behind
+    /// every take the watch reads the file as a start does, though it
+    /// never moved. The standing document again is no change, and a
+    /// replica that followed another document applies its own file's as
+    /// the next generation. A file that does not run refuses this start as
+    /// it refuses the other.
+    #[test]
+    fn a_start_under_a_shared_lease_passes_its_file_and_the_first_take_applies_it() {
+        let bed = bed(LEAST_LOAD.as_bytes());
+        let mut file = SpecFile::start_deferred(bed.path.clone(), Arc::clone(&bed.generations))
+            .expect("a file that runs");
+        assert_eq!(bed.generation(), 0, "passed, not applied");
+        assert_eq!(file.poll(), Look::Same, "no take, and the file never moved");
+        bed.generations.at_take();
+        assert_eq!(bed.generation(), 1);
+        assert_eq!(settle(&mut file), Ok(Applied::Unchanged(1)));
+        assert_eq!(file.poll(), Look::Same);
+
+        // The rollout: a replica that starts over a new file follows its
+        // old leader's document. The take applies none of the start's
+        // bytes, and behind it the file is read though it never moved: the
+        // new document stands as the next generation.
+        let bed = self::bed(LEAST_LOAD.as_bytes());
+        let mut file = SpecFile::start_deferred(bed.path.clone(), Arc::clone(&bed.generations))
+            .expect("a file that runs");
+        follow(&bed, &[RANDOM]);
+        bed.generations.at_take();
+        assert_eq!(bed.generation(), 1, "the leader's, and none of the start's");
+        assert_eq!(bed.answered().2, RANDOM.as_bytes());
+        assert_eq!(settle(&mut file), Ok(Applied::Generation(2)));
+        assert_eq!(bed.answered().2, LEAST_LOAD.as_bytes());
+        // And behind its next take the file is read again: the standing
+        // document, no change.
+        bed.generations.at_take();
+        assert_eq!(settle(&mut file), Ok(Applied::Unchanged(2)));
+        // A file that moved is read at any look.
+        replace(&bed.path, bound_to(1).as_bytes());
+        assert_eq!(settle(&mut file), Ok(Applied::Generation(3)));
+
+        let unrun = self::bed(LEAST_LOAD.replace("healthy", "no-such-stage").as_bytes());
+        let refused = SpecFile::start_deferred(unrun.path.clone(), Arc::clone(&unrun.generations));
+        assert!(refused.is_err(), "a stage this build lacks");
+        unrun.generations.at_take();
+        assert_eq!(unrun.generation(), 0);
+    }
+
+    /// A look in flight when the replica stops leading applies nothing:
+    /// the door holds who writes, whatever the watch asked ahead of the
+    /// look. The state stays unread, so the looks of the replica's next
+    /// lead read it, behind a take or behind none.
+    #[test]
+    fn a_look_in_flight_when_the_replica_stops_leading_applies_nothing() {
+        let bed = bed(LEAST_LOAD.as_bytes());
+        let mut elector = election();
+        bed.generations.under(elector.fence());
+        let mut file = SpecFile::start_deferred(bed.path.clone(), Arc::clone(&bed.generations))
+            .expect("a file that runs");
+        let door = Arc::clone(&bed.generations);
+        elector.at_take(move || door.at_take());
+        elector.tick(Instant::now()).expect("a take");
+        assert_eq!(bed.generation(), 1, "the start's document, at the take");
+        replace(&bed.path, bound_to(1).as_bytes());
+        assert_eq!(file.poll(), Look::Settling);
+        // The replica is deposed here and follows its next leader, whose
+        // generation is above its own.
+        assert!(elector.release().expect("a release"), "it held the lease");
+        follow(&bed, &[RANDOM, &bound_to(2)]);
+        assert_eq!(bed.generation(), 2);
+        // The look resumes: the door reads nothing of it.
+        assert_eq!(file.poll(), Look::Read(Ok(Applied::Waits(2))));
+        assert_eq!(bed.generation(), 2);
+        assert_eq!(bed.answered().2, bound_to(2).as_bytes());
+        assert_eq!(bed.rejected(), 0);
+        // Behind its next take the state is read: it never was.
+        elector.tick(Instant::now()).expect("a take");
+        assert!(bed.generations.source_writes(), "it leads again");
+        assert_eq!(settle(&mut file), Ok(Applied::Generation(3)));
+        assert_eq!(bed.answered().2, bound_to(1).as_bytes());
+
+        // A lead comes back with no take as well: a fence closes by itself
+        // at the renew deadline, and the holder's next renewal opens it
+        // again under the same term. A look refused in between is read
+        // behind that renewal.
+        let deadline = Duration::from_secs(1);
+        let bed = self::bed(LEAST_LOAD.as_bytes());
+        let mut elector = election_under(deadline);
+        bed.generations.under(elector.fence());
+        let mut file = SpecFile::start_deferred(bed.path.clone(), Arc::clone(&bed.generations))
+            .expect("a file that runs");
+        let door = Arc::clone(&bed.generations);
+        elector.at_take(move || door.at_take());
+        // The take's write lands two deadlines late: its fence is closed.
+        let late = Instant::now()
+            .checked_sub(2 * deadline)
+            .expect("a host that is up for two seconds");
+        elector.tick(late).expect("a take");
+        assert_eq!(bed.generation(), 1, "the start's document, at the take");
+        assert!(!bed.generations.source_writes(), "past its deadline");
+        replace(&bed.path, bound_to(1).as_bytes());
+        assert_eq!(settle(&mut file), Ok(Applied::Waits(1)));
+        // A round whose window closed again ahead of its read waits as the
+        // first look did.
+        let read = (0..8).find_map(|_| {
+            let renewed = elector.tick(Instant::now());
+            assert!(matches!(renewed, Ok(Tick::Renewed { .. })), "a renewal");
+            Some(settle(&mut file)).filter(|read| !matches!(read, Ok(Applied::Waits(_))))
+        });
+        assert_eq!(read, Some(Ok(Applied::Generation(2))));
+        assert_eq!(bed.generations.takes(), 1, "no take since the first");
     }
 }

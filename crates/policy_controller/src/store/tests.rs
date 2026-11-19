@@ -2380,6 +2380,8 @@ impl Journal for WaitsAtRestart {
 
     fn term_rose(&self, _: u64) {}
 
+    fn generation(&self, _: Option<Position>, _: u64) {}
+
     fn term_followed(&self, _: Position) {}
 
     fn carries_loads(&self) -> bool {
