@@ -62,6 +62,7 @@ use serde_json::{Map, Value};
 mod classic {
     pub mod all_vetoed;
     pub mod bucket;
+    pub mod cache_aware;
     pub mod encode_pair;
     pub mod manual;
     pub mod minimum_tokens;
@@ -273,9 +274,10 @@ const fn module<R: Recorded>(inline: &'static str) -> Module {
 /// An encode-pair row is replayed in its store part by its own module;
 /// its copied rows name no runtime either, and the pair index's rule
 /// holds them.
-const MODULES: [Module; 10] = [
+const MODULES: [Module; 11] = [
     module::<classic::all_vetoed::Row>(classic::all_vetoed::INLINE),
     module::<classic::bucket::Row>(classic::bucket::INLINE),
+    module::<classic::cache_aware::Row>(classic::cache_aware::INLINE),
     Module {
         policy: classic::encode_pair::POLICY,
         inline: classic::encode_pair::INLINE,
@@ -1073,6 +1075,7 @@ fn every_json_file_of_the_directory_is_a_sheet_to_answer_for() {
             "all_vetoed.json",
             "broken.json",
             "bucket.json",
+            "cache_aware.json",
             "encode_pair.json",
             "manual.json",
             "minimum_tokens.json",
