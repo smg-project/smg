@@ -75,19 +75,107 @@ pub struct ModelInfo {
     pub architectures: Option<Vec<String>>,
 }
 
+/// Public model objects carried through the existing discovery/refresh pipeline.
+pub(super) const MODEL_OBJECTS_LABEL: &str = "upstream_model_objects";
+
+/// Bound the public metadata copied into worker labels and per-rank cards.
+pub(super) const MAX_MODEL_OBJECTS_BYTES: usize = 64 * 1024;
+
 /// Single entry from `/v1/models` (shared by sglang and vllm).
 #[derive(Debug, Clone, Deserialize)]
+#[serde(try_from = "serde_json::Value")]
 pub(super) struct ModelsResponseEntry {
     pub owned_by: Option<String>,
     pub id: Option<String>,
     pub root: Option<String>,
     pub max_model_len: Option<usize>,
+    pub model_object: serde_json::Value,
+}
+
+impl TryFrom<serde_json::Value> for ModelsResponseEntry {
+    type Error = serde_json::Error;
+
+    /// Keep original fields until card creation can supply provider-aware defaults.
+    fn try_from(raw: serde_json::Value) -> Result<Self, Self::Error> {
+        if !raw.is_object() {
+            return Err(serde::de::Error::custom("model entry must be an object"));
+        }
+        #[derive(Deserialize)]
+        struct Identity {
+            owned_by: Option<String>,
+            id: Option<String>,
+            root: Option<String>,
+            max_model_len: Option<usize>,
+        }
+        let identity: Identity = serde_json::from_value(raw.clone())?;
+        if identity.id.is_none()
+            && identity.owned_by.is_none()
+            && identity.root.is_none()
+            && identity.max_model_len.is_none()
+        {
+            return Err(serde::de::Error::custom(
+                "model entry has no identity fields",
+            ));
+        }
+        Ok(Self {
+            owned_by: identity.owned_by,
+            id: identity.id,
+            root: identity.root,
+            max_model_len: identity.max_model_len,
+            model_object: raw,
+        })
+    }
 }
 
 /// `/v1/models` response wrapper.
 #[derive(Debug, Clone, Deserialize)]
 pub(super) struct ModelsResponse {
+    #[serde(deserialize_with = "ModelsResponse::deserialize_entries")]
     pub data: Vec<ModelsResponseEntry>,
+}
+
+impl ModelsResponse {
+    /// A malformed sibling must not discard valid public model objects. Keep
+    /// their order, but fail a wholly malformed nonempty catalog so a strict
+    /// refresh cannot mistake a failed read for an empty catalog.
+    fn deserialize_entries<'de, D>(deserializer: D) -> Result<Vec<ModelsResponseEntry>, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = Vec::<serde_json::Value>::deserialize(deserializer)?;
+        let was_empty = raw.is_empty();
+        let entries: Vec<_> = raw
+            .into_iter()
+            .filter_map(|entry| ModelsResponseEntry::try_from(entry).ok())
+            .collect();
+        if !was_empty && entries.is_empty() {
+            return Err(serde::de::Error::custom(
+                "model catalog has no valid entries",
+            ));
+        }
+        Ok(entries)
+    }
+
+    /// Cache a bounded catalog, keeping the first occurrence of each model ID.
+    /// Oversized metadata is omitted; identity and context discovery still proceed.
+    fn record_model_objects(&self, labels: &mut HashMap<String, String>) {
+        labels.remove(MODEL_OBJECTS_LABEL);
+        let mut models = HashMap::new();
+        for entry in &self.data {
+            if let Some(id) = &entry.id {
+                models.entry(id).or_insert(&entry.model_object);
+            }
+        }
+        if !models.is_empty() {
+            if let Ok(json) = serde_json::to_string(&models) {
+                if json.len() <= MAX_MODEL_OBJECTS_BYTES {
+                    labels.insert(MODEL_OBJECTS_LABEL.to_string(), json);
+                } else {
+                    warn!("Skipping public model metadata larger than {MAX_MODEL_OBJECTS_BYTES} bytes");
+                }
+            }
+        }
+    }
 }
 
 /// vLLM `/version` response.
@@ -270,6 +358,7 @@ async fn fetch_sglang_http_metadata_checked(
         .await
     {
         Ok(models) => {
+            models.record_model_objects(&mut labels);
             if let Some(m) = models.data.first() {
                 if let Some(id) = m.id.as_ref().filter(|id| !id.is_empty()) {
                     labels
@@ -322,6 +411,7 @@ async fn fetch_vllm_http_metadata_checked(
         .await
     {
         Ok(models) => {
+            models.record_model_objects(&mut labels);
             if let Some(m) = models.data.first() {
                 if let Some(ref root) = m.root {
                     labels.insert("model_path".to_string(), root.clone());
@@ -1242,6 +1332,194 @@ mod tests {
 
         let labels = flat_labels(&info);
         assert!(!labels.contains_key("max_running_requests"));
+    }
+
+    /// Duplicate metadata follows the first identity entry; oversized caches are
+    /// omitted without losing the identity used to register the worker.
+    #[test]
+    fn model_metadata_cache_is_bounded_and_first_wins() {
+        use serde_json::json;
+        let models: ModelsResponse = serde_json::from_value(json!({"data": [
+            {"id": "served", "root": "first", "max_model_len": 4096},
+            {"id": "served", "root": "second", "max_model_len": 8192}
+        ]}))
+        .unwrap();
+        let mut labels = HashMap::new();
+        models.record_model_objects(&mut labels);
+        let cached: serde_json::Value = serde_json::from_str(&labels[MODEL_OBJECTS_LABEL]).unwrap();
+        assert_eq!(cached["served"]["root"], "first");
+        assert_eq!(cached["served"]["max_model_len"], 4096);
+        let oversized: ModelsResponse = serde_json::from_value(json!({"data": [
+            {"id": "served", "extra": "x".repeat(MAX_MODEL_OBJECTS_BYTES)}
+        ]}))
+        .unwrap();
+        oversized.record_model_objects(&mut labels);
+        assert!(!labels.contains_key(MODEL_OBJECTS_LABEL));
+        assert_eq!(oversized.data[0].id.as_deref(), Some("served"));
+    }
+
+    /// Both HTTP runtimes preserve valid sibling metadata through registration
+    /// and refresh, keeping the first valid identity and duplicate object.
+    #[tokio::test]
+    async fn http_model_metadata_survives_discovery_and_card_refresh() {
+        use axum::{routing::get, Json, Router};
+        use openai_protocol::worker::WorkerSpec;
+        use serde_json::json;
+        use tokio::net::TcpListener;
+
+        use super::super::create_worker::{build_model_card, model_card_for_labels};
+
+        let expected = json!({
+            "id": "served-model", "object": "model", "created": 123,
+            "owned_by": "vllm", "root": "org/checkpoint", "parent": null,
+            "max_model_len": 32768,
+            "permission": [{"id": "permission-1", "allow_sampling": true}],
+            "future_field": {"nested": [false, null, 5]}
+        });
+        let mut duplicate = expected.clone();
+        duplicate["root"] = json!("later/checkpoint");
+        duplicate["max_model_len"] = json!(8192);
+        let body = json!({"object": "list", "data": [
+            {"id": 42},
+            null,
+            {},
+            {"future_field": true},
+            {"id": null, "owned_by": null, "root": null, "max_model_len": null},
+            ["vllm", "positional-model", "wrong/checkpoint", 1],
+            expected.clone(),
+            {"id": "malformed", "max_model_len": "invalid"},
+            duplicate,
+            "not a model object"
+        ]});
+        let app = Router::new().route(
+            "/v1/models",
+            get(move || {
+                let body = body.clone();
+                async move { Json(body) }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        #[expect(clippy::disallowed_methods, reason = "test-only server, aborted below")]
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = http_client();
+        let url = format!("http://{addr}");
+        let vllm = fetch_vllm_http_metadata(&client, &url, None).await;
+        let sglang = fetch_sglang_http_metadata(&client, &url, None).await;
+        let strict_vllm = fetch_vllm_http_metadata_checked(&client, &url, None, true)
+            .await
+            .expect("valid siblings survive a strict vLLM read");
+        let strict_sglang = fetch_sglang_http_metadata_checked(&client, &url, None, true)
+            .await
+            .expect("valid siblings survive a strict SGLang read");
+        server.abort();
+
+        for labels in [vllm, sglang, strict_vllm, strict_sglang] {
+            assert_eq!(label(&labels, "served_model_name"), Some("served-model"));
+            assert_eq!(label(&labels, "model_path"), Some("org/checkpoint"));
+            assert_eq!(label(&labels, "max_model_len"), Some("32768"));
+            let card = build_model_card(
+                "served-model",
+                &WorkerSpec::new(&url),
+                &labels,
+                &HashMap::new(),
+            );
+            assert_eq!(
+                serde_json::to_value(card.clone().into_model_object()).unwrap(),
+                expected
+            );
+            let other = build_model_card(
+                "other-model",
+                &WorkerSpec::new(&url),
+                &labels,
+                &HashMap::new(),
+            );
+            assert!(
+                other.upstream_model.is_none(),
+                "metadata must not cross model IDs"
+            );
+
+            let mut after = labels.clone();
+            let mut updated = expected.clone();
+            updated["max_model_len"] = json!(65536);
+            after.insert(
+                MODEL_OBJECTS_LABEL.into(),
+                json!({"served-model": updated}).to_string(),
+            );
+            after.insert("max_model_len".into(), "65536".into());
+            let (refreshed, changed) = model_card_for_labels(&card, &labels, &after);
+            assert!(changed.contains(&"upstream_model"));
+            assert_eq!(
+                serde_json::to_value(refreshed.into_model_object()).unwrap(),
+                updated
+            );
+        }
+    }
+
+    /// Refresh rejects unusable catalogs, while an explicitly empty catalog is
+    /// still a successful read for both HTTP runtimes.
+    #[tokio::test]
+    async fn http_model_metadata_distinguishes_malformed_and_empty_catalogs() {
+        use http::StatusCode;
+        use serde_json::json;
+
+        use crate::workflow::steps::local::test_support::serve_json_routes;
+
+        let client = http_client();
+        for body in [
+            json!({}),
+            json!({"data": null}),
+            json!({"data": {"id": "served"}}),
+            json!({"data": [{"id": 42}, null, ["vllm", "positional", "root", 1]]}),
+            json!({"data": [null, {}]}),
+            json!({"data": [
+                {"future_field": true},
+                {"id": null, "owned_by": null, "root": null, "max_model_len": null}
+            ]}),
+        ] {
+            let base = serve_json_routes(vec![("/v1/models", StatusCode::OK, body)]).await;
+            assert!(fetch_vllm_http_metadata(&client, &base, None)
+                .await
+                .is_empty());
+            assert!(fetch_sglang_http_metadata(&client, &base, None)
+                .await
+                .is_empty());
+            for result in [
+                fetch_vllm_http_metadata_checked(&client, &base, None, true).await,
+                fetch_sglang_http_metadata_checked(&client, &base, None, true).await,
+            ] {
+                let error = result.expect_err("a malformed catalog must fail refresh");
+                assert!(error.starts_with("/v1/models: Failed to parse"), "{error}");
+            }
+        }
+
+        let base =
+            serve_json_routes(vec![("/v1/models", StatusCode::OK, json!({"data": []}))]).await;
+        for result in [
+            fetch_vllm_http_metadata_checked(&client, &base, None, true).await,
+            fetch_sglang_http_metadata_checked(&client, &base, None, true).await,
+        ] {
+            assert!(result.expect("an empty catalog is valid").is_empty());
+        }
+    }
+
+    /// Engines may supply only one identity field; filtering empty siblings
+    /// must preserve those partial objects without inventing missing fields.
+    #[test]
+    fn model_metadata_preserves_each_supported_partial_identity() {
+        use serde_json::json;
+
+        for entry in [
+            json!({"id": "served"}),
+            json!({"owned_by": "vllm"}),
+            json!({"root": "org/checkpoint"}),
+            json!({"max_model_len": 4096}),
+        ] {
+            let models: ModelsResponse =
+                serde_json::from_value(json!({"data": [{}, entry.clone(), {}]})).unwrap();
+            assert_eq!(models.data.len(), 1);
+            assert_eq!(models.data[0].model_object, entry);
+        }
     }
 
     #[tokio::test]
