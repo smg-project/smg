@@ -37,14 +37,15 @@ use crate::{
     affinity::{blocks_within, Gates, KvPressure, PrefixAffinity, WarmupSlice},
     bucket::Bucket,
     builtins::{
-        with_report_age, FewestSessions, LeastLoad, LeastRequests, ResidentWork, SampledBest,
-        SessionAffinity, DEFAULT_KV_PRESSURE_WEIGHT, DEFAULT_MEAN_PREFILL_TOKENS,
+        with_report_age, FewestSessions, LeastCost, LeastLoad, LeastRequests, ResidentWork,
+        SampledBest, SessionAffinity, DEFAULT_KV_PRESSURE_WEIGHT, DEFAULT_MEAN_PREFILL_TOKENS,
         DEFAULT_THROUGHPUT,
     },
     catalog::{Catalog, Found, StageBuild},
     framework::{Binding, Engine, OverloadThresholds, Picker, Plan, Profile, Scorer, Weighted},
     ring::ConsistentHash,
     sessions::SessionRule,
+    terms::Term,
     view::{permille, HashKind, Phase, MAX_REPORT_AGE_MS},
 };
 
@@ -95,7 +96,7 @@ pub const FILTERS: [&str; 5] = [
 
 /// The scorers of v1. Each has a parameter struct in this module; the ones
 /// this build lacks parse and are refused as not in this build.
-pub const SCORERS: [&str; 10] = [
+pub const SCORERS: &[&str] = &[
     "least-load",
     "least-requests",
     "fewest-sessions",
@@ -106,6 +107,7 @@ pub const SCORERS: [&str; 10] = [
     "bucket",
     "consistent-hash",
     "resident-work",
+    LeastCost::NAME,
 ];
 
 /// The pickers of v1; `count-first` and `power-of-two-count-first` compare
@@ -714,6 +716,103 @@ pub struct ResidentWorkParams {
     pub request_tokens: u32,
 }
 
+const COST_PARAMETER_LIMIT: f64 = 1e15;
+const RELATIVE_MARGIN_LIMIT: f64 = 1e6;
+
+/// The least-cost scorer: a sum of a row's fields times their coefficients,
+/// in the document's units. Lower cost scores higher.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LeastCostParams {
+    /// The scorer's weight in the profile's combined score.
+    #[serde(default = "one")]
+    #[schemars(extend("exclusiveMinimum" = 0, "maximum" = COST_PARAMETER_LIMIT))]
+    pub weight: f32,
+    /// Field names and their coefficients. At least one field is required.
+    #[serde(deserialize_with = "keyed_once")]
+    #[schemars(extend("minProperties" = 1))]
+    pub terms: BTreeMap<String, f64>,
+    /// How far above the least cost a row still ties for the top score.
+    #[serde(default)]
+    pub margin: CostMargin,
+    /// What a row costs when a named value is missing. Required for terms
+    /// that read a report.
+    pub unreported: Option<Unreported>,
+}
+
+/// How to cost a row that lacks a value a term reads.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(
+    rename_all = "kebab-case",
+    deny_unknown_fields,
+    from = "UnreportedEntry",
+    into = "UnreportedEntry"
+)]
+#[schemars(!from, !into)]
+#[non_exhaustive]
+pub enum Unreported {
+    /// Start at the least cost among the reported rows handed to the scorer,
+    /// or zero if none report, and add `request_cost` for each request in flight.
+    OverLeast {
+        #[schemars(extend("minimum" = 0, "maximum" = COST_PARAMETER_LIMIT))]
+        request_cost: f64,
+    },
+    /// Sum the row's available values. A missing value adds nothing.
+    MissingAsZero,
+}
+
+// Use a string or a one-key map in both document formats.
+#[derive(Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+enum UnreportedEntry {
+    MissingAsZero,
+    #[serde(untagged)]
+    OverLeast {
+        #[serde(rename = "over-least")]
+        over_least: RequestCost,
+    },
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RequestCost {
+    request_cost: f64,
+}
+
+impl From<UnreportedEntry> for Unreported {
+    fn from(entry: UnreportedEntry) -> Self {
+        match entry {
+            UnreportedEntry::MissingAsZero => Self::MissingAsZero,
+            UnreportedEntry::OverLeast { over_least } => Self::OverLeast {
+                request_cost: over_least.request_cost,
+            },
+        }
+    }
+}
+
+impl From<Unreported> for UnreportedEntry {
+    fn from(unreported: Unreported) -> Self {
+        match unreported {
+            Unreported::MissingAsZero => Self::MissingAsZero,
+            Unreported::OverLeast { request_cost } => Self::OverLeast {
+                over_least: RequestCost { request_cost },
+            },
+        }
+    }
+}
+
+/// The sum of the absolute and relative margins. Both default to zero.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields, default)]
+pub struct CostMargin {
+    /// In cost units.
+    #[schemars(extend("minimum" = 0, "maximum" = COST_PARAMETER_LIMIT))]
+    pub absolute: f64,
+    /// A share of the magnitude of the least cost.
+    #[schemars(extend("minimum" = 0, "maximum" = RELATIVE_MARGIN_LIMIT))]
+    pub relative: f64,
+}
+
 /// The `best` picker's parameters.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -741,6 +840,7 @@ pub struct BestWithTemperatureParams {
 /// parameter is refused by name.
 #[derive(Clone, Debug, PartialEq, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum ScoreStage {
     LeastLoad(LeastLoadParams),
     LeastRequests(Weight),
@@ -752,6 +852,7 @@ pub enum ScoreStage {
     Bucket(BucketParams),
     ConsistentHash(ConsistentHashParams),
     ResidentWork(ResidentWorkParams),
+    LeastCost(LeastCostParams),
 }
 
 impl ScoreStage {
@@ -768,6 +869,7 @@ impl ScoreStage {
             Self::Bucket(_) => "bucket",
             Self::ConsistentHash(_) => "consistent-hash",
             Self::ResidentWork(_) => "resident-work",
+            Self::LeastCost(_) => LeastCost::NAME,
         }
     }
 
@@ -782,12 +884,13 @@ impl ScoreStage {
             Self::Bucket(p) => p.weight,
             Self::ConsistentHash(p) => p.weight,
             Self::ResidentWork(p) => p.weight,
+            Self::LeastCost(p) => p.weight,
         }
     }
 
     /// The stage a bare name stands for, with its parameters at their
     /// defaults; `None` for a name outside the catalog or one whose
-    /// parameters have no default (`resident-work`).
+    /// parameters have no default.
     fn by_name(name: &str) -> Option<Self> {
         Some(match name {
             "least-load" => Self::LeastLoad(LeastLoadParams::default()),
@@ -893,6 +996,7 @@ impl Serialize for ScoreSpec {
             ScoreStage::Bucket(p) => map.serialize_entry(stage.name(), p)?,
             ScoreStage::ConsistentHash(p) => map.serialize_entry(stage.name(), p)?,
             ScoreStage::ResidentWork(p) => map.serialize_entry(stage.name(), p)?,
+            ScoreStage::LeastCost(p) => map.serialize_entry(stage.name(), p)?,
         }
         map.end()
     }
@@ -918,6 +1022,7 @@ fn scorer_entry<'de, A: MapAccess<'de>>(mut map: A) -> Result<ScoreSpec, A::Erro
         "bucket" => ScoreStage::Bucket(map.next_value()?),
         "consistent-hash" => ScoreStage::ConsistentHash(map.next_value()?),
         "resident-work" => ScoreStage::ResidentWork(map.next_value()?),
+        LeastCost::NAME => ScoreStage::LeastCost(map.next_value()?),
         _ => {
             let Written(written) = map.next_value()?;
             return single_key(map, ScoreSpec::Added { name: key, written });
@@ -1078,7 +1183,7 @@ impl JsonSchema for ScoreSpec {
         let names: Vec<&str> = SCORERS
             .iter()
             .copied()
-            .filter(|name| *name != "resident-work")
+            .filter(|name| ScoreStage::by_name(name).is_some())
             .collect();
         json_schema!({
             "description": "A scorer: its bare name (the stage at its defaults), or the name mapped to its weight and parameters.",
@@ -2135,6 +2240,7 @@ fn check_stage(stage: &ScoreStage, at: &At) -> Result<(), SpecError> {
         | ScoreStage::FewestSessions(_)
         | ScoreStage::SessionAffinity(_)
         | ScoreStage::ResidentWork(_) => Ok(()),
+        ScoreStage::LeastCost(_) => Ok(()),
         ScoreStage::PrefixAffinity(p) => {
             at.number("threshold", p.threshold, unit_interval, "between 0 and 1")?;
             at.number(
@@ -2189,6 +2295,65 @@ fn check_stage(stage: &ScoreStage, at: &At) -> Result<(), SpecError> {
             }
         }
     }
+}
+
+/// Check the cost parameters while resolving the field names into readers.
+fn least_cost_of(p: &LeastCostParams, at: &At) -> Result<LeastCost, SpecError> {
+    const COST_RANGE: &str = "a finite number from 0 to 1e15";
+    if f64::from(p.weight) > COST_PARAMETER_LIMIT {
+        return Err(at.bad(
+            "weight",
+            p.weight,
+            "a finite number above zero and at most 1e15",
+        ));
+    }
+    if p.terms.is_empty() {
+        return Err(at.bad("terms", "{}", "at least one field with its coefficient"));
+    }
+    let mut terms = Vec::new();
+    for (name, &coefficient) in &p.terms {
+        let term =
+            Term::named(name).ok_or_else(|| at.bad("terms", name, "a field this build reads"))?;
+        if coefficient == 0.0
+            || !(-COST_PARAMETER_LIMIT..=COST_PARAMETER_LIMIT).contains(&coefficient)
+        {
+            return Err(at.sub("terms").bad(
+                name,
+                coefficient,
+                "a finite number other than zero, of magnitude at most 1e15",
+            ));
+        }
+        terms.push((term, coefficient));
+    }
+    if !(0.0..=COST_PARAMETER_LIMIT).contains(&p.margin.absolute) {
+        return Err(at
+            .sub("margin")
+            .bad("absolute", p.margin.absolute, COST_RANGE));
+    }
+    if !(0.0..=RELATIVE_MARGIN_LIMIT).contains(&p.margin.relative) {
+        return Err(at.sub("margin").bad(
+            "relative",
+            p.margin.relative,
+            "a finite number from 0 to 1e6",
+        ));
+    }
+    if let Some(Unreported::OverLeast { request_cost }) = p.unreported {
+        if !(0.0..=COST_PARAMETER_LIMIT).contains(&request_cost) {
+            return Err(at.sub("unreported.over-least").bad(
+                "request_cost",
+                request_cost,
+                COST_RANGE,
+            ));
+        }
+    }
+    let scorer = LeastCost::new(terms.into_boxed_slice(), p.margin, p.unreported);
+    if scorer.needs().loads && p.unreported.is_none() {
+        return Err(at.bad(
+            "unreported", "null",
+            "what a row with no report costs, which a term that reads a report needs: over-least or missing-as-zero",
+        ));
+    }
+    Ok(scorer)
 }
 
 /// A stage of this build, or the name of what the build lacks.
@@ -2293,9 +2458,14 @@ fn gates_of(p: &ProfileSpec, view: &ViewSpec) -> Gates {
 }
 
 /// The stage's scorer, with its profile's gates and the view's settings.
-fn scorer_of(stage: &ScoreStage, gates: Gates, view: &ViewSpec) -> Resolved<Box<dyn Scorer>> {
+fn scorer_of(
+    stage: &ScoreStage,
+    gates: Gates,
+    view: &ViewSpec,
+    at: &At,
+) -> Result<Resolved<Box<dyn Scorer>>, SpecError> {
     let max_age = view.max_report_age_ms;
-    match stage {
+    Ok(match stage {
         ScoreStage::LeastLoad(p) => Resolved::Built(with_report_age(
             LeastLoad::new(
                 p.kv_pressure_weight.unwrap_or(DEFAULT_KV_PRESSURE_WEIGHT),
@@ -2339,7 +2509,10 @@ fn scorer_of(stage: &ScoreStage, gates: Gates, view: &ViewSpec) -> Resolved<Box<
             ResidentWork::new(p.request_tokens),
             max_age,
         )),
-    }
+        ScoreStage::LeastCost(p) => {
+            Resolved::Built(with_report_age(least_cost_of(p, at)?, max_age))
+        }
+    })
 }
 
 fn picker_of(
@@ -2418,11 +2591,16 @@ fn scored(
         (ScoreSpec::Params(stage), _) => Ok(Scored::Typed(stage.clone())),
         (ScoreSpec::Name(_), Found::Typed) => match ScoreStage::by_name(name) {
             Some(stage) => Ok(Scored::Typed(stage)),
-            // The one scorer whose parameters have no default.
             None => Err(SpecError::BadField {
                 path: at.0.clone(),
                 value: name.to_string(),
-                reason: "a scorer with its request_tokens: { resident-work: { request_tokens } }",
+                reason: match name {
+                    "resident-work" => {
+                        "a scorer with its request_tokens: { resident-work: { request_tokens } }"
+                    }
+                    LeastCost::NAME => "a scorer with its terms: { least-cost: { terms } }",
+                    _ => "a scorer with its required parameters",
+                },
             }),
         },
         (ScoreSpec::Name(_), Found::Built(scorer)) => Ok(Scored::Built(Weighted {
@@ -2606,7 +2784,7 @@ fn check_profile(
             );
             continue;
         }
-        match scorer_of(&stage, gates, view) {
+        match scorer_of(&stage, gates, view, &stage_at)? {
             Resolved::Built(scorer) => {
                 let read = HashDepth::of_scorer(&stage, &view.boundaries, scorer.needs());
                 depth.deepen(read);
@@ -5498,6 +5676,32 @@ mod tests {
     }
 
     #[test]
+    fn least_cost_reads_the_compared_rows_whole_behind_a_rank() {
+        let spec = spec_with_score(
+            r#"{"least-cost":{"terms":{"load.running":7},"unreported":"missing-as-zero"}}"#,
+        );
+        let catalog = Catalog::builtin();
+        let entry = &spec.profiles["p"].score[0];
+        let Scored::Typed(stage) = scored(entry, "p", &At::new("profiles.p.score[0]"), &catalog)
+            .expect("a built-in scorer")
+        else {
+            panic!("a typed scorer");
+        };
+        let Resolved::Built(scorer) = scorer_of(
+            &stage,
+            Gates::of(None, None, None),
+            &spec.view,
+            &At::new("profiles.p.score[0].least-cost"),
+        )
+        .expect("valid parameters") else {
+            panic!("least-cost is built");
+        };
+        assert_eq!(scorer.name(), "least-cost");
+        assert!(scorer.row_wise());
+        assert!(!scorer.front_wise());
+    }
+
+    #[test]
     fn every_catalog_scorer_parses_and_the_ones_this_build_lacks_are_refused_by_name() {
         let in_build = [
             "least-load",
@@ -5510,11 +5714,11 @@ mod tests {
             "warmup-slice",
             "bucket",
         ];
-        for name in SCORERS {
+        for &name in SCORERS {
             let bare = spec_with_score(&format!("{name:?}"));
             if in_build.contains(&name) {
                 assert!(bare.validate().is_ok(), "{name}");
-            } else if name == "resident-work" {
+            } else if matches!(name, "resident-work" | "least-cost") {
                 assert_eq!(bad_field(&bare), "profiles.p.score[0]");
             } else {
                 assert_eq!(
@@ -7041,10 +7245,14 @@ mod tests {
         let tempered = r#"{"best-with-temperature":{"temperature":1.0}}"#;
         let mut profiles: Vec<Vec<String>> = vec![
             vec![r#"{"score":[{"resident-work":{"request_tokens":512}}],"pick":"best"}"#.into()],
+            vec![
+                r#"{"score":[{"least-cost":{"terms":{"candidate.in_flight":3}}}],"pick":"best"}"#
+                    .into(),
+            ],
             vec![format!(r#"{{"score":[{bounded}],"pick":"best"}}"#)],
             vec![scored(tempered), alone(tempered)],
         ];
-        let apart = ["resident-work", "best-with-temperature"];
+        let apart = ["resident-work", "least-cost", "best-with-temperature"];
 
         for name in FILTERS {
             profiles.push(vec![format!(

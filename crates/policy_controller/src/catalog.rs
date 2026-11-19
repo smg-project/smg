@@ -883,7 +883,7 @@ profiles:
                 answers: "worst",
             })
         );
-        assert!(catalog.scorers().eq(SCORERS));
+        assert!(catalog.scorers().eq(SCORERS.iter().copied()));
     }
 
     #[test]
@@ -1110,7 +1110,7 @@ profiles:
             }
         }
         // Every scorer is the validator's to build.
-        for name in SCORERS {
+        for &name in SCORERS {
             assert!(
                 matches!(stock.find_scorer(name), Some(Found::Typed)),
                 "{name}"
@@ -1122,7 +1122,7 @@ profiles:
     fn the_stock_catalog_is_the_lists_the_spec_publishes() {
         let stock = Catalog::builtin();
         assert!(stock.filters().eq(FILTERS), "{stock:?}");
-        assert!(stock.scorers().eq(SCORERS), "{stock:?}");
+        assert!(stock.scorers().eq(SCORERS.iter().copied()), "{stock:?}");
         assert!(stock.pickers().eq(PICKERS), "{stock:?}");
         // Every bare name of the lists is held: whatever else a document
         // that names it is refused for, it is not an unknown name.

@@ -1,10 +1,11 @@
 //! What a decision allocates, pinned at zero: once a first decision has sized
 //! the per-thread scratch, a decision of every preset over a reporting fleet
-//! of 64 and of 512 rows, a decision over rows with a credit held in the
-//! least-load tally, a decision over a pool doubted on every row, and a
-//! pair decision allocate nothing (design 4.4: a
-//! scorer or picker allocates nothing per decision; the host keeps one scratch
-//! per thread so the framework allocates nothing after the first). The
+//! of 64 and of 512 rows, a least-cost decision over mixed reports, a
+//! decision over rows with a credit held in the least-load tally, a decision
+//! over a pool doubted on every row, and a pair decision allocate nothing
+//! (design 4.4: a scorer or picker allocates nothing per decision; the host
+//! keeps one scratch per thread so the framework allocates nothing after the
+//! first). The
 //! store's pins stand beside them: a build from the store allocates nothing
 //! after the first, and two membership writes are held to each other, a
 //! write that moves an offer to one that moves none and a registration into
@@ -115,6 +116,36 @@ fn a_decision_after_the_first_allocates_nothing_for_any_preset() {
             assert_eq!(allocations, 0, "{preset} at {n}: a decision allocated");
         }
     }
+}
+
+#[test]
+fn a_least_cost_decision_after_the_first_allocates_nothing() {
+    let profile = serde_yaml::from_str(
+        "filter: [healthy]\nscore: [{least-cost: {terms: {load.running: 7, load.queued: 13}, unreported: {over-least: {request_cost: 11}}}}]\npick: best",
+    )
+    .expect("a least-cost profile");
+    let engine = PolicySpec::new([("p".to_string(), profile)].into())
+        .validate()
+        .expect("the profile validates");
+    let n = 512;
+    let mut view = fleet(n);
+    for (i, row) in (0u32..).zip(&mut view) {
+        row.health.healthy = true;
+        if i.is_multiple_of(3) {
+            row.load = None;
+        }
+    }
+    let cx = Constraints::default();
+    let mut scratch = Scratch::new();
+    let pool = pool(n);
+    assert!(engine
+        .decide(&facts(1), &pool, &view, &cx, &mut scratch)
+        .pick()
+        .is_some());
+    let (decision, allocations) =
+        allocations_during(|| engine.decide(&facts(2), &pool, &view, &cx, &mut scratch));
+    assert!(decision.pick().is_some());
+    assert_eq!(allocations, 0);
 }
 
 /// A decision asked by rank allocates nothing after the thread's first of

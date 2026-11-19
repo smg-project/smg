@@ -354,6 +354,18 @@
             "resident-work"
           ],
           "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "least-cost": {
+              "$ref": "#/$defs/LeastCostParams"
+            }
+          },
+          "required": [
+            "least-cost"
+          ],
+          "additionalProperties": false
         }
       ]
     },
@@ -761,6 +773,110 @@
       "additionalProperties": false,
       "required": [
         "request_tokens"
+      ]
+    },
+    "LeastCostParams": {
+      "description": "The least-cost scorer: a sum of a row's fields times their coefficients,\nin the document's units. Lower cost scores higher.",
+      "type": "object",
+      "properties": {
+        "weight": {
+          "description": "The scorer's weight in the profile's combined score.",
+          "type": "number",
+          "format": "float",
+          "default": 1.0,
+          "exclusiveMinimum": 0,
+          "maximum": 1000000000000000.0
+        },
+        "terms": {
+          "description": "Field names and their coefficients. At least one field is required.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "number",
+            "format": "double"
+          },
+          "minProperties": 1
+        },
+        "margin": {
+          "description": "How far above the least cost a row still ties for the top score.",
+          "$ref": "#/$defs/CostMargin",
+          "default": {
+            "absolute": 0.0,
+            "relative": 0.0
+          }
+        },
+        "unreported": {
+          "description": "What a row costs when a named value is missing. Required for terms\nthat read a report.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Unreported"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "terms"
+      ]
+    },
+    "CostMargin": {
+      "description": "The sum of the absolute and relative margins. Both default to zero.",
+      "type": "object",
+      "properties": {
+        "absolute": {
+          "description": "In cost units.",
+          "type": "number",
+          "format": "double",
+          "default": 0.0,
+          "minimum": 0,
+          "maximum": 1000000000000000.0
+        },
+        "relative": {
+          "description": "A share of the magnitude of the least cost.",
+          "type": "number",
+          "format": "double",
+          "default": 0.0,
+          "minimum": 0,
+          "maximum": 1000000.0
+        }
+      },
+      "additionalProperties": false
+    },
+    "Unreported": {
+      "description": "How to cost a row that lacks a value a term reads.",
+      "oneOf": [
+        {
+          "description": "Start at the least cost among the reported rows handed to the scorer,\nor zero if none report, and add `request_cost` for each request in flight.",
+          "type": "object",
+          "properties": {
+            "over-least": {
+              "type": "object",
+              "properties": {
+                "request_cost": {
+                  "type": "number",
+                  "format": "double",
+                  "minimum": 0,
+                  "maximum": 1000000000000000.0
+                }
+              },
+              "additionalProperties": false,
+              "required": [
+                "request_cost"
+              ]
+            }
+          },
+          "required": [
+            "over-least"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "description": "Sum the row's available values. A missing value adds nothing.",
+          "type": "string",
+          "const": "missing-as-zero"
+        }
       ]
     },
     "PickSpec": {

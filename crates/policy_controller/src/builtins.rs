@@ -26,7 +26,8 @@ use crate::{
         DRAW_BOUND,
     },
     lease::{Lease, Lifecycle, Membership, Side, Signal},
-    spec::Needs,
+    spec::{CostMargin, Needs, Unreported},
+    terms::{Term, TermValues},
     view::{
         Candidate, Constraints, LoadRow, ModelFingerprint, PoolFacts, ReportCutoff, RequestFacts,
         WorkerId,
@@ -2165,6 +2166,192 @@ impl ReadsLoad for ResidentWork {
             TieBand::NORMALIZED
         }
     }
+}
+
+/// The sum of a row's named fields times their coefficients. Rows within
+/// the cost margin of the least cost share the top score.
+#[derive(Debug)]
+pub struct LeastCost {
+    terms: Box<[(Term, f64)]>,
+    margin: CostMargin,
+    request_cost: Option<f64>,
+    loads: bool,
+}
+
+impl LeastCost {
+    pub(crate) const NAME: &str = "least-cost";
+
+    pub(crate) fn new(
+        terms: Box<[(Term, f64)]>,
+        margin: CostMargin,
+        unreported: Option<Unreported>,
+    ) -> Self {
+        let loads = terms.iter().any(|&(term, _)| term.reads_load());
+        let request_cost = match unreported {
+            Some(Unreported::OverLeast { request_cost }) => Some(request_cost),
+            Some(Unreported::MissingAsZero) | None => None,
+        };
+        Self {
+            terms,
+            margin,
+            request_cost,
+            loads,
+        }
+    }
+
+    /// The cost of `row` with `load`, its report as the decision reads it.
+    fn cost_of(&self, facts: &RequestFacts<'_>, row: &Candidate, load: Option<LoadRow>) -> RowCost {
+        let mut values = TermValues::new(facts, row, load);
+        let mut sum = 0.0;
+        for &(term, coefficient) in &self.terms {
+            if let Some(value) = term.read(&mut values) {
+                sum += value * coefficient;
+            } else if let Some(price) = self.request_cost {
+                return RowCost::OverLeast(f64::from(values.in_flight()) * price);
+            }
+        }
+        RowCost::Sum(sum)
+    }
+}
+
+impl Lifecycle for LeastCost {}
+
+impl Scorer for LeastCost {
+    fn name(&self) -> &'static str {
+        Self::NAME
+    }
+
+    // Costs by reports and the count in flight: late ones move the pick.
+    fn refuses_by_reports(&self) -> bool {
+        false
+    }
+
+    fn row_wise(&self) -> bool {
+        true
+    }
+
+    fn needs(&self) -> Needs {
+        Needs {
+            loads: self.loads,
+            ..Needs::default()
+        }
+    }
+
+    fn score(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &[u32],
+        out: &mut [f32],
+    ) -> TieBand {
+        self.score_with(facts, candidates, kept, out, |c| c.load)
+    }
+}
+
+impl ReadsLoad for LeastCost {
+    fn score_with(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &[u32],
+        out: &mut [f32],
+        load: impl Fn(&Candidate) -> Option<LoadRow> + Copy,
+    ) -> TieBand {
+        with_costs(|costs| {
+            let mut least_reported = f64::INFINITY;
+            let mut pending = false;
+            costs.extend(kept.iter().map(|&i| {
+                let row = &candidates[i as usize];
+                let cost = self.cost_of(facts, row, load(row));
+                match cost {
+                    RowCost::Sum(sum) => least_reported = least_reported.min(sum),
+                    RowCost::OverLeast(_) => pending = true,
+                }
+                cost
+            }));
+            if pending {
+                let baseline = if least_reported.is_finite() {
+                    least_reported
+                } else {
+                    0.0
+                };
+                for cost in costs.iter_mut() {
+                    if let RowCost::OverLeast(price) = *cost {
+                        *cost = RowCost::Sum(baseline + price);
+                    }
+                }
+            }
+            write_cost_scores(out, self.margin, costs)
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+enum RowCost {
+    Sum(f64),
+    /// The price for the row's requests in flight, before adding the least reported cost.
+    OverLeast(f64),
+}
+
+impl RowCost {
+    fn value(self) -> f64 {
+        match self {
+            Self::Sum(value) | Self::OverLeast(value) => value,
+        }
+    }
+}
+
+thread_local! {
+    /// One slot per row scored. The deciding thread keeps the buffer for reuse.
+    static COSTS: Cell<Vec<RowCost>> = const { Cell::new(Vec::new()) };
+}
+
+fn with_costs(work: impl FnOnce(&mut Vec<RowCost>) -> TieBand) -> TieBand {
+    // Move the buffer out so a cost callback can score another set of rows.
+    let mut costs = COSTS.take();
+    let band = work(&mut costs);
+    costs.clear();
+    COSTS.set(costs);
+    band
+}
+
+/// Writes scores from finite costs with a finite span, lower cost better.
+/// Costs within `margin` of the least cost score `1.0`. The returned band
+/// is zero, since the tie is already in the scores. Calls `cost` once for
+/// each position of `out`, in order.
+pub fn score_costs(
+    out: &mut [f32],
+    margin: CostMargin,
+    mut cost: impl FnMut(usize) -> f64,
+) -> TieBand {
+    with_costs(|costs| {
+        costs.extend((0..out.len()).map(|i| RowCost::Sum(cost(i))));
+        write_cost_scores(out, margin, costs)
+    })
+}
+
+fn write_cost_scores(out: &mut [f32], margin: CostMargin, costs: &[RowCost]) -> TieBand {
+    let (mut least, mut greatest) = (f64::INFINITY, f64::NEG_INFINITY);
+    for &cost in costs {
+        least = least.min(cost.value());
+        greatest = greatest.max(cost.value());
+    }
+    let span = greatest - least;
+    if span == 0.0 {
+        out.fill(1.0);
+    } else {
+        let limit = least + margin.absolute + margin.relative * least.abs();
+        for (slot, &cost) in out.iter_mut().zip(costs) {
+            let cost = cost.value();
+            *slot = if cost <= limit {
+                1.0
+            } else {
+                // Keep rounding to f32 from adding a row to the tie.
+                ((1.0 - (cost - least) / span) as f32).min(1.0_f32.next_down())
+            };
+        }
+    }
+    TieBand(0.0)
 }
 
 // ---------------------------------------------------------------- pickers

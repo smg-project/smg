@@ -147,6 +147,7 @@ pub mod ring;
 pub mod sessions;
 pub mod spec;
 pub mod store;
+mod terms;
 pub mod view;
 #[cfg(feature = "wasm")]
 pub mod wasm;
