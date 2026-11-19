@@ -376,8 +376,8 @@ mod held {
         assert!(members.contains(&target), "a row the restore replaced");
         assert_eq!(ring.ring().len(), 2, "the ring kept a replaced row");
         // A followed registration is told as the leader's own is: at the
-        // door, under the world that stands, one window before a view
-        // lists its row.
+        // door, under the world that stands, ahead of the build that lists
+        // its row.
         let joined = member(&leader, "http://c:8000");
         let row = WorkersStore::get(&leader, joined).expect("the row");
         let unjournaled = Position::default();
@@ -410,7 +410,7 @@ mod held {
         assert_eq!(told.lock().last(), Some(&(5, replaced)));
     }
 
-    /// A join is told when the store takes it, one window before a view
+    /// A join is told when the store takes it, ahead of the build that
     /// lists its row. Inside the window a keyed decision reads the four
     /// rows that stand and goes to the worker it went to: the call put no
     /// member on the ring. At the window's end the view lists the fifth

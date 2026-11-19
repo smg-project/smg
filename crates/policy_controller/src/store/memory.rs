@@ -800,15 +800,14 @@ impl MemoryStore {
     /// paid its leave's, and with the load lock let go: the engine hears the
     /// writes in their order, a load write under the load lock alone waits
     /// for no stage, and an apply, which takes the workers lock, moves no
-    /// generation in between. A leave
-    /// is told after the build that takes its rows out of their pools: the
-    /// worker is in no pool when its write returns, whoever wrote. A join is
-    /// told when the store takes it, and the world that lists its row
-    /// follows within one publication window. A decision takes neither lock
-    /// and meets the call at a stage's own lock alone. One that built its
-    /// view before a leave's swap may still name the worker: a stage answers
-    /// that from its own state, as the ring fences a pruned id
-    /// ([`crate::ring::FENCE`]).
+    /// generation in between. A leave is told after the build that takes its
+    /// rows out of their pools: the worker is in no pool when its write
+    /// returns, whoever wrote. A join is told when the store takes it, and
+    /// the world that lists its row follows at its window's build. A
+    /// decision takes neither lock and meets the call at a stage's own lock
+    /// alone. One that built its view before a leave's swap may still name
+    /// the worker: a stage answers that from its own state, as the ring
+    /// fences a pruned id ([`crate::ring::FENCE`]).
     fn tell_membership(&self, change: MembershipChange) {
         if let Some(change) = change.as_lifecycle() {
             self.tell_engine(&change);
@@ -845,7 +844,10 @@ impl MemoryStore {
     /// the workers lock by every membership write, with what the write asks
     /// of the pair classes. The build is owed until the store's window ends
     /// and takes in every write since the last: a storm of registrations
-    /// builds once a window, never once a write.
+    /// builds once a window, never once a write. A lease or a poll's answer
+    /// that needs a worker's row asks for the build sooner
+    /// ([`Self::publish_now`]): registrations each followed by one inside
+    /// their window build once a registration.
     fn owe(&self, classes: Classes, at: Instant) {
         let first = self.loads.lock().writer.owe(classes, at);
         self.wake_host(first);
@@ -907,9 +909,12 @@ impl MemoryStore {
     /// due instant ([`LoadSink::publish_due`]), and they are in force for
     /// decisions when it ends. A caller that needs its own write in force
     /// at once asks here: a test, a bench's fill, a host with no loop. The
-    /// store asks for itself before it writes a poll's answer for a rank
-    /// that has no row yet. The ask builds the whole membership under the
-    /// workers lock and the load lock: a writer's wait, never a decision's.
+    /// store asks for itself where a write is of a worker's row: a lease on
+    /// the worker, a poll's answer for a rank of it. The ask builds the
+    /// whole membership under the workers lock and the load lock: a
+    /// writer's wait. No decision asks; a host that files its decision's
+    /// lease through the issue door takes the wait where the pick left the
+    /// standing world before the lease was filed.
     pub fn publish_now(&self) {
         let workers = self.workers.lock();
         self.pay(&workers, None);
@@ -1121,7 +1126,8 @@ impl MemoryStore {
 
     /// How many times the pools were built from the membership since the
     /// store was made. A storm of membership writes builds once a window,
-    /// never once a write: the count says so by run.
+    /// never once a write, and once more where a lease or a poll's answer
+    /// asks for the build: the count says so by run.
     pub fn membership_builds(&self) -> u64 {
         self.loads.lock().writer.builds()
     }
@@ -2504,7 +2510,11 @@ const DUE_STEPS: usize = 4;
 struct Held {
     record: LeaseRecord,
     /// `None` for a lease whose worker stood in no pool when it was
-    /// written: it books no row a decision reads.
+    /// written, the build its registration owed paid first
+    /// ([`MemoryStore::slot_ahead`]): it books no row a decision reads.
+    /// A first dispatch that moves the lease to another worker reads the
+    /// standing world and asks for no build: a worker inside its
+    /// registration window is not booked, then or later.
     booked: Option<Slot>,
 }
 
@@ -2853,6 +2863,23 @@ impl MemoryStore {
     }
 }
 
+impl MemoryStore {
+    /// The slot of `target`'s count, for a lease written outside a
+    /// decision. The standing world lists a member from its first build
+    /// on, so a target it does not list may be a member whose build is
+    /// owed to the window: the build is asked for, and the world it leaves
+    /// is read. A lease on a worker that is no member asks too, and the
+    /// ask does nothing where no build is owed. Called with no lock of the
+    /// store held: the ask takes the workers lock and the load lock.
+    fn slot_ahead(&self, target: WorkerId) -> Option<Slot> {
+        if let Some(slot) = self.world.load().booked_of(target) {
+            return Some(slot);
+        }
+        self.publish_now();
+        self.world.load().booked_of(target)
+    }
+}
+
 impl LeasesStore for MemoryStore {
     fn term(&self) -> u64 {
         self.files[0].take().term
@@ -2870,10 +2897,9 @@ impl LeasesStore for MemoryStore {
     }
 
     fn issue(&self, record: LeaseRecord) -> Result<(), LeaseRefused> {
-        // The slot of the record's target's count, where the standing world
-        // lists it: read before the turn is taken.
-        let world = self.world.load();
-        let booked = world.booked_of(record.target);
+        // The slot of the record's target's count: read before the turn is
+        // taken.
+        let booked = self.slot_ahead(record.target);
         // The file the id names, read again under that file's turn: a rise
         // of the term holds every turn, so the name stands while this one
         // is held.
@@ -2966,6 +2992,10 @@ impl LeasesStore for MemoryStore {
     }
 
     fn restore(&self, gateway: GatewayId, records: &[LeaseRecord]) -> usize {
+        // A page may list a lease on a member whose first build is owed.
+        // The build is asked for before the standing world is read, so
+        // each lease the pages list books its worker's count.
+        self.publish_now();
         let world = self.world.load();
         // Each file's turn in the files' order, one at a time: the
         // gateway's leases there go, and the records its ids name are

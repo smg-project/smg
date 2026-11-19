@@ -1074,8 +1074,11 @@ async fn run_pays_the_build_another_tasks_registration_owes_before_any_tick() {
     register("http://c:1");
     after(store.publish_due().expect("a build is owed")).await;
     assert_eq!((store.membership_builds(), store.publish_due()), (2, None));
-    // Both were paid before the loop's next tick.
-    assert!(now() < started + Duration::from_millis(50));
+    // Both were paid well before the loop's next tick, a period after its
+    // first. The store stamps a write by the system clock, so the time this
+    // thread loses ahead of a registration moves the instants the case
+    // sleeps to: a bound of milliseconds would count that time.
+    assert!(now() < started + TEN / 2);
 
     stop.send_replace(true);
     tasks

@@ -1981,6 +1981,92 @@ fn a_member_keeps_its_slot_and_a_leavers_slot_is_given_to_no_one() {
     }
 }
 
+/// Two leases filed through `file`, one on a member that is built and one
+/// on a member whose first build is owed to the window. Each books its
+/// worker's count: the row the build lists reads its lease, and each lease
+/// ends on the count it booked.
+fn filed_ahead_of_a_first_build(file: fn(&dyn LeasesStore, GatewayId, &[LeaseRecord; 2])) {
+    let store = MemoryStore::new();
+    let built = ready(&store, "http://a:1");
+    // No build is asked for the second worker: its registration's is owed
+    // to the window when its lease is filed.
+    let owed = store.upsert(facts("http://b:1", 1)).id();
+    let revision = WorkersStore::get(&store, owed).expect("the row").revision;
+    store
+        .set_status(owed, WorkerStatus::Ready, revision)
+        .expect("ready");
+    assert!(store.publish_due().is_some(), "a build is owed");
+    let leases: &dyn LeasesStore = &store;
+    let (gateway, now) = (GatewayId(1), Instant::now());
+    leases.set_term(1);
+    let records = [
+        booking(gateway, 1, built, now),
+        booking(gateway, 2, owed, now),
+    ];
+    file(leases, gateway, &records);
+    store.publish_now();
+    let of = |count| {
+        let mut rows = [(built, count), (owed, count)];
+        rows.sort_unstable();
+        rows
+    };
+    assert_eq!(in_flight(&store), of(1));
+    for id in [1, 2] {
+        assert!(leases.released(gateway, LeaseId(id), None, ReleaseReason::ClientGone));
+    }
+    assert_eq!(in_flight(&store), of(0));
+}
+
+/// The issue door asks for the build a lease's worker is owed before it
+/// reads the standing world.
+#[test]
+fn a_lease_issued_ahead_of_its_workers_first_build_books_its_count() {
+    filed_ahead_of_a_first_build(|leases, _, records| {
+        for record in records {
+            assert_eq!(leases.issue(*record), Ok(()));
+        }
+    });
+}
+
+/// The restore door asks for it too: a gateway's pages may list a lease on
+/// a member inside its registration window.
+#[test]
+fn a_lease_restored_ahead_of_its_workers_first_build_books_its_count() {
+    filed_ahead_of_a_first_build(|leases, gateway, records| {
+        assert_eq!(leases.restore(gateway, records), 2);
+    });
+}
+
+/// The issue door asks for no build where the standing world lists the
+/// lease's worker: a build owed to a registration beside it stays with its
+/// window. A lease on the worker inside that window asks for it, once.
+#[test]
+fn a_lease_issued_on_a_listed_worker_leaves_an_owed_build_to_its_window() {
+    let store = MemoryStore::new();
+    let built = ready(&store, "http://a:1");
+    let owed = store.upsert(facts("http://b:1", 1)).id();
+    assert!(store.publish_due().is_some(), "a build is owed");
+    let builds = store.membership_builds();
+    let leases: &dyn LeasesStore = &store;
+    let (gateway, now) = (GatewayId(1), Instant::now());
+    leases.set_term(1);
+    assert_eq!(leases.issue(booking(gateway, 1, built, now)), Ok(()));
+    assert_eq!(
+        (store.membership_builds(), store.publish_due().is_some()),
+        (builds, true),
+        "a lease on a listed worker asked for the build"
+    );
+    assert_eq!(leases.issue(booking(gateway, 2, owed, now)), Ok(()));
+    assert_eq!(
+        (store.membership_builds(), store.publish_due().is_some()),
+        (builds + 1, false),
+        "a lease on a worker inside its window asks once"
+    );
+    for id in [1, 2] {
+        assert!(leases.released(gateway, LeaseId(id), None, ReleaseReason::ClientGone));
+    }
+}
+
 /// A member back under its key and incarnation is one that joined: it is
 /// given the table's next slot, and the leases on file for the one that
 /// left end on the count they booked.

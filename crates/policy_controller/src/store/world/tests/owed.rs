@@ -877,6 +877,15 @@ fn a_record_at_a_rank_its_member_does_not_stand_at_takes_no_row() {
     assert_eq!(overloaded(&store, t0), []);
 }
 
+/// Raises its flag when dropped: at a thread's return and at its unwind.
+struct Raise<'a>(&'a AtomicBool);
+
+impl Drop for Raise<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
 #[test]
 fn no_decision_is_handed_a_worker_after_its_leaves_answer_under_a_storm() {
     const WORKERS: usize = 256;
@@ -897,6 +906,10 @@ fn no_decision_is_handed_a_worker_after_its_leaves_answer_under_a_storm() {
         // The storm: every other worker leaves, by its removal or by a new
         // life under its key, and a new worker registers after each removal.
         scope.spawn(|| {
+            // The flag is raised when this thread ends, by its return or by
+            // a panic: the threads that poll it stop, and the scope reports
+            // the panic where it would wait on them.
+            let _ended = Raise(&done);
             for index in (0..WORKERS).step_by(2) {
                 if index % 4 == 0 {
                     store
@@ -912,7 +925,6 @@ fn no_decision_is_handed_a_worker_after_its_leaves_answer_under_a_storm() {
                     gone[index].store(true, Ordering::SeqCst);
                 }
             }
-            done.store(true, Ordering::SeqCst);
         });
         // The host, as the driver's loop: it pays what is due.
         scope.spawn(|| {
@@ -992,7 +1004,7 @@ fn the_writes_one_build_pays_ask_the_pair_classes_once() {
 /// The contract names the window by its figure, for a caller that reads no
 /// source: the sentence and the store's constant move together.
 #[test]
-fn the_contract_names_the_window_a_registration_is_in_force_within() {
+fn the_contract_names_the_window_a_registrations_build_starts_within() {
     const CONTRACT: &str = include_str!("../../../../contracts/policy_controller.proto");
     let figure = format!(
         "publication window ({} ms) of their answer",
