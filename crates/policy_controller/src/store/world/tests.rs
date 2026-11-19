@@ -16,9 +16,9 @@ use super::{
 use crate::{
     spec::{BindingSpec, Match, OverloadSpec, Pairing},
     store::{
-        pairing::Refusal, GatewayId, HealthSink, LeasesStore, LoadSink, LoadSource, MembershipTail,
-        MemoryStore, Overload, PairingDescriptor, Reachability, VetoWrite, WorkerFacts,
-        WorkerPatch, WorkerRow, WorkerStatus, WorkersStore,
+        loads::LoadSample, pairing::Refusal, GatewayId, HealthSink, LeasesStore, LoadSink,
+        LoadSource, MembershipTail, MemoryStore, Overload, PairingDescriptor, Reachability,
+        VetoWrite, WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus, WorkersStore,
     },
     view::{
         fingerprint, AffinityFacts, Candidate, Constraints, LoadRow, Phase, RequestFacts, Role,
@@ -3475,6 +3475,44 @@ fn a_store_with_no_threshold_writes_no_verdict() {
     store.record(a, 0, pressure(1_000, 1_000), t0, LoadSource::Stream);
     assert_eq!(overloaded(&store, t0), []);
     assert_eq!(store.overload_flips(), 0, "no write moved a verdict");
+}
+
+#[test]
+fn the_pass_over_every_engine_says_whether_it_moved_a_verdict() {
+    let origin = Instant::now();
+    // One member that names a count of its own, with three requests queued.
+    let member = WorkerRow {
+        facts: WorkerFacts {
+            overload: Overload {
+                waiting_requests: Some(2),
+                kv_usage_permille: None,
+            },
+            ..facts("http://w1:8000", Role::Single, &[MODEL])
+        },
+        ..row_serving(1, &[MODEL], origin)
+    };
+    let sample = |_, _| {
+        Some(LoadSample {
+            row: pressure(3, 0),
+            received_at: origin,
+            sampled_at: origin,
+            source: LoadSource::Stream,
+        })
+    };
+    let mut writer = Writer::new(PUBLISH_WINDOW, origin);
+    writer.rebuild(1, [member].iter(), sample, Classes::Derive);
+    let verdict = |writer: &Writer| writer.working[0].rows[0].health.overloaded;
+    // The build judged every engine: the row carries its verdict, and a
+    // pass finds it as that write left it.
+    assert!(verdict(&writer));
+    assert!(!writer.judge_every());
+    // A verdict that stands against what is on file is one the pass moves,
+    // and the pass says so: what a door behind its own judgment holds to
+    // none.
+    writer.working[0].rows[0].health.overloaded = false;
+    assert!(writer.judge_every());
+    assert!(verdict(&writer));
+    assert!(!writer.judge_every());
 }
 
 #[test]
