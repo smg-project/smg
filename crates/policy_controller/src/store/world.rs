@@ -1580,6 +1580,21 @@ pub(super) fn same_offer(old: &WorkerFacts, new: &WorkerFacts) -> bool {
         && old.encode == new.encode
 }
 
+/// The models `old` stands in a pool of and `new` does not, where both are
+/// one worker's facts under one registration: every model of the old list
+/// where the role moved, and the old list less the new where it did not.
+/// None where the worker left no pool: a refresh, an offer that moved
+/// inside its pools, a model added. The names move out of the facts the
+/// write replaced, which end here: a write that takes no model off frees
+/// them whole ahead of its world and allocates nothing for the list.
+pub(super) fn left_models(old: WorkerFacts, new: &WorkerFacts) -> Vec<String> {
+    let moved = old.role != new.role;
+    let mut models = old.models;
+    models
+        .extract_if(.., |model| moved || !new.models.contains(model))
+        .collect()
+}
+
 /// One model's pair classes under `mode`, each prefill's and each decode's
 /// class written on its row. `carried` is the last write's and `kept` holds
 /// the model's derivation as that write left it: the classes are carried

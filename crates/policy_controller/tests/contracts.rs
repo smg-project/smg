@@ -491,19 +491,28 @@ fn enum_mirrors() -> Vec<(
             "MembershipChange.Kind",
             "KIND",
             "membership",
-            cases!(
-                Membership<'_>,
-                Membership {
-                    Added,
-                    Removed,
-                    Replaced,
-                    Relabelled,
-                    Resized,
-                    Snapshot,
-                }
-            ),
+            membership_cases().0,
         ),
     ]
+}
+
+/// The membership words in declaration order: the kinds the two contracts
+/// spell out, then the words they do not carry. A plugin is told nothing of
+/// a word of the second part.
+fn membership_cases() -> (&'static [&'static str], &'static [&'static str]) {
+    cases!(
+        Membership<'_>,
+        Membership {
+            Added,
+            Removed,
+            Replaced,
+            Relabelled,
+            Resized,
+            Snapshot,
+            Left,
+        }
+    )
+    .split_at(6)
 }
 
 /// The shed reasons have a proto enum and no WIT counterpart (a guest never
@@ -1465,6 +1474,9 @@ fn the_protocol_compiles_and_mirrors_the_engine_record() {
             .unwrap_or_else(|| panic!("enum {proto_name} is missing from {PLUGIN_PROTO}"));
         assert_eq!(found, proto_enum(prefix, cases), "enum {proto_name}");
     }
+    // The membership word no contract carries: a plugin is told nothing of
+    // it.
+    assert_eq!(membership_cases().1, ["Left"]);
     let found = enum_values(plugin, "ShedReason").expect("ShedReason is an enum");
     assert_eq!(found, proto_enum("SHED_REASON", shed_reasons()));
     // The lifted veto: the mark's variants in order, numbered from zero.

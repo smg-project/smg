@@ -1882,6 +1882,8 @@ impl Plugin {
             }
             Membership::Relabelled(worker) => Some(Membership::Relabelled(worker)),
             Membership::Resized(worker) => Some(Membership::Resized(worker)),
+            // No contract carries the word yet: a plugin is told nothing.
+            Membership::Left { .. } => return,
         };
         if told.changes.len() == FEED_CHANGES {
             told.changes.pop_front();
@@ -1934,15 +1936,17 @@ impl Plugin {
             whole
         };
         if whole {
-            let event = marshal::membership(&Membership::Snapshot(&members), &mut ids);
-            self.tell(slot, wit::LifecycleEvent::Membership(event));
+            if let Some(event) = marshal::membership(&Membership::Snapshot(&members), &mut ids) {
+                self.tell(slot, wit::LifecycleEvent::Membership(event));
+            }
         } else {
             for change in &changes {
                 if slot.is_none() {
                     break;
                 }
-                let event = marshal::membership(change, &mut ids);
-                self.tell(slot, wit::LifecycleEvent::Membership(event));
+                if let Some(event) = marshal::membership(change, &mut ids) {
+                    self.tell(slot, wit::LifecycleEvent::Membership(event));
+                }
             }
         }
         if let Some(instance) = slot.as_mut() {

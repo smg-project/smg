@@ -139,6 +139,16 @@ pub enum Membership<'a> {
     /// Every worker of every pool the engine decides over, after a resync;
     /// a host with a prefill and a decode pool sends one snapshot of both.
     Snapshot(&'a [WorkerId]),
+    /// The worker stands in no pool of `models` any more and keeps its
+    /// registration: its role moved, or it serves them no longer. Said
+    /// ahead of the [`Membership::Relabelled`] or [`Membership::Resized`]
+    /// of the same write. A stage that lists workers by model unlists the
+    /// worker under these alone. The plugin contracts carry no such kind: a
+    /// plugin is told nothing of it.
+    Left {
+        id: WorkerId,
+        models: &'a [String],
+    },
 }
 
 /// A signal about one worker.

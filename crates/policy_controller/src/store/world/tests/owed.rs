@@ -220,6 +220,44 @@ fn a_replaced_incarnation_pays_its_build_before_it_answers() {
     );
 }
 
+/// A registration that takes its worker off a model is a leave from that
+/// model's pool and pays its build as one: no decision made after its
+/// answer lists the worker under the model it left, and the model it keeps
+/// lists it on. One that takes it off none leaves its build owed.
+#[test]
+fn a_registration_that_takes_its_worker_off_a_model_pays_its_build_before_it_answers() {
+    let store = MemoryStore::new();
+    let t0 = Instant::now();
+    let serves = |models: &[&str]| {
+        let facts = facts("http://a:8000", Role::Single, models);
+        store.upsert(facts).id()
+    };
+    let id = serves(&[MODEL, "other"]);
+    store.publish_now();
+    // The rows a decision for a model is handed, of any health.
+    let listed = |model: &str| {
+        let mut out = ViewBuffers::default();
+        let built = store.build_view(model, Role::Single, &ask(t0), &mut out);
+        built.map_or_else(Vec::new, |_| {
+            out.candidates.iter().map(|row| row.id).collect()
+        })
+    };
+    assert_eq!((listed(MODEL), listed("other")), (vec![id], vec![id]));
+    let builds = store.membership_builds();
+    // A refresh takes the worker off no model: its build is owed.
+    serves(&[MODEL, "other"]);
+    assert_eq!(store.membership_builds(), builds);
+    assert!(store.publish_due().is_some());
+    serves(&[MODEL]);
+    // The write built before it answered: the pool it left lists the row
+    // no more, the pool it keeps lists it on, and nothing is left owed.
+    assert_eq!((listed(MODEL), listed("other")), (vec![id], Vec::new()));
+    assert_eq!(
+        (store.membership_builds(), store.publish_due()),
+        (builds + 1, None)
+    );
+}
+
 /// A standby's follow door owes and pays as its leader's writes do: a
 /// followed registration and a followed refresh leave their build owed,
 /// the registration's row in no view before it, and a followed removal and

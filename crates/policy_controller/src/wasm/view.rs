@@ -969,11 +969,15 @@ pub(crate) fn release_reason(r: ReleaseReason) -> wit::ReleaseReason {
     }
 }
 
+/// A membership word as the guest's world carries it. `None` for
+/// [`Membership::Left`]: the world has no case for it, and a guest hears
+/// the `relabelled` or `resized` that follows it.
 pub(crate) fn membership<'a>(
     m: &Membership<'_>,
     snapshot: &'a mut Vec<u64>,
-) -> wit::Membership<'a> {
-    match m {
+) -> Option<wit::Membership<'a>> {
+    Some(match m {
+        Membership::Left { .. } => return None,
         Membership::Added(w) => wit::Membership::Added(w.0),
         Membership::Removed(w) => wit::Membership::Removed(w.0),
         Membership::Replaced { old, new } => wit::Membership::Replaced((old.0, new.0)),
@@ -984,7 +988,7 @@ pub(crate) fn membership<'a>(
             snapshot.extend(workers.iter().map(|w| w.0));
             wit::Membership::Snapshot(snapshot)
         }
-    }
+    })
 }
 
 /// A signal; a veto's instant on the host's clock becomes the microseconds
