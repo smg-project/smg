@@ -1003,7 +1003,8 @@ pub struct Door {
 struct Kept {
     /// The words kept, the words a caller hands on, and each report that
     /// looks at the ring under the list's lock. At zero a report goes
-    /// straight to the ring.
+    /// straight to the ring, and the door's pass ends the file's due
+    /// leases ([`Door::sweep`]).
     waits: AtomicUsize,
     /// The words kept, in the order said.
     words: Mutex<Vec<Word>>,
@@ -1156,15 +1157,20 @@ impl Door {
     /// engine is told, at each file where no caller decides: a caller
     /// that decides ends its own file's due leases at its issue, and one
     /// that takes up its work meanwhile waits for the pass at its file.
+    /// A file is passed too while words the door keeps for it wait
+    /// ([`Door::report`]): what was said of a lease is applied before the
+    /// end of its span is read, and the next pass ends what is still due.
     /// The pins of record past their end leave their table once a pass
     /// of the standing rules is due. A host that never calls keeps such a
     /// lease on file, counted on its worker, until the next issue at its
     /// file, and such a pin for the life of the store.
     pub fn sweep(&self, now: Instant) -> Swept {
         let store = &*self.store;
+        // A kept word counts until its caller has handed it on.
+        let settled = |at: usize| self.kept[at].waits.load(Ordering::SeqCst) == 0;
         Swept {
             pins: store.sweep_pins(now),
-            leases: LeasesStore::expire(store, now).len(),
+            leases: store.expire_where(now, settled).len(),
         }
     }
 
@@ -1192,6 +1198,7 @@ impl Door {
             let decided = catch_unwind(AssertUnwindSafe(order));
             // It leaves the work: what was handed meanwhile is applied,
             // and what the door kept beside a full ring goes on behind it.
+            // Until it has, the door's pass ends no lease at the file.
             seat.rest();
             if self.kept[at].waits.load(Ordering::SeqCst) != 0 {
                 self.hand_kept(at);
@@ -2180,5 +2187,32 @@ mod tests {
         let calls = ["issued", "dispatched", "completed", "issued", "released"];
         assert_eq!(*heard.lock(), calls.map(|call| (call, by)));
         assert_eq!(store.lifecycle_faults(), 0);
+    }
+
+    /// A word the door keeps beside a full ring is said: until its caller
+    /// has handed it on, the pass of the door's clock ends no lease at
+    /// that file. Here a lease's dispatch stands kept at the end of the
+    /// lease's span, as it does between a caller's rest and its hand: the
+    /// pass leaves the lease on file, and the word handed on finds it.
+    #[test]
+    fn a_sweep_ends_no_lease_at_a_file_whose_kept_words_wait() {
+        let store = fleet(1);
+        let door = Door::new(Arc::clone(&store));
+        let decided = door.decide(GATEWAY, &request(b"r-1", 7), Instant::now());
+        let leased = decided.expect("a decision").lease;
+        let leased = leased.expect("a pick's lease");
+        let id = leased.lease.id;
+        // What a caller leaves between its rest and its hand: the word
+        // kept and counted, and no thread at work at the file.
+        let kept = &door.kept[0];
+        kept.words.lock().push((GATEWAY, id, dispatched()));
+        kept.waits.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(door.sweep(leased.due), Swept::default(), "its word waits");
+        door.hand_kept(0);
+        assert_eq!(kept.waits.load(Ordering::SeqCst), 0);
+        let on_file = LeasesStore::get(&*store, GATEWAY, id).expect("the lease is on file");
+        assert!(matches!(on_file.state, LeaseState::Dispatched { .. }));
+        assert_eq!(door.sweep(leased.due), Swept::default(), "dispatched");
+        assert_eq!(counted(&store).len(), 1);
     }
 }

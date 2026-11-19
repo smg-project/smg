@@ -2953,6 +2953,42 @@ impl MemoryStore {
         self.publish_now();
         self.world.load().booked_of(target)
     }
+
+    /// Ends the leases past their dispatch deadline at `now`
+    /// ([`LeasesStore::expire`]): each file's turn in the files' order,
+    /// one at a time, where the caller may act at the file: a decider at
+    /// work ends its own file's due leases at its issues. Each end is
+    /// told under the turn, as a frame's end is told. A file is passed
+    /// too where `settled` says no, asked under the file's turn behind
+    /// everything handed to it: a host that keeps what was said of a
+    /// file's leases beside its ring says no until it has handed that
+    /// on, so no lease is ended ahead of a dispatch said of it.
+    pub(crate) fn expire_where(
+        &self,
+        now: Instant,
+        settled: impl Fn(usize) -> bool,
+    ) -> Vec<LeaseRecord> {
+        let mut ended = Vec::new();
+        for at in 0..self.files.len() {
+            // A file whose decider works is passed with no wait for its
+            // turn; the same is read again under the turn.
+            if !self.may_act(at) {
+                continue;
+            }
+            let mut leases = self.files[at].take();
+            let mut told = turn::Told::default();
+            if !self.applied(at, &mut leases, &mut told) || !settled(at) {
+                continue;
+            }
+            let mut steps = usize::MAX;
+            while let Some(record) = leases.end_due(now, &mut steps) {
+                let said = Said::Released(None, ReleaseReason::Abandoned);
+                self.tell(at, told.world(self), &record, said);
+                ended.push(record);
+            }
+        }
+        ended
+    }
 }
 
 impl LeasesStore for MemoryStore {
@@ -3047,31 +3083,9 @@ impl LeasesStore for MemoryStore {
             .map(|held| held.record)
     }
 
-    /// Each file's turn in the files' order, one at a time, where the
-    /// caller may act at the file: a decider at work ends its own file's
-    /// due leases at its issues. Each end is told under the turn, as a
-    /// frame's end is told.
+    /// The store's pass over its files, none held back by a host.
     fn expire(&self, now: Instant) -> Vec<LeaseRecord> {
-        let mut ended = Vec::new();
-        for at in 0..self.files.len() {
-            // A file whose decider works is passed with no wait for its
-            // turn; the same is read again under the turn.
-            if !self.may_act(at) {
-                continue;
-            }
-            let mut leases = self.files[at].take();
-            let mut told = turn::Told::default();
-            if !self.applied(at, &mut leases, &mut told) {
-                continue;
-            }
-            let mut steps = usize::MAX;
-            while let Some(record) = leases.end_due(now, &mut steps) {
-                let said = Said::Released(None, ReleaseReason::Abandoned);
-                self.tell(at, told.world(self), &record, said);
-                ended.push(record);
-            }
-        }
-        ended
+        self.expire_where(now, |_| true)
     }
 
     fn restore(&self, gateway: GatewayId, records: &[LeaseRecord]) -> usize {
