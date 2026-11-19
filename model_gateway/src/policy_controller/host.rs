@@ -91,6 +91,14 @@ fn outcome(decision: &Decision) -> &'static str {
 /// that does not fit the rows, rows not written for a profile's scope, a
 /// gateway that shares a wire with no row of the pool, and a subset hint of
 /// none.
+///
+/// A copy of the policy crate's own words, kept until a decision says which
+/// profile made it. It mirrors the sheds `Engine::decide` and
+/// `Engine::decide_pair` make on the bare trace, and the two the door makes
+/// in their place. A shed the crate adds ahead of a profile is counted under
+/// the first profile until it joins this table. So is a shed of the encode
+/// entry, which this host does not ask. A plugin stage registered under one
+/// of these words is read as no profile.
 const AHEAD_OF_A_PROFILE: [(ShedReason, &str); 5] = [
     (ShedReason::PolicyDeclined, "binding"),
     (ShedReason::PolicyDeclined, "affinity-column"),

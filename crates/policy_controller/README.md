@@ -626,25 +626,28 @@ name after that generation has been replaced. When a commit finds no sendable ta
 subsequent ask counts on its own.
 
 The embedded column gives the gateway family to query. `Same` carries the classic names over.
-The contract column also records families whose embedded writers are pending. The shipped
-dashboard uses the classic names. Decision series appear after their first observation.
-The standalone controller keeps the `smg_policy_controller_` prefix for its process metrics,
-including role, replication, election, and load polling.
+The last column also records families whose embedded writers are pending. Four names in it
+are planned, and no code writes them yet: `smg_policy_lease_expired_total{kind}`,
+`smg_policy_leases{kind,state}`, `smg_policy_fallback_total{reason}` and
+`smg_policy_deadline_misses_total`. The shipped dashboard uses the classic names. Decision
+series appear after their first observation. The standalone controller keeps the
+`smg_policy_controller_` prefix for its process metrics, including role, replication,
+election, and load polling.
 
-| Classic gateway | Embedded gateway | Class and contract |
+| Classic gateway | Embedded gateway | Class and plan |
 | --- | --- | --- |
 | `smg_worker_selection_total{policy}` | `smg_worker_selection_total{profile}` | Kept. The embedded profile label comes with the router's send path. |
 | `smg_worker_overload_shed_total`, `smg_worker_overload_fallback_total`, `smg_worker_liveness_fallback_total` | Same | Kept. The embedded writers will use the decision's outcome and lifted veto. |
 | `smg_pd_admission_waits_total`, `smg_pd_admission_sheds_total`, `smg_pd_admission_window`, `smg_pd_prefill_admission_inflight`, `smg_pd_prefill_admission_queued`, `smg_pd_prefill_admission_rejections_total`, `smg_pd_prefill_admission_wait_seconds` | Same | Kept. The gateway owns admission. |
 | `smg_routing_key_source_total{source}` | Same | Kept. The gateway reads `header` or `rid` as the source. |
-| `smg_cache_aware_policy_branch_total`, `smg_manual_policy_branch_total{branch}`, `smg_consistent_hashing_policy_branch_total`, `smg_prefix_hash_policy_branch_total` | `smg_policy_decisions_total{model,profile,outcome,mode}` | Renamed. The contract groups by outcome. The standalone controller's `smg_policy_controller_decide_no_decision_total` corresponds to `outcome="refused"`. |
-| `smg_policy_inflight_reconciled_total{policy}` | — | Renamed to `smg_policy_lease_expired_total{kind}` in the controller contract. |
+| `smg_cache_aware_policy_branch_total`, `smg_manual_policy_branch_total{branch}`, `smg_consistent_hashing_policy_branch_total`, `smg_prefix_hash_policy_branch_total` | `smg_policy_decisions_total{model,profile,outcome,mode}` | Renamed. The new family groups by outcome. The standalone controller's `smg_policy_controller_decide_no_decision_total` corresponds to `outcome="refused"`. |
+| `smg_policy_inflight_reconciled_total{policy}` | — | Planned rename to `smg_policy_lease_expired_total{kind}`. No code writes the new name yet. |
 | `smg_cache_aware_match_ratio`, `smg_kv_index_lookup_seconds`, `smg_cache_placement_entries` | Same | Moved to the process that holds the index. Match ratio is observed only when the scorer reports the chosen worker's overlap. Embedded observations from the index are pending. |
 | `smg_cache_tree_chars`, `smg_cache_tree_tokens`, `smg_cache_tree_tenants`, `smg_manual_policy_cache_entries` | — | Ends with the classic trees and manual cache. |
 | `smg_cache_aware_prefix_margin_held_total` | — | Open. An embedded successor requires the scorer to report whether the margin held without an extra read. Otherwise the counter ends with classic routing. |
 | — | `smg_policy_decision_seconds{mode,outcome}` | Added. One observation per ask. |
-| — | — | Added by the contract. Embedded writers are pending for `smg_policy_leases{kind,state}`, `smg_policy_spec_generation`, and `smg_policy_spec_apply_total{result}`. The standalone controller already publishes the two spec families when it has a spec source. |
-| — | — | The contract renames the standalone controller's `smg_policy_controller_decide_busy_total` to `smg_policy_fallback_total{reason}` for fallback and its `smg_policy_controller_decide_budget_outlasted_total` to `smg_policy_deadline_misses_total` for decision deadlines. Both contract writers are pending. |
+| — | — | Planned additions. Embedded writers are pending for `smg_policy_leases{kind,state}`, `smg_policy_spec_generation`, and `smg_policy_spec_apply_total{result}`. The standalone controller already publishes the two spec families when it has a spec source. No code writes `smg_policy_leases` yet. |
+| — | — | Planned renames of the standalone controller's `smg_policy_controller_decide_busy_total` to `smg_policy_fallback_total{reason}` for fallback and of its `smg_policy_controller_decide_budget_outlasted_total` to `smg_policy_deadline_misses_total` for decision deadlines. No code writes the new names yet. |
 | `smg_router_requests_total`, `smg_router_request_errors_total`, `smg_router_request_duration_seconds`, `smg_router_tokens_total`, `smg_router_ttft_seconds`, `smg_router_tpot_seconds`, `smg_http_responses_total`, `smg_http_request_duration_seconds`, `smg_http_inflight_request_age_count`, `smg_http_connections_active` | Same | Kept. Request and connection metrics. |
 | `smg_admission_inflight`, `smg_admission_queue_depth`, `smg_admission_queue_rejected_total`, `smg_scheduler_admit_total`, `smg_scheduler_inflight`, `smg_scheduler_queue_depth` | Same | Kept. Admission and scheduling. |
 | `smg_engine_running_requests`, `smg_engine_waiting_requests`, `smg_engine_token_usage`, `smg_engine_cache_hit_rate`, `smg_worker_health`, `smg_worker_cb_state`, `smg_worker_health_checks_total`, `smg_worker_retries_total`, `smg_worker_retries_exhausted_total` | Same | Kept. Worker reports and resilience. |
