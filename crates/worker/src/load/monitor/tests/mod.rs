@@ -941,6 +941,28 @@ async fn the_poll_decision_follows_the_receipt_of_pushed_records() {
     assert_eq!(monitor.poll_mode(url, late, interval), PollMode::Poll);
 }
 
+/// A worker's first record files its receipt under the record's own rank.
+/// Under another rank the receipt would age with no record to renew it,
+/// and one interval later the worker would fall back to the poll with its
+/// stream at work.
+#[tokio::test]
+async fn a_workers_first_record_files_its_receipt_under_its_own_rank() {
+    let (registry, monitor) = build_monitor();
+    let worker = ready_worker("grpc://w1:9000", "llama-3");
+    registry.register(Arc::clone(&worker)).unwrap();
+    let url = "grpc://w1:9000";
+    let interval = Duration::from_secs(10);
+    let t0 = Instant::now();
+    monitor.apply_pushed_load(&worker, 1, &pushed(3), t0);
+    assert!(monitor.has_receipt(url, 1));
+    assert!(!monitor.has_receipt(url, 0), "rank 0 pushed nothing");
+    monitor.apply_pushed_load(&worker, 1, &pushed(4), t0 + interval);
+    assert_eq!(
+        monitor.poll_mode(url, t0 + interval, interval),
+        PollMode::Suppressed
+    );
+}
+
 /// Under data parallelism a quiet rank's record stops arriving while
 /// the other rank's heartbeats keep the stream alive, and the tick
 /// falls back to the poll for the worker. The poll's figure for the
@@ -1613,6 +1635,48 @@ async fn the_conditional_gate_asks_the_sink_whether_loads_are_wanted() {
     }
 }
 
+/// A sink that writes the seven calls with no default and keeps the port's
+/// answer at the two that have one.
+struct BareSink;
+
+impl LoadSink for BareSink {
+    fn record(&self, _: &Arc<dyn Worker>, _: i32, _: &WorkerLoadResponse, _: Instant, _: Instant) {}
+
+    fn poll_mode(&self, _: &Arc<dyn Worker>, _: Instant, _: Duration) -> PollMode {
+        PollMode::Poll
+    }
+
+    fn report(&self, _: &[PolledMember<'_>], _: Instant) -> PolledRanks {
+        PolledRanks::default()
+    }
+
+    fn report_empty(&self, _: &[PolledMember<'_>], _: Instant) -> Vec<i32> {
+        Vec::new()
+    }
+
+    fn fetch_failed(&self, _: &[Arc<dyn Worker>]) {}
+
+    fn forget(&self, _: &Arc<dyn Worker>) {}
+
+    fn reset(&self) {}
+}
+
+/// A sink that does not say whether its readers want loads is fed: the
+/// port's own answer is that they do, so a collector told to fetch on
+/// demand alone still polls for it.
+#[test]
+fn a_sink_that_keeps_the_ports_answer_is_fed_under_the_conditional_gate() {
+    let monitor = WorkerMonitor::with_sink(
+        Arc::new(WorkerRegistry::new()),
+        Arc::new(BareSink),
+        5,
+        false,
+        true,
+    );
+    let worker = ready_worker("http://w:1", "m");
+    assert!(monitor.loads_wanted(std::slice::from_ref(&worker)));
+}
+
 /// The monitor running over a recording sink, with one Ready worker
 /// registered and the event loop started.
 fn recording_with_a_worker() -> (
@@ -1684,7 +1748,13 @@ async fn a_status_that_leaves_ready_forgets_the_workers_loads_at_the_sink() {
 /// A Ready worker under overload thresholds: eight waiting requests, or a
 /// token usage of 0.8.
 fn overload_worker(url: &str) -> Arc<dyn Worker> {
-    let worker = BasicWorkerBuilder::new(url)
+    overload_member(url, None)
+}
+
+/// [`overload_worker`], or with a `rank` that rank worker of a
+/// data-parallel engine of two at `url`.
+fn overload_member(url: &str, rank: Option<usize>) -> Arc<dyn Worker> {
+    let mut builder = BasicWorkerBuilder::new(url)
         .worker_type(WorkerType::Regular)
         .connection_mode(ConnectionMode::Http)
         .model(ModelCard::new("m"))
@@ -1695,8 +1765,11 @@ fn overload_worker(url: &str) -> Arc<dyn Worker> {
         .overload_defaults(OverloadThresholds {
             waiting_requests: Some(8),
             token_usage: Some(0.8),
-        })
-        .build();
+        });
+    if let Some(rank) = rank {
+        builder = builder.dp_config(rank, 2);
+    }
+    let worker = builder.build();
     worker.set_status(WorkerStatus::Ready);
     Arc::new(worker)
 }
@@ -1758,4 +1831,103 @@ fn the_monitors_own_sink_fails_the_vetoes_open_at_a_reset_and_says_so() {
     assert!(logs_contain(
         "smg_worker::load::monitor: Overload vetoes cleared with the load feed"
     ));
+}
+
+/// The receipts outlive a reset, with the pushed reports they are the
+/// receipts of: the collector stops its polls, not the workers' streams. A
+/// worker whose stream pushed within the interval is still not polled.
+#[tokio::test]
+async fn a_reset_keeps_the_receipts_at_the_monitors_own_sink() {
+    let (registry, monitor) = build_monitor();
+    let worker = ready_worker("http://w:1", "m");
+    registry.register(Arc::clone(&worker)).unwrap();
+    let now = Instant::now();
+    monitor.apply_pushed_load(&worker, 0, &pushed(1), now);
+
+    monitor.stop_all_groups();
+
+    assert!(monitor.pushed_reports.lock().contains_key("http://w:1"));
+    assert_eq!(
+        monitor.poll_mode("http://w:1", now, Duration::from_secs(5)),
+        PollMode::Suppressed
+    );
+}
+
+/// A dropped collector says nothing to its sink: its drop aborts its tasks
+/// and makes no call. A sink's code inside a drop would run on whatever
+/// thread lets the last handle go, under the locks that thread holds. The
+/// host that drops a collector owns the sink too: it voids its store when
+/// it chooses, or it starts the next collector over the same sink, whose
+/// start says the reset.
+#[tokio::test]
+async fn a_dropped_collector_says_nothing_to_its_sink() {
+    let (_registry, monitor, sink, _id) = recording_with_a_worker();
+    settle().await;
+    let said_before = sink.said.lock().clone();
+    assert_eq!(
+        said_before.first(),
+        Some(&Said::Reset),
+        "the start says the reset"
+    );
+
+    drop(monitor);
+    settle().await;
+
+    assert!(
+        sink.monitor.get().and_then(Weak::upgrade).is_none(),
+        "the collector is gone"
+    );
+    assert_eq!(*sink.said.lock(), said_before, "the drop says nothing");
+}
+
+/// Register `worker` and put it under the overload veto by another hand.
+fn veto(registry: &WorkerRegistry, worker: &Arc<dyn Worker>) {
+    registry.register(Arc::clone(worker)).unwrap();
+    assert!(registry.set_worker_overloaded(worker, true));
+}
+
+/// Absent means no opinion. An engine whose fetch failed for every member
+/// brought none, and the monitor's own sink clears the overload veto: a
+/// worker whose feed went away is not left out of routing.
+#[test]
+fn a_fetch_that_failed_whole_clears_the_veto_at_the_monitors_own_sink() {
+    let (registry, monitor) = build_monitor();
+    let worker = overload_worker("http://w:1");
+    veto(&registry, &worker);
+
+    monitor.reconcile_engine(&mut [(Arc::clone(&worker), None)], Instant::now());
+
+    assert!(!worker.is_overloaded());
+}
+
+/// An answer with no row is no opinion either: the veto is cleared.
+#[test]
+fn an_answer_with_no_row_clears_the_veto_at_the_monitors_own_sink() {
+    let (registry, monitor) = build_monitor();
+    let worker = overload_worker("http://w:1");
+    veto(&registry, &worker);
+    let no_row = Some(WorkerLoadResponse::default());
+
+    monitor.reconcile_engine(&mut [(Arc::clone(&worker), no_row)], Instant::now());
+
+    assert!(!worker.is_overloaded());
+}
+
+/// A rank worker whose own fetch failed beside one that answered has no
+/// opinion of its own: its veto is cleared, whatever the other's rows say.
+#[test]
+fn a_members_failed_fetch_beside_an_answer_clears_its_veto_at_the_monitors_own_sink() {
+    let (registry, monitor) = build_monitor();
+    let failed = overload_member("http://w:1", Some(0));
+    let answered = overload_member("http://w:1", Some(1));
+    veto(&registry, &failed);
+    registry.register(Arc::clone(&answered)).unwrap();
+    let mut engine = [
+        (Arc::clone(&failed), None),
+        (answered, Some(answer_of(1, 1))),
+    ];
+
+    monitor.reconcile_engine(&mut engine, Instant::now());
+
+    assert!(!failed.is_overloaded());
 }
