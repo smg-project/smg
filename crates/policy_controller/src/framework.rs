@@ -4925,6 +4925,79 @@ mod tests {
         assert_eq!(pick.trace.top_len, 3);
     }
 
+    /// A profile's first prefix stage keeps its word behind a second. The
+    /// engine asks the first, and the second's pass does not take the slot
+    /// from it: the price that kept the busy holder in front is said.
+    #[test]
+    fn a_profiles_first_prefix_stage_keeps_its_word_behind_a_second() {
+        let params = PrefixAffinityParams {
+            spill: Some(SpillParams {
+                rel: Some(1.1),
+                prefix_margin_tokens: Some(8),
+                ..SpillParams::default()
+            }),
+            ..PrefixAffinityParams::default()
+        };
+        let stage = || Weighted {
+            scorer: Box::new(PrefixAffinity::new(
+                &params,
+                Gates::of(Some(&params), None, Some(16)),
+            )),
+            weight: 1.0,
+        };
+        let engine = Engine::new(
+            vec![Profile {
+                name: "cache".into(),
+                filters: vec![Box::new(Healthy)],
+                scorers: vec![stage(), stage()],
+                picker: Box::new(Best),
+            }],
+            vec![Binding {
+                model: "*".into(),
+                phases: vec![],
+                plan: Plan::Single,
+                profile: 0,
+                decode_profile: None,
+                sessions: None,
+                overload: None,
+            }],
+            1,
+            Needs::default(),
+        );
+        // Row 0 holds eight of the request's sixteen blocks.
+        let mut column = [AffinityFacts::default(); 4];
+        column[0] = AffinityFacts {
+            overlap_blocks: 8,
+            admitted_age_ms: u32::MAX,
+            ..AffinityFacts::default()
+        };
+        let hashes = [0u64; 16];
+        let facts = RequestFacts {
+            model: "m",
+            block_hashes: &hashes,
+            prompt_tokens: 256,
+            seed: 7,
+            affinity: &column,
+            ..RequestFacts::default()
+        };
+        let busy = [
+            candidate(0, 10),
+            candidate(1, 0),
+            candidate(2, 0),
+            candidate(3, 0),
+        ];
+        let decision = engine.decide_stated(
+            &facts,
+            &PoolFacts::default(),
+            &busy,
+            &Constraints::default(),
+            &mut Scratch::new(),
+        );
+        let pick = decision.pick().expect("a pick");
+        assert_eq!(pick.targets.first().map(|target| target.position), Some(0));
+        assert!(pick.overlap().margin_held);
+    }
+
     /// A stated decision begins with no word of an earlier pass. The plain
     /// entry asks no stage what it judged, so the word of its priced pass
     /// stays on the thread. The next stated decision is a decode phase's

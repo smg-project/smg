@@ -77,8 +77,11 @@ impl Targets {
         }
     }
 
+    /// Empties the list. What was stated of its first target goes with it
+    /// ([`Pick::overlap`]).
     pub fn clear(&mut self) {
         self.len = 0;
+        self.overlap = Overlap::NONE;
     }
 
     /// Puts `target` first and keeps the others behind it in their order; a
@@ -272,9 +275,10 @@ pub enum OverlapSource {
 /// leading blocks of the request the worker holds, of how many, and where
 /// they were read. A host observes its cache series from it: the share
 /// held is `blocks` over `of`, and a miss reads zero of `of`. `of` is zero
-/// for a request of no block, and where no stage said: the profile holds
-/// no such stage, or the decision was made at an entry that asks none
-/// ([`Engine::decide_stated`](crate::Engine::decide_stated) asks).
+/// only where no stage said: the profile holds no such stage, or the
+/// decision was made at an entry that asks none
+/// ([`Engine::decide_stated`](crate::Engine::decide_stated) asks). A
+/// stage counts a request as one block at the least.
 ///
 /// Six bytes, in bytes a pick's targets had spare behind their count: a
 /// pick is no larger for it ([`Pick::overlap`]).
@@ -282,9 +286,12 @@ pub enum OverlapSource {
 pub struct Overlap {
     /// The leading blocks the worker holds, by the stage's source: the
     /// index's, the predictor's past the stage's threshold, the larger of
-    /// the two under `merged`. Held at 65,535.
+    /// the two under `merged`. Halved with `of` where the request's count
+    /// is past sixteen bits.
     pub blocks: u16,
-    /// The request's blocks as the stage counts them, held at 65,535.
+    /// The request's blocks as the stage counts them. A request of more
+    /// than 65,535 halves this count and `blocks` together until it fits,
+    /// so their share stays true.
     pub of: u16,
     /// Where `blocks` was read: the index on a tie under `merged`.
     pub source: OverlapSource,
@@ -390,7 +397,7 @@ mod tests {
 
     /// The overlap costs the pick no byte: it shares the eight bytes the
     /// targets' count stood alone in, a pick no stage spoke of reads none,
-    /// and a list led anew says nothing of its new first target.
+    /// and a list led anew or cleared says nothing of a first target.
     #[test]
     fn the_overlap_costs_the_pick_no_byte() {
         assert_eq!(size_of::<Overlap>(), 6);
@@ -424,6 +431,9 @@ mod tests {
         assert_eq!(pick.overlap(), held);
         let second = *pick.targets.as_slice().last().expect("two targets");
         pick.targets.lead(second);
+        assert_eq!(pick.overlap(), Overlap::NONE);
+        pick.targets.state(held);
+        pick.targets.clear();
         assert_eq!(pick.overlap(), Overlap::NONE);
     }
 
