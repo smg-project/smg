@@ -21,8 +21,9 @@ use crate::{
     proto::{self, worker_event::Event},
     replication::{Entry, Event as Written},
     store::{
-        GatewayId, HealthPolicy, LoadSample, LoadSource, Maker, MembershipChange, Overload,
-        Position, Reachability, Signals, Unmade, WorkerFacts, WorkerPatch, WorkerRow, WorkerStatus,
+        membership::blank, GatewayId, HealthPolicy, LoadSample, LoadSource, Maker,
+        MembershipChange, Overload, Position, Reachability, Signals, Unmade, WorkerFacts,
+        WorkerPatch, WorkerRow, WorkerStatus,
     },
     view::{LoadRow, Role, SignalSource, WireModes, WorkerId},
 };
@@ -66,22 +67,18 @@ pub(crate) fn of_a_new_row(refusal: &Refused) -> bool {
     *refusal == NEW_WIRE || *refusal == NEW_ROLE
 }
 
-/// The bounds of what a row states (contract: `WorkerSpec`). A row tells
-/// its URL three times, a replacement's answer carries two rows and a
-/// snapshot pages at 128 rows: under these each fits a frame of 4 MiB.
+/// The bounds of what a row states (contract: `WorkerSpec`). A replacement's
+/// answer carries two rows and a snapshot pages at 128 rows. Both fit a
+/// frame of 4 MiB.
 const URL_BYTES: usize = WorkerFacts::URL_BYTES;
 const NAME_BYTES: usize = WorkerFacts::NAME_BYTES;
 const KEY_BYTES: usize = WorkerFacts::LABEL_KEY_BYTES;
 const VALUE_BYTES: usize = WorkerFacts::LABEL_VALUE_BYTES;
 const LABELS: usize = WorkerFacts::LABELS;
-/// The model ids of one row: a limit of this build and no number of the
-/// contract, said again once the store's cost of a row's ids is measured.
+/// The most model ids a watch or snapshot request can select.
 pub(super) const MODELS: usize = 128;
 /// The row whole on the wire, as [`weight`] measures it.
-const ROW_BYTES: usize = 16 * 1024;
-// A provider's name takes a label key's bound and its key a URL's. The store
-// states both numbers for a build without the wire, and each pair is one.
-const _: () = assert!(Maker::NAME_BYTES == KEY_BYTES && Maker::KEY_BYTES == URL_BYTES);
+const ROW_BYTES: usize = WorkerFacts::ROW_BYTES;
 
 /// The contract's status of a row.
 pub(crate) const fn status(status: WorkerStatus) -> proto::WorkerStatus {
@@ -417,11 +414,6 @@ pub(crate) fn start_again(floor: Position) -> proto::WorkerEvent {
         oldest_seq: floor.seq + 1,
     };
     event(Event::SnapshotRequired(word), 0, 0, 0)
-}
-
-/// Whether a stated name holds a blank or a control character.
-fn blank(name: &str) -> bool {
-    name.chars().any(|c| c.is_whitespace() || c.is_control())
 }
 
 /// A log entry of a membership or status write in its envelope, at the
@@ -859,11 +851,6 @@ pub(crate) fn registration(
 ///
 /// The URL's own rules are [`key`]'s, held before this is called.
 fn over(spec: &proto::WorkerSpec, standing: Option<&WorkerFacts>) -> Result<WorkerFacts, Refused> {
-    // The count first, before one id is read or copied: every membership
-    // write walks the ids of every standing row.
-    if spec.models.len() > MODELS {
-        return Err(refused("spec.models", "a row names at most 128 model ids"));
-    }
     if spec.runtime.len() > NAME_BYTES {
         return Err(refused("spec.runtime", "a runtime is at most 256 bytes"));
     }
@@ -1162,14 +1149,14 @@ mod tests {
     use super::{
         event, load, member, page, patch, refused, registration, removed, replaced, replication,
         row, start_again, status, status_changed, told_change, told_load, told_part, told_row,
-        Refused, KEY_BYTES, LABELS, MODELS, NAME_BYTES, ROW_BYTES, URL_BYTES, VALUE_BYTES,
+        Refused, KEY_BYTES, LABELS, NAME_BYTES, ROW_BYTES, URL_BYTES, VALUE_BYTES,
     };
     use crate::{
         proto::{self, replication_event::Event as Sent, worker_event::Event},
         replication::{Entry, Event as Written},
         store::{
-            identity, GatewayId, HealthPolicy, LoadSample, LoadSource, MembershipChange, Overload,
-            Position, Reachability, Signals, WorkerFacts, WorkerRow, WorkerStatus,
+            identity, GatewayId, HealthPolicy, LoadSample, LoadSource, Maker, MembershipChange,
+            Overload, Position, Reachability, Signals, WorkerFacts, WorkerRow, WorkerStatus,
         },
         view::{LoadRow, Role, SignalSource, WireModes, WorkerId},
     };
@@ -2089,7 +2076,7 @@ mod tests {
     #[test]
     fn a_field_at_its_bound_is_taken_and_one_over_is_refused_by_its_path() {
         type Stating = fn(usize) -> proto::WorkerSpec;
-        let cases: [(&str, usize, &str, Stating); 8] = [
+        let cases: [(&str, usize, &str, Stating); 7] = [
             (
                 "spec.url",
                 URL_BYTES,
@@ -2156,15 +2143,6 @@ mod tests {
                     }
                 },
             ),
-            (
-                "spec.models",
-                MODELS,
-                "a row names at most 128 model ids",
-                |count| proto::WorkerSpec {
-                    models: (0..count).map(|n| n.to_string()).collect(),
-                    ..spec()
-                },
-            ),
         ];
         for (path, bound, why, stating) in cases {
             assert!(facts(&stating(bound), None).is_ok(), "{path} at {bound}");
@@ -2175,15 +2153,33 @@ mod tests {
             );
             assert!(why.contains(&bound.to_string()), "{why}");
         }
-        // The models' count is read before the list is: past it a
-        // registration is refused by the count, whatever its ids hold.
-        let unread = proto::WorkerSpec {
-            models: vec![text(NAME_BYTES + 1); MODELS + 1],
+        let long_id = proto::WorkerSpec {
+            models: vec![text(NAME_BYTES + 1); 129],
             ..spec()
         };
         assert_eq!(
-            facts(&unread, None).map(|_| ()),
-            Err(refused("spec.models", "a row names at most 128 model ids"))
+            facts(&long_id, None).map(|_| ()),
+            Err(refused("spec.models", "a model id is at most 256 bytes"))
+        );
+    }
+
+    #[test]
+    fn a_registration_limits_model_ids_by_the_wires_row_weight() {
+        let short = proto::WorkerSpec {
+            models: (0..129).map(|n| n.to_string()).collect(),
+            ..spec()
+        };
+        assert_eq!(
+            facts(&short, None).expect("the ids fit").models,
+            short.models
+        );
+        let heavy = proto::WorkerSpec {
+            models: vec![text(256); 64],
+            ..spec()
+        };
+        assert_eq!(
+            facts(&heavy, None),
+            Err(refused("spec", "a row is at most 16384 bytes on the wire"))
         );
     }
 
@@ -2468,6 +2464,88 @@ mod tests {
         ] {
             let at = WorkerRow { status, ..full() };
             assert!(row(&at).encoded_len() <= weight(&at.facts), "{status:?}");
+        }
+    }
+
+    #[test]
+    fn the_stores_measure_is_never_under_the_wires_weight() {
+        let widest = WorkerFacts {
+            incarnation: u64::MAX,
+            role: Role::Encode,
+            wire_modes: WireModes::HTTP.union(WireModes::GRPC).union(WireModes::ZMQ),
+            dp_rank: u16::MAX,
+            dp_size: u16::MAX,
+            kv_block_size: Some(u32::MAX),
+            max_running: Some(u32::MAX),
+            bootstrap_port: Some(u16::MAX),
+            priority: i32::MAX,
+            reachable_from: Reachability::Gateway(GatewayId(u64::MAX)),
+            overload: Overload {
+                kv_usage_permille: Some(u16::MAX),
+                waiting_requests: Some(u32::MAX),
+            },
+            health: HealthPolicy {
+                failure_threshold: u32::MAX,
+                success_threshold: u32::MAX,
+                check_interval_ms: u32::MAX,
+                timeout_ms: u32::MAX,
+                probes: false,
+            },
+            signals: Signals {
+                events: true,
+                loads: true,
+                scrape_interval_ms: u32::MAX,
+            },
+            ..WorkerFacts::default()
+        };
+        let mut numbers = row(&WorkerRow {
+            facts: widest.clone(),
+            id: WorkerId(u64::MAX),
+            revision: u64::MAX,
+            status: WorkerStatus::Ready,
+            ..full()
+        });
+        numbers.admitted_age_ms = u64::MAX;
+        assert!(
+            numbers.encoded_len() <= WorkerFacts::NUMBERS,
+            "{} numeric bytes",
+            numbers.encoded_len()
+        );
+
+        let makers = [
+            Maker::Control,
+            Maker::provider("p", "k").expect("the shortest maker"),
+            Maker::provider(text(128), text(2_048)).expect("the widest maker"),
+        ];
+        for long in [false, true] {
+            let sized = |least, most| text(if long { most } else { least });
+            for scrape in [false, true] {
+                let facts = WorkerFacts {
+                    key: sized(1, 2_048),
+                    engine: sized(0, 2_048),
+                    engine_kind: sized(0, 256),
+                    models: vec![sized(1, 256)],
+                    zone: Some(sized(0, 256)),
+                    labels: [
+                        (sized(0, 128), sized(0, 4_096)),
+                        ("policy".to_owned(), sized(0, 4_096)),
+                    ]
+                    .into(),
+                    signals: Signals {
+                        scrape_interval_ms: if scrape { u32::MAX } else { 0 },
+                        ..widest.signals
+                    },
+                    ..widest.clone()
+                };
+                for maker in &makers {
+                    let wire = weight(&facts) + super::maker_weight(maker);
+                    let stored = facts.weight(maker);
+                    assert!(
+                        wire <= stored,
+                        "long={long}, scrape={scrape}, wire={wire}, store={stored}"
+                    );
+                }
+            }
         }
     }
 

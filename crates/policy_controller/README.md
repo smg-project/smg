@@ -854,6 +854,21 @@ cargo bench -p smg-policy-controller --locked --bench decision
 
 The gates run three interleaved measurements per side when timing is needed. Each benchmark ID uses the first matching threshold. A time regression must exceed that threshold in the median of the runs, with every changed run slower than every base run. Overlap is reported as suspect. Some gates also repeat suspect measurements or check for executable placement effects before failing a row. Missing gated IDs are detected. These are relative regressions for the measured paths. The plugin and wire round-trip benchmarks have no dedicated policy gate here. [Gate rules and report](../../scripts/bench_gate.py)
 
+## A worker's row
+
+The controller keeps one row a worker. A registration states the row's facts. One that states a fact past its bound is refused by the fact's name.
+
+| fact | bound |
+|---|---|
+| the URL | 2,048 bytes |
+| the runtime, the zone, a model id | 256 bytes each |
+| the labels | 128 of them, a key of 128 bytes, a value of 4,096 |
+| the row as a whole | 16,384 bytes |
+
+No count bounds a row's model ids: the row's size does. A control call's row is weighed as the wire frames it. A row that a host writes in its own process is weighed by the store: 160 bytes for its numbers, and for each text its bytes and five more. That measure is never under the wire's weight, so a row the store takes fits a frame.
+
+A host that links the library with the `worker-host` feature writes rows at a membership door, `worker_host::Membership`. The door lays a found worker's facts over the row at its URL, marks a row draining and takes a row away. Only a row's maker changes it. `worker_host::StoreDoor` is the door over a store alone, for a host with no election. `worker_host::facts` reads a worker object back to a row's facts. No step of the stock controller calls the door yet.
+
 ## What is not built yet
 
 - A client that marks a request as asked again. The controller serves the mark. The crate's own client does not set it yet.

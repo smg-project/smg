@@ -16,8 +16,9 @@
 //!
 //! # The one table
 //!
-//! [`object()`] makes the object from a row. Each fact of the row lands in
-//! one field of the object, or is not carried:
+//! [`object()`] reads the table from row to object and [`facts()`] reads it
+//! back. Each fact of the row lands in one field of the object, or is not
+//! carried:
 //!
 //! | The row's fact | The object's field |
 //! |---|---|
@@ -58,18 +59,29 @@
 //! above rank 0 of a data-parallel worker gets no feed yet ([`NoFeed`]).
 //! The module `kv` names the decode's limits.
 //!
+//! # The door
+//!
+//! The host hands out a [`Membership`] door. A host without election uses
+//! [`StoreDoor`]. A replica that may lead uses the controller's door.
+//!
 //! # What the module does not hold
 //!
 //! It builds no registry, no engine and no task. The host builds the
 //! registry and hands it in, and calls [`Objects::follow`] where the store
 //! moved. It names nothing of the controller.
 
+mod door;
+mod found;
 mod health;
 mod kv;
 mod lead;
 mod object;
 mod objects;
 
+#[cfg(feature = "controller")]
+pub(crate) use door::{drain, lay, take, Turn};
+pub use door::{Membership, Refused, StoreDoor, Wrote};
+pub use found::facts;
 pub use health::HealthAdapter;
 pub use kv::{KvAdapter, KvHost, NoFeed, Unfed};
 pub use lead::{Lead, SoleLead};
