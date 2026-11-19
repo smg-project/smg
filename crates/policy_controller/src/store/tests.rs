@@ -400,7 +400,7 @@ fn a_connect_signal_read_under_a_revision_the_row_left_is_dropped() {
 
 #[test]
 fn a_health_write_says_what_happened_and_the_status_that_stands() {
-    use super::HealthWrite::{Gone, Moved, Stale, Stood};
+    use super::HealthWrite::{Moved, NoRow, Stale, Stood};
 
     let store = MemoryStore::new();
     let health: &dyn HealthSink = &store;
@@ -413,7 +413,10 @@ fn a_health_write_says_what_happened_and_the_status_that_stands() {
     );
     assert_eq!(
         health.probe_outcome(id, true, revision()),
-        Moved(WorkerStatus::Pending, WorkerStatus::Ready)
+        Moved {
+            from: WorkerStatus::Pending,
+            to: WorkerStatus::Ready
+        }
     );
     // The connect signal on a ready row stands and clears no counter: two
     // failures ahead of it and one behind it are the threshold's three.
@@ -426,7 +429,10 @@ fn a_health_write_says_what_happened_and_the_status_that_stands() {
     assert_eq!(health.connected(id, revision()), Stood(WorkerStatus::Ready));
     assert_eq!(
         health.probe_outcome(id, false, revision()),
-        Moved(WorkerStatus::Ready, WorkerStatus::NotReady),
+        Moved {
+            from: WorkerStatus::Ready,
+            to: WorkerStatus::NotReady
+        },
         "the signal cleared no counter of the ready row"
     );
     // A write read under a revision the row left is stale: it says no
@@ -443,7 +449,10 @@ fn a_health_write_says_what_happened_and_the_status_that_stands() {
     );
     assert_eq!(
         health.probe_outcome(id, true, revision()),
-        Moved(WorkerStatus::NotReady, WorkerStatus::Ready)
+        Moved {
+            from: WorkerStatus::NotReady,
+            to: WorkerStatus::Ready
+        }
     );
     // A draining row stands at the signal too.
     WorkersStore::set_status(&store, id, WorkerStatus::Draining, revision()).expect("drained");
@@ -451,18 +460,21 @@ fn a_health_write_says_what_happened_and_the_status_that_stands() {
         health.connected(id, revision()),
         Stood(WorkerStatus::Draining)
     );
-    // A write for a row that is gone says so.
+    // A write for a worker whose row is gone says no row.
     let last = revision();
     store.remove(id, last).expect("removed");
-    assert_eq!(health.probe_outcome(id, true, last), Gone);
-    assert_eq!(health.connected(id, last), Gone);
+    assert_eq!(health.probe_outcome(id, true, last), NoRow);
+    assert_eq!(health.connected(id, last), NoRow);
 }
 
 #[test]
 fn a_health_writes_two_readers_say_the_transition_and_the_status_that_stands() {
-    use super::HealthWrite::{Gone, Moved, Stale, Stood};
+    use super::HealthWrite::{Moved, NoRow, Stale, Stood};
 
-    let moved = Moved(WorkerStatus::Pending, WorkerStatus::Ready);
+    let moved = Moved {
+        from: WorkerStatus::Pending,
+        to: WorkerStatus::Ready,
+    };
     assert_eq!(
         moved.moved(),
         Some((WorkerStatus::Pending, WorkerStatus::Ready))
@@ -471,7 +483,7 @@ fn a_health_writes_two_readers_say_the_transition_and_the_status_that_stands() {
     let stood = Stood(WorkerStatus::Draining);
     assert_eq!(stood.moved(), None);
     assert_eq!(stood.stands(), Some(WorkerStatus::Draining));
-    for unjudged in [Stale, Gone] {
+    for unjudged in [Stale, NoRow] {
         assert_eq!(unjudged.moved(), None);
         assert_eq!(unjudged.stands(), None);
     }
