@@ -226,7 +226,9 @@ repository of your own needs its tag.
   picker take none yet.
 - A filter and a picker. They register as the scorer does.
 - State. `Lifecycle` reports what became of each decision to a scorer that
-  learns from it. `Pack` reads the view alone.
+  learns from it. A scorer that keeps a number of each worker's load report
+  answers true to `keeps_loads`, and is then told every report before a
+  decision reads it. `Pack` reads the view alone.
 - A fallback. A plugin that fails falls back to a built-in stage. A stage in
   code is the controller's own code and has none.
 - A name of its own. `--version` and `/version` answer the crate's name and

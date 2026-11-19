@@ -6868,6 +6868,20 @@ mod tests {
                     shown.store(word, Ordering::Release);
                 }
             }
+            // One more word, of the rank told last. A cell keeps no number
+            // of an instant it was told two ranks under, so the last word
+            // above hands over none, and this one can. The round ends once
+            // a reader was handed a number: on one or two cores the tells
+            // could end before any reader ran between two of them.
+            let last = (INSTANTS + 1) << 1 | ((INSTANTS + 1) & 1);
+            tell(&stage, slot, &row_of(last));
+            shown.store(last, Ordering::Release);
+            let patience = std::time::Instant::now();
+            while handed.load(Ordering::Relaxed) == 0
+                && patience.elapsed() < std::time::Duration::from_secs(30)
+            {
+                std::thread::yield_now();
+            }
             done.store(true, Ordering::Relaxed);
         });
         let handed = handed.load(Ordering::Relaxed);
