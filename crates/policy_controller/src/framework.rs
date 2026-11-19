@@ -10123,6 +10123,72 @@ mod tests {
         assert_eq!(crate::view::LOOKS_BEHIND.with(std::cell::Cell::get), 0);
     }
 
+    /// The resident-work stage answers row by row, as the least-load stage
+    /// does, so a `best` that takes a sample draws under it: for a request
+    /// whose host names rows, over a pool of more than twice the sample and
+    /// of sixteen rows or more, the decision draws, and the stage costs the
+    /// rows drawn and the rows named among themselves. The row of least work
+    /// among the rows handed leads, so the pool's least row leads where the
+    /// sample reached it and not otherwise. A request that names no row
+    /// reads the pool whole, and there that row leads.
+    #[test]
+    fn a_sampled_best_draws_under_the_resident_work_stage() {
+        let engine = Engine::new(
+            vec![Profile {
+                name: "sampled".into(),
+                filters: vec![Box::new(Healthy)],
+                scorers: vec![Weighted {
+                    scorer: Box::new(crate::builtins::ResidentWork::new(0)),
+                    weight: 1.0,
+                }],
+                picker: Box::new(crate::builtins::SampledBest::new(4)),
+            }],
+            vec![Binding {
+                model: "m".into(),
+                profile: 0,
+                ..single_binding()
+            }],
+            1,
+            Needs::default(),
+        );
+        // Every row holds one request and reports its resident tokens, fewer
+        // the further its place: no two rows hold the same work, and the
+        // last row holds the least of the pool.
+        let pool: Vec<Candidate> = pool_of(64, |_| false)
+            .into_iter()
+            .map(|row| Candidate {
+                in_flight: 1,
+                load: Some(crate::view::LoadRow {
+                    running: 1,
+                    resident_tokens: 1_000 * (64 - row.position),
+                    resident_counted: true,
+                    ..crate::view::LoadRow::default()
+                }),
+                ..row
+            })
+            .collect();
+        let holders = [holding(20, 8)];
+        let mut led = 0;
+        for seed in 0..64u64 {
+            let got = drawn(&engine, &naming(seed, &holders), &pool);
+            assert!(got.trace().drew_first(), "seed {seed}: the decision drew");
+            let handed = positions(&got);
+            assert_eq!(
+                handed.first(),
+                handed.iter().max(),
+                "seed {seed}: the furthest of the rows handed leads"
+            );
+            led += u32::from(handed.first() == Some(&63));
+        }
+        assert!(
+            led < 32,
+            "the pool's least row led {led} of 64 decisions over a sample of four"
+        );
+        let whole = drawn(&engine, &request(1), &pool);
+        assert!(!whole.trace().drew_first(), "no row named: the pool whole");
+        assert_eq!(positions(&whole).first(), Some(&63));
+    }
+
     /// A host caps each list of rows it names at the picker's sample. Past
     /// it a decision reads dearer and is never wrong, so a debug build
     /// alone stops, by the assertion's own words.
