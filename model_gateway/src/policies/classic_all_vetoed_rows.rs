@@ -837,12 +837,21 @@ fn liveness_rows(rows: &mut Vec<Row>) {
     liveness_keys(rows);
 }
 
+/// One cell of a policy under the two vetoes: what it shows, whether the
+/// binding sheds, each worker's state with its requests in flight, and the
+/// steps.
+type PolicyCell = (&'static str, bool, Vec<(State, u32)>, Vec<Step>);
+
+/// One cell of the ring under the two vetoes: what it shows, whether the
+/// binding sheds, and four workers' states with their requests in flight.
+type RingCell = (&'static str, bool, [(State, u32); 4]);
+
 /// The cells of one policy: the two vetoes beside each other.
 fn liveness_cells(rows: &mut Vec<Row>) {
     use State::{Down, Free, Over, Stalled, StalledOver};
     let rr = "round_robin";
     let follow = || vec![pick(), Step::Loads(vec![0, 1, 3]), pick()];
-    let cells: Vec<(&str, bool, Vec<(State, u32)>, Vec<Step>)> = vec![
+    let cells: Vec<PolicyCell> = vec![
         (
             "a-doubted-worker-under-its-thresholds-beside-one-over-under-shedding",
             true,
@@ -1002,7 +1011,7 @@ fn liveness_keys(rows: &mut Vec<Row>) {
     ));
     let ring = "consistent_hashing";
     let beside_over = [(Stalled, 5), (Over, 4), (Over, 0), (Over, 2)];
-    let cells: [(&str, bool, [(State, u32); 4]); 4] = [
+    let cells: [RingCell; 4] = [
         (
             "a-key-whose-worker-is-doubted-beside-free-members",
             false,
