@@ -2756,6 +2756,163 @@ async fn an_eviction_behind_the_workers_return_writes_no_sentinel() {
     assert!(running_series(&rendered).ends_with(" 7"), "{rendered}");
 }
 
+/// A successor inherits its predecessor's status. One that is not `Ready`
+/// has its records held and has written no series: its report on file
+/// does not keep its predecessor's sentinel away.
+#[tokio::test]
+async fn a_held_successor_does_not_keep_its_predecessors_sentinel_away() {
+    let rendered = render_with_recorder(|| {
+        let (registry, monitor) = build_monitor();
+        let first = ready_worker("http://w:1", "m");
+        let id = registry.register(Arc::clone(&first)).unwrap();
+        monitor.apply_pushed_load(&first, 0, &pushed(7), Instant::now());
+        monitor.flush_pushed();
+        registry.transition_status(&id, WorkerStatus::NotReady);
+        let next = ready_worker("http://w:1", "m");
+        assert!(registry.replace(&id, Arc::clone(&next)));
+        assert!(next.status() != WorkerStatus::Ready, "inherited");
+        monitor.apply_pushed_load(&next, 0, &pushed(9), Instant::now());
+
+        monitor.evict_worker_loads(&first);
+        monitor.flush_pending_evictions();
+    });
+    assert!(running_series(&rendered).ends_with(" -1"), "{rendered}");
+}
+
+/// A successor's first record takes its predecessor's report off the
+/// file, and the predecessor's series go with it. The rank the record
+/// names reads its load, and a rank the successor has not reported reads
+/// the sentinel.
+#[tokio::test]
+async fn a_successors_first_record_clears_the_ranks_its_predecessor_reported() {
+    let rendered = render_with_recorder(|| {
+        let (monitor, _replaced, next) = a_replaced_pusher_ahead_of_its_event();
+
+        monitor.apply_pushed_load(&next, 0, &pushed(9), Instant::now());
+    });
+    assert!(running_series(&rendered).ends_with(" 9"), "{rendered}");
+    assert!(
+        running_series_of(&rendered, 1).ends_with(" -1"),
+        "{rendered}"
+    );
+}
+
+/// A report can hold a rank far past its worker's width. The eviction's
+/// sentinel covers that rank by itself: no series is made for a rank
+/// between, and the cost does not grow with the rank.
+#[tokio::test]
+async fn a_far_rank_has_its_own_sentinel_and_no_rank_between() {
+    let rendered = render_with_recorder(|| {
+        let (registry, monitor) = build_monitor();
+        let worker = ready_worker("http://w:1", "m");
+        let id = registry.register(Arc::clone(&worker)).unwrap();
+        for rank in [0, 1_000] {
+            monitor.apply_pushed_load(&worker, rank, &pushed(7), Instant::now());
+        }
+        registry.transition_status(&id, WorkerStatus::NotReady);
+
+        monitor.evict_worker_loads(&worker);
+    });
+    assert!(
+        running_series_of(&rendered, 1_000).ends_with(" -1"),
+        "the far rank"
+    );
+    assert!(!rendered.contains("dp_rank=\"999\""), "a rank between");
+}
+
+/// A report held through a flush: the worker at `http://w:1` reported 7,
+/// left `Ready`, reported 9 while it was not `Ready`, and the window's
+/// flush came ahead of its return. `applied` says whether the eviction's
+/// batch was applied ahead of the held record.
+fn a_report_held_through_a_flush(applied: bool) -> Arc<WorkerMonitor> {
+    let (registry, monitor) = build_monitor();
+    let worker = ready_worker("http://w:1", "m");
+    let id = registry.register(Arc::clone(&worker)).unwrap();
+    monitor.apply_pushed_load(&worker, 0, &pushed(7), Instant::now());
+    monitor.flush_pushed();
+    registry.transition_status(&id, WorkerStatus::NotReady);
+    monitor.evict_worker_loads(&worker);
+    if applied {
+        monitor.flush_pending_evictions();
+    }
+    monitor.apply_pushed_load(&worker, 0, &pushed(9), Instant::now());
+    monitor.flush_pushed();
+    registry.transition_status(&id, WorkerStatus::Ready);
+    monitor
+}
+
+/// A report held through a flush stays queued. The first flush that finds
+/// its worker `Ready` publishes it and writes its series, with no record
+/// since the return and whether or not the eviction's batch was applied.
+#[tokio::test]
+async fn a_report_held_through_a_flush_is_published_once_its_worker_is_ready() {
+    for applied in [true, false] {
+        let rendered = render_with_recorder(|| {
+            let monitor = a_report_held_through_a_flush(applied);
+
+            monitor.flush_pending_evictions();
+
+            assert_eq!(
+                published_rows(&monitor),
+                vec![(0, 9)],
+                "the batch applied first: {applied}"
+            );
+        });
+        assert!(running_series(&rendered).ends_with(" 9"), "{rendered}");
+    }
+}
+
+/// A worker's return wakes the flusher: a report held through a flush is
+/// published a window later, with no record since the return.
+#[tokio::test]
+async fn a_workers_return_publishes_the_report_held_through_a_flush() {
+    let (registry, monitor, _sink, id) = recording_with_a_worker();
+    let worker = registry.get(&id).unwrap();
+    monitor.apply_pushed_load(&worker, 0, &pushed(7), Instant::now());
+    registry.transition_status(&id, WorkerStatus::NotReady);
+    assert!(
+        within_two_seconds(|| !monitor.pushed_reports.lock().contains_key("http://w:1")).await,
+        "the leave's eviction"
+    );
+    monitor.apply_pushed_load(&worker, 0, &pushed(9), Instant::now());
+    settle().await;
+    assert!(
+        monitor.load_state.snapshot().get("http://w:1").is_none(),
+        "held"
+    );
+
+    registry.transition_status(&id, WorkerStatus::Ready);
+
+    assert!(
+        within_two_seconds(|| monitor.load_state.snapshot().get("http://w:1").is_some()).await,
+        "published at the return"
+    );
+    assert_eq!(
+        rows(monitor.load_state.snapshot().get("http://w:1").unwrap()),
+        vec![(0, 9)]
+    );
+}
+
+/// An eviction takes its worker out of the flush's queue with the report:
+/// the queue keeps no worker that is gone, held report or not.
+#[tokio::test]
+async fn an_eviction_takes_a_held_report_out_of_the_queue() {
+    let (registry, monitor) = build_monitor();
+    let worker = ready_worker("http://w:1", "m");
+    let id = registry.register(Arc::clone(&worker)).unwrap();
+    registry.transition_status(&id, WorkerStatus::NotReady);
+    monitor.apply_pushed_load(&worker, 0, &pushed(9), Instant::now());
+    monitor.flush_pushed();
+    let gone = registry.remove(&id).unwrap();
+    drop(worker);
+
+    monitor.evict_worker_loads(&gone);
+    monitor.flush_pending_evictions();
+
+    assert_eq!(monitor.pending_pushed_len(), 0);
+    assert!(!held(gone), "nothing holds the worker that is gone");
+}
+
 /// A pusher that left `Ready` while registry events were lost stays
 /// registered, so its engine series would read its last load as live. The
 /// reset's eviction writes the series' sentinel, as its event's would.

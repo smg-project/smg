@@ -1520,43 +1520,59 @@ impl Metrics {
     pub fn remove_engine_load_metrics(worker_url: &str, model_id: &str, dp_size: usize) {
         let worker = intern_string(worker_url);
         let model = intern_model_label(model_id);
-
         for rank in 0..dp_size.max(1) {
-            let dp_rank = intern_string(&rank.to_string());
+            Self::set_engine_rank_sentinel(&worker, &model, &rank.to_string());
+        }
+    }
+
+    /// Sentinel-out one rank's `smg_engine_*` series: a rank a worker
+    /// reported past its own width, which
+    /// [`Self::remove_engine_load_metrics`] does not reach. One call a
+    /// rank: no rank between is written.
+    pub(crate) fn remove_engine_rank_load_metrics(worker_url: &str, model_id: &str, dp_rank: i32) {
+        Self::set_engine_rank_sentinel(
+            &intern_string(worker_url),
+            &intern_model_label(model_id),
+            &dp_rank.to_string(),
+        );
+    }
+
+    /// Set every `smg_engine_*` gauge of one rank to the sentinel.
+    fn set_engine_rank_sentinel(worker: &Arc<str>, model: &Arc<str>, rank: &str) {
+        let dp_rank = intern_string(rank);
+        for name in [
+            "smg_engine_running_requests",
+            "smg_engine_waiting_requests",
+            "smg_engine_token_usage",
+            "smg_engine_gen_throughput",
+            "smg_engine_cache_hit_rate",
+            "smg_engine_kv_capacity_tokens",
+        ] {
+            gauge!(
+                name,
+                "worker" => Arc::clone(worker),
+                "model" => Arc::clone(model),
+                "dp_rank" => Arc::clone(&dp_rank),
+            )
+            .set(-1.0);
+        }
+
+        // PD gauges are labeled {worker, role, dp_rank}; the role is unknown
+        // at teardown, so clear every role for this rank.
+        for role in ["prefill", "decode", "null"] {
             for name in [
-                "smg_engine_running_requests",
-                "smg_engine_waiting_requests",
-                "smg_engine_token_usage",
-                "smg_engine_gen_throughput",
-                "smg_engine_cache_hit_rate",
-                "smg_engine_kv_capacity_tokens",
+                "smg_engine_pd_kv_transfer_latency_ms",
+                "smg_engine_pd_kv_transfer_speed_gb_s",
+                "smg_engine_pd_prefill_queue_reqs",
+                "smg_engine_pd_decode_queue_reqs",
             ] {
                 gauge!(
                     name,
-                    "worker" => Arc::clone(&worker),
-                    "model" => Arc::clone(&model),
+                    "worker" => Arc::clone(worker),
+                    "role" => role,
                     "dp_rank" => Arc::clone(&dp_rank),
                 )
                 .set(-1.0);
-            }
-
-            // PD gauges are labeled {worker, role, dp_rank}; the role is unknown
-            // at teardown, so clear every role for this rank.
-            for role in ["prefill", "decode", "null"] {
-                for name in [
-                    "smg_engine_pd_kv_transfer_latency_ms",
-                    "smg_engine_pd_kv_transfer_speed_gb_s",
-                    "smg_engine_pd_prefill_queue_reqs",
-                    "smg_engine_pd_decode_queue_reqs",
-                ] {
-                    gauge!(
-                        name,
-                        "worker" => Arc::clone(&worker),
-                        "role" => role,
-                        "dp_rank" => Arc::clone(&dp_rank),
-                    )
-                    .set(-1.0);
-                }
             }
         }
     }
