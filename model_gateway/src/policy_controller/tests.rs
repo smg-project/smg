@@ -12,6 +12,7 @@ use openai_protocol::{
     model_card::ModelCard,
     transcription::{AudioFile, TranscriptionRequest},
     worker::WorkerStatus,
+    UNKNOWN_MODEL_ID,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
@@ -23,7 +24,8 @@ use crate::{
     config::{ManualAssignmentMode, PolicyConfig, RouterConfig},
     middleware::{RouteRequestMeta, TenantKey},
     routers::{
-        common::snapshot::WorkerRegistry, grpc::backend_client::BasicWorkerBuilder, RouterTrait,
+        common::snapshot::WorkerRegistry, grpc::backend_client::BasicWorkerBuilder,
+        http::router::Router, RouterTrait,
     },
     server::{serving_router, ServerConfig},
 };
@@ -449,5 +451,26 @@ async fn a_starts_context_holds_the_store_where_the_controller_was_picked() -> C
         refusal.as_deref(),
         Some("routing_key_override.enabled = true: the controller holds no recorded form of the sticky sessions' rule yet")
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_starts_context_holds_the_host_where_it_holds_the_store() -> Case {
+    let hosted = AppContext::from_config(picked(quiet()), 30, None, None).await?;
+    assert!(hosted.policy_store.is_some());
+    assert!(hosted.policy_host.is_some());
+    let router = Router::new(&Arc::new(hosted)).await?;
+    let meta = RouteRequestMeta::new(TenantKey::from("test-tenant"));
+    let routed = router
+        .route_generate(None, &meta, body(json!({"text": "hi"})), UNKNOWN_MODEL_ID)
+        .await;
+    assert_eq!(
+        refusal(routed).await,
+        (StatusCode::NOT_IMPLEMENTED, BY_NAME.to_owned())
+    );
+
+    let classic = AppContext::from_config(quiet(), 30, None, None).await?;
+    assert!(classic.policy_store.is_none());
+    assert!(classic.policy_host.is_none());
     Ok(())
 }

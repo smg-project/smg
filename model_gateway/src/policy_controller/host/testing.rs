@@ -37,6 +37,17 @@ pub(crate) fn bed(urls: &[&str]) -> Bed {
 
 /// [`bed`] where the gateway routes by `policy`.
 pub(crate) fn bed_under(policy: PolicyConfig, urls: &[&str]) -> Bed {
+    started(policy, Arc::new(WorkerRegistry::new()), urls)
+}
+
+/// The same store and host over workers registered in `registry`.
+pub(crate) fn bed_over(registry: Arc<WorkerRegistry>, urls: &[&str]) -> Bed {
+    started(RouterConfig::default().policy, registry, urls)
+}
+
+/// The store a start makes for `policy`, with its rows and its workers in
+/// `registry`.
+fn started(policy: PolicyConfig, registry: Arc<WorkerRegistry>, urls: &[&str]) -> Bed {
     let config = RouterConfig {
         policy_controller: true,
         policy,
@@ -45,7 +56,7 @@ pub(crate) fn bed_under(policy: PolicyConfig, urls: &[&str]) -> Bed {
     let store = start(&config)
         .expect("the start takes the routing")
         .expect("the controller was picked");
-    bed_with(store, urls)
+    bed_with(store, registry, urls)
 }
 
 /// Three ready rows under the cache-aware preset, with the second row's id.
@@ -55,16 +66,15 @@ pub(crate) fn cache_bed() -> (Host, Arc<MemoryStore>, WorkerId) {
     let applied = AppliedSpec::validate(&document).expect("the preset validates");
     store.apply(applied).expect("the store takes the preset");
     let urls = ["http://w0:8000", "http://w1:8000", "http://w2:8000"];
-    let (host, store, _) = bed_with(store, &urls);
+    let (host, store, _) = bed_with(store, Arc::new(WorkerRegistry::new()), &urls);
     let holder = store.by_key(urls[1]).expect("the second worker's row").id;
     (host, store, holder)
 }
 
-/// [`bed`] over `store`: a row publishes cache events where the store's
-/// generation reads them.
-fn bed_with(store: Arc<MemoryStore>, urls: &[&str]) -> Bed {
+/// [`bed`] over `store` and `registry`: a row publishes cache events where
+/// the store's generation reads them.
+fn bed_with(store: Arc<MemoryStore>, registry: Arc<WorkerRegistry>, urls: &[&str]) -> Bed {
     let events = store.deciding(|world| world.spec().needs().events);
-    let registry = Arc::new(WorkerRegistry::new());
     let mut workers = Vec::new();
     for url in urls {
         let facts = WorkerFacts {

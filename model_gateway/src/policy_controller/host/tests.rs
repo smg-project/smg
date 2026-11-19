@@ -2,8 +2,8 @@
 //! through the store's own door, beside workers registered by hand.
 
 use std::{
-    collections::BTreeSet,
-    sync::Arc,
+    collections::{BTreeSet, HashSet},
+    sync::{Arc, Barrier},
     thread,
     time::{Duration, Instant},
 };
@@ -31,7 +31,7 @@ use smg_policy_controller::{
 use smg_worker::identity::basic::WorkerLoadGuard;
 
 use super::{
-    left_no_worker, profile_of,
+    left_no_worker, mark, profile_of,
     testing::{bed, bed_under, cache_bed, store_blocks, MODEL},
     Ask, End, Hashes, Held, Prompt, Unplaced, GATEWAY,
 };
@@ -97,6 +97,25 @@ fn manual() -> PolicyConfig {
         max_idle_secs: 14_400,
         assignment_mode: ManualAssignmentMode::Random,
     }
+}
+
+#[test]
+fn each_mark_is_new() {
+    let start = Arc::new(Barrier::new(4));
+    let threads: Vec<_> = (0..4)
+        .map(|_| {
+            let start = Arc::clone(&start);
+            thread::spawn(move || {
+                start.wait();
+                (0..250).map(|_| mark()).collect::<Vec<_>>()
+            })
+        })
+        .collect();
+    let marks: HashSet<_> = threads
+        .into_iter()
+        .flat_map(|thread| thread.join().expect("the thread finished"))
+        .collect();
+    assert_eq!(marks.len(), 1000);
 }
 
 /// A first attempt's ask of the request `id`.
