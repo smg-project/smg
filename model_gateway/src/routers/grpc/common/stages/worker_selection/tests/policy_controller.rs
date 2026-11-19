@@ -19,21 +19,29 @@ const WINDOW: u32 = 16;
 fn stage_with_host(urls: &[&str]) -> (WorkerSelectionStage, Arc<MemoryStore>) {
     let workers: Vec<_> = urls
         .iter()
-        .map(|url| (*url, ConnectionMode::Grpc, RuntimeType::Vllm))
+        .map(|url| {
+            (
+                *url,
+                WorkerType::Regular,
+                ConnectionMode::Grpc,
+                RuntimeType::Vllm,
+            )
+        })
         .collect();
     stage_with_workers(&workers)
 }
 
-/// The stage over a host whose rows have one worker a URL, each on the
-/// connection and of the runtime beside it.
+/// The stage over a host whose rows have one worker a URL, each of the
+/// type, on the connection and of the runtime beside it.
 fn stage_with_workers(
-    workers: &[(&str, ConnectionMode, RuntimeType)],
+    workers: &[(&str, WorkerType, ConnectionMode, RuntimeType)],
 ) -> (WorkerSelectionStage, Arc<MemoryStore>) {
     let urls: Vec<&str> = workers.iter().map(|(url, ..)| *url).collect();
     let (_, store, rows) = host::testing::bed(&urls);
     let registry = Arc::new(WorkerRegistry::new());
-    for (row, (_, connection, runtime)) in rows.iter().zip(workers) {
+    for (row, (_, worker_type, connection, runtime)) in rows.iter().zip(workers) {
         let worker = BasicWorkerBuilder::carrying(row)
+            .worker_type(*worker_type)
             .connection_mode(*connection)
             .runtime_type(*runtime)
             .model(ModelCard::new(MODEL).with_context_length(WINDOW))
@@ -253,14 +261,24 @@ async fn a_retry_under_a_decoding_rule_is_refused_by_name() -> anyhow::Result<()
 #[tokio::test]
 async fn a_target_off_the_requests_wire_is_passed_over() {
     let pool = [
-        (URLS[0], ConnectionMode::Grpc, RuntimeType::Vllm),
-        (URLS[1], ConnectionMode::Grpc, RuntimeType::Sglang),
+        (
+            URLS[0],
+            WorkerType::Regular,
+            ConnectionMode::Grpc,
+            RuntimeType::Vllm,
+        ),
+        (
+            URLS[1],
+            WorkerType::Regular,
+            ConnectionMode::Grpc,
+            RuntimeType::Sglang,
+        ),
     ];
     let (stage, store) = stage_with_workers(&pool);
     let plan = retained_plan(&[1]);
     // Each wire admits one worker of the two. Every attempt under it lands
     // there, whichever target the controller names first.
-    for (url, _, runtime) in pool {
+    for (url, _, _, runtime) in pool {
         for _ in 0..4 {
             let mut ctx = dispatch_ctx(MODEL, grpc_wire(runtime));
             stage
@@ -287,20 +305,38 @@ async fn a_target_off_the_requests_wire_is_passed_over() {
 }
 
 #[tokio::test]
-async fn a_worker_the_pipeline_does_not_send_to_is_passed_over() {
+async fn a_worker_outside_the_regular_pool_is_passed_over() {
+    const REGULAR: &str = "http://w2:8000";
     let (stage, store) = stage_with_workers(&[
-        (URLS[0], ConnectionMode::Http, RuntimeType::Vllm),
-        (URLS[1], ConnectionMode::Grpc, RuntimeType::Vllm),
+        (
+            URLS[0],
+            WorkerType::Regular,
+            ConnectionMode::Http,
+            RuntimeType::Vllm,
+        ),
+        (
+            URLS[1],
+            WorkerType::Prefill,
+            ConnectionMode::Grpc,
+            RuntimeType::Vllm,
+        ),
+        (
+            REGULAR,
+            WorkerType::Regular,
+            ConnectionMode::Grpc,
+            RuntimeType::Vllm,
+        ),
     ]);
-    // No wire is pinned: the pipeline's own connections are the rule.
+    // No wire is pinned: the regular pool's own match is the rule. One
+    // worker is on another connection, one is of another type.
     for _ in 0..8 {
         let mut ctx = ingress(&stage.worker_registry);
         stage
             .execute(&mut ctx)
             .await
-            .expect("the worker the pipeline sends to");
+            .expect("the worker of the regular pool");
         let placed = ctx.state.placed.as_ref().expect("a placement");
-        assert_eq!(placed.worker().url(), URLS[1]);
+        assert_eq!(placed.worker().url(), REGULAR);
     }
     assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 0);
 }
@@ -355,11 +391,6 @@ async fn a_retry_names_the_rows_of_its_failed_attempts() {
         .worker_registry
         .get_by_url(other_url)
         .expect("the other worker");
-    let mut failure = error::internal_error("upstream", "Definitive failure");
-    mark_upstream_answer(&mut failure);
-    ctx.ledger.settle(&mut failure, [&other], []);
-    assert!(!ctx.ledger.admits(other.as_ref()));
-
     // The attempt fails ahead of its send, and its row is named all the same.
     ctx.release_attempt();
     assert_eq!(*ctx.tried_rows, [first_row]);
@@ -380,6 +411,49 @@ async fn a_retry_names_the_rows_of_its_failed_attempts() {
     };
     assert!(Arc::ptr_eq(worker, second.worker()));
     assert_the_lease_is_named_by_none_of(&store, &["retry-id", ""]);
+}
+
+#[tokio::test]
+async fn a_retry_never_returns_to_a_worker_that_answered_definitively() {
+    let (stage, store) = stage_with_host(&URLS);
+    let plan = retained_plan(&[1]);
+    let mut ctx = dispatch_ctx(MODEL, grpc_wire(RuntimeType::Vllm));
+
+    // The first attempt's worker answers the request definitively: the
+    // ledger closes its window, and its row is named as tried.
+    stage
+        .reselect(&mut ctx, &plan)
+        .await
+        .expect("the first pick");
+    let closed = Arc::clone(ctx.placed.as_ref().expect("a placement").worker());
+    let mut failure = error::internal_error("upstream", "Definitive failure");
+    mark_upstream_answer(&mut failure);
+    ctx.ledger.settle(&mut failure, [&closed], []);
+    assert!(!ctx.ledger.admits(closed.as_ref()));
+    ctx.release_attempt();
+
+    // The second attempt's worker fails in passing: its row is tried too,
+    // and its window stays open.
+    stage
+        .reselect(&mut ctx, &plan)
+        .await
+        .expect("the other worker");
+    let open = Arc::clone(ctx.placed.as_ref().expect("a placement").worker());
+    assert!(!Arc::ptr_eq(&open, &closed));
+    ctx.release_attempt();
+    assert_eq!(ctx.tried_rows.len(), 2);
+
+    // Every row is tried now, so the controller's soft filter hands both
+    // back. The commit still passes over the worker the ledger closed.
+    for _ in 0..8 {
+        stage
+            .reselect(&mut ctx, &plan)
+            .await
+            .expect("the open worker");
+        let placed = ctx.placed.take().expect("a placement");
+        assert!(Arc::ptr_eq(placed.worker(), &open));
+    }
+    assert_eq!(LeasesStore::live(&*store, GatewayId::LOCAL), 0);
 }
 
 #[tokio::test]

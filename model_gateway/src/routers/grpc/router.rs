@@ -174,9 +174,8 @@ impl GrpcRouter {
                 Mode::EncodePrefillDecode => {}
             }
         }
-        let host = ctx.policy_host.clone();
         // Deps for the parser-consuming endpoints (chat/messages/harmony).
-        let mut configured_deps = PipelineDeps::new(
+        let configured_deps = PipelineDeps::new(
             worker_registry.clone(),
             policy_registry.clone(),
             ctx.prefill_admission.clone(),
@@ -188,11 +187,11 @@ impl GrpcRouter {
             queue_timeout,
         )
         .with_request_timeout(request_timeout)
-        .with_grouped_dp_sticky(grouped_dp_sticky);
-        configured_deps.host.clone_from(&host);
+        .with_grouped_dp_sticky(grouped_dp_sticky)
+        .with_host(ctx.policy_host.clone());
         // Deps for the parser-free endpoints (completion/embeddings/classify/
         // decisions/transcription).
-        let mut pair_deps = PipelineDeps::pair(
+        let pair_deps = PipelineDeps::pair(
             worker_registry.clone(),
             policy_registry.clone(),
             ctx.prefill_admission.clone(),
@@ -200,8 +199,8 @@ impl GrpcRouter {
             queue_timeout,
         )
         .with_request_timeout(request_timeout)
-        .with_grouped_dp_sticky(grouped_dp_sticky);
-        pair_deps.host = host;
+        .with_grouped_dp_sticky(grouped_dp_sticky)
+        .with_host(ctx.policy_host.clone());
 
         // Present in every mode: chat/generate, messages, completion.
         let pipeline = RequestPipeline::build(Endpoint::Chat, mode, &configured_deps)

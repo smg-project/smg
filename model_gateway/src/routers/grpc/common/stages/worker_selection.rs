@@ -36,6 +36,7 @@ use crate::{
     },
     routers::{
         common::{
+            attempt_ledger::AttemptLedger,
             pair_index::{PdPairIndex, PdWire},
             placement::{
                 self, CandidateFilter, PairFailure, PipelinePin, PlacementFailure, PlacementInputs,
@@ -1132,16 +1133,31 @@ impl<'a> RegularAttempt<'a> {
             hashes: None,
         }
     }
+
+    /// The ledger of the request's attempts, where this is a retry: a
+    /// worker that answered the request definitively takes no next attempt.
+    fn ledger(&self) -> Option<&'a AttemptLedger> {
+        match self {
+            Self::First(_) => None,
+            Self::Retry(ctx) => Some(&ctx.ledger),
+        }
+    }
 }
 
-/// The regular route's rule at the controller's commit: a worker this
-/// pipeline sends to, on the request's wire. The controller reads no
-/// connection and no wire, so a target off either is passed over like one
-/// the gateway cannot send to. A demand the controller keeps ahead of its
+/// The regular route's rule at the controller's commit, built from the
+/// classic selection's own rules: the regular pool's match, the request's
+/// wire, and on a retry the ledger's admit. The controller reads none of
+/// them, so a target one of them refuses is passed over like one the
+/// gateway cannot send to. A demand the controller keeps ahead of its
 /// stages takes this function's place once a request can state it.
-fn on_route(wire: Option<WireConstraint>) -> impl Fn(&dyn Worker) -> bool + Send + Sync {
+fn on_route<'a>(
+    wire: Option<WireConstraint>,
+    ledger: Option<&'a AttemptLedger>,
+) -> impl Fn(&dyn Worker) -> bool + Send + Sync + 'a {
     move |worker| {
-        worker.connection_mode().uses_grpc_pipeline() && WireConstraint::admits(wire, worker)
+        RoutingPool::GrpcPipelineRegular.matches(worker)
+            && WireConstraint::admits(wire, worker)
+            && ledger.is_none_or(|ledger| ledger.admits(worker))
     }
 }
 
@@ -1795,9 +1811,10 @@ impl WorkerSelectionStage {
         }
 
         let id = host::mark();
+        let rule = on_route(wire, attempt.ledger());
         let ask = attempt.ask(model_id, &id);
         let placed = host
-            .place_where(&ask, on_route(wire), Instant::now())
+            .place_where(&ask, rule, Instant::now())
             .await
             .map_err(|unplaced| unplaced.answer(model_id))?;
         Ok((Arc::clone(placed.worker()), Some(placed)))

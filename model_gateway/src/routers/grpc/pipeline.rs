@@ -119,7 +119,7 @@ pub(crate) enum Endpoint {
 pub(crate) struct PipelineDeps {
     worker_registry: Arc<WorkerRegistry>,
     policy_registry: Arc<PolicyRegistry>,
-    pub(super) host: Option<Arc<Host>>,
+    host: Option<Arc<Host>>,
     prefill_admission: Option<Arc<PrefillAdmission>>,
     tool_parser_factory: ToolParserFactory,
     reasoning_parser_factory: ReasoningParserFactory,
@@ -213,6 +213,14 @@ impl PipelineDeps {
     #[must_use]
     pub(crate) fn with_grouped_dp_sticky(mut self, sticky: GroupedDpSticky) -> Self {
         self.grouped_dp_sticky = sticky;
+        self
+    }
+
+    /// Place regular requests through the policy controller's `host`, where
+    /// the context holds one.
+    #[must_use]
+    pub(crate) fn with_host(mut self, host: Option<Arc<Host>>) -> Self {
+        self.host = host;
         self
     }
 
