@@ -55,13 +55,19 @@ struct Place {
     history: u64,
 }
 
+/// A row and the object the holder built from it.
+struct Laid {
+    standing: Standing,
+    object: Arc<dyn Worker>,
+}
+
 /// What stands, both ways.
 #[derive(Default)]
 struct Held {
     /// A row's object, by the row's id.
     objects: HashMap<WorkerId, ObjectId>,
     /// An object's row, by the object's id in the registry.
-    rows: HashMap<ObjectId, Standing>,
+    rows: HashMap<ObjectId, Laid>,
 }
 
 /// A replica's worker objects: for every row of the membership store that
@@ -150,7 +156,18 @@ impl<G: Generation> Objects<G> {
     /// was built from; `None` for an id the holder laid no object under, or
     /// one whose row went.
     pub fn standing(&self, object: &ObjectId) -> Option<Standing> {
-        self.held.read().rows.get(object).copied()
+        self.held.read().rows.get(object).map(|laid| laid.standing)
+    }
+
+    /// The row and revision the holder built this object from. A writer
+    /// holding the object's registry lock uses this to name that revision.
+    pub fn standing_of(&self, id: &ObjectId, object: &Arc<dyn Worker>) -> Option<Standing> {
+        self.held
+            .read()
+            .rows
+            .get(id)
+            .filter(|laid| Arc::ptr_eq(&laid.object, object))
+            .map(|laid| laid.standing)
     }
 
     /// The registry's id of the object that stands for `row`.
@@ -330,9 +347,12 @@ impl<G: Generation> Objects<G> {
             entries.objects.insert(row.id, id.clone());
             entries.rows.insert(
                 id,
-                Standing {
-                    row: row.id,
-                    revision: row.revision,
+                Laid {
+                    standing: Standing {
+                        row: row.id,
+                        revision: row.revision,
+                    },
+                    object: Arc::clone(&built),
                 },
             );
         }
@@ -486,6 +506,37 @@ mod tests {
         }
         let told = [("registered", replica.id(A)), ("registered", replica.id(B))];
         assert_eq!(replica.told(), told);
+    }
+
+    #[test]
+    fn the_row_is_answered_only_for_the_object_the_entry_was_written_for() {
+        let replica = Replica::new();
+        let row = replica.store.upsert(facts(A, 1)).id();
+        replica.store.upsert(facts(B, 1));
+        replica.follow();
+        let id = replica.id(A);
+        let laid = replica.at(A);
+        let standing = Standing {
+            row,
+            revision: replica.row(A).revision,
+        };
+        assert_eq!(replica.objects.standing_of(&id, &laid), Some(standing));
+        assert_eq!(replica.objects.standing_of(&replica.id(B), &laid), None);
+        assert_eq!(
+            replica.objects.standing_of(&id, &object(&replica.row(A))),
+            None
+        );
+
+        replica.patch(A, labels("gold"));
+        replica.follow();
+        assert_eq!(replica.objects.standing_of(&id, &laid), None);
+        assert_eq!(
+            replica.objects.standing_of(&id, &replica.at(A)),
+            Some(Standing {
+                row,
+                revision: replica.row(A).revision,
+            })
+        );
     }
 
     /// The second act.

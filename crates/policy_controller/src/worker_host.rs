@@ -45,14 +45,24 @@
 //! host hands the holder its connector ([`Objects::with_connector`]); a
 //! credential has no door yet.
 //!
+//! # The adapters
+//!
+//! [`HealthAdapter`] writes probe outcomes and connect signals to the store
+//! and sets the object's status to the status that stands there. The host
+//! supplies the [`Lead`] and the term the adapter writes under.
+//!
 //! # What the module does not hold
 //!
 //! It builds no registry, no engine and no task. The host builds the
 //! registry and hands it in, and calls [`Objects::follow`] where the store
 //! moved. It names nothing of the controller.
 
+mod health;
+mod lead;
 mod object;
 mod objects;
 
+pub use health::HealthAdapter;
+pub use lead::{Lead, SoleLead};
 pub use object::object;
 pub use objects::{Members, Objects, Standing};
