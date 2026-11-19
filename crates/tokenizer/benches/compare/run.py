@@ -219,8 +219,12 @@ def one(args, column, family, cores, cell):
             command, capture_output=True, encoding="utf-8", errors="replace", timeout=CELL_TIMEOUT
         )
         context["rc"], lines, context["stderr"] = done.returncode, done.stdout, done.stderr[-300:]
-    except subprocess.TimeoutExpired:
-        context["rc"], lines, context["stderr"] = 124, "", "timeout"
+    except subprocess.TimeoutExpired as exc:
+        # A thread that panicked before a barrier leaves its cell waiting: what the process wrote
+        # to stderr until the timeout is kept (the exception holds it as bytes).
+        tail = (exc.stderr or b"").decode("utf-8", "replace")[-300:]
+        context["rc"], lines = 124, ""
+        context["stderr"] = f"timeout; {tail}" if tail else "timeout"
     try:
         out = json.loads(lines.strip().splitlines()[-1]) if lines.strip() else None
     except ValueError:
@@ -368,6 +372,9 @@ def run(args):
 def ids(args):
     """Every column's token ids on the parity strings; the count that equals the column smg."""
     corpus = args.corpus / "parity.jsonl"
+    # The parity cell writes one record per string of the corpus: a non-blank line of the file.
+    with corpus.open(encoding="utf-8") as handle:
+        strings = sum(1 for line in handle if line.strip())
     totals = {}
     lines = []
 
@@ -386,8 +393,8 @@ def ids(args):
                     hashlib.sha256(text).hexdigest() if value is not None else "error"
                 )
         except ValueError:
-            # A process that died can leave a cut-off last line: the strings before it are kept,
-            # and the summary names the column's exit status.
+            # A line that does not parse is where the file was cut off: the strings before it are
+            # kept, and the summary names the column, whose file is short of a record per string.
             pass
         digests[column] = found
 
@@ -422,6 +429,16 @@ def ids(args):
         ended = [f"{column} {code}" for column, code in sorted(status.items()) if code]
         if ended:
             parts.append("exit status not 0: " + ", ".join(ended))
+        # A file without a whole record for every string is named whatever the exit status: a
+        # write that failed leaves it short, or cut off inside a line, and the cell still ends
+        # at status 0. A column that did not load has no record and is named above.
+        short = [
+            f"{column} {len(digests[column])} of {strings}"
+            for column in columns
+            if len(digests[column]) != strings and (digests[column] or column == "smg")
+        ]
+        if short:
+            parts.append("incomplete output: " + ", ".join(short))
         lines.append("; ".join(parts))
         print(lines[-1], flush=True)
     lines.append("TOTAL SAME: " + "; ".join(f"{c} {t[0]} of {t[1]}" for c, t in totals.items()))

@@ -277,9 +277,9 @@ same harness); **fastokens**: the open-source Rust tokenizer stack built on `fas
 tiktoken files, `tekken` 0.2.0 for `tekken.json`, `tokenizers` 0.22.2 where those decline a file), pinned at one
 commit; **v1**: this crate built with `--features tokenizers-v1`, so the `tokenizers` 1.0.0-rc.3 pipeline encodes and
 everything else is shared, which isolates the encoder. Where the v1 pipeline declines a file (a
-tiktoken file, `tekken.json`, WordPiece, Unigram) its build runs SMG's own path and the column reads `-`. The csv files
-hold two more reference columns that the tables leave out: the `tokenizers` crate 0.23.2 through its default pipeline,
-and `tiktoken-rs` 0.12.1 on gpt-oss and Kimi K3.
+tiktoken file, `tekken.json`, WordPiece, Unigram) its build takes its next encode path (SMG's own; the `tokenizers`
+crate's for Unigram) and the column reads `-`. The csv files hold two more reference columns that the tables leave
+out: the `tokenizers` crate 0.23.2 through its default pipeline, and `tiktoken-rs` 0.12.1 on gpt-oss and Kimi K3.
 
 Corpus: 33 texts per size class of about 256, 2,000, 32,000, 128,000, 500,000 and 1,000,000 tokens (counted with the
 DeepSeek V4.1 vocabulary; a 1M text is two 500k texts joined), assembled from public text: XL-Sum news articles in Arabic, Chinese, English, Hindi, Japanese,
@@ -446,7 +446,7 @@ difference between implementations.
 - Batch of 1,000 texts, one thread, against v1: SMG is ahead beyond the band on 12 of 12 families, behind beyond it on 0, inside it on 0 (the margins run from +268 % to +1642 %).
 - Load and memory, against v1.15.0: SMG 1.16.0 reads lower by more than 5 % on 16 of 16 families in the load time; on 16 of 16 families in the resident memory after the load; on 16 of 16 families in the high-water mark after a 1m-token encode; on 15 of 16 families in the growth per thread on one shared tokenizer; on 16 of 16 families in the resident level per thread with a tokenizer per thread.
 - Load and memory, against fastokens: SMG 1.16.0 reads lower by more than 5 % on 15 of 16 families in the load time (higher on Mistral (tekken)); on 14 of 16 families in the resident memory after the load (higher on Mistral (tekken), Kimi K3); on 14 of 16 families in the high-water mark after a 1m-token encode (higher on Mistral (tekken), Kimi K3); on 13 of 16 families in the growth per thread on one shared tokenizer (higher on Mistral (tekken), Kimi K3); on 15 of 16 families in the resident level per thread with a tokenizer per thread (higher on Kimi K3).
-- The v1 column reads `-` for Mistral (tekken), Kimi K3, BERT base, T5 small: the v1 pipeline declines their files, and that build takes its next encode path there (SMG's own, or the `tokenizers` crate's).
+- The v1 column reads `-` for Mistral (tekken), Kimi K3, BERT base, T5 small: the v1 pipeline declines their files, and that build takes its next encode path there (SMG's own for Mistral (tekken), Kimi K3, BERT base; the `tokenizers` crate's for T5 small).
 - The placement band: the v1 build shares SMG's decode and streaming code, and between the two builds those 80 cells read -18 % to +25 %.
 - The corpus: 17 to 39 % of the bytes of a size class are outside ASCII (`corpus.json`).
 

@@ -41,15 +41,19 @@ built `--locked` against the adapter's `Cargo.lock`. A `--previous` column start
 cargo changes what that release's manifest requires. `--columns` and `--families` take a subset.
 
 `ids` runs first: every column encodes the 7,015 parity strings of every family, and
-`ids-summary.txt` counts the strings on which a column's ids equal the `smg` column's. Timing two
-implementations that tokenize a text differently compares different work, so read it before the tables.
+`ids-summary.txt` counts the strings on which a column's ids equal the `smg` column's. A family's line
+also names a column whose process ended at a non-zero exit status, and a column whose file does not hold
+a whole record for every string. Timing two implementations that tokenize a text differently compares
+different work, so read it before the tables.
 
 `run` writes one JSON line per process under `--output/raw/`: `{"ctx": ..., "out": ...}`, where `ctx` is
 the column, the family, the round, the core, the exit status and the load average, and `out` is the
-cell's own line. A process that failed has a non-zero `rc`. The `v1` column on a family whose file the v1
-pipeline declines runs this crate's own encoder: its `backend` string then has no `hf:v1`, and that cell
-is no reference. The last command above is the edge pass: five more rounds on the encode cells in which
-`smg` stands within 10 % of its best reference, where three rounds can leave the side open.
+cell's own line. A process that failed has a non-zero `rc`, and one that ran into the timeout keeps what
+it wrote to stderr until then. The `v1` column on a family whose file the v1 pipeline declines takes its
+next encode path (this crate's own encoder, or the `tokenizers` crate's): its `backend` string then has
+no `hf:v1`, and that cell is no reference. The last command above is the edge pass: five more rounds on
+the encode cells in which `smg` stands within 10 % of its best reference, where three rounds can leave
+the side open.
 
 `collect` writes the three csv files that `tables.py` reads from those raw lines, one line per process:
 `encode-rounds.csv` (the p50 of nanoseconds per token), `misc-rounds.csv` (decode, streams and batch) and

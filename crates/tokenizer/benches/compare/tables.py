@@ -84,8 +84,17 @@ class Run:
                     self.memory[(row["family"], name, row["arm"])] = float(text)
 
     def v1_encodes(self, family):
-        """Whether the v1 build took the v1 encoder for the family (else it ran SMG's own)."""
+        """Whether the v1 build took the v1 encoder for the family (else its next encode path)."""
         return "hf:v1" in self.backend.get((family, "v1"), "")
+
+    def v1_path(self, family):
+        """The encode path the v1 build took on a family whose file the v1 pipeline declines."""
+        backend = self.backend.get((family, "v1"), "")
+        if "hf:tokenizers" in backend:
+            return "the `tokenizers` crate's"
+        if "hf:native" in backend or "tiktoken" in backend:
+            return "SMG's own"
+        return f"`{backend}`" if backend else "one the csv files do not name"
 
     def enc(self, family, cls, mode, arm):
         if arm == "v1" and not self.v1_encodes(family):
@@ -462,11 +471,17 @@ def reading(run):
                 f"- Load and memory, against {label}: SMG {new} reads lower by more than"
                 f" {100 * LEVEL:.0f} % on " + "; on ".join(parts) + "."
             )
-    declined = [model["family"] for model in MODELS if not run.v1_encodes(model["name"])]
+    declined = [model for model in MODELS if not run.v1_encodes(model["name"])]
     if declined:
+        # Which path that build took on each of them, as its backend text says.
+        took = {}
+        for model in declined:
+            took.setdefault(run.v1_path(model["name"]), []).append(model["family"])
+        paths = "; ".join(f"{path} for {', '.join(names)}" for path, names in took.items())
         lines.append(
-            f"- The v1 column reads `-` for {', '.join(declined)}: the v1 pipeline declines their files,"
-            " and that build takes its next encode path there (SMG's own, or the `tokenizers` crate's)."
+            f"- The v1 column reads `-` for {', '.join(model['family'] for model in declined)}:"
+            " the v1 pipeline declines their files, and that build takes its next encode path"
+            f" there ({paths})."
         )
     spread = []
     for model in MODELS:
