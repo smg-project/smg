@@ -83,6 +83,7 @@ profiles:
 - A profile has exactly one picker.
 - Workers whose scores are equal, within a small band, tie. `best` draws among them at random.
 - A decision that ends with no worker is a **shed**. It names the stage that left it empty.
+- A pick can state what its first worker holds of the request's prefix (`Pick::overlap`): the leading blocks held, the request's blocks, where the match came from, and whether the prefix margin kept that worker in front. The profile's first `prefix-affinity` scorer says it. A host that calls the library asks through `Engine::decide_stated`. The controller's `Decide` answer does not carry it yet.
 
 ### Filters
 
@@ -631,6 +632,7 @@ A host that holds a store of its own, with no controller around it, validates a 
 - The code above is from [`examples/policy-controller`](../../examples/policy-controller), the guide with the scorer, its tests and its document. That page also lists the data the stock controller feeds a stage today.
 - A stage that keeps a number of each worker's load report says so through `Lifecycle::keeps_loads`. The controller then tells it every report before a decision can read that report, through `Lifecycle::on_signal`. A stage that does not say so is told no report. In process the load signal names two more things: the worker's slot in the host's counts and the report's sample instant. A host that builds the signal itself fills both.
 - [`policyspec.schema.json`](policyspec.schema.json) is the JSON schema of the document, generated from the crate's types. It lists every field with its description.
+- A scorer of your own can state a pick's overlap too: implement `Scorer::states_overlap` and `Scorer::said`. Both have a default that says nothing. `said` is asked once a decision, of the first target alone.
 - [`contracts`](contracts) holds the wire contracts: the controller's calls and the plugin interfaces.
 
 A scorer can take settings of its own from the document. Register it with `scorer_with`. The factory reads the entry's parameters into a type of its own and returns the scorer, or refuses a value.
