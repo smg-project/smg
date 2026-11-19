@@ -29,7 +29,6 @@ pub use shared::{
 };
 use smg_worker::workflow::{
     startup_attempts, worker_registration_workflow, RegistrationGates, DISCOVER_DP_STEP,
-    DISCOVER_METADATA_STEP,
 };
 use wfaas::{BackoffStrategy, FailureAction, RetryPolicy, StepDefinition, WorkflowDefinition};
 
@@ -54,12 +53,10 @@ use crate::{
 ///       |                               |
 ///  discover_metadata                    |
 ///       |                               |
-///       +----------------+              |
-///       |                |              |
-///  discover_dp_info discover_zmq_labels |
-///       |           (ZMQ only)          |
-///       |                |              |
-///       +----------------+              |
+///  discover_dp_info                     |
+///       |                               |
+///  discover_zmq_labels                  |
+///  (ZMQ only)                           |
 ///       |                               |
 ///  create_local_worker           create_external_workers
 ///       |                               |
@@ -101,7 +98,10 @@ pub fn create_worker_registration_workflow(
     // Steps 1, 1.5, 2a and 2b, the connection mode (HTTP vs gRPC), the
     // runtime, the metadata read and the DP read, are the worker crate's.
     // The first waits on the classification, which carries the startup
-    // delay.
+    // delay. The gateway's own steps of the local line hang behind the
+    // last of them, one after another: the engine writes a step's whole
+    // copy of the run's data back, so two steps that wait on one step
+    // would each drop what the other wrote.
     worker_registration_workflow::<AppContext>(
         &settings,
         RegistrationGates {
@@ -111,9 +111,10 @@ pub fn create_worker_registration_workflow(
     // Step 0: Classify worker type (Local vs External)
     .add_step(classify_worker_type)
     // === LOCAL BRANCH ===
-    // Step 2a (ZMQ): what the gateway knows of a ZMQ worker ahead of its
-    // handshake, behind the crate's metadata read, which reads nothing for
-    // such a worker.
+    // Step 2c (ZMQ): what the gateway knows of a ZMQ worker ahead of its
+    // handshake. It waits on the crate's DP read, the last step of the
+    // crate's detection, so the two write the run's data one after the
+    // other. The crate's metadata read reads nothing for such a worker.
     .add_step(
         StepDefinition::new(
             ZMQ_LABELS_STEP,
@@ -126,10 +127,10 @@ pub fn create_worker_registration_workflow(
         })
         .with_timeout(Duration::from_secs(10))
         .with_failure_action(FailureAction::ContinueNextStep)
-        .depends_on(&[DISCOVER_METADATA_STEP]),
+        .depends_on(&[DISCOVER_DP_STEP]),
     )
-    // Step 3 (local): Create local worker(s), behind the crate's DP read and
-    // the ZMQ label step: the creation reads what both wrote.
+    // Step 3 (local): Create local worker(s), behind the ZMQ label step,
+    // the last step of the local line's detection.
     .add_step(
         StepDefinition::new(
             "create_local_worker",
@@ -138,7 +139,7 @@ pub fn create_worker_registration_workflow(
         )
         .with_timeout(Duration::from_secs(5))
         .with_failure_action(FailureAction::FailWorkflow)
-        .depends_on(&[DISCOVER_DP_STEP, ZMQ_LABELS_STEP]),
+        .depends_on(&[ZMQ_LABELS_STEP]),
     )
     // Step 3b (local): gRPC gpt-oss workers need the Harmony encoding; load
     // it before registration so an unavailable vocab fails this worker
@@ -255,7 +256,9 @@ mod policy_lifecycle_tests;
 
 #[cfg(test)]
 mod tests {
-    use smg_worker::workflow::DETECT_CONNECTION_MODE_STEP;
+    use smg_worker::workflow::{
+        DETECT_CONNECTION_MODE_STEP, DETECT_RUNTIME_STEP, DISCOVER_METADATA_STEP,
+    };
 
     use super::*;
     use crate::config::RouterConfig;
@@ -349,5 +352,44 @@ mod tests {
         let config = config_with(1800, 30);
         assert_eq!(config.worker_startup_delay_secs, 0);
         assert_eq!(startup_delay(&config), None);
+    }
+
+    /// From the classification to the creation a local worker's steps form
+    /// one chain: each waits on the step before it and on no other. The
+    /// engine writes a step's whole copy of the run's data back, so two of
+    /// them waiting on one step would each drop what the other wrote: a ZMQ
+    /// worker's default runtime and labels, or its DP shape.
+    #[test]
+    fn a_local_workers_steps_write_the_data_one_after_another() {
+        let workflow = create_worker_registration_workflow(&config_with(1800, 30));
+        let waits_on = |id: &str| -> Vec<String> {
+            workflow
+                .steps
+                .iter()
+                .find(|step| step.id.to_string() == id)
+                .expect("the step is in the workflow")
+                .depends_on
+                .iter()
+                .map(ToString::to_string)
+                .collect()
+        };
+        let line = [
+            "classify_worker_type",
+            DETECT_CONNECTION_MODE_STEP,
+            DETECT_RUNTIME_STEP,
+            DISCOVER_METADATA_STEP,
+            DISCOVER_DP_STEP,
+            ZMQ_LABELS_STEP,
+            "create_local_worker",
+        ];
+        for pair in line.windows(2) {
+            assert_eq!(
+                waits_on(pair[1]),
+                [pair[0]],
+                "{} waits on {} alone",
+                pair[1],
+                pair[0]
+            );
+        }
     }
 }

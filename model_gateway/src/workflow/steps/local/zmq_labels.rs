@@ -117,9 +117,9 @@ async fn sampling_defaults_label(path: &std::path::Path) -> HashMap<String, Stri
 }
 
 /// Writes what the gateway knows of a ZMQ worker ahead of its handshake. It
-/// runs behind the worker crate's metadata read, which reads nothing for a
-/// ZMQ worker, and is skipped for every other worker. The worker's creation
-/// waits on it.
+/// runs behind the worker crate's detection, whose metadata read reads
+/// nothing for a ZMQ worker, and is skipped for every other worker. The
+/// worker's creation waits on it.
 ///
 /// A ZMQ engine reports its geometry at the handshake, which runs after the
 /// registration's detection; the facts worth having earlier are the model's

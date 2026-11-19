@@ -64,6 +64,13 @@ pub fn startup_attempts(settings: &RegistrationSettings) -> u32 {
 /// `gates.detection` named that step is the host's, and the host sets the
 /// delay there; the detection then waits on it and carries none. With no
 /// gate the detection opens the workflow and carries the delay.
+///
+/// The engine runs a step on a copy of the run's data and writes the whole
+/// copy back, unless the step skipped. Two steps that wait on one step can
+/// run at once, and the copy written last then replaces what the other
+/// step wrote. So a host hangs a step of its own that writes the data
+/// behind the last step here, the DP read, or behind another step of its
+/// own, never beside one.
 pub fn worker_registration_workflow<H: WorkflowHost>(
     settings: &RegistrationSettings,
     gates: RegistrationGates,

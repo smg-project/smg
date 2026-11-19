@@ -12,8 +12,8 @@ use crate::{
     test_support::{labels_of, RefusedAddress, ScriptedConnector},
     workflow::{
         host::testing::{serve_json_routes, ProbingHost},
+        metadata::ServerInfo,
         runtimes::HTTP_RUNTIMES,
-        ServerInfo,
     },
 };
 

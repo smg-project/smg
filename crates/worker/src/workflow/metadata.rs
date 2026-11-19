@@ -33,7 +33,7 @@ const METADATA_TIMEOUT: Duration = Duration::from_secs(10);
 /// `/server_info` response — curated subset of the full response (~800 fields).
 /// Uses `deny_unknown_fields = false` (the default) so extra fields are silently ignored.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct ServerInfo {
+pub(super) struct ServerInfo {
     #[serde(alias = "model")]
     pub model_id: Option<String>,
     pub model_path: Option<String>,
@@ -63,7 +63,7 @@ pub struct ServerInfo {
 
 /// `/model_info` response.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct ModelInfo {
+struct ModelInfo {
     pub model_path: Option<String>,
     pub tokenizer_path: Option<String>,
     pub is_generation: Option<bool>,
@@ -159,7 +159,7 @@ async fn http_get_json_classified<T: serde::de::DeserializeOwned>(
         .map_err(|e| MetadataError::Failed(format!("Failed to parse {shown}: {}", e.without_url())))
 }
 
-pub async fn get_server_info(
+pub(super) async fn get_server_info(
     client: &Client,
     url: &str,
     api_key: Option<&str>,
