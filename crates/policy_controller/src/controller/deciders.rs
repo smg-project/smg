@@ -5232,7 +5232,19 @@ pub(crate) mod tests {
         let hand = lifecycle::open(&bed.store, GATEWAY);
         lifecycle::dispatched(&bed.store, &hand, &a_dispatched(lease.id.0), at)
             .expect("the frame reads");
-        let pin = SessionsStore::lookup(&*bed.store, lease.session.get()).expect("a pin");
+        // The decider waits on its empty queue, or is about to: it applies
+        // the frame as it leaves its work, or the hand did.
+        let since = Instant::now();
+        let pin = loop {
+            if let Some(pin) = SessionsStore::lookup(&*bed.store, lease.session.get()) {
+                break pin;
+            }
+            assert!(
+                since.elapsed() < PATIENCE,
+                "a handed frame waits on no lull"
+            );
+            tokio::task::yield_now().await;
+        };
         assert_eq!(pin.ends, Some(lease.issued_micros + kept));
     }
 
