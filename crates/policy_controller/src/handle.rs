@@ -290,10 +290,11 @@ impl<D: Deref<Target = Door>> Handle<D> {
     /// lease's events in their order. That dispatch carries the
     /// completion's instant, so a stage that times a request from its
     /// dispatch reads a span of zero for it. On a pair's handle a decode
-    /// outcome ends the decode side, and an encode outcome writes
-    /// nothing: the lease holds no such side. Any other outcome ends the
-    /// handle's own side, and a single's lease ends under any side its
-    /// host names. Said once.
+    /// outcome ends the decode side. An encode outcome is said whole
+    /// there and ends no side, since the lease holds none such: the
+    /// served worker's health takes it, and what the handle owes stands.
+    /// Any other outcome ends the handle's own side, and a single's lease
+    /// ends under any side its host names. Said once.
     pub fn completed(&mut self, outcome: &Outcome, now: Instant) {
         let pair = self.decided.pair();
         let owed = match outcome.side {
@@ -301,9 +302,15 @@ impl<D: Deref<Target = Door>> Handle<D> {
                 self.dispatched_decode(now);
                 &mut self.decode
             }
-            // A side the pair's lease does not hold: nothing is written,
-            // as the served path writes nothing for such a frame.
-            Side::Encode if pair => return,
+            // A side the pair's lease does not hold: the completion is said
+            // whole, as a served controller says such a frame. The file ends
+            // no side of the lease, and the served worker's health takes it.
+            Side::Encode if pair => {
+                if let Some(leased) = self.decided.lease {
+                    self.say_completion(leased.lease.id, outcome, now);
+                }
+                return;
+            }
             Side::Single | Side::Prefill | Side::Decode | Side::Encode => {
                 self.dispatched(now);
                 &mut self.owed
@@ -385,8 +392,13 @@ impl<D: Deref<Target = Door>> Drop for Handle<D> {
     /// A handle dropped with a report owed speaks for a lease nobody
     /// spoke for, in the word of its phase that names no cause: a release
     /// as abandoned before any dispatch, a completion of class cancelled
-    /// after one. A drop is handed no instant and reads the clock.
+    /// after one. A drop is handed no instant and reads the clock. A
+    /// handle that owes nothing says nothing and reads no clock.
     fn drop(&mut self) {
+        // The common drop: the request completed, on every side.
+        if matches!((self.owed, self.decode), (Owed::Nothing, Owed::Nothing)) {
+            return;
+        }
         self.released(ReleaseReason::Abandoned, Instant::now());
     }
 }
@@ -1221,10 +1233,12 @@ mod tests {
         assert_eq!(*heard.lock(), told, "the drop says nothing more");
     }
 
-    /// A pair's lease holds no encode side: an encode outcome writes
-    /// nothing, and the prefill's lease stands for its own end.
+    /// A pair's lease holds no encode side: an encode outcome ends no
+    /// side and says no word of the lease, and the prefill's lease stands
+    /// for its own end. The served worker's health takes the completion,
+    /// as a served controller writes it for such a frame.
     #[test]
-    fn an_encode_outcome_on_a_pairs_handle_says_nothing() {
+    fn an_encode_outcome_on_a_pairs_handle_writes_its_workers_health_alone() {
         let door = pair_door(1, 1).expect("a pair door");
         let store = door.store();
         let now = Instant::now();
@@ -1235,12 +1249,23 @@ mod tests {
         let before = states(store, lease);
         let encoded = Outcome {
             side: Side::Encode,
-            ..outcome(first.id, TransportClass::Ok)
+            ..outcome(decode, TransportClass::Ok)
         };
+        assert!(!HealthSink::completed_ok_since(
+            &**store, GATEWAY, decode, now
+        ));
         handle.completed(&encoded, now);
         assert_eq!(states(store, lease), before, "neither side moved");
         assert_eq!(pair_counts(store, [first.id, decode]), [1, 1]);
-        assert!(words().is_empty(), "nothing was said");
+        // The file hears the completion whole, under its own side, and a
+        // frame on that side ends no side: no stage is told of it.
+        assert_eq!(words(), [Said::Completed(encoded)]);
+        let sides = store.sides(GATEWAY, lease).expect("the lease on file");
+        assert_eq!(sides.ending(Some(Side::Encode)), [None, None]);
+        assert!(
+            HealthSink::completed_ok_since(&**store, GATEWAY, decode, now),
+            "the served worker's health takes the completion"
+        );
         handle.completed(&outcome(first.id, TransportClass::Ok), now);
         let ended = states(store, lease).map(|[prefill, _]| prefill);
         assert_eq!(ended, Some(LeaseState::Completed));
