@@ -1631,12 +1631,13 @@ class CountingServer(FakeServer):
         super().__init__()
         self.engine_ready = True
         self._counts = list(counts)
+        self.reads: list[int] = []  # every count the drain read, in order
 
     @property
     def active_requests(self) -> int:
-        if len(self._counts) > 1:
-            return self._counts.pop(0)
-        return self._counts[0]
+        count = self._counts.pop(0) if len(self._counts) > 1 else self._counts[0]
+        self.reads.append(count)
+        return count
 
 
 def _drain_time(server, engine, drain_secs, linger_secs=0.0):
@@ -1654,8 +1655,11 @@ def test_drain_ends_at_once_when_nothing_is_in_flight():
 
 
 def test_drain_waits_for_in_flight_streams_and_ends_when_they_finish():
-    # Three reads with streams open, then none: done long before the bound.
-    elapsed = _drain_time(CountingServer([2, 2, 1, 0]), FakeEngine(), drain_secs=30.0)
+    # Three reads with streams open, then none: done long before the bound,
+    # and not before the count reached zero.
+    server = CountingServer([2, 2, 1, 0])
+    elapsed = _drain_time(server, FakeEngine(), drain_secs=30.0)
+    assert server.reads == [2, 2, 1, 0]
     assert elapsed < 1.0
 
 
@@ -1871,6 +1875,24 @@ def test_the_linger_is_read_with_the_launcher_knobs(tmp_path):
     assert read(**names, default_drain_linger_secs=5.0, environ=env).drain_linger_secs == 0.0
     with pytest.raises(rust_lifecycle.ServicerConfigError, match="must be at least 0"):
         read(**names, environ={rust.DRAIN_LINGER_SECS_ENV: "-1", **socket_dir})
+
+
+def test_an_unset_drain_knob_is_thirty_seconds(tmp_path):
+    """The drain bound's default is what the chart's termination grace is
+    sized for: 30 s when the launcher's variable is unset."""
+    launcher = rust.VllmLauncher()
+    knobs = rust_lifecycle.read_launcher_knobs(
+        handshake_port_env=launcher.handshake_port_env,
+        drain_secs_env=launcher.drain_secs_env,
+        startup_timeout_secs_env=launcher.startup_timeout_secs_env,
+        startup_ceiling_secs_env=launcher.startup_ceiling_secs_env,
+        silence_timeout_secs_env=launcher.silence_timeout_secs_env,
+        prefill_tokens_per_sec_env=launcher.prefill_tokens_per_sec_env,
+        drain_linger_secs_env=launcher.drain_linger_secs_env,
+        environ={"SMG_ZMQ_SOCKET_DIR": str(tmp_path)},
+    )
+    assert rust.DRAIN_SECS_ENV == "SMG_VLLM_SERVICER_DRAIN_SECS"
+    assert knobs.drain_secs == 30.0
 
 
 def test_supervise_stops_an_idle_server_without_waiting_out_the_drain_bound():

@@ -995,6 +995,32 @@ def test_a_worker_pod_gets_a_termination_grace_that_covers_the_servicer_drain(tm
 
 
 @needs_helm
+@pytest.mark.parametrize("written", ['"90s"', '"90"', "90.5", "-1"])
+def test_a_termination_grace_that_is_not_whole_seconds_is_refused_by_the_schema(tmp_path, written):
+    """The template reads the grace through ``int``, which turns ``"90s"`` into
+    0: a pod with no grace at all, its streams cut on SIGTERM. The schema
+    refuses a string, a fraction and a negative value under the entry's name
+    (helm 3.18 moved to a JSON pointer for it); ``null`` is the default."""
+    values = tmp_path / "values.yaml"
+    values.write_text(
+        WORKERS.format('"0.31"', '"0.31"') + f"    terminationGracePeriodSeconds: {written}\n"
+    )
+    error = render_error(files=(values,))
+    assert any(
+        name in error
+        for name in (
+            "workers.1.terminationGracePeriodSeconds",
+            "/workers/1/terminationGracePeriodSeconds",
+        )
+    ), error
+    values.write_text(
+        WORKERS.format('"0.31"', '"0.31"') + "    terminationGracePeriodSeconds: null\n"
+    )
+    _, documents = render(files=(values,))
+    assert worker_pods(documents)["two"]["terminationGracePeriodSeconds"] == 90
+
+
+@needs_helm
 @pytest.mark.parametrize("value", [-1, 0, 4096])
 def test_the_concurrency_bound_value_reaches_the_launcher_as_given(value):
     """``router.maxConcurrentRequests`` is passed through as the launcher's
