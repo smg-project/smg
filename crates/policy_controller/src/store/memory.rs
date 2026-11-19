@@ -2496,6 +2496,10 @@ impl SessionsStore for MemoryStore {
         );
     }
 
+    // The one product caller is the pin's writer for a lease whose own
+    // rule ends its pin, an arm that stands out of line: the door is
+    // part of that arm, so the arm is one call.
+    #[inline(always)]
     fn pin_no_earlier(&self, key: u64, worker: WorkerId, at: Instant, ends: Option<u64>) {
         if key == 0 {
             return;

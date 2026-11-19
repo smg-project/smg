@@ -983,7 +983,8 @@ pub(crate) fn pinned(
 }
 
 /// The pin of a lease whose own rule ends it, [`pinned`]'s last arm. Few
-/// leases come here, so it stands out of the path every dispatch takes.
+/// leases come here, so it stands out of the path every dispatch takes,
+/// and the store's door is forced into it: the arm is one call.
 /// The rule's word lives in a side's issued state alone, and the door
 /// tells a side's dispatch once, with the side as it stood issued. A side
 /// past that state would read as a rule with no TTL: it pins nothing by
