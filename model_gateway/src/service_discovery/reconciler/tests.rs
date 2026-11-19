@@ -1,13 +1,14 @@
-use std::sync::Arc;
+use std::{slice, sync::Arc};
 
 use openai_protocol::worker::WorkerType;
-use smg_worker::identity::endpoint::endpoint_key;
+use smg_worker::{
+    identity::endpoint::endpoint_key,
+    test_support::{assert_metric, render_with_recorder},
+};
+use tokio::runtime::Builder;
 
 use super::*;
-use crate::{
-    app_context::AppContext, config::RouterConfig, server::http_client,
-    service_discovery::testing::create_test_app_context,
-};
+use crate::service_discovery::testing::{Queued, TestHost, STAMPED_API_KEY, STAMPED_ATTEMPTS};
 
 fn key(url: &str) -> EndpointKey {
     endpoint_key(url).expect(url)
@@ -223,7 +224,7 @@ fn diverged_ranks_do_not_collapse_on_equal_revisions() {
     assert_eq!(actions.remove[1].guards.len(), 1);
 }
 
-fn register_with_labels(app_context: &AppContext, url: &str, labels: &[(&str, &str)]) {
+fn register_with_labels(host: &TestHost, url: &str, labels: &[(&str, &str)]) {
     use openai_protocol::model_card::ModelCard;
 
     use crate::routers::grpc::backend_client::BasicWorkerBuilder;
@@ -238,7 +239,7 @@ fn register_with_labels(app_context: &AppContext, url: &str, labels: &[(&str, &s
             .labels(labels)
             .build(),
     );
-    app_context.worker_registry.register(worker).unwrap();
+    host.registry.register(worker).unwrap();
 }
 
 /// Ownership is the provider label alone: a manual worker carries none,
@@ -246,9 +247,9 @@ fn register_with_labels(app_context: &AppContext, url: &str, labels: &[(&str, &s
 /// remove.
 #[test]
 fn owned_workers_are_scoped_by_provider_label_and_origin() {
-    let app_context = create_test_app_context();
+    let host = TestHost::without_a_queue();
     register_with_labels(
-        &app_context,
+        &host,
         "http://10.0.0.1:8080",
         &[
             (DISCOVERY_PROVIDER_LABEL, "kubernetes"),
@@ -256,16 +257,16 @@ fn owned_workers_are_scoped_by_provider_label_and_origin() {
         ],
     );
     register_with_labels(
-        &app_context,
+        &host,
         "http://10.0.0.2:8080",
         &[
             (DISCOVERY_PROVIDER_LABEL, "file"),
             (DISCOVERY_ID_LABEL, "f-1"),
         ],
     );
-    register_with_labels(&app_context, "http://10.0.0.3:8080", &[]);
+    register_with_labels(&host, "http://10.0.0.3:8080", &[]);
 
-    let owned = owned_workers(&*app_context, DiscoveryKind::Kubernetes);
+    let owned = owned_workers(&*host, DiscoveryKind::Kubernetes);
     assert_eq!(owned.len(), 1);
     assert_eq!(owned[0].endpoint.key().as_str(), "10.0.0.1:8080");
     assert_eq!(owned[0].discovery_id.as_deref(), Some("uid-1:8080"));
@@ -275,10 +276,10 @@ fn owned_workers_are_scoped_by_provider_label_and_origin() {
 /// carrying the current one is kept.
 #[test]
 fn owned_workers_read_back_the_spec_hash() {
-    let app_context = create_test_app_context();
+    let host = TestHost::without_a_queue();
     let worker = published("10.0.0.1:8080", "uid-1:8080");
     register_with_labels(
-        &app_context,
+        &host,
         "http://10.0.0.1:8080",
         &[
             (DISCOVERY_PROVIDER_LABEL, "kubernetes"),
@@ -286,7 +287,7 @@ fn owned_workers_read_back_the_spec_hash() {
             (DISCOVERY_SPEC_HASH_LABEL, &worker.fingerprint()),
         ],
     );
-    let owned = owned_workers(&*app_context, DiscoveryKind::Kubernetes);
+    let owned = owned_workers(&*host, DiscoveryKind::Kubernetes);
     assert_eq!(owned[0].spec_hash, Some(worker.fingerprint()));
 
     let actions = compute_actions(&desired_state_of(&[worker]), &owned);
@@ -298,16 +299,16 @@ fn owned_workers_read_back_the_spec_hash() {
 /// so it is updated in place and comes back labelled properly.
 #[test]
 fn an_owned_worker_without_a_spec_hash_is_updated_in_place() {
-    let app_context = create_test_app_context();
+    let host = TestHost::without_a_queue();
     register_with_labels(
-        &app_context,
+        &host,
         "http://10.0.0.1:8080",
         &[
             (DISCOVERY_PROVIDER_LABEL, "kubernetes"),
             (DISCOVERY_ID_LABEL, "uid-1:8080"),
         ],
     );
-    let owned = owned_workers(&*app_context, DiscoveryKind::Kubernetes);
+    let owned = owned_workers(&*host, DiscoveryKind::Kubernetes);
     assert_eq!(owned[0].spec_hash, None);
 
     let desired = desired_state_of(&[published("10.0.0.1:8080", "uid-1:8080")]);
@@ -320,13 +321,13 @@ fn an_owned_worker_without_a_spec_hash_is_updated_in_place() {
 /// so it is replaced and comes back labelled properly.
 #[test]
 fn an_owned_worker_without_an_id_is_replaced() {
-    let app_context = create_test_app_context();
+    let host = TestHost::without_a_queue();
     register_with_labels(
-        &app_context,
+        &host,
         "http://10.0.0.1:8080",
         &[(DISCOVERY_PROVIDER_LABEL, "kubernetes")],
     );
-    let owned = owned_workers(&*app_context, DiscoveryKind::Kubernetes);
+    let owned = owned_workers(&*host, DiscoveryKind::Kubernetes);
     assert_eq!(owned[0].discovery_id, None);
 
     let desired = desired_state_of(&[published("10.0.0.1:8080", "uid-1:8080")]);
@@ -342,13 +343,13 @@ fn an_owned_worker_without_an_id_is_replaced() {
 /// empty id outright; this keeps the diff correct even without it.
 #[test]
 fn an_empty_published_id_does_not_match_a_missing_label() {
-    let app_context = create_test_app_context();
+    let host = TestHost::without_a_queue();
     register_with_labels(
-        &app_context,
+        &host,
         "http://10.0.0.1:8080",
         &[(DISCOVERY_PROVIDER_LABEL, "kubernetes")],
     );
-    let owned = owned_workers(&*app_context, DiscoveryKind::Kubernetes);
+    let owned = owned_workers(&*host, DiscoveryKind::Kubernetes);
 
     let desired = desired_state_of(&[published("10.0.0.1:8080", "")]);
     let actions = compute_actions(&desired, &owned);
@@ -361,7 +362,7 @@ fn owned_workers_exclude_mesh_imported_workers() {
     // A peer's discovered worker arrives via mesh sync carrying the peer's
     // provider label; it is absent from this node's snapshot, so without
     // the Local-origin filter the reconciler would remove it every pass.
-    let app_context = create_test_app_context();
+    let host = TestHost::without_a_queue();
 
     let mut spec = WorkerSpec::new("http://10.0.0.3:8080");
     spec.labels.insert(
@@ -376,18 +377,15 @@ fn owned_workers_exclude_mesh_imported_workers() {
         version: 0,
         spec: serde_json::to_vec(&spec).unwrap(),
     };
-    app_context.worker_registry.on_remote_worker_state(&state);
-    assert!(app_context
-        .worker_registry
-        .get_by_url("http://10.0.0.3:8080")
-        .is_some());
+    host.registry.on_remote_worker_state(&state);
+    assert!(host.registry.get_by_url("http://10.0.0.3:8080").is_some());
 
-    assert!(owned_workers(&*app_context, DiscoveryKind::Kubernetes).is_empty());
+    assert!(owned_workers(&*host, DiscoveryKind::Kubernetes).is_empty());
 }
 
 #[test]
 fn build_worker_spec_carries_the_record_and_stamps_provenance() {
-    let app_context = create_test_app_context();
+    let host = TestHost::without_a_queue();
     let worker = DiscoveredWorker {
         worker_type: WorkerType::Prefill,
         bootstrap_port: Some(9080),
@@ -397,7 +395,7 @@ fn build_worker_spec_carries_the_record_and_stamps_provenance() {
         kv_engine_id: Some("engine-1".to_string()),
         ..published("10.0.0.1:8081", "uid-1:8081")
     };
-    let spec = build_worker_spec(&worker, DiscoveryKind::Kubernetes, &*app_context);
+    let spec = build_worker_spec(&worker, DiscoveryKind::Kubernetes, &*host);
 
     assert_eq!(spec.url, "10.0.0.1:8081");
     assert_eq!(spec.worker_type, WorkerType::Prefill);
@@ -419,15 +417,9 @@ fn build_worker_spec_carries_the_record_and_stamps_provenance() {
         spec.labels.get(DISCOVERY_ID_LABEL).map(String::as_str),
         Some("uid-1:8081")
     );
-    // The discovered budget: the context's default success threshold
-    // of 2, twenty attempts per success.
-    assert_eq!(
-        spec.max_connection_attempts,
-        app_context
-            .router_config
-            .connection_attempt_budget(RouterConfig::DISCOVERED_WORKER_ATTEMPTS_PER_SUCCESS)
-    );
-    assert_eq!(spec.max_connection_attempts, 40);
+    // What the host stamps: its credential and its budget of attempts.
+    assert_eq!(spec.api_key.as_deref(), Some(STAMPED_API_KEY));
+    assert_eq!(spec.max_connection_attempts, STAMPED_ATTEMPTS);
     // Taken from the record, so the API key and retry budget injected into
     // the spec cannot move it.
     assert_eq!(
@@ -441,7 +433,7 @@ fn build_worker_spec_carries_the_record_and_stamps_provenance() {
 /// reconciler has no notion of which provider's labels it is carrying.
 #[test]
 fn compat_labels_are_written_verbatim_but_cannot_claim_provenance() {
-    let app_context = create_test_app_context();
+    let host = TestHost::without_a_queue();
     let worker = DiscoveredWorker {
         compat_labels: BTreeMap::from([
             ("example.com/source-ref".to_string(), "rec-7".to_string()),
@@ -453,7 +445,7 @@ fn compat_labels_are_written_verbatim_but_cannot_claim_provenance() {
         ]),
         ..published("10.0.0.1:8080", "rec-7")
     };
-    let spec = build_worker_spec(&worker, DiscoveryKind::Kubernetes, &*app_context);
+    let spec = build_worker_spec(&worker, DiscoveryKind::Kubernetes, &*host);
 
     assert_eq!(
         spec.labels
@@ -491,165 +483,171 @@ fn test_deregistration_reconciled_metric_label() {
 
 #[tokio::test]
 async fn test_reconcile_without_job_queue_is_safe() {
-    let app_context = create_test_app_context();
+    let host = TestHost::without_a_queue();
     let desired = desired_state_of(&[published("10.0.0.1:8080", "u1")]);
     reconcile(
         &desired,
         DiscoveryKind::Kubernetes,
-        &*app_context,
+        &*host,
         time::Instant::now(),
     )
     .await;
 }
 
-/// A pass that waits for a queue slot with an addition in hand holds that
-/// URL's claim while it waits: a `POST` of the URL during the wait is told
-/// a registration is in flight. The pass used to read the URL's status
-/// first and submit without a claim, so such a `POST` was admitted and the
-/// pass then queued a second registration of the URL beside it.
-#[tokio::test]
-async fn an_addition_waiting_for_a_queue_slot_holds_its_urls_claim() {
-    use crate::workflow::{Job, JobQueue, JobQueueConfig};
-
-    let app_context = create_test_app_context();
-    // One slot and no runner: the dispatcher takes one job out and waits for
-    // a permit that never comes, and the next job fills the slot.
-    let queue = JobQueue::new(
-        JobQueueConfig {
-            queue_capacity: 1,
-            max_concurrent_jobs: 0,
-        },
-        Arc::downgrade(&app_context),
-    );
-    app_context.worker_job_queue.set(Arc::clone(&queue)).ok();
-    let registration = |url: &str, registration_mode| Job::AddWorker {
-        config: Box::new(WorkerSpec::new(url)),
-        registration_mode,
+/// A prefill worker discovered without a bootstrap annotation carries no
+/// bootstrap port into its spec: its host hands it the default port on the
+/// request path.
+#[test]
+fn a_discovered_prefill_worker_without_a_bootstrap_annotation_carries_no_port() {
+    let host = TestHost::without_a_queue();
+    let worker = DiscoveredWorker {
+        worker_type: WorkerType::Prefill,
+        ..published("127.0.0.1:18081", "uid-1:18081")
     };
-    for other in 1.. {
-        tokio::task::yield_now().await;
-        if queue.get_load_info().0 == 1 {
-            break;
-        }
-        let url = format!("http://10.0.0.{other}:8080");
-        queue
-            .submit(registration(&url, WorkerRegistrationMode::Upsert))
-            .await
-            .expect("a slot");
-    }
+    let spec = build_worker_spec(&worker, DiscoveryKind::Kubernetes, &*host);
+    assert_eq!(spec.worker_type, WorkerType::Prefill);
+    assert_eq!(spec.bootstrap_port, None, "no annotation, no port");
+}
 
-    let worker = published("http://10.0.9.1:8080", "u1");
-    let url = worker.endpoint.render();
-    let desired = desired_state_of(&[worker]);
-    let mut pass = std::pin::pin!(reconcile(
-        &desired,
+/// One pass of the Kubernetes provider over `desired`, against `host`.
+async fn pass(desired: &DesiredState, host: &TestHost) {
+    reconcile(
+        desired,
         DiscoveryKind::Kubernetes,
-        &*app_context,
+        host,
         time::Instant::now(),
-    ));
-    assert!(
-        matches!(futures::poll!(pass.as_mut()), std::task::Poll::Pending),
-        "the pass waits for a queue slot"
-    );
+    )
+    .await;
+}
 
-    assert!(
-        !queue.claim_if_idle(&registration(&url, WorkerRegistrationMode::CreateOnly)),
-        "the waiting addition holds its URL: a POST of it is told to poll"
+/// Run `scenario` to its end and return the scrape of what it recorded.
+fn scrape_of(scenario: impl std::future::Future<Output = ()>) -> String {
+    render_with_recorder(|| {
+        Builder::new_current_thread()
+            .build()
+            .expect("a runtime")
+            .block_on(scenario);
+    })
+}
+
+/// A worker the Kubernetes provider registered at `url` and no longer
+/// publishes.
+fn register_an_unpublished_worker(host: &TestHost, url: &str) {
+    register_with_labels(
+        host,
+        url,
+        &[
+            (DISCOVERY_PROVIDER_LABEL, "kubernetes"),
+            (DISCOVERY_ID_LABEL, "gone"),
+        ],
     );
 }
 
-/// A prefill worker discovered without a bootstrap annotation carries no
-/// bootstrap port into its spec and is handed the default port on the
-/// request path (here a vLLM worker on the Mooncake connector, as the
-/// provider reports it). Registered, it is probed on that default port:
-/// with nothing listening there, the failed probe is counted like a
-/// registered port's.
+/// What a pass hands the queue is the spec its host stamped, the credential
+/// and the budget of attempts on it, under an Upsert.
 #[tokio::test]
-async fn a_discovered_prefill_worker_without_a_bootstrap_annotation_is_probed_on_the_default_port()
-{
-    use std::{
-        net::{SocketAddr, TcpStream},
-        sync::Arc,
-        time::Duration,
+async fn a_pass_registers_the_spec_its_host_stamped() {
+    let (host, jobs) = TestHost::recording();
+    let worker = published("10.0.0.1:8080", "u1");
+    pass(&desired_state_of(slice::from_ref(&worker)), &host).await;
+
+    let queued = jobs.queued();
+    let [Queued::Add { spec, mode }] = queued.as_slice() else {
+        panic!("one addition and nothing else: {queued:?}");
     };
-
-    use openai_protocol::worker::RuntimeType;
-    use smg_worker::identity::basic::{ConnectionMode, DEFAULT_BOOTSTRAP_PORT};
-    use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowInstanceId};
-
-    use crate::workflow::{
-        data::WorkerKind,
-        steps::{create_worker_workflow_data, CreateLocalWorkerStep, RegisterWorkersStep},
-    };
-
-    // A listener on the default port would make a passed probe and an
-    // absent one look alike, so the test stands down then.
-    let default_port = SocketAddr::from(([127, 0, 0, 1], DEFAULT_BOOTSTRAP_PORT));
-    if TcpStream::connect_timeout(&default_port, Duration::from_millis(500)).is_ok() {
-        return;
-    }
-
-    let app_context = create_test_app_context();
-    let worker = DiscoveredWorker {
-        worker_type: WorkerType::Prefill,
-        kv_connector: Some("MooncakeConnector".to_string()),
-        kv_role: Some("kv_producer".to_string()),
-        kv_engine_id: Some("engine-1".to_string()),
-        ..published("127.0.0.1:18081", "uid-1:18081")
-    };
-    let mut spec = build_worker_spec(&worker, DiscoveryKind::Kubernetes, &*app_context);
-    assert_eq!(spec.bootstrap_port, None, "no annotation, no port");
-    // The runtime the worker's engine reports when the registration detects it.
-    spec.runtime_type = RuntimeType::Vllm;
-
-    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
-    let handle = recorder.handle();
-    let _guard = metrics::set_default_local_recorder(&recorder);
-
-    let mut data = create_worker_workflow_data(
-        spec,
-        WorkerRegistrationMode::Upsert,
-        Arc::clone(&app_context),
-    );
-    data.worker_kind = Some(WorkerKind::Local);
-    data.connection_mode = Some(ConnectionMode::Http);
-    data.http_client_handle = Some(Arc::new(http_client()));
-    let mut ctx = WorkflowContext::new(WorkflowInstanceId::new(), data);
+    assert_eq!(*mode, WorkerRegistrationMode::Upsert);
+    assert_eq!(spec.url, "10.0.0.1:8080");
+    assert_eq!(spec.api_key.as_deref(), Some(STAMPED_API_KEY));
+    assert_eq!(spec.max_connection_attempts, STAMPED_ATTEMPTS);
     assert_eq!(
-        CreateLocalWorkerStep.execute(&mut ctx).await.unwrap(),
-        StepResult::Success
+        spec.labels.get(DISCOVERY_SPEC_HASH_LABEL),
+        Some(&worker.fingerprint())
     );
-    assert_eq!(
-        RegisterWorkersStep.execute(&mut ctx).await.unwrap(),
-        StepResult::Success
-    );
-    let registered = &ctx.data.actual_workers.as_ref().unwrap()[0];
-    assert_eq!(
-        registered.bootstrap_port(),
-        None,
-        "the spec keeps what was discovered"
-    );
+}
 
-    // The probe runs off the path, within its own timeout.
-    let deadline = time::Instant::now() + Duration::from_secs(5);
-    let counted = loop {
-        let rendered = handle.render();
-        if let Some(line) = rendered
-            .lines()
-            .find(|line| line.starts_with("smg_pd_rendezvous_failures_total{"))
-        {
-            break line.to_string();
-        }
-        assert!(
-            time::Instant::now() < deadline,
-            "the failed probe of the default port is counted within its timeout:\n{rendered}"
-        );
-        time::sleep(Duration::from_millis(20)).await;
+/// A pass asks nothing for an address whose job is in flight, and asks once
+/// that job has ended. It reads a removal's address by its lookup form and
+/// an addition's as the provider published it: the forms the two jobs are
+/// queued under.
+#[tokio::test]
+async fn a_pass_leaves_an_address_whose_job_is_in_flight() {
+    let (host, jobs) = TestHost::recording();
+    register_an_unpublished_worker(&host, "http://10.0.0.2:8080");
+    let desired = desired_state_of(&[published("http://10.0.0.1:8080", "u1")]);
+    jobs.hold("10.0.0.2:8080");
+    jobs.hold("http://10.0.0.1:8080");
+
+    pass(&desired, &host).await;
+    assert!(jobs.queued().is_empty(), "{:?}", jobs.queued());
+    assert!(jobs.refused().is_empty(), "a held address is not asked for");
+
+    jobs.release("10.0.0.2:8080");
+    jobs.release("http://10.0.0.1:8080");
+    pass(&desired, &host).await;
+    let queued = jobs.queued();
+    let [Queued::Remove { url, guards }, Queued::Add { spec, .. }] = queued.as_slice() else {
+        panic!("the removal, then the addition: {queued:?}");
     };
+    assert_eq!(url, "10.0.0.2:8080");
+    assert_eq!(guards.len(), 1);
+    assert_eq!(spec.url, "http://10.0.0.1:8080");
+}
+
+/// A registration that takes the address after the pass asked about it keeps
+/// it: the queue refuses the pass's addition, the pass counts it as neither
+/// a success nor a failure, and the next pass adds what is still missing.
+#[test]
+fn an_addition_the_queue_refuses_is_left_to_the_next_pass() {
+    let (host, jobs) = TestHost::recording();
+    let desired = desired_state_of(&[published("10.0.0.1:8080", "u1")]);
+    jobs.hold_after_the_next_read("10.0.0.1:8080");
+
+    let rendered = scrape_of(pass(&desired, &host));
+    assert_eq!(jobs.refused(), ["10.0.0.1:8080"]);
+    assert!(jobs.queued().is_empty(), "{:?}", jobs.queued());
     assert!(
-        counted.contains(r#"leg="prefill""#)
-            && counted.contains(r#"phase="probe""#)
-            && counted.ends_with(" 1"),
-        "{counted}"
+        !rendered.contains("smg_discovery_registrations_total"),
+        "{rendered}"
+    );
+
+    jobs.release("10.0.0.1:8080");
+    let rendered = scrape_of(pass(&desired, &host));
+    assert_eq!(jobs.queued().len(), 1, "{:?}", jobs.queued());
+    assert_metric(
+        &rendered,
+        "smg_discovery_registrations_total",
+        &[r#"source="kubernetes""#, r#"result="success""#],
+        "1",
+    );
+}
+
+/// A pass counts what the queue took, by source: a registration, a removal,
+/// and the workers the provider published.
+#[test]
+fn a_pass_counts_what_the_queue_took() {
+    let (host, jobs) = TestHost::recording();
+    register_an_unpublished_worker(&host, "http://10.0.0.2:8080");
+    let desired = desired_state_of(&[published("10.0.0.1:8080", "u1")]);
+
+    let rendered = scrape_of(pass(&desired, &host));
+    assert_eq!(jobs.queued().len(), 2, "{:?}", jobs.queued());
+    let kubernetes = r#"source="kubernetes""#;
+    assert_metric(
+        &rendered,
+        "smg_discovery_registrations_total",
+        &[kubernetes, r#"result="success""#],
+        "1",
+    );
+    assert_metric(
+        &rendered,
+        "smg_discovery_deregistrations_total",
+        &[kubernetes, r#"reason="reconciled""#],
+        "1",
+    );
+    assert_metric(
+        &rendered,
+        "smg_discovery_workers_discovered",
+        &[kubernetes],
+        "1",
     );
 }

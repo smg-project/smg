@@ -131,8 +131,8 @@ mod tests {
 
     use super::*;
     use crate::{
+        app_context::testing::create_test_app_context,
         routers::grpc::backend_client::BasicWorkerBuilder,
-        service_discovery::testing::create_test_app_context,
     };
 
     fn context(

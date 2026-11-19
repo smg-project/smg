@@ -2203,6 +2203,41 @@ mod tests {
         assert!(!shown.contains("secret"), "{shown}");
     }
 
+    /// A mode with worker pools names the roles a discovery provider fills.
+    /// A mode with none names no roles, and a provider refuses it.
+    #[test]
+    fn a_routing_mode_names_the_roles_discovery_fills() {
+        use crate::config::test_support::{
+            epd_routing_mode, pd_routing_mode, regular_routing_mode,
+        };
+
+        assert_eq!(
+            regular_routing_mode().discovery_roles(),
+            Some(Roles::Regular)
+        );
+        assert_eq!(
+            pd_routing_mode().discovery_roles(),
+            Some(Roles::PrefillDecode)
+        );
+        assert_eq!(
+            epd_routing_mode().discovery_roles(),
+            Some(Roles::EncodePrefillDecode)
+        );
+        for mode in [
+            RoutingMode::OpenAI {
+                worker_urls: vec![],
+            },
+            RoutingMode::Anthropic {
+                worker_urls: vec![],
+            },
+            RoutingMode::Gemini {
+                worker_urls: vec![],
+            },
+        ] {
+            assert_eq!(mode.discovery_roles(), None, "{mode:?}");
+        }
+    }
+
     #[test]
     fn test_router_config_default() {
         let config = RouterConfig::default();

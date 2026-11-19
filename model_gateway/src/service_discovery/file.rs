@@ -554,7 +554,7 @@ mod tests {
     use std::path::Path;
 
     use super::*;
-    use crate::service_discovery::testing::create_test_app_context;
+    use crate::service_discovery::testing::TestHost;
 
     fn parse(json: &str, roles: Roles) -> Result<Vec<DiscoveredWorker>, String> {
         parse_manifest(json.as_bytes(), roles)
@@ -975,7 +975,7 @@ mod tests {
         let config =
             FileProviderConfig::new(path.to_path_buf(), check_interval, Some(Roles::Regular))
                 .unwrap();
-        FileDiscovery::new(config, create_test_app_context())
+        FileDiscovery::new(config, TestHost::without_a_queue())
     }
 
     /// The endpoints of the last good snapshot, `None` before the first good

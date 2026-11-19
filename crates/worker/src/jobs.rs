@@ -68,7 +68,10 @@ pub trait WorkerJobs: Send + Sync {
 
     /// Queue the registration of the worker `spec` describes, under `mode`.
     /// `Ok(false)` when a registration of that address is in flight: nothing
-    /// is queued, and the caller asks again later.
+    /// is queued, and the caller asks again later. The check and the claim of
+    /// the address are one step: of two callers at once one is queued and the
+    /// other refused, and a caller that waits for a queue slot holds its
+    /// claim while it waits.
     async fn add_worker(
         &self,
         spec: WorkerSpec,
@@ -81,6 +84,12 @@ pub trait WorkerJobs: Send + Sync {
     /// the slot is held (a removal's), and may keep one record an address,
     /// which a job that ends clears. So the answer is one to plan by, not a
     /// claim: `false` reserves nothing, and [`Self::add_worker`] is the
-    /// claim.
+    /// claim. A job is recorded under the address it was asked with, so a
+    /// caller reads in that form: a registration's as its spec writes the
+    /// address, a removal's as the removal was asked. A discovery source
+    /// registers an address
+    /// [as published](crate::identity::endpoint::Endpoint::render) and asks
+    /// its removal at the address's
+    /// [lookup form](crate::identity::endpoint::Endpoint::lookup_form).
     fn job_in_flight(&self, url: &str) -> bool;
 }
