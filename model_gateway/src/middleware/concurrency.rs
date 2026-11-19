@@ -35,7 +35,8 @@ use super::{
     edge_body::{BodyDuties, Permit},
     tenant_resolution::restamp_accepted_at,
     token_bucket::TokenBucket,
-    SHED_RETRY_AFTER_SECS,
+    ADMISSION_QUEUE_FULL_CODE, ADMISSION_QUEUE_FULL_STATUS, ADMISSION_QUEUE_TIMEOUT_CODE,
+    ADMISSION_QUEUE_TIMEOUT_STATUS, SHED_RETRY_AFTER_SECS,
 };
 use crate::{
     observability::metrics::{metrics_labels, Metrics},
@@ -206,8 +207,8 @@ where
             warn!("No tokens available and queuing is disabled, returning 429");
             Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_REJECTED);
             return ConcurrencyLimitFuture::Shed {
-                status: StatusCode::TOO_MANY_REQUESTS,
-                code: "admission_queue_full",
+                status: ADMISSION_QUEUE_FULL_STATUS,
+                code: ADMISSION_QUEUE_FULL_CODE,
                 message: "concurrency limit reached and queuing is disabled",
             };
         };
@@ -218,8 +219,8 @@ where
             Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_REJECTED);
             Metrics::record_admission_rejected(metrics_labels::ADMISSION_REJECTED_FULL);
             return ConcurrencyLimitFuture::Shed {
-                status: StatusCode::TOO_MANY_REQUESTS,
-                code: "admission_queue_full",
+                status: ADMISSION_QUEUE_FULL_STATUS,
+                code: ADMISSION_QUEUE_FULL_CODE,
                 message: "admission queue is at capacity",
             };
         };
@@ -277,8 +278,8 @@ where
             Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_REJECTED);
             Metrics::record_admission_rejected(metrics_labels::ADMISSION_REJECTED_TIMEOUT);
             Ok(shed_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "admission_queue_timeout",
+                ADMISSION_QUEUE_TIMEOUT_STATUS,
+                ADMISSION_QUEUE_TIMEOUT_CODE,
                 "timed out waiting for an admission slot",
             ))
         }
@@ -616,6 +617,15 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(shed.status(), StatusCode::TOO_MANY_REQUESTS);
+        let body = axum::body::to_bytes(shed.into_body(), usize::MAX)
+            .await
+            .expect("the shed response body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("the shed error object");
+        assert_eq!(json["error"]["code"], "admission_queue_full");
+        assert_eq!(
+            json["error"]["message"],
+            "concurrency limit reached and queuing is disabled"
+        );
 
         let echoed = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
@@ -850,6 +860,7 @@ mod tests {
                     .unwrap();
                 let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
                 assert_eq!(json["error"]["code"], "admission_queue_full");
+                assert_eq!(json["error"]["message"], "admission queue is at capacity");
 
                 let rendered = handle.render();
                 assert_metric_line(&rendered, "smg_admission_queue_depth", "1");
@@ -896,6 +907,10 @@ mod tests {
                     .unwrap();
                 let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
                 assert_eq!(json["error"]["code"], "admission_queue_timeout");
+                assert_eq!(
+                    json["error"]["message"],
+                    "timed out waiting for an admission slot"
+                );
                 drop(held);
             });
         });

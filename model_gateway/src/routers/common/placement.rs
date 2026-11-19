@@ -682,6 +682,11 @@ pub(crate) const NO_AVAILABLE_WORKERS_CODE: &str = "no_available_workers";
 /// backstop of it answer under this code.
 pub(crate) const NO_MEDIA_REF_CAPABLE_WORKER_CODE: &str = "no_media_ref_capable_worker";
 
+/// The client-visible code of [`policy_declined`].
+pub(crate) const POLICY_DECLINED_CODE: &str = "policy_declined";
+
+const POLICY_DECLINED_MESSAGE: &str = "The policy declined the request for model";
+
 /// The 503 for a pool whose every worker is unavailable (unhealthy or its
 /// circuit breaker open). Terminal for the retry layer: the verdict clears at
 /// the health interval or the breaker timeout, never inside a backoff window,
@@ -733,13 +738,25 @@ pub(crate) fn no_media_ref_capable_worker(message: impl Into<String>) -> Respons
     response
 }
 
-/// The reason a refusal's line names, when the router gave one (a
-/// `no_available_workers` 503; a 404 names none).
+/// The reason a refusal's line names, when the router gave one.
 pub(crate) fn refusal_reason(response: &Response) -> Option<&str> {
     response
         .extensions()
         .get::<RefusalReason>()
         .map(|reason| reason.0.as_str())
+}
+
+/// The 503 for a declined request. The line names where the policy
+/// declined. A retry reads the same rows, so the answer gives no retry hint.
+pub(crate) fn policy_declined(model: &str, declined_at: &str) -> Response {
+    let mut response = error::service_unavailable(
+        POLICY_DECLINED_CODE,
+        format!("{POLICY_DECLINED_MESSAGE} '{model}'"),
+    );
+    let reason = format!("the policy declined at {declined_at}");
+    response.extensions_mut().insert(RefusalReason(reason));
+    mark_non_retryable(&mut response);
+    response
 }
 
 /// The workers of `pool` a placement may use: those on `wire` when a retry
@@ -781,16 +798,16 @@ fn admitted_pool(
 /// line recognises the 404 by.
 pub(crate) const MODEL_NOT_FOUND_CODE: &str = "model_not_found";
 
-/// The reason a `no_available_workers` refusal names (the role that is down,
-/// the policy that declined), carried on the response for its log line.
+/// The reason carried on a refusal response for its log line.
 #[derive(Clone, Debug)]
 struct RefusalReason(String);
 
 /// Lines per second the gateway writes for each refusal it answers on its
 /// own: a model whose workers are all unavailable (`no_available_workers`),
-/// a model nobody serves (`model_not_found`) and a model none of whose
+/// a model nobody serves (`model_not_found`), a model none of whose
 /// workers processes the media references forwarded to it
-/// (`no_media_ref_capable_worker`). One line per refusal, with
+/// (`no_media_ref_capable_worker`), or a request the policy declined
+/// (`policy_declined`). One line per refusal, with
 /// the request id, the model and the pool's state, shows the condition and
 /// whom it hits; past this rate the lines are counted and the next one
 /// carries the count, while `smg_router_request_errors_total` keeps the
@@ -821,6 +838,12 @@ static NO_MEDIA_REF_CAPABLE_WORKER_LOG: KeyedLogThrottle = KeyedLogThrottle::new
     REFUSAL_LOG_MODELS,
 );
 
+static POLICY_DECLINED_LOG: KeyedLogThrottle = KeyedLogThrottle::new(
+    REFUSAL_LINES_PER_SECOND,
+    Duration::from_secs(1),
+    REFUSAL_LOG_MODELS,
+);
+
 /// The router answering a refusal, as its line names it.
 #[derive(Clone, Copy)]
 pub(crate) struct RefusalSite<'a> {
@@ -843,6 +866,7 @@ enum Refusal {
     /// verdict that holds until a capable worker registers, so it is keyed
     /// and capped like the pool's 503.
     NoMediaRefCapableWorker,
+    PolicyDeclined,
 }
 
 impl Refusal {
@@ -851,6 +875,7 @@ impl Refusal {
             NO_AVAILABLE_WORKERS_CODE => Some(Self::NoAvailableWorkers),
             MODEL_NOT_FOUND_CODE => Some(Self::ModelNotFound),
             NO_MEDIA_REF_CAPABLE_WORKER_CODE => Some(Self::NoMediaRefCapableWorker),
+            POLICY_DECLINED_CODE => Some(Self::PolicyDeclined),
             _ => None,
         }
     }
@@ -860,6 +885,7 @@ impl Refusal {
             Self::NoAvailableWorkers => &NO_AVAILABLE_WORKERS_LOG,
             Self::ModelNotFound => &MODEL_NOT_FOUND_LOG,
             Self::NoMediaRefCapableWorker => &NO_MEDIA_REF_CAPABLE_WORKER_LOG,
+            Self::PolicyDeclined => &POLICY_DECLINED_LOG,
         }
     }
 
@@ -868,6 +894,7 @@ impl Refusal {
             Self::NoAvailableWorkers => "No available workers for model",
             Self::ModelNotFound => "No worker serves model",
             Self::NoMediaRefCapableWorker => "No worker processes media references for model",
+            Self::PolicyDeclined => POLICY_DECLINED_MESSAGE,
         }
     }
 
@@ -883,19 +910,25 @@ impl Refusal {
     /// shares one allowance with every other such name, for the same reason.
     fn key(self, model_id: &str, registered: bool) -> &str {
         match self {
-            Self::NoAvailableWorkers | Self::NoMediaRefCapableWorker if registered => model_id,
-            Self::NoAvailableWorkers | Self::NoMediaRefCapableWorker | Self::ModelNotFound => "",
+            Self::NoAvailableWorkers | Self::NoMediaRefCapableWorker | Self::PolicyDeclined
+                if registered =>
+            {
+                model_id
+            }
+            Self::NoAvailableWorkers
+            | Self::NoMediaRefCapableWorker
+            | Self::PolicyDeclined
+            | Self::ModelNotFound => "",
         }
     }
 }
 
 /// The log line of a refusal the gateway answers on its own, and its marker.
 ///
-/// A `no_available_workers` 503, a `no_media_ref_capable_worker` 503 or a
-/// `model_not_found` 404 gets one WARN with the request id, the model and
-/// the state of the pools `site` draws from, and the reason the refusal
-/// names when it has one (the role that is down, the policy that declined,
-/// the media references no worker processes), capped at
+/// A `no_available_workers`, `no_media_ref_capable_worker` or
+/// `policy_declined` 503, or a `model_not_found` 404, gets one WARN with
+/// the request id, the model, the state of the pools `site` draws from,
+/// and the reason the refusal names when it has one, capped at
 /// [`REFUSAL_LINES_PER_SECOND`] per model with workers for the 503s and for
 /// all unknown names together
 /// (the 404, and a 503 for a name with no workers at all; see
@@ -949,7 +982,7 @@ pub(crate) fn report_refusal_under(
     // pool lookup per role, no walk over the workers; the 404 needs none.
     let registered = matches!(
         kind,
-        Refusal::NoAvailableWorkers | Refusal::NoMediaRefCapableWorker
+        Refusal::NoAvailableWorkers | Refusal::NoMediaRefCapableWorker | Refusal::PolicyDeclined
     ) && site
         .pools
         .iter()
@@ -3743,6 +3776,53 @@ mod tests {
             event.record(&mut rendered);
             self.1.lock().unwrap().push(rendered.0);
         }
+    }
+
+    #[test]
+    fn a_declined_request_is_reported_once_as_a_refusal() {
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let _subscriber = test_subscriber(EventLines(tracing::Level::WARN, Arc::clone(&lines)));
+        let registry = http_registry(&["http://worker:8080"]);
+        let site = RefusalSite {
+            function: "Router::route_typed_request",
+            mode: "Regular",
+            pools: &[("regular", RoutingPool::HttpRegular)],
+        };
+        let refusal = policy_declined(MODEL, "binding");
+        let reported = report_refusal(&registry, site, None, MODEL, refusal);
+        assert!(reported.extensions().get::<ReportedRefusal>().is_some());
+        let reported = report_refusal(&registry, site, None, MODEL, reported);
+        assert!(reported.extensions().get::<ReportedRefusal>().is_some());
+        {
+            let lines = lines.lock().expect("the refusal's lines");
+            assert_eq!(lines.len(), 1, "{lines:?}");
+            assert!(lines[0].contains("message=The policy declined the request for model"));
+            assert!(lines[0].contains("reason=\"the policy declined at binding\""));
+        }
+
+        let kind = Refusal::of(&reported).expect("the reported refusal's kind");
+        for other in [
+            Refusal::NoAvailableWorkers,
+            Refusal::ModelNotFound,
+            Refusal::NoMediaRefCapableWorker,
+        ] {
+            assert!(!std::ptr::eq(kind.throttle(), other.throttle()));
+        }
+
+        let throttle = KeyedLogThrottle::new(1, Duration::from_secs(60), REFUSAL_LOG_MODELS);
+        for model in ["missing-a", "missing-b", MODEL] {
+            report_refusal_under(
+                &throttle,
+                &registry,
+                site,
+                None,
+                model,
+                policy_declined(model, "binding"),
+            );
+        }
+        let lines = lines.lock().expect("the refusal's lines");
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert!(lines[2].contains(&format!("model_id=\"{MODEL}\"")));
     }
 
     /// The model in the line is the caller's own text, so it is written as a

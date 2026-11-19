@@ -730,3 +730,29 @@ async fn the_classic_policy_serves_the_three_shapes_without_a_host() -> Case {
     assert_eq!(LeasesStore::live(&*store, GATEWAY), 0);
     Ok(())
 }
+
+#[tokio::test]
+async fn a_request_for_a_model_no_binding_covers_reads_declined_with_a_line() -> Case {
+    let registry = Arc::new(WorkerRegistry::new());
+    let (host, store, _) = bed_over(Arc::clone(&registry), &["http://127.0.0.1:1"]);
+    let mut doc = PolicySpec::preset("random")?;
+    doc.generation += 1;
+    doc.bindings[0].matcher.model = "other-model".into();
+    store.apply(AppliedSpec::validate(&doc)?)?;
+
+    let answer = chat(&router(registry, Some(host))).await?;
+    assert_eq!(answer.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(answer.extensions().get::<ReportedRefusal>().is_some());
+    assert_eq!(
+        placement::refusal_reason(&answer),
+        Some("the policy declined at binding")
+    );
+    let body = to_bytes(answer.into_body(), 1024).await?;
+    let error: Value = serde_json::from_slice(&body)?;
+    assert_eq!(error["error"]["code"], "policy_declined");
+    assert_eq!(
+        error["error"]["message"],
+        format!("The policy declined the request for model '{MODEL}'")
+    );
+    Ok(())
+}

@@ -51,7 +51,10 @@ use smg_policy_controller::{
 use smg_worker::identity::basic::{Worker, WorkerLoadGuard};
 
 use crate::{
-    middleware::SHED_RETRY_AFTER_SECS,
+    middleware::{
+        ADMISSION_QUEUE_FULL_CODE, ADMISSION_QUEUE_FULL_STATUS, ADMISSION_QUEUE_TIMEOUT_CODE,
+        ADMISSION_QUEUE_TIMEOUT_STATUS, SHED_RETRY_AFTER_SECS,
+    },
     observability::{
         cache_trace,
         metrics::{Metrics, PolicyDecision},
@@ -59,7 +62,8 @@ use crate::{
     routers::{
         common::{
             overload::WORKER_OVERLOAD_PROTECTION_SHED_ERROR_CODE,
-            placement::no_available_workers_because, retry::mark_non_retryable,
+            placement::{self, no_available_workers_because},
+            retry::mark_non_retryable,
             snapshot::WorkerRegistry,
         },
         error,
@@ -274,9 +278,8 @@ impl Unplaced {
     /// | The policy declined the request | 503 `policy_declined` |
     /// | The door made no decision | 503 `policy_controller_unavailable`, with a retry hint |
     ///
-    /// A declined request's message names no stage. The policy declines at
-    /// its picker, and also where no binding covers the model, so one text
-    /// must be true of each.
+    /// A declined request reads the same message for every cause. Its
+    /// refusal line names where the policy declined.
     ///
     /// No answer is retried in process: a second ask a moment later reads
     /// the same rows. A route that asks for a side of a pair refuses by name
@@ -317,8 +320,9 @@ impl Unplaced {
                 reason: ShedReason::FlowLimit,
                 ..
             } => hinted(
-                error::too_many_requests(
-                    "admission_queue_full",
+                error::create_error(
+                    ADMISSION_QUEUE_FULL_STATUS,
+                    ADMISSION_QUEUE_FULL_CODE,
                     "a queue of the policy controller is at its limit",
                 ),
                 SHED_RETRY_AFTER_SECS,
@@ -327,19 +331,18 @@ impl Unplaced {
                 reason: ShedReason::Deadline,
                 ..
             } => hinted(
-                error::service_unavailable(
-                    "admission_queue_timeout",
+                error::create_error(
+                    ADMISSION_QUEUE_TIMEOUT_STATUS,
+                    ADMISSION_QUEUE_TIMEOUT_CODE,
                     "the decision's budget passed before a worker was picked",
                 ),
                 SHED_RETRY_AFTER_SECS,
             ),
             Self::Shed {
                 reason: ShedReason::PolicyDeclined,
+                emptied_by,
                 ..
-            } => error::service_unavailable(
-                "policy_declined",
-                format!("The policy declined the request for model '{model}'"),
-            ),
+            } => return placement::policy_declined(model, emptied_by),
             Self::Refused(_) => hinted(
                 error::service_unavailable(
                     "policy_controller_unavailable",

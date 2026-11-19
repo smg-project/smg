@@ -45,8 +45,14 @@ use super::{
 };
 use crate::{
     config::{ManualAssignmentMode, PolicyConfig, RouterConfig},
+    middleware::{
+        ADMISSION_QUEUE_FULL_CODE, ADMISSION_QUEUE_FULL_STATUS, ADMISSION_QUEUE_TIMEOUT_CODE,
+        ADMISSION_QUEUE_TIMEOUT_STATUS,
+    },
     observability::{cache_trace, metrics::test_support::render_with_recorder},
-    routers::common::stream::GuardedStream,
+    routers::common::{
+        placement::refusal_reason, retry::is_retryable_response, stream::GuardedStream,
+    },
 };
 
 /// The workers of a keyed case.
@@ -810,36 +816,42 @@ async fn each_reason_an_attempt_has_no_worker_reads_its_own_answer() {
             unavailable,
             shed_code,
             Some("7"),
+            None,
         ),
-        (Unplaced::Queued, unavailable, shed_code, Some("1")),
+        (Unplaced::Queued, unavailable, shed_code, Some("1"), None),
         (
             shed(ShedReason::NoEndpoints),
             unavailable,
             "no_available_workers",
             Some("1"),
+            None,
         ),
         (
             Unplaced::NoTargetHolds,
             unavailable,
             "no_available_workers",
             Some("1"),
+            None,
         ),
         (
             shed(ShedReason::FlowLimit),
-            StatusCode::TOO_MANY_REQUESTS,
-            "admission_queue_full",
+            ADMISSION_QUEUE_FULL_STATUS,
+            ADMISSION_QUEUE_FULL_CODE,
             Some("2"),
+            Some("a queue of the policy controller is at its limit"),
         ),
         (
             shed(ShedReason::Deadline),
-            unavailable,
-            "admission_queue_timeout",
+            ADMISSION_QUEUE_TIMEOUT_STATUS,
+            ADMISSION_QUEUE_TIMEOUT_CODE,
             Some("2"),
+            Some("the decision's budget passed before a worker was picked"),
         ),
         (
             shed(ShedReason::PolicyDeclined),
             unavailable,
             "policy_declined",
+            None,
             None,
         ),
         (
@@ -847,9 +859,10 @@ async fn each_reason_an_attempt_has_no_worker_reads_its_own_answer() {
             unavailable,
             "policy_controller_unavailable",
             Some("1"),
+            None,
         ),
     ];
-    for (unplaced, status, code, retry_after) in rows {
+    for (unplaced, status, code, retry_after, message) in rows {
         let answer = unplaced.answer(MODEL);
         let hint = answer
             .headers()
@@ -863,6 +876,9 @@ async fn each_reason_an_attempt_has_no_worker_reads_its_own_answer() {
             .expect("the answer's body");
         let error: Value = serde_json::from_slice(&body).expect("a JSON error object");
         assert_eq!(error["error"]["code"], code, "{unplaced:?}");
+        if let Some(message) = message {
+            assert_eq!(error["error"]["message"], message, "{unplaced:?}");
+        }
     }
 }
 
@@ -900,17 +916,24 @@ async fn a_placement_names_the_rank_its_decision_named() {
 }
 
 #[tokio::test]
-async fn a_declined_request_reads_one_message_whatever_declined_it() {
+async fn a_declined_answer_names_no_cause_and_its_line_names_what_declined() {
     for emptied_by in ["binding", "affinity-column", "random"] {
         let declined = Unplaced::Shed {
             reason: ShedReason::PolicyDeclined,
             emptied_by,
             retry_after_secs: 0,
         };
-        let body = to_bytes(declined.answer(MODEL).into_body(), usize::MAX)
+        let answer = declined.answer(MODEL);
+        assert_eq!(answer.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!answer.headers().contains_key(RETRY_AFTER));
+        assert!(!is_retryable_response(&answer));
+        let reason = format!("the policy declined at {emptied_by}");
+        assert_eq!(refusal_reason(&answer), Some(reason.as_str()));
+        let body = to_bytes(answer.into_body(), usize::MAX)
             .await
             .expect("the answer's body");
         let error: Value = serde_json::from_slice(&body).expect("a JSON error object");
+        assert_eq!(error["error"]["code"], "policy_declined");
         assert_eq!(
             error["error"]["message"],
             format!("The policy declined the request for model '{MODEL}'"),
